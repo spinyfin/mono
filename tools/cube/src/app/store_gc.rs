@@ -23,7 +23,10 @@
 //!    [`QUIESCENCE_WAIT`] for one); when none comes, the pass abandons and
 //!    collects nothing and the next daily pass tries again. After the
 //!    abandon the store must hold exactly one operation head; otherwise the
-//!    pass stops before collecting and reports the extra heads.
+//!    pass stops before collecting and reports the extra heads. The heads
+//!    are counted once more after the post-abandon quiet wait and before
+//!    any collection, because a command that started mid-abandon loaded the
+//!    old head and only commits its second head later.
 //! 2. `jj util gc`, which deletes operation and view files no head reaches.
 //!    By default jj only deletes files older than two weeks, and jj 0.26
 //!    accepts no other threshold than `--expire now`. A collection that
@@ -34,7 +37,14 @@
 //!    store before the rewrite has then finished, and any command that
 //!    starts later loads the rewritten head, whose files the collection
 //!    keeps. If no such instant comes within [`QUIESCENCE_WAIT`], the pass
-//!    falls back to the two-week default.
+//!    falls back to the two-week default. Either way it collects only
+//!    when the head re-check found a single head.
+//!
+//! The pass does not hold an exclusion that lease, goto or the engine's own
+//! jj calls honour; the process-table probes and the head checks detect a
+//! race rather than prevent it. Every run records its outcome (maintained,
+//! skipped, failed) in pool metadata, and `cube workspace list` reports
+//! repos whose runs keep being skipped or failing.
 //!
 //! Each workspace's working copy records the id of the operation it last
 //! updated at, and the abandon rewrites that operation under a new id
@@ -94,6 +104,119 @@ pub(super) const PR_BOOKMARK_NAMES_TEMPLATE: &str = r#"name ++ "\n""#;
 /// Pool-metadata key stamped when the periodic pass last ran for `repo`.
 pub(super) fn store_gc_last_at_key(repo: &str) -> String {
     format!("last_store_gc_at:{repo}")
+}
+
+/// Pool-metadata key for the outcome of the last `cube repo gc` run for
+/// `repo`; see [`StoreGcOutcome`].
+pub(super) fn store_gc_outcome_key(repo: &str) -> String {
+    format!("store_gc_last_outcome:{repo}")
+}
+
+/// Pool-metadata key counting `repo`'s consecutive upkeep runs that did not
+/// maintain the store (skipped or failed).
+pub(super) fn store_gc_failures_key(repo: &str) -> String {
+    format!("store_gc_consecutive_failures:{repo}")
+}
+
+/// How the last upkeep run for a repo ended. The detached daily child has no
+/// standard streams, so this is the only place a skipped or failed pass is
+/// visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum StoreGcOutcome {
+    /// The pass ran to completion.
+    Maintained,
+    /// The host never went quiet, so nothing was abandoned or collected.
+    Skipped,
+    /// The pass failed, including a racing operation head.
+    Failed,
+}
+
+impl StoreGcOutcome {
+    fn code(self) -> i64 {
+        match self {
+            Self::Maintained => 0,
+            Self::Skipped => 1,
+            Self::Failed => 2,
+        }
+    }
+
+    fn from_code(code: i64) -> Option<Self> {
+        match code {
+            0 => Some(Self::Maintained),
+            1 => Some(Self::Skipped),
+            2 => Some(Self::Failed),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Maintained => "maintained",
+            Self::Skipped => "skipped: jj never went quiet",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Record how an upkeep run ended and bump or reset the consecutive-failure
+/// count.
+pub(super) fn record_store_gc_outcome(store: &Store, repo: &str, outcome: StoreGcOutcome) -> Result<()> {
+    store.set_pool_metadata_i(&store_gc_outcome_key(repo), outcome.code())?;
+    let failures = if outcome == StoreGcOutcome::Maintained {
+        0
+    } else {
+        store
+            .get_pool_metadata_i(&store_gc_failures_key(repo))?
+            .unwrap_or(0)
+            .saturating_add(1)
+    };
+    store.set_pool_metadata_i(&store_gc_failures_key(repo), failures)
+}
+
+/// A repo whose last upkeep runs did not maintain its store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct StoreGcAttention {
+    pub repo: String,
+    pub last_outcome: StoreGcOutcome,
+    pub consecutive_failures: i64,
+}
+
+impl StoreGcAttention {
+    pub(super) fn summary(&self) -> String {
+        format!(
+            "Store upkeep: {} has not been maintained for {} consecutive run(s) (last: {}); the op log is growing. \
+             Run `cube repo gc {}` and check the audit log (`repo.store_gc`).",
+            self.repo,
+            self.consecutive_failures,
+            self.last_outcome.label(),
+            self.repo
+        )
+    }
+}
+
+/// Repos in `repos` whose last upkeep run was skipped or failed.
+pub(super) fn store_gc_attention(store: &Store, repos: &[String]) -> Vec<StoreGcAttention> {
+    repos
+        .iter()
+        .filter_map(|repo| {
+            let consecutive_failures = store
+                .get_pool_metadata_i(&store_gc_failures_key(repo))
+                .ok()
+                .flatten()
+                .filter(|n| *n > 0)?;
+            let last_outcome = store
+                .get_pool_metadata_i(&store_gc_outcome_key(repo))
+                .ok()
+                .flatten()
+                .and_then(StoreGcOutcome::from_code)?;
+            Some(StoreGcAttention {
+                repo: repo.clone(),
+                last_outcome,
+                consecutive_failures,
+            })
+        })
+        .collect()
 }
 
 /// The lock one upkeep run holds for its whole run, so a second one cannot
@@ -195,7 +318,24 @@ pub(super) fn jj_processes(ps_output: &str) -> Vec<String> {
 pub(super) fn count_op_heads(source: &Path) -> Result<usize> {
     let heads = source.join(".jj/repo/op_heads/heads");
     let entries = std::fs::read_dir(&heads).map_err(CubeError::Io)?;
-    Ok(entries.flatten().filter(|entry| entry.path().is_file()).count())
+    Ok(entries.flatten().count())
+}
+
+/// Stop the pass unless the store holds exactly one operation head. A second
+/// head means a jj command raced the abandon: the next jj command merges the
+/// heads against an empty base, so nothing may be collected.
+fn require_single_op_head(record: &RepoRecord, source: &Path, when: &str) -> Result<()> {
+    let heads = count_op_heads(source)?;
+    if heads == 1 {
+        return Ok(());
+    }
+    Err(CubeError::InvalidArgument(format!(
+        "repo `{}`: the store holds {heads} operation heads {when} (expected 1); \
+         a jj command raced the maintenance, so nothing was collected. The next jj command merges the heads; \
+         check `jj bookmark list --conflicted` in {}",
+        record.repo,
+        source.display()
+    )))
 }
 
 /// Wait up to `timeout` for an instant with no `jj` process on the host,
@@ -349,16 +489,7 @@ pub(super) fn gc_repo_store(
                     &RealCommandRunner::invocation(&source, "jj", &["--ignore-working-copy", "op", "abandon", &range]),
                     MAINTENANCE_CMD_TIMEOUT,
                 )?;
-                let heads = count_op_heads(&source)?;
-                if heads != 1 {
-                    return Err(CubeError::InvalidArgument(format!(
-                        "repo `{}`: the store holds {heads} operation heads after the abandon (expected 1); \
-                         a jj command raced it, so nothing was collected. The next jj command merges the heads; \
-                         check `jj bookmark list --conflicted` in {}",
-                        record.repo,
-                        source.display()
-                    )));
-                }
+                require_single_op_head(record, &source, "after the abandon")?;
             } else {
                 abandoned_through = None;
                 collection = Collection::Skipped;
@@ -369,7 +500,13 @@ pub(super) fn gc_repo_store(
             // after the abandon: it is the commands that loaded the store
             // before the rewrite that must have finished.
             let mut gc_args = vec!["--ignore-working-copy", "util", "gc"];
-            if wait_for_jj_quiescence(runner, &source, quiescence, QUIESCENCE_POLL)? {
+            let quiet = wait_for_jj_quiescence(runner, &source, quiescence, QUIESCENCE_POLL)?;
+            // A command that started during the abandon loaded the old head
+            // and may have committed on it since; its head only shows up
+            // now, so the heads are counted again after the wait and before
+            // any collection, on both the immediate and the deferred path.
+            require_single_op_head(record, &source, "before the collection")?;
+            if quiet {
                 gc_args.extend(["--expire", "now"]);
                 collection = Collection::Immediate;
             } else {

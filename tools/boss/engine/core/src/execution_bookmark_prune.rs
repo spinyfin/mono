@@ -214,19 +214,44 @@ async fn prune_candidate(
             let kept_list = kept.join("`, `");
             tracing::warn!(execution_id = %execution.id, kept = %kept_list, missing = missing.len(), "execution bookmark prune: work not proven published; keeping the unproven heads");
             if db.reraise_open_execution_attention(&execution.id, UNPROVEN)?.is_none() {
-                let missing_lines = missing
-                    .iter()
-                    .map(|change| format!("- `{}` ({}): {}", change.commit, change.change_id, change.description))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let missing_lines = if missing.is_empty() {
+                    "- no voucher resolved in the store".to_owned()
+                } else {
+                    missing
+                        .iter()
+                        .map(|change| format!("- `{}` ({}): {}", change.commit, change.change_id, change.description))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
                 let tried_lines = tried.iter().map(|t| format!("- {t}")).collect::<Vec<_>>().join("\n");
-                let forgotten_note = if forgotten.is_empty() {
+                // The baseline is dropped because the record rebuilds it; only
+                // the other pointers were carried by a voucher.
+                let (baseline, carried): (Vec<&String>, Vec<&String>) =
+                    forgotten.iter().partition(|name| name.starts_with("boss-base/"));
+                let mut forgotten_notes = Vec::new();
+                if !carried.is_empty() {
+                    forgotten_notes.push(format!(
+                        "The {} `{}` {} carried by a voucher and forgotten.",
+                        if carried.len() == 1 { "pointer" } else { "pointers" },
+                        carried.iter().map(|n| n.as_str()).collect::<Vec<_>>().join("`, `"),
+                        if carried.len() == 1 { "was" } else { "were" },
+                    ));
+                }
+                if !baseline.is_empty() {
+                    forgotten_notes.push(format!(
+                        "The baseline `{}` was forgotten too; it is rebuilt from the record when needed.",
+                        baseline.iter().map(|n| n.as_str()).collect::<Vec<_>>().join("`, `"),
+                    ));
+                }
+                let forgotten_note = if forgotten_notes.is_empty() {
                     String::new()
                 } else {
-                    format!(
-                        "\n\nThe pointers `{}` were carried by a voucher and forgotten; the baseline is rebuilt from the record when needed.",
-                        forgotten.join("`, `")
-                    )
+                    format!("\n\n{}", forgotten_notes.join(" "))
+                };
+                let (kept_noun, kept_verb) = if kept.len() == 1 {
+                    ("pointer", "was")
+                } else {
+                    ("pointers", "were")
                 };
                 db.create_attention_item(CreateAttentionItemInput {
                     execution_id: Some(execution.id.clone()),
@@ -235,7 +260,7 @@ async fn prune_candidate(
                     status: None,
                     title: "Finished PR left execution work nothing vouches for".to_owned(),
                     body_markdown: format!(
-                        "The PR owning execution `{}` is merged or closed, but the work preserved at `{kept_list}` in the shared jj store is not carried by anything the engine recorded, so the pointer was kept. Changes nothing vouches for:\n{missing_lines}\n\nVouchers tried:\n{tried_lines}{forgotten_note}\n\nInspect with `jj -R {} log -r 'bookmarks(exact:\"{first_kept}\")'`. If the work is known to be obsolete, `jj bookmark forget {kept_args}` retires it; the sweep re-examines the record daily.",
+                        "The PR owning execution `{}` is merged or closed, but the work preserved at `{kept_list}` in the shared jj store is not carried by anything the engine recorded, so the {kept_noun} {kept_verb} kept. Changes nothing vouches for:\n{missing_lines}\n\nVouchers tried:\n{tried_lines}{forgotten_note}\n\nInspect with `jj -R {} log -r 'bookmarks(exact:\"{first_kept}\")'`. If the work is known to be obsolete, `jj bookmark forget {kept_args}` retires it; the sweep re-examines the record daily.",
                         execution.id,
                         record.repo_path.display(),
                         first_kept = kept[0],
