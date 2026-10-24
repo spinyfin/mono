@@ -84,6 +84,12 @@ extension ChatViewModel {
         boardReadFences[productID] = fence
         if !accepted && productID == currentSelectedProductID {
             refetchBoard(productID: productID)
+        } else if accepted, productID == currentSelectedProductID,
+                  let fence = boardReadFences[productID],
+                  fence.trees.isEmpty, !fence.needsTree, !fence.queuedPatchItemIDs.isEmpty {
+            // Cards that went runtime-dirty while this tree was outstanding may
+            // postdate its read; the patch reads after it, so it cannot undo it.
+            requestRuntimePatch(productID: productID, itemIDs: fence.queuedPatchItemIDs)
         }
         return accepted
     }
@@ -153,8 +159,16 @@ extension ChatViewModel {
         let now = ContinuousClock.now
         fence.expire(now: now, isQueued: engine.isReadQueued(requestId:))
         boardReadFences[productID] = fence
-        if itemIDs.union(fence.queuedPatchItemIDs).count > Self.maxRuntimePatchItems || !fence.trees.isEmpty || fence.needsTree {
+        if itemIDs.union(fence.queuedPatchItemIDs).count > Self.maxRuntimePatchItems || fence.needsTree {
             refetchBoard(productID: productID)
+            return
+        }
+        if !fence.trees.isEmpty {
+            // An older tree could land after a patch and undo it, but a second
+            // full assembly is the dearer answer. Hold the ids; the patch goes
+            // out once the outstanding tree is accepted (`acceptWorkTree`).
+            fence.queuedPatchItemIDs.formUnion(itemIDs)
+            boardReadFences[productID] = fence
             return
         }
         if fence.patchRequestID != nil {
