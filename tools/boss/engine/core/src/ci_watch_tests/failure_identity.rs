@@ -35,10 +35,16 @@ async fn failure_identity_survives_terminal_attempts_and_repeated_linking() {
         close_superseded_moot_revision(&db, &chore, Some(revision), "failure handled");
         let transitioned =
             on_ci_failure_detected(&db, &publisher, &fix_checker(), &candidate, &probe(pr, head), &[check]).await;
+        assert!(transitioned, "a terminal attempt must not hide a still-red head");
+        let (status, reason) = chore_state(&db, &chore);
+        assert_eq!(status, TaskStatus::Blocked);
         assert_eq!(
-            transitioned,
-            expected == 3,
-            "only genuine exhaustion changes the parent"
+            reason.as_deref(),
+            Some(if expected == 3 {
+                "ci_failure_exhausted"
+            } else {
+                "ci_failure"
+            })
         );
         assert!(db.active_ci_remediation_for_work_item(&chore).unwrap().is_none());
         assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), expected);
@@ -160,4 +166,115 @@ async fn prior_fix_does_not_suppress_a_budget_free_infrastructure_retrigger() {
         "retrigger"
     );
     assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 1);
+}
+
+#[tokio::test]
+async fn multiple_failures_select_one_unattempted_check_after_prior_revision_finishes() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/3277";
+    let (product, chore) = make_in_review(&db, "multiple failures", pr);
+    let publisher = RecordingPublisher::default();
+    let candidate = candidate(&product, &chore, pr);
+    let failures = [
+        failure("buildkite/mono/mac-app-build", "FAILURE"),
+        failure("buildkite/mono/bazel-build-test", "FAILURE"),
+    ];
+    for (index, selected) in failures.iter().enumerate() {
+        assert!(
+            on_ci_failure_detected(
+                &db,
+                &publisher,
+                &fix_checker(),
+                &candidate,
+                &probe(pr, "head"),
+                &failures
+            )
+            .await
+        );
+        let attempt = db.active_ci_remediation_for_work_item(&chore).unwrap().unwrap();
+        let revision = attempt.revision_task_id.as_deref().unwrap();
+        assert!(task(&db, revision).name.contains(&selected.name));
+        assert!(!task(&db, revision).name.contains(&failures[1 - index].name));
+        assert_eq!(
+            attempt.failed_checks,
+            encode_failed_checks(std::slice::from_ref(selected))
+        );
+        assert!(
+            !on_ci_failure_detected(
+                &db,
+                &publisher,
+                &fix_checker(),
+                &candidate,
+                &probe(pr, "head"),
+                &failures
+            )
+            .await
+        );
+        assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), (index + 1) as i64);
+        db.mark_ci_remediation_succeeded(&attempt.id, None).unwrap();
+        close_superseded_moot_revision(&db, &chore, Some(revision), "handled");
+    }
+}
+
+#[tokio::test]
+async fn mixed_infrastructure_and_real_failures_select_the_real_failure() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/3277";
+    let (product, chore) = make_in_review(&db, "mixed failures", pr);
+    let real = failure("ci/build", "FAILURE");
+    assert!(
+        on_ci_failure_detected(
+            &db,
+            &RecordingPublisher::default(),
+            &fix_checker(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, "head"),
+            &[failure("ci/start", "STARTUP_FAILURE"), real.clone()]
+        )
+        .await
+    );
+    let attempt = db.active_ci_remediation_for_work_item(&chore).unwrap().unwrap();
+    assert_eq!(attempt.attempt_kind, "fix");
+    assert_eq!(attempt.failed_checks, encode_failed_checks(std::slice::from_ref(&real)));
+    let title = task(&db, attempt.revision_task_id.as_deref().unwrap()).name;
+    assert!(title.contains(&real.name));
+    assert!(!title.contains("ci/start"));
+    assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 1);
+}
+
+#[tokio::test]
+async fn retrigger_remains_once_per_head_when_first_failure_changes() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/3277";
+    let (product, chore) = make_in_review(&db, "retrigger identity", pr);
+    let publisher = RecordingPublisher::default();
+    let candidate = candidate(&product, &chore, pr);
+    let failures = [failure("ci/a", "STARTUP_FAILURE"), failure("ci/b", "STARTUP_FAILURE")];
+    assert!(
+        on_ci_failure_detected(
+            &db,
+            &publisher,
+            &fix_checker(),
+            &candidate,
+            &probe(pr, "head"),
+            &failures
+        )
+        .await
+    );
+    let attempt = db.active_ci_remediation_for_work_item(&chore).unwrap().unwrap();
+    db.mark_ci_remediation_retriggered(&attempt.id).unwrap();
+    on_ci_failure_detected(
+        &db,
+        &publisher,
+        &fix_checker(),
+        &candidate,
+        &probe(pr, "head"),
+        &failures[1..],
+    )
+    .await;
+    assert!(db.active_ci_remediation_for_work_item(&chore).unwrap().is_none());
+    assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 0);
 }

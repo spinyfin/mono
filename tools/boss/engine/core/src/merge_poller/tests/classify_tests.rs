@@ -714,9 +714,15 @@ fn rerun_timestamps_win_over_rollup_order() {
 }
 
 #[test]
-fn queued_rerun_without_start_time_is_not_hidden_by_old_success() {
-    let mut old = check_run("ci/build", "COMPLETED", "SUCCESS");
-    old["startedAt"] = serde_json::json!("2026-10-24T03:00:00Z");
-    let queued = check_run("ci/build", "QUEUED", "");
-    assert_eq!(classify_ci(&[old, queued], None), OpenPrCiStatus::InFlight);
+fn undated_active_rerun_wins_in_either_order_over_completed_results() {
+    for conclusion in ["SUCCESS", "FAILURE"] {
+        for status in ["QUEUED", "IN_PROGRESS", "PENDING", "WAITING"] {
+            let mut old = check_run("ci/build", "COMPLETED", conclusion);
+            old["startedAt"] = serde_json::json!("2026-10-24T03:00:00Z");
+            let queued = check_run("ci/build", status, "");
+            for leaves in [[old.clone(), queued.clone()], [queued, old]] {
+                assert_eq!(classify_ci(&leaves, None), OpenPrCiStatus::InFlight);
+            }
+        }
+    }
 }

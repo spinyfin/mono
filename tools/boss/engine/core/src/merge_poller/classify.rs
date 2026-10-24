@@ -399,7 +399,11 @@ pub(crate) fn classify_ci(leaves: &[serde_json::Value], combined_state: Option<&
         if by_name.get(name).is_none_or(|old| {
             let new_time = leaf_timestamp(leaf);
             let old_time = leaf_timestamp(old);
-            new_time.is_empty() || old_time.is_empty() || new_time >= old_time
+            match (new_time.is_empty(), old_time.is_empty()) {
+                (true, false) => matches!(normalize_leaf(leaf), LeafVerdict::InFlight),
+                (false, true) => !matches!(normalize_leaf(old), LeafVerdict::InFlight),
+                _ => new_time >= old_time,
+            }
         }) {
             by_name.insert(name.to_owned(), leaf);
         }
