@@ -46,9 +46,9 @@ extension ChatViewModel {
     func bindBoardReadObserver() {
         engine.onQueuedWorkTreeRetired = { [weak self] productID, requestID in
             if Thread.isMainThread {
-                MainActor.assumeIsolated { self?.boardReadFences[productID]?.trees.removeValue(forKey: requestID) }
+                MainActor.assumeIsolated { _ = self?.boardReadFences[productID]?.trees.removeValue(forKey: requestID) }
             } else {
-                Task { @MainActor in self?.boardReadFences[productID]?.trees.removeValue(forKey: requestID) }
+                Task { @MainActor in _ = self?.boardReadFences[productID]?.trees.removeValue(forKey: requestID) }
             }
         }
         engine.onWorkTreeRequested = { [weak self] productID, requestID in
