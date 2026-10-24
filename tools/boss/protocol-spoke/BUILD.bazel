@@ -22,9 +22,7 @@ rust_prost_library(
     proto = ":spoke_v1_proto",
 )
 
-# Visible only to its consumers. The rest of the design-named ones
-# (engine/core, engine/spoke, engine/spoke-journal, engine/spoke-stream) are
-# added in the PR that makes each depend on this crate.
+# Visible only to implemented wire consumers.
 rust_library(
     name = "protocol-spoke",
     srcs = glob(["src/**/*.rs"]),
@@ -34,6 +32,8 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/engine/host-enrollment:__pkg__",
+        "//tools/boss/engine/spoke:__pkg__",
+        "//tools/boss/engine/spoke-journal:__pkg__",
         "//tools/boss/engine/spoke-stream:__pkg__",
         "//tools/boss/spoke-credentials:__pkg__",
     ],

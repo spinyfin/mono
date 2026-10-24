@@ -6,6 +6,7 @@
 //! in `store`; this crate owns no second database or execution policy.
 mod codec;
 mod commands;
+pub mod outbound;
 mod service;
 mod session;
 pub mod store;
