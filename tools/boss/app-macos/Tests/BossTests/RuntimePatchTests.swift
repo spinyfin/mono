@@ -272,7 +272,8 @@ final class RuntimePatchTests: XCTestCase {
         XCTAssertTrue(model.boardReadFences["prod_a"]!.trees.isEmpty)
         recorder.reset()
         model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_1"])
-        XCTAssertEqual(recorder.counts, ["get_work_runtime_patch": 1])
+        XCTAssertEqual(recorder.counts, ["get_work_tree": 1, "list_deferred_scope_attentions": 1])
+        XCTAssertTrue(model.boardReadFences["prod_a"]!.needsTree, "decode failure still owes a structural refresh")
     }
 
     func testUnrelatedErrorLeavesPatchOutstanding() {
@@ -294,7 +295,7 @@ final class RuntimePatchTests: XCTestCase {
         model.engine.sendGetWorkTree(productId: "prod_a", flow: .invalidationRefetch)
         let treeID = model.boardReadFences["prod_a"]!.trees.keys.first!
         model.boardReadFences["prod_a"]!.trees[treeID] = .now - .seconds(31)
-        model.boardReadFences["prod_a"]!.expire()
+        model.boardReadFences["prod_a"]!.expire(isQueued: { _ in false })
         var updated = makeTask(id: "task_1")
         updated.ciRequiredState = "success"
         model.applyEventForTest(.workItemUpdated(item: .task(updated), revision: 12))
@@ -313,8 +314,11 @@ final class RuntimePatchTests: XCTestCase {
         model.requestRuntimePatch(productID: "prod_a", itemIDs: ["updated"])
         XCTAssertEqual(recorder.counts["get_work_tree"], 1)
         XCTAssertTrue(recorder.patchBodies.isEmpty)
-        model.applyEventForTest(makeWorkTreeEvent(tasks: [makeTask(id: "updated")], requestID: treeID, revision: 12))
+        XCTAssertTrue(model.boardReadFences["prod_a"]!.needsTree)
+        let replacementID = model.boardReadFences["prod_a"]!.trees.keys.first!
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [makeTask(id: "updated")], requestID: replacementID, revision: 12))
         XCTAssertNil(model.task(withID: "deleted"))
+        XCTAssertFalse(model.boardReadFences["prod_a"]!.needsTree)
     }
 
     func testQueuedTreeReregistersAfterSecondDisconnect() {
@@ -324,16 +328,49 @@ final class RuntimePatchTests: XCTestCase {
         model.engine.sendGetWorkTree(productId: "prod_a", flow: .invalidationRefetch)
         let treeID = model.boardReadFences["prod_a"]!.trees.keys.first!
         model.applyEventForTest(.disconnected)
-        XCTAssertNil(model.boardReadFences["prod_a"])
+        XCTAssertNotNil(model.boardReadFences["prod_a"]?.trees[treeID])
+        model.boardReadFences["prod_a"]!.trees[treeID] = .now - .seconds(31)
+        model.boardReadFences["prod_a"]!.expire(isQueued: model.engine.isReadQueued(requestId:))
+        XCTAssertNotNil(model.boardReadFences["prod_a"]?.trees[treeID])
         model.engine.simulateConnectedForTesting = true
         model.engine.resetConnectTreeClaims()
         model.engine.flushQueuedReads()
         XCTAssertNotNil(model.boardReadFences["prod_a"]?.trees[treeID])
+        XCTAssertLessThan(model.boardReadFences["prod_a"]!.trees[treeID]!.duration(to: .now), .seconds(30))
         recorder.reset()
         model.applyEventForTest(.connected)
         XCTAssertNil(recorder.counts["get_work_tree"])
         model.applyEventForTest(makeWorkTreeEvent(tasks: [makeTask(id: "task_1")], requestID: treeID, revision: 12))
         XCTAssertNotNil(model.task(withID: "task_1"))
+    }
+
+    func testQueuedTreeReplacementRetiresOldFence() {
+        let (model, _) = makeModel()
+        model.engine.simulateConnectedForTesting = false
+        model.engine.sendGetWorkTree(productId: "prod_a", flow: .invalidationRefetch)
+        let oldID = model.boardReadFences["prod_a"]!.trees.keys.first!
+        model.engine.sendGetWorkTree(productId: "prod_a", flow: .invalidationRefetch)
+        XCTAssertNil(model.boardReadFences["prod_a"]!.trees[oldID])
+        XCTAssertEqual(model.boardReadFences["prod_a"]!.trees.count, 1)
+    }
+
+    func testFailedTreeRetainsDeletionUntilReplacementAccepted() {
+        let (model, recorder) = makeModel(cards: [makeTask(id: "deleted"), makeTask(id: "updated")])
+        model.engine.sendGetWorkTree(productId: "prod_a", flow: .invalidationRefetch)
+        let failedID = model.boardReadFences["prod_a"]!.trees.keys.first!
+        recorder.reset()
+        model.applyEventForTest(.workError(message: "read failed", requestId: failedID))
+        XCTAssertTrue(recorder.sent.isEmpty, "errors must not start a retry loop")
+        model.requestRuntimePatch(productID: "prod_a", itemIDs: ["updated"])
+        XCTAssertEqual(recorder.counts["get_work_tree"], 1)
+        XCTAssertTrue(recorder.patchBodies.isEmpty)
+        XCTAssertTrue(model.boardReadFences["prod_a"]!.needsTree)
+        let replacementID = model.boardReadFences["prod_a"]!.trees.keys.first!
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [makeTask(id: "updated")], requestID: failedID, revision: 12))
+        XCTAssertTrue(model.boardReadFences["prod_a"]!.needsTree, "a retired read cannot settle the obligation")
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [makeTask(id: "updated")], requestID: replacementID, revision: 12))
+        XCTAssertNil(model.task(withID: "deleted"))
+        XCTAssertFalse(model.boardReadFences["prod_a"]!.needsTree)
     }
 
     func testMalformedTreeDeltaDoesNotFailOptimisticMove() async {
