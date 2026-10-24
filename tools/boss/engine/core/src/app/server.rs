@@ -2106,14 +2106,18 @@ async fn serve_scoped(
         crate::run_done_finalize_sweep::DEFAULT_INTERVAL,
     );
 
+    // Bridges every committed work-item change (dependency, dispatch,
+    // revision-settle, review-verdict application) to `work_invalidated`
+    // pushes. See `crate::board_notification_bridge`.
+    let _board_notification_bridge = crate::board_notification_bridge::spawn_notifications(
+        server_state.event_bus.clone(),
+        server_state.publisher.clone(),
+    );
+
     // Asynchronous review-verdict application: a supervisor submission
     // stays `proposed` so GitHub probes and remediation task creation do
     // not block the worker socket. This sweep is the crash-recovery path;
     // `app::proposals` also applies immediately after a fresh submit.
-    let _review_verdict_notifications = crate::review_verdict_apply_sweep::spawn_notifications(
-        server_state.event_bus.clone(),
-        server_state.publisher.clone(),
-    );
     let _review_verdict_apply_sweep_handle = crate::review_verdict_apply_sweep::spawn_loop(
         server_state.work_db.clone(),
         server_state.execution_coordinator.clone(),

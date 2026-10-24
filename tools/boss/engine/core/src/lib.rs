@@ -170,6 +170,7 @@ pub mod repo_slug;
 pub mod resolution_signal_capture;
 pub mod review_guide_capture;
 mod review_guide_workspace;
+pub mod board_notification_bridge;
 pub mod review_verdict_apply_sweep;
 pub mod rotating_file;
 pub mod run_done_backstop;

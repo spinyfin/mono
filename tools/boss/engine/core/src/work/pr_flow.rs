@@ -1677,9 +1677,10 @@ impl WorkDb {
     /// sweep diffs its probe against the row this call just wrote, so a
     /// refresh that already stored what the sweep would have stored makes
     /// that sweep report "unchanged" and publish nothing — the board would
-    /// keep showing the card where the last published state put it (for
-    /// example under Pending with `pr_mergeable_state = "unknown"`) while the
-    /// engine itself classifies the row as Ready.
+    /// keep showing the card where the last published state put it until the
+    /// next product-topic invalidation triggers a tree refetch (for example
+    /// under Pending with `pr_mergeable_state = "unknown"`) while the engine
+    /// itself classifies the row as Ready.
     pub fn set_pr_status_observation(
         &self,
         work_item_id: &str,

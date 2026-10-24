@@ -797,15 +797,7 @@ impl WorkDb {
         // Same single-item projection `get_work_item` runs, so SetStatus's
         // WorkItemUpdated does not flicker derived flags to mapper zeros
         // for the 150 ms until the invalidation refetch lands.
-        let mut doc_pointer_queries = 0u64;
-        attach_task_doc_link_state(&tx, &mut updated, "update_task", &mut doc_pointer_queries);
-        if let Err(err) = attach_task_derived_projections(&tx, &mut updated) {
-            tracing::warn!(
-                ?err,
-                task_id = %id,
-                "update_task: derived projections failed; returning unprojected row"
-            );
-        }
+        project_for_work_item_updated(&tx, &mut updated, "update_task");
         // Audit inside `tx`: the action row and the write it describes
         // commit together or not at all. Inert unless `actor` is Boothby.
         // Derived fields are not part of `task_image`, so projecting

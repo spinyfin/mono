@@ -87,7 +87,7 @@ async fn committed_dependency_change_reaches_board_publisher() {
     let prerequisite = create_test_chore(&db, product.id.clone(), "Prerequisite");
     let dependent = create_test_chore(&db, product.id.clone(), "Dependent");
     let publisher = std::sync::Arc::new(crate::test_support::RecordingPublisher::default());
-    let bridge = crate::review_verdict_apply_sweep::spawn_notifications(db.event_bus().clone(), publisher.clone());
+    let bridge = crate::board_notification_bridge::spawn_notifications(db.event_bus().clone(), publisher.clone());
     db.add_dependency(AddDependencyInput {
         dependent: dependent.id.clone(),
         prerequisite: prerequisite.id,
