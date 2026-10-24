@@ -25,6 +25,7 @@ pub(super) fn kind(event: &FrontendEvent) -> &'static str {
         FrontendEvent::OperatorQuestionsList { .. } => "OperatorQuestionsList",
         FrontendEvent::OperatorQuestionError { .. } => "OperatorQuestionError",
         FrontendEvent::ProjectTasksReordered { .. } => "ProjectTasksReordered",
+        FrontendEvent::WorkItemRefused { .. } => "WorkItemRefused",
         FrontendEvent::ExecutionsList { .. } => "ExecutionsList",
         FrontendEvent::TaskRuntimeResult { .. } => "TaskRuntimeResult",
         FrontendEvent::ExecutionResult { .. } => "ExecutionResult",
