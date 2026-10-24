@@ -1391,3 +1391,17 @@ fn parse_probe_queued_with_unknown_merge_state_status_never_classifies_conflict(
         );
     }
 }
+
+#[test]
+fn batched_probe_rejects_checks_for_a_previous_head() {
+    let node = serde_json::json!({
+        "state": "OPEN", "headRefOid": "rebased-head",
+        "commits": {"nodes": [{"commit": {
+            "oid": "old-head",
+            "statusCheckRollup": {"contexts": {"nodes": []}}
+        }}]}
+    });
+    let flat = flatten_batched_pr_node(&node);
+    let error = parse_probe_json("https://github.com/foo/bar/pull/3277", &flat.to_string(), None).unwrap_err();
+    assert!(error.to_string().contains("does not match current PR head"));
+}

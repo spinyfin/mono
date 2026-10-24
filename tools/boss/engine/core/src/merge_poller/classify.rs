@@ -310,6 +310,15 @@ pub(crate) fn normalize_leaf(leaf: &serde_json::Value) -> LeafVerdict {
     LeafVerdict::InFlight
 }
 
+fn leaf_timestamp(leaf: &serde_json::Value) -> &str {
+    // Start time orders reruns even if an older run completes later.
+    leaf.get("startedAt")
+        .or_else(|| leaf.get("createdAt"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| leaf.get("completedAt").and_then(serde_json::Value::as_str))
+        .unwrap_or("")
+}
+
 /// Collapse the `statusCheckRollup` array into one [`OpenPrCiStatus`]
 /// per the design's §Q1 predicate:
 ///
@@ -318,9 +327,8 @@ pub(crate) fn normalize_leaf(leaf: &serde_json::Value) -> LeafVerdict {
 ///      providers that don't fill the field) default to `true` —
 ///      branch protection is the authority, and we'd rather over-trip
 ///      on a third-party check than ignore a real signal.
-///   2. Group by check name; pick the latest leaf per name (we use the
-///      last entry, which matches GitHub's natural ordering for
-///      re-runs — the most recent run lands last in the rollup).
+///   2. Group by check name; pick the latest timestamp per name.
+///      Provider rollup ordering is not a chronology guarantee.
 ///   3. For each surviving leaf, run [`normalize_leaf`] to fold the
 ///      two leaf shapes (`CheckRun` and `StatusContext`) into a single
 ///      verdict bucket.
@@ -372,8 +380,8 @@ pub(crate) fn normalize_leaf(leaf: &serde_json::Value) -> LeafVerdict {
 pub(crate) fn classify_ci(leaves: &[serde_json::Value], combined_state: Option<&str>) -> OpenPrCiStatus {
     use std::collections::BTreeMap;
 
-    // Group by name, keeping the most-recently-seen leaf per name.
-    // The rollup is ordered oldest-to-newest for same-name re-runs.
+    // A historical failure can follow a newer success in the API array.
+    // Prefer run timestamps; retain array order only for undated legacy data.
     let mut by_name: BTreeMap<String, &serde_json::Value> = BTreeMap::new();
     for leaf in leaves {
         // `isRequired` defaults to `true` when missing; only filter
@@ -388,7 +396,17 @@ pub(crate) fn classify_ci(leaves: &[serde_json::Value], combined_state: Option<&
         if name.starts_with(TRUNK_QUEUE_CHECK_NAME_PREFIX) {
             continue;
         }
-        by_name.insert(name.to_owned(), leaf);
+        if by_name.get(name).is_none_or(|old| {
+            let new_time = leaf_timestamp(leaf);
+            let old_time = leaf_timestamp(old);
+            match (new_time.is_empty(), old_time.is_empty()) {
+                (true, false) => matches!(normalize_leaf(leaf), LeafVerdict::InFlight),
+                (false, true) => !matches!(normalize_leaf(old), LeafVerdict::InFlight),
+                _ => new_time >= old_time,
+            }
+        }) {
+            by_name.insert(name.to_owned(), leaf);
+        }
     }
 
     let mut failures: Vec<RequiredCheckFailure> = Vec::new();

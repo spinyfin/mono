@@ -348,6 +348,9 @@ pub async fn on_ci_failure_detected(
     probe: &PrLifecycleProbe,
     failures: &[RequiredCheckFailure],
 ) -> bool {
+    if !matches!(&probe.state, PrLifecycleState::Open(open) if matches!(open.ci, OpenPrCiStatus::Failing { .. })) {
+        return false;
+    }
     if failures.is_empty() {
         // Defensive — the dispatch site already filtered on Failing,
         // but if a future caller hands us an empty set we should not
@@ -459,8 +462,7 @@ pub async fn on_ci_failure_detected(
     // check now passes) while the revision worker is still running and has
     // not pushed a fix commit. Without this guard, a new revision can spawn
     // concurrently with the prior one, wasting the attempt budget and racing
-    // the same PR branch (observed: T1437→T1438→T1439 firing 4–6 min apart,
-    // shorter than one worker+CI cycle — issue T1431 / PR #1404).
+    // the same PR branch (PR #1404).
     match work_db.has_in_flight_ci_fix_revision(&candidate.work_item_id) {
         Ok(true) => {
             tracing::debug!(
@@ -581,34 +583,69 @@ pub async fn on_ci_failure_detected(
         }
     }
 
+    // Work on one distinct failing check at a time. Include terminal attempts
+    // in deduplication so re-observing a failure cannot mint another revision.
+    // The budget gate above still surfaces genuine exhaustion on a red head.
+    let attempt_kind = classify_pre_triage(failures);
+    let mut selected = None;
+    for failure in failures {
+        if attempt_kind == "retrigger" {
+            selected = Some(failure);
+            break;
+        }
+        if classify_pre_triage(std::slice::from_ref(failure)) == "retrigger" {
+            continue;
+        }
+        match work_db.ci_check_attempted(&candidate.work_item_id, head_sha, &failure.name) {
+            Ok(false) => {
+                selected = Some(failure);
+                break;
+            }
+            Ok(true) => {}
+            Err(err) => {
+                tracing::warn!(?err, "ci_watch: cannot read failure identity; deferring");
+                return false;
+            }
+        }
+    }
+    let failures = if attempt_kind == "fix" {
+        selected.map(std::slice::from_ref).unwrap_or(failures)
+    } else {
+        failures
+    };
+
     // Pre-spawn classification (design §Q4 "pre-triage"): if every
     // failure is `STARTUP_FAILURE` or `CANCELLED` we choose
     // `retrigger`; otherwise `fix`. Retriggers don't consume budget.
-    let attempt_kind = classify_pre_triage(failures);
     let consumes_budget: i64 = if attempt_kind == "fix" { 1 } else { 0 };
 
     let failed_checks_json = encode_failed_checks(failures);
     let pr_number = stored_pr_number(&candidate.pr_url).unwrap_or(0);
 
     // Best-effort attempt insert. The unique key
-    // (work_item_id, head_sha, attempt_kind) is the idempotency lock —
-    // a second probe for the same triplet finds the row already
+    // (work_item_id, head_sha, attempt_kind, failing_check) is the
+    // idempotency lock — a repeat observation finds the row already
     // present and `INSERT OR IGNORE` updates zero rows; we still want
     // to flip the parent to `blocked: ci_failure` if it isn't already
     // there (e.g. the engine restarted mid-cycle).
-    let insert_result = work_db.insert_ci_remediation(CiRemediationInsertInput {
-        product_id: candidate.product_id.clone(),
-        work_item_id: candidate.work_item_id.clone(),
-        pr_url: candidate.pr_url.clone(),
-        pr_number,
-        head_branch: probe.head_ref_name.clone().unwrap_or_default(),
-        head_sha_at_trigger: head_sha.to_owned(),
-        attempt_kind: attempt_kind.to_owned(),
-        consumes_budget,
-        failed_checks: failed_checks_json,
-        failure_kind: "pr_branch_ci".to_owned(),
-        before_commit_sha: None,
-    });
+    let insert_result = if selected.is_some() {
+        work_db.insert_ci_remediation(CiRemediationInsertInput {
+            product_id: candidate.product_id.clone(),
+            work_item_id: candidate.work_item_id.clone(),
+            pr_url: candidate.pr_url.clone(),
+            pr_number,
+            head_branch: probe.head_ref_name.clone().unwrap_or_default(),
+            head_sha_at_trigger: head_sha.to_owned(),
+            attempt_kind: attempt_kind.to_owned(),
+            consumes_budget,
+            failed_checks: failed_checks_json,
+            failure_kind: "pr_branch_ci".to_owned(),
+            before_commit_sha: None,
+        })
+    } else {
+        // Terminal attempts still block a red parent without minting or charging again.
+        Ok(None)
+    };
     let attempt = match insert_result {
         Ok(row) => row,
         Err(err) => {
@@ -682,7 +719,7 @@ pub async fn on_ci_failure_detected(
     // Phase 4 cutover (design Q1/Q5): on a genuinely-new live `fix` attempt
     // the fix vehicle is an engine-triggered revision, NOT a bespoke
     // `ci_remediation` execution. The `revision_task_id` soft-FK is the
-    // idempotency latch (a same-triplet repeat probe hits `Ok(None)` on the
+    // idempotency latch (a same-key repeat probe hits `Ok(None)` on the
     // insert above, so `attempt` is `None` and this branch is skipped) and
     // the marker that hides the row from the dormant `ci_remediation` rescue
     // path. Decoupled from `task_transitioned` (mirrors
@@ -717,22 +754,6 @@ pub async fn on_ci_failure_detected(
     // is set only by a fresh-attempt spawn.)
     let task_changed = task_transitioned || task_unblocked_for_revision;
     if task_changed {
-        // Bump the budget counter when we created a fix-kind attempt — the
-        // design (§Q3) says the counter increments when "a fix attempt
-        // actually progresses past the worker's go/no-go." The flip may have
-        // been cleared back to `in_review` for an in-flight revision, but a fix
-        // attempt still progressed, so the bump is keyed off the attempt, not
-        // the parent's terminal status.
-        if attempt.is_some()
-            && attempt_kind == "fix"
-            && let Err(err) = work_db.increment_ci_attempts_used(&candidate.work_item_id)
-        {
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                ?err,
-                "ci_watch: failed to increment ci_attempts_used",
-            );
-        }
         // Parent stays in Review while the revision runs
         // (`ci_revision_in_flight`); it surfaces in Blocked
         // (`blocked_ci_failure`) only when there is no fix vehicle.
@@ -750,7 +771,7 @@ pub async fn on_ci_failure_detected(
             // `ready` execution and kick the scheduler. `fix` attempts ride
             // the engine-triggered revision spawned above and must NOT get a
             // bespoke execution (the cutover). The unique key already gated
-            // us, so a second probe with the same triplet sees
+            // us, so a second probe with the same key sees
             // `attempt = None` and skips this branch entirely.
             if attempt.attempt_kind == "retrigger" {
                 match work_db.create_execution(
@@ -1365,8 +1386,8 @@ async fn on_queue_side_failure_detected(
             // Per-(work_item_id, discriminator) idempotency — THE flap root
             // cause for the rebounce case, and the same shape for a Trunk
             // eviction episode. `INSERT OR IGNORE` found an existing row for
-            // the triplet (work_item_id, head_sha_at_trigger=discriminator,
-            // attempt_kind='fix'): we have already bounced this exact
+            // the key (work_item_id, head_sha_at_trigger=discriminator,
+            // attempt_kind='fix', failure_check=''): we have already bounced this exact
             // episode on an earlier sweep. The underlying dequeue/eviction
             // event stays in the PR timeline forever, so without this guard
             // we would re-flip the parent to `blocked: ci_failure` on every
@@ -1374,7 +1395,7 @@ async fn on_queue_side_failure_detected(
             // returned it to `in_review` would produce a flap. Bounce a
             // given episode AT MOST ONCE; do not re-bounce until the
             // discriminator advances (a new fix commit -> a new synthetic
-            // merge SHA, or a new Trunk `stateChangedAt` -> a new triplet).
+            // merge SHA, or a new Trunk `stateChangedAt` -> a new key).
             // The first bounce's block is sticky on its own WHERE guard.
             tracing::debug!(
                 work_item_id = %candidate.work_item_id,
@@ -1477,17 +1498,6 @@ async fn on_queue_side_failure_detected(
 
     let task_changed = task_transitioned || task_unblocked_for_revision;
     if task_changed {
-        // Keyed off the attempt (mirrors on_ci_failure_detected's budget
-        // comment): a fresh `fix` attempt progressed even when the upfront
-        // flip was immediately undone by a successful revision spawn.
-        if let Err(err) = work_db.increment_ci_attempts_used(&candidate.work_item_id) {
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                ?err,
-                failure_kind,
-                "ci_watch: failed to increment ci_attempts_used (queue-side failure)",
-            );
-        }
         let change_reason = if task_unblocked_for_revision {
             "ci_revision_in_flight"
         } else {
@@ -2562,7 +2572,7 @@ pub async fn on_ci_resolved(
         // emit `CiFailureCleared` so the UI can clear the `ci failing`
         // badge. The `CiRemediationSucceeded` path covers the case where
         // an active attempt is retired; this covers every other path where
-        // the blocked status clears without an active attempt (T606).
+        // the blocked status clears without an active attempt.
         if !attempt_transitioned {
             publisher
                 .publish_frontend_event_on_product(
@@ -2614,7 +2624,7 @@ pub async fn on_ci_resolved(
 /// the verify-at-call-time gate shared by two verbs — `boss engine ci
 /// mark-noop` ("nothing to fix, it's already green") and `boss engine
 /// ci mark-succeeded-via-rebase` ("I rebased and pushed, CI came back
-/// green"; T2764 postmortem, PR spinyfin/mono#2023) — since both are
+/// green"; PR spinyfin/mono#2023) — since both are
 /// exactly the same claim: "the PR's current head SHA is green,
 /// verify it before honoring." The engine handler runs the (impure)
 /// probe, then calls this to decide whether to honor or reject.

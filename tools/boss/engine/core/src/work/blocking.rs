@@ -222,15 +222,15 @@ impl WorkDb {
         Ok(Some(updated))
     }
 
-    /// Foreign-bucket takeover (T2381/PR#1861 fix): re-bucket a chore/
+    /// Foreign-bucket takeover (PR #1861): re-bucket a chore/
     /// project_task currently `blocked: ci_failure` or
     /// `blocked: ci_failure_exhausted` into `blocked: merge_conflict`.
     ///
     /// Unlike [`Self::recanonicalize_blocked_merge_conflict`] (which only
     /// claims a NULL-reason strand), this explicitly overwrites *another*
     /// watcher's scalar reason. It exists because a row `ci_watch` flips and
-    /// then fails to return to `in_review` (e.g. the merge-queue-rebounce gap
-    /// that produced T2381) is invisible to every reason-scoped candidate
+    /// then fails to return to `in_review` (e.g. a merge-queue rebounce gap)
+    /// is invisible to every reason-scoped candidate
     /// list `conflict_watch` would otherwise use — `mark_chore_blocked_merge_conflict`'s
     /// `status='in_review'` WHERE guard never matches it, so without an
     /// explicit takeover a live CONFLICTING probe is silently dropped forever.
@@ -326,10 +326,10 @@ impl WorkDb {
         Ok(Some(updated))
     }
 
-    /// T9 (T2562) result-gate halt: flip a chore/project_task currently
+    /// Result-gate halt: flip a chore/project_task currently
     /// `blocked: merge_conflict` to `blocked: deletion_signoff` when the
     /// escalation ladder's mechanical rungs (0/1) push a resolution the
-    /// both-parents deletion tripwire (incident-002 P2) rejects. Mirrors
+    /// both-parents deletion tripwire rejects. Mirrors
     /// the `blocked_reason` the worker-driven `pr_review` path stamps via
     /// `record_worker_pr_completion`'s
     /// `WorkerPrCompletionTarget::BlockedDeletionSignoff` (`work/pr_flow.rs`),
@@ -762,7 +762,7 @@ impl WorkDb {
     /// Re-upsert the `task_blocked_signals` row for `merge_conflict` when the
     /// parent task is already `blocked: merge_conflict` but the signal row
     /// was cleared (e.g. by the polymorphic-clear path that ran prematurely
-    /// against a stale probe — T230 scenario).
+    /// against a stale probe while the parent remained blocked).
     ///
     /// Returns `true` if the task IS `blocked: merge_conflict` (and the
     /// signal was upserted); `false` when the task is not in that state, which
@@ -832,7 +832,7 @@ impl WorkDb {
     /// Returns `Ok(None)` when the task is not blocked (or is soft-deleted,
     /// or does not exist). Used by the merge-poller's drift-guard fallback in
     /// `maybe_clear_blocked` to drive the retire path even when
-    /// `task_blocked_signals` is empty (T230-style inconsistency).
+    /// `task_blocked_signals` is empty after a stale probe cleared the signal.
     pub fn task_blocked_reason(&self, work_item_id: &str) -> Result<Option<String>> {
         let conn = self.connect()?;
         conn.query_row(
@@ -864,13 +864,8 @@ impl WorkDb {
         Ok(used.unwrap_or(0))
     }
 
-    /// Increment the `ci_attempts_used` counter for `work_item_id` by
-    /// one. Used by the CI-watch detect path when a fix attempt
-    /// progresses past the worker's go/no-go (design §Q3 "what counts
-    /// as one attempt"). Idempotent only insofar as the unique key on
-    /// `ci_remediations` prevents the same `(work_item, head_sha, kind)`
-    /// from incrementing twice — callers are expected to bump only
-    /// when an insert actually produced a fresh row.
+    /// Seed budget usage in tests. Production charges atomically when
+    /// `set_ci_remediation_revision_task_id` first links a fix revision.
     pub fn increment_ci_attempts_used(&self, work_item_id: &str) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
@@ -900,9 +895,9 @@ impl WorkDb {
 
     /// Insert a `ci_remediations` row with `status='pending'`.
     /// Mirrors [`Self::insert_conflict_resolution`] but for the CI
-    /// signal: the unique key is `(work_item_id, head_sha_at_trigger,
-    /// attempt_kind)` and the engine uses `INSERT OR IGNORE` so a
-    /// second probe for the same triplet is a no-op (caller reads the
+    /// signal: the unique key includes the work item, trigger head, attempt
+    /// kind, and branch failure's check name. Queue episodes use an empty
+    /// check key. A repeat insert is a no-op (caller reads the
     /// existing row separately). `failed_checks` is the JSON-encoded
     /// snapshot the engine captured at trigger time; `consumes_budget`
     /// must be `1` for `attempt_kind='fix'` and `0` for `'retrigger'`.
@@ -926,8 +921,10 @@ impl WorkDb {
                 (id, product_id, work_item_id, pr_url, pr_number,
                  head_branch, head_sha_at_trigger, attempt_kind,
                  consumes_budget, failed_checks, status, created_at,
-                 failure_kind, before_commit_sha, queue_base_sha)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?13, ?14)",
+                 failure_kind, before_commit_sha, queue_base_sha, failure_check)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?13, ?14,
+                CASE WHEN ?12 = 'pr_branch_ci' AND ?8 = 'fix' AND json_valid(?10)
+                     THEN COALESCE(json_extract(?10, '$[0].name'), '') ELSE '' END)",
             params![
                 id,
                 input.product_id,
@@ -1990,8 +1987,8 @@ impl WorkDb {
     /// link / Phase 4 cutover). Mirrors
     /// [`Self::set_conflict_resolution_revision_task_id`]. Set by
     /// `ci_watch::on_ci_failure_detected` immediately after `create_revision`
-    /// succeeds. Idempotent — a second call with the same id overwrites;
-    /// `Ok(None)` when the attempt id is unknown.
+    /// succeeds. The first link charges budget in the same transaction;
+    /// repeated links never charge again. `Ok(None)` for an unknown attempt.
     ///
     /// Once set, this row is owned by the revision substrate: the dormant
     /// `ci_remediation` rescue path skips it (its query filters
@@ -2004,6 +2001,14 @@ impl WorkDb {
     ) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
+        // Charge atomically with the first successful revision link. Re-linking
+        // or redispatching the same attempt cannot spend another slot.
+        tx.execute(
+            "UPDATE tasks SET ci_attempts_used = ci_attempts_used + 1
+             WHERE id = (SELECT work_item_id FROM ci_remediations
+                         WHERE id = ?1 AND revision_task_id IS NULL AND consumes_budget = 1)",
+            [attempt_id],
+        )?;
         let rows = tx.execute(
             "UPDATE ci_remediations
                 SET revision_task_id = ?2
