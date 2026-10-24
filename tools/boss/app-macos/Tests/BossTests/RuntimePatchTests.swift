@@ -148,15 +148,23 @@ final class RuntimePatchTests: XCTestCase {
         XCTAssertNil(recorder.counts["get_work_runtime_patch"], "\(count) cards: the tree is the cheaper read")
     }
 
-    func testNoPatchIsSentWhileATreeIsOutstanding() {
-        let (model, recorder) = makeModel(cards: [makeTask(id: "task_1")])
+    func testRuntimePushWhileATreeIsOutstandingWaitsForItAndThenSendsOnePatch() {
+        let (model, recorder) = makeModel(cards: [makeTask(id: "task_1"), makeTask(id: "task_2")])
 
         model.engine.sendGetWorkTree(productId: "prod_a", flow: .invalidationRefetch)
         recorder.reset()
         model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_1"])
+        model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_2"])
 
-        XCTAssertEqual(recorder.counts["get_work_tree"], 1, "an older tree could land after the patch and undo it")
-        XCTAssertNil(recorder.counts["get_work_runtime_patch"])
+        XCTAssertTrue(recorder.sent.isEmpty, "an older tree could land after the patch and undo it; a second tree is dearer than waiting")
+
+        model.applyEventForTest(makeWorkTreeEvent(
+            tasks: [makeTask(id: "task_1"), makeTask(id: "task_2")],
+            requestID: model.boardReadFences["prod_a"]?.trees.keys.first
+        ))
+
+        XCTAssertEqual(recorder.patchBodies, [["task_1", "task_2"]])
+        XCTAssertNil(recorder.counts["get_work_tree"])
     }
 
     func testAnAnsweredTreeNoLongerBlocksPatches() {
