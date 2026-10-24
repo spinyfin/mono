@@ -417,6 +417,11 @@ fn top_cost_report() -> crate::TopCostReport {
 fn tag_cases() -> Vec<TagCase> {
     vec![
         TagCase {
+            label: "operator_decision_snapshot",
+            event: FrontendEvent::OperatorDecisionSnapshot { questions: vec![] },
+            expected_tag: "operator_decision_snapshot",
+        },
+        TagCase {
             label: "operator_questions",
             event: FrontendEvent::OperatorQuestionsList { questions: vec![] },
             expected_tag: "operator_questions_list",
@@ -2381,6 +2386,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::SelectedProductReported { .. }
         | FrontendEvent::AttachmentStored { .. }
         | FrontendEvent::AttachmentsList { .. }
+        | FrontendEvent::OperatorDecisionSnapshot { .. }
         | FrontendEvent::OperatorQuestionsList { .. }
         | FrontendEvent::OperatorQuestionError { .. } => {}
     }

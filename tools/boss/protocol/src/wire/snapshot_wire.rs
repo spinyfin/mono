@@ -7,6 +7,16 @@
 
 use serde::{Deserialize, Serialize};
 
+/// An open operator decision, independent of the selected product or board filters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperatorDecisionNotification {
+    pub question_id: String,
+    pub text: String,
+    pub work_item_id: String,
+    pub product_id: String,
+    pub label: String,
+}
+
 /// Snapshot of one feature flag's static metadata + current value.
 /// Mirrors `boss_engine::feature_flags::FeatureFlagSnapshot` so the
 /// engine can ship its in-memory snapshot over the wire without

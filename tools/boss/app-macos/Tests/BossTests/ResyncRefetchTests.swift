@@ -133,6 +133,7 @@ final class ResyncRefetchTests: XCTestCase {
         XCTAssertEqual(
             recorder.counts,
             [
+                "subscribe": 1,
                 "list_products": 1,
                 "list_worker_live_states": 1,
                 "get_engine_health": 1,
@@ -145,6 +146,8 @@ final class ResyncRefetchTests: XCTestCase {
             "25 resyncs must cost exactly one set, none of it per project"
         )
         let attempts = recorder.sent.filter { $0["type"] as? String == "list_engine_attempts" }
+        let subscriptions = recorder.sent.filter { $0["type"] as? String == "subscribe" }
+        XCTAssertEqual(subscriptions.first?["topics"] as? [String], ["work.decisions"])
         XCTAssertEqual(attempts.filter { $0["open_prs_only"] as? Bool == true }.count, 1)
         XCTAssertEqual(attempts.filter { $0["limit"] as? Int == 0 }.count, 1)
         XCTAssertFalse(attempts.contains { $0["limit"] as? Int == 200 }, "hidden Activity must not fetch history")

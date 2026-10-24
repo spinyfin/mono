@@ -19,7 +19,14 @@ pub(super) async fn handle_subscribe(ctx: Dispatch, req: FrontendRequest) {
         unreachable!()
     };
     {
+        let wants_decisions = topics.iter().any(|topic| topic.trim() == decision_notifications::TOPIC);
         let topics = server_state.topic_broker.subscribe(&session_id, &topics).await;
+        if wants_decisions {
+            server_state
+                .topic_broker
+                .refresh_decisions(&server_state.work_db, true)
+                .await;
+        }
         send_response(
             &sink,
             &request_id,
