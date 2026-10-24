@@ -209,5 +209,9 @@ pub(super) fn kind(event: &FrontendEvent) -> &'static str {
         FrontendEvent::IdeaUpdated { .. } => "IdeaUpdated",
         FrontendEvent::IdeaDeleted { .. } => "IdeaDeleted",
         FrontendEvent::IdeaGraduated { .. } => "IdeaGraduated",
+        FrontendEvent::BoothbyPassesList { .. } => "BoothbyPassesList",
+        FrontendEvent::BoothbyState { .. } => "BoothbyState",
+        FrontendEvent::BoothbyPassStarted { .. } => "BoothbyPassStarted",
+        FrontendEvent::BoothbyActivity { .. } => "BoothbyActivity",
     }
 }
