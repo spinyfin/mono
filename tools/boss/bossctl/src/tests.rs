@@ -25,6 +25,7 @@ fn live(slot: u8, run: &str) -> LiveWorkerState {
         wait_expires_at: None,
         tmux_hosted: None,
         agent_type: None,
+        review_stage: None,
         project_id: None,
         project_name: None,
         host_id: None,

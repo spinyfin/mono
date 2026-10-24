@@ -7,7 +7,7 @@
 //! metadata whether it was just spawned or recovered after an engine restart —
 //! the values derive from durable rows, never from in-memory spawn state.
 
-use boss_protocol::{AgentType, LiveWorkerMetadata, WorkItem};
+use boss_protocol::{AgentType, ExecutionKind, LiveWorkerMetadata, WorkItem};
 
 use crate::work::{WorkDb, WorkExecution};
 
@@ -40,6 +40,22 @@ fn project_attribution(work_db: &WorkDb, work_item_id: &str) -> (Option<String>,
     }
 }
 
+/// Stage of an AI review for a `pr_review` execution, from the durable batch
+/// member role the engine recorded when it launched the run. `None` for any
+/// other kind and for a legacy reviewer that has no batch member row.
+fn review_stage(work_db: &WorkDb, execution: &WorkExecution) -> Option<String> {
+    if execution.kind != ExecutionKind::PrReview {
+        return None;
+    }
+    match work_db.review_batch_member_for_execution(&execution.id) {
+        Ok(member) => member.map(|member| member.role.stage().as_str().to_owned()),
+        Err(error) => {
+            tracing::warn!(execution_id = %execution.id, %error, "live worker metadata: could not read review batch member");
+            None
+        }
+    }
+}
+
 /// Build the metadata for `execution` running on `host_id` (`"local"` or a
 /// registered remote host id).
 ///
@@ -66,6 +82,7 @@ pub(crate) fn resolve_with_automation(
 ) -> LiveWorkerMetadata {
     let (project_id, project_name) = project_attribution(work_db, &execution.work_item_id);
     LiveWorkerMetadata {
+        review_stage: review_stage(work_db, execution),
         agent_type: Some(
             AgentType::for_execution(&execution.kind, has_source_automation)
                 .as_str()

@@ -310,6 +310,7 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         last_reviewed_sha: row.get::<_, Option<String>>(35)?.filter(|s| !s.is_empty()),
         // Derived; populated after mapping by attach_ai_reviewing_flag.
         ai_reviewing: false,
+        ai_review_stage: None,
         // Derived; populated after mapping by attach_ai_review_state.
         ai_review_state: None,
         ai_review_badge: None,

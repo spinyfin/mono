@@ -1128,10 +1128,12 @@ impl ExecutionRunner for PaneSpawnRunner {
         // comment demands this — see `execution.rs`) to decide whether this kind
         // needs a pure derived phrase or can use the cached/LLM path; see its
         // doc comment for why some kinds can't share `get_or_generate`.
-        let title_summary = match pane_summary::derived_title_summary(&execution.kind, work_item_name(work_item)) {
-            Some(summary) => summary,
-            None => pane_summary::get_or_generate(&self.work_db, utility.as_ref(), work_item).await,
-        };
+        let review_stage = review_batch_member_role.map(ReviewBatchMemberRole::stage);
+        let title_summary =
+            match pane_summary::derived_title_summary(&execution.kind, review_stage, work_item_name(work_item)) {
+                Some(summary) => summary,
+                None => pane_summary::get_or_generate(&self.work_db, utility.as_ref(), work_item).await,
+            };
 
         let work_item_binding = Some(WorkItemBinding {
             work_item_id: work_item_id(work_item).to_owned(),

@@ -43,7 +43,7 @@ use sha2::{Digest, Sha256};
 use crate::claude_client::{self, CallConfig, Message, MessagesRequest, RetryPolicy};
 use crate::utility_model::{UtilityCall, UtilityModel, UtilityTask};
 use crate::work::{WorkDb, WorkItem};
-use boss_protocol::ExecutionKind;
+use boss_protocol::{ExecutionKind, ReviewStage};
 
 // The model is no longer pinned here: it comes from the `UtilityModel`
 // provider via `UtilityTask::PaneSummary`, whose default is Sonnet 4.6 —
@@ -274,6 +274,19 @@ pub fn pr_review_summary(task_name: &str) -> Option<String> {
     ))
 }
 
+/// Pane summary for the consolidating agent of an AI review. Distinct from
+/// [`pr_review_summary`] so the pane does not read as one more reviewer: it
+/// reads `"<Name> is consolidating review findings for <task-name>"`. The
+/// task name is capped to 2 words to stay within the 7-word UI guidance.
+pub fn pr_review_consolidation_summary(task_name: &str) -> Option<String> {
+    Some(derived_task_phrase(
+        "consolidating review findings for",
+        "consolidating review findings",
+        task_name,
+        2,
+    ))
+}
+
 /// Pane summary for `answer_agent` workers. The synthetic work item's
 /// name/description are derived straight from the comment being answered
 /// (up to 600 raw chars of someone else's text as the "description") —
@@ -310,10 +323,17 @@ pub fn review_guide_summary() -> Option<String> {
 ///
 /// Matches [`ExecutionKind`] exhaustively per its doc comment so a new
 /// variant forces a decision here rather than silently falling through.
-pub fn derived_title_summary(kind: &ExecutionKind, task_name: &str) -> Option<Option<String>> {
+pub fn derived_title_summary(
+    kind: &ExecutionKind,
+    review_stage: Option<ReviewStage>,
+    task_name: &str,
+) -> Option<Option<String>> {
     match kind {
         ExecutionKind::CiRemediation => Some(ci_remediation_summary(task_name)),
         ExecutionKind::ConflictResolution => Some(conflict_resolution_summary(task_name)),
+        ExecutionKind::PrReview if review_stage == Some(ReviewStage::Consolidation) => {
+            Some(pr_review_consolidation_summary(task_name))
+        }
         ExecutionKind::PrReview => Some(pr_review_summary(task_name)),
         ExecutionKind::AnswerAgent => Some(answer_agent_summary()),
         ExecutionKind::PrReviewGuide => Some(review_guide_summary()),
@@ -689,6 +709,28 @@ mod tests {
     }
 
     #[test]
+    fn consolidation_stage_gets_its_own_pane_summary() {
+        let summary = |stage| {
+            derived_title_summary(&ExecutionKind::PrReview, stage, "Fix flaky test")
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(
+            summary(Some(ReviewStage::Consolidation)),
+            "consolidating review findings for Fix flaky…"
+        );
+        assert_eq!(
+            summary(Some(ReviewStage::Reviewers)),
+            "reviewing the PR for Fix flaky test"
+        );
+        assert_eq!(summary(None), "reviewing the PR for Fix flaky test");
+        assert_eq!(
+            pr_review_consolidation_summary("").as_deref(),
+            Some("consolidating review findings")
+        );
+    }
+
+    #[test]
     fn answer_agent_summary_is_fixed() {
         assert_eq!(answer_agent_summary().as_deref(), Some("answering a doc comment"));
     }
@@ -696,25 +738,25 @@ mod tests {
     #[test]
     fn derived_title_summary_routes_cache_hazard_kinds_to_derived_phrases() {
         assert_eq!(
-            derived_title_summary(&ExecutionKind::CiRemediation, "Fix flaky test")
+            derived_title_summary(&ExecutionKind::CiRemediation, None, "Fix flaky test")
                 .unwrap()
                 .as_deref(),
             Some("fixing CI for Fix flaky test"),
         );
         assert_eq!(
-            derived_title_summary(&ExecutionKind::ConflictResolution, "Fix flaky test")
+            derived_title_summary(&ExecutionKind::ConflictResolution, None, "Fix flaky test")
                 .unwrap()
                 .as_deref(),
             Some("resolving merge conflicts for Fix flaky test"),
         );
         assert_eq!(
-            derived_title_summary(&ExecutionKind::PrReview, "Fix flaky test")
+            derived_title_summary(&ExecutionKind::PrReview, None, "Fix flaky test")
                 .unwrap()
                 .as_deref(),
             Some("reviewing the PR for Fix flaky test"),
         );
         assert_eq!(
-            derived_title_summary(&ExecutionKind::AnswerAgent, "Answer comment: anything")
+            derived_title_summary(&ExecutionKind::AnswerAgent, None, "Answer comment: anything")
                 .unwrap()
                 .as_deref(),
             Some("answering a doc comment"),
@@ -733,7 +775,7 @@ mod tests {
             ExecutionKind::TaskImplementation,
         ] {
             assert_eq!(
-                derived_title_summary(&kind, "Fix flaky test"),
+                derived_title_summary(&kind, None, "Fix flaky test"),
                 None,
                 "{kind:?} should fall through to get_or_generate",
             );

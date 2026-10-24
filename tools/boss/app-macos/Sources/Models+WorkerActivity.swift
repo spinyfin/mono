@@ -67,6 +67,9 @@ struct WorkerLiveState {
     /// Wire badge type (`"coding"`, `"review"`, …). Missing or unrecognised
     /// values render as Unknown; they are never dropped from membership.
     let agentType: String?
+    /// Engine-reported stage of an AI review (`"reviewers"` or
+    /// `"consolidation"`); `nil` for non-review runs and older engines.
+    let reviewStage: String?
     let projectId: String?
     let projectName: String?
     /// Host the run executes on. Agents membership is
@@ -89,6 +92,7 @@ struct WorkerLiveState {
     static let localHostId = "local"
 
     var badgeType: AgentType { AgentType.fromWire(agentType) }
+    var badgeLabel: String { badgeType.badgeLabel(reviewStage: reviewStage) }
 
     var agentProject: AgentProject {
         if let projectId, !projectId.isEmpty { return .project(id: projectId) }
@@ -114,6 +118,7 @@ struct WorkerLiveState {
         waitReason: String? = nil,
         waitExpiresAt: String? = nil,
         agentType: String? = nil,
+        reviewStage: String? = nil,
         projectId: String? = nil,
         projectName: String? = nil,
         hostId: String? = nil,
@@ -137,6 +142,7 @@ struct WorkerLiveState {
         self.waitReason = waitReason
         self.waitExpiresAt = waitExpiresAt
         self.agentType = agentType
+        self.reviewStage = reviewStage
         self.projectId = projectId
         self.projectName = projectName
         self.hostId = hostId
@@ -188,6 +194,7 @@ extension WorkerLiveState: Hashable {
             && lhs.waitReason == rhs.waitReason
             && lhs.waitExpiresAt == rhs.waitExpiresAt
             && lhs.agentType == rhs.agentType
+            && lhs.reviewStage == rhs.reviewStage
             && lhs.projectId == rhs.projectId
             && lhs.projectName == rhs.projectName
             && lhs.hostId == rhs.hostId
@@ -211,6 +218,7 @@ extension WorkerLiveState: Hashable {
         hasher.combine(waitReason)
         hasher.combine(waitExpiresAt)
         hasher.combine(agentType)
+        hasher.combine(reviewStage)
         hasher.combine(projectId)
         hasher.combine(projectName)
         hasher.combine(hostId)
@@ -387,7 +395,8 @@ enum AgentActivityState: Equatable {
         isDispatchPending: Bool,
         isResolvingConflicts: Bool,
         isRemediatingCI: Bool,
-        isAIReviewing: Bool = false
+        isAIReviewing: Bool = false,
+        aiReviewStage: String? = nil
     ) -> AgentActivityState {
         if isDispatchPending {
             return .dispatchPending
@@ -414,9 +423,15 @@ enum AgentActivityState: Equatable {
             return .waiting(reason: "Resolving CI failure")
         }
         if isAIReviewing {
-            return .waiting(reason: "AI review in progress")
+            return .waiting(reason: aiReviewCaption(stage: aiReviewStage))
         }
         return AgentActivityState(runtime: runtime, liveState: liveState)
+    }
+
+    /// Doing-card caption for a held AI review. The engine reports the stage;
+    /// the consolidating agent reads differently from the parallel reviewers.
+    static func aiReviewCaption(stage: String?) -> String {
+        stage == AgentReviewStage.consolidation ? "Consolidating review findings" : "AI review in progress"
     }
 
     static func waitCaption(_ liveState: WorkerLiveState) -> String {

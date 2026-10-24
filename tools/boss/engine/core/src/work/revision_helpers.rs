@@ -1,4 +1,5 @@
 use super::*;
+use boss_protocol::ReviewStage;
 
 #[work_db_boundary::instrument]
 impl WorkDb {
@@ -604,37 +605,61 @@ pub(crate) fn attach_ai_reviewing_flag(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT DISTINCT we.work_item_id
+        "SELECT we.work_item_id,
+                EXISTS(SELECT 1 FROM pr_review_batch_members m
+                       WHERE m.execution_id = we.id AND m.role = ?{supervisor_param})
          FROM work_executions we
          WHERE we.work_item_id IN ({})
            AND we.kind = 'pr_review'
            AND we.status = 'running'",
-        placeholders
+        placeholders,
+        supervisor_param = candidate_ids.len() + 1,
     );
     let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::ToSql> = candidate_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-    let reviewing: std::collections::HashSet<String> = stmt
-        .query_map(params.as_slice(), |row| row.get::<_, String>(0))?
-        .filter_map(|r| r.ok())
-        .collect();
+    let supervisor_role = ReviewBatchMemberRole::Supervisor.as_str();
+    let mut params: Vec<&dyn rusqlite::ToSql> = candidate_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    params.push(&supervisor_role);
+    // Stage per target: consolidation as soon as any running review for it is
+    // the batch's supervisor, otherwise the parallel reviewers.
+    let mut reviewing: std::collections::HashMap<String, ReviewStage> = std::collections::HashMap::new();
+    for row in stmt.query_map(params.as_slice(), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+    })? {
+        let Ok((work_item_id, is_supervisor)) = row else {
+            continue;
+        };
+        let stage = if is_supervisor {
+            ReviewStage::Consolidation
+        } else {
+            ReviewStage::Reviewers
+        };
+        reviewing
+            .entry(work_item_id)
+            .and_modify(|current| {
+                if stage == ReviewStage::Consolidation {
+                    *current = stage;
+                }
+            })
+            .or_insert(stage);
+    }
 
     if reviewing.is_empty() {
         return Ok(());
     }
-    for task in tasks.iter_mut() {
-        if target_ids
-            .get(&task.id)
-            .is_some_and(|targets| targets.iter().any(|target| reviewing.contains(target)))
-        {
-            task.ai_reviewing = true;
-        }
-    }
-    for chore in chores.iter_mut() {
-        if target_ids
-            .get(&chore.id)
-            .is_some_and(|targets| targets.iter().any(|target| reviewing.contains(target)))
-        {
-            chore.ai_reviewing = true;
+    let running_stage = |id: &str| {
+        let stages = target_ids.get(id)?.iter().filter_map(|target| reviewing.get(target));
+        stages.copied().reduce(|a, b| {
+            if a == ReviewStage::Consolidation || b == ReviewStage::Consolidation {
+                ReviewStage::Consolidation
+            } else {
+                ReviewStage::Reviewers
+            }
+        })
+    };
+    for row in tasks.iter_mut().chain(chores.iter_mut()) {
+        if let Some(stage) = running_stage(&row.id) {
+            row.ai_reviewing = true;
+            row.ai_review_stage = Some(stage.as_str().to_owned());
         }
     }
     Ok(())
@@ -1050,6 +1075,7 @@ fn copy_derived_projection_fields(dst: &mut Task, src: &Task) {
     dst.in_revision_blocked_only = src.in_revision_blocked_only;
     dst.has_attachments = src.has_attachments;
     dst.ai_reviewing = src.ai_reviewing;
+    dst.ai_review_stage = src.ai_review_stage.clone();
     dst.ai_review_state = src.ai_review_state.clone();
     dst.ai_review_findings_revision_id = src.ai_review_findings_revision_id.clone();
     dst.ready_for_review = src.ready_for_review;

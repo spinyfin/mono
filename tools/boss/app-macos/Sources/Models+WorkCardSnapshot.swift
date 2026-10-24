@@ -257,7 +257,8 @@ struct WorkCardSnapshot: Equatable {
                 isDispatchPending: isDispatchPending,
                 isResolvingConflicts: isResolvingConflicts,
                 isRemediatingCI: isRemediatingCI,
-                isAIReviewing: isAIReviewing)
+                isAIReviewing: isAIReviewing,
+                aiReviewStage: task.aiReviewStage)
             : nil
 
         let assignedSlotId: Int? = column == .doing ? context.liveState?.slotId : nil
