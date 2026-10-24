@@ -118,6 +118,11 @@ pub(super) fn attach_board_derivations(
     if let Err(err) = attach_pr_updated_at(conn, &mut tasks, chores) {
         tracing::warn!(?err, "{caller}: failed to attach pr_updated_at; ignoring");
     }
+    // The blocked-PR sweep's stored diagnosis, for Review-lane cards only
+    // (reads review_section, so it must follow attach_review_section).
+    if let Err(err) = attach_review_blocked_reason(conn, &mut tasks, chores) {
+        tracing::warn!(?err, "{caller}: failed to attach review_blocked_reason; ignoring");
+    }
 
     // Resolve has_attachments for every task/chore so the kanban card can
     // gate its screenshot-viewer affordance without a per-card query.

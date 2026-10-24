@@ -25,6 +25,7 @@ pub mod automation_triage;
 pub mod awaiting_input_status;
 pub mod background_children;
 pub mod background_work;
+pub mod blocked_pr_sweep;
 pub mod blocking_signal;
 pub mod board_invalidation_metrics;
 #[cfg(test)]
@@ -34,6 +35,7 @@ pub mod build_info;
 pub mod build_wait;
 pub mod build_wait_tracker;
 pub use boss_ci_log_reader as ci_log_reader;
+pub mod ci_transient_retry;
 pub mod ci_watch;
 mod queue_ci_contract;
 mod remediation_push;
