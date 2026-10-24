@@ -899,3 +899,154 @@ fn a_failed_pass_and_a_skipped_pass_are_each_recorded_and_surfaced_by_workspace_
     record_store_gc_outcome(&store, "mono", StoreGcOutcome::Maintained).unwrap();
     assert!(store_gc_attention(&store, &repos).is_empty());
 }
+
+/// Delegates to a [`FakeRunner`] and, on each destructive jj call, records
+/// whether a cube-started jj command (a shared gate holder) would have to
+/// wait: `(subcommand, blocked)`.
+struct GateProbe<'a> {
+    inner: &'a FakeRunner,
+    gate_path: std::path::PathBuf,
+    observed: std::cell::RefCell<Vec<(String, bool)>>,
+}
+
+impl crate::command_runner::CommandRunner for GateProbe<'_> {
+    fn run(&self, invocation: &crate::command_runner::CommandInvocation) -> crate::app::errors::Result<String> {
+        self.inner.run(invocation)
+    }
+
+    fn run_with_timeout(
+        &self,
+        invocation: &crate::command_runner::CommandInvocation,
+        timeout: Duration,
+    ) -> crate::app::errors::Result<String> {
+        if invocation.program == "jj" && invocation.args.iter().any(|a| a == "abandon" || a == "gc") {
+            let blocked = crate::command_runner::JjGate::shared(&self.gate_path, Duration::from_millis(30)).is_err();
+            let kind = if invocation.args.iter().any(|a| a == "abandon") {
+                "abandon"
+            } else {
+                "gc"
+            };
+            self.observed.borrow_mut().push((kind.to_owned(), blocked));
+            assert!(
+                invocation
+                    .env
+                    .iter()
+                    .any(|(k, _)| k == crate::command_runner::JJ_GATE_HELD_ENV),
+                "maintenance jj calls must be marked as gate holders"
+            );
+        }
+        self.inner.run_with_timeout(invocation, timeout)
+    }
+}
+
+#[test]
+fn cube_started_jj_commands_are_held_off_for_the_abandon_but_not_the_collection() {
+    let (tempdir, database_path) = with_database_path();
+    seed_mono_repo(&tempdir.path().join("workspaces"), &database_path);
+    let source = seed_store_files(&source_of(&database_path));
+    let record = mono_record(&database_path);
+    let now = crate::app::util::current_epoch_s().unwrap();
+    let mut expected = vec![
+        op_log_command(&source, &op_log(now)),
+        ps_command(&source, ""),
+        abandon_command(&source),
+        ps_command(&source, ""),
+        ExpectedCommand::ok(
+            source.clone(),
+            "jj",
+            &["--ignore-working-copy", "util", "gc", "--expire", "now"],
+            "",
+        ),
+    ];
+    expected.extend(pr_ref_commands(&source, "", ""));
+    let fake = FakeRunner::new(expected);
+    let probe = GateProbe {
+        inner: &fake,
+        gate_path: crate::command_runner::JjGate::path(tempdir.path()),
+        observed: Default::default(),
+    };
+    gc_repo_store(
+        &probe,
+        Some(&database_path),
+        &record,
+        DEFAULT_KEEP,
+        Duration::from_millis(400),
+        false,
+    )
+    .expect("repo gc");
+    fake.assert_exhausted();
+    assert_eq!(
+        *probe.observed.borrow(),
+        vec![("abandon".to_owned(), true), ("gc".to_owned(), false)],
+        "a jj command that starts mid-abandon waits on the gate; the collection runs after it is released"
+    );
+}
+
+#[test]
+fn the_gate_stays_held_until_the_post_abandon_head_check_fails_the_pass() {
+    let (tempdir, database_path) = with_database_path();
+    seed_mono_repo(&tempdir.path().join("workspaces"), &database_path);
+    let source = seed_store_files(&source_of(&database_path));
+    let record = mono_record(&database_path);
+    let now = crate::app::util::current_epoch_s().unwrap();
+    // The racing head appears during the second quiet probe, after the
+    // first count, as a command that started after the quiet snapshot and
+    // committed late would leave it.
+    let fake = FakeRunner::new(vec![
+        op_log_command(&source, &op_log(now)),
+        ps_command(&source, ""),
+        abandon_command(&source),
+        ps_command(&source, "").creating_dir(source.join(".jj/repo/op_heads/heads/raced")),
+    ]);
+    let probe = GateProbe {
+        inner: &fake,
+        gate_path: crate::command_runner::JjGate::path(tempdir.path()),
+        observed: Default::default(),
+    };
+    gc_repo_store(
+        &probe,
+        Some(&database_path),
+        &record,
+        DEFAULT_KEEP,
+        Duration::from_millis(400),
+        false,
+    )
+    .expect_err("racing head");
+    fake.assert_exhausted();
+    assert_eq!(*probe.observed.borrow(), vec![("abandon".to_owned(), true)]);
+    crate::command_runner::JjGate::shared(
+        &crate::command_runner::JjGate::path(tempdir.path()),
+        Duration::from_millis(100),
+    )
+    .expect("the gate is released when the pass ends");
+}
+
+#[test]
+fn cube_jj_commands_still_running_skip_the_abandon() {
+    let (tempdir, database_path) = with_database_path();
+    seed_mono_repo(&tempdir.path().join("workspaces"), &database_path);
+    let source = seed_store_files(&source_of(&database_path));
+    let record = mono_record(&database_path);
+    let now = crate::app::util::current_epoch_s().unwrap();
+    // A cube-started jj command holds the gate shared for the whole pass.
+    let _running = crate::command_runner::JjGate::shared(
+        &crate::command_runner::JjGate::path(tempdir.path()),
+        Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut expected = vec![op_log_command(&source, &op_log(now))];
+    expected.extend(pr_ref_commands(&source, "", ""));
+    let runner = FakeRunner::new(expected);
+    let report = gc_repo_store(
+        &runner,
+        Some(&database_path),
+        &record,
+        DEFAULT_KEEP,
+        Duration::from_millis(200),
+        false,
+    )
+    .expect("repo gc");
+    runner.assert_exhausted();
+    assert_eq!(report.collection, Collection::Skipped);
+    assert_eq!(report.abandoned_through, None);
+}
