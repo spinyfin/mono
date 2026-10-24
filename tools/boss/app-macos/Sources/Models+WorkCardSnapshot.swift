@@ -311,7 +311,8 @@ struct WorkCardSnapshot: Equatable {
                 answerInFlight: context.operatorAnswerInFlight,
                 errorMessage: context.operatorAnswerError,
                 runSummary: question.runSummary,
-                prerequisiteTask: question.prerequisiteTask
+                prerequisiteTask: question.prerequisiteTask,
+                choices: question.choices
             )
         }()
 

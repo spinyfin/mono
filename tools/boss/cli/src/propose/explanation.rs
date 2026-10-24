@@ -1,28 +1,51 @@
 //! Validate the labelled explanation before submitting a new question.
 
 const HEADINGS: [&str; 5] = ["Context:", "Yes:", "No:", "Recommendation:", "Details:"];
+/// A multiple-choice question has option buttons rather than Yes/No, so its
+/// explanation carries no Yes/No sections.
+const CHOICE_HEADINGS: [&str; 3] = ["Context:", "Recommendation:", "Details:"];
 const EXPECTED: &str = "--explanation requires nonempty sections with labels on separate lines, in order:\nContext:\nWork and blocker\nYes:\nWhat approval authorizes\nNo:\nWhat declining means\nRecommendation:\nRecommended answer and reason\nDetails:\nTechnical evidence (omit this section if unnecessary)";
+const EXPECTED_CHOICE: &str = "--explanation for --answer-type multiple-choice requires nonempty sections with labels on separate lines, in order, and no Yes:/No: sections:\nContext:\nWork and blocker, and what each option leads to\nRecommendation:\nRecommended option and reason\nDetails:\nTechnical evidence (omit this section if unnecessary)";
 
+/// Clap-time check: accepts either shape. The shape that must hold depends on
+/// `--answer-type`, which a value parser cannot see; `validate_for` enforces it.
 pub(super) fn validate(raw: &str) -> Result<String, String> {
+    check(raw, &HEADINGS)
+        .or_else(|_| check(raw, &CHOICE_HEADINGS))
+        .map_err(|_| EXPECTED.into())
+}
+
+/// The explanation shape required by the question's answer type.
+pub(super) fn validate_for(raw: &str, multiple_choice: bool) -> Result<String, String> {
+    if multiple_choice {
+        check(raw, &CHOICE_HEADINGS).map_err(|()| EXPECTED_CHOICE.into())
+    } else {
+        check(raw, &HEADINGS).map_err(|()| EXPECTED.into())
+    }
+}
+
+fn check(raw: &str, headings: &[&str]) -> Result<String, ()> {
+    // Details is the last heading; every heading before it is required.
+    let required = headings.len() - 1;
     let mut next = 0;
     let mut has_content = false;
     for line in raw.lines().map(str::trim) {
         // Details is verbatim evidence, including any label-like lines.
-        if next < HEADINGS.len() && HEADINGS.contains(&line) {
-            if line != HEADINGS[next] || (next > 0 && !has_content) {
-                return Err(EXPECTED.into());
+        if next < headings.len() && headings.contains(&line) {
+            if line != headings[next] || (next > 0 && !has_content) {
+                return Err(());
             }
             next += 1;
             has_content = false;
         } else if !line.is_empty() {
-            if next == 0 {
-                return Err(EXPECTED.into());
+            if next == 0 || (next < headings.len() && matches!(line, "Yes:" | "No:")) {
+                return Err(());
             }
             has_content = true;
         }
     }
-    if next < 4 || !has_content {
-        return Err(EXPECTED.into());
+    if next < required || !has_content {
+        return Err(());
     }
     Ok(raw.into())
 }
@@ -44,6 +67,25 @@ pub(super) mod tests {
             assert_eq!(validate(&text).unwrap(), text);
         }
         assert!(validate(&VALID.replace('\n', "\r\n")).is_ok());
+    }
+
+    pub(crate) const VALID_CHOICE: &str =
+        "Context:\nThe rollout needs a strategy.\nRecommendation:\nGradual, to limit risk.";
+
+    #[test]
+    fn multiple_choice_requires_the_short_shape_and_rejects_yes_no() {
+        assert!(validate_for(VALID_CHOICE, true).is_ok());
+        assert!(validate_for(&format!("{VALID_CHOICE}\nDetails:\nEvidence\nYes:\nverbatim"), true).is_ok());
+        assert!(validate_for(VALID, true).is_err());
+        assert!(validate_for(VALID_CHOICE, false).is_err());
+        for text in [
+            VALID_CHOICE.replace("Gradual, to limit risk.", ""),
+            VALID_CHOICE.replace("Recommendation:", "Yes:\nA\nNo:\nB\nRecommendation:"),
+            VALID_CHOICE.replace("Context:", "Preamble\nContext:"),
+        ] {
+            assert!(validate_for(&text, true).is_err(), "{text}");
+        }
+        assert!(validate(VALID_CHOICE).is_ok());
     }
 
     #[test]

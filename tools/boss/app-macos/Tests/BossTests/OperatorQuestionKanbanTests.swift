@@ -47,26 +47,81 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         XCTAssertFalse(task.isAwaitingOperatorAnswer)
     }
 
-    /// The card only has Yes/No buttons, so a question of any other answer
-    /// type must not decode into a Needs Attention card nobody can answer.
+    /// The card can only answer the kinds it has buttons for, so a question it
+    /// cannot answer must not decode into a Needs Attention card nobody can
+    /// answer: an unknown kind, or a multiple-choice question whose options
+    /// are missing or cannot be rendered as two to six distinct buttons.
     func testParseTaskDropsQuestionWithUnsupportedAnswerType() throws {
+        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        let unanswerable: [[String: Any]] = [
+            ["kind": "prompt"],
+            ["kind": "multiple_choice"],
+            ["kind": "multiple_choice", "choices": ["only one"]],
+            ["kind": "multiple_choice", "choices": ["a", "a"]],
+            ["kind": "multiple_choice", "choices": ["a", ""]],
+            ["kind": "multiple_choice", "choices": ["a", "b", "c", "d", "e", "f", "g"]],
+        ]
+        for answerType in unanswerable {
+            var payload = basePayload()
+            payload["status"] = "blocked"
+            payload["blocked_reason"] = "awaiting_operator_answer"
+            payload["operator_question"] = [
+                "id": "oq_1", "text": "Pick one", "answer_type": answerType,
+                "explanation": "", "asked_at": "1790000000", "execution_id": "exec_1",
+            ] as [String: Any]
+            let task = try XCTUnwrap(client.parseTask(payload))
+            XCTAssertNil(task.operatorQuestion, "\(answerType)")
+            XCTAssertEqual(task.boardColumn, .backlog, "an unanswerable question falls back to the plain blocked card")
+        }
+    }
+
+    func testParseTaskDecodesMultipleChoiceQuestionWithItsOptionsInOrder() throws {
         let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
         var payload = basePayload()
         payload["status"] = "blocked"
         payload["blocked_reason"] = "awaiting_operator_answer"
         payload["operator_question"] = [
             "id": "oq_1",
-            "text": "Pick one",
-            "answer_type": ["kind": "multiple_choice"],
-            "explanation": "",
+            "text": "Which rollout should I use?",
+            "answer_type": ["kind": "multiple_choice", "choices": ["Gradual", "All at once", "Behind a flag"]],
+            "explanation": "The brief allows each.",
             "asked_at": "1790000000",
             "execution_id": "exec_1",
         ] as [String: Any]
 
         let task = try XCTUnwrap(client.parseTask(payload))
 
-        XCTAssertNil(task.operatorQuestion)
-        XCTAssertEqual(task.boardColumn, .backlog, "an unanswerable question falls back to the plain blocked card")
+        let question = try XCTUnwrap(task.operatorQuestion)
+        XCTAssertEqual(question.answerType, .multipleChoice)
+        XCTAssertEqual(question.choices, ["Gradual", "All at once", "Behind a flag"])
+        XCTAssertTrue(task.isAwaitingOperatorAnswer)
+        XCTAssertEqual(task.boardColumn, .doing, "same Needs Attention routing as the Yes/No question")
+        let snapshot = WorkCardSnapshot.build(task: task, context: WorkCardSnapshotContext(column: .doing))
+        XCTAssertEqual(snapshot.operatorQuestion?.choices, question.choices)
+        XCTAssertEqual(OperatorAnswer.multipleChoice("All at once").wirePayload["kind"] as? String, "multiple_choice")
+        XCTAssertEqual(OperatorAnswer.multipleChoice("All at once").wirePayload["value"] as? String, "All at once")
+    }
+
+    func testMultipleChoiceAnswerRequestEncodingMatchesTheEngineWireShape() throws {
+        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        var sent: [[String: Any]] = []
+        client.outboundRecorder = { sent.append($0) }
+
+        client.sendAnswerOperatorQuestion(id: "oq_1", answer: .multipleChoice("All at once"))
+
+        let data = try JSONSerialization.data(withJSONObject: try XCTUnwrap(sent.first), options: [.sortedKeys])
+        XCTAssertEqual(
+            String(decoding: data, as: UTF8.self),
+            #"{"answer":{"kind":"multiple_choice","value":"All at once"},"id":"oq_1","type":"answer_operator_question"}"#
+        )
+    }
+
+    func testConflictMessageNamesTheRecordedChoice() {
+        let message = OperatorQuestionFailure.message(from: [
+            "code": "conflict", "state": "answered",
+            "answer": ["kind": "multiple_choice", "value": "Gradual"],
+        ] as [String: Any])
+        XCTAssertTrue(message.contains("Recorded answer: Gradual."), message)
     }
 
     /// A "create a prerequisite task" question reads and routes exactly like

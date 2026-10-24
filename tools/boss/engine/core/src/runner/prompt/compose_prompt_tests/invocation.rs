@@ -175,7 +175,13 @@ fn run_done_seam_on_worker_signal_seam_off_teaches_summary_not_blocked_verb() {
     assert!(prompt.contains(
         "--question \"Approve including the remaining files needed for this fix?\" --answer-type yes-no --explanation"
     ));
-    assert!(prompt.contains("Before asking, check the brief for a `## Operator authorization` section."));
+    assert!(
+        prompt.contains(
+            "Before asking, check the brief for a `## Operator authorization` or `## Operator answer` section."
+        )
+    );
+    assert!(prompt.contains("--answer-type multiple-choice --choices \"Gradual\" \"All at once\""));
+    assert!(prompt.contains("your next run's brief ends with a `## Operator answer` section"));
     assert!(prompt.contains("### Write operator questions for someone arriving cold"));
     assert!(prompt.contains("Context:\n"));
     assert!(prompt.contains("Yes:\n"));

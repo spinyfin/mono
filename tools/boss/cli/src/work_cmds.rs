@@ -828,7 +828,10 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
             let response = client
                 .send_request(&FrontendRequest::AnswerOperatorQuestion {
                     id: args.id,
-                    answer: boss_protocol::OperatorAnswer::YesNo { value: args.yes },
+                    answer: match args.choice {
+                        Some(value) => boss_protocol::OperatorAnswer::MultipleChoice { value },
+                        None => boss_protocol::OperatorAnswer::YesNo { value: args.yes },
+                    },
                 })
                 .await
                 .map_err(CliError::internal)?;
@@ -1541,6 +1544,7 @@ pub(crate) async fn run_show_leaf(
             let answer_type = match &q.answer_type {
                 boss_protocol::OperatorAnswerType::YesNo => "yes_no",
                 boss_protocol::OperatorAnswerType::CreatePrerequisiteTask { .. } => "create_prerequisite_task",
+                boss_protocol::OperatorAnswerType::MultipleChoice { .. } => "multiple_choice",
             };
             println!(
                 "  Answer type: {answer_type}; asked: {}; execution: {}",
@@ -1554,10 +1558,19 @@ pub(crate) async fn run_show_leaf(
                     println!("    {line}");
                 }
             }
-            if let Some(boss_protocol::OperatorAnswer::YesNo { value }) = &record.answer {
+            if let boss_protocol::OperatorAnswerType::MultipleChoice { choices } = &q.answer_type {
+                println!("  Options:");
+                for choice in choices {
+                    println!("    {choice}");
+                }
+            }
+            if let Some(answer) = &record.answer {
+                let answer = match answer {
+                    boss_protocol::OperatorAnswer::YesNo { value } => (if *value { "Yes" } else { "No" }).to_owned(),
+                    boss_protocol::OperatorAnswer::MultipleChoice { value } => value.clone(),
+                };
                 println!(
-                    "  Answer: {}; by: {}; at: {}",
-                    if *value { "Yes" } else { "No" },
+                    "  Answer: {answer}; by: {}; at: {}",
                     record.answered_by.as_deref().unwrap_or(""),
                     record.answered_at.as_deref().unwrap_or("")
                 );

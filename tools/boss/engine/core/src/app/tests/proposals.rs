@@ -292,6 +292,7 @@ The operator recorded this answer on the kanban. It is explicit, human-granted a
 }
 
 mod chore_questions;
+mod multiple_choice;
 mod prerequisites;
 
 #[tokio::test]

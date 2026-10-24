@@ -8,11 +8,15 @@ import Foundation
 /// technical details stay in the "Why?" popover. `askedAt` orders the Doing
 /// column's "Needs Attention" section.
 struct OperatorQuestion: Hashable {
-    /// How the user answers. Mirrors `OperatorAnswerType`. Both kinds are
-    /// answered with Yes/No; a payload carrying any other kind is not decoded
-    /// (see [[parse(_:)]]) because the card has no UI to answer it.
+    /// How the user answers. Mirrors `OperatorAnswerType`. The yes/no and
+    /// prerequisite kinds are answered with Yes/No buttons, a multiple-choice
+    /// question with one button per option; a payload carrying any other kind
+    /// is not decoded (see [[parse(_:)]]) because the card has no UI to answer it.
     enum AnswerType: String, Hashable {
         case yesNo = "yes_no"
+        /// One button per entry of [[OperatorQuestion.choices]]; the answer is
+        /// the chosen string, verbatim.
+        case multipleChoice = "multiple_choice"
         /// The worker proposes a task that must land before it can proceed;
         /// the proposal rides on [[OperatorQuestion.prerequisiteTask]].
         case createPrerequisiteTask = "create_prerequisite_task"
@@ -30,6 +34,13 @@ struct OperatorQuestion: Hashable {
     /// The proposed task, present exactly when `answerType` is
     /// `.createPrerequisiteTask`. The card shows it behind "Why?".
     var prerequisiteTask: PrerequisiteTaskProposal? = nil
+    /// The options of a `.multipleChoice` question, in the worker's order;
+    /// empty for every other answer type.
+    var choices: [String] = []
+
+    /// How many options the engine accepts on a multiple-choice question
+    /// (`OperatorAnswerType::MIN_CHOICES` / `MAX_CHOICES`).
+    static let choiceCountRange = 2...6
 
     /// Decode the wire `operator_question` object. Absent / null / malformed
     /// → `nil`, and so is a question whose `answer_type.kind` this build
@@ -55,6 +66,20 @@ struct OperatorQuestion: Hashable {
             else { return nil }
             prerequisiteTask = PrerequisiteTaskProposal(name: name, brief: brief)
         }
+        var choices: [String] = []
+        if answerType == .multipleChoice {
+            // Options the card cannot render as distinct buttons make a
+            // question nobody can answer; fall back to the plain blocked card.
+            guard let wireChoices = answerTypeDict["choices"] as? [String],
+                  choiceCountRange.contains(wireChoices.count),
+                  // Compare scalars, as the engine compares bytes: String equality
+                  // would merge canonically equivalent spellings the engine
+                  // accepts as distinct.
+                  Set(wireChoices.map { Array($0.unicodeScalars.map(\.value)) }).count == wireChoices.count,
+                  !wireChoices.contains(where: { $0.isEmpty })
+            else { return nil }
+            choices = wireChoices
+        }
         return OperatorQuestion(
             id: id,
             text: text,
@@ -63,7 +88,8 @@ struct OperatorQuestion: Hashable {
             askedAt: askedAt,
             executionID: (dict["execution_id"] as? String) ?? "",
             runSummary: dict["run_summary"] as? String,
-            prerequisiteTask: prerequisiteTask
+            prerequisiteTask: prerequisiteTask,
+            choices: choices
         )
     }
 }
@@ -80,11 +106,15 @@ struct PrerequisiteTaskProposal: Hashable {
 /// the wire `OperatorAnswer` tagged object.
 enum OperatorAnswer: Equatable {
     case yesNo(Bool)
+    /// The chosen option of a multiple-choice question, exactly as offered.
+    case multipleChoice(String)
 
     var wirePayload: [String: Any] {
         switch self {
         case .yesNo(let value):
             return ["kind": "yes_no", "value": value]
+        case .multipleChoice(let value):
+            return ["kind": "multiple_choice", "value": value]
         }
     }
 }
@@ -108,6 +138,9 @@ struct OperatorQuestionPresentation: Equatable {
     /// Set for a "create a prerequisite task" question; the details popover
     /// shows the proposed task's name and brief.
     var prerequisiteTask: PrerequisiteTaskProposal? = nil
+    /// The options of a multiple-choice question, one button each; empty for
+    /// a Yes/No question, which keeps its Yes / No buttons.
+    var choices: [String] = []
 
     /// The inline question is capped here; the popover shows the whole text.
     static let inlineLineLimit = 3
@@ -126,8 +159,12 @@ enum OperatorQuestionFailure {
         case "conflict":
             let state = (dict["state"] as? String) ?? "closed"
             var message = "This question can no longer be answered (it was \(state))."
-            if let answer = dict["answer"] as? [String: Any], let yes = answer["value"] as? Bool {
-                message += " Recorded answer: \(yes ? "Yes" : "No")."
+            if let answer = dict["answer"] as? [String: Any] {
+                if let yes = answer["value"] as? Bool {
+                    message += " Recorded answer: \(yes ? "Yes" : "No")."
+                } else if let choice = answer["value"] as? String {
+                    message += " Recorded answer: \(choice)."
+                }
             }
             return message
         case "validation_failed":

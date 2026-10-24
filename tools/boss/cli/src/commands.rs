@@ -459,7 +459,7 @@ pub(crate) enum ProjectCommand {
 }
 
 #[derive(Debug, Args)]
-#[command(group(clap::ArgGroup::new("answer").required(true).args(["yes", "no"])))]
+#[command(group(clap::ArgGroup::new("answer").required(true).args(["yes", "no", "choice"])))]
 pub(crate) struct TaskAnswerArgs {
     #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub id: String,
@@ -467,6 +467,10 @@ pub(crate) struct TaskAnswerArgs {
     pub yes: bool,
     #[arg(long)]
     pub no: bool,
+    /// Answer a multiple-choice question with this option, spelled exactly
+    /// as the question lists it (`boss task show` prints the options).
+    #[arg(long, value_name = "OPTION")]
+    pub choice: Option<String>,
 }
 
 /// Subcommands under `boss task ...`.

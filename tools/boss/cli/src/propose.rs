@@ -380,22 +380,48 @@ pub(crate) struct RunDoneArgs {
     #[arg(long)]
     summary: String,
 
-    /// One specific Yes/No decision in everyday words, without internal symbols,
+    /// One specific decision in everyday words, without internal symbols,
     /// types, file names, API names, or review jargon. Required with
-    /// `--answer-type yes-no`; not accepted with `create-prerequisite-task`,
-    /// whose question the engine words from `--prerequisite-name`.
-    #[arg(long, requires_all = ["answer_type", "explanation"], required_if_eq("answer_type", "yes-no"))]
+    /// `--answer-type yes-no` and `multiple-choice`; not accepted with
+    /// `create-prerequisite-task`, whose question the engine words from
+    /// `--prerequisite-name`.
+    #[arg(
+        long,
+        requires_all = ["answer_type", "explanation"],
+        required_if_eq_any([("answer_type", "yes-no"), ("answer_type", "multiple-choice")])
+    )]
     question: Option<String>,
 
-    /// `yes-no` for a plain approval. `create-prerequisite-task` when this
-    /// task cannot proceed until some other, unrelated piece of work lands
-    /// first: also pass `--prerequisite-name` and `--prerequisite-brief`, and
-    /// explain the dependency and both answers in `--explanation`.
-    #[arg(long, value_parser = ["yes-no", "create-prerequisite-task"], requires = "explanation")]
+    /// `yes-no` for a plain approval. `multiple-choice` when the decision is
+    /// a pick among alternatives: also pass `--choices`. `create-prerequisite-task`
+    /// when this task cannot proceed until some other, unrelated piece of work
+    /// lands first: also pass `--prerequisite-name` and `--prerequisite-brief`,
+    /// and explain the dependency and both answers in `--explanation`.
+    #[arg(
+        long,
+        value_parser = ["yes-no", "multiple-choice", "create-prerequisite-task"],
+        requires = "explanation"
+    )]
     answer_type: Option<String>,
+
+    /// The options of a `multiple-choice` question, each a short single-line
+    /// button label: two to six distinct, non-empty values, e.g.
+    /// `--choices "Merge now" "Wait for review"`. The kanban card shows one
+    /// button per option and the chosen option reaches the next run verbatim.
+    #[arg(
+        long,
+        num_args = 1..,
+        value_name = "CHOICE",
+        requires = "answer_type",
+        required_if_eq("answer_type", "multiple-choice")
+    )]
+    choices: Vec<String>,
 
     /// Self-contained decision explanation with these labels on their own lines,
     /// in order: Context:, Yes:, No:, Recommendation:, and optional Details:.
+    /// For `multiple-choice` use only Context:, Recommendation:, and optional
+    /// Details: (there are no Yes/No buttons); say in Context what each option
+    /// leads to.
     /// Context opens with 1–2 plain-language sentences about the work and blocker.
     /// Yes/No state the user-visible result and rough work size; No leaves work
     /// blocked, rather than starting an alternative automatically. Recommend an
@@ -741,6 +767,7 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
                 question: operator_question_from_flags(
                     args.question,
                     args.answer_type.as_deref(),
+                    args.choices,
                     args.explanation,
                     args.prerequisite_name,
                     args.prerequisite_brief,
@@ -781,25 +808,43 @@ pub(crate) fn read_queue_ci_evidence(
 fn operator_question_from_flags(
     question: Option<String>,
     answer_type: Option<&str>,
+    choices: Vec<String>,
     explanation: Option<String>,
     prerequisite_name: Option<String>,
     prerequisite_brief: Option<String>,
 ) -> Result<Option<boss_protocol::OperatorQuestion>, CliError> {
-    let explanation = explanation.unwrap_or_default();
+    let explanation = match answer_type {
+        None => explanation.unwrap_or_default(),
+        Some(kind) => explanation::validate_for(&explanation.unwrap_or_default(), kind == "multiple-choice")
+            .map_err(CliError::usage)?,
+    };
+    if answer_type != Some("multiple-choice") && !choices.is_empty() {
+        return Err(CliError::usage(
+            "--choices only applies to --answer-type multiple-choice",
+        ));
+    }
     match answer_type {
         None => Ok(None),
-        Some("yes-no") => {
-            if prerequisite_name.is_some() || prerequisite_brief.is_some() {
-                return Err(CliError::usage(
-                    "--prerequisite-name and --prerequisite-brief only apply to --answer-type create-prerequisite-task",
-                ));
-            }
+        Some("yes-no" | "multiple-choice") if prerequisite_name.is_some() || prerequisite_brief.is_some() => {
+            Err(CliError::usage(
+                "--prerequisite-name and --prerequisite-brief only apply to --answer-type create-prerequisite-task",
+            ))
+        }
+        Some("multiple-choice") => {
+            let choices: Vec<String> = choices.into_iter().map(|choice| choice.trim().to_owned()).collect();
+            boss_protocol::OperatorAnswerType::validate_choices(&choices)
+                .map_err(|message| CliError::usage(format!("--choices: {message}")))?;
             Ok(question.map(|text| boss_protocol::OperatorQuestion {
                 text,
-                answer_type: boss_protocol::OperatorAnswerType::YesNo,
+                answer_type: boss_protocol::OperatorAnswerType::MultipleChoice { choices },
                 explanation,
             }))
         }
+        Some("yes-no") => Ok(question.map(|text| boss_protocol::OperatorQuestion {
+            text,
+            answer_type: boss_protocol::OperatorAnswerType::YesNo,
+            explanation,
+        })),
         Some("create-prerequisite-task") => {
             if question.is_some() {
                 return Err(CliError::usage(
@@ -985,6 +1030,7 @@ fn flag_hint_for_field(kind: ProposalKind, field: &str) -> Option<&'static str> 
         (ProposalKind::RunDone, "summary") => Some("--summary"),
         (ProposalKind::RunDone, "question" | "question.text") => Some("--question"),
         (ProposalKind::RunDone, "question.answer_type.kind") => Some("--answer-type"),
+        (ProposalKind::RunDone, "question.answer_type.choices") => Some("--choices"),
         (ProposalKind::RunDone, "question.explanation") => Some("--explanation"),
         (ProposalKind::RunDone, "question.answer_type.name") => Some("--prerequisite-name"),
         (ProposalKind::RunDone, "question.answer_type.brief") => Some("--prerequisite-brief"),
@@ -1078,6 +1124,90 @@ mod tests {
         for flag in ["--yes", "--no"] {
             assert!(Cli::try_parse_from(["boss", "task", "answer", "oq_example", flag]).is_ok());
         }
+    }
+
+    #[test]
+    fn multiple_choice_flags_build_the_typed_question_and_enforce_the_choice_rules() {
+        let base = [
+            "boss",
+            "propose",
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "Need a decision",
+            "--question",
+            "Which rollout should I use?",
+            "--answer-type",
+            "multiple-choice",
+            "--explanation",
+            explanation::tests::VALID_CHOICE,
+        ];
+        let payload = |extra: &[&str]| {
+            let Commands::Propose(args) = Cli::try_parse_from(base.iter().chain(extra)).ok()?.command else {
+                panic!("expected propose")
+            };
+            payload_for(args.command.unwrap()).ok().map(|(_, payload, _)| payload)
+        };
+        // The options are required with the multiple-choice type.
+        assert!(Cli::try_parse_from(base).is_err());
+        // A multiple-choice explanation has no Yes/No sections.
+        let mut with_yes_no = base;
+        *with_yes_no.last_mut().unwrap() = explanation::tests::VALID;
+        let Commands::Propose(args) = Cli::try_parse_from(with_yes_no.iter().chain(&["--choices", "a", "b"]))
+            .unwrap()
+            .command
+        else {
+            panic!("expected propose")
+        };
+        assert!(payload_for(args.command.unwrap()).is_err());
+        let built = payload(&["--choices", " Gradual ", "All at once"]).unwrap();
+        assert_eq!(
+            built["question"]["answer_type"],
+            serde_json::json!({"kind": "multiple_choice", "choices": ["Gradual", "All at once"]})
+        );
+        assert_eq!(built["question"]["text"], "Which rollout should I use?");
+        // Repeating the flag accumulates, like listing the values after one flag.
+        let repeated = payload(&["--choices", "a", "--choices", "b"]).unwrap();
+        assert_eq!(
+            repeated["question"]["answer_type"]["choices"],
+            serde_json::json!(["a", "b"])
+        );
+        for bad in [
+            vec!["--choices", "only one"],
+            vec!["--choices", "a", "a"],
+            vec!["--choices", "a", " "],
+            vec!["--choices", "a", "b", "c", "d", "e", "f", "g"],
+        ] {
+            assert!(payload(&bad).is_none(), "{bad:?}");
+        }
+        // The options belong to the multiple-choice type only.
+        let yes_no_with_choices = [
+            "boss",
+            "propose",
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "s",
+            "--question",
+            "Approve?",
+            "--answer-type",
+            "yes-no",
+            "--explanation",
+            explanation::tests::VALID,
+            "--choices",
+            "a",
+            "b",
+        ];
+        let Commands::Propose(args) = Cli::try_parse_from(yes_no_with_choices).unwrap().command else {
+            panic!("expected propose")
+        };
+        assert!(payload_for(args.command.unwrap()).is_err());
+        for flag in [vec!["--yes"], vec!["--choice", "Gradual"]] {
+            assert!(Cli::try_parse_from(["boss", "task", "answer", "oq_example"].into_iter().chain(flag)).is_ok());
+        }
+        assert!(Cli::try_parse_from(["boss", "task", "answer", "oq_example", "--yes", "--choice", "a"]).is_err());
     }
 
     #[test]

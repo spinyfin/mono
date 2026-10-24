@@ -27,7 +27,7 @@ final class OperatorQuestionExplanationTests: XCTestCase {
         let value = try XCTUnwrap(OperatorQuestionExplanation(plain + "\nDetails:\n" + evidence))
         XCTAssertEqual(value.details, evidence)
         XCTAssertFalse(value.context.contains("EngineClient"))
-        XCTAssertFalse(value.no.contains("example.com"))
+        XCTAssertFalse(try XCTUnwrap(value.no).contains("example.com"))
     }
 
     func testIncompleteOrLegacyTextFallsBackToVerbatimPresentation() {
@@ -46,5 +46,19 @@ final class OperatorQuestionExplanationTests: XCTestCase {
         let text = plain.replacingOccurrences(of: "\n", with: "\r\n  ")
         XCTAssertEqual(try XCTUnwrap(OperatorQuestionExplanation(text)).yes,
                        "Resend only actions that never left. Smaller change.")
+    }
+
+    func testMultipleChoiceShapeHasNoYesNoSections() throws {
+        let choice = "Context:\nPick a rollout.\nRecommendation:\nGradual, to limit risk."
+        let value = try XCTUnwrap(OperatorQuestionExplanation(choice))
+        XCTAssertEqual(value.context, "Pick a rollout.")
+        XCTAssertNil(value.yes)
+        XCTAssertNil(value.no)
+        XCTAssertEqual(value.recommendation, "Gradual, to limit risk.")
+        XCTAssertNil(value.details)
+        let withDetails = try XCTUnwrap(OperatorQuestionExplanation(choice + "\nDetails:\nYes:\nverbatim"))
+        XCTAssertEqual(withDetails.details, "Yes:\nverbatim")
+        XCTAssertNil(OperatorQuestionExplanation("Context:\nPick.\nRecommendation:\n"))
+        XCTAssertNil(OperatorQuestionExplanation("Context:\nPick.\nYes:\nA\nRecommendation:\nB"))
     }
 }
