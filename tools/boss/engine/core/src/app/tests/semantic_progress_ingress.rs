@@ -418,6 +418,13 @@ fn live_check_and_hook_dispatch_do_not_deadlock() {
     let (inside_tx, inside_rx) = std::sync::mpsc::channel();
     let (live_done_tx, live_done_rx) = std::sync::mpsc::channel();
     let (dispatch_done_tx, dispatch_done_rx) = std::sync::mpsc::channel();
+    let (persist_boundary_tx, persist_boundary_rx) = std::sync::mpsc::channel();
+    *server_state
+        .live_worker_states
+        .test_hooks
+        .persist_boundary
+        .lock()
+        .unwrap() = Some(persist_boundary_tx);
 
     let live_state = server_state.clone();
     let live_check = std::thread::spawn(move || {
@@ -426,19 +433,12 @@ fn live_check_and_hook_dispatch_do_not_deadlock() {
             RequestExecutionInput::builder().work_item_id(work_item_id).build(),
             |run_id| {
                 inside_tx.send(()).unwrap();
-                // Observe dispatch's transition while holding the DB connection.
-                // Dispatch cannot finish persistence until this closure returns.
-                let deadline = std::time::Instant::now() + wait;
-                loop {
-                    if registry
-                        .semantic_progress_for_slot(SLOT)
-                        .is_some_and(|checkpoint| checkpoint.turn_condition == SemanticTurnCondition::InTurn)
-                    {
-                        break;
-                    }
-                    assert!(std::time::Instant::now() < deadline, "dispatch never applied its event");
-                    std::thread::yield_now();
-                }
+                // Wait until dispatch is inside persistence (persist lock held,
+                // checkpoint captured), then check liveness while still holding
+                // the DB connection. Dispatch cannot finish until we return.
+                persist_boundary_rx
+                    .recv_timeout(wait)
+                    .expect("dispatch never reached the persistence boundary");
                 registry.is_run_live(run_id)
             },
         );

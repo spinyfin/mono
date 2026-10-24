@@ -210,6 +210,9 @@ struct SerialLocks {
 pub(crate) struct TestHooks {
     pub(crate) persona_boundary: Mutex<Option<Box<dyn Fn() + Send>>>,
     pub(crate) lifecycle_waiter: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    /// Signalled once `with_semantic_progress` has taken the persistence lock
+    /// and captured its checkpoint, immediately before `consume` runs.
+    pub(crate) persist_boundary: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 /// Hook evidence buffered for a run before its slot entry exists.
@@ -1063,6 +1066,10 @@ impl LiveWorkerStateRegistry {
     ) -> R {
         let _persist = self.serial.persist.lock().unwrap_or_else(|e| e.into_inner());
         let checkpoint = self.capture_semantic_progress(slot_id, Some(run_id));
+        #[cfg(test)]
+        if let Some(boundary) = self.test_hooks.persist_boundary.lock().unwrap().take() {
+            let _ = boundary.send(());
+        }
         consume(checkpoint)
     }
 
