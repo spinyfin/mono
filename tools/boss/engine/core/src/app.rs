@@ -122,6 +122,7 @@ pub(crate) mod proposals;
 // `pub(crate)` so `crate::attention_lifecycle` can name
 // `PROGRESS_INGRESS_UNRECOVERABLE_ATTENTION_KIND` in the lifecycle registry
 // (crate-internal only — nothing outside the engine sees this module).
+mod decision_notifications;
 mod panic_hook;
 pub(crate) mod readoption;
 mod review;
@@ -1384,6 +1385,7 @@ impl ServerState {
         let topic_broker = Arc::new(TopicBroker::default());
         let work_revision = Arc::new(AtomicU64::new(0));
         let publisher_impl = Arc::new(BrokerExecutionPublisher {
+            work_db: work_db.clone(),
             topic_broker: topic_broker.clone(),
             work_revision: work_revision.clone(),
             metrics: metrics_registry.clone(),
@@ -2240,6 +2242,7 @@ impl crate::transient_recovery::WorkerNudger for ServerState {
 }
 
 struct BrokerExecutionPublisher {
+    work_db: Arc<WorkDb>,
     topic_broker: Arc<TopicBroker>,
     work_revision: Arc<AtomicU64>,
     metrics: Arc<crate::metrics::Registry>,
@@ -2261,6 +2264,7 @@ impl BrokerExecutionPublisher {
         reason: &str,
         class: InvalidationClass,
     ) {
+        self.topic_broker.refresh_decisions(&self.work_db, false).await;
         tracing::info!(
             source = "execution",
             reason,

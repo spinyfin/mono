@@ -2896,8 +2896,8 @@ pub use invalidation::{InvalidationClass, MAX_RUNTIME_PATCH_ITEMS, WorkRuntimePa
 // `boss_protocol::{..}` paths are unchanged.
 mod snapshot_wire;
 pub use snapshot_wire::{
-    FeatureFlagSnapshot, OffsiteBackupSettings, SettingSnapshot, WorkerPoolClaimEntry, WorkerPoolEntry,
-    WorkspacePoolEntry,
+    FeatureFlagSnapshot, OffsiteBackupSettings, OperatorDecisionNotification, SettingSnapshot, WorkerPoolClaimEntry,
+    WorkerPoolEntry, WorkspacePoolEntry,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

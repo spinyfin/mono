@@ -42,10 +42,13 @@ enum BossOperatorQuestionCapture {
         )
         let view = HStack(alignment: .top, spacing: 32) {
             VStack(alignment: .leading) {
-                Text("Board card").font(.headline)
-                WorkBoardCardOperatorQuestion(slice: .init(presentation: question))
-                Text("Board card — multiple choice").font(.headline).padding(.top, 16)
-                WorkBoardCardOperatorQuestion(slice: .init(presentation: choiceQuestion))
+                CollapsibleWorkBoardSection(
+                    sectionID: "doing-needs-attention", title: "Needs Attention",
+                    count: 2, defaultExpanded: true, countLabel: "2 decisions waiting"
+                ) {
+                    WorkBoardCardOperatorQuestion(slice: .init(presentation: question))
+                    WorkBoardCardOperatorQuestion(slice: .init(presentation: choiceQuestion))
+                }
             }.frame(width: 300)
             VStack(alignment: .leading) {
                 Text("Why? — details collapsed initially").font(.headline)

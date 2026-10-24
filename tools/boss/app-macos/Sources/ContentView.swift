@@ -1204,6 +1204,7 @@ struct ContentView: View {
                     title: section.title,
                     count: section.items.count,
                     defaultExpanded: section.defaultExpanded,
+                    countLabel: section.countLabel,
                     shortIDLabel: sectionProject?.shortID.map { "P" + String($0) },
                     banner: section.queueBannerText,
                     revealGeneration: section.items.contains { $0.id == model.revealScrollTarget }

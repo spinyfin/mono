@@ -76,7 +76,8 @@ extension ChatViewModel {
             items: sorted,
             isCollapsible: true,
             defaultExpanded: true,
-            groupKey: .needsAttention
+            groupKey: .needsAttention,
+            countLabel: "\(sorted.count) \(sorted.count == 1 ? "decision" : "decisions") waiting"
         )
     }
 

@@ -926,6 +926,12 @@ final class EngineClient: @unchecked Sendable {
         case "work_error":
             let message = payload["message"] as? String ?? "unknown work error"
             emit(.workError(message: message, requestId: envelopeRequestId))
+        case "operator_decision_snapshot":
+            if let raw = payload["questions"],
+               let data = try? JSONSerialization.data(withJSONObject: raw),
+               let questions = try? JSONDecoder().decode([DecisionNotification].self, from: data) {
+                emit(.operatorDecisionSnapshot(questions: questions))
+            }
         case "operator_question_error":
             emit(.operatorQuestionError(
                 message: OperatorQuestionFailure.message(from: payload["error"]),
