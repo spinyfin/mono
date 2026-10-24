@@ -12,7 +12,7 @@ use crate::app::checkleft_gate::run_checkleft_gate;
 use crate::app::errors::{CubeError, Result, RunResult};
 use crate::app::gh_pr;
 use crate::app::jj::{run_jj, run_jj_network};
-use crate::app::pr::{record_published_workspace_head, verify_push_reached_github};
+use crate::app::pr::{record_published_pr_head, resolve_workspace_pr_number, verify_push_reached_github};
 use crate::app::pr_bookmarks;
 use crate::app::provision::find_workspace_record;
 use crate::app::reset::resolve_github_remote_for_workspace;
@@ -952,6 +952,10 @@ pub(super) fn rebase_workspace_branch(
         }
     }
 
+    let push_cmd = match opts.explicit_pr {
+        Some(n) => format!("cube workspace push --pr {n}"),
+        None => format!("cube workspace push --bookmark {boss_branch}"),
+    };
     if has_conflicts {
         // Best-effort: list conflicted files across every conflicted commit
         // in the range, deduped by path (the same file can show as
@@ -978,9 +982,6 @@ pub(super) fn rebase_workspace_branch(
         } else {
             conflicted_files.join(", ")
         };
-        let push_cmd = format!(
-            "jj bookmark set {boss_branch} -r @ --allow-backwards && jj git push -b {boss_branch} --remote {github_remote}"
-        );
         // Which guard refused the mechanical collapse is the difference
         // between "a real content conflict at the head" and "the tree drifted
         // after three squashes". Report it on both surfaces so the engine can
@@ -1042,7 +1043,7 @@ pub(super) fn rebase_workspace_branch(
             format!(
                 "REBASED_CLEAN: branch `{boss_branch}` rebased onto `{main_branch}` with no conflicts.\
                  {linearized_note} Push skipped (--no-push); update the PR with \
-                 `jj git push -b {boss_branch} --remote {github_remote}`."
+                 `{push_cmd}`."
             ),
             json!({
                 "status": "clean",
@@ -1063,6 +1064,7 @@ pub(super) fn rebase_workspace_branch(
     // commit — the legitimate, expected shape of a rebase, not a force-flag
     // anomaly. Surface a lease mismatch clearly instead of letting the worker
     // reach for force flags.
+    let number = resolve_workspace_pr_number(runner, cwd, owner_repo, &boss_branch, opts.explicit_pr)?;
     if let Err(err) = runner.run(&RealCommandRunner::invocation(
         cwd,
         "jj",
@@ -1072,11 +1074,11 @@ pub(super) fn rebase_workspace_branch(
             "rebase of `{boss_branch}` onto `{main_branch}` succeeded, but pushing it to \
              `{github_remote}` failed: {err}. If the remote head moved since the fetch, re-run \
              `cube workspace rebase`; otherwise push manually with \
-             `jj git push -b {boss_branch} --remote {github_remote}`."
+             `{push_cmd}`."
         )));
     }
     let published = verify_push_reached_github(runner, cwd, owner_repo, &boss_branch)?;
-    record_published_workspace_head(runner, cwd, owner_repo, &boss_branch, opts.explicit_pr, &published)?;
+    record_published_pr_head(runner, cwd, number, &published)?;
 
     eprintln!("cube: workspace rebase: {boss_branch} rebased onto {main_branch} cleanly and pushed");
     RunResult::new(
@@ -1183,6 +1185,8 @@ pub(super) fn workspace_push(
     // `cube pr update`'s equivalent call for the full rationale.
     run_checkleft_gate(&cwd, None)?;
 
+    let number = resolve_workspace_pr_number(runner, &cwd, &owner_repo, &boss_branch, pr)?;
+
     // jj's own tracked remote-bookmark state (refreshed by callers via `cube
     // workspace goto`/`rebase`'s fetch) is the compare-and-swap token here —
     // no destructive `--force` flag needed for what is, from jj's point of
@@ -1196,7 +1200,7 @@ pub(super) fn workspace_push(
         .map_err(|e| CubeError::InvalidArgument(format!("failed to push `{boss_branch}`: {e}")))?;
 
     let published = verify_push_reached_github(runner, &cwd, &owner_repo, &boss_branch)?;
-    record_published_workspace_head(runner, &cwd, &owner_repo, &boss_branch, pr, &published)?;
+    record_published_pr_head(runner, &cwd, number, &published)?;
 
     RunResult::new(
         format!("PUSHED: branch `{boss_branch}` pushed to `{github_remote}`."),

@@ -28,3 +28,9 @@ mod remove_tests;
 mod repo_tests;
 mod setup_tests;
 mod support;
+
+pub(super) fn with_checkleft_fixture<T>(run: impl FnOnce() -> T) -> T {
+    let _lock = support::ENV_MUTEX.lock().unwrap();
+    let _env = checkleft_tests::CheckleftEnvGuard::with_gate_disabled();
+    run()
+}

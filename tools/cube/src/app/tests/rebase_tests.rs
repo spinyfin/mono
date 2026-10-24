@@ -266,15 +266,18 @@ fn push_and_verify_cmds(branch: &str, pr: Option<u64>) -> Vec<ExpectedCommand> {
         ),
     ];
     if pr.is_none() {
-        cmds.push(ExpectedCommand::ok(
-            rebase_cwd(),
-            "gh",
-            &[
-                "api",
-                &format!("repos/{REBASE_OWNER_REPO}/pulls?head=spinyfin:{branch}&state=open"),
-            ],
-            "[]",
-        ));
+        cmds.insert(
+            0,
+            ExpectedCommand::ok(
+                rebase_cwd(),
+                "gh",
+                &[
+                    "api",
+                    &format!("repos/{REBASE_OWNER_REPO}/pulls?head=spinyfin:{branch}&state=open"),
+                ],
+                "[]",
+            ),
+        );
     }
     cmds
 }
@@ -426,7 +429,7 @@ fn rebase_conflicts_skip_push_and_name_the_bookmark() {
     assert_eq!(result.payload["conflicted_files"][0], "src/foo.rs");
     assert!(result.message.starts_with("REBASED_WITH_CONFLICTS"));
     assert!(
-        result.message.contains("jj git push -b boss/exec_c"),
+        result.message.contains("cube workspace push --bookmark boss/exec_c"),
         "conflict message names the exact push command: {}",
         result.message
     );
@@ -553,6 +556,15 @@ fn rebase_push_failure_surfaces_clear_error_without_force_flags() {
         positioned_cmd(branch, "h1"),
     ];
     cmds.extend(set_track_rebase_check_cmds(branch, &[]));
+    cmds.push(ExpectedCommand::ok(
+        rebase_cwd(),
+        "gh",
+        &[
+            "api",
+            &format!("repos/{REBASE_OWNER_REPO}/pulls?head=spinyfin:{branch}&state=open"),
+        ],
+        "[]",
+    ));
     cmds.push(failing_cmd(
         rebase_cwd(),
         "jj",

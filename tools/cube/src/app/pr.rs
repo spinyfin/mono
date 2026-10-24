@@ -76,7 +76,7 @@ fn resolve_pr_context(branch_arg: Option<String>, runner: &dyn CommandRunner) ->
 /// following `jj edit <bookmark>`) leaves the bookmark on the rebased commit
 /// while `@` stays on the old tree. Any local build/test gate then runs
 /// against the wrong tree, and a push ships a commit that was never actually
-/// verified locally (T2764 postmortem, spinyfin/mono#2023). Accepts the two
+/// verified locally (see spinyfin/mono#2023). Accepts the two
 /// shapes a clean workflow leaves `@` in: `@` IS the bookmark head, or `@` is
 /// an empty working-copy child of it.
 fn assert_working_copy_matches_branch(ctx: &PrContext, runner: &dyn CommandRunner) -> Result<()> {
@@ -334,7 +334,8 @@ pub(super) fn pr_create(args: PrCreateArgs, runner: &dyn CommandRunner) -> Resul
             branch = ctx.branch
         );
         let number = pr_number_from_url(&url);
-        let pr_bookmark_name = set_pr_bookmark(runner, &ctx.cwd, number, &ctx.branch)?;
+        let published = verify_push_reached_github(runner, &ctx.cwd, &ctx.owner_repo, &ctx.branch)?;
+        let pr_bookmark_name = record_published_pr_head(runner, &ctx.cwd, number, &published)?;
         return RunResult::new(
             url.clone(),
             json!({"action": "already_exists", "url": url, "number": number, "pr_bookmark": pr_bookmark_name}),
@@ -419,19 +420,6 @@ pub(super) fn ensure_pr_deprecated(args: PrCreateArgs, runner: &dyn CommandRunne
     )
 }
 
-/// Sets the local `pr/<n>` bookmark on the given branch.
-///
-/// Returns the bookmark name if the number was resolved, or `None` if the PR
-/// URL didn't contain a parseable number (so callers can include it in JSON).
-pub(super) fn set_pr_bookmark(
-    runner: &dyn CommandRunner,
-    cwd: &Path,
-    number: Option<u64>,
-    branch: &str,
-) -> Result<Option<String>> {
-    write_pr_bookmark(runner, cwd, number, branch, false)
-}
-
 /// Record only a verified published SHA, never a branch that can move during
 /// publication. Rebased revisions can replace a conflicted sibling, so this
 /// bookkeeping update deliberately allows non-fast-forward movement.
@@ -441,23 +429,38 @@ pub(super) fn record_published_pr_head(
     number: Option<u64>,
     published: &str,
 ) -> Result<Option<String>> {
-    let bookmark = write_pr_bookmark(runner, cwd, number, published, true)?;
+    let bookmark = write_pr_bookmark(runner, cwd, number, published).map_err(|e| {
+        CubeError::InvalidArgument(format!(
+            "push succeeded at {published}, but PR bookmark bookkeeping failed: {e}; \
+             retry `cube pr create` for the published branch to repair bookkeeping without pushing"
+        ))
+    })?;
     if let Some(name) = &bookmark {
-        // `point_pr_bookmark` has already verified the bookmark resolves to
-        // exactly `published` in both jj and git.
+        let revision = format!("bookmarks(exact:{})", serde_json::to_string(name).unwrap());
+        let actual = jj_commit_id(runner, cwd, &revision).map_err(|e| {
+            CubeError::InvalidArgument(format!(
+                "push succeeded at {published}, but bookmark readback failed: {e}; \
+                 retry `cube pr create` for the published branch"
+            ))
+        })?;
+        if actual != published {
+            return Err(CubeError::InvalidArgument(format!(
+                "push succeeded at {published}, but local bookmark `{name}` resolves to `{actual}`; \
+                 publication bookkeeping failed; retry `cube pr create` for the published branch without re-pushing"
+            )));
+        }
         eprintln!("cube: published PR bookmark `{name}` verified at {published}");
     }
     Ok(bookmark)
 }
 
-pub(super) fn record_published_workspace_head(
+pub(super) fn resolve_workspace_pr_number(
     runner: &dyn CommandRunner,
     cwd: &Path,
     owner_repo: &str,
     branch: &str,
     number: Option<u64>,
-    published: &str,
-) -> Result<()> {
+) -> Result<Option<u64>> {
     let number = match number {
         Some(number) => Some(number),
         None => {
@@ -470,8 +473,7 @@ pub(super) fn record_published_workspace_head(
             list_open_pr(&ctx, runner)?.as_deref().and_then(pr_number_from_url)
         }
     };
-    record_published_pr_head(runner, cwd, number, published)?;
-    Ok(())
+    Ok(number)
 }
 
 fn write_pr_bookmark(
@@ -479,16 +481,13 @@ fn write_pr_bookmark(
     cwd: &Path,
     number: Option<u64>,
     revision: &str,
-    published: bool,
 ) -> Result<Option<String>> {
     let Some(n) = number else {
         return Ok(None);
     };
     let bookmark_name = pr_bookmark::pr_bookmark_name(n);
     let _lock = runner.lock_pr_bookmarks(cwd)?;
-    if published {
-        eprintln!("cube: synchronizing published PR bookmark `{bookmark_name}` to {revision}");
-    }
+    eprintln!("cube: synchronizing published PR bookmark `{bookmark_name}` to {revision}");
     crate::app::pr_bookmarks::point_pr_bookmark(runner, None, cwd, n, revision)?;
     Ok(Some(bookmark_name))
 }

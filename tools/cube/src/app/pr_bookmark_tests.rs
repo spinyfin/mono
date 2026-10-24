@@ -14,6 +14,37 @@ impl CommandRunner for TestJj {
     }
 }
 
+// Keep all jj operations real; GitHub reads use the local remote fixture.
+struct PublishFixture<'a> {
+    worker: &'a Path,
+    remote: &'a Path,
+}
+
+impl CommandRunner for PublishFixture<'_> {
+    fn run(&self, invocation: &crate::command_runner::CommandInvocation) -> Result<String> {
+        if invocation.program == "gh" {
+            if invocation.args == ["api", "repos/test/repo/pulls/42"] {
+                return Ok(r#"{"head":{"ref":"feature"}}"#.into());
+            }
+            if invocation.args == ["api", "repos/test/repo/pulls?head=test:feature&state=open"] {
+                return Ok(r#"[{"html_url":"https://github.com/test/repo/pull/42"}]"#.into());
+            }
+            assert_eq!(
+                invocation.args,
+                ["api", "repos/test/repo/branches/feature", "--jq", ".commit.sha"]
+            );
+            TestJj.run(&RealCommandRunner::invocation(self.remote, "jj", &["git", "import"]))?;
+            return jj_commit_id(&TestJj, self.remote, "feature");
+        }
+        if invocation.args == ["git", "remote", "list"] {
+            return Ok("origin git@github.com:test/repo.git\n".into());
+        }
+        let mut invocation = invocation.clone();
+        invocation.cwd = self.worker.to_owned();
+        TestJj.run(&invocation)
+    }
+}
+
 #[test]
 fn resolved_rebase_updates_shared_pr_bookmark_for_next_launch() {
     exercise_publication(false);
@@ -61,9 +92,7 @@ fn exercise_publication(ambiguous: bool) {
     jj(&worker, &["edit", "@-"]);
     std::fs::write(worker.join("file"), "upstream and feature\n").unwrap();
     jj(&worker, &["bookmark", "set", "feature", "-r", "@", "--allow-backwards"]);
-    jj(&worker, &["git", "push", "-b", "feature"]);
-    jj(&remote, &["git", "import"]);
-    let pushed = jj_commit_id(&runner, &remote, "feature").unwrap();
+    let pushed = jj_commit_id(&runner, &worker, "feature").unwrap();
     assert_eq!(jj_commit_id(&runner, &worker, "feature").unwrap(), pushed);
     assert_eq!(
         jj(&worker, &["log", "-r", &pushed, "--no-graph", "-T", "conflict"]).trim(),
@@ -119,8 +148,21 @@ fn exercise_publication(ambiguous: bool) {
         );
     }
 
-    // The post-publish operation must replace, rather than fast-forward, pr/42.
-    record_published_pr_head(&runner, &worker, Some(42), &pushed).unwrap();
+    // Exercise the command recommended by the conflict handoff, including
+    // its real push, verification and shared-bookmark synchronization.
+    crate::app::tests::with_checkleft_fixture(|| {
+        let publisher = PublishFixture {
+            worker: &worker,
+            remote: &remote,
+        };
+        let (bookmark, pr) = if ambiguous {
+            (Some("feature".into()), None)
+        } else {
+            (None, Some(42))
+        };
+        crate::app::workspace_ops::workspace_push(None, &publisher, bookmark, pr).unwrap();
+    });
+    assert_eq!(jj_commit_id(&runner, &remote, "feature").unwrap(), pushed);
     let heads = jj(
         &repo,
         &[

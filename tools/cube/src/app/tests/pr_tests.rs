@@ -1086,12 +1086,24 @@ fn pr_create_is_idempotent_when_pr_already_exists() {
             r#"[{"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
         ),
         // No push, no `gh pr create` — only the local pr/<n> bookmark is set.
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "-r", "my-feature", "--no-graph", "-T", "commit_id"],
+            "published",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "gh",
+            &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
+            "published",
+        ),
         ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
-            "head",
+            &["log", "--no-graph", "-r", "published", "-T", r#"commit_id ++ "\n""#],
+            "published",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -1109,7 +1121,7 @@ fn pr_create_is_idempotent_when_pr_already_exists() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["bookmark", "set", "pr/7", "-r", "my-feature", "--allow-backwards"],
+            &["bookmark", "set", "pr/7", "-r", "published", "--allow-backwards"],
             "",
         ),
         ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
@@ -1124,7 +1136,7 @@ fn pr_create_is_idempotent_when_pr_already_exists() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "published",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -1137,7 +1149,20 @@ fn pr_create_is_idempotent_when_pr_already_exists() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "published",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                "bookmarks(exact:\"pr/7\")",
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "published",
         ),
     ]);
 
@@ -1318,7 +1343,7 @@ fn pr_update_errors_when_no_pr_exists() {
 
 #[test]
 fn pr_update_refuses_when_working_copy_is_stale() {
-    // T2764 postmortem: a worker rebased the bookmark onto main but never
+    // Regression: a worker rebased the bookmark onto main but never
     // `jj edit`ed into it, so `@` stayed on the old tree while the
     // bookmark advanced. `cube pr update` must refuse before pushing —
     // and before even checking whether a PR exists — rather than ship a
@@ -1705,5 +1730,22 @@ fn publication_fails_if_bookmark_verification_observes_multiple_heads() {
     ]);
     let error = crate::app::pr::record_published_pr_head(&runner, &cwd, Some(42), "published").unwrap_err();
     assert!(error.to_string().contains("publication bookkeeping failed"));
+    assert!(error.to_string().contains("push succeeded"));
+    assert!(error.to_string().contains("cube pr create"));
+    runner.assert_exhausted();
+}
+
+#[test]
+fn workspace_pr_lookup_failure_prevents_publication() {
+    let cwd = std::env::current_dir().unwrap();
+    let runner = FakeRunner::new(vec![super::rebase_tests::failing_cmd(
+        cwd.clone(),
+        "gh",
+        &["api", "repos/spinyfin/mono/pulls?head=spinyfin:feature&state=open"],
+        "GitHub unavailable",
+    )]);
+    let error =
+        crate::app::pr::resolve_workspace_pr_number(&runner, &cwd, "spinyfin/mono", "feature", None).unwrap_err();
+    assert!(error.to_string().contains("GitHub unavailable"));
     runner.assert_exhausted();
 }

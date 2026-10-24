@@ -50,6 +50,15 @@ fn workspace_push_happy_path_advances_and_pushes() {
         ),
         ExpectedCommand::ok(
             cwd.clone(),
+            "gh",
+            &[
+                "api",
+                &format!("repos/spinyfin/mono/pulls?head=spinyfin:{branch}&state=open"),
+            ],
+            "[]",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
             "jj",
             &["git", "push", "-b", branch, "--remote", "github"],
             "",
@@ -70,15 +79,6 @@ fn workspace_push_happy_path_advances_and_pushes() {
                 ".commit.sha",
             ],
             "deadbeef\n",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "gh",
-            &[
-                "api",
-                &format!("repos/spinyfin/mono/pulls?head=spinyfin:{branch}&state=open"),
-            ],
-            "[]",
         ),
     ]);
 
@@ -227,6 +227,15 @@ fn workspace_push_describes_an_undescribed_working_copy_before_pushing() {
         ),
         ExpectedCommand::ok(
             cwd.clone(),
+            "gh",
+            &[
+                "api",
+                &format!("repos/spinyfin/mono/pulls?head=spinyfin:{branch}&state=open"),
+            ],
+            "[]",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
             "jj",
             &["git", "push", "-b", branch, "--remote", "github"],
             "",
@@ -247,15 +256,6 @@ fn workspace_push_describes_an_undescribed_working_copy_before_pushing() {
                 ".commit.sha",
             ],
             "beef\n",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "gh",
-            &[
-                "api",
-                &format!("repos/spinyfin/mono/pulls?head=spinyfin:{branch}&state=open"),
-            ],
-            "[]",
         ),
     ]);
 
@@ -294,6 +294,15 @@ fn workspace_push_leaves_an_existing_description_untouched() {
         ),
         ExpectedCommand::ok(
             cwd.clone(),
+            "gh",
+            &[
+                "api",
+                &format!("repos/spinyfin/mono/pulls?head=spinyfin:{branch}&state=open"),
+            ],
+            "[]",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
             "jj",
             &["git", "push", "-b", branch, "--remote", "github"],
             "",
@@ -314,15 +323,6 @@ fn workspace_push_leaves_an_existing_description_untouched() {
                 ".commit.sha",
             ],
             "d00d\n",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "gh",
-            &[
-                "api",
-                &format!("repos/spinyfin/mono/pulls?head=spinyfin:{branch}&state=open"),
-            ],
-            "[]",
         ),
     ]);
 
@@ -383,6 +383,15 @@ fn workspace_push_failure_surfaces_clear_error() {
             "jj",
             &["bookmark", "set", branch, "-r", "@", "--allow-backwards"],
             "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "gh",
+            &[
+                "api",
+                &format!("repos/spinyfin/mono/pulls?head=spinyfin:{branch}&state=open"),
+            ],
+            "[]",
         ),
         failing_cmd(
             cwd.clone(),
