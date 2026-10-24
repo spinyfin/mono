@@ -2279,7 +2279,7 @@ fn restart_after_answer(
 /// the decision itself.
 fn choice_block(question: &OperatorQuestionView, choice: &str, timestamp: &str) -> String {
     format!(
-        "\n\n---\n\n## Operator answer ({timestamp})\n\n\
+        "\n\n---\n\n## Recorded answer ({timestamp})\n\n\
 - **Question the previous worker asked:** {}\n\
 - **Options offered:** {}\n\
 - **Operator chose:** {choice}\n\

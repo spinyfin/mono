@@ -177,11 +177,11 @@ fn run_done_seam_on_worker_signal_seam_off_teaches_summary_not_blocked_verb() {
     ));
     assert!(
         prompt.contains(
-            "Before asking, check the task description for recorded approval of the requested action or an `## Operator answer` section."
+            "Before asking, check the task description for recorded approval of the requested action or an `## Recorded answer` section."
         )
     );
     assert!(prompt.contains("--answer-type multiple-choice --choices \"Gradual\" \"All at once\""));
-    assert!(prompt.contains("your next run's brief ends with a `## Operator answer` section"));
+    assert!(prompt.contains("your next run's task description ends with a `## Recorded answer` section"));
     assert!(prompt.contains("### Write questions for someone arriving cold"));
     assert!(prompt.contains("Context:\n"));
     assert!(prompt.contains("Yes:\n"));
