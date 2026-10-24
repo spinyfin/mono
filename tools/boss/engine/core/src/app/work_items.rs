@@ -78,6 +78,23 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
         Ok(outcome) => {
             let item = outcome.item;
             let product_id = item.product_id().to_string();
+            // The run that asked was admitted by an operator force launch,
+            // which bypasses the dispatch pause by design. Admit its resume
+            // the same way; queueing it would hold it behind the pause and
+            // make the operator force-launch it a second time. A resume
+            // whose asking run came through normal dispatch is untouched.
+            if let Some(execution_id) = outcome.force_resume_execution_id {
+                let coordinator = server_state.execution_coordinator.clone();
+                if let Err(err) = coordinator
+                    .force_dispatch(&execution_id, crate::coordinator::DispatchAdmission::OperatorForced)
+                    .await
+                {
+                    tracing::warn!(
+                        %execution_id,
+                        "force-launched run's resume was not force-dispatched, it stays queued: {err:#}"
+                    );
+                }
+            }
             // A Yes on a prerequisite proposal also created (or linked) a
             // task; the board must refresh that card too.
             let mut changed = vec![work_item_id(&item)];

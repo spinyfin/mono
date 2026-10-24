@@ -1265,6 +1265,25 @@ impl WorkDb {
         query_execution(&conn, id).require("execution", id)
     }
 
+    /// Stamp `work_executions.force_launched`: the engine accepted this
+    /// execution through an operator force launch (`bossctl agents launch`),
+    /// which bypasses the dispatch pause. Idempotent.
+    pub(crate) fn mark_execution_force_launched(&self, execution_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE work_executions SET force_launched = 1 WHERE id = ?1",
+            [execution_id],
+        )?;
+        Ok(())
+    }
+
+    /// Whether `execution_id` was admitted by an operator force launch; see
+    /// [`Self::mark_execution_force_launched`]. `false` for an unknown id.
+    pub(crate) fn execution_force_launched(&self, execution_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        Ok(execution_force_launched_in(&conn, execution_id)?)
+    }
+
     /// `work_executions.host_id` for one execution — the host the
     /// scheduler attributed the run to. `None` before a run has picked a
     /// host (not yet dispatched, or a pre-migration row); the engine
@@ -1892,6 +1911,20 @@ fn chain_member_ids_on(conn: &Connection, work_item_id: &str) -> Result<Vec<Stri
     member_ids.push(root_id.clone());
     member_ids.extend(collect_chain_revision_ids_including_deleted(conn, &root_id)?);
     Ok(member_ids)
+}
+
+/// Connection-level half of [`WorkDb::execution_force_launched`], shared with
+/// the answered-question restart that reads it inside its own transaction.
+pub(crate) fn execution_force_launched_in(conn: &Connection, execution_id: &str) -> rusqlite::Result<bool> {
+    use rusqlite::OptionalExtension;
+    Ok(conn
+        .query_row(
+            "SELECT force_launched FROM work_executions WHERE id = ?1",
+            [execution_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some_and(|flag| flag != 0))
 }
 
 #[cfg(test)]
