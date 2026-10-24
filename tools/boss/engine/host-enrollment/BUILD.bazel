@@ -42,9 +42,14 @@ rust_test(
 # and the authority behind a real mutual-TLS listener (enrollment and renewal
 # over gRPC, a stand-in for the stream manager's Connect handler, revocation
 # closing open streams and refusing reconnects).
+#
+# `medium` for the 300 s timeout, not for its footprint. The suite takes about
+# 5.5 s on a developer Mac, but its lagged-receiver tests each commit 600
+# fsynced SQLite transactions, which is slow on a busy CI agent; the 300 s
+# limit leaves a wide margin over that.
 rust_test(
     name = "integration_test",
-    size = "small",
+    size = "medium",
     srcs = glob(["tests/integration/**/*.rs"]),
     crate_root = "tests/integration/main.rs",
     edition = "2024",

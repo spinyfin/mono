@@ -835,6 +835,16 @@ mod stream_guard {
         fx.credentials.clone()
     }
 
+    /// Publishes one `Revoked` event about a host other than the one under
+    /// test. The host only has to exist to be revoked, so it is authorized and
+    /// never enrolled: two synced writes and no key generation or signing,
+    /// which keeps a 300-event backlog overflow cheap.
+    fn revoke_noise_host(fx: &Fixture, i: usize) {
+        let id = format!("other-{i}");
+        fx.credentials.authorize_host(&id, "test").expect("authorize");
+        fx.credentials.revoke(&id, "test", "noise").expect("revoke");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn admission_checks_the_hello_against_the_certificates_host() {
         let fx = Fixture::new();
@@ -906,9 +916,7 @@ mod stream_guard {
         // Overflow the event backlog with other hosts' revocations, then
         // revoke this one: the receiver has lagged past all of it.
         for i in 0..300 {
-            let id = format!("other-{i}");
-            fx.enrolled(&id);
-            fx.credentials.revoke(&id, "test", "noise").expect("revoke");
+            revoke_noise_host(&fx, i);
         }
         fx.credentials.revoke("edge-1", "test", "gone").expect("revoke");
         assert_eq!(guard.closed().await, CloseReason::Revoked);
@@ -931,9 +939,7 @@ mod stream_guard {
         // backlog by other hosts' events, so only a recheck can find it.
         fx.credentials.revoke("edge-1", "test", "gone").expect("revoke");
         for i in 0..300 {
-            let id = format!("other-{i}");
-            fx.enrolled(&id);
-            fx.credentials.revoke(&id, "test", "noise").expect("revoke");
+            revoke_noise_host(&fx, i);
         }
 
         // Hold the recheck open, let the guard start it, and abandon the call.
