@@ -61,7 +61,7 @@ Creation is two operations at dispatch (`boss-base/` on the durable baseline, th
 
 A voucher proves the work the same way reconciliation does ([`containment`]): each head is the voucher or one of its ancestors, or every non-empty preserved change has a content-equivalent variant (same change id, empty bookkeeping-filtered interdiff) in the voucher's history. Nothing is ever inferred from a name, and a voucher the store cannot resolve is skipped, never trusted.
 
-Outcomes, recorded in `execution_bookmarks.prune_outcome` / `prune_checked_at` (schema 51):
+Outcomes, recorded in `execution_bookmarks.prune_outcome` / `prune_checked_at` (schema 52):
 
 - `published`: all three bookmarks are forgotten in one operation and the record is retired with the voucher in `retired_reason`. The commits stay in the store; only the references go.
 - `already_gone`: both heads were already gone; a surviving baseline is forgotten and the record retired.
