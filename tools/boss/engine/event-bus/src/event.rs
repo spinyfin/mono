@@ -5,6 +5,8 @@
 /// add a variant here without touching unrelated topics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// A committed task mutation changed inputs used by the work board.
+    WorkItemChanged { product_id: String, task_id: String },
     /// A task reached a terminal status (`done`/`archived`).
     TaskTerminal { task_id: String, project_id: String },
     /// The last non-terminal impl task of a project reached terminal.
@@ -53,6 +55,7 @@ pub enum Event {
 /// [`TopicFilter`](crate::TopicFilter) matches against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventKind {
+    WorkItemChanged,
     TaskTerminal,
     ProjectImplDrained,
     ExecutionTerminal,
@@ -76,6 +79,7 @@ impl EventKind {
     /// metric-name-safe string. Snake_case mirror of the variant name.
     pub fn topic_name(&self) -> &'static str {
         match self {
+            EventKind::WorkItemChanged => "work_item_changed",
             EventKind::TaskTerminal => "task_terminal",
             EventKind::ProjectImplDrained => "project_impl_drained",
             EventKind::ExecutionTerminal => "execution_terminal",
@@ -97,6 +101,7 @@ impl EventKind {
 impl Event {
     pub fn kind(&self) -> EventKind {
         match self {
+            Event::WorkItemChanged { .. } => EventKind::WorkItemChanged,
             Event::TaskTerminal { .. } => EventKind::TaskTerminal,
             Event::ProjectImplDrained { .. } => EventKind::ProjectImplDrained,
             Event::ExecutionTerminal { .. } => EventKind::ExecutionTerminal,
@@ -124,6 +129,7 @@ impl Event {
     /// pending at a time.
     pub fn coalesce_key(&self) -> String {
         match self {
+            Event::WorkItemChanged { task_id, .. } => task_id.clone(),
             Event::TaskTerminal { task_id, .. } => task_id.clone(),
             Event::ProjectImplDrained { project_id } => project_id.clone(),
             Event::ExecutionTerminal { execution_id, .. } => execution_id.clone(),

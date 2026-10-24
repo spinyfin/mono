@@ -195,6 +195,25 @@ fn rearm_parent_failure_signal(work_db: &crate::work::WorkDb, execution_id: &str
     }
 }
 
+async fn rearm_and_notify(
+    work_db: &crate::work::WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    execution_id: &str,
+    input: &QueueCiAuditInput,
+) -> bool {
+    if !rearm_parent_failure_signal(work_db, execution_id, input) {
+        return false;
+    }
+    publisher
+        .publish_work_item_changed(
+            &input.attempt.product_id,
+            &input.attempt.work_item_id,
+            "queue_ci_audit_rearmed",
+        )
+        .await;
+    true
+}
+
 /// `pr_url` may be empty (a `blocked` declaration resolves no PR); the
 /// attempt's own PR is used then.
 pub(super) async fn audit_queue_ci_delivery(
@@ -227,7 +246,7 @@ pub(super) async fn audit_queue_ci_delivery(
         tracing::warn!(?err, "failed to correct authoritative requeue boundary");
     }
     if found.rearm {
-        rearm_parent_failure_signal(work_db, execution_id, &input);
+        rearm_and_notify(work_db, publisher, execution_id, &input).await;
     }
     let body = if input.delivered {
         format!(
@@ -515,7 +534,14 @@ mod tests {
         db.connect().unwrap().execute("UPDATE ci_remediations SET status = 'abandoned', failure_reason = 'verified_requeue', requeue_enqueued_at = 1 WHERE id = ?1", [&audit.attempt.id]).unwrap();
         // The revision itself is not blocked: re-arming it would be a no-op.
         assert!(!db.rearm_blocked_ci_failure_signal(&revision.id).unwrap());
-        assert!(rearm_parent_failure_signal(&db, "exec", &audit));
+        let publisher = crate::test_support::RecordingPublisher::default();
+        assert!(rearm_and_notify(&db, &publisher, "exec", &audit).await);
+        assert_eq!(
+            *publisher.events.lock().await,
+            vec![(product.id.clone(), parent.id.clone(), "queue_ci_audit_rearmed".into())]
+        );
+        assert!(!rearm_and_notify(&db, &publisher, "exec", &audit).await);
+        assert_eq!(publisher.events.lock().await.len(), 1);
         let reasons: Vec<_> = db
             .active_blocked_signals(&parent.id)
             .unwrap()

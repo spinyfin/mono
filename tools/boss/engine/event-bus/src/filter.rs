@@ -24,6 +24,8 @@ impl TopicFilter {
     /// Match every event kind.
     pub fn all() -> Self {
         Self::kinds([
+            EventKind::WorkItemChanged,
+            EventKind::ReviewVerdictApplied,
             EventKind::TaskTerminal,
             EventKind::ProjectImplDrained,
             EventKind::ExecutionTerminal,
