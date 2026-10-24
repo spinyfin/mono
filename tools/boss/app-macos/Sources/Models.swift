@@ -187,6 +187,10 @@ struct WorkTask: Identifiable, Hashable {
     /// intentional. Mirrors `Task.ai_reviewing` on the wire; `false` when
     /// absent (older engines / tasks not undergoing an AI review pass).
     var aiReviewing: Bool = false
+    /// Engine-reported stage of the running AI review (`"reviewers"` or
+    /// `"consolidation"`). Mirrors `Task.ai_review_stage`; only set while
+    /// `aiReviewing` is true.
+    var aiReviewStage: String? = nil
     /// Engine-resolved review for the current PR head. `not_reviewed`
     /// explicitly marks missing review evidence; `reviewed_clean_pending`
     /// means AI passed but CI, mergeability, or revisions prevent readiness.

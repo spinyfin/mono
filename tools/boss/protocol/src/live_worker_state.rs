@@ -272,6 +272,13 @@ pub struct LiveWorkerState {
     /// work-item dispatch path and for payloads from an older engine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_type: Option<String>,
+    /// Stage of an AI review (`"reviewers"` or `"consolidation"`, per
+    /// [`crate::ReviewStage::as_str`]) for a `pr_review` run that is a
+    /// review-batch member; the engine resolves it from the durable member
+    /// role at launch. `None` for every other run, for a legacy memberless
+    /// reviewer, and for payloads from an older engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_stage: Option<String>,
     /// Project the dispatched work item belongs to. `None` means the work
     /// is Unfiled (no project) — it is never guessed from the pool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -376,9 +383,11 @@ impl AgentType {
 /// Membership and ordering metadata the engine stamps on a [`LiveWorkerState`]
 /// at spawn and again on adoption, carried alongside the pool/kind routing.
 /// Fields mirror the like-named `LiveWorkerState` fields.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct LiveWorkerMetadata {
     pub agent_type: Option<String>,
+    pub review_stage: Option<String>,
     pub project_id: Option<String>,
     pub project_name: Option<String>,
     pub host_id: Option<String>,
@@ -389,6 +398,7 @@ impl LiveWorkerState {
     /// Stamp the engine-resolved [`LiveWorkerMetadata`] onto this state.
     pub fn apply_metadata(&mut self, metadata: LiveWorkerMetadata) {
         self.agent_type = metadata.agent_type;
+        self.review_stage = metadata.review_stage;
         self.project_id = metadata.project_id;
         self.project_name = metadata.project_name;
         self.host_id = metadata.host_id;
@@ -477,6 +487,7 @@ impl LiveWorkerState {
             wait_expires_at: None,
             tmux_hosted,
             agent_type: None,
+            review_stage: None,
             project_id: None,
             project_name: None,
             host_id: None,
@@ -645,6 +656,7 @@ mod tests {
             wait_expires_at: None,
             tmux_hosted: Some(true),
             agent_type: Some("coding".into()),
+            review_stage: None,
             project_id: Some("proj_1".into()),
             project_name: Some("Dynamic Agents pane layout".into()),
             host_id: Some("local".into()),
@@ -707,6 +719,7 @@ mod tests {
             wait_expires_at: None,
             tmux_hosted: None,
             agent_type: None,
+            review_stage: None,
             project_id: None,
             project_name: None,
             host_id: None,
@@ -814,7 +827,14 @@ mod tests {
     fn metadata_fields_default_absent_and_are_omitted_from_json() {
         let state = LiveWorkerState::new_spawning(1, "exec-1", "claude-opus-4-7", 0, None);
         let json = serde_json::to_string(&state).unwrap();
-        for key in ["agent_type", "project_id", "project_name", "host_id", "started_at"] {
+        for key in [
+            "agent_type",
+            "review_stage",
+            "project_id",
+            "project_name",
+            "host_id",
+            "started_at",
+        ] {
             assert!(!json.contains(key), "{key} leaked into {json}");
         }
         let old: LiveWorkerState = serde_json::from_str(
@@ -831,12 +851,14 @@ mod tests {
         let mut state = LiveWorkerState::new_spawning(1, "exec-1", "m", 0, None);
         state.apply_metadata(LiveWorkerMetadata {
             agent_type: Some("review".into()),
+            review_stage: Some("consolidation".into()),
             project_id: Some("proj_9".into()),
             project_name: Some("Nine".into()),
             host_id: Some(LOCAL_HOST_ID.into()),
             started_at: Some("2026-10-09T00:00:00Z".into()),
         });
         assert_eq!(state.agent_type.as_deref(), Some("review"));
+        assert_eq!(state.review_stage.as_deref(), Some("consolidation"));
         assert_eq!(state.project_id.as_deref(), Some("proj_9"));
         assert_eq!(state.project_name.as_deref(), Some("Nine"));
         assert_eq!(state.host_id.as_deref(), Some("local"));

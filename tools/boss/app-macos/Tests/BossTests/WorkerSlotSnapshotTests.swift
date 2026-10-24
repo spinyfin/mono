@@ -1,3 +1,4 @@
+import PaneLayout
 import XCTest
 @testable import Boss
 
@@ -118,6 +119,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         "recoveryStatus",
         "lastEventAt",
         "agentType",
+        "reviewStage",
         "projectName",
         "pool",
         "tmuxHosted",
@@ -272,6 +274,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             ("recoveryStatus", Self.makeLiveState(recoveryStatus: "recovering from API error")),
             ("lastEventAt", Self.makeLiveState(lastEventAt: "2026-09-01T00:00:00Z")),
             ("agentType", Self.makeLiveState(agentType: "review")),
+            ("reviewStage", Self.makeLiveState(reviewStage: "consolidation")),
             ("projectName", Self.makeLiveState(projectName: "Nine")),
             ("pool", Self.makeLiveState(pool: "automation")),
             ("tmuxHosted", Self.makeLiveState(tmuxHosted: false)),
@@ -289,6 +292,37 @@ final class WorkerSlotSnapshotTests: XCTestCase {
                 "rendered live-state field \(field) did not flip snapshot equality"
             )
         }
+    }
+
+    /// The agent pane and the Doing card word the consolidating agent
+    /// differently from a parallel reviewer, from the engine's stage alone.
+    func testConsolidationStageReadsDifferentlyFromReviewersOnPaneAndCard() throws {
+        let client = EngineClient(socketPath: "/tmp/stage-test-\(UUID().uuidString).sock")
+        func slice(stage: String?) throws -> WorkerSlotLiveSlice {
+            var payload: [String: Any] = [
+                "slot_id": 1, "run_id": "exec-1", "model": "m", "shell_pid": 1,
+                "activity": "working", "agent_type": "review",
+            ]
+            payload["review_stage"] = stage
+            return WorkerSlotLiveSlice(try XCTUnwrap(client.parseWorkerLiveState(payload)))
+        }
+        XCTAssertEqual(try slice(stage: "reviewers").badgeLabel, "Reviewing")
+        XCTAssertEqual(try slice(stage: nil).badgeLabel, "Reviewing")
+        XCTAssertEqual(try slice(stage: "consolidation").badgeLabel, "Consolidating")
+        // A stage never relabels a non-review run.
+        XCTAssertEqual(AgentType.coding.badgeLabel(reviewStage: "consolidation"), "Coding")
+
+        XCTAssertEqual(AgentActivityState.aiReviewCaption(stage: "reviewers"), "AI review in progress")
+        XCTAssertEqual(AgentActivityState.aiReviewCaption(stage: "consolidation"), "Consolidating review findings")
+        func cardState(stage: String?) -> AgentActivityState {
+            .forDoingCard(
+                runtime: nil, liveState: nil, isDispatchPending: false,
+                isResolvingConflicts: false, isRemediatingCI: false,
+                isAIReviewing: true, aiReviewStage: stage)
+        }
+        XCTAssertEqual(cardState(stage: "reviewers"), .waiting(reason: "AI review in progress"))
+        XCTAssertEqual(cardState(stage: "consolidation"), .waiting(reason: "Consolidating review findings"))
+        XCTAssertNotEqual(cardState(stage: "reviewers"), cardState(stage: "consolidation"))
     }
 
     func testSlotIdentityFieldsFlipEquality() {
@@ -789,6 +823,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         waitReason: String? = nil,
         waitExpiresAt: String? = nil,
         agentType: String? = nil,
+        reviewStage: String? = nil,
         projectId: String? = nil,
         projectName: String? = nil,
         hostId: String? = nil,
@@ -813,6 +848,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             waitReason: waitReason,
             waitExpiresAt: waitExpiresAt,
             agentType: agentType,
+            reviewStage: reviewStage,
             projectId: projectId,
             projectName: projectName,
             hostId: hostId,

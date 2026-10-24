@@ -1314,6 +1314,7 @@ fn readoption_of_a_tracked_run_backfills_missing_metadata_without_overwriting() 
         false,
         LiveSpawnRouting::none().with_metadata(LiveWorkerMetadata {
             agent_type: Some("review".to_owned()),
+            review_stage: None,
             project_id: Some("proj_1".to_owned()),
             project_name: Some("One".to_owned()),
             host_id: Some("local".to_owned()),

@@ -241,6 +241,57 @@ impl std::str::FromStr for ReviewBatchMemberRole {
     }
 }
 
+impl ReviewBatchMemberRole {
+    /// The stage of an AI review this role belongs to. The engine knows the
+    /// role when it launches the member, so clients render the stage rather
+    /// than inferring it from prompt text or timing.
+    pub const fn stage(self) -> ReviewStage {
+        match self {
+            Self::Supervisor => ReviewStage::Consolidation,
+            Self::ClaudeReviewer | Self::CodexReviewer | Self::GrokReviewer | Self::PostMergeReviewer => {
+                ReviewStage::Reviewers
+            }
+        }
+    }
+}
+
+/// Which stage of an AI review a `pr_review` execution is in. Several
+/// reviewers run in parallel on the PR head, then one consolidating agent
+/// merges their findings into a single review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewStage {
+    Reviewers,
+    Consolidation,
+}
+
+impl ReviewStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reviewers => "reviewers",
+            Self::Consolidation => "consolidation",
+        }
+    }
+}
+
+impl std::fmt::Display for ReviewStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ReviewStage {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "reviewers" => Ok(Self::Reviewers),
+            "consolidation" => Ok(Self::Consolidation),
+            _ => Err(format!("unknown review stage: {value}")),
+        }
+    }
+}
+
 /// Per-attempt member state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -367,5 +418,19 @@ mod tests {
         assert_eq!("supervising".parse(), Ok(ReviewBatchStatus::Supervising));
         assert_eq!("grok_reviewer".parse(), Ok(ReviewBatchMemberRole::GrokReviewer));
         assert_eq!("reported".parse(), Ok(ReviewBatchMemberStatus::Reported));
+        assert_eq!("consolidation".parse(), Ok(ReviewStage::Consolidation));
+    }
+
+    #[test]
+    fn only_the_supervisor_role_is_the_consolidation_stage() {
+        assert_eq!(ReviewBatchMemberRole::Supervisor.stage(), ReviewStage::Consolidation);
+        for role in [
+            ReviewBatchMemberRole::ClaudeReviewer,
+            ReviewBatchMemberRole::CodexReviewer,
+            ReviewBatchMemberRole::GrokReviewer,
+            ReviewBatchMemberRole::PostMergeReviewer,
+        ] {
+            assert_eq!(role.stage(), ReviewStage::Reviewers);
+        }
     }
 }

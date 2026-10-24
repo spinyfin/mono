@@ -1109,6 +1109,14 @@ pub struct Task {
     #[builder(default)]
     pub ai_reviewing: bool,
 
+    /// Which stage of the running AI review this is: `"reviewers"` (the
+    /// parallel reviewers) or `"consolidation"` (the agent merging their
+    /// findings into one review), per [`crate::ReviewStage::as_str`]. Set
+    /// only while `ai_reviewing` is true; a derived projection, not a stored
+    /// column. Clients render it and never infer it themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_review_stage: Option<String>,
+
     /// Engine-resolved AI review for the PR owner's current observed head.
     /// States: reviewing, review_queued, not_reviewed, reviewed_with_findings,
     /// reviewed_all_clear, reviewed_clean_pending, review_not_required.

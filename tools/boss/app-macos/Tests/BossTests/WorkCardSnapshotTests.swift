@@ -71,6 +71,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         "blockedDetail",
         "operatorQuestion",
         "aiReviewing",
+        "aiReviewStage",
         "aiReviewState",
         "aiReviewBadge",
         "aiReviewFindingsRevisionId",
@@ -575,6 +576,19 @@ final class WorkCardSnapshotTests: XCTestCase {
                 }
             ),
             Case(
+                name: "aiReviewStage",
+                context: doing,
+                base: {
+                    var t = Self.makeTask(id: "task_1", status: "active")
+                    t.aiReviewing = true
+                    t.aiReviewStage = "reviewers"
+                    return t
+                },
+                mutate: {
+                    var t = $0; t.aiReviewStage = "consolidation"; return t
+                }
+            ),
+            Case(
                 name: "aiReviewBadge",
                 context: review,
                 base: { Self.makeTask(id: "task_1", status: "in_review") },
@@ -916,6 +930,19 @@ final class WorkCardSnapshotTests: XCTestCase {
         )
         XCTAssertTrue(snap.isAIReviewing)
         XCTAssertNil(snap.aiReviewState)
+    }
+
+    /// The Doing card words a consolidating review differently from the
+    /// parallel reviewers, from the engine-reported stage alone.
+    func testDoingCardCaptionFollowsEngineReviewStage() {
+        func caption(stage: String?) -> AgentActivityState? {
+            var task = Self.makeTask(status: "active")
+            task.aiReviewing = true
+            task.aiReviewStage = stage
+            return WorkCardSnapshot.build(task: task, context: WorkCardSnapshotContext(column: .doing)).activityState
+        }
+        XCTAssertEqual(caption(stage: "reviewers"), .waiting(reason: "AI review in progress"))
+        XCTAssertEqual(caption(stage: "consolidation"), .waiting(reason: "Consolidating review findings"))
     }
 
     func testIsAIReviewingFalseOutsideDoing() {

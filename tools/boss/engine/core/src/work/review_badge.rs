@@ -1,5 +1,5 @@
 use super::*;
-use boss_protocol::AiReviewBadge;
+use boss_protocol::{AiReviewBadge, ReviewStage};
 
 /// Resolve against the observed PR head, across legacy revision-owned and
 /// modern cycle-root verdicts. Missing heads and late old-head results never
@@ -165,7 +165,7 @@ pub(super) fn attach_review_badges(conn: &Connection, tasks: &mut [Task], chores
         row.ai_review_badge = if row.status == TaskStatus::InReview {
             row.ai_review_state
                 .as_deref()
-                .map(|state| badge_presentation(state, history.get(&row.id)))
+                .map(|state| badge_presentation(state, row.ai_review_stage.as_deref(), history.get(&row.id)))
         } else {
             None
         };
@@ -214,9 +214,15 @@ struct ReviewBadgeHistory {
     revision: Option<(String, String, bool)>,
 }
 
-fn badge_presentation(state: &str, history: Option<&ReviewBadgeHistory>) -> AiReviewBadge {
+fn badge_presentation(state: &str, stage: Option<&str>, history: Option<&ReviewBadgeHistory>) -> AiReviewBadge {
     let findings = history.and_then(|h| h.verdict.as_ref()).map(|v| v.2);
+    let consolidating = stage.and_then(|stage| stage.parse().ok()) == Some(ReviewStage::Consolidation);
     let (label, icon, explanation) = match state {
+        AI_REVIEW_STATE_REVIEWING if consolidating => (
+            "Consolidating review findings".into(),
+            "arrow.triangle.merge",
+            "The reviewers have finished on this head; one agent is consolidating their findings into a single review.",
+        ),
         AI_REVIEW_STATE_REVIEWING => ("AI reviewing…".into(), "brain", "An AI review pass is running."),
         AI_REVIEW_STATE_REVIEW_QUEUED => ("AI review queued".into(), "clock", "Waiting for a review-pool slot."),
         AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS => (

@@ -45,6 +45,18 @@ fn review_family_uses_parent_index_and_preserves_cycle_semantics() {
 }
 
 #[test]
+fn reviewing_badge_reads_differently_for_the_consolidation_stage() {
+    let reviewers = badge_presentation("reviewing", Some("reviewers"), None);
+    let consolidation = badge_presentation("reviewing", Some("consolidation"), None);
+    assert_eq!(reviewers.label, "AI reviewing…");
+    assert_eq!(consolidation.label, "Consolidating review findings");
+    assert_ne!(reviewers.system_image, consolidation.system_image);
+    assert_ne!(reviewers.tooltip, consolidation.tooltip);
+    // No stage (a legacy reviewer with no batch member) is the plain review.
+    assert_eq!(badge_presentation("reviewing", None, None), reviewers);
+}
+
+#[test]
 fn review_badge_labels_and_icons_cover_every_state() {
     let history = ReviewBadgeHistory {
         verdict_payload: None,
@@ -68,7 +80,7 @@ fn review_badge_labels_and_icons_cover_every_state() {
         ("reviewed_clean_pending", "AI review: clean", "checkmark.seal.fill"),
         ("review_not_required", "AI review not required", "minus.circle"),
     ] {
-        let badge = badge_presentation(state, Some(&history));
+        let badge = badge_presentation(state, None, Some(&history));
         assert_eq!(badge.label, label, "{state}");
         assert_eq!(badge.system_image, icon, "{state}");
         assert!(
@@ -90,14 +102,14 @@ fn review_badge_head_moved_preserves_findings_and_revision_history() {
         verdict: Some(("completed_with_findings".into(), "0".into(), 2)),
         revision: Some(("Fix review findings".into(), "active".into(), false)),
     };
-    let badge = badge_presentation("not_reviewed", Some(&history));
+    let badge = badge_presentation("not_reviewed", None, Some(&history));
     assert_eq!(badge.label, "Not reviewed: latest commit");
     assert!(badge.tooltip.contains("Last reviewed oldhead"));
     assert!(badge.tooltip.contains("Current head newhead differs"));
     assert!(badge.tooltip.contains("Fix review findings (Doing)"));
     assert!(!badge.tooltip.contains("Findings addressed"));
     history.revision = Some(("Fix review findings".into(), "in_review".into(), true));
-    let badge = badge_presentation("not_reviewed", Some(&history));
+    let badge = badge_presentation("not_reviewed", None, Some(&history));
     assert!(
         badge
             .tooltip
@@ -105,7 +117,7 @@ fn review_badge_head_moved_preserves_findings_and_revision_history() {
     );
     assert_eq!(badge.label, "Not reviewed: latest commit");
     history.head = history.reviewed_sha.clone();
-    let badge = badge_presentation("not_reviewed", Some(&history));
+    let badge = badge_presentation("not_reviewed", None, Some(&history));
     assert_eq!(badge.label, "Findings addressed");
     assert_eq!(badge.system_image, "checkmark.circle");
 }
@@ -122,7 +134,7 @@ fn review_badge_missing_history_is_explicit() {
         revision: None,
     };
     assert!(
-        badge_presentation("not_reviewed", Some(&history))
+        badge_presentation("not_reviewed", None, Some(&history))
             .tooltip
             .contains("No reviewed commit")
     );
@@ -130,7 +142,7 @@ fn review_badge_missing_history_is_explicit() {
         reviewed_sha: Some("legacy1".into()),
         ..history
     };
-    let badge = badge_presentation("not_reviewed", Some(&legacy));
+    let badge = badge_presentation("not_reviewed", None, Some(&legacy));
     assert!(badge.tooltip.contains("review time and verdict unavailable"));
     assert!(badge.tooltip.contains("Current PR head is not yet known"));
 }
@@ -138,11 +150,11 @@ fn review_badge_missing_history_is_explicit() {
 #[test]
 fn review_badge_unknown_head_and_clean_pending_have_distinct_explanations() {
     assert!(
-        badge_presentation("not_reviewed", None)
+        badge_presentation("not_reviewed", None, None)
             .tooltip
             .contains("no completed AI review")
     );
-    let pending = badge_presentation("reviewed_clean_pending", None);
+    let pending = badge_presentation("reviewed_clean_pending", None, None);
     assert!(pending.tooltip.contains("AI review passed"));
     assert!(pending.tooltip.contains("prevent readiness"));
 }
