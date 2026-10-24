@@ -2104,6 +2104,17 @@ mod tests {
             origin_pos < preamble_pos,
             "origin must open the description before the generic no-punting preamble: {instructions}"
         );
+        for task_short_id in [None, origin.task_short_id] {
+            let instructions = render_revision_instructions(
+                &result,
+                ReviewOrigin {
+                    task_short_id,
+                    pr_number: None,
+                },
+            );
+            assert!(instructions.contains("review of the reviewed PR found"));
+            assert!(!instructions.contains(&short_id_marker));
+        }
     }
 
     /// The `## HARD RULE ...` heading is the structural marker the macOS
