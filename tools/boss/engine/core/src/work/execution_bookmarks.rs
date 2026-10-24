@@ -340,3 +340,140 @@ impl WorkDb {
         Ok(prior.status.is_terminal().then_some(prior))
     }
 }
+
+/// Where the prune sweep left a record. Stored in
+/// `execution_bookmarks.prune_outcome`; the sweep re-examines a record on a
+/// schedule that depends on it.
+pub(crate) mod prune_outcome {
+    pub(crate) const PUBLISHED: &str = "published";
+    pub(crate) const ALREADY_GONE: &str = "already_gone";
+    pub(crate) const UNPROVEN: &str = "unproven";
+    pub(crate) const PR_OPEN: &str = "pr_open";
+    pub(crate) const ERROR: &str = "error";
+}
+
+/// A terminal, local execution whose recovery record is still live, with
+/// everything the prune sweep can prove publication from.
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
+pub(crate) struct PruneCandidate {
+    pub execution: WorkExecution,
+    /// The chain root's PR, when one was ever bound.
+    pub pr_url: Option<String>,
+    /// True when the chain root is `done` or `archived`: its PR is merged
+    /// or closed, or a human closed the item without one.
+    pub chain_closed: bool,
+    /// `tasks.pr_head_sha` of the chain root: the last PR head the merge
+    /// poller observed, which for a merged PR is the head that merged.
+    pub observed_pr_head: Option<String>,
+    /// PR heads the chain's executions recorded around their own pushes
+    /// (`pr_head_before` / `pr_head_after`), oldest first, deduplicated.
+    pub recorded_pr_heads: Vec<String>,
+}
+
+#[work_db_boundary::instrument]
+impl WorkDb {
+    /// Live local recovery records of terminal executions that are due for
+    /// a prune check: never checked, or checked long enough ago for their
+    /// last outcome. Oldest-finished first, never-checked before re-checks,
+    /// at most `limit` rows so one pass stays bounded however large the
+    /// backlog is.
+    pub(crate) fn list_prune_candidates(
+        &self,
+        grace_secs: i64,
+        recheck_open_secs: i64,
+        recheck_unproven_secs: i64,
+        limit: usize,
+    ) -> Result<Vec<PruneCandidate>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT we.id FROM work_executions we
+             JOIN execution_bookmarks eb ON eb.execution_id = we.id
+             WHERE eb.retired_at IS NULL
+               AND eb.host_id = 'local'
+               AND we.status IN ('completed', 'failed', 'cancelled', 'orphaned', 'abandoned')
+               AND we.finished_at IS NOT NULL
+               AND CAST(we.finished_at AS INTEGER) <= unixepoch('now') - ?1
+               AND COALESCE(eb.prune_checked_at, 0)
+                   + CASE eb.prune_outcome WHEN 'unproven' THEN ?3 WHEN 'error' THEN ?3 ELSE ?2 END
+                   <= unixepoch('now')
+             ORDER BY (eb.prune_checked_at IS NOT NULL), CAST(we.finished_at AS INTEGER) ASC, we.id ASC
+             LIMIT ?4",
+        )?;
+        let ids = stmt
+            .query_map(
+                params![grace_secs, recheck_open_secs, recheck_unproven_secs, limit as i64],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // The database has one connection behind a mutex, so everything that
+        // needs it is read here before it is released: the chain walk below
+        // (`list_executions_for_chain`) takes its own.
+        let mut rows = Vec::with_capacity(ids.len());
+        for id in ids {
+            let execution = query_execution(&conn, &id)?.context("prune candidate disappeared")?;
+            let chain_root_id = super::chain_helpers::chain_root(&conn, &execution.work_item_id)?;
+            let root: Option<(String, Option<String>, Option<String>)> = conn
+                .query_row(
+                    "SELECT status, pr_url, pr_head_sha FROM tasks WHERE id = ?1",
+                    [&chain_root_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            rows.push((execution, chain_root_id, root.unwrap_or_default()));
+        }
+        drop(stmt);
+        drop(conn);
+        let mut candidates = Vec::with_capacity(rows.len());
+        for (execution, chain_root_id, (status, pr_url, observed_pr_head)) in rows {
+            let mut recorded_pr_heads = Vec::new();
+            let mut push_head = |head: Option<String>| {
+                if let Some(head) = head.filter(|h| !h.trim().is_empty())
+                    && !recorded_pr_heads.contains(&head)
+                {
+                    recorded_pr_heads.push(head);
+                }
+            };
+            // Chronological, so the head that merged tends to come last and
+            // the vouchers are tried oldest first; the sweep reverses them.
+            for chained in self.list_executions_for_chain(&chain_root_id)? {
+                push_head(chained.pr_head_before.clone());
+                push_head(chained.pr_head_after.clone());
+            }
+            candidates.push(PruneCandidate {
+                execution,
+                pr_url: pr_url.filter(|url| !url.trim().is_empty()),
+                chain_closed: matches!(status.as_str(), "done" | "archived"),
+                observed_pr_head: observed_pr_head.filter(|sha| !sha.trim().is_empty()),
+                recorded_pr_heads,
+            });
+        }
+        Ok(candidates)
+    }
+
+    /// Stamp the outcome of a prune examination so the next pass can
+    /// schedule the re-check. A retired record is stamped too: the row
+    /// stays as the audit trail of what was proven.
+    pub(crate) fn record_execution_bookmark_prune_check(&self, execution_id: &str, outcome: &str) -> Result<()> {
+        let changed = self.connect()?.execute(
+            "UPDATE execution_bookmarks SET prune_checked_at = unixepoch('now'), prune_outcome = ?2
+             WHERE execution_id = ?1",
+            params![execution_id, outcome],
+        )?;
+        anyhow::ensure!(changed == 1, "execution bookmark record to stamp is missing");
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execution_bookmark_prune_outcome(&self, execution_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .connect()?
+            .query_row(
+                "SELECT prune_outcome FROM execution_bookmarks WHERE execution_id = ?1",
+                [execution_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+}

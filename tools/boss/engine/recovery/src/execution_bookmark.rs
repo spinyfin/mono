@@ -21,6 +21,12 @@ pub use snapshot::{PointerSnapshot, restore_pointers, snapshot_pointers};
 mod redispatch;
 pub use redispatch::{RestoreReport, restore_rebased};
 
+mod prune;
+pub use prune::{PruneOutcome, Voucher, prune};
+
+#[cfg(test)]
+mod prune_tests;
+
 #[cfg(test)]
 mod redispatch_tests;
 

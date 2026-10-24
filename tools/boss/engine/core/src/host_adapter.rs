@@ -224,6 +224,17 @@ pub trait HostAdapter: Send + Sync {
         let _ = record;
         bail!("execution bookmark release is not supported by this host adapter")
     }
+    /// Forget a finished execution's pointers once a voucher proves its
+    /// preserved work is published; unproven work keeps its recovery head.
+    async fn prune_execution_bookmark(
+        &self,
+        record: &ExecutionBookmark,
+        vouchers: &[execution_bookmark::Voucher],
+        trunk: &str,
+    ) -> Result<execution_bookmark::PruneOutcome> {
+        let _ = (record, vouchers, trunk);
+        bail!("execution bookmark pruning is not supported by this host adapter")
+    }
     /// Stable host identifier (e.g. `"local"`, `"zakalwe"`).
     fn host_id(&self) -> &str;
 
@@ -575,6 +586,19 @@ impl HostAdapter for LocalHostAdapter {
             record.host_id
         );
         execution_bookmark::release_heads(&LocalJj, record).await
+    }
+    async fn prune_execution_bookmark(
+        &self,
+        record: &ExecutionBookmark,
+        vouchers: &[execution_bookmark::Voucher],
+        trunk: &str,
+    ) -> Result<execution_bookmark::PruneOutcome> {
+        anyhow::ensure!(
+            record.host_id == "local",
+            "recovery bookmark belongs to host {}",
+            record.host_id
+        );
+        execution_bookmark::prune(&LocalJj, record, vouchers, trunk).await
     }
 
     fn host_id(&self) -> &str {

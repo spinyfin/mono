@@ -812,6 +812,7 @@ pub use critical_priority::{
     PRIORITY_CRITICAL, authorize_priority_write, critical_refusal, inherited_priority, is_critical,
     refuse_worker_critical_raise,
 };
+pub(crate) use execution_bookmarks::{PruneCandidate, prune_outcome};
 pub use output_types::AutomationDedupSuppression;
 pub use output_types::AutomationSiblingTask;
 pub use output_types::HostBoundExecution;

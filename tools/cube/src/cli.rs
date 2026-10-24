@@ -75,6 +75,30 @@ pub enum RepoCommand {
         #[arg(long)]
         purge_workspaces: bool,
     },
+    /// Bound the shared jj store's operation log: abandon operations older
+    /// than the keep window and collect what no operation references.
+    ///
+    /// Every workspace of a repo shares one jj store, and every operation
+    /// any of them records writes a view listing every bookmark in it, so
+    /// an untended op log grows without bound. This runs `jj op abandon`
+    /// for operations that ended before the keep window, then `jj util gc`.
+    /// The collection is immediate (`--expire now`) once the host has had an
+    /// instant with no `jj` process — every command that loaded the store
+    /// before the abandon has then finished — and otherwise falls back to
+    /// jj's two-week threshold. It also drops `refs/heads/pr/<n>` git refs
+    /// whose `pr/<n>` bookmark is gone. The periodic pool GC pass starts
+    /// this in the background once a day per repo; one run per repo at a
+    /// time.
+    Gc {
+        /// Stable repo identifier such as `mono`.
+        repo: String,
+        /// Keep operations from the last this many hours (default 72).
+        #[arg(long)]
+        keep_hours: Option<u64>,
+        /// Report what would be abandoned and removed without doing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

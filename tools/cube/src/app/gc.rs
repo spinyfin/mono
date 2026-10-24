@@ -26,6 +26,7 @@ use crate::app::salvage::{
     ProbeSalvageError, ProbedAndSalvaged, attributed_holder, attributed_task, discard_salvage_record,
     gc_aged_salvage_records, probe_and_salvage,
 };
+use crate::app::store_gc::{spawn_detached_store_gc, store_gc_due};
 use crate::app::util::current_epoch_s;
 
 /// Pool-wide gc runs at most once per 24 hours (when there is no known
@@ -358,7 +359,12 @@ fn aged_unhealthy_since(record: &WorkspaceRecord, threshold_epoch_s: i64) -> Opt
 /// stall lease dispatch, and wrapped in `catch_unwind` so a panic inside it
 /// cannot leave `last_pool_gc_started_at` permanently ahead of
 /// `last_pool_gc_at`.
-pub(super) fn maybe_trigger_pool_gc(store: &mut Store, database_path: Option<&Path>, now_epoch_s: i64) -> Result<()> {
+pub(super) fn maybe_trigger_pool_gc(
+    runner: &dyn CommandRunner,
+    store: &mut Store,
+    database_path: Option<&Path>,
+    now_epoch_s: i64,
+) -> Result<()> {
     // Skip if a pass is already in progress (started within the safety-net timeout).
     let last_started = store.get_pool_metadata_i(POOL_GC_STARTED_AT_KEY)?;
     if last_started.is_some_and(|t| (now_epoch_s - t) < POOL_GC_IN_PROGRESS_TIMEOUT_SECS) {
@@ -397,7 +403,7 @@ pub(super) fn maybe_trigger_pool_gc(store: &mut Store, database_path: Option<&Pa
     let db_path_owned = database_path.map(Path::to_path_buf);
     let deadline = Instant::now() + POOL_GC_TIME_BUDGET;
     if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_pool_gc_background(db_path_owned, deadline);
+        run_pool_gc_background(runner, db_path_owned, deadline);
     })) {
         eprintln!("cube: auto gc: pass panicked: {panic:?}");
     }
@@ -410,7 +416,15 @@ pub(super) fn maybe_trigger_pool_gc(store: &mut Store, database_path: Option<&Pa
     Ok(())
 }
 
-pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, deadline: Instant) {
+/// Every subprocess of the pass, including the detached store-upkeep
+/// child, goes through `runner`: the pass must never build its own real
+/// runner, or a test that leases on a fresh database would start real
+/// processes (see `store_gc` for the one that fork-bombed a dev Mac).
+pub(super) fn run_pool_gc_background(
+    runner: &dyn CommandRunner,
+    database_path: Option<std::path::PathBuf>,
+    deadline: Instant,
+) {
     let store = match database_path.as_deref() {
         Some(p) => Store::open_at(p),
         None => Store::open_default(),
@@ -419,7 +433,6 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
         eprintln!("cube: auto gc: failed to open store");
         return;
     };
-    let runner = RealCommandRunner;
 
     // Compaction goes first: it is the pass that actually returns the disk
     // (uncleaned build-artifact trees were 82% of the entire workspaces tree
@@ -440,7 +453,7 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
     let compaction_deadline = deadline.checked_sub(POOL_GC_TIME_BUDGET / 2).unwrap_or(deadline);
     if let Ok(now) = current_epoch_s() {
         let compacted = compact_free_workspaces(
-            &runner,
+            runner,
             &store,
             database_path.as_deref(),
             None,
@@ -464,7 +477,7 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
     // low-water mark (or to finish a cleanup that failed earlier), so on a
     // healthy volume this is one `statvfs` per repo.
     let cleanup = run_cleanup_pass(
-        &runner,
+        runner,
         &store,
         database_path.as_deref(),
         &CleanupOptions {
@@ -495,7 +508,7 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
     let max_age_secs = gc_config.max_age_secs();
     if let Ok(now) = current_epoch_s() {
         gc_aged_unhealthy_workspaces(
-            &runner,
+            runner,
             &store,
             database_path.as_deref(),
             now,
@@ -517,7 +530,7 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
     // it could) and is itself bounded by the same deadline so it cannot eat
     // into the remaining budget meant for the log/bookmark sweep below.
     let health_report = reconcile_free_workspace_health(
-        &runner,
+        runner,
         &store,
         database_path.as_deref(),
         None,
@@ -544,7 +557,7 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
     // stuck-dirty workspaces (making them provably empty of work, hence
     // eligible here) and reconcile has just relabelled whatever recovered.
     if let Ok(now) = current_epoch_s() {
-        let trimmed = trim_free_workspaces_to_mark(&runner, &store, database_path.as_deref(), now, Some(deadline));
+        let trimmed = trim_free_workspaces_to_mark(runner, &store, database_path.as_deref(), now, Some(deadline));
         if trimmed.workspaces_removed > 0 {
             eprintln!(
                 "cube: auto gc: removed {} surplus free workspace(s), reclaiming {}",
@@ -579,6 +592,21 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
         }
     }
 
+    // Shared-store upkeep, once a day per repo, in a detached `cube repo gc`
+    // process: abandoning old operations is quick, but the collection that
+    // follows deletes one file per abandoned operation and view and cannot
+    // be bounded by this pass's budget (the first run on a neglected store
+    // is minutes of unlinks). The stamp is written before the child starts,
+    // so a slow child is never doubled by the next lease, and the child
+    // itself takes the repo's store-gc lock.
+    if let (Ok(now), Ok(repos)) = (current_epoch_s(), store.list_repos()) {
+        for record in repos.iter().filter(|r| r.source.is_some()) {
+            if store_gc_due(&store, &record.repo, now) {
+                spawn_detached_store_gc(runner, &store, database_path.as_deref(), &record.repo, now);
+            }
+        }
+    }
+
     // Sweep consumed bookmarks from every non-leased workspace. Each workspace
     // runs jj git fetch; a broken/unreachable remote times out after
     // network_cmd_timeout() and is skipped so one slow workspace cannot block
@@ -607,7 +635,7 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
         // rather than absorbed: this sweep is the only thing that prunes
         // either bookmark namespace, so a silent failure is unbounded growth
         // with no signal.
-        if let Err(e) = gc_workspace_bookmarks(&runner, database_path.as_deref(), &record.workspace_path, true, false) {
+        if let Err(e) = gc_workspace_bookmarks(runner, database_path.as_deref(), &record.workspace_path, true, false) {
             eprintln!(
                 "cube: auto gc: error: bookmark gc for {} failed, nothing pruned: {e}",
                 record.workspace_id,

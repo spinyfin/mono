@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 50;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 51;
 
 /// Schema 43: the baseline commit a recovery record was created at, the
 /// pointer-reconciliation note for the worker prompt, and the retirement
@@ -27,6 +27,14 @@ pub(in crate::work) const EXECUTION_BOOKMARK_COLUMNS_43: &str =
      ALTER TABLE execution_bookmarks ADD COLUMN reconciliation_note TEXT;
      ALTER TABLE execution_bookmarks ADD COLUMN retired_at TEXT;
      ALTER TABLE execution_bookmarks ADD COLUMN retired_reason TEXT";
+
+/// Schema 51: when the bookmark prune sweep last examined a recovery record
+/// (Unix epoch seconds) and what it concluded (`published`, `already_gone`,
+/// `unproven`, `pr_open`, `error`), so a record that could not be proven
+/// published is re-examined on a schedule instead of on every pass.
+pub(in crate::work) const EXECUTION_BOOKMARK_PRUNE_COLUMNS_51: &str =
+    "ALTER TABLE execution_bookmarks ADD COLUMN prune_checked_at INTEGER;
+     ALTER TABLE execution_bookmarks ADD COLUMN prune_outcome TEXT";
 
 /// Schema 45: GitHub's `updatedAt` for the task's PR, written by the merge
 /// poller. The Review column orders its Pending section by it.
@@ -246,6 +254,9 @@ impl WorkDb {
         // database that already carries the column must be a no-op.
         if version < 50 && !table_has_column(&tx, "work_runs", "semantic_turn_condition")? {
             tx.execute_batch(WORK_RUNS_SEMANTIC_TURN_CONDITION_50)?;
+        }
+        if version < 51 && !table_has_column(&tx, "execution_bookmarks", "prune_checked_at")? {
+            tx.execute_batch(EXECUTION_BOOKMARK_PRUNE_COLUMNS_51)?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
@@ -832,6 +843,9 @@ mod floor_tests {
             if version >= 50 {
                 conn.execute_batch(WORK_RUNS_SEMANTIC_TURN_CONDITION_50).unwrap();
             }
+            if version >= 51 {
+                conn.execute_batch(EXECUTION_BOOKMARK_PRUNE_COLUMNS_51).unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -869,6 +883,7 @@ mod floor_tests {
             expected.execute_batch(ATTENTION_OPEN_KIND_INDEX_SQL).unwrap();
             expected.execute_batch(BOARD_RUNTIME_EPOCH_49).unwrap();
             expected.execute_batch(WORK_RUNS_SEMANTIC_TURN_CONDITION_50).unwrap();
+            expected.execute_batch(EXECUTION_BOOKMARK_PRUNE_COLUMNS_51).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

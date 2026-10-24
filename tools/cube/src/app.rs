@@ -27,6 +27,7 @@ mod repo;
 mod reset;
 mod salvage;
 mod stage;
+mod store_gc;
 mod util;
 mod workspace;
 mod workspace_ops;

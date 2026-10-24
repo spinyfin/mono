@@ -392,9 +392,21 @@ fn not_contained_error(
     )
 }
 
+/// Move the named bookmarks onto `commit` in one operation, skipping any
+/// that already point there: an operation that changes nothing still writes
+/// a full view of every bookmark in the shared store.
 async fn set_bookmarks(jj: &dyn Jj, record: &ExecutionBookmark, bookmarks: &[String], commit: &str) -> Result<()> {
+    let mut moving = Vec::with_capacity(bookmarks.len());
+    for bookmark in bookmarks {
+        if resolve_optional(jj, &record.repo_path, bookmark).await?.as_deref() != Some(commit) {
+            moving.push(bookmark.as_str());
+        }
+    }
+    if moving.is_empty() {
+        return Ok(());
+    }
     let mut args = vec!["bookmark", "set"];
-    args.extend(bookmarks.iter().map(String::as_str));
+    args.extend(moving);
     args.extend(["-r", commit, "--allow-backwards"]);
     jj.run(&record.repo_path, &args).await?;
     Ok(())

@@ -22,6 +22,7 @@ use crate::app::errors::{
     CubeError, JJ_NO_REMOTE_BOOKMARK_SIGNATURE, JJ_REVISION_DOESNT_EXIST_SIGNATURE, Result, RunResult,
 };
 use crate::app::jj::network_cmd_timeout;
+use crate::app::store_gc::store_gc_lock_path;
 use crate::app::util::repo_lock_path;
 
 #[derive(Debug, Clone)]
@@ -99,6 +100,57 @@ pub(super) fn run_repo(
                     "repo": record,
                 }),
             )
+        }
+        RepoCommand::Gc {
+            repo,
+            keep_hours,
+            dry_run,
+        } => {
+            let record = store
+                .get_repo(&repo)?
+                .ok_or_else(|| CubeError::RepoNotFound(repo.clone()))?;
+            let keep = keep_hours
+                .map(|hours| std::time::Duration::from_secs(hours * 60 * 60))
+                .unwrap_or(crate::app::store_gc::DEFAULT_KEEP);
+            // One upkeep run per repo at a time, on its own lock: the
+            // per-repo lease lock is deliberately not taken, because a
+            // collection runs for minutes and every `cube workspace lease`
+            // waits on that lock. jj itself tolerates the workspaces'
+            // concurrent commands (see store_gc).
+            let _lock = RepoLock::try_acquire(&store_gc_lock_path(&repo, database_path)?)?.ok_or_else(|| {
+                CubeError::InvalidArgument(format!(
+                    "shared-store upkeep for `{repo}` is already running; one run per repo at a time"
+                ))
+            })?;
+            let result = crate::app::store_gc::gc_repo_store(
+                runner,
+                database_path,
+                &record,
+                keep,
+                crate::app::store_gc::QUIESCENCE_WAIT,
+                dry_run,
+            );
+            if !dry_run {
+                // The detached daily child's stderr goes nowhere, so the
+                // outcome is persisted for `cube workspace list` to surface.
+                use crate::app::store_gc::{Collection, StoreGcOutcome, record_store_gc_outcome};
+                let outcome = match &result {
+                    Ok(report) if report.collection == Collection::Skipped => StoreGcOutcome::Skipped,
+                    Ok(_) => StoreGcOutcome::Maintained,
+                    Err(_) => StoreGcOutcome::Failed,
+                };
+                if let Err(err) = record_store_gc_outcome(&store, &repo, outcome) {
+                    eprintln!("cube: store gc: cannot record the outcome for {repo}: {err}");
+                }
+            }
+            let report = result?;
+            if !dry_run {
+                store.set_pool_metadata_i(
+                    &crate::app::store_gc::store_gc_last_at_key(&repo),
+                    crate::app::util::current_epoch_s()?,
+                )?;
+            }
+            RunResult::new(report.summary(), json!({ "store_gc": report }))
         }
         RepoCommand::Remove {
             repo,
