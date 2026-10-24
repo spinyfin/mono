@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+boss-board-projection = { path = "../board-projection" }
 boss-task-scope = { path = "../task-scope" }
 anyhow = { workspace = true }
 boss-backoff = { path = "../../backoff" }

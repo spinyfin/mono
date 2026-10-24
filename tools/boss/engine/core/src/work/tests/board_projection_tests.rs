@@ -1,0 +1,392 @@
+//! Complete serialized projection parity, including fields outside the cards.
+use super::*;
+use crate::population_timing::PopulationTrace;
+use crate::work::{
+    board_caches::BoardCaches,
+    board_projection::{CachedProjection as Projection, Refresh},
+};
+
+fn check(db: &WorkDb, product: &str, model: &mut Option<Projection>, now: i64) -> Refresh {
+    let (tree, refresh) = db
+        .refresh_board_projection(
+            product,
+            model,
+            &mut PopulationTrace::disabled(),
+            &BoardCaches::default(),
+            now,
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&tree).unwrap(),
+        serde_json::to_value(db.get_work_tree_at(product, now).unwrap()).unwrap()
+    );
+    if let Some(model) = model {
+        let actual = serde_json::to_vec(&tree).unwrap().len();
+        assert!((actual..=actual + 6).contains(&model.retained_bytes));
+    }
+    refresh
+}
+
+#[test]
+fn board_projection_evicts_oversized_content_without_truncating_the_response() {
+    let db = WorkDb::open(temp_db_path("projection-size")).unwrap();
+    let product = make_revision_product(&db, "size");
+    let task = create_test_chore_manual(&db, product.clone(), "large card").id;
+    let mut model = None;
+    check(&db, &product, &mut model, 100);
+    let large = "x".repeat(32 * 1024 * 1024);
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET description = ?2 WHERE id = ?1", params![task, large])
+        .unwrap();
+    drop(large);
+    for expected in [Refresh::Incremental(1), Refresh::Snapshot("cold")] {
+        let (tree, refresh) = db
+            .refresh_board_projection(
+                &product,
+                &mut model,
+                &mut PopulationTrace::disabled(),
+                &BoardCaches::default(),
+                100,
+            )
+            .unwrap();
+        assert_eq!(refresh, expected);
+        assert_eq!(tree.chores[0].description.len(), 32 * 1024 * 1024);
+        assert!(model.is_none());
+    }
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET description = 'small again' WHERE id = ?1", [&task])
+        .unwrap();
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Snapshot("cold"));
+    assert!(model.is_some());
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Incremental(0));
+}
+
+#[test]
+fn board_projection_runtime_and_structural_sequence_matches_every_field() {
+    let db = WorkDb::open(temp_db_path("projection")).unwrap();
+    let product = make_revision_product(&db, "projection");
+    let other = make_revision_product(&db, "other");
+    let root = make_in_review_chore(&db, &product, "https://github.com/spinyfin/mono/pull/7");
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET name = 'Source family' WHERE id = ?1", [&root])
+        .unwrap();
+    let sibling = make_in_review_chore(&db, &product, "https://github.com/spinyfin/mono/pull/8");
+    let revision = insert_revision_row(&db, &product, &root);
+    let nested = insert_revision_row(&db, &product, &revision);
+    let mut model = None;
+    let mut other_model = None;
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Snapshot("cold"));
+    check(&db, &other, &mut other_model, 100);
+    for sql in [
+        "UPDATE tasks SET status = 'active' WHERE id = ?1",
+        "UPDATE tasks SET ci_required_state = 'success', pr_mergeable_state = 'mergeable' WHERE id = ?1",
+        "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+        "UPDATE tasks SET status = 'done' WHERE id = ?1",
+        "UPDATE tasks SET status = 'archived' WHERE id = ?1",
+        "UPDATE tasks SET status = 'todo', ordinal = 3 WHERE id = ?1",
+    ] {
+        db.connect().unwrap().execute(sql, [&revision]).unwrap();
+        assert!(
+            matches!(check(&db, &product, &mut model, 100), Refresh::Incremental(_)),
+            "{sql}"
+        );
+    }
+    // Reparent a nested chain: both old/new roots and all descendants change.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET parent_task_id = ?2 WHERE id = ?1",
+            params![revision, sibling],
+        )
+        .unwrap();
+    assert!(matches!(check(&db, &product, &mut model, 100), Refresh::Incremental(_)));
+    // Hard deletion removes the only persisted edge back to the old root.
+    db.connect()
+        .unwrap()
+        .execute("DELETE FROM tasks WHERE id = ?1", [&nested])
+        .unwrap();
+    check(&db, &product, &mut model, 100);
+    // A new task and a move into a different lane/product are incremental too.
+    let task = create_test_chore_manual(&db, product.clone(), "new").id;
+    check(&db, &product, &mut model, 100);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET kind = 'project_task', ordinal = 0 WHERE id = ?1",
+            [&task],
+        )
+        .unwrap();
+    check(&db, &product, &mut model, 100);
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET product_id = ?2 WHERE id = ?1", params![task, other])
+        .unwrap();
+    check(&db, &product, &mut model, 100);
+    check(&db, &other, &mut other_model, 100);
+
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&root)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    for status in ["ready", "claimed", "running", "waiting_human", "completed", "abandoned"] {
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET status = ?2 WHERE id = ?1",
+                params![execution.id, status],
+            )
+            .unwrap();
+        assert!(matches!(check(&db, &product, &mut model, 100), Refresh::Incremental(_)));
+    }
+    // Deadlines must expire even without a write or invalidation.
+    db.connect().unwrap().execute("UPDATE work_executions SET status = 'ready', dispatch_not_before = '150', pre_start_failure_count = 1 WHERE id = ?1", [&execution.id]).unwrap();
+    for now in [100, 149, 150, 151] {
+        check(&db, &product, &mut model, now);
+    }
+    // A run's existing runtime epoch is sufficient; no transport dependency.
+    db.connect().unwrap().execute("INSERT INTO work_runs(id,execution_id,agent_id,status,created_at) VALUES ('projection-run',?1,'synthetic','active','1')", [&execution.id]).unwrap();
+    check(&db, &product, &mut model, 151);
+    for sql in [
+        "UPDATE work_runs SET status = 'completed' WHERE id = 'projection-run'",
+        "DELETE FROM work_runs WHERE id = 'projection-run'",
+    ] {
+        db.connect().unwrap().execute(sql, []).unwrap();
+        check(&db, &product, &mut model, 151);
+    }
+}
+
+#[test]
+fn board_projection_recovers_gaps_broad_changes_and_bounded_closures() {
+    let db = WorkDb::open(temp_db_path("projection-recovery")).unwrap();
+    let product = make_revision_product(&db, "projection");
+    let root = create_test_chore_manual(&db, product.clone(), "root").id;
+    let mut model = None;
+    check(&db, &product, &mut model, 100);
+    db.connect()
+        .unwrap()
+        .execute("UPDATE products SET name = 'changed' WHERE id = ?1", [&product])
+        .unwrap();
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Snapshot("broad_input"));
+    db.set_metadata("unrelated_scheduler_watermark", "100").unwrap();
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Incremental(0));
+    db.set_metadata("pr_review_verdicts_since", "100").unwrap();
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Snapshot("broad_input"));
+    {
+        let conn = db.connect().unwrap();
+        for i in 0..2100 {
+            conn.execute("UPDATE tasks SET name = ?2 WHERE id = ?1", params![root, i.to_string()])
+                .unwrap();
+        }
+        let count: u64 = conn
+            .query_row("SELECT COUNT(*) FROM board_changes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, crate::work::board_projection_schema::JOURNAL_LIMIT);
+    }
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Snapshot("journal_gap"));
+    for _ in 0..boss_board_projection::MAX_AFFECTED {
+        insert_revision_row(&db, &product, &root);
+    }
+    assert_eq!(
+        check(&db, &product, &mut model, 100),
+        Refresh::Snapshot("affected_limit")
+    );
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Incremental(0));
+    // Restart/eviction simply starts from a fresh snapshot.
+    model = None;
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Snapshot("cold"));
+}
+
+#[test]
+fn board_projection_external_commit_and_rollback_are_snapshot_consistent() {
+    let (_dir, path) = disk_db_path("projection-external");
+    let db = WorkDb::open(path).unwrap();
+    let product = make_revision_product(&db, "projection");
+    let task = create_test_chore_manual(&db, product.clone(), "before").id;
+    let mut model = None;
+    check(&db, &product, &mut model, 100);
+    let writer = Connection::open(db.path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    writer
+        .execute("UPDATE tasks SET name = 'after' WHERE id = ?1", [&task])
+        .unwrap();
+    assert_eq!(
+        check(&db.reader().unwrap(), &product, &mut model, 100),
+        Refresh::Incremental(0)
+    );
+    writer.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Incremental(0));
+    writer
+        .execute("UPDATE tasks SET name = 'after' WHERE id = ?1", [&task])
+        .unwrap();
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Incremental(1));
+    assert_eq!(model.unwrap().tree().chores[0].name, "after");
+}
+
+#[test]
+fn board_projection_cross_product_dependencies_and_chain_holds_follow_their_inputs() {
+    let db = WorkDb::open(temp_db_path("projection-related")).unwrap();
+    let product = make_revision_product(&db, "dependent");
+    let other = make_revision_product(&db, "prerequisite");
+    let dependent = create_test_chore_manual(&db, product.clone(), "dependent").id;
+    let prerequisite = create_test_chore_manual(&db, other, "prerequisite").id;
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&dependent)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::WaitingDependency)
+                .build(),
+        )
+        .unwrap();
+    let mut model = None;
+    check(&db, &product, &mut model, 100);
+    db.connect().unwrap().execute("INSERT INTO work_item_dependencies(dependent_id, prerequisite_id, relation, created_at) VALUES (?1,?2,'blocks','1')", params![dependent, prerequisite]).unwrap();
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Snapshot("broad_input"));
+    assert_eq!(
+        model.as_ref().unwrap().tree().task_runtimes[0]
+            .dispatch_wait_reason
+            .as_deref(),
+        Some("waiting_dependency")
+    );
+    for status in ["done", "active"] {
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = ?2 WHERE id = ?1",
+                params![prerequisite, status],
+            )
+            .unwrap();
+        assert!(matches!(check(&db, &product, &mut model, 100), Refresh::Incremental(_)));
+    }
+    let blocker = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&prerequisite)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+    db.connect().unwrap().execute("UPDATE work_executions SET status = 'ready', dispatch_wait_reason = 'chain hold', dispatch_wait_blocker_id = ?2 WHERE id = ?1", params![execution.id, prerequisite]).unwrap();
+    check(&db, &product, &mut model, 100);
+    for status in ["completed", "running", "abandoned"] {
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET status = ?2 WHERE id = ?1",
+                params![blocker.id, status],
+            )
+            .unwrap();
+        check(&db, &product, &mut model, 100);
+    }
+    db.connect()
+        .unwrap()
+        .execute(
+            "DELETE FROM work_item_dependencies WHERE dependent_id = ?1",
+            [&dependent],
+        )
+        .unwrap();
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Snapshot("broad_input"));
+}
+
+#[test]
+fn board_projection_review_evidence_and_metadata_sequences_match_complete_projection() {
+    let db = WorkDb::open(temp_db_path("projection-evidence")).unwrap();
+    let product = make_revision_product(&db, "evidence");
+    let root = make_in_review_chore(&db, &product, "https://github.com/spinyfin/mono/pull/7");
+    let revision = insert_revision_row(&db, &product, &root);
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&root)
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+    let mut model = None;
+    check(&db, &product, &mut model, 100);
+    db.connect().unwrap().execute("INSERT INTO pr_review_batches(id,cycle_root_id,base_sha,classification_json,created_at,phase,pr_number,pr_url,status,target_sha,updated_at) VALUES ('projection-batch',?1,'base','{}','1','pre_merge',7,'https://github.com/spinyfin/mono/pull/7','collecting','head','1')", [&root]).unwrap();
+    db.connect().unwrap().execute("INSERT INTO pr_review_batch_members(id,batch_id,attempt,created_at,provider_effort,requested_driver,resolved_model,role,status,updated_at,execution_id) VALUES ('projection-member','projection-batch',1,'1','medium','claude','synthetic','supervisor','pending','1',?1)", [&execution.id]).unwrap();
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Snapshot("broad_input"));
+    assert_eq!(
+        model
+            .as_ref()
+            .unwrap()
+            .tree()
+            .chores
+            .iter()
+            .find(|t| t.id == root)
+            .unwrap()
+            .ai_review_stage
+            .as_deref(),
+        Some("consolidation")
+    );
+    db.connect()
+        .unwrap()
+        .execute("DELETE FROM pr_review_batch_members WHERE id = 'projection-member'", [])
+        .unwrap();
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Snapshot("broad_input"));
+    assert_eq!(
+        model
+            .as_ref()
+            .unwrap()
+            .tree()
+            .chores
+            .iter()
+            .find(|t| t.id == root)
+            .unwrap()
+            .ai_review_stage
+            .as_deref(),
+        Some("reviewers")
+    );
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET pr_head_sha = 'head' WHERE id = ?1", [&root])
+        .unwrap();
+    db.connect().unwrap().execute("INSERT INTO pr_review_verdicts(id, execution_id, work_item_id, head_sha, gate_outcome, created_at) VALUES ('verdict',?1,?2,'head','completed_clean','1')", params![execution.id, root]).unwrap();
+    assert!(matches!(check(&db, &product, &mut model, 100), Refresh::Incremental(_)));
+    db.connect().unwrap().execute("INSERT INTO work_attachments(id,execution_id,work_item_id,content_digest,media_type,pixel_width,pixel_height,size_bytes,source_name,created_at) VALUES ('attachment',?1,?2,'digest','png',1,1,1,'image','1')", params![execution.id, revision]).unwrap();
+    assert!(matches!(check(&db, &product, &mut model, 100), Refresh::Incremental(_)));
+    assert!(
+        model
+            .as_ref()
+            .unwrap()
+            .tree()
+            .chores
+            .iter()
+            .find(|t| t.id == root)
+            .unwrap()
+            .has_attachments
+    );
+    db.connect()
+        .unwrap()
+        .execute("DELETE FROM work_attachments WHERE id = 'attachment'", [])
+        .unwrap();
+    check(&db, &product, &mut model, 100);
+    db.connect()
+        .unwrap()
+        .execute("DELETE FROM pr_review_verdicts WHERE id = 'verdict'", [])
+        .unwrap();
+    check(&db, &product, &mut model, 100);
+    // Non-card state is recovered too, including product alert membership.
+    db.connect().unwrap().execute("INSERT INTO work_attention_items(id,work_item_id,kind,status,title,body_markdown,created_at) VALUES ('alert',?1,'test','open','alert','body','1')", [&product]).unwrap();
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Snapshot("broad_input"));
+    assert_eq!(model.as_ref().unwrap().tree().attention_items.len(), 1);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_attention_items SET status = 'resolved', resolved_at = '2' WHERE id = 'alert'",
+            [],
+        )
+        .unwrap();
+    check(&db, &product, &mut model, 100);
+}

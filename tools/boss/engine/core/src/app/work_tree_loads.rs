@@ -2,6 +2,8 @@
 //! fetch_seq is correlation and delta is a per-session encoding choice.
 use super::*;
 
+type BoardSlot = Arc<StdMutex<Option<crate::work::board_projection::CachedProjection>>>;
+
 #[derive(Default)]
 pub(super) struct WorkTreeLoads {
     flights: boss_single_flight::SingleFlight<String, (u64, i64), (u64, boss_protocol::WorkTree)>,
@@ -12,6 +14,9 @@ pub(super) struct WorkTreeLoads {
     // product's assembly, validated against per-item epochs in each load's
     // own snapshot (see `board_runtime_cache` and `board_review_cache`).
     caches: crate::work::board_caches::BoardCaches,
+    // At most four retained products, each capped by the database adapter.
+    // Individual locks preserve parallel reads for different products.
+    projections: StdMutex<HashMap<String, BoardSlot>>,
 }
 
 impl WorkTreeLoads {
@@ -31,12 +36,58 @@ impl WorkTreeLoads {
                 // connection. Only the batch owner scans it (with Deferred).
                 // The detached spawn_blocking job survives client disconnects.
                 let snapshot_revision = revision.load(Ordering::SeqCst);
-                crate::board_invalidation_metrics::record_full_assembly(metrics);
-                db.get_work_tree_cached(product_id, trace, &self.caches)
-                    .map(|tree| (snapshot_revision, tree))
-                    .map_err(|err| err.to_string())
+                let slot = self.projection(product_id);
+                let mut projection = slot.lock().expect("board projection poisoned");
+                let (tree, refresh) = db
+                    .refresh_board_projection(
+                        product_id,
+                        &mut projection,
+                        trace,
+                        &self.caches,
+                        boss_engine_utils::epoch_time::now_epoch_secs(),
+                    )
+                    .map_err(|err| err.to_string())?;
+                match refresh {
+                    crate::work::board_projection::Refresh::Snapshot(reason) => {
+                        crate::board_invalidation_metrics::record_full_assembly(metrics);
+                        metrics.counter_inc_by_dynamic(
+                            &format!("board.projection.snapshot.{reason}"),
+                            "Board projection snapshot recoveries.",
+                            1,
+                        );
+                    }
+                    crate::work::board_projection::Refresh::Incremental(count) => {
+                        metrics.counter_inc_by_dynamic(
+                            "board.projection.incremental",
+                            "Incremental board refreshes.",
+                            1,
+                        );
+                        metrics.counter_inc_by_dynamic(
+                            "board.projection.cards",
+                            "Cards refreshed incrementally.",
+                            count as u64,
+                        );
+                    }
+                }
+                Ok((snapshot_revision, tree))
             },
         )
+    }
+
+    fn projection(&self, product: &str) -> BoardSlot {
+        let mut projections = self.projections.lock().expect("board projections poisoned");
+        if let Some(slot) = projections.get(product) {
+            return slot.clone();
+        }
+        if projections.len() >= 4 {
+            // Eviction affects reuse only. An in-flight reader owns its Arc,
+            // and a later request starts from a fresh database snapshot.
+            let victim = projections.keys().next().cloned().unwrap();
+            projections.remove(&victim);
+        }
+        let slot = Arc::new(StdMutex::new(None));
+        projections.insert(product.to_owned(), slot.clone());
+        slot
     }
     // Both fences are database-wide: unrelated writes may conservatively
     // require a follow-up, but never serialize scans for different products.
