@@ -160,5 +160,27 @@ fn unrecoverable_revision_raises_attention_on_the_pr_owner() {
     assert_eq!(attention[0].work_item_id.as_deref(), Some(root.as_str()));
     assert!(attention[0].body_markdown.contains("Later revisions"));
     assert!(attention[0].body_markdown.contains("GitHub unavailable"));
+    let original_id = attention[0].id.clone();
+    let next = insert_revision_row(&db, &product, &root);
+    let next_execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(next.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::WaitingDependency)
+                .build(),
+        )
+        .unwrap();
+    crate::execution_bookmark_recovery::report_chain_block(&db, &next_execution, "PR head deleted").unwrap();
+    let attention = db
+        .list_open_attention_items_of_kind(crate::execution_bookmark_recovery::CHAIN_BLOCKED)
+        .unwrap();
+    assert_eq!(attention.len(), 1);
+    assert_eq!(attention[0].id, original_id);
+    assert!(attention[0].body_markdown.contains(&next));
+    assert!(attention[0].body_markdown.contains(&next_execution.id));
+    assert!(attention[0].body_markdown.contains("PR head deleted"));
+    assert!(!attention[0].body_markdown.contains(&execution.id));
+    assert!(!attention[0].body_markdown.contains("GitHub unavailable"));
     assert_eq!(task_status(&db, &revision), "todo");
 }

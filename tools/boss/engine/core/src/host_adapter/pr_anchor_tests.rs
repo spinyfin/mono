@@ -7,6 +7,8 @@ struct Store {
     repo: JjRepo,
     damage_on_fetch: AtomicBool,
     conflicted: bool,
+    fail_fetch: bool,
+    damage_after_repair: bool,
 }
 
 fn one(repo: &Path, rev: &str) -> String {
@@ -64,7 +66,13 @@ impl Jj for Store {
         if args == ["git", "remote", "list"] {
             return Ok("origin https://github.com/example/recovery.git\n".into());
         }
+        if self.fail_fetch && args.starts_with(&["git", "fetch"]) {
+            anyhow::bail!("SSH connection reset");
+        }
         let result = LocalJj.run(workspace, args).await?;
+        if self.damage_after_repair && args.starts_with(&["bookmark", "set", "pr/7"]) {
+            damage(&self.repo.repo, self.conflicted);
+        }
         if args.starts_with(&["git", "fetch"]) && self.damage_on_fetch.swap(false, Ordering::SeqCst) {
             damage(&self.repo.repo, self.conflicted);
         }
@@ -119,6 +127,8 @@ async fn scene(dir: &Path, conflicted: bool, restore: bool) -> (Store, Execution
             repo,
             damage_on_fetch: AtomicBool::new(restore),
             conflicted,
+            fail_fetch: false,
+            damage_after_repair: false,
         },
         record,
         head,
@@ -221,9 +231,108 @@ async fn lookup_timeout_keeps_prestart_retry_classification() {
     let dir = tempfile::tempdir().unwrap();
     let (_, record, _) = scene(dir.path(), false, false).await;
     tokio::time::pause();
-    let err = repair_with_gh(&PendingLookup, &record, 7, Path::new("unused-gh"))
+    let err = repair_with_gh(&PendingLookup, &record, 7, &PathBuf::from("unused-gh"))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("timed out"));
     assert!(!execution_bookmark::is_pointer_integrity_error(&err));
+}
+
+struct FakeHead {
+    sha: String,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl PrHeadLookup for FakeHead {
+    async fn fetch(&self, slug: &str, pr: u64) -> Result<(String, String)> {
+        assert_eq!((slug, pr), ("example/recovery", 7));
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(("published".into(), self.sha.clone()))
+    }
+}
+
+#[tokio::test]
+async fn ensure_repairs_missing_and_conflicted_alias_once() {
+    for conflicted in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, record, sha) = scene(dir.path(), conflicted, false).await;
+        let lookup = FakeHead { sha, calls: 0.into() };
+        ensure_with_gh(&store, &record, 7, &lookup).await.unwrap();
+        assert_eq!(one(&store.repo.repo, "pr/7"), lookup.sha);
+        ensure_with_gh(&store, &record, 7, &lookup).await.unwrap();
+        assert_eq!(lookup.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn lost_again_after_repair_is_loud_and_not_a_legacy_blocker() {
+    for conflicted in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, record, sha) = scene(dir.path(), conflicted, false).await;
+        store.damage_after_repair = true;
+        let lookup = FakeHead { sha, calls: 0.into() };
+        let err = reconcile_with_gh(&store, &record, Some("pr/7"), "main", &lookup)
+            .await
+            .unwrap_err();
+        assert!(execution_bookmark::is_pointer_integrity_error(&err));
+        assert!(err.to_string().contains("removed or conflicted again"));
+        assert!(err.to_string().contains(&lookup.sha));
+        assert!(!execution_bookmark::is_legacy_pr_anchor_blocker(&err.to_string()));
+        assert_eq!(lookup.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn transient_fetch_failure_retries_repair_and_preserves_pointers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, record, sha) = scene(dir.path(), false, false).await;
+    let saved = one(&store.repo.repo, &record.head());
+    let lookup = FakeHead { sha, calls: 0.into() };
+    store.fail_fetch = true;
+    let err = ensure_with_gh(&store, &record, 7, &lookup).await.unwrap_err();
+    assert!(!execution_bookmark::is_pointer_integrity_error(&err));
+    assert!(format!("{err:#}").contains("SSH connection reset"));
+    use crate::work::{CreateExecutionInput, ExecutionKind, WorkDb};
+    let db = WorkDb::open_in_memory().unwrap();
+    let product = crate::test_support::create_test_product(&db);
+    let task = crate::test_support::create_test_chore(&db, &product.id, "retry recovery");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(task.id.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .build(),
+        )
+        .unwrap();
+    assert!(!crate::execution_bookmark_recovery::block_unrecoverable(&db, &execution, &err).unwrap());
+    let crate::work::WorkItem::Chore(current) = db.get_work_item(&task.id).unwrap() else {
+        panic!("expected chore")
+    };
+    assert_eq!(current.status, task.status);
+    assert_eq!(current.autostart, task.autostart);
+    assert!(current.blocked_reason.is_none());
+    assert!(
+        db.list_open_attention_items_of_kind(crate::execution_bookmark_recovery::CHAIN_BLOCKED)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(one(&store.repo.repo, &record.head()), saved);
+    store.fail_fetch = false;
+    ensure_with_gh(&store, &record, 7, &lookup).await.unwrap();
+    assert_eq!(lookup.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(one(&store.repo.repo, "pr/7"), lookup.sha);
+}
+
+#[tokio::test]
+async fn invalid_authoritative_sha_is_an_integrity_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, record, _) = scene(dir.path(), false, false).await;
+    let lookup = FakeHead {
+        sha: "not-a-sha".into(),
+        calls: 0.into(),
+    };
+    let err = ensure_with_gh(&store, &record, 7, &lookup).await.unwrap_err();
+    assert!(execution_bookmark::is_pointer_integrity_error(&err));
+    assert!(format!("{err:#}").contains("invalid or absent"));
 }

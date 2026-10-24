@@ -15,6 +15,34 @@ pub(crate) const CREATE_FAILED: &str = "execution_bookmark_create_failed";
 /// heads nothing it recorded could vouch for, and started the item fresh.
 pub(crate) const RECOVERY_RETIRED: &str = "execution_bookmark_recovery_retired";
 
+/// Only authoritative integrity failures park work; transport failures keep
+/// the coordinator's pre-start backoff and rerun repair on the next attempt.
+pub(crate) fn block_unrecoverable(db: &WorkDb, execution: &WorkExecution, err: &anyhow::Error) -> Result<bool> {
+    use crate::work::ExecutionKind;
+    let damaged = boss_engine_recovery::execution_bookmark::is_pointer_integrity_error(err);
+    if damaged
+        && matches!(
+            execution.kind,
+            ExecutionKind::ChoreImplementation
+                | ExecutionKind::TaskImplementation
+                | ExecutionKind::RevisionImplementation
+        )
+    {
+        db.update_work_item_as_actor(
+            &execution.work_item_id,
+            boss_protocol::WorkItemPatch::builder()
+                .status("blocked")
+                .blocked_reason("execution_recovery_failed")
+                .blocked_detail(format!("{err:#}"))
+                .autostart(false)
+                .build(),
+            "engine",
+        )?;
+        report_chain_block(db, execution, &format!("{err:#}"))?;
+    }
+    Ok(damaged)
+}
+
 pub(crate) fn report_chain_block(db: &WorkDb, execution: &WorkExecution, reason: &str) -> Result<()> {
     if execution.kind != crate::work::ExecutionKind::RevisionImplementation {
         return Ok(());
@@ -22,7 +50,7 @@ pub(crate) fn report_chain_block(db: &WorkDb, execution: &WorkExecution, reason:
     let Some(root) = db.get_revision_chain_root_task_id(&execution.work_item_id) else {
         return Ok(());
     };
-    db.upsert_work_item_attention(
+    db.upsert_external_tracker_attention(
         &root,
         CHAIN_BLOCKED,
         "PR revision chain blocked on recovery",
