@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 51;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 52;
 
 /// Schema 43: the baseline commit a recovery record was created at, the
 /// pointer-reconciliation note for the worker prompt, and the retirement
@@ -47,12 +47,12 @@ const TASKS_CRITICAL_PROVENANCE_46: &str = "ALTER TABLE tasks ADD COLUMN critica
 /// which parses as `unknown`; see `semantic_progress::SemanticTurnCondition`.
 const WORK_RUNS_SEMANTIC_TURN_CONDITION_50: &str = "ALTER TABLE work_runs ADD COLUMN semantic_turn_condition TEXT";
 
-/// Schema 51: whether the execution was admitted by an operator force launch
+/// Schema 52: whether the execution was admitted by an operator force launch
 /// (`bossctl agents launch`, i.e. `DispatchAdmission::OperatorForced`),
 /// stamped by the engine once the launch is accepted. Answering a question
-/// that run asked reads it so the resume is admitted the same way instead of
-/// queueing behind the dispatch pause. 0 on every pre-existing row.
-const WORK_EXECUTIONS_FORCE_LAUNCHED_51: &str =
+/// that run asked reads it so the resume can bypass an operator-originated
+/// dispatch pause. 0 on every pre-existing row.
+const WORK_EXECUTIONS_FORCE_LAUNCHED_52: &str =
     "ALTER TABLE work_executions ADD COLUMN force_launched INTEGER NOT NULL DEFAULT 0";
 
 /// Serves the shared-PR probes (`o.pr_url = t.pr_url`, `pr_url = ?`) so they
@@ -259,8 +259,8 @@ impl WorkDb {
             ci_failure_identity::migrate(&tx)?;
         }
         // Guarded for the same reason as schema 46.
-        if version < 51 && !table_has_column(&tx, "work_executions", "force_launched")? {
-            tx.execute_batch(WORK_EXECUTIONS_FORCE_LAUNCHED_51)?;
+        if version < 52 && !table_has_column(&tx, "work_executions", "force_launched")? {
+            tx.execute_batch(WORK_EXECUTIONS_FORCE_LAUNCHED_52)?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
@@ -782,6 +782,7 @@ mod floor_tests {
             44,
             45,
             50,
+            51,
             CURRENT_SCHEMA_VERSION,
             CURRENT_SCHEMA_VERSION + 1,
         ] {
@@ -851,8 +852,8 @@ mod floor_tests {
             if version >= 51 {
                 ci_failure_identity::migrate(&conn).unwrap();
             }
-            if version >= 51 {
-                conn.execute_batch(WORK_EXECUTIONS_FORCE_LAUNCHED_51).unwrap();
+            if version >= 52 {
+                conn.execute_batch(WORK_EXECUTIONS_FORCE_LAUNCHED_52).unwrap();
             }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
@@ -892,7 +893,7 @@ mod floor_tests {
             expected.execute_batch(BOARD_RUNTIME_EPOCH_49).unwrap();
             expected.execute_batch(WORK_RUNS_SEMANTIC_TURN_CONDITION_50).unwrap();
             ci_failure_identity::migrate(&expected).unwrap();
-            expected.execute_batch(WORK_EXECUTIONS_FORCE_LAUNCHED_51).unwrap();
+            expected.execute_batch(WORK_EXECUTIONS_FORCE_LAUNCHED_52).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {
