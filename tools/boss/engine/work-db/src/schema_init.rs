@@ -848,6 +848,10 @@ mod floor_tests {
                 Box::new(|c| c.execute_batch(EXECUTION_BOOKMARK_PRUNE_COLUMNS_60).unwrap()),
             ),
             (
+                super::super::blocked_pr::MIGRATION_ID,
+                Box::new(|c| super::super::blocked_pr::migrate(c).unwrap()),
+            ),
+            (
                 super::super::conflict_mismatch::MIGRATION_ID,
                 Box::new(|c| super::super::conflict_mismatch::migrate(c).unwrap()),
             ),

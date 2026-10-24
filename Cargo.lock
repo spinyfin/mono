@@ -414,6 +414,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-blocked-pr-diagnosis"
+version = "0.1.0"
+dependencies = [
+ "bon",
+]
+
+[[package]]
 name = "boss-build-info"
 version = "0.1.0"
 
@@ -1000,6 +1007,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bon",
+ "boss-blocked-pr-diagnosis",
  "boss-ci-log-reader",
  "boss-engine-gh-invocation",
  "boss-engine-recovery",
@@ -2044,6 +2052,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bon",
+ "boss-blocked-pr-diagnosis",
  "boss-board-projection",
  "boss-comment-anchor",
  "boss-conflict-diagnosis",

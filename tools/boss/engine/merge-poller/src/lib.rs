@@ -106,7 +106,9 @@ mod schedule;
 mod sweep;
 mod walk_order;
 
+pub mod blocked_pr_sweep;
 pub mod blocking_signal;
+pub mod ci_transient_retry;
 pub mod ci_watch;
 pub mod host;
 pub mod merge_queue_renumber;

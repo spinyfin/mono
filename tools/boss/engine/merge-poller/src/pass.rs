@@ -1061,6 +1061,13 @@ pub async fn run_one_pass_tracked(
     // Two cheap reads, taken whether or not the upkeep group had time to run,
     // so a pass under load does not publish the gauges as 0.
     sample_review_pool_gauges(work_db, &mut outcome);
+
+    // Last, after every lifecycle transition above has written its state:
+    // say WHY each Review-lane card that is still blocked or stalled is so,
+    // and re-kick the one path that has no owner (a dead revision).
+    let blocked = crate::blocked_pr_sweep::run_one_pass(work_db, publisher, skip_unbatched_review_holds).await;
+    outcome.blocked_pr_diagnosed = blocked.diagnosed;
+    outcome.blocked_pr_redispatched = blocked.redispatched;
     trace.end();
 
     let observations = poll_observations(&probe_urls, &snapshot.results);
