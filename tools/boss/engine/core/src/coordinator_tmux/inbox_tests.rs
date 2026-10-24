@@ -255,9 +255,18 @@ async fn registration_resolves_through_the_coordinator_launcher_command() {
         &fake,
         format!(
             r#"#!/usr/bin/env python3
-import os, time
+import json, os, sys, time, tty
 from pathlib import Path
 sessions = Path({sessions:?})
+# Complete the launcher's readiness and brief-delivery handshake, as the real
+# agent does, so the launcher's fixed readiness deadline never fires.
+marker = json.loads(Path({config:?}).read_text())["agent_markers"][0]
+tty.setraw(0)
+sys.stdout.write("\x1b[?2004h" + marker)
+sys.stdout.flush()
+received = b""
+while not received.endswith(b"\r"):
+    received += os.read(0, 4096)
 if os.fork() == 0:
     (sessions / (str(os.getpid()) + ".json")).write_text("{{}}")
     time.sleep(60)
@@ -269,6 +278,7 @@ while not list(sessions.iterdir()):
 time.sleep(60)
 "#,
             sessions = sessions.to_str().unwrap(),
+            config = input.join("initial-prompt.json").to_str().unwrap(),
         ),
     )
     .unwrap();
@@ -281,27 +291,42 @@ time.sleep(60)
         .spawn()
         .unwrap();
     let pane_pid = pane.id() as libc::pid_t;
+    // Hang guard only: the fake agent registers on its own schedule, which
+    // stretches on a loaded host, so wait on the registrations themselves.
+    // The launcher's own 30s readiness deadline is satisfied because the fake
+    // completes the brief handshake before registering, so the launcher stays
+    // in its steady state for the whole guard.
+    let expected_path = sessions.parent().unwrap().join("expected");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let mut resolved = None;
+    let mut registered = None;
+    let mut registration_count = 0;
     let mut last_error = String::new();
-    for _ in 0..100 {
+    while tokio::time::Instant::now() < deadline {
         match resolve_claude_pid(&sessions, pane_pid).await {
-            Ok(pid) => {
-                resolved = Some(pid);
-                break;
-            }
+            Ok(pid) => resolved = Some(pid),
             Err(error) => last_error = format!("{error:#}"),
+        }
+        registered = std::fs::read_to_string(&expected_path)
+            .ok()
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok());
+        registration_count = std::fs::read_dir(&sessions).unwrap().count();
+        if resolved.is_some() && registered.is_some() && registration_count >= 2 {
+            break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let registered = std::fs::read_to_string(sessions.parent().unwrap().join("expected"))
-        .ok()
-        .and_then(|pid| pid.parse::<libc::pid_t>().ok());
-    let registration_count = std::fs::read_dir(&sessions).unwrap().count();
+    if resolved.is_some() && (registered.is_none() || registration_count < 2) {
+        last_error = format!(
+            "resolved {resolved:?} but the fake agent's own registration is missing (expected pid file: {registered:?}, session files: {registration_count} of 2)"
+        );
+        resolved = None;
+    }
     pane.kill().unwrap();
     let relay = pane.wait_with_output().unwrap();
     let resolved = resolved.unwrap_or_else(|| {
         panic!(
-            "registration resolves below the relay: {last_error}; relay stderr: {}",
+            "registration did not resolve below the relay within 60s: {last_error}; relay stderr: {}",
             String::from_utf8_lossy(&relay.stderr)
         )
     });
