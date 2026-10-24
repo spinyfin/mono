@@ -65,7 +65,7 @@ final class EngineClient: @unchecked Sendable {
         "set_product_external_tracker", "set_product_merge_mechanism", "set_host_enabled",
         "add_host", "remove_host", "add_host_tag", "remove_host_tag",
         "update_work_item", "move_work_item_on_board", "evaluate_dispatch_admission",
-        "evaluate_editorial_rules",
+        "evaluate_editorial_rules", "create_revision",
         "accept_deferred_scope_attention", "action_attention_group", "answer_operator_question",
         "create_task_from_deferred_scope_attention", "comments_revise_doc", "retry_review_guide",
         "recreate_coordinator", "generate_review_guide", "open_live_workspace_terminal",
