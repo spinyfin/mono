@@ -116,13 +116,13 @@ pub fn render_verdict_submission_block(batch_id: &str, body_path: &str) -> Strin
          2. Submit it immediately with:\n\
          \n\
          ```sh\n\
-         boss propose review-verdict --batch-id {batch_id} --verdict-file \"{body_path}\"\n\
+         \"$BOSS_BIN\" propose review-verdict --batch-id {batch_id} --verdict-file \"{body_path}\"\n\
          ```\n\
          \n\
          The command validates the verdict immediately. If it rejects the file, correct the\n\
          reported field errors and submit again before ending your turn. Do not put the JSON\n\
          in your final response: transcript recovery is intentionally unavailable for batch\n\
-         reviews. The one body-file write and this local `boss propose` call are permitted;\n\
+         reviews. The one body-file write and this local `\"$BOSS_BIN\" propose` call are permitted;\n\
          do not edit repository files or publish anything.\n",
         body_path = body_path,
         batch_id = batch_id,

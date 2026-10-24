@@ -42,12 +42,12 @@ pub fn render_supervisor_claude_md(
                     PR head, after at least two independent reviewers reported \
                     on this PR.",
             last_forbidden_bullet: "Running `cube pr create`/`cube pr update` or any Boss PR helper —\n\
-               this does NOT include the `boss propose review-verdict` call named\n\
+               this does NOT include the `\"$BOSS_BIN\" propose review-verdict` call named\n\
                in your task prompt, which is not a Boss PR helper: it records\n\
                your consolidated verdict, it does not touch the PR.",
-            permitted_write_section: "**The one permitted write** is the `boss propose review-verdict`\n\
+            permitted_write_section: "**The one permitted write** is the `\"$BOSS_BIN\" propose review-verdict`\n\
              call your task prompt names. Write your verdict JSON to the body\n\
-             file it names, then run exactly that one `boss propose` call to\n\
+             file it names, then run exactly that one `\"$BOSS_BIN\" propose` call to\n\
              submit it. That call is a local call to the engine control socket,\n\
              not a write to the PR or repo, so it does not violate the\n\
              read-only mandate. Do not write anywhere else.\n\
@@ -347,7 +347,7 @@ mod tests {
         );
         assert!(prompt.contains("### claude reviewer"));
         assert!(prompt.contains("### codex reviewer"));
-        assert!(prompt.contains("boss propose review-verdict --batch-id rvb_1 --verdict-file"));
+        assert!(prompt.contains("\"$BOSS_BIN\" propose review-verdict --batch-id rvb_1 --verdict-file"));
         assert!(prompt.contains("Semantic dedup with source attribution"));
         assert!(prompt.contains("Contradiction handling"));
         assert!(!prompt.contains("grok"));
@@ -397,7 +397,7 @@ mod tests {
     #[test]
     fn supervisor_claude_md_authorizes_review_verdict_and_forbids_pr_writes() {
         let rendered = render_supervisor_claude_md("lease-1", "/tmp/ws", "", "");
-        assert!(rendered.contains("boss propose review-verdict"));
+        assert!(rendered.contains("\"$BOSS_BIN\" propose review-verdict"));
         assert!(rendered.contains("MUST NOT change the PR"));
         assert!(rendered.contains("jj log -R /tmp/ws"));
     }

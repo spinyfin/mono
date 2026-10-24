@@ -362,7 +362,7 @@ pub fn render_reviewer_claude_md(
             intro: "You are running inside a Boss-managed **reviewer** session. The engine\n\
                     spawned you in a leased cube workspace checked out to the PR head.",
             last_forbidden_bullet: "Running `cube pr create`/`cube pr update` or any Boss PR helper —\n\
-               this does NOT include the `boss propose review-report` call named\n\
+               this does NOT include the `\"$BOSS_BIN\" propose review-report` call named\n\
                below, which is not a Boss PR helper: it reports findings, it does\n\
                not touch the PR.",
             permitted_write_section: "**The one permitted write** is whichever single delivery your task\n\
@@ -372,9 +372,9 @@ pub fn render_reviewer_claude_md(
                (also exported as `$BOSS_STRUCTURED_OUTPUT`): write your\n\
                `ReviewResult` JSON there.\n\
              - If it instead names a review-report body-file path and a\n\
-               `boss propose review-report` command: write the report JSON to\n\
-               that body file, then run exactly that one `boss propose` call to\n\
-               submit it. `boss propose` is a local call to the engine control\n\
+               `\"$BOSS_BIN\" propose review-report` command: write the report JSON to\n\
+               that body file, then run exactly that one `\"$BOSS_BIN\" propose` call to\n\
+               submit it. `\"$BOSS_BIN\" propose` is a local call to the engine control\n\
                socket, not a write to the PR or repo.\n\
              \n\
              Either path is OUTSIDE every worker workspace, so making that one\n\
@@ -744,13 +744,13 @@ pub fn render_batch_reviewer_initial_prompt(
          2. Submit it immediately with:\n\
          \n\
          ```sh\n\
-         boss propose review-report --batch-id {batch_id} --target-sha {target_sha} --body-file \"{body_path}\"\n\
+         \"$BOSS_BIN\" propose review-report --batch-id {batch_id} --target-sha {target_sha} --body-file \"{body_path}\"\n\
          ```\n\
          \n\
          The command validates the report immediately. If it rejects the file, correct the\n\
          reported field errors and submit again before ending your turn. Do not put the JSON\n\
          in your final response: transcript recovery is intentionally unavailable for batch\n\
-         reviews. The one body-file write and this local `boss propose` call are permitted;\n\
+         reviews. The one body-file write and this local `\"$BOSS_BIN\" propose` call are permitted;\n\
          do not edit repository files or publish anything.\n\
          \n\
          This is static analysis only. Do not run builds, tests, formatters, generators, or\n\
@@ -1137,13 +1137,13 @@ mod tests {
             "reviewer CLAUDE.md must still authorise the legacy ReviewResult artifact write"
         );
         assert!(
-            rendered.contains("boss propose review-report"),
-            "reviewer CLAUDE.md must authorise the review-batch boss propose call"
+            rendered.contains("\"$BOSS_BIN\" propose review-report"),
+            "reviewer CLAUDE.md must authorise the review-batch \"$BOSS_BIN\" propose call"
         );
         assert!(
             !rendered.contains("**The one permitted write** is your `ReviewResult`"),
             "reviewer CLAUDE.md must not categorically name ReviewResult as the only permitted write, \
-             which reads as forbidding the boss propose delivery a batch member's task prompt requires"
+             which reads as forbidding the \"$BOSS_BIN\" propose delivery a batch member's task prompt requires"
         );
     }
 
@@ -1245,7 +1245,7 @@ mod tests {
             None,
             "org/repo",
         );
-        assert!(prompt.contains("boss propose review-report --batch-id rvb_1 --target-sha head_1 --body-file"));
+        assert!(prompt.contains("\"$BOSS_BIN\" propose review-report --batch-id rvb_1 --target-sha head_1 --body-file"));
         assert!(prompt.contains("needs_runtime_verification"));
         assert!(prompt.contains("transcript recovery is intentionally unavailable"));
         assert!(!prompt.contains("revision_warranted\": true"));
