@@ -148,6 +148,11 @@ const fn entry(kind: &'static str, cleared_by: ClearedBy, rationale: &'static st
 /// `every_registered_kind_is_declared_once` below pins the table itself.
 pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
+        crate::execution_bookmark_recovery::CHAIN_BLOCKED,
+        ClearedBy::HumanDecision,
+        "The PR owner must acknowledge an unrecoverable revision blocking the chain; unrelated root PR review activity does not prove the blocked revision recovered.",
+    ),
+    entry(
         crate::execution_bookmark_recovery::CREATE_FAILED,
         ClearedBy::WorkResumed,
         "Dispatch creates the execution recovery bookmark before starting a worker; a subsequent start proves creation succeeded.",
@@ -716,6 +721,7 @@ mod tests {
             crate::worker_escalation::WORKER_BLOCKED_ATTENTION_KIND,
             crate::abandoned_branch_pr_sweep::ATTENTION_KIND_ABANDONED_BRANCH_NO_PR,
             crate::execution_bookmark_recovery::CREATE_FAILED,
+            crate::execution_bookmark_recovery::CHAIN_BLOCKED,
             crate::execution_bookmark_recovery::RECOVERY_FAILED,
             crate::execution_bookmark_recovery::RECOVERY_RETIRED,
             crate::abandoned_execution_bookmarks::RECOVERABLE_WORK,

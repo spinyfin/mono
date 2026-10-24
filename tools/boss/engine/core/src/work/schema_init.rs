@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 50;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 51;
 
 /// Schema 43: the baseline commit a recovery record was created at, the
 /// pointer-reconciliation note for the worker prompt, and the retirement
@@ -246,6 +246,12 @@ impl WorkDb {
         // database that already carries the column must be a no-op.
         if version < 50 && !table_has_column(&tx, "work_runs", "semantic_turn_condition")? {
             tx.execute_batch(WORK_RUNS_SEMANTIC_TURN_CONDITION_50)?;
+        }
+        if version < 51 {
+            execution_recovery_rearm::migrate(
+                &tx,
+                boss_engine_recovery::execution_bookmark::is_legacy_pr_anchor_blocker,
+            )?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(

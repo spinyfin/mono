@@ -1,4 +1,6 @@
-use super::dispatch_admission::{primary_pr_awaits_review, work_item_is_deliberately_parked};
+use super::dispatch_admission::{
+    primary_pr_awaits_review, revision_implementation_completed, work_item_is_deliberately_parked,
+};
 use super::*;
 
 #[work_db_boundary::instrument]
@@ -583,7 +585,7 @@ impl WorkDb {
             //   - latest execution terminal → yes,
             //   - latest execution non-terminal but `is_live`
             //     reports the slot is gone → yes (stale row).
-            if primary_pr_awaits_review(&tx, &work_item_id)? {
+            if primary_pr_awaits_review(&tx, &work_item_id)? || revision_implementation_completed(&tx, &work_item_id)? {
                 continue;
             }
             let existing = query_latest_execution_for_work_item(&tx, &work_item_id)?;
@@ -710,7 +712,7 @@ impl WorkDb {
             if !autostart {
                 continue;
             }
-            if primary_pr_awaits_review(&tx, &work_item_id)? {
+            if primary_pr_awaits_review(&tx, &work_item_id)? || revision_implementation_completed(&tx, &work_item_id)? {
                 continue;
             }
             let needs_dispatch = match query_latest_execution_for_work_item(&tx, &work_item_id)? {
@@ -946,7 +948,7 @@ impl WorkDb {
             let id = row?;
             // A completed producer waiting for review admission is not
             // an orphan. Review recovery owns it, even without a batch.
-            if !primary_pr_awaits_review(&conn, &id)? {
+            if !primary_pr_awaits_review(&conn, &id)? && !revision_implementation_completed(&conn, &id)? {
                 out.push(id);
             }
         }

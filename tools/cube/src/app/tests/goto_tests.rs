@@ -116,9 +116,9 @@ fn goto_bookmark_not_yet_positioned_creates_new_commit() {
         goto_remote_list_cmd(),
         goto_fetch_cmd(),
         goto_exists_cmd(branch, "abc1"),
-        goto_set_bookmark_cmd(branch),
         goto_positioned_cmd(branch, ""), // not yet positioned
         goto_new_cmd(branch),
+        goto_set_bookmark_cmd(branch),
     ];
     let runner = FakeRunner::new(cmds);
     let result = run_goto(&runner, Some(branch), None).expect("goto succeeds");
@@ -134,9 +134,9 @@ fn goto_bookmark_already_positioned_skips_jj_new() {
         goto_remote_list_cmd(),
         goto_fetch_cmd(),
         goto_exists_cmd(branch, "def2"),
-        goto_set_bookmark_cmd(branch),
         goto_positioned_cmd(branch, "def2"), // already positioned
-                                             // no jj new expected
+        goto_set_bookmark_cmd(branch),
+        // no jj new expected
     ];
     let runner = FakeRunner::new(cmds);
     let result = run_goto(&runner, Some(branch), None).expect("idempotent goto");
@@ -158,10 +158,10 @@ fn goto_pr_resolves_branch_and_sets_pr_bookmark() {
             &format!(r#"{{"head":{{"ref":"{branch}"}},"state":"open","merged":false}}"#),
         ),
         goto_exists_cmd(branch, "e42"),
-        goto_set_bookmark_cmd(branch),
-        goto_set_pr_bookmark_cmd(42, branch),
         goto_positioned_cmd(branch, ""),
         goto_new_cmd(branch),
+        goto_set_bookmark_cmd(branch),
+        goto_set_pr_bookmark_cmd(42, branch),
     ];
     let runner = FakeRunner::new(cmds);
     let result = run_goto(&runner, None, Some(42)).expect("pr goto");

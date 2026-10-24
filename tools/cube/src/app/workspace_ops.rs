@@ -564,6 +564,36 @@ pub(super) fn workspace_goto(
         )));
     }
 
+    // Move the working copy first and set the bookmarks last: workspace gc
+    // forgets a `pr/<n>` alias that nothing references, so setting the alias
+    // and only then running `jj new` leaves a window in which it can be
+    // forgotten before the new working copy keeps it alive.
+    // Idempotency check: if @ already has <remote_ref> as a direct parent,
+    // skip `jj new` — the workspace is already positioned correctly.
+    let already_positioned = runner
+        .run(&RealCommandRunner::invocation(
+            &cwd,
+            "jj",
+            &[
+                "log",
+                "-r",
+                &format!("{remote_ref} & ::@"),
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+        ))
+        .map(|out| !out.trim().is_empty())
+        .unwrap_or(false);
+
+    if !already_positioned {
+        run_jj(
+            runner,
+            database_path,
+            &RealCommandRunner::invocation(&cwd, "jj", &["new", &remote_ref]),
+        )?;
+    }
+
     // Set the local bookmark to track the remote head (idempotent; --allow-backwards
     // handles any local divergence).
     run_jj(
@@ -588,32 +618,6 @@ pub(super) fn workspace_goto(
                 "jj",
                 &["bookmark", "set", &pr_bm, "-r", &remote_ref, "--allow-backwards"],
             ),
-        )?;
-    }
-
-    // Idempotency check: if @ already has <remote_ref> as a direct parent,
-    // skip `jj new` — the workspace is already positioned correctly.
-    let already_positioned = runner
-        .run(&RealCommandRunner::invocation(
-            &cwd,
-            "jj",
-            &[
-                "log",
-                "-r",
-                &format!("{remote_ref} & ::@"),
-                "--no-graph",
-                "-T",
-                "commit_id",
-            ],
-        ))
-        .map(|out| !out.trim().is_empty())
-        .unwrap_or(false);
-
-    if !already_positioned {
-        run_jj(
-            runner,
-            database_path,
-            &RealCommandRunner::invocation(&cwd, "jj", &["new", &remote_ref]),
         )?;
     }
 

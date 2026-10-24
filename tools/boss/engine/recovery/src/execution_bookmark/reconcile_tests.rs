@@ -593,7 +593,10 @@ async fn intact_pointers_and_missing_pr_heads_are_never_reconciled() {
     let error = reconcile(&LocalJj, &s.record, Some("pr/404"), "main")
         .await
         .unwrap_err();
-    assert_eq!(pointer_integrity_kind(&error), Some(PointerIntegrityKind::Other));
+    assert_eq!(
+        pointer_integrity_kind(&error),
+        Some(PointerIntegrityKind::PrHeadUnavailable)
+    );
     assert!(error.to_string().contains("pr/404"), "{error}");
     // Both heads gone: a missing pointer, not an integrity failure.
     JjRepo::run(repo, &["bookmark", "delete", &s.record.head(), &s.record.publication()]);

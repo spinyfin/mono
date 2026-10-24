@@ -1,4 +1,6 @@
-use super::dispatch_admission::{primary_pr_awaits_review, work_item_is_deliberately_parked};
+use super::dispatch_admission::{
+    primary_pr_awaits_review, revision_implementation_completed, work_item_is_deliberately_parked,
+};
 use super::*;
 
 /// Shared per-product short-id read-modify-write. Reads the current
@@ -1069,6 +1071,9 @@ pub(crate) fn reconcile_revision_execution(
             task_id = %task.id,
             "reconcile_revision: item is deferred/future-scope — suppressing execution mint until explicit approval",
         );
+        return Ok(());
+    }
+    if revision_implementation_completed(conn, &task.id)? {
         return Ok(());
     }
     match query_latest_execution_for_work_item(conn, &task.id)? {
