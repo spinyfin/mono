@@ -1935,7 +1935,7 @@ pub(super) async fn record_pane_write_outcome(
 const MID_TURN_PROBE_VERIFY_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// On the `PostToolUse` boundary, pop the front probe in the per-run queue
-/// and attempt a verified pane write (prefixed with `[coordinator-nudge]`).
+/// and attempt a verified pane write (prefixed with `[nudge]`).
 /// The tool call has already completed at this point, so no in-flight Bash
 /// is cancelled.
 ///
@@ -2092,7 +2092,7 @@ pub(super) async fn dispatch_probe_on_post_tool_use(
 /// Shared by the two mid-turn delivery opportunities — the `PostToolUse`
 /// boundary ([`dispatch_probe_on_post_tool_use`]) and the write issued while
 /// the `ProbeRun` RPC is still in hand ([`dispatch_probe_now`]) — so both
-/// record the same lifecycle states and the same `[coordinator-nudge]`
+/// record the same lifecycle states and the same `[nudge]`
 /// marking. `posture` must already have been resolved as write-permitting by
 /// the caller; a probe whose write does not happen is put back on the front
 /// of the queue with its id intact.
@@ -2122,7 +2122,7 @@ async fn inject_probe_mid_turn(
         );
         return ProbeDispatchOutcome::RacedToEmpty;
     };
-    let marked_text = format!("[coordinator-nudge] {}", probe.text);
+    let marked_text = format!("{} {}", super::probe_interrupt::NUDGE_NOTICE, probe.text);
     let probe_id = probe.probe_id.clone();
     // Lifecycle `Injected` only after the posture guard has passed and the
     // probe has been claimed (we are about to write). A short-circuit before

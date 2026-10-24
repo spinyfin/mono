@@ -233,9 +233,10 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
     }
     let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     let mut prompt = String::new();
-    prompt.push_str("You are a reusable Boss worker running one execution inside a dedicated repo workspace.\n");
+    prompt.push_str("You are a reusable worker running one execution inside a dedicated repo workspace.\n");
     prompt.push_str("The current session cwd is already set to that workspace.\n");
     prompt.push_str("Do the work directly in the repository checkout before ending this run.\n");
+    prompt.push_str(project_terms_directive());
     if matches!(
         execution.kind,
         ExecutionKind::TaskImplementation
@@ -276,7 +277,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
     prompt.push_str(&format!("- execution id: `{}`\n", execution.id));
     prompt.push_str(&format!("- execution kind: `{}`\n", execution.kind));
     prompt.push_str(&format!("- workspace: `{}`\n", workspace_path.display()));
-    prompt.push_str(&format!("- work item: `{}`\n", work_item_name(work_item)));
+    prompt.push_str(&format!("- task: `{}`\n", work_item_name(work_item)));
     // Publication uses the execution branch only for a new PR. Revisions
     // maintain their engine-owned recovery bookmark locally and publish
     // to the existing parent PR branch.
@@ -711,6 +712,19 @@ fn bazel_caching_rule_text() -> &'static str {
     "\n**Trust Bazel's caching.** Bazel's action cache, disk cache and remote cache are reliable. Never disable, bypass or bust them in CI steps, scripts, verification gates, or as a debugging reflex. That means no `--disk_cache=` overrides, no `--remote_accept_cached=false`, no `--noremote_*` or `--nouse_action_cache`, no `bazel clean` \"to be sure\", no cache-key-busting env/`--action_env` changes, and no \"rebuild uncached and compare\" determinism checks. If a result looks stale, treat it as a defect to root-cause (an undeclared input, a non-hermetic action, a toolchain auto-detection leak) and fix that. Never route around the cache. The one documented exception is `bazel clean --expunge` to repair Xcode/Apple-toolchain config after an Xcode or macOS upgrade.\n"
 }
 
+/// The one writing rule every dispatch kind inherits: how to word PR titles
+/// and bodies, commit messages, and source comments and docs.
+///
+/// Workers copy whatever nouns the surrounding prompt uses into text that
+/// reviewers read on GitHub, where the engine's own vocabulary means nothing.
+/// The rest of the prompt avoids those nouns (pinned by
+/// `worker_prompts_for_every_dispatch_kind_avoid_internal_vocabulary`); this
+/// rule states the expectation outright without enumerating them, so it does
+/// not teach the very terms it is about.
+pub(super) fn project_terms_directive() -> &'static str {
+    "\n**Write in project terms.** PR titles and bodies, commit messages, and any comments or docs you add to source must describe the change and why it is needed purely in terms of the project: what behaviour changes and the motivation. Do not refer to the text you were given, who assigned it, or the system that dispatched the work. To point at related work, cite the public PR or issue. Phrase approvals neutrally, for example \"approved by the repo owner\".\n\n"
+}
+
 /// Hard constraint text forbidding check/CI bypasses. Injected into every
 /// prompt surface where a worker might encounter a failing check or CI failure.
 fn check_bypass_prohibition_text() -> &'static str {
@@ -721,7 +735,7 @@ fn check_bypass_prohibition_text() -> &'static str {
      - Passing `--no-verify` / skipping git hooks; adding broad `#[allow(...)]` / `// swiftlint:disable` / `# noqa` annotations solely to suppress a warning or error.\n\
      - Deleting, `#[ignore]`-ing, `xfail`-ing, skipping, or weakening assertions in a failing test to make it pass.\n\
      - Raising a threshold or limit (e.g. `max_lines` in a file-size check) solely to accommodate the offending file without reducing its size.\n\n\
-     Required behavior: fix the real problem — split the oversized file, fix the lint/compile error, fix the test failure, resolve the root cause. If a check genuinely SHOULD be relaxed (a legitimately needed exclusion or threshold change), that is a human decision — STOP and surface it for operator approval with full justification. Use the typed question flags on a blocked declaration described in Declaring your run finished when that channel is enabled. Do not decide this autonomously.\n"
+     Required behavior: fix the real problem — split the oversized file, fix the lint/compile error, fix the test failure, resolve the root cause. If a check genuinely SHOULD be relaxed (a legitimately needed exclusion or threshold change), that is a human decision — STOP and surface it for approval by the repo owner with full justification. Use the typed question flags on a blocked declaration described in Declaring your run finished when that channel is enabled. Do not decide this autonomously.\n"
 }
 
 /// Render the `[editorial-rules]` block for the worker prompt (chore #5).
@@ -752,15 +766,14 @@ fn render_editorial_rules_block(
     );
     out.push_str("Baked-in rules (always apply):\n");
     out.push_str(
-        "- Do not mention Boss execution / project / task / chore identifiers \
-         in user-facing text. The shapes are `exec_…`, `proj_…`, `task_…`, \
-         `chg_…`. They are internal vocabulary that humans on this repo have no \
-         context for.\n",
+        "- Do not mention internal run, project or task identifiers in \
+         user-facing text. The shapes are `exec_…`, `proj_…`, `task_…`, \
+         `chg_…`. Humans on this repo have no context for them.\n",
     );
     out.push_str(
-        "- Do not refer to \"Boss worker\", \"the engine\", \"the coordinator\", \
-         \"cube workspace\", or \"work item\" in user-facing text — these are \
-         internal Boss vocabulary.\n",
+        "- Do not describe the tooling or process that produced the work (the \
+         workspace, the worker session, the engine) in user-facing text — humans \
+         on this repo have no context for it.\n",
     );
     out.push_str(
         "- When referring to your branch in PR text, say \"this branch\" rather \
@@ -926,8 +939,8 @@ fn pr_terminal_directive(seam_enabled: bool) -> String {
 pub(crate) fn worker_escalation_protocol_directive(seam_enabled: bool) -> String {
     if !seam_enabled {
         return "\n## If you are blocked or the work is bigger than estimated\n\n\
-     Two sanctioned markers, each on its own line in your final response, tell the coordinator \
-     you need help. Emitting one is always the right move over pushing broken/unvalidated work \
+     Two sanctioned markers, each on its own line in your final response, flag \
+     that you need help. Emitting one is always the right move over pushing broken/unvalidated work \
      or idling silently:\n\n\
      - **`[effort-escalation] requested_level=<level> reason=\"<why>\"`** — the assigned work \
      needs more effort than it was classified at. `<level>` is one bareword, one of \
@@ -936,7 +949,7 @@ pub(crate) fn worker_escalation_protocol_directive(seam_enabled: bool) -> String
      ```\n\
      [effort-escalation] requested_level=large reason=\"ran into a multi-subsystem race; description didn't mention the engine/app boundary\"\n\
      ```\n\n\
-     - **`[blocked] reason=\"<why>\"`** — you cannot proceed without a human/coordinator \
+     - **`[blocked] reason=\"<why>\"`** — you cannot proceed without a human \
      decision: a build failure you can't resolve, an ambiguous requirement, conflicting \
      instructions, a missing credential. `<why>` is a double-quoted, one-line reason. Example:\n\n\
      ```\n\
@@ -948,15 +961,15 @@ pub(crate) fn worker_escalation_protocol_directive(seam_enabled: bool) -> String
      \"was not completed\" is not a valid reason: none of those are blockers, they are you \
      choosing to stop, and this marker is not a channel for that.\n\n\
      A marker missing `requested_level=`/`reason=\"...\"` is still detected but flagged \
-     malformed to the coordinator — include both fields so it's processed automatically instead \
+     malformed — include both fields so it's processed automatically instead \
      of by hand. Do NOT stop silently or push code you know is broken to work around a blocker: \
-     emit the marker instead. The engine files it as an attention item for the coordinator and \
-     pauses the auto-nudge loop for this run until it acks, so you will not be re-prompted to \
+     emit the marker instead. The engine files it as an attention item for a human and \
+     pauses the auto-nudge loop for this run until it is acknowledged, so you will not be re-prompted to \
      \"produce a PR\" while a marker is pending.\n"
             .to_string();
     }
     "\n## If you are blocked or the work is bigger than estimated\n\n\
-     Two verbs on the `boss` CLI tell the coordinator you need help. Calling one is always the \
+     Two verbs on the `boss` CLI flag that you need help. Calling one is always the \
      right move over pushing broken/unvalidated work or idling silently. Submission is synchronous \
      and validated immediately, so a malformed call fails right away with a typed error you can fix \
      and retry — unlike a marker line, which the engine only reads long after you've moved on:\n\n\
@@ -967,7 +980,7 @@ pub(crate) fn worker_escalation_protocol_directive(seam_enabled: bool) -> String
      \"$BOSS_BIN\" propose effort-escalation --level large --reason \"ran into a multi-subsystem race; description didn't mention the engine/app boundary\"\n\
      ```\n\n\
      - **`\"$BOSS_BIN\" propose blocked --reason \"<why>\"`** — you cannot proceed without a \
-     human/coordinator decision: a build failure you can't resolve, an ambiguous requirement, \
+     human decision: a build failure you can't resolve, an ambiguous requirement, \
      conflicting instructions, a missing credential. Example:\n\n\
      ```\n\
      \"$BOSS_BIN\" propose blocked --reason \"bazel build fails with E0583 for a newly added file, survives clean --expunge; need guidance or explicit direction before proceeding\"\n\
@@ -977,8 +990,8 @@ pub(crate) fn worker_escalation_protocol_directive(seam_enabled: bool) -> String
      own duration, your own context usage, your own decision to stop, or that a required step \
      \"was not completed\" is not a valid reason: none of those are blockers, they are you \
      choosing to stop, and this call is not a channel for that.\n\n\
-     Either call files a coordinator-visible attention item immediately and pauses the \"produce a \
-     PR\" auto-nudge loop for this run until a coordinator acks it, so you will not be re-prompted \
+     Either call files an attention item for a human immediately and pauses the \"produce a \
+     PR\" auto-nudge loop for this run until it is acknowledged, so you will not be re-prompted \
      to \"produce a PR\" while one is pending. Do NOT stop silently or push code you know is broken \
      to work around a blocker: call `\"$BOSS_BIN\" propose` instead.\n\n\
      **Bootstrap fallback only:** if `\"$BOSS_BIN\" propose` itself is unreachable (the mechanism is down, \
@@ -1099,7 +1112,7 @@ pub(crate) fn run_done_directive(
          a successful `bazel build` is a precondition for this push. Bazel \
          remains the source of truth: do not bypass or weaken checks, and still stop for required \
          approval to relax a check, missing credentials or authorization, genuine instruction \
-         conflicts or contradictory briefs."
+         conflicts or contradictory requirements."
             .to_string()
     } else {
         "For validation failures, this is a narrow exception to the earlier gate/stop rules, including \
@@ -1114,7 +1127,7 @@ pub(crate) fn run_done_directive(
          your change cannot cause it), recording the target, failure, attempts and evidence in the \
          PR body; merely calling it flaky is not evidence. Bazel remains the source of truth: do not \
          bypass or weaken checks, and still stop for required approval to relax a check, missing \
-         credentials or authorization, genuine instruction conflicts or contradictory briefs."
+         credentials or authorization, genuine instruction conflicts or contradictory requirements."
             .to_string()
     };
     let question_guidance = operator_question::GUIDANCE;
@@ -1146,7 +1159,7 @@ pub(crate) fn run_done_directive(
      ```\n\
      {boss} propose done --outcome blocked --summary \"<blocker>\" --question \"Approve including the remaining files needed for this fix?\" --answer-type yes-no --explanation \"<Context, Yes, No, Recommendation, and optional Details; see below>\"\n\
      ```\n\n\
-     Say in plain words what is blocked and what Yes will let you do; put check names and numbers in Details. \"Can I proceed?\" is not specific enough. Put the justification in --explanation, not the question.{question_companion} One question per run: ask the most blocking decision and disclose any further decisions in the explanation. Tasks and chores alike wait durably for the answer as a question card on the kanban; Yes appends authorization and restarts in the preserved workspace, No leaves the item blocked in Backlog.\n\n\
+     Say in plain words what is blocked and what Yes will let you do; put check names and numbers in Details. \"Can I proceed?\" is not specific enough. Put the justification in --explanation, not the question.{question_companion} One question per run: ask the most blocking decision and disclose any further decisions in the explanation. The run waits durably for the answer; Yes appends authorization and restarts in the preserved workspace, No leaves the task blocked.\n\n\
      {question_guidance}\n\n\
      **When the decision is a choice among several options rather than approve/decline, use `--answer-type multiple-choice`.** Pass two to six short, distinct, single-line labels with `--choices`; the card shows one button per label. Use `--question` for the decision itself and an `--explanation` with only `Context:` (say what each option leads to), `Recommendation:` and optional `Details:` — no `Yes:` or `No:` sections, which are rejected for this type. Example:\n\n\
      ```\n\
@@ -1155,10 +1168,10 @@ pub(crate) fn run_done_directive(
      The same one-question-per-run rule applies. The chosen label is recorded verbatim and the task restarts in the preserved workspace; your next run's brief ends with a `## Operator answer` section naming the question and the chosen option. Act on that choice; it grants no authorization beyond the decision itself.\n\n\
      **When your task cannot proceed until some other, unrelated piece of work lands first, ask to create a prerequisite task instead of a plain Yes/No.** Example: a CI-fix revision finds that a pre-existing test fixture races retention cleanup; that needs its own fix on main before the PR's CI can go green, and it is out of scope for you. Propose that work as its own task:\n\n\
      ```\n\
-     {boss} propose done --outcome blocked --summary \"<blocker>\" --answer-type create-prerequisite-task --prerequisite-name \"<short task name>\" --prerequisite-brief \"<self-contained brief>\" --explanation \"<Context, Yes, No, Recommendation, and optional Details; see above>\"\n\
+     {boss} propose done --outcome blocked --summary \"<blocker>\" --answer-type create-prerequisite-task --prerequisite-name \"<short task name>\" --prerequisite-brief \"<self-contained description>\" --explanation \"<Context, Yes, No, Recommendation, and optional Details; see above>\"\n\
      ```\n\n\
-     The brief must stand alone: the prerequisite becomes a separate chore that a different worker picks up cold, seeing only that brief. Name the files, the failure and its evidence, and what done looks like; never refer to \"this task\", \"above\", or your own session. Do not pass `--question` — the engine words it for the operator (\"Create prerequisite task '<name>'? This task will wait for it.\"). The operator still answers Yes or No. Yes creates the chore in this product (or, if an equivalent open task already exists, links to it instead), makes your task depend on it, appends a dated note to your brief, and redispatches your task once the prerequisite is done; No leaves the task blocked in Backlog like any declined question. Use this only for work that blocks your task: `{boss} propose followup-task` remains the non-blocking path for nice-to-have work later. The one-question-per-run rule applies here too.\n\n\
-     Before asking, check the brief for a `## Operator authorization` or `## Operator answer` section. If it already grants the authorization or makes the decision needed, proceed and cite it in the PR body. Do not ask for decisions you are allowed to make, or use questions to hand back work that is merely hard. The answer authorizes exactly the question; it does not disable or bypass repository checks.\n\n\
+     The description must stand alone: the prerequisite becomes a separate task that a different worker picks up cold, seeing only that description. Name the files, the failure and its evidence, and what done looks like; never refer to \"this task\", \"above\", or your own session. Do not pass `--question` — the engine words it for the repo owner (\"Create prerequisite task '<name>'? This task will wait for it.\"). The repo owner still answers Yes or No. Yes creates the task in this product (or, if an equivalent open task already exists, links to it instead), makes your task depend on it, appends a dated note to your task description, and redispatches your task once the prerequisite is done; No leaves the task blocked like any declined question. Use this only for work that blocks your task: `{boss} propose followup-task` remains the non-blocking path for nice-to-have work later. The one-question-per-run rule applies here too.\n\n\
+     Before asking, check the task description for a `## Operator authorization` or `## Operator answer` section. If it already grants the authorization or makes the decision needed, proceed and cite it in the PR body. Do not ask for decisions you are allowed to make, or use questions to hand back work that is merely hard. The answer authorizes exactly the question; it does not disable or bypass repository checks.\n\n\
      {gate_exception}\n\n\
      To flag a concern while continuing, {blocked_while_continuing} the blocker and pauses the \
      nudge loop; it does NOT end the run. Only `{boss} propose done --outcome blocked` ends the \
@@ -1205,7 +1218,7 @@ pub(crate) fn run_done_directive(
 /// fallback (see [`crate::deferred_scope`]).
 pub(crate) fn deferred_scope_directive(seam_enabled: bool) -> String {
     if !seam_enabled {
-        return "\n## If you deliver less than the brief asks: declare the gap\n\n\
+        return "\n## If you deliver less than the task asks: declare the gap\n\n\
      If you consciously decide to narrow scope — implement part of what was asked and \
      deliberately leave a piece undone (it needs plumbing/data/access this run doesn't have, \
      it's a genuinely separate concern, etc.) rather than doing it — emit one line per deferred \
@@ -1215,7 +1228,7 @@ pub(crate) fn deferred_scope_directive(seam_enabled: bool) -> String {
      ```\n\n\
      Both fields are double-quoted and required. Example:\n\n\
      ```\n\
-     [deferred-scope] summary=\"wiring for the third data source\" reason=\"needs a new ingestion pipeline; out of scope for this wiring-only chore\"\n\
+     [deferred-scope] summary=\"wiring for the third data source\" reason=\"needs a new ingestion pipeline; out of scope for this wiring-only change\"\n\
      ```\n\n\
      Do NOT write \"filed as a followup\", \"tracked separately\", or similar in your PR body or \
      summary as a substitute — you have no ability to file or track anything, that sentence would \
@@ -1223,7 +1236,7 @@ pub(crate) fn deferred_scope_directive(seam_enabled: bool) -> String {
      `[deferred-scope]` marker is the channel that actually creates one: it is recorded against \
      this task and surfaced to a human, who decides whether to spin up a followup or accept the \
      gap. This is distinct from the followups mechanism above, which proposes brand-new \
-     out-of-scope work you noticed — use `[deferred-scope]` specifically for work the brief asked \
+     out-of-scope work you noticed — use `[deferred-scope]` specifically for work the task asked \
      for that you did not deliver.\n\n\
      **The marker is the only sanctioned channel for declaring deferred scope — prose is not \
      enough.** If your PR body, a summary section, or your final response says anything that \
@@ -1236,7 +1249,7 @@ pub(crate) fn deferred_scope_directive(seam_enabled: bool) -> String {
      marker costs one line and is parsed even if malformed, so there is no excuse to skip it.\n"
             .to_string();
     }
-    "\n## If you deliver less than the brief asks: declare the gap\n\n\
+    "\n## If you deliver less than the task asks: declare the gap\n\n\
      If you consciously decide to narrow scope — implement part of what was asked and \
      deliberately leave a piece undone (it needs plumbing/data/access this run doesn't have, \
      it's a genuinely separate concern, etc.) rather than doing it — call `\"$BOSS_BIN\" propose \
@@ -1246,7 +1259,7 @@ pub(crate) fn deferred_scope_directive(seam_enabled: bool) -> String {
      ```\n\n\
      Both flags are required. Example:\n\n\
      ```\n\
-     \"$BOSS_BIN\" propose deferred-scope --summary \"wiring for the third data source\" --reason \"needs a new ingestion pipeline; out of scope for this wiring-only chore\"\n\
+     \"$BOSS_BIN\" propose deferred-scope --summary \"wiring for the third data source\" --reason \"needs a new ingestion pipeline; out of scope for this wiring-only change\"\n\
      ```\n\n\
      Submission is synchronous and validated immediately — a malformed call fails right away with \
      a typed error you can fix and retry, unlike a marker line the engine only reads long after \
@@ -1256,7 +1269,7 @@ pub(crate) fn deferred_scope_directive(seam_enabled: bool) -> String {
      channel that actually creates a durable record: it is recorded against this task and \
      surfaced to a human, who decides whether to spin up a followup or accept the gap. This is \
      distinct from the followups mechanism above, which proposes brand-new out-of-scope work you \
-     noticed — use `\"$BOSS_BIN\" propose deferred-scope` specifically for work the brief asked for that \
+     noticed — use `\"$BOSS_BIN\" propose deferred-scope` specifically for work the task asked for that \
      you did not deliver.\n\n\
      **The verb is the only sanctioned channel for declaring deferred scope — prose is not \
      enough.** If your PR body, a summary section, or your final response says anything that \
@@ -1323,7 +1336,7 @@ fn no_op_completion_directive(seam_enabled: bool) -> String {
          an empty diff because the work is done is a success terminal, not an error. Do NOT declare \
          `no-changes-needed` to abandon work you simply found hard or are blocked on — if you are \
          blocked, {blocked_pointer} (see \"If you are blocked or the work is bigger than estimated\" \
-         above), and the engine will route it to the coordinator without nudging you to produce a PR.\n"
+         above), and the engine will route it for a human to look at without nudging you to produce a PR.\n"
     ));
     out
 }
@@ -1635,7 +1648,7 @@ fn compose_revision_directive(
             "The engine recovered this revision's prior work from its recorded execution bookmark. The engine did NOT run `cube workspace goto` for this \
              run, and running it now — or `jj new main` — would discard the preserved commits. Stay at `@`: \
              inspect `jj status`, `jj diff`, and `jj log -r '::@' -n 10` to see what the prior worker left, \
-             reconcile it with this brief and current `main`, then continue making changes directly.\n",
+             reconcile it with this task and current `main`, then continue making changes directly.\n",
         );
     } else if pr_number != "?" {
         if is_conflict_resolution {
@@ -1690,7 +1703,7 @@ fn compose_revision_directive(
     out.push_str(
         "      Never pass the body as an inline `--body` argument — the shell evaluates backticks and `$(...)`.\n",
     );
-    out.push_str("   d. What to write: rewrite the description so it is accurate and self-contained for reviewers NOW. The main summary must describe the CURRENT state — what the PR does, not what it used to do. Do NOT append a changelog that leaves a contradictory original summary above it; instead correct the summary in place. A brief \"Changes in this revision\" note may follow the corrected summary if it adds context, but it must never contradict or overshadow the corrected summary.\n");
+    out.push_str("   d. What to write: rewrite the description so it is accurate and self-contained for reviewers NOW. The main summary must describe the CURRENT state — what the PR does, not what it used to do. Do NOT append a changelog that leaves a contradictory original summary above it; instead correct the summary in place. A short \"Changes in this revision\" note may follow the corrected summary if it adds context, but it must never contradict or overshadow the corrected summary.\n");
     out.push_str("   e. A revision may skip steps c–d ONLY if it changes ZERO source files (e.g. a PR-description-only fix or a pure markdown/comment edit) AND involves no rebase, merge, or conflict resolution. Rebase and conflict-resolution revisions do NOT qualify for this skip — they touch compiled output and must go through the full description review. The title check (step b2) is NEVER skippable — always verify it.\n");
     out.push_str("   f. If, after the comparison in step b, the description already matches the PR's current state, do NOT edit it just to have touched it — leave it as-is and say so explicitly in your final response (e.g. \"PR description verified accurate against this revision's diff; no edit needed\"). The bar is whether the description describes the PR's current state, not whether this revision left a visible mark on it.\n");
     out.push('\n');
@@ -1699,7 +1712,7 @@ fn compose_revision_directive(
         "   a. This applies ONLY when this task's description (above, in \"What this revision \
          should change\") enumerates review findings — look for one or more `### [<severity>] \
          <title>` sections, the shape an automated review pass renders. If this revision is \
-         responding to a plain operator instruction with no such findings, SKIP the comment \
+         responding to a plain instruction from the repo owner with no such findings, SKIP the comment \
          entirely: do not post an empty table, and state in your final response that the \
          findings-status comment was not applicable.\n",
     );
@@ -1737,7 +1750,7 @@ fn compose_revision_directive(
     );
     out.push_str(
         "   e. Never reference a finding by an internal row id in this comment — title or \
-         `file:line` only, per this repo's editorial rules against Boss-internal id shapes in \
+         `file:line` only, per this repo's editorial rules against internal id shapes in \
          worker-authored text.\n",
     );
     out.push_str(
@@ -1901,7 +1914,7 @@ Write a JSON evidence file, for example `/tmp/queue-ci-evidence.json`:
   }]
 }
 ```
-For a failing lint job (the captured check name's last `/` segment is the Buildkite job label), record `checkleft run` and its output as that job's verification command. Include every failing check name and job URL and every required build/test invocation. Only successful verification of this tree permits a terminal declaration. The engine rejects missing, incomplete, wrong-queue or failing evidence every time; repeating the declaration does not waive the gate. Do not classify from green PR-head checks, hand back coordinator resubmission, or use branch-CI noop/retrigger shortcuts for this queue failure. `engine ci classify` requires `--queue-ci-evidence-file` for every class except `tractable`; `tractable` is metadata and can be recorded before verification.
+For a failing lint job (the captured check name's last `/` segment is the Buildkite job label), record `checkleft run` and its output as that job's verification command. Include every failing check name and job URL and every required build/test invocation. Only successful verification of this tree permits a terminal declaration. The engine rejects missing, incomplete, wrong-queue or failing evidence every time; repeating the declaration does not waive the gate. Do not classify from green PR-head checks, hand resubmission back to someone else, or use branch-CI noop/retrigger shortcuts for this queue failure. `engine ci classify` requires `--queue-ci-evidence-file` for every class except `tractable`; `tractable` is metadata and can be recorded before verification.
 
 If verification passed but a genuine external blocker prevents recovery, both `"$BOSS_BIN" engine ci mark-failed --attempt-id <attempt> --reason <reason> --queue-ci-evidence-file /tmp/queue-ci-evidence.json` and `"$BOSS_BIN" propose done --outcome blocked --summary <reason> --queue-ci-evidence-file /tmp/queue-ci-evidence.json` require that evidence. State the main SHA, targets and results in the summary too. An unsatisfied gate must stay loud; do not claim completion.
 "#);
@@ -1918,7 +1931,7 @@ gh api graphql -f query='mutation($id: ID!, $head: GitObjectID!) { enqueuePullRe
 If already queued, read its existing entry ID with `gh api graphql -f query='query($id: ID!) { node(id: $id) { ... on PullRequest { headRefOid mergeQueueEntry { id enqueuedAt } } } }' -f id='<PR node ID>'`. Put the returned entry ID in `queue_entry_id` and its `enqueuedAt` in `queue_entry_enqueued_at` in the evidence file; the engine checks the receipt against GitHub after you declare and flags a mismatch. A rejected mutation is not a receipt: resolve its error, do not loop enqueue until green. This requests a normal queue build with all checks still required. Do not poll CI to completion.
 "#);
     } else {
-        out.push_str("\n### Re-enter the Trunk queue\n\nDeclare the verified revision delivered. Boss's existing poller resubmits once the revision is in review and head CI is green; it does not require a changed head SHA. Do not submit a competing queue request.\n");
+        out.push_str("\n### Re-enter the Trunk queue\n\nDeclare the verified revision delivered. The engine's existing poller resubmits once the revision is in review and head CI is green; it does not require a changed head SHA. Do not submit a competing queue request.\n");
     }
     out.push_str("\nFinish with `\"$BOSS_BIN\" propose done --outcome delivered --summary <main-SHA-and-target-results> --queue-ci-evidence-file /tmp/queue-ci-evidence.json`. Verified requeue is a delivery even when no code changed. This queue-specific completion path replaces any generic requirement to produce a diff or new head SHA.\n");
     out.push_str(check_bypass_prohibition_text());
@@ -1969,8 +1982,8 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
          drop one side to make the conflict disappear. Deleting the harder-to-merge side is \
          never the default resolution.\n\
          - **If you believe one side is genuinely superseded, STOP.** Do not delete it and \
-         rationalize the removal. Deletion of code a merged parent added is an operator \
-         decision, not a resolution choice: run `\"$BOSS_BIN\" engine conflicts mark-failed <attempt-id> \
+         rationalize the removal. Deletion of code a merged parent added is a decision \
+         for the repo owner, not a resolution choice: run `\"$BOSS_BIN\" engine conflicts mark-failed <attempt-id> \
          --reason product_decision_required`, comment on the PR explaining the situation, and \
          do NOT push a resolution that drops the feature.\n\
          - **Any removal of code a merged parent added must be called out explicitly** in your \
@@ -2162,7 +2175,7 @@ fn compose_conflict_ground_truth_fragment(attempt: &ConflictResolution) -> Strin
          recomputing — it is **not** a clean bill of health; re-run the query after the \
          rebase below. Only `mergeable: MERGEABLE` supports a claim that the conflict is \
          already resolved.\n\n\
-         **2. Rebase — this is step 3 of your brief and it is not optional:**\n\n\
+         **2. Rebase — this is step 3 of these instructions and it is not optional:**\n\n\
          ```\n\
          {cube} workspace rebase\n\
          ```\n\n\
@@ -2505,7 +2518,8 @@ fn compose_ci_remediation_prompt(
     if let Some(change) = cube_change_id {
         prompt.push_str(&format!("**Local change**: `{change}`\n"));
     }
-    prompt.push_str(&format!("**Work item**: `{}`\n\n", work_item_name(work_item),));
+    prompt.push_str(&format!("**Task**: `{}`\n\n", work_item_name(work_item),));
+    prompt.push_str(project_terms_directive().trim_start());
 
     if crate::work::queue_ci_evidence::queue_ci_verification_required(attempt) {
         prompt.push_str(&compose_queue_ci_fragment(attempt));

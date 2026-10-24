@@ -139,9 +139,9 @@ static GROK_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
 /// isn't asking anything answerable by a default, it's entered a UI whose
 /// only exit is a human pressing a key. Planning and recording a plan are
 /// still fine; blocking on approval of one is not.
-const GROK_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
+const GROK_AGENT_RULES_PREAMBLE: &str = "You are running inside a managed worker session. The engine\n\
      spawned you in a leased cube workspace and observes this session\n\
-     via Grok hooks under a Boss-owned GROK_HOME.\n\
+     via Grok hooks under an engine-owned GROK_HOME.\n\
      For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
      `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
      strong stated justification.\n\
@@ -1081,7 +1081,7 @@ mod tests {
             "preamble must still reserve asking for genuinely blocking cases: {preamble}",
         );
         // The pre-existing observability paragraph must survive untouched.
-        assert!(preamble.contains("via Grok hooks under a Boss-owned GROK_HOME"));
+        assert!(preamble.contains("via Grok hooks under an engine-owned GROK_HOME"));
     }
 
     /// Extends the ask-threshold guidance to cover interactive approval

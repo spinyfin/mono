@@ -1,6 +1,6 @@
-# Boss worker rules
+# Worker rules
 
-You are running inside a Boss-managed worker session. The engine
+You are running inside a managed worker session. The engine
 spawned you in a leased cube workspace and observes this session
 via claude hooks.
 For ordinary pre-push validation, run `checkleft run` with no flags; use
@@ -50,7 +50,7 @@ do NOT commit, push, or open a PR — stop and explain.
 
 ## Checking your own PR's state
 
-Boss already stores most of what you'd otherwise ask GitHub for.
+The engine already stores most of what you'd otherwise ask GitHub for.
 These read your own PR only — never another run's — and cost one
 local round trip against the engine, not a GitHub API call:
 
@@ -65,7 +65,7 @@ not the revision), so it reads as "no PR" even when one exists.
 ```sh
 "$BOSS_BIN" pr status --json
 ```
-This is Boss's **last stored observation from the merge poller,
+This is the engine's **last stored observation from the merge poller,
 not live GitHub truth** — `observed_at` (Unix epoch seconds) is
 the timestamp of that observation, not of your call. Right after
 a push, the stored snapshot usually still reflects the *pre-push*
@@ -82,8 +82,8 @@ or a hang. Never loop calling `--refresh` waiting for a state
 change: the engine's own merge poller is what watches your PR to
 green after you push, not you — the same "do not babysit CI"
 principle your task prompt states applies here too.
-- `"$BOSS_BIN" pr body` — the PR title and body/description Boss
-snapshotted when this run started, for a read-modify-write of
+- `"$BOSS_BIN" pr body` — the PR title and body/description the
+engine snapshotted when this run started, for a read-modify-write of
 the description without a `gh pr view` round trip. If the
 response's `body` is null (`--json`) or says "(none stored)"
 (text), it means this run began a brand-new PR flow — there is
@@ -245,7 +245,7 @@ config loading, caching, logging wiring, retry/backoff, or similar
 infrastructure), search the repo for an existing implementation
 first. If one exists, reuse or extend it instead of writing a new
 one. If duplication is genuinely necessary, say so explicitly in the
-PR description with the reason — a justified, operator-visible
+PR description with the reason — a justified, visible
 exception is the only way to avoid a "revision required"
 reuse/duplication finding from the automated reviewer.
 
@@ -254,10 +254,10 @@ reuse/duplication finding from the automated reviewer.
 - Do not modify files outside this workspace. Sibling workspaces
 belong to other workers.
 - Do not modify cube's database, lease state, or workspace registry.
-- `~/Library/Application Support/Boss/` is coordinator/engine-only.
-Never read, write, or touch it. Ask the coordinator for
-work-taxonomy context; do not query the DB yourself.
-`bossctl` is coordinator-only.
+- `~/Library/Application Support/Boss/` is engine-only.
+Never read, write, or touch it. Do not query the database
+yourself; ask for any task or product context you need.
+`bossctl` is not available to workers.
 
 ## Running Boss itself
 
@@ -308,9 +308,9 @@ Attach them:
 ```
 
 The engine stores the image outside this workspace (which is
-recycled after your run), for your own verification and for an
-operator looking at this run locally. `"$BOSS_BIN" attach --list` shows
-what this work item already has, across runs.
+recycled after your run), for your own verification and for
+someone looking at this run locally. `"$BOSS_BIN" attach --list` shows
+what this task already has, across runs.
 
 Validation is immediate and typed: a path outside this workspace or
 a temp dir, a file that is not really a PNG/JPEG, an oversize render,
@@ -330,7 +330,7 @@ a PR body needs evidence a GitHub reader can actually open, use
 something that is — a CI artifact, a deploy preview, a code
 reference.
 
-## Coordinator
+## Probes
 
-The coordinator may probe this session between turns. Treat probes
-as questions from a human reviewer — short, specific answers.
+Messages may arrive between turns. Treat them as questions from a
+human reviewer — short, specific answers.

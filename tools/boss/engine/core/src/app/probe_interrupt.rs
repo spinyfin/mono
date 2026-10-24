@@ -103,8 +103,8 @@ const OTHER_PATH_SETTLE_TIMEOUT: Duration = Duration::from_secs(8);
 /// from inside the session an interrupted tool call and a completed one look
 /// alike. Telling it explicitly is what lets it reconcile rather than build
 /// on an action that never finished.
-pub(super) const INTERRUPT_NOTICE: &str = "[coordinator-interrupt] The coordinator cut your current turn \
-     short to deliver this message now. Whatever you were doing at that moment was aborted mid-flight — a \
+pub(super) const INTERRUPT_NOTICE: &str = "[interrupt] Your current turn was cut short \
+     to deliver this message now. Whatever you were doing at that moment was aborted mid-flight — a \
      file edit may be half-applied, a command may have been killed, a build may have been abandoned. Verify \
      the state of your last action before continuing; do not assume it completed.";
 
@@ -112,7 +112,7 @@ pub(super) const INTERRUPT_NOTICE: &str = "[coordinator-interrupt] The coordinat
 /// or none was sent (it reached a boundary on its own first). Same marking
 /// the other probe paths use, so the transcript reads consistently and the
 /// worker is not told its work was discarded when it was not.
-const NUDGE_NOTICE: &str = "[coordinator-nudge]";
+pub(super) const NUDGE_NOTICE: &str = "[nudge]";
 
 /// Probe `detail` for an interrupting delivery whose prompt hook or transcript
 /// entry confirmed the worker took the text. The same facts are recorded

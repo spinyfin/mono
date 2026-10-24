@@ -125,8 +125,8 @@ async fn run_attach_submit(ctx: &RunContext, path: PathBuf, caption: Option<Stri
                             println!("  gallery: {gallery}");
                             println!(
                                 "This link is only reachable on this machine — do not put it (or any other \
-                                 localhost link) in your PR body. It's for your own verification and for an \
-                                 operator looking at this run locally."
+                                 localhost link) in your PR body. It's for your own verification and for \
+                                 someone looking at this run locally."
                             );
                         }
                         // Stored, but nothing is serving it — say so instead

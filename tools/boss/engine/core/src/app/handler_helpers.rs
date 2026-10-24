@@ -1193,7 +1193,7 @@ pub(super) fn active_chore_run_id(server_state: &ServerState, item: &WorkItem) -
     server_state.live_worker_states.run_id_for_work_item(&task.id)
 }
 
-/// Build the `[chore-update]` notice text. Returns `None` when neither
+/// Build the `[task-update]` notice text. Returns `None` when neither
 /// name nor description actually changed (so the caller can skip the
 /// send).
 pub(super) fn build_chore_update_message(
@@ -1217,7 +1217,7 @@ pub(super) fn build_chore_update_message(
     }
     let body = changes.join("\n");
     Some(format!(
-        "[chore-update] The chore you're working on was edited.\nField changes:\n{body}\nPlease re-read the spec and adjust your in-flight work to match. If the change invalidates work you've already done, surface that in your final response.\n"
+        "[task-update] The task you're working on was edited.\nField changes:\n{body}\nPlease re-read the task and adjust your in-flight work to match. If the change invalidates work you've already done, surface that in your final response.\n"
     ))
 }
 

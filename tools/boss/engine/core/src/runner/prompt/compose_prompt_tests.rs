@@ -9,6 +9,7 @@ use crate::work::Task;
 
 mod blocked_recovery;
 mod invocation;
+mod vocabulary_leakage;
 
 #[test]
 fn execution_prompts_include_bazel_caching_rule_once() {
@@ -2268,7 +2269,7 @@ fn editorial_rules_block_always_rendered_with_baked_in_rules() {
         "baked-in identifier rule must be present:\n{prompt}",
     );
     assert!(
-        prompt.contains("Boss worker"),
+        prompt.contains("Do not describe the tooling or process that produced the work"),
         "baked-in phrase rule must be present:\n{prompt}",
     );
 }

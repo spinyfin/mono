@@ -177,12 +177,12 @@ fn run_done_seam_on_worker_signal_seam_off_teaches_summary_not_blocked_verb() {
     ));
     assert!(
         prompt.contains(
-            "Before asking, check the brief for a `## Operator authorization` or `## Operator answer` section."
+            "Before asking, check the task description for a `## Operator authorization` or `## Operator answer` section."
         )
     );
     assert!(prompt.contains("--answer-type multiple-choice --choices \"Gradual\" \"All at once\""));
     assert!(prompt.contains("your next run's brief ends with a `## Operator answer` section"));
-    assert!(prompt.contains("### Write operator questions for someone arriving cold"));
+    assert!(prompt.contains("### Write questions for someone arriving cold"));
     assert!(prompt.contains("Context:\n"));
     assert!(prompt.contains("Yes:\n"));
     assert!(prompt.contains("No:\n"));
@@ -194,12 +194,12 @@ fn run_done_seam_on_worker_signal_seam_off_teaches_summary_not_blocked_verb() {
     assert!(prompt.contains("This writing contract does not change when a question is warranted"));
     assert!(prompt.contains("Use the typed question flags on a blocked declaration"));
     assert!(prompt.contains("Yes appends authorization and restarts in the preserved workspace"));
-    assert!(prompt.contains("No leaves the task blocked in Backlog"));
+    assert!(prompt.contains("No leaves the task blocked."));
     assert!(
         prompt.contains("--answer-type create-prerequisite-task --prerequisite-name"),
         "blocked guidance must teach the prerequisite-task question type:\n{prompt}",
     );
-    assert!(prompt.contains("The brief must stand alone"));
+    assert!(prompt.contains("The description must stand alone"));
     assert!(prompt.contains("remains the non-blocking path for nice-to-have work later"));
     assert!(
         prompt.contains("the marker is Stop-boundary-only"),

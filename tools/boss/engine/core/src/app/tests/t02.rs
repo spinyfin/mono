@@ -2344,7 +2344,7 @@ fn build_chore_update_message_returns_none_when_nothing_changed() {
 #[test]
 fn build_chore_update_message_includes_name_diff() {
     let msg = build_chore_update_message("old name", "new name", "desc", "desc").expect("should produce a message");
-    assert!(msg.contains("[chore-update]"), "must contain the tag");
+    assert!(msg.contains("[task-update]"), "must contain the tag");
     assert!(msg.contains("old name"), "must contain the old name");
     assert!(msg.contains("new name"), "must contain the new name");
     assert!(
@@ -2357,9 +2357,13 @@ fn build_chore_update_message_includes_name_diff() {
 fn build_chore_update_message_includes_description_diff() {
     let msg = build_chore_update_message("name", "name", "old description", "new description")
         .expect("should produce a message");
-    assert!(msg.contains("[chore-update]"));
+    assert!(msg.contains("[task-update]"));
     assert!(msg.contains("old description"));
     assert!(msg.contains("new description"));
+    // The notice is engine-authored prose a worker reads, so it must not teach
+    // the engine's internal vocabulary.
+    let boilerplate = msg.replace("old description", "").replace("new description", "");
+    crate::prose_vocabulary::assert_no_forbidden_prose("task update notice", &boilerplate);
 }
 
 #[test]
@@ -2509,7 +2513,7 @@ async fn chore_update_notify_sends_message_to_live_worker() {
 
     let pasted = String::from_utf8(runner.stdin().last().cloned().unwrap_or_default()).unwrap();
     assert!(
-        pasted.contains("[chore-update]"),
+        pasted.contains("[task-update]"),
         "message must contain [chore-update] tag: {pasted:?} calls={:?}",
         runner.calls()
     );

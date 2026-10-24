@@ -320,14 +320,14 @@ static CODEX_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
 /// The block says nothing to discourage backgrounding: a job deliberately left
 /// running is covered by the engine-wide `propose wait` rule, which the block
 /// points at in one sentence.
-const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
+const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a managed worker session. The engine\n\
      spawned you in a leased cube workspace and observes this session\n\
      via the Codex rollout JSONL file in this run's isolated CODEX_HOME.\n\
      For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
      `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
      strong stated justification.\n\
      \n\
-     Two tool routes are blocked in this session, because Boss's command\n\
+     Two tool routes are blocked in this session, because the command\n\
      guardrails cannot see them:\n\
      \n\
      - **Do not use `mcp__*` app tools** (the Codex GitHub/Gmail/Drive\n\

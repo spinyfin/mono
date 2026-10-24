@@ -630,7 +630,7 @@ pub fn render_triage_claude_md(lease_id: &str, automation_outcome_proposals_seam
         decision_contract = claude_md_decision_contract(automation_outcome_proposals_seam_enabled),
         lease = lease_id,
         absolute_paths = crate::prompt_fragments::absolute_paths_fragment(),
-        boundaries_and_coordinator = crate::prompt_fragments::boundaries_and_coordinator_fragment(),
+        boundaries_and_coordinator = crate::prompt_fragments::boundaries_and_probes_fragment(),
     )
 }
 

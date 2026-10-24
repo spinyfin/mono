@@ -30,7 +30,7 @@ use boss_protocol::{ProbeDeliveryState, ProbeInterruptOutcome, WorkerEvent};
 use boss_tmux::{CommandOutput, CommandRunner, Tmux};
 
 use crate::app::executions;
-use crate::app::probe_interrupt::INTERRUPT_NOTICE;
+use crate::app::probe_interrupt::{INTERRUPT_NOTICE, NUDGE_NOTICE};
 
 use super::tmux_stub::RecordingPaneRunner;
 
@@ -1473,4 +1473,12 @@ async fn interrupted_reply_read_cannot_resurrect_settled_snapshot() {
     assert!(state.take_previous_probe_reply(&run).is_none());
     assert_eq!(state.probe_lifecycle_state(&first), Some(ProbeDeliveryState::Orphaned));
     assert_eq!(state.in_flight_probe_id(&run), Some(second));
+}
+
+/// Both markers prefix text the worker reads in its own transcript, so they
+/// must not teach it the engine's internal vocabulary.
+#[test]
+fn probe_notices_avoid_internal_vocabulary() {
+    crate::prose_vocabulary::assert_no_forbidden_prose("interrupt notice", INTERRUPT_NOTICE);
+    crate::prose_vocabulary::assert_no_forbidden_prose("nudge notice", NUDGE_NOTICE);
 }

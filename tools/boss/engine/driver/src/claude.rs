@@ -736,7 +736,7 @@ pub const REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND: &str = python_command_guard!(
 /// The driver-specific preamble for the agent-rules file. Names the hook
 /// mechanism ("claude hooks") and is injected at the top of `CLAUDE.md` by
 /// `boss_engine::worker_setup::render_claude_md`.
-const CLAUDE_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
+const CLAUDE_AGENT_RULES_PREAMBLE: &str = "You are running inside a managed worker session. The engine\n\
      spawned you in a leased cube workspace and observes this session\n\
      via claude hooks.\n\
      For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
@@ -2091,8 +2091,8 @@ mod tests {
             "preamble must name 'claude hooks': {preamble}"
         );
         assert!(
-            preamble.contains("Boss-managed"),
-            "preamble must describe Boss session: {preamble}"
+            preamble.contains("managed worker session"),
+            "preamble must describe the managed worker session: {preamble}"
         );
         assert!(
             preamble.contains("checkleft run") && preamble.contains("checkleft --all"),
@@ -2259,12 +2259,12 @@ mod tests {
         // The self-check survives: the worker still checks its own plan
         // against the work item before writing code.
         assert!(
-            addendum.contains("Check that plan against the work item's description yourself"),
+            addendum.contains("Check that plan against the task description yourself"),
             "addendum must keep the self-check; got: {addendum}",
         );
         // The correction is explicit, not merely an omission.
         assert!(
-            addendum.contains("do not ask the operator to confirm scope"),
+            addendum.contains("do not ask anyone to confirm scope"),
             "addendum must explicitly redirect the confirmation to the worker itself; got: {addendum}",
         );
         // Genuinely underspecified work still has an instruction: pick, say

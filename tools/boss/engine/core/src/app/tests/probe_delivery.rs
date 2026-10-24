@@ -105,7 +105,7 @@ async fn probe_injects_mid_turn_for_a_working_claude_worker() {
 
     let text = runner.last_paste();
     assert_eq!(
-        text, "[coordinator-nudge] re-read the spec",
+        text, "[nudge] re-read the spec",
         "mid-turn probes stay marked in the transcript so the worker and human readers can spot them",
     );
     // Popped from the queue (delivered), not left behind for Stop.
@@ -136,7 +136,7 @@ async fn probe_injects_mid_turn_for_a_working_codex_worker() {
     dispatch_probe_on_post_tool_use(&server_state, &post_tool_use(&run_id)).await;
 
     let text = runner.last_paste();
-    assert_eq!(text, "[coordinator-nudge] re-read the spec");
+    assert_eq!(text, "[nudge] re-read the spec");
     assert!(
         server_state.pop_pending_probe(&run_id).is_none(),
         "a delivered probe must not remain queued",
@@ -274,7 +274,7 @@ async fn probe_run_steers_a_mid_turn_worker_without_any_boundary() {
     }
     assert_eq!(
         text.as_deref(),
-        Some("[coordinator-nudge] stop — you are building the wrong target"),
+        Some("[nudge] stop — you are building the wrong target"),
     );
     assert!(
         server_state.pop_pending_probe(&run_id).is_none(),
@@ -303,7 +303,7 @@ async fn a_second_probe_waits_for_the_first_probes_reply_cycle() {
 
     dispatch_probe_on_post_tool_use(&server_state, &post_tool_use(&run_id)).await;
     let text = runner.last_paste();
-    assert_eq!(text, "[coordinator-nudge] first");
+    assert_eq!(text, "[nudge] first");
 
     // Second tool boundary while the first probe still owes a reply: no write.
     dispatch_probe_on_post_tool_use(&server_state, &post_tool_use(&run_id)).await;
@@ -333,13 +333,13 @@ async fn a_second_probe_waits_for_the_first_probes_reply_cycle() {
     let runner = install_probe_tmux(&server_state, &run_id);
     dispatch_probe_on_post_tool_use(&server_state, &post_tool_use(&run_id)).await;
     let text = runner.last_paste();
-    assert_eq!(text, "[coordinator-nudge] second");
+    assert_eq!(text, "[nudge] second");
 }
 
 /// The `[effort-escalation-ack]` protocol must keep working unchanged: a
 /// worker that emitted `[effort-escalation]` in its final response sits parked
 /// at its prompt, producing no further boundary of its own. The ack is written
-/// straight in — verbatim, with no `[coordinator-nudge]` marking, since a
+/// straight in — verbatim, with no `[nudge]` marking, since a
 /// parked write becomes the prompt itself — and recorded as `Consumed`.
 #[tokio::test]
 async fn effort_escalation_ack_reaches_a_parked_worker_immediately() {
@@ -1102,7 +1102,7 @@ async fn a_folded_codex_turn_completes_the_probe_cycle_on_its_single_boundary() 
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new().append(true).open(&transcript_path).unwrap();
         for line in [
-            r#"{"type":"event_msg","payload":{"type":"user_message","message":"[coordinator-nudge] what is your status?"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"[nudge] what is your status?"}}"#,
             r#"{"type":"event_msg","payload":{"type":"agent_message","message":"status: pushed, waiting on CI"}}"#,
             r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"status: pushed, waiting on CI"}]}}"#,
             r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
