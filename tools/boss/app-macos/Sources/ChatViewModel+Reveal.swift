@@ -41,7 +41,7 @@ extension ChatViewModel {
         let generation = revealGeneration
         let token = UUID()
         revealDeadlineToken = token
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+        revealDeadlineScheduler { [weak self] in
             guard let self, self.revealGeneration == generation,
                   self.revealDeadlineToken == token else { return }
             self.finishReveal(.failure(.internalFailure(

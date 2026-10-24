@@ -359,6 +359,19 @@ final class ChatViewModel: ObservableObject {
     var revealCompletion: ((EngineRevealResult) -> Void)?
     var revealProductID: String?
     var revealDeadlineToken = UUID()
+    /// How long a reveal waits for the target's product tree, and then
+    /// again for the card to confirm it is visible, before it fails.
+    static let revealDeadline: TimeInterval = 3
+    /// Schedules the work that fails a reveal once `revealDeadline` has
+    /// elapsed. Production arms a main-queue timer. Tests replace this
+    /// with a scheduler that captures the work and fires it on demand,
+    /// so a deadline can be shown to fire — or to be a stale no-op —
+    /// without sleeping the real interval out.
+    var revealDeadlineScheduler: (@escaping @MainActor () -> Void) -> Void = { work in
+        DispatchQueue.main.asyncAfter(deadline: .now() + ChatViewModel.revealDeadline) {
+            work()
+        }
+    }
     weak var revealBoardViewport: NSView?
     /// Task id whose card should be scrolled to once its product's
     /// work tree arrives. Used when a reveal crosses a product

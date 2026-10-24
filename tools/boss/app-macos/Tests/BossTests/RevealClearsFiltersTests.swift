@@ -214,14 +214,17 @@ final class RevealClearsFiltersTests: XCTestCase {
         }
     }
 
-    func testNoVisibleCardNeverReportsSuccess() async throws {
+    func testNoVisibleCardNeverReportsSuccess() {
         let model = makeModel()
+        let deadlines = captureRevealDeadlines(of: model)
         model.applyEventForTest(makeWorkTreeEvent(tasks: [makeTask(id: "done", name: "Done", status: "done")]))
         var result: EngineRevealResult?
         model.revealWorkCard("done", productID: "prod_test") { result = $0 }
         XCTAssertNil(result, "scheduling a scroll is not success")
         XCTAssertNil(model.revealHighlightID)
-        try await Task.sleep(for: .milliseconds(3200))
+        XCTAssertEqual(deadlines.armed.count, 1, "a visibility deadline is armed for the scheduled scroll")
+        // No viewport ever confirms the card; the deadline elapses.
+        deadlines.fire(0)
         guard case .failure(.internalFailure(let reason)) = result else {
             return XCTFail("a card with no mounted viewport must fail")
         }
@@ -266,18 +269,24 @@ final class RevealClearsFiltersTests: XCTestCase {
         guard case .success = result else { return XCTFail("expected confirmed success") }
     }
 
-    func testDelayedTreeGetsFullVisibilityDeadline() async throws {
+    func testDelayedTreeGetsFullVisibilityDeadline() {
         let model = makeModel()
+        let deadlines = captureRevealDeadlines(of: model)
         var result: EngineRevealResult?
         model.revealWorkCard("later", productID: "prod_test") { result = $0 }
         let treeDeadline = model.revealDeadlineToken
-        try await Task.sleep(for: .milliseconds(2000))
+        XCTAssertEqual(deadlines.armed.count, 1, "waiting for the tree arms a deadline")
         model.applyEventForTest(makeWorkTreeEvent(tasks: [makeTask(id: "later", name: "Later")]))
         XCTAssertNotEqual(model.revealDeadlineToken, treeDeadline)
-        try await Task.sleep(for: .milliseconds(1300))
+        XCTAssertEqual(deadlines.armed.count, 2, "the tree's arrival arms a fresh visibility deadline")
+        // The original tree deadline elapses after the tree arrived.
+        deadlines.fire(0)
         XCTAssertNil(result, "the original tree deadline must not expire the visibility phase")
         model.confirmReveal(cardID: "later", generation: model.revealGeneration)
         guard case .success = result else { return XCTFail("expected confirmed success") }
+        // The visibility deadline elapsing after confirmation changes nothing.
+        deadlines.fire(1)
+        guard case .success = result else { return XCTFail("a stale deadline must not overwrite success") }
     }
 
     func testLoadedTreeMissingDeferredTargetFailsWithReason() {
@@ -293,6 +302,25 @@ final class RevealClearsFiltersTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    /// Captured reveal deadlines, fired by the test instead of waiting
+    /// out the real interval.
+    @MainActor
+    private final class CapturedDeadlines {
+        var armed: [@MainActor () -> Void] = []
+        func fire(_ index: Int) {
+            guard armed.indices.contains(index) else {
+                return XCTFail("no reveal deadline \(index) was armed (\(armed.count) armed)")
+            }
+            armed[index]()
+        }
+    }
+
+    private func captureRevealDeadlines(of model: ChatViewModel) -> CapturedDeadlines {
+        let deadlines = CapturedDeadlines()
+        model.revealDeadlineScheduler = { deadlines.armed.append($0) }
+        return deadlines
+    }
 
     private func makeTask(
         id: String,

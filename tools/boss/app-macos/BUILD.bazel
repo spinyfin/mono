@@ -111,6 +111,8 @@ genrule(
 # without the checked-in copy being regenerated.
 sh_test(
     name = "engine_binary_name_swift_up_to_date_test",
+    # A byte comparison of two small files in bash; about one second on CI.
+    size = "small",
     srcs = ["engine_binary_name_swift_up_to_date_test.sh"],
     args = [
         "$(location Sources/EngineBinaryName.swift)",
@@ -125,13 +127,37 @@ sh_test(
 # Independent bundles keep each test action inside the small (60s) timeout.
 # The macOS runner does not implement Bazel's shard_count protocol, so each
 # partition must be a separate macos_unit_test target.
-# Keep the existing explicit source groups; distribute the growing catch-all
+#
+# CommentsTests.swift + TranscriptViewTests.swift are split into their own
+# shard because CommentLayerTests alone accounts for ~85% of total XCTest
+# runtime (~12.8s of ~14.9s measured locally); bundling it with anything else
+# risks that shard alone approaching the timeout. The AppKit-hosted markdown
+# and revision-footer render suites form the Render shard: together they are
+# the heaviest remaining suites (about 25 s of XCTest wall time on an Apple
+# Silicon dev box in an unoptimised build). The remaining files are split
+# into the explicit source groups below plus a catch-all that is distributed
 # across four further bundles. Every new test file is included automatically.
-# The shared principal installs the missing-review-section assertion in each
-# bundle before XCTest starts.
+#
+# When a shard creeps towards its budget, measure before moving files:
+# `bazel test --nocache_test_results --test_verbose_timeout_warnings
+# //tools/boss/app-macos:BossTestsShard3`, then read the per-suite
+# "Test Suite '...' passed at" timestamps in bazel-testlogs/.../test.log.
+# Every shard's local wall time should stay under about half of the 60 s
+# budget.
+#
+# The shared principal is compiled into every bundle: it is the bundle's
+# NSPrincipalClass, which XCTest instantiates before the first test runs, and
+# it installs the missing-review-section assertion before XCTest starts. See
+# BossTestsPrincipal.swift and Tests/BossTests/Info.plist.
 _BOSS_TESTS_PRINCIPAL_SRCS = ["Tests/BossTests/BossTestsPrincipal.swift"]
 
 _BOSS_TESTS_INFOPLISTS = ["Tests/BossTests/Info.plist"]
+
+_RENDER_SHARD_SRCS = [
+    "Tests/BossTests/MarkdownDocumentChromeTests.swift",
+    "Tests/BossTests/MarkdownTableOverflowTests.swift",
+    "Tests/BossTests/RevisionFooterRenderTests.swift",
+]
 
 _COMMENTS_TRANSCRIPT_SHARD_SRCS = [
     "Tests/BossTests/CommentsTests.swift",
@@ -234,6 +260,26 @@ swift_library(
 )
 
 macos_unit_test(
+    name = "BossTestsRender",
+    size = "small",
+    env = XCODE_TEST_ENV,
+    infoplists = _BOSS_TESTS_INFOPLISTS,
+    minimum_os_version = "15.0",
+    runner = "//tools/test-sandbox:macos_direct_test_runner",
+    deps = [":boss_mac_app_tests_render_lib"],
+)
+
+swift_library(
+    name = "boss_mac_app_tests_render_lib",
+    testonly = True,
+    srcs = _RENDER_SHARD_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
+    copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
+    linkopts = _COVERAGE_LINKOPTS,
+    module_name = "BossTestsRender",
+    deps = [":boss_mac_app_lib"],
+)
+
+macos_unit_test(
     name = "BossTestsShard1",
     size = "small",
     env = XCODE_TEST_ENV,
@@ -313,7 +359,7 @@ genrule(
 app_test_shards(
     srcs = glob(
         ["Tests/BossTests/**/*.swift"],
-        exclude = _COMMENTS_TRANSCRIPT_SHARD_SRCS + _SHARD1_SRCS + _SHARD2_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
+        exclude = _RENDER_SHARD_SRCS + _COMMENTS_TRANSCRIPT_SHARD_SRCS + _SHARD1_SRCS + _SHARD2_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
     ),
     linkopts = _COVERAGE_LINKOPTS,
     principal_srcs = _BOSS_TESTS_PRINCIPAL_SRCS,

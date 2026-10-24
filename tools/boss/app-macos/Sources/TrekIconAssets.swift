@@ -118,38 +118,81 @@ enum TrekIconAssets {
     /// boxes overlap, so each crop can contain a sliver of the
     /// neighbouring bust; those slivers are separate components and
     /// are removed here.
+    ///
+    /// Components are built from horizontal runs of opaque pixels,
+    /// unioning each run with the runs it touches on the row above,
+    /// rather than flood-filling pixel by pixel. A bust is a handful of
+    /// runs per row, so the labelling touches hundreds of runs instead
+    /// of tens of thousands of pixels; the per-pixel work is one alpha
+    /// read through a raw pointer. The pixel flood fill this replaced
+    /// cost about half a second per portrait in an unoptimised test
+    /// build, which pushed the 56-portrait sweep in
+    /// TrekPortraitGridTests past its shard's one-minute budget.
     static func keepLargestComponent(
         _ buffer: UnsafeMutableRawBufferPointer, width: Int, height: Int
     ) {
-        var label = [Int32](repeating: 0, count: width * height)
-        var sizes: [Int] = [0]
-        var stack: [Int] = []
-        for start in 0..<(width * height)
-        where label[start] == 0 && buffer[start * 4 + 3] != 0 {
-            let id = Int32(sizes.count)
-            var size = 0
-            label[start] = id
-            stack.append(start)
-            while let index = stack.popLast() {
-                size += 1
-                let x = index % width, y = index / width
-                for ny in max(y - 1, 0)...min(y + 1, height - 1) {
-                    for nx in max(x - 1, 0)...min(x + 1, width - 1) {
-                        let neighbour = ny * width + nx
-                        if label[neighbour] == 0, buffer[neighbour * 4 + 3] != 0 {
-                            label[neighbour] = id
-                            stack.append(neighbour)
-                        }
-                    }
+        guard width > 0, height > 0, buffer.count >= width * height * 4,
+              let base = buffer.baseAddress
+        else { return }
+        let pixels = base.assumingMemoryBound(to: UInt8.self)
+        // One entry per run: its row, its first column, one past its last
+        // column, and its union-find parent.
+        var runRow: [Int] = []
+        var runStart: [Int] = []
+        var runEnd: [Int] = []
+        var parent: [Int] = []
+        func find(_ run: Int) -> Int {
+            var run = run
+            while parent[run] != run {
+                parent[run] = parent[parent[run]]
+                run = parent[run]
+            }
+            return run
+        }
+        var previousRow = 0..<0
+        for y in 0..<height {
+            let rowBase = y * width * 4
+            let firstRunOfRow = runStart.count
+            var x = 0
+            while x < width {
+                if pixels[rowBase + x * 4 + 3] == 0 {
+                    x += 1
+                    continue
+                }
+                let start = x
+                while x < width, pixels[rowBase + x * 4 + 3] != 0 { x += 1 }
+                let run = runStart.count
+                runRow.append(y)
+                runStart.append(start)
+                runEnd.append(x)
+                parent.append(run)
+                // 8-connectivity: a run on the row above touches this one
+                // when the two column spans overlap or sit diagonally
+                // adjacent, i.e. the above run starts no later than one
+                // past this run's end and ends no earlier than its start.
+                for above in previousRow where runStart[above] <= x && runEnd[above] >= start {
+                    let aboveRoot = find(above)
+                    let root = find(run)
+                    if aboveRoot != root { parent[root] = aboveRoot }
                 }
             }
-            sizes.append(size)
+            previousRow = firstRunOfRow..<runStart.count
         }
-        guard sizes.count > 2,
-              let keep = sizes.indices.dropFirst().max(by: { sizes[$0] < sizes[$1] })
+        var sizes = [Int](repeating: 0, count: runStart.count)
+        var components = 0
+        for run in runStart.indices {
+            let root = find(run)
+            if sizes[root] == 0 { components += 1 }
+            sizes[root] += runEnd[run] - runStart[run]
+        }
+        guard components > 1,
+              let keep = sizes.indices.max(by: { sizes[$0] < sizes[$1] })
         else { return }
-        for index in 0..<(width * height) where label[index] != 0 && label[index] != Int32(keep) {
-            for byte in 0..<4 { buffer[index * 4 + byte] = 0 }
+        for run in runStart.indices where find(run) != keep {
+            let rowBase = runRow[run] * width * 4
+            for x in runStart[run]..<runEnd[run] {
+                for byte in 0..<4 { pixels[rowBase + x * 4 + byte] = 0 }
+            }
         }
     }
 
