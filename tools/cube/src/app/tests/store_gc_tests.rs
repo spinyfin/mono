@@ -9,9 +9,9 @@ use clap::Parser;
 use crate::app::dispatch::run_with_dependencies;
 use crate::app::errors::CubeError;
 use crate::app::store_gc::{
-    Collection, DEFAULT_KEEP, OP_LOG_TEMPLATE, PR_BOOKMARK_NAMES_TEMPLATE, QUIESCENCE_WAIT, gc_repo_store,
-    jj_processes, measure_op_store, select_abandon_cut, stale_pr_refs, store_gc_due, store_gc_last_at_key,
-    store_gc_lock_path, wait_for_jj_quiescence,
+    Collection, DEFAULT_KEEP, OP_LOG_TEMPLATE, PR_BOOKMARK_NAMES_TEMPLATE, QUIESCENCE_WAIT, StoreGcOutcome,
+    gc_repo_store, jj_processes, measure_op_store, record_store_gc_outcome, select_abandon_cut, stale_pr_refs,
+    store_gc_attention, store_gc_due, store_gc_last_at_key, store_gc_lock_path, wait_for_jj_quiescence,
 };
 use crate::app::util::repo_lock_path;
 use crate::cli::Cli;
@@ -762,4 +762,140 @@ fn a_second_operation_head_after_the_abandon_stops_the_pass_before_collecting() 
     .expect_err("two heads");
     runner.assert_exhausted();
     assert!(err.to_string().contains("2 operation heads"), "{err}");
+}
+
+fn abandon_command(source: &std::path::Path) -> ExpectedCommand {
+    ExpectedCommand::ok(
+        source.to_path_buf(),
+        "jj",
+        &[
+            "--ignore-working-copy",
+            "op",
+            "abandon",
+            &format!("..{}", "d".repeat(64)),
+        ],
+        "",
+    )
+}
+
+fn mono_record(database_path: &std::path::Path) -> crate::metadata::RepoRecord {
+    Store::open_at(database_path)
+        .unwrap()
+        .get_repo("mono")
+        .unwrap()
+        .unwrap()
+}
+
+#[test]
+fn a_head_that_appears_after_the_abandon_returns_stops_the_pass_before_collecting() {
+    let (tempdir, database_path) = with_database_path();
+    seed_mono_repo(&tempdir.path().join("workspaces"), &database_path);
+    let source = seed_store_files(&source_of(&database_path));
+    let record = mono_record(&database_path);
+    let now = crate::app::util::current_epoch_s().unwrap();
+    // The racing command commits on the pre-rewrite head while the pass
+    // waits for the second quiet instant; the immediate count after the
+    // abandon saw one head. No `util gc` is expected.
+    let runner = FakeRunner::new(vec![
+        op_log_command(&source, &op_log(now)),
+        ps_command(&source, ""),
+        abandon_command(&source),
+        ps_command(&source, "").creating_dir(source.join(".jj/repo/op_heads/heads/raced")),
+    ]);
+    let err = gc_repo_store(
+        &runner,
+        Some(&database_path),
+        &record,
+        DEFAULT_KEEP,
+        Duration::from_millis(400),
+        false,
+    )
+    .expect_err("racing head");
+    runner.assert_exhausted();
+    assert!(
+        err.to_string().contains("2 operation heads before the collection"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_head_that_appears_while_the_post_abandon_wait_fails_stops_the_deferred_collection() {
+    let (tempdir, database_path) = with_database_path();
+    seed_mono_repo(&tempdir.path().join("workspaces"), &database_path);
+    let source = seed_store_files(&source_of(&database_path));
+    let record = mono_record(&database_path);
+    let now = crate::app::util::current_epoch_s().unwrap();
+    let runner = FakeRunner::new(vec![
+        op_log_command(&source, &op_log(now)),
+        ps_command(&source, ""),
+        abandon_command(&source),
+        // Busy at every poll, so the wait fails; the racing head shows up
+        // meanwhile and the two-week collection must not run either.
+        ps_command(&source, "/opt/homebrew/bin/jj\n"),
+        ps_command(&source, "/opt/homebrew/bin/jj\n").creating_dir(source.join(".jj/repo/op_heads/heads/raced")),
+    ]);
+    let err = gc_repo_store(
+        &runner,
+        Some(&database_path),
+        &record,
+        DEFAULT_KEEP,
+        Duration::from_millis(400),
+        false,
+    )
+    .expect_err("racing head");
+    runner.assert_exhausted();
+    assert!(
+        err.to_string().contains("operation heads before the collection"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_failed_pass_and_a_skipped_pass_are_each_recorded_and_surfaced_by_workspace_list() {
+    let (tempdir, database_path) = with_database_path();
+    seed_mono_repo(&tempdir.path().join("workspaces"), &database_path);
+    let source = seed_store_files(&source_of(&database_path));
+    std::fs::write(source.join(".jj/repo/op_heads/heads/raced"), b"").unwrap();
+    let now = crate::app::util::current_epoch_s().unwrap();
+    let runner = FakeRunner::new(vec![
+        op_log_command(&source, &op_log(now)),
+        ps_command(&source, ""),
+        abandon_command(&source),
+    ]);
+    run_with_dependencies(
+        Cli::parse_from(["cube", "repo", "gc", "mono"]),
+        Some(&database_path),
+        &runner,
+    )
+    .expect_err("raced head fails the run");
+    runner.assert_exhausted();
+
+    let store = Store::open_at(&database_path).unwrap();
+    let repos = vec!["mono".to_owned()];
+    let attention = store_gc_attention(&store, &repos);
+    assert_eq!(attention.len(), 1);
+    assert_eq!(attention[0].last_outcome, StoreGcOutcome::Failed);
+    assert_eq!(attention[0].consecutive_failures, 1);
+
+    record_store_gc_outcome(&store, "mono", StoreGcOutcome::Skipped).unwrap();
+    let attention = store_gc_attention(&store, &repos);
+    assert_eq!(attention[0].last_outcome, StoreGcOutcome::Skipped);
+    assert_eq!(attention[0].consecutive_failures, 2);
+    assert!(
+        attention[0].summary().contains("2 consecutive"),
+        "{}",
+        attention[0].summary()
+    );
+
+    let listing = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "list", "--repo", "mono"]),
+        Some(&database_path),
+        &FakeRunner::new(vec![]),
+    )
+    .expect("workspace list");
+    assert!(listing.message.contains("Store upkeep: mono"), "{}", listing.message);
+    assert_eq!(listing.payload["store_gc_attention"][0]["consecutive_failures"], 2);
+
+    record_store_gc_outcome(&store, "mono", StoreGcOutcome::Maintained).unwrap();
+    assert!(store_gc_attention(&store, &repos).is_empty());
 }

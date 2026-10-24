@@ -763,6 +763,25 @@ mod prune_sweep {
             "the baseline is rebuilt from the record"
         );
         assert_eq!(f.unproven_items(&id), 1);
+        let body =
+            f.db.list_attention_items(&id)
+                .unwrap()
+                .into_iter()
+                .find(|item| item.kind == UNPROVEN)
+                .unwrap()
+                .body_markdown;
+        assert!(
+            body.contains("so the pointers were kept"),
+            "two kept heads read plural: {body}"
+        );
+        assert!(
+            body.contains("The baseline `boss-base/") && body.contains("rebuilt from the record"),
+            "the baseline is named apart: {body}"
+        );
+        assert!(
+            !body.contains("carried by a voucher and forgotten"),
+            "no voucher carried the baseline: {body}"
+        );
         // The daily re-check finds the same thing and does not stack a second item.
         f.sql(
             "UPDATE execution_bookmarks SET prune_checked_at = prune_checked_at - ?2 WHERE execution_id = ?1",

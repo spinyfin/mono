@@ -122,14 +122,28 @@ pub(super) fn run_repo(
                     "shared-store upkeep for `{repo}` is already running; one run per repo at a time"
                 ))
             })?;
-            let report = crate::app::store_gc::gc_repo_store(
+            let result = crate::app::store_gc::gc_repo_store(
                 runner,
                 database_path,
                 &record,
                 keep,
                 crate::app::store_gc::QUIESCENCE_WAIT,
                 dry_run,
-            )?;
+            );
+            if !dry_run {
+                // The detached daily child's stderr goes nowhere, so the
+                // outcome is persisted for `cube workspace list` to surface.
+                use crate::app::store_gc::{Collection, StoreGcOutcome, record_store_gc_outcome};
+                let outcome = match &result {
+                    Ok(report) if report.collection == Collection::Skipped => StoreGcOutcome::Skipped,
+                    Ok(_) => StoreGcOutcome::Maintained,
+                    Err(_) => StoreGcOutcome::Failed,
+                };
+                if let Err(err) = record_store_gc_outcome(&store, &repo, outcome) {
+                    eprintln!("cube: store gc: cannot record the outcome for {repo}: {err}");
+                }
+            }
+            let report = result?;
             if !dry_run {
                 store.set_pool_metadata_i(
                     &crate::app::store_gc::store_gc_last_at_key(&repo),
