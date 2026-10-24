@@ -12,7 +12,9 @@ fn snapshot(db: &WorkDb) -> anyhow::Result<Vec<OperatorDecisionNotification>> {
                 CASE WHEN t.short_id IS NULL THEN t.name
                      ELSE '#' || t.short_id || ': ' || t.name END
          FROM operator_questions q JOIN tasks t ON t.id = q.work_item_id
-         WHERE q.status = 'open' AND t.deleted_at IS NULL ORDER BY q.id",
+         WHERE q.status = 'open' AND t.deleted_at IS NULL
+           AND t.status = 'blocked' AND t.blocked_reason = 'awaiting_operator_answer'
+         ORDER BY q.id",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(OperatorDecisionNotification {

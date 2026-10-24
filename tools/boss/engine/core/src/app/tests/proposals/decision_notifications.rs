@@ -1,5 +1,40 @@
 use super::*;
 
+#[tokio::test]
+async fn open_question_is_hidden_until_task_is_awaiting_an_answer() {
+    let (state, _dir, _execution, task_id) = parked_question_task().await;
+    let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
+    let sink = Arc::new(SessionSink::new(tx, crate::app::frontend_metrics::test_registry()));
+    state.topic_broker.register_session("decisions", sink.clone()).await;
+    state
+        .topic_broker
+        .subscribe("decisions", &["work.decisions".into()])
+        .await;
+    for (status, reason, expected) in [
+        ("active", None, 0),
+        ("done", None, 0),
+        ("blocked", Some("dependencies"), 0),
+        ("blocked", Some("awaiting_operator_answer"), 1),
+    ] {
+        let conn = state.work_db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = ?1, blocked_reason = ?2 WHERE id = ?3",
+            rusqlite::params![status, reason, task_id],
+        )
+        .unwrap();
+        // Recreate the proposal-before-finalization window: status changes
+        // normally withdraw the fixture's already-parked question.
+        conn.execute(
+            "UPDATE operator_questions SET status = 'open', withdrawn_reason = NULL WHERE work_item_id = ?1",
+            [&task_id],
+        )
+        .unwrap();
+        drop(conn);
+        state.topic_broker.refresh_decisions(&state.work_db, true).await;
+        assert_eq!(next_snapshot(&sink).await.len(), expected, "{status}: {reason:?}");
+    }
+}
+
 async fn next_snapshot(sink: &SessionSink) -> Vec<boss_protocol::OperatorDecisionNotification> {
     let envelope = tokio::time::timeout(std::time::Duration::from_secs(2), sink.next())
         .await
