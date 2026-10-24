@@ -133,13 +133,12 @@ impl Journal {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        if let Some((hub, authority, commands)) = old {
-            if hub != welcome.hub_id
+        if let Some((hub, authority, commands)) = old
+            && (hub != welcome.hub_id
                 || authority != welcome.authority_generation
-                || commands != welcome.command_journal_id
-            {
-                return Err(Fault::ReplayGap("hub authority or command journal changed".into()).into());
-            }
+                || commands != welcome.command_journal_id)
+        {
+            return Err(Fault::ReplayGap("hub authority or command journal changed".into()).into());
         }
         tx.execute(
             "UPDATE identity SET hub=?1,authority=?2,command_journal=?3,acked_record=?4",

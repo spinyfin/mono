@@ -14,8 +14,8 @@ rust_library(
     visibility = ["//tools/boss/engine/spoke:__pkg__"],
     deps = [
         "//tools/boss/backoff",
-        "//tools/boss/engine/spoke-journal",
         "//tools/boss/engine/host-enrollment",
+        "//tools/boss/engine/spoke-journal",
         "//tools/boss/protocol-spoke",
     ] + all_crate_deps(normal = True),
 )
@@ -45,6 +45,6 @@ rust_test(
     size = "small",
     crate = ":spoke-stream",
     edition = "2024",
-    deps = ["//tools/boss/protocol-spoke"] + all_crate_deps(normal = True),
     proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = ["//tools/boss/protocol-spoke"] + all_crate_deps(normal = True),
 )

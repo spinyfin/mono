@@ -218,3 +218,36 @@ fn bounded_spool_preserves_reserved_lifecycle_space_without_consuming_sequence()
     while journal.append(capacity(1), Admission::Lifecycle, &contract()).is_ok() {}
     assert!(journal.bytes().unwrap() <= 4096);
 }
+
+#[test]
+fn failed_result_commit_keeps_command_pending_for_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("state");
+    let mut journal = Journal::open(
+        &root,
+        "host",
+        Limits {
+            spool_bytes: 4096,
+            lifecycle_reserve: 1024,
+        },
+    )
+    .unwrap();
+    journal.welcome(&welcome(&journal, 0)).unwrap();
+    journal.receive_command(&command(1, "one")).unwrap();
+    while journal.append(capacity(1), Admission::Lifecycle, &contract()).is_ok() {}
+    let bounds = journal.record_bounds().unwrap();
+    assert!(matches!(
+        journal
+            .reject_pending(&stamp(2000), &contract())
+            .unwrap_err()
+            .downcast_ref(),
+        Some(Fault::Full)
+    ));
+    assert_eq!(journal.record_bounds().unwrap(), bounds);
+    assert_eq!(journal.applied_commands().unwrap(), 0);
+    drop(journal);
+    let mut journal = open(&root);
+    assert!(journal.reject_pending(&stamp(2000), &contract()).unwrap());
+    assert_eq!(journal.applied_commands().unwrap(), 1);
+    assert_eq!(journal.record_bounds().unwrap().1, bounds.1 + 1);
+}

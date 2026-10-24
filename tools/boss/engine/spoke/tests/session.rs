@@ -128,6 +128,48 @@ async fn actual_daemon_stops_on_gap_without_advancing_receipt() {
 }
 
 #[tokio::test]
+async fn restored_hub_cannot_skip_compacted_history() {
+    use boss_spoke_journal::Admission;
+    let mut hub = Fixture::new().await;
+    let mut journal = Journal::open(&hub.root(), "host", Limits::default()).unwrap();
+    let contract = boss_spoke_stream::outbound::hello(&journal, "old-boot", &[1; 16]).unwrap();
+    journal
+        .append(
+            v1::Record {
+                observed: Some(v1::Stamp {
+                    boot_id: "old-boot".into(),
+                    ..Default::default()
+                }),
+                body: Some(record::Body::Capacity(v1::Capacity {
+                    generation: 1,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            Admission::Capacity,
+            &contract,
+        )
+        .unwrap();
+    journal
+        .receipt(&v1::Cursor {
+            journal_id: contract.journal_id.clone(),
+            through: 1,
+        })
+        .unwrap();
+    journal.compact(8 * 24 * 60 * 60 * 1000).unwrap();
+    assert_eq!(journal.record_bounds().unwrap(), (2, 1));
+    drop(journal);
+    let mut daemon = hub.start();
+    let connection = hub.connection().await;
+    assert_eq!(connection.hello.first_retained, 2);
+    connection.welcome(0).await;
+    assert!(daemon.failed().await.contains("replay_gap"));
+    let journal = Journal::open(&hub.root(), "host", Limits::default()).unwrap();
+    assert_eq!(journal.identity().unwrap().1, contract.journal_id);
+    assert_eq!(journal.record_bounds().unwrap().0, 2);
+}
+
+#[tokio::test]
 async fn actual_daemon_rejects_stale_generation_and_unreceived_commands() {
     let mut hub = Fixture::new().await;
     let mut daemon = hub.start();

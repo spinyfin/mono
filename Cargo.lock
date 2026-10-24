@@ -1230,22 +1230,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "boss-spoke-journal"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "boss-protocol-spoke",
- "fs4",
- "libc",
- "prost",
- "rusqlite",
- "sha2",
- "tempfile",
- "thiserror 1.0.69",
- "uuid",
-]
-
-[[package]]
 name = "boss-spoke-credentials"
 version = "0.1.0"
 dependencies = [
@@ -1260,6 +1244,22 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tonic",
+]
+
+[[package]]
+name = "boss-spoke-journal"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boss-protocol-spoke",
+ "fs4",
+ "libc",
+ "prost",
+ "rusqlite",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "uuid",
 ]
 
 [[package]]

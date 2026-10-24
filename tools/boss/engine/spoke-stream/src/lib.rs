@@ -4,9 +4,9 @@
 //! Connect still requires a peer certificate if enrollment shares an optional-
 //! client-auth listener. Supply HostAuthorizer and the transactional contracts
 //! in `store`; this crate owns no second database or execution policy.
-pub mod outbound;
 mod codec;
 mod commands;
+pub mod outbound;
 mod service;
 mod session;
 pub mod store;
