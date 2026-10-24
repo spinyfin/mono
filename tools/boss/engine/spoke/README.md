@@ -33,9 +33,12 @@ ceiling and a bounded checkpoint cadence. Queue accounting includes metadata
 overhead, but filesystem exhaustion can precede the configured ceiling and is
 reported as a storage failure. No indefinite offline retention is promised.
 
-The stream allows one unreceipted record at a time and two bounded outgoing
-frames. It validates downward-negotiated frame/credit limits, deadlines, sequence
-continuity and connection generation. Receipts are never treated as command
+The stream pipelines records within the negotiated byte credit and uses a
+two-frame outgoing channel. Transport readiness is polled alongside inbound
+traffic, with bounded control replies prioritized over replay. A full inbox
+retains one raw command and retries admission after compaction, without requiring
+a reconnect or resend. It validates downward-negotiated frame/credit limits,
+deadlines, sequence continuity and connection generation. Receipts are never treated as command
 success. Raw command bytes and their digest survive duplicate delivery; a
 changed request under the same ID is rejected. Pending commands recover to one
 durable rejection result in the same transaction as their applied cursor.
