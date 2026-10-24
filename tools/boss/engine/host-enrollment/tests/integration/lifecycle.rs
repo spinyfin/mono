@@ -678,6 +678,38 @@ fn a_spent_token_only_recovers_the_certificate_it_produced() {
     );
 }
 
+#[test]
+fn a_fresh_token_cannot_reuse_a_request_id_that_already_enrolled() {
+    let fx = Fixture::new();
+    let first = fx.grant("h1", "job-1");
+    let spoke = Spoke::new();
+    fx.enroll(&spoke, ("h1", "job-1", "req-1"), &first.token)
+        .expect("enroll with the first token");
+
+    // The job re-delivers a token; the spoke retries with its old request id.
+    let second = fx.grant("h1", "job-1");
+    assert_eq!(
+        refusal(fx.enroll(&Spoke::new(), ("h1", "job-1", "req-1"), &second.token)),
+        Denial::RequestReused
+    );
+    // The refusal did not spend the token: a new request id still enrolls.
+    fx.enroll(&Spoke::new(), ("h1", "job-1", "req-2"), &second.token)
+        .expect("a new request id enrolls with the second token");
+    // The refusal is audited even though its transaction rolled back.
+    let trail: Vec<_> = fx
+        .credentials
+        .audit_trail("h1")
+        .expect("trail")
+        .into_iter()
+        .map(|(event, _)| event)
+        .collect();
+    assert_eq!(
+        trail.iter().filter(|e| *e == "enroll_request_reused").count(),
+        1,
+        "{trail:?}"
+    );
+}
+
 // ------------------------------------------------------- state permissions
 
 fn set_mode(path: &std::path::Path, mode: u32) {
@@ -751,4 +783,235 @@ fn the_default_policy_is_the_designs() {
     assert_eq!(policy.leaf_lifetime, 30 * DAY);
     assert_eq!(policy.token_lifetime, 15 * MINUTE);
     assert_eq!(policy.renewal_overlap, DAY);
+}
+
+// ------------------------------------------------------------ stream guard
+
+mod stream_guard {
+    use std::sync::Arc;
+
+    use boss_host_enrollment::{CloseReason, Denial, HostAuthorizer, RenewInput, admit};
+
+    use crate::support::{Fixture, Spoke, presented};
+
+    /// Delegates to the real authority, but can hold `revalidate` shut so a
+    /// test controls when a recheck finishes.
+    struct Gated {
+        inner: Arc<dyn HostAuthorizer>,
+        open: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl HostAuthorizer for Gated {
+        fn authorize(
+            &self,
+            peer_chain: &[rustls::pki_types::CertificateDer<'_>],
+        ) -> Result<boss_host_enrollment::AuthorizedHost, Denial> {
+            self.inner.authorize(peer_chain)
+        }
+
+        fn revalidate(
+            &self,
+            host: &boss_host_enrollment::AuthorizedHost,
+        ) -> Result<boss_host_enrollment::AuthorizedHost, Denial> {
+            let (lock, wake) = &*self.open;
+            let mut open = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*open {
+                open = wake.wait(open).unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            drop(open);
+            self.inner.revalidate(host)
+        }
+
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<boss_host_enrollment::CredentialEvent> {
+            self.inner.subscribe()
+        }
+
+        fn now(&self) -> std::time::SystemTime {
+            self.inner.now()
+        }
+    }
+
+    fn authorizer(fx: &Fixture) -> Arc<dyn HostAuthorizer> {
+        fx.credentials.clone()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admission_checks_the_hello_against_the_certificates_host() {
+        let fx = Fixture::new();
+        let (_spoke, cert) = fx.enrolled("edge-1");
+        let guard = admit(authorizer(&fx), presented(&cert)).await.expect("admitted");
+        assert_eq!(guard.host().host_id, "edge-1");
+        assert_eq!(guard.check_hello("edge-1"), Ok(()));
+        assert_eq!(guard.check_hello("edge-2"), Err(Denial::WrongIdentity));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revoked_hosts_certificate_is_not_admitted() {
+        let fx = Fixture::new();
+        let (_spoke, cert) = fx.enrolled("edge-1");
+        fx.credentials.revoke("edge-1", "test", "gone").expect("revoke");
+        let denied = admit(authorizer(&fx), presented(&cert)).await.err();
+        assert_eq!(denied, Some(Denial::Revoked));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revocation_closes_an_open_guard() {
+        let fx = Fixture::new();
+        let (_spoke, cert) = fx.enrolled("edge-1");
+        let mut guard = admit(authorizer(&fx), presented(&cert)).await.expect("admitted");
+        fx.credentials.revoke("edge-1", "test", "gone").expect("revoke");
+        assert_eq!(guard.closed().await, CloseReason::Revoked);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_renewal_shortens_the_old_certificates_stream_to_the_overlap() {
+        let fx = Fixture::new();
+        let (_spoke, cert) = fx.enrolled("edge-1");
+        let mut old = admit(authorizer(&fx), presented(&cert)).await.expect("admitted");
+        let renewed = Spoke::new();
+        let new_cert = fx
+            .credentials
+            .renew(
+                old.host(),
+                &RenewInput {
+                    request_id: "renew-1",
+                    csr_der: &renewed.csr(),
+                },
+            )
+            .expect("renew");
+        let mut fresh = admit(authorizer(&fx), presented(&new_cert)).await.expect("admitted");
+
+        // Wake on the Superseded event so the deadline moves to the overlap.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), old.closed())
+                .await
+                .is_err(),
+            "the overlap keeps the old stream open for now"
+        );
+        fx.clock.advance(std::time::Duration::from_secs(25 * 60 * 60));
+        assert_eq!(old.closed().await, CloseReason::DeadlineElapsed);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1500), fresh.closed())
+                .await
+                .is_err(),
+            "the renewed certificate's stream is unaffected"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lagged_guard_rechecks_and_finds_the_revocation_it_missed() {
+        let fx = Fixture::new();
+        let (_spoke, cert) = fx.enrolled("edge-1");
+        let mut guard = admit(authorizer(&fx), presented(&cert)).await.expect("admitted");
+        // Overflow the event backlog with other hosts' revocations, then
+        // revoke this one: the receiver has lagged past all of it.
+        for i in 0..300 {
+            let id = format!("other-{i}");
+            fx.enrolled(&id);
+            fx.credentials.revoke(&id, "test", "noise").expect("revoke");
+        }
+        fx.credentials.revoke("edge-1", "test", "gone").expect("revoke");
+        assert_eq!(guard.closed().await, CloseReason::Revoked);
+    }
+
+    /// A caller that `select!`s `closed()` against frames drops the future
+    /// whenever a frame arrives. The recheck a lag owes must survive that.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recheck_owed_after_a_lag_survives_the_future_being_dropped() {
+        let fx = Fixture::new();
+        let (_spoke, cert) = fx.enrolled("edge-1");
+        let open = Arc::new((std::sync::Mutex::new(true), std::sync::Condvar::new()));
+        let gated: Arc<dyn HostAuthorizer> = Arc::new(Gated {
+            inner: authorizer(&fx),
+            open: Arc::clone(&open),
+        });
+        let mut guard = admit(gated, presented(&cert)).await.expect("admitted");
+
+        // The target's revocation goes first and is then pushed out of the
+        // backlog by other hosts' events, so only a recheck can find it.
+        fx.credentials.revoke("edge-1", "test", "gone").expect("revoke");
+        for i in 0..300 {
+            let id = format!("other-{i}");
+            fx.enrolled(&id);
+            fx.credentials.revoke(&id, "test", "noise").expect("revoke");
+        }
+
+        // Hold the recheck open, let the guard start it, and abandon the call.
+        *open.0.lock().expect("lock") = false;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), guard.closed())
+                .await
+                .is_err(),
+            "the recheck is blocked, so nothing is reported yet"
+        );
+        *open.0.lock().expect("lock") = true;
+        open.1.notify_all();
+
+        assert_eq!(guard.closed().await, CloseReason::Revoked);
+    }
+}
+
+// ------------------------------------------------------------ CA rotation
+
+#[test]
+fn a_ca_rotation_keeps_old_certificates_valid_until_it_is_finished() {
+    use boss_host_enrollment::CertificateAuthority;
+
+    let mut fx = Fixture::new();
+    let (kept_spoke, kept) = fx.enrolled("kept");
+    let (_stale_spoke, stale) = fx.enrolled("stale");
+    let ca_dir = fx.dir.path().join("ca");
+    let policy = Policy::default();
+
+    CertificateAuthority::begin_rotation(&ca_dir, fx.now(), &policy).expect("begin rotation");
+    fx.restart();
+    let bundle = fx.credentials.trust_bundle_der();
+    assert_eq!(bundle.len(), 2, "both CAs are trusted during the rotation");
+    assert_eq!(
+        fx.credentials.hosts_awaiting_rotation().expect("query"),
+        ["kept", "stale"],
+        "nobody has renewed under the incoming CA yet"
+    );
+
+    // Certificates issued before the rotation still authorize.
+    let kept_host = fx
+        .credentials
+        .authorize(&presented(&kept))
+        .expect("old CA still trusted");
+    fx.credentials
+        .authorize(&presented(&stale))
+        .expect("old CA still trusted");
+
+    // A renewal during the rotation is signed by the incoming CA and carries
+    // the overlap bundle to the spoke.
+    let renewed = fx
+        .credentials
+        .renew(
+            &kept_host,
+            &RenewInput {
+                request_id: "renew-1",
+                csr_der: &Spoke::new().csr(),
+            },
+        )
+        .expect("renew");
+    assert_eq!(renewed.chain_der, bundle);
+    assert_eq!(
+        fx.credentials.hosts_awaiting_rotation().expect("query"),
+        ["stale"],
+        "a renewal moves its host off the list"
+    );
+    fx.credentials.authorize(&presented(&renewed)).expect("new CA trusted");
+    drop(kept_spoke);
+
+    CertificateAuthority::finish_rotation(&ca_dir, fx.now(), &policy).expect("finish rotation");
+    fx.restart();
+    assert_eq!(fx.credentials.trust_bundle_der().len(), 1);
+    fx.credentials
+        .authorize(&presented(&renewed))
+        .expect("a host that renewed survives the rotation");
+    assert_eq!(
+        fx.credentials.authorize(&presented(&stale)).err(),
+        Some(Denial::Untrusted),
+        "a host that never renewed is refused once the outgoing CA is dropped"
+    );
 }

@@ -88,6 +88,13 @@ impl HostCredentials {
                     if unix_secs(now) >= grant.expires_at {
                         return Err(Denial::TokenExpired.into());
                     }
+                    // Request ids are scoped to the host and job for good; a
+                    // fresh token cannot reuse one that already produced a
+                    // certificate. Refuse it by name rather than let the
+                    // uniqueness constraint surface as an internal error.
+                    if store::certificate_for_request(tx, request.host_id, CertKind::Enroll, ids)?.is_some() {
+                        return Err(Denial::RequestReused.into());
+                    }
                     let leaf =
                         self.trust
                             .ca
@@ -125,6 +132,22 @@ impl HostCredentials {
             Ok(stored) => stored,
             Err(CredentialError::Denied(denial)) => {
                 tracing::warn!(host_id = request.host_id, reason = denial.code(), "enrollment refused");
+                if matches!(denial, Denial::RequestReused) {
+                    // The refusal rolled its transaction back to keep the
+                    // token unspent, so the audit row needs one of its own.
+                    // Only this denial is recorded: it is reachable solely
+                    // with a valid token, so it cannot be used to flood the
+                    // trail the way an unknown-token guess could.
+                    self.store.write(|tx| {
+                        store::audit(
+                            tx,
+                            unix_secs(now),
+                            request.host_id,
+                            "enroll_request_reused",
+                            &note_job(request.job_id),
+                        )
+                    })?;
+                }
                 return Err(denial.into());
             }
             Err(other) => return Err(other),

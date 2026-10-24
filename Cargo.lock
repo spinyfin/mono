@@ -1207,6 +1207,23 @@ name = "boss-single-flight"
 version = "0.1.0"
 
 [[package]]
+name = "boss-spoke-credentials"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bon",
+ "boss-host-enrollment",
+ "boss-protocol-spoke",
+ "rand 0.8.6",
+ "rcgen",
+ "rustls",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "boss-spoke-stream"
 version = "0.1.0"
 dependencies = [

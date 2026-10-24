@@ -3,7 +3,10 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 exports_files(["Cargo.toml"])
 
-# Visible only to the authenticated stream boundary.
+# The hub stream manager (engine/spoke-stream) and the hub's provisioning jobs
+# are added to `visibility` in the PRs that make them depend on this crate.
+# spoke-credentials depends on it from its tests only, to run the spoke client
+# against the real authority.
 rust_library(
     name = "host-enrollment",
     srcs = glob(["src/**/*.rs"]),
@@ -11,7 +14,10 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    visibility = ["//tools/boss/engine/spoke-stream:__pkg__"],
+    visibility = [
+        "//tools/boss/engine/spoke-stream:__pkg__",
+        "//tools/boss/spoke-credentials:__pkg__",
+    ],
     deps = ["//tools/boss/protocol-spoke"] + all_crate_deps(normal = True),
 )
 

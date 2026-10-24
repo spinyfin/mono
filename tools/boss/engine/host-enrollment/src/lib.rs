@@ -16,6 +16,9 @@
 //! - [`HostAuthorizer`] is what the stream manager calls: `authorize` a
 //!   handshake's certificate chain, `revalidate` an open stream, and
 //!   `subscribe` to the [`CredentialEvent`]s that end one.
+//! - [`admit`] and [`StreamGuard`] are the stream manager's use of that: admit a
+//!   connection (subscribe, then authorize off the runtime), check its hello,
+//!   and learn when it must close.
 //! - [`EnrollmentService`] serves the `Enroll` and `Renew` RPCs.
 //!
 //! Enrollment gives a host an identity, not a place to run work: a host is
@@ -35,6 +38,7 @@ mod limiter;
 mod policy;
 mod renew;
 mod service;
+mod session;
 mod store;
 mod token;
 
@@ -49,5 +53,6 @@ pub use limiter::AttemptLimiter;
 pub use policy::Policy;
 pub use renew::RenewInput;
 pub use service::{EnrollmentService, ServiceLimits};
+pub use session::{CloseReason, StreamGuard, admit};
 pub use store::HostState;
 pub use token::{EnrollmentToken, TOKEN_BYTES};

@@ -249,6 +249,24 @@ impl HostCredentials {
         })
     }
 
+    /// Enrolled hosts whose current certificate was not issued under the
+    /// issuing CA, sorted by host id: the hosts that would fail to connect if
+    /// [`CertificateAuthority::finish_rotation`] dropped the outgoing CA now.
+    /// Empty when no rotation is open in the state this authority was opened
+    /// with (reopen after `begin_rotation` to see one). A host moves off the
+    /// list by renewing.
+    pub fn hosts_awaiting_rotation(&self) -> Result<Vec<String>, CredentialError> {
+        if !self.trust.ca.is_rotating() {
+            return Ok(Vec::new());
+        }
+        let current = self.store.read(store::enrolled_current_certificates)?;
+        Ok(current
+            .into_iter()
+            .filter(|(_, leaf_der)| !self.trust.ca.issued_by_current(leaf_der))
+            .map(|(host_id, _)| host_id)
+            .collect())
+    }
+
     /// The audit trail for `host_id`, oldest first, as `(event, detail)`.
     pub fn audit_trail(&self, host_id: &str) -> Result<Vec<(String, String)>, CredentialError> {
         check_host_id(host_id)?;

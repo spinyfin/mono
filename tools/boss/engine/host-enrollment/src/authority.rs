@@ -84,6 +84,12 @@ pub trait HostAuthorizer: Send + Sync {
 
     /// Changes that can end an open stream.
     fn subscribe(&self) -> broadcast::Receiver<CredentialEvent>;
+
+    /// The time deadlines are judged against: the authority's own clock, so a
+    /// stream and the records it was authorized from agree on "now".
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
 }
 
 impl HostAuthorizer for HostCredentials {
@@ -130,6 +136,10 @@ impl HostAuthorizer for HostCredentials {
 
     fn subscribe(&self) -> broadcast::Receiver<CredentialEvent> {
         self.events.subscribe()
+    }
+
+    fn now(&self) -> SystemTime {
+        self.clock.now()
     }
 }
 

@@ -66,6 +66,7 @@ members = [
   "tools/boss/protocol",
   "tools/boss/protocol-spoke",
   "tools/boss/shell-quote",
+  "tools/boss/spoke-credentials",
   "tools/boss/engine/ssh-transport",
   "tools/boss/engine/stdout-progress",
   "tools/boss/engine/structured-output",
