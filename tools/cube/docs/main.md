@@ -699,7 +699,13 @@ checkout and not aware of anything above jj:
    no `jj` process on the host (the pass waits up to five minutes for one and
    otherwise skips the abandon and the collection until the next daily
    pass), and the pass stops before collecting if the store then holds
-   anything but exactly one operation head.
+   anything but exactly one operation head. Every `jj` command cube itself
+   starts holds a host-wide shared gate (`locks/jj-maintenance.lock`) for
+   its run, and the pass holds the gate exclusive from before the abandon
+   until the post-abandon head check, so no cube-started command can load the
+   pre-rewrite head (cube commands wait up to two minutes on it). A `jj`
+   command that does not go through cube cannot take the gate; only the
+   process probes and head checks cover those.
 2. `jj util gc`. By default jj deletes only unreferenced files older than
    two weeks, and jj 0.26 accepts no other threshold than `--expire now`.
    A command that loaded the store before the abandon still names the old

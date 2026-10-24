@@ -40,9 +40,14 @@
 //!    falls back to the two-week default. Either way it collects only
 //!    when the head re-check found a single head.
 //!
-//! The pass does not hold an exclusion that lease, goto or the engine's own
-//! jj calls honour; the process-table probes and the head checks detect a
-//! race rather than prevent it. Every run records its outcome (maintained,
+//! The abandon holds the exclusive host-wide [`JjGate`] from before the
+//! abandon until the second head check, and every `jj` command cube starts
+//! (lease, goto, push, fetch; see `command_runner`) holds the gate shared for
+//! its run, so none of those can load the pre-rewrite head; cube commands
+//! wait on it for the length of the abandon. A `jj` command that does not go
+//! through cube (a worker's own shell, the engine) cannot take part, so for
+//! those the process-table probes and the head checks detect a race rather
+//! than prevent it. Every run records its outcome (maintained,
 //! skipped, failed) in pool metadata, and `cube workspace list` reports
 //! repos whose runs keep being skipped or failing.
 //!
@@ -71,7 +76,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use crate::audit;
-use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
+use crate::command_runner::{CommandInvocation, CommandRunner, JJ_GATE_HELD_ENV, JjGate, RealCommandRunner};
 use crate::metadata::RepoRecord;
 use crate::store::Store;
 
@@ -338,6 +343,32 @@ fn require_single_op_head(record: &RepoRecord, source: &Path, when: &str) -> Res
     )))
 }
 
+/// The exclusive [`JjGate`] for the store gate file under the data dir the
+/// run resolves. `None` when cube-started jj commands never drained within
+/// `wait`, which skips the abandon like a host that is never quiet.
+fn jj_maintenance_gate(database_path: Option<&Path>, wait: Duration) -> Result<Option<JjGate>> {
+    let data_dir = match database_path.and_then(Path::parent) {
+        Some(parent) => parent.to_path_buf(),
+        None => crate::paths::data_dir()?,
+    };
+    match JjGate::exclusive(&JjGate::path(&data_dir), wait) {
+        Ok(gate) => Ok(Some(gate)),
+        Err(CubeError::InvalidArgument(message)) => {
+            eprintln!("cube: store gc: {message}");
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// A maintenance `jj` command. It is marked as made by the pass that holds
+/// the gate, so it does not wait on its own exclusive hold.
+fn gated_jj_invocation(source: &Path, args: &[&str]) -> CommandInvocation {
+    let mut invocation = RealCommandRunner::invocation(source, "jj", args);
+    invocation.env.push((JJ_GATE_HELD_ENV.to_owned(), "1".to_owned()));
+    invocation
+}
+
 /// Wait up to `timeout` for an instant with no `jj` process on the host,
 /// polling the process table every `poll`. `Ok(true)` when one was seen.
 pub(super) fn wait_for_jj_quiescence(
@@ -480,17 +511,24 @@ pub(super) fn gc_repo_store(
     let mut collection = Collection::None;
     let mut abandoned_through = abandoned_through;
     if !dry_run {
+        // Held from before the abandon until the heads are verified after
+        // the post-abandon wait: cube-started jj commands wait on it, so
+        // none of them can load the pre-rewrite head in between.
+        let mut gate = None;
         if let Some(cut) = abandoned_through.clone() {
             // The abandon rewrites every kept operation under a new id, so
-            // it runs only at an instant with no jj process to race it.
-            if wait_for_jj_quiescence(runner, &source, quiescence, QUIESCENCE_POLL)? {
+            // it runs only with the gate held and at an instant with no jj
+            // process to race it.
+            gate = jj_maintenance_gate(database_path, quiescence)?;
+            if gate.is_some() && wait_for_jj_quiescence(runner, &source, quiescence, QUIESCENCE_POLL)? {
                 let range = format!("..{cut}");
                 runner.run_with_timeout(
-                    &RealCommandRunner::invocation(&source, "jj", &["--ignore-working-copy", "op", "abandon", &range]),
+                    &gated_jj_invocation(&source, &["--ignore-working-copy", "op", "abandon", &range]),
                     MAINTENANCE_CMD_TIMEOUT,
                 )?;
                 require_single_op_head(record, &source, "after the abandon")?;
             } else {
+                gate = None;
                 abandoned_through = None;
                 collection = Collection::Skipped;
             }
@@ -506,16 +544,14 @@ pub(super) fn gc_repo_store(
             // now, so the heads are counted again after the wait and before
             // any collection, on both the immediate and the deferred path.
             require_single_op_head(record, &source, "before the collection")?;
+            drop(gate);
             if quiet {
                 gc_args.extend(["--expire", "now"]);
                 collection = Collection::Immediate;
             } else {
                 collection = Collection::Deferred;
             }
-            runner.run_with_timeout(
-                &RealCommandRunner::invocation(&source, "jj", &gc_args),
-                MAINTENANCE_CMD_TIMEOUT,
-            )?;
+            runner.run_with_timeout(&gated_jj_invocation(&source, &gc_args), MAINTENANCE_CMD_TIMEOUT)?;
         }
     }
 

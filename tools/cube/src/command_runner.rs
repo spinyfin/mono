@@ -1,11 +1,12 @@
+use std::fs::{self, File, OpenOptions};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 #[cfg(test)]
 use std::thread;
-use std::time::Duration;
-#[cfg(test)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use fs4::fs_std::FileExt;
 
 use crate::app::CubeError;
 
@@ -77,6 +78,101 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 pub struct RealCommandRunner;
 
+/// Environment marker on a `jj` invocation made by the maintenance pass
+/// itself, which holds the exclusive [`JjGate`] and so must not wait on it.
+pub const JJ_GATE_HELD_ENV: &str = "CUBE_JJ_GATE_HELD";
+
+/// Host-wide gate between cube's own `jj` commands and shared-store
+/// maintenance. Every `jj` command cube starts holds the gate shared for its
+/// run; the op-log abandon holds it exclusive from before the abandon until
+/// the operation heads are verified, so no cube-started jj command can load
+/// the pre-rewrite head. A `jj` command started by something that does not
+/// go through cube (a worker's own shell, the engine) cannot take part; the
+/// maintenance pass covers those with its process-table probes and head
+/// checks.
+pub struct JjGate {
+    _file: File,
+}
+
+impl JjGate {
+    pub fn path(data_dir: &Path) -> std::path::PathBuf {
+        data_dir.join("locks").join("jj-maintenance.lock")
+    }
+
+    pub fn shared(lock_path: &Path, wait: Duration) -> Result<Self, CubeError> {
+        Self::acquire_within(lock_path, wait, false)
+    }
+
+    pub fn exclusive(lock_path: &Path, wait: Duration) -> Result<Self, CubeError> {
+        Self::acquire_within(lock_path, wait, true)
+    }
+
+    fn acquire_within(lock_path: &Path, wait: Duration, exclusive: bool) -> Result<Self, CubeError> {
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| CubeError::LockIo {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let io_error = |source| CubeError::LockIo {
+            path: lock_path.to_path_buf(),
+            source,
+        };
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path)
+            .map_err(io_error)?;
+        let started = Instant::now();
+        loop {
+            let got = if exclusive {
+                FileExt::try_lock_exclusive(&file)
+            } else {
+                FileExt::try_lock_shared(&file)
+            }
+            .map_err(io_error)?;
+            if got {
+                return Ok(Self { _file: file });
+            }
+            if started.elapsed() >= wait {
+                return Err(CubeError::InvalidArgument(format!(
+                    "timed out after {}s waiting for the jj maintenance gate {} ({})",
+                    wait.as_secs(),
+                    lock_path.display(),
+                    if exclusive {
+                        "jj commands are still running"
+                    } else {
+                        "shared-store maintenance is rewriting the operation log"
+                    }
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+/// How long a cube-started `jj` command waits for the maintenance gate
+/// (see [`JjGate`]) before failing loudly.
+const JJ_GATE_WAIT: Duration = Duration::from_secs(120);
+
+/// Hold the maintenance gate shared for the run of a `jj` command. Anything
+/// else, and the maintenance pass's own `jj` commands, run ungated. A gate
+/// that cannot be opened (no resolvable data dir) does not stop the command.
+fn jj_gate(invocation: &CommandInvocation) -> Result<Option<JjGate>, CubeError> {
+    let is_jj = Path::new(&invocation.program)
+        .file_name()
+        .is_some_and(|name| name == "jj");
+    if !is_jj || invocation.env.iter().any(|(k, _)| k == JJ_GATE_HELD_ENV) {
+        return Ok(None);
+    }
+    let Ok(data_dir) = crate::paths::data_dir() else {
+        return Ok(None);
+    };
+    JjGate::shared(&JjGate::path(&data_dir), JJ_GATE_WAIT).map(Some)
+}
+
 impl RealCommandRunner {
     pub fn invocation(cwd: &Path, program: &str, args: &[&str]) -> CommandInvocation {
         CommandInvocation {
@@ -119,6 +215,7 @@ impl RealCommandRunner {
 
 impl CommandRunner for RealCommandRunner {
     fn run(&self, invocation: &CommandInvocation) -> Result<String, CubeError> {
+        let _gate = jj_gate(invocation)?;
         let mut cmd = Command::new(&invocation.program);
         cmd.args(&invocation.args).current_dir(&invocation.cwd);
         Self::configure_env(&mut cmd);
@@ -141,6 +238,7 @@ impl CommandRunner for RealCommandRunner {
     }
 
     fn run_cleanup(&self, invocation: &CommandInvocation, timeout: Duration) -> Result<String, CubeError> {
+        let _gate = jj_gate(invocation)?;
         let output = self
             .run_with_timeout_capturing_output_and_heartbeat(
                 invocation,
@@ -176,6 +274,7 @@ impl CommandRunner for RealCommandRunner {
     }
 
     fn run_with_timeout(&self, invocation: &CommandInvocation, timeout: Duration) -> Result<String, CubeError> {
+        let _gate = jj_gate(invocation)?;
         let program = invocation.program.clone();
         let args = invocation.args.join(" ");
         self.run_with_timeout_and_heartbeat(invocation, timeout, HEARTBEAT_INTERVAL, |elapsed, timeout| {
@@ -237,6 +336,7 @@ impl RealCommandRunner {
         env_remove: &[&str],
         timeout: Duration,
     ) -> Result<Option<std::process::Output>, CubeError> {
+        let _gate = jj_gate(invocation)?;
         let program = invocation.program.clone();
         let args = invocation.args.join(" ");
         self.run_with_timeout_capturing_output_and_heartbeat(
@@ -503,5 +603,29 @@ mod tests {
             matches!(err, CubeError::CommandFailed { .. }),
             "expected CommandFailed, got {err:?}"
         );
+    }
+
+    #[test]
+    fn jj_gate_shared_holders_coexist_and_exclude_the_exclusive_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = JjGate::path(dir.path());
+        let wait = Duration::from_millis(100);
+        let first = JjGate::shared(&path, wait).unwrap();
+        let _second = JjGate::shared(&path, wait).unwrap();
+        assert!(JjGate::exclusive(&path, wait).is_err());
+        drop(first);
+        assert!(JjGate::exclusive(&path, wait).is_err());
+    }
+
+    #[test]
+    fn jj_gate_exclusive_holder_blocks_shared_until_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = JjGate::path(dir.path());
+        let wait = Duration::from_millis(100);
+        let held = JjGate::exclusive(&path, wait).unwrap();
+        let err = JjGate::shared(&path, wait).err().expect("blocked");
+        assert!(err.to_string().contains("maintenance"), "{err}");
+        drop(held);
+        JjGate::shared(&path, wait).unwrap();
     }
 }
