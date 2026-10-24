@@ -3,7 +3,7 @@ import SwiftUI
 // ===========================================================================
 // The inline question on a Doing ▸ Needs Attention card: what a blocked
 // worker asked the user, a "Why?" disclosure with the full detail, and
-// Yes / No buttons.
+// Yes / No buttons (or one button per option for a multiple-choice question).
 //
 // Equatable over its own [[OperatorQuestionPresentation]] so a live-status
 // flip elsewhere on the card does not re-lay-out the block. The answer
@@ -31,7 +31,7 @@ struct WorkBoardCardOperatorQuestion: View, @MainActor Equatable {
     /// locally: the engine's `work_item_updated` reply moves the card.
     var onAnswer: ((OperatorAnswer) -> Void)? = nil
 
-    @State private var showingDetail = false
+    @State fileprivate var showingDetail = false
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.slice == rhs.slice
@@ -58,24 +58,40 @@ struct WorkBoardCardOperatorQuestion: View, @MainActor Equatable {
                     .accessibilityIdentifier("operator-question-text")
             }
 
-            HStack(spacing: 8) {
-                Button("Why?") { showingDetail.toggle() }
-                    .buttonStyle(.link)
-                    .controlSize(.small)
-                    .popover(isPresented: $showingDetail, arrowEdge: .bottom) {
-                        OperatorQuestionDetailPopover(question: question)
+            if question.choices.isEmpty {
+                HStack(spacing: 8) {
+                    whyButton(question)
+                    Spacer(minLength: 0)
+                    // No default action on either button: a stray Return must not
+                    // authorize a bypass.
+                    Button("Yes") { onAnswer?(.yesNo(true)) }
+                        .accessibilityIdentifier("operator-question-yes")
+                    Button("No") { onAnswer?(.yesNo(false)) }
+                        .accessibilityIdentifier("operator-question-no")
+                }
+                .controlSize(.small)
+                .disabled(question.answerInFlight)
+            } else {
+                // One button per option, in the worker's order. The label is the
+                // string the engine records, so the click is the answer.
+                VStack(alignment: .leading, spacing: 6) {
+                    whyButton(question)
+                    ForEach(Array(question.choices.enumerated()), id: \.offset) { index, choice in
+                        Button {
+                            onAnswer?(.multipleChoice(choice))
+                        } label: {
+                            Text(choice)
+                                .lineLimit(2)
+                                .multilineTextAlignment(.leading)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .help(choice)
+                        .accessibilityIdentifier("operator-question-choice-\(index)")
                     }
-                    .accessibilityIdentifier("operator-question-why")
-                Spacer(minLength: 0)
-                // No default action on either button: a stray Return must not
-                // authorize a bypass.
-                Button("Yes") { onAnswer?(.yesNo(true)) }
-                    .accessibilityIdentifier("operator-question-yes")
-                Button("No") { onAnswer?(.yesNo(false)) }
-                    .accessibilityIdentifier("operator-question-no")
+                }
+                .controlSize(.small)
+                .disabled(question.answerInFlight)
             }
-            .controlSize(.small)
-            .disabled(question.answerInFlight)
 
             if let error = question.errorMessage {
                 Text(error)
@@ -85,6 +101,18 @@ struct WorkBoardCardOperatorQuestion: View, @MainActor Equatable {
                     .accessibilityIdentifier("operator-question-error")
             }
         }
+    }
+}
+
+extension WorkBoardCardOperatorQuestion {
+    fileprivate func whyButton(_ question: OperatorQuestionPresentation) -> some View {
+        Button("Why?") { showingDetail.toggle() }
+            .buttonStyle(.link)
+            .controlSize(.small)
+            .popover(isPresented: $showingDetail, arrowEdge: .bottom) {
+                OperatorQuestionDetailPopover(question: question)
+            }
+            .accessibilityIdentifier("operator-question-why")
     }
 }
 

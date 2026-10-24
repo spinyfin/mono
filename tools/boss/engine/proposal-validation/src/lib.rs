@@ -588,7 +588,7 @@ impl<'a> PayloadReader<'a> {
             self.error("question", "a question is only meaningful on a blocked declaration");
         }
         if let Some(kind) = value.pointer("/answer_type/kind").and_then(Value::as_str)
-            && !matches!(kind, "yes_no" | "create_prerequisite_task")
+            && !matches!(kind, "yes_no" | "create_prerequisite_task" | "multiple_choice")
         {
             self.error("question.answer_type.kind", format!("unsupported answer type: {kind}"));
             return None;
@@ -620,6 +620,12 @@ impl<'a> PayloadReader<'a> {
             question.text = boss_protocol::OperatorAnswerType::prerequisite_question_text(&name);
             question.answer_type = boss_protocol::OperatorAnswerType::CreatePrerequisiteTask { name, brief };
         } else {
+            if let boss_protocol::OperatorAnswerType::MultipleChoice { choices } = &question.answer_type
+                && let Err(message) = boss_protocol::OperatorAnswerType::validate_choices(choices)
+            {
+                self.error("question.answer_type.choices", message);
+                return None;
+            }
             question.text = self.text_from("question.text", &Value::String(question.text), 500)?;
             if question.text.contains(['\n', '\r']) {
                 self.error("question.text", "must be a single line");
@@ -808,7 +814,7 @@ mod operator_question_tests {
             invalid["outcome"] = json!(outcome);
             assert!(validate_payload(ProposalKind::RunDone, &invalid).is_err());
         }
-        for kind in ["multiple_choice", "prompt", "unknown"] {
+        for kind in ["prompt", "unknown"] {
             let mut invalid = valid.clone();
             invalid["question"]["answer_type"]["kind"] = json!(kind);
             assert!(validate_payload(ProposalKind::RunDone, &invalid).is_err());
@@ -842,6 +848,58 @@ mod operator_question_tests {
                 "brief":"  A stand-alone brief.  "},
             "explanation":"  CI cannot go green until the fixture is fixed on main.  "
         }})
+    }
+
+    fn multiple_choice_payload(choices: serde_json::Value) -> serde_json::Value {
+        json!({"outcome":"blocked", "summary":"Needs a decision", "question":{
+            "text":"  Which rollout should I use?  ",
+            "answer_type":{"kind":"multiple_choice", "choices": choices},
+            "explanation":"The brief allows both."
+        }})
+    }
+
+    #[test]
+    fn multiple_choice_question_is_accepted_with_two_to_six_distinct_choices() {
+        let canonical = validate_payload(
+            ProposalKind::RunDone,
+            &multiple_choice_payload(json!(["Gradual", "All at once"])),
+        )
+        .unwrap();
+        let parsed: RunDoneProposalPayload = serde_json::from_str(&canonical.canonical_json).unwrap();
+        let question = parsed.question.unwrap();
+        assert_eq!(question.text, "Which rollout should I use?");
+        assert_eq!(
+            question.answer_type,
+            boss_protocol::OperatorAnswerType::MultipleChoice {
+                choices: vec!["Gradual".into(), "All at once".into()]
+            }
+        );
+        let six = json!(["a", "b", "c", "d", "e", "f"]);
+        assert!(validate_payload(ProposalKind::RunDone, &multiple_choice_payload(six)).is_ok());
+        for choices in [
+            json!([]),
+            json!(["only one"]),
+            json!(["a", "b", "c", "d", "e", "f", "g"]),
+            json!(["a", ""]),
+            json!(["a", "   "]),
+            json!(["a", "a"]),
+            json!(["a", "two\nlines"]),
+            json!(["a", 7]),
+        ] {
+            assert!(
+                validate_payload(ProposalKind::RunDone, &multiple_choice_payload(choices.clone())).is_err(),
+                "{choices}"
+            );
+        }
+        let mut missing = multiple_choice_payload(json!(["a", "b"]));
+        missing["question"]["answer_type"]
+            .as_object_mut()
+            .unwrap()
+            .remove("choices");
+        assert!(validate_payload(ProposalKind::RunDone, &missing).is_err());
+        let mut not_blocked = multiple_choice_payload(json!(["a", "b"]));
+        not_blocked["outcome"] = json!("delivered");
+        assert!(validate_payload(ProposalKind::RunDone, &not_blocked).is_err());
     }
 
     #[test]

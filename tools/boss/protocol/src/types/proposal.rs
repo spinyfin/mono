@@ -699,9 +699,85 @@ pub enum OperatorAnswerType {
         name: String,
         brief: String,
     },
+    /// The operator picks one of `choices`; the answer is
+    /// [`OperatorAnswer::MultipleChoice`] carrying the chosen string verbatim.
+    /// The card renders one button per choice. Producers must keep `choices`
+    /// valid per [`OperatorAnswerType::validate_choices`].
+    MultipleChoice {
+        choices: Vec<String>,
+    },
 }
 
 impl OperatorAnswerType {
+    /// A multiple-choice question offers at least this many options (one
+    /// option is not a choice; use Yes/No for approval).
+    pub const MIN_CHOICES: usize = 2;
+    /// A multiple-choice question offers at most this many options: each is a
+    /// button on the kanban card.
+    pub const MAX_CHOICES: usize = 6;
+    /// Longest single choice, in characters; it is a button label.
+    pub const MAX_CHOICE_CHARS: usize = 80;
+
+    /// Check a multiple-choice option list: [`Self::MIN_CHOICES`] to
+    /// [`Self::MAX_CHOICES`] entries, each a non-empty single line of at most
+    /// [`Self::MAX_CHOICE_CHARS`] characters with no surrounding whitespace,
+    /// and no two equal. The same rule runs in the CLI, proposal validation
+    /// and the answer path so a stored question is always answerable.
+    pub fn validate_choices(choices: &[String]) -> Result<(), String> {
+        if !(Self::MIN_CHOICES..=Self::MAX_CHOICES).contains(&choices.len()) {
+            return Err(format!(
+                "a multiple-choice question needs between {} and {} choices, got {}",
+                Self::MIN_CHOICES,
+                Self::MAX_CHOICES,
+                choices.len()
+            ));
+        }
+        for (index, choice) in choices.iter().enumerate() {
+            if choice.trim().is_empty() {
+                return Err(format!("choice {} is empty", index + 1));
+            }
+            if choice.trim() != choice {
+                return Err(format!("choice {} has leading or trailing whitespace", index + 1));
+            }
+            if choice.contains(['\n', '\r']) {
+                return Err(format!("choice {} must be a single line", index + 1));
+            }
+            if choice.chars().count() > Self::MAX_CHOICE_CHARS {
+                return Err(format!(
+                    "choice {} is longer than {} characters",
+                    index + 1,
+                    Self::MAX_CHOICE_CHARS
+                ));
+            }
+            if choices[..index].contains(choice) {
+                return Err(format!("choice `{choice}` is listed more than once"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `answer` is the right shape for a question of this type. A
+    /// multiple-choice answer must be exactly one of the offered choices; the
+    /// other types are answered with Yes/No.
+    pub fn check_answer(&self, answer: &OperatorAnswer) -> Result<(), String> {
+        match (self, answer) {
+            (Self::YesNo | Self::CreatePrerequisiteTask { .. }, OperatorAnswer::YesNo { .. }) => Ok(()),
+            (Self::MultipleChoice { choices }, OperatorAnswer::MultipleChoice { value }) => {
+                if choices.contains(value) {
+                    Ok(())
+                } else {
+                    Err(format!("`{value}` is not one of the offered choices"))
+                }
+            }
+            (Self::MultipleChoice { .. }, OperatorAnswer::YesNo { .. }) => {
+                Err("this question is answered by choosing one of its options, not Yes/No".into())
+            }
+            (Self::YesNo | Self::CreatePrerequisiteTask { .. }, OperatorAnswer::MultipleChoice { .. }) => {
+                Err("this question is answered Yes or No, not by choosing an option".into())
+            }
+        }
+    }
+
     /// The question wording the kanban shows for a prerequisite proposal. The
     /// engine owns the phrasing so every producer (CLI, validation) agrees.
     pub fn prerequisite_question_text(name: &str) -> String {
@@ -712,7 +788,15 @@ impl OperatorAnswerType {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OperatorAnswer {
-    YesNo { value: bool },
+    YesNo {
+        value: bool,
+    },
+    /// The chosen option, verbatim from the question's
+    /// [`OperatorAnswerType::MultipleChoice`] `choices`. The engine records
+    /// the string; whatever consumes the answer interprets it.
+    MultipleChoice {
+        value: String,
+    },
 }
 
 /// The open question projected onto a task for board and detail readers.
@@ -771,8 +855,12 @@ impl std::fmt::Display for OperatorQuestionError {
             Self::NotFound => write!(f, "no operator question found for that id"),
             Self::Conflict { state, answer } => {
                 write!(f, "the question can no longer be answered (state: {state}")?;
-                if let Some(OperatorAnswer::YesNo { value }) = answer {
-                    write!(f, ", recorded answer: {}", if *value { "yes" } else { "no" })?;
+                match answer {
+                    Some(OperatorAnswer::YesNo { value }) => {
+                        write!(f, ", recorded answer: {}", if *value { "yes" } else { "no" })?;
+                    }
+                    Some(OperatorAnswer::MultipleChoice { value }) => write!(f, ", recorded answer: {value}")?,
+                    None => {}
                 }
                 write!(f, ")")
             }
@@ -812,7 +900,7 @@ mod tests {
                 answer
             );
         }
-        for kind in ["multiple_choice", "prompt", "unknown"] {
+        for kind in ["prompt", "unknown"] {
             let json = serde_json::json!({"kind": kind});
             assert!(serde_json::from_value::<OperatorAnswerType>(json.clone()).is_err());
             assert!(serde_json::from_value::<OperatorAnswer>(json).is_err());
@@ -846,5 +934,76 @@ mod tests {
             serde_json::from_str(r#"{"outcome":"blocked","summary":"Waiting"}"#).unwrap();
         assert!(old.question.is_none());
         assert!(serde_json::to_value(old).unwrap().get("question").is_none());
+    }
+
+    fn choices(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_owned()).collect()
+    }
+
+    #[test]
+    fn multiple_choice_question_and_answer_round_trip() {
+        let question = OperatorAnswerType::MultipleChoice {
+            choices: choices(&["Ship now", "Wait a week"]),
+        };
+        let json = serde_json::to_value(&question).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"kind": "multiple_choice", "choices": ["Ship now", "Wait a week"]})
+        );
+        assert_eq!(serde_json::from_value::<OperatorAnswerType>(json).unwrap(), question);
+        let answer = OperatorAnswer::MultipleChoice {
+            value: "Ship now".into(),
+        };
+        let json = serde_json::to_value(&answer).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"kind": "multiple_choice", "value": "Ship now"})
+        );
+        assert_eq!(serde_json::from_value::<OperatorAnswer>(json).unwrap(), answer);
+        // A multiple-choice type without options, or answer without a value, is not decodable.
+        assert!(serde_json::from_value::<OperatorAnswerType>(serde_json::json!({"kind": "multiple_choice"})).is_err());
+        assert!(serde_json::from_value::<OperatorAnswer>(serde_json::json!({"kind": "multiple_choice"})).is_err());
+    }
+
+    #[test]
+    fn choice_lists_must_be_two_to_six_distinct_non_empty_single_lines() {
+        let ok = |items: &[&str]| OperatorAnswerType::validate_choices(&choices(items));
+        assert!(ok(&["a", "b"]).is_ok());
+        assert!(ok(&["a", "b", "c", "d", "e", "f"]).is_ok());
+        assert!(ok(&[]).is_err());
+        assert!(ok(&["only"]).is_err());
+        assert!(ok(&["a", "b", "c", "d", "e", "f", "g"]).is_err());
+        assert!(ok(&["a", ""]).is_err());
+        assert!(ok(&["a", "  "]).is_err());
+        assert!(ok(&["a", " b"]).is_err());
+        assert!(ok(&["a", "b "]).is_err());
+        assert!(ok(&["a", "b\nc"]).is_err());
+        assert!(ok(&["a", "a"]).is_err());
+        assert!(ok(&["a", "A"]).is_ok(), "distinctness is exact, not case-folded");
+        let long = "x".repeat(OperatorAnswerType::MAX_CHOICE_CHARS + 1);
+        assert!(ok(&["a", &long]).is_err());
+        let limit = "é".repeat(OperatorAnswerType::MAX_CHOICE_CHARS);
+        assert!(ok(&["a", &limit]).is_ok(), "the limit counts characters, not bytes");
+    }
+
+    #[test]
+    fn answers_must_fit_the_question_type() {
+        let pick = OperatorAnswerType::MultipleChoice {
+            choices: choices(&["Ship now", "Wait a week"]),
+        };
+        let choose = |value: &str| OperatorAnswer::MultipleChoice { value: value.into() };
+        let yes = OperatorAnswer::YesNo { value: true };
+        assert!(pick.check_answer(&choose("Wait a week")).is_ok());
+        assert!(pick.check_answer(&choose("wait a week")).is_err());
+        assert!(pick.check_answer(&choose("Something else")).is_err());
+        assert!(pick.check_answer(&yes).is_err());
+        assert!(OperatorAnswerType::YesNo.check_answer(&yes).is_ok());
+        assert!(OperatorAnswerType::YesNo.check_answer(&choose("Ship now")).is_err());
+        let prerequisite = OperatorAnswerType::CreatePrerequisiteTask {
+            name: "n".into(),
+            brief: "b".into(),
+        };
+        assert!(prerequisite.check_answer(&yes).is_ok());
+        assert!(prerequisite.check_answer(&choose("n")).is_err());
     }
 }

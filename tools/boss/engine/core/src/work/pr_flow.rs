@@ -2146,6 +2146,11 @@ impl WorkDb {
             }
             .into());
         }
+        question
+            .question
+            .answer_type
+            .check_answer(&answer)
+            .map_err(|message| OperatorQuestionError::ValidationFailed { message })?;
         let now = now_string();
         let answered_at = chrono::DateTime::from_timestamp(now.parse::<i64>()?, 0)
             .context("answer timestamp is outside the supported range")?;
@@ -2173,32 +2178,14 @@ impl WorkDb {
             }
             (OperatorAnswer::YesNo { value: true }, OperatorAnswerType::YesNo) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
-                let description = format!(
-                    "{}{}",
-                    task.description,
-                    authorization_block(&question.question, &timestamp)
-                );
-                super::description_guard::validate_description_update(&task.description, &description, false)?;
-                tx.execute(
-                    "UPDATE tasks SET description = ?2, status = 'todo', blocked_reason = NULL,
-                     blocked_detail = NULL, autostart = 1, last_status_actor = 'human', updated_at = ?3 WHERE id = ?1",
-                    params![task.id, description, now],
-                )?;
-                let asking = query_execution(&tx, &question.question.execution_id)
-                    .require("execution", &question.question.execution_id)?;
-                request_execution_in_tx_with_live_check(
-                    &mut pending,
-                    &tx,
-                    RequestExecutionInput::builder()
-                        .work_item_id(&task.id)
-                        .maybe_preferred_workspace_id(asking.preferred_workspace_id)
-                        .entry_point(DispatchAdmissionEntryPoint::OperatorAnswer)
-                        .explicit_start(true)
-                        .build(),
-                    // Match request_execution's conservative behavior when
-                    // no live-worker oracle is supplied.
-                    |_| true,
-                )?;
+                let block = authorization_block(&question.question, &timestamp);
+                restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
+                minted_execution = true;
+            }
+            (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. }) => {
+                let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
+                let block = choice_block(&question.question, &value, &timestamp);
+                restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
                 minted_execution = true;
             }
             (OperatorAnswer::YesNo { value: false }, _) => {
@@ -2216,7 +2203,10 @@ impl WorkDb {
                     params![task.id, detail, now],
                 )?;
             }
+            // `check_answer` above refuses every other pairing.
+            (answer, answer_type) => anyhow::bail!("unhandled operator answer {answer:?} for {answer_type:?}"),
         }
+
         let updated = query_task(&tx, &task.id).require("task", &task.id)?;
         commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(OperatorAnswerOutcome {
@@ -2247,6 +2237,62 @@ impl OperatorAnswerOutcome {
             prerequisite_work_item_id: None,
         }
     }
+}
+
+/// Move the answered task back to Todo with `block` appended to its brief and
+/// mint the ready execution that carries the answer to the next worker.
+fn restart_after_answer(
+    pending: &mut PendingEvents,
+    tx: &rusqlite::Transaction<'_>,
+    task: &Task,
+    question: &OperatorQuestionView,
+    block: &str,
+    now: &str,
+) -> Result<()> {
+    let description = format!("{}{block}", task.description);
+    super::description_guard::validate_description_update(&task.description, &description, false)?;
+    tx.execute(
+        "UPDATE tasks SET description = ?2, status = 'todo', blocked_reason = NULL,
+         blocked_detail = NULL, autostart = 1, last_status_actor = 'human', updated_at = ?3 WHERE id = ?1",
+        params![task.id, description, now],
+    )?;
+    let asking = query_execution(tx, &question.execution_id).require("execution", &question.execution_id)?;
+    request_execution_in_tx_with_live_check(
+        pending,
+        tx,
+        RequestExecutionInput::builder()
+            .work_item_id(&task.id)
+            .maybe_preferred_workspace_id(asking.preferred_workspace_id)
+            .entry_point(DispatchAdmissionEntryPoint::OperatorAnswer)
+            .explicit_start(true)
+            .build(),
+        // Match request_execution's conservative behavior when
+        // no live-worker oracle is supplied.
+        |_| true,
+    )?;
+    Ok(())
+}
+
+/// The brief addendum for a multiple-choice answer: the option the operator
+/// picked, verbatim. Unlike [`authorization_block`] it grants nothing beyond
+/// the decision itself.
+fn choice_block(question: &OperatorQuestionView, choice: &str, timestamp: &str) -> String {
+    format!(
+        "\n\n---\n\n## Operator answer ({timestamp})\n\n\
+- **Question the previous worker asked:** {}\n\
+- **Options offered:** {}\n\
+- **Operator chose:** {choice}\n\
+- **The worker's explanation:** {}\n\
+- **Asked by run:** `{}`\n\n\
+The operator recorded this choice on the kanban. Proceed with the chosen option. It decides exactly the question above and nothing broader: it does not authorize bypassing any check or exceeding any limit.\n",
+        question.text,
+        match &question.answer_type {
+            OperatorAnswerType::MultipleChoice { choices } => choices.join(" / "),
+            _ => String::new(),
+        },
+        question.explanation,
+        question.execution_id
+    )
 }
 
 fn authorization_block(question: &OperatorQuestionView, timestamp: &str) -> String {

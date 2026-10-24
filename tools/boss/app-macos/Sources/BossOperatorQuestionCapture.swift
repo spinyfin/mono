@@ -27,10 +27,25 @@ enum BossOperatorQuestionCapture {
             askedAt: "2026-10-14T12:00:00Z", answerInFlight: false, errorMessage: nil,
             runSummary: "Connection recovery needs a delivery decision."
         )
+        let choiceQuestion = OperatorQuestionPresentation(
+            questionID: "capture-choice-question",
+            text: "Which rollout should I use for the new scheduler?",
+            explanation: """
+            Context:
+            The brief allows several ways to switch to the new scheduler, and they differ in how much risk you take on and how long the switch takes.
+            Recommendation:
+            I recommend “Behind a flag” because you can turn it off without a release.
+            """,
+            askedAt: "2026-10-14T12:00:00Z", answerInFlight: false, errorMessage: nil,
+            runSummary: "The rollout strategy needs a decision.",
+            choices: ["Gradual, one product at a time", "All at once", "Behind a flag"]
+        )
         let view = HStack(alignment: .top, spacing: 32) {
             VStack(alignment: .leading) {
                 Text("Board card").font(.headline)
                 WorkBoardCardOperatorQuestion(slice: .init(presentation: question))
+                Text("Board card — multiple choice").font(.headline).padding(.top, 16)
+                WorkBoardCardOperatorQuestion(slice: .init(presentation: choiceQuestion))
             }.frame(width: 300)
             VStack(alignment: .leading) {
                 Text("Why? — details collapsed initially").font(.headline)
