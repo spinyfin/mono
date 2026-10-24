@@ -593,15 +593,91 @@ pub(super) async fn publish_work_invalidation(
     product_id: Option<String>,
     item_ids: Vec<String>,
 ) -> u64 {
+    publish_classified_work_invalidation(
+        server_state,
+        origin_session_id,
+        origin_request_id,
+        topics,
+        reason,
+        InvalidationScope {
+            product_id,
+            item_ids,
+            class: InvalidationClass::Structural,
+        },
+    )
+    .await
+}
+
+/// [`publish_work_invalidation`] for a mutation that changed only runtime
+/// fields of the named cards (a hand-set doc pointer): no card moved, so the
+/// product's executions cannot have changed shape and the reconcile and
+/// scheduler kick are skipped, and subscribers re-read only the named cards.
+/// Anything that may add, remove, re-parent or re-status a card, or touch a
+/// dependency, stays on [`publish_work_invalidation`].
+pub(super) async fn publish_runtime_work_invalidation(
+    server_state: &ServerState,
+    origin_session_id: &str,
+    origin_request_id: &str,
+    topics: Vec<String>,
+    reason: &str,
+    product_id: Option<String>,
+    item_ids: Vec<String>,
+) -> u64 {
+    publish_classified_work_invalidation(
+        server_state,
+        origin_session_id,
+        origin_request_id,
+        topics,
+        reason,
+        InvalidationScope {
+            product_id,
+            item_ids,
+            class: InvalidationClass::Runtime,
+        },
+    )
+    .await
+}
+
+/// What one work invalidation says changed: the product and cards it names and
+/// how much of the board they can have touched.
+struct InvalidationScope {
+    product_id: Option<String>,
+    item_ids: Vec<String>,
+    class: InvalidationClass,
+}
+
+async fn publish_classified_work_invalidation(
+    server_state: &ServerState,
+    origin_session_id: &str,
+    origin_request_id: &str,
+    topics: Vec<String>,
+    reason: &str,
+    scope: InvalidationScope,
+) -> u64 {
+    let InvalidationScope {
+        product_id,
+        item_ids,
+        class,
+    } = scope;
     tracing::info!(
         source = "mutation",
         reason,
+        class = class.as_str(),
         product_id = ?product_id,
         item_count = item_ids.len(),
         topic_count = topics.len(),
         "work invalidation fanout"
     );
-    if let Some(product_id) = product_id.as_deref() {
+    crate::board_invalidation_metrics::record_push(
+        &server_state.metrics,
+        crate::board_invalidation_metrics::SOURCE_MUTATION,
+        class,
+    );
+    // Reconciliation and the scheduler kick are structural work: they exist to
+    // react to a changed task graph. A runtime-class mutation does not change
+    // it, so it must not pay a product-wide write transaction for the privilege.
+    let structural_product = product_id.as_deref().filter(|_| class == InvalidationClass::Structural);
+    if let Some(product_id) = structural_product {
         match server_state.work_db.reconcile_product_executions(product_id) {
             Ok(result) => {
                 if !result.created.is_empty() || !result.updated.is_empty() {
@@ -636,6 +712,7 @@ pub(super) async fn publish_work_invalidation(
             reason: reason.to_owned(),
             product_id,
             item_ids,
+            class,
         },
     };
 
@@ -683,6 +760,7 @@ pub(super) async fn publish_comment_invalidation(
             reason: reason.to_owned(),
             product_id: None,
             item_ids: vec![artifact_id.to_owned()],
+            class: InvalidationClass::Structural,
         },
     };
     server_state
@@ -746,7 +824,13 @@ pub(super) async fn publish_batch_work_invalidation(
             product_id = %product_id,
             item_count = item_ids.len(),
             topic_count = 1,
+            class = InvalidationClass::Structural.as_str(),
             "work invalidation fanout"
+        );
+        crate::board_invalidation_metrics::record_push(
+            &server_state.metrics,
+            crate::board_invalidation_metrics::SOURCE_BATCH_MUTATION,
+            InvalidationClass::Structural,
         );
         let topic = work_product_topic(&product_id);
         let event = FrontendEvent::TopicEvent {
@@ -758,6 +842,7 @@ pub(super) async fn publish_batch_work_invalidation(
                 reason: reason.to_owned(),
                 product_id: Some(product_id),
                 item_ids,
+                class: InvalidationClass::Structural,
             },
         };
         server_state

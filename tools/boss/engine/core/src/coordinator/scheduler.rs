@@ -754,8 +754,10 @@ impl ExecutionCoordinator {
     async fn publish_dispatch_runtime_changed(&self, executions: &[WorkExecution], reason: &str) {
         for execution in executions {
             if let Ok(item) = self.resolve_execution_work_item(execution) {
+                // The drain only rewrites this execution's wait reason or claims
+                // it: the card's runtime changes, nothing about the board's shape.
                 self.publisher
-                    .publish_work_item_changed(item.product_id(), item.primary_id(), reason)
+                    .publish_work_item_runtime_changed(item.product_id(), item.primary_id(), reason)
                     .await;
             }
         }

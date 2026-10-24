@@ -32,6 +32,11 @@ async fn queue_wait_changes_and_claims_refresh_the_board_without_repeated_hold_n
         *publisher.events.lock().await,
         vec![(product.id.clone(), chore.id.clone(), "dispatch_wait_changed".into())]
     );
+    assert_eq!(
+        publisher.runtime_reasons().await,
+        vec!["dispatch_wait_changed".to_owned()],
+        "a wait-reason change touches one card's runtime, never the board's shape"
+    );
     coordinator.drain_ready_queue().await;
     assert_eq!(
         publisher.events.lock().await.len(),
@@ -48,6 +53,13 @@ async fn queue_wait_changes_and_claims_refresh_the_board_without_repeated_hold_n
             .await
             .iter()
             .any(|(pid, id, reason)| { pid == &product.id && id == &chore.id && reason == "dispatch_claimed" })
+    );
+    assert!(
+        publisher
+            .runtime_reasons()
+            .await
+            .contains(&"dispatch_claimed".to_owned()),
+        "claiming a slot clears the card's wait: a runtime-class change"
     );
     assert!(db.get_task_runtime(&chore.id).unwrap().dispatch_wait_reason.is_none());
 }

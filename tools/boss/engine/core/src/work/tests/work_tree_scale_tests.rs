@@ -144,6 +144,7 @@ fn measure(db: &WorkDb, product: &str, expected: Option<usize>) {
         totals[p50], totals[p95], reviews[p50], reviews[p95]
     );
     if expected.is_some() {
+        measure_runtime_patches(db, product);
         measure_deltas(db, product);
         measure_cached_runtimes(db, product, samples);
     }
@@ -230,6 +231,76 @@ fn measure_cached_runtimes(db: &WorkDb, product: &str, samples: usize) {
             "{count} writes: cached runtimes diverged"
         );
         assert_eq!(cache.stats().misses - misses_before, count as u64, "{count} writes");
+    }
+}
+
+/// The cost of answering a runtime-class invalidation (hub-and-spoke design
+/// §2.4): a patch of the named cards, against the full assembly above that
+/// every invalidation costs without the split. Also pins, at production
+/// cardinality, that a patched card is the card the tree produces.
+fn measure_runtime_patches(db: &WorkDb, product: &str) {
+    use std::collections::HashMap;
+    let samples: usize = std::env::var("BOSS_BENCH_SAMPLES")
+        .map(|value| value.parse().expect("BOSS_BENCH_SAMPLES must be an integer"))
+        .unwrap_or(1)
+        .max(5);
+    let tree = db.get_work_tree(product).unwrap();
+    let tree_cards: HashMap<&str, serde_json::Value> = tree
+        .tasks
+        .iter()
+        .chain(&tree.chores)
+        .map(|task| (task.id.as_str(), serde_json::to_value(task).unwrap()))
+        .collect();
+    // The cards runtime changes land on: in review, running or queued.
+    let live: Vec<String> = tree
+        .tasks
+        .iter()
+        .chain(&tree.chores)
+        .filter(|task| {
+            matches!(
+                task.status,
+                TaskStatus::InReview | TaskStatus::Active | TaskStatus::Todo
+            )
+        })
+        .map(|task| task.id.clone())
+        .collect();
+    for count in [1usize, 10, 100] {
+        let ids: Vec<String> = live.iter().take(count).cloned().collect();
+        assert_eq!(ids.len(), count, "the fixture must have {count} live cards");
+        let mut millis = Vec::new();
+        let mut bytes = 0;
+        let mut returned = 0;
+        for _ in 0..samples {
+            let start = Instant::now();
+            let patch = db.get_work_runtime_patch(product, &ids).unwrap();
+            bytes = serde_json::to_vec(&patch.items).unwrap().len();
+            millis.push(start.elapsed().as_secs_f64() * 1000.0);
+            returned = patch.items.len();
+            assert!(
+                patch.absent.is_empty(),
+                "live cards are never absent: {:?}",
+                patch.absent
+            );
+            for entry in &patch.items {
+                let (WorkItem::Task(task) | WorkItem::Chore(task)) = &entry.item else {
+                    panic!("a patch carries only tasks and chores");
+                };
+                assert_eq!(
+                    serde_json::to_value(task).unwrap(),
+                    tree_cards[task.id.as_str()],
+                    "patched card {} differs from the tree's card at production scale",
+                    task.id
+                );
+            }
+        }
+        millis.sort_by(f64::total_cmp);
+        let p50 = (samples * 50).div_ceil(100) - 1;
+        let p95 = (samples * 95).div_ceil(100) - 1;
+        println!(
+            "scale runtime_patch cards_requested={count} cards_returned={returned} bytes={bytes} \
+             samples={samples} patch_ms p50={:.3} p95={:.3}",
+            millis[p50], millis[p95]
+        );
     }
 }
 

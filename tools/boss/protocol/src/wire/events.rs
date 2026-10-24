@@ -46,6 +46,16 @@ pub enum FrontendEvent {
         product_id: String,
         revisions: Vec<Task>,
     },
+    /// Reply for [`FrontendRequest::GetWorkRuntimePatch`]: the named cards
+    /// (and their revision-chain relatives) re-read without a board
+    /// assembly. `absent` lists requested ids that are not live cards of
+    /// `product_id`; a consumer treats any as a structural change.
+    WorkRuntimePatch {
+        product_id: String,
+        items: Vec<WorkRuntimePatchItem>,
+        #[serde(default)]
+        absent: Vec<String>,
+    },
     /// Ordered board update, independent of global topic revisions.
     WorkTreeUpdate {
         update: crate::work_tree_delta::WorkTreeUpdate,

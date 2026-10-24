@@ -174,6 +174,7 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::ChoresList { .. }
         | FrontendEvent::RevisionsList { .. }
         | FrontendEvent::WorkItemResult { .. }
+        | FrontendEvent::WorkRuntimePatch { .. }
         | FrontendEvent::WorkItemsByPrResult { .. }
         | FrontendEvent::WorkItemCreated { .. }
         | FrontendEvent::WorkItemsCreated { .. }

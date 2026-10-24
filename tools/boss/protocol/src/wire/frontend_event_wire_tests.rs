@@ -462,6 +462,7 @@ fn tag_cases() -> Vec<TagCase> {
                     reason: "created".into(),
                     product_id: Some("prod_1".into()),
                     item_ids: vec!["task_1".into()],
+                    class: InvalidationClass::Structural,
                 },
             },
             expected_tag: "topic_event",
@@ -504,6 +505,15 @@ fn tag_cases() -> Vec<TagCase> {
                 revisions: vec![],
             },
             expected_tag: "revisions_list",
+        },
+        TagCase {
+            label: "WorkRuntimePatch",
+            event: FrontendEvent::WorkRuntimePatch {
+                product_id: "prod_1".into(),
+                items: vec![],
+                absent: vec![],
+            },
+            expected_tag: "work_runtime_patch",
         },
         TagCase {
             label: "WorkTreeUpdate",
@@ -2187,6 +2197,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::TasksList { .. }
         | FrontendEvent::ChoresList { .. }
         | FrontendEvent::RevisionsList { .. }
+        | FrontendEvent::WorkRuntimePatch { .. }
         | FrontendEvent::WorkTreeUpdate { .. }
         | FrontendEvent::WorkTree { .. }
         | FrontendEvent::WorkItemResult { .. }
@@ -2467,6 +2478,7 @@ fn topic_event_pins_field_names_and_nested_payload_tag() {
             reason: "updated".into(),
             product_id: Some("prod_1".into()),
             item_ids: vec!["task_1".into(), "task_2".into()],
+            class: InvalidationClass::Runtime,
         },
     })
     .unwrap();
@@ -2481,6 +2493,68 @@ fn topic_event_pins_field_names_and_nested_payload_tag() {
     assert_eq!(v["event"]["reason"], "updated");
     assert_eq!(v["event"]["product_id"], "prod_1");
     assert_eq!(v["event"]["item_ids"], serde_json::json!(["task_1", "task_2"]));
+    assert_eq!(v["event"]["class"], "runtime");
+}
+
+#[test]
+fn work_invalidated_without_a_class_decodes_as_structural() {
+    // An engine that predates the field sends no `class`. The app must treat
+    // that push as a full-board invalidation, exactly as it always did.
+    let payload: TopicEventPayload = serde_json::from_value(serde_json::json!({
+        "type": "work_invalidated",
+        "reason": "work_item_updated",
+        "product_id": "prod_1",
+        "item_ids": ["task_1"],
+    }))
+    .unwrap();
+    let TopicEventPayload::WorkInvalidated { class, .. } = payload else {
+        panic!("expected work_invalidated");
+    };
+    assert_eq!(class, InvalidationClass::Structural);
+    assert_eq!(InvalidationClass::default(), InvalidationClass::Structural);
+    assert_eq!(serde_json::to_value(InvalidationClass::Runtime).unwrap(), "runtime");
+    assert_eq!(
+        serde_json::to_value(InvalidationClass::Structural).unwrap(),
+        "structural"
+    );
+}
+
+#[test]
+fn merging_invalidation_classes_lets_structural_win() {
+    use InvalidationClass::{Runtime, Structural};
+    assert_eq!(Runtime.merge(Runtime), Runtime);
+    assert_eq!(Runtime.merge(Structural), Structural);
+    assert_eq!(Structural.merge(Runtime), Structural);
+    assert_eq!(Structural.merge(Structural), Structural);
+}
+
+#[test]
+fn get_work_runtime_patch_request_pins_wire_names() {
+    let v = serde_json::to_value(FrontendRequest::GetWorkRuntimePatch {
+        product_id: "prod_1".into(),
+        item_ids: vec!["task_1".into()],
+    })
+    .unwrap();
+    assert_eq!(v["type"], "get_work_runtime_patch");
+    assert_eq!(v["product_id"], "prod_1");
+    assert_eq!(v["item_ids"], serde_json::json!(["task_1"]));
+}
+
+#[test]
+fn work_runtime_patch_event_pins_wire_names_and_tolerates_missing_absent() {
+    let v = serde_json::to_value(FrontendEvent::WorkRuntimePatch {
+        product_id: "prod_1".into(),
+        items: vec![],
+        absent: vec!["task_9".into()],
+    })
+    .unwrap();
+    assert_eq!(v["type"], "work_runtime_patch");
+    assert_eq!(v["product_id"], "prod_1");
+    assert_eq!(v["items"], serde_json::json!([]));
+    assert_eq!(v["absent"], serde_json::json!(["task_9"]));
+    let back: FrontendEvent =
+        serde_json::from_value(serde_json::json!({"type":"work_runtime_patch","product_id":"p","items":[]})).unwrap();
+    assert!(matches!(back, FrontendEvent::WorkRuntimePatch { absent, .. } if absent.is_empty()));
 }
 
 // --- Option omission grammar (skip_serializing_if) -------------------------
@@ -2549,4 +2623,20 @@ fn every_remediation_lifecycle_push_carries_a_compact_row() {
         }
     }
     assert_eq!(count, 8);
+}
+
+#[test]
+fn unknown_invalidation_class_is_structural() {
+    let payload: TopicEventPayload = serde_json::from_value(serde_json::json!({
+        "type": "work_invalidated", "reason": "future_writer",
+        "product_id": "prod", "item_ids": [], "class": "something_new"
+    }))
+    .unwrap();
+    assert!(matches!(
+        payload,
+        TopicEventPayload::WorkInvalidated {
+            class: InvalidationClass::Structural,
+            ..
+        }
+    ));
 }

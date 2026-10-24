@@ -24,7 +24,9 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
     if bulk_read {
         let connection = if matches!(
             request,
-            FrontendRequest::ListProposals { .. } | FrontendRequest::GetWorkTree { .. }
+            FrontendRequest::ListProposals { .. }
+                | FrontendRequest::GetWorkTree { .. }
+                | FrontendRequest::GetWorkRuntimePatch { .. }
         ) {
             ctx.work_db.reader()
         } else {
@@ -176,6 +178,7 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
             Box::pin(work_items::handle_get_work_item_by_short_id(ctx, r))
         }
         r @ FrontendRequest::GetWorkItemCostReport { .. } => Box::pin(cost::handle_get_work_item_cost_report(ctx, r)),
+        r @ FrontendRequest::GetWorkRuntimePatch { .. } => Box::pin(work_items::handle_get_work_runtime_patch(ctx, r)),
         r @ FrontendRequest::GetWorkTree { .. } => Box::pin(work_items::handle_get_work_tree(ctx, r)),
         r @ FrontendRequest::GitHubAuthCancel => Box::pin(github_auth::handle_git_hub_auth_cancel(ctx, r)),
         r @ FrontendRequest::GitHubAuthDisconnect => Box::pin(github_auth::handle_git_hub_auth_disconnect(ctx, r)),
