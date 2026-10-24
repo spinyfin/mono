@@ -465,8 +465,8 @@ impl ExecutionCoordinator {
         spawn_claim.disarm();
         self.consume_operator_forced_if_admitted(execution_id, admission);
         // Durable record that an operator force launch admitted this run, so
-        // a resume after one of its answered questions is admitted the same
-        // way (see `work_executions.force_launched`). Best-effort: the run is
+        // a resume after an answered question can bypass an operator pause
+        // (see `work_executions.force_launched`). Best-effort: the run is
         // already started, and a lost stamp only means the resume queues.
         if matches!(admission, DispatchAdmission::OperatorForced)
             && let Err(err) = self.work_db.mark_execution_force_launched(&execution.id)

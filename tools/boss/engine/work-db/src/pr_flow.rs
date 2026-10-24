@@ -2848,7 +2848,7 @@ impl RestartAfterAnswer {
 ///
 /// When the asking run was admitted by an operator force launch (see
 /// `work_executions.force_launched`), `force_resume_execution_id` is the
-/// minted resume so the caller can admit it the same way.
+/// minted resume so the caller can bypass an operator-originated pause.
 ///
 /// A task still gated by prerequisites (a conflict revision queued behind
 /// another writer on the same PR is the common case) cannot be started

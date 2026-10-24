@@ -28,8 +28,8 @@ pub struct OperatorAnswerOutcome {
     /// runs it once the answer has committed.
     pub archive_work_item_id: Option<String>,
     /// The minted resume execution, when the run that asked the question was
-    /// admitted by an operator force launch. The RPC layer re-admits it the
-    /// same way so it does not queue behind the dispatch pause.
+    /// admitted by an operator force launch. The RPC layer may bypass an
+    /// operator-originated dispatch pause for this resume.
     pub force_resume_execution_id: Option<String>,
 }
 
