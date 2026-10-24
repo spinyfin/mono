@@ -116,6 +116,9 @@ pub(super) fn resolve_retained(
             eprintln!("warning: cube retained {name}: PR number is out of range");
             continue;
         };
+        if pr_bookmarks::recently_unresolved(cwd, number) {
+            continue;
+        }
         let resolve = || -> Result<Resolved> {
             let info = gh_pr::fetch_pr_json_with_timeout(
                 runner,
@@ -132,15 +135,28 @@ pub(super) fn resolve_retained(
             })
         };
         match resolve() {
-            Ok(head) => resolved.push(head),
-            Err(error) => eprintln!("warning: cube retained {name}: {error}"),
+            Ok(head) => {
+                pr_bookmarks::set_unresolved(cwd, number, false);
+                resolved.push(head);
+            }
+            Err(error) => {
+                eprintln!("warning: cube retained {name}: {error}");
+                pr_bookmarks::set_unresolved(cwd, number, true);
+            }
         }
     }
     resolved
 }
 
+/// Most bookmarks repaired per lock acquisition. The lock blocks `goto`,
+/// `pr push` and lease repair with no timeout, and each repair runs several jj
+/// commands, so a large legacy backlog is worked off over successive sweeps
+/// instead of in one long critical section.
+const MAX_REPAIRS_PER_SWEEP: usize = 20;
+
 /// Called under the lock; re-read sides because goto may have run meanwhile.
-/// Open PRs are repaired but kept during this sweep.
+/// Open PRs are repaired but kept during this sweep, as are bookmarks beyond
+/// [`MAX_REPAIRS_PER_SWEEP`], which a later sweep picks up.
 pub(super) fn repair_retained(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
@@ -148,26 +164,44 @@ pub(super) fn repair_retained(
     resolved: &[Resolved],
 ) -> Vec<String> {
     let mut keep = Vec::new();
-    for head in resolved {
+    let (batch, deferred) = resolved.split_at(resolved.len().min(MAX_REPAIRS_PER_SWEEP));
+    keep.extend(deferred.iter().map(|head| format!("pr/{}", head.number)));
+    if batch.is_empty() {
+        return keep;
+    }
+    // One jj call finds every bookmark a workspace is positioned on.
+    let revset = batch
+        .iter()
+        .map(|head| format!(r#"bookmarks(exact:"pr/{}")"#, head.number))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let in_use = match run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(
+            cwd,
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                &format!("({revset}) & ::working_copies()"),
+                "-T",
+                super::gc::BOOKMARK_NAMES_TEMPLATE,
+            ],
+        ),
+    ) {
+        Ok(out) => out,
+        Err(error) => {
+            eprintln!("warning: cube retained PR bookmarks: {error}");
+            keep.extend(batch.iter().map(|head| format!("pr/{}", head.number)));
+            return keep;
+        }
+    };
+    for head in batch {
         let name = format!("pr/{}", head.number);
         let repair = || -> Result<()> {
-            let in_use = run_jj(
-                runner,
-                database_path,
-                &RealCommandRunner::invocation(
-                    cwd,
-                    "jj",
-                    &[
-                        "log",
-                        "--no-graph",
-                        "-r",
-                        &format!(r#"bookmarks(exact:"{name}") & ::working_copies()"#),
-                        "-T",
-                        "commit_id",
-                    ],
-                ),
-            )?;
-            if !in_use.trim().is_empty() {
+            if in_use.lines().any(|line| line.trim() == name) {
                 return Err(super::errors::CubeError::InvalidArgument(format!("{name} is in use")));
             }
             pr_bookmarks::record_published_head(cwd, head.number, &head.sha);

@@ -428,12 +428,15 @@ pub(super) fn ensure_pr_deprecated(args: PrCreateArgs, runner: &dyn CommandRunne
     )
 }
 
-fn record_published_head(cwd: &Path, number: Option<u64>, sha: &str, runner: &dyn CommandRunner) -> Result<()> {
-    if let Some(number) = number {
-        let _lock = runner.lock_pr_bookmarks(cwd)?;
-        crate::app::pr_bookmarks::record_published_head(cwd, number, sha);
+/// Best-effort: the push or PR creation has already reached GitHub, so a lock
+/// failure here must not turn that success into an error (a retry could open a
+/// duplicate PR).
+fn record_published_head(cwd: &Path, number: Option<u64>, sha: &str, runner: &dyn CommandRunner) {
+    let Some(number) = number else { return };
+    match runner.lock_pr_bookmarks(cwd) {
+        Ok(_lock) => crate::app::pr_bookmarks::record_published_head(cwd, number, sha),
+        Err(error) => eprintln!("warning: cube could not record published PR {number} head {sha}: {error}"),
     }
-    Ok(())
 }
 
 /// Record only a verified published SHA, never a branch that can move during
@@ -477,7 +480,7 @@ pub(super) fn record_published_pr_head(
         }
         eprintln!("cube: published PR bookmark `{name}` verified at {published}");
     }
-    record_published_head(cwd, number, published, runner)?;
+    record_published_head(cwd, number, published, runner);
     Ok(bookmark)
 }
 

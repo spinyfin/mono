@@ -606,14 +606,142 @@ pub(super) fn resolve_pr_head(
     if sha_is_present(runner, database_path, cwd, &sha)? {
         return Ok(head);
     }
+    // The source branch is gone (deleted on merge) or its fork was deleted, but
+    // the base repository keeps `refs/pull/<n>/head` for the life of the PR.
+    let pull_error = fetch_pull_ref(runner, database_path, cwd, owner_repo, number, deadline);
+    if sha_is_present(runner, database_path, cwd, &sha)? {
+        return Ok(head);
+    }
+    let describe = |result: Result<()>, what: &str| match result {
+        Ok(()) => format!("fetching {what} did not bring it in (the PR head moved again)"),
+        Err(error) => format!("fetching {what} failed: {error}"),
+    };
     Err(CubeError::InvalidArgument(format!(
-        "PR {number}'s head {sha} (on {}) is not in the shared jj store{}",
+        "PR {number}'s head {sha} (on {}) is not in the shared jj store; {}; {}",
         head_repo.unwrap_or("an unknown repository"),
-        match fetch_error {
-            Ok(()) => " and fetching the head branch did not bring it in (the branch moved again)".to_string(),
-            Err(error) => format!(" and could not be fetched: {error}"),
-        }
+        describe(fetch_error, "the head branch"),
+        describe(pull_error, "the base repository's pull ref"),
     )))
+}
+
+/// Prefix of the temporary jj remotes used to bring a PR head in. The name is
+/// `cube-pr-fetch-<n>-<unix seconds>-<uuid>`: unique per call so concurrent
+/// fetches never share a remote, and timestamped so a leftover from a killed
+/// run can be told apart from one still in use.
+const TEMP_REMOTE_PREFIX: &str = "cube-pr-fetch-";
+
+/// A temporary remote older than this cannot belong to a live fetch: every
+/// network attempt is bounded well below it.
+const STALE_TEMP_REMOTE_AGE_SECS: u64 = 15 * 60;
+
+fn temp_remote_name(number: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{TEMP_REMOTE_PREFIX}{number}-{now}-{}", uuid::Uuid::new_v4())
+}
+
+/// Remove temporary fetch remotes left behind by a run that was killed between
+/// `remote add` and `remote remove`. Their remote-tracking bookmarks would
+/// otherwise protect commits from collection forever. Run before each new
+/// temporary remote is added, so leftovers never outlive the next fetch. A
+/// remote younger than [`STALE_TEMP_REMOTE_AGE_SECS`] is left alone because a
+/// live fetch may own it.
+pub(super) fn prune_stale_temp_remotes(runner: &dyn CommandRunner, database_path: Option<&Path>, cwd: &Path) {
+    let Ok(listing) = run(runner, database_path, cwd, &["git", "remote", "list"]) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for name in listing.lines().filter_map(|line| line.split_whitespace().next()) {
+        let Some(rest) = name.strip_prefix(TEMP_REMOTE_PREFIX) else {
+            continue;
+        };
+        // `<n>-<unix seconds>-<uuid>`
+        let created = rest.split('-').nth(1).and_then(|ts| ts.parse::<u64>().ok());
+        // A name from before timestamps were added has no way to be live.
+        let stale = created.is_none_or(|ts| now.saturating_sub(ts) >= STALE_TEMP_REMOTE_AGE_SECS);
+        if !stale {
+            continue;
+        }
+        if let Err(error) = run(runner, database_path, cwd, &["git", "remote", "remove", name]) {
+            eprintln!("warning: cube could not remove stale temporary remote {name}: {error}");
+        }
+    }
+}
+
+/// URL of the base repository: the `origin` remote, else any remote naming
+/// `owner_repo`, else GitHub's canonical URL.
+fn base_repo_url(runner: &dyn CommandRunner, database_path: Option<&Path>, cwd: &Path, owner_repo: &str) -> String {
+    let listing = run(runner, database_path, cwd, &["git", "remote", "list"]).unwrap_or_default();
+    let remotes: Vec<(&str, &str)> = listing
+        .lines()
+        .filter_map(|line| line.split_once(char::is_whitespace))
+        .map(|(name, url)| (name, url.trim()))
+        .collect();
+    let needle = owner_repo.to_ascii_lowercase();
+    remotes
+        .iter()
+        .find(|(name, _)| *name == "origin")
+        .or_else(|| {
+            remotes
+                .iter()
+                .find(|(_, url)| url.to_ascii_lowercase().contains(&needle))
+        })
+        .map(|(_, url)| (*url).to_string())
+        .unwrap_or_else(|| format!("https://github.com/{owner_repo}.git"))
+}
+
+/// The git directory behind the shared jj store.
+fn store_git_dir(cwd: &Path) -> Result<PathBuf> {
+    let store = crate::lock::shared_repo_dir(cwd)?.join("store");
+    let target = std::fs::read_to_string(store.join("git_target")).map_err(CubeError::Io)?;
+    std::fs::canonicalize(store.join(target.trim())).map_err(CubeError::Io)
+}
+
+/// Fetch `refs/pull/<number>/head` of the base repository into the store.
+///
+/// jj itself only fetches branches, so the ref is fetched with git into a
+/// remote-tracking ref of a temporary jj remote and then imported; removing the
+/// remote afterwards leaves just the commits in the store.
+fn fetch_pull_ref(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    cwd: &Path,
+    owner_repo: &str,
+    number: u64,
+    deadline: Option<Instant>,
+) -> Result<()> {
+    let url = base_repo_url(runner, database_path, cwd, owner_repo);
+    let git_dir = store_git_dir(cwd)?;
+    prune_stale_temp_remotes(runner, database_path, cwd);
+    let remote = temp_remote_name(number);
+    run(runner, database_path, cwd, &["git", "remote", "add", &remote, &url])?;
+    let refspec = format!("+refs/pull/{number}/head:refs/remotes/{remote}/pull-{number}");
+    let fetched = run_jj_network_within(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(
+            cwd,
+            "git",
+            &[
+                "--git-dir",
+                &git_dir.display().to_string(),
+                "fetch",
+                "--no-tags",
+                "--no-write-fetch-head",
+                &url,
+                &refspec,
+            ],
+        ),
+        deadline,
+    );
+    let imported = fetched.and_then(|_| import_git_refs(runner, database_path, cwd));
+    let _ = run(runner, database_path, cwd, &["git", "remote", "remove", &remote]);
+    imported
 }
 
 fn fetch_head_from_head_repo(
@@ -634,7 +762,8 @@ fn fetch_head_from_head_repo(
         .map(str::to_string)
         .or_else(|| head_repo_full_name(info).map(|name| format!("https://github.com/{name}.git")))
         .ok_or_else(|| CubeError::InvalidArgument(format!("PR {number} reports no head repository")))?;
-    let remote = format!("cube-pr-fetch-{number}-{}", uuid::Uuid::new_v4());
+    prune_stale_temp_remotes(runner, database_path, cwd);
+    let remote = temp_remote_name(number);
     let jj = |args: &[&str]| run_jj(runner, database_path, &RealCommandRunner::invocation(cwd, "jj", args));
     jj(&["git", "remote", "add", &remote, &url])?;
     let fetched = run_jj_network_within(
@@ -696,5 +825,51 @@ pub(super) fn record_head(cwd: &Path, number: u64, commit: &str) -> Result<()> {
 pub(super) fn record_published_head(cwd: &Path, number: u64, commit: &str) {
     if let Err(error) = record_head(cwd, number, commit) {
         eprintln!("warning: cube could not record published PR {number} head {commit}: {error}");
+    }
+}
+
+/// How long a PR bookmark whose head could not be resolved is left alone by
+/// the sweep before GitHub is asked about it again.
+const UNRESOLVED_RETRY_SECS: u64 = 60 * 60;
+
+fn unresolved_path(cwd: &Path, number: u64) -> Result<PathBuf> {
+    Ok(crate::lock::shared_repo_dir(cwd)?
+        .join("cube-pr-heads")
+        .join("unresolved")
+        .join(number.to_string()))
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Whether a sweep recently failed to resolve PR `number`'s head, so asking
+/// GitHub again now would only repeat the same round trip.
+pub(super) fn recently_unresolved(cwd: &Path, number: u64) -> bool {
+    let Ok(path) = unresolved_path(cwd, number) else {
+        return false;
+    };
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .is_some_and(|at| unix_now().saturating_sub(at) < UNRESOLVED_RETRY_SECS)
+}
+
+/// Remember (or, with `unresolved == false`, forget) a failed head resolution.
+/// Best-effort: losing the memory only costs one extra lookup.
+pub(super) fn set_unresolved(cwd: &Path, number: u64, unresolved: bool) {
+    let Ok(path) = unresolved_path(cwd, number) else {
+        return;
+    };
+    if unresolved {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, format!("{}\n", unix_now()));
+    } else {
+        let _ = std::fs::remove_file(path);
     }
 }

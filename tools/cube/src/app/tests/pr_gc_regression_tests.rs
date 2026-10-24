@@ -156,3 +156,109 @@ fn deleted_fork_does_not_move_the_local_main_bookmark() {
     assert_eq!(f.commit("main"), main);
     assert_eq!(f.commit("@-"), head);
 }
+
+/// A final PR head that only the base repository's `refs/pull/<n>/head`
+/// still serves: the source branch was deleted on merge and the fork is gone.
+fn base_repo_serving_only_a_pull_ref(f: &Fixture) -> String {
+    let base = f._dir.path().join("base");
+    f.jj(
+        f._dir.path(),
+        &[
+            "git",
+            "clone",
+            "--colocate",
+            f.root.to_str().unwrap(),
+            base.to_str().unwrap(),
+        ],
+    );
+    f.jj(&base, &["bookmark", "track", "feat@origin"]);
+    f.jj(&base, &["new", "feat", "-m", "squashed final head"]);
+    std::fs::write(base.join("final.txt"), "final\n").unwrap();
+    f.jj(&base, &["bookmark", "create", "tip", "-r", "@"]);
+    let head = f.jj(&base, &["log", "--no-graph", "-r", "tip", "-T", "commit_id"]);
+    f.jj(&base, &["new", "main@origin"]);
+    // GitHub keeps this ref after the branch is deleted; the fixture creates
+    // only loose refs, so write it directly rather than invoking host git.
+    let pull = base.join(".git/refs/pull/1");
+    std::fs::create_dir_all(&pull).unwrap();
+    std::fs::write(pull.join("head"), format!("{head}\n")).unwrap();
+    f.jj(&base, &["bookmark", "delete", "tip"]);
+    f.jj(&f.ws, &["git", "remote", "add", "origin", base.to_str().unwrap()]);
+    head
+}
+
+/// Answers GitHub's PR lookup and leaves every other command to real jj/git.
+struct PrJsonOnly<'a> {
+    jj: &'a DeclaredJj,
+    pr_json: String,
+}
+
+impl CommandRunner for PrJsonOnly<'_> {
+    fn run(&self, invocation: &CommandInvocation) -> Result<String> {
+        if invocation.program == "gh" {
+            return Ok(self.pr_json.clone());
+        }
+        self.jj.run(invocation)
+    }
+}
+
+#[test]
+fn merged_pr_ref_is_collected_when_only_the_pull_ref_serves_the_head() {
+    let f = Fixture::new();
+    let ancestor = f.commit("feat");
+    point_pr_bookmark(&f.runner, None, &f.ws, 1, &ancestor).unwrap();
+    let head = base_repo_serving_only_a_pull_ref(&f);
+    assert_eq!(f.commit(&format!("present({head})")), "", "head must start absent");
+    assert_eq!(f.git_ref(1), Some(ancestor));
+    // A temporary remote orphaned by a killed run, and one a live fetch may own.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let url = f.root.to_str().unwrap();
+    f.jj(&f.ws, &["git", "remote", "add", "cube-pr-fetch-9-100-killed", url]);
+    f.jj(
+        &f.ws,
+        &["git", "remote", "add", &format!("cube-pr-fetch-9-{now}-live"), url],
+    );
+    // The PR's base repository, as GitHub identifies it. Never contacted:
+    // `origin` (the local `base`) is what the pull-ref fetch uses.
+    f.jj(
+        &f.ws,
+        &["git", "remote", "add", "upstream", "https://github.com/example/repo"],
+    );
+    let runner = PrJsonOnly {
+        jj: &f.runner,
+        pr_json: format!(
+            r#"{{"state":"closed","merged":true,"head":{{"ref":"deleted-branch","sha":"{head}","repo":null}}}}"#
+        ),
+    };
+    let deleted = crate::app::gc::gc_workspace_bookmarks(&runner, None, &f.ws, false, false).unwrap();
+    assert!(deleted.contains(&"pr/1".to_string()), "{deleted:?}");
+    let remotes = f.jj(&f.ws, &["git", "remote", "list"]);
+    assert!(!remotes.contains("killed"), "{remotes}");
+    assert!(remotes.contains("-live"), "{remotes}");
+    assert!(f.pr_commits(1).is_empty());
+    assert_eq!(f.git_ref(1), None);
+}
+
+#[test]
+fn unresolvable_head_is_not_looked_up_again_on_the_next_sweep() {
+    let f = Fixture::new();
+    let ancestor = f.commit("feat");
+    point_pr_bookmark(&f.runner, None, &f.ws, 1, &ancestor).unwrap();
+    f.jj(&f.ws, &["git", "remote", "add", "origin", f.root.to_str().unwrap()]);
+    f.jj(
+        &f.ws,
+        &["git", "remote", "add", "upstream", "https://github.com/example/repo"],
+    );
+    let runner = PrJsonOnly {
+        jj: &f.runner,
+        pr_json: r#"{"state":"closed","merged":true,"head":{"ref":"gone","sha":"0123456789abcdef0123456789abcdef01234567","repo":null}}"#
+            .to_string(),
+    };
+    let deleted = crate::app::gc::gc_workspace_bookmarks(&runner, None, &f.ws, false, false).unwrap();
+    assert!(!deleted.contains(&"pr/1".to_string()));
+    assert!(crate::app::pr_bookmarks::recently_unresolved(&f.ws, 1));
+    assert_eq!(f.pr_commits(1), vec![ancestor]);
+}
