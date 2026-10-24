@@ -257,6 +257,8 @@ extension EngineClient {
             readyForReview: (payload["ready_for_review"] as? Bool) ?? false,
             reviewSection: (payload["review_section"] as? String).flatMap(ReviewSection.init(rawValue:)),
             prUpdatedAt: payload["pr_updated_at"] as? String,
+            reviewBlockedReason: payload["review_blocked_reason"] as? String,
+            reviewBlockedCategory: payload["review_blocked_category"] as? String,
             docLinkState: parseDocLinkState(payload["doc_link_state"]),
             reviewGuideLifecycle: payload["review_guide_lifecycle"] as? String,
             reviewGuideReadableVersionId: payload["review_guide_readable_version_id"] as? String,

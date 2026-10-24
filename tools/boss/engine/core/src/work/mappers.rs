@@ -320,6 +320,10 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         review_section: None,
         // Derived; populated after mapping by attach_pr_updated_at.
         pr_updated_at: None,
+        // Derived; populated after mapping by attach_review_blocked_reason
+        // from the `pr_blocked_diagnoses` side table.
+        review_blocked_reason: None,
+        review_blocked_category: None,
         // Resolved per-task doc-link state. Computed by
         // attach_task_doc_link_state from the task's `doc_*` columns on
         // every read path that returns a Task; None here because the

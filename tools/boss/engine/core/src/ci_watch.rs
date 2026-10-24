@@ -348,6 +348,36 @@ pub async fn on_ci_failure_detected(
     probe: &PrLifecycleProbe,
     failures: &[RequiredCheckFailure],
 ) -> bool {
+    on_ci_failure_detected_with(
+        work_db,
+        publisher,
+        pr_checker,
+        candidate,
+        probe,
+        failures,
+        &crate::ci_transient_retry::NoTransientRetry,
+    )
+    .await
+}
+
+/// [`on_ci_failure_detected`] with the transient-CI retry step enabled
+/// through `retrier` (`crate::ci_transient_retry`). When every failing
+/// check is a PR-branch Buildkite job that failed on positive
+/// infrastructure evidence, the failed jobs are retried in place and the
+/// card is neither flipped to `blocked: ci_failure` nor given a fix
+/// revision; the blocked-PR sweep renders "CI retrying: … (n/N)" from the
+/// ledger until the next probe sees the retried job running. Anything
+/// not positively transient — or a head whose retry budget is spent —
+/// continues into the ordinary fix path below unchanged.
+pub async fn on_ci_failure_detected_with(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    pr_checker: &dyn PrStateChecker,
+    candidate: &PendingMergeCheck,
+    probe: &PrLifecycleProbe,
+    failures: &[RequiredCheckFailure],
+    retrier: &dyn crate::ci_transient_retry::BuildkiteRetrier,
+) -> bool {
     if failures.is_empty() {
         // Defensive — the dispatch site already filtered on Failing,
         // but if a future caller hands us an empty set we should not
@@ -522,6 +552,32 @@ pub async fn on_ci_failure_detected(
         }
     }
 
+    // Transient-infrastructure retry runs only once every in-flight guard
+    // above has passed, so a head already owned by a rebase, conflict fix,
+    // CI remediation or ci-fix revision never re-fetches Buildkite.
+    // A failure set pre-triage would `retrigger` (every check STARTUP_FAILURE
+    // or CANCELLED) belongs to that path; the job-level retry never also
+    // claims it.
+    if classify_pre_triage(failures) != "retrigger" {
+        match crate::ci_transient_retry::try_transient_retry(work_db, publisher, retrier, candidate, probe, failures)
+            .await
+        {
+            crate::ci_transient_retry::TransientOutcome::Handled { retried_jobs } => {
+                tracing::info!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    retried_jobs = ?retried_jobs,
+                    "ci_watch: failing checks were transient; jobs retried, no fix revision minted",
+                );
+                return true;
+            }
+            // The failure is transient but the retry budget could not be
+            // read: stop this pass. Falling through would spend a CI-fix
+            // attempt on an infrastructure failure.
+            crate::ci_transient_retry::TransientOutcome::Deferred { .. } => return false,
+            crate::ci_transient_retry::TransientOutcome::NotApplicable { .. } => {}
+        }
+    }
     // Budget check (design §Q3). A used >= budget here means we've
     // already burned the allotment for this PR — flip the parent to
     // `ci_failure_exhausted` and emit the typed event, but do not

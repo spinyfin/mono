@@ -1,0 +1,8 @@
+[package]
+name = "boss-blocked-pr-diagnosis"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+bon = { workspace = true }

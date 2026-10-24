@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 50;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 51;
 
 /// Schema 43: the baseline commit a recovery record was created at, the
 /// pointer-reconciliation note for the worker prompt, and the retirement
@@ -246,6 +246,12 @@ impl WorkDb {
         // database that already carries the column must be a no-op.
         if version < 50 && !table_has_column(&tx, "work_runs", "semantic_turn_condition")? {
             tx.execute_batch(WORK_RUNS_SEMANTIC_TURN_CONDITION_50)?;
+        }
+        if version < 51 {
+            // Blocked-PR sweep: diagnosis projection + remediation ledger
+            // (`work/blocked_pr.rs`). `IF NOT EXISTS` for the same
+            // replay-fixture reason as schema 46.
+            tx.execute_batch(blocked_pr::BLOCKED_PR_TABLES_51)?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
@@ -766,6 +772,7 @@ mod floor_tests {
             43,
             44,
             45,
+            49,
             CURRENT_SCHEMA_VERSION,
             CURRENT_SCHEMA_VERSION + 1,
         ] {
@@ -832,6 +839,9 @@ mod floor_tests {
             if version >= 50 {
                 conn.execute_batch(WORK_RUNS_SEMANTIC_TURN_CONDITION_50).unwrap();
             }
+            if version >= 51 {
+                conn.execute_batch(blocked_pr::BLOCKED_PR_TABLES_51).unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -869,6 +879,7 @@ mod floor_tests {
             expected.execute_batch(ATTENTION_OPEN_KIND_INDEX_SQL).unwrap();
             expected.execute_batch(BOARD_RUNTIME_EPOCH_49).unwrap();
             expected.execute_batch(WORK_RUNS_SEMANTIC_TURN_CONDITION_50).unwrap();
+            expected.execute_batch(blocked_pr::BLOCKED_PR_TABLES_51).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

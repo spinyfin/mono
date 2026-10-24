@@ -1183,6 +1183,23 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_updated_at: Option<String>,
 
+    /// Why this Review-lane card is not progressing, in one human-readable
+    /// sentence ("CI retrying: HTTP 504 in checks (1/2)", "Needs you: merge
+    /// conflict with main; automatic resolution is disabled"). Written by the
+    /// engine's blocked-PR sweep from the facts it diagnosed, including every
+    /// remediation it attempted; the client renders the text and never
+    /// derives its own. `None` when the sweep found nothing blocking or
+    /// stalling the card, or has not yet examined it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_blocked_reason: Option<String>,
+
+    /// Machine key for `review_blocked_reason` (`ci_transient_retrying`,
+    /// `merge_conflict_no_remediation`, `revision_dead`, …), so a client can
+    /// style or group by cause without parsing the sentence. Same lifetime as
+    /// `review_blocked_reason`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_blocked_category: Option<String>,
+
     /// Resolved doc-link state for this work item, derived from the
     /// task's own `doc_*` columns. Independent of `kind`: any work item
     /// may carry a per-task doc pointer. The engine resolves those
