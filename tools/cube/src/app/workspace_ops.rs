@@ -585,6 +585,16 @@ pub(super) fn workspace_goto(
 
     let _pr_lock = runner.lock_pr_bookmarks(&cwd)?;
 
+    // Also set the pr/<n> bookmark when the caller specified --pr so that
+    // `cube pr push` and `cube workspace rebase` can find the PR number later.
+    // This repairs a conflicted `pr/<n>` to the GitHub head (refusing when the
+    // other side has unique content) and exports to the colocated git repo, so
+    // a stale `refs/heads/pr/<n>` cannot re-conflict it on the next auto-import.
+    if let Some(n) = pr {
+        pr_bookmarks::record_published_head(&cwd, n, &remote_ref);
+        pr_bookmarks::point_pr_bookmark(runner, database_path, &cwd, n, &remote_ref)?;
+    }
+
     // Set the local bookmark to track the head (idempotent; --allow-backwards
     // handles any local divergence). A fork's branch name is never mapped onto
     // a local bookmark: it could be `main`.
@@ -598,15 +608,6 @@ pub(super) fn workspace_goto(
                 &["bookmark", "set", &branch, "-r", &remote_ref, "--allow-backwards"],
             ),
         )?;
-    }
-
-    // Also set the pr/<n> bookmark when the caller specified --pr so that
-    // `cube pr push` and `cube workspace rebase` can find the PR number later.
-    // This repairs a conflicted `pr/<n>` to the GitHub head (refusing when the
-    // other side has unique content) and exports to the colocated git repo, so
-    // a stale `refs/heads/pr/<n>` cannot re-conflict it on the next auto-import.
-    if let Some(n) = pr {
-        pr_bookmarks::point_pr_bookmark(runner, database_path, &cwd, n, &remote_ref)?;
     }
 
     // Idempotency check: if @ already has <remote_ref> as a direct parent,

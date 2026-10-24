@@ -245,7 +245,7 @@ fn gc_retains_pr_bookmark_a_workspace_is_still_positioned_on() {
 /// per-bookmark — would panic on "unexpected command invocation" rather than
 /// silently pass.
 #[test]
-fn gc_sweeps_an_accumulated_backlog_with_one_local_command_and_no_network() {
+fn gc_sweeps_an_accumulated_backlog_with_batched_local_commands_and_no_network() {
     let (tempdir, database_path) = with_database_path();
     let workspace_root = tempdir.path().join("workspaces");
     let workspace_path = workspace_root.join("mono-agent-001");
@@ -260,13 +260,9 @@ fn gc_sweeps_an_accumulated_backlog_with_one_local_command_and_no_network() {
         gc_git_import_command(&workspace_path),
         gc_noop_command(&workspace_path),
         gc_pr_sweep_command(&workspace_path, "pr/1579\npr/2201\npr/2332\n"),
-        gc_pr_safe_command(&workspace_path, "pr/1579", ""),
-        gc_pr_safe_command(&workspace_path, "pr/2201", ""),
-        gc_pr_safe_command(&workspace_path, "pr/2332", ""),
+        gc_batch_safe_command(&workspace_path, &["pr/1579", "pr/2201", "pr/2332"]),
         // Decided again immediately before acting.
-        gc_pr_safe_command(&workspace_path, "pr/1579", ""),
-        gc_pr_safe_command(&workspace_path, "pr/2201", ""),
-        gc_pr_safe_command(&workspace_path, "pr/2332", ""),
+        gc_batch_safe_command(&workspace_path, &["pr/1579", "pr/2201", "pr/2332"]),
         ExpectedCommand::ok(
             workspace_path.clone(),
             "jj",
@@ -274,9 +270,19 @@ fn gc_sweeps_an_accumulated_backlog_with_one_local_command_and_no_network() {
             "",
         ),
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "export"], ""),
-        pr_git_verify_command(&workspace_path, "pr/1579", ""),
-        pr_git_verify_command(&workspace_path, "pr/2201", ""),
-        pr_git_verify_command(&workspace_path, "pr/2332", ""),
+        ExpectedCommand::ok(
+            workspace_path.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "present(pr/1579@git) | present(pr/2201@git) | present(pr/2332@git)",
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "",
+        ),
     ]);
     let release_runner = FakeRunner::new(commands);
     run_with_dependencies(
@@ -1780,4 +1786,21 @@ fn gc_defers_a_probe_whose_remaining_budget_is_too_small_to_spawn() {
     // Untouched, and eligible again next pass.
     let ws_after = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
     assert_eq!(ws_after.health_status, Some(crate::metadata::WorkspaceHealth::Dirty));
+}
+
+fn gc_batch_safe_command(cwd: &std::path::Path, names: &[&str]) -> ExpectedCommand {
+    let revset = names.iter().map(|name| format!(r#"(bookmarks(exact:"{name}") & ::working_copies()) | (bookmarks(exact:"{name}") ~ ::(remote_bookmarks()))"#)).collect::<Vec<_>>().join(" | ");
+    ExpectedCommand::ok(
+        cwd.to_path_buf(),
+        "jj",
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            &revset,
+            "-T",
+            crate::app::gc::BOOKMARK_NAMES_TEMPLATE,
+        ],
+        "",
+    )
 }

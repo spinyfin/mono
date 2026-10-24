@@ -428,6 +428,14 @@ pub(super) fn ensure_pr_deprecated(args: PrCreateArgs, runner: &dyn CommandRunne
     )
 }
 
+fn record_published_head(cwd: &Path, number: Option<u64>, sha: &str, runner: &dyn CommandRunner) -> Result<()> {
+    if let Some(number) = number {
+        let _lock = runner.lock_pr_bookmarks(cwd)?;
+        crate::app::pr_bookmarks::record_published_head(cwd, number, sha);
+    }
+    Ok(())
+}
+
 /// Record only a verified published SHA, never a branch that can move during
 /// publication. Rebased revisions can replace a conflicted sibling, so this
 /// bookkeeping update deliberately allows non-fast-forward movement.
@@ -469,6 +477,7 @@ pub(super) fn record_published_pr_head(
         }
         eprintln!("cube: published PR bookmark `{name}` verified at {published}");
     }
+    record_published_head(cwd, number, published, runner)?;
     Ok(bookmark)
 }
 

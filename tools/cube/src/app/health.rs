@@ -22,7 +22,7 @@ pub(super) enum WorkspaceHealthOutcome {
     /// Working copy is clean and no bookmarks are conflicted. Ready to use as-is.
     Clean,
     /// Working copy is clean, but one or more bookmarks are conflicted.
-    /// Auto-repairable: forget the named bookmarks before resetting.
+    /// Forget other namespaces before resetting; best-effort repair pr/* to the GitHub head.
     ConflictedBookmarks(Vec<String>),
     /// Working copy has uncommitted changes from a prior worker session.
     /// Not safe to auto-repair — skip this workspace.
@@ -298,6 +298,7 @@ pub(super) fn repair_conflicted_bookmarks(
     if !heads.is_empty() {
         let _lock = runner.lock_pr_bookmarks(workspace_path)?;
         for (bookmark, number, sha) in &heads {
+            pr_bookmarks::record_published_head(workspace_path, *number, sha);
             if let Err(error) = pr_bookmarks::point_pr_bookmark(runner, database_path, workspace_path, *number, sha) {
                 skip(&mut outcome, bookmark, &error.to_string());
             }

@@ -15,6 +15,9 @@ use crate::app::errors::{CubeError, Result};
 use crate::app::pr_bookmarks::{delete_pr_bookmarks, point_pr_bookmark};
 use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
 
+#[path = "pr_gc_regression_tests.rs"]
+mod regression;
+
 /// Runs `jj` invocations with the Bazel-declared binary and a fixed identity,
 /// so the fixture needs no global jj config and cannot read the host's.
 struct DeclaredJj {
@@ -362,6 +365,15 @@ impl<'a> LeaseRunner<'a> {
     }
 
     fn with_pr_json(jj: &'a DeclaredJj, pr_json: String) -> Self {
+        let pr_json = match serde_json::from_str::<serde_json::Value>(&pr_json) {
+            Ok(mut info) => {
+                if info["head"].get("repo").is_none() {
+                    info["head"]["repo"] = serde_json::json!({"full_name": "example/repo"});
+                }
+                info.to_string()
+            }
+            Err(_) => pr_json,
+        };
         Self {
             jj,
             pr_json,
@@ -598,6 +610,7 @@ fn pr_rewritten_outside_this_store(f: &Fixture, churn: bool) -> (String, String)
     f.jj(&f.ws, &["git", "fetch", "--remote", "forge"]);
     point_pr_bookmark(&f.runner, None, &f.ws, 1, "feat@forge").expect("initial positioning");
     let published = f.commit("pr/1");
+    crate::app::pr_bookmarks::record_head(&f.ws, 1, &published).unwrap();
 
     // Someone else (GitHub's "Update branch", a human's checkout, a worker on
     // another store) rewrites the PR branch to an unrelated commit.
@@ -685,6 +698,7 @@ fn a_side_published_only_on_an_unrelated_branch_is_not_obsolete() {
 
     let err = point_pr_bookmark(&f.runner, None, &f.ws, 1, &head).expect_err("published on wip only");
     assert!(err.to_string().contains("will not pick a side"), "{err}");
+    assert_eq!(f.jj(&f.ws, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]), before);
 
     // The backup branch is deleted and the deletion fetched: the commit was
     // never tied to this PR in the first place.
@@ -692,17 +706,15 @@ fn a_side_published_only_on_an_unrelated_branch_is_not_obsolete() {
     f.root_write();
     f.jj(&f.ws, &["git", "fetch", "--remote", "backup"]);
     assert_eq!(f.commit(wip_remote), "", "precondition: the branch is gone");
+    let before = f.jj(&f.ws, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
     let err = point_pr_bookmark(&f.runner, None, &f.ws, 1, &head).expect_err("branch deleted");
     assert!(err.to_string().contains("will not pick a side"), "{err}");
+    assert_eq!(f.jj(&f.ws, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]), before);
 
     assert_eq!(f.pr_commits(1).len(), 2, "still conflicted, no side picked");
     assert!(f.pr_commits(1).contains(&other));
     let after = f.jj(&f.ws, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
-    assert_eq!(
-        after.lines().count(),
-        before.lines().count(),
-        "refused writes leave no bookmark change"
-    );
+    assert_eq!(after, before, "refused writes leave no bookmark change");
 }
 
 #[test]

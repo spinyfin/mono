@@ -82,19 +82,31 @@ pub(super) fn delete_pr_bookmarks(
     if names.is_empty() {
         return Ok(());
     }
-    for name in names {
-        if !can_delete(runner, database_path, cwd, name)? {
-            return Err(CubeError::InvalidArgument(format!(
-                "refusing to delete {name}: a side is in use or has no remote protection"
-            )));
-        }
+    let eligible = crate::app::pr_gc::eligible(runner, database_path, cwd, names)?;
+    if eligible.len() != names.len() {
+        return Err(CubeError::InvalidArgument(
+            "refusing to delete PR bookmarks with in-use or unprotected sides".into(),
+        ));
     }
     let mut args: Vec<&str> = vec!["bookmark", "delete"];
     args.extend(names.iter().map(String::as_str));
     run(runner, database_path, cwd, &args)?;
     export_git_refs(runner, database_path, cwd)?;
-    for name in names {
-        verify_git_ref(runner, database_path, cwd, name, &[])?;
+    let refs = names
+        .iter()
+        .map(|name| format!("present({name}@git)"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let remaining = run(
+        runner,
+        database_path,
+        cwd,
+        &["log", "--no-graph", "-r", &refs, "-T", r#"commit_id ++ "\n""#],
+    )?;
+    if !remaining.trim().is_empty() {
+        return Err(CubeError::InvalidArgument(format!(
+            "deleted PR git refs remain: {remaining}"
+        )));
     }
     Ok(())
 }
@@ -148,7 +160,8 @@ fn point_pr_bookmark_with_mode(
         recorded_heads: recorded_heads(cwd, pr_number),
         publication,
     };
-    ensure_sides_are_obsolete(runner, database_path, cwd, &name, &head, &sides, &policy)?;
+    ensure_sides_are_obsolete(runner, database_path, cwd, &name, &head, &sides, &policy)
+        .map_err(|error| CubeError::InvalidArgument(format!("{error} Requested target came from `{head_ref}`.")))?;
 
     run(
         runner,
@@ -180,11 +193,6 @@ fn point_pr_bookmark_with_mode(
         )));
     }
     verify_git_ref(runner, database_path, cwd, &name, std::slice::from_ref(&head))?;
-    // Callers hold the PR-bookmark lock. A store that cannot hold the record
-    // loses only the durable proof, never the correctly written bookmark.
-    if let Err(error) = record_head(cwd, pr_number, &head) {
-        eprintln!("warning: cube could not record `{head}` as a head of PR {pr_number}: {error}");
-    }
     Ok(())
 }
 
@@ -204,6 +212,27 @@ fn bookmark_commits(
         &["log", "--no-graph", "-r", &revset, "-T", r#"commit_id ++ "\n""#],
     )?;
     Ok(distinct_lines(&out))
+}
+
+/// Read-only proof for the rare predecessor case that ancestry alone cannot
+/// classify. GC performs this work outside the store lock, then checks again
+/// when repairing. No network is needed for previously confirmed PR content.
+pub(super) fn obsolete_at_recorded_head(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    cwd: &Path,
+    number: u64,
+) -> Option<String> {
+    let recorded = recorded_heads(cwd, number);
+    let head = recorded.last()?;
+    let name = pr_bookmark::pr_bookmark_name(number);
+    let sides = bookmark_commits(runner, database_path, cwd, &name).ok()?;
+    let policy = RepairPolicy {
+        recorded_heads: recorded.clone(),
+        publication: false,
+    };
+    ensure_sides_are_obsolete(runner, database_path, cwd, &name, head, &sides, &policy).ok()?;
+    Some(head.clone())
 }
 
 /// [`bookmark_commits`] rendered for a diagnostic: never fails.
@@ -327,6 +356,11 @@ fn ensure_sides_are_obsolete(
             use git_utils::jj_provenance::{
                 COMMIT_ID_LINES_TEMPLATE, candidate_revset, evolution_contains, sole_candidate,
             };
+            let scope = if recorded.is_empty() {
+                format!("::{head}")
+            } else {
+                format!("::({head} | {recorded})")
+            };
             let candidates = run(
                 runner,
                 database_path,
@@ -335,7 +369,7 @@ fn ensure_sides_are_obsolete(
                     "log",
                     "--no-graph",
                     "-r",
-                    &candidate_revset(change, &format!("::{head}")),
+                    &candidate_revset(change, &scope),
                     "-T",
                     COMMIT_ID_LINES_TEMPLATE,
                 ],
@@ -453,8 +487,8 @@ pub(super) fn is_unsafe_repair(error: &CubeError) -> bool {
 
 fn unsafe_repair(name: &str, head: &str, side: &str, why: &str) -> CubeError {
     CubeError::InvalidArgument(format!(
-        "`{name}` is conflicted and {UNSAFE_REPAIR_PHRASE}: the GitHub head is {head} but the other side \
-         {side} has unique content ({why}). Inspect with `jj log -r 'bookmarks(exact:\"{name}\")'`; if {side} \
+        "cube cannot move `{name}` from {side} to requested target {head}: {UNSAFE_REPAIR_PHRASE} \
+         with unique content ({why}). Inspect with `jj log -r 'bookmarks(exact:\"{name}\")'`; if {side} \
          is really obsolete, resolve with `jj bookmark set {name} -r {head} --allow-backwards`."
     ))
 }
@@ -489,40 +523,14 @@ fn verify_git_ref(
     Ok(())
 }
 
-/// A bookmark can be collected only if all its sides are remotely protected
-/// and none is an ancestor of a working copy. @git is local, not protection.
-pub(super) fn can_delete(
-    runner: &dyn CommandRunner,
-    database_path: Option<&Path>,
-    cwd: &Path,
-    name: &str,
-) -> Result<bool> {
-    let unsafe_sides = run(
-        runner,
-        database_path,
-        cwd,
-        &[
-            "log",
-            "--no-graph",
-            "-r",
-            &format!(
-                r#"(bookmarks(exact:"{name}") & ::working_copies()) | (bookmarks(exact:"{name}") ~ ::remote_bookmarks())"#
-            ),
-            "-T",
-            r#"commit_id ++ "\n""#,
-        ],
-    )?;
-    Ok(unsafe_sides.trim().is_empty())
-}
-
 // ── A PR's authoritative head ───────────────────────────────────────────────
 //
 // The commit GitHub reports as `head.sha`, shared by `goto --pr` and
 // lease-time `pr/<n>` repair so the two cannot disagree about which commit is
 // the PR head. `resolve_pr_head` makes it present in the shared jj store
 // (fetching it from the head repository when the base remote lacks it). The
-// *recorded heads* of a PR are every commit cube successfully pointed `pr/<n>`
-// at, kept in a cube-owned file inside the shared store: a conflicting side
+// *recorded heads* of a PR are only heads confirmed published on GitHub,
+// kept in a cube-owned file inside the shared store: a conflicting side
 // whose unique commits are all ancestors of a recorded head was a head of
 // *this PR* and lost nothing when GitHub's head replaced it, however long ago
 // and whatever became of any branch it was pushed to.
@@ -585,7 +593,7 @@ pub(super) fn resolve_pr_head(
         .ok_or_else(|| CubeError::InvalidArgument(format!("PR {number} returned no head.sha")))?
         .to_string();
     let head_repo = head_repo_full_name(info);
-    let same_repo = head_repo.is_none_or(|name| name.eq_ignore_ascii_case(owner_repo));
+    let same_repo = head_repo.is_some_and(|name| name.eq_ignore_ascii_case(owner_repo));
     let head = PrHead {
         sha: sha.clone(),
         same_repo,
@@ -626,10 +634,8 @@ fn fetch_head_from_head_repo(
         .map(str::to_string)
         .or_else(|| head_repo_full_name(info).map(|name| format!("https://github.com/{name}.git")))
         .ok_or_else(|| CubeError::InvalidArgument(format!("PR {number} reports no head repository")))?;
-    let remote = format!("cube-pr-fetch-{number}");
+    let remote = format!("cube-pr-fetch-{number}-{}", uuid::Uuid::new_v4());
     let jj = |args: &[&str]| run_jj(runner, database_path, &RealCommandRunner::invocation(cwd, "jj", args));
-    // A leftover from an interrupted run; absent is the normal case.
-    let _ = jj(&["git", "remote", "remove", &remote]);
     jj(&["git", "remote", "add", &remote, &url])?;
     let fetched = run_jj_network_within(
         runner,
@@ -643,10 +649,11 @@ fn fetch_head_from_head_repo(
     fetched.map(|_| ())
 }
 
-/// `<shared jj repo>/cube-pr-heads/<n>`, one commit id per line, oldest first.
+/// `<shared jj repo>/cube-pr-heads/published/<n>`, one commit id per line, oldest first.
 fn heads_path(cwd: &Path, number: u64) -> Result<PathBuf> {
     Ok(crate::lock::shared_repo_dir(cwd)?
         .join("cube-pr-heads")
+        .join("published")
         .join(number.to_string()))
 }
 
@@ -669,6 +676,7 @@ pub(super) fn recorded_heads(cwd: &Path, number: u64) -> Vec<String> {
 
 /// Record `commit` as a head of PR `number`. Callers hold the PR-bookmark lock.
 pub(super) fn record_head(cwd: &Path, number: u64, commit: &str) -> Result<()> {
+    // Legacy records included unpushed tips and cannot prove publication.
     let path = heads_path(cwd, number)?;
     let mut heads = recorded_heads(cwd, number);
     heads.retain(|h| h != commit);
@@ -682,4 +690,11 @@ pub(super) fn record_head(cwd: &Path, number: u64, commit: &str) -> Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, heads.join("\n") + "\n").map_err(CubeError::Io)?;
     std::fs::rename(&tmp, &path).map_err(CubeError::Io)
+}
+
+/// Persist only a head confirmed by GitHub, while holding the bookmark lock.
+pub(super) fn record_published_head(cwd: &Path, number: u64, commit: &str) {
+    if let Err(error) = record_head(cwd, number, commit) {
+        eprintln!("warning: cube could not record published PR {number} head {commit}: {error}");
+    }
 }

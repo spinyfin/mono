@@ -1,0 +1,184 @@
+//! Batched local PR retention checks and repair of legacy stale refs.
+
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use crate::app::errors::Result;
+use crate::app::{gh_pr, jj::run_jj, pr_bookmarks, reset};
+use crate::command_runner::{CommandRunner, RealCommandRunner};
+
+/// Check every candidate in one jj invocation. Protection is specific to each
+/// PR's confirmed published heads; local @git refs are never protection.
+pub(super) fn eligible(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    cwd: &Path,
+    names: &[String],
+) -> Result<Vec<String>> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let unsafe_revset = names
+        .iter()
+        .map(|name| {
+            let heads = name[3..]
+                .parse()
+                .ok()
+                .map(|number| pr_bookmarks::recorded_heads(cwd, number))
+                .unwrap_or_default();
+            let mut protection = "remote_bookmarks()".to_string();
+            for head in heads {
+                protection.push_str(&format!(" | present({head})"));
+            }
+            format!(
+                r#"(bookmarks(exact:"{name}") & ::working_copies()) | (bookmarks(exact:"{name}") ~ ::({protection}))"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let unsafe_names = run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(
+            cwd,
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                &unsafe_revset,
+                "-T",
+                super::gc::BOOKMARK_NAMES_TEMPLATE,
+            ],
+        ),
+    )?;
+    Ok(names
+        .iter()
+        .filter(|name| !unsafe_names.lines().any(|line| line.trim() == name.as_str()))
+        .cloned()
+        .collect())
+}
+
+pub(super) struct Resolved {
+    number: u64,
+    sha: String,
+    closed: bool,
+}
+
+/// Network resolution runs without the store lock. Failures preserve the refs
+/// and identify what could not be checked rather than silently claiming success.
+pub(super) fn resolve_retained(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    cwd: &Path,
+    names: &[String],
+) -> Vec<Resolved> {
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let mut resolved = Vec::new();
+    let mut unknown = Vec::new();
+    for name in names {
+        let Ok(number) = name[3..].parse() else {
+            eprintln!("warning: cube retained {name}: PR number is out of range");
+            continue;
+        };
+        if let Some(sha) = pr_bookmarks::obsolete_at_recorded_head(runner, database_path, cwd, number) {
+            // Like the batched ancestry case, a proven predecessor of this
+            // PR's published content can be collected without a state lookup.
+            resolved.push(Resolved {
+                number,
+                sha,
+                closed: true,
+            });
+        } else {
+            unknown.push(name);
+        }
+    }
+    if unknown.is_empty() {
+        return resolved;
+    }
+    let result = reset::resolve_github_remote_for_workspace(runner, database_path, cwd);
+    let (_, repo) = match result {
+        Ok(repo) => repo,
+        Err(error) => {
+            eprintln!("warning: cube retained PR bookmarks {unknown:?}: {error}");
+            return resolved;
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    for name in unknown {
+        if Instant::now() >= deadline {
+            eprintln!("warning: cube retained {name}: PR lookup deadline exhausted");
+            continue;
+        }
+        let Ok(number) = name[3..].parse() else {
+            eprintln!("warning: cube retained {name}: PR number is out of range");
+            continue;
+        };
+        let resolve = || -> Result<Resolved> {
+            let info = gh_pr::fetch_pr_json_with_timeout(
+                runner,
+                cwd,
+                &repo,
+                number,
+                deadline.saturating_duration_since(Instant::now()),
+            )?;
+            let head = pr_bookmarks::resolve_pr_head(runner, database_path, cwd, &repo, number, &info, Some(deadline))?;
+            Ok(Resolved {
+                number,
+                sha: head.sha,
+                closed: matches!(gh_pr::state(&info).as_str(), "CLOSED" | "MERGED"),
+            })
+        };
+        match resolve() {
+            Ok(head) => resolved.push(head),
+            Err(error) => eprintln!("warning: cube retained {name}: {error}"),
+        }
+    }
+    resolved
+}
+
+/// Called under the lock; re-read sides because goto may have run meanwhile.
+/// Open PRs are repaired but kept during this sweep.
+pub(super) fn repair_retained(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    cwd: &Path,
+    resolved: &[Resolved],
+) -> Vec<String> {
+    let mut keep = Vec::new();
+    for head in resolved {
+        let name = format!("pr/{}", head.number);
+        let repair = || -> Result<()> {
+            let in_use = run_jj(
+                runner,
+                database_path,
+                &RealCommandRunner::invocation(
+                    cwd,
+                    "jj",
+                    &[
+                        "log",
+                        "--no-graph",
+                        "-r",
+                        &format!(r#"bookmarks(exact:"{name}") & ::working_copies()"#),
+                        "-T",
+                        "commit_id",
+                    ],
+                ),
+            )?;
+            if !in_use.trim().is_empty() {
+                return Err(super::errors::CubeError::InvalidArgument(format!("{name} is in use")));
+            }
+            pr_bookmarks::record_published_head(cwd, head.number, &head.sha);
+            pr_bookmarks::point_pr_bookmark(runner, database_path, cwd, head.number, &head.sha)
+        };
+        if let Err(error) = repair() {
+            eprintln!("warning: cube retained {name}: {error}");
+            keep.push(name);
+        } else if !head.closed {
+            keep.push(name);
+        }
+    }
+    keep
+}

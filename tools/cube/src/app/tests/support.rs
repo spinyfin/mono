@@ -637,10 +637,10 @@ pub(super) fn gc_pr_safe_command(cwd: &std::path::Path, name: &str, output: &str
             "--no-graph",
             "-r",
             &format!(
-                r#"(bookmarks(exact:"{name}") & ::working_copies()) | (bookmarks(exact:"{name}") ~ ::remote_bookmarks())"#
+                r#"(bookmarks(exact:"{name}") & ::working_copies()) | (bookmarks(exact:"{name}") ~ ::(remote_bookmarks()))"#
             ),
             "-T",
-            r#"commit_id ++ "\n""#,
+            crate::app::gc::BOOKMARK_NAMES_TEMPLATE,
         ],
         output,
     )
