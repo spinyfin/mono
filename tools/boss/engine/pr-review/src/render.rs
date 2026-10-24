@@ -27,17 +27,14 @@ pub const REVISION_CLOSE_SENTENCE: &str = "Address ALL findings before finalisin
 /// `tools/boss/app-macos/Sources/MarkdownDocumentChrome.swift`.
 pub const REVISION_HARD_RULE_HEADING: &str = "HARD RULE: no punting — do the actual work";
 
-/// Provenance of the PR + work item that produced a `ReviewResult`. Threaded
-/// into both the rendered revision instructions and the revision/follow-up
-/// card title so a row is never anonymous — including after
+/// Provenance of the PR that produced a `ReviewResult`. Threaded into both
+/// the rendered revision instructions and the revision/follow-up card title so
+/// a row is never anonymous — including after
 /// `block_pending_revisions_on_parent_close` converts it from `revision` to
 /// `followup` when the reviewed PR merges before the findings are addressed.
+/// Only the public PR number is carried: both strings are worker-facing.
 #[derive(Debug, Clone, Copy)]
 pub struct ReviewOrigin {
-    /// Per-product short id of the task under review — the chain root for a
-    /// re-review of an existing revision, the task itself otherwise. `None`
-    /// only for a legacy row that predates the `short_id` column.
-    pub task_short_id: Option<i64>,
     /// GitHub PR number parsed from `ReviewResult::pr_url`. `None` when the
     /// URL didn't parse to a canonical `.../pull/<n>` form (defensive; the
     /// finalize path always supplies a validated PR url in practice).
@@ -69,15 +66,13 @@ impl ReviewOrigin {
     }
 }
 
-/// Short (1–10 word) card title identifying the origin PR and work item so
+/// Short (1–10 word) card title identifying the origin PR so
 /// automated-review cards are distinguishable on the board without opening
 /// them — see `boss task create-revision`'s `name` field.
 pub fn render_revision_title(origin: ReviewOrigin, finding_count: usize) -> String {
-    match (origin.task_short_id, origin.pr_number) {
-        (Some(short_id), Some(pr)) => format!("T{short_id} PR #{pr} review: {finding_count} finding(s)"),
-        (Some(short_id), None) => format!("T{short_id} PR review: {finding_count} finding(s)"),
-        (None, Some(pr)) => format!("PR #{pr} review: {finding_count} finding(s)"),
-        (None, None) => format!("Automated PR review: {finding_count} finding(s)"),
+    match origin.pr_number {
+        Some(pr) => format!("PR #{pr} review: {finding_count} finding(s)"),
+        None => format!("Automated PR review: {finding_count} finding(s)"),
     }
 }
 
@@ -124,8 +119,7 @@ pub fn render_post_merge_followup_provenance(origin_pr_url: &str) -> String {
 /// is the `revision_instructions` passed to the revising worker — it must
 /// be specific enough to act on without guessing.
 ///
-/// Opens with `origin` (the PR reviewed and the work item that produced it)
-/// before the generic no-punting preamble, so the description alone
+/// Opens with `origin` (the PR reviewed) before the generic no-punting preamble, so the description alone
 /// identifies what the findings are about.
 ///
 /// This string is stored verbatim (only `.trim()`'d) as the created
@@ -1987,10 +1981,7 @@ mod tests {
     /// from data at the call site (never a literal short-id string) so
     /// nothing here reads as a hardcoded work-item reference.
     fn test_origin() -> ReviewOrigin {
-        ReviewOrigin {
-            task_short_id: Some(40 + 2),
-            pr_number: Some(5),
-        }
+        ReviewOrigin { pr_number: Some(5) }
     }
 
     #[test]
@@ -2089,14 +2080,9 @@ mod tests {
         let origin = test_origin();
         let instructions = render_revision_instructions(&result, origin);
         let origin_marker = format!("PR #{}", origin.pr_number.expect("test origin has a pr_number"));
-        let short_id_marker = format!("T{}", origin.task_short_id.expect("test origin has a task_short_id"));
         let origin_pos = instructions
             .find(&origin_marker)
             .expect("origin PR reference must be present");
-        assert!(
-            !instructions.contains(&short_id_marker),
-            "only public PR provenance belongs in instructions"
-        );
         let preamble_pos = instructions
             .find("HARD RULE: no punting")
             .expect("no-punting preamble must be present");
@@ -2104,17 +2090,8 @@ mod tests {
             origin_pos < preamble_pos,
             "origin must open the description before the generic no-punting preamble: {instructions}"
         );
-        for task_short_id in [None, origin.task_short_id] {
-            let instructions = render_revision_instructions(
-                &result,
-                ReviewOrigin {
-                    task_short_id,
-                    pr_number: None,
-                },
-            );
-            assert!(instructions.contains("review of the reviewed PR found"));
-            assert!(!instructions.contains(&short_id_marker));
-        }
+        let instructions = render_revision_instructions(&result, ReviewOrigin { pr_number: None });
+        assert!(instructions.contains("review of the reviewed PR found"));
     }
 
     /// The `## HARD RULE ...` heading is the structural marker the macOS
@@ -2152,13 +2129,7 @@ mod tests {
         let pre_merge = render_revision_instructions(&result, test_origin());
         let post_merge = {
             let mut description = render_post_merge_followup_provenance("https://github.com/org/repo/pull/117");
-            description.push_str(&render_revision_instructions(
-                &result,
-                ReviewOrigin {
-                    task_short_id: None,
-                    ..test_origin()
-                },
-            ));
+            description.push_str(&render_revision_instructions(&result, test_origin()));
             description
         };
 
@@ -2184,16 +2155,30 @@ mod tests {
     }
 
     #[test]
+    fn titles_carry_only_the_public_pr_number() {
+        let origin = test_origin();
+        let pr = origin.pr_number.expect("test origin has a pr_number");
+        assert_eq!(
+            render_revision_title(origin, 2),
+            format!("PR #{pr} review: 2 finding(s)")
+        );
+        assert_eq!(
+            render_post_merge_followup_title(origin, 2),
+            format!("Post-merge review findings: PR #{pr} review: 2 finding(s)")
+        );
+        assert_eq!(
+            render_post_merge_followup_title(ReviewOrigin { pr_number: None }, 1),
+            "Post-merge review findings: Automated PR review: 1 finding(s)"
+        );
+    }
+
+    #[test]
     fn render_revision_title_identifies_origin_without_pr_number() {
-        let origin = ReviewOrigin {
-            task_short_id: Some(7),
-            pr_number: None,
-        };
+        let origin = ReviewOrigin { pr_number: None };
         let title = render_revision_title(origin, 3);
-        let short_id_marker = format!("T{}", origin.task_short_id.expect("test origin has a task_short_id"));
         assert!(
-            title.contains(&short_id_marker),
-            "title must name the origin work item: {title}"
+            title.starts_with("Automated PR review"),
+            "title must fall back to the generic form: {title}"
         );
         assert!(title.contains('3'), "title must include the finding count: {title}");
         assert!(

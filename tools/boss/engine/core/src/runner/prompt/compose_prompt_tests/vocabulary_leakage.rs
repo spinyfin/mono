@@ -191,12 +191,12 @@ fn review_findings_task(pr: &str) -> WorkItem {
     .unwrap();
     let mut item = chore_with_pr(pr);
     if let WorkItem::Task(task) | WorkItem::Chore(task) = &mut item {
-        task.description = boss_pr_review::render_revision_instructions(
-            &result,
-            boss_pr_review::ReviewOrigin {
-                task_short_id: Some(1234),
-                pr_number: Some(42),
-            },
+        let origin = boss_pr_review::ReviewOrigin { pr_number: Some(42) };
+        task.name = boss_pr_review::render_revision_title(origin, result.findings.len());
+        task.description = boss_pr_review::render_revision_instructions(&result, origin);
+        assert_no_forbidden_prose(
+            "post-merge follow-up title",
+            &boss_pr_review::render_post_merge_followup_title(origin, result.findings.len()),
         );
         assert!(task.description.contains("review of PR #42 found"));
     }

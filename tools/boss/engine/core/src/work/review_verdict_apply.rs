@@ -238,7 +238,6 @@ impl WorkDb {
         };
 
         let origin = crate::pr_review::ReviewOrigin {
-            task_short_id: origin_task.short_id,
             pr_number: Some(batch.pr_number),
         };
         // A `PostMerge` batch's origin PR is already merged by the time its
@@ -253,20 +252,7 @@ impl WorkDb {
         let (title, instructions) = if batch.phase == boss_protocol::ReviewBatchPhase::PostMerge {
             let title = crate::pr_review::render_post_merge_followup_title(origin, review_result.findings.len());
             let mut instructions = crate::pr_review::render_post_merge_followup_provenance(&batch.pr_url);
-            // Strip the origin task's short id from the origin fed into the
-            // findings body: `ReviewOrigin::describe()` would otherwise emit
-            // a literal `T<short_id>` token into the very description text a
-            // PostMerge follow-up's PR body is built from, tripping
-            // `boss-ism/pr-text-leakage`. The title above is unaffected — a
-            // work-item title is never PR text.
-            let instructions_origin = crate::pr_review::ReviewOrigin {
-                task_short_id: None,
-                ..origin
-            };
-            instructions.push_str(&crate::pr_review::render_revision_instructions(
-                &review_result,
-                instructions_origin,
-            ));
+            instructions.push_str(&crate::pr_review::render_revision_instructions(&review_result, origin));
             (title, instructions)
         } else {
             (

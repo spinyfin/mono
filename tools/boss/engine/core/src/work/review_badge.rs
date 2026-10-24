@@ -190,7 +190,6 @@ fn findings_markdown(history: &ReviewBadgeHistory) -> Result<Option<String>> {
         let payload: boss_protocol::ReviewVerdictProposalPayload = serde_json::from_str(payload)?;
         let verdict: crate::pr_review::SupervisorVerdict = serde_json::from_value(payload.verdict)?;
         let origin = crate::pr_review::ReviewOrigin {
-            task_short_id: None,
             pr_number: verdict.pr_url.rsplit('/').next().and_then(|value| value.parse().ok()),
         };
         return Ok(Some(crate::pr_review::render_revision_instructions(
