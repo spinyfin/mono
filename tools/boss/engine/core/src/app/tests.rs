@@ -16,6 +16,7 @@ fn topic_envelope(topic: &str, revision: u64) -> FrontendEventEnvelope {
                 reason: "test".to_owned(),
                 product_id: None,
                 item_ids: vec![],
+                class: crate::protocol::InvalidationClass::Structural,
             },
         },
     )
@@ -474,6 +475,7 @@ mod dispatch_pause;
 mod driver_start_signal;
 mod engine_health_report;
 mod engine_pool_config;
+mod invalidation_routing;
 mod metadata_persistence;
 mod open_document;
 mod pause_broadcast;

@@ -627,6 +627,7 @@ mod automations;
 mod blocked_workspace;
 mod blocking;
 mod board_notifications;
+mod board_patch;
 pub(crate) mod board_runtime_cache;
 mod boothby;
 mod cached_task_runtimes;
@@ -791,6 +792,7 @@ pub use audit_misc::ProjectPropertyAuditEntry;
 pub use audit_misc::canonicalize_repo_remote_url;
 pub use audit_misc::canonicalize_worker_branch_prefix;
 pub use automations::AutomationFireRecord;
+pub use board_patch::WorkRuntimePatch;
 pub use boothby::{BoothbyActionContext, BoothbyActionGuard};
 pub use exec_tail::ClearedExecutionWorkspace;
 pub use execution_retention::{

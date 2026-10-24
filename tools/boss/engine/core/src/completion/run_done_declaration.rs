@@ -1072,7 +1072,7 @@ async fn run_declared_delivery_doc_link_detection(
     };
     design_detector::on_task_doc_pr_detected(work_db, &task.id, &task.product_id, pr_url).await;
     publisher
-        .publish_work_item_changed(&task.product_id, &task.id, "task_doc_pointer_set")
+        .publish_work_item_runtime_changed(&task.product_id, &task.id, "task_doc_pointer_set")
         .await;
 
     if matches!(task.kind, TaskKind::Design | TaskKind::DesignPostmortem)

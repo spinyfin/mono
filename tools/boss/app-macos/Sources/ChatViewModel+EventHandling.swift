@@ -59,6 +59,8 @@ extension ChatViewModel {
             cancelPendingResyncRefetch()
             pendingProjectDesignDocOpen = nil
             engine.resetConnectTreeClaims()
+            // No reply is coming for a read the dropped connection carried.
+            resetBoardReadFences()
             disconnectOffsiteBackupEdit()
             if engine.hasUnsentAction(kind: "recreate_coordinator") {
                 coordinatorResetWaiting = false
@@ -103,7 +105,7 @@ extension ChatViewModel {
             // kept; only checks whose request was in flight are settled.
             bounceUnparkedDrags(message: nil, includeMovesWithoutCheck: false)
             scheduleConnectionLostBannerCheck()
-        case .workInvalidated(let topic, let productId, let itemIDs):
+        case .workInvalidated(let topic, let productId, let itemIDs, let invalidationClass):
             if CommentEngineBridge.isCommentTopic(topic) {
                 // A comment row on an open viewer's artifact changed elsewhere;
                 // the bridge reloads the bound layer(s). Invalidation-not-patch.
@@ -123,8 +125,11 @@ extension ChatViewModel {
             } ?? false
             scheduleInvalidationRefetch(
                 productID: onBoard ? currentSelectedProductID : productId,
-                itemIDs: itemIDs
+                itemIDs: itemIDs,
+                invalidationClass: invalidationClass
             )
+        case .workRuntimePatch(let productId, let cards, let absent, let isComplete, let requestID, let revision):
+            handleWorkRuntimePatch(productID: productId, cards: cards, absent: absent, isComplete: isComplete, requestID: requestID, revision: revision)
         case .productsList(let products):
             self.products = products.sorted(by: { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending })
             let activeIDs = Set(activeProducts.map(\.id))
@@ -148,7 +153,8 @@ extension ChatViewModel {
             refreshWorkSubscriptions()
         case .projectsList(let productId, let projects):
             projectsByProductID[productId] = projects.sorted(by: projectSort)
-        case .workTree(let product, let projects, let tasks, let chores, let taskRuntimes, let dependencies, let ideas, let attentionItems, let attentionGroups, let attentionMembers, let plannerRuns):
+        case .workTree(let product, let projects, let tasks, let chores, let taskRuntimes, let dependencies, let ideas, let attentionItems, let attentionGroups, let attentionMembers, let plannerRuns, let requestID, let revision):
+            guard acceptWorkTree(productID: product.id, requestID: requestID, revision: revision) else { return }
             applyWorkTree(
                 product: product,
                 projects: projects,
@@ -166,7 +172,8 @@ extension ChatViewModel {
             handleCreatedWorkItem(item)
         case .workItemsCreated(let items):
             handleCreatedWorkItemsBatch(items)
-        case .workItemUpdated(let item):
+        case .workItemUpdated(let item, let revision):
+            noteBoardRevision(revision, item: item)
             handleUpdatedWorkItem(item)
         case .projectTasksReordered(let projectId, _):
             if let productID = project(withID: projectId)?.productID {
@@ -182,7 +189,10 @@ extension ChatViewModel {
             }
         case .operatorQuestionError(let message, let requestId):
             handleOperatorQuestionError(message: message, requestId: requestId)
+        case .boardReadFailed(let requestId):
+            failBoardRead(requestID: requestId)
         case .workError(let message, let requestId):
+            failBoardRead(requestID: requestId)
             if settleOffsiteBackupError(message, requestID: requestId) { return }
             // An error carrying the answer's own request id is not ambiguous:
             // settle it onto that card without blaming any other request.
@@ -191,9 +201,9 @@ extension ChatViewModel {
             // mark and the message surfaces, with no other state touched.
             if settleArchiveWorkError(message: message, requestId: requestId) { return }
             abandonBackgroundWorkRequest(requestId: requestId)
-            // The engine's WorkError reply carries no request context, so we
-            // can't tell which in-flight list_executions/list_attachments
-            // call failed. `hasOtherTrackedAppRequestInFlight` checks every
+            // Legacy list_executions/list_attachments guards do not retain
+            // request IDs, so they cannot match the error's envelope ID.
+            // `hasOtherTrackedAppRequestInFlight` checks every
             // other in-flight guard this same handler already reacts to
             // (merge, review terminal, planner action, kanban move, engine
             // attempt detail, …), captured BEFORE any of them are cleared

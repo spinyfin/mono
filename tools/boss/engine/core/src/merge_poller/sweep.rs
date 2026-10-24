@@ -2449,8 +2449,10 @@ pub(crate) async fn update_pr_poll_state(
     if outcome.changed {
         // State changed — emit event so the macOS kanban refreshes the
         // card's CI / review / merging indicators within the poll interval.
+        // `update_task_pr_poll_state` rewrites only this task's CI / review /
+        // mergeability / merge-queue columns, so the change is runtime-class.
         publisher
-            .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "pr_poll_state_updated")
+            .publish_work_item_runtime_changed(&candidate.product_id, &candidate.work_item_id, "pr_poll_state_updated")
             .await;
         tracing::debug!(
             work_item_id = %candidate.work_item_id,

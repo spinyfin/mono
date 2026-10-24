@@ -764,7 +764,7 @@ impl WorkerCompletionHandler {
             // `boss task set-doc` path (`app/work_items.rs`, reason
             // `task_doc_pointer_set`).
             self.publisher
-                .publish_work_item_changed(&task.product_id, &task.id, "task_doc_pointer_set")
+                .publish_work_item_runtime_changed(&task.product_id, &task.id, "task_doc_pointer_set")
                 .await;
         }
 

@@ -85,8 +85,10 @@ pub(crate) async fn renumber_section_order<T, K: Ord>(
         match ctx.work_db.update_task_merge_queue_detail(task_id, &json) {
             Ok(true) => {
                 writes += 1;
+                // `update_task_merge_queue_detail` rewrites only the position
+                // detail of this one task (runtime-class).
                 ctx.publisher
-                    .publish_work_item_changed(ctx.product_id, task_id, ctx.event)
+                    .publish_work_item_runtime_changed(ctx.product_id, task_id, ctx.event)
                     .await;
                 tracing::debug!(
                     work_item_id = %task_id,

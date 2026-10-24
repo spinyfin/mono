@@ -653,6 +653,14 @@ async fn writes_queued_state_with_a_one_based_position_and_section_order() {
             (product_id, task_id, "trunk_queue_renumbered".to_owned()),
         ]
     );
+    // Both rewrite only this task's merge-queue columns: runtime-class.
+    assert_eq!(
+        publisher.runtime_reasons().await,
+        vec![
+            "trunk_queue_state_updated".to_owned(),
+            "trunk_queue_renumbered".to_owned()
+        ],
+    );
 
     // And the intent remembers what the queue said.
     let intent = db.list_active_trunk_merge_intents().unwrap().remove(0);

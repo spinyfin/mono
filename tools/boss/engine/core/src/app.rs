@@ -45,9 +45,10 @@ use crate::merge_when_ready;
 use crate::protocol::{
     DispatchAdmissionEntryPoint, EngineToAppError, EngineToAppRequest, EngineToAppResponse, FocusWorkerPaneInput,
     FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, GitHubAuthStateDto,
-    HostedPaneState, HostedPaneStatus, ListHostedPanesInput, OpenDocumentInput, OrgAuthState, RequestExecutionInput,
-    RevealWorkItemInput, TOPIC_ENGINE_HEALTH, TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES,
-    TopicEventPayload, comment_topic, editorial_actions_topic, execution_topic, probe_topic, work_product_topic,
+    HostedPaneState, HostedPaneStatus, InvalidationClass, ListHostedPanesInput, OpenDocumentInput, OrgAuthState,
+    RequestExecutionInput, RevealWorkItemInput, TOPIC_ENGINE_HEALTH, TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS,
+    TOPIC_WORKER_LIVE_STATES, TopicEventPayload, comment_topic, editorial_actions_topic, execution_topic, probe_topic,
+    work_product_topic,
 };
 use crate::repo_slug;
 use crate::runner::ExecutionRunner;
@@ -199,10 +200,10 @@ use handler_helpers::{
     handle_create_many, in_review_chore_execution, live_execution_for_task_id, load_automation_paused_state,
     load_dispatch_concurrency_limit, load_dispatch_paused_state, load_live_status_disabled_slots,
     open_review_terminal_async, persist_live_status_disabled_slots, publish_comment_invalidation,
-    publish_work_invalidation, read_transcript_tail, resolve_transcript_for_tail, segment_to_wire, send_push,
-    send_response, send_response_with_revision, send_work_error, tail_lines_from_content, task_name_description_for_id,
-    task_status_for_id, task_transitioned_to_active, terminal_chore_execution, transport_default_created_via,
-    validate_external_tracker_config, work_item_id, work_item_needs_dispatch,
+    publish_runtime_work_invalidation, publish_work_invalidation, read_transcript_tail, resolve_transcript_for_tail,
+    segment_to_wire, send_push, send_response, send_response_with_revision, send_work_error, tail_lines_from_content,
+    task_name_description_for_id, task_status_for_id, task_transitioned_to_active, terminal_chore_execution,
+    transport_default_created_via, validate_external_tracker_config, work_item_id, work_item_needs_dispatch,
 };
 
 /// Per-request handler context: the connection-scoped state every
@@ -1385,6 +1386,7 @@ impl ServerState {
         let publisher_impl = Arc::new(BrokerExecutionPublisher {
             topic_broker: topic_broker.clone(),
             work_revision: work_revision.clone(),
+            metrics: metrics_registry.clone(),
             kick: std::sync::OnceLock::new(),
         });
         let publisher: Arc<dyn ExecutionPublisher> = publisher_impl.clone();
@@ -2240,6 +2242,7 @@ impl crate::transient_recovery::WorkerNudger for ServerState {
 struct BrokerExecutionPublisher {
     topic_broker: Arc<TopicBroker>,
     work_revision: Arc<AtomicU64>,
+    metrics: Arc<crate::metrics::Registry>,
     /// Late-bound kick function set after the coordinator is created.
     /// `None` until [`BrokerExecutionPublisher::set_kick`] is called;
     /// `kick_scheduler` is a no-op until the coordinator is wired up.
@@ -2249,6 +2252,46 @@ struct BrokerExecutionPublisher {
 impl BrokerExecutionPublisher {
     fn set_kick(&self, f: impl Fn() + Send + Sync + 'static) {
         let _ = self.kick.set(Arc::new(f));
+    }
+
+    async fn publish_classified_work_item_changed(
+        &self,
+        product_id: &str,
+        work_item_id: &str,
+        reason: &str,
+        class: InvalidationClass,
+    ) {
+        tracing::info!(
+            source = "execution",
+            reason,
+            class = class.as_str(),
+            product_id,
+            item_count = 1,
+            topic_count = 1,
+            "work invalidation fanout"
+        );
+        crate::board_invalidation_metrics::record_push(
+            &self.metrics,
+            crate::board_invalidation_metrics::SOURCE_EXECUTION,
+            class,
+        );
+        let revision = self.work_revision.fetch_add(1, Ordering::SeqCst) + 1;
+        let topic = work_product_topic(product_id);
+        let event = FrontendEvent::TopicEvent {
+            topic: topic.clone(),
+            revision,
+            origin_session_id: String::new(),
+            origin_request_id: None,
+            event: TopicEventPayload::WorkInvalidated {
+                reason: reason.to_owned(),
+                product_id: Some(product_id.to_owned()),
+                item_ids: vec![work_item_id.to_owned()],
+                class,
+            },
+        };
+        self.topic_broker
+            .publish(&topic, FrontendEventEnvelope::push_with_revision(revision, event))
+            .await;
     }
 }
 
@@ -2275,29 +2318,12 @@ impl ExecutionPublisher for BrokerExecutionPublisher {
     }
 
     async fn publish_work_item_changed(&self, product_id: &str, work_item_id: &str, reason: &str) {
-        tracing::info!(
-            source = "execution",
-            reason,
-            product_id,
-            item_count = 1,
-            topic_count = 1,
-            "work invalidation fanout"
-        );
-        let revision = self.work_revision.fetch_add(1, Ordering::SeqCst) + 1;
-        let topic = work_product_topic(product_id);
-        let event = FrontendEvent::TopicEvent {
-            topic: topic.clone(),
-            revision,
-            origin_session_id: String::new(),
-            origin_request_id: None,
-            event: TopicEventPayload::WorkInvalidated {
-                reason: reason.to_owned(),
-                product_id: Some(product_id.to_owned()),
-                item_ids: vec![work_item_id.to_owned()],
-            },
-        };
-        self.topic_broker
-            .publish(&topic, FrontendEventEnvelope::push_with_revision(revision, event))
+        self.publish_classified_work_item_changed(product_id, work_item_id, reason, InvalidationClass::Structural)
+            .await;
+    }
+
+    async fn publish_work_item_runtime_changed(&self, product_id: &str, work_item_id: &str, reason: &str) {
+        self.publish_classified_work_item_changed(product_id, work_item_id, reason, InvalidationClass::Runtime)
             .await;
     }
 

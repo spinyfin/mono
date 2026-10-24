@@ -91,6 +91,7 @@ fn freshness_probe_and_tree_read_do_not_wait_for_an_uncommitted_writer() {
         .load(
             &db,
             &AtomicU64::new(0),
+            &crate::metrics::Registry::new(),
             &product.id,
             &mut crate::population_timing::PopulationTrace::disabled(),
         )
