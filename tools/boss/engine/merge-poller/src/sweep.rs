@@ -1417,7 +1417,16 @@ pub(crate) async fn reconcile_stranded(
                 },
                 _ => Vec::new(),
             };
-            if ci_watch::on_ci_failure_detected(work_db, publisher, &checker, candidate, probe_result, &failures).await
+            if ci_watch::on_ci_failure_detected_with(
+                work_db,
+                publisher,
+                &checker,
+                candidate,
+                probe_result,
+                &failures,
+                crate::ci_transient_retry::poller_retrier().as_ref(),
+            )
+            .await
             {
                 outcome.ci_flagged += 1;
             }
@@ -1438,13 +1447,14 @@ pub(crate) async fn dispatch_ci_axis(
     outcome: &mut SweepOutcome,
 ) {
     if let OpenPrCiStatus::Failing { failures } = ci
-        && ci_watch::on_ci_failure_detected(
+        && ci_watch::on_ci_failure_detected_with(
             work_db,
             publisher,
             &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
             candidate,
             probe_result,
             failures,
+            crate::ci_transient_retry::poller_retrier().as_ref(),
         )
         .await
     {

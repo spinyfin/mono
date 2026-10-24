@@ -28,8 +28,9 @@
 //! (2026-10-06 → 2026-10-21, 2,323 builds): one positively transient PR
 //! failure (an HTTP 504 resolving the PR description), two checkleft
 //! input-unavailable exits on `main` builds, and no failure that needed
-//! more than one retry to clear. The measurement table those limits
-//! come from (including retry clear times per job) lands with #3242.
+//! more than one retry to clear. The full table — including retry
+//! clear times per job — is in `tools/boss/docs/blocked-pr-sweep.md`
+//! ("Measurements behind the limits").
 
 /// Maximum number of job retries the engine will request for one PR head
 /// (`(work_item, head_sha)`), across all of its failing checks. Every
@@ -63,9 +64,8 @@ pub struct JobEvidence {
     pub log_tail: Option<String>,
 }
 
-/// The infrastructure class a transient verdict names. Stored verbatim
-/// (the `ci_job_retries` ledger that persists it lands with #3242) and
-/// rendered on the card.
+/// The infrastructure class a transient verdict names. Stored verbatim in
+/// the `ci_job_retries` ledger and rendered on the card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransientSignal {
     /// The Buildkite agent stopped, refused, or could not start the job.

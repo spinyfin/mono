@@ -259,6 +259,11 @@ pub(super) fn all() -> Vec<Migration> {
             },
         },
         Migration {
+            id: blocked_pr::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: blocked_pr::migrate,
+        },
+        Migration {
             id: "20261118_0918_board_runtime_epoch_run_finished".into(),
             legacy_version: None,
             apply: queued_display::migrate,

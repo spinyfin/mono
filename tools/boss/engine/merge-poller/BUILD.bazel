@@ -8,6 +8,7 @@ exports_files(["Cargo.toml"])
 # engine host reach it through the `SweepHost` traits its caller injects, and the
 # completion service's requests through the observation-contract traits.
 POLLER_DEPS = [
+    "//tools/boss/engine/blocked-pr-diagnosis",
     "//tools/boss/engine/ci-log-reader",
     "//tools/boss/engine/event-bus",
     "//tools/boss/engine/execution-contracts",
