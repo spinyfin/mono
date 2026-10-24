@@ -21,7 +21,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose, SanType,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Server, ServerTlsConfig};
 use tonic::{Code, Request, Response, Status, Streaming};
@@ -122,16 +122,17 @@ impl ServerPki {
 struct Running {
     addr: SocketAddr,
     pki: ServerPki,
-    shutdown: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl Running {
-    async fn stop(mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-        let _ = tokio::time::timeout(STEP, self.task).await;
+    /// Tears down the listener and every connection on it. This aborts rather
+    /// than shutting down gracefully: a graceful shutdown waits for open
+    /// `Connect` streams to end, and a test may finish with one still open,
+    /// which would stall here until a timeout instead of returning at once.
+    async fn stop(self) {
+        self.task.abort();
+        let _ = self.task.await;
     }
 }
 
@@ -145,25 +146,17 @@ async fn start(fx: &Fixture, limits: ServiceLimits) -> Running {
         .client_auth_optional(true);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
-    let (shutdown, stopped) = oneshot::channel::<()>();
     let authorizer: Arc<dyn HostAuthorizer> = fx.credentials.clone();
     let server = Server::builder()
         .tls_config(tls)
         .expect("server tls")
         .add_service(EnrollmentService::new(fx.credentials.clone(), limits).into_server())
         .add_service(SpokeHubServer::new(Hub { authorizer }))
-        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
-            let _ = stopped.await;
-        });
+        .serve_with_incoming(TcpListenerStream::new(listener));
     let task = tokio::spawn(async move {
         let _ = server.await;
     });
-    Running {
-        addr,
-        pki,
-        shutdown: Some(shutdown),
-        task,
-    }
+    Running { addr, pki, task }
 }
 
 // ------------------------------------------------------------ the spokes
