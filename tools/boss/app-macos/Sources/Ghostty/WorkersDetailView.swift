@@ -304,8 +304,8 @@ struct WorkerSlotView: View, @MainActor Equatable {
             if let badge = snapshot.headerBadge {
                 AgentTypeBadge(type: badge, raw: snapshot.live?.agentType, reviewStage: snapshot.live?.reviewStage)
             }
-            if let live = snapshot.live {
-                statusPill(live.activity.agentsPaneLabel, color: liveActivityColor(live.activity))
+            if let live = snapshot.live, let label = snapshot.statusPillLabel {
+                statusPill(label, color: liveActivityColor(live))
             }
             // "Connecting…" only while nothing is known to have failed; a
             // refused or failed attach shows its reason (see
@@ -370,7 +370,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
             // `.equatable()` skipping this body does not freeze the
             // fallback chrome.
             if let label = snapshot.statusPillLabel {
-                statusPill(label, color: snapshot.isPlaceholder ? .secondary : liveActivityColor(snapshot.live?.activity))
+                statusPill(label, color: snapshot.isPlaceholder ? .secondary : liveActivityColor(snapshot.live))
             } else if let session = snapshot.session {
                 WorkerSlotFallbackMonitorPill(session: session)
             }
@@ -409,14 +409,15 @@ struct WorkerSlotView: View, @MainActor Equatable {
         .accessibilityLabel(enabled ? "Disable live status" : "Enable live status")
     }
 
-    private func liveActivityColor(_ activity: WorkerActivity?) -> Color {
-        switch activity {
-        case .working: .blue
-        case .waitingForInput: .orange
-        case .idle: .green
-        case .spawning: .secondary
-        case .errored: .red
-        case .terminated, nil: .secondary
+    private func liveActivityColor(_ live: WorkerSlotLiveSlice?) -> Color {
+        if live?.isWaitingOnJob == true { return .secondary }
+        switch live?.activity {
+        case .working: return .blue
+        case .waitingForInput: return .orange
+        case .idle: return .green
+        case .spawning: return .secondary
+        case .errored: return .red
+        case .terminated, nil: return .secondary
         }
     }
 
@@ -480,6 +481,18 @@ struct WorkerSlotView: View, @MainActor Equatable {
                     .lineLimit(1)
                     .help(snapshot.runId ?? "")
                     .accessibilityLabel("Recovering: \(recovering)")
+            }
+        } else if let wait = snapshot.live?.waitCaption {
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Image(systemName: "clock")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text(wait)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .help(snapshot.runId ?? "")
+                    .accessibilityLabel(wait)
             }
         } else if let live = snapshot.live?.liveStatus,
            !live.isEmpty

@@ -118,6 +118,8 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         "liveStatus",
         "recoveryStatus",
         "lastEventAt",
+        "waitReason",
+        "waitExpiresAt",
         "agentType",
         "reviewStage",
         "projectName",
@@ -136,8 +138,6 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         "currentTool",
         "lastToolEndedAt",
         "liveStatusAt",
-        "waitReason",
-        "waitExpiresAt",
         "projectId",
         "hostId",
         "startedAt",
@@ -205,8 +205,6 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             Self.makeLiveState(currentTool: "Bash"),
             Self.makeLiveState(lastToolEndedAt: "2026-09-01T00:00:00Z"),
             Self.makeLiveState(liveStatusAt: "2026-09-01T00:00:00Z"),
-            Self.makeLiveState(waitReason: "CI build"),
-            Self.makeLiveState(waitExpiresAt: "2026-09-01T00:00:00Z"),
             Self.makeLiveState(projectId: "proj-other"),
             Self.makeLiveState(hostId: "remote-1"),
             Self.makeLiveState(startedAt: "2026-01-01T00:00:00Z"),
@@ -235,15 +233,22 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         XCTAssertEqual(live.waitReason, "bazel test")
         XCTAssertEqual(live.waitExpiresAt, "2026-10-09T12:00:00Z")
 
-        let caption = "Waiting: bazel test (until 2026-10-09T12:00:00Z)"
-        XCTAssertEqual(AgentActivityState(runtime: nil, liveState: live), .waiting(reason: caption))
-        XCTAssertEqual(
+        // The clock time is rendered in the viewer's locale and zone, so
+        // assert the contract rather than a fixed string.
+        let states = [
+            AgentActivityState(runtime: nil, liveState: live),
             AgentActivityState.forDoingCard(
                 runtime: nil, liveState: live, isDispatchPending: false,
                 isResolvingConflicts: false, isRemediatingCI: false
             ),
-            .waiting(reason: caption)
-        )
+        ]
+        for state in states {
+            guard case let .waiting(reason) = state else {
+                return XCTFail("expected .waiting; got \(state)")
+            }
+            XCTAssertTrue(reason.hasPrefix("Waiting: bazel test · until "), reason)
+            XCTAssertFalse(reason.contains("2026-10-09T12:00:00Z"), reason)
+        }
 
         // A worker that resumed before the wait expired is active again.
         let resumed = Self.makeLiveState(
@@ -256,6 +261,32 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             ),
             .active
         )
+    }
+
+    func testPaneSnapshotShowsJobWaitForNormalizedIdle() {
+        let slot = WorkerSlot(slotId: 1, runId: "exec-1")
+        let idleWait = Self.makeLiveState(
+            activity: .idle, liveStatus: nil,
+            waitReason: "bazel test", waitExpiresAt: "2026-10-09T12:00:00Z"
+        )
+        let snap = WorkerSlotSnapshot.build(slot: slot, liveState: idleWait, liveStatusEnabled: true)
+        XCTAssertEqual(snap.statusPillLabel, "Waiting")
+        let caption = snap.live?.waitCaption
+        XCTAssertTrue(caption?.hasPrefix("Waiting: bazel test · until ") == true, caption ?? "nil")
+
+        // A prompt raised mid-turn keeps `.waitingForInput`: still the
+        // owner's, so no wait caption even though the reason is carried.
+        let midTurn = Self.makeLiveState(activity: .waitingForInput, waitReason: "bazel test")
+        let midSnap = WorkerSlotSnapshot.build(slot: slot, liveState: midTurn, liveStatusEnabled: true)
+        XCTAssertEqual(midSnap.statusPillLabel, "Waiting")
+        XCTAssertNil(midSnap.live?.waitCaption)
+        XCTAssertFalse(midSnap.live?.isWaitingOnJob ?? true)
+
+        // A resumed worker with a leftover wait is not waiting.
+        let resumed = Self.makeLiveState(activity: .working, waitReason: "bazel test")
+        let resumedSnap = WorkerSlotSnapshot.build(slot: slot, liveState: resumed, liveStatusEnabled: true)
+        XCTAssertNil(resumedSnap.live?.waitCaption)
+        XCTAssertEqual(resumedSnap.statusPillLabel, "Working")
     }
 
     func testRenderedLiveStateFieldsFlipEquality() {
@@ -273,6 +304,8 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             ("liveStatus", Self.makeLiveState(liveStatus: "something else")),
             ("recoveryStatus", Self.makeLiveState(recoveryStatus: "recovering from API error")),
             ("lastEventAt", Self.makeLiveState(lastEventAt: "2026-09-01T00:00:00Z")),
+            ("waitReason", Self.makeLiveState(waitReason: "CI build")),
+            ("waitExpiresAt", Self.makeLiveState(waitExpiresAt: "2026-09-01T00:00:00Z")),
             ("agentType", Self.makeLiveState(agentType: "review")),
             ("reviewStage", Self.makeLiveState(reviewStage: "consolidation")),
             ("projectName", Self.makeLiveState(projectName: "Nine")),

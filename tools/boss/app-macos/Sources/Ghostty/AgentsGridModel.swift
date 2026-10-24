@@ -253,8 +253,8 @@ final class AgentsGridModel: ObservableObject {
                 startedAt: state.startedAt.flatMap(WorkerStaleness.parse) ?? .distantFuture,
                 project: state.agentProject,
                 type: state.badgeType,
-                isWaiting: state.activity == .waitingForInput && !state.hasDeclaredWait,
-                isWaitingOnJob: state.hasDeclaredWait,
+                isWaiting: state.activity == .waitingForInput,
+                isWaitingOnJob: state.isWaitingOnJob,
                 hasViewer: viewers[state.runId]?.session != nil
             )
         }

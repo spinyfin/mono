@@ -519,6 +519,11 @@ enum WorkCardLiveStatus {
         if isQueued(task: task, runtime: runtime) {
             return queuedLabel(runtime: runtime, now: now)
         }
+        // A declared job wait names what the worker is waiting on, so it
+        // is shown even for conflict / CI-remediation runs.
+        if let liveState, liveState.isWaitingOnJob {
+            return AgentActivityState.waitCaption(liveState)
+        }
         if isResolvingConflicts { return nil }
         if isRemediatingCI { return nil }
         if isAIReviewing { return nil }

@@ -20,6 +20,10 @@ struct WorkerSlotLiveSlice: Equatable {
     let liveStatus: String?
     let recoveryStatus: String?
     let lastEventAt: String?
+    /// Declared job wait, rendered as a caption and a Waiting pill when the
+    /// engine reports the worker idle on it.
+    let waitReason: String?
+    let waitExpiresAt: String?
     let agentType: String?
     let reviewStage: String?
     let projectName: String?
@@ -38,6 +42,8 @@ struct WorkerSlotLiveSlice: Equatable {
         self.liveStatus = live.liveStatus
         self.recoveryStatus = live.recoveryStatus
         self.lastEventAt = live.lastEventAt
+        self.waitReason = live.waitReason
+        self.waitExpiresAt = live.waitExpiresAt
         self.agentType = live.agentType
         self.reviewStage = live.reviewStage
         self.projectName = live.projectName
@@ -49,6 +55,17 @@ struct WorkerSlotLiveSlice: Equatable {
     var badgeType: AgentType { AgentType.fromWire(agentType) }
     var badgeLabel: String { badgeType.badgeLabel(reviewStage: reviewStage) }
     var isExited: Bool { activity == .terminated }
+
+    /// Mirrors `WorkerLiveState.isWaitingOnJob`.
+    var isWaitingOnJob: Bool {
+        activity == .idle && !(waitReason ?? "").isEmpty
+    }
+
+    /// "Waiting: <reason> · until <time>" while a job wait is active.
+    var waitCaption: String? {
+        guard isWaitingOnJob else { return nil }
+        return AgentActivityState.waitCaption(reason: waitReason, expiresAt: waitExpiresAt)
+    }
 }
 
 /// Per-slot view input. Closures stay off this type so a parent rebuild
@@ -165,6 +182,7 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
     /// falls back to the session-observing pane-monitor pill.
     var statusPillLabel: String? {
         if isPlaceholder { return "Finished" }
+        if live?.isWaitingOnJob == true { return "Waiting" }
         return live?.activity.agentsPaneLabel
     }
 

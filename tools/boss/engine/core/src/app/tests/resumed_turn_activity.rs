@@ -612,10 +612,9 @@ async fn a_declared_wait_overrides_waiting_for_input_while_a_bare_prompt_keeps_i
     assert!(asking.wait_reason.is_none());
 
     // The same activity under an active declared wait is a job wait.
-    server_state.live_worker_states.set_live_status(
-        SLOT,
-        Some(crate::live_status::AWAITING_INPUT_LITERAL.to_owned()),
-    );
+    server_state
+        .live_worker_states
+        .set_live_status(SLOT, Some(crate::live_status::AWAITING_INPUT_LITERAL.to_owned()));
     declare_wait(&server_state, &execution_id);
     // Mid-turn prompt: the declaring turn has not ended, so it still asks.
     assert_eq!(snapshot(&server_state).activity, WorkerActivity::WaitingForInput);
@@ -627,4 +626,56 @@ async fn a_declared_wait_overrides_waiting_for_input_while_a_bare_prompt_keeps_i
     assert_eq!(waiting.activity, WorkerActivity::Idle);
     assert_eq!(waiting.wait_reason.as_deref(), Some(WAIT_REASON));
     assert!(waiting.live_status.is_none(), "no generic 'awaiting input' subtitle");
+}
+
+#[tokio::test]
+async fn a_stop_from_a_turn_before_the_wait_was_declared_keeps_waiting_for_input() {
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+
+    // An earlier turn ends, then a new turn declares the wait and is still
+    // running when a permission prompt appears.
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 1)).await;
+    dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 2)).await;
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 3)).await;
+    declare_wait(&server_state, &execution_id);
+    server_state
+        .live_worker_states
+        .set_activity_for_test(SLOT, WorkerActivity::WaitingForInput);
+
+    let asking = snapshot(&server_state);
+    assert_eq!(
+        asking.activity,
+        WorkerActivity::WaitingForInput,
+        "a Stop numbered at or below the declaration belongs to an earlier turn",
+    );
+    assert_eq!(asking.wait_reason.as_deref(), Some(WAIT_REASON));
+}
+
+#[tokio::test]
+async fn an_expired_wait_reverts_a_normalized_idle_worker_to_waiting_for_input() {
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 1)).await;
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    server_state
+        .wait_registry
+        .declare_after(&execution_id, WAIT_REASON.to_owned(), None, 60, now, Some(1))
+        .expect("wait is within budget");
+    dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 2)).await;
+    server_state
+        .live_worker_states
+        .set_activity_for_test(SLOT, WorkerActivity::WaitingForInput);
+    assert_eq!(snapshot(&server_state).activity, WorkerActivity::Idle);
+
+    // Once the deadline passes the registry no longer reports the wait, so
+    // the snapshot stops normalizing and the pending prompt asks the owner.
+    server_state
+        .wait_registry
+        .declare_after(&execution_id, WAIT_REASON.to_owned(), None, 60, now - 3600, Some(1))
+        .expect("wait is within budget");
+    let expired = snapshot(&server_state);
+    assert_eq!(expired.activity, WorkerActivity::WaitingForInput);
+    assert!(expired.wait_reason.is_none());
 }
