@@ -60,15 +60,11 @@ pub struct ReviewerReportDestination {
 }
 
 impl ReviewOrigin {
-    /// Human-readable origin reference, e.g. `"PR #<n> (originating work
-    /// item T<short_id>)"`. Degrades gracefully when either half is
-    /// unavailable, and falls back to a generic phrase if neither is.
+    /// Public PR reference for worker-facing revision instructions.
     fn describe(&self) -> String {
-        match (self.pr_number, self.task_short_id) {
-            (Some(pr), Some(short_id)) => format!("PR #{pr} (originating work item T{short_id})"),
-            (Some(pr), None) => format!("PR #{pr}"),
-            (None, Some(short_id)) => format!("originating work item T{short_id}"),
-            (None, None) => "the reviewed PR".to_owned(),
+        match self.pr_number {
+            Some(pr) => format!("PR #{pr}"),
+            None => "the reviewed PR".to_owned(),
         }
     }
 }
@@ -171,7 +167,7 @@ pub fn render_revision_instructions(result: &ReviewResult, origin: ReviewOrigin)
          Each finding below requires a real code change that resolves it.\n\
          The following are FORBIDDEN — they do NOT count as addressing a finding:\n\
          \n\
-         - Filing a follow-up task, chore, or issue in lieu of fixing the finding.\n\
+         - Filing a follow-up task or issue in lieu of fixing the finding.\n\
          - Leaving a `TODO`, `FIXME`, `Phase N`, \"wire this later\", or similar\n\
            deferral comment and calling the finding done.\n\
          - Acknowledging the finding in a comment or PR description without making\n\
@@ -185,7 +181,7 @@ pub fn render_revision_instructions(result: &ReviewResult, origin: ReviewOrigin)
          **If — and only if — a finding genuinely cannot or should not be fixed within\n\
          this revision's scope**, you must EXPLICITLY SURFACE that in your response:\n\
          state which finding you are not fixing and exactly why (technical blocker,\n\
-         out-of-scope dependency, requires operator decision, etc.). Do NOT silently\n\
+         out-of-scope dependency, requires a decision from the repo owner, etc.). Do NOT silently\n\
          file a follow-up or leave a TODO. The default is to do the work.\n\
          \n",
         origin.describe(),
@@ -2097,14 +2093,15 @@ mod tests {
         let origin_pos = instructions
             .find(&origin_marker)
             .expect("origin PR reference must be present");
-        let short_id_pos = instructions
-            .find(&short_id_marker)
-            .expect("origin work item short id must be present");
+        assert!(
+            !instructions.contains(&short_id_marker),
+            "only public PR provenance belongs in instructions"
+        );
         let preamble_pos = instructions
             .find("HARD RULE: no punting")
             .expect("no-punting preamble must be present");
         assert!(
-            origin_pos < preamble_pos && short_id_pos < preamble_pos,
+            origin_pos < preamble_pos,
             "origin must open the description before the generic no-punting preamble: {instructions}"
         );
     }

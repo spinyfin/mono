@@ -1272,12 +1272,12 @@ import sys
     r#"
 
 MALFORMED = (
-    "Blocked (fail-closed): the Boss data-directory gate could not read this "
+    "Blocked (fail-closed): the data-directory gate could not read this "
     "tool call's payload, so it cannot tell whether the call targets the "
     "engine-owned data directory. Guards deny what they cannot parse rather "
     "than approving by default. Re-issue the operation as an ordinary shell "
-    "command or file edit, and report this payload shape to the operator -- it "
-    "means Boss guard wiring needs updating for this agent driver."
+    "command or file edit, and report this payload shape to the repo owner -- it "
+    "means guard wiring needs updating for this agent driver."
 )
 
 # Codex `apply_patch` header lines that name a target path. The patch body
@@ -1304,14 +1304,14 @@ def patch_target_paths(patch):
     return found
 
 RECOVERY = (
-    "Blocked: direct access to the Boss data directory "
-    "(~/Library/Application Support/Boss) is not allowed from a coordinator "
-    "or worker session. That directory is engine-owned -- state.db, its "
+    "Blocked: direct access to the engine data directory "
+    "(~/Library/Application Support/Boss) is not allowed from this "
+    "session. That directory is engine-owned -- state.db, its "
     "-wal/-shm sidecars, the events socket, and engine pid/state files must "
     "never be read, copied, moved, edited, or opened by a session (no "
     "sqlite3, duckdb, litecli, sqlite-utils, cp/mv/rm, cat/head/tail/hexdump, "
-    "editors, lsof, etc.). To recover or inspect Boss state use the "
-    "sanctioned surface instead: ask the coordinator, file a shake with "
+    "editors, lsof, etc.). To recover or inspect engine state use the "
+    "sanctioned surface instead: ask the repo owner, file a shake with "
     "'boss shake' describing what you need, or use the dedicated boss/bossctl "
     "verb once it exists (e.g. 'boss task restore'). Do not work around this "
     "gate."
@@ -1365,12 +1365,12 @@ RECURSIVE_LONG_FLAGS = frozenset((
 
 TRAVERSAL_RECOVERY = (
     "Blocked: this tool call starts a recursive directory walk rooted at %s, "
-    "which spans the operator's whole machine rather than the work. A Boss "
-    "worker reads inside its leased workspace, the cube workspace/repo "
-    "directories, and specific files a task names -- not the operator's home "
+    "which spans the whole machine rather than the work. This "
+    "session reads inside its leased workspace, the cube workspace/repo "
+    "directories, and specific files a task names -- not the machine owner's home "
     "directory, other users' home directories, mounted volumes, or /. A walk "
     "that wide also reads private files belonging to other people on a shared "
-    "Mac, and raises macOS privacy (TCC) prompts attributed to Boss for "
+    "Mac, and raises macOS privacy (TCC) prompts attributed to the app for "
     "Desktop, Documents, Downloads, Photos and network volumes. Re-run the "
     "search rooted at the directory you actually need -- the workspace root, "
     "or a named subdirectory under it. If you need one specific file outside "

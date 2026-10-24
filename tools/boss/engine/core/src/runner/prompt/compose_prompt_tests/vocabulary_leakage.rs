@@ -80,6 +80,13 @@ fn cases() -> Vec<Case> {
         ),
         case("revision", revision_execution(PR), chore_with_pr(PR), None, None),
         case(
+            "revision, rendered review findings",
+            revision_execution(PR),
+            review_findings_task(PR),
+            None,
+            None,
+        ),
+        case(
             "revision, conflict",
             revision_execution(PR),
             revision_task_with_created_via(None, "merge-conflict:crz_frag_01"),
@@ -171,6 +178,29 @@ fn cases() -> Vec<Case> {
             None,
         ),
     ]
+}
+
+fn review_findings_task(pr: &str) -> WorkItem {
+    let result = boss_pr_review::ReviewResult::from_json(
+        r#"{"pr_url":"https://github.com/org/repo/pull/42","head_sha":"abc",
+        "summary":"Correct the missing validation.","revision_warranted":true,
+        "findings":[{"severity":"high","category":"correctness","confidence":"high",
+        "title":"Validate input","file":"src/input.rs","location":"parse_input",
+        "detail":"Reject empty input before parsing."}]}"#,
+    )
+    .unwrap();
+    let mut item = chore_with_pr(pr);
+    if let WorkItem::Task(task) | WorkItem::Chore(task) = &mut item {
+        task.description = boss_pr_review::render_revision_instructions(
+            &result,
+            boss_pr_review::ReviewOrigin {
+                task_short_id: Some(1234),
+                pr_number: Some(42),
+            },
+        );
+        assert!(task.description.contains("review of PR #42 found"));
+    }
+    item
 }
 
 #[test]

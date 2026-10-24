@@ -2298,12 +2298,12 @@ The operator recorded this choice on the kanban. Proceed with the chosen option.
 
 fn authorization_block(question: &OperatorQuestionView, timestamp: &str) -> String {
     format!(
-        "\n\n---\n\n## Operator authorization ({timestamp})\n\n\
+        "\n\n---\n\n## Repo owner approval ({timestamp})\n\n\
 - **Question the previous worker asked:** {}\n\
 - **Answer:** Yes\n\
 - **The worker's explanation:** {}\n\
 - **Asked by run:** `{}`\n\n\
-The operator recorded this answer on the kanban. It is explicit, human-granted approval for exactly what the question asks and nothing broader. Treat it as the authorization the worker rules require before relaxing a check or exceeding a limit for this task; state in the PR body that the operator authorized it on the date above. It does not authorize bypassing any other check, and it does not change what the repository's checks enforce.\n",
+The repo owner recorded this answer. It is explicit, human-granted approval for exactly what the question asks and nothing broader. Treat it as the authorization the worker rules require before relaxing a check or exceeding a limit for this task; state in the PR body that this was approved by the repo owner on the date above. It does not authorize bypassing any other check, and it does not change what the repository's checks enforce.\n",
         question.text, question.explanation, question.execution_id
     )
 }
@@ -2312,6 +2312,21 @@ The operator recorded this answer on the kanban. It is explicit, human-granted a
 mod tests {
     use crate::test_support::*;
     use boss_protocol::WorkItem;
+
+    #[test]
+    fn approval_text_avoids_internal_vocabulary() {
+        let question = boss_protocol::OperatorQuestionView::builder()
+            .id("question-1")
+            .text("Include the additional files?")
+            .answer_type(boss_protocol::OperatorAnswerType::YesNo)
+            .explanation("The fix requires both files.")
+            .asked_at("2026-10-23")
+            .execution_id("exec_example")
+            .build();
+        let text = super::authorization_block(&question, "2026-10-23");
+        crate::prose_vocabulary::assert_no_forbidden_prose("recorded approval", &text);
+        assert!(text.contains("## Repo owner approval (2026-10-23)"));
+    }
 
     /// A task whose `review_cycle` is a known non-zero value must serialise
     /// that real value through every mapper path, not the hardcoded `0`

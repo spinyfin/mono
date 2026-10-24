@@ -25,9 +25,6 @@ pub(crate) const STRUCTURED_MARKERS: &[&str] = &[
     // follow-up proposal verb.
     "one of `task` | `chore` | `project` (defaults to `task`)",
     "one of `task` | `chore` | `project` (defaults to `chore`)",
-    // Heading the engine appends to a task description when a question is
-    // answered; the prompt has to name it so the worker can find it.
-    "`## Operator authorization`",
     // The flag that carries a prerequisite task's description.
     "--prerequisite-brief",
     // The engine's on-disk state directory, which workers are told to keep
@@ -111,7 +108,6 @@ mod tests {
             "- execution kind: `chore_implementation`",
             "bookmark `boss-recovery/exec_abc` and `\"$BOSS_BIN\" propose done`",
             "- `proposed_work_kind` (optional): one of `task` | `chore` | `project` (defaults to `task`).",
-            "check for a `## Operator authorization` section",
             "the briefly stated plan, chorewalk, operatorless",
         ] {
             assert_eq!(

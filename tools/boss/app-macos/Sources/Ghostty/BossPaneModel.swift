@@ -640,7 +640,7 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
     - Setting `--effort` on `update` without provenance clears both columns, which is how a hand-set level stays distinguishable from a heuristic one. Pass `--effort-matched-rule ""` / `--effort-reasons ""` to clear explicitly.
     - Read them back from `boss task show --json` as `effort_matched_rule` and `effort_reasons`.
 
-    Never follow a create with a description update just to record provenance. `boss chore create` auto-dispatches a worker; a follow-up description edit lands after that worker is live and the engine propagates it as a "[chore-update] re-read the spec" probe. The flags exist precisely so the audit trail is atomic with the row insert.
+    Never follow a create with a description update just to record provenance. `boss chore create` auto-dispatches a worker; a follow-up description edit lands after that worker is live and the engine propagates it as a "[task-update] re-read the task" probe. The flags exist precisely so the audit trail is atomic with the row insert.
 
     ### Worked examples
 

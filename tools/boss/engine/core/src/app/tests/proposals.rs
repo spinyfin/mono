@@ -260,12 +260,12 @@ async fn question_yes_appends_exact_authorization_and_mints_one_preserved_execut
     assert_eq!(
         task.description,
         format!(
-            "Original brief\n\n---\n\n## Operator authorization ({timestamp})\n\n\
+            "Original brief\n\n---\n\n## Repo owner approval ({timestamp})\n\n\
 - **Question the previous worker asked:** Approve raising the file limit from 30 to 48?\n\
 - **Answer:** Yes\n\
 - **The worker's explanation:** All 48 files are needed for the requested migration.\n\
 - **Asked by run:** `{old_execution}`\n\n\
-The operator recorded this answer on the kanban. It is explicit, human-granted approval for exactly what the question asks and nothing broader. Treat it as the authorization the worker rules require before relaxing a check or exceeding a limit for this task; state in the PR body that the operator authorized it on the date above. It does not authorize bypassing any other check, and it does not change what the repository's checks enforce.\n"
+The repo owner recorded this answer. It is explicit, human-granted approval for exactly what the question asks and nothing broader. Treat it as the authorization the worker rules require before relaxing a check or exceeding a limit for this task; state in the PR body that this was approved by the repo owner on the date above. It does not authorize bypassing any other check, and it does not change what the repository's checks enforce.\n"
         )
     );
     let executions = state.work_db.list_executions(Some(&task_id)).unwrap();

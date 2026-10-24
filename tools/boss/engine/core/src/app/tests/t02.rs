@@ -2514,7 +2514,7 @@ async fn chore_update_notify_sends_message_to_live_worker() {
     let pasted = String::from_utf8(runner.stdin().last().cloned().unwrap_or_default()).unwrap();
     assert!(
         pasted.contains("[task-update]"),
-        "message must contain [chore-update] tag: {pasted:?} calls={:?}",
+        "message must contain [task-update] tag: {pasted:?} calls={:?}",
         runner.calls()
     );
     assert!(
