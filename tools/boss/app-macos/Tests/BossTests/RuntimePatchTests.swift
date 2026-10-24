@@ -324,6 +324,19 @@ final class RuntimePatchTests: XCTestCase {
         XCTAssertTrue(model.boardReadFences["prod_a"]!.trees.isEmpty)
     }
 
+    func testExpiredPatchQueueAndNewBurstOverLimitRefetchTree() {
+        let (model, recorder) = makeModel()
+        model.requestRuntimePatch(productID: "prod_a", itemIDs: ["first"])
+        let queued = Set((0..<64).map { "card_\($0)" })
+        model.requestRuntimePatch(productID: "prod_a", itemIDs: queued)
+        model.boardReadFences["prod_a"]!.patchSentAt = .now - .seconds(31)
+        recorder.reset()
+        model.requestRuntimePatch(productID: "prod_a", itemIDs: ["another"])
+        XCTAssertTrue(recorder.patchBodies.isEmpty)
+        XCTAssertFalse(model.boardReadFences["prod_a"]!.trees.isEmpty)
+        XCTAssertTrue(model.boardReadFences["prod_a"]!.queuedPatchItemIDs.isEmpty)
+    }
+
     func testExpiredPatchReplyCannotSettleReplacementPatch() {
         let (model, recorder) = makeModel(cards: [makeTask(id: "task_1")])
         model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_1"])

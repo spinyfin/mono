@@ -199,9 +199,9 @@ extension ChatViewModel {
             // mark and the message surfaces, with no other state touched.
             if settleArchiveWorkError(message: message, requestId: requestId) { return }
             abandonBackgroundWorkRequest(requestId: requestId)
-            // The engine's WorkError reply carries no request context, so we
-            // can't tell which in-flight list_executions/list_attachments
-            // call failed. `hasOtherTrackedAppRequestInFlight` checks every
+            // Legacy list_executions/list_attachments guards do not retain
+            // request IDs, so they cannot match the error's envelope ID.
+            // `hasOtherTrackedAppRequestInFlight` checks every
             // other in-flight guard this same handler already reacts to
             // (merge, review terminal, planner action, kanban move, engine
             // attempt detail, …), captured BEFORE any of them are cleared

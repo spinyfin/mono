@@ -124,7 +124,7 @@ extension ChatViewModel {
         let now = ContinuousClock.now
         fence.expire(now: now)
         boardReadFences[productID] = fence
-        if itemIDs.count > Self.maxRuntimePatchItems || !fence.trees.isEmpty {
+        if itemIDs.union(fence.queuedPatchItemIDs).count > Self.maxRuntimePatchItems || !fence.trees.isEmpty {
             refetchBoard(productID: productID)
             return
         }
