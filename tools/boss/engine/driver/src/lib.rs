@@ -38,8 +38,8 @@ pub mod transcript_store;
 /// underspecified item does not become a silent guess. Escalation for a
 /// genuinely blocked worker (stop and summarize) is intentionally untouched.
 pub(crate) const LARGE_EFFORT_PROMPT_ADDENDUM: &str = "Begin with a written plan. Identify the files you expect to touch \
-     and the order you'll touch them in. Check that plan against the work item's description yourself before \
-     writing code — do not ask the operator to confirm scope. If the description genuinely leaves a decision \
+     and the order you'll touch them in. Check that plan against the task description yourself before \
+     writing code — do not ask anyone to confirm scope. If the description genuinely leaves a decision \
      open, pick the option consistent with the project's design and conventions, state which you picked and why \
      in your summary, and continue.";
 

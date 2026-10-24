@@ -1089,9 +1089,9 @@ mod tests {
         // as the two-character sequence `\n`, which is not whitespace, so a
         // raw substring scan after normalize_ws misses it. The unescape
         // step is what makes the fallback actually confirm those writes.
-        let body = br#"{"type":"user","message":"[coordinator-interrupt] cut short.\n\nre-read the spec"}"#;
+        let body = br#"{"type":"user","message":"[interrupt] cut short.\n\nre-read the spec"}"#;
         let (_f, path) = transcript_with(body);
-        let needle = "[coordinator-interrupt] cut short.\n\nre-read the spec";
+        let needle = "[interrupt] cut short.\n\nre-read the spec";
         assert!(
             transcript_shows_text(&path, 0, needle).await,
             "JSON-escaped newlines in the transcript must not hide a multi-line injection"

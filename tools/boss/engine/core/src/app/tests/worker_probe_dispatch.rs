@@ -174,7 +174,7 @@ fn extract_last_assistant_text_returns_the_folded_prompts_answer() {
         "\n",
         r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"working on the original ask"}]}}"#,
         "\n",
-        r#"{"type":"event_msg","payload":{"type":"user_message","message":"[coordinator-nudge] what is your status?"}}"#,
+        r#"{"type":"event_msg","payload":{"type":"user_message","message":"[nudge] what is your status?"}}"#,
         "\n",
         r#"{"type":"event_msg","payload":{"type":"agent_message","message":"status: pushed, waiting on CI"}}"#,
         "\n",

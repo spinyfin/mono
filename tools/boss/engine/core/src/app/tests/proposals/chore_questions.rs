@@ -121,7 +121,7 @@ async fn question_on_chore_answers_like_a_task() {
     assert!(
         chore
             .description
-            .starts_with("Original brief\n\n---\n\n## Operator authorization (")
+            .starts_with("Original brief\n\n---\n\n## Repo owner approval (")
     );
     assert!(
         chore

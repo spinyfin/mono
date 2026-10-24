@@ -1964,7 +1964,7 @@ pub enum FrontendRequest {
     /// [`FrontendEvent::ProbeReplied`] on the [`probe_topic`] for
     /// `run_id`, and delivery progress can be polled with
     /// [`FrontendRequest::ProbeStatus`]. Mid-turn probes are prefixed with
-    /// `[coordinator-nudge]` in the transcript so the worker and human
+    /// `[nudge]` in the transcript so the worker and human
     /// readers can identify coordinator-injected text.
     ProbeRun {
         run_id: String,

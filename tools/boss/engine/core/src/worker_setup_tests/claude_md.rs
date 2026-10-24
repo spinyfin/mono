@@ -169,7 +169,7 @@ fn reviewer_claude_md_omits_reuse_before_you_build_guardrail() {
         "lease-1",
         "/tmp/ws",
         crate::prompt_fragments::absolute_paths_fragment(),
-        crate::prompt_fragments::boundaries_and_coordinator_fragment(),
+        crate::prompt_fragments::boundaries_and_probes_fragment(),
     );
     assert!(
         !rendered.contains("Reuse before you build"),
@@ -423,6 +423,30 @@ fn every_worker_kind_claude_md_carries_the_absolute_paths_instruction() {
         assert!(
             rendered.contains(crate::prompt_fragments::absolute_paths_fragment()),
             "{label} CLAUDE.md must embed the shared fragment verbatim, not a paraphrase",
+        );
+    }
+}
+
+/// The generated rules file is read by every standard worker, so it must not
+/// teach the engine's internal vocabulary any more than the prompt does (see
+/// `crate::prose_vocabulary`).
+#[test]
+fn claude_md_avoids_internal_vocabulary() {
+    for draft_pr_mode in [false, true] {
+        let mut input = sample_input();
+        input.draft_pr_mode = draft_pr_mode;
+        let rendered = claude_md_for(&input);
+        // The section on running the Boss application is about that product by
+        // name, so it legitimately says "Boss". It sits between these headings.
+        let (before, rest) = rendered
+            .split_once("## Running Boss itself")
+            .expect("rules describe how to run the app");
+        let (_, after) = rest
+            .split_once("## Capturing a screenshot")
+            .expect("rules describe how to capture a screenshot");
+        crate::prose_vocabulary::assert_no_forbidden_prose(
+            &format!("worker rules (draft_pr_mode={draft_pr_mode})"),
+            &format!("{before}{after}"),
         );
     }
 }

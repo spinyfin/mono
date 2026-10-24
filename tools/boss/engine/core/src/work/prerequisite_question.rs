@@ -202,18 +202,53 @@ fn prerequisite_note(
     // note in a commit or PR body must not trip the work-item-id leakage check.
     let label = format!("{} (`{}`)", prerequisite.name, prerequisite.id);
     let outcome = if created {
-        "The engine created it as a chore with normal dispatch."
+        "The prerequisite task was created and scheduled for dispatch."
     } else if enabled_dispatch {
-        "An equivalent task already existed in the backlog with autostart off, so the engine linked to it and turned autostart on and queued it for dispatch once its dependencies are satisfied."
+        "An equivalent task already existed in the backlog with autostart off, so this task now links to it, and it has been scheduled for dispatch once its dependencies are satisfied."
     } else {
-        "An equivalent open task already existed, so the engine linked to it instead of creating a duplicate."
+        "An equivalent open task already existed, so this task now links to it instead of creating a duplicate."
     };
     format!(
-        "\n\n---\n\n## Operator-approved prerequisite ({timestamp})\n\n\
+        "\n\n---\n\n## Prerequisite approved by the repo owner ({timestamp})\n\n\
 - **Prerequisite task:** {label}\n\
 - **Why this task cannot proceed without it:** {}\n\
 - **Asked by run:** `{}`\n\n\
-The operator approved this on the kanban. {outcome} This task now depends on it (a `blocks` dependency): it stays parked until the prerequisite is done, and the engine then dispatches it again. When you resume, assume the prerequisite's change is on `main`; do not redo its work here.\n",
+The repo owner approved this. {outcome} This task now depends on it (a `blocks` dependency): it stays parked until the prerequisite is done, and it is then dispatched again. When you resume, assume the prerequisite's change is on `main`; do not redo its work here.\n",
         question.explanation, question.execution_id
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_note_avoids_internal_vocabulary_in_every_outcome() {
+        let (_tmp, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_test_product(&db);
+        let prerequisite = crate::test_support::create_test_chore(&db, product.id.clone(), "Fix the shared fixture");
+        let question = OperatorQuestionView::builder()
+            .id("question-1")
+            .text("Create the prerequisite?")
+            .answer_type(boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
+                name: "Fix the shared fixture".to_owned(),
+                brief: "Fix the shared fixture on main.".to_owned(),
+            })
+            .explanation("CI cannot go green until the fixture is fixed on main.")
+            .asked_at("2026-10-23")
+            .execution_id("exec_example")
+            .build();
+        // created; linked with dispatch enabled; already linked.
+        for (created, enabled_dispatch) in [(true, false), (false, true), (false, false)] {
+            let note = prerequisite_note(
+                &question,
+                &prerequisite,
+                created,
+                enabled_dispatch,
+                "2026-10-23 00:00 UTC",
+            );
+            crate::prose_vocabulary::assert_no_forbidden_prose("prerequisite approval note", &note);
+            assert!(note.contains("## Prerequisite approved by the repo owner (2026-10-23 00:00 UTC)"));
+        }
+    }
 }

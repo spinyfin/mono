@@ -19,11 +19,11 @@ pub(super) fn block_boundary_fragment() -> &'static str {
      Stop and declare blocked only when you need a decision you have no \
      authority or information to make:\n\
      - Two defensible resolutions exist and the choice changes product \
-     behaviour, with nothing in the brief, the design doc, or the code to \
+     behaviour, with nothing in the task description, the design doc, or the code to \
      disambiguate.\n\
      - A required credential, permission, or external system is genuinely \
      unavailable.\n\
-     - The brief conflicts with what the code actually does, in a way that \
+     - The task description conflicts with what the code actually does, in a way that \
      means delivering it as written would be wrong.\n\
      - A build or test failure that you have genuinely tried to fix and \
      cannot resolve — see the build-gate rules below for the marker to \
@@ -35,7 +35,7 @@ pub(super) fn block_boundary_fragment() -> &'static str {
      `main` and resolving the result. Rebase, resolve, verify, and carry on.\n\
      - A CI failure caused by your change. Fix it; there is no judgement \
      call.\n\
-     - Work that is tedious, large, or feels risky but is within the brief.\n\
+     - Work that is tedious, large, or feels risky but is within the task.\n\
      \n\
      When a merge conflict itself requires a product decision — most often a \
      semantic conflict where both sides changed the same behaviour and the \

@@ -154,6 +154,8 @@ pub mod project_postmortem_sweep;
 pub(crate) mod prompt_fragments;
 pub mod proposal_channel_error;
 pub mod proposal_expiry_sweep;
+#[cfg(test)]
+pub(crate) mod prose_vocabulary;
 pub mod protocol;
 pub(crate) mod reconcile_audit;
 pub mod remote_input_lifecycle;

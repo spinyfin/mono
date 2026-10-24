@@ -306,7 +306,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
             &input.lease_id,
             &input.workspace_path.display().to_string(),
             crate::prompt_fragments::absolute_paths_fragment(),
-            crate::prompt_fragments::boundaries_and_coordinator_fragment(),
+            crate::prompt_fragments::boundaries_and_probes_fragment(),
         );
     }
     if input.worker_kind == WorkerKind::Reviewer && input.is_post_merge_reviewer {
@@ -314,7 +314,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
             &input.lease_id,
             &input.workspace_path.display().to_string(),
             crate::prompt_fragments::absolute_paths_fragment(),
-            crate::prompt_fragments::boundaries_and_coordinator_fragment(),
+            crate::prompt_fragments::boundaries_and_probes_fragment(),
         );
     }
     if input.worker_kind == WorkerKind::Reviewer {
@@ -322,7 +322,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
             &input.lease_id,
             &input.workspace_path.display().to_string(),
             crate::prompt_fragments::absolute_paths_fragment(),
-            crate::prompt_fragments::boundaries_and_coordinator_fragment(),
+            crate::prompt_fragments::boundaries_and_probes_fragment(),
         );
     }
     if input.worker_kind == WorkerKind::Triage {
@@ -347,7 +347,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
             "\n## PR creation mode\n\
              \n\
              Default PR creation mode: pass `--draft` to `{cube} pr create`\n\
-             unless the chore description explicitly says to create a non-draft PR.\n"
+             unless the task description explicitly says to create a non-draft PR.\n"
         )
     } else {
         String::new()
@@ -358,7 +358,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
     // `//tools/boss/engine:engine` string did.
     let engine_bazel_run_command = env!("BOSS_ENGINE_BAZEL_RUN_COMMAND");
     format!(
-        "# Boss worker rules\n\
+        "# Worker rules\n\
          \n\
          {preamble}\n\
          \n\
@@ -405,7 +405,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          \n\
          ## Checking your own PR's state\n\
          \n\
-         Boss already stores most of what you'd otherwise ask GitHub for.\n\
+         The engine already stores most of what you'd otherwise ask GitHub for.\n\
          These read your own PR only — never another run's — and cost one\n\
          local round trip against the engine, not a GitHub API call:\n\
          \n\
@@ -420,7 +420,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
            ```sh\n\
            {boss} pr status --json\n\
            ```\n\
-           This is Boss's **last stored observation from the merge poller,\n\
+           This is the engine's **last stored observation from the merge poller,\n\
            not live GitHub truth** — `observed_at` (Unix epoch seconds) is\n\
            the timestamp of that observation, not of your call. Right after\n\
            a push, the stored snapshot usually still reflects the *pre-push*\n\
@@ -437,8 +437,8 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
            change: the engine's own merge poller is what watches your PR to\n\
            green after you push, not you — the same \"do not babysit CI\"\n\
            principle your task prompt states applies here too.\n\
-         - `{boss} pr body` — the PR title and body/description Boss\n\
-           snapshotted when this run started, for a read-modify-write of\n\
+         - `{boss} pr body` — the PR title and body/description the\n\
+           engine snapshotted when this run started, for a read-modify-write of\n\
            the description without a `gh pr view` round trip. If the\n\
            response's `body` is null (`--json`) or says \"(none stored)\"\n\
            (text), it means this run began a brand-new PR flow — there is\n\
@@ -582,7 +582,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          infrastructure), search the repo for an existing implementation\n\
          first. If one exists, reuse or extend it instead of writing a new\n\
          one. If duplication is genuinely necessary, say so explicitly in the\n\
-         PR description with the reason — a justified, operator-visible\n\
+         PR description with the reason — a justified, visible\n\
          exception is the only way to avoid a \"revision required\"\n\
          reuse/duplication finding from the automated reviewer.\n\
          \n\
@@ -591,10 +591,10 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          - Do not modify files outside this workspace. Sibling workspaces\n\
            belong to other workers.\n\
          - Do not modify cube's database, lease state, or workspace registry.\n\
-         - `~/Library/Application Support/Boss/` is coordinator/engine-only.\n\
-           Never read, write, or touch it. Ask the coordinator for\n\
-           work-taxonomy context; do not query the DB yourself.\n\
-           `bossctl` is coordinator-only.\n\
+         - `~/Library/Application Support/Boss/` is engine-only.\n\
+           Never read, write, or touch it. Do not query the database\n\
+           yourself; ask for any task or product context you need.\n\
+           `bossctl` is not available to workers.\n\
          \n\
          ## Running Boss itself\n\
          \n\
@@ -645,9 +645,9 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          ```\n\
          \n\
          The engine stores the image outside this workspace (which is\n\
-         recycled after your run), for your own verification and for an\n\
-         operator looking at this run locally. `{boss} attach --list` shows\n\
-         what this work item already has, across runs.\n\
+         recycled after your run), for your own verification and for\n\
+         someone looking at this run locally. `{boss} attach --list` shows\n\
+         what this task already has, across runs.\n\
          \n\
          Validation is immediate and typed: a path outside this workspace or\n\
          a temp dir, a file that is not really a PNG/JPEG, an oversize render,\n\
@@ -667,10 +667,10 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          something that is — a CI artifact, a deploy preview, a code\n\
          reference.\n\
          \n\
-         ## Coordinator\n\
+         ## Probes\n\
          \n\
-         The coordinator may probe this session between turns. Treat probes\n\
-         as questions from a human reviewer — short, specific answers.\n\
+         Messages may arrive between turns. Treat them as questions from a\n\
+         human reviewer — short, specific answers.\n\
          {draft_directive}",
         absolute_paths = crate::prompt_fragments::absolute_paths_fragment(),
         boss = boss,
@@ -1272,12 +1272,12 @@ import sys
     r#"
 
 MALFORMED = (
-    "Blocked (fail-closed): the Boss data-directory gate could not read this "
+    "Blocked (fail-closed): the data-directory gate could not read this "
     "tool call's payload, so it cannot tell whether the call targets the "
     "engine-owned data directory. Guards deny what they cannot parse rather "
     "than approving by default. Re-issue the operation as an ordinary shell "
-    "command or file edit, and report this payload shape to the operator -- it "
-    "means Boss guard wiring needs updating for this agent driver."
+    "command or file edit, and report this payload shape to the repo owner -- it "
+    "means guard wiring needs updating for this agent driver."
 )
 
 # Codex `apply_patch` header lines that name a target path. The patch body
@@ -1304,14 +1304,14 @@ def patch_target_paths(patch):
     return found
 
 RECOVERY = (
-    "Blocked: direct access to the Boss data directory "
-    "(~/Library/Application Support/Boss) is not allowed from a coordinator "
-    "or worker session. That directory is engine-owned -- state.db, its "
+    "Blocked: direct access to the engine data directory "
+    "(~/Library/Application Support/Boss) is not allowed from this "
+    "session. That directory is engine-owned -- state.db, its "
     "-wal/-shm sidecars, the events socket, and engine pid/state files must "
     "never be read, copied, moved, edited, or opened by a session (no "
     "sqlite3, duckdb, litecli, sqlite-utils, cp/mv/rm, cat/head/tail/hexdump, "
-    "editors, lsof, etc.). To recover or inspect Boss state use the "
-    "sanctioned surface instead: ask the coordinator, file a shake with "
+    "editors, lsof, etc.). To recover or inspect engine state use the "
+    "sanctioned surface instead: ask the repo owner, file a shake with "
     "'boss shake' describing what you need, or use the dedicated boss/bossctl "
     "verb once it exists (e.g. 'boss task restore'). Do not work around this "
     "gate."
@@ -1365,12 +1365,12 @@ RECURSIVE_LONG_FLAGS = frozenset((
 
 TRAVERSAL_RECOVERY = (
     "Blocked: this tool call starts a recursive directory walk rooted at %s, "
-    "which spans the operator's whole machine rather than the work. A Boss "
-    "worker reads inside its leased workspace, the cube workspace/repo "
-    "directories, and specific files a task names -- not the operator's home "
+    "which spans the whole machine rather than the work. This "
+    "session reads inside its leased workspace, the cube workspace/repo "
+    "directories, and specific files a task names -- not the machine owner's home "
     "directory, other users' home directories, mounted volumes, or /. A walk "
     "that wide also reads private files belonging to other people on a shared "
-    "Mac, and raises macOS privacy (TCC) prompts attributed to Boss for "
+    "Mac, and raises macOS privacy (TCC) prompts attributed to the app for "
     "Desktop, Documents, Downloads, Photos and network volumes. Re-run the "
     "search rooted at the directory you actually need -- the workspace root, "
     "or a named subdirectory under it. If you need one specific file outside "

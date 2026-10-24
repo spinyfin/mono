@@ -68,7 +68,7 @@ async fn choosing_records_the_clicked_option_closes_the_question_and_restarts_th
     // The next run's brief carries the chosen option, and only grants the decision.
     assert!(
         task.description
-            .starts_with("Original brief\n\n---\n\n## Operator answer (")
+            .starts_with("Original brief\n\n---\n\n## Recorded answer (")
     );
     assert!(task.description.contains("- **Operator chose:** All at once\n"));
     assert!(

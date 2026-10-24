@@ -1,6 +1,32 @@
 use super::super::*;
 use super::helpers::*;
 
+#[test]
+fn path_guard_denials_avoid_internal_vocabulary() {
+    for name in ["MALFORMED", "RECOVERY", "TRAVERSAL_RECOVERY"] {
+        let prefix = format!("{name} = (\n");
+        let body = PATH_GUARD_SCRIPT
+            .split_once(&prefix)
+            .unwrap()
+            .1
+            .split_once("\n)")
+            .unwrap()
+            .0;
+        let mut message = String::new();
+        for line in body.lines() {
+            message.push_str(&serde_json::from_str::<String>(line.trim()).unwrap());
+        }
+        // Directory spellings with and without a trailing slash name the
+        // same structured path already exempted by the shared scanner.
+        for marker in crate::prose_vocabulary::STRUCTURED_MARKERS {
+            if marker.ends_with('/') {
+                message = message.replace(marker.trim_end_matches('/'), "");
+            }
+        }
+        crate::prose_vocabulary::assert_no_forbidden_prose(name, &message);
+    }
+}
+
 /// Locate the deterministic path-guard PreToolUse hook command (the
 /// one that invokes the gate script), if present.
 fn path_guard_command(parsed: &serde_json::Value) -> Option<String> {

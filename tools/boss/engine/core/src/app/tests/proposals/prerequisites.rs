@@ -98,11 +98,11 @@ async fn prerequisite_yes_creates_chore_edge_and_note_then_redispatches_when_it_
     assert_eq!(
         task.description,
         format!(
-            "Original brief\n\n---\n\n## Operator-approved prerequisite ({timestamp})\n\n\
+            "Original brief\n\n---\n\n## Prerequisite approved by the repo owner ({timestamp})\n\n\
 - **Prerequisite task:** {PREREQUISITE_NAME} (`{}`)\n\
 - **Why this task cannot proceed without it:** CI cannot go green until the fixture is fixed on main.\n\
 - **Asked by run:** `{old_execution}`\n\n\
-The operator approved this on the kanban. The engine created it as a chore with normal dispatch. This task now depends on it (a `blocks` dependency): it stays parked until the prerequisite is done, and the engine then dispatches it again. When you resume, assume the prerequisite's change is on `main`; do not redo its work here.\n",
+The repo owner approved this. The prerequisite task was created and scheduled for dispatch. This task now depends on it (a `blocks` dependency): it stays parked until the prerequisite is done, and it is then dispatched again. When you resume, assume the prerequisite's change is on `main`; do not redo its work here.\n",
             prerequisite.id
         )
     );
@@ -208,7 +208,7 @@ async fn prerequisite_yes_links_an_equivalent_open_task_instead_of_duplicating_i
     assert_eq!(task.blocked_reason.as_deref(), Some("dependency"));
     assert!(
         task.description.contains(
-            "An equivalent open task already existed, so the engine linked to it instead of creating a duplicate."
+            "An equivalent open task already existed, so this task now links to it instead of creating a duplicate."
         ),
         "the brief says the existing task was reused: {}",
         task.description
@@ -261,10 +261,7 @@ async fn prerequisite_yes_enables_dispatch_on_a_backlog_candidate_and_skips_a_hu
             .iter()
             .any(|e| e.status == boss_protocol::ExecutionStatus::Ready)
     );
-    assert!(
-        task.description
-            .contains("turned autostart on and queued it for dispatch")
-    );
+    assert!(task.description.contains("it has been scheduled for dispatch"));
 }
 
 #[tokio::test]

@@ -801,7 +801,7 @@ async fn untagged_row_spawn_matches_engine_default() {
     // must be the first thing the worker sees.
     let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
     assert!(
-        prompt.starts_with("You are a reusable Boss worker"),
+        prompt.starts_with("You are a reusable worker"),
         "untagged-row prompt must start with the original framing, got: {prompt:?}",
     );
     assert!(
