@@ -90,6 +90,7 @@ rust_library(
         "//tools/boss/client:__pkg__",
     ],
     deps = [
+        "//tools/boss/engine/host-execution",
         "//lib/rust/git_utils",
         "//tools/boss/backoff",
         # NOT "//tools/boss/build-provenance": that crate's source embeds

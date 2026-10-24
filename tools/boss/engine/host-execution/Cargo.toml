@@ -1,0 +1,23 @@
+[package]
+name = "boss-host-execution"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bon = { workspace = true }
+boss-engine-driver = { path = "../driver" }
+boss-engine-recovery = { path = "../recovery" }
+boss-engine-utils = { path = "../utils" }
+boss-protocol = { path = "../../protocol" }
+boss-protocol-spoke = { path = "../../protocol-spoke" }
+git-utils = { path = "../../../../lib/rust/git_utils" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "time"] }
+
+[dev-dependencies]
+boss-engine-test-git = { path = "../test-git" }
+tempfile = { workspace = true }

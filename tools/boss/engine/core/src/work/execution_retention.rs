@@ -206,7 +206,7 @@ fn prune_terminal_executions_on(
         if still_referenced.contains(&path) {
             continue;
         }
-        match boss_engine_driver::codex::reclaim_codex_home(&path) {
+        match boss_host_execution::input::reclaim_home(&path) {
             Ok(()) => {
                 reclaimed = reclaimed.saturating_add(1);
                 tracing::info!(

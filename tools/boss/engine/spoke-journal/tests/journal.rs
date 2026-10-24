@@ -226,3 +226,55 @@ fn failed_result_commit_keeps_command_pending_for_recovery() {
     assert_eq!(journal.applied_commands().unwrap(), 1);
     assert_eq!(journal.record_bounds().unwrap().1, bounds.1 + 1);
 }
+
+#[test]
+fn attempting_survives_restart_and_result_commits_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("state");
+    let mut journal = open(&root);
+    journal.welcome(&welcome(&journal, 0)).unwrap();
+    journal.receive_command(&command(1, "workspace")).unwrap();
+    let (pending, interrupted) = journal.begin_pending().unwrap().unwrap();
+    assert!(!interrupted);
+    assert_eq!(journal.applied_commands().unwrap(), 0);
+    drop(journal);
+    let mut journal = open(&root);
+    let (recovered, interrupted) = journal.begin_pending().unwrap().unwrap();
+    assert!(interrupted);
+    assert_eq!(recovered, pending);
+    let result = v1::CommandResult {
+        command_id: pending.command_id.clone(),
+        code: v1::ResultCode::OutcomeUncertain.into(),
+        reason: "reconcile interrupted host effect".into(),
+        value: None,
+    };
+    journal
+        .complete_command(&pending, result.clone(), &stamp(2000))
+        .unwrap();
+    assert!(journal.complete_command(&pending, result, &stamp(2000)).is_err());
+    drop(journal);
+    let mut journal = open(&root);
+    assert!(journal.begin_pending().unwrap().is_none());
+    assert_eq!(journal.applied_commands().unwrap(), 1);
+    assert_eq!(journal.record_bounds().unwrap().1, 1);
+}
+
+#[test]
+fn upgrades_received_commands_from_original_schema_without_losing_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("state");
+    let mut journal = open(&root);
+    let identity = journal.identity().unwrap();
+    journal.welcome(&welcome(&journal, 0)).unwrap();
+    journal.receive_command(&command(1, "before-upgrade")).unwrap();
+    drop(journal);
+    let db = rusqlite::Connection::open(root.join("journal.db")).unwrap();
+    db.execute_batch("ALTER TABLE commands DROP COLUMN attempting; PRAGMA user_version=1;")
+        .unwrap();
+    drop(db);
+    let mut journal = open(&root);
+    assert_eq!(journal.identity().unwrap(), identity);
+    let (command, interrupted) = journal.begin_pending().unwrap().unwrap();
+    assert_eq!(command.command_id, "before-upgrade");
+    assert!(!interrupted);
+}

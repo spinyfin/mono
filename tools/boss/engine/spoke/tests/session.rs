@@ -16,7 +16,19 @@ async fn actual_daemon_reconnects_replays_and_recovers_command_receipt_after_sig
     let mut hub = Fixture::new().await;
     let daemon = hub.start();
     let mut first = hub.connection().await;
-    assert_eq!(first.hello.features, boss_spoke_outbound::contracts().features);
+    assert_eq!(
+        first.hello.features,
+        vec![
+            v1::Feature {
+                name: "journal".into(),
+                revision: 1
+            },
+            v1::Feature {
+                name: "workspace".into(),
+                revision: 1
+            }
+        ]
+    );
     let identity = first.hello.journal_id.clone();
     let boot = first.hello.boot_id.clone();
     first.welcome(0).await;
@@ -520,4 +532,56 @@ mod flow {
         assert!(!task.is_finished());
         task.abort();
     }
+}
+
+#[tokio::test]
+async fn actual_daemon_dispatches_workspace_command_and_replays_result() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut hub = Fixture::new().await;
+    let cube = hub.dir.path().join("cube-fixture");
+    std::fs::write(
+        &cube,
+        r#"#!/bin/sh
+[ "$*" = "--json repo list" ] || exit 9
+printf '%s\n' '{"repos":[]}'
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&cube, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let daemon = hub.start_with_cube(&cube);
+    let mut connection = hub.connection().await;
+    connection.welcome(0).await;
+    let request = v1::Command {
+        sequence: 1,
+        command_id: "list-repos".into(),
+        not_after_unix_ms: i64::MAX,
+        body: Some(command::Body::Workspace(v1::WorkspaceOp {
+            kind: v1::WorkspaceKind::ListRepos.into(),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    connection.send(hub_frame::Body::Command(request)).await;
+    let result_record = loop {
+        if let spoke_frame::Body::Record(record) = connection.next().await {
+            if matches!(record.body, Some(record::Body::Result(_))) {
+                break record;
+            }
+            connection.receipt(record.sequence).await;
+        }
+    };
+    let Some(record::Body::Result(result)) = &result_record.body else {
+        unreachable!()
+    };
+    assert_eq!(result.code, v1::ResultCode::Ok as i32);
+    let Some(v1::command_result::Value::Workspace(value)) = &result.value else {
+        panic!("missing workspace result")
+    };
+    assert_eq!(value.cube_result_json, b"[]");
+    drop(connection);
+    drop(daemon);
+    let _daemon = hub.start_with_cube(&cube);
+    let mut connection = hub.connection().await;
+    connection.welcome(result_record.sequence - 1).await;
+    assert_eq!(connection.next().await, spoke_frame::Body::Record(result_record));
 }

@@ -52,48 +52,85 @@ impl Journal {
         Ok(command.sequence)
     }
 
-    /// The foundation daemon has no executor. Reject durably in order, including
-    /// commands received just before a crash. Receipt alone never means success.
-    pub fn reject_pending(&mut self, stamp: &Stamp) -> Result<bool> {
+    /// Claim the oldest command before any host effect. On restart an attempting
+    /// command is returned with interrupted=true; the executor must reconcile it.
+    pub fn begin_pending(&mut self) -> Result<Option<(Command, bool)>> {
         let tx = self.db.transaction()?;
-        let pending: Option<(u64, Vec<u8>, Vec<u8>)> = tx
+        let pending: Option<(Vec<u8>, Vec<u8>, bool)> = tx
             .query_row(
-                "SELECT sequence,bytes,digest FROM commands WHERE applied=0 ORDER BY sequence LIMIT 1",
+                "SELECT bytes,digest,attempting FROM commands WHERE applied=0 ORDER BY sequence LIMIT 1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let Some((sequence, bytes, digest)) = pending else {
-            return Ok(false);
+        let Some((bytes, digest, interrupted)) = pending else {
+            return Ok(None);
         };
         ensure!(Sha256::digest(&bytes)[..] == digest, "corrupt command digest");
         let command = Command::decode(bytes.as_slice())?;
+        tx.execute("UPDATE commands SET attempting=1 WHERE sequence=?1", [command.sequence])?;
+        tx.commit()?;
+        Ok(Some((command, interrupted)))
+    }
+
+    /// Commit result and application cursor atomically. A full spool leaves the
+    /// command attempting, so callers retain the result and retry this commit.
+    pub fn complete_command(&mut self, command: &Command, result: CommandResult, stamp: &Stamp) -> Result<()> {
+        ensure!(result.command_id == command.command_id, "result command mismatch");
+        let tx = self.db.transaction()?;
+        let pending: Option<(u64, String, u64)> = tx
+            .query_row(
+                "SELECT sequence,command_id,length(bytes) FROM commands WHERE applied=0 AND attempting=1 ORDER BY sequence LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((sequence, command_id, payload_bytes)) = pending else {
+            anyhow::bail!("result does not match oldest attempting command");
+        };
+        ensure!(
+            (sequence, command_id) == (command.sequence, command.command_id.clone()),
+            "result does not match oldest attempting command"
+        );
+        let mut record = Record {
+            observed: Some(stamp.clone()),
+            run: command.run.clone(),
+            body: Some(record::Body::Result(result)),
+            ..Default::default()
+        };
+        records::insert(&tx, &mut record, Admission::Lifecycle, self.limits)?;
+        // Shrink the applied command to a tombstone (id, sequence, digest) so its
+        // payload stops counting against the spool.
+        tx.execute("UPDATE identity SET queued_bytes=queued_bytes-?1", [payload_bytes])?;
+        tx.execute(
+            "UPDATE commands SET applied=1,bytes=zeroblob(0) WHERE sequence=?1",
+            [command.sequence],
+        )?;
+        tx.execute("UPDATE identity SET applied_command=?1", [command.sequence])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Durable rejection for callers without an installed execution capability.
+    pub fn reject_pending(&mut self, stamp: &Stamp) -> Result<bool> {
+        let Some((command, _)) = self.begin_pending()? else {
+            return Ok(false);
+        };
         let reason = if command.not_after_unix_ms <= stamp.wall_unix_ms {
             "command expired"
         } else {
             "execution capability unavailable"
         };
-        let mut result = Record {
-            observed: Some(stamp.clone()),
-            run: command.run,
-            body: Some(record::Body::Result(CommandResult {
-                command_id: command.command_id,
+        self.complete_command(
+            &command,
+            CommandResult {
+                command_id: command.command_id.clone(),
                 code: ResultCode::Rejected.into(),
                 reason: reason.into(),
                 value: None,
-            })),
-            ..Default::default()
-        };
-        records::insert(&tx, &mut result, Admission::Lifecycle, self.limits)?;
-        // Shrink the applied command to a tombstone (id, sequence, digest) so its
-        // payload stops counting against the spool.
-        tx.execute("UPDATE identity SET queued_bytes=queued_bytes-?1", [bytes.len() as u64])?;
-        tx.execute(
-            "UPDATE commands SET applied=1,bytes=zeroblob(0) WHERE sequence=?1",
-            [sequence],
+            },
+            stamp,
         )?;
-        tx.execute("UPDATE identity SET applied_command=?1", [sequence])?;
-        tx.commit()?;
         Ok(true)
     }
 }

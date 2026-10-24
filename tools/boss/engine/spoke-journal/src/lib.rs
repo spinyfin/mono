@@ -8,7 +8,7 @@ mod schema {
     pub fn migrate(db: &mut Connection) -> Result<()> {
         let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         ensure!(
-            version <= 1,
+            version <= 2,
             "journal schema is newer than this reader; rollback refused"
         );
         if version == 0 {
@@ -42,6 +42,13 @@ mod schema {
                 END;
                 PRAGMA user_version=1;
             ",
+            )?;
+            tx.commit()?;
+        }
+        if version < 2 {
+            let tx = db.transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE commands ADD COLUMN attempting INTEGER NOT NULL DEFAULT 0; PRAGMA user_version=2;",
             )?;
             tx.commit()?;
         }

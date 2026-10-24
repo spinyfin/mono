@@ -33,7 +33,6 @@ use crate::config::RuntimeConfig;
 use crate::coordinator::{
     CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
 };
-use crate::cube_commands::CubeJsonTransport;
 use crate::host_registry::Host;
 use crate::remote_wrapper::remote_wrapper_path;
 use crate::runner::{
@@ -622,10 +621,8 @@ impl HostAdapter for LocalHostAdapter {
         if !recovery_pr_is_open(self, repo_id, pr).await? {
             return Ok(false);
         }
-        let saved = execution_bookmark::snapshot_pointers(&LocalJj, record).await?;
-        let result = self.goto_workspace(workspace, pr).await;
-        execution_bookmark::restore_pointers(&LocalJj, record, &saved).await?;
-        result?;
+        boss_host_execution::workspace::preserve_recovery_pointers(record, self.goto_workspace(workspace, pr))
+            .await?;
         pr_anchor::ensure(&LocalJj, record, pr).await?;
         Ok(true)
     }
@@ -1271,36 +1268,11 @@ impl HostAdapter for SshHostAdapter {
     }
 
     async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()> {
-        let workspace_arg = workspace_path.display().to_string();
-        let pr_str = pr.to_string();
-        let _ = self
-            .run_cube_json(&[
-                "--json",
-                "workspace",
-                "goto",
-                "--workspace",
-                workspace_arg.as_str(),
-                "--pr",
-                pr_str.as_str(),
-            ])
-            .await?;
-        Ok(())
+        crate::cube_commands::goto_workspace(self, workspace_path, "--pr", &pr.to_string()).await
     }
 
     async fn goto_workspace_revision(&self, workspace_path: &Path, sha: &str) -> Result<()> {
-        let workspace_arg = workspace_path.display().to_string();
-        let _ = self
-            .run_cube_json(&[
-                "--json",
-                "workspace",
-                "goto",
-                "--workspace",
-                workspace_arg.as_str(),
-                "--revision",
-                sha,
-            ])
-            .await?;
-        Ok(())
+        crate::cube_commands::goto_workspace(self, workspace_path, "--revision", sha).await
     }
 
     async fn probe_initial_input_alive(&self, workspace: &str, run_id: &str) -> Result<Option<bool>> {
@@ -2752,5 +2724,47 @@ mod tests {
             validate_remote_output_path("/tmp/a.review-result.json\n", ReviewResult).unwrap(),
             "/tmp/a.review-result.json"
         );
+    }
+}
+
+#[cfg(test)]
+mod cube_budget_tests {
+    use crate::ssh_transport::SSH_COMMAND_TIMEOUT;
+    use boss_host_execution::cube_op_budget::*;
+
+    /// The whole point of the module: the transport bound must sit strictly
+    /// inside the outer bound, so the transport's better-attributed timeout
+    /// error is the one the operator sees.
+    #[test]
+    fn transport_budgets_are_strictly_inside_their_outer_bounds() {
+        assert!(lease_transport_budget() < LEASE);
+        assert!(repo_ensure_transport_budget() < REPO_ENSURE);
+    }
+
+    /// The regression this module exists to prevent. If a provisioning-class
+    /// budget ever collapses to (or below) the generic fast-command bound,
+    /// the remote path is back to the anaplian behaviour: the operation is
+    /// killed at 30s no matter what the dispatcher budgeted for it.
+    #[test]
+    fn provisioning_budgets_exceed_the_generic_fast_command_bound() {
+        assert!(
+            lease_transport_budget() > SSH_COMMAND_TIMEOUT,
+            "a remote lease must get more than the generic {}s ssh bound",
+            SSH_COMMAND_TIMEOUT.as_secs()
+        );
+        assert!(
+            repo_ensure_transport_budget() > SSH_COMMAND_TIMEOUT,
+            "a remote repo ensure must get more than the generic {}s ssh bound",
+            SSH_COMMAND_TIMEOUT.as_secs()
+        );
+    }
+
+    /// `saturating_sub` must not silently produce a zero budget if someone
+    /// later sets an outer bound below the grace margin — a zero budget
+    /// would time out every call instantly.
+    #[test]
+    fn transport_budget_never_reaches_zero_for_the_defined_operations() {
+        assert!(!lease_transport_budget().is_zero());
+        assert!(!repo_ensure_transport_budget().is_zero());
     }
 }

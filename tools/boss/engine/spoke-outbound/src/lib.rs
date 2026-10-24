@@ -178,6 +178,17 @@ mod session {
         nonce: &[u8],
         stamp: &impl Fn() -> Result<v1::Stamp>,
     ) -> Result<()> {
+        connect_with_executor(journal, endpoint, nonce, stamp, false).await
+    }
+
+    /// External execution runs independently from connection liveness.
+    pub async fn connect_with_executor(
+        journal: &SharedJournal,
+        endpoint: Endpoint,
+        nonce: &[u8],
+        stamp: &impl Fn() -> Result<v1::Stamp>,
+        external_executor: bool,
+    ) -> Result<()> {
         ensure!(
             endpoint.uri().scheme_str() == Some("https"),
             "spoke requires mTLS HTTPS"
@@ -191,7 +202,16 @@ mod session {
             .max_encoding_message_size(MAX_FRAME_BYTES as usize);
         grpc.ready().await.map_err(network)?;
         let (tx, rx) = mpsc::channel(2);
-        let hello = hello(&*locked(journal)?, &stamp()?.boot_id, nonce)?;
+        let mut hello = hello(&*locked(journal)?, &stamp()?.boot_id, nonce)?;
+        let mut selected_contracts = contracts();
+        if external_executor {
+            selected_contracts.features.push(v1::Feature {
+                name: "workspace".into(),
+                revision: 1,
+            });
+            selected_contracts.required.push("workspace".into());
+            hello.features = selected_contracts.features.clone();
+        }
         send(
             &tx,
             control(spoke_frame::Body::Hello(hello.clone())),
@@ -215,7 +235,7 @@ mod session {
             }
             _ => bail!("expected Welcome as first hub frame"),
         };
-        contracts().confirm(&welcome)?;
+        selected_contracts.confirm(&welcome)?;
         ensure!(
             first.frame.connection_generation == welcome.connection_generation,
             "Welcome generation mismatch"
@@ -288,7 +308,7 @@ mod session {
                         locked(journal)?.compact(observed.wall_unix_ms)?;
                         admit_command(journal, &mut pending_command, &mut controls)?;
                     }
-                    let rejected = locked(journal)?.reject_pending(&observed);
+                    let rejected = if external_executor { Ok(false) } else { locked(journal)?.reject_pending(&observed) };
                     if let Err(error) = rejected {
                         if !Fault::is_full(&error) {
                             return Err(error);
@@ -412,6 +432,15 @@ pub fn hello(journal: &Journal, boot_id: &str, nonce: &[u8]) -> Result<Hello> {
 struct Retry(String);
 
 pub async fn run(journal: SharedJournal, endpoint: Endpoint, stamp: impl Fn() -> Result<Stamp>) -> Result<()> {
+    run_with_executor(journal, endpoint, stamp, false).await
+}
+
+pub async fn run_with_executor(
+    journal: SharedJournal,
+    endpoint: Endpoint,
+    stamp: impl Fn() -> Result<Stamp>,
+    external_executor: bool,
+) -> Result<()> {
     ensure!(
         endpoint.uri().scheme_str() == Some("https"),
         "spoke requires mTLS HTTPS"
@@ -420,7 +449,9 @@ pub async fn run(journal: SharedJournal, endpoint: Endpoint, stamp: impl Fn() ->
     let mut attempt = 0u32;
     loop {
         let started = std::time::Instant::now();
-        if let Err(error) = connect_once(&journal, endpoint.clone(), &nonce, &stamp).await {
+        if let Err(error) =
+            session::connect_with_executor(&journal, endpoint.clone(), &nonce, &stamp, external_executor).await
+        {
             if error.downcast_ref::<Retry>().is_none() {
                 return Err(error);
             }

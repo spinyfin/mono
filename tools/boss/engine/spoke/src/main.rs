@@ -1,4 +1,46 @@
-//! Minimal, non-schedulable spoke: real durable capacity producer and mTLS stream.
+//! Non-schedulable spoke with durable workspace execution and an mTLS stream.
+mod workspace {
+    use anyhow::Result;
+    use boss_host_execution::{cube::LocalCube, workspace::Executor};
+    use boss_protocol_spoke::v1::Stamp;
+    use boss_spoke_journal::Fault;
+    use boss_spoke_outbound::SharedJournal;
+
+    /// One serialized executor survives network reconnects. Never hold the journal
+    /// lock across a subprocess, and never re-execute an effect because result
+    /// admission is temporarily full.
+    pub async fn run(
+        journal: SharedJournal,
+        executor: Executor<LocalCube>,
+        stamp: impl Fn() -> Result<Stamp>,
+    ) -> Result<()> {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+        loop {
+            interval.tick().await;
+            let pending = journal
+                .lock()
+                .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+                .begin_pending()?;
+            let Some((command, interrupted)) = pending else {
+                continue;
+            };
+            let observed = stamp()?;
+            let result = executor.execute(&command, interrupted, observed.wall_unix_ms).await;
+            let observed = stamp()?;
+            loop {
+                let completed = journal
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+                    .complete_command(&command, result.clone(), &observed);
+                match completed {
+                    Ok(()) => break,
+                    Err(error) if Fault::is_full(&error) => interval.tick().await,
+                    Err(error) => return Err(error),
+                };
+            }
+        }
+    }
+}
 mod host {
     use anyhow::{Result, ensure};
     use boss_protocol_spoke::v1::Stamp;
@@ -79,10 +121,13 @@ use std::{
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 #[derive(Parser)]
-#[command(about = "Journal-only Boss spoke (zero execution slots)")]
+#[command(about = "Boss spoke workspace executor (zero worker slots)")]
 struct Args {
     #[arg(long)]
     state_dir: PathBuf,
+    /// Host-configured executable; never accepted from a wire command.
+    #[arg(long, default_value = "cube")]
+    cube_bin: PathBuf,
     #[arg(long)]
     host_id: String,
     #[arg(long)]
@@ -112,8 +157,17 @@ async fn main() -> Result<()> {
         .tls_config(tls)?;
     let boot = host::boot_id()?;
     let stamp = || host::stamp(&boot);
+    let executor = boss_host_execution::workspace::Executor {
+        cube: boss_host_execution::cube::LocalCube {
+            command: args.cube_bin,
+            args: Vec::new(),
+            cwd: args.state_dir.clone(),
+        },
+        host_id: args.host_id.clone(),
+    };
     tokio::select! {
-        result = boss_spoke_outbound::run(Arc::clone(&journal), endpoint, stamp) => result,
+        result = boss_spoke_outbound::run_with_executor(Arc::clone(&journal), endpoint, stamp, true) => result,
+        result = workspace::run(Arc::clone(&journal), executor, stamp) => result,
         result = produce(&journal, &args.state_dir, &boot) => result,
         result = tokio::signal::ctrl_c() => { result?; Ok(()) }
     }

@@ -13,6 +13,7 @@ rust_library(
     visibility = [
         "//tools/boss/engine/conflict-diagnosis:__pkg__",
         "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/host-execution:__pkg__",
         "//tools/boss/engine/recovery:__pkg__",
         "//tools/cube:__pkg__",
     ],

@@ -1,6 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -12,7 +11,6 @@ use boss_protocol::{
     DispatchPauseScope, EngineToAppError, ExecutionKind, ExecutionStatus, FrontendEvent, LiveWorkerState, PauseReason,
     TaskKind, TaskStatus,
 };
-use tokio::process::Command;
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::config::RuntimeConfig;
@@ -501,37 +499,9 @@ impl Drop for HeartbeatGuard {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CubeRepoHandle {
-    pub repo_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CubeWorkspaceLease {
-    pub lease_id: String,
-    pub workspace_id: String,
-    pub workspace_path: PathBuf,
-    /// Cube's positive recovery check, reported only on an `--allow-dirty`
-    /// reclaim:
-    ///
-    /// - `Some(true)`  — the workspace still held work that exists on no
-    ///   remote, i.e. cube recovered the dead worker's tree in place. This is
-    ///   the good path: the work is live, with its jj operation log intact.
-    /// - `Some(false)` — the lease succeeded but there was nothing left to
-    ///   recover (the tree had already been reset). The caller must fall back
-    ///   to the engine's saved recovery patch.
-    /// - `None`        — not a recovery lease; the field does not apply.
-    ///
-    /// The distinction matters because lease success alone never proved
-    /// recovery: a caller that inferred it would start from an empty tree
-    /// while believing it was resuming.
-    pub dirty_verified: Option<bool>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CubeChangeHandle {
-    pub change_id: String,
-}
+pub use boss_host_execution::types::{
+    CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
+};
 
 /// Outcome of an engine-direct `cube workspace rebase` (rung 1 of the
 /// merge-conflict escalation ladder — see
@@ -582,39 +552,6 @@ pub struct RebaseOutcome {
     /// silence undiagnosable. Stamped on the ladder's rung-1 fall-through
     /// trace so guard hits can be counted without a code change.
     pub linearize_decline: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, bon::Builder, serde::Deserialize)]
-#[builder(on(String, into))]
-pub struct CubeWorkspaceStatus {
-    pub workspace_id: String,
-    pub workspace_path: PathBuf,
-    pub state: String,
-    pub lease_id: Option<String>,
-    pub holder: Option<String>,
-    pub task: Option<String>,
-    /// Exact task identity recorded by Cube when the previous lease ended.
-    #[serde(default)]
-    pub last_task: Option<String>,
-    pub leased_at_epoch_s: Option<i64>,
-    pub lease_expires_at_epoch_s: Option<i64>,
-}
-
-/// Pool-config view of a repo as returned by `cube repo list --json`.
-/// Used by the cold-pool probe in [`ExecutionCoordinator::schedule_execution`]
-/// to decide whether the auto-provisioned defaults are worth flagging
-/// to the operator. See `multi-repo-work-modeling.md` Q6.
-#[derive(Debug, Clone, PartialEq, Eq, bon::Builder, serde::Deserialize)]
-#[builder(on(String, into))]
-pub struct CubeRepoSummary {
-    #[serde(rename = "repo")]
-    pub repo_id: String,
-    pub origin: String,
-    pub main_branch: String,
-    pub workspace_root: PathBuf,
-    pub workspace_prefix: String,
-    #[serde(default)]
-    pub source: Option<PathBuf>,
 }
 
 #[async_trait]
@@ -856,37 +793,13 @@ impl CommandCubeClient {
     /// current directory rather than a `--workspace` flag.
     async fn run_json_in_dir(&self, cwd: &Path, args: &[&str]) -> Result<serde_json::Value> {
         let agent = self.cfg.agent()?;
-        let mut command = Command::new(&agent.cube.command);
-        command
-            .args(&agent.cube.args)
-            .args(args)
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        let output = command.output().await.with_context(|| {
-            format!(
-                "failed to spawn Cube command: {} {}",
-                agent.cube.command,
-                agent.cube.args.join(" ")
-            )
-        })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            return Err(crate::cube_commands::CubeCliError {
-                host: "local".to_owned(),
-                exit_code: output.status.code(),
-                stderr,
-                stdout,
-            }
-            .into());
+        boss_host_execution::cube::LocalCube {
+            command: agent.cube.command.clone().into(),
+            args: agent.cube.args.clone(),
+            cwd: cwd.to_path_buf(),
         }
-
-        serde_json::from_slice(&output.stdout).context("failed to decode Cube JSON output")
+        .run(args)
+        .await
     }
 }
 
@@ -972,36 +885,11 @@ impl CubeClient for CommandCubeClient {
     }
 
     async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()> {
-        let workspace_arg = workspace_path.display().to_string();
-        let pr_str = pr.to_string();
-        let _ = self
-            .run_json(&[
-                "--json",
-                "workspace",
-                "goto",
-                "--workspace",
-                &workspace_arg,
-                "--pr",
-                &pr_str,
-            ])
-            .await?;
-        Ok(())
+        crate::cube_commands::goto_workspace(self, workspace_path, "--pr", &pr.to_string()).await
     }
 
     async fn goto_workspace_revision(&self, workspace_path: &Path, sha: &str) -> Result<()> {
-        let workspace_arg = workspace_path.display().to_string();
-        let _ = self
-            .run_json(&[
-                "--json",
-                "workspace",
-                "goto",
-                "--workspace",
-                &workspace_arg,
-                "--revision",
-                sha,
-            ])
-            .await?;
-        Ok(())
+        crate::cube_commands::goto_workspace(self, workspace_path, "--revision", sha).await
     }
 
     async fn rebase_workspace(&self, workspace_path: &Path, pr: u64) -> Result<RebaseOutcome> {

@@ -825,16 +825,20 @@ impl ExecutionRunner for PaneSpawnRunner {
         // on the execution so every teardown path can hand it back after
         // engine restart / orphan recovery / workspace release without
         // inferring a home from the engine environment.
-        let runtime_state = driver
-            .provision_workspace(workspace_path, &prompt_text, &execution.id)
-            .await
-            .with_context(|| {
-                format!(
-                    "provisioning workspace {} for execution {}",
-                    workspace_path.display(),
-                    execution.id,
-                )
-            })?;
+        let runtime_state = boss_host_execution::input::provision(
+            driver.as_ref(),
+            workspace_path,
+            prompt_text.as_bytes(),
+            &execution.id,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "provisioning workspace {} for execution {}",
+                workspace_path.display(),
+                execution.id,
+            )
+        })?;
         // Persist must succeed when the driver returned state (Codex
         // CODEX_HOME): a silent failure would make every teardown path
         // no-op, leak Boss-owned homes, and skip auth adopt. Fail the

@@ -1,0 +1,42 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "host-execution",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "boss_host_execution",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = [
+        "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/spoke:__pkg__",
+    ],
+    deps = [
+        "//lib/rust/git_utils",
+        "//tools/boss/engine/driver",
+        "//tools/boss/engine/recovery",
+        "//tools/boss/engine/utils",
+        "//tools/boss/protocol",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "host-execution_test",
+    size = "small",
+    crate = ":host-execution",
+    data = ["//tools/boss/engine/recovery:jj_test_binary"],
+    edition = "2024",
+    env = {"BOSS_JJ_BIN": "$(rootpath //tools/boss/engine/recovery:jj_test_binary)"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = ["//tools/boss/engine/test-git"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

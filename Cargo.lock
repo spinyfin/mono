@@ -618,6 +618,7 @@ dependencies = [
  "boss-gh-telemetry",
  "boss-github",
  "boss-github-tracker",
+ "boss-host-execution",
  "boss-http-retry",
  "boss-log-files",
  "boss-metrics",
@@ -1098,6 +1099,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-host-execution"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bon",
+ "boss-engine-driver",
+ "boss-engine-recovery",
+ "boss-engine-test-git",
+ "boss-engine-utils",
+ "boss-protocol",
+ "boss-protocol-spoke",
+ "git-utils",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "boss-http-retry"
 version = "0.1.0"
 dependencies = [
@@ -1230,6 +1251,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "boss-host-enrollment",
+ "boss-host-execution",
  "boss-protocol-spoke",
  "boss-spoke-journal",
  "boss-spoke-outbound",
