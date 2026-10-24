@@ -66,6 +66,10 @@ pub async fn connect_once(
         first.frame.connection_generation == welcome.connection_generation,
         "Welcome generation mismatch"
     );
+    ensure!(
+        welcome.received_records.as_ref().expect("validated receipt").through <= hello.last_record,
+        "replay_gap: hub receipt exceeds advertised journal"
+    );
     locked(journal)?.welcome(&welcome)?;
     let frame_limit = downward(welcome.max_frame_bytes, MAX_FRAME_BYTES);
     let credit = downward(welcome.max_inflight_bytes, MAX_INFLIGHT_BYTES);
