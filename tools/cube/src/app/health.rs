@@ -14,7 +14,7 @@ use crate::app::jj::{
     budgeted_timeout, jj_needs_colocate_init, jj_update_stale_recovery_kind, network_cmd_timeout, run_jj,
     run_jj_network_within, run_jj_within,
 };
-use crate::app::pr_bookmarks::delete_pr_bookmarks;
+use crate::app::pr_bookmarks;
 
 /// Outcome of a pre-lease health check on a free workspace.
 #[derive(Debug, Clone)]
@@ -187,16 +187,8 @@ fn parse_conflicted_bookmarks_from_status(status: &str) -> Vec<String> {
 /// `ConflictedBookmarks` and the workspace is otherwise clean (working
 /// copy empty).
 ///
-/// A conflicted `pr/<n>` is *deleted* (and the deletion exported to the
-/// colocated git repo), never forgotten: `jj bookmark forget` leaves
-/// `refs/heads/pr/<n>` behind in git, and the next auto-import resurrects it
-/// as a stale target that conflicts with the head `cube workspace goto --pr`
-/// sets next — see [`crate::app::pr_bookmarks`]. Deleting is lossless here:
-/// `pr/*` is a derived pointer from a PR number to its head, re-established
-/// from GitHub's head by the very next `goto --pr`, and the lease path
-/// deliberately makes no network call to resolve that head itself. Every
-/// other conflicted bookmark is forgotten, which removes the local tracking
-/// state without touching remote refs.
+/// PR bookmarks are repaired from their fetched GitHub head only after the
+/// same provenance check used by goto. Unpublished sides are never deleted.
 pub(super) fn repair_conflicted_bookmarks(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
@@ -223,15 +215,32 @@ pub(super) fn repair_conflicted_bookmarks(
             },
         )?;
     }
-    for bookmark in &pr_bookmarks {
-        audit!(
+    if !pr_bookmarks.is_empty() {
+        let (remote, repo) =
+            crate::app::reset::resolve_github_remote_for_workspace(runner, database_path, workspace_path)?;
+        crate::app::jj::run_jj_network(
+            runner,
             database_path,
-            "workspace.bookmark_deleted",
-            workspace_path = workspace_path.display().to_string(),
-            bookmark = bookmark,
-        );
+            &RealCommandRunner::invocation(workspace_path, "jj", &["git", "fetch", "--remote", &remote]),
+        )?;
+        let _lock = runner.lock_pr_bookmarks(workspace_path)?;
+        for bookmark in &pr_bookmarks {
+            let number = bookmark[3..]
+                .parse()
+                .map_err(|_| CubeError::InvalidArgument(format!("invalid PR bookmark {bookmark}")))?;
+            let info = crate::app::gh_pr::fetch_pr_json(runner, workspace_path, &repo, number)?;
+            let branch = crate::app::gh_pr::head_ref(&info)
+                .ok_or_else(|| CubeError::InvalidArgument(format!("PR {number} returned no head.ref")))?;
+            pr_bookmarks::point_pr_bookmark(
+                runner,
+                database_path,
+                workspace_path,
+                number,
+                &format!("{branch}@{remote}"),
+            )?;
+        }
     }
-    delete_pr_bookmarks(runner, database_path, workspace_path, &pr_bookmarks)
+    Ok(())
 }
 
 /// Audit one of cube's own `jj` invocations against a leased

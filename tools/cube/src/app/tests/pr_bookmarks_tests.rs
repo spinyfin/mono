@@ -2,13 +2,12 @@
 //!
 //! The stale-git-ref cycle only exists in the interplay between jj's
 //! import/export bookkeeping and the colocated `.git`, so a scripted
-//! `FakeRunner` cannot show it. These tests run the declared `jj` (and `git`,
-//! for ref inspection) against a throwaway colocated repo plus one secondary
+//! `FakeRunner` cannot show it. These tests run the declared `jj`
+//! against a throwaway colocated repo plus one secondary
 //! workspace in a temp dir — never cube's live shared store, never cube
 //! itself, and never the test binary.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use tempfile::TempDir;
 
@@ -114,20 +113,22 @@ impl Fixture {
         self.jj(&self.ws, &["bookmark", "list", "--conflicted"])
     }
 
-    fn git(&self, args: &[&str]) -> Option<String> {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&self.root)
-            .args(args)
-            .output()
-            .expect("git");
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    fn git_ref(&self, n: u64) -> Option<String> {
+        // The fixture creates only loose refs, so read the actual exported
+        // ref without invoking an undeclared host git.
+        match std::fs::read_to_string(self.root.join(format!(".git/refs/heads/pr/{n}"))) {
+            Ok(value) => Some(value.trim().to_owned()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => panic!("read git ref: {e}"),
+        }
     }
 
-    fn git_ref(&self, n: u64) -> Option<String> {
-        self.git(&["rev-parse", "--verify", "-q", &format!("refs/heads/pr/{n}")])
+    fn protect_feat_remotely(&self) {
+        self.jj(
+            &self.ws,
+            &["git", "remote", "add", "backup", self.root.to_str().unwrap()],
+        );
+        self.jj(&self.ws, &["git", "fetch", "--remote", "backup"]);
     }
 
     /// `pr/1` exported to git at `feat`'s current commit, then `feat` rewritten
@@ -166,6 +167,8 @@ fn forget_from_a_secondary_workspace_is_resurrected_by_the_next_auto_import() {
 fn delete_then_auto_import_does_not_resurrect() {
     let f = Fixture::new();
     let (_old, _new) = f.rewritten_feat_with_exported_pr_ref();
+    f.jj(&f.ws, &["git", "export"]);
+    f.protect_feat_remotely();
 
     delete_pr_bookmarks(&f.runner, None, &f.ws, &["pr/1".to_string()]).expect("delete");
 
@@ -243,11 +246,288 @@ fn conflicted_bookmark_with_unique_content_fails_loudly_and_writes_nothing() {
     assert!(msg.contains(&head) && msg.contains(&other), "names both commits: {msg}");
     assert_eq!(f.pr_commits(1).len(), 2, "still conflicted, no side picked");
     assert!(f.conflicted().contains("pr/1"));
-    // The only operation allowed between the two reads is the import that
-    // runs first; the bookmark itself was not rewritten.
-    let after = f.jj(&f.ws, &["op", "log", "--no-graph", "-n", "1", "-T", "description"]);
-    assert!(
-        !after.contains("set bookmark") && !after.contains("point bookmark"),
-        "{after} ({before})"
+    let after = f.jj(&f.ws, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
+    assert_eq!(after, before, "unsafe repair must not write an operation");
+}
+
+#[test]
+fn newer_local_rewrite_is_not_an_obsolete_predecessor() {
+    let f = Fixture::new();
+    let old = f.commit("feat");
+    f.jj(&f.ws, &["new", "feat"]);
+    // Rewrite the actual feature, adding unpublished content.
+    f.jj(&f.ws, &["edit", "feat"]);
+    std::fs::write(f.ws.join("local.txt"), "unpublished\n").unwrap();
+    f.jj(&f.ws, &["bookmark", "set", "pr/1", "-r", "@"]);
+    let newer = f.commit("pr/1");
+    let err = point_pr_bookmark(&f.runner, None, &f.ws, 1, &old)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(&old) && err.contains(&newer), "{err}");
+    assert_eq!(f.pr_commits(1), vec![newer]);
+}
+
+#[test]
+fn divergent_successors_do_not_prove_obsolescence() {
+    let f = Fixture::new();
+    let op = f.jj(&f.ws, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
+    f.jj(&f.ws, &["edit", "feat"]);
+    std::fs::write(f.ws.join("left.txt"), "left\n").unwrap();
+    f.jj(&f.ws, &["bookmark", "set", "pr/1", "-r", "@"]);
+    let left = f.commit("pr/1");
+    // A second successor from the same operation, not from the first rewrite.
+    f.jj(
+        &f.root,
+        &["--at-op", &op, "describe", "-r", "feat", "-m", "divergent successor"],
     );
+    let variants = f.jj(
+        &f.ws,
+        &["log", "--no-graph", "-r", "feat", "-T", "commit_id ++ \"\\n\""],
+    );
+    let right = variants.lines().find(|id| *id != left).unwrap();
+    let err = point_pr_bookmark(&f.runner, None, &f.ws, 1, right)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(&left) && err.contains(right), "{err}");
+    assert!(f.pr_commits(1).contains(&left));
+}
+
+#[test]
+fn unique_singleton_stale_git_ref_survives_migration_and_gc() {
+    let f = Fixture::new();
+    f.jj(&f.root, &["new", "main", "-m", "unpublished"]);
+    std::fs::write(f.root.join("local.txt"), "unique\n").unwrap();
+    f.jj(&f.root, &["bookmark", "create", "pr/1", "-r", "@"]);
+    let unique = f.commit("pr/1");
+    f.root_write();
+    f.jj(&f.ws, &["bookmark", "forget", "pr/1"]);
+    assert!(point_pr_bookmark(&f.runner, None, &f.ws, 1, "feat").is_err());
+    assert_eq!(f.pr_commits(1), vec![unique.clone()]);
+    let collected = crate::app::gc::gc_workspace_bookmarks(&f.runner, None, &f.ws, false, false).unwrap();
+    assert!(!collected.contains(&"pr/1".to_string()));
+    assert_eq!(f.git_ref(1), Some(unique));
+}
+
+#[test]
+fn export_failure_names_the_ref_even_when_jj_exits_successfully() {
+    let f = Fixture::new();
+    let (old, new) = f.rewritten_feat_with_exported_pr_ref();
+    // Git's ref lock forces jj's export warning/exit-zero failure path.
+    let lock = f.root.join(".git/refs/heads/pr/1.lock");
+    std::fs::write(lock, "held by another writer\n").unwrap();
+    let err = point_pr_bookmark(&f.runner, None, &f.ws, 1, "feat")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("refs/heads/pr/1"), "{err}");
+    assert_eq!(f.pr_commits(1), vec![new]);
+    assert_eq!(f.git_ref(1), Some(old));
+}
+
+/// Only GitHub's metadata lookup is simulated; all repository operations,
+/// including fetching the authoritative remote, run through declared jj.
+struct LeaseRunner<'a>(&'a DeclaredJj);
+
+impl CommandRunner for LeaseRunner<'_> {
+    fn run(&self, invocation: &CommandInvocation) -> Result<String> {
+        if invocation.program == "gh" {
+            assert_eq!(invocation.args, ["api", "repos/example/repo/pulls/1"]);
+            return Ok(r#"{"state":"open","head":{"ref":"feat"}}"#.to_string());
+        }
+        if invocation.args == ["git", "remote", "list"] {
+            return Ok("backup https://github.com/example/repo".to_string());
+        }
+        self.0.run(invocation)
+    }
+}
+
+#[test]
+fn lease_repairs_obsolete_conflict_and_preserves_unique_conflict() {
+    for unique in [false, true] {
+        let f = Fixture::new();
+        let (_, head) = f.rewritten_feat_with_exported_pr_ref();
+        f.jj(&f.ws, &["git", "export"]);
+        f.protect_feat_remotely();
+        let other = if unique {
+            f.jj(&f.root, &["new", "main", "-m", "unpublished"]);
+            std::fs::write(f.root.join("unique.txt"), "unique\n").unwrap();
+            f.jj(&f.root, &["bookmark", "set", "pr/1", "-r", "@", "--allow-backwards"]);
+            f.commit("pr/1")
+        } else {
+            // Another predecessor remains recorded in the head's evolution.
+            let history = f.jj(
+                &f.ws,
+                &["evolog", "--no-graph", "-r", &head, "-T", "commit_id ++ \"\\n\""],
+            );
+            let old = history.lines().nth(1).unwrap().to_string();
+            f.jj(&f.root, &["bookmark", "set", "pr/1", "-r", &old, "--allow-backwards"]);
+            old
+        };
+        f.root_write();
+        f.jj(&f.ws, &["bookmark", "forget", "pr/1"]);
+        f.jj(&f.ws, &["bookmark", "set", "pr/1", "-r", &head]);
+        f.root_write();
+        assert_eq!(f.pr_commits(1).len(), 2);
+        let result = crate::app::health::repair_conflicted_bookmarks(
+            &LeaseRunner(&f.runner),
+            None,
+            &f.ws,
+            &["pr/1".to_string()],
+        );
+        if unique {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains(&head) && error.contains(&other), "{error}");
+            assert_eq!(f.pr_commits(1).len(), 2);
+            assert_eq!(f.git_ref(1), Some(other));
+        } else {
+            result.unwrap();
+            assert_eq!(f.pr_commits(1), vec![head.clone()]);
+            assert_eq!(f.git_ref(1), Some(head));
+        }
+    }
+}
+
+#[test]
+fn gc_retains_whole_conflict_when_one_side_is_in_use() {
+    let f = Fixture::new();
+    let (old, head) = f.rewritten_feat_with_exported_pr_ref();
+    f.jj(&f.ws, &["bookmark", "forget", "pr/1"]);
+    f.jj(&f.ws, &["bookmark", "set", "pr/1", "-r", &head]);
+    f.root_write();
+    f.jj(&f.root, &["bookmark", "create", "archive", "-r", &old]);
+    f.protect_feat_remotely();
+    f.jj(&f.ws, &["new", &head]);
+    assert_eq!(f.pr_commits(1).len(), 2);
+    let collected = crate::app::gc::gc_workspace_bookmarks(&f.runner, None, &f.ws, false, false).unwrap();
+    assert!(!collected.contains(&"pr/1".to_string()));
+    assert_eq!(f.pr_commits(1).len(), 2);
+    f.jj(&f.ws, &["new", "main"]);
+    let collected = crate::app::gc::gc_workspace_bookmarks(&f.runner, None, &f.ws, false, false).unwrap();
+    assert!(
+        collected.contains(&"pr/1".to_string()),
+        "both sides protected and now unused"
+    );
+    assert!(f.pr_commits(1).is_empty());
+}
+
+#[test]
+fn publication_writers_export_from_secondary_workspace() {
+    let f = Fixture::new();
+    crate::app::pr::set_pr_bookmark(&f.runner, &f.ws, Some(1), "feat").unwrap();
+    assert_eq!(f.git_ref(1), Some(f.commit("feat")));
+    f.jj(&f.ws, &["new", "feat", "-m", "next revision"]);
+    std::fs::write(f.ws.join("next.txt"), "next\n").unwrap();
+    crate::app::pr::advance_pr_bookmarks(&f.runner, &f.ws, "feat", "pr/1").unwrap();
+    let head = f.commit("@");
+    assert_eq!(f.pr_commits(1), vec![head.clone()]);
+    assert_eq!(f.git_ref(1), Some(head));
+}
+
+struct PostReadRunner<'a> {
+    runner: &'a DeclaredJj,
+    reads: std::cell::Cell<usize>,
+    old: String,
+    head: String,
+}
+
+impl CommandRunner for PostReadRunner<'_> {
+    fn run(&self, invocation: &CommandInvocation) -> Result<String> {
+        if invocation.args.iter().any(|arg| arg == "bookmarks(exact:\"pr/1\")") {
+            self.reads.set(self.reads.get() + 1);
+            if self.reads.get() == 2 {
+                return Ok(format!("{}\n{}", self.old, self.head));
+            }
+        }
+        self.runner.run(invocation)
+    }
+}
+
+#[test]
+fn obsolete_side_in_post_read_gets_one_bounded_repair() {
+    let f = Fixture::new();
+    let (old, head) = f.rewritten_feat_with_exported_pr_ref();
+    let runner = PostReadRunner {
+        runner: &f.runner,
+        reads: std::cell::Cell::new(0),
+        old,
+        head: head.clone(),
+    };
+    point_pr_bookmark(&runner, None, &f.ws, 1, "feat").unwrap();
+    assert_eq!(runner.reads.get(), 3, "one final read after the repair");
+    assert_eq!(f.pr_commits(1), vec![head.clone()]);
+    assert_eq!(f.git_ref(1), Some(head));
+}
+
+struct WaitingGcRunner {
+    runner: DeclaredJj,
+    waiting: std::sync::mpsc::Sender<()>,
+    lock_path: PathBuf,
+}
+
+impl CommandRunner for WaitingGcRunner {
+    fn run(&self, invocation: &CommandInvocation) -> Result<String> {
+        self.runner.run(invocation)
+    }
+    fn lock_pr_bookmarks(&self, cwd: &Path) -> Result<crate::lock::RepoLock> {
+        assert!(
+            crate::lock::RepoLock::try_acquire(&self.lock_path)?.is_none(),
+            "goto must still hold the lock after setting its bookmark"
+        );
+        self.waiting.send(()).unwrap();
+        crate::lock::RepoLock::for_workspace(cwd)
+    }
+}
+
+struct PausingGotoRunner {
+    runner: DeclaredJj,
+    positioned_bookmark: std::sync::mpsc::Sender<()>,
+    proceed: std::sync::mpsc::Receiver<()>,
+}
+
+impl CommandRunner for PausingGotoRunner {
+    fn run(&self, invocation: &CommandInvocation) -> Result<String> {
+        if invocation.args.iter().any(|arg| arg == "feat@backup & ::@") {
+            self.positioned_bookmark.send(()).unwrap();
+            self.proceed.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        }
+        LeaseRunner(&self.runner).run(invocation)
+    }
+}
+
+#[test]
+fn gc_waits_until_positioning_has_made_the_bookmark_reachable() {
+    let f = Fixture::new();
+    f.protect_feat_remotely();
+    let (positioned_tx, positioned_rx) = std::sync::mpsc::channel();
+    let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+    let goto_runner = PausingGotoRunner {
+        runner: DeclaredJj {
+            binary: f.runner.binary.clone(),
+            config: f.runner.config.clone(),
+        },
+        positioned_bookmark: positioned_tx,
+        proceed: proceed_rx,
+    };
+    let ws = f.ws.display().to_string();
+    let goto = std::thread::spawn(move || {
+        crate::app::workspace_ops::workspace_goto(None, &goto_runner, Some(ws), None, Some(1), None)
+    });
+    positioned_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let runner = WaitingGcRunner {
+        runner: DeclaredJj {
+            binary: f.runner.binary.clone(),
+            config: f.runner.config.clone(),
+        },
+        waiting: tx,
+        lock_path: f.root.join(".jj/repo/cube-pr-bookmarks.lock"),
+    };
+    let root = f.root.clone();
+    let gc = std::thread::spawn(move || crate::app::gc::gc_workspace_bookmarks(&runner, None, &root, false, false));
+    rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    // GC is attempting the lock from a different workspace in the same store.
+    // Finish goto's final step before releasing that shared critical section.
+    proceed_tx.send(()).unwrap();
+    goto.join().unwrap().unwrap();
+    assert!(!gc.join().unwrap().unwrap().contains(&"pr/1".to_string()));
+    assert_eq!(f.pr_commits(1), vec![f.commit("feat")]);
 }

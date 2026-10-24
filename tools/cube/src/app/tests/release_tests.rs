@@ -56,8 +56,8 @@ fn workspace_release_clears_health_status() {
             "",
         ),
         ExpectedCommand::ok(ws_path.clone(), "jj", &["new", "main@origin"], ""),
-        gc_noop_command(&ws_path),
         gc_git_import_command(&ws_path),
+        gc_noop_command(&ws_path),
         gc_pr_noop_command(&ws_path),
     ]);
     run_with_dependencies(
@@ -201,8 +201,8 @@ fn workspace_release_resets_and_frees_the_workspace() {
             "",
         ),
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
-        gc_noop_command(&workspace_path),
         gc_git_import_command(&workspace_path),
+        gc_noop_command(&workspace_path),
         gc_pr_noop_command(&workspace_path),
     ]);
     let release = Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]);
@@ -274,8 +274,8 @@ fn lease_and_release_emit_audit_log_entries() {
             "",
         ),
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
-        gc_noop_command(&workspace_path),
         gc_git_import_command(&workspace_path),
+        gc_noop_command(&workspace_path),
         gc_pr_noop_command(&workspace_path),
     ]);
     let release = Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id, "--reason", "done"]);
@@ -398,8 +398,8 @@ fn workspace_release_by_workspace_id_resolves_active_lease() {
             "",
         ),
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
-        gc_noop_command(&workspace_path),
         gc_git_import_command(&workspace_path),
+        gc_noop_command(&workspace_path),
         gc_pr_noop_command(&workspace_path),
     ]);
     let release = Cli::parse_from(["cube", "workspace", "release", "mono-agent-004"]);
@@ -654,8 +654,8 @@ fn workspace_release_force_reset_overrides_the_preservation_guard() {
             "",
         ),
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
-        gc_noop_command(&workspace_path),
         gc_git_import_command(&workspace_path),
+        gc_noop_command(&workspace_path),
         gc_pr_noop_command(&workspace_path),
     ]);
     let result = run_with_dependencies(
@@ -821,8 +821,8 @@ fn workspace_release_gc_forgets_consumed_bookmarks() {
             "",
         ),
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
-        gc_exec_sweep_command(&workspace_path, "boss/exec_18abcd_01"),
         gc_git_import_command(&workspace_path),
+        gc_exec_sweep_command(&workspace_path, "boss/exec_18abcd_01"),
         gc_pr_noop_command(&workspace_path),
         ExpectedCommand::ok(
             workspace_path.clone(),

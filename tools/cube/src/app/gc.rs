@@ -95,7 +95,8 @@ pub(super) const POOL_GC_CLEANUP_PROGRESS_KEY: &str = "last_pool_gc_cleanup_made
 ///
 /// A `boss/exec_*` bookmark is "consumed" when its tip is reachable from `main`
 /// (`bookmarks(glob:"boss/exec_*") & ::main`). A `pr/<n>` bookmark is eligible
-/// for GC when no workspace in the shared store is positioned on it any more
+/// for GC when every side is remotely protected and no workspace in the
+/// shared store is positioned on any side
 /// (see [`collect_unreferenced_pr_bookmarks`]) — a purely local decision, with
 /// no network call and no dependence on GitHub's view of the PR.
 ///
@@ -116,12 +117,22 @@ pub(super) fn gc_workspace_bookmarks(
     do_fetch: bool,
     dry_run: bool,
 ) -> Result<Vec<String>> {
+    let _lock = runner.lock_pr_bookmarks(workspace_path)?;
     if do_fetch {
         run_jj_network(
             runner,
             database_path,
             &RealCommandRunner::invocation(workspace_path, "jj", &["git", "fetch"]),
         )?;
+    }
+
+    // A stale `refs/heads/pr/<n>` left in the colocated git repo by an older
+    // cube's `forget` only becomes visible to the sweep once imported; do that
+    // first so those leftovers are found and removed rather than lingering
+    // until some unrelated command at the colocated root happens to import
+    // them. A dry run must not write, so it sees only what jj already knows.
+    if !dry_run {
+        pr_bookmarks::import_git_refs(runner, database_path, workspace_path)?;
     }
 
     let output = run_jj(
@@ -143,33 +154,13 @@ pub(super) fn gc_workspace_bookmarks(
 
     let exec_bookmarks: Vec<String> = dedup_bookmark_names(&output, |s| s.starts_with("boss/exec_"));
 
-    // A stale `refs/heads/pr/<n>` left in the colocated git repo by an older
-    // cube's `forget` only becomes visible to the sweep once imported; do that
-    // first so those leftovers are found and removed rather than lingering
-    // until some unrelated command at the colocated root happens to import
-    // them. A dry run must not write, so it sees only what jj already knows.
-    if !dry_run {
-        pr_bookmarks::import_git_refs(runner, database_path, workspace_path)?;
-    }
-
     // Also sweep pr/<n> bookmarks no workspace is positioned on any more.
-    let mut pr_candidates = collect_unreferenced_pr_bookmarks(runner, database_path, workspace_path)?;
+    let pr_candidates = collect_unreferenced_pr_bookmarks(runner, database_path, workspace_path)?;
 
     let mut bookmarks = exec_bookmarks.clone();
     bookmarks.extend(pr_candidates.iter().cloned());
     if bookmarks.is_empty() || dry_run {
         return Ok(bookmarks);
-    }
-
-    // The candidate set was decided a few jj calls ago; a concurrent `cube
-    // workspace goto --pr` in another workspace can have positioned on (and
-    // re-set) one of them since. Decide again immediately before acting and
-    // act only on bookmarks that are still unreferenced.
-    if !pr_candidates.is_empty() {
-        let still_unreferenced = collect_unreferenced_pr_bookmarks(runner, database_path, workspace_path)?;
-        pr_candidates.retain(|name| still_unreferenced.contains(name));
-        bookmarks = exec_bookmarks.clone();
-        bookmarks.extend(pr_candidates.iter().cloned());
     }
 
     if !exec_bookmarks.is_empty() {
@@ -223,39 +214,12 @@ fn dedup_bookmark_names(output: &str, keep: impl Fn(&str) -> bool) -> Vec<String
 pub(super) const UNREFERENCED_PR_BOOKMARKS_REVSET: &str = r#"bookmarks(glob:"pr/*") ~ ::(working_copies())"#;
 
 /// Collect local `pr/<n>` bookmarks that no workspace in the shared store is
-/// positioned on any more, and which are therefore safe to forget.
+/// positioned on any more, and whose sides are all remotely protected.
 ///
-/// ## Why the retained set is bounded by construction
-///
-/// Cube workspaces are *secondary jj workspaces sharing one object store per
-/// repo*, so `pr/*` bookmarks are repo-global, not per-workspace: the set one
-/// release walks is every PR any workspace of that repo has ever touched.
-/// Deciding eligibility from GitHub's view of the PR bounded that set at
-/// "every open PR the pool has ever touched", which is not a bound cube owns
-/// — measured on the live `mono` store, 57 of 60 accumulated bookmarks were
-/// for PRs still open, so a *fully successful* sweep would have forgotten
-/// three and left fifty-seven.
-///
-/// Reachability replaces that with a bound cube does own. A `pr/<n>` bookmark
-/// is retained only while some workspace's `@` sits at or below it, so the
-/// retained set is at most one PR stack per workspace. It cannot grow with
-/// elapsed time, with the number of PRs the pool has touched, with GitHub's
-/// PR lifecycle, or with whether the previous sweep succeeded — a workspace
-/// that has been in the pool for a year carries the stack it is on, not a
-/// year of stacks.
-///
-/// ## Why forgetting the rest cannot lose anything
-///
-/// These bookmarks are derivable on demand: every path that needs one also
-/// creates it (`cube workspace goto --pr`, `cube pr create`, `cube pr
-/// update`), so a worker returning to a PR re-establishes the bookmark as a
-/// side effect of the command it was going to run anyway. The one use that
-/// genuinely requires local state — `cube pr push` inferring its PR from
-/// `@`'s ancestry — only ever consults bookmarks that are reachable from `@`,
-/// which is exactly the set kept here. A workspace still holding unpushed
-/// work keeps its bookmarks for the same reason: its `@` is still on them,
-/// and the release path does not even reach this sweep when the reuse guard
-/// preserves a working copy.
+/// Every side must also be reachable from a remote bookmark. Unpublished
+/// work and conflicts with any in-use side retain the entire bookmark. This
+/// can retain bookmarks indefinitely; preserving unique work takes precedence
+/// over bounding the number of local convenience pointers.
 ///
 /// ## Failure is not an empty result
 ///
@@ -294,7 +258,13 @@ pub(super) fn collect_unreferenced_pr_bookmarks(
     // other namespaces (a `boss/exec_*` head, most commonly). Only the `pr/*`
     // ones are this sweep's business; the `boss/exec_*` half has its own,
     // stricter "reachable from main" test in `gc_workspace_bookmarks`.
-    Ok(dedup_bookmark_names(&output, pr_bookmark::is_pr_bookmark))
+    let mut eligible = Vec::new();
+    for name in dedup_bookmark_names(&output, pr_bookmark::is_pr_bookmark) {
+        if pr_bookmarks::can_delete(runner, database_path, workspace_path, &name)? {
+            eligible.push(name);
+        }
+    }
+    Ok(eligible)
 }
 
 /// Cheap, read-only check for whether any aged-unhealthy candidate currently
