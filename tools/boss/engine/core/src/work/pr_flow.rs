@@ -2282,8 +2282,8 @@ pub struct OperatorAnswerOutcome {
     /// invalidate it alongside the answered task.
     pub prerequisite_work_item_id: Option<String>,
     /// The minted resume execution, when the run that asked the question was
-    /// admitted by an operator force launch. The RPC layer re-admits it the
-    /// same way so it does not queue behind the dispatch pause.
+    /// admitted by an operator force launch. The RPC layer may bypass an
+    /// operator-originated dispatch pause for this resume.
     pub force_resume_execution_id: Option<String>,
 }
 
@@ -2302,7 +2302,7 @@ impl OperatorAnswerOutcome {
 /// mint the ready execution that carries the answer to the next worker.
 /// Returns that execution's id when the asking run was admitted by an
 /// operator force launch (see `work_executions.force_launched`), so the
-/// caller can admit the resume the same way.
+/// caller can bypass an operator-originated pause for the resume.
 fn restart_after_answer(
     pending: &mut PendingEvents,
     tx: &rusqlite::Transaction<'_>,
