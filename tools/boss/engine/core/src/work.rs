@@ -630,6 +630,7 @@ pub(crate) mod board_runtime_cache;
 mod boothby;
 mod cached_task_runtimes;
 mod chain_helpers;
+mod ci_failure_identity;
 mod comment_thread_entries;
 mod comments;
 mod conflict_res;

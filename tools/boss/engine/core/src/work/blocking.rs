@@ -900,9 +900,9 @@ impl WorkDb {
 
     /// Insert a `ci_remediations` row with `status='pending'`.
     /// Mirrors [`Self::insert_conflict_resolution`] but for the CI
-    /// signal: the unique key is `(work_item_id, head_sha_at_trigger,
-    /// attempt_kind)` and the engine uses `INSERT OR IGNORE` so a
-    /// second probe for the same triplet is a no-op (caller reads the
+    /// signal: the unique key includes the work item, trigger head, attempt
+    /// kind, and branch failure's check name. Queue episodes use an empty
+    /// check key. A repeat insert is a no-op (caller reads the
     /// existing row separately). `failed_checks` is the JSON-encoded
     /// snapshot the engine captured at trigger time; `consumes_budget`
     /// must be `1` for `attempt_kind='fix'` and `0` for `'retrigger'`.
@@ -926,8 +926,10 @@ impl WorkDb {
                 (id, product_id, work_item_id, pr_url, pr_number,
                  head_branch, head_sha_at_trigger, attempt_kind,
                  consumes_budget, failed_checks, status, created_at,
-                 failure_kind, before_commit_sha, queue_base_sha)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?13, ?14)",
+                 failure_kind, before_commit_sha, queue_base_sha, failure_check)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?13, ?14,
+                CASE WHEN ?12 = 'pr_branch_ci' AND json_valid(?10)
+                     THEN COALESCE(json_extract(?10, '$[0].name'), '') ELSE '' END)",
             params![
                 id,
                 input.product_id,
@@ -1990,8 +1992,8 @@ impl WorkDb {
     /// link / Phase 4 cutover). Mirrors
     /// [`Self::set_conflict_resolution_revision_task_id`]. Set by
     /// `ci_watch::on_ci_failure_detected` immediately after `create_revision`
-    /// succeeds. Idempotent — a second call with the same id overwrites;
-    /// `Ok(None)` when the attempt id is unknown.
+    /// succeeds. The first link charges budget in the same transaction;
+    /// repeated links never charge again. `Ok(None)` for an unknown attempt.
     ///
     /// Once set, this row is owned by the revision substrate: the dormant
     /// `ci_remediation` rescue path skips it (its query filters
@@ -2004,6 +2006,14 @@ impl WorkDb {
     ) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
+        // Charge atomically with the first successful revision link. Re-linking
+        // or redispatching the same attempt cannot spend another slot.
+        tx.execute(
+            "UPDATE tasks SET ci_attempts_used = ci_attempts_used + 1
+             WHERE id = (SELECT work_item_id FROM ci_remediations
+                         WHERE id = ?1 AND revision_task_id IS NULL AND consumes_budget = 1)",
+            [attempt_id],
+        )?;
         let rows = tx.execute(
             "UPDATE ci_remediations
                 SET revision_task_id = ?2
