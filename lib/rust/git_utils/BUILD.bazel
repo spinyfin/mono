@@ -7,6 +7,7 @@ rust_library(
     name = "git_utils",
     srcs = [
         "src/gh_cli.rs",
+        "src/jj_provenance.rs",
         "src/lib.rs",
         "src/pr_bookmark.rs",
         "src/repo_slug.rs",
@@ -19,6 +20,7 @@ rust_library(
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/design-doc-fetcher:__pkg__",
         "//tools/boss/engine/design-docs:__pkg__",
+        "//tools/boss/engine/recovery:__pkg__",
         "//tools/cube:__pkg__",
     ],
     deps = all_crate_deps(normal = True),
