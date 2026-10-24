@@ -352,12 +352,13 @@ fn goto_pr_refuses_conflicted_bookmark_with_unique_content() {
         ],
         "chg1\tuniq9\n",
     ));
+    cmds.extend(super::support::not_published_commands(goto_cwd(), "uniq9"));
     cmds.push(goto_jj(
         &[
             "log",
             "--no-graph",
             "-r",
-            "(::e42) & present(chg1)",
+            "present(chg1) & (::e42)",
             "-T",
             r#"commit_id ++ "\n""#,
         ],

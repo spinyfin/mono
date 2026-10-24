@@ -1165,23 +1165,34 @@ pub(super) fn run_workspace(
             // new worker — better to clean them up now so the workspace is
             // truly pristine.
             if !repair_bookmarks.is_empty() {
-                if let Err(error) =
-                    repair_conflicted_bookmarks(runner, database_path, &workspace.workspace_path, &repair_bookmarks)
-                {
-                    let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
-                    if let Some(undo) = &lease_reclaim_undo {
-                        undo.roll_back(&store, database_path, "bookmark_repair_failed");
+                let repair = match repair_conflicted_bookmarks(
+                    runner,
+                    database_path,
+                    &workspace.workspace_path,
+                    &repair_bookmarks,
+                ) {
+                    Ok(repair) => repair,
+                    Err(error) => {
+                        let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
+                        if let Some(undo) = &lease_reclaim_undo {
+                            undo.roll_back(&store, database_path, "bookmark_repair_failed");
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
-                }
+                };
                 // Bookmarks live in the repo's shared jj store, not in any
                 // one workspace, so `jj status` reported this same conflict
                 // from every free workspace the scan probed and each of them
-                // was cached `conflicted` — withheld from every later lease
-                // until the revalidation window or pool GC happened to
-                // re-probe it. The repair just removed the conflict for all
-                // of them at once; let the cache say so.
-                match store.clear_cached_conflicted_health(&workspace.repo) {
+                // was cached `conflicted`. When the repair removed the conflict
+                // for all of them at once, let the cache say so. A bookmark
+                // that was left conflicted is still conflicted everywhere, so
+                // the cache stays accurate and is not cleared.
+                let cache_result = if repair.unrepaired.is_empty() {
+                    store.clear_cached_conflicted_health(&workspace.repo)
+                } else {
+                    Ok(0)
+                };
+                match cache_result {
                     Ok(cleared) if cleared > 0 => {
                         audit!(
                             database_path,

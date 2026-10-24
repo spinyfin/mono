@@ -50,6 +50,12 @@ use crate::command_runner::{CommandRunner, RealCommandRunner};
 /// rewrite of one commit" and is refused rather than traversed.
 const MAX_UNIQUE_SIDE_COMMITS: usize = 100;
 
+/// How many recent operations `was_published` lists, and how many of the
+/// remote-touching ones among them it probes. Bounded because it only runs
+/// when the cheaper local proofs have already failed.
+const MAX_OPS_SCANNED: usize = 400;
+const MAX_REMOTE_OPS_PROBED: usize = 60;
+
 fn run(runner: &dyn CommandRunner, database_path: Option<&Path>, cwd: &Path, args: &[&str]) -> Result<String> {
     run_jj(runner, database_path, &RealCommandRunner::invocation(cwd, "jj", args))
 }
@@ -254,44 +260,92 @@ fn ensure_sides_are_obsolete(
             return Err(unsafe_repair(name, head, side, "more than 100 commits the head lacks"));
         }
 
+        // Published content is recoverable from the remote, so a side whose tip
+        // was ever published loses nothing when replaced. This is what keeps a
+        // PR that was rewritten outside this store (GitHub's "Update branch",
+        // a force-push from another checkout) from looking like unique local
+        // work: the superseded head was published, even though no local evolog
+        // links it to the new one.
+        if was_published(runner, database_path, cwd, side)? {
+            continue;
+        }
+
         for (change, commit) in unique {
-            let candidates = run(
-                runner,
-                database_path,
-                cwd,
-                &[
-                    "log",
-                    "--no-graph",
-                    "-r",
-                    &format!("(::{head}) & present({change})"),
-                    "-T",
-                    r#"commit_id ++ "\n""#,
-                ],
-            )?;
-            let candidates = distinct_lines(&candidates);
-            let proven = if let [candidate] = candidates.as_slice() {
-                let evolution = run(
-                    runner,
-                    database_path,
-                    cwd,
-                    &["evolog", "--no-graph", "-r", candidate, "-T", r#"commit_id ++ "\n""#],
-                )
-                .map_err(|error| unsafe_repair(name, head, side, &format!("evolution unavailable: {error}")))?;
-                evolution.lines().any(|old| old == commit)
-            } else {
-                false
-            };
+            let proven = git_utils::jj_provenance::proven_successor(
+                |args| run(runner, database_path, cwd, args),
+                change,
+                &format!("::{head}"),
+                commit,
+            )
+            .map_err(|error| unsafe_repair(name, head, side, &format!("evolution unavailable: {error}")))?
+            .is_some()
+                // The side's tip was already probed above.
+                || (commit != side && was_published(runner, database_path, cwd, commit)?);
             if !proven {
                 return Err(unsafe_repair(
                     name,
                     head,
                     side,
-                    &format!("commit {commit} is not a recorded predecessor of the head's history"),
+                    &format!(
+                        "commit {commit} is neither a recorded predecessor of the head's history nor was it \
+                         ever published to a remote"
+                    ),
                 ));
             }
         }
     }
     Ok(())
+}
+
+/// Whether `commit` was ever reachable from a remote branch (never the
+/// `@git` pseudo-remote, never a `pr/<n>` bookmark), in the current view or in the views jj recorded at
+/// the most recent remote-touching operations (fetches and pushes).
+///
+/// A commit that appears there was published, so replacing a bookmark that
+/// points at it cannot lose content. A commit that never appears there is
+/// unpublished local work, and is never proven by this function.
+fn was_published(runner: &dyn CommandRunner, database_path: Option<&Path>, cwd: &Path, commit: &str) -> Result<bool> {
+    // cube's own `pr/<n>` refs can be fetched back from a colocated remote;
+    // they are bookkeeping, never publication.
+    let revset = format!(r#"present({commit}) & ::(remote_bookmarks() ~ remote_bookmarks(glob:"pr/*"))"#);
+    let probe = |at_op: Option<&str>| -> Result<bool> {
+        let mut args = vec!["--ignore-working-copy"];
+        if let Some(op) = at_op {
+            args.extend(["--at-op", op]);
+        }
+        args.extend(["log", "--no-graph", "-r", &revset, "-T", r#"commit_id ++ "\n""#]);
+        Ok(!run(runner, database_path, cwd, &args)?.trim().is_empty())
+    };
+    if probe(None)? {
+        return Ok(true);
+    }
+    let ops = run(
+        runner,
+        database_path,
+        cwd,
+        &[
+            "--ignore-working-copy",
+            "op",
+            "log",
+            "--no-graph",
+            "-n",
+            &MAX_OPS_SCANNED.to_string(),
+            "-T",
+            r#"id ++ "\t" ++ description.first_line() ++ "\n""#,
+        ],
+    )?;
+    for op in ops
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter(|(_, description)| description.contains("git remote"))
+        .map(|(id, _)| id.trim())
+        .take(MAX_REMOTE_OPS_PROBED)
+    {
+        if probe(Some(op))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn unsafe_repair(name: &str, head: &str, side: &str, why: &str) -> CubeError {

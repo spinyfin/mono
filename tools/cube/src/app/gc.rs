@@ -117,7 +117,11 @@ pub(super) fn gc_workspace_bookmarks(
     do_fetch: bool,
     dry_run: bool,
 ) -> Result<Vec<String>> {
-    let _lock = runner.lock_pr_bookmarks(workspace_path)?;
+    // Fetch before taking the store-wide PR-bookmark lock: every `goto --pr`,
+    // `pr create/update/push` and lease repair in the repo waits on that lock
+    // with no timeout, so it must never be held across the network. Anything
+    // the fetch imports after this point is picked up by the next sweep; the
+    // eligibility reads below all happen under the lock.
     if do_fetch {
         run_jj_network(
             runner,
@@ -125,6 +129,7 @@ pub(super) fn gc_workspace_bookmarks(
             &RealCommandRunner::invocation(workspace_path, "jj", &["git", "fetch"]),
         )?;
     }
+    let _lock = runner.lock_pr_bookmarks(workspace_path)?;
 
     // A stale `refs/heads/pr/<n>` left in the colocated git repo by an older
     // cube's `forget` only becomes visible to the sweep once imported; do that

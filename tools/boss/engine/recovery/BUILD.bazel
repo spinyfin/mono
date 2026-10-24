@@ -14,6 +14,7 @@ rust_library(
         "//tools/boss/engine/core:__pkg__",
     ],
     deps = [
+        "//lib/rust/git_utils",
         "//tools/boss/log-files",
     ] + all_crate_deps(normal = True),
 )
@@ -30,6 +31,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//lib/rust/git_utils",
         "//tools/boss/engine/test-git",
         "//tools/boss/log-files",
     ] + all_crate_deps(
