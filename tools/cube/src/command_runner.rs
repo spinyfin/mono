@@ -20,6 +20,11 @@ pub struct CommandInvocation {
 }
 
 pub trait CommandRunner {
+    /// Shared-store critical section for PR bookmark writes and GC.
+    fn lock_pr_bookmarks(&self, cwd: &Path) -> Result<crate::lock::RepoLock, CubeError> {
+        crate::lock::RepoLock::for_workspace(cwd)
+    }
+
     fn run(&self, invocation: &CommandInvocation) -> Result<String, CubeError>;
 
     /// Cleanup runs in an isolated group and retains both output streams.

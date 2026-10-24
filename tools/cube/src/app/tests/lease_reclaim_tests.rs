@@ -434,10 +434,89 @@ fn repairing_a_conflicted_bookmark_clears_the_cached_conflict_of_sibling_workspa
         // store-wide conflict. The first becomes the repairable candidate.
         scan_status_command(ws1, &jj_status_conflicted("pr/3226")),
         scan_status_command(ws2, &jj_status_conflicted("pr/3226")),
-        // A conflicted `pr/<n>` is deleted and the deletion exported — never
-        // forgotten, which would leave a stale git ref to resurrect it.
-        ExpectedCommand::ok(ws1.clone(), "jj", &["bookmark", "delete", "pr/3226"], ""),
+        ExpectedCommand::ok(
+            ws1.clone(),
+            "jj",
+            &["git", "remote", "list"],
+            "origin https://github.com/spinyfin/mono",
+        ),
+        ExpectedCommand::ok(ws1.clone(), "jj", &["git", "fetch", "--remote", "origin"], ""),
+        ExpectedCommand::ok(
+            ws1.clone(),
+            "gh",
+            &["api", "repos/spinyfin/mono/pulls/3226"],
+            r#"{"head":{"ref":"feature"}}"#,
+        ),
+        ExpectedCommand::ok(ws1.clone(), "jj", &["git", "import"], ""),
+        ExpectedCommand::ok(
+            ws1.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "feature@origin",
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            ws1.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/3226")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "old\nhead",
+        ),
+        ExpectedCommand::ok(
+            ws1.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-n",
+                "101",
+                "-r",
+                "(::old) ~ (::head)",
+                "-T",
+                r#"change_id ++ "\t" ++ commit_id ++ "\n""#,
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            ws1.clone(),
+            "jj",
+            &[
+                "bookmark",
+                "set",
+                "pr/3226",
+                "-r",
+                "feature@origin",
+                "--allow-backwards",
+            ],
+            "",
+        ),
         ExpectedCommand::ok(ws1.clone(), "jj", &["git", "export"], ""),
+        ExpectedCommand::ok(
+            ws1.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/3226")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
+        super::support::pr_git_verify_command(ws1, "pr/3226", "head"),
     ];
     script.extend(claim_reset_commands_for(ws1, "def5678"));
     let runner = FakeRunner::new(script);

@@ -82,7 +82,59 @@ fn ensure_pr_uses_body_file_flag_not_body_flag() {
             ],
             "https://github.com/spinyfin/mono/pull/99",
         ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/99", "-r", "my-feature"], ""),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/99")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["bookmark", "set", "pr/99", "-r", "my-feature", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/99")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "present(pr/99@git)",
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
     ]);
 
     let cli = Cli::parse_from([
@@ -167,7 +219,59 @@ fn ensure_pr_created_json_has_action_url_number() {
             ],
             "https://github.com/spinyfin/mono/pull/42",
         ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/42", "-r", "my-feature"], ""),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["bookmark", "set", "pr/42", "-r", "my-feature", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "present(pr/42@git)",
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
     ]);
 
     let cli = Cli::parse_from(["cube", "pr", "ensure", "--branch", "my-feature", "--title", "New PR"]);
@@ -226,7 +330,59 @@ fn ensure_pr_exists_json_has_action_url_number() {
             &["api", "repos/spinyfin/mono/pulls?head=spinyfin:my-feature&state=open"],
             r#"[{"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
         ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/7", "-r", "my-feature"], ""),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/7")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["bookmark", "set", "pr/7", "-r", "my-feature", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/7")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "present(pr/7@git)",
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
     ]);
 
     let cli = Cli::parse_from([
@@ -316,7 +472,59 @@ fn ensure_pr_pushes_to_github_remote_not_local_mirror() {
             ],
             "https://github.com/spinyfin/mono/pull/77",
         ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/77", "-r", "my-feature"], ""),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/77")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["bookmark", "set", "pr/77", "-r", "my-feature", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/77")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "present(pr/77@git)",
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
     ]);
 
     let cli = Cli::parse_from(["cube", "pr", "ensure", "--branch", "my-feature", "--title", "New PR"]);
@@ -469,7 +677,59 @@ fn ensure_pr_sets_pr_bookmark_on_create() {
             "https://github.com/spinyfin/mono/pull/55",
         ),
         // Must call `jj bookmark set pr/55 -r my-feature` after creation.
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/55", "-r", "my-feature"], ""),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/55")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["bookmark", "set", "pr/55", "-r", "my-feature", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/55")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "present(pr/55@git)",
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
     ]);
 
     let cli = Cli::parse_from([
@@ -535,7 +795,59 @@ fn ensure_pr_sets_pr_bookmark_on_existing_pr() {
             r#"[{"html_url":"https://github.com/spinyfin/mono/pull/33"}]"#,
         ),
         // Bookmark set must happen even on the reuse/backfill path.
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/33", "-r", "my-feature"], ""),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/33")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["bookmark", "set", "pr/33", "-r", "my-feature", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/33")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "present(pr/33@git)",
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
     ]);
 
     let cli = Cli::parse_from([
@@ -687,7 +999,59 @@ fn pr_create_opens_pr_when_none_exists() {
             ],
             "https://github.com/spinyfin/mono/pull/42",
         ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/42", "-r", "my-feature"], ""),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["bookmark", "set", "pr/42", "-r", "my-feature", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "present(pr/42@git)",
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
     ]);
 
     let cli = Cli::parse_from(["cube", "pr", "create", "--branch", "my-feature", "--title", "New PR"]);
@@ -722,7 +1086,59 @@ fn pr_create_is_idempotent_when_pr_already_exists() {
             r#"[{"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
         ),
         // No push, no `gh pr create` — only the local pr/<n> bookmark is set.
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/7", "-r", "my-feature"], ""),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/7")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["bookmark", "set", "pr/7", "-r", "my-feature", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/7")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "present(pr/7@git)",
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
     ]);
 
     let cli = Cli::parse_from(["cube", "pr", "create", "--branch", "my-feature", "--title", "Dup"]);
@@ -792,7 +1208,59 @@ fn pr_update_pushes_when_pr_exists() {
             &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
             "abc123\n",
         ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/7", "-r", "my-feature"], ""),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/7")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["bookmark", "set", "pr/7", "-r", "my-feature", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/7")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "present(pr/7@git)",
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
     ]);
 
     let cli = Cli::parse_from(["cube", "pr", "update", "--branch", "my-feature"]);
@@ -968,7 +1436,59 @@ fn pr_update_proceeds_when_working_copy_is_empty_child_of_branch_head() {
             &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
             "abc123\n",
         ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/7", "-r", "my-feature"], ""),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/7")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["bookmark", "set", "pr/7", "-r", "my-feature", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/7")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "present(pr/7@git)",
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
     ]);
 
     let cli = Cli::parse_from(["cube", "pr", "update", "--branch", "my-feature"]);
@@ -1025,7 +1545,59 @@ fn pr_update_allow_detached_push_skips_working_copy_check() {
             &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
             "abc123\n",
         ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/7", "-r", "my-feature"], ""),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/7")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["bookmark", "set", "pr/7", "-r", "my-feature", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/7")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "present(pr/7@git)",
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
     ]);
 
     let cli = Cli::parse_from([

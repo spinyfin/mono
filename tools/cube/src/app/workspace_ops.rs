@@ -564,6 +564,8 @@ pub(super) fn workspace_goto(
         )));
     }
 
+    let _pr_lock = runner.lock_pr_bookmarks(&cwd)?;
+
     // Set the local bookmark to track the remote head (idempotent; --allow-backwards
     // handles any local divergence).
     run_jj(

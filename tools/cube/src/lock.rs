@@ -10,6 +10,25 @@ pub struct RepoLock {
 }
 
 impl RepoLock {
+    /// Serialize PR bookmark mutation and positioning across secondary workspaces.
+    /// Reuse the existing file-lock implementation with a separate store-wide lock
+    /// so callers already holding the pool/registry lock cannot deadlock.
+    pub fn for_workspace(cwd: &Path) -> Result<Self, CubeError> {
+        let marker = cwd
+            .ancestors()
+            .map(|p| p.join(".jj/repo"))
+            .find(|p| p.exists())
+            .ok_or_else(|| CubeError::InvalidArgument(format!("no jj repository in {}", cwd.display())))?;
+        let repo = if marker.is_dir() {
+            marker
+        } else {
+            let target = std::fs::read_to_string(&marker).map_err(CubeError::Io)?;
+            marker.parent().unwrap().join(target.trim())
+        };
+        let repo = std::fs::canonicalize(repo).map_err(CubeError::Io)?;
+        crate::lock::RepoLock::acquire(&repo.join("cube-pr-bookmarks.lock"))
+    }
+
     pub fn acquire(lock_path: &Path) -> Result<Self, CubeError> {
         Self::open_and_lock(lock_path, true)?.ok_or_else(|| unreachable!("a blocking lock always acquires"))
     }

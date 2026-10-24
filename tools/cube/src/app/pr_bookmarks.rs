@@ -78,16 +78,27 @@ pub(super) fn delete_pr_bookmarks(
     if names.is_empty() {
         return Ok(());
     }
+    for name in names {
+        if !can_delete(runner, database_path, cwd, name)? {
+            return Err(CubeError::InvalidArgument(format!(
+                "refusing to delete {name}: a side is in use or has no remote protection"
+            )));
+        }
+    }
     let mut args: Vec<&str> = vec!["bookmark", "delete"];
     args.extend(names.iter().map(String::as_str));
     run(runner, database_path, cwd, &args)?;
-    export_git_refs(runner, database_path, cwd)
+    export_git_refs(runner, database_path, cwd)?;
+    for name in names {
+        verify_git_ref(runner, database_path, cwd, name, &[])?;
+    }
+    Ok(())
 }
 
 /// Point `pr/<pr_number>` at `head_ref` (the PR's authoritative GitHub head,
 /// e.g. `feature@github`) and leave jj and git agreeing about it.
 ///
-/// If the bookmark is already conflicted, it is repaired to the head only
+/// Every existing target, including a singleton stale ref, is replaced only
 /// when every conflicting side is an ancestor of the head or an obsolete
 /// predecessor of commits the head already contains. Otherwise this fails
 /// naming both commits; it never picks a side and never forgets-and-retries.
@@ -106,9 +117,7 @@ pub(super) fn point_pr_bookmark(
 
     let head = resolve_one_commit(runner, database_path, cwd, head_ref)?;
     let sides = bookmark_commits(runner, database_path, cwd, &name)?;
-    if sides.len() > 1 {
-        ensure_sides_are_obsolete(runner, database_path, cwd, &name, &head, &sides)?;
-    }
+    ensure_sides_are_obsolete(runner, database_path, cwd, &name, &head, &sides)?;
 
     run(
         runner,
@@ -118,7 +127,18 @@ pub(super) fn point_pr_bookmark(
     )?;
     export_git_refs(runner, database_path, cwd)?;
 
-    let after = bookmark_commits(runner, database_path, cwd, &name)?;
+    let mut after = bookmark_commits(runner, database_path, cwd, &name)?;
+    if after != [head.clone()] {
+        ensure_sides_are_obsolete(runner, database_path, cwd, &name, &head, &after)?;
+        run(
+            runner,
+            database_path,
+            cwd,
+            &["bookmark", "set", &name, "-r", &head, "--allow-backwards"],
+        )?;
+        export_git_refs(runner, database_path, cwd)?;
+        after = bookmark_commits(runner, database_path, cwd, &name)?;
+    }
     if after != [head.clone()] {
         return Err(CubeError::InvalidArgument(format!(
             "`{name}` does not resolve to the PR head after being set: expected exactly `{head}`, found {} \
@@ -128,7 +148,7 @@ pub(super) fn point_pr_bookmark(
             after.join(", "),
         )));
     }
-    Ok(())
+    verify_git_ref(runner, database_path, cwd, &name, &[head])
 }
 
 /// Distinct commit ids a local bookmark resolves to: one for a healthy
@@ -185,10 +205,9 @@ fn distinct_lines(out: &str) -> Vec<String> {
 /// Refuse to repair a conflicted `name` unless every side that is not the head
 /// carries nothing the head lacks.
 ///
-/// A side is safe when it is an ancestor of the head, or when each commit it
-/// has beyond the head's history shares a change id with a commit *in* the
-/// head's history — i.e. the head already contains a rewrite of it (jj shows
-/// such a pair as divergent). Anything else is content only that side has.
+/// A side is safe when it is an ancestor of the head, or every unique
+/// commit is a recorded predecessor of a commit in the head's history.
+/// Matching change ids alone never establish provenance.
 fn ensure_sides_are_obsolete(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
@@ -220,6 +239,14 @@ fn ensure_sides_are_obsolete(
             .filter_map(|l| l.split_once('\t'))
             .map(|(change, commit)| (change.trim(), commit.trim()))
             .collect();
+        if unique.len() != out.lines().filter(|line| !line.trim().is_empty()).count() {
+            return Err(unsafe_repair(
+                name,
+                head,
+                side,
+                "could not parse the unique commit history",
+            ));
+        }
         if unique.is_empty() {
             continue; // ancestor of the head
         }
@@ -227,33 +254,41 @@ fn ensure_sides_are_obsolete(
             return Err(unsafe_repair(name, head, side, "more than 100 commits the head lacks"));
         }
 
-        // Which of those change ids already have a commit in the head's
-        // history? A change id as a revset resolves to every visible commit
-        // carrying it, so intersecting with the head's ancestry yields the
-        // head's rewrite of each one.
-        let changes: BTreeSet<&str> = unique.iter().map(|(change, _)| *change).collect();
-        let union = changes.iter().copied().collect::<Vec<_>>().join(" | ");
-        let rewritten = run(
-            runner,
-            database_path,
-            cwd,
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                &format!("(::{head}) & ({union})"),
-                "-T",
-                r#"change_id ++ "\n""#,
-            ],
-        )?;
-        let superseded: BTreeSet<String> = distinct_lines(&rewritten).into_iter().collect();
-        if let Some((_, commit)) = unique.iter().find(|(change, _)| !superseded.contains(*change)) {
-            return Err(unsafe_repair(
-                name,
-                head,
-                side,
-                &format!("commit {commit} is not in the head's history and has no rewrite there"),
-            ));
+        for (change, commit) in unique {
+            let candidates = run(
+                runner,
+                database_path,
+                cwd,
+                &[
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    &format!("(::{head}) & present({change})"),
+                    "-T",
+                    r#"commit_id ++ "\n""#,
+                ],
+            )?;
+            let candidates = distinct_lines(&candidates);
+            let proven = if let [candidate] = candidates.as_slice() {
+                let evolution = run(
+                    runner,
+                    database_path,
+                    cwd,
+                    &["evolog", "--no-graph", "-r", candidate, "-T", r#"commit_id ++ "\n""#],
+                )
+                .map_err(|error| unsafe_repair(name, head, side, &format!("evolution unavailable: {error}")))?;
+                evolution.lines().any(|old| old == commit)
+            } else {
+                false
+            };
+            if !proven {
+                return Err(unsafe_repair(
+                    name,
+                    head,
+                    side,
+                    &format!("commit {commit} is not a recorded predecessor of the head's history"),
+                ));
+            }
         }
     }
     Ok(())
@@ -265,4 +300,60 @@ fn unsafe_repair(name: &str, head: &str, side: &str, why: &str) -> CubeError {
          {side} has unique content ({why}). Inspect with `jj log -r 'bookmarks(exact:\"{name}\")'`; if {side} \
          is really obsolete, resolve with `jj bookmark set {name} -r {head} --allow-backwards`."
     ))
+}
+
+/// Export may exit successfully while warning that a ref could not be moved.
+/// The @git target changes only after a successful export of that ref.
+fn verify_git_ref(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    cwd: &Path,
+    name: &str,
+    expected: &[String],
+) -> Result<()> {
+    let actual = run(
+        runner,
+        database_path,
+        cwd,
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            &format!("present({name}@git)"),
+            "-T",
+            r#"commit_id ++ "\n""#,
+        ],
+    )?;
+    if distinct_lines(&actual) != expected {
+        return Err(CubeError::InvalidArgument(format!(
+            "failed to export refs/heads/{name}: expected {expected:?}, @git is {actual:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// A bookmark can be collected only if all its sides are remotely protected
+/// and none is an ancestor of a working copy. @git is local, not protection.
+pub(super) fn can_delete(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    cwd: &Path,
+    name: &str,
+) -> Result<bool> {
+    let unsafe_sides = run(
+        runner,
+        database_path,
+        cwd,
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            &format!(
+                r#"(bookmarks(exact:"{name}") & ::working_copies()) | (bookmarks(exact:"{name}") ~ ::remote_bookmarks())"#
+            ),
+            "-T",
+            r#"commit_id ++ "\n""#,
+        ],
+    )?;
+    Ok(unsafe_sides.trim().is_empty())
 }

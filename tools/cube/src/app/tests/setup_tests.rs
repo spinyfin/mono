@@ -108,8 +108,8 @@ steps:
             "",
         ),
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
-        gc_noop_command(&workspace_path),
         gc_git_import_command(&workspace_path),
+        gc_noop_command(&workspace_path),
         gc_pr_noop_command(&workspace_path),
     ]);
     run_with_dependencies(
@@ -260,8 +260,8 @@ steps:
             "",
         ),
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
-        gc_noop_command(&workspace_path),
         gc_git_import_command(&workspace_path),
+        gc_noop_command(&workspace_path),
         gc_pr_noop_command(&workspace_path),
     ]);
     run_with_dependencies(
@@ -572,8 +572,8 @@ steps:
             "",
         ),
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
-        gc_noop_command(&workspace_path),
         gc_git_import_command(&workspace_path),
+        gc_noop_command(&workspace_path),
         gc_pr_noop_command(&workspace_path),
     ]);
     run_with_dependencies(

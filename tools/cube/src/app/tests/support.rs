@@ -202,8 +202,8 @@ pub(super) fn release_runner_for(workspace_path: &std::path::Path) -> FakeRunner
             "",
         ),
         ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["new", "main@origin"], ""),
-        gc_noop_command(workspace_path),
         gc_git_import_command(workspace_path),
+        gc_noop_command(workspace_path),
         gc_pr_noop_command(workspace_path),
     ])
 }
@@ -349,6 +349,13 @@ impl FakeRunner {
 }
 
 impl CommandRunner for FakeRunner {
+    fn lock_pr_bookmarks(&self, _cwd: &std::path::Path) -> Result<crate::lock::RepoLock> {
+        // Scripted runners have synthetic paths; real-jj fixtures exercise
+        // shared-store lock identity and interleaving.
+        let dir = tempfile::tempdir().unwrap();
+        crate::lock::RepoLock::acquire(&dir.path().join("bookmarks.lock"))
+    }
+
     fn run(&self, invocation: &CommandInvocation) -> Result<String> {
         self.next_expectation(invocation).result
     }
@@ -619,4 +626,37 @@ impl ExpectedCommand {
 /// Initialize a git repo at `path` whose `HEAD` names `branch`.
 pub(super) fn init_repo_with_branch(path: &Path, branch: &str) {
     boss_engine_test_git::init_repo_with_branch(path, branch);
+}
+
+pub(super) fn gc_pr_safe_command(cwd: &std::path::Path, name: &str, output: &str) -> ExpectedCommand {
+    ExpectedCommand::ok(
+        cwd.to_path_buf(),
+        "jj",
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            &format!(
+                r#"(bookmarks(exact:"{name}") & ::working_copies()) | (bookmarks(exact:"{name}") ~ ::remote_bookmarks())"#
+            ),
+            "-T",
+            r#"commit_id ++ "\n""#,
+        ],
+        output,
+    )
+}
+pub(super) fn pr_git_verify_command(cwd: &std::path::Path, name: &str, output: &str) -> ExpectedCommand {
+    ExpectedCommand::ok(
+        cwd.to_path_buf(),
+        "jj",
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            &format!("present({name}@git)"),
+            "-T",
+            r#"commit_id ++ "\n""#,
+        ],
+        output,
+    )
 }

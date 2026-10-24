@@ -78,6 +78,17 @@ fn goto_pr_bookmark_set_cmds(pr: u64, branch: &str, head: &str) -> Vec<ExpectedC
         goto_jj(&["bookmark", "set", &pr_bm, "-r", &remote_ref, "--allow-backwards"], ""),
         goto_jj(&["git", "export"], ""),
         goto_pr_bookmark_commits_cmd(pr, head),
+        goto_jj(
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                &format!("present(pr/{pr}@git)"),
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            head,
+        ),
     ]
 }
 
@@ -346,9 +357,9 @@ fn goto_pr_refuses_conflicted_bookmark_with_unique_content() {
             "log",
             "--no-graph",
             "-r",
-            "(::e42) & (chg1)",
+            "(::e42) & present(chg1)",
             "-T",
-            r#"change_id ++ "\n""#,
+            r#"commit_id ++ "\n""#,
         ],
         "",
     ));
