@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize};
 mod baseline;
 pub use baseline::checkpoint_baseline;
 
+mod pr_anchor;
+pub use pr_anchor::{is_legacy_pr_anchor_blocker, repair_pr_anchor};
+#[cfg(test)]
+mod pr_anchor_tests;
+
 mod snapshot;
 pub use snapshot::{PointerSnapshot, restore_pointers, snapshot_pointers};
 
@@ -36,8 +41,8 @@ mod reconcile_tests;
 /// Which invariant a damaged pointer broke. The engine repairs the first
 /// three only against pointers it recorded itself (the PR head cube wrote,
 /// the baseline commit in the record, or the other head of the same
-/// execution); every other kind is a real pointer problem that re-running
-/// cannot fix.
+/// execution). A missing or conflicted PR alias requires a fresh GitHub head
+/// lookup; other pointer failures cannot be repaired by merely re-running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PointerIntegrityKind {
     /// A head no longer descends from `boss-base/<execution id>`: the
@@ -53,8 +58,9 @@ pub enum PointerIntegrityKind {
     /// Reconciliation was attempted and the preserved work is not carried by
     /// anything the engine can vouch for. Nothing was moved.
     NotContained,
-    /// Ambiguous (conflicted) bookmark, wrong store, or a PR head that does
-    /// not resolve.
+    /// The disposable PR bookmark is missing or conflicted; refresh it from GitHub.
+    PrHeadUnavailable,
+    /// Ambiguous execution bookmark or wrong store.
     Other,
 }
 

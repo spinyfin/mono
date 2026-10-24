@@ -172,14 +172,15 @@ async fn resolve_pr_head(jj: &dyn Jj, record: &ExecutionBookmark, pr_bookmark: &
     let pr_head = match resolve_optional(jj, &record.repo_path, pr_bookmark).await {
         Ok(head) => head,
         Err(err) if is_pointer_integrity_error(&err) => {
-            return Err(pointer_integrity_error(format!(
-                "PR head bookmark {pr_bookmark} {UNRESOLVED_MESSAGE}; it is conflicted"
-            )));
+            return Err(pointer_integrity_error_of(
+                PointerIntegrityKind::PrHeadUnavailable,
+                format!("PR head bookmark {pr_bookmark} {UNRESOLVED_MESSAGE}; it is conflicted"),
+            ));
         }
         Err(err) => return Err(err),
     };
     pr_head.ok_or_else(|| {
-        pointer_integrity_error(format!(
+        pointer_integrity_error_of(PointerIntegrityKind::PrHeadUnavailable, format!(
             "PR head bookmark {pr_bookmark} does not exist in the shared store; the bound-PR checkout must write it before reconciliation"
         ))
     })

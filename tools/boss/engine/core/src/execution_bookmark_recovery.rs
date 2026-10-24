@@ -9,10 +9,30 @@ use boss_engine_recovery::recovery_backup::{backup_execution_patch, default_reco
 use crate::work::{CreateAttentionItemInput, WorkDb, WorkExecution};
 
 pub(crate) const RECOVERY_FAILED: &str = "execution_bookmark_recovery_failed";
+pub(crate) const CHAIN_BLOCKED: &str = "revision_chain_recovery_blocked";
 pub(crate) const CREATE_FAILED: &str = "execution_bookmark_create_failed";
 /// The engine retired a recovery record whose baseline was gone and whose
 /// heads nothing it recorded could vouch for, and started the item fresh.
 pub(crate) const RECOVERY_RETIRED: &str = "execution_bookmark_recovery_retired";
+
+pub(crate) fn report_chain_block(db: &WorkDb, execution: &WorkExecution, reason: &str) -> Result<()> {
+    if execution.kind != crate::work::ExecutionKind::RevisionImplementation {
+        return Ok(());
+    }
+    let Some(root) = db.get_revision_chain_root_task_id(&execution.work_item_id) else {
+        return Ok(());
+    };
+    db.upsert_work_item_attention(
+        &root,
+        CHAIN_BLOCKED,
+        "PR revision chain blocked on recovery",
+        &format!(
+            "Revision `{}` cannot recover its preserved work: {reason}\n\nLater revisions on this PR remain sequenced behind it. Repair the reported state and explicitly restart the blocked revision; do not discard its work or bypass sequencing. Execution: `{}`.",
+            execution.work_item_id, execution.id
+        ),
+    )?;
+    Ok(())
+}
 
 pub(crate) fn worker_instructions(execution: &WorkExecution) -> String {
     let bookmark = format!("boss-recovery/{}", execution.id);

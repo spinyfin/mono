@@ -1554,6 +1554,11 @@ impl ExecutionCoordinator {
                             .build(),
                         "engine",
                     )?;
+                    crate::execution_bookmark_recovery::report_chain_block(
+                        &self.work_db,
+                        execution,
+                        &format!("{err:#}"),
+                    )?;
                 }
                 let attention = if pointer_damaged {
                     (
