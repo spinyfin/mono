@@ -149,6 +149,11 @@ const fn entry(kind: &'static str, cleared_by: ClearedBy, rationale: &'static st
 /// `every_registered_kind_is_declared_once` below pins the table itself.
 pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
+        QUESTION_RESUME_DISPATCH_FAILED,
+        ClearedBy::WorkResumed,
+        "An answered question could not resume dispatch; a subsequent run starting proves the hold cleared.",
+    ),
+    entry(
         REVISION_CHAIN_RECOVERY_BLOCKED_ATTENTION_KIND,
         ClearedBy::HumanDecision,
         "The PR owner must acknowledge an unrecoverable revision blocking the chain; unrelated root PR review activity does not prove the blocked revision recovered.",

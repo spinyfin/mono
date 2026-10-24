@@ -431,3 +431,6 @@ pub const LEGACY_PANE_DEATH_RECONCILE_ATTENTION_KIND: &str = "pane_death_reconci
 /// the review-cycle chain root, so a later successful fetch for any revision
 /// or the post-merge root review resolves it.
 pub const REVIEW_DESIGN_DOC_UNRESOLVED_ATTENTION_KIND: &str = "review_design_doc_unresolved";
+
+/// An answered question could not start its queued resume.
+pub const QUESTION_RESUME_DISPATCH_FAILED: &str = "question_resume_dispatch_failed";
