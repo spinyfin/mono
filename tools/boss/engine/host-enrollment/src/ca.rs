@@ -376,7 +376,8 @@ fn random_serial() -> SerialNumber {
     SerialNumber::from_slice(&bytes)
 }
 
-fn pem_encode(label: &str, der: &[u8]) -> String {
+/// Encode DER bytes as a PEM block for TLS configuration.
+pub fn pem_encode(label: &str, der: &[u8]) -> String {
     let body = STANDARD.encode(der);
     let mut pem = format!("-----BEGIN {label}-----\n");
     for line in body.as_bytes().chunks(64) {

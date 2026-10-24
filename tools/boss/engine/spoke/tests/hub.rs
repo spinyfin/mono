@@ -1,4 +1,3 @@
-use base64::Engine as _;
 use boss_host_enrollment::{EnrollInput, HostCredentials, Policy, SystemClock};
 use boss_protocol_spoke::v1::{
     self, hub_frame, spoke_frame,
@@ -25,16 +24,6 @@ use tonic::{
 };
 
 pub const STEP: Duration = Duration::from_secs(20);
-
-fn pem(label: &str, der: &[u8]) -> String {
-    let body = base64::engine::general_purpose::STANDARD.encode(der);
-    let lines: Vec<&str> = body
-        .as_bytes()
-        .chunks(64)
-        .map(|c| std::str::from_utf8(c).unwrap())
-        .collect();
-    format!("-----BEGIN {label}-----\n{}\n-----END {label}-----\n", lines.join("\n"))
-}
 
 pub struct Connection {
     pub hello: v1::Hello,
@@ -169,7 +158,11 @@ impl Fixture {
         ca.key_usages = vec![KeyUsagePurpose::KeyCertSign];
         let issuer = CertifiedIssuer::self_signed(ca, KeyPair::generate().unwrap()).unwrap();
         std::fs::write(dir.path().join("ca.pem"), issuer.pem()).unwrap();
-        std::fs::write(dir.path().join("cert.pem"), pem("CERTIFICATE", &issued.leaf_der)).unwrap();
+        std::fs::write(
+            dir.path().join("cert.pem"),
+            boss_host_enrollment::pem_encode("CERTIFICATE", &issued.leaf_der),
+        )
+        .unwrap();
         std::fs::write(dir.path().join("key.pem"), key.serialize_pem()).unwrap();
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::default();
@@ -185,6 +178,7 @@ impl Fixture {
         let (tx, connections) = mpsc::channel(8);
         let server = tokio::spawn(async move {
             Server::builder()
+                .initial_stream_window_size(1024)
                 .tls_config(tls)
                 .unwrap()
                 .add_service(SpokeHubServer::new(Hub {

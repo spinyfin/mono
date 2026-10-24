@@ -370,22 +370,40 @@ mod flow {
         let (journal, old, pending) = spool(&hub.root(), command_cost - 40);
         let (shared, task) = session(&hub, journal);
         let mut connection = hub.connection().await;
-        connection.welcome(old).await;
+        connection.welcome(0).await;
         connection.send(hub_frame::Body::Command(inventory_command())).await;
-        for _ in 0..pending {
-            let spoke_frame::Body::Record(record) = record_or_receipt(&mut connection).await else {
-                panic!("a command receipt was sent although the command was not stored");
-            };
-            assert!(matches!(record.body, Some(record::Body::Capacity(_))));
+        // Without receipts even the old prefix cannot be reclaimed.
+        for _ in 0..old as usize + pending {
+            assert!(matches!(connection.next().await, spoke_frame::Body::Record(_)));
         }
-        // Nothing else is sent: no receipt, and the session is still up.
         assert!(
-            tokio::time::timeout(Duration::from_millis(500), connection.incoming.message())
+            tokio::time::timeout(Duration::from_millis(300), connection.incoming.message())
                 .await
                 .is_err()
         );
-        assert!(!task.is_finished());
         assert_eq!(shared.lock().unwrap().received_commands().unwrap().unwrap().through, 0);
+        // Free the old prefix, without resending the command or restarting.
+        connection.receipt(old + pending as u64).await;
+        let (mut receipt, mut result) = (false, false);
+        while !receipt || !result {
+            match record_or_receipt(&mut connection).await {
+                spoke_frame::Body::CommandReceipt(cursor) => {
+                    assert_eq!(cursor.through, 1);
+                    receipt = true;
+                }
+                spoke_frame::Body::Record(record) => {
+                    let Some(record::Body::Result(value)) = record.body else {
+                        panic!("expected result");
+                    };
+                    assert_eq!(value.command_id, "one");
+                    result = true;
+                }
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+        assert_eq!(shared.lock().unwrap().received_commands().unwrap().unwrap().through, 1);
+        assert_eq!(shared.lock().unwrap().applied_commands().unwrap(), 1);
+        assert!(!task.is_finished());
         task.abort();
     }
 
@@ -402,5 +420,65 @@ mod flow {
         assert_eq!(record.sequence, 1);
         assert!(daemon.running(), "shedding must not stop the daemon");
         assert_eq!(connection.hello.journal_id, identity);
+    }
+
+    #[tokio::test]
+    async fn saturated_replay_keeps_reading_commands_receipts_and_pulses() {
+        let mut hub = Fixture::new().await;
+        let mut journal = Journal::open(&hub.root(), "host", Limits::default()).unwrap();
+        for _ in 0..2000 {
+            journal.append(filler(200, now_ms()), Admission::Capacity).unwrap();
+        }
+        let (shared, task) = session(&hub, journal);
+        let mut connection = hub.connection().await;
+        connection.welcome(0).await;
+        // The server's small HTTP/2 window stops replay while it is not reading.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        connection.send(hub_frame::Body::Command(inventory_command())).await;
+        connection
+            .send(hub_frame::Body::Pulse(v1::Pulse {
+                nonce: vec![9; 16],
+                stamp: None,
+            }))
+            .await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while shared.lock().unwrap().received_commands().unwrap().unwrap().through == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("inbound command must commit while outbound transport is blocked");
+        let (mut records, mut pulses, mut receipt) = (0, 0, false);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while records < 2001 || pulses < 21 || !receipt {
+                match record_or_receipt(&mut connection).await {
+                    spoke_frame::Body::Record(record) => {
+                        records += 1;
+                        assert_eq!(record.sequence, records);
+                        if records % 100 == 0 {
+                            connection
+                                .send(hub_frame::Body::Pulse(v1::Pulse {
+                                    nonce: vec![9; 16],
+                                    stamp: None,
+                                }))
+                                .await;
+                        }
+                    }
+                    spoke_frame::Body::PulseReply(pulse) => {
+                        assert_eq!(pulse.nonce, vec![9; 16]);
+                        pulses += 1;
+                    }
+                    spoke_frame::Body::CommandReceipt(cursor) => {
+                        assert_eq!(cursor.through, 1);
+                        receipt = true;
+                    }
+                    other => panic!("unexpected frame {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("replay, receipts and pulse replies must keep flowing");
+        assert!(!task.is_finished());
+        task.abort();
     }
 }

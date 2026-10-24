@@ -10,8 +10,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use boss_host_enrollment::{EnrollmentService, HostAuthorizer, ServiceLimits, admit};
 use boss_protocol_spoke::v1::enrollment_client::EnrollmentClient;
 use boss_protocol_spoke::v1::spoke_hub_server::{SpokeHub, SpokeHubServer};
@@ -29,16 +27,6 @@ use tonic::{Code, Request, Response, Status, Streaming};
 use crate::support::{Fixture, Spoke};
 
 const STEP: Duration = Duration::from_secs(20);
-
-fn pem(label: &str, der: &[u8]) -> String {
-    let body = STANDARD.encode(der);
-    let lines: Vec<&str> = body
-        .as_bytes()
-        .chunks(64)
-        .map(|c| std::str::from_utf8(c).expect("ascii"))
-        .collect();
-    format!("-----BEGIN {label}-----\n{}\n-----END {label}-----\n", lines.join("\n"))
-}
 
 // ------------------------------------------------------------ the server
 
@@ -177,7 +165,10 @@ async fn dial(hub: &Running, identity: Option<Identity>) -> Result<Channel, toni
 }
 
 fn identity_of(spoke: &Spoke, cert: &v1::Certificate) -> Identity {
-    Identity::from_pem(pem("CERTIFICATE", &cert.leaf_der), spoke.key.serialize_pem())
+    Identity::from_pem(
+        boss_host_enrollment::pem_encode("CERTIFICATE", &cert.leaf_der),
+        spoke.key.serialize_pem(),
+    )
 }
 
 fn enroll_request(spoke: &Spoke, ids: (&str, &str, &str), token: &[u8]) -> EnrollRequest {
