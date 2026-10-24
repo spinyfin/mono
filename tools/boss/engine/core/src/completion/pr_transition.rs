@@ -162,26 +162,6 @@ impl WorkerCompletionHandler {
                 .refuse_foreign_pr_binding(execution, &pr_url, &conflict, source)
                 .await;
         }
-        // Worker-proposal seam (design implementation task 12 — the last of
-        // the per-seam migrations): every PR finalization funnels through
-        // this one function regardless of which layer of the staging-cache
-        // / driver-prose / cold-reconstruction ladder produced the URL, so
-        // this is the single choke point that can count "the pr_created
-        // proposal did NOT cover this finalization" without instrumenting
-        // every individual call site in `on_stop_inner`/`recheck_for_pr`.
-        // `source` names the two call sites that already resolved the URL
-        // from a durable `pr_created` proposal row
-        // (`WorkerCompletionHandler::pr_created_from_proposal`) — every
-        // OTHER source reaching here is definitionally a fallback for this
-        // seam while it's on.
-        if source != PR_CREATED_PROPOSAL_STOP_SOURCE
-            && source != PR_CREATED_PROPOSAL_RECHECK_SOURCE
-            && self.feature_flags.is_enabled("worker_proposals")
-            && self.feature_flags.is_enabled("pr_created_proposals_seam")
-            && let Ok(ref execution) = execution_result
-        {
-            self.record_pr_created_fallback_hit(execution, source);
-        }
         let workspace_path = match &execution_result {
             Ok(execution) => execution.workspace_path.clone(),
             Err(err) => {
