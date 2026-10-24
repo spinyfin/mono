@@ -21,7 +21,6 @@ struct AgentPageSelectors<Chip: View>: View {
             }
         }
     }
-
 }
 
 extension AgentPageSelectors where Chip == AgentPageSelectorChip {
@@ -54,6 +53,8 @@ struct AgentPageSelectorChip: View {
                         .accessibilityLabel("Waiting workers")
                 }
             }
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .background(
