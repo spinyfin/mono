@@ -3,7 +3,7 @@
 //! that bounds every automatic action, and the fact-gathering query the
 //! sweep feeds to `boss_blocked_pr_diagnosis::diagnose`.
 //!
-//! Two tables, both schema 49:
+//! Two tables, both schema 50:
 //!
 //! - `pr_blocked_diagnoses` — one row per work item currently blocked or
 //!   stalled, replaced on every pass and deleted when the card is healthy.
