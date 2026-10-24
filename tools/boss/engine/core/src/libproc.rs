@@ -78,6 +78,11 @@ struct RawProcBsdInfo {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ProcBsdInfo {
     pub(crate) ppid: libc::pid_t,
+    /// `pbi_start_tvsec` / `pbi_start_tvusec`: when the process started. A
+    /// pid recycled by the kernel reports a different value than its
+    /// previous holder, which is what makes this usable as process identity.
+    pub(crate) start_seconds: u64,
+    pub(crate) start_microseconds: u64,
 }
 
 unsafe extern "C" {
@@ -90,7 +95,8 @@ unsafe extern "C" {
     ) -> libc::c_int;
 }
 
-/// Fetch `pid`'s `proc_bsdinfo` via `libproc` and pull out `pbi_ppid`.
+/// Fetch `pid`'s `proc_bsdinfo` via `libproc` and pull out `pbi_ppid` and
+/// the process start time.
 pub(crate) fn proc_bsd_info(pid: libc::pid_t) -> std::io::Result<ProcBsdInfo> {
     let mut info = RawProcBsdInfo::default();
     let info_size = std::mem::size_of::<RawProcBsdInfo>() as libc::c_int;
@@ -106,6 +112,8 @@ pub(crate) fn proc_bsd_info(pid: libc::pid_t) -> std::io::Result<ProcBsdInfo> {
     }
     Ok(ProcBsdInfo {
         ppid: info.header.ppid as libc::pid_t,
+        start_seconds: info.start_time.seconds,
+        start_microseconds: info.start_time.microseconds,
     })
 }
 

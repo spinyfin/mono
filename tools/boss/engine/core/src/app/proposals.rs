@@ -201,7 +201,7 @@ pub(super) fn attribute_caller(
         ));
     };
 
-    let Some(resolved_run_id) = server_state.worker_registry.lookup_with_ancestor_walk(peer_pid) else {
+    let Some((matched_pid, resolved_run_id)) = server_state.worker_registry.resolve_with_ancestor_walk(peer_pid) else {
         return Err(ProposalSubmissionError::new(
             ProposalErrorCode::AttributionUnresolved,
             format!(
@@ -216,6 +216,17 @@ pub(super) fn attribute_caller(
     // the power to make a call fail — so a worker cannot reach another run's
     // work item by supplying its id.
     if claimed_run_id != resolved_run_id {
+        // The caller-facing error cannot carry the matched pid, and the call
+        // sites log only the claimed id; without this a mismatch caused by a
+        // stale registry entry is indistinguishable from a misconfigured
+        // worker in the log.
+        tracing::warn!(
+            claimed_run_id,
+            resolved_run_id = %resolved_run_id,
+            matched_pid,
+            peer_pid,
+            "attribution failed: peer resolves to a different run than the claimed BOSS_RUN_ID",
+        );
         return Err(ProposalSubmissionError::new(
             ProposalErrorCode::AttributionMismatch,
             format!(

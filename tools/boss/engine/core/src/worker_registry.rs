@@ -11,6 +11,15 @@
 //! peer pid, walk up the process tree until we hit a registered
 //! ancestor. That's the run the hook event belongs to.
 //!
+//! Pids are recycled by the OS, so a registered pid alone is not process
+//! identity: each entry also records the process's start time at
+//! registration, and an entry whose pid now belongs to a process with a
+//! different start time is treated as absent. Entries are additionally
+//! dropped when the run's pane is torn down
+//! ([`WorkerRegistry::take_worker_pane_for_run`]), so a finished run's shell
+//! pid does not linger to be matched by an unrelated process that later
+//! reuses it.
+//!
 //! Platform-specific process-tree walks: macOS uses `proc_pidinfo`; Linux
 //! reads `/proc/<pid>/stat`. `getppid()` is per-process and would require
 //! IPC for either implementation.
@@ -61,8 +70,39 @@ impl Default for WorkerRegistry {
 
 #[derive(Default)]
 struct RegistryInner {
-    pid_to_run: HashMap<libc::pid_t, String>,
+    pid_to_run: HashMap<libc::pid_t, RegisteredPid>,
     run_to_slot: HashMap<String, RegisteredWorkerPane>,
+}
+
+/// When a process started, in a platform-specific but equality-comparable
+/// form. Two readings for the same pid are the same process iff they are
+/// equal; the OS never hands a recycled pid the previous holder's start time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProcessStart {
+    major: u64,
+    minor: u64,
+}
+
+/// A registered worker shell pid and the process identity it was registered
+/// with. `start` is `None` when the process could not be read at registration
+/// (it had already exited, or the platform has no reader); such an entry is
+/// matched by pid alone.
+#[derive(Clone, Debug)]
+struct RegisteredPid {
+    run_id: String,
+    start: Option<ProcessStart>,
+}
+
+impl RegisteredPid {
+    /// Whether `pid` still belongs to the process that was registered. A pid
+    /// that cannot be read now is not treated as reused: it cannot be an
+    /// ancestor of any live caller, and the walk fails closed on its own.
+    fn is_current(&self, pid: libc::pid_t) -> bool {
+        match (self.start, process_start(pid)) {
+            (Some(recorded), Ok(live)) => recorded == live,
+            _ => true,
+        }
+    }
 }
 
 /// A worker's presentation slot and optional local tmux identity.
@@ -92,11 +132,17 @@ impl WorkerRegistry {
     /// Record that pid is the worker process for run `run_id`. Called by
     /// the spawn flow once it has both the run id and the spawned pid.
     pub fn register(&self, pid: libc::pid_t, run_id: impl Into<String>) {
-        self.inner
-            .lock()
-            .expect("registry poisoned")
-            .pid_to_run
-            .insert(pid, run_id.into());
+        self.register_with_start(pid, run_id, process_start(pid).ok());
+    }
+
+    fn register_with_start(&self, pid: libc::pid_t, run_id: impl Into<String>, start: Option<ProcessStart>) {
+        self.inner.lock().expect("registry poisoned").pid_to_run.insert(
+            pid,
+            RegisteredPid {
+                run_id: run_id.into(),
+                start,
+            },
+        );
     }
 
     /// Record the viewer slot id for `run_id` without a tmux session identity.
@@ -219,9 +265,14 @@ impl WorkerRegistry {
     /// Atomically remove and return the pane registration for `run_id`.
     /// Cleanup detaches the app viewer; the worker itself is torn down by
     /// token-verified tmux teardown.
+    ///
+    /// Also drops every shell pid registered for the run, whether or not a
+    /// pane was still mapped: a finished run's pid must not stay resolvable,
+    /// because the OS will hand it to some unrelated process.
     pub fn take_worker_pane_for_run(&self, run_id: &str) -> Option<RegisteredWorkerPane> {
         {
             let mut inner = self.inner.lock().expect("registry poisoned");
+            inner.pid_to_run.retain(|_, entry| entry.run_id != run_id);
             let pane = inner.run_to_slot.remove(run_id);
             self.sleep_assertion
                 .set_live_worker_panes(local_live_pane_count(&inner));
@@ -234,7 +285,7 @@ impl WorkerRegistry {
     pub fn unregister(&self, pid: libc::pid_t) -> Option<String> {
         {
             let mut inner = self.inner.lock().expect("registry poisoned");
-            let run_id = inner.pid_to_run.remove(&pid);
+            let run_id = inner.pid_to_run.remove(&pid).map(|entry| entry.run_id);
             if let Some(rid) = run_id.as_deref() {
                 inner.run_to_slot.remove(rid);
             }
@@ -245,24 +296,33 @@ impl WorkerRegistry {
     }
 
     /// Direct pid lookup — no ancestor walk. Returns `None` if the pid
-    /// is not a registered worker.
+    /// is not a registered worker, or if it was registered but now belongs
+    /// to a different process (the OS recycled the pid).
     pub fn lookup(&self, pid: libc::pid_t) -> Option<String> {
-        self.inner
+        let entry = self
+            .inner
             .lock()
             .expect("registry poisoned")
             .pid_to_run
             .get(&pid)
-            .cloned()
+            .cloned()?;
+        entry.is_current(pid).then_some(entry.run_id)
     }
 
     /// Walk up the process tree from `pid` until we find a registered
     /// ancestor or hit the depth limit. The shim runs as a descendant
     /// of the worker (claude → shell? → boss-event), so this is how
     /// hook events are correlated to runs.
-    pub fn lookup_with_ancestor_walk(&self, mut pid: libc::pid_t) -> Option<String> {
+    pub fn lookup_with_ancestor_walk(&self, pid: libc::pid_t) -> Option<String> {
+        self.resolve_with_ancestor_walk(pid).map(|(_, run_id)| run_id)
+    }
+
+    /// [`Self::lookup_with_ancestor_walk`], also returning the registered
+    /// pid the walk matched, so a refusal can name the evidence it acted on.
+    pub fn resolve_with_ancestor_walk(&self, mut pid: libc::pid_t) -> Option<(libc::pid_t, String)> {
         for _ in 0..ANCESTOR_WALK_DEPTH {
             if let Some(run_id) = self.lookup(pid) {
-                return Some(run_id);
+                return Some((pid, run_id));
             }
             pid = match parent_pid(pid) {
                 Ok(Some(parent)) => parent,
@@ -281,12 +341,18 @@ impl WorkerRegistry {
     /// whose process tree descends from one of these pids are workers,
     /// not the Boss session.
     pub fn registered_pids(&self) -> Vec<libc::pid_t> {
-        self.inner
+        let entries: Vec<(libc::pid_t, RegisteredPid)> = self
+            .inner
             .lock()
             .expect("registry poisoned")
             .pid_to_run
-            .keys()
-            .copied()
+            .iter()
+            .map(|(pid, entry)| (*pid, entry.clone()))
+            .collect();
+        entries
+            .into_iter()
+            .filter(|(pid, entry)| entry.is_current(*pid))
+            .map(|(pid, _)| pid)
             .collect()
     }
 
@@ -307,6 +373,55 @@ fn local_live_pane_count(inner: &RegistryInner) -> u32 {
         .values()
         .filter(|pane| pane.slot_id < REMOTE_SLOT_BASE)
         .count() as u32
+}
+
+/// Read when `pid` started via macOS `proc_pidinfo`.
+#[cfg(target_os = "macos")]
+pub(crate) fn process_start(pid: libc::pid_t) -> io::Result<ProcessStart> {
+    let info = crate::libproc::proc_bsd_info(pid)?;
+    Ok(ProcessStart {
+        major: info.start_seconds,
+        minor: info.start_microseconds,
+    })
+}
+
+/// Read when `pid` started from field 22 (`starttime`, clock ticks since
+/// boot) of Linux's `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+pub(crate) fn process_start(pid: libc::pid_t) -> io::Result<ProcessStart> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let (_, fields) = stat.rsplit_once(')').ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("/proc/{pid}/stat is missing its process-name terminator"),
+        )
+    })?;
+    // `fields` starts at field 3 (state), so field 22 is index 19.
+    let ticks = fields
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("/proc/{pid}/stat is missing starttime"),
+            )
+        })?
+        .parse::<u64>()
+        .map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid starttime in /proc/{pid}/stat: {err}"),
+            )
+        })?;
+    Ok(ProcessStart { major: ticks, minor: 0 })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn process_start(_pid: libc::pid_t) -> io::Result<ProcessStart> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "process_start is only implemented on macOS and Linux",
+    ))
 }
 
 /// Look up the parent pid of `pid` via macOS `proc_pidinfo`. Returns
@@ -499,6 +614,86 @@ mod tests {
         let (c, fresh) = reg.get_or_allocate_remote_slot("exec-c").unwrap();
         assert_eq!(c, REMOTE_SLOT_BASE);
         assert!(fresh);
+    }
+
+    #[test]
+    fn take_worker_pane_for_run_drops_the_runs_pids() {
+        let reg = WorkerRegistry::new();
+        reg.register_with_start(5001, "run-done", None);
+        reg.register_with_start(5002, "run-live", None);
+        reg.register_run_slot("run-done", 3);
+        reg.register_run_slot("run-live", 4);
+
+        assert_eq!(reg.lookup(5001).as_deref(), Some("run-done"));
+        assert!(reg.take_worker_pane_for_run("run-done").is_some());
+
+        assert_eq!(reg.lookup(5001), None, "a torn-down run's pid must no longer resolve");
+        assert!(!reg.registered_pids().contains(&5001));
+        assert_eq!(
+            reg.lookup(5002).as_deref(),
+            Some("run-live"),
+            "other runs are untouched"
+        );
+    }
+
+    #[test]
+    fn take_worker_pane_for_run_drops_pids_even_without_a_mapped_pane() {
+        let reg = WorkerRegistry::new();
+        reg.register_with_start(5003, "run-no-slot", None);
+        assert!(reg.take_worker_pane_for_run("run-no-slot").is_none());
+        assert_eq!(reg.lookup(5003), None);
+        assert!(reg.is_empty());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn registered_pid_reused_by_a_process_with_a_different_start_time_misses() {
+        let reg = WorkerRegistry::new();
+        let self_pid = std::process::id() as libc::pid_t;
+        let live = process_start(self_pid).unwrap();
+        // Simulate the pid having been registered by an earlier process that
+        // has since exited and whose pid this test process now holds.
+        let earlier = ProcessStart {
+            major: live.major.wrapping_sub(1),
+            minor: live.minor,
+        };
+        reg.register_with_start(self_pid, "finished-run", Some(earlier));
+
+        assert_eq!(reg.lookup(self_pid), None);
+        assert_eq!(reg.lookup_with_ancestor_walk(self_pid), None);
+        assert_eq!(reg.resolve_with_ancestor_walk(self_pid), None);
+        assert!(!reg.registered_pids().contains(&self_pid));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn ancestor_walk_skips_a_reused_pid_and_finds_the_live_registered_ancestor() {
+        let reg = WorkerRegistry::new();
+        let self_pid = std::process::id() as libc::pid_t;
+        let Some(parent) = parent_pid(self_pid).unwrap() else {
+            return;
+        };
+        let live = process_start(self_pid).unwrap();
+        let earlier = ProcessStart {
+            major: live.major.wrapping_sub(1),
+            minor: live.minor,
+        };
+        reg.register_with_start(self_pid, "stale-run", Some(earlier));
+        reg.register(parent, "live-run");
+
+        assert_eq!(
+            reg.resolve_with_ancestor_walk(self_pid),
+            Some((parent, "live-run".to_owned()))
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn register_records_start_time_so_the_live_process_still_matches() {
+        let reg = WorkerRegistry::new();
+        let self_pid = std::process::id() as libc::pid_t;
+        reg.register(self_pid, "self-run");
+        assert_eq!(reg.lookup(self_pid).as_deref(), Some("self-run"));
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
