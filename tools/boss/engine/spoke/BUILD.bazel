@@ -1,0 +1,41 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+rust_binary(
+    name = "boss-spoke",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "boss_spoke",
+    crate_root = "src/main.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = [
+        "//tools/boss/engine/spoke-journal",
+        "//tools/boss/engine/spoke-outbound",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "spoke_test",
+    size = "small",
+    srcs = glob(["tests/**/*.rs"]),
+    crate_root = "tests/session.rs",
+    data = [":boss-spoke"],
+    edition = "2024",
+    env = {"SPOKE_BIN": "$(rootpath :boss-spoke)"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//tools/boss/engine/host-enrollment",
+        "//tools/boss/engine/spoke-journal",
+        "//tools/boss/engine/spoke-outbound",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

@@ -13,6 +13,7 @@ rust_library(
     visibility = [
         "//tools/boss/client:__pkg__",
         "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/spoke-outbound:__pkg__",
         "//tools/boss/http_retry:__pkg__",
     ],
     deps = all_crate_deps(normal = True),

@@ -43,7 +43,7 @@ mod store;
 mod token;
 
 pub use authority::{AuthorizedHost, CredentialEvent, HostAuthorizer};
-pub use ca::{CaError, CertificateAuthority};
+pub use ca::{CaError, CertificateAuthority, pem_encode};
 pub use clock::{Clock, SystemClock};
 pub use credentials::{CertificateSummary, CredentialStatus, EnrollmentGrant, HostCredentials, IssuedCertificate};
 pub use csr::MAX_CSR_BYTES;

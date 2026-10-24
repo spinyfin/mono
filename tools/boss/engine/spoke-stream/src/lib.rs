@@ -41,6 +41,9 @@ pub struct Config {
     pub pulse_interval: Duration,
     #[builder(default = Duration::from_secs(15))]
     pub pulse_timeout: Duration,
+    /// What this hub offers and requires of a spoke.
+    #[builder(default = Contracts::first_release())]
+    pub contracts: Contracts,
 }
 
 /// How a nonce challenge against the connection that holds a host ended.
@@ -138,10 +141,6 @@ impl StreamManager {
         hosts.insert(id.into(), host.clone());
         Ok(host)
     }
-}
-
-pub(crate) fn contracts() -> Contracts {
-    Contracts::first_release()
 }
 
 pub(crate) fn status(error: store::StoreError) -> tonic::Status {

@@ -3,7 +3,8 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 exports_files(["Cargo.toml"])
 
-# No engine consumer until the adapter supplies durable policy/storage.
+# Hub-side stream manager. engine/core adds itself to `visibility` when it
+# consumes it.
 rust_library(
     name = "spoke-stream",
     srcs = glob(["src/**/*.rs"]),
@@ -30,9 +31,20 @@ rust_test(
     deps = [
         ":spoke-stream",
         "//tools/boss/engine/host-enrollment",
+        "//tools/boss/engine/spoke-journal",
+        "//tools/boss/engine/spoke-outbound",
         "//tools/boss/protocol-spoke",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),
+)
+
+rust_test(
+    name = "spoke-stream_test",
+    size = "small",
+    crate = ":spoke-stream",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = ["//tools/boss/protocol-spoke"] + all_crate_deps(normal = True),
 )

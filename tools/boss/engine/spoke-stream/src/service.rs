@@ -1,7 +1,6 @@
 use crate::{
     ChallengeOutcome, Connection, StreamManager,
     codec::{Outbound, RawFrame, WireCodec},
-    contracts,
     session::{Driver, watch_credentials},
     status,
     store::Session,
@@ -113,11 +112,14 @@ impl StreamManager {
         let (tx, rx) = mpsc::channel(1);
         let active = Arc::new(AtomicBool::new(true));
         let terminal = Arc::new(std::sync::Mutex::new(None));
-        let selection = match contracts().select(&hello) {
+        let selection = match self.0.config.contracts.select(&hello) {
             Ok(selection) => selection,
             Err(rejection) => {
-                tx.try_send(Ok(frame(0, hub_frame::Body::Reject(rejection.to_reject(&contracts())))))
-                    .expect("empty channel");
+                tx.try_send(Ok(frame(
+                    0,
+                    hub_frame::Body::Reject(rejection.to_reject(&self.0.config.contracts)),
+                )))
+                .expect("empty channel");
                 return Ok(Response::new(Output { rx, active, terminal }));
             }
         };

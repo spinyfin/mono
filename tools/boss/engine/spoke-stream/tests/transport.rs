@@ -357,3 +357,79 @@ async fn credential_lost_during_storage_admission_never_gets_a_stream() {
         assert_eq!(fx.store.outbox.lock().unwrap().received, 0);
     }
 }
+
+/// Spoke daemon session behaviour, driven over the real transport.
+mod outbound_session {
+    use crate::support::{Fixture, STEP};
+    use boss_protocol_spoke::v1::{self, record};
+    use boss_spoke_journal::{Admission, Journal, Limits};
+    use std::{
+        sync::{Arc, Mutex},
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    fn stamp() -> anyhow::Result<v1::Stamp> {
+        Ok(v1::Stamp {
+            boot_id: "boot".into(),
+            wall_unix_ms: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64,
+            awake_ns: 1,
+            elapsed_ns: 1,
+        })
+    }
+
+    fn capacity(generation: u64) -> v1::Record {
+        v1::Record {
+            observed: Some(stamp().unwrap()),
+            body: Some(record::Body::Capacity(v1::Capacity {
+                generation,
+                inventory: Some(v1::Inventory {
+                    os: "linux".into(),
+                    arch: "x86_64".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    async fn committed(fixture: &Fixture, count: usize) {
+        tokio::time::timeout(STEP, async {
+            while fixture.store.ingress.lock().unwrap().records.len() < count {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("hub committed the spoke's records");
+    }
+
+    #[tokio::test]
+    async fn spoke_session_is_welcomed_receipted_and_answers_pulses() {
+        let fixture = Fixture::with_contracts(boss_spoke_outbound::contracts()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&dir.path().join("state"), "host", Limits::default()).unwrap();
+        journal.append(capacity(1), Admission::Capacity).unwrap();
+        journal.append(capacity(2), Admission::Capacity).unwrap();
+        let journal = Arc::new(Mutex::new(journal));
+        let task = tokio::spawn({
+            let (journal, dialer) = (Arc::clone(&journal), fixture.dialer.clone());
+            async move { boss_spoke_outbound::connect_once(&journal, dialer, &[7; 16], &stamp).await }
+        });
+        // Both backlog records reach the hub's durable sink and are receipted.
+        committed(&fixture, 2).await;
+        // Outlive several hub pulses (interval 2s, answer deadline 500ms): an
+        // unanswered pulse would fence the stream and end the session.
+        tokio::time::sleep(Duration::from_millis(4500)).await;
+        assert!(!task.is_finished(), "hub fenced or dropped the spoke session");
+        // A record produced later flows over the same session, so receipts moved
+        // the send window forward.
+        journal
+            .lock()
+            .unwrap()
+            .append(capacity(3), Admission::Capacity)
+            .unwrap();
+        committed(&fixture, 3).await;
+        assert!(!task.is_finished());
+        task.abort();
+    }
+}

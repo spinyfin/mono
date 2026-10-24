@@ -55,10 +55,16 @@ pub struct Fixture {
     pub auth: Arc<Authority>,
     pub channel: Channel,
     pub anonymous: Channel,
+    /// The authenticated client's endpoint, for dialing the hub from a real spoke session.
+    pub dialer: Endpoint,
     server: tokio::task::JoinHandle<()>,
 }
 impl Fixture {
     pub async fn new() -> Self {
+        Self::with_contracts(None).await
+    }
+    /// A hub offering `contracts` instead of the first-release set.
+    pub async fn with_contracts(contracts: impl Into<Option<Contracts>>) -> Self {
         let mut params = CertificateParams::default();
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
@@ -94,6 +100,7 @@ impl Fixture {
                 .hello_timeout(Duration::from_millis(300))
                 .pulse_interval(Duration::from_secs(2))
                 .pulse_timeout(Duration::from_millis(500))
+                .maybe_contracts(contracts.into())
                 .build(),
             auth.clone(),
             store.clone(),
@@ -119,13 +126,8 @@ impl Fixture {
         let tls = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(ca.pem()))
             .domain_name("localhost");
-        let channel = endpoint
-            .clone()
-            .tls_config(tls.clone().identity(identity))
-            .unwrap()
-            .connect()
-            .await
-            .unwrap();
+        let dialer = endpoint.clone().tls_config(tls.clone().identity(identity)).unwrap();
+        let channel = dialer.connect().await.unwrap();
         let anonymous = endpoint.tls_config(tls).unwrap().connect().await.unwrap();
         Self::builder()
             .manager(manager)
@@ -133,6 +135,7 @@ impl Fixture {
             .auth(auth)
             .channel(channel)
             .anonymous(anonymous)
+            .dialer(dialer)
             .server(server)
             .build()
     }
