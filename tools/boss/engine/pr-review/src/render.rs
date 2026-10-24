@@ -1245,7 +1245,9 @@ mod tests {
             None,
             "org/repo",
         );
-        assert!(prompt.contains("\"$BOSS_BIN\" propose review-report --batch-id rvb_1 --target-sha head_1 --body-file"));
+        assert!(
+            prompt.contains("\"$BOSS_BIN\" propose review-report --batch-id rvb_1 --target-sha head_1 --body-file")
+        );
         assert!(prompt.contains("needs_runtime_verification"));
         assert!(prompt.contains("transcript recovery is intentionally unavailable"));
         assert!(!prompt.contains("revision_warranted\": true"));
