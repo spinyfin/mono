@@ -6,9 +6,11 @@ import XCTest
 /// excludes the target the card stays hidden and the scroll lands on
 /// nothing — `reveal` reports success while revealing nothing.
 ///
-/// `revealWorkCard` must reset every narrowing filter (search query,
-/// blocked-only, chores-only, hidden chores, project filter) before
-/// scrolling so the revealed card is guaranteed visible.
+/// `revealWorkCard` must reset the narrowing filters (search query,
+/// blocked-only, chores-only, hidden chores) and reconcile the project
+/// filter (kept when the target's card is in it, otherwise switched to
+/// the target's project, All only when it has none) before scrolling so
+/// the revealed card is guaranteed visible.
 @MainActor
 final class RevealClearsFiltersTests: XCTestCase {
 
@@ -80,13 +82,117 @@ final class RevealClearsFiltersTests: XCTestCase {
         XCTAssertTrue(model.visibleWorkItems.contains { $0.id == "chore_x" })
     }
 
-    func testRevealClearsProjectFilter() {
+    func testRevealKeepsProjectFilterWhenTargetIsInIt() {
         let model = makeModel()
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [makeTask(id: "task_a", name: "Apple")]))
+        model.selectedProjectFilterIDs = ["proj_test"]
+
+        model.revealWorkCard("task_a", productID: "prod_test")
+
+        XCTAssertEqual(model.selectedProjectFilterIDs, ["proj_test"], "same-project reveal must keep the filter")
+        XCTAssertEqual(model.revealScrollTarget, "task_a")
+    }
+
+    func testRevealSwitchesProjectFilterToTargetsProjectWhenHidden() {
+        let model = makeModel()
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [makeTask(id: "task_a", name: "Apple")]))
         model.selectedProjectFilterIDs = ["proj_other"]
 
         model.revealWorkCard("task_a", productID: "prod_test")
 
-        XCTAssertTrue(model.selectedProjectFilterIDs.isEmpty, "reveal must clear the project filter")
+        XCTAssertEqual(model.selectedProjectFilterIDs, ["proj_test"])
+    }
+
+    func testRevealClearsProjectFilterWhenTargetHasNoProject() {
+        let model = makeModel()
+        model.applyEventForTest(makeWorkTreeEvent(chores: [makeTask(id: "chore_x", name: "Chore", projectID: nil)]))
+        model.selectedProjectFilterIDs = ["proj_test"]
+
+        model.revealWorkCard("chore_x", productID: "prod_test")
+
+        XCTAssertTrue(model.selectedProjectFilterIDs.isEmpty)
+    }
+
+    func testRevisionInFilteredProjectKeepsFilter() {
+        let model = makeModel()
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [
+            makeTask(id: "parent", name: "Parent", status: "active"),
+            makeTask(id: "rev", name: "Rev", status: "active", kind: "revision", parentTaskId: "parent"),
+        ]))
+        model.selectedProjectFilterIDs = ["proj_test"]
+        model.revealWorkCard("rev", productID: "prod_test")
+        XCTAssertEqual(model.selectedProjectFilterIDs, ["proj_test"])
+    }
+
+    func testRevisionInOtherProjectSwitchesFilter() {
+        let model = makeModel()
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [
+            makeTask(id: "parent", name: "Parent", status: "active"),
+            makeTask(id: "rev", name: "Rev", status: "active", kind: "revision", parentTaskId: "parent"),
+        ]))
+        model.selectedProjectFilterIDs = ["proj_other"]
+        model.revealWorkCard("rev", productID: "prod_test")
+        XCTAssertEqual(model.selectedProjectFilterIDs, ["proj_test"])
+    }
+
+    func testRolledUpRevisionKeepsFilterViaParentHostCard() {
+        for status in ["in_review", "done"] {
+            let model = makeModel()
+            model.applyEventForTest(makeWorkTreeEvent(tasks: [
+                makeTask(id: "parent", name: "Parent", status: "active"),
+                makeTask(id: "rev", name: "Rev", status: status, projectID: "proj_other",
+                         kind: "revision", parentTaskId: "parent"),
+            ]))
+            model.selectedProjectFilterIDs = ["proj_test"]
+            model.revealWorkCard("rev", productID: "prod_test")
+            XCTAssertEqual(model.selectedProjectFilterIDs, ["proj_test"], status)
+        }
+    }
+
+    func testMultiProjectFilterContainingTargetsProjectIsKept() {
+        let model = makeModel()
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [makeTask(id: "task_a", name: "Apple")]))
+        model.selectedProjectFilterIDs = ["proj_test", "proj_other"]
+        model.revealWorkCard("task_a", productID: "prod_test")
+        XCTAssertEqual(model.selectedProjectFilterIDs, ["proj_test", "proj_other"])
+    }
+
+    func testDeferredSameProductRevealKeepsFilterThroughTreeLoad() {
+        let model = makeModel()
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [makeTask(id: "task_a", name: "Apple")]))
+        model.selectedProjectFilterIDs = ["proj_test"]
+        model.revealWorkCard("later", productID: "prod_test")
+        XCTAssertEqual(model.selectedProjectFilterIDs, ["proj_test"], "unresolved target must not drop the filter")
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [
+            makeTask(id: "task_a", name: "Apple"), makeTask(id: "later", name: "Later"),
+        ]))
+        XCTAssertEqual(model.selectedProjectFilterIDs, ["proj_test"])
+        XCTAssertEqual(model.revealScrollTarget, "later")
+    }
+
+    func testCrossProductRevealSwitchesFilterToTargetsProject() {
+        let model = makeModel()
+        model.products.append(WorkProduct(
+            id: "prod_other", name: "Other", slug: "other", description: "",
+            repoRemoteURL: "https://github.com/org/other.git", status: "active",
+            createdAt: "2026-05-26T00:00:00Z", updatedAt: "2026-05-26T00:00:00Z"
+        ))
+        model.selectedProjectFilterIDs = ["proj_elsewhere"]
+        model.revealWorkCard("task_a", productID: "prod_other")
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [makeTask(id: "task_a", name: "Apple")], productID: "prod_other"))
+        XCTAssertEqual(model.selectedProjectFilterIDs, ["proj_test"])
+    }
+
+    func testCrossProductRevealWithoutFilterStaysUnfiltered() {
+        let model = makeModel()
+        model.products.append(WorkProduct(
+            id: "prod_other", name: "Other", slug: "other", description: "",
+            repoRemoteURL: "https://github.com/org/other.git", status: "active",
+            createdAt: "2026-05-26T00:00:00Z", updatedAt: "2026-05-26T00:00:00Z"
+        ))
+        model.revealWorkCard("task_a", productID: "prod_other")
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [makeTask(id: "task_a", name: "Apple")], productID: "prod_other"))
+        XCTAssertTrue(model.selectedProjectFilterIDs.isEmpty)
     }
 
     func testEveryLifecycleStateRequiresExactViewportConfirmation() {
@@ -192,13 +298,15 @@ final class RevealClearsFiltersTests: XCTestCase {
         id: String,
         name: String,
         status: String = "todo",
-        projectID: String? = "proj_test"
+        projectID: String? = "proj_test",
+        kind: String = "task",
+        parentTaskId: String? = nil
     ) -> WorkTask {
-        WorkTask(
+        var task = WorkTask(
             id: id,
             productID: "prod_test",
             projectID: projectID,
-            kind: "task",
+            kind: kind,
             name: name,
             description: "",
             status: status,
@@ -209,9 +317,13 @@ final class RevealClearsFiltersTests: XCTestCase {
             createdAt: "2026-05-26T00:00:00Z",
             updatedAt: "2026-05-26T00:00:00Z"
         )
+        task.parentTaskId = parentTaskId
+        return task
     }
 
-    private func makeWorkTreeEvent(tasks: [WorkTask] = [], chores: [WorkTask] = []) -> EngineEvent {
+    private func makeWorkTreeEvent(
+        tasks: [WorkTask] = [], chores: [WorkTask] = [], productID: String = "prod_test"
+    ) -> EngineEvent {
         let project = WorkProject(
             id: "proj_test",
             productID: "prod_test",
@@ -226,7 +338,7 @@ final class RevealClearsFiltersTests: XCTestCase {
         )
         return .workTree(
             product: WorkProduct(
-                id: "prod_test",
+                id: productID,
                 name: "Test Product",
                 slug: "test",
                 description: "",

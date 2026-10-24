@@ -58,6 +58,7 @@ extension ChatViewModel {
         revealCompletion = nil
         revealScrollTarget = nil
         pendingRevealScrollID = nil
+        pendingRevealReconcilesProjectFilter = false
         revealProductID = nil
         completion?(result)
     }

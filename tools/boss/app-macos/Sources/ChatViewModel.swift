@@ -365,6 +365,9 @@ final class ChatViewModel: ObservableObject {
     /// boundary — `revealWorkCard` sets this and the `workTree`
     /// event handler resolves it against the newly loaded board.
     var pendingRevealScrollID: String?
+    /// Whether a project filter was active when the deferred reveal began,
+    /// so the filter is reconciled against the target once its tree loads.
+    var pendingRevealReconcilesProjectFilter = false
     @Published var workBoardGrouping: WorkBoardGrouping = .none {
         didSet { notePublishedWorkInputChanged() }
     }

@@ -100,6 +100,9 @@ extension ChatViewModel {
         workErrorMessage = nil
         if let pending = pendingRevealScrollID, revealProductID == product.id {
             pendingRevealScrollID = nil
+            reconcileProjectFilterForReveal(
+                pending, hadProjectFilter: pendingRevealReconcilesProjectFilter)
+            pendingRevealReconcilesProjectFilter = false
             prepareReveal(pending)
         }
         recordPopulationApplyBurst(
