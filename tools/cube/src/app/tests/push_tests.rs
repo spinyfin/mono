@@ -71,6 +71,15 @@ fn workspace_push_happy_path_advances_and_pushes() {
             ],
             "deadbeef\n",
         ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "gh",
+            &[
+                "api",
+                &format!("repos/spinyfin/mono/pulls?head=spinyfin:{branch}&state=open"),
+            ],
+            "[]",
+        ),
     ]);
 
     let result = run_push(&runner, Some(branch), None).expect("push happy path");
@@ -143,6 +152,25 @@ fn workspace_push_pr_arg_resolves_head_branch_from_github() {
                 "repos/spinyfin/mono/branches/boss/exec_pr9",
                 "--jq",
                 ".commit.sha",
+            ],
+            "cafe\n",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["bookmark", "set", "pr/9", "-r", "cafe", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/9")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
             ],
             "cafe\n",
         ),
@@ -220,6 +248,15 @@ fn workspace_push_describes_an_undescribed_working_copy_before_pushing() {
             ],
             "beef\n",
         ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "gh",
+            &[
+                "api",
+                &format!("repos/spinyfin/mono/pulls?head=spinyfin:{branch}&state=open"),
+            ],
+            "[]",
+        ),
     ]);
 
     let result = run_push(&runner, Some(branch), None).expect("push describes then pushes");
@@ -277,6 +314,15 @@ fn workspace_push_leaves_an_existing_description_untouched() {
                 ".commit.sha",
             ],
             "d00d\n",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "gh",
+            &[
+                "api",
+                &format!("repos/spinyfin/mono/pulls?head=spinyfin:{branch}&state=open"),
+            ],
+            "[]",
         ),
     ]);
 

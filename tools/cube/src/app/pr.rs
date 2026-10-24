@@ -17,6 +17,10 @@ use crate::app::gh_pr;
 use crate::app::jj::run_jj_push;
 use crate::app::stage::run_stage;
 
+#[cfg(test)]
+#[path = "pr_bookmark_tests.rs"]
+mod bookmark_tests;
+
 /// Resolved context for a PR create/update operation: the workspace, the
 /// github.com remote name + `owner/repo` slug, and the validated branch name.
 struct PrContext {
@@ -136,7 +140,7 @@ fn jj_is_empty(runner: &dyn CommandRunner, cwd: &Path, revision: &str) -> Result
 /// `--body`/`--body-file`), when the caller has one to check — see
 /// [`run_checkleft_gate`] for why this must be resolved and passed in
 /// *before* the push, not looked up afterward.
-fn push_branch_to_github(ctx: &PrContext, runner: &dyn CommandRunner, pr_description: Option<&str>) -> Result<()> {
+fn push_branch_to_github(ctx: &PrContext, runner: &dyn CommandRunner, pr_description: Option<&str>) -> Result<String> {
     // Run checkleft against the outgoing changes before pushing. Refuses
     // (with the findings) if checkleft reports errors — no PR push reaches
     // GitHub with a known convention violation.
@@ -338,10 +342,10 @@ pub(super) fn pr_create(args: PrCreateArgs, runner: &dyn CommandRunner) -> Resul
     }
 
     let body = resolve_pr_body(&args)?;
-    push_branch_to_github(&ctx, runner, body.text.as_deref())?;
+    let published = push_branch_to_github(&ctx, runner, body.text.as_deref())?;
     let url = gh_create_pr(&args, &ctx, runner, &body)?;
     let number = pr_number_from_url(&url);
-    let pr_bookmark_name = set_pr_bookmark(runner, &ctx.cwd, number, &ctx.branch)?;
+    let pr_bookmark_name = record_published_pr_head(runner, &ctx.cwd, number, &published)?;
     RunResult::new(
         url.clone(),
         json!({"action": "created", "url": url, "number": number, "pr_bookmark": pr_bookmark_name}),
@@ -374,9 +378,9 @@ pub(super) fn pr_update(args: PrUpdateArgs, runner: &dyn CommandRunner) -> Resul
         )));
     };
 
-    push_branch_to_github(&ctx, runner, None)?;
+    let published = push_branch_to_github(&ctx, runner, None)?;
     let number = pr_number_from_url(&url);
-    let pr_bookmark_name = set_pr_bookmark(runner, &ctx.cwd, number, &ctx.branch)?;
+    let pr_bookmark_name = record_published_pr_head(runner, &ctx.cwd, number, &published)?;
     RunResult::new(
         url.clone(),
         json!({"action": "updated", "url": url, "number": number, "pr_bookmark": pr_bookmark_name}),
@@ -395,11 +399,11 @@ pub(super) fn ensure_pr_deprecated(args: PrCreateArgs, runner: &dyn CommandRunne
 
     let ctx = resolve_pr_context(args.branch.clone(), runner)?;
     let body = resolve_pr_body(&args)?;
-    push_branch_to_github(&ctx, runner, body.text.as_deref())?;
+    let published = push_branch_to_github(&ctx, runner, body.text.as_deref())?;
 
     if let Some(url) = list_open_pr(&ctx, runner)? {
         let number = pr_number_from_url(&url);
-        let pr_bookmark_name = set_pr_bookmark(runner, &ctx.cwd, number, &ctx.branch)?;
+        let pr_bookmark_name = record_published_pr_head(runner, &ctx.cwd, number, &published)?;
         return RunResult::new(
             url.clone(),
             json!({"action": "exists", "url": url, "number": number, "pr_bookmark": pr_bookmark_name}),
@@ -408,7 +412,7 @@ pub(super) fn ensure_pr_deprecated(args: PrCreateArgs, runner: &dyn CommandRunne
 
     let url = gh_create_pr(&args, &ctx, runner, &body)?;
     let number = pr_number_from_url(&url);
-    let pr_bookmark_name = set_pr_bookmark(runner, &ctx.cwd, number, &ctx.branch)?;
+    let pr_bookmark_name = record_published_pr_head(runner, &ctx.cwd, number, &published)?;
     RunResult::new(
         url.clone(),
         json!({"action": "created", "url": url, "number": number, "pr_bookmark": pr_bookmark_name}),
@@ -425,12 +429,67 @@ pub(super) fn set_pr_bookmark(
     number: Option<u64>,
     branch: &str,
 ) -> Result<Option<String>> {
+    write_pr_bookmark(runner, cwd, number, branch, false)
+}
+
+/// Record only a verified published SHA, never a branch that can move during
+/// publication. Rebased revisions can replace a conflicted sibling, so this
+/// bookkeeping update deliberately allows non-fast-forward movement.
+pub(super) fn record_published_pr_head(
+    runner: &dyn CommandRunner,
+    cwd: &Path,
+    number: Option<u64>,
+    published: &str,
+) -> Result<Option<String>> {
+    let bookmark = write_pr_bookmark(runner, cwd, number, published, true)?;
+    if let Some(name) = &bookmark {
+        // `point_pr_bookmark` has already verified the bookmark resolves to
+        // exactly `published` in both jj and git.
+        eprintln!("cube: published PR bookmark `{name}` verified at {published}");
+    }
+    Ok(bookmark)
+}
+
+pub(super) fn record_published_workspace_head(
+    runner: &dyn CommandRunner,
+    cwd: &Path,
+    owner_repo: &str,
+    branch: &str,
+    number: Option<u64>,
+    published: &str,
+) -> Result<()> {
+    let number = match number {
+        Some(number) => Some(number),
+        None => {
+            let ctx = PrContext {
+                cwd: cwd.to_owned(),
+                github_remote: String::new(),
+                owner_repo: owner_repo.to_owned(),
+                branch: branch.to_owned(),
+            };
+            list_open_pr(&ctx, runner)?.as_deref().and_then(pr_number_from_url)
+        }
+    };
+    record_published_pr_head(runner, cwd, number, published)?;
+    Ok(())
+}
+
+fn write_pr_bookmark(
+    runner: &dyn CommandRunner,
+    cwd: &Path,
+    number: Option<u64>,
+    revision: &str,
+    published: bool,
+) -> Result<Option<String>> {
     let Some(n) = number else {
         return Ok(None);
     };
     let bookmark_name = pr_bookmark::pr_bookmark_name(n);
     let _lock = runner.lock_pr_bookmarks(cwd)?;
-    crate::app::pr_bookmarks::point_pr_bookmark(runner, None, cwd, n, branch)?;
+    if published {
+        eprintln!("cube: synchronizing published PR bookmark `{bookmark_name}` to {revision}");
+    }
+    crate::app::pr_bookmarks::point_pr_bookmark(runner, None, cwd, n, revision)?;
     Ok(Some(bookmark_name))
 }
 
@@ -446,7 +505,7 @@ pub(super) fn verify_push_reached_github(
     cwd: &Path,
     owner_repo: &str,
     branch: &str,
-) -> Result<()> {
+) -> Result<String> {
     let local_sha = runner
         .run(&RealCommandRunner::invocation(
             cwd,
@@ -485,7 +544,7 @@ pub(super) fn verify_push_reached_github(
              against `gh api repos/{owner_repo}/branches/{branch} --jq .commit.sha`."
         )));
     }
-    Ok(())
+    Ok(local_sha.to_owned())
 }
 
 /// Extract the PR number from a GitHub pull request URL.
@@ -673,7 +732,8 @@ pub(super) fn pr_push(args: PrPushArgs, runner: &dyn CommandRunner) -> Result<Ru
     }
 
     // Verify the push reached GitHub.
-    verify_push_reached_github(runner, &cwd, &owner_repo, &head_branch)?;
+    let published = verify_push_reached_github(runner, &cwd, &owner_repo, &head_branch)?;
+    record_published_pr_head(runner, &cwd, Some(pr_number), &published)?;
 
     let pr_url = format!("https://github.com/{owner_repo}/pull/{pr_number}");
     RunResult::new(

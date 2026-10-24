@@ -122,6 +122,25 @@ fn pr_push_happy_path_advance() {
             ],
             "deadbeef\n",
         ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["bookmark", "set", "pr/42", "-r", "deadbeef", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "deadbeef\n",
+        ),
     ]);
 
     let cli = Cli::parse_from(["cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc"]);
@@ -545,6 +564,25 @@ fn pr_push_force_with_lease_happy_path() {
             ],
             "new_sha\n",
         ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["bookmark", "set", "pr/42", "-r", "new_sha", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "new_sha\n",
+        ),
     ]);
 
     let cli = Cli::parse_from([
@@ -742,6 +780,25 @@ fn pr_push_infers_from_ancestry() {
                 "repos/spinyfin/mono/branches/boss/exec_abc",
                 "--jq",
                 ".commit.sha",
+            ],
+            "deadbeef\n",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["bookmark", "set", "pr/42", "-r", "deadbeef", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
             ],
             "deadbeef\n",
         ),

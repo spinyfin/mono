@@ -243,9 +243,9 @@ fn tree_delta_cmd(head_before: &str, branch: &str, out: &str) -> ExpectedCommand
 }
 
 /// Push + verify, the clean-rebase tail.
-fn push_and_verify_cmds(branch: &str) -> Vec<ExpectedCommand> {
+fn push_and_verify_cmds(branch: &str, pr: Option<u64>) -> Vec<ExpectedCommand> {
     let api_path = format!("repos/{REBASE_OWNER_REPO}/branches/{branch}");
-    vec![
+    let mut cmds = vec![
         ExpectedCommand::ok(
             rebase_cwd(),
             "jj",
@@ -264,7 +264,19 @@ fn push_and_verify_cmds(branch: &str) -> Vec<ExpectedCommand> {
             &["api", &api_path, "--jq", ".commit.sha"],
             "pushed1",
         ),
-    ]
+    ];
+    if pr.is_none() {
+        cmds.push(ExpectedCommand::ok(
+            rebase_cwd(),
+            "gh",
+            &[
+                "api",
+                &format!("repos/{REBASE_OWNER_REPO}/pulls?head=spinyfin:{branch}&state=open"),
+            ],
+            "[]",
+        ));
+    }
+    cmds
 }
 
 fn run_rebase(runner: &FakeRunner, opts: &RebaseOpts) -> Result<crate::app::errors::RunResult> {
@@ -295,7 +307,7 @@ fn rebase_happy_path_positioned_clean_then_pushes() {
         positioned_cmd(branch, "aaa111"),
     ];
     cmds.extend(set_track_rebase_check_cmds(branch, &[]));
-    cmds.extend(push_and_verify_cmds(branch));
+    cmds.extend(push_and_verify_cmds(branch, None));
 
     let runner = FakeRunner::new(cmds);
     let result = run_rebase(&runner, &rebase_opts(None, None, false)).expect("clean rebase");
@@ -336,7 +348,7 @@ fn rebase_explicit_bookmark_skips_discovery_and_strips_remote_suffix() {
     let mut cmds = vec![fetch_cmd(), remote_exists_cmd(branch, "ccc")];
     cmds.push(positioned_cmd(branch, "ccc"));
     cmds.extend(set_track_rebase_check_cmds(branch, &[]));
-    cmds.extend(push_and_verify_cmds(branch));
+    cmds.extend(push_and_verify_cmds(branch, None));
 
     let runner = FakeRunner::new(cmds);
     // pass the @origin form; expect it stripped to the plain name
@@ -361,8 +373,29 @@ fn rebase_pr_arg_resolves_head_branch_from_github() {
         positioned_cmd(branch, "e1"),
     ];
     cmds.extend(set_track_rebase_check_cmds(branch, &[]));
-    cmds.extend(push_and_verify_cmds(branch));
+    cmds.extend(push_and_verify_cmds(branch, Some(7)));
 
+    cmds.extend([
+        ExpectedCommand::ok(
+            rebase_cwd(),
+            "jj",
+            &["bookmark", "set", "pr/7", "-r", "pushed1", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(
+            rebase_cwd(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/7")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "pushed1\n",
+        ),
+    ]);
     let runner = FakeRunner::new(cmds);
     let result = run_rebase(&runner, &rebase_opts(None, Some(7), false)).expect("pr rebase");
     runner.assert_exhausted();
@@ -551,7 +584,7 @@ fn rebase_mispositioned_at_self_heals_with_jj_new_before_rebase() {
         ExpectedCommand::ok(rebase_cwd(), "jj", &["new", &format!("{branch}@{REBASE_REMOTE}")], ""),
     ];
     cmds.extend(set_track_rebase_check_cmds(branch, &[]));
-    cmds.extend(push_and_verify_cmds(branch));
+    cmds.extend(push_and_verify_cmds(branch, None));
 
     let runner = FakeRunner::new(cmds);
     let result = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect("self-heal rebase");
@@ -664,7 +697,7 @@ fn rebase_collapses_a_replay_only_conflicted_ancestor_and_pushes() {
         &merged_description("the real change", &["wip: half the fix"]),
     ));
     cmds.push(op_id_cmd("op-describe\n"));
-    cmds.extend(push_and_verify_cmds(branch));
+    cmds.extend(push_and_verify_cmds(branch, None));
 
     let runner = FakeRunner::new(cmds);
     let result = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect("replay-only rebase");
@@ -1029,7 +1062,7 @@ fn rebase_clean_path_runs_no_linearization_probes() {
         positioned_cmd(branch, "u1"),
     ];
     cmds.extend(set_track_rebase_check_cmds(branch, &[]));
-    cmds.extend(push_and_verify_cmds(branch));
+    cmds.extend(push_and_verify_cmds(branch, None));
 
     let runner = FakeRunner::new(cmds);
     let result = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect("clean rebase");

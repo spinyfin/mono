@@ -12,7 +12,7 @@ use crate::app::checkleft_gate::run_checkleft_gate;
 use crate::app::errors::{CubeError, Result, RunResult};
 use crate::app::gh_pr;
 use crate::app::jj::{run_jj, run_jj_network};
-use crate::app::pr::verify_push_reached_github;
+use crate::app::pr::{record_published_workspace_head, verify_push_reached_github};
 use crate::app::pr_bookmarks;
 use crate::app::provision::find_workspace_record;
 use crate::app::reset::resolve_github_remote_for_workspace;
@@ -1075,7 +1075,8 @@ pub(super) fn rebase_workspace_branch(
              `jj git push -b {boss_branch} --remote {github_remote}`."
         )));
     }
-    verify_push_reached_github(runner, cwd, owner_repo, &boss_branch)?;
+    let published = verify_push_reached_github(runner, cwd, owner_repo, &boss_branch)?;
+    record_published_workspace_head(runner, cwd, owner_repo, &boss_branch, opts.explicit_pr, &published)?;
 
     eprintln!("cube: workspace rebase: {boss_branch} rebased onto {main_branch} cleanly and pushed");
     RunResult::new(
@@ -1194,7 +1195,8 @@ pub(super) fn workspace_push(
         ))
         .map_err(|e| CubeError::InvalidArgument(format!("failed to push `{boss_branch}`: {e}")))?;
 
-    verify_push_reached_github(runner, &cwd, &owner_repo, &boss_branch)?;
+    let published = verify_push_reached_github(runner, &cwd, &owner_repo, &boss_branch)?;
+    record_published_workspace_head(runner, &cwd, &owner_repo, &boss_branch, pr, &published)?;
 
     RunResult::new(
         format!("PUSHED: branch `{boss_branch}` pushed to `{github_remote}`."),
