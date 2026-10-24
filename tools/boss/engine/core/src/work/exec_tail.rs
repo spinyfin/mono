@@ -377,12 +377,14 @@ impl WorkDb {
     /// Fetch a single task/chore by primary id, including the
     /// `external_ref_*` columns. Used by the `LinkWorkItemExternalRef` /
     /// `UnlinkWorkItemExternalRef` handlers so the `WorkItemUpdated`
-    /// response carries the live `external_ref` snapshot.
+    /// response carries the live `external_ref` snapshot — and, because the
+    /// app replaces its cached card with that response, every derived
+    /// projection too (`project_for_work_item_updated`).
     ///
     /// Returns an error if the work item does not exist or is soft-deleted.
     pub fn get_task_with_external_ref(&self, id: &str) -> Result<WorkItem> {
         let conn = self.connect()?;
-        conn.query_row(
+        let mut task = conn.query_row(
             "SELECT id, product_id, project_id, kind, name, description, status, ordinal,
                     pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor,
                     priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url,
@@ -399,8 +401,9 @@ impl WorkDb {
         )
         .optional()
         .map_err(anyhow::Error::from)?
-        .map(task_to_item)
-        .with_context(|| format!("work item not found or soft-deleted: {id}"))
+        .with_context(|| format!("work item not found or soft-deleted: {id}"))?;
+        project_for_work_item_updated(&conn, &mut task, "get_task_with_external_ref");
+        Ok(task_to_item(task))
     }
 
     /// Find the work item actively bound to `(kind, canonical_id)`.

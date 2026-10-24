@@ -626,6 +626,7 @@ mod audit_misc;
 mod automations;
 mod blocked_workspace;
 mod blocking;
+mod board_notifications;
 pub(crate) mod board_runtime_cache;
 mod boothby;
 mod cached_task_runtimes;
@@ -732,6 +733,7 @@ pub(crate) use attention_filing::warn_if_lifecycle_undeclared;
 pub use attention_reconcile::AttentionReconcileOutcome;
 use attentions::create_attention_in_tx;
 pub(crate) use audit_misc::*;
+use board_notifications::stage_task_board_change;
 pub(crate) use cached_task_runtimes::*;
 pub(crate) use chain_helpers::*;
 use create_entities::create_project_in_tx;
@@ -750,7 +752,7 @@ pub(crate) use mappers::*;
 pub(crate) use pr_state::stored_pr_number;
 pub(crate) use products_design::{
     attach_task_doc_link_state, attach_task_doc_link_states, attach_task_doc_link_states_for_groups,
-    parse_pr_doc_artifact_id,
+    parse_pr_doc_artifact_id, project_for_work_item_updated,
 };
 pub(crate) use review_guide_jobs::{
     PrReviewGuideAttempt, PrReviewGuideVersion, PublishReviewGuideOutcome, RetryReviewGuideOutcome,

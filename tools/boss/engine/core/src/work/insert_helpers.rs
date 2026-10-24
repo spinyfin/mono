@@ -237,7 +237,8 @@ pub(crate) fn apply_create_time_dependencies(
     // `dependent_id` is always freshly created in the same transaction as
     // this call (see the comment above), so it can never have a live
     // execution attached yet — `add_dependency_edge_in_tx`'s cancelled-
-    // execution channel is guaranteed empty and `pending` stays empty too.
+    // execution channel is guaranteed empty. Board-change hints are redundant
+    // here: the enclosing create publishes the newly created item after commit.
     let mut pending = PendingEvents::new();
     for prerequisite_id in prerequisite_ids {
         let prerequisite_id = prerequisite_id.trim();
@@ -251,12 +252,19 @@ pub(crate) fn apply_create_time_dependencies(
         // inner message into a single flat string so a rejection reason
         // set deeper in `add_dependency_edge_in_tx` actually reaches the
         // caller.
-        add_dependency_edge_in_tx(&mut pending, conn, dependent_id, prerequisite_id, RELATION_BLOCKS, now)
-            .map_err(|err| anyhow::anyhow!("declaring create-time dependency on `{prerequisite_id}`: {err}"))?;
+        let (_, cancelled) =
+            add_dependency_edge_in_tx(&mut pending, conn, dependent_id, prerequisite_id, RELATION_BLOCKS, now)
+                .map_err(|err| anyhow::anyhow!("declaring create-time dependency on `{prerequisite_id}`: {err}"))?;
+        debug_assert!(
+            cancelled.is_none(),
+            "freshly-created work item cannot have a live execution"
+        );
     }
     debug_assert!(
-        pending.is_empty(),
-        "freshly-created work item cannot have a live execution"
+        pending.into_events().iter().all(|event| matches!(
+            event, boss_event_bus::Event::WorkItemChanged { task_id, .. } if task_id == dependent_id
+        )),
+        "create-time dependencies may only stage changes to the new item"
     );
     Ok(())
 }

@@ -142,6 +142,13 @@ sh_test(
 # never drift apart. Any new file added under Tests/BossTests/ therefore
 # automatically lands in shard3 and runs, instead of silently being skipped
 # by every shard (a false green) because no one remembered to hand-list it.
+# Compiled into every BossTests shard (shard3 picks it up through its glob):
+# the bundle's NSPrincipalClass, which XCTest instantiates before the first
+# test runs. See BossTestsPrincipal.swift and Tests/BossTests/Info.plist.
+_BOSS_TESTS_PRINCIPAL_SRCS = ["Tests/BossTests/BossTestsPrincipal.swift"]
+
+_BOSS_TESTS_INFOPLISTS = ["Tests/BossTests/Info.plist"]
+
 _COMMENTS_TRANSCRIPT_SHARD_SRCS = [
     "Tests/BossTests/CommentsTests.swift",
     "Tests/BossTests/TranscriptViewTests.swift",
@@ -226,6 +233,7 @@ macos_unit_test(
     name = "BossTestsCommentsTranscript",
     size = "small",
     env = XCODE_TEST_ENV,
+    infoplists = _BOSS_TESTS_INFOPLISTS,
     minimum_os_version = "15.0",
     runner = "//tools/test-sandbox:macos_direct_test_runner",
     deps = [":boss_mac_app_tests_comments_transcript_lib"],
@@ -234,7 +242,7 @@ macos_unit_test(
 swift_library(
     name = "boss_mac_app_tests_comments_transcript_lib",
     testonly = True,
-    srcs = _COMMENTS_TRANSCRIPT_SHARD_SRCS,
+    srcs = _COMMENTS_TRANSCRIPT_SHARD_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
     copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
     linkopts = _COVERAGE_LINKOPTS,
     module_name = "BossTestsCommentsTranscript",
@@ -245,6 +253,7 @@ macos_unit_test(
     name = "BossTestsShard1",
     size = "small",
     env = XCODE_TEST_ENV,
+    infoplists = _BOSS_TESTS_INFOPLISTS,
     minimum_os_version = "15.0",
     runner = "//tools/test-sandbox:macos_direct_test_runner",
     deps = [":boss_mac_app_tests_shard1_lib"],
@@ -253,7 +262,7 @@ macos_unit_test(
 swift_library(
     name = "boss_mac_app_tests_shard1_lib",
     testonly = True,
-    srcs = _SHARD1_SRCS,
+    srcs = _SHARD1_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
     copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
     linkopts = _COVERAGE_LINKOPTS,
     module_name = "BossTestsShard1",
@@ -264,6 +273,7 @@ macos_unit_test(
     name = "BossTestsShard2",
     size = "small",
     env = XCODE_TEST_ENV,
+    infoplists = _BOSS_TESTS_INFOPLISTS,
     minimum_os_version = "15.0",
     runner = "//tools/test-sandbox:macos_direct_test_runner",
     deps = [":boss_mac_app_tests_shard2_lib"],
@@ -272,7 +282,7 @@ macos_unit_test(
 swift_library(
     name = "boss_mac_app_tests_shard2_lib",
     testonly = True,
-    srcs = _SHARD2_SRCS,
+    srcs = _SHARD2_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
     copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
     linkopts = _COVERAGE_LINKOPTS,
     module_name = "BossTestsShard2",
@@ -285,6 +295,7 @@ macos_unit_test(
     # TrekPortraitGridTests slices the real bundled sheet.
     data = ["//tools/boss/app-macos/Sources/Resources/TrekIcons:trek_icons"],
     env = XCODE_TEST_ENV,
+    infoplists = _BOSS_TESTS_INFOPLISTS,
     minimum_os_version = "15.0",
     runner = "//tools/test-sandbox:macos_direct_test_runner",
     deps = [":boss_mac_app_tests_shard3_lib"],

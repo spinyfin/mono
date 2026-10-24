@@ -627,9 +627,11 @@ impl WorkDb {
         // Surface the just-written pointer immediately — without this,
         // `set-doc` echoes only the raw Task columns (none of which carry
         // doc_path) and the caller has no way to see the write took effect
-        // until a separate `task show`.
-        let mut doc_pointer_queries = 0u64;
-        attach_task_doc_link_state(&conn, &mut task, "set_task_doc", &mut doc_pointer_queries);
+        // until a separate `task show`. The same row is the app's
+        // `WorkItemUpdated` payload, so it also needs every derived
+        // projection (`review_section` among them): the app replaces its
+        // cached card with this row as-is.
+        project_for_work_item_updated(&conn, &mut task, "set_task_doc");
         Ok(task)
     }
 
@@ -839,6 +841,27 @@ impl WorkDb {
             })
         })?;
         collect_rows(rows)
+    }
+}
+
+/// Attach everything a `WorkItemUpdated` reply must carry beyond the raw
+/// `tasks` columns: the doc-link state and the derived projections
+/// (`has_in_progress_revision`, `ready_for_review`, `ai_review_state`,
+/// `review_section`, ...). The macOS client applies such a reply by
+/// replacing its cached card wholesale, so a row shipped without these
+/// would blank them on the board until the next full tree refetch — and a
+/// Review card with no `review_section` is reported by the client as a
+/// defect. Projection failures are logged and leave the raw row intact,
+/// matching `update_task`.
+pub(crate) fn project_for_work_item_updated(conn: &Connection, task: &mut Task, caller: &str) {
+    let mut doc_pointer_queries = 0u64;
+    attach_task_doc_link_state(conn, task, caller, &mut doc_pointer_queries);
+    if let Err(err) = attach_task_derived_projections(conn, task) {
+        tracing::warn!(
+            ?err,
+            task_id = %task.id,
+            "{caller}: derived projections failed; returning unprojected row"
+        );
     }
 }
 

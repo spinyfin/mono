@@ -1018,6 +1018,7 @@ pub(crate) fn reconcile_revision_execution(
                 )?
             };
             if settled > 0 {
+                stage_task_board_change(pending, conn, &task.id)?;
                 if attempt_succeeded {
                     tracing::info!(
                         task_id = %task.id,
@@ -1299,6 +1300,10 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
 
     let preferred_workspace_id = normalize_optional_text(preferred_workspace_id);
     let kind = execution_kind_for_work_item(conn, &work_item_id)?;
+
+    // Every successful request can clear blocks or change revision readiness.
+    // Failed transactions drop this event together with their writes.
+    stage_task_board_change(pending, conn, &work_item_id)?;
 
     // Refuse explicit dispatch against a status that can't accept one
     // (terminal or deleted) instead of silently creating a `ready`

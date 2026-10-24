@@ -24,6 +24,11 @@ use boss_protocol::{PrBodyView, PrStatusView, ProposalErrorCode, ProposalSubmiss
 
 use crate::merge_poller::PrLifecycleState;
 
+/// `work_invalidated` reason published when a `boss pr status --refresh`
+/// observation changed a stored PR-state column. `pub(super)` so the handler
+/// tests assert on the same constant the handler publishes.
+pub(super) const PR_STATUS_REFRESHED_REASON: &str = "pr_status_refreshed";
+
 /// Engine-wide bound on `boss pr status --refresh` probes: at most
 /// [`Self::MAX_PER_WINDOW`] live `gh pr view` calls per
 /// [`Self::WINDOW_SECS`]-second **fixed** window, shared across every
@@ -149,6 +154,7 @@ pub(super) async fn handle_get_pr_status(ctx: Dispatch, req: FrontendRequest) {
         server_state,
         work_db,
         sink,
+        session_id,
         request_id,
         peer_pid,
         ..
@@ -326,19 +332,43 @@ pub(super) async fn handle_get_pr_status(ctx: Dispatch, req: FrontendRequest) {
     let probe_head_sha = probe.head_ref_oid.as_deref();
     use crate::work::now_string;
     let observed_at = now_string();
-    if let Err(err) = work_db.set_pr_status_observation(
+    match work_db.set_pr_status_observation(
         &effective.status_task_id,
         mergeable,
         probe_merge_state_status,
         probe_head_sha,
         &observed_at,
     ) {
-        tracing::warn!(
-            work_item_id = %caller.work_item_id,
-            pr_url = %pr_url,
-            ?err,
-            "get_pr_status: failed to persist refresh observation (response still reflects the live probe)",
-        );
+        Ok(true) => {
+            // The observation moved a column the Review-column classifier
+            // (`classify_review_section`) or the merge poller's changed-guard
+            // reads. The board only re-reads a card when it is told to, and
+            // the poller's next sweep will diff its probe against the row
+            // just written and find nothing new to announce — so this is the
+            // only place the invalidation can come from. Without it the card
+            // stays wherever the last published state put it (typically
+            // Pending, with mergeability still "unknown") while the engine
+            // classifies it Ready.
+            publish_work_invalidation(
+                &server_state,
+                &session_id,
+                &request_id,
+                vec![work_product_topic(&task.product_id)],
+                PR_STATUS_REFRESHED_REASON,
+                Some(task.product_id.clone()),
+                vec![effective.status_task_id.clone()],
+            )
+            .await;
+        }
+        Ok(false) => {}
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %caller.work_item_id,
+                pr_url = %pr_url,
+                ?err,
+                "get_pr_status: failed to persist refresh observation (response still reflects the live probe)",
+            );
+        }
     }
 
     // Mirror the write path's COALESCE: a probe response missing a field
