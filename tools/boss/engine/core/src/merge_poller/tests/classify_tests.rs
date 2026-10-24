@@ -686,3 +686,37 @@ fn leaf_matches_check_name_no_match_is_false() {
 }
 
 // ── record_conflict_class_counter (Layer 0 per-product counters) ──
+
+#[test]
+fn rerun_timestamps_win_over_rollup_order() {
+    for (name_key, state_key, time_key, pass, fail) in [
+        ("context", "state", "createdAt", "SUCCESS", "FAILURE"),
+        ("name", "conclusion", "startedAt", "SUCCESS", "FAILURE"),
+    ] {
+        let newer = serde_json::json!({
+            name_key: "buildkite/mono/mac-app-build", state_key: pass,
+            time_key: "2026-10-24T04:00:00Z", "status": "COMPLETED"
+        });
+        let older = serde_json::json!({
+            name_key: "buildkite/mono/mac-app-build", state_key: fail,
+            time_key: "2026-10-24T03:00:00Z", "status": "COMPLETED"
+        });
+        assert!(matches!(
+            classify_ci(std::slice::from_ref(&older), None),
+            OpenPrCiStatus::Failing { .. }
+        ));
+        assert_eq!(
+            classify_ci(&[newer.clone(), older.clone()], None),
+            OpenPrCiStatus::Clean
+        );
+        assert_eq!(classify_ci(&[older, newer], None), OpenPrCiStatus::Clean);
+    }
+}
+
+#[test]
+fn queued_rerun_without_start_time_is_not_hidden_by_old_success() {
+    let mut old = check_run("ci/build", "COMPLETED", "SUCCESS");
+    old["startedAt"] = serde_json::json!("2026-10-24T03:00:00Z");
+    let queued = check_run("ci/build", "QUEUED", "");
+    assert_eq!(classify_ci(&[old, queued], None), OpenPrCiStatus::InFlight);
+}

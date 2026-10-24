@@ -38,7 +38,12 @@ pub(super) fn candidate(product_id: &str, work_item_id: &str, pr_url: &str) -> P
 pub(super) fn probe(pr_url: &str, head_sha: &str) -> PrLifecycleProbe {
     PrLifecycleProbe::builder()
         .url(pr_url.to_owned())
-        .state(PrLifecycleState::Open(OpenPrStatus::clean()))
+        .state(PrLifecycleState::Open(OpenPrStatus {
+            ci: OpenPrCiStatus::Failing {
+                failures: one_failure(),
+            },
+            ..OpenPrStatus::clean()
+        }))
         .base_ref_oid("base-1")
         .head_ref_oid(head_sha.to_owned())
         .labels(Vec::new())
@@ -49,7 +54,12 @@ pub(super) fn probe(pr_url: &str, head_sha: &str) -> PrLifecycleProbe {
 pub(super) fn probe_with_labels(pr_url: &str, head_sha: &str, labels: &[&str]) -> PrLifecycleProbe {
     PrLifecycleProbe::builder()
         .url(pr_url.to_owned())
-        .state(PrLifecycleState::Open(OpenPrStatus::clean()))
+        .state(PrLifecycleState::Open(OpenPrStatus {
+            ci: OpenPrCiStatus::Failing {
+                failures: one_failure(),
+            },
+            ..OpenPrStatus::clean()
+        }))
         .base_ref_oid("base-1")
         .head_ref_oid(head_sha.to_owned())
         .labels(labels.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())

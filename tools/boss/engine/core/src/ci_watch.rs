@@ -348,6 +348,9 @@ pub async fn on_ci_failure_detected(
     probe: &PrLifecycleProbe,
     failures: &[RequiredCheckFailure],
 ) -> bool {
+    if !matches!(&probe.state, PrLifecycleState::Open(open) if matches!(open.ci, OpenPrCiStatus::Failing { .. })) {
+        return false;
+    }
     if failures.is_empty() {
         // Defensive — the dispatch site already filtered on Failing,
         // but if a future caller hands us an empty set we should not
@@ -581,6 +584,40 @@ pub async fn on_ci_failure_detected(
         }
     }
 
+    // Work on one distinct failing check at a time. Include terminal attempts
+    // in deduplication so re-observing a failure cannot mint another revision.
+    // The budget gate above still surfaces genuine exhaustion on a red head.
+    let attempt_kind = classify_pre_triage(failures);
+    let mut selected = None;
+    for failure in failures {
+        if attempt_kind == "retrigger" {
+            selected = Some(failure);
+            break;
+        }
+        if classify_pre_triage(std::slice::from_ref(failure)) == "retrigger" {
+            continue;
+        }
+        match work_db.ci_check_attempted(&candidate.work_item_id, head_sha, &failure.name) {
+            Ok(false) => {
+                selected = Some(failure);
+                break;
+            }
+            Ok(true) => {}
+            Err(err) => {
+                tracing::warn!(?err, "ci_watch: cannot read failure identity; deferring");
+                return false;
+            }
+        }
+    }
+    let Some(selected) = selected else {
+        return false;
+    };
+    let failures = if attempt_kind == "fix" {
+        std::slice::from_ref(selected)
+    } else {
+        failures
+    };
+
     // Pre-spawn classification (design §Q4 "pre-triage"): if every
     // failure is `STARTUP_FAILURE` or `CANCELLED` we choose
     // `retrigger`; otherwise `fix`. Retriggers don't consume budget.
@@ -591,8 +628,8 @@ pub async fn on_ci_failure_detected(
     let pr_number = stored_pr_number(&candidate.pr_url).unwrap_or(0);
 
     // Best-effort attempt insert. The unique key
-    // (work_item_id, head_sha, attempt_kind) is the idempotency lock —
-    // a second probe for the same triplet finds the row already
+    // (work_item_id, head_sha, attempt_kind, failing_check) is the
+    // idempotency lock — a repeat observation finds the row already
     // present and `INSERT OR IGNORE` updates zero rows; we still want
     // to flip the parent to `blocked: ci_failure` if it isn't already
     // there (e.g. the engine restarted mid-cycle).
@@ -717,22 +754,6 @@ pub async fn on_ci_failure_detected(
     // is set only by a fresh-attempt spawn.)
     let task_changed = task_transitioned || task_unblocked_for_revision;
     if task_changed {
-        // Bump the budget counter when we created a fix-kind attempt — the
-        // design (§Q3) says the counter increments when "a fix attempt
-        // actually progresses past the worker's go/no-go." The flip may have
-        // been cleared back to `in_review` for an in-flight revision, but a fix
-        // attempt still progressed, so the bump is keyed off the attempt, not
-        // the parent's terminal status.
-        if attempt.is_some()
-            && attempt_kind == "fix"
-            && let Err(err) = work_db.increment_ci_attempts_used(&candidate.work_item_id)
-        {
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                ?err,
-                "ci_watch: failed to increment ci_attempts_used",
-            );
-        }
         // Parent stays in Review while the revision runs
         // (`ci_revision_in_flight`); it surfaces in Blocked
         // (`blocked_ci_failure`) only when there is no fix vehicle.
@@ -1477,17 +1498,6 @@ async fn on_queue_side_failure_detected(
 
     let task_changed = task_transitioned || task_unblocked_for_revision;
     if task_changed {
-        // Keyed off the attempt (mirrors on_ci_failure_detected's budget
-        // comment): a fresh `fix` attempt progressed even when the upfront
-        // flip was immediately undone by a successful revision spawn.
-        if let Err(err) = work_db.increment_ci_attempts_used(&candidate.work_item_id) {
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                ?err,
-                failure_kind,
-                "ci_watch: failed to increment ci_attempts_used (queue-side failure)",
-            );
-        }
         let change_reason = if task_unblocked_for_revision {
             "ci_revision_in_flight"
         } else {

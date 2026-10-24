@@ -14,3 +14,5 @@ mod revision;
 mod revision_description;
 mod stale_revision;
 mod trunk_eviction;
+
+mod failure_identity;

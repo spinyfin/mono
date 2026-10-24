@@ -9,7 +9,8 @@ use super::helpers::*;
 
 #[test]
 fn noop_validation_honors_clean_ci_keyed_to_live_head() {
-    let p = probe("https://github.com/foo/bar/pull/1", "sha-green");
+    let mut p = probe("https://github.com/foo/bar/pull/1", "sha-green");
+    p.state = PrLifecycleState::Open(OpenPrStatus::clean());
     assert_eq!(
         classify_noop_validation(&p),
         NoopValidation::Green {
@@ -83,5 +84,6 @@ fn noop_validation_carries_no_sha_when_github_omits_head_ref_oid() {
     // but there is no SHA to record.
     let mut p = probe("https://github.com/foo/bar/pull/1", "ignored");
     p.head_ref_oid = None;
+    p.state = PrLifecycleState::Open(OpenPrStatus::clean());
     assert_eq!(classify_noop_validation(&p), NoopValidation::Green { head_sha: None },);
 }

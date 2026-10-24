@@ -413,14 +413,14 @@ pub(crate) const PR_PROBE_FIELDS: &str = concat!(
     "mergeQueueEntry { state position enqueuedAt } ",
     "autoMergeRequest { enabledAt } ",
     "mergeCommit { oid } updatedAt ",
-    "commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 30) { nodes { ",
+    "commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: 30) { nodes { ",
     // `completedAt` is requested for one reader only: it is the episode
     // discriminator `trunk_queue_adopt` keys adoption on (a head sha is not
     // one — a PR can be queued twice on an unchanged head) and the only
     // datum that says how old an eviction is. It is a scalar on a node
     // already being fetched, so it costs no extra GraphQL nodes.
-    "__typename ... on CheckRun { name status conclusion detailsUrl completedAt } ",
-    "... on StatusContext { context state targetUrl } } } } } } }",
+    "__typename ... on CheckRun { name status conclusion detailsUrl startedAt completedAt } ",
+    "... on StatusContext { context state targetUrl createdAt } } } } } } }",
 );
 
 /// Batch-probe every PR in `pr_urls` with a single `gh api graphql` round
@@ -729,6 +729,7 @@ pub(crate) fn flatten_batched_pr_node(node: &serde_json::Value) -> serde_json::V
         "baseRefName": node["baseRefName"],
         "labels": labels,
         "statusCheckRollup": rollup,
+        "ciHeadOid": node["commits"]["nodes"][0]["commit"]["oid"],
         "reviewDecision": node["reviewDecision"],
         "reviews": reviews,
         "mergeQueueEntry": node["mergeQueueEntry"],
@@ -927,6 +928,14 @@ pub(crate) fn parse_probe_json(url: &str, body: &str, combined_state: Option<&st
     }
     let root: serde_json::Value =
         serde_json::from_str(trimmed).with_context(|| format!("failed to parse `gh pr view {url}` JSON"))?;
+    // A force-push can race a batched probe. Never attribute a previous
+    // commit's rollup to the newly observed PR head.
+    if let Some(ci_head) = root.get("ciHeadOid").and_then(|v| v.as_str())
+        && root.get("state").and_then(|v| v.as_str()) == Some("OPEN")
+        && root.get("headRefOid").and_then(|v| v.as_str()) != Some(ci_head)
+    {
+        return Err(anyhow!("CI rollup commit does not match current PR head for {url}"));
+    }
     let raw_state = root.get("state").and_then(|v| v.as_str()).unwrap_or("");
     let merged_at = root.get("mergedAt").and_then(|v| v.as_str()).unwrap_or("");
     let mergeable = root.get("mergeable").and_then(|v| v.as_str()).unwrap_or("");
