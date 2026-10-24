@@ -419,6 +419,9 @@ pub(crate) struct RunDoneArgs {
 
     /// Self-contained decision explanation with these labels on their own lines,
     /// in order: Context:, Yes:, No:, Recommendation:, and optional Details:.
+    /// For `multiple-choice` use only Context:, Recommendation:, and optional
+    /// Details: (there are no Yes/No buttons); say in Context what each option
+    /// leads to.
     /// Context opens with 1–2 plain-language sentences about the work and blocker.
     /// Yes/No state the user-visible result and rough work size; No leaves work
     /// blocked, rather than starting an alternative automatically. Recommend an
@@ -810,7 +813,11 @@ fn operator_question_from_flags(
     prerequisite_name: Option<String>,
     prerequisite_brief: Option<String>,
 ) -> Result<Option<boss_protocol::OperatorQuestion>, CliError> {
-    let explanation = explanation.unwrap_or_default();
+    let explanation = match answer_type {
+        None => explanation.unwrap_or_default(),
+        Some(kind) => explanation::validate_for(&explanation.unwrap_or_default(), kind == "multiple-choice")
+            .map_err(CliError::usage)?,
+    };
     if answer_type != Some("multiple-choice") && !choices.is_empty() {
         return Err(CliError::usage(
             "--choices only applies to --answer-type multiple-choice",
@@ -1134,7 +1141,7 @@ mod tests {
             "--answer-type",
             "multiple-choice",
             "--explanation",
-            explanation::tests::VALID,
+            explanation::tests::VALID_CHOICE,
         ];
         let payload = |extra: &[&str]| {
             let Commands::Propose(args) = Cli::try_parse_from(base.iter().chain(extra)).ok()?.command else {
@@ -1144,6 +1151,16 @@ mod tests {
         };
         // The options are required with the multiple-choice type.
         assert!(Cli::try_parse_from(base).is_err());
+        // A multiple-choice explanation has no Yes/No sections.
+        let mut with_yes_no = base;
+        *with_yes_no.last_mut().unwrap() = explanation::tests::VALID;
+        let Commands::Propose(args) = Cli::try_parse_from(with_yes_no.iter().chain(&["--choices", "a", "b"]))
+            .unwrap()
+            .command
+        else {
+            panic!("expected propose")
+        };
+        assert!(payload_for(args.command.unwrap()).is_err());
         let built = payload(&["--choices", " Gradual ", "All at once"]).unwrap();
         assert_eq!(
             built["question"]["answer_type"],

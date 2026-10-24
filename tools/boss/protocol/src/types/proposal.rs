@@ -699,7 +699,7 @@ pub enum OperatorAnswerType {
         name: String,
         brief: String,
     },
-    /// The operator picks one of `choices`; the answer is
+    /// One of `choices` is selected; the answer is
     /// [`OperatorAnswer::MultipleChoice`] carrying the chosen string verbatim.
     /// The card renders one button per choice. Producers must keep `choices`
     /// valid per [`OperatorAnswerType::validate_choices`].

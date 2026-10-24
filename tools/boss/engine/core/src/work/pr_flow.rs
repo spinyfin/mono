@@ -2099,7 +2099,8 @@ impl WorkDb {
     /// The selector is a question id or a canonical task id (RPC resolves short ids).
     ///
     /// `minted_execution` is true only when this call minted a ready execution
-    /// (a first Yes on a plain question); the caller must then kick the
+    /// (a first Yes on a plain question, or a first choice on a multiple-choice
+    /// question); the caller must then kick the
     /// scheduler, since the transaction stages no dispatch wakeup of its own.
     /// It is false for No answers, for idempotent repeats, and for a
     /// prerequisite approval (the task is parked behind its prerequisite; the
@@ -2273,8 +2274,8 @@ fn restart_after_answer(
     Ok(())
 }
 
-/// The brief addendum for a multiple-choice answer: the option the operator
-/// picked, verbatim. Unlike [`authorization_block`] it grants nothing beyond
+/// The brief addendum for a multiple-choice answer: the chosen option,
+/// verbatim. Unlike [`authorization_block`] it grants nothing beyond
 /// the decision itself.
 fn choice_block(question: &OperatorQuestionView, choice: &str, timestamp: &str) -> String {
     format!(

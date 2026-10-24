@@ -1,5 +1,5 @@
-// Multiple-choice operator questions: a blocked worker offers two to six
-// options, the operator picks one, and the engine records exactly that string.
+// Multiple-choice questions: a blocked worker offers two to six options, one
+// is chosen, and the engine records exactly that string.
 use super::*;
 
 fn multiple_choice_payload() -> Value {

@@ -4,18 +4,27 @@ import Foundation
 /// format. Old or incomplete explanations remain visible verbatim.
 struct OperatorQuestionExplanation: Equatable {
     let context: String
-    let yes: String
-    let no: String
+    /// Nil for a multiple-choice question, whose answers are option buttons
+    /// rather than Yes/No.
+    let yes: String?
+    let no: String?
     let recommendation: String
     let details: String?
 
+    private static let yesNoHeadings = ["Context:", "Yes:", "No:", "Recommendation:", "Details:"]
+    private static let choiceHeadings = ["Context:", "Recommendation:", "Details:"]
+
     init?(_ explanation: String) {
-        let lines = explanation.components(separatedBy: .newlines)
-        let headings = ["Context:", "Yes:", "No:", "Recommendation:", "Details:"]
+        // The second label tells the two shapes apart.
+        let isChoice = explanation.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .first(where: { Self.yesNoHeadings.contains($0) && $0 != "Context:" }) == "Recommendation:"
+        let headings = isChoice ? Self.choiceHeadings : Self.yesNoHeadings
+        let required = headings.count - 1
         var parts: [String] = []
         var body: [String] = []
         var next = 0
-        for line in lines {
+        for line in explanation.components(separatedBy: .newlines) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if next < headings.count, trimmed == headings[next] {
                 if next == 0 {
@@ -30,17 +39,23 @@ struct OperatorQuestionExplanation: Equatable {
             } else {
                 // Reject malformed labels before Details; never discard or
                 // interpret technical content inside Details.
-                if next < headings.count, headings.contains(trimmed) { return nil }
+                if next < headings.count, Self.yesNoHeadings.contains(trimmed) { return nil }
                 body.append(line)
             }
         }
-        guard next >= 4 else { return nil }
+        guard next >= required else { return nil }
         parts.append(body.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines))
-        guard parts.prefix(4).allSatisfy({ !$0.isEmpty }) else { return nil }
+        guard parts.prefix(required).allSatisfy({ !$0.isEmpty }) else { return nil }
         context = parts[0]
-        yes = parts[1]
-        no = parts[2]
-        recommendation = parts[3]
-        details = parts.count == 5 ? parts[4] : nil
+        if isChoice {
+            yes = nil
+            no = nil
+            recommendation = parts[1]
+        } else {
+            yes = parts[1]
+            no = parts[2]
+            recommendation = parts[3]
+        }
+        details = parts.count == headings.count ? parts[required] : nil
     }
 }

@@ -11,8 +11,8 @@ struct OperatorQuestionDecisionContent: View {
             Text(question)
                 .fontWeight(.medium)
                 .accessibilityIdentifier("operator-question-text")
-            labeled("Yes", explanation.yes)
-            labeled("No", explanation.no)
+            if let yes = explanation.yes { labeled("Yes", yes) }
+            if let no = explanation.no { labeled("No", no) }
             labeled("Recommendation", explanation.recommendation)
         }
         .font(.callout)

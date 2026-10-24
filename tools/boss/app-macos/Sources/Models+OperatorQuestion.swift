@@ -72,7 +72,10 @@ struct OperatorQuestion: Hashable {
             // question nobody can answer; fall back to the plain blocked card.
             guard let wireChoices = answerTypeDict["choices"] as? [String],
                   choiceCountRange.contains(wireChoices.count),
-                  Set(wireChoices).count == wireChoices.count,
+                  // Compare scalars, as the engine compares bytes: String equality
+                  // would merge canonically equivalent spellings the engine
+                  // accepts as distinct.
+                  Set(wireChoices.map { Array($0.unicodeScalars.map(\.value)) }).count == wireChoices.count,
                   !wireChoices.contains(where: { $0.isEmpty })
             else { return nil }
             choices = wireChoices
