@@ -281,27 +281,39 @@ time.sleep(60)
         .spawn()
         .unwrap();
     let pane_pid = pane.id() as libc::pid_t;
+    // Hang guard only: the fake agent registers on its own schedule, which
+    // stretches on a loaded host, so wait on the registrations themselves.
+    let expected_path = sessions.parent().unwrap().join("expected");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let mut resolved = None;
+    let mut registered = None;
+    let mut registration_count = 0;
     let mut last_error = String::new();
-    for _ in 0..100 {
+    while tokio::time::Instant::now() < deadline {
         match resolve_claude_pid(&sessions, pane_pid).await {
-            Ok(pid) => {
-                resolved = Some(pid);
-                break;
-            }
+            Ok(pid) => resolved = Some(pid),
             Err(error) => last_error = format!("{error:#}"),
+        }
+        registered = std::fs::read_to_string(&expected_path)
+            .ok()
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok());
+        registration_count = std::fs::read_dir(&sessions).unwrap().count();
+        if resolved.is_some() && registered.is_some() && registration_count >= 2 {
+            break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let registered = std::fs::read_to_string(sessions.parent().unwrap().join("expected"))
-        .ok()
-        .and_then(|pid| pid.parse::<libc::pid_t>().ok());
-    let registration_count = std::fs::read_dir(&sessions).unwrap().count();
+    if resolved.is_some() && (registered.is_none() || registration_count < 2) {
+        last_error = format!(
+            "resolved {resolved:?} but the fake agent's own registration is missing (expected pid file: {registered:?}, session files: {registration_count} of 2)"
+        );
+        resolved = None;
+    }
     pane.kill().unwrap();
     let relay = pane.wait_with_output().unwrap();
     let resolved = resolved.unwrap_or_else(|| {
         panic!(
-            "registration resolves below the relay: {last_error}; relay stderr: {}",
+            "registration did not resolve below the relay within 60s: {last_error}; relay stderr: {}",
             String::from_utf8_lossy(&relay.stderr)
         )
     });
