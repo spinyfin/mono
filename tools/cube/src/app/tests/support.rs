@@ -159,6 +159,12 @@ pub(super) fn gc_pr_sweep_command(workspace_path: &std::path::Path, output: &str
     )
 }
 
+/// The git-ref import that precedes the `pr/<n>` half of the sweep, which
+/// surfaces stale `refs/heads/pr/*` left behind by an older cube.
+pub(super) fn gc_git_import_command(workspace_path: &std::path::Path) -> ExpectedCommand {
+    ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "import"], "")
+}
+
 /// The `pr/<n>` half reporting that every `pr/*` bookmark is still
 /// referenced, so nothing is swept. Add to any release runner after
 /// [`gc_noop_command`].
@@ -197,6 +203,7 @@ pub(super) fn release_runner_for(workspace_path: &std::path::Path) -> FakeRunner
         ),
         ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["new", "main@origin"], ""),
         gc_noop_command(workspace_path),
+        gc_git_import_command(workspace_path),
         gc_pr_noop_command(workspace_path),
     ])
 }

@@ -1,6 +1,6 @@
 use super::support::{
-    ExpectedCommand, FakeRunner, gc_noop_command, gc_pr_noop_command, lease_runner_for, lease_runner_with_setup,
-    release_guard_reusable_command, seed_mono_repo, with_database_path, write_setup_yaml,
+    ExpectedCommand, FakeRunner, gc_git_import_command, gc_noop_command, gc_pr_noop_command, lease_runner_for,
+    lease_runner_with_setup, release_guard_reusable_command, seed_mono_repo, with_database_path, write_setup_yaml,
 };
 use clap::Parser;
 use serde_json::json;
@@ -109,6 +109,7 @@ steps:
         ),
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
         gc_noop_command(&workspace_path),
+        gc_git_import_command(&workspace_path),
         gc_pr_noop_command(&workspace_path),
     ]);
     run_with_dependencies(
@@ -260,6 +261,7 @@ steps:
         ),
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
         gc_noop_command(&workspace_path),
+        gc_git_import_command(&workspace_path),
         gc_pr_noop_command(&workspace_path),
     ]);
     run_with_dependencies(
@@ -571,6 +573,7 @@ steps:
         ),
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
         gc_noop_command(&workspace_path),
+        gc_git_import_command(&workspace_path),
         gc_pr_noop_command(&workspace_path),
     ]);
     run_with_dependencies(

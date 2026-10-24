@@ -3,7 +3,6 @@
 
 use std::path::{Path, PathBuf};
 
-use git_utils::pr_bookmark;
 use serde_json::json;
 
 use crate::command_runner::{CommandRunner, RealCommandRunner};
@@ -14,6 +13,7 @@ use crate::app::errors::{CubeError, Result, RunResult};
 use crate::app::gh_pr;
 use crate::app::jj::{run_jj, run_jj_network};
 use crate::app::pr::verify_push_reached_github;
+use crate::app::pr_bookmarks;
 use crate::app::provision::find_workspace_record;
 use crate::app::reset::resolve_github_remote_for_workspace;
 
@@ -578,17 +578,11 @@ pub(super) fn workspace_goto(
 
     // Also set the pr/<n> bookmark when the caller specified --pr so that
     // `cube pr push` and `cube workspace rebase` can find the PR number later.
+    // This repairs a conflicted `pr/<n>` to the GitHub head (refusing when the
+    // other side has unique content) and exports to the colocated git repo, so
+    // a stale `refs/heads/pr/<n>` cannot re-conflict it on the next auto-import.
     if let Some(n) = pr {
-        let pr_bm = pr_bookmark::pr_bookmark_name(n);
-        run_jj(
-            runner,
-            database_path,
-            &RealCommandRunner::invocation(
-                &cwd,
-                "jj",
-                &["bookmark", "set", &pr_bm, "-r", &remote_ref, "--allow-backwards"],
-            ),
-        )?;
+        pr_bookmarks::point_pr_bookmark(runner, database_path, &cwd, n, &remote_ref)?;
     }
 
     // Idempotency check: if @ already has <remote_ref> as a direct parent,

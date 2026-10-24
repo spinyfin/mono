@@ -4,6 +4,8 @@
 use std::path::Path;
 use std::time::Instant;
 
+use git_utils::pr_bookmark;
+
 use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
 use crate::{audit, reuse_guard};
 
@@ -12,6 +14,7 @@ use crate::app::jj::{
     budgeted_timeout, jj_needs_colocate_init, jj_update_stale_recovery_kind, network_cmd_timeout, run_jj,
     run_jj_network_within, run_jj_within,
 };
+use crate::app::pr_bookmarks::delete_pr_bookmarks;
 
 /// Outcome of a pre-lease health check on a free workspace.
 #[derive(Debug, Clone)]
@@ -179,18 +182,30 @@ fn parse_conflicted_bookmarks_from_status(status: &str) -> Vec<String> {
     bookmarks
 }
 
-/// Forget each conflicted bookmark so the workspace no longer reports
+/// Repair each conflicted bookmark so the workspace no longer reports
 /// bookmark conflicts. Called at lease time when the health check finds
 /// `ConflictedBookmarks` and the workspace is otherwise clean (working
-/// copy empty). `jj bookmark forget` removes the local tracking state
-/// without touching remote refs.
+/// copy empty).
+///
+/// A conflicted `pr/<n>` is *deleted* (and the deletion exported to the
+/// colocated git repo), never forgotten: `jj bookmark forget` leaves
+/// `refs/heads/pr/<n>` behind in git, and the next auto-import resurrects it
+/// as a stale target that conflicts with the head `cube workspace goto --pr`
+/// sets next — see [`crate::app::pr_bookmarks`]. Deleting is lossless here:
+/// `pr/*` is a derived pointer from a PR number to its head, re-established
+/// from GitHub's head by the very next `goto --pr`, and the lease path
+/// deliberately makes no network call to resolve that head itself. Every
+/// other conflicted bookmark is forgotten, which removes the local tracking
+/// state without touching remote refs.
 pub(super) fn repair_conflicted_bookmarks(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
     workspace_path: &Path,
     bookmarks: &[String],
 ) -> Result<()> {
-    for bookmark in bookmarks {
+    let (pr_bookmarks, others): (Vec<String>, Vec<String>) =
+        bookmarks.iter().cloned().partition(|b| pr_bookmark::is_pr_bookmark(b));
+    for bookmark in &others {
         audit!(
             database_path,
             "workspace.bookmark_forgotten",
@@ -208,7 +223,15 @@ pub(super) fn repair_conflicted_bookmarks(
             },
         )?;
     }
-    Ok(())
+    for bookmark in &pr_bookmarks {
+        audit!(
+            database_path,
+            "workspace.bookmark_deleted",
+            workspace_path = workspace_path.display().to_string(),
+            bookmark = bookmark,
+        );
+    }
+    delete_pr_bookmarks(runner, database_path, workspace_path, &pr_bookmarks)
 }
 
 /// Audit one of cube's own `jj` invocations against a leased
