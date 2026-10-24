@@ -12,6 +12,11 @@ use boss_protocol::RequestExecutionInput;
 const SLOT: u8 = 1;
 
 fn spawned_worker(server_state: &ServerState) -> String {
+    spawned_worker_for_item(server_state).0
+}
+
+/// Like [`spawned_worker`], also returning the governing work item id.
+fn spawned_worker_for_item(server_state: &ServerState) -> (String, String) {
     let db = server_state.work_db.as_ref();
     let product = create_test_product_with_repo(db, "p", Some("git@example.com:p.git"));
     let chore = create_test_chore_manual(db, product.id.clone(), "c");
@@ -26,7 +31,7 @@ fn spawned_worker(server_state: &ServerState) -> String {
         .live_worker_states
         .register_spawn(SLOT, execution.id.clone(), "claude-opus-4-7", 4242, None);
     server_state.worker_registry.register_run_slot(&execution.id, SLOT);
-    execution.id
+    (execution.id, chore.id)
 }
 
 fn hook(event: WorkerEvent, execution_id: &str) -> crate::events_socket::IncomingHookEvent {
@@ -374,5 +379,169 @@ async fn an_older_accepted_dispatch_persists_the_latest_checkpoint() {
         &execution_id,
         SemanticTurnCondition::InTurn,
         boss_protocol::WorkerActivity::Working,
+    );
+}
+
+/// The persistence callback talks to the database, whose connection holders
+/// (dispatch's live-run check) take the registry mutex. The registry mutex
+/// must therefore not be held while the callback runs, or the two orders
+/// deadlock.
+#[test]
+fn semantic_checkpoint_persistence_does_not_hold_the_registry_mutex() {
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let state = server_state.clone();
+    std::thread::spawn(move || {
+        let run_id = execution_id.clone();
+        state.live_worker_states.with_semantic_progress(SLOT, &run_id, |_| {
+            // Re-taking the registry mutex here self-deadlocks if it is held.
+            let _ = state.live_worker_states.is_run_live(&execution_id);
+        });
+        done_tx.send(()).unwrap();
+    });
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("with_semantic_progress held the registry mutex across the callback");
+}
+
+/// `request_execution_with_live_check` holds the DB connection while its
+/// closure takes the registry mutex; hook dispatch applies an event and then
+/// persists its checkpoint to the DB. Overlap the two deterministically: the
+/// live check parks inside the closure (DB connection held) until dispatch has
+/// applied its event, then checks liveness. Both must finish.
+#[test]
+fn live_check_and_hook_dispatch_do_not_deadlock() {
+    let wait = std::time::Duration::from_secs(20);
+    let (server_state, _dir) = test_server_state();
+    let (execution_id, work_item_id) = spawned_worker_for_item(&server_state);
+    let (inside_tx, inside_rx) = std::sync::mpsc::channel();
+    let (live_done_tx, live_done_rx) = std::sync::mpsc::channel();
+    let (dispatch_done_tx, dispatch_done_rx) = std::sync::mpsc::channel();
+    let (persist_boundary_tx, persist_boundary_rx) = std::sync::mpsc::channel();
+    *server_state
+        .live_worker_states
+        .test_hooks
+        .persist_boundary
+        .lock()
+        .unwrap() = Some(persist_boundary_tx);
+
+    let live_state = server_state.clone();
+    let live_check = std::thread::spawn(move || {
+        let registry = live_state.live_worker_states.clone();
+        let result = live_state.work_db.request_execution_with_live_check(
+            RequestExecutionInput::builder().work_item_id(work_item_id).build(),
+            |run_id| {
+                inside_tx.send(()).unwrap();
+                // Wait until dispatch is inside persistence (persist lock held,
+                // checkpoint captured), then check liveness while still holding
+                // the DB connection. Dispatch cannot finish until we return.
+                persist_boundary_rx
+                    .recv_timeout(wait)
+                    .expect("dispatch never reached the persistence boundary");
+                registry.is_run_live(run_id)
+            },
+        );
+        live_done_tx.send(result.is_ok()).unwrap();
+    });
+    inside_rx.recv_timeout(wait).expect("live-check closure never ran");
+
+    let dispatch_state = server_state.clone();
+    let dispatch_id = execution_id.clone();
+    let dispatch = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(dispatch_live_worker_state(&dispatch_state, &pre_tool_use(&dispatch_id)));
+        dispatch_done_tx.send(()).unwrap();
+    });
+    assert!(
+        live_done_rx
+            .recv_timeout(wait)
+            .expect("request_execution_with_live_check deadlocked"),
+        "live check should succeed"
+    );
+    dispatch_done_rx.recv_timeout(wait).expect("hook dispatch deadlocked");
+    live_check.join().unwrap();
+    dispatch.join().unwrap();
+}
+
+/// A dispatch paused after applying its event must not write another run's
+/// checkpoint if its slot is released and re-leased in the meantime.
+#[tokio::test]
+async fn a_recycled_slot_never_leaks_its_checkpoint_to_the_prior_run() {
+    use crate::live_worker_state::HookOrigin;
+    let (server_state, _dir) = test_server_state();
+    let run_a = spawned_worker(&server_state);
+    let applied = server_state.live_worker_states.apply_hook_event(
+        SLOT,
+        HookOrigin {
+            ingress_seq: Some(1),
+            from_subagent: false,
+        },
+        &stop(&run_a).event,
+    );
+    assert!(matches!(
+        applied.outcome,
+        crate::live_worker_state::ApplyEventOutcome::Applied { .. }
+    ));
+
+    // A newer event persists the opposite state before the old Stop resumes.
+    let mut newer = pre_tool_use(&run_a);
+    newer.connection.ingress_seq = Some(2);
+    dispatch_live_worker_state(&server_state, &newer).await;
+    let newer_checkpoint = server_state
+        .work_db
+        .get_run_semantic_progress_checkpoint(&run_a)
+        .unwrap()
+        .unwrap();
+    assert_eq!(newer_checkpoint.turn_condition, SemanticTurnCondition::InTurn);
+
+    // Run A's slot is recycled to run B, which has its own (ended-turn) state.
+    server_state.live_worker_states.release_slot(SLOT);
+    server_state
+        .live_worker_states
+        .register_spawn(SLOT, "run-b", "claude-opus-4-7", 4343, None);
+    server_state.live_worker_states.apply_hook_event(
+        SLOT,
+        HookOrigin {
+            ingress_seq: Some(1),
+            from_subagent: false,
+        },
+        &stop("run-b").event,
+    );
+    let b_checkpoint = server_state
+        .live_worker_states
+        .semantic_progress_for_slot(SLOT)
+        .unwrap();
+    assert_eq!(b_checkpoint.turn_condition, SemanticTurnCondition::Ended);
+
+    // A's paused persistence resumes: it must not see B's checkpoint.
+    let seen = server_state
+        .live_worker_states
+        .with_semantic_progress(SLOT, &run_a, |settled| settled);
+    assert!(seen.is_none(), "run A captured run B's checkpoint: {seen:?}");
+    crate::app::worker_events::persist_applied_semantic_progress(
+        &server_state,
+        &run_a,
+        SLOT,
+        &stop(&run_a),
+        &applied.outcome,
+    );
+    let a_row = server_state
+        .work_db
+        .get_run_semantic_progress_checkpoint(&run_a)
+        .unwrap()
+        .expect("run A still records its own progress");
+    assert_eq!(a_row.turn_condition, newer_checkpoint.turn_condition);
+    assert_eq!(a_row.tool_condition, newer_checkpoint.tool_condition);
+    assert!(
+        server_state
+            .work_db
+            .get_run_semantic_progress_checkpoint("run-b")
+            .unwrap()
+            .is_none(),
+        "A's persistence must not write B's row"
     );
 }

@@ -179,8 +179,8 @@ pub struct LiveWorkerStateRegistry {
     /// per-field lifecycle, and there is no failure mode where one table
     /// keeps a stale entry a sibling table already dropped.
     inner: Mutex<HashMap<u8, SlotEntry>>,
-    // Serialize lifecycle mutations independently of dispatch registry reads.
-    lifecycle: Mutex<()>,
+    /// Serialization locks that are independent of dispatch registry reads.
+    serial: SerialLocks,
     /// Driver-hook evidence for runs whose pane is launching but whose slot
     /// entry is not registered yet, keyed by run id. Armed by
     /// [`Self::arm_pending_hooks`] before the CLI starts and drained into
@@ -193,12 +193,26 @@ pub struct LiveWorkerStateRegistry {
     persona_store: Option<std::sync::Arc<crate::work::WorkDb>>,
 }
 
+#[derive(Default)]
+struct SerialLocks {
+    /// Serializes lifecycle mutations.
+    lifecycle: Mutex<()>,
+    /// Serializes semantic-checkpoint capture-and-persist so an older
+    /// dispatch cannot overwrite a newer one. Never held together with
+    /// `inner` across a database call: `inner` is taken only briefly to
+    /// capture, and the lock order is `persist` -> database connection.
+    persist: Mutex<()>,
+}
+
 /// Test-only synchronization points for lifecycle/persona race tests.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct TestHooks {
     pub(crate) persona_boundary: Mutex<Option<Box<dyn Fn() + Send>>>,
     pub(crate) lifecycle_waiter: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    /// Signalled once `with_semantic_progress` has taken the persistence lock
+    /// and captured its checkpoint, immediately before `consume` runs.
+    pub(crate) persist_boundary: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 /// Hook evidence buffered for a run before its slot entry exists.
@@ -551,12 +565,14 @@ impl LiveWorkerStateRegistry {
     }
     fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, ()> {
         #[cfg(test)]
-        if matches!(self.lifecycle.try_lock(), Err(std::sync::TryLockError::WouldBlock))
-            && let Some(waiter) = self.test_hooks.lifecycle_waiter.lock().unwrap().take()
+        if matches!(
+            self.serial.lifecycle.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ) && let Some(waiter) = self.test_hooks.lifecycle_waiter.lock().unwrap().take()
         {
             let _ = waiter.send(());
         }
-        self.lifecycle.lock().expect("lifecycle mutex poisoned")
+        self.serial.lifecycle.lock().expect("lifecycle mutex poisoned")
     }
 
     #[cfg(test)]
@@ -1006,25 +1022,54 @@ impl LiveWorkerStateRegistry {
     /// or `None` if no driver-originated event has been recorded (and none
     /// was restored on re-adoption).
     pub fn semantic_progress_for_slot(&self, slot_id: u8) -> Option<SemanticProgressCheckpoint> {
-        self.with_semantic_progress(slot_id, |checkpoint| checkpoint)
+        self.capture_semantic_progress(slot_id, None)
     }
 
-    /// Consume the latest checkpoint while holding the reducer lock.
-    /// Persistence must finish inside this callback so an older dispatch
-    /// cannot overwrite a newer accepted event. Do not re-enter the registry.
-    pub fn with_semantic_progress<R>(
+    /// Clone the slot's checkpoint under one brief registry lock. With
+    /// `expect_run_id`, a slot that now belongs to a different run (released
+    /// and re-leased since the caller applied its event) yields `None`
+    /// rather than the new occupant's state.
+    fn capture_semantic_progress(
         &self,
         slot_id: u8,
-        consume: impl FnOnce(Option<SemanticProgressCheckpoint>) -> R,
-    ) -> R {
+        expect_run_id: Option<&str>,
+    ) -> Option<SemanticProgressCheckpoint> {
         let guard = self.inner.lock().expect("registry mutex poisoned");
-        let checkpoint = guard.get(&slot_id).and_then(|entry| {
+        guard.get(&slot_id).and_then(|entry| {
+            if expect_run_id.is_some_and(|run_id| entry.state.run_id != run_id) {
+                return None;
+            }
             Some(SemanticProgressCheckpoint {
                 progress_at: entry.meta.semantic_progress_at.clone()?,
                 tool_condition: entry.meta.semantic_tool_condition,
                 turn_condition: entry.meta.semantic_turn_condition,
             })
-        });
+        })
+    }
+
+    /// Capture the latest checkpoint and run `consume` (which persists it)
+    /// under a dedicated persistence lock, so writes are ordered by capture
+    /// and an older dispatch always writes the latest state. The registry
+    /// mutex is released before `consume` runs: `consume` may take the
+    /// database connection, whose holders (dispatch's live-run check) in
+    /// turn take the registry mutex. Do not re-enter this method from
+    /// `consume`.
+    ///
+    /// The checkpoint is captured only while `slot_id` still belongs to
+    /// `run_id`; otherwise `consume` sees `None` so one run's state is never
+    /// written to another run's row.
+    pub fn with_semantic_progress<R>(
+        &self,
+        slot_id: u8,
+        run_id: &str,
+        consume: impl FnOnce(Option<SemanticProgressCheckpoint>) -> R,
+    ) -> R {
+        let _persist = self.serial.persist.lock().unwrap_or_else(|e| e.into_inner());
+        let checkpoint = self.capture_semantic_progress(slot_id, Some(run_id));
+        #[cfg(test)]
+        if let Some(boundary) = self.test_hooks.persist_boundary.lock().unwrap().take() {
+            let _ = boundary.send(());
+        }
         consume(checkpoint)
     }
 

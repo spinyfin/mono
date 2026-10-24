@@ -475,11 +475,14 @@ pub(super) fn dispatch_codex_guard_trace_on_notification(
 /// Persist the semantic-progress checkpoint for one dispatched event.
 ///
 /// `settled` is the registry's post-apply checkpoint, present only when the
-/// live-state reducer accepted the event, refreshed under the registry lock
-/// which remains held through the DB write. The reducer owns ingress ordering
-/// and the subagent rules, so a refused (stale) event stamps the time alone
-/// and an accepted one writes what the reducer settled on. With no slot to
-/// settle it, main-session signals are used; subagent tools only stamp liveness.
+/// live-state reducer accepted the event and the slot still belongs to this
+/// run, captured under the dedicated persistence lock after the registry
+/// mutex is released. The registry mutex is deliberately not held across the
+/// DB write: DB-connection holders call `is_run_live`.
+/// The reducer owns ingress ordering and the subagent rules, so a refused
+/// (stale) event or an ownership mismatch stamps the time alone. An accepted
+/// event writes what the reducer settled on. Without a reducer outcome,
+/// main-session signals are used; subagent tools only stamp liveness.
 fn persist_semantic_progress(
     server_state: &Arc<ServerState>,
     run_id: &str,
@@ -489,7 +492,9 @@ fn persist_semantic_progress(
     settled: Option<crate::semantic_progress::SemanticProgressCheckpoint>,
 ) {
     let result = match (outcome, settled) {
-        (Some(ApplyEventOutcome::Stale { .. }), _) => server_state.work_db.record_semantic_progress_stamp(run_id),
+        (Some(ApplyEventOutcome::Stale { .. }), _) | (Some(ApplyEventOutcome::Applied { .. }), None) => {
+            server_state.work_db.record_semantic_progress_stamp(run_id)
+        }
         (Some(ApplyEventOutcome::Applied { .. }), Some(checkpoint)) => {
             server_state.work_db.record_semantic_checkpoint(run_id, &checkpoint)
         }
@@ -518,8 +523,11 @@ fn persist_semantic_progress(
 }
 
 /// Persist accepted state without allowing a dispatch paused after apply to
-/// write an obsolete snapshot. The registry lock serializes capture and write
-/// with every reducer transition, even when another dispatch overtakes this one.
+/// write an obsolete snapshot. The checkpoint is captured under the dedicated
+/// persistence lock, so writes are ordered by capture and an overtaken
+/// dispatch writes the latest state. Reducer transitions are not serialized
+/// with the write (the registry mutex is released before the DB is touched);
+/// a slot re-leased to another run yields no checkpoint for this one.
 pub(super) fn persist_applied_semantic_progress(
     server_state: &Arc<ServerState>,
     run_id: &str,
@@ -533,7 +541,7 @@ pub(super) fn persist_applied_semantic_progress(
     };
     server_state
         .live_worker_states
-        .with_semantic_progress(slot_id, |settled| {
+        .with_semantic_progress(slot_id, run_id, |settled| {
             persist_semantic_progress(server_state, run_id, &incoming.event, origin, Some(outcome), settled);
         });
 }
