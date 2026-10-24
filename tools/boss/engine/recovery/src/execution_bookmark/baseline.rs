@@ -1,3 +1,5 @@
+use git_utils::jj_provenance;
+
 use super::*;
 
 /// Follow a baseline rewrite only along jj's recorded evolution and only
@@ -39,15 +41,14 @@ pub(super) async fn evolved_baseline(
                 "log",
                 "--no-graph",
                 "-r",
-                &format!("present({change}) & ({common})"),
+                &jj_provenance::candidate_revset(&change, &common),
                 "-T",
-                "commit_id ++ \"\\n\"",
+                jj_provenance::COMMIT_ID_LINES_TEMPLATE,
             ],
         )
         .await?;
-    let candidates: Vec<_> = candidates.lines().filter(|line| !line.is_empty()).collect();
-    if let [candidate] = candidates.as_slice() {
-        if *candidate == base {
+    if let Some(candidate) = jj_provenance::sole_candidate(&candidates) {
+        if candidate == base {
             return Ok(base.to_owned());
         }
         let evolution = jj
@@ -60,12 +61,12 @@ pub(super) async fn evolved_baseline(
                     "-r",
                     candidate,
                     "-T",
-                    "commit_id ++ \"\\n\"",
+                    jj_provenance::COMMIT_ID_LINES_TEMPLATE,
                 ],
             )
             .await?;
-        if evolution.lines().any(|commit| commit == base) {
-            return Ok((*candidate).to_owned());
+        if jj_provenance::evolution_contains(&evolution, base) {
+            return Ok(candidate.to_owned());
         }
     }
     Ok(base.to_owned())

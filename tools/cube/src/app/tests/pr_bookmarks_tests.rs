@@ -325,65 +325,240 @@ fn export_failure_names_the_ref_even_when_jj_exits_successfully() {
 
 /// Only GitHub's metadata lookup is simulated; all repository operations,
 /// including fetching the authoritative remote, run through declared jj.
-struct LeaseRunner<'a>(&'a DeclaredJj);
+/// Network-shaped commands and lock acquisition are recorded in order.
+struct LeaseRunner<'a> {
+    jj: &'a DeclaredJj,
+    pr_json: String,
+    events: std::cell::RefCell<Vec<&'static str>>,
+}
+
+impl<'a> LeaseRunner<'a> {
+    fn new(jj: &'a DeclaredJj) -> Self {
+        Self::with_pr_json(jj, r#"{"state":"open","head":{"ref":"feat"}}"#.to_string())
+    }
+
+    fn with_pr_json(jj: &'a DeclaredJj, pr_json: String) -> Self {
+        Self {
+            jj,
+            pr_json,
+            events: Default::default(),
+        }
+    }
+
+    fn assert_no_network_while_locked(&self) {
+        let events = self.events.borrow();
+        let first_lock = events.iter().position(|e| *e == "lock");
+        if let Some(lock) = first_lock {
+            assert!(
+                !events[lock..].contains(&"network"),
+                "network command ran while the PR-bookmark lock was held: {events:?}"
+            );
+        }
+    }
+}
 
 impl CommandRunner for LeaseRunner<'_> {
     fn run(&self, invocation: &CommandInvocation) -> Result<String> {
         if invocation.program == "gh" {
             assert_eq!(invocation.args, ["api", "repos/example/repo/pulls/1"]);
-            return Ok(r#"{"state":"open","head":{"ref":"feat"}}"#.to_string());
+            self.events.borrow_mut().push("network");
+            return Ok(self.pr_json.clone());
         }
         if invocation.args == ["git", "remote", "list"] {
             return Ok("backup https://github.com/example/repo".to_string());
         }
-        self.0.run(invocation)
+        if invocation.args.starts_with(&["git".to_string(), "fetch".to_string()]) {
+            self.events.borrow_mut().push("network");
+        }
+        self.jj.run(invocation)
+    }
+
+    fn lock_pr_bookmarks(&self, cwd: &Path) -> Result<crate::lock::RepoLock> {
+        self.events.borrow_mut().push("lock");
+        crate::lock::RepoLock::for_workspace(cwd)
     }
 }
 
-#[test]
-fn lease_repairs_obsolete_conflict_and_preserves_unique_conflict() {
-    for unique in [false, true] {
-        let f = Fixture::new();
-        let (_, head) = f.rewritten_feat_with_exported_pr_ref();
-        f.jj(&f.ws, &["git", "export"]);
-        f.protect_feat_remotely();
-        let other = if unique {
-            f.jj(&f.root, &["new", "main", "-m", "unpublished"]);
-            std::fs::write(f.root.join("unique.txt"), "unique\n").unwrap();
-            f.jj(&f.root, &["bookmark", "set", "pr/1", "-r", "@", "--allow-backwards"]);
-            f.commit("pr/1")
-        } else {
-            // Another predecessor remains recorded in the head's evolution.
-            let history = f.jj(
-                &f.ws,
-                &["evolog", "--no-graph", "-r", &head, "-T", "commit_id ++ \"\\n\""],
-            );
-            let old = history.lines().nth(1).unwrap().to_string();
-            f.jj(&f.root, &["bookmark", "set", "pr/1", "-r", &old, "--allow-backwards"]);
-            old
-        };
-        f.root_write();
-        f.jj(&f.ws, &["bookmark", "forget", "pr/1"]);
-        f.jj(&f.ws, &["bookmark", "set", "pr/1", "-r", &head]);
-        f.root_write();
-        assert_eq!(f.pr_commits(1).len(), 2);
-        let result = crate::app::health::repair_conflicted_bookmarks(
-            &LeaseRunner(&f.runner),
-            None,
+/// A conflicted `pr/1` as the incident produced it: `head` (feat) and `other`
+/// are its two sides. `unique` makes `other` unpublished content the head lacks;
+/// otherwise it is a predecessor recorded in the head's evolution.
+fn conflicted_pr_bookmark(f: &Fixture, unique: bool) -> (String, String) {
+    let (_, head) = f.rewritten_feat_with_exported_pr_ref();
+    f.jj(&f.ws, &["git", "export"]);
+    f.protect_feat_remotely();
+    let other = if unique {
+        f.jj(&f.root, &["new", "main", "-m", "unpublished"]);
+        std::fs::write(f.root.join("unique.txt"), "unique\n").unwrap();
+        f.jj(&f.root, &["bookmark", "set", "pr/1", "-r", "@", "--allow-backwards"]);
+        f.commit("pr/1")
+    } else {
+        // Another predecessor remains recorded in the head's evolution.
+        let history = f.jj(
             &f.ws,
-            &["pr/1".to_string()],
+            &["evolog", "--no-graph", "-r", &head, "-T", "commit_id ++ \"\\n\""],
         );
-        if unique {
-            let error = result.unwrap_err().to_string();
-            assert!(error.contains(&head) && error.contains(&other), "{error}");
-            assert_eq!(f.pr_commits(1).len(), 2);
-            assert_eq!(f.git_ref(1), Some(other));
-        } else {
-            result.unwrap();
-            assert_eq!(f.pr_commits(1), vec![head.clone()]);
-            assert_eq!(f.git_ref(1), Some(head));
-        }
-    }
+        let old = history.lines().nth(1).unwrap().to_string();
+        f.jj(&f.root, &["bookmark", "set", "pr/1", "-r", &old, "--allow-backwards"]);
+        old
+    };
+    f.root_write();
+    f.jj(&f.ws, &["bookmark", "forget", "pr/1"]);
+    f.jj(&f.ws, &["bookmark", "set", "pr/1", "-r", &head]);
+    f.root_write();
+    assert_eq!(f.pr_commits(1).len(), 2);
+    (head, other)
+}
+
+fn repair(f: &Fixture, runner: &LeaseRunner) -> crate::app::health::BookmarkRepair {
+    let repair = crate::app::health::repair_conflicted_bookmarks(runner, None, &f.ws, &["pr/1".to_string()])
+        .expect("pr/<n> repair is best-effort and never fails the lease");
+    runner.assert_no_network_while_locked();
+    repair
+}
+
+#[test]
+fn lease_repairs_obsolete_conflict() {
+    let f = Fixture::new();
+    let (head, _) = conflicted_pr_bookmark(&f, false);
+    let runner = LeaseRunner::with_pr_json(
+        &f.runner,
+        format!(r#"{{"state":"open","head":{{"ref":"feat","sha":"{head}"}}}}"#),
+    );
+    assert!(repair(&f, &runner).unrepaired.is_empty());
+    assert_eq!(f.pr_commits(1), vec![head.clone()]);
+    assert_eq!(f.git_ref(1), Some(head));
+}
+
+#[test]
+fn lease_succeeds_and_leaves_a_conflict_with_unique_content_untouched() {
+    let f = Fixture::new();
+    let (head, other) = conflicted_pr_bookmark(&f, true);
+    let runner = LeaseRunner::with_pr_json(
+        &f.runner,
+        format!(r#"{{"state":"open","head":{{"ref":"feat","sha":"{head}"}}}}"#),
+    );
+    let repair = repair(&f, &runner);
+    assert_eq!(repair.unrepaired, ["pr/1"]);
+    assert_eq!(f.pr_commits(1).len(), 2, "still conflicted, no side picked");
+    assert_eq!(f.git_ref(1), Some(other));
+}
+
+#[test]
+fn lease_repairs_from_head_sha_when_the_source_branch_is_gone() {
+    let f = Fixture::new();
+    let (head, _) = conflicted_pr_bookmark(&f, false);
+    let runner = LeaseRunner::with_pr_json(
+        &f.runner,
+        format!(r#"{{"state":"closed","merged":true,"head":{{"ref":"deleted-branch","sha":"{head}"}}}}"#),
+    );
+    assert!(repair(&f, &runner).unrepaired.is_empty());
+    assert_eq!(f.pr_commits(1), vec![head]);
+}
+
+#[test]
+fn lease_repairs_a_fork_headed_pr_from_head_sha() {
+    let f = Fixture::new();
+    let (head, _) = conflicted_pr_bookmark(&f, false);
+    // `head.ref` names a branch on the fork; a same-named branch here is a
+    // different commit and must not be consulted.
+    let runner = LeaseRunner::with_pr_json(
+        &f.runner,
+        format!(r#"{{"state":"open","head":{{"ref":"main","sha":"{head}","repo":{{"full_name":"fork/repo"}}}}}}"#),
+    );
+    assert!(repair(&f, &runner).unrepaired.is_empty());
+    assert_eq!(f.pr_commits(1), vec![head]);
+}
+
+#[test]
+fn lease_leaves_a_conflict_untouched_when_the_head_is_not_in_the_store() {
+    let f = Fixture::new();
+    let (_, other) = conflicted_pr_bookmark(&f, false);
+    let runner = LeaseRunner::with_pr_json(
+        &f.runner,
+        format!(
+            r#"{{"state":"open","head":{{"ref":"feat","sha":"{}","repo":{{"full_name":"fork/repo"}}}}}}"#,
+            "0123456789abcdef0123456789abcdef01234567"
+        ),
+    );
+    assert_eq!(repair(&f, &runner).unrepaired, ["pr/1"]);
+    assert_eq!(f.pr_commits(1).len(), 2);
+    assert!(f.pr_commits(1).contains(&other));
+}
+
+#[test]
+fn lease_leaves_a_conflict_untouched_when_github_cannot_be_reached() {
+    let f = Fixture::new();
+    conflicted_pr_bookmark(&f, false);
+    let runner = LeaseRunner::with_pr_json(&f.runner, "not json".to_string());
+    assert_eq!(repair(&f, &runner).unrepaired, ["pr/1"]);
+    assert_eq!(f.pr_commits(1).len(), 2);
+}
+
+#[test]
+fn goto_replaces_a_head_that_was_rewritten_outside_this_store() {
+    let f = Fixture::new();
+    // The "forge" is a separate jj store with its own clone of the history.
+    let forge = f._dir.path().join("forge");
+    let parent = f._dir.path().to_path_buf();
+    f.jj(
+        &parent,
+        &[
+            "git",
+            "clone",
+            "--colocate",
+            f.root.to_str().unwrap(),
+            forge.to_str().unwrap(),
+        ],
+    );
+    f.jj(&forge, &["bookmark", "track", "feat@origin"]);
+    f.jj(&f.ws, &["git", "remote", "add", "forge", forge.to_str().unwrap()]);
+    f.jj(&f.ws, &["git", "fetch", "--remote", "forge"]);
+    point_pr_bookmark(&f.runner, None, &f.ws, 1, "feat@forge").expect("initial positioning");
+    let published = f.commit("pr/1");
+
+    // Someone else (GitHub's "Update branch", a human's checkout, a worker on
+    // another store) rewrites the PR branch to an unrelated commit.
+    f.jj(&forge, &["new", "main@origin", "-m", "rewritten elsewhere"]);
+    std::fs::write(forge.join("rewrite.txt"), "rewrite\n").unwrap();
+    f.jj(&forge, &["bookmark", "set", "feat", "-r", "@", "--allow-backwards"]);
+    f.jj(&forge, &["new", "main@origin"]);
+    f.jj(&f.ws, &["git", "fetch", "--remote", "forge"]);
+    let rewritten = f.commit("feat@forge");
+    assert_ne!(rewritten, published);
+    assert_eq!(
+        f.jj(
+            &f.ws,
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                &format!("{published} & ::{rewritten}"),
+                "-T",
+                "commit_id"
+            ]
+        ),
+        "",
+        "precondition: no local ancestry links the two heads"
+    );
+
+    point_pr_bookmark(&f.runner, None, &f.ws, 1, "feat@forge").expect("superseded published head is replaced");
+
+    assert_eq!(f.pr_commits(1), vec![rewritten.clone()]);
+    assert_eq!(f.git_ref(1), Some(rewritten));
+}
+
+#[test]
+fn gc_fetches_before_taking_the_pr_bookmark_lock() {
+    let f = Fixture::new();
+    f.protect_feat_remotely();
+    let runner = LeaseRunner::new(&f.runner);
+    crate::app::gc::gc_workspace_bookmarks(&runner, None, &f.ws, true, false).unwrap();
+    let events = runner.events.borrow().clone();
+    assert_eq!(
+        events,
+        ["network", "lock"],
+        "fetch must finish before the lock is taken"
+    );
 }
 
 #[test]
@@ -489,7 +664,7 @@ impl CommandRunner for PausingGotoRunner {
             self.positioned_bookmark.send(()).unwrap();
             self.proceed.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
         }
-        LeaseRunner(&self.runner).run(invocation)
+        LeaseRunner::new(&self.runner).run(invocation)
     }
 }
 
