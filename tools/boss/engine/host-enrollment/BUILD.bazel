@@ -43,13 +43,10 @@ rust_test(
 # over gRPC, a stand-in for the stream manager's Connect handler, revocation
 # closing open streams and refusing reconnects).
 #
-# `medium` for the 300 s timeout, not for its footprint. The suite runs in
-# about 5.5 s on a developer Mac, but its lagged-receiver tests each commit
-# 600 fsynced SQLite transactions, which is what dominates on a busy CI agent:
-# the same suite measured 2x-9x slower per unit of work there (55 s average,
-# 91 s worst over 11 runs, when 20 s of each run was a since-removed shutdown
-# stall). `short` (60 s) would leave about 2x headroom over the worst case
-# that implies; `moderate` leaves about 10x.
+# `medium` for the 300 s timeout, not for its footprint. The suite takes about
+# 5.5 s on a developer Mac, but its lagged-receiver tests each commit 600
+# fsynced SQLite transactions, which is slow on a busy CI agent; the 300 s
+# limit leaves a wide margin over that.
 rust_test(
     name = "integration_test",
     size = "medium",

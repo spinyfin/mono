@@ -126,10 +126,12 @@ struct Running {
 }
 
 impl Running {
-    /// Tears down the listener and every connection on it. This aborts rather
-    /// than shutting down gracefully: a graceful shutdown waits for open
-    /// `Connect` streams to end, and a test may finish with one still open,
-    /// which would stall here until a timeout instead of returning at once.
+    /// Stops the listener without waiting for open `Connect` streams to end;
+    /// any connection still open is dropped when the test's runtime shuts
+    /// down. This aborts rather than shutting down gracefully: a graceful
+    /// shutdown waits for those streams, and a test may finish with one still
+    /// open, which would stall here until a timeout instead of returning at
+    /// once.
     async fn stop(self) {
         self.task.abort();
         let _ = self.task.await;
