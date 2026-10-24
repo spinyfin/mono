@@ -189,6 +189,8 @@ extension ChatViewModel {
             }
         case .operatorQuestionError(let message, let requestId):
             handleOperatorQuestionError(message: message, requestId: requestId)
+        case .boardReadFailed(let requestId):
+            failBoardRead(requestID: requestId)
         case .workError(let message, let requestId):
             failBoardRead(requestID: requestId)
             if settleOffsiteBackupError(message, requestID: requestId) { return }
