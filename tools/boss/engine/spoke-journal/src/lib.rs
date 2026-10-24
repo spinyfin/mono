@@ -46,6 +46,14 @@ pub enum Fault {
     Full,
 }
 
+impl Fault {
+    /// Whether `error` is spool admission backpressure rather than a disk or
+    /// integrity failure.
+    pub fn is_full(error: &anyhow::Error) -> bool {
+        matches!(error.downcast_ref::<Fault>(), Some(Fault::Full))
+    }
+}
+
 impl Journal {
     pub fn open(root: &Path, host: &str, limits: Limits) -> Result<Self> {
         ensure!(boss_protocol_spoke::identity::is_valid_host_id(host), "invalid host id");

@@ -6,7 +6,8 @@ exports_files(["Cargo.toml"])
 # The hub stream manager (engine/spoke-stream) and the hub's provisioning jobs
 # are added to `visibility` in the PRs that make them depend on this crate.
 # spoke-credentials depends on it from its tests only, to run the spoke client
-# against the real authority.
+# against the real authority, and the spoke daemon's tests issue its client
+# certificate from it.
 rust_library(
     name = "host-enrollment",
     srcs = glob(["src/**/*.rs"]),
@@ -15,6 +16,7 @@ rust_library(
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
+        "//tools/boss/engine/spoke:__pkg__",
         "//tools/boss/engine/spoke-stream:__pkg__",
         "//tools/boss/spoke-credentials:__pkg__",
     ],

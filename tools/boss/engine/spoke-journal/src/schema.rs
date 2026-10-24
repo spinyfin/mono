@@ -21,18 +21,17 @@ pub fn migrate(db: &mut Connection) -> Result<()> {
             );
             CREATE TABLE records (
                 sequence INTEGER PRIMARY KEY, bytes BLOB NOT NULL, digest BLOB NOT NULL,
-                created_ms INTEGER NOT NULL, host_only INTEGER NOT NULL,
-                epoch INTEGER NOT NULL, contract BLOB NOT NULL
+                created_ms INTEGER NOT NULL, host_only INTEGER NOT NULL
             );
             CREATE TABLE commands (
                 sequence INTEGER PRIMARY KEY, command_id TEXT NOT NULL UNIQUE,
                 bytes BLOB NOT NULL, digest BLOB NOT NULL, applied INTEGER NOT NULL DEFAULT 0
             );
             CREATE TRIGGER records_added AFTER INSERT ON records BEGIN
-                UPDATE identity SET queued_bytes=queued_bytes+length(new.bytes)+length(new.contract)+128;
+                UPDATE identity SET queued_bytes=queued_bytes+length(new.bytes)+128;
             END;
             CREATE TRIGGER records_removed AFTER DELETE ON records BEGIN
-                UPDATE identity SET queued_bytes=queued_bytes-length(old.bytes)-length(old.contract)-128;
+                UPDATE identity SET queued_bytes=queued_bytes-length(old.bytes)-128;
             END;
             CREATE TRIGGER commands_added AFTER INSERT ON commands BEGIN
                 UPDATE identity SET queued_bytes=queued_bytes+length(new.bytes)+128;

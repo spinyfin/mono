@@ -16,7 +16,7 @@ async fn actual_daemon_reconnects_replays_and_recovers_command_receipt_after_sig
     let mut hub = Fixture::new().await;
     let daemon = hub.start();
     let mut first = hub.connection().await;
-    assert_eq!(first.hello.features, boss_spoke_stream::outbound::contracts().features);
+    assert_eq!(first.hello.features, boss_spoke_outbound::contracts().features);
     let identity = first.hello.journal_id.clone();
     let boot = first.hello.boot_id.clone();
     first.welcome(0).await;
@@ -109,10 +109,11 @@ async fn actual_daemon_journals_capacity_before_welcome_and_replays_offline_back
     let _daemon = hub.start();
     let mut connection = hub.connection().await;
     connection.welcome(0).await;
+    // Both backlog records are in flight under the credit window before any receipt.
     let one = capacity(connection.next().await);
-    connection.receipt(one.sequence).await;
     let two = capacity(connection.next().await);
     assert_eq!((one.sequence, two.sequence), (1, 2));
+    connection.receipt(two.sequence).await;
     assert!(two.observed.unwrap().awake_ns > one.observed.unwrap().awake_ns);
 }
 
@@ -132,7 +133,7 @@ async fn restored_hub_cannot_skip_compacted_history() {
     use boss_spoke_journal::Admission;
     let mut hub = Fixture::new().await;
     let mut journal = Journal::open(&hub.root(), "host", Limits::default()).unwrap();
-    let contract = boss_spoke_stream::outbound::hello(&journal, "old-boot", &[1; 16]).unwrap();
+    let journal_id = journal.identity().unwrap().1;
     journal
         .append(
             v1::Record {
@@ -147,12 +148,11 @@ async fn restored_hub_cannot_skip_compacted_history() {
                 ..Default::default()
             },
             Admission::Capacity,
-            &contract,
         )
         .unwrap();
     journal
         .receipt(&v1::Cursor {
-            journal_id: contract.journal_id.clone(),
+            journal_id: journal_id.clone(),
             through: 1,
         })
         .unwrap();
@@ -165,7 +165,7 @@ async fn restored_hub_cannot_skip_compacted_history() {
     connection.welcome(0).await;
     assert!(daemon.failed().await.contains("replay_gap"));
     let journal = Journal::open(&hub.root(), "host", Limits::default()).unwrap();
-    assert_eq!(journal.identity().unwrap().1, contract.journal_id);
+    assert_eq!(journal.identity().unwrap().1, journal_id);
     assert_eq!(journal.record_bounds().unwrap().0, 2);
 }
 
@@ -212,5 +212,195 @@ async fn pulse_reply_is_current_control_and_does_not_consume_sequence() {
             assert_eq!(pulse.stamp.unwrap().boot_id, connection.hello.boot_id);
             break;
         }
+    }
+}
+
+/// Spoke daemon session behaviour, driven over the real transport.
+mod flow {
+    use crate::hub::{Connection, Fixture};
+    use boss_protocol_spoke::v1::{self, command, hub_frame, record, spoke_frame};
+    use boss_spoke_journal::{Admission, Journal, Limits};
+    use boss_spoke_outbound::SharedJournal;
+    use prost::Message;
+    use std::{
+        sync::{Arc, Mutex},
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    const SPOOL: u64 = 16 * 1024;
+
+    fn now_ms() -> i64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+    }
+
+    fn stamp() -> anyhow::Result<v1::Stamp> {
+        Ok(v1::Stamp {
+            boot_id: "boot".into(),
+            wall_unix_ms: now_ms(),
+            awake_ns: 1,
+            elapsed_ns: 1,
+        })
+    }
+
+    fn filler(pad: usize, time: i64) -> v1::Record {
+        v1::Record {
+            observed: Some(v1::Stamp {
+                boot_id: "boot".into(),
+                wall_unix_ms: time,
+                ..Default::default()
+            }),
+            body: Some(record::Body::Capacity(v1::Capacity {
+                generation: 1,
+                inventory: Some(v1::Inventory {
+                    os: "linux".into(),
+                    arch: "x86_64".into(),
+                    failed_preflights: vec!["p".repeat(pad)],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn inventory_command() -> v1::Command {
+        v1::Command {
+            sequence: 1,
+            command_id: "one".into(),
+            not_after_unix_ms: i64::MAX,
+            body: Some(command::Body::Inventory(v1::Empty {})),
+            ..Default::default()
+        }
+    }
+
+    /// Journal with a receipted, week-old prefix (reclaimable by compaction), three
+    /// fresh unreceipted records and exactly `remaining` bytes of admission left.
+    /// Returns the journal, the length of the old prefix and the unreceipted count.
+    fn spool(root: &std::path::Path, remaining: u64) -> (Journal, u64, usize) {
+        let mut journal = Journal::open(
+            root,
+            "host",
+            Limits {
+                spool_bytes: SPOOL,
+                lifecycle_reserve: 1024,
+            },
+        )
+        .unwrap();
+        let mut old = 0;
+        while journal.bytes().unwrap() < SPOOL / 2 {
+            journal.append(filler(200, 1000), Admission::Lifecycle).unwrap();
+            old += 1;
+        }
+        for _ in 0..2 {
+            journal.append(filler(200, now_ms()), Admission::Capacity).unwrap();
+        }
+        // Size one filler so the last one can be tuned to the byte budget.
+        let before = journal.bytes().unwrap();
+        journal.append(filler(200, now_ms()), Admission::Lifecycle).unwrap();
+        let cost = journal.bytes().unwrap() - before;
+        let base = cost - 200;
+        // Leave one to two fillers' worth above the target, then tune it exactly.
+        while SPOOL - journal.bytes().unwrap() >= remaining + 2 * cost {
+            journal.append(filler(200, now_ms()), Admission::Lifecycle).unwrap();
+        }
+        let slack = SPOOL - journal.bytes().unwrap() - remaining;
+        journal
+            .append(filler((slack - base) as usize, now_ms()), Admission::Lifecycle)
+            .unwrap();
+        let pending = (journal.record_bounds().unwrap().1 - old) as usize;
+        (journal, old, pending)
+    }
+
+    fn session(hub: &Fixture, journal: Journal) -> (SharedJournal, tokio::task::JoinHandle<anyhow::Result<()>>) {
+        let shared: SharedJournal = Arc::new(Mutex::new(journal));
+        let endpoint = hub.endpoint();
+        let task = tokio::spawn({
+            let journal = Arc::clone(&shared);
+            async move { boss_spoke_outbound::connect_once(&journal, endpoint, &[1; 16], &stamp).await }
+        });
+        (shared, task)
+    }
+
+    async fn record_or_receipt(connection: &mut Connection) -> spoke_frame::Body {
+        let body = connection.next().await;
+        if let spoke_frame::Body::Record(record) = &body {
+            connection.receipt(record.sequence).await;
+        }
+        body
+    }
+
+    #[tokio::test]
+    async fn full_spool_defers_the_command_result_and_keeps_replaying() {
+        let mut hub = Fixture::new().await;
+        let command_cost = inventory_command().encode_to_vec().len() as u64 + 128;
+        // Room for the command, none for its rejection record.
+        let (journal, old, pending) = spool(&hub.root(), command_cost + 8);
+        let (_journal, task) = session(&hub, journal);
+        let mut connection = hub.connection().await;
+        connection.welcome(old).await;
+        connection.send(hub_frame::Body::Command(inventory_command())).await;
+        let (mut records, mut receipts, mut results) = (0, 0, 0);
+        while results == 0 {
+            match record_or_receipt(&mut connection).await {
+                spoke_frame::Body::CommandReceipt(cursor) => {
+                    assert_eq!(cursor.through, 1);
+                    receipts += 1;
+                }
+                spoke_frame::Body::Record(record) => match record.body {
+                    Some(record::Body::Result(result)) => {
+                        assert_eq!(result.command_id, "one");
+                        results += 1;
+                    }
+                    _ => records += 1,
+                },
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+        // The backlog streamed and was receipted, and the result committed once
+        // compaction made room, all on the original session.
+        assert_eq!((records, receipts, results), (pending, 1, 1));
+        assert!(!task.is_finished(), "a full spool must not end the session");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn full_inbox_withholds_the_command_receipt_without_ending_the_session() {
+        let mut hub = Fixture::new().await;
+        let command_cost = inventory_command().encode_to_vec().len() as u64 + 128;
+        let (journal, old, pending) = spool(&hub.root(), command_cost - 40);
+        let (shared, task) = session(&hub, journal);
+        let mut connection = hub.connection().await;
+        connection.welcome(old).await;
+        connection.send(hub_frame::Body::Command(inventory_command())).await;
+        for _ in 0..pending {
+            let spoke_frame::Body::Record(record) = record_or_receipt(&mut connection).await else {
+                panic!("a command receipt was sent although the command was not stored");
+            };
+            assert!(matches!(record.body, Some(record::Body::Capacity(_))));
+        }
+        // Nothing else is sent: no receipt, and the session is still up.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), connection.incoming.message())
+                .await
+                .is_err()
+        );
+        assert!(!task.is_finished());
+        assert_eq!(shared.lock().unwrap().received_commands().unwrap().unwrap().through, 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn hub_resource_exhaustion_is_retried_by_the_same_daemon() {
+        let mut hub = Fixture::refusing(2).await;
+        let mut daemon = hub.start();
+        let mut connection = hub.connection().await;
+        let identity = connection.hello.journal_id.clone();
+        connection.welcome(0).await;
+        let spoke_frame::Body::Record(record) = connection.next().await else {
+            panic!("expected the journaled capacity record");
+        };
+        assert_eq!(record.sequence, 1);
+        assert!(daemon.running(), "shedding must not stop the daemon");
+        assert_eq!(connection.hello.journal_id, identity);
     }
 }

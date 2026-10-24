@@ -12,6 +12,7 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/engine/spoke:__pkg__",
+        "//tools/boss/engine/spoke-outbound:__pkg__",
         "//tools/boss/engine/spoke-stream:__pkg__",
     ],
     deps = ["//tools/boss/protocol-spoke"] + all_crate_deps(normal = True),

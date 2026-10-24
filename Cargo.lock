@@ -1212,9 +1212,11 @@ name = "boss-spoke"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "boss-host-enrollment",
  "boss-protocol-spoke",
  "boss-spoke-journal",
- "boss-spoke-stream",
+ "boss-spoke-outbound",
  "clap",
  "fs4",
  "libc",
@@ -1263,25 +1265,41 @@ dependencies = [
 ]
 
 [[package]]
-name = "boss-spoke-stream"
+name = "boss-spoke-outbound"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bon",
  "boss-backoff",
- "boss-host-enrollment",
  "boss-protocol-spoke",
  "boss-spoke-journal",
  "prost",
- "rand 0.8.6",
- "rcgen",
- "rustls",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
  "tonic",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "boss-spoke-stream"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bon",
+ "boss-host-enrollment",
+ "boss-protocol-spoke",
+ "boss-spoke-journal",
+ "boss-spoke-outbound",
+ "prost",
+ "rand 0.8.6",
+ "rcgen",
+ "rustls",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]

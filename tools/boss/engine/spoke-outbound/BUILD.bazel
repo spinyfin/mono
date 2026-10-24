@@ -1,0 +1,35 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+# The spoke side of the stream: Hello/Welcome, record replay under byte credit
+# and the reconnect loop. It links the SQLite journal, so it is a separate
+# crate from the hub-side spoke-stream. spoke-stream's tests run it against the
+# real hub manager.
+rust_library(
+    name = "spoke-outbound",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "boss_spoke_outbound",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = [
+        "//tools/boss/engine/spoke:__pkg__",
+        "//tools/boss/engine/spoke-stream:__pkg__",
+    ],
+    deps = [
+        "//tools/boss/backoff",
+        "//tools/boss/engine/spoke-journal",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "spoke-outbound_test",
+    size = "small",
+    crate = ":spoke-outbound",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = ["//tools/boss/protocol-spoke"] + all_crate_deps(normal = True),
+)

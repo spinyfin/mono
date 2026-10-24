@@ -12,7 +12,7 @@ rust_binary(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     deps = [
         "//tools/boss/engine/spoke-journal",
-        "//tools/boss/engine/spoke-stream",
+        "//tools/boss/engine/spoke-outbound",
         "//tools/boss/protocol-spoke",
     ] + all_crate_deps(normal = True),
 )
@@ -30,8 +30,9 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//tools/boss/engine/host-enrollment",
         "//tools/boss/engine/spoke-journal",
-        "//tools/boss/engine/spoke-stream",
+        "//tools/boss/engine/spoke-outbound",
         "//tools/boss/protocol-spoke",
     ] + all_crate_deps(
         normal = True,

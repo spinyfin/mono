@@ -3,7 +3,8 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 exports_files(["Cargo.toml"])
 
-# Hub manager and outbound daemon share the wire transport crate.
+# Hub-side stream manager. engine/core adds itself to `visibility` when it
+# consumes it.
 rust_library(
     name = "spoke-stream",
     srcs = glob(["src/**/*.rs"]),
@@ -11,11 +12,8 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    visibility = ["//tools/boss/engine/spoke:__pkg__"],
     deps = [
-        "//tools/boss/backoff",
         "//tools/boss/engine/host-enrollment",
-        "//tools/boss/engine/spoke-journal",
         "//tools/boss/protocol-spoke",
     ] + all_crate_deps(normal = True),
 )
@@ -33,6 +31,8 @@ rust_test(
     deps = [
         ":spoke-stream",
         "//tools/boss/engine/host-enrollment",
+        "//tools/boss/engine/spoke-journal",
+        "//tools/boss/engine/spoke-outbound",
         "//tools/boss/protocol-spoke",
     ] + all_crate_deps(
         normal = True,

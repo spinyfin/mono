@@ -6,10 +6,6 @@ workspace = "../../../.."
 
 [dependencies]
 anyhow = { workspace = true }
-boss-backoff = { path = "../../backoff" }
-boss-spoke-journal = { path = "../spoke-journal" }
-tracing = { workspace = true }
-uuid = { workspace = true, features = ["v4"] }
 bon = { workspace = true }
 boss-host-enrollment = { path = "../host-enrollment" }
 boss-protocol-spoke = { path = "../../protocol-spoke" }
@@ -21,6 +17,9 @@ tonic = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+boss-spoke-journal = { path = "../spoke-journal" }
+boss-spoke-outbound = { path = "../spoke-outbound" }
+tempfile = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt-multi-thread"] }

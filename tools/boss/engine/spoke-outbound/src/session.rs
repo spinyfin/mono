@@ -4,7 +4,9 @@ use boss_protocol_spoke::{
     limits::{MAX_FRAME_BYTES, MAX_INFLIGHT_BYTES},
     v1::{self, hub_frame, spoke_frame},
 };
+use boss_spoke_journal::Fault;
 use prost::Message;
+use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -18,8 +20,46 @@ use super::{
 
 const DEADLINE: Duration = Duration::from_secs(20);
 
-/// One bounded session, also used by the real tonic fault tests. Outbound records
-/// have one outstanding receipt at a time; transport flow control is not receipt.
+/// Records sent and not yet receipted, bounded by the negotiated byte credit.
+/// Transport flow control is not receipt.
+struct Window {
+    acknowledged: u64,
+    sent: u64,
+    outstanding: usize,
+    frames: VecDeque<(u64, usize)>,
+}
+
+impl Window {
+    fn new(acknowledged: u64) -> Self {
+        Self {
+            acknowledged,
+            sent: acknowledged,
+            outstanding: 0,
+            frames: VecDeque::new(),
+        }
+    }
+
+    fn sent(&mut self, sequence: u64, bytes: usize) {
+        self.sent = sequence;
+        self.outstanding += bytes;
+        self.frames.push_back((sequence, bytes));
+    }
+
+    /// Release the credit of every record the hub has now receipted.
+    fn receipted(&mut self, through: u64) {
+        self.acknowledged = through;
+        while let Some(&(sequence, bytes)) = self.frames.front() {
+            if sequence > through {
+                break;
+            }
+            self.outstanding -= bytes;
+            self.frames.pop_front();
+        }
+    }
+}
+
+/// One bounded session, also used by the real tonic fault tests. Records are
+/// pipelined up to the negotiated byte credit and released by receipts.
 pub async fn connect_once(
     journal: &SharedJournal,
     endpoint: Endpoint,
@@ -73,8 +113,7 @@ pub async fn connect_once(
     locked(journal)?.welcome(&welcome)?;
     let frame_limit = downward(welcome.max_frame_bytes, MAX_FRAME_BYTES);
     let credit = downward(welcome.max_inflight_bytes, MAX_INFLIGHT_BYTES);
-    let mut acknowledged = welcome.received_records.as_ref().expect("validated receipt").through;
-    let mut sent = acknowledged;
+    let mut window = Window::new(welcome.received_records.as_ref().expect("validated receipt").through);
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut last_read = tokio::time::Instant::now();
     loop {
@@ -87,17 +126,27 @@ pub async fn connect_once(
                 last_read = tokio::time::Instant::now();
                 match message.frame.body.expect("validated body") {
                     hub_frame::Body::RecordReceipt(cursor) => {
-                        ensure!(cursor.through >= acknowledged && cursor.through <= sent, "receipt outside sent prefix");
+                        ensure!(cursor.through >= window.acknowledged && cursor.through <= window.sent, "receipt outside sent prefix");
                         locked(journal)?.receipt(&cursor)?;
-                        acknowledged = cursor.through;
+                        window.receipted(cursor.through);
+                        // The freed credit lets the next records out now, not on the next tick.
+                        pump(journal, &tx, &mut window, frame_limit, credit).await?;
                     }
                     hub_frame::Body::Command(_) => {
                         let cursor = {
                             let mut journal = locked(journal)?;
-                            journal.receive_command(&message.command.expect("decoded command bytes"))?;
-                            journal.received_commands()?.expect("bound command journal")
+                            match journal.receive_command(&message.command.expect("decoded command bytes")) {
+                                Ok(_) => Some(journal.received_commands()?.expect("bound command journal")),
+                                // A full spool withholds the receipt; the hub keeps the
+                                // command and delivers it again, so nothing is lost.
+                                Err(error) if Fault::is_full(&error) => None,
+                                Err(error) => return Err(error),
+                            }
                         };
-                        send(&tx, control(spoke_frame::Body::CommandReceipt(cursor)), frame_limit).await?;
+                        match cursor {
+                            Some(cursor) => send(&tx, control(spoke_frame::Body::CommandReceipt(cursor)), frame_limit).await?,
+                            None => tracing::warn!("spool full; command receipt withheld"),
+                        }
                     }
                     hub_frame::Body::Pulse(mut pulse) => {
                         pulse.stamp = Some(stamp()?);
@@ -108,19 +157,44 @@ pub async fn connect_once(
             }
             _ = tick.tick() => {
                 if last_read.elapsed() > DEADLINE { return Err(network("hub read deadline expired")); }
-                // Recovery runs even if the receipt's network write was lost.
-                locked(journal)?.reject_pending(&stamp()?, &hello)?;
-                if sent == acknowledged {
-                    let next = locked(journal)?.next_record(sent)?;
-                    if let Some(next) = next {
-                        let bytes = record_frame(next.bytes);
-                        ensure!(bytes.len() <= credit, "record exceeds negotiated send credit");
-                        send(&tx, bytes, frame_limit).await?;
-                        sent = next.sequence;
+                // Recovery runs even if the receipt's network write was lost. A full
+                // spool leaves the command pending: replay and receipts below carry
+                // on, and compaction makes room for the result on a later tick.
+                let observed = stamp()?;
+                let rejected = locked(journal)?.reject_pending(&observed);
+                if let Err(error) = rejected {
+                    if !Fault::is_full(&error) {
+                        return Err(error);
                     }
+                    tracing::debug!("spool full; command result deferred");
+                    locked(journal)?.compact(observed.wall_unix_ms)?;
                 }
+                pump(journal, &tx, &mut window, frame_limit, credit).await?;
             }
         }
+    }
+}
+
+/// Send records in sequence while they fit in the unreceipted byte credit.
+async fn pump(
+    journal: &SharedJournal,
+    tx: &mpsc::Sender<Vec<u8>>,
+    window: &mut Window,
+    frame_limit: usize,
+    credit: usize,
+) -> Result<()> {
+    loop {
+        let Some(next) = locked(journal)?.next_record(window.sent)? else {
+            return Ok(());
+        };
+        let bytes = record_frame(next.bytes);
+        ensure!(bytes.len() <= credit, "record exceeds negotiated send credit");
+        if window.outstanding + bytes.len() > credit {
+            return Ok(());
+        }
+        let length = bytes.len();
+        send(tx, bytes, frame_limit).await?;
+        window.sent(next.sequence, length);
     }
 }
 

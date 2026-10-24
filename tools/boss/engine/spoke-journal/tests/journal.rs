@@ -12,16 +12,6 @@ fn stamp(time: i64) -> v1::Stamp {
         ..Default::default()
     }
 }
-fn contract() -> v1::Hello {
-    v1::Hello {
-        max_epoch: 1,
-        features: vec![v1::Feature {
-            name: "journal".into(),
-            revision: 1,
-        }],
-        ..Default::default()
-    }
-}
 fn capacity(time: i64) -> v1::Record {
     v1::Record {
         observed: Some(stamp(time)),
@@ -62,19 +52,13 @@ fn lock_identity_migration_and_sequence_survive_reopen() {
     let mut journal = open(&root);
     assert!(Journal::open(&root, "host", Limits::default()).is_err());
     let id = journal.identity().unwrap();
-    assert_eq!(
-        journal.append(capacity(1), Admission::Capacity, &contract()).unwrap(),
-        1
-    );
+    assert_eq!(journal.append(capacity(1), Admission::Capacity).unwrap(), 1);
     let raw = journal.next_record(0).unwrap().unwrap().bytes;
     drop(journal);
     let mut journal = open(&root);
     assert_eq!(journal.identity().unwrap(), id);
     assert_eq!(journal.next_record(0).unwrap().unwrap().bytes, raw);
-    assert_eq!(
-        journal.append(capacity(2), Admission::Capacity, &contract()).unwrap(),
-        2
-    );
+    assert_eq!(journal.append(capacity(2), Admission::Capacity).unwrap(), 2);
     drop(journal);
     assert!(Journal::open(&root, "another-host", Limits::default()).is_err());
     let db = rusqlite::Connection::open(root.join("journal.db")).unwrap();
@@ -93,17 +77,14 @@ fn rollback_replays_committed_prefix_without_allocating_a_gap() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("state");
     let mut journal = open(&root);
-    journal.append(capacity(1), Admission::Capacity, &contract()).unwrap();
+    journal.append(capacity(1), Admission::Capacity).unwrap();
     drop(journal);
     let db = rusqlite::Connection::open(root.join("journal.db")).unwrap();
     db.execute_batch("BEGIN IMMEDIATE; UPDATE identity SET next_record=99;")
         .unwrap();
     drop(db); // An interrupted transaction must not consume sequence numbers.
     let mut journal = open(&root);
-    assert_eq!(
-        journal.append(capacity(2), Admission::Capacity, &contract()).unwrap(),
-        2
-    );
+    assert_eq!(journal.append(capacity(2), Admission::Capacity).unwrap(), 2);
 }
 
 #[test]
@@ -111,8 +92,8 @@ fn missing_suffix_and_corrupt_record_fail_closed() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("state");
     let mut journal = open(&root);
-    journal.append(capacity(1), Admission::Capacity, &contract()).unwrap();
-    journal.append(capacity(2), Admission::Capacity, &contract()).unwrap();
+    journal.append(capacity(1), Admission::Capacity).unwrap();
+    journal.append(capacity(2), Admission::Capacity).unwrap();
     drop(journal);
     let db = rusqlite::Connection::open(root.join("journal.db")).unwrap();
     db.execute("DELETE FROM records WHERE sequence=2", []).unwrap();
@@ -141,8 +122,8 @@ fn inbox_deduplicates_raw_unknown_fields_and_commits_result_with_application() {
     let mut journal = open(&root);
     assert_eq!(journal.received_commands().unwrap().unwrap().through, 1);
     assert_eq!(journal.applied_commands().unwrap(), 0);
-    assert!(journal.reject_pending(&stamp(2000), &contract()).unwrap());
-    assert!(!journal.reject_pending(&stamp(2000), &contract()).unwrap());
+    assert!(journal.reject_pending(&stamp(2000)).unwrap());
+    assert!(!journal.reject_pending(&stamp(2000)).unwrap());
     let result = v1::Record::decode(journal.next_record(0).unwrap().unwrap().bytes.as_slice()).unwrap();
     let Some(record::Body::Result(result)) = result.body else {
         panic!("missing result")
@@ -153,7 +134,7 @@ fn inbox_deduplicates_raw_unknown_fields_and_commits_result_with_application() {
     drop(journal);
     let mut journal = open(&root);
     assert_eq!(journal.receive_command(&raw).unwrap(), 1);
-    assert!(!journal.reject_pending(&stamp(2001), &contract()).unwrap());
+    assert!(!journal.reject_pending(&stamp(2001)).unwrap());
     assert_eq!(journal.record_bounds().unwrap(), (1, 1));
 }
 
@@ -162,7 +143,7 @@ fn receipt_retention_and_gap_rules_do_not_silently_reset_identity() {
     let dir = tempfile::tempdir().unwrap();
     let mut journal = open(&dir.path().join("state"));
     for _ in 0..3 {
-        journal.append(capacity(0), Admission::Capacity, &contract()).unwrap();
+        journal.append(capacity(0), Admission::Capacity).unwrap();
     }
     journal.welcome(&welcome(&journal, 2)).unwrap();
     journal.compact(1000).unwrap();
@@ -206,16 +187,13 @@ fn bounded_spool_preserves_reserved_lifecycle_space_without_consuming_sequence()
         },
     )
     .unwrap();
-    while journal.append(capacity(1), Admission::Capacity, &contract()).is_ok() {}
+    while journal.append(capacity(1), Admission::Capacity).is_ok() {}
     let before = journal.record_bounds().unwrap();
-    assert!(journal.append(capacity(1), Admission::Bulk, &contract()).is_err());
-    assert!(journal.append(capacity(1), Admission::Capture, &contract()).is_err());
+    assert!(journal.append(capacity(1), Admission::Bulk).is_err());
+    assert!(journal.append(capacity(1), Admission::Capture).is_err());
     assert_eq!(journal.record_bounds().unwrap(), before);
-    assert_eq!(
-        journal.append(capacity(1), Admission::Lifecycle, &contract()).unwrap(),
-        before.1 + 1
-    );
-    while journal.append(capacity(1), Admission::Lifecycle, &contract()).is_ok() {}
+    assert_eq!(journal.append(capacity(1), Admission::Lifecycle).unwrap(), before.1 + 1);
+    while journal.append(capacity(1), Admission::Lifecycle).is_ok() {}
     assert!(journal.bytes().unwrap() <= 4096);
 }
 
@@ -234,20 +212,17 @@ fn failed_result_commit_keeps_command_pending_for_recovery() {
     .unwrap();
     journal.welcome(&welcome(&journal, 0)).unwrap();
     journal.receive_command(&command(1, "one")).unwrap();
-    while journal.append(capacity(1), Admission::Lifecycle, &contract()).is_ok() {}
+    while journal.append(capacity(1), Admission::Lifecycle).is_ok() {}
     let bounds = journal.record_bounds().unwrap();
     assert!(matches!(
-        journal
-            .reject_pending(&stamp(2000), &contract())
-            .unwrap_err()
-            .downcast_ref(),
+        journal.reject_pending(&stamp(2000)).unwrap_err().downcast_ref(),
         Some(Fault::Full)
     ));
     assert_eq!(journal.record_bounds().unwrap(), bounds);
     assert_eq!(journal.applied_commands().unwrap(), 0);
     drop(journal);
     let mut journal = open(&root);
-    assert!(journal.reject_pending(&stamp(2000), &contract()).unwrap());
+    assert!(journal.reject_pending(&stamp(2000)).unwrap());
     assert_eq!(journal.applied_commands().unwrap(), 1);
     assert_eq!(journal.record_bounds().unwrap().1, bounds.1 + 1);
 }

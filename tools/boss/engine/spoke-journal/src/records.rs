@@ -1,9 +1,5 @@
 use anyhow::{Result, ensure};
-use boss_protocol_spoke::{
-    Validate,
-    limits::MAX_FRAME_BYTES,
-    v1::{Hello, Record},
-};
+use boss_protocol_spoke::{Validate, limits::MAX_FRAME_BYTES, v1::Record};
 use prost::Message;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -25,9 +21,9 @@ pub struct StoredRecord {
 
 impl Journal {
     /// Sequence and immutable bytes become visible in the same FULL-sync commit.
-    pub fn append(&mut self, mut record: Record, class: Admission, contract: &Hello) -> Result<u64> {
+    pub fn append(&mut self, mut record: Record, class: Admission) -> Result<u64> {
         let tx = self.db.transaction()?;
-        let sequence = insert(&tx, &mut record, class, self.limits, contract)?;
+        let sequence = insert(&tx, &mut record, class, self.limits)?;
         tx.commit()?;
         Ok(sequence)
     }
@@ -65,13 +61,7 @@ impl Journal {
     }
 }
 
-pub(crate) fn insert(
-    db: &Connection,
-    record: &mut Record,
-    class: Admission,
-    limits: Limits,
-    contract: &Hello,
-) -> Result<u64> {
+pub(crate) fn insert(db: &Connection, record: &mut Record, class: Admission, limits: Limits) -> Result<u64> {
     record.sequence = db.query_row("SELECT next_record FROM identity", [], |r| r.get(0))?;
     ensure!(record.sequence < i64::MAX as u64, "journal sequence exhausted");
     record.validate()?;
@@ -80,19 +70,16 @@ pub(crate) fn insert(
         bytes.len() + 16 <= MAX_FRAME_BYTES as usize,
         "record exceeds frame limit"
     );
-    let encoded_contract = contract.encode_to_vec();
-    admit(db, (bytes.len() + encoded_contract.len()) as u64 + 128, class, limits)?;
+    admit(db, bytes.len() as u64 + 128, class, limits)?;
     let observed = record.observed.as_ref().expect("validated stamp");
     db.execute(
-        "INSERT INTO records VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        "INSERT INTO records VALUES(?1,?2,?3,?4,?5)",
         params![
             record.sequence,
             bytes,
             &Sha256::digest(&bytes)[..],
             observed.wall_unix_ms,
-            record.run.is_none(),
-            contract.max_epoch,
-            encoded_contract
+            record.run.is_none()
         ],
     )?;
     db.execute("UPDATE identity SET next_record=next_record+1", [])?;

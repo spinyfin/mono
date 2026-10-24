@@ -2,7 +2,7 @@ use anyhow::{Result, ensure};
 use boss_protocol_spoke::{
     Validate,
     limits::MAX_FRAME_BYTES,
-    v1::{Command, CommandResult, Hello, Record, ResultCode, Stamp, record},
+    v1::{Command, CommandResult, Record, ResultCode, Stamp, record},
 };
 use prost::Message;
 use rusqlite::{OptionalExtension, params};
@@ -51,7 +51,7 @@ impl Journal {
 
     /// The foundation daemon has no executor. Reject durably in order, including
     /// commands received just before a crash. Receipt alone never means success.
-    pub fn reject_pending(&mut self, stamp: &Stamp, contract: &Hello) -> Result<bool> {
+    pub fn reject_pending(&mut self, stamp: &Stamp) -> Result<bool> {
         let tx = self.db.transaction()?;
         let pending: Option<(u64, Vec<u8>, Vec<u8>)> = tx
             .query_row(
@@ -81,7 +81,7 @@ impl Journal {
             })),
             ..Default::default()
         };
-        records::insert(&tx, &mut result, Admission::Lifecycle, self.limits, contract)?;
+        records::insert(&tx, &mut result, Admission::Lifecycle, self.limits)?;
         tx.execute("UPDATE commands SET applied=1 WHERE sequence=?1", [sequence])?;
         tx.execute("UPDATE identity SET applied_command=?1", [sequence])?;
         tx.commit()?;

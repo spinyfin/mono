@@ -4,7 +4,7 @@ mod host;
 use anyhow::Result;
 use boss_protocol_spoke::v1::{Capacity, Inventory, Record, record};
 use boss_spoke_journal::{Admission, Fault, Journal, Limits};
-use boss_spoke_stream::outbound::SharedJournal;
+use boss_spoke_outbound::SharedJournal;
 use clap::Parser;
 use std::{
     path::PathBuf,
@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
     let boot = host::boot_id()?;
     let stamp = || host::stamp(&boot);
     tokio::select! {
-        result = boss_spoke_stream::outbound::run(Arc::clone(&journal), endpoint, stamp) => result,
+        result = boss_spoke_outbound::run(Arc::clone(&journal), endpoint, stamp) => result,
         result = produce(&journal, &args.state_dir, &boot) => result,
         result = tokio::signal::ctrl_c() => { result?; Ok(()) }
     }
@@ -62,7 +62,6 @@ async fn produce(journal: &SharedJournal, root: &std::path::Path, boot: &str) ->
         let observed = host::stamp(boot)?;
         let mut journal = journal.lock().map_err(|_| anyhow::anyhow!("journal owner panicked"))?;
         journal.compact(observed.wall_unix_ms)?;
-        let contract = boss_spoke_stream::outbound::hello(&journal, boot, &[1])?;
         let capacity = Capacity {
             generation: journal.record_bounds()?.1 + 1,
             free_disk_bytes: fs4::available_space(root)?,
@@ -82,8 +81,8 @@ async fn produce(journal: &SharedJournal, root: &std::path::Path, boot: &str) ->
             body: Some(record::Body::Capacity(capacity)),
             ..Default::default()
         };
-        if let Err(error) = journal.append(record, Admission::Capacity, &contract) {
-            if matches!(error.downcast_ref::<Fault>(), Some(Fault::Full)) {
+        if let Err(error) = journal.append(record, Admission::Capacity) {
+            if Fault::is_full(&error) {
                 tracing::error!("capacity spool full; retaining numbered evidence and stopping capacity admission");
             } else {
                 return Err(error);
