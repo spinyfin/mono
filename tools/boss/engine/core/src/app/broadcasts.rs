@@ -18,6 +18,22 @@ impl ServerState {
             if let Some(wait) = self.wait_registry.active(&state.run_id, now) {
                 state.wait_reason = Some(wait.reason);
                 state.wait_expires_at = Some(boss_engine_utils::iso8601::format_epoch_iso8601(wait.expires_at_epoch));
+                // An unexpired declared wait means the worker is waiting on a
+                // job, not on the owner. The hook-derived `WaitingForInput`
+                // activity (and its "awaiting input" subtitle) would make the
+                // owner look needed, so report the wait as an idle one.
+                // A prompt raised mid-turn, before the turn that declared the
+                // wait ended, is still a real ask of the owner.
+                let turn_ended = self
+                    .live_worker_states
+                    .last_stop_ingress_seq(state.slot_id)
+                    .is_some_and(|stop| wait.declared_after_seq.is_none_or(|declared| stop > declared));
+                if turn_ended && state.activity == boss_protocol::WorkerActivity::WaitingForInput {
+                    state.activity = boss_protocol::WorkerActivity::Idle;
+                    if state.live_status.as_deref() == Some(crate::live_status::AWAITING_INPUT_LITERAL) {
+                        state.live_status = None;
+                    }
+                }
             }
         }
         states

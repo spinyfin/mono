@@ -69,6 +69,8 @@ public struct PaneMember: Equatable, Sendable, Identifiable {
     public var type: AgentType
     /// The worker is waiting for input. Feeds waiting counts and selector dots.
     public var isWaiting: Bool
+    /// The worker declared a bounded wait on a job; the owner is not needed.
+    public var isWaitingOnJob: Bool
     public var hasViewer: Bool
 
     public var id: String { runId }
@@ -79,6 +81,7 @@ public struct PaneMember: Equatable, Sendable, Identifiable {
         project: AgentProject = .unfiled,
         type: AgentType = .coding,
         isWaiting: Bool = false,
+        isWaitingOnJob: Bool = false,
         hasViewer: Bool = true
     ) {
         self.runId = runId
@@ -86,6 +89,7 @@ public struct PaneMember: Equatable, Sendable, Identifiable {
         self.project = project
         self.type = type
         self.isWaiting = isWaiting
+        self.isWaitingOnJob = isWaitingOnJob
         self.hasViewer = hasViewer
     }
 }

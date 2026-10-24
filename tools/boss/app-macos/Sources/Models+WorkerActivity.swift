@@ -165,6 +165,18 @@ struct WorkerLiveState {
     }
 }
 
+extension WorkerLiveState {
+    /// The worker declared a wait on a job and the owner is not needed.
+    /// The engine snapshot is authoritative: it normalizes a wait whose
+    /// declaring turn has ended to `.idle`, and keeps `.waitingForInput`
+    /// (which still carries `waitReason`) for a prompt raised mid-turn,
+    /// which is a real ask of the owner. So a job wait is exactly idle plus
+    /// a declared reason; any other activity is never a job wait.
+    var isWaitingOnJob: Bool {
+        activity == .idle && !(waitReason ?? "").isEmpty
+    }
+}
+
 extension WorkerLiveState: Hashable {
     /// Custom `==`/`hash(into:)` that exclude `lastEventAt` and
     /// `lastToolEndedAt`. Both fields advance on every hook event —
@@ -338,7 +350,7 @@ enum AgentActivityState: Equatable {
             case .waitingForInput:
                 self = .waiting(reason: "Waiting on user input")
             case .idle:
-                if let waitReason = liveState.waitReason, !waitReason.isEmpty {
+                if liveState.isWaitingOnJob {
                     self = .waiting(reason: Self.waitCaption(liveState))
                 } else if let recovering = liveState.recoveryStatus, !recovering.isEmpty {
                     self = .waiting(reason: recovering)
@@ -370,17 +382,19 @@ enum AgentActivityState: Equatable {
     ///    missing identity is an invariant failure, never a supported
     ///    local hosting mode. Remote workers (`tmuxHosted == nil`) skip
     ///    this rule.
-    /// 3. A worker paused on a permission prompt
-    ///    (`activity == .waitingForInput`) reads as *waiting*, not
-    ///    active. Without this, the card shows a green "working" dot
-    ///    while the run is actually stalled on an input prompt no one
-    ///    is watching for. This must precede the bound-slot shortcut
-    ///    below; it clears on its own once the worker resumes and the
-    ///    activity flips back to `.working`.
-    /// 4. An idle worker with a declared wait (`waitReason`) reads as
+    /// 3. An idle worker with a declared wait (`waitReason`) reads as
     ///    *waiting* with the wait caption, matching
-    ///    `init(runtime:liveState:)`. A worker that has resumed (any other
-    ///    activity) falls through even if the wait has not yet expired.
+    ///    `init(runtime:liveState:)`. The engine normalizes a wait whose
+    ///    declaring turn has ended to idle; any other activity falls
+    ///    through even if the wait has not yet expired.
+    /// 4. A worker paused on a permission prompt
+    ///    (`activity == .waitingForInput`, including a prompt raised
+    ///    mid-turn while a wait is declared) reads as *waiting on the
+    ///    owner*, not active. Without this, the card shows a green
+    ///    "working" dot while the run is actually stalled on an input
+    ///    prompt no one is watching for. This must precede the bound-slot
+    ///    shortcut below; it clears on its own once the worker resumes
+    ///    and the activity flips back to `.working`.
     /// 5. A slot-bound worker which has not reported a hook-derived state
     ///    reads as unknown rather than being guessed as active: after
     ///    re-adoption, `.spawning` means the engine knows the process exists
@@ -404,11 +418,11 @@ enum AgentActivityState: Equatable {
         if liveState?.tmuxHosted == false {
             return .errored(reason: Self.identityUnavailableReason)
         }
+        if let liveState, liveState.isWaitingOnJob {
+            return .waiting(reason: waitCaption(liveState))
+        }
         if liveState?.activity == .waitingForInput {
             return .waiting(reason: "Waiting on user input")
-        }
-        if let liveState, liveState.activity == .idle, let reason = liveState.waitReason, !reason.isEmpty {
-            return .waiting(reason: waitCaption(liveState))
         }
         if liveState?.activity == .spawning {
             return .unknown(reason: "Worker state not yet reported")
@@ -434,10 +448,20 @@ enum AgentActivityState: Equatable {
         stage == AgentReviewStage.consolidation ? "Consolidating review findings" : "AI review in progress"
     }
 
+    private static func clockTime(_ iso: String) -> String {
+        let parser = ISO8601DateFormatter()
+        guard let date = parser.date(from: iso) else { return iso }
+        return date.formatted(date: .omitted, time: .shortened)
+    }
+
     static func waitCaption(_ liveState: WorkerLiveState) -> String {
-        let reason = liveState.waitReason ?? "long-running job"
-        if let expiry = liveState.waitExpiresAt, !expiry.isEmpty {
-            return "Waiting: \(reason) (until \(expiry))"
+        waitCaption(reason: liveState.waitReason, expiresAt: liveState.waitExpiresAt)
+    }
+
+    static func waitCaption(reason: String?, expiresAt: String?) -> String {
+        let reason = reason ?? "long-running job"
+        if let expiry = expiresAt, !expiry.isEmpty {
+            return "Waiting: \(reason) · until \(Self.clockTime(expiry))"
         }
         return "Waiting: \(reason)"
     }

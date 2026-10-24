@@ -595,3 +595,36 @@ async fn a_durable_status_write_decided_from_a_stale_transition_follows_the_pane
         "the pane is Working, so the row stays running",
     );
 }
+
+#[tokio::test]
+async fn a_declared_wait_overrides_waiting_for_input_while_a_bare_prompt_keeps_it() {
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 1)).await;
+    dispatch_worker_event_fanout(&server_state, &post_tool_use(&execution_id, "Bash", 2)).await;
+    // A pending prompt with no declared wait still needs the owner.
+    server_state
+        .live_worker_states
+        .set_activity_for_test(SLOT, WorkerActivity::WaitingForInput);
+    let asking = snapshot(&server_state);
+    assert_eq!(asking.activity, WorkerActivity::WaitingForInput);
+    assert!(asking.wait_reason.is_none());
+
+    // The same activity under an active declared wait is a job wait.
+    server_state.live_worker_states.set_live_status(
+        SLOT,
+        Some(crate::live_status::AWAITING_INPUT_LITERAL.to_owned()),
+    );
+    declare_wait(&server_state, &execution_id);
+    // Mid-turn prompt: the declaring turn has not ended, so it still asks.
+    assert_eq!(snapshot(&server_state).activity, WorkerActivity::WaitingForInput);
+    dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 3)).await;
+    server_state
+        .live_worker_states
+        .set_activity_for_test(SLOT, WorkerActivity::WaitingForInput);
+    let waiting = snapshot(&server_state);
+    assert_eq!(waiting.activity, WorkerActivity::Idle);
+    assert_eq!(waiting.wait_reason.as_deref(), Some(WAIT_REASON));
+    assert!(waiting.live_status.is_none(), "no generic 'awaiting input' subtitle");
+}

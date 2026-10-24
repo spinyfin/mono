@@ -1733,6 +1733,12 @@ impl LiveWorkerStateRegistry {
         guard.get(&slot_id)?.meta.last_applied_ingress_seq
     }
 
+    /// Ingress sequence of the newest `Stop` applied to `slot_id`, if any.
+    pub fn last_stop_ingress_seq(&self, slot_id: u8) -> Option<u64> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard.get(&slot_id)?.meta.last_stop_seq
+    }
+
     /// [`Self::apply_sequenced_event`] with the hook's full provenance, and
     /// the turn-resume evidence the reduction produced.
     ///

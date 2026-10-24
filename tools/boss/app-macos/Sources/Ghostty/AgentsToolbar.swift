@@ -42,10 +42,13 @@ struct AgentsToolbar: View {
             if grid.layout.filter.isActive {
                 hiddenSummary
             }
-            if grid.layout.waitingCount > 0 {
-                Text("Needs input \(grid.layout.waitingCount)")
+            ForEach(AgentsBadge.labels(
+                waitingOnJob: grid.layout.waitingOnJobCount,
+                needsInput: grid.layout.waitingCount
+            ), id: \.text) { badge in
+                Text(badge.text)
                     .font(.caption.weight(.medium))
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(badge.needsOwner ? Color.orange : Color.secondary)
             }
             Button("Tidy") { grid.tidy() }
                 .font(.caption)
@@ -116,4 +119,20 @@ struct AgentsToolbar: View {
         AgentPageSelectors(layout: grid.layout, onSelect: grid.selectPage)
     }
 
+}
+
+/// Header badge labels: declared job waits are separate from agents that need
+/// the owner, and each group appears only when non-empty.
+enum AgentsBadge {
+    struct Label: Equatable {
+        let text: String
+        let needsOwner: Bool
+    }
+
+    static func labels(waitingOnJob: Int, needsInput: Int) -> [Label] {
+        var out: [Label] = []
+        if waitingOnJob > 0 { out.append(Label(text: "Waiting \(waitingOnJob)", needsOwner: false)) }
+        if needsInput > 0 { out.append(Label(text: "Needs input \(needsInput)", needsOwner: true)) }
+        return out
+    }
 }
