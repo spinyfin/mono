@@ -80,13 +80,35 @@ final class RevealClearsFiltersTests: XCTestCase {
         XCTAssertTrue(model.visibleWorkItems.contains { $0.id == "chore_x" })
     }
 
-    func testRevealClearsProjectFilter() {
+    func testRevealKeepsProjectFilterWhenTargetIsInIt() {
         let model = makeModel()
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [makeTask(id: "task_a", name: "Apple")]))
+        model.selectedProjectFilterIDs = ["proj_test"]
+
+        model.revealWorkCard("task_a", productID: "prod_test")
+
+        XCTAssertEqual(model.selectedProjectFilterIDs, ["proj_test"], "same-project reveal must keep the filter")
+        XCTAssertEqual(model.revealScrollTarget, "task_a")
+    }
+
+    func testRevealSwitchesProjectFilterToTargetsProjectWhenHidden() {
+        let model = makeModel()
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [makeTask(id: "task_a", name: "Apple")]))
         model.selectedProjectFilterIDs = ["proj_other"]
 
         model.revealWorkCard("task_a", productID: "prod_test")
 
-        XCTAssertTrue(model.selectedProjectFilterIDs.isEmpty, "reveal must clear the project filter")
+        XCTAssertEqual(model.selectedProjectFilterIDs, ["proj_test"])
+    }
+
+    func testRevealClearsProjectFilterWhenTargetHasNoProject() {
+        let model = makeModel()
+        model.applyEventForTest(makeWorkTreeEvent(chores: [makeTask(id: "chore_x", name: "Chore", projectID: nil)]))
+        model.selectedProjectFilterIDs = ["proj_test"]
+
+        model.revealWorkCard("chore_x", productID: "prod_test")
+
+        XCTAssertTrue(model.selectedProjectFilterIDs.isEmpty)
     }
 
     func testEveryLifecycleStateRequiresExactViewportConfirmation() {

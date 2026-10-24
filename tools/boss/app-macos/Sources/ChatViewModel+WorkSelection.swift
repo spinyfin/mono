@@ -290,8 +290,9 @@ extension ChatViewModel {
         // Reveal owns its refresh: entering Work must not fetch the old
         // product before selection, or refetch the target a second time.
         setNavigationMode(.work, refreshWorkOnEntry: false)
-        clearWorkFiltersForReveal()
         let switching = currentSelectedProductID != productID
+        clearWorkFiltersForReveal()
+        reconcileProjectFilterForReveal(taskID, switchingProduct: switching)
         if switching {
             selectWorkProduct(productID)
         } else {
@@ -315,11 +316,33 @@ extension ChatViewModel {
     /// `computeVisibleWorkItems` — any new narrowing filter added there
     /// must be neutralized here too, or reveal can silently fail again.
     private func clearWorkFiltersForReveal() {
-        selectedProjectFilterIDs = []
         workSearchText = ""
         showBlockedOnly = false
         filterToChoresOnly = false
         includeChores = true
+    }
+
+    /// Leave the project filter alone when the reveal target is already in
+    /// it. Only when the target would be hidden does the filter change: to
+    /// the target's project, or to All when the target has no project (or
+    /// can't be resolved yet, e.g. its product tree hasn't loaded).
+    private func reconcileProjectFilterForReveal(_ taskID: String, switchingProduct: Bool) {
+        guard !selectedProjectFilterIDs.isEmpty else { return }
+        guard !switchingProduct, let item = task(withID: taskID) else {
+            selectedProjectFilterIDs = []
+            return
+        }
+        var cardTask = item
+        if case .revealed(let cardID) = revealCardTarget(for: taskID), let host = task(withID: cardID) {
+            cardTask = host
+        }
+        guard let projectID = cardTask.projectID else {
+            selectedProjectFilterIDs = []
+            return
+        }
+        if !selectedProjectFilterIDs.contains(projectID) {
+            selectedProjectFilterIDs = [projectID]
+        }
     }
 
     func setWorkBoardGrouping(_ grouping: WorkBoardGrouping) {
