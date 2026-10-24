@@ -1,21 +1,22 @@
 import Foundation
 
 /// Request identities and snapshot watermark for one product's board.
-/// Expired reads retain their refresh obligations until a replacement is requested.
+/// Expired reads retain their refresh obligations until a replacement is accepted.
 struct BoardReadFence {
     static let staleAfter: Duration = .seconds(30)
     var trees: [String: ContinuousClock.Instant] = [:]
     var patchRequestID: String?
     var patchSentAt: ContinuousClock.Instant?
     var patchItemIDs: Set<String> = []
-    var needsTree = false
+    var needsTreeSince: ContinuousClock.Instant?
+    var needsTree: Bool { needsTreeSince != nil }
     var patchSuperseded = false
     var queuedPatchItemIDs: Set<String> = []
     var revision: UInt64 = 0
 
-    mutating func expire(now: ContinuousClock.Instant = .now) {
-        let liveTrees = trees.filter { $0.value.duration(to: now) < Self.staleAfter }
-        needsTree = needsTree || liveTrees.count != trees.count
+    mutating func expire(now: ContinuousClock.Instant = .now, isQueued: (String) -> Bool) {
+        let liveTrees = trees.filter { isQueued($0.key) || $0.value.duration(to: now) < Self.staleAfter }
+        if liveTrees.count != trees.count { needsTreeSince = now }
         trees = liveTrees
         if let sent = patchSentAt, sent.duration(to: now) >= Self.staleAfter {
             queuedPatchItemIDs.formUnion(patchItemIDs)
@@ -43,6 +44,13 @@ extension ChatViewModel {
 
     /// Hear every `get_work_tree` the client sends, wherever it is sent from.
     func bindBoardReadObserver() {
+        engine.onQueuedWorkTreeRetired = { [weak self] productID, requestID in
+            if Thread.isMainThread {
+                MainActor.assumeIsolated { self?.boardReadFences[productID]?.trees.removeValue(forKey: requestID) }
+            } else {
+                Task { @MainActor in self?.boardReadFences[productID]?.trees.removeValue(forKey: requestID) }
+            }
+        }
         engine.onWorkTreeRequested = { [weak self] productID, requestID in
             if Thread.isMainThread {
                 MainActor.assumeIsolated { self?.noteWorkTreeRequested(productID: productID, requestID: requestID) }
@@ -54,9 +62,8 @@ extension ChatViewModel {
 
     func noteWorkTreeRequested(productID: String, requestID: String) {
         var fence = boardReadFences[productID] ?? BoardReadFence()
-        fence.expire()
+        fence.expire(isQueued: engine.isReadQueued(requestId:))
         fence.trees[requestID] = .now
-        fence.needsTree = false
         if fence.patchRequestID != nil { fence.patchSuperseded = true }
         fence.queuedPatchItemIDs.removeAll()
         boardReadFences[productID] = fence
@@ -64,12 +71,15 @@ extension ChatViewModel {
 
     func acceptWorkTree(productID: String, requestID: String?, revision: UInt64?) -> Bool {
         var fence = boardReadFences[productID] ?? BoardReadFence()
-        let known = requestID.map { fence.trees.removeValue(forKey: $0) != nil } ?? true
+        let requestedAt = requestID.flatMap { fence.trees.removeValue(forKey: $0) }
+        let known = requestID == nil || requestedAt != nil
         let fresh = revision.map { $0 >= fence.revision } ?? true
         let accepted = fresh && (known || revision != nil)
         if accepted {
             fence.revision = revision ?? fence.revision
-            fence.needsTree = false
+            if let since = fence.needsTreeSince, let requestedAt, requestedAt >= since {
+                fence.needsTreeSince = nil
+            }
         }
         boardReadFences[productID] = fence
         if !accepted && productID == currentSelectedProductID {
@@ -95,17 +105,22 @@ extension ChatViewModel {
         boardReadFences[productID] = fence
     }
 
-    /// Drop every outstanding read: the connection that carried them is gone,
-    /// so no reply is coming.
+    /// Sent reads died with the connection; unsent reads still belong to the queue.
     func resetBoardReadFences() {
-        boardReadFences.removeAll()
+        for (productID, fence) in boardReadFences {
+            var reset = BoardReadFence()
+            reset.trees = fence.trees.filter { engine.isReadQueued(requestId: $0.key) }
+            boardReadFences[productID] = reset
+        }
     }
 
     /// Settle only the read named by the error envelope.
     func failBoardRead(requestID: String?) {
         guard let requestID else { return }
         for (productID, var fence) in boardReadFences {
-            fence.trees.removeValue(forKey: requestID)
+            if fence.trees.removeValue(forKey: requestID) != nil {
+                fence.needsTreeSince = .now
+            }
             let patchFailed = fence.patchRequestID == requestID
             if patchFailed {
                 fence.patchRequestID = nil
@@ -136,7 +151,7 @@ extension ChatViewModel {
         guard !itemIDs.isEmpty else { return }
         var fence = boardReadFences[productID] ?? BoardReadFence()
         let now = ContinuousClock.now
-        fence.expire(now: now)
+        fence.expire(now: now, isQueued: engine.isReadQueued(requestId:))
         boardReadFences[productID] = fence
         if itemIDs.union(fence.queuedPatchItemIDs).count > Self.maxRuntimePatchItems || !fence.trees.isEmpty || fence.needsTree {
             refetchBoard(productID: productID)

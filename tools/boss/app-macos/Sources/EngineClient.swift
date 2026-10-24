@@ -283,6 +283,7 @@ final class EngineClient: @unchecked Sendable {
     /// whichever thread issued it. `ChatViewModel` uses it to order tree reads
     /// against runtime patches (`BoardReadFence`); it is set once at start-up.
     var onWorkTreeRequested: ((String, String) -> Void)?
+    var onQueuedWorkTreeRetired: ((String, String) -> Void)?
 
     /// Test-only: report sends as accepted without a socket, so view-model
     /// tests can exercise the connected path.
@@ -361,10 +362,17 @@ final class EngineClient: @unchecked Sendable {
             // other reads preserve their existing exact-payload identity.
             if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) {
                 let treeProductID = kind == "get_work_tree" ? payload["product_id"] as? String : nil
-                queuedReads.withLock { state in
+                let retired = queuedReads.withLock { state in
+                    let previous = state
                     state.removeAll { treeProductID != nil ? $0.treeProductID == treeProductID : $0.data == data }
                     state.append((envelopeRequestId, data, treeProductID))
                     if state.count > Self.maxQueuedReads { state.removeFirst(state.count - Self.maxQueuedReads) }
+                    return previous.filter { old in !state.contains { $0.id == old.id } }
+                }
+                for item in retired {
+                    if let productID = item.treeProductID {
+                        onQueuedWorkTreeRetired?(productID, item.id)
+                    }
                 }
             } else {
                 emit(.notConnected(requestKind: kind))
