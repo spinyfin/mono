@@ -533,59 +533,8 @@ fn pr_push_force_with_lease_happy_path() {
         ),
         // advance bookmarks
         ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "boss/exec_abc", "-r", "@"], ""),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &["log", "--no-graph", "-r", "@", "-T", r#"commit_id ++ "\n""#],
-            "head",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                r#"bookmarks(exact:"pr/42")"#,
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &["bookmark", "set", "pr/42", "-r", "@", "--allow-backwards"],
-            "",
-        ),
+        // Export only the branch; PR repair follows push verification.
         ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                r#"bookmarks(exact:"pr/42")"#,
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "head",
-        ),
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                "present(pr/42@git)",
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "head",
-        ),
         // force push via git
         ExpectedCommand::ok(
             cwd.clone(),

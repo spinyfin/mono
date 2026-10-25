@@ -699,8 +699,13 @@ pub(super) fn pr_push(args: PrPushArgs, runner: &dyn CommandRunner) -> Result<Ru
             )));
         }
 
-        // Advance both bookmarks to @.
-        advance_pr_bookmarks(runner, &cwd, &head_branch, &pr_bm)?;
+        // Only a verified push authorizes publication-mode PR bookmark repair.
+        runner.run(&RealCommandRunner::invocation(
+            &cwd,
+            "jj",
+            &["bookmark", "set", &head_branch, "-r", "@"],
+        ))?;
+        crate::app::pr_bookmarks::export_git_refs(runner, None, &cwd)?;
 
         // Force push via git (jj git push has no --force-with-lease flag).
         runner

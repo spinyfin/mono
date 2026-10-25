@@ -62,7 +62,13 @@ enum Scenario {
     /// bookmark, and the pushed resolution shares a change id with the
     /// conflicted rebase result, evolved from the pre-rebase commit.
     Divergent,
+    /// Both rebased commits conflict; only the original tip was recorded.
     DivergentStack,
+    /// Only the second commit conflicts after rebasing.
+    CleanIntermediate,
+    /// No default trunk bookmark exists; publication must fail closed.
+    UnknownTrunk,
+    /// A clean amend contains unpublished work.
     UnpublishedAmend,
 }
 
@@ -96,9 +102,23 @@ fn unpublished_amend_is_not_discarded_at_publication() {
     exercise_publication(Scenario::UnpublishedAmend);
 }
 
+#[test]
+fn clean_rebased_intermediate_is_repaired_at_publication() {
+    exercise_publication(Scenario::CleanIntermediate);
+}
+
+#[test]
+fn publication_without_a_known_trunk_is_refused() {
+    exercise_publication(Scenario::UnknownTrunk);
+}
+
 fn exercise_publication(scenario: Scenario) {
-    let divergent = matches!(scenario, Scenario::Divergent | Scenario::DivergentStack);
-    let stack = scenario == Scenario::DivergentStack;
+    let divergent = matches!(
+        scenario,
+        Scenario::Divergent | Scenario::DivergentStack | Scenario::CleanIntermediate
+    );
+    let stack = matches!(scenario, Scenario::DivergentStack | Scenario::CleanIntermediate);
+    let clean_first = scenario == Scenario::CleanIntermediate;
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
@@ -110,11 +130,15 @@ fn exercise_publication(scenario: Scenario) {
     std::fs::write(repo.join("file"), "base\n").unwrap();
     jj(&repo, &["commit", "-m", "base"]);
     jj(&repo, &["bookmark", "set", "base", "-r", "@-"]);
-    std::fs::write(repo.join("file"), "feature\n").unwrap();
+    std::fs::write(repo.join(if clean_first { "first" } else { "file" }), "feature\n").unwrap();
     jj(&repo, &["describe", "-m", "feature"]);
     if stack {
         jj(&repo, &["commit", "-m", "first feature commit"]);
-        std::fs::write(repo.join("second"), "second feature commit\n").unwrap();
+        std::fs::write(
+            repo.join(if clean_first { "file" } else { "second" }),
+            "second feature commit\n",
+        )
+        .unwrap();
         jj(&repo, &["describe", "-m", "feature tip"]);
     }
     jj(&repo, &["bookmark", "set", "pr/42", "feature", "-r", "@"]);
@@ -132,16 +156,21 @@ fn exercise_publication(scenario: Scenario) {
     jj(&repo, &["new", "base", "-m", "upstream"]);
     std::fs::write(repo.join("file"), "upstream\n").unwrap();
     jj(&repo, &["bookmark", "set", "main", "-r", "@"]);
-    jj(
-        &repo,
-        &["config", "set", "--repo", r#"revset-aliases."trunk()""#, "main"],
-    );
+    if scenario != Scenario::UnknownTrunk {
+        jj(&repo, &["git", "push", "-b", "main", "--allow-new"]);
+    }
     let first = jj_commit_id(&runner, &repo, if stack { "feature-" } else { "feature" }).unwrap();
     jj(&repo, &["rebase", "-s", &first, "-d", "main"]);
     assert_eq!(
         jj(&repo, &["log", "-r", "pr/42", "--no-graph", "-T", "conflict"]).trim(),
         "true"
     );
+    if clean_first {
+        assert_eq!(
+            jj(&repo, &["log", "-r", "pr/42-", "--no-graph", "-T", "conflict"]).trim(),
+            "false"
+        );
+    }
     let conflicted = jj_commit_id(&runner, &repo, "pr/42").unwrap();
     if divergent {
         // Recovery bookmarks keep the pre-rebase commit addressable next to
@@ -220,12 +249,15 @@ fn exercise_publication(scenario: Scenario) {
     }
 
     let retained = jj_commit_id(&runner, &worker, "pr/42").unwrap();
-    let ambiguous = matches!(scenario, Scenario::AmbiguousRewrite | Scenario::AmbiguousUnrelated);
+    let ambiguous = matches!(
+        scenario,
+        Scenario::AmbiguousRewrite | Scenario::AmbiguousUnrelated | Scenario::CleanIntermediate
+    );
     if ambiguous {
         // Concurrent bookmark operations can leave two added targets. Publish
         // must resolve that ambiguity explicitly; launch must never pick one.
         let operation = jj(&repo, &["op", "log", "--no-graph", "--limit", "1", "-T", "id"]);
-        if scenario == Scenario::AmbiguousRewrite {
+        if matches!(scenario, Scenario::AmbiguousRewrite | Scenario::CleanIntermediate) {
             // The other target is a rewrite of the conflicted rebase result.
             jj(&repo, &["describe", "-r", &conflicted, "-m", "concurrent rewrite"]);
         } else {
@@ -302,7 +334,10 @@ fn exercise_publication(scenario: Scenario) {
             "commit_id ++ \"\\n\"",
         ],
     );
-    if matches!(scenario, Scenario::AmbiguousUnrelated | Scenario::UnpublishedAmend) {
+    if matches!(
+        scenario,
+        Scenario::AmbiguousUnrelated | Scenario::UnpublishedAmend | Scenario::UnknownTrunk
+    ) {
         let error = published.unwrap_err().to_string();
         assert!(error.contains("will not pick a side"), "{error}");
         assert!(error.contains("will not help"), "{error}");

@@ -106,6 +106,7 @@ pub(super) fn delete_pr_bookmarks(
 /// when every conflicting side is an ancestor of the head or recorded PR
 /// history, or a proven predecessor of commits the head contains. Otherwise this fails
 /// naming both commits; it never picks a side and never forgets-and-retries.
+/// Only `point_published_pr_bookmark` enables conflicted-side rewrite acceptance.
 pub(super) fn point_pr_bookmark(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
@@ -252,15 +253,18 @@ fn distinct_lines(out: &str) -> Vec<String> {
         .collect()
 }
 
-/// Accept ancestors of the head or recorded PR heads, and proven predecessors
-/// of the head's history. Publication additionally accepts conflicted rewrites
-/// whose evolution reaches published PR history outside trunk. A clean amend
-/// may contain pending work and is never accepted by that additional rule.
+/// Recorded PR heads provide provenance; publication enables conflicted-side repair.
 struct RepairPolicy {
     recorded_heads: Vec<String>,
     publication: bool,
 }
 
+/// Accept ancestors of the head or recorded PR heads, and proven predecessors
+/// of the head's history. Publication additionally accepts a conflicted side
+/// when every unique commit evolves from published PR history outside trunk.
+/// This permits clean rebased intermediates, but preserves clean unpublished
+/// amends. Matching change ids alone never establish provenance.
+/// If trunk resolves to root, the publication-only rule fails closed.
 fn ensure_sides_are_obsolete(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
@@ -336,14 +340,23 @@ fn ensure_sides_are_obsolete(
                         "log",
                         "--no-graph",
                         "-r",
-                        &format!("{commit} & conflicts()"),
+                        &format!("{side} & conflicts()"),
                         "-T",
                         "commit_id",
                     ],
                 )?
                 .trim()
                 .is_empty();
-            let rewrite = conflicted
+            let has_trunk = conflicted
+                && !run(
+                    runner,
+                    database_path,
+                    cwd,
+                    &["log", "--no-graph", "-r", "trunk() ~ root()", "-T", "commit_id"],
+                )?
+                .trim()
+                .is_empty();
+            let rewrite = has_trunk
                 && git_utils::jj_provenance::is_rewrite_of_history(
                     |args| run(runner, database_path, cwd, args),
                     commit,
@@ -351,13 +364,18 @@ fn ensure_sides_are_obsolete(
                 )
                 .map_err(|error| unsafe_repair(name, head, side, &format!("evolution unavailable: {error}")))?;
             if !rewrite {
+                let publication_rule = if policy.publication {
+                    ", nor part of a conflicted side rewritten from published PR history with a known trunk"
+                } else {
+                    ""
+                };
                 return Err(unsafe_repair(
                     name,
                     head,
                     side,
                     &format!(
-                        "commit {commit} is neither an ancestor of a head recorded for this PR, a conflicted rewrite of published PR history accepted during publication, \
-                         nor a recorded predecessor of the head's history"
+                        "commit {commit} is neither an ancestor of a head recorded for this PR \
+                         nor a recorded predecessor of the head's history{publication_rule}"
                     ),
                 ));
             }
