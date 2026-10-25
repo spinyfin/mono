@@ -28,12 +28,12 @@ enum BossAgentPaneActivityCapture {
         let view = HStack(alignment: .top, spacing: 32) {
             column(
                 title: "Mid-turn, waiting on its own background command",
-                caption: "Turn open (no Stop from the driver); last tool call balanced. Pill must read Working.",
+                caption: "Turn open (no Stop from the driver); last tool call balanced. Coding alone indicates normal work.",
                 live: midTurn
             )
             column(
                 title: "Turn ended (driver reported Stop)",
-                caption: "The one signal that parks a worker at its prompt. Pill reads Idle.",
+                caption: "The one signal that parks a worker at its prompt. Idle replaces Coding in the header and connection placeholder.",
                 live: turnEnded
             )
         }

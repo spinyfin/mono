@@ -702,6 +702,24 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         XCTAssertTrue(untyped.showsLiveStatusToggle)
     }
 
+    func testIdleReplacesKindBadgeUntilWorkResumes() {
+        for kind in ["coding", "design", "review", "automation", "answer"] {
+            for activity in [WorkerActivity.working, .idle, .working] {
+                let snapshot = WorkerSlotSnapshot.render(
+                    runId: "exec-1", viewer: nil,
+                    liveState: Self.makeLiveState(activity: activity, agentType: kind),
+                    liveStatusDisabledSlotIDs: [], cachedPersona: nil
+                )
+                if activity == .idle {
+                    XCTAssertNil(snapshot.headerBadge, kind)
+                    XCTAssertEqual(snapshot.statusPillLabel, "Idle")
+                } else {
+                    XCTAssertNotNil(snapshot.headerBadge, kind)
+                }
+            }
+        }
+    }
+
     func testHeaderTitleFallsBackFromSummaryToTaskTitle() {
         let live = Self.makeLiveState(name: "Crusher")
         let titled = WorkerSlotSnapshot.build(

@@ -370,7 +370,10 @@ struct WorkerSlotView: View, @MainActor Equatable {
             // `.equatable()` skipping this body does not freeze the
             // fallback chrome.
             if let label = snapshot.statusPillLabel {
-                statusPill(label, color: snapshot.isPlaceholder ? .secondary : liveActivityColor(snapshot.live))
+                // Normal work needs no extra badge beside the agent kind.
+                if snapshot.isPlaceholder || snapshot.live?.activity != .working || snapshot.live?.isWaitingOnJob == true {
+                    statusPill(label, color: snapshot.isPlaceholder ? .secondary : liveActivityColor(snapshot.live))
+                }
             } else if let session = snapshot.session {
                 WorkerSlotFallbackMonitorPill(session: session)
             }
@@ -589,10 +592,12 @@ private struct WorkerSlotFallbackMonitorPill: View {
     @ObservedObject var session: TerminalPaneSession
 
     var body: some View {
-        statusPill(
-            session.paneMonitorState.label,
-            color: paneMonitorStateColor(session.paneMonitorState)
-        )
+        if session.paneMonitorState != .working {
+            statusPill(
+                session.paneMonitorState.label,
+                color: paneMonitorStateColor(session.paneMonitorState)
+            )
+        }
     }
 }
 
