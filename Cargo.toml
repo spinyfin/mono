@@ -93,6 +93,7 @@ members = [
   "tools/checkleft/checks/file/ifchange",
   "tools/checkleft/checks/file/size",
   "tools/checkleft/checks/md/link-integrity",
+  "tools/checkleft/checks/proto/breaking",
   "tools/checkleft/checks/rust/giant-structs",
   "tools/checkleft/checks/rust/giant-structs-common",
   "tools/checkleft/checks/rust/giant-structs-create",
@@ -140,6 +141,9 @@ libc = "0.2.186"
 md-5 = "0.10.6"
 prost = "0.13.5"
 prost-types = "0.13.5"
+# Pure-Rust .proto parser (no protoc) for the proto/breaking checkleft check;
+# 0.8 is the last line on prost-types 0.13, matching the prost pin above.
+protox-parse = "0.8.0"
 rand = "0.8"
 # `x509-parser` lets rcgen read a CSR (verifying its signature) and reload a CA
 # certificate from disk; the hub's host-enrollment crate needs both.

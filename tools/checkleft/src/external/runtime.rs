@@ -1408,17 +1408,24 @@ fn lower_file_diff(path: &Path, diff: &FileDiff) -> wit_types::FileDiff {
 }
 
 fn lower_changeset(changeset: &ChangeSet, source_tree: &dyn SourceTree) -> wit_types::ChangeSet {
+    // Base content is read at the path that existed at the base revision: the
+    // file's own path, or its old path for a rename. The entry is keyed by
+    // that same path (see `base-file.path` in check.wit).
     let base_files: Vec<wit_types::BaseFile> = changeset
         .changed_files
         .iter()
-        .filter(|f| matches!(f.kind, ChangeKind::Deleted | ChangeKind::Modified))
-        .filter_map(|f| {
+        .filter_map(|f| match f.kind {
+            ChangeKind::Deleted | ChangeKind::Modified => Some(f.path.as_path()),
+            ChangeKind::Renamed => f.old_path.as_deref(),
+            ChangeKind::Added => None,
+        })
+        .filter_map(|base_path| {
             source_tree
-                .read_file_versioned(&f.path, crate::input::TreeVersion::Base)
+                .read_file_versioned(base_path, crate::input::TreeVersion::Base)
                 .ok()
                 .and_then(|bytes| String::from_utf8(bytes).ok())
                 .map(|content| wit_types::BaseFile {
-                    path: f.path.to_string_lossy().into_owned(),
+                    path: base_path.to_string_lossy().into_owned(),
                     content,
                 })
         })

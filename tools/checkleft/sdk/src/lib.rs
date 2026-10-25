@@ -82,11 +82,15 @@ pub struct FileDiff {
 
 /// Base-revision content of a single file.
 ///
-/// Provided for files that were deleted or modified in the current changeset
-/// when a base revision is available. Absent for added files and when running
-/// in `--all` mode. Use [`ChangeSet::base_file_content`] to look up by path.
+/// Provided for files that were deleted, modified or renamed in the current
+/// changeset when a base revision is available. Absent for added files and
+/// when running in `--all` mode. Use [`ChangeSet::base_file_content`] to look
+/// up by path, or [`ChangeSet::base_content_for`] to look up a
+/// [`ChangedFile`] whatever its kind.
 #[derive(Debug, Clone)]
 pub struct BaseFile {
+    /// The path the content was read from at the base revision: the changed
+    /// file's `path`, or its `old_path` for a renamed file.
     pub path: String,
     pub content: String,
 }
@@ -107,7 +111,9 @@ pub struct ChangeSet {
     pub pr_description_unavailable_reason: Option<String>,
     pub change_id: Option<String>,
     pub repository: Option<String>,
-    /// Base-revision content for deleted and modified files.
+    /// Base-revision content for deleted, modified and renamed files. A
+    /// renamed file's entry is keyed by its `old_path`, the path that existed
+    /// at the base revision.
     ///
     /// Empty when no base revision is available (e.g. `--all` mode). Checks
     /// should handle the absent case by skipping base-revision enforcement.
@@ -126,6 +132,17 @@ impl ChangeSet {
             .iter()
             .find(|f| f.path == path)
             .map(|f| f.content.as_str())
+    }
+
+    /// Return the base-revision content of `file`, looking under its
+    /// `old_path` when it was renamed, or `None` when not available (an added
+    /// file, `--all` mode, or a base the host could not read).
+    pub fn base_content_for(&self, file: &ChangedFile) -> Option<&str> {
+        let base_path = match (&file.kind, &file.old_path) {
+            (ChangeKind::Renamed, Some(old_path)) => old_path.as_str(),
+            _ => file.path.as_str(),
+        };
+        self.base_file_content(base_path)
     }
 }
 
@@ -455,6 +472,41 @@ mod tests {
             },
             config_json: "{}".to_owned(),
         }
+    }
+
+    #[test]
+    fn base_content_for_uses_the_old_path_of_a_renamed_file() {
+        let mut input = empty_input();
+        input.changeset.base_files = vec![
+            BaseFile {
+                path: "old/a.proto".to_owned(),
+                content: "old a".to_owned(),
+            },
+            BaseFile {
+                path: "b.proto".to_owned(),
+                content: "old b".to_owned(),
+            },
+        ];
+        let renamed = ChangedFile {
+            path: "new/a.proto".to_owned(),
+            kind: ChangeKind::Renamed,
+            old_path: Some("old/a.proto".to_owned()),
+        };
+        let modified = ChangedFile {
+            path: "b.proto".to_owned(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        };
+        let added = ChangedFile {
+            path: "c.proto".to_owned(),
+            kind: ChangeKind::Added,
+            old_path: None,
+        };
+        assert_eq!(input.changeset.base_content_for(&renamed), Some("old a"));
+        assert_eq!(input.changeset.base_content_for(&modified), Some("old b"));
+        assert_eq!(input.changeset.base_content_for(&added), None);
+        // The new path of a rename did not exist at the base revision.
+        assert_eq!(input.changeset.base_file_content("new/a.proto"), None);
     }
 
     #[test]

@@ -588,6 +588,43 @@ Notes:
 - Bypass is for rare, intentional large surfaces (coordinated renames, unsplittable generated trees). Do not raise the silent default or use bypass for convenience dumps.
 - **No-op under `checkleft run --all`.** Whole-repo mode lists every tracked file as modified (no real PR-sized change), so a file-count ceiling would always fire on any real tree. Like `policy.changed_lines_only` under `--all`, this check skips when the changeset is a full-repo scan (`ChangeSet.whole_repo`). PR-scoped / base-ref runs still enforce `max_files`.
 
+## `proto/breaking`
+
+Purpose:
+
+- Fails a change when a `.proto` file it modifies is not backward compatible with the same file at the change's **base revision** — the base checkleft already computes for every change-scoped check.
+- Enforces the protobuf evolution rules a fleet of independently upgraded peers depends on, each reported as a finding at the line in the new file:
+  - field numbers are permanent: no number reuse, and no type, cardinality (`repeated` / `optional` / implicit), name, oneof-membership or `json_name` change on an existing number;
+  - a removed field or enum value must `reserved` both its number and its name, and an existing reservation is never dropped;
+  - no enum value renumbering or renaming;
+  - no message, enum, service or RPC removal or rename;
+  - no package or syntax change;
+  - no change to an existing RPC's request type, response type or streaming mode.
+
+Config keys: none.
+
+Example:
+
+```yaml
+checks:
+  - id: proto/breaking
+    include:
+      - "tools/boss/protocol-spoke/proto/**/*.proto"
+    policy:
+      severity: error
+```
+
+Notes:
+
+- Runs as an embedded WASM check (preinstalled bundle). It parses each file in-process with `protox-parse`, a pure-Rust protobuf parser, so it needs no `protoc`, no `buf` and no network. Every rule above is a property of a single file, so imports are never resolved; type references are compared **as written** (`Foo` vs `.pkg.Foo` counts as a change), which fails closed.
+- **Opt-in by scope.** The check has no file filter of its own; scope it with the framework's `include` globs to the protocol directories that declare a compatibility contract. Nothing happens for `.proto` files elsewhere.
+- A file that is **new** in the change passes: there is nothing for it to be compatible with. A **renamed** file is compared with the content of its old path.
+- A modified file whose base-revision content is **unavailable** on a change run is an **error finding**, never a silent pass. checkleft deepens shallow checkouts to reach the merge base itself, so a missing base means the comparison could not be made and the gate says so.
+- A removed definition has no line in the new file; its finding sits on the definition that used to contain it (the enclosing message, enum or service, or the `package` statement for a top-level one).
+- A deleted `.proto` file never reaches a file-scoped check (the scheduler skips deletions). Deleting a whole schema file is a review matter.
+- A schema check proves only that the schema grows compatibly. It does not replace tests that run an old peer against a new one.
+- **No-op under `checkleft run --all`.** Whole-repo mode lists every tracked file as modified against no base revision, so there is nothing to compare; like `change/file-count`, the check returns no findings when `ChangeSet.whole_repo` is set.
+
 ## `forbidden-imports-deps`
 
 Purpose:
