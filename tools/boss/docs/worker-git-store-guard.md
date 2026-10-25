@@ -74,7 +74,13 @@ find its repository the way git itself does:
 The shared shell tokenizer preserves logical lines, heredoc data and subshell
 boundaries. The gate restores parent directory and environment state after a
 subshell and treats directory state across conditionals and loops as uncertain.
-Exported variables retain their export attribute when reassigned. Directory
+Pipeline elements cannot change the tracked parent directory or environment.
+Comments are removed before lexing and heredoc detection; malformed syntax
+cannot hide later commands from the shared denylist guards. Function definitions
+with store involvement fail closed rather than applying an unexecuted body.
+Exported variables retain their export attribute when reassigned, including
+names exported before assignment, allexport mode, and declaration export flags.
+Directory
 changes through `builtin` are tracked; relative changes with `CDPATH` are
 uncertain. Argument-appending launchers such as `xargs` cannot establish a
 read-only git invocation, and `jj util exec` payloads are inspected.
@@ -83,8 +89,12 @@ An unjudged git word with a store reference is refused. Unrecognized git or
 wrapper options fail closed only when the store is involved. Clone option
 values are consumed before identifying its destination. Shell stdin, script
 files and interpreter code are refused when the command references the store
-or starts there. A heredoc written only as data can pass; executing a script
-later in that same command is still checked.
+or starts there. Quoted heredoc data can pass; command substitutions in expanding
+heredocs are refused with store involvement. Sourcing scripts and executing
+unjudged paths are refused when the store is involved, including files written
+earlier in the command. Shell options stop at the script operand, so a script's
+own `-c` argument cannot masquerade as inspected shell code. Command words held
+in variables and eval arguments are expanded before dispatch.
 
 Scripts and other programs are refused when their effective git-location
 environment points into the store. From a store working directory, only
@@ -109,10 +119,10 @@ would touch the store is refused with its own message naming the shallowing
 hazard, in every spelling and from every directory.
 
 When a mutating git's target cannot be resolved (command substitution, a
-variable the gate cannot see) and the command text names the repos root
-anyway, the gate refuses: a store write that cannot be proven safe is not
-approved. The same unresolvable shape with no mention of the store is not
-the gate's business.
+variable the gate cannot see) and the command text names the repos root or
+derives it through `.jj/repo`, `jj root`, or `jj workspace root`, the gate
+refuses. Shallow operations with an unresolved target always fail closed in
+a cube lease; a throwaway destination under `$TMPDIR` still resolves and passes.
 
 The refusal is loud and says what to do instead: jj inside the worker's own
 workspace for VCS work, the cube PR helpers for publishing, and a throwaway

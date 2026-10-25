@@ -635,7 +635,10 @@ mod tests {
             format!("git --git-dir {store}/.git log -1"),
             format!("GIT_DIR={store}/.git git show HEAD:README.md"),
             "jj git fetch".to_owned(),
-        ] {
+        ]
+        .into_iter()
+        .chain(crate::git_store_guard::tests::approved_commands(&layout))
+        {
             let (decision, reason) = decide(command.clone());
             assert_eq!(decision, "allow", "{command}: {reason}");
         }
@@ -1022,16 +1025,23 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let adapter_path = write_adapter_script(tmp.path());
 
-        let payload = json!({
-            "hookEventName": "pre_tool_use",
-            "toolName": "run_terminal_command",
-            "toolInput": {"command": "open -a Boss"},
-        });
+        for command in [
+            "open -a Boss",
+            "open -a Boss # it's installed",
+            "# don't restart\n\"$BOSS_BIN\" engine stop",
+            "echo 'unterminated\nopen -a Boss",
+        ] {
+            let payload = json!({
+                "hookEventName": "pre_tool_use",
+                "toolName": "run_terminal_command",
+                "toolInput": {"command": command},
+            });
 
-        let (code, stdout, _stderr) = run_adapter(&adapter_path, BOSS_LAUNCH_GUARD_COMMAND, &payload, true);
-        assert_eq!(code, 0);
-        let decision: serde_json::Value = serde_json::from_str(&stdout).expect(&stdout);
-        assert_eq!(decision["decision"], "deny", "must refuse to launch Boss.app: {stdout}");
+            let (code, stdout, _stderr) = run_adapter(&adapter_path, BOSS_LAUNCH_GUARD_COMMAND, &payload, true);
+            assert_eq!(code, 0);
+            let decision: serde_json::Value = serde_json::from_str(&stdout).expect(&stdout);
+            assert_eq!(decision["decision"], "deny", "must refuse to launch Boss.app: {stdout}");
+        }
     }
 
     /// Path guard: a `write` tool call targeting a path under the Boss data

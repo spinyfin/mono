@@ -1042,7 +1042,10 @@ fn git_store_guard_is_armed_through_the_trace_shim_and_refuses_store_writes() {
         format!("git --git-dir {store}/.git show HEAD:README.md"),
         format!("GIT_DIR={store}/.git git log -1"),
         "jj git fetch".to_owned(),
-    ] {
+    ]
+    .into_iter()
+    .chain(crate::git_store_guard::tests::approved_commands(&layout))
+    {
         let (decision, reason) = run_codex_wrapper(&guard.command_path, &command, &layout.workspace);
         assert_eq!(decision, "approve", "{command}: {reason}");
     }
@@ -1081,6 +1084,14 @@ fn codex_tool_surface_guard_is_always_armed_on_every_tool() {
         Some(".*"),
         "it must see every tool name, not just Bash"
     );
+    for command in [
+        "bash # it's interactive",
+        "# Let's start a shell\nbash",
+        "echo 'unterminated\nbash",
+    ] {
+        let (decision, reason) = run_codex_wrapper(&surface.command_path, command, tmp.path());
+        assert_eq!(decision, "block", "{command}: {reason}");
+    }
 }
 
 #[test]
@@ -1095,6 +1106,14 @@ fn reviewer_publish_guard_is_armed_only_for_reviewers() {
             .file_name()
             .is_some_and(|name| name.to_string_lossy().contains("reviewer_publish_guard"))
     });
+    for command in [
+        "git push # don't publish",
+        "# Let's publish\ngh pr review 1 --approve",
+        "echo 'unterminated\ngh pr review 1 --approve",
+    ] {
+        let (decision, reason) = run_codex_wrapper(&reviewer_guard.unwrap().command_path, command, tmp.path());
+        assert_eq!(decision, "block", "{command}: {reason}");
+    }
     assert_eq!(reviewer_guard.map(|guard| guard.matcher), Some(Some(".*")));
 
     let non_reviewer_home = tmp.path().join("non-reviewer");

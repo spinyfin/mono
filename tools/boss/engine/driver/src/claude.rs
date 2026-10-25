@@ -1884,7 +1884,10 @@ mod tests {
             format!("git -C {store} diff --no-ext-diff abc def"),
             "jj git fetch && jj new main@origin".to_owned(),
             "git status".to_owned(),
-        ] {
+        ]
+        .into_iter()
+        .chain(crate::git_store_guard::tests::approved_commands(&layout))
+        {
             let (decision, reason) = claude_git_store_guard_decision(&layout, &command);
             assert_eq!(decision, "approve", "{command}: {reason}");
         }

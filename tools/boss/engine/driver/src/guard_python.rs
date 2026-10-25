@@ -33,14 +33,49 @@ def heredoc_delim(line):
         return None
     if quote and (end == len(rest) or rest[end] != quote):
         return None
-    return word
+    return word, bool(quote)
 
 class CommandGroup(list):
     def __init__(self, tokens, body='', boundary=None, error=None):
         super().__init__(tokens)
         self.body = body
+        self.expanding_body = False
         self.boundary = boundary
         self.error = error
+
+
+def shell_text(text):
+    # Comments cannot open quotes. Protect fd redirections from punctuation
+    # splitting, while preserving quoted data exactly.
+    out, quote, escaped, comment = [], None, False, False
+    for index, char in enumerate(text):
+        if comment:
+            if char != chr(10):
+                continue
+            comment = False
+        if escaped:
+            out.append(char)
+            escaped = False
+            continue
+        if char == chr(92) and quote != chr(39):
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = None
+        elif char in (chr(39), chr(34)):
+            quote = char
+        elif char == '#' and (index == 0 or text[index - 1].isspace() or text[index - 1] in ';|&()<>'):
+            comment = True
+            continue
+        elif char == '&':
+            before = text[index - 1:index]
+            after = text[index + 1:index + 2]
+            if before in ('>', '<') or after == '>':
+                char = '__GUARD_FD_AMP__'
+            elif before == '|':
+                continue
+        out.append(char)
+    return ''.join(out)
 
 
 def command_records(command):
@@ -57,16 +92,17 @@ def command_records(command):
             else:
                 receiver.body += line + chr(10)
             continue
-        pending += line + chr(10)
+        pending = shell_text(pending + line + chr(10))
         try:
             lexer = shlex.shlex(pending, posix=True, punctuation_chars=';&|()')
             lexer.whitespace_split = True
             lexer.commenters = ''
-            tokens = list(lexer)
+            tokens = [token.replace('__GUARD_FD_AMP__', '&') for token in lexer]
         except ValueError:
             # A quote can span physical lines. Never reinterpret failed lexing
             # as whitespace-separated argv.
             continue
+        logical_line = pending
         pending = ''
         current = []
         tokens = [part for token in tokens for part in (re.findall(r'[()]|[;&|]+', token) if token and all(c in '();&|' for c in token) else [token])]
@@ -80,17 +116,25 @@ def command_records(command):
                 current.append(token)
         if current:
             groups.append(CommandGroup(current))
-        delim = heredoc_delim(line)
+        delim = heredoc_delim(logical_line)
         if delim and groups:
-            heredoc_end = delim
+            heredoc_end, quoted = delim
             receiver = groups[-1]
+            receiver.expanding_body = not quoted
+        if tokens and tokens[-1] not in ('&&', '||', '|'):
+            groups.append(CommandGroup([], boundary=';'))
     if pending or heredoc_end:
         groups.append(CommandGroup([], error='incomplete shell syntax'))
     return groups
 
 
 def command_groups(command):
-    return [group for group in command_records(command) if group]
+    records = command_records(command)
+    if any(group.error for group in records):
+        # Keep every physical command visible to denylists after a lex error.
+        return [part.split() for line in shell_text(command).splitlines()
+                for part in re.split(r'[;&|()]', line) if part.split()]
+    return [group for group in records if group]
 
 def strip_prefixes(group):
     index = 0
