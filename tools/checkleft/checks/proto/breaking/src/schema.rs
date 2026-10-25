@@ -116,10 +116,10 @@ pub struct Method {
     pub server_streaming: bool,
 }
 
-/// A syntax error in the file, with the 1-based line it was found on when the
-/// parser could attribute it to one.
+/// A syntax or name-resolution error, with its 1-based source line when known.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseFailure {
+    pub unresolved_type: bool,
     pub message: String,
     pub line: Option<u32>,
 }
@@ -127,6 +127,7 @@ pub struct ParseFailure {
 /// Parse one `.proto` file's text. `name` only labels diagnostics.
 pub fn parse(name: &str, source: &str) -> Result<Schema, ParseFailure> {
     let descriptor = protox_parse::parse(name, source).map_err(|err| ParseFailure {
+        unresolved_type: false,
         message: err.to_string(),
         line: err.span().map(|span| line_of_byte_offset(source, span.start)),
     })?;

@@ -159,3 +159,49 @@ fn default_file_scope_still_skips_deleted_files() {
     assert!(runner.schedule_runs(&changeset).unwrap().runs.is_empty());
     assert!(runner.list_configured_checks(&changeset).unwrap().is_empty());
 }
+
+#[test]
+fn rename_into_destination_override_preserves_old_contract_removal() {
+    for config in [
+        "checks:\n  - id: proto/breaking\n    enabled: false\n",
+        "checks:\n  - id: proto/breaking\n    include: [other/**]\n",
+        "exclude: [schema.proto]\n",
+        "checks:\n  - id: proto/breaking\n    scope: files\n",
+    ] {
+        let temp = tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("api/sub")).unwrap();
+        fs::write(
+            temp.path().join("CHECKS.yaml"),
+            "checks:\n  - id: proto/breaking\n    scope: files-including-removed\n    include: [api/**]\n",
+        )
+        .unwrap();
+        fs::write(temp.path().join("api/sub/CHECKS.yaml"), config).unwrap();
+        let runner = Runner::with_external_package_provider(
+            Arc::new(CheckRegistry::new()),
+            Arc::new(ConfigResolver::new(temp.path()).unwrap()),
+            Arc::new(LocalSourceTree::new(temp.path()).unwrap()),
+            Arc::new(crate::external::BundledExternalCheckPackageProvider),
+        );
+        let changeset = ChangeSet::new(vec![ChangedFile {
+            path: "api/sub/schema.proto".into(),
+            kind: ChangeKind::Renamed,
+            old_path: Some("api/schema.proto".into()),
+        }]);
+        assert_eq!(
+            runner.list_configured_checks(&changeset).unwrap(),
+            vec!["proto/breaking"]
+        );
+        let scheduled = runner.schedule_runs(&changeset).unwrap();
+        let files: Vec<_> = scheduled
+            .runs
+            .iter()
+            .flat_map(|run| run.path_scope.filter_changeset(&run.changeset).changed_files)
+            .collect();
+        assert!(
+            files
+                .iter()
+                .any(|file| file.path == Path::new("api/schema.proto") && file.kind == ChangeKind::Deleted),
+            "{config}: {files:?}"
+        );
+    }
+}

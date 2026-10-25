@@ -1104,15 +1104,7 @@ impl Runner {
                 continue;
             }
             for check in resolved.enabled() {
-                if changed_file.kind == ChangeKind::Deleted
-                    && (check.scope != CheckScope::FilesIncludingRemoved
-                        || rename_destination.as_ref().is_some_and(|destination| {
-                            resolved
-                                .effective_matcher_for(check)
-                                .expect("validated scope")
-                                .is_in_scope(destination)
-                        }))
-                {
+                if skips_removed_candidate(check, &changed_file, rename_destination.as_deref(), &self.resolver)? {
                     continue;
                 }
                 if check.scope == CheckScope::Changeset {
@@ -1174,15 +1166,7 @@ impl Runner {
                 continue;
             }
             for check in resolved.enabled() {
-                if changed_file.kind == ChangeKind::Deleted
-                    && (check.scope != CheckScope::FilesIncludingRemoved
-                        || rename_destination.as_ref().is_some_and(|destination| {
-                            resolved
-                                .effective_matcher_for(check)
-                                .expect("validated scope")
-                                .is_in_scope(destination)
-                        }))
-                {
+                if skips_removed_candidate(check, &changed_file, rename_destination.as_deref(), &self.resolver)? {
                     continue;
                 }
                 if check.scope == CheckScope::Changeset {
@@ -1481,6 +1465,37 @@ fn removal_candidates(changeset: &ChangeSet) -> Vec<(ChangedFile, Option<PathBuf
             candidates
         })
         .collect()
+}
+
+// Suppress a rename's synthetic removal only when its destination schedules
+// the same removal-aware check under its own configuration.
+fn skips_removed_candidate(
+    check: &CheckConfig,
+    file: &ChangedFile,
+    destination: Option<&Path>,
+    resolver: &ConfigResolver,
+) -> Result<bool> {
+    if file.kind != ChangeKind::Deleted {
+        return Ok(false);
+    }
+    if check.scope != CheckScope::FilesIncludingRemoved {
+        return Ok(true);
+    }
+    let Some(destination) = destination else {
+        return Ok(false);
+    };
+    let resolved = resolver.resolve_for_file(destination)?;
+    for destination_check in resolved.enabled() {
+        if destination_check.id == check.id
+            && destination_check.scope == CheckScope::FilesIncludingRemoved
+            && resolved
+                .effective_matcher_for(destination_check)?
+                .is_in_scope(destination)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn should_skip_file(changed_file: &ChangedFile, resolved: &crate::config::ResolvedChecks) -> bool {

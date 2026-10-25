@@ -121,6 +121,9 @@ pub fn check_file(file: &ChangedFile, base_source: &str, new_source: &str) -> Ve
     let base_label = file.old_path.as_deref().unwrap_or(&file.path);
     let old = match schema::parse(base_label, base_source) {
         Ok(schema) => schema,
+        Err(failure) if failure.unresolved_type => {
+            return vec![resolution_failure(file, base_label, &failure, true)];
+        }
         Err(failure) => {
             return vec![
                 Finding::error(format!(
@@ -136,6 +139,9 @@ pub fn check_file(file: &ChangedFile, base_source: &str, new_source: &str) -> Ve
     };
     let new = match schema::parse(&file.path, new_source) {
         Ok(schema) => schema,
+        Err(failure) if failure.unresolved_type => {
+            return vec![resolution_failure(file, &file.path, &failure, false)];
+        }
         Err(failure) => {
             return vec![
                 Finding::error(format!("`{}` does not parse: {}", file.path, failure.message))
@@ -155,6 +161,18 @@ pub fn check_file(file: &ChangedFile, base_source: &str, new_source: &str) -> Ve
                 .with_remediation(violation.remediation)
         })
         .collect()
+}
+
+fn resolution_failure(file: &ChangedFile, label: &str, failure: &ParseFailure, base: bool) -> Finding {
+    let revision = if base { "base revision of " } else { "" };
+    Finding::error(format!(
+        "{revision}`{label}` has a type that is not declared in this file: {}. proto/breaking compares only same-file declarations",
+        failure.message
+    ))
+    .at(&file.path, if base { 1 } else { failure.line.unwrap_or(1) })
+    .with_remediation(
+        "Declare the type in the contracted file or keep imported types out of it; both the base and current schema must use same-file declarations.",
+    )
 }
 
 fn base_unavailable(file: &ChangedFile) -> Finding {

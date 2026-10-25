@@ -63,3 +63,35 @@ fn removed_definitions_anchor_to_moved_new_containers() {
         assert_eq!(finding.line, if finding.message.contains("Outer.") { 8 } else { 7 });
     }
 }
+
+#[test]
+fn resolution_findings_explain_same_file_limit_for_both_revisions() {
+    let valid = "syntax = \"proto3\"; message Envelope {}";
+    let unresolved = "syntax = \"proto3\";\nimport \"google/protobuf/timestamp.proto\";\nmessage Envelope { google.protobuf.Timestamp time = 1; }";
+    let file = checkleft_check_sdk::ChangedFile {
+        path: "new.proto".into(),
+        old_path: Some("old.proto".into()),
+        kind: checkleft_check_sdk::ChangeKind::Renamed,
+    };
+    for base in [false, true] {
+        let findings = if base {
+            crate::check_file(&file, unresolved, valid)
+        } else {
+            crate::check_file(&file, valid, unresolved)
+        };
+        assert_eq!(findings.len(), 1);
+        let finding = &findings[0];
+        assert!(finding.message.contains("not declared in this file"));
+        assert!(finding.message.contains("compares only same-file declarations"));
+        assert!(finding.message.contains(if base {
+            "base revision of `old.proto`"
+        } else {
+            "`new.proto`"
+        }));
+        assert!(!finding.message.contains("does not parse"));
+        assert!(finding.remediations[0].contains("Declare the type in the contracted file or keep imported types out"));
+        let location = finding.location.as_ref().unwrap();
+        assert_eq!(location.path, "new.proto");
+        assert_eq!(location.line, Some(if base { 1 } else { 3 }));
+    }
+}

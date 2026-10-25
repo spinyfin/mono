@@ -77,6 +77,7 @@ fn resolve_name(
         }
     }
     Err(ParseFailure {
+        unresolved_type: true,
         message: format!(
             "cannot resolve type `{name}` in scope `{scope}` to a same-file declaration; compatibility cannot be established"
         ),
