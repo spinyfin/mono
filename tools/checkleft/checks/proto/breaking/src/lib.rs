@@ -23,10 +23,8 @@
 //!
 //! Parsing is done in-process by `protox-parse`, a pure-Rust protobuf parser
 //! that produces a `FileDescriptorProto` with source spans, so the check needs
-//! no `protoc`, no `buf` and no imports: every rule above is a property of a
-//! single file, and type references are compared as written (a differently
-//! qualified reference to the same type counts as a change, which fails
-//! closed).
+//! no `protoc` or `buf`. Same-file type references resolve to canonical names;
+//! unresolved references (including imports) fail explicitly.
 //!
 //! ## Which files
 //!
@@ -36,6 +34,7 @@
 //!
 //! ```yaml
 //! - id: proto/breaking
+//!   scope: files-including-removed
 //!   include:
 //!     - "tools/boss/protocol-spoke/proto/**/*.proto"
 //!   policy:
@@ -55,14 +54,18 @@
 //! - Under `checkleft run --all` there is no base revision (every tracked file
 //!   is listed as modified against nothing), so the check is a documented
 //!   no-op, like `change/file-count`.
-//! - A deleted `.proto` file never reaches a file-scoped check (the scheduler
-//!   skips deletions); deleting a whole schema file is a review matter.
+//! - Use `scope: files-including-removed` to compare deleted files and renames
+//!   leaving the include scope against an empty schema, reporting removed
+//!   definitions at line 1 of the old path.
 //!
 //! The check has no configuration.
 
 mod compare;
 #[cfg(test)]
 mod fixtures;
+#[cfg(test)]
+mod regression_tests;
+mod resolve;
 mod schema;
 #[cfg(test)]
 mod tests;
@@ -88,13 +91,17 @@ pub fn proto_breaking_check(input: CheckInput) -> Vec<Finding> {
     for file in &input.changeset.changed_files {
         match file.kind {
             // Nothing to be compatible with.
-            ChangeKind::Added | ChangeKind::Deleted => continue,
-            ChangeKind::Modified | ChangeKind::Renamed => {}
+            ChangeKind::Added => continue,
+            ChangeKind::Modified | ChangeKind::Renamed | ChangeKind::Deleted => {}
         }
         let Some(base) = input.changeset.base_content_for(file) else {
             findings.push(base_unavailable(file));
             continue;
         };
+        if file.kind == ChangeKind::Deleted {
+            findings.extend(check_file(file, base, ""));
+            continue;
+        }
         let Ok(new_source) = std::fs::read_to_string(&file.path) else {
             findings.push(
                 Finding::error(format!("`{}` could not be read from the sandbox", file.path))

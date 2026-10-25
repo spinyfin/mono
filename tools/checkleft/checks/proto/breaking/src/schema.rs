@@ -4,10 +4,8 @@
 //! resulting `FileDescriptorProto` into [`Schema`]: every message, enum and
 //! service keyed by its name within the file, every field and enum value keyed
 //! by number, and a 1-based line for each definition taken from the parser's
-//! `source_code_info` spans. Type references are kept exactly as written
-//! (`Foo`, `pkg.Foo`, `.pkg.Foo`), since a single file cannot resolve them;
-//! the comparison treats a differently qualified reference as a change, which
-//! fails closed.
+//! `source_code_info` spans. Named references resolve in their declaration
+//! scope to canonical same-file names; unresolved references fail explicitly.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -37,10 +35,7 @@ pub struct Schema {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     pub line: u32,
-    /// Line of the message that directly contains this one, or of the file's
-    /// package statement for a top-level message. Where a finding about a
-    /// *removed* nested definition is reported.
-    pub parent_line: u32,
+    pub map_entry: bool,
     pub fields: BTreeMap<i32, Field>,
     /// Inclusive reserved number ranges.
     pub reserved_numbers: Vec<(i32, i32)>,
@@ -52,8 +47,9 @@ pub struct Field {
     pub name: String,
     pub number: i32,
     pub line: u32,
-    /// The scalar type (`int32`) or the type reference as written (`Foo`).
+    /// The scalar type (`int32`) or canonical named type (`.pkg.Foo`).
     pub type_text: String,
+    pub named_type: bool,
     pub cardinality: Cardinality,
     /// The oneof this field belongs to, if any. Synthetic oneofs created by
     /// proto3 `optional` are not oneofs here.
@@ -88,8 +84,6 @@ impl Cardinality {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Enum {
     pub line: u32,
-    /// See [`Message::parent_line`].
-    pub parent_line: u32,
     /// Values in declaration order. Two values may share a number when the
     /// enum sets `allow_alias`.
     pub values: Vec<EnumValue>,
@@ -114,9 +108,9 @@ pub struct Service {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Method {
     pub line: u32,
-    /// Request type as written.
+    /// Canonical request type.
     pub input: String,
-    /// Response type as written.
+    /// Canonical response type.
     pub output: String,
     pub client_streaming: bool,
     pub server_streaming: bool,
@@ -136,7 +130,9 @@ pub fn parse(name: &str, source: &str) -> Result<Schema, ParseFailure> {
         message: err.to_string(),
         line: err.span().map(|span| line_of_byte_offset(source, span.start)),
     })?;
-    Ok(Schema::from_descriptor(&descriptor))
+    let mut schema = Schema::from_descriptor(&descriptor);
+    super::resolve::resolve(&mut schema)?;
+    Ok(schema)
 }
 
 fn line_of_byte_offset(source: &str, offset: usize) -> u32 {
@@ -273,7 +269,7 @@ impl Schema {
             name.clone(),
             Message {
                 line,
-                parent_line,
+                map_entry: message.options.as_ref().and_then(|o| o.map_entry).unwrap_or(false),
                 fields,
                 reserved_numbers,
                 reserved_names: message.reserved_name.iter().cloned().collect(),
@@ -326,7 +322,6 @@ impl Schema {
             name,
             Enum {
                 line,
-                parent_line,
                 values,
                 reserved_numbers,
                 reserved_names: enum_type.reserved_name.iter().cloned().collect(),
@@ -376,6 +371,7 @@ fn convert_field(field: &FieldDescriptorProto, number: i32, line: u32, proto3: b
         number,
         line,
         type_text,
+        named_type: field.type_name.as_ref().is_some_and(|n| !n.is_empty()),
         cardinality,
         oneof,
         json_name: field.json_name.clone(),

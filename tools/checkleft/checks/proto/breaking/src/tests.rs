@@ -316,16 +316,34 @@ fn message_removed_is_reported_once_at_the_package_line() {
         "message-removed",
         &found[2],
         "rpc Ping(Hello) returns (Hello);",
-        &["rpc `Ping`", "changed its response type from `Goodbye` to `Hello`"],
+        &[
+            "rpc `Ping`",
+            "changed its response type from `.fixture.v1.Goodbye` to `.fixture.v1.Hello`",
+        ],
     );
 }
 
 #[test]
 fn message_renamed_is_reported_as_removed() {
-    assert_single(
+    let found = violations("message-renamed");
+    assert_eq!(found.len(), 3, "{found:#?}");
+    assert_violation(
         "message-renamed",
+        &found[0],
         "package fixture.v1;",
         &["message `Goodbye` was removed or renamed"],
+    );
+    assert_violation(
+        "message-renamed",
+        &found[1],
+        "Farewell goodbye = 11;",
+        &["from `.fixture.v1.Goodbye` to `.fixture.v1.Farewell`"],
+    );
+    assert_violation(
+        "message-renamed",
+        &found[2],
+        "returns (Farewell)",
+        &["from `.fixture.v1.Goodbye` to `.fixture.v1.Farewell`"],
     );
 }
 
@@ -345,7 +363,7 @@ fn nested_message_removed_is_reported_at_its_parent() {
         "string inner = 1;",
         &[
             "field `inner` (1) of message `Outer`",
-            "changed type from `Inner` to `string`",
+            "changed type from `.fixture.v1.Outer.Inner` to `string`",
         ],
     );
 }
@@ -413,7 +431,10 @@ fn rpc_request_type_change() {
     assert_single(
         "rpc-request-type-change",
         "rpc Ping(Record)",
-        &["rpc `Ping`", "changed its request type from `Hello` to `Record`"],
+        &[
+            "rpc `Ping`",
+            "changed its request type from `.fixture.v1.Hello` to `.fixture.v1.Record`",
+        ],
     );
 }
 
@@ -422,7 +443,10 @@ fn rpc_response_type_change() {
     assert_single(
         "rpc-response-type-change",
         "rpc Ping(Hello) returns (Hello);",
-        &["rpc `Ping`", "changed its response type from `Goodbye` to `Hello`"],
+        &[
+            "rpc `Ping`",
+            "changed its response type from `.fixture.v1.Goodbye` to `.fixture.v1.Hello`",
+        ],
     );
 }
 
@@ -442,11 +466,17 @@ fn rpc_streaming_change() {
 
 #[test]
 fn package_change() {
-    assert_single(
+    let found = violations("package-change");
+    assert_eq!(found.len(), 7, "{found:#?}");
+    assert_violation(
         "package-change",
+        &found[0],
         "package fixture.v2;",
         &["package changed from `fixture.v1` to `fixture.v2`"],
     );
+    for finding in &found[1..] {
+        assert!(finding.message.contains("from `.fixture.v1.") && finding.message.contains("to `.fixture.v2."));
+    }
 }
 
 #[test]
@@ -647,5 +677,38 @@ fn renamed_file_is_compared_with_the_content_of_its_old_path() {
     assert_eq!(
         findings[0].location.as_ref().map(|l| l.path.as_str()),
         Some("api/v1/x.proto")
+    );
+}
+
+#[test]
+fn deleted_file_reports_removed_definitions_without_reading_current_file() {
+    let old = "syntax = \"proto3\"; package p; message Gone {} enum Kind { ZERO = 0; } service Hub { rpc Call(Gone) returns (Gone); }";
+    let findings = proto_breaking_check(input(
+        vec![changed("api/gone.proto", ChangeKind::Deleted, None)],
+        vec![("api/gone.proto", old)],
+        false,
+    ));
+    for definition in ["message `Gone`", "enum `Kind`", "service `Hub`"] {
+        assert!(findings.iter().any(|f| f.message.contains(definition)), "{findings:?}");
+    }
+    assert!(findings.iter().all(|f| {
+        f.location
+            .as_ref()
+            .is_some_and(|l| l.line == Some(1) && l.path == "api/gone.proto")
+    }));
+}
+
+#[test]
+fn deleted_file_without_base_is_an_error() {
+    let findings = proto_breaking_check(input(
+        vec![changed("api/gone.proto", ChangeKind::Deleted, None)],
+        vec![],
+        false,
+    ));
+    assert_eq!(findings.len(), 1);
+    assert!(
+        findings[0]
+            .message
+            .contains("base-revision content of `api/gone.proto` is unavailable")
     );
 }

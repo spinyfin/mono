@@ -1095,19 +1095,26 @@ impl Runner {
         let mut resolution_errors = BTreeMap::new();
         let mut config_diagnostics = BTreeSet::new();
 
-        for changed_file in &changeset.changed_files {
-            if matches!(changed_file.kind, ChangeKind::Deleted) {
-                continue;
-            }
-
+        for (changed_file, rename_destination) in removal_candidates(changeset) {
             let resolved = self.resolver.resolve_for_file(&changed_file.path)?;
             for diagnostic in resolved.diagnostics() {
                 config_diagnostics.insert(format_config_diagnostic(diagnostic));
             }
-            if should_skip_file(changed_file, &resolved) {
+            if should_skip_file(&changed_file, &resolved) {
                 continue;
             }
             for check in resolved.enabled() {
+                if changed_file.kind == ChangeKind::Deleted
+                    && (check.scope != CheckScope::FilesIncludingRemoved
+                        || rename_destination.as_ref().is_some_and(|destination| {
+                            resolved
+                                .effective_matcher_for(check)
+                                .expect("validated scope")
+                                .is_in_scope(destination)
+                        }))
+                {
+                    continue;
+                }
                 if check.scope == CheckScope::Changeset {
                     // Listed via the root-resolved pass below, not per changed file.
                     continue;
@@ -1158,18 +1165,26 @@ impl Runner {
         let mut grouped_runs: BTreeMap<RunGroupKey, ScheduledCheckRun> = BTreeMap::new();
         let mut grouped_diagnostics: BTreeMap<DiagnosticGroupKey, CheckResult> = BTreeMap::new();
 
-        for changed_file in &changeset.changed_files {
-            if matches!(changed_file.kind, ChangeKind::Deleted) {
-                continue;
-            }
+        for (changed_file, rename_destination) in removal_candidates(changeset) {
             info!(path = %changed_file.path.display(), "evaluating changed file");
 
             let resolved = self.resolver.resolve_for_file(&changed_file.path)?;
             collect_diagnostics(resolved.diagnostics(), &mut grouped_diagnostics);
-            if should_skip_file(changed_file, &resolved) {
+            if should_skip_file(&changed_file, &resolved) {
                 continue;
             }
             for check in resolved.enabled() {
+                if changed_file.kind == ChangeKind::Deleted
+                    && (check.scope != CheckScope::FilesIncludingRemoved
+                        || rename_destination.as_ref().is_some_and(|destination| {
+                            resolved
+                                .effective_matcher_for(check)
+                                .expect("validated scope")
+                                .is_in_scope(destination)
+                        }))
+                {
+                    continue;
+                }
                 if check.scope == CheckScope::Changeset {
                     // Scheduled once per run by `schedule_changeset_scope_runs`
                     // below, independent of any particular changed file.
@@ -1441,6 +1456,31 @@ impl Runner {
             package: Box::new(package),
         }
     }
+}
+
+// A rename leaving a contract's scope is a removal from that contract.
+// Keep its old path for base lookup and findings; no current file is staged.
+fn removal_candidates(changeset: &ChangeSet) -> Vec<(ChangedFile, Option<PathBuf>)> {
+    changeset
+        .changed_files
+        .iter()
+        .flat_map(|file| {
+            let mut candidates = vec![(file.clone(), None)];
+            if file.kind == ChangeKind::Renamed
+                && let Some(old_path) = &file.old_path
+            {
+                candidates.push((
+                    ChangedFile {
+                        path: old_path.clone(),
+                        kind: ChangeKind::Deleted,
+                        old_path: None,
+                    },
+                    Some(file.path.clone()),
+                ));
+            }
+            candidates
+        })
+        .collect()
 }
 
 fn should_skip_file(changed_file: &ChangedFile, resolved: &crate::config::ResolvedChecks) -> bool {

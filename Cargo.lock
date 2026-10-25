@@ -1693,7 +1693,6 @@ dependencies = [
  "checkleft-check-sdk",
  "prost-types",
  "protox-parse",
- "serde",
 ]
 
 [[package]]

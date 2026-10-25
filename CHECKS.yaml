@@ -118,6 +118,7 @@ checks:
   # new in the change passes; a modified file with no reachable base is an
   # error, not a skip. No-op under `checkleft run --all` (no base revision).
   - id: proto/breaking
+    scope: files-including-removed
     include:
       - "tools/boss/protocol-spoke/proto/**/*.proto"
     policy:

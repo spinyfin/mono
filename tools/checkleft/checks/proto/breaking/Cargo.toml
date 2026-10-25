@@ -12,4 +12,3 @@ description = "checkleft check (proto/breaking): fail a change whose .proto file
 checkleft-check-sdk = { path = "../../../sdk" }
 prost-types = { workspace = true }
 protox-parse = { workspace = true }
-serde = { workspace = true, features = ["derive"] }

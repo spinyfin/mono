@@ -174,7 +174,7 @@ fn new_from_base(case: &str) -> String {
             "returns (Goodbye)",
             "returns (Hello)",
         ),
-        "message-renamed" => r(BASE, "message Goodbye {", "message Farewell {"),
+        "message-renamed" => BASE.replace("Goodbye", "Farewell"),
         "enum-removed" => r(
             BASE,
             "enum Kind {\n  KIND_UNSPECIFIED = 0;\n  KIND_RECORD = 1;\n  KIND_COMMAND = 2;\n  reserved 3;\n  reserved \"KIND_RETIRED\";\n}\n\n",

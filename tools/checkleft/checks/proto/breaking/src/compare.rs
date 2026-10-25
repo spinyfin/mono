@@ -50,8 +50,9 @@ pub fn compare(old: &Schema, new: &Schema) -> Vec<Violation> {
     for (name, old_message) in &old.messages {
         match new.messages.get(name) {
             Some(new_message) => compare_message(name, old_message, new_message, &mut out),
+            None if old_message.map_entry => {}
             None => out.push(Violation {
-                line: old_message.parent_line.min(line_of_container(new, name)),
+                line: line_of_container(new, name),
                 message: format!("message `{name}` was removed or renamed"),
                 remediation: "Keep the message; a shape that is no longer needed stays in the schema (optionally marked `deprecated`) so old peers can still name it.".to_owned(),
             }),
@@ -61,7 +62,7 @@ pub fn compare(old: &Schema, new: &Schema) -> Vec<Violation> {
         match new.enums.get(name) {
             Some(new_enum) => compare_enum(name, old_enum, new_enum, &mut out),
             None => out.push(Violation {
-                line: old_enum.parent_line.min(line_of_container(new, name)),
+                line: line_of_container(new, name),
                 message: format!("enum `{name}` was removed or renamed"),
                 remediation: "Keep the enum; a shape that is no longer needed stays in the schema (optionally marked `deprecated`) so old peers can still name it.".to_owned(),
             }),

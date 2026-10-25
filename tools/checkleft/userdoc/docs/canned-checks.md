@@ -608,6 +608,7 @@ Example:
 ```yaml
 checks:
   - id: proto/breaking
+    scope: files-including-removed
     include:
       - "tools/boss/protocol-spoke/proto/**/*.proto"
     policy:
@@ -616,12 +617,12 @@ checks:
 
 Notes:
 
-- Runs as an embedded WASM check (preinstalled bundle). It parses each file in-process with `protox-parse`, a pure-Rust protobuf parser, so it needs no `protoc`, no `buf` and no network. Every rule above is a property of a single file, so imports are never resolved; type references are compared **as written** (`Foo` vs `.pkg.Foo` counts as a change), which fails closed.
+- Runs as an embedded WASM check (preinstalled bundle). It parses each file in-process with `protox-parse`, a pure-Rust protobuf parser, so it needs no `protoc`, no `buf` and no network. Same-file field and RPC type references resolve in their declaration scopes to canonical names, so equivalent qualifications are compatible and nested shadowing is detected. References that cannot be resolved, including imported types, produce an explicit error.
 - **Opt-in by scope.** The check has no file filter of its own; scope it with the framework's `include` globs to the protocol directories that declare a compatibility contract. Nothing happens for `.proto` files elsewhere.
 - A file that is **new** in the change passes: there is nothing for it to be compatible with. A **renamed** file is compared with the content of its old path.
 - A modified file whose base-revision content is **unavailable** on a change run is an **error finding**, never a silent pass. checkleft deepens shallow checkouts to reach the merge base itself, so a missing base means the comparison could not be made and the gate says so.
 - A removed definition has no line in the new file; its finding sits on the definition that used to contain it (the enclosing message, enum or service, or the `package` statement for a top-level one).
-- A deleted `.proto` file never reaches a file-scoped check (the scheduler skips deletions). Deleting a whole schema file is a review matter.
+- With `scope: files-including-removed`, deletions and renames leaving the configured include scope are compared against an empty schema. Removed definitions are reported at line 1 of the old path.
 - A schema check proves only that the schema grows compatibly. It does not replace tests that run an old peer against a new one.
 - **No-op under `checkleft run --all`.** Whole-repo mode lists every tracked file as modified against no base revision, so there is nothing to compare; like `change/file-count`, the check returns no findings when `ChangeSet.whole_repo` is set.
 

@@ -112,6 +112,8 @@ pub struct CheckConfig {
 pub enum CheckScope {
     #[default]
     Files,
+    /// Include deletions and renames leaving the path scope.
+    FilesIncludingRemoved,
     Changeset,
 }
 
@@ -119,7 +121,8 @@ fn parse_check_scope(raw: &str) -> Result<CheckScope> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "files" => Ok(CheckScope::Files),
         "changeset" => Ok(CheckScope::Changeset),
-        _ => bail!("expected one of `files` or `changeset`"),
+        "files-including-removed" => Ok(CheckScope::FilesIncludingRemoved),
+        _ => bail!("expected one of `files`, `files-including-removed` or `changeset`"),
     }
 }
 
