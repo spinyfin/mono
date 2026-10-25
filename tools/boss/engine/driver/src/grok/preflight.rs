@@ -16,6 +16,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, bail};
 
 use super::environment::GrokProcessEnvironment;
+use super::oauth_refresh::GROK_LOGIN_AFFIRMATION;
 
 /// Wall-clock limit for the OAuth-sensitive `grok models` probe.
 const GROK_MODELS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -124,10 +125,27 @@ fn render_command(command: &Command) -> String {
 /// [`boss_command_runner::output_blocking_timeout_in_group`]) so a chatty child
 /// cannot deadlock against a non-reading parent.
 pub(super) fn run_bounded(command: &mut Command, timeout: Duration) -> anyhow::Result<Output> {
-    run_bounded_in(&IN_FLIGHT, command, timeout)
+    run_bounded_in(&IN_FLIGHT, command, timeout, PREFLIGHT_FAILURE_PREFIX)
 }
 
-fn run_bounded_in(in_flight: &InFlight, command: &mut Command, timeout: Duration) -> anyhow::Result<Output> {
+/// Prefix on every preflight error, so a failure reads as what it is wherever
+/// it surfaces.
+const PREFLIGHT_FAILURE_PREFIX: &str = "Grok worker preflight failed";
+
+/// [`run_bounded`] for a caller that is not a worker preflight — same bound,
+/// same process-group kill, same in-flight registry (so an engine shutdown
+/// still reaps the child) — with `failure_prefix` naming that caller in the
+/// timeout error instead of the preflight.
+pub(super) fn run_bounded_as(command: &mut Command, timeout: Duration, failure_prefix: &str) -> anyhow::Result<Output> {
+    run_bounded_in(&IN_FLIGHT, command, timeout, failure_prefix)
+}
+
+fn run_bounded_in(
+    in_flight: &InFlight,
+    command: &mut Command,
+    timeout: Duration,
+    failure_prefix: &str,
+) -> anyhow::Result<Output> {
     let rendered = render_command(command);
     let registered = std::cell::Cell::new(None);
     let result = boss_command_runner::output_blocking_timeout_in_group(command, timeout, |pid| {
@@ -140,12 +158,12 @@ fn run_bounded_in(in_flight: &InFlight, command: &mut Command, timeout: Duration
     result.map_err(|err| {
         if err.kind() == std::io::ErrorKind::TimedOut {
             anyhow::anyhow!(
-                "Grok worker preflight failed: `{rendered}` did not complete within {}s and was killed \
+                "{failure_prefix}: `{rendered}` did not complete within {}s and was killed \
                  along with its process group",
                 timeout.as_secs()
             )
         } else {
-            anyhow::Error::new(err).context(format!("running Grok worker preflight capability `{rendered}`"))
+            anyhow::Error::new(err).context(format!("{failure_prefix}: running `{rendered}`"))
         }
     })
 }
@@ -288,7 +306,7 @@ fn assert_grok_oauth_with_reprobe(
 
 fn assert_grok_oauth(output: &PreflightOutput) -> anyhow::Result<()> {
     require_success("Grok OAuth", output)?;
-    if !output.stdout.contains("You are logged in with grok.com.") {
+    if !output.stdout.contains(GROK_LOGIN_AFFIRMATION) {
         bail!(
             "Grok worker preflight failed: Grok OAuth is unavailable; `grok models` did not affirm a grok.com login. {}",
             rendered_output(output)
@@ -664,9 +682,14 @@ mod tests {
         command.arg("60");
         let started = std::time::Instant::now();
         let registry = InFlight::default();
-        let error = run_bounded_in(&registry, &mut command, Duration::from_millis(300))
-            .unwrap_err()
-            .to_string();
+        let error = run_bounded_in(
+            &registry,
+            &mut command,
+            Duration::from_millis(300),
+            PREFLIGHT_FAILURE_PREFIX,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             started.elapsed() < Duration::from_secs(30),
             "timeout did not bound the call"
@@ -705,7 +728,14 @@ mod tests {
         let registry = std::sync::Arc::new(InFlight::default());
         let runner = {
             let registry = registry.clone();
-            std::thread::spawn(move || run_bounded_in(&registry, &mut command, Duration::from_secs(120)))
+            std::thread::spawn(move || {
+                run_bounded_in(
+                    &registry,
+                    &mut command,
+                    Duration::from_secs(120),
+                    PREFLIGHT_FAILURE_PREFIX,
+                )
+            })
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while registry.map().is_empty() && std::time::Instant::now() < deadline {

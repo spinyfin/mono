@@ -12,7 +12,7 @@
 //! |--------|-----------|-----|
 //! | `claude` | `claude -p "/usage" --output-format json` | `/usage` is a **local** slash command: in print mode Claude Code executes it without a model turn (`num_turns: 0`, `total_cost_usd: 0`) and prints the provider's report in the JSON envelope's `result`. No credential ever passes through Boss — the CLI reads its own keychain entry. |
 //! | `codex` | `codex app-server` stdio JSON-RPC → `account/rateLimits/read` (via the shared client in `boss-engine-codex-hook-trust`) | Codex exposes no `usage`/`status` subcommand, but its app-server protocol has a first-class, machine-readable method for exactly this. One handshake, no thread started, no model turn. Again no credential passes through Boss: the child reads `$CODEX_HOME/auth.json` itself. |
-//! | `grok` | HTTPS GET of the CLI's own billing/credits endpoint | Grok's `/usage` is an in-TUI extension with no CLI equivalent, and headless `grok -p "/usage"` treats the text as a *prompt to the model* — it would burn tokens and answer with prose. The endpoint the extension itself calls is the only non-interactive route, so this is the one driver where Boss handles a bearer token. It is read from the same `auth.json` the driver reads, held in memory for one request, and never logged, echoed, or persisted. |
+//! | `grok` | HTTPS GET of the CLI's own billing/credits endpoint | Grok's `/usage` is an in-TUI extension with no CLI equivalent, and headless `grok -p "/usage"` treats the text as a *prompt to the model* — it would burn tokens and answer with prose. The endpoint the extension itself calls is the only non-interactive route, so this is the one driver where Boss handles a bearer token. It is read from the same `auth.json` the driver reads, held in memory for one request, and never logged, echoed, or persisted. The CLI stores a short-lived access token (observed: six hours) beside a refresh token and renews it lazily, so when the stored token has expired the probe asks the CLI to refresh it through its own non-interactive path (`grok models`, via a [`GrokCredentialRefresher`]) and re-reads the file the CLI rewrote — Boss never writes the credential, and never opens a login flow. |
 //!
 //! # What this must never become
 //!
@@ -683,6 +683,7 @@ pub mod probes;
 mod grok_tests;
 
 pub use cache::{DEFAULT_MIN_REFRESH_INTERVAL, DEFAULT_TTL, QuotaCache, QuotaLookup, QuotaProbeSet};
+pub use probes::grok::{GrokCredentialRefresher, GrokRefreshOutcome};
 
 // ---------------------------------------------------------------------------
 // The probe seam
@@ -729,12 +730,17 @@ pub(crate) fn now_epoch_s() -> i64 {
 /// (`boss_engine_driver::grok::resolve_grok_auth_source`) so the probe reads
 /// the identical `auth.json` the Grok driver reads — this crate deliberately
 /// does not re-derive that path, because two independent derivations of a
-/// credential location is exactly how they drift apart.
-pub fn default_probes(grok_auth_path: std::path::PathBuf) -> QuotaProbeSet {
+/// credential location is exactly how they drift apart. `grok_refresher` is
+/// the Grok CLI's own credential-refresh path, likewise supplied by the
+/// composition root so this crate holds no knowledge of how to run `grok`.
+pub fn default_probes(
+    grok_auth_path: std::path::PathBuf,
+    grok_refresher: std::sync::Arc<dyn GrokCredentialRefresher>,
+) -> QuotaProbeSet {
     vec![
         std::sync::Arc::new(probes::claude::ClaudeQuotaProbe::default()),
         std::sync::Arc::new(probes::codex::CodexQuotaProbe::default()),
-        std::sync::Arc::new(probes::grok::GrokQuotaProbe::new(grok_auth_path)),
+        std::sync::Arc::new(probes::grok::GrokQuotaProbe::new(grok_auth_path, grok_refresher)),
     ]
 }
 
@@ -743,9 +749,23 @@ mod tests {
     use super::*;
     use boss_protocol::DRIVER_QUOTA_ORDER;
 
+    struct NoRefresh;
+
+    #[async_trait]
+    impl GrokCredentialRefresher for NoRefresh {
+        async fn refresh(&self) -> GrokRefreshOutcome {
+            GrokRefreshOutcome::Failed {
+                detail: "not under test".to_owned(),
+            }
+        }
+    }
+
     #[test]
     fn production_probe_set_covers_every_driver_the_snapshot_promises() {
-        let probes = default_probes(std::path::PathBuf::from("/tmp/auth.json"));
+        let probes = default_probes(
+            std::path::PathBuf::from("/tmp/auth.json"),
+            std::sync::Arc::new(NoRefresh),
+        );
         let slugs: Vec<&str> = probes.iter().map(|p| p.driver()).collect();
         assert_eq!(slugs, DRIVER_QUOTA_ORDER.to_vec());
     }

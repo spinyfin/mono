@@ -731,7 +731,7 @@ struct ServerState {
     /// it allocates no worker slot, creates no execution row, and opens no
     /// pane, so it can never be mistaken for, or occupy, a dispatch slot.
     #[builder(default = Arc::new(boss_engine_driver_quota::QuotaCache::new(
-        boss_engine_driver_quota::default_probes(boss_engine_driver::grok::resolve_grok_auth_source()),
+        crate::grok_quota_refresh::production_probes(),
     )))]
     driver_quota: Arc<boss_engine_driver_quota::QuotaCache>,
     /// Startup result for the required tmux runtime. The process only ever

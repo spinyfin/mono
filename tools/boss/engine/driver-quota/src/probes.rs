@@ -334,9 +334,26 @@ pub mod codex {
 /// - the token is held only for the duration of one request;
 /// - it is never logged, never returned, and never placed in a
 ///   [`DriverQuotaOutcome`] reason. Failure reasons here are written by hand
-///   for that reason: no provider body and no header value is echoed.
+///   for that reason: no provider body and no header value is echoed;
+/// - Boss never *writes* the credential. When the stored access token has
+///   expired, the probe asks the Grok CLI to refresh it through the CLI's own
+///   non-interactive path (a [`GrokCredentialRefresher`]), then re-reads the
+///   file the CLI rewrote.
+///
+/// # Why a refresh step at all
+///
+/// The CLI stores a short-lived access token (observed: six hours) beside a
+/// refresh token, and renews it lazily — on its next API call, never on a
+/// timer. Judged by `expires_at` alone, the stored token therefore reads as
+/// expired for most of any day on which the operator has not run `grok`,
+/// while the CLI itself would report (and be) logged in. Reporting "not
+/// signed in" from the file alone was wrong whenever a refresh token sat
+/// beside the expired access token; the refresh step is what makes the panel
+/// agree with the CLI. "Not signed in" is now reserved for the cases where it
+/// is true: no account, no refresh token, or a refresh the issuer rejected.
 pub mod grok {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
     use async_trait::async_trait;
     use boss_protocol::{DRIVER_SLUG_GROK, DriverQuotaFailureKind, DriverQuotaOutcome};
@@ -361,6 +378,39 @@ pub mod grok {
     /// client would be the wrong thing for Boss to do.
     const USER_AGENT: &str = "boss-quota-probe/1.0";
 
+    /// The Grok CLI's own credential-refresh path, as the probe sees it.
+    ///
+    /// The production implementation runs `grok models` against the shared
+    /// credential (it is the CLI subcommand that exercises — and, when the
+    /// token has expired, refreshes — the credential without an inference
+    /// call, and the same probe the worker preflight relies on). The contract
+    /// an implementation must keep:
+    ///
+    /// - it never opens a browser, starts a device-code flow, or prompts;
+    /// - it never reads, logs, or writes the credential file itself — the
+    ///   CLI does any rewriting;
+    /// - the `detail` strings it returns are CLI banner text, never file
+    ///   content, because they reach the panel.
+    #[async_trait]
+    pub trait GrokCredentialRefresher: Send + Sync {
+        /// Run the CLI's credential pass to completion and report what it said.
+        async fn refresh(&self) -> GrokRefreshOutcome;
+    }
+
+    /// What the CLI's credential pass reported. Carries no credential material.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum GrokRefreshOutcome {
+        /// The CLI affirmed a grok.com login; `auth.json` now holds whatever
+        /// it wrote (a refreshed token, or the old one if it was still good).
+        LoggedIn,
+        /// The CLI ran but did not affirm a login — logged out, or a refresh
+        /// token the issuer no longer accepts.
+        NotLoggedIn { detail: String },
+        /// The CLI could not be run to completion (not installed, crashed,
+        /// timed out). Says nothing about whether the operator is signed in.
+        Failed { detail: String },
+    }
+
     /// Probe for the `grok` driver.
     pub struct GrokQuotaProbe {
         /// Path to the Grok `auth.json` the driver reads, resolved by the
@@ -368,12 +418,14 @@ pub mod grok {
         /// identical file.
         auth_path: PathBuf,
         base_url: String,
+        /// The CLI's refresh path, invoked at most once per probe.
+        refresher: Arc<dyn GrokCredentialRefresher>,
     }
 
     impl GrokQuotaProbe {
         /// Build a probe reading the given `auth.json`. The base URL comes from
         /// [`BASE_URL_ENV`] when set, matching the CLI's own override.
-        pub fn new(auth_path: impl Into<PathBuf>) -> Self {
+        pub fn new(auth_path: impl Into<PathBuf>, refresher: Arc<dyn GrokCredentialRefresher>) -> Self {
             let base_url = std::env::var(BASE_URL_ENV)
                 .ok()
                 .map(|v| v.trim().to_owned())
@@ -382,15 +434,21 @@ pub mod grok {
             Self {
                 auth_path: auth_path.into(),
                 base_url,
+                refresher,
             }
         }
 
         /// Explicit base URL — tests point this at a local server.
         #[cfg(test)]
-        pub fn with_base_url(auth_path: impl Into<PathBuf>, base_url: impl Into<String>) -> Self {
+        pub fn with_base_url(
+            auth_path: impl Into<PathBuf>,
+            base_url: impl Into<String>,
+            refresher: Arc<dyn GrokCredentialRefresher>,
+        ) -> Self {
             Self {
                 auth_path: auth_path.into(),
                 base_url: base_url.into(),
+                refresher,
             }
         }
 
@@ -400,32 +458,46 @@ pub mod grok {
     }
 
     /// Why a bearer token could not be produced. Carries no credential material.
+    #[derive(Debug)]
     struct TokenError {
         kind: DriverQuotaFailureKind,
         reason: String,
     }
 
-    /// Pull the bearer token out of a Grok `auth.json` document.
+    /// The signed-in account's credential as stored on disk, judged at one
+    /// instant. `refreshable` is whether a refresh token sits beside the access
+    /// token — i.e. whether the CLI *could* mint a new one without a login.
+    #[derive(Debug, PartialEq, Eq)]
+    enum StoredCredential {
+        /// `expires_at` is absent, unparseable, or in the future.
+        Live { bearer: String, refreshable: bool },
+        /// `expires_at` has passed.
+        Expired { refreshable: bool },
+    }
+
+    /// Read the signed-in account out of a Grok `auth.json` document.
     ///
     /// The file maps an issuer-scoped account key to a record whose `key` field
-    /// holds the bearer. More than one account can be present; the entry with the
-    /// furthest-future `expires_at` wins, which is the live one after a re-login
-    /// under a second issuer. RFC-3339 timestamps compare correctly as strings
-    /// when they share an offset, and these are all written by the same CLI.
+    /// holds the bearer and whose `refresh_token`, when present, is what the
+    /// CLI uses to renew it. More than one account can be present; the entry
+    /// with the furthest-future `expires_at` wins, which is the live one after
+    /// a re-login under a second issuer. RFC-3339 timestamps compare correctly
+    /// as strings when they share an offset, and these are all written by the
+    /// same CLI.
     ///
     /// `now_epoch_s` is the instant expiry is judged against; the probe
     /// passes the live clock and tests pass a fixed value so fixtures never
     /// age into "expired".
     ///
     /// Returns the token by value. Callers must not log or store it.
-    fn extract_bearer(document: &serde_json::Value, now_epoch_s: i64) -> Result<String, TokenError> {
+    fn read_stored_credential(document: &serde_json::Value, now_epoch_s: i64) -> Result<StoredCredential, TokenError> {
         let Some(accounts) = document.as_object() else {
             return Err(TokenError {
                 kind: DriverQuotaFailureKind::NotAuthenticated,
                 reason: "Grok auth.json was not a JSON object — sign in with `grok login`".to_owned(),
             });
         };
-        let mut best: Option<(&str, &str)> = None;
+        let mut best: Option<(&str, &serde_json::Value, &str)> = None;
         for record in accounts.values() {
             let Some(key) = record.get("key").and_then(serde_json::Value::as_str) else {
                 continue;
@@ -438,20 +510,27 @@ pub mod grok {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
             match best {
-                Some((best_expires, _)) if best_expires >= expires => {}
-                _ => best = Some((expires, key)),
+                Some((best_expires, _, _)) if best_expires >= expires => {}
+                _ => best = Some((expires, record, key)),
             }
         }
-        match best {
-            Some((expires, _)) if token_expired(expires, now_epoch_s) => Err(TokenError {
-                kind: DriverQuotaFailureKind::NotAuthenticated,
-                reason: "stored Grok token has expired — run any grok command or `grok login` to refresh".to_owned(),
-            }),
-            Some((_, key)) => Ok(key.to_owned()),
-            None => Err(TokenError {
+        let Some((expires, record, key)) = best else {
+            return Err(TokenError {
                 kind: DriverQuotaFailureKind::NotAuthenticated,
                 reason: "Grok auth.json has no signed-in account — sign in with `grok login`".to_owned(),
-            }),
+            });
+        };
+        let refreshable = record
+            .get("refresh_token")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|token| !token.is_empty());
+        if token_expired(expires, now_epoch_s) {
+            Ok(StoredCredential::Expired { refreshable })
+        } else {
+            Ok(StoredCredential::Live {
+                bearer: key.to_owned(),
+                refreshable,
+            })
         }
     }
 
@@ -471,7 +550,7 @@ pub mod grok {
 
     /// Read and parse the auth document, mapping IO problems onto the failure
     /// kinds the UI distinguishes.
-    fn read_auth_document(path: &std::path::Path) -> Result<serde_json::Value, TokenError> {
+    fn read_auth_document(path: &Path) -> Result<serde_json::Value, TokenError> {
         let raw = std::fs::read_to_string(path).map_err(|err| TokenError {
             kind: if err.kind() == std::io::ErrorKind::NotFound {
                 DriverQuotaFailureKind::NotAuthenticated
@@ -491,6 +570,113 @@ pub mod grok {
         })
     }
 
+    /// Stored token expired and nothing to renew it with: genuinely signed out.
+    const EXPIRED_UNREFRESHABLE_REASON: &str =
+        "stored Grok token has expired and no refresh token is stored — sign in with `grok login`";
+
+    /// What a probe is holding after the credential has been resolved.
+    struct Bearer {
+        token: String,
+        /// Whether a CLI refresh is still worth trying on a rejected request.
+        refreshable: bool,
+    }
+
+    impl GrokQuotaProbe {
+        /// Current stored credential, judged against the live clock.
+        fn stored_credential(&self) -> Result<StoredCredential, TokenError> {
+            read_auth_document(&self.auth_path)
+                .and_then(|document| read_stored_credential(&document, crate::now_epoch_s()))
+        }
+
+        /// Ask the CLI to refresh, then re-read whatever it left on disk.
+        /// `why` names the trigger in a failure reason ("has expired" or
+        /// "was rejected by the Grok billing endpoint").
+        async fn refresh_via_cli(&self, why: &str) -> Result<Bearer, TokenError> {
+            match self.refresher.refresh().await {
+                GrokRefreshOutcome::LoggedIn => match self.stored_credential()? {
+                    StoredCredential::Live { bearer, refreshable } => Ok(Bearer {
+                        token: bearer,
+                        refreshable,
+                    }),
+                    // The CLI says signed in; the file still says expired. The
+                    // CLI's word wins on *sign-in state* — reporting "not
+                    // signed in" here would be the very bug this path fixes —
+                    // but there is no usable token, so the figure is
+                    // unavailable for a reason that is not the operator's.
+                    StoredCredential::Expired { .. } => Err(TokenError {
+                        kind: DriverQuotaFailureKind::ProbeFailed,
+                        reason: format!(
+                            "stored Grok token {why}; the grok CLI affirmed a login but left the stored token expired (clock skew?)"
+                        ),
+                    }),
+                },
+                GrokRefreshOutcome::NotLoggedIn { detail } => Err(TokenError {
+                    kind: DriverQuotaFailureKind::NotAuthenticated,
+                    reason: format!(
+                        "stored Grok token {why} and the grok CLI could not refresh it ({detail}) — sign in with `grok login`"
+                    ),
+                }),
+                GrokRefreshOutcome::Failed { detail } => Err(TokenError {
+                    kind: DriverQuotaFailureKind::ProbeFailed,
+                    reason: format!(
+                        "stored Grok token {why} and the grok CLI could not be run to refresh it: {detail}"
+                    ),
+                }),
+            }
+        }
+
+        /// Resolve a bearer to send: the stored one if live, otherwise the one
+        /// the CLI writes when asked to refresh. `refreshed` records whether
+        /// the CLI pass has already been spent on this probe.
+        async fn resolve_bearer(&self, refreshed: &mut bool) -> Result<Bearer, TokenError> {
+            match self.stored_credential()? {
+                StoredCredential::Live { bearer, refreshable } => Ok(Bearer {
+                    token: bearer,
+                    refreshable,
+                }),
+                StoredCredential::Expired { refreshable: false } => Err(TokenError {
+                    kind: DriverQuotaFailureKind::NotAuthenticated,
+                    reason: EXPIRED_UNREFRESHABLE_REASON.to_owned(),
+                }),
+                StoredCredential::Expired { refreshable: true } => {
+                    *refreshed = true;
+                    self.refresh_via_cli("has expired").await
+                }
+            }
+        }
+
+        /// One GET of the billing endpoint. `Err` is a transport failure (the
+        /// error is dropped: reqwest's Display includes the URL but never a
+        /// request header, so the bearer could not reach a reason string
+        /// anyway, and nothing from it is wanted in one).
+        async fn billing_request(&self, bearer: &str) -> Result<BillingResponse, ()> {
+            let response = boss_http_retry::http_client()
+                .get(self.billing_url())
+                .header("Authorization", format!("Bearer {bearer}"))
+                .header("Accept", "application/json")
+                .header("User-Agent", USER_AGENT)
+                .send()
+                .await
+                .map_err(|_| ())?;
+            let status = response.status().as_u16();
+            Ok(BillingResponse {
+                status,
+                body: response.text().await.ok(),
+            })
+        }
+    }
+
+    /// What the billing endpoint answered: the status, and the body when it
+    /// could be read. The body is only ever parsed on a 2xx and never echoed.
+    struct BillingResponse {
+        status: u16,
+        body: Option<String>,
+    }
+
+    fn rejected(status: u16) -> bool {
+        status == 401 || status == 403
+    }
+
     #[async_trait]
     impl DriverQuotaProbe for GrokQuotaProbe {
         fn driver(&self) -> &'static str {
@@ -498,25 +684,33 @@ pub mod grok {
         }
 
         async fn probe(&self) -> DriverQuotaOutcome {
-            let bearer =
-                match read_auth_document(&self.auth_path).and_then(|doc| extract_bearer(&doc, crate::now_epoch_s())) {
-                    Ok(bearer) => bearer,
-                    Err(TokenError { kind, reason }) => return unavailable(kind, reason),
-                };
+            let mut refreshed = false;
+            let bearer = match self.resolve_bearer(&mut refreshed).await {
+                Ok(bearer) => bearer,
+                Err(TokenError { kind, reason }) => return unavailable(kind, reason),
+            };
 
-            let response = boss_http_retry::http_client()
-                .get(self.billing_url())
-                .header("Authorization", format!("Bearer {bearer}"))
-                .header("Accept", "application/json")
-                .header("User-Agent", USER_AGENT)
-                .send()
-                .await;
+            let mut response = self.billing_request(&bearer.token).await;
+
+            // A token the clock calls live but the endpoint rejects (revoked,
+            // or the clock is wrong) gets the same single CLI pass an expired
+            // one does — once per probe, and only when there is a refresh
+            // token for the CLI to use.
+            if let Ok(resp) = &response
+                && rejected(resp.status)
+                && bearer.refreshable
+                && !refreshed
+            {
+                refreshed = true;
+                match self.refresh_via_cli("was rejected by the Grok billing endpoint").await {
+                    Ok(renewed) => response = self.billing_request(&renewed.token).await,
+                    Err(TokenError { kind, reason }) => return unavailable(kind, reason),
+                }
+            }
 
             let response = match response {
                 Ok(response) => response,
-                // reqwest's Display includes the URL but never a request header,
-                // so the bearer cannot reach this string.
-                Err(_) => {
+                Err(()) => {
                     return unavailable(
                         DriverQuotaFailureKind::ProbeFailed,
                         "could not reach the Grok billing endpoint".to_owned(),
@@ -524,20 +718,28 @@ pub mod grok {
                 }
             };
 
-            let status = response.status();
-            if !status.is_success() {
-                let kind = if status.as_u16() == 401 || status.as_u16() == 403 {
+            let BillingResponse { status, body } = response;
+            if !(200..300).contains(&status) {
+                let kind = if rejected(status) {
                     DriverQuotaFailureKind::NotAuthenticated
                 } else {
                     DriverQuotaFailureKind::ProbeFailed
                 };
+                let after_refresh = if refreshed {
+                    " after a grok CLI credential refresh"
+                } else {
+                    ""
+                };
                 // Status code only — the body is not echoed.
-                return unavailable(kind, format!("Grok billing endpoint answered HTTP {}", status.as_u16()));
+                return unavailable(
+                    kind,
+                    format!("Grok billing endpoint answered HTTP {status}{after_refresh}"),
+                );
             }
 
-            match response.text().await {
-                Ok(body) => parse_grok_billing(&body),
-                Err(_) => unavailable(
+            match body {
+                Some(body) => parse_grok_billing(&body),
+                None => unavailable(
                     DriverQuotaFailureKind::ProbeFailed,
                     "Grok billing response could not be read".to_owned(),
                 ),
@@ -548,6 +750,10 @@ pub mod grok {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use boss_protocol::DriverQuotaReading;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         /// Fixed "now" every expiry fixture below is judged against:
         /// 2026-06-01T00:00:00Z. Fixtures are written relative to this
@@ -561,12 +767,19 @@ pub mod grok {
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         }
 
+        fn live(doc: &serde_json::Value) -> Option<String> {
+            match read_stored_credential(doc, NOW) {
+                Ok(StoredCredential::Live { bearer, .. }) => Some(bearer),
+                _ => None,
+            }
+        }
+
         #[test]
         fn bearer_taken_from_the_only_account() {
             let doc = serde_json::json!({
                 "https://auth.example::acct": { "key": "token-a", "expires_at": rfc3339(NOW + 30 * DAY) }
             });
-            assert_eq!(extract_bearer(&doc, NOW).ok(), Some("token-a".to_owned()));
+            assert_eq!(live(&doc), Some("token-a".to_owned()));
         }
 
         #[test]
@@ -575,44 +788,79 @@ pub mod grok {
                 "issuer-a::1": { "key": "old", "expires_at": rfc3339(NOW + 7 * DAY) },
                 "issuer-b::2": { "key": "new", "expires_at": rfc3339(NOW + 30 * DAY) },
             });
-            assert_eq!(extract_bearer(&doc, NOW).ok(), Some("new".to_owned()));
+            assert_eq!(live(&doc), Some("new".to_owned()));
         }
 
         #[test]
         fn empty_document_reads_as_not_authenticated() {
-            let err = extract_bearer(&serde_json::json!({}), NOW).unwrap_err();
+            let err = read_stored_credential(&serde_json::json!({}), NOW).unwrap_err();
             assert_eq!(err.kind, DriverQuotaFailureKind::NotAuthenticated);
         }
 
         #[test]
-        fn expired_token_is_named_as_expired_not_unsigned() {
+        fn expired_token_with_a_refresh_token_is_expired_but_refreshable() {
             let doc = serde_json::json!({
-                "issuer-a::1": { "key": "old", "expires_at": rfc3339(NOW - DAY) }
+                "issuer-a::1": { "key": "old", "refresh_token": "r", "expires_at": rfc3339(NOW - DAY) }
             });
-            let err = extract_bearer(&doc, NOW).unwrap_err();
-            assert_eq!(err.kind, DriverQuotaFailureKind::NotAuthenticated);
-            assert!(
-                err.reason.contains("expired"),
-                "reason must name expiry, got {}",
-                err.reason
+            assert_eq!(
+                read_stored_credential(&doc, NOW).unwrap(),
+                StoredCredential::Expired { refreshable: true }
+            );
+        }
+
+        #[test]
+        fn expired_token_without_a_refresh_token_is_not_refreshable() {
+            for record in [
+                serde_json::json!({ "key": "old", "expires_at": rfc3339(NOW - DAY) }),
+                serde_json::json!({ "key": "old", "refresh_token": "", "expires_at": rfc3339(NOW - DAY) }),
+            ] {
+                let doc = serde_json::json!({ "issuer-a::1": record });
+                assert_eq!(
+                    read_stored_credential(&doc, NOW).unwrap(),
+                    StoredCredential::Expired { refreshable: false }
+                );
+            }
+        }
+
+        /// The exact shape the CLI writes (`grok 1.0.70`): microsecond
+        /// fraction, `Z` suffix. Six hours after creation.
+        #[test]
+        fn the_clis_own_timestamp_format_is_judged_correctly() {
+            let doc = serde_json::json!({
+                "https://auth.x.ai::client": {
+                    "key": "k", "auth_mode": "oidc", "refresh_token": "r",
+                    "create_time": "2026-10-24T21:49:20.645060Z",
+                    "expires_at": "2026-10-25T03:49:20.645060Z",
+                }
+            });
+            // 2026-10-24T21:50:00Z — a minute after the refresh.
+            let just_after_login = 1_792_878_600;
+            assert!(matches!(
+                read_stored_credential(&doc, just_after_login).unwrap(),
+                StoredCredential::Live { refreshable: true, .. }
+            ));
+            // 2026-10-25T03:49:21Z — one second past expiry.
+            assert_eq!(
+                read_stored_credential(&doc, 1_792_900_161).unwrap(),
+                StoredCredential::Expired { refreshable: true }
             );
         }
 
         #[test]
         fn record_without_a_key_is_skipped_rather_than_treated_as_a_token() {
             let doc = serde_json::json!({ "issuer::1": { "expires_at": rfc3339(NOW + 30 * DAY) } });
-            assert!(extract_bearer(&doc, NOW).is_err());
+            assert!(read_stored_credential(&doc, NOW).is_err());
         }
 
         #[test]
         fn non_object_document_reads_as_not_authenticated() {
-            let err = extract_bearer(&serde_json::json!([]), NOW).unwrap_err();
+            let err = read_stored_credential(&serde_json::json!([]), NOW).unwrap_err();
             assert_eq!(err.kind, DriverQuotaFailureKind::NotAuthenticated);
         }
 
         #[test]
         fn missing_auth_file_reads_as_not_authenticated_not_a_blank() {
-            let err = read_auth_document(std::path::Path::new("/nonexistent/grok/auth.json")).unwrap_err();
+            let err = read_auth_document(Path::new("/nonexistent/grok/auth.json")).unwrap_err();
             assert_eq!(err.kind, DriverQuotaFailureKind::NotAuthenticated);
         }
 
@@ -633,19 +881,320 @@ pub mod grok {
 
         #[test]
         fn billing_url_is_the_endpoint_the_cli_calls() {
-            let probe = GrokQuotaProbe::with_base_url("/tmp/auth.json", "https://example.test/v1");
+            let probe = GrokQuotaProbe::with_base_url("/tmp/auth.json", "https://example.test/v1", never());
             assert_eq!(probe.billing_url(), "https://example.test/v1/billing?format=credits");
         }
 
         #[test]
         fn trailing_slash_on_the_base_url_does_not_double_up() {
-            let probe = GrokQuotaProbe::with_base_url("/tmp/auth.json", "https://example.test/v1/");
+            let probe = GrokQuotaProbe::with_base_url("/tmp/auth.json", "https://example.test/v1/", never());
             assert_eq!(probe.billing_url(), "https://example.test/v1/billing?format=credits");
         }
 
         #[test]
         fn driver_slug_is_grok() {
-            assert_eq!(GrokQuotaProbe::new("/tmp/auth.json").driver(), "grok");
+            assert_eq!(GrokQuotaProbe::new("/tmp/auth.json", never()).driver(), "grok");
+        }
+
+        // ---- end-to-end: stored credential → CLI refresh → endpoint -------
+
+        /// A scripted CLI: counts calls, optionally rewrites the credential
+        /// file the way the real CLI would, then reports the scripted outcome.
+        struct ScriptedCli {
+            calls: AtomicUsize,
+            rewrite: Option<(PathBuf, serde_json::Value)>,
+            outcome: GrokRefreshOutcome,
+        }
+
+        #[async_trait]
+        impl GrokCredentialRefresher for ScriptedCli {
+            async fn refresh(&self) -> GrokRefreshOutcome {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if let Some((path, document)) = &self.rewrite {
+                    std::fs::write(path, document.to_string()).expect("rewrite auth.json like the CLI");
+                }
+                self.outcome.clone()
+            }
+        }
+
+        fn cli(outcome: GrokRefreshOutcome, rewrite: Option<(PathBuf, serde_json::Value)>) -> Arc<ScriptedCli> {
+            Arc::new(ScriptedCli {
+                calls: AtomicUsize::new(0),
+                rewrite,
+                outcome,
+            })
+        }
+
+        /// A refresher that must never be reached.
+        fn never() -> Arc<ScriptedCli> {
+            cli(
+                GrokRefreshOutcome::Failed {
+                    detail: "the refresher must not have been called".to_owned(),
+                },
+                None,
+            )
+        }
+
+        /// A fresh private directory per test, under the test's own tmpdir.
+        fn scratch(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!("boss-driver-quota-grok-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            dir
+        }
+
+        fn write_auth(dir: &Path, document: &serde_json::Value) -> PathBuf {
+            let path = dir.join("auth.json");
+            std::fs::write(&path, document.to_string()).expect("write auth.json");
+            path
+        }
+
+        /// A record whose `expires_at` is well in the future of the real clock
+        /// (the probe judges against `now_epoch_s()`, which tests cannot pin).
+        fn live_record(key: &str, refreshable: bool) -> serde_json::Value {
+            let far_future = crate::now_epoch_s() + 365 * DAY;
+            let mut record = serde_json::json!({ "key": key, "expires_at": rfc3339(far_future) });
+            if refreshable {
+                record["refresh_token"] = serde_json::Value::String("r".to_owned());
+            }
+            record
+        }
+
+        fn expired_record(key: &str, refreshable: bool) -> serde_json::Value {
+            let past = crate::now_epoch_s() - DAY;
+            let mut record = serde_json::json!({ "key": key, "expires_at": rfc3339(past) });
+            if refreshable {
+                record["refresh_token"] = serde_json::Value::String("r".to_owned());
+            }
+            record
+        }
+
+        fn doc(record: serde_json::Value) -> serde_json::Value {
+            serde_json::json!({ "https://auth.x.ai::client": record })
+        }
+
+        const BILLING_OK: &str = r#"{"config":{"creditUsagePercent":12.5,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-10-09T22:22:42Z"}}}"#;
+
+        /// One-shot canned HTTP server: answers each connection with the next
+        /// scripted (status, body) and records the bearer each request carried.
+        struct CannedEndpoint {
+            base_url: String,
+            bearers: Arc<Mutex<Vec<String>>>,
+        }
+
+        async fn endpoint(responses: Vec<(u16, &'static str)>) -> CannedEndpoint {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let base_url = format!("http://{}/v1", listener.local_addr().expect("addr"));
+            let bearers: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&bearers);
+            tokio::spawn(async move {
+                for (status, body) in responses {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let mut buf = vec![0u8; 8192];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let bearer = request
+                        .lines()
+                        .find_map(|line| line.strip_prefix("authorization: Bearer "))
+                        .or_else(|| {
+                            request
+                                .lines()
+                                .find_map(|line| line.strip_prefix("Authorization: Bearer "))
+                        })
+                        .unwrap_or("<none>")
+                        .to_owned();
+                    seen.lock().unwrap().push(bearer);
+                    let reason = match status {
+                        200 => "OK",
+                        401 => "Unauthorized",
+                        _ => "Error",
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                }
+            });
+            CannedEndpoint { base_url, bearers }
+        }
+
+        fn reading(outcome: DriverQuotaOutcome) -> DriverQuotaReading {
+            match outcome {
+                DriverQuotaOutcome::Reading(reading) => reading,
+                other => panic!("expected a reading, got {other:?}"),
+            }
+        }
+
+        fn failure(outcome: DriverQuotaOutcome) -> (DriverQuotaFailureKind, String) {
+            match outcome {
+                DriverQuotaOutcome::Unavailable { kind, reason } => (kind, reason),
+                other => panic!("expected a failure, got {other:?}"),
+            }
+        }
+
+        /// The bug this crate's refresh step exists for: the stored access
+        /// token has expired but a refresh token sits beside it. The CLI
+        /// refreshes, the probe re-reads, and the panel gets the real figure.
+        #[tokio::test]
+        async fn expired_but_refreshable_token_is_refreshed_through_the_cli_and_read() {
+            let dir = scratch("expired_but_refreshable_token_is_refreshed_through_the_cli_and_read");
+            let auth = write_auth(&dir, &doc(expired_record("stale-token", true)));
+            let cli = cli(
+                GrokRefreshOutcome::LoggedIn,
+                Some((auth.clone(), doc(live_record("fresh-token", true)))),
+            );
+            let server = endpoint(vec![(200, BILLING_OK)]).await;
+            let probe = GrokQuotaProbe::with_base_url(&auth, &server.base_url, cli.clone());
+
+            let reading = reading(probe.probe().await);
+            assert_eq!(reading.used_percent, 12.5);
+            assert_eq!(cli.calls.load(Ordering::SeqCst), 1, "exactly one CLI pass");
+            assert_eq!(
+                server.bearers.lock().unwrap().as_slice(),
+                ["fresh-token"],
+                "the request must carry the token the CLI wrote, never the stale one"
+            );
+        }
+
+        #[tokio::test]
+        async fn live_token_is_used_without_consulting_the_cli() {
+            let dir = scratch("live_token_is_used_without_consulting_the_cli");
+            let auth = write_auth(&dir, &doc(live_record("live-token", true)));
+            let cli = never();
+            let server = endpoint(vec![(200, BILLING_OK)]).await;
+            let probe = GrokQuotaProbe::with_base_url(&auth, &server.base_url, cli.clone());
+
+            reading(probe.probe().await);
+            assert_eq!(cli.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(server.bearers.lock().unwrap().as_slice(), ["live-token"]);
+        }
+
+        #[tokio::test]
+        async fn expired_token_the_cli_cannot_refresh_is_not_signed_in_naming_the_cli_banner() {
+            let dir = scratch("expired_token_the_cli_cannot_refresh_is_not_signed_in_naming_the_cli_banner");
+            let auth = write_auth(&dir, &doc(expired_record("stale-token", true)));
+            let cli = cli(
+                GrokRefreshOutcome::NotLoggedIn {
+                    detail: "You are not authenticated.".to_owned(),
+                },
+                None,
+            );
+            let probe = GrokQuotaProbe::with_base_url(&auth, "http://127.0.0.1:9/v1", cli.clone());
+
+            let (kind, reason) = failure(probe.probe().await);
+            assert_eq!(kind, DriverQuotaFailureKind::NotAuthenticated);
+            assert!(reason.contains("has expired"), "{reason}");
+            assert!(reason.contains("You are not authenticated."), "{reason}");
+            assert!(reason.contains("grok login"), "{reason}");
+            assert!(!reason.contains("stale-token"), "{reason}");
+            assert_eq!(cli.calls.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn expired_token_with_no_refresh_token_is_not_signed_in_without_running_the_cli() {
+            let dir = scratch("expired_token_with_no_refresh_token_is_not_signed_in_without_running_the_cli");
+            let auth = write_auth(&dir, &doc(expired_record("stale-token", false)));
+            let cli = never();
+            let probe = GrokQuotaProbe::with_base_url(&auth, "http://127.0.0.1:9/v1", cli.clone());
+
+            let (kind, reason) = failure(probe.probe().await);
+            assert_eq!(kind, DriverQuotaFailureKind::NotAuthenticated);
+            assert_eq!(reason, EXPIRED_UNREFRESHABLE_REASON);
+            assert_eq!(cli.calls.load(Ordering::SeqCst), 0);
+        }
+
+        /// A CLI that cannot run says nothing about sign-in state, so the
+        /// row must not claim "not signed in" — nor pretend to know.
+        #[tokio::test]
+        async fn expired_token_when_the_cli_cannot_run_is_a_check_failure_not_a_sign_in_verdict() {
+            let dir = scratch("expired_token_when_the_cli_cannot_run_is_a_check_failure_not_a_sign_in_verdict");
+            let auth = write_auth(&dir, &doc(expired_record("stale-token", true)));
+            let cli = cli(
+                GrokRefreshOutcome::Failed {
+                    detail: "`grok` is not installed or not on PATH".to_owned(),
+                },
+                None,
+            );
+            let probe = GrokQuotaProbe::with_base_url(&auth, "http://127.0.0.1:9/v1", cli.clone());
+
+            let (kind, reason) = failure(probe.probe().await);
+            assert_eq!(kind, DriverQuotaFailureKind::ProbeFailed);
+            assert!(reason.contains("not installed"), "{reason}");
+        }
+
+        #[tokio::test]
+        async fn cli_affirming_a_login_but_leaving_the_token_expired_is_not_reported_as_signed_out() {
+            let dir = scratch("cli_affirming_a_login_but_leaving_the_token_expired_is_not_reported_as_signed_out");
+            let auth = write_auth(&dir, &doc(expired_record("stale-token", true)));
+            let cli = cli(GrokRefreshOutcome::LoggedIn, None);
+            let probe = GrokQuotaProbe::with_base_url(&auth, "http://127.0.0.1:9/v1", cli.clone());
+
+            let (kind, reason) = failure(probe.probe().await);
+            assert_eq!(kind, DriverQuotaFailureKind::ProbeFailed);
+            assert!(reason.contains("affirmed a login"), "{reason}");
+        }
+
+        /// A token the clock calls live but the endpoint rejects gets one CLI
+        /// pass and one retry with whatever the CLI wrote.
+        #[tokio::test]
+        async fn rejected_live_token_is_refreshed_once_and_retried() {
+            let dir = scratch("rejected_live_token_is_refreshed_once_and_retried");
+            let auth = write_auth(&dir, &doc(live_record("revoked-token", true)));
+            let cli = cli(
+                GrokRefreshOutcome::LoggedIn,
+                Some((auth.clone(), doc(live_record("renewed-token", true)))),
+            );
+            let server = endpoint(vec![(401, "{}"), (200, BILLING_OK)]).await;
+            let probe = GrokQuotaProbe::with_base_url(&auth, &server.base_url, cli.clone());
+
+            let reading = reading(probe.probe().await);
+            assert_eq!(reading.used_percent, 12.5);
+            assert_eq!(cli.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                server.bearers.lock().unwrap().as_slice(),
+                ["revoked-token", "renewed-token"]
+            );
+        }
+
+        #[tokio::test]
+        async fn rejected_token_with_no_refresh_token_is_not_signed_in_and_not_retried() {
+            let dir = scratch("rejected_token_with_no_refresh_token_is_not_signed_in_and_not_retried");
+            let auth = write_auth(&dir, &doc(live_record("revoked-token", false)));
+            let cli = never();
+            let server = endpoint(vec![(401, "{}")]).await;
+            let probe = GrokQuotaProbe::with_base_url(&auth, &server.base_url, cli.clone());
+
+            let (kind, reason) = failure(probe.probe().await);
+            assert_eq!(kind, DriverQuotaFailureKind::NotAuthenticated);
+            assert_eq!(reason, "Grok billing endpoint answered HTTP 401");
+            assert_eq!(cli.calls.load(Ordering::SeqCst), 0);
+        }
+
+        /// One CLI pass per probe, however it went: a refresh that produced a
+        /// token the endpoint still rejects ends the probe, it does not loop.
+        #[tokio::test]
+        async fn a_second_rejection_after_the_refresh_ends_the_probe_without_another_cli_pass() {
+            let dir = scratch("a_second_rejection_after_the_refresh_ends_the_probe_without_another_cli_pass");
+            let auth = write_auth(&dir, &doc(expired_record("stale-token", true)));
+            let cli = cli(
+                GrokRefreshOutcome::LoggedIn,
+                Some((auth.clone(), doc(live_record("still-bad-token", true)))),
+            );
+            let server = endpoint(vec![(401, "{}")]).await;
+            let probe = GrokQuotaProbe::with_base_url(&auth, &server.base_url, cli.clone());
+
+            let (kind, reason) = failure(probe.probe().await);
+            assert_eq!(kind, DriverQuotaFailureKind::NotAuthenticated);
+            assert_eq!(
+                reason,
+                "Grok billing endpoint answered HTTP 401 after a grok CLI credential refresh"
+            );
+            assert_eq!(cli.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(server.bearers.lock().unwrap().as_slice(), ["still-bad-token"]);
         }
     }
 }

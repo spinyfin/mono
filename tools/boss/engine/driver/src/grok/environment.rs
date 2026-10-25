@@ -136,7 +136,7 @@ impl GrokProcessEnvironment {
     pub fn directives(&self) -> Vec<EnvDirective> {
         let mut directives = vec![
             EnvDirective::Set("GROK_HOME".to_owned(), self.grok_home.display().to_string()),
-            EnvDirective::Set(GROK_AUTH_PATH_ENV.to_owned(), self.auth_path.display().to_string()),
+            shared_credential_directive(&self.auth_path),
             EnvDirective::Set("HOME".to_owned(), self.process_home.display().to_string()),
             EnvDirective::Set(
                 "GH_CONFIG_DIR".to_owned(),
@@ -180,16 +180,9 @@ impl GrokProcessEnvironment {
                 self.host_tools.caches.bazel_output_root.display().to_string(),
             ),
         ]);
-        directives.extend([
-            // Boss's Grok driver is OAuth-only. Without both belts below, a
-            // permanently failed refresh silently falls through to an
-            // inherited XAI_API_KEY and changes endpoint/credential families.
-            EnvDirective::Set(GROK_DISABLE_API_KEY_AUTH_ENV.to_owned(), "1".to_owned()),
-            EnvDirective::Unset(XAI_API_KEY_ENV.to_owned()),
-            EnvDirective::Unset(GROK_AMBIENT_AUTH_ENV.to_owned()),
-            // A host value of 0 ungates project hooks/MCP.
-            EnvDirective::Unset("GROK_FOLDER_TRUST".to_owned()),
-        ]);
+        directives.extend(oauth_only_directives());
+        // A host value of 0 ungates project hooks/MCP.
+        directives.push(EnvDirective::Unset("GROK_FOLDER_TRUST".to_owned()));
         directives
     }
 
@@ -331,6 +324,29 @@ impl GrokProcessEnvironment {
     }
 }
 
+/// Point Grok at the one shared OAuth credential (`GROK_AUTH_PATH`). Every
+/// Grok process Boss starts — worker panes, preflight probes, and the quota
+/// panel's credential refresh — must use this same directive so they all
+/// read one file and share the CLI's adjacent `auth.json.lock`.
+pub(super) fn shared_credential_directive(auth_path: &Path) -> EnvDirective {
+    EnvDirective::Set(GROK_AUTH_PATH_ENV.to_owned(), auth_path.display().to_string())
+}
+
+/// Boss's Grok driver is OAuth-only. Without both belts below, a permanently
+/// failed refresh silently falls through to an inherited `XAI_API_KEY` and
+/// changes endpoint/credential families — and a present `XAI_API_KEY` makes
+/// `grok models` answer "You are using XAI_API_KEY." without ever touching
+/// (or refreshing) the OAuth credential, which would turn a credential probe
+/// into a no-op. Shared by the worker environment and the quota panel's
+/// refresh so the two cannot drift.
+pub(super) fn oauth_only_directives() -> Vec<EnvDirective> {
+    vec![
+        EnvDirective::Set(GROK_DISABLE_API_KEY_AUTH_ENV.to_owned(), "1".to_owned()),
+        EnvDirective::Unset(XAI_API_KEY_ENV.to_owned()),
+        EnvDirective::Unset(GROK_AMBIENT_AUTH_ENV.to_owned()),
+    ]
+}
+
 /// Wait for a live Grok refresh identified by its CLI-managed `pid:timestamp`
 /// lock body. The lock is foreign state: this function never creates, edits,
 /// or removes it.
@@ -338,7 +354,7 @@ fn wait_for_grok_auth_refresh(auth_path: &Path) -> anyhow::Result<()> {
     wait_for_grok_auth_refresh_with_timeout(auth_path, AUTH_LOCK_ACQUIRE_TIMEOUT)
 }
 
-fn wait_for_grok_auth_refresh_with_timeout(auth_path: &Path, timeout: Duration) -> anyhow::Result<()> {
+pub(super) fn wait_for_grok_auth_refresh_with_timeout(auth_path: &Path, timeout: Duration) -> anyhow::Result<()> {
     wait_for_grok_auth_refresh_at(auth_path, timeout, Instant::now, std::thread::sleep)
 }
 
