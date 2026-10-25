@@ -885,7 +885,8 @@ impl ExecutionCoordinator {
                     None,
                     ("work_item_unresolved", "Could not resolve work item for execution"),
                     &err,
-                )?;
+                )
+                .await?;
                 return Err(err);
             }
         };
@@ -1038,7 +1039,8 @@ impl ExecutionCoordinator {
                     None,
                     ("no_eligible_host", "No eligible host for execution"),
                     &err,
-                )?;
+                )
+                .await?;
                 return Err(err);
             }
         };
@@ -1061,7 +1063,8 @@ impl ExecutionCoordinator {
                     )
                     .await;
                 if had_requested_host {
-                    self.cancel_requested_host_pre_start_failure(execution, "host adapter build", &err);
+                    self.cancel_requested_host_pre_start_failure(execution, "host adapter build", &err)
+                        .await;
                     return Err(err);
                 }
                 self.record_start_failure(
@@ -1071,7 +1074,8 @@ impl ExecutionCoordinator {
                     None,
                     ("host_adapter_unavailable", "Could not build host adapter"),
                     &err,
-                )?;
+                )
+                .await?;
                 return Err(err);
             }
         };
@@ -1131,7 +1135,8 @@ impl ExecutionCoordinator {
                 )
                 .await;
                 if had_requested_host {
-                    self.cancel_requested_host_pre_start_failure(execution, "cube repo ensure", &err);
+                    self.cancel_requested_host_pre_start_failure(execution, "cube repo ensure", &err)
+                        .await;
                     return Err(err);
                 }
                 self.record_start_failure(
@@ -1141,7 +1146,8 @@ impl ExecutionCoordinator {
                     None,
                     ("cube_repo_ensure_failed", "Cube `repo ensure` failed"),
                     &err,
-                )?;
+                )
+                .await?;
                 return Err(err);
             }
             Err(_elapsed) => {
@@ -1162,7 +1168,8 @@ impl ExecutionCoordinator {
                 )
                 .await;
                 if had_requested_host {
-                    self.cancel_requested_host_pre_start_failure(execution, "cube repo ensure", &err);
+                    self.cancel_requested_host_pre_start_failure(execution, "cube repo ensure", &err)
+                        .await;
                     return Err(err);
                 }
                 self.record_start_failure(
@@ -1172,7 +1179,8 @@ impl ExecutionCoordinator {
                     None,
                     ("cube_repo_ensure_failed", "Cube `repo ensure` timed out"),
                     &err,
-                )?;
+                )
+                .await?;
                 return Err(err);
             }
         };
@@ -1248,7 +1256,8 @@ impl ExecutionCoordinator {
             Ok(lease) => lease,
             Err(err) => {
                 if had_requested_host {
-                    self.cancel_requested_host_pre_start_failure(execution, "cube workspace lease", &err);
+                    self.cancel_requested_host_pre_start_failure(execution, "cube workspace lease", &err)
+                        .await;
                     return Err(err);
                 }
                 // The lease helper has already emitted attempt /
@@ -1263,7 +1272,8 @@ impl ExecutionCoordinator {
                     Some(repo.repo_id.as_str()),
                     ("cube_workspace_lease_failed", "Cube `workspace lease` failed"),
                     &err,
-                )?;
+                )
+                .await?;
                 return Err(err);
             }
         };
@@ -1379,7 +1389,8 @@ impl ExecutionCoordinator {
                         "Cube leased a workspace occupied by a live worker",
                     ),
                     &err,
-                )?;
+                )
+                .await?;
                 return Err(err);
             }
         }
@@ -1570,7 +1581,8 @@ impl ExecutionCoordinator {
                     Some(&repo.repo_id),
                     attention,
                     &err,
-                )?;
+                )
+                .await?;
                 return Err(err);
             }
         };
@@ -1727,7 +1739,8 @@ impl ExecutionCoordinator {
                             Some(repo.repo_id.as_str()),
                             ("cube_workspace_positioning_failed", failure_label),
                             &err,
-                        )?;
+                        )
+                        .await?;
                         return Err(err);
                     }
                 }
@@ -1799,7 +1812,8 @@ impl ExecutionCoordinator {
                         )
                         .await;
                     if had_requested_host {
-                        self.cancel_requested_host_pre_start_failure(execution, "cube change create", &err);
+                        self.cancel_requested_host_pre_start_failure(execution, "cube change create", &err)
+                            .await;
                         return Err(err);
                     }
                     self.record_start_failure(
@@ -1809,7 +1823,8 @@ impl ExecutionCoordinator {
                         Some(repo.repo_id.as_str()),
                         ("cube_change_create_failed", "Cube `change create` failed"),
                         &err,
-                    )?;
+                    )
+                    .await?;
                     return Err(err);
                 }
             }
@@ -1860,7 +1875,8 @@ impl ExecutionCoordinator {
                     "Execution bookmark creation failed",
                 ),
                 &err,
-            )?;
+            )
+            .await?;
             return Err(err);
         }
 
@@ -1998,7 +2014,8 @@ impl ExecutionCoordinator {
                     )
                     .await;
                 if had_requested_host {
-                    self.cancel_requested_host_pre_start_failure(execution, "start_execution_run", &err);
+                    self.cancel_requested_host_pre_start_failure(execution, "start_execution_run", &err)
+                        .await;
                     return Err(err);
                 }
                 self.record_start_failure(
@@ -2008,7 +2025,8 @@ impl ExecutionCoordinator {
                     Some(repo.repo_id.as_str()),
                     ("execution_run_start_failed", "`start_execution_run` failed"),
                     &err,
-                )?;
+                )
+                .await?;
                 Err(err)
             }
         }
@@ -2361,7 +2379,7 @@ impl ExecutionCoordinator {
     ///
     /// Do NOT call this for post-`run_started` failures — those require
     /// `finish_execution_run`.
-    pub(super) fn record_start_failure(
+    pub(super) async fn record_start_failure(
         &self,
         coordinator: Arc<ExecutionCoordinator>,
         execution: &WorkExecution,
@@ -2392,6 +2410,33 @@ impl ExecutionCoordinator {
                 &self.pre_start_retry_delays
             },
         )?;
+
+        // The tracing log alone is not enough: `bossctl dispatch diagnose`
+        // and the stage-stalled detector read the dispatch event stream, and
+        // without an `error` record here a failed pre-start stage looks like
+        // a timeline that simply stopped (and then trips `stage_stalled`).
+        // Emitted for every failure, retried or not; the error outcome is
+        // what makes the stage terminal on the timeline.
+        let will_retry = matches!(outcome, PreStartFailureOutcome::Retry { .. });
+        let mut failure_event = DispatchEvent::new(Stage::PreStartFailure, DispatchOutcome::Error, &execution.id)
+            .with_work_item(&execution.work_item_id)
+            .with_worker(worker_id)
+            .with_error(error);
+        if let Some(repo_id) = cube_repo_id {
+            failure_event = failure_event.with_cube_repo(repo_id);
+        }
+        let retry_delay_secs = match &outcome {
+            PreStartFailureOutcome::Retry { delay } => Some(delay.as_secs()),
+            PreStartFailureOutcome::PermanentFail => None,
+        };
+        self.dispatch_events
+            .emit(failure_event.with_details(serde_json::json!({
+                "reason": attention_kind,
+                "pre_start_failure_count": execution.pre_start_failure_count,
+                "will_retry": will_retry,
+                "retry_delay_secs": retry_delay_secs,
+            })))
+            .await;
 
         match outcome {
             PreStartFailureOutcome::Retry { delay } => {
@@ -2491,25 +2536,44 @@ impl ExecutionCoordinator {
                 // (`pr_review`, `ci_remediation`, `conflict_resolution`)
                 // whose work item sits in `in_review`/`blocked` — bouncing
                 // those would erase review context.
-                match self.work_db.bounce_dispatch_failed_to_backlog(
+                let bounced = match self.work_db.bounce_dispatch_failed_to_backlog(
                     &execution.work_item_id,
                     attention_kind,
                     &error_text,
                 ) {
-                    Ok(true) => tracing::info!(
-                        execution_id = %execution.id,
-                        work_item_id = %execution.work_item_id,
-                        reason = attention_kind,
-                        "bounced work item to backlog after permanent pre-start dispatch failure",
-                    ),
-                    Ok(false) => {}
-                    Err(bounce_err) => tracing::error!(
-                        ?bounce_err,
-                        execution_id = %execution.id,
-                        work_item_id = %execution.work_item_id,
-                        "failed to bounce work item to backlog after permanent pre-start dispatch failure",
-                    ),
-                }
+                    Ok(true) => {
+                        tracing::info!(
+                            execution_id = %execution.id,
+                            work_item_id = %execution.work_item_id,
+                            reason = attention_kind,
+                            "bounced work item to backlog after permanent pre-start dispatch failure",
+                        );
+                        true
+                    }
+                    Ok(false) => false,
+                    Err(bounce_err) => {
+                        tracing::error!(
+                            ?bounce_err,
+                            execution_id = %execution.id,
+                            work_item_id = %execution.work_item_id,
+                            "failed to bounce work item to backlog after permanent pre-start dispatch failure",
+                        );
+                        false
+                    }
+                };
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::PreStartRetriesExhausted, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_error(error)
+                            .with_details(serde_json::json!({
+                                "reason": attention_kind,
+                                "pre_start_failure_count": execution.pre_start_failure_count,
+                                "bounced_to_backlog": bounced,
+                            })),
+                    )
+                    .await;
 
                 let publisher = self.publisher.clone();
                 let execution_id = execution.id.clone();
@@ -2579,12 +2643,31 @@ impl ExecutionCoordinator {
     /// execution instead (leaving no residue queued behind an unpinned
     /// retry) and drop the constraint, matching how the ineligible-host
     /// case in [`Self::schedule_execution`] already behaves.
-    fn cancel_requested_host_pre_start_failure(&self, execution: &WorkExecution, stage: &str, err: &anyhow::Error) {
+    async fn cancel_requested_host_pre_start_failure(
+        &self,
+        execution: &WorkExecution,
+        stage: &str,
+        err: &anyhow::Error,
+    ) {
         // Not retried, but must still be reported: a `--host` pre-start
         // failure never reaches `record_start_failure`'s permanent-failure
         // path, so without this a requested-host dispatch can
         // silently disappear as a `cancelled` row with no attention item —
-        // exactly the case an SSH-unreachable remote host hits.
+        // exactly the case an SSH-unreachable remote host hits. The dispatch
+        // event stream gets the same record as an ordinary pre-start failure,
+        // so the failed stage is terminal on the timeline.
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::PreStartFailure, DispatchOutcome::Error, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_error(err)
+                    .with_details(serde_json::json!({
+                        "reason": "requested_host_dispatch_failed",
+                        "failed_step": stage,
+                        "will_retry": false,
+                    })),
+            )
+            .await;
         let attention_body = format!(
             "Execution `{execution_id}` (requested host) failed during `{stage}` and was \
              cancelled rather than retried, so the `--host` constraint is not silently \

@@ -1052,6 +1052,7 @@ async fn non_implementation_pointer_failure_keeps_pre_start_retries() {
             (crate::execution_bookmark_recovery::RECOVERY_FAILED, "Recovery failed"),
             &boss_engine_recovery::execution_bookmark::pointer_integrity_error("deleted refs"),
         )
+        .await
         .unwrap();
     let after = db.get_execution(&next.id).unwrap();
     assert_ne!(after.status, ExecutionStatus::Failed);
