@@ -624,3 +624,21 @@ mod work_tree_scale_tests;
 mod board_patch_tests;
 
 mod design_doc_contention_tests;
+
+#[cfg(test)]
+mod review_detail_tests {
+    use crate::merge_poller::review_detail_json;
+
+    #[test]
+    fn review_detail_json_none_when_empty() {
+        assert_eq!(review_detail_json(&[]), None);
+    }
+
+    #[test]
+    fn review_detail_json_serializes_logins() {
+        let reviewers = vec!["alice".to_owned(), "bob".to_owned()];
+        let json = review_detail_json(&reviewers).expect("non-empty → Some");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(parsed, serde_json::json!(["alice", "bob"]));
+    }
+}

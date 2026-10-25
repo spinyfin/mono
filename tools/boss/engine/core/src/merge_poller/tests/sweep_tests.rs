@@ -2993,16 +2993,3 @@ fn ci_detail_json_none_for_non_failing_variants() {
     assert_eq!(ci_detail_json(&OpenPrCiStatus::Clean), None);
     assert_eq!(ci_detail_json(&OpenPrCiStatus::InFlight), None);
 }
-
-#[test]
-fn review_detail_json_none_when_empty() {
-    assert_eq!(review_detail_json(&[]), None);
-}
-
-#[test]
-fn review_detail_json_serializes_logins() {
-    let reviewers = vec!["alice".to_owned(), "bob".to_owned()];
-    let json = review_detail_json(&reviewers).expect("non-empty → Some");
-    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
-    assert_eq!(parsed, serde_json::json!(["alice", "bob"]));
-}
