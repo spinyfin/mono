@@ -4,7 +4,7 @@
 //! schema 49's exhaustive runtime epochs rather than duplicate run triggers.
 use super::*;
 
-pub(super) const JOURNAL_LIMIT: u64 = 4096;
+pub(crate) const JOURNAL_LIMIT: u64 = 4096;
 
 pub(super) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(&format!(
@@ -31,13 +31,23 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         ] {
             let mut body = String::new();
             for row in rows {
+                let distinct = if operation == "UPDATE" && row == "OLD" {
+                    format!(" AND OLD.{column} IS NOT NEW.{column}")
+                } else {
+                    String::new()
+                };
                 body.push_str(&format!(
-                    "INSERT INTO board_changes(item_id, source) VALUES ({row}.{column}, '{table}');"
+                    "INSERT INTO board_changes(item_id, source) SELECT {row}.{column}, '{table}' WHERE {row}.{column} IS NOT NULL{distinct};"
                 ));
                 if table == "tasks" {
                     // Keep the severed edge even for a hard deletion, reparent,
                     // or move across products before any reader sees it.
-                    body.push_str(&format!("INSERT INTO board_changes(item_id, source) SELECT {row}.parent_task_id, 'tasks' WHERE {row}.parent_task_id IS NOT NULL;"));
+                    let distinct = if operation == "UPDATE" && row == "OLD" {
+                        " AND OLD.parent_task_id IS NOT NEW.parent_task_id"
+                    } else {
+                        ""
+                    };
+                    body.push_str(&format!("INSERT INTO board_changes(item_id, source) SELECT {row}.parent_task_id, 'tasks' WHERE {row}.parent_task_id IS NOT NULL{distinct};"));
                 }
             }
             conn.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS board_changes_{table}_{operation} AFTER {operation} ON {table} BEGIN {body} END;"))?;
@@ -55,17 +65,51 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         "attention_groups",
         "attentions",
         "planner_runs",
-        "pr_review_batch_members",
-        "pr_review_guide_source_series",
-        "pr_review_guide_source_comparisons",
-        "pr_review_guide_versions",
-        "pr_review_guide_attempts",
-        "pr_review_guide_updates",
-        "pr_review_guide_revision_heads",
-        "pr_review_guide_automatic_attempts",
     ] {
         for operation in ["INSERT", "UPDATE", "DELETE"] {
             conn.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS board_changes_{table}_{operation} AFTER {operation} ON {table} BEGIN INSERT INTO board_changes(source) VALUES ('{table}'); END;"))?;
+        }
+    }
+    // Card derivations read only these review columns. Other guide tables
+    // drive jobs, whose projected results arrive through series/attempt writes.
+    for (table, columns, select) in [
+        (
+            "pr_review_batch_members",
+            "execution_id, role",
+            "SELECT work_item_id FROM work_executions WHERE id = ROW.execution_id",
+        ),
+        (
+            "pr_review_guide_source_series",
+            "id, root_task_id, canonical_pr_url, guide_lifecycle, readable_version_id, selected_comparison_id, latest_observation_sequence",
+            "SELECT ROW.root_task_id",
+        ),
+        (
+            "pr_review_guide_versions",
+            "id, comparison_id",
+            "SELECT root_task_id FROM pr_review_guide_source_series WHERE readable_version_id = ROW.id",
+        ),
+        (
+            "pr_review_guide_attempts",
+            "id, series_id, status, error, finished_at",
+            "SELECT root_task_id FROM pr_review_guide_source_series WHERE id = ROW.series_id",
+        ),
+    ] {
+        for (operation, rows) in [
+            ("INSERT", vec!["NEW"]),
+            ("UPDATE", vec!["OLD", "NEW"]),
+            ("DELETE", vec!["OLD"]),
+        ] {
+            let event = if operation == "UPDATE" {
+                format!("UPDATE OF {columns}")
+            } else {
+                operation.to_owned()
+            };
+            let selects = rows
+                .iter()
+                .map(|row| select.replace("ROW", row))
+                .collect::<Vec<_>>()
+                .join(" UNION ");
+            conn.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS board_changes_{table}_{operation} AFTER {event} ON {table} BEGIN INSERT INTO board_changes(item_id, source) SELECT value, '{table}' FROM (WITH affected(value) AS ({selects}) SELECT value FROM affected) WHERE value IS NOT NULL; END;"))?;
         }
     }
     // Board review badges consult this migration watermark. Scheduler and
@@ -79,4 +123,13 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS board_changes_metadata_{operation} AFTER {operation} ON metadata WHEN {condition} BEGIN INSERT INTO board_changes(source) VALUES ('metadata'); END;"))?;
     }
     Ok(())
+}
+
+/// Replace schema 56 triggers without discarding its recovery watermark.
+pub(super) fn refine_triggers(conn: &Connection) -> Result<()> {
+    let names: Vec<String> = collect_rows(conn.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'board_changes_%' AND name != 'board_changes_bound'")?.query_map([], |row| row.get(0))?)?;
+    for name in names {
+        conn.execute_batch(&format!("DROP TRIGGER [{name}];"))?;
+    }
+    migrate(conn)
 }

@@ -30,7 +30,12 @@ fn board_projection_scale_measurement() {
         .map(|s| s.parse().unwrap())
         .unwrap_or(1);
     assert!(samples > 0);
-    for workers in [8, 32, 64] {
+    let batches: &[usize] = if std::env::var_os("BOSS_BENCH_SAMPLES").is_some() {
+        &[8, 32, 64]
+    } else {
+        &[8]
+    };
+    for &workers in batches {
         println!("projection setup workers={workers}");
         let cache = BoardCaches::default();
         let mut model = None;

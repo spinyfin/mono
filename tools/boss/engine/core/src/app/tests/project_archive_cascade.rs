@@ -300,9 +300,12 @@ async fn archive_with_children(child_count: usize) -> Cost {
     );
 
     // One durable input regardless of child count, with at most one expired
-    // journal row pruned. Keep the original domain-write bound independently.
+    // journal row pruned. Domain-row writes are bounded separately by MAX_ROW_WRITES.
     assert_eq!(journal_after - journal_before, 1, "one project journal entry");
-    assert_eq!(journal_rows_after, (journal_rows_before + 1).min(4096));
+    assert_eq!(
+        journal_rows_after,
+        (journal_rows_before + 1).min(crate::work::board_projection_schema::JOURNAL_LIMIT)
+    );
     let journal_pruned = journal_rows_before + 1 - journal_rows_after;
     let row_writes = writes_after - writes_before - 1 - journal_pruned;
     assert!(

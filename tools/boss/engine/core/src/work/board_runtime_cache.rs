@@ -68,6 +68,7 @@ pub(crate) struct CachedRuntime {
 pub(crate) struct Lookup {
     pub pass: u64,
     pub hits: Vec<Option<TaskRuntime>>,
+    pub expiries: Vec<Option<i64>>,
 }
 
 #[cfg(test)]
@@ -105,6 +106,7 @@ impl BoardRuntimeCache {
         state.next_pass += 1;
         let pass = state.next_pass;
         let mut hits = Vec::with_capacity(items.len());
+        let mut expiries = Vec::with_capacity(items.len());
         for (id, epoch) in items {
             let hit = state.entries.get_mut(*id).and_then(|entry| {
                 let fresh = entry.epoch == *epoch && entry.expires_at.is_none_or(|expires| now < expires);
@@ -116,12 +118,13 @@ impl BoardRuntimeCache {
                     entry.runtime.clone()
                 })
             });
+            expiries.push(state.entries.get(*id).and_then(|entry| entry.expires_at));
             hits.push(hit);
         }
         let found = hits.iter().filter(|hit| hit.is_some()).count() as u64;
         self.hits.fetch_add(found, Ordering::Relaxed);
         self.misses.fetch_add(items.len() as u64 - found, Ordering::Relaxed);
-        Lookup { pass, hits }
+        Lookup { pass, hits, expiries }
     }
 
     /// Finish the pass: store `fresh` runtimes, prune this product's entries no

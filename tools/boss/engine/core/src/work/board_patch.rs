@@ -54,15 +54,25 @@ pub(super) fn chores_lane_query() -> String {
     )
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum CardScope {
+    WholeProduct,
+    Subset,
+}
+
 /// Attach every derived per-card field the board carries, in the order the
 /// fields depend on each other, and return the tasks lane (the revision
 /// projection rebuilds it). `tasks` and `chores` must contain whole revision
-/// chains. `caller` labels per-card warnings.
+/// chains. `scope` selects bulk or per-card queries; `caller` only labels warnings.
+// The scope and the optional review cache are independent per-caller choices;
+// bundling them into a struct would only rename the two call sites.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn attach_board_derivations(
     conn: &Connection,
     tasks: Vec<Task>,
     chores: &mut [Task],
     product_id: &str,
+    scope: CardScope,
     caller: &str,
     trace: &mut PopulationTrace,
     review_cache: Option<&BoardReviewCache>,
@@ -123,7 +133,7 @@ pub(super) fn attach_board_derivations(
     // Errors are non-fatal — log and leave the field at its default
     // (affordance hidden). Single batched `IN (...)` query.
     let t = Instant::now();
-    let attachments = if caller == "get_work_tree" {
+    let attachments = if matches!(scope, CardScope::WholeProduct) {
         attach_has_attachments_flag(conn, &mut tasks, chores)
     } else {
         revision_helpers::attach_has_attachments_flag_for_ids(conn, &mut tasks, chores)
@@ -154,19 +164,21 @@ pub(super) fn attach_board_derivations(
     // task are non-fatal — log and leave the field None (affordance
     // hidden).
     //
-    // A single prefilter finds the rows with a pointer; each of those
-    // costs 1-3 resolution queries. `resolved` is the number of
-    // pointer-bearing items and `doc_pointer_queries` is the aggregate
-    // statement count, recorded alongside `db.task_runtimes`.
+    // Whole-product reads prefilter pointer-bearing rows; subset reads probe
+    // each requested card. `resolved` counts pointer-bearing items (including
+    // broken links), not all probed cards. `doc_pointer_queries` counts all
+    // statements, including probes without pointers.
     let t = Instant::now();
-    let (resolved, doc_pointer_queries) = if caller == "get_work_tree" {
+    let (resolved, doc_pointer_queries) = if matches!(scope, CardScope::WholeProduct) {
         attach_task_doc_link_states_for_groups(conn, &mut [&mut tasks[..], &mut chores[..]], caller, product_id)
     } else {
         let mut queries = 0;
+        let mut resolved = 0;
         for task in tasks.iter_mut().chain(chores.iter_mut()) {
             attach_task_doc_link_state(conn, task, caller, &mut queries);
+            resolved += usize::from(task.doc_link_state.is_some());
         }
-        (tasks.len() + chores.len(), queries)
+        (resolved, queries)
     };
     trace.record_nplus1(segment::DB_DOC_POINTERS, elapsed_ms(t), resolved, doc_pointer_queries);
     tasks
@@ -182,6 +194,7 @@ pub struct WorkRuntimePatch {
     /// archived, moved to another product, or not tasks at all. A consumer
     /// holding any of them must treat that as a structural change.
     pub absent: Vec<String>,
+    pub(super) validity: HashMap<String, (bool, Option<i64>)>,
 }
 
 impl WorkDb {
@@ -253,11 +266,11 @@ pub(super) fn read_cards(
     chores.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
     let mut queries = 0u64;
     let mut runtimes = HashMap::new();
+    let mut validity = HashMap::new();
     for task in tasks.iter().chain(chores.iter()) {
-        runtimes.insert(
-            task.id.clone(),
-            dispatch_helpers::compute_task_runtime(conn, &task.id, &mut queries, now)?.runtime,
-        );
+        let computed = dispatch_helpers::compute_task_runtime(conn, &task.id, &mut queries, now)?;
+        validity.insert(task.id.clone(), (computed.cacheable, computed.expires_at));
+        runtimes.insert(task.id.clone(), computed.runtime);
     }
 
     let mut trace = PopulationTrace::disabled();
@@ -269,6 +282,7 @@ pub(super) fn read_cards(
         tasks,
         &mut chores,
         product_id,
+        CardScope::Subset,
         "get_work_runtime_patch",
         &mut trace,
         None,
@@ -297,5 +311,9 @@ pub(super) fn read_cards(
         };
         items.push(WorkRuntimePatchItem { item, runtime });
     }
-    Ok(WorkRuntimePatch { items, absent })
+    Ok(WorkRuntimePatch {
+        items,
+        absent,
+        validity,
+    })
 }

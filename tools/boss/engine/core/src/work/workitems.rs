@@ -1124,7 +1124,7 @@ impl WorkDb {
         // All projections must describe one consistent database snapshot.
         let conn = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
 
-        Self::assemble_work_tree_in(&conn, product_id, trace, caches, now)
+        Self::assemble_work_tree_in(&conn, product_id, trace, caches, now, None)
     }
 
     pub(super) fn assemble_work_tree_in(
@@ -1133,6 +1133,7 @@ impl WorkDb {
         trace: &mut PopulationTrace,
         caches: Option<&BoardCaches>,
         now: i64,
+        validity: Option<&mut HashMap<String, (bool, Option<i64>)>>,
     ) -> Result<WorkTree> {
         let runtime_cache = caches.map(|caches| &caches.runtimes);
         let review_cache = caches.map(|caches| &caches.reviews);
@@ -1189,7 +1190,7 @@ impl WorkDb {
         // per-row fan-out visible in the log.
         let t = Instant::now();
         let (task_runtimes, runtime_queries) = match runtime_cache {
-            Some(cache) => collect_task_runtimes_cached(conn, product_id, &tasks, &chores, cache, now)?,
+            Some(cache) => collect_task_runtimes_cached(conn, product_id, &tasks, &chores, cache, now, validity)?,
             None => collect_task_runtimes(conn, &tasks, &chores, now)?,
         };
         trace.record_nplus1(
@@ -1211,6 +1212,7 @@ impl WorkDb {
             tasks,
             &mut chores,
             product_id,
+            board_patch::CardScope::WholeProduct,
             "get_work_tree",
             trace,
             review_cache,

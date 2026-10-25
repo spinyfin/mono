@@ -16,7 +16,7 @@ pub(super) struct WorkTreeLoads {
     caches: crate::work::board_caches::BoardCaches,
     // At most four retained products, each capped by the database adapter.
     // Individual locks preserve parallel reads for different products.
-    projections: StdMutex<HashMap<String, BoardSlot>>,
+    projections: StdMutex<HashMap<String, (std::time::Instant, BoardSlot)>>,
 }
 
 impl WorkTreeLoads {
@@ -76,17 +76,22 @@ impl WorkTreeLoads {
 
     fn projection(&self, product: &str) -> BoardSlot {
         let mut projections = self.projections.lock().expect("board projections poisoned");
-        if let Some(slot) = projections.get(product) {
+        if let Some((accessed, slot)) = projections.get_mut(product) {
+            *accessed = std::time::Instant::now();
             return slot.clone();
         }
         if projections.len() >= 4 {
             // Eviction affects reuse only. An in-flight reader owns its Arc,
             // and a later request starts from a fresh database snapshot.
-            let victim = projections.keys().next().cloned().unwrap();
+            let victim = projections
+                .iter()
+                .min_by_key(|(_, (accessed, _))| *accessed)
+                .map(|(id, _)| id.clone())
+                .unwrap();
             projections.remove(&victim);
         }
         let slot = Arc::new(StdMutex::new(None));
-        projections.insert(product.to_owned(), slot.clone());
+        projections.insert(product.to_owned(), (std::time::Instant::now(), slot.clone()));
         slot
     }
     // Both fences are database-wide: unrelated writes may conservatively

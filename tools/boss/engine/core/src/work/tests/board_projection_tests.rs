@@ -136,6 +136,9 @@ fn board_projection_runtime_and_structural_sequence_matches_every_field() {
                 .build(),
         )
         .unwrap();
+    check(&db, &product, &mut model, 100);
+    db.connect().unwrap().execute("INSERT INTO worker_proposals(id, execution_id, kind, payload_json, idempotency_key, created_at) VALUES ('unscoped', ?1, 'test', '{}', 'unscoped', '1')", [&execution.id]).unwrap();
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Incremental(0));
     for status in ["ready", "claimed", "running", "waiting_human", "completed", "abandoned"] {
         db.connect()
             .unwrap()
@@ -181,7 +184,7 @@ fn board_projection_recovers_gaps_broad_changes_and_bounded_closures() {
     assert_eq!(check(&db, &product, &mut model, 100), Refresh::Snapshot("broad_input"));
     {
         let conn = db.connect().unwrap();
-        for i in 0..2100 {
+        for i in 0..=crate::work::board_projection_schema::JOURNAL_LIMIT {
             conn.execute("UPDATE tasks SET name = ?2 WHERE id = ?1", params![root, i.to_string()])
                 .unwrap();
         }
@@ -316,7 +319,7 @@ fn board_projection_review_evidence_and_metadata_sequences_match_complete_projec
     check(&db, &product, &mut model, 100);
     db.connect().unwrap().execute("INSERT INTO pr_review_batches(id,cycle_root_id,base_sha,classification_json,created_at,phase,pr_number,pr_url,status,target_sha,updated_at) VALUES ('projection-batch',?1,'base','{}','1','pre_merge',7,'https://github.com/spinyfin/mono/pull/7','collecting','head','1')", [&root]).unwrap();
     db.connect().unwrap().execute("INSERT INTO pr_review_batch_members(id,batch_id,attempt,created_at,provider_effort,requested_driver,resolved_model,role,status,updated_at,execution_id) VALUES ('projection-member','projection-batch',1,'1','medium','claude','synthetic','supervisor','pending','1',?1)", [&execution.id]).unwrap();
-    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Snapshot("broad_input"));
+    assert!(matches!(check(&db, &product, &mut model, 100), Refresh::Incremental(_)));
     assert_eq!(
         model
             .as_ref()
@@ -330,11 +333,13 @@ fn board_projection_review_evidence_and_metadata_sequences_match_complete_projec
             .as_deref(),
         Some("consolidation")
     );
+    db.connect().unwrap().execute("UPDATE pr_review_batch_members SET status = 'reported', updated_at = '2', terminal_at = '2' WHERE id = 'projection-member'", []).unwrap();
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Incremental(0));
     db.connect()
         .unwrap()
         .execute("DELETE FROM pr_review_batch_members WHERE id = 'projection-member'", [])
         .unwrap();
-    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Snapshot("broad_input"));
+    assert!(matches!(check(&db, &product, &mut model, 100), Refresh::Incremental(_)));
     assert_eq!(
         model
             .as_ref()
@@ -389,4 +394,147 @@ fn board_projection_review_evidence_and_metadata_sequences_match_complete_projec
         )
         .unwrap();
     check(&db, &product, &mut model, 100);
+}
+
+#[test]
+fn board_projection_large_ready_backlog_stays_incremental() {
+    let db = WorkDb::open(temp_db_path("projection-ready-backlog")).unwrap();
+    let product = make_revision_product(&db, "backlog");
+    for i in 0..=boss_board_projection::MAX_AFFECTED {
+        let task = create_test_chore_manual(&db, product.clone(), format!("ready {i}")).id;
+        db.create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(task)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    }
+    let mut model = None;
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Snapshot("cold"));
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Incremental(0));
+    assert_eq!(check(&db, &product, &mut model, 101), Refresh::Incremental(0));
+}
+
+#[test]
+fn board_projection_review_guide_changes_are_card_scoped() {
+    let (_dir, path) = disk_db_path("projection-guide");
+    let db = WorkDb::open(path).unwrap();
+    let product = make_revision_product(&db, "guide");
+    let other = make_revision_product(&db, "unrelated");
+    let root = make_in_review_chore(&db, &product, "https://github.com/acme/widget/pull/9");
+    let (series, comparison) = crate::test_support::seed_review_guide_series(&db, &root);
+    let mut model = None;
+    let mut unrelated = None;
+    check(&db, &product, &mut model, 100);
+    check(&db, &other, &mut unrelated, 100);
+    let attempt = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Incremental(1));
+    assert_eq!(check(&db, &other, &mut unrelated, 100), Refresh::Incremental(0));
+    db.publish_pr_review_guide_version(&attempt.id, "# Guide", "raw")
+        .unwrap();
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Incremental(1));
+    assert_eq!(check(&db, &other, &mut unrelated, 100), Refresh::Incremental(0));
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_guide_attempts SET retries = retries + 1 WHERE id = ?1",
+            [&attempt.id],
+        )
+        .unwrap();
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Incremental(0));
+}
+
+#[test]
+fn board_projection_task_updates_do_not_duplicate_journal_ids() {
+    let db = WorkDb::open(temp_db_path("projection-journal-ids")).unwrap();
+    let product = make_revision_product(&db, "journal");
+    let root = create_test_chore_manual(&db, product.clone(), "root").id;
+    let child = insert_revision_row(&db, &product, &root);
+    let conn = db.connect().unwrap();
+    conn.execute("DELETE FROM board_changes", []).unwrap();
+    conn.execute("UPDATE tasks SET name = 'renamed' WHERE id = ?1", [&child])
+        .unwrap();
+    let ids: Vec<String> = collect_rows(
+        conn.prepare("SELECT item_id FROM board_changes")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&root));
+    assert!(ids.contains(&child));
+}
+
+#[test]
+fn board_projection_snapshot_preserves_cached_runtime_expiry() {
+    let db = WorkDb::open(temp_db_path("projection-cached-expiry")).unwrap();
+    let product = make_revision_product(&db, "expiry");
+    let root = create_test_chore_manual(&db, product.clone(), "ready").id;
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(root)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET dispatch_not_before = '150', pre_start_failure_count = 1 WHERE id = ?1",
+            [&execution.id],
+        )
+        .unwrap();
+    let cache = BoardCaches::default();
+    db.get_work_tree_cached_at(&product, &mut PopulationTrace::disabled(), &cache, 100)
+        .unwrap();
+    let mut model = None;
+    db.refresh_board_projection(&product, &mut model, &mut PopulationTrace::disabled(), &cache, 100)
+        .unwrap();
+    assert!(cache.runtimes.stats().hits > 0);
+    assert_eq!(check(&db, &product, &mut model, 149), Refresh::Incremental(0));
+    assert_eq!(check(&db, &product, &mut model, 150), Refresh::Incremental(1));
+    assert_eq!(check(&db, &product, &mut model, 151), Refresh::Incremental(0));
+}
+
+#[test]
+fn board_projection_upgrade_replaces_broad_triggers_and_preserves_watermark() {
+    let (_dir, path) = disk_db_path("projection-trigger-upgrade");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = make_revision_product(&db, "upgrade");
+    let root = create_test_chore_manual(&db, product, "root").id;
+    let conn = db.connect().unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER board_changes_tasks_UPDATE;
+        CREATE TRIGGER board_changes_tasks_UPDATE AFTER UPDATE ON tasks BEGIN
+            INSERT INTO board_changes(source) VALUES ('tasks');
+        END;
+        UPDATE metadata SET value = '56' WHERE key = 'schema_version';",
+    )
+    .unwrap();
+    let before: u64 = conn
+        .query_row("SELECT MAX(sequence) FROM board_changes", [], |row| row.get(0))
+        .unwrap();
+    drop(conn);
+    drop(db);
+    let db = WorkDb::open(path.clone()).unwrap();
+    let conn = db.connect().unwrap();
+    let after: u64 = conn
+        .query_row("SELECT MAX(sequence) FROM board_changes", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(before, after);
+    conn.execute("UPDATE tasks SET name = 'changed' WHERE id = ?1", [&root])
+        .unwrap();
+    let item: String = conn
+        .query_row(
+            "SELECT item_id FROM board_changes WHERE sequence > ?1",
+            [before],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(item, root);
 }

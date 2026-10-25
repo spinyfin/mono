@@ -14,6 +14,7 @@ pub(crate) enum Refresh {
 
 pub(crate) struct CachedProjection {
     model: Projection,
+    validity: HashMap<String, (bool, Option<i64>)>,
     pub(crate) retained_bytes: usize,
 }
 
@@ -58,7 +59,8 @@ impl WorkDb {
             },
         };
         // Exactly one complete read, with no retry loop or partial publication.
-        let tree = Self::assemble_work_tree_in(&conn, product, trace, Some(caches), now)?;
+        let mut validity = HashMap::new();
+        let tree = Self::assemble_work_tree_in(&conn, product, trace, Some(caches), now, Some(&mut validity))?;
         // Bound retained state by both cardinality and encoded size. Oversized
         // products still work through the existing snapshot path.
         // Three bytes cover the changing comma counts in tasks, chores and
@@ -68,6 +70,7 @@ impl WorkDb {
         *projection = if retainable(&tree, retained_bytes) {
             Some(CachedProjection {
                 model: Projection::snapshot(revision, tree.clone()),
+                validity,
                 retained_bytes,
             })
         } else {
@@ -98,24 +101,10 @@ fn incremental(
         return Ok(Err("broad_input"));
     }
     let mut seeds: BTreeSet<_> = changes.into_iter().flatten().collect();
-    // Pending runtimes can read dependencies/chain holds in other products,
-    // including a blocker not currently displayed. Re-evaluate that bounded
-    // set even when its own run did not change. Deadlines also change on reads
-    // with no new events. Live/settled runtimes are supplied only for changed runs.
-    for runtime in &model.tree().task_runtimes {
-        if matches!(
-            runtime.execution_status,
-            Some(ExecutionStatus::Queued | ExecutionStatus::Ready | ExecutionStatus::WaitingDependency)
-        ) || [&runtime.dispatch_retry_at, &runtime.dispatch_not_before]
-            .iter()
-            .any(|value| {
-                value
-                    .as_deref()
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .is_some_and(|at| at <= now)
-            })
-        {
-            seeds.insert(runtime.work_item_id.clone());
+    // Cross-item reads and elapsed deadlines need refresh without a write.
+    for (id, (cacheable, expires_at)) in &cached.validity {
+        if !cacheable || expires_at.is_some_and(|at| at <= now) {
+            seeds.insert(id.clone());
         }
     }
     // Union the old and new graphs to a fixed point, with a hard bound on
@@ -180,6 +169,8 @@ fn incremental(
             (task, entry.runtime)
         })
         .unzip();
+    cached.validity.retain(|id, _| !affected.contains(id));
+    cached.validity.extend(patch.validity);
     model
         .apply(Change {
             base: model.revision(),

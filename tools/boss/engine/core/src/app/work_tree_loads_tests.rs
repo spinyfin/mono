@@ -99,3 +99,16 @@ fn freshness_probe_and_tree_read_do_not_wait_for_an_uncommitted_writer() {
     assert_eq!(loaded.value.as_ref().unwrap().1.product.name, "Committed");
     writer.execute_batch("ROLLBACK").unwrap();
 }
+
+#[test]
+fn projection_retention_evicts_the_least_recently_read_product() {
+    let loads = WorkTreeLoads::default();
+    let hot = loads.projection("hot");
+    let cold = loads.projection("cold");
+    loads.projection("third");
+    loads.projection("fourth");
+    assert!(Arc::ptr_eq(&hot, &loads.projection("hot")));
+    loads.projection("fifth");
+    assert!(Arc::ptr_eq(&hot, &loads.projection("hot")));
+    assert!(!Arc::ptr_eq(&cold, &loads.projection("cold")));
+}
