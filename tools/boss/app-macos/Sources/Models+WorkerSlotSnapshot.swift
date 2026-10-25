@@ -172,9 +172,10 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
     }
 
     /// Type badge in the titlebar and on the viewer-missing card. Only an
-    /// engine-listed run has a type to show; a finished run shows none.
+    /// engine-listed run has a type to show; idle and finished runs show none.
+    /// Idle replaces the kind so the chrome does not imply ongoing work.
     var headerBadge: AgentType? {
-        guard !isPlaceholder, live != nil else { return nil }
+        guard !isPlaceholder, let live, live.activity != .idle else { return nil }
         return badgeType
     }
 

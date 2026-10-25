@@ -33,7 +33,7 @@ enum BossAgentPaneActivityCapture {
             )
             column(
                 title: "Turn ended (driver reported Stop)",
-                caption: "The one signal that parks a worker at its prompt. Pill reads Idle.",
+                caption: "The one signal that parks a worker at its prompt. Idle replaces Coding in the header and connection placeholder.",
                 live: turnEnded
             )
         }
