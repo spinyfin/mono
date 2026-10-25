@@ -444,6 +444,96 @@ fn board_projection_review_guide_changes_are_card_scoped() {
         )
         .unwrap();
     assert_eq!(check(&db, &product, &mut model, 100), Refresh::Incremental(0));
+
+    let revision = insert_revision_row(&db, &product, &root);
+    let PrSourceCapturePersistOutcome::Stored(capture) = db
+        .persist_pr_review_guide_source_capture(
+            &root,
+            2,
+            PrSourceCaptureTrigger::Completion,
+            &crate::test_support::review_guide_source_packet("base", "new-head"),
+        )
+        .unwrap()
+    else {
+        panic!("capture must persist");
+    };
+    let held = db
+        .create_automatic_pr_review_guide_attempt(&series, &capture.comparison_id)
+        .unwrap();
+    check(&db, &product, &mut model, 100);
+    check(&db, &other, &mut unrelated, 100);
+    assert!(
+        model.as_ref().unwrap().tree().chores[0]
+            .review_guide_update_status
+            .is_none()
+    );
+    let pr = "https://github.com/acme/widget/pull/9";
+    db.record_review_guide_revision_head(&root, pr, "new-head", &revision, 2)
+        .unwrap();
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Incremental(2));
+    assert_eq!(check(&db, &other, &mut unrelated, 100), Refresh::Incremental(0));
+    assert_eq!(
+        model.as_ref().unwrap().tree().chores[0].review_guide_update_status,
+        Some(format!("Updating after revision {revision}..."))
+    );
+    let conn = db.connect().unwrap();
+    let prompt: String = conn
+        .query_row(
+            "SELECT prompt_version FROM pr_review_guide_attempts WHERE id = ?1",
+            [&held.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(prompt, boss_review_guide::UPDATE_PROMPT_VERSION);
+    drop(conn);
+    // Exercise the joined status inputs independently of attribution so one
+    // working trigger cannot conceal a missing trigger on another table.
+    for (sql, id) in [
+        (
+            "UPDATE pr_review_guide_source_series SET request_epoch = request_epoch + 1 WHERE id = ?1",
+            &series,
+        ),
+        (
+            "UPDATE pr_review_guide_source_series SET request_epoch = request_epoch - 1 WHERE id = ?1",
+            &series,
+        ),
+        (
+            "UPDATE pr_review_guide_attempts SET request_epoch = request_epoch + 1 WHERE id = ?1",
+            &held.id,
+        ),
+        (
+            "UPDATE pr_review_guide_attempts SET request_epoch = request_epoch - 1 WHERE id = ?1",
+            &held.id,
+        ),
+        (
+            "UPDATE pr_review_guide_source_comparisons SET head_sha = 'different' WHERE id = ?1",
+            &capture.comparison_id,
+        ),
+        (
+            "UPDATE pr_review_guide_source_comparisons SET head_sha = 'new-head' WHERE id = ?1",
+            &capture.comparison_id,
+        ),
+        ("DELETE FROM pr_review_guide_updates WHERE attempt_id = ?1", &held.id),
+    ] {
+        db.connect().unwrap().execute(sql, [id]).unwrap();
+        assert_eq!(check(&db, &product, &mut model, 100), Refresh::Incremental(2));
+        assert_eq!(check(&db, &other, &mut unrelated, 100), Refresh::Incremental(0));
+    }
+    db.fail_pr_review_guide_attempt(&held.id, "generation failed").unwrap();
+    db.record_pr_review_guide_source_capture_failure(&root, pr, 3, "capture failed")
+        .unwrap();
+    check(&db, &product, &mut model, 100);
+    check(&db, &other, &mut unrelated, 100);
+    db.record_review_guide_revision_head(&root, pr, "failed-head", &revision, 3)
+        .unwrap();
+    assert_eq!(check(&db, &product, &mut model, 100), Refresh::Incremental(2));
+    assert_eq!(check(&db, &other, &mut unrelated, 100), Refresh::Incremental(0));
+    assert_eq!(
+        model.as_ref().unwrap().tree().chores[0].review_guide_update_status,
+        Some(format!(
+            "Update after revision {revision} failed; previous guide retained"
+        ))
+    );
 }
 
 #[test]
@@ -513,7 +603,8 @@ fn board_projection_upgrade_replaces_broad_triggers_and_preserves_watermark() {
         CREATE TRIGGER board_changes_tasks_UPDATE AFTER UPDATE ON tasks BEGIN
             INSERT INTO board_changes(source) VALUES ('tasks');
         END;
-        UPDATE metadata SET value = '56' WHERE key = 'schema_version';",
+        DROP TRIGGER board_changes_pr_review_guide_revision_heads_INSERT;
+        UPDATE metadata SET value = '57' WHERE key = 'schema_version';",
     )
     .unwrap();
     let before: u64 = conn
@@ -533,6 +624,19 @@ fn board_projection_upgrade_replaces_broad_triggers_and_preserves_watermark() {
         .query_row(
             "SELECT item_id FROM board_changes WHERE sequence > ?1",
             [before],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(item, root);
+    conn.execute(
+        "INSERT INTO pr_review_guide_revision_heads VALUES (?1, 'pr', 'head', 'revision', 1)",
+        [&root],
+    )
+    .unwrap();
+    let item: String = conn
+        .query_row(
+            "SELECT item_id FROM board_changes ORDER BY sequence DESC LIMIT 1",
+            [],
             |row| row.get(0),
         )
         .unwrap();

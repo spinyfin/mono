@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 57;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 58;
 
 /// Schema 43: the baseline commit a recovery record was created at, the
 /// pointer-reconciliation note for the worker prompt, and the retirement
@@ -472,7 +472,7 @@ impl WorkDb {
         if version < 56 {
             super::board_projection_schema::migrate(&tx)?;
         }
-        if version < 57 {
+        if version < 58 {
             super::board_projection_schema::refine_triggers(&tx)?;
         }
         if version < CURRENT_SCHEMA_VERSION {

@@ -70,8 +70,8 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
             conn.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS board_changes_{table}_{operation} AFTER {operation} ON {table} BEGIN INSERT INTO board_changes(source) VALUES ('{table}'); END;"))?;
         }
     }
-    // Card derivations read only these review columns. Other guide tables
-    // drive jobs, whose projected results arrive through series/attempt writes.
+    // Journal review badge and guide-update status inputs at their owning root.
+    // Job-only bookkeeping does not affect card derivations.
     for (table, columns, select) in [
         (
             "pr_review_batch_members",
@@ -80,8 +80,23 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         ),
         (
             "pr_review_guide_source_series",
-            "id, root_task_id, canonical_pr_url, guide_lifecycle, readable_version_id, selected_comparison_id, latest_observation_sequence",
+            "id, root_task_id, canonical_pr_url, guide_lifecycle, readable_version_id, selected_comparison_id, latest_observation_sequence, last_capture_error, request_epoch",
             "SELECT ROW.root_task_id",
+        ),
+        (
+            "pr_review_guide_revision_heads",
+            "root_task_id, revision_task_id, observation_sequence, head_sha, pr_url",
+            "SELECT ROW.root_task_id",
+        ),
+        (
+            "pr_review_guide_updates",
+            "attempt_id",
+            "SELECT s.root_task_id FROM pr_review_guide_attempts a JOIN pr_review_guide_source_series s ON s.id = a.series_id WHERE a.id = ROW.attempt_id",
+        ),
+        (
+            "pr_review_guide_source_comparisons",
+            "id, series_id, head_sha",
+            "SELECT root_task_id FROM pr_review_guide_source_series WHERE id = ROW.series_id",
         ),
         (
             "pr_review_guide_versions",
@@ -90,7 +105,7 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         ),
         (
             "pr_review_guide_attempts",
-            "id, series_id, status, error, finished_at",
+            "id, series_id, status, error, finished_at, request_epoch, comparison_id, prompt_version",
             "SELECT root_task_id FROM pr_review_guide_source_series WHERE id = ROW.series_id",
         ),
     ] {
