@@ -413,8 +413,9 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              flag is on, the mediation policy is enforced only by prompt text — `boss task update` from a \
              worker shell executes at `RpcTier::User`, unconditionally allowed. DEFAULT OFF: enabling it \
              newly denies any script or human debugging session that runs a mutating verb from inside a \
-             worker pane. Kill switch: set false to return every connection to `RpcTier::User` without a \
-             rebuild.",
+             worker pane. Kill switch: set false to return ordinary worker connections to `RpcTier::User` \
+             without a rebuild. Progression connections always enforce their tier policy and sanitization, \
+             regardless of this flag.",
         category: "worker-isolation",
         default_enabled: false,
         capability_id: None,

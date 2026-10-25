@@ -187,7 +187,7 @@ pub use trust::{PeerClass, RpcTier};
 // consults, and the row sanitizer the writer task applies. Both are pure
 // functions over the wire types — see the crate docs for why they live
 // outside `boss-engine`.
-use boss_engine_worker_policy::{sanitize_event_for_worker, variant_name, worker_verb_decision};
+use boss_engine_worker_policy::{sanitize_event_for_worker, variant_name};
 use boss_protocol::{
     ProbeDeliveryExpectation, ProbeDeliveryState, ProbeResumeEvidence, WorkerTierDenial, WorkerTierDenialReason,
 };
@@ -2393,6 +2393,7 @@ async fn handle_frontend_connection(
         );
     }
     let peer_is_worker = peer_class.is_worker();
+    let peer_is_progression = peer_class.is_progression();
     let connection_reads = server_state.read_admission.connection();
     let connection_live_reads = server_state.live_read_admission.connection();
 
@@ -2426,7 +2427,7 @@ async fn handle_frontend_connection(
             // `transcript_path` by forgetting to. Non-worker connections
             // short-circuit on `peer_is_worker`, so the app pays nothing but
             // a bool test per frame.
-            if peer_is_worker && writer_flags.is_enabled("worker_rpc_tier") {
+            if peer_is_progression || (peer_is_worker && writer_flags.is_enabled("worker_rpc_tier")) {
                 event.payload = sanitize_event_for_worker(event.payload);
             }
 

@@ -57,13 +57,7 @@ use super::*;
 ///   `authorize_rpc` entry point rather than reaching for
 ///   `classify_peer` directly; it is not itself on the production
 ///   dispatch path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RpcTier {
-    User,
-    AppOrBoss,
-    BossOnly,
-    Worker,
-}
+pub use boss_engine_worker_policy::RpcTier;
 
 /// How a frontend connection's socket peer was classified.
 ///
@@ -79,6 +73,8 @@ pub enum PeerClass {
     /// verb gate logs it, and because the read verbs coming in later tasks
     /// scope on it.
     Worker { run_id: String },
+    /// A registered progression pane, confined regardless of the worker flag.
+    Progression { run_id: String },
     /// Everything else: the macOS app, the Boss pane, a plain terminal, a
     /// connection with no local peer pid at all.
     ///
@@ -97,9 +93,13 @@ impl PeerClass {
     /// The execution this connection belongs to, if it is a worker.
     pub fn worker_run_id(&self) -> Option<&str> {
         match self {
-            PeerClass::Worker { run_id } => Some(run_id),
+            PeerClass::Worker { run_id } | PeerClass::Progression { run_id } => Some(run_id),
             PeerClass::Other => None,
         }
+    }
+
+    pub fn is_progression(&self) -> bool {
+        matches!(self, PeerClass::Progression { .. })
     }
 
     pub fn is_worker(&self) -> bool {
@@ -108,6 +108,27 @@ impl PeerClass {
 }
 
 impl ServerState {
+    /// Gate each existing target of a progression mutation using verified
+    /// peer identity. Callers cannot select another execution's neighbourhood.
+    pub fn progression_scope_denial(
+        &self,
+        peer_class: &PeerClass,
+        verb: &str,
+        target: &str,
+    ) -> Option<WorkerTierDenial> {
+        let permitted = match peer_class {
+            PeerClass::Progression { run_id } => self.work_db.check_progression_scope(run_id, target).is_ok(),
+            PeerClass::Worker { .. } | PeerClass::Other => false,
+        };
+        if permitted {
+            return None;
+        }
+        let mut denial = WorkerTierDenial::closed(verb, WorkerTierDenialReason::RuntimeIsolation);
+        denial.message =
+            "Target is outside the caller's captured progression neighbourhood, or its scope is unavailable.".into();
+        Some(denial)
+    }
+
     /// Set the Boss session's shell pid (the second trust root). Any
     /// peer whose process tree includes this pid as an ancestor will
     /// satisfy `BossOnly` / `AppOrBoss` checks.
@@ -179,6 +200,9 @@ impl ServerState {
         if matches!(tier, RpcTier::Worker) {
             return self.classify_peer(peer_pid).is_worker();
         }
+        if matches!(tier, RpcTier::Progression) {
+            return self.classify_peer(peer_pid).is_progression();
+        }
         let app_pid = self.current_app_pid();
         let boss_pid = self.current_boss_pid();
         if app_pid.is_none() && boss_pid.is_none() {
@@ -192,7 +216,7 @@ impl ServerState {
         match tier {
             // Both handled above; repeated here only to keep the match
             // exhaustive without a wildcard arm.
-            RpcTier::User | RpcTier::Worker => true,
+            RpcTier::User | RpcTier::Worker | RpcTier::Progression => true,
             RpcTier::AppOrBoss => {
                 // Fast path: peer descends from a known trust root. Common
                 // case is the human running bossctl from the Boss pane
@@ -259,8 +283,9 @@ impl ServerState {
         let Some(peer_pid) = peer_pid else {
             return PeerClass::Other;
         };
-        match self.worker_registry.lookup_with_ancestor_walk(peer_pid) {
-            Some(run_id) => PeerClass::Worker { run_id },
+        match self.worker_registry.lookup_classified_with_ancestor_walk(peer_pid) {
+            Some((run_id, true)) => PeerClass::Progression { run_id },
+            Some((run_id, false)) => PeerClass::Worker { run_id },
             None => PeerClass::Other,
         }
     }
@@ -270,11 +295,11 @@ impl ServerState {
     ///
     /// Two gates, in order:
     ///
-    /// 1. **The flag.** While `worker_rpc_tier` is off, every connection
-    ///    keeps the historical unconditional `RpcTier::User` behaviour, so a
+    /// 1. **The flag.** While `worker_rpc_tier` is off, ordinary workers
+    ///    keep the historical unconditional `RpcTier::User` behaviour, so a
     ///    rollback is a flag flip rather than a redeploy.
-    /// 2. **The classification.** Only worker-classified peers are subject to
-    ///    the verb policy; the app, the Boss pane, and plain terminals are
+    /// 2. **The classification.** Progression always enforces both policies;
+    ///    the app, the Boss pane, and plain terminals are
     ///    untouched, which is the "a human/coordinator shell not descended
     ///    from a worker pid is unaffected" property.
     pub(super) fn worker_tier_denial(
@@ -282,16 +307,35 @@ impl ServerState {
         peer_class: &PeerClass,
         request: &FrontendRequest,
     ) -> Option<WorkerTierDenial> {
-        if !peer_class.is_worker() {
-            return None;
-        }
-        if !self.feature_flags.is_enabled("worker_rpc_tier") {
-            return None;
-        }
-        worker_verb_decision(request).denial().cloned()
+        let tier = match peer_class {
+            PeerClass::Progression { .. } => RpcTier::Progression,
+            PeerClass::Worker { .. } if self.feature_flags.is_enabled("worker_rpc_tier") => RpcTier::Worker,
+            PeerClass::Worker { .. } | PeerClass::Other => return None,
+        };
+        boss_engine_worker_policy::verb_decision(tier, request)
+            .denial()
+            .cloned()
+            .or_else(|| {
+                if let FrontendRequest::SubmitProposal { kind, .. } = request {
+                    boss_engine_worker_policy::proposal_kind_decision(tier, *kind)
+                        .denial()
+                        .cloned()
+                        .or_else(|| {
+                            let PeerClass::Progression { run_id } = peer_class else {
+                                return None;
+                            };
+                            // Admission checks the originating item. Each kind's
+                            // handler must also check every target it will mutate.
+                            let item = self.work_db.get_execution(run_id).ok().map(|e| e.work_item_id);
+                            self.progression_scope_denial(peer_class, "SubmitProposal", item.as_deref().unwrap_or(""))
+                        })
+                } else {
+                    None
+                }
+            })
     }
 
-    /// Per-row scoping for the two verbs [`worker_verb_decision`] allows but
+    /// Per-row scoping for the two verbs the tier policy allows but
     /// cannot itself scope, because it is pure over the verb and has no
     /// caller identity or database access: `GetRun` and `ListRuns`. Both are
     /// on the worker allowlist because a worker must be able to read its
@@ -314,7 +358,7 @@ impl ServerState {
         request: &FrontendRequest,
     ) -> Option<WorkerTierDenial> {
         let caller_execution_id = peer_class.worker_run_id()?;
-        if !self.feature_flags.is_enabled("worker_rpc_tier") {
+        if !peer_class.is_progression() && !self.feature_flags.is_enabled("worker_rpc_tier") {
             return None;
         }
         let owning_execution_id = match request {

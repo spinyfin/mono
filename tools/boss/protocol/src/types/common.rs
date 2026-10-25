@@ -293,6 +293,8 @@ pub const LAST_STATUS_ACTOR_ENGINE: &str = "engine";
 /// only ever resolves `'boss'` or `'human'`); it is engine-internal and
 /// passes this literal to `update_work_item_as_actor` directly.
 pub const LAST_STATUS_ACTOR_BOOTHBY: &str = "boothby";
+/// Scoped autonomous progression decisions are not reversible engine cascades.
+pub const LAST_STATUS_ACTOR_PROGRESSION: &str = "progression";
 
 /// The `last_status_actor` vocabulary as a closed set.
 ///
@@ -317,6 +319,7 @@ pub enum StatusActor {
     Boss,
     Engine,
     Boothby,
+    Progression,
 }
 
 impl StatusActor {
@@ -325,6 +328,7 @@ impl StatusActor {
         StatusActor::Boss,
         StatusActor::Engine,
         StatusActor::Boothby,
+        StatusActor::Progression,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -333,6 +337,7 @@ impl StatusActor {
             StatusActor::Boss => LAST_STATUS_ACTOR_BOSS,
             StatusActor::Engine => LAST_STATUS_ACTOR_ENGINE,
             StatusActor::Boothby => LAST_STATUS_ACTOR_BOOTHBY,
+            StatusActor::Progression => LAST_STATUS_ACTOR_PROGRESSION,
         }
     }
 
@@ -354,7 +359,7 @@ impl StatusActor {
     pub fn is_engine_cascade(self) -> bool {
         match self {
             StatusActor::Engine => true,
-            StatusActor::Human | StatusActor::Boss | StatusActor::Boothby => false,
+            StatusActor::Human | StatusActor::Boss | StatusActor::Boothby | StatusActor::Progression => false,
         }
     }
 }
@@ -373,8 +378,9 @@ impl std::str::FromStr for StatusActor {
             LAST_STATUS_ACTOR_BOSS => Ok(StatusActor::Boss),
             LAST_STATUS_ACTOR_ENGINE => Ok(StatusActor::Engine),
             LAST_STATUS_ACTOR_BOOTHBY => Ok(StatusActor::Boothby),
+            LAST_STATUS_ACTOR_PROGRESSION => Ok(StatusActor::Progression),
             other => Err(format!(
-                "unknown status actor `{other}`; expected one of: human, boss, engine, boothby"
+                "unknown status actor `{other}`; expected one of: human, boss, engine, boothby, progression"
             )),
         }
     }

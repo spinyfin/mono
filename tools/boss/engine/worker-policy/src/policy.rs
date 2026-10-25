@@ -1,9 +1,9 @@
-//! The worker-tier verb policy: one deny-by-default decision per
+//! The agent-tier verb policy: one deny-by-default decision per
 //! [`FrontendRequest`].
 //!
 //! ## Deny by default, exhaustively
 //!
-//! [`worker_verb_decision`] is a single `match` with **no wildcard arm**.
+//! [`verb_decision`] classifies requests with **no wildcard arm**.
 //! That is deliberate and load-bearing: a verb added to `FrontendRequest`
 //! tomorrow will not compile until someone classifies it here. The
 //! alternative — a `_ => Allow` or `_ => Deny` catch-all — either quietly
@@ -28,8 +28,10 @@
 //!   `bossctl`-shaped verb stay denied.
 //!
 //! Writes are mediated: a worker submits proposals and the engine applies
-//! them. The narrow exceptions are enumerated in [`worker_verb_decision`]'s
-//! "sanctioned writes" arm, each with the reason it is sanctioned.
+//! them. Ordinary workers also have the narrow exceptions enumerated in
+//! [`verb_decision`]'s "sanctioned writes" arm. Progression has no exceptions.
+
+use crate::RpcTier;
 
 use boss_protocol::{FrontendRequest, WorkItemPatch, WorkerTierDenial, WorkerTierDenialReason};
 
@@ -102,6 +104,13 @@ fn closed(verb: String, reason: WorkerTierDenialReason) -> WorkerVerbDecision {
     WorkerVerbDecision::Deny(Box::new(WorkerTierDenial::closed(verb, reason)))
 }
 
+fn sanctioned_write(tier: RpcTier, request: &FrontendRequest) -> WorkerVerbDecision {
+    match tier {
+        RpcTier::Progression => taxonomy(variant_name(request)),
+        RpcTier::Worker | RpcTier::User | RpcTier::AppOrBoss | RpcTier::BossOnly => WorkerVerbDecision::Allow,
+    }
+}
+
 fn taxonomy(verb: String) -> WorkerVerbDecision {
     closed(verb, WorkerTierDenialReason::MutatingTaxonomy)
 }
@@ -127,6 +136,15 @@ fn coordinator(verb: String) -> WorkerVerbDecision {
 /// `boss-engine-core`'s `app/trust.rs`), ahead of the handler, denying a
 /// `GetRun`/`ListRuns` whose target execution is not the caller's own.
 pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
+    verb_decision(RpcTier::Worker, request)
+}
+
+/// Classify every request for the authenticated connection tier.
+pub fn verb_decision(tier: RpcTier, request: &FrontendRequest) -> WorkerVerbDecision {
+    match tier {
+        RpcTier::User | RpcTier::AppOrBoss | RpcTier::BossOnly => return WorkerVerbDecision::Allow,
+        RpcTier::Worker | RpcTier::Progression => {}
+    }
     use WorkerVerbDecision::Allow;
 
     match request {
@@ -226,7 +244,8 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         // proposal kind. Its confinement (the path must resolve inside the
         // peer-resolved execution's own workspace) is enforced in the
         // handler, not here, because this match is pure.
-        FrontendRequest::ListAttachments { .. } | FrontendRequest::SubmitAttachment { .. } => Allow,
+        FrontendRequest::ListAttachments { .. } => Allow,
+        FrontendRequest::SubmitAttachment { .. } => sanctioned_write(tier, request),
 
         // ── Denied: app-only screenshot listing ────────────────────────────
         //
@@ -292,7 +311,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::MarkConflictResolutionFailed { .. }
         | FrontendRequest::RecordProducerSideConflict { .. }
         | FrontendRequest::SetProjectDesignDoc { .. }
-        | FrontendRequest::SetTaskDocPointer { .. } => Allow,
+        | FrontendRequest::SetTaskDocPointer { .. } => sanctioned_write(tier, request),
 
         // ── Allowed: engine version ──────────────────────────────────────
         //

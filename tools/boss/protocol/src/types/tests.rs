@@ -613,12 +613,13 @@ fn task_roundtrips_with_effort_provenance() {
 // ── StatusActor round-trip / classification tests ────────────────────────
 
 #[test]
-fn status_actor_parses_all_four_values() {
+fn status_actor_parses_all_values() {
     use std::str::FromStr;
     assert_eq!(StatusActor::from_str("human").unwrap(), StatusActor::Human);
     assert_eq!(StatusActor::from_str("boss").unwrap(), StatusActor::Boss);
     assert_eq!(StatusActor::from_str("engine").unwrap(), StatusActor::Engine);
     assert_eq!(StatusActor::from_str("boothby").unwrap(), StatusActor::Boothby);
+    assert_eq!(StatusActor::from_str("progression").unwrap(), StatusActor::Progression);
 }
 
 #[test]
@@ -627,7 +628,7 @@ fn status_actor_rejects_unknown_values_with_documented_message() {
     let err = StatusActor::from_str("gremlin").unwrap_err();
     assert!(err.contains("gremlin"), "error should echo the offending value: {err}");
     // The message documents the full closed set of accepted actors.
-    for expected in ["human", "boss", "engine", "boothby"] {
+    for expected in ["human", "boss", "engine", "boothby", "progression"] {
         assert!(err.contains(expected), "error should list `{expected}`: {err}");
     }
 }
@@ -657,6 +658,7 @@ fn status_actor_is_engine_cascade_true_only_for_engine() {
     assert!(!StatusActor::Human.is_engine_cascade());
     assert!(!StatusActor::Boss.is_engine_cascade());
     assert!(!StatusActor::Boothby.is_engine_cascade());
+    assert!(!StatusActor::Progression.is_engine_cascade());
 }
 
 // ── short_id_label tests ─────────────────────────────────────────────────
