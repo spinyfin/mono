@@ -93,7 +93,7 @@ Supported keys:
 - `enabled` (optional, default `true`): disable with `false`.
 - `config` (optional table): check-specific configuration.
 - `policy` (optional table): framework-managed severity/bypass controls.
-- `scope` (optional `files|changeset`, default `files`): what the check's scheduling is keyed on. See [Changeset-scope checks](#changeset-scope-checks).
+- `scope` (optional `files|files-including-removed|changeset`, default `files`): what the check's scheduling is keyed on. See [Changeset-scope checks](#changeset-scope-checks).
 
 `policy` keys:
 
@@ -115,6 +115,8 @@ Note what this does _not_ catch: a correctly-spelled key holding a value that ca
 ## Changeset-scope checks
 
 Most checks look at individual files: `scope: files` (the default) schedules a check once per distinct configuration and runs it only against the changed files that resolved to it.
+
+`scope: files-including-removed` additionally schedules deleted paths. A rename whose old path matches a check's scope and whose destination does not is presented as a deletion at the old path, preserving base-content lookup and findings. Renames within scope retain both paths and compare against the old content. Use this for compatibility checks such as `proto/breaking`; ordinary file checks retain the default deletion-skipping behavior.
 
 A check with `scope: changeset` has no file to point at — it inspects the changeset as a whole, for example the PR description or the commit message. Set `scope: changeset` on such a check and it is scheduled exactly once per invocation, regardless of the changed-file set (including a changeset with no file changes, or one where every changed file is excluded):
 

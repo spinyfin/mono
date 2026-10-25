@@ -1485,6 +1485,7 @@ include!("tests_external.rs");
 include!("tests_fix_multipass.rs");
 include!("tests_fix_suggested.rs");
 include!("tests_changeset_scope.rs");
+include!("tests_removed_scope.rs");
 
 // ── change-scope finding filter ─────────────────────────────────────────────────
 

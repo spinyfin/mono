@@ -182,6 +182,7 @@ static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[
             "file/size",
             "file/ifchange",
             "md/link-integrity",
+            "proto/breaking",
             "rust/giant-structs",
             "rust/giant-structs-create",
             "text/forbidden-pattern",

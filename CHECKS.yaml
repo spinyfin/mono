@@ -107,6 +107,23 @@ checks:
     policy:
       severity: error
 
+  # Backward-compatibility gate for the hub/spoke wire schema. Compares each
+  # changed .proto file with the same file at the change's base revision (the
+  # base every other change-scoped check uses) and fails on a field number or
+  # type change, a removal without `reserved`, an enum renumbering, a
+  # message/service/RPC removal or rename, a package change, or a changed RPC
+  # request/response type — the evolution rules in
+  # tools/boss/protocol-spoke/README.md. Opt-in by scope: only the protocol
+  # directories that declare a compatibility contract are listed here. A file
+  # new in the change passes; a modified file with no reachable base is an
+  # error, not a skip. No-op under `checkleft run --all` (no base revision).
+  - id: proto/breaking
+    scope: files-including-removed
+    include:
+      - "tools/boss/protocol-spoke/proto/**/*.proto"
+    policy:
+      severity: error
+
   - id: format/oxc
     policy:
       severity: error

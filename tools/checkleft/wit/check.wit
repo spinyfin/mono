@@ -77,16 +77,18 @@ interface types {
 
     /// The base-revision content of a single file.
     ///
-    /// Provided for files that were deleted or modified in the current changeset,
-    /// when a base revision is available (e.g. a diff-based run against a VCS).
-    /// Absent for added files (no prior revision) and when running in `--all`
-    /// (whole-tree) mode where there is no meaningful base.
+    /// Provided for files that were deleted, modified or renamed in the current
+    /// changeset, when a base revision is available (e.g. a diff-based run
+    /// against a VCS). Absent for added files (no prior revision) and when
+    /// running in `--all` (whole-tree) mode where there is no meaningful base.
     ///
     /// Checks can use this to inspect what a file contained before the change —
     /// for example, to enforce contracts on deleted files or to detect when
     /// a guarded region's markers are removed while their content changes.
     record base-file {
-        /// Repo-relative path, matching the corresponding `changed-file.path`.
+        /// Repo-relative path the content was read from at the base revision:
+        /// the corresponding `changed-file.path`, or `changed-file.old-path` for
+        /// a renamed file.
         path: string,
         /// UTF-8 content of the file at the base revision.
         content: string,
@@ -108,7 +110,8 @@ interface types {
         pr-description-unavailable-reason: option<string>,
         change-id: option<string>,
         repository: option<string>,
-        /// Base-revision content for deleted and modified files.
+        /// Base-revision content for deleted, modified and renamed files (a
+        /// renamed file's entry is keyed by its old path).
         ///
         /// Empty when no base revision is available (e.g. `--all` mode, unit
         /// tests that do not configure a VCS base). Checks that need old content
