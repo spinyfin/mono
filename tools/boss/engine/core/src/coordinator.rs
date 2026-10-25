@@ -1748,7 +1748,9 @@ fn slot_busy_occupant(err: &anyhow::Error) -> Option<Option<String>> {
 /// (prompt composition, driver provision), whose `error_message` is the
 /// only description there is.
 fn spawn_failure_classification(err: &anyhow::Error) -> Option<serde_json::Value> {
-    let start_err = err.chain().find_map(|cause| cause.downcast_ref::<StartWorkerError>())?;
+    let start_err = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::spawn_flow::StartWorkerError>())?;
     Some(serde_json::json!({
         "class": start_err.class(),
         "cause": start_err.cause_detail(),

@@ -1273,7 +1273,7 @@ mod pane_spawn_failed_attention_body_tests {
     #[test]
     fn composer_timeout_uses_neutral_wording() {
         let err = composer_not_ready_error("claude", "exec-1", Duration::from_secs(20));
-        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true, false);
+        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, "", true, false);
         assert!(
             body.contains("spawn confirmation failed and the pane was reaped"),
             "{body}"
@@ -1286,7 +1286,7 @@ mod pane_spawn_failed_attention_body_tests {
     #[test]
     fn turn_start_timeout_says_the_driver_started() {
         let err = turn_did_not_start_error("claude", "exec-1", Duration::from_secs(45));
-        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true, false);
+        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, "", true, false);
         assert!(body.contains("the driver started"), "{body}");
         assert!(body.contains("the pane was reaped"), "{body}");
         assert!(!body.contains("never came up"), "{body}");
@@ -1296,7 +1296,7 @@ mod pane_spawn_failed_attention_body_tests {
     #[test]
     fn other_spawn_failure_says_the_pane_never_came_up() {
         let err = anyhow::anyhow!("worker prompt failed");
-        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true, false);
+        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, "", true, false);
         assert!(body.contains("worker pane never came up"), "{body}");
         assert!(!body.contains("the driver started"), "{body}");
     }

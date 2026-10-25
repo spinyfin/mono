@@ -640,9 +640,9 @@ impl StartWorkerError {
     pub fn class(&self) -> &'static str {
         match self {
             Self::WriteFiles(_) => "write_files",
-            Self::Send(_) => "send_spawn_request",
-            Self::AppError(_) => "app_rejected",
-            Self::ResponseKindMismatch => "response_kind_mismatch",
+            Self::ViewerRejected(_) => "viewer_rejected",
+            Self::ViewerAbortFailed { .. } => "viewer_abort_failed",
+            Self::ProgressFidelity(_) => "progress_fidelity",
             Self::ProgressIngress(_) => "progress_ingress",
             Self::Tmux(_) => "tmux_host",
         }

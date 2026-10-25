@@ -2465,7 +2465,6 @@ async fn wait_for_review_guide_failed(publisher: &RecordingPublisher, product_id
     panic!("expected publish_work_item_changed review_guide_failed for {root_id} on {product_id}, got {events:?}");
 }
 
-
 // ── pane-spawn precondition rejection: the three operator surfaces ──────
 
 /// The precondition text the codex-driver spawn outage of 2026-08-06/07

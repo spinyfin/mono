@@ -515,7 +515,7 @@ impl ExecutionRunner for FakeExecutionRunner {
             return Err(anyhow::Error::from(source));
         }
         if let Some(detail) = &self.progress_ingress_failure {
-            let root = StartWorkerError::ProgressIngress(detail.clone());
+            let root = crate::spawn_flow::StartWorkerError::ProgressIngress(detail.clone());
             return Err(anyhow::Error::new(root).context(format!("spawning worker pane for run {}", execution.id)));
         }
         if self.fail {
