@@ -26,7 +26,7 @@ fn resume_execution(state: &Arc<ServerState>, task_id: &str, asking_execution: &
 }
 
 #[derive(Default)]
-struct QuestionRunner(std::sync::atomic::AtomicUsize);
+struct QuestionRunner(std::sync::atomic::AtomicUsize, tokio::sync::Notify);
 
 #[async_trait::async_trait]
 impl crate::runner::ExecutionRunner for QuestionRunner {
@@ -39,18 +39,24 @@ impl crate::runner::ExecutionRunner for QuestionRunner {
         _cube_change_id: Option<&str>,
     ) -> anyhow::Result<crate::runner::RunOutcome> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.1.notify_one();
         std::future::pending().await
     }
 }
 
-async fn wait_for_starts(runner: &QuestionRunner, count: usize) {
+async fn wait_for_starts(state: &ServerState, runner: &QuestionRunner, count: usize) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while runner.0.load(std::sync::atomic::Ordering::SeqCst) < count {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("the runner must receive the execution");
+    .unwrap_or_else(|err| {
+        panic!(
+            "the runner must receive {count} executions: {err}; executions: {:?}",
+            state.work_db.list_executions(None)
+        )
+    });
 }
 
 async fn force_launched_question() -> (Arc<ServerState>, tempfile::TempDir, String, String, Arc<QuestionRunner>) {
@@ -90,7 +96,7 @@ async fn force_launched_question() -> (Arc<ServerState>, tempfile::TempDir, Stri
         .force_dispatch(&asking, crate::coordinator::DispatchAdmission::OperatorForced)
         .await
         .unwrap();
-    wait_for_starts(&runner, 1).await;
+    wait_for_starts(&state, &runner, 1).await;
     assert_eq!(
         state.work_db.get_execution(&asking).unwrap().status,
         ExecutionStatus::Running
@@ -130,7 +136,7 @@ async fn answering_a_force_launched_runs_question_resumes_it_past_the_pause() {
     ));
 
     let resume_id = resume_execution(&state, &task_id, &asking).id;
-    wait_for_starts(&runner, 2).await;
+    wait_for_starts(&state, &runner, 2).await;
     assert_eq!(
         state.work_db.get_execution(&resume_id).unwrap().status,
         ExecutionStatus::Running,
@@ -176,7 +182,7 @@ async fn answering_a_normally_dispatched_runs_question_still_waits_behind_the_pa
 
 #[tokio::test]
 async fn unpaused_answer_uses_normal_dispatch() {
-    let (state, _dir, asking, task_id, _runner) = force_launched_question().await;
+    let (state, _dir, asking, task_id, runner) = force_launched_question().await;
     state
         .execution_coordinator
         .set_dispatch_preflight_block(Some("test normal dispatch hold".into()));
@@ -189,6 +195,35 @@ async fn unpaused_answer_uses_normal_dispatch() {
     assert_eq!(resume.status, ExecutionStatus::Ready);
     assert!(!state.work_db.execution_force_launched(&resume.id).unwrap());
     assert!(state.work_db.list_attention_items(&resume.id).unwrap().is_empty());
+    // The pending runner fake retains the fixture's only worker slot.
+    // Model the terminal asker's exit before checking normal admission.
+    let worker_id = state
+        .execution_coordinator
+        .worker_pool()
+        .claims()
+        .await
+        .into_iter()
+        .find(|claim| claim.execution_id == asking)
+        .expect("the asking runner holds a worker slot")
+        .worker_id;
+    state
+        .execution_coordinator
+        .release_worker_and_kick(&worker_id, None)
+        .await;
+    state.execution_coordinator.set_dispatch_preflight_block(None);
+    state.execution_coordinator.kick();
+    // Synchronize with dispatch completion: the real jj fixture can still
+    // be preparing a claimed execution while other suite tests run.
+    while runner.0.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+        runner.1.notified().await;
+    }
+    assert_eq!(
+        state.work_db.get_execution(&resume.id).unwrap().status,
+        ExecutionStatus::Running,
+        "normal dispatch must start the answered resume once preflight clears"
+    );
+    assert!(!state.work_db.execution_force_launched(&resume.id).unwrap());
+    assert!(!state.execution_coordinator.is_dispatch_paused());
 }
 
 #[tokio::test]
