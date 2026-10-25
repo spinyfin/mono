@@ -71,11 +71,20 @@ find its repository the way git itself does:
   recursively;
 - for `clone`, `init` and `worktree`, the directories they create.
 
-The shared shell tokenizer separates subshell boundaries; the gate handles
-brace groups, conditionals, loops, negation, directory-change options and
-environment wrappers. An unjudged git token with a store reference is refused,
-as are unrecognized git location or clone options. Clone option values are
-consumed before identifying its destination.
+The shared shell tokenizer preserves logical lines, heredoc data and subshell
+boundaries. The gate restores parent directory and environment state after a
+subshell and treats directory state across conditionals and loops as uncertain.
+Exported variables retain their export attribute when reassigned. Directory
+changes through `builtin` are tracked; relative changes with `CDPATH` are
+uncertain. Argument-appending launchers such as `xargs` cannot establish a
+read-only git invocation, and `jj util exec` payloads are inspected.
+
+An unjudged git word with a store reference is refused. Unrecognized git or
+wrapper options fail closed only when the store is involved. Clone option
+values are consumed before identifying its destination. Shell stdin, script
+files and interpreter code are refused when the command references the store
+or starts there. A heredoc written only as data can pass; executing a script
+later in that same command is still checked.
 
 Scripts and other programs are refused when their effective git-location
 environment points into the store. From a store working directory, only

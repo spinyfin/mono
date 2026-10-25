@@ -251,96 +251,16 @@ macro_rules! python_command_guard {
 ///
 /// `shlex.split` does not tokenize a shell operator written without
 /// surrounding spaces (`cd x&&bazel test //y` is a single token), so this
-/// uses `shlex.shlex(..., punctuation_chars=";&|")` with `whitespace_split =
-/// True`, which splits `a&&b` into `a`, `&&`, `b`. `commenters` is cleared
-/// because `shlex.shlex` otherwise treats `#` as a comment introducer
-/// anywhere in a word, not just at the start of one, silently discarding the
-/// remainder of the line (`shlex.split` does not have this behavior — it
-/// sets `commenters=''` itself). This is the same lexer configuration used
-/// by `boss_engine::worker_setup`'s `PATH_GUARD_SCRIPT` for the
-/// `BOSS_DATA_DIR` path guard, and by
-/// `crate::guard_python::CODEX_COMMAND_TOKENIZER_PY`'s
-/// `command_groups` — the Codex-side copy of this fragment, spliced into
-/// both Codex guard scripts. It is kept separate only because this macro
-/// must expand to string literals for `concat!`.
+/// uses the shared logical-line tokenizer from `guard_python`. Parentheses
+/// delimit commands, heredoc data stays attached to its receiving command,
+/// and launcher prefixes use the same vocabulary across drivers.
 ///
 /// A plain string-literal macro (not a `const`) for the same reason
 /// [`python_command_guard!`] is one: it is spliced into other `concat!`
 /// invocations, which require every argument to be a literal.
 macro_rules! shell_command_tokenizer_fragment {
     () => {
-        "DELIMS={'&&','||',';','|','&'}\n\
-         WRAPPERS={'env','command','exec','nohup','stdbuf','setsid','caffeinate','sudo','time','xargs'}\n\
-         ASSIGNMENT_RE=re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')\n\
-         def heredoc_delim(line):\n\
-         \x20   idx=line.find('<<')\n\
-         \x20   if idx<0:\n\
-         \x20       return None\n\
-         \x20   rest=line[idx+2:]\n\
-         \x20   if rest.startswith('-'):\n\
-         \x20       rest=rest[1:]\n\
-         \x20   rest=rest.lstrip()\n\
-         \x20   if not rest:\n\
-         \x20       return None\n\
-         \x20   q1=chr(39)\n\
-         \x20   q2=chr(34)\n\
-         \x20   quote=None\n\
-         \x20   if rest[0] in (q1,q2):\n\
-         \x20       quote=rest[0]\n\
-         \x20       rest=rest[1:]\n\
-         \x20   end=0\n\
-         \x20   while end<len(rest) and (rest[end].isalnum() or rest[end]=='_'):\n\
-         \x20       end+=1\n\
-         \x20   word=rest[:end]\n\
-         \x20   if not word:\n\
-         \x20       return None\n\
-         \x20   if quote:\n\
-         \x20       if end<len(rest) and rest[end]==quote:\n\
-         \x20           return word\n\
-         \x20       return None\n\
-         \x20   return word\n\
-         def command_groups(command):\n\
-         \x20   groups=[]\n\
-         \x20   heredoc_end=None\n\
-         \x20   for line in command.split(chr(10)):\n\
-         \x20       if heredoc_end is not None:\n\
-         \x20           if line==heredoc_end:\n\
-         \x20               heredoc_end=None\n\
-         \x20           continue\n\
-         \x20       d=heredoc_delim(line)\n\
-         \x20       if d:\n\
-         \x20           heredoc_end=d\n\
-         \x20       try:\n\
-         \x20           _lex=shlex.shlex(line,posix=True,punctuation_chars=';&|')\n\
-         \x20           _lex.whitespace_split=True\n\
-         \x20           _lex.commenters=''\n\
-         \x20           toks=list(_lex)\n\
-         \x20       except Exception:\n\
-         \x20           toks=line.split()\n\
-         \x20       cur=[]\n\
-         \x20       for tok in toks:\n\
-         \x20           if tok in DELIMS:\n\
-         \x20               if cur:\n\
-         \x20                   groups.append(cur)\n\
-         \x20               cur=[]\n\
-         \x20           else:\n\
-         \x20               cur.append(tok)\n\
-         \x20       if cur:\n\
-         \x20           groups.append(cur)\n\
-         \x20   return groups\n\
-         def strip_prefixes(group):\n\
-         \x20   i=0\n\
-         \x20   while i<len(group):\n\
-         \x20       tok=group[i]\n\
-         \x20       base=os.path.basename(tok)\n\
-         \x20       if ASSIGNMENT_RE.match(tok) or base in WRAPPERS:\n\
-         \x20           i+=1\n\
-         \x20           continue\n\
-         \x20       if base=='timeout' and i+1<len(group):\n\
-         \x20           i+=2\n\
-         \x20           continue\n\
-         \x20       break\n\
-         \x20   return group[i:]\n"
+        crate::render_command_tokenizer!("", "")
     };
 }
 

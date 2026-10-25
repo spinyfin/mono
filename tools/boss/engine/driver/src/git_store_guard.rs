@@ -335,7 +335,9 @@ def strip_prefixes(group, prefix_env, shell_vars):
                 elif option not in ("-i", "--ignore-environment", "--") and not option.startswith("--unset="):
                     raise Unresolved(option)
             continue
-        if base in WRAPPERS:
+        if base in ("xargs", "parallel"):
+            prefix_env["__APPENDS_ARGS"] = "1"
+        if base in WRAPPERS or base in ("builtin", "parallel"):
             index += 1
             continue
         if base == "timeout" and index + 1 < len(group):
@@ -568,16 +570,52 @@ class Verdict(Exception):
         self.reason = reason
 
 
+def store_context(cwd, env, roots, needle_present):
+    if needle_present or (cwd and inside_store(cwd, roots)):
+        return True
+    for key in GIT_LOCATION_ENV:
+        value = env.get(key)
+        if value:
+            try:
+                if inside_store(resolve_dir(value, cwd, env), roots):
+                    return True
+            except Unresolved:
+                pass
+    return False
+
+
+def unparsed(detail, roots):
+    return Verdict("Cannot prove shell operation safe near shared store %s: %s. Use jj/cube or a throwaway clone." % (roots[0], detail))
+
+
+def plain_reader(argv):
+    program = os.path.basename(argv[0])
+    if program == "sed":
+        # Only the plain line-printing form is a proven reader; sed's e/w
+        # commands and script files can execute programs or write files.
+        return len(argv) >= 3 and argv[1] == "-n" and bool(re.fullmatch(r"[0-9,$/ .^*+-]*p", argv[2])) and all(not a.startswith("-") for a in argv[3:])
+    if program == "sort" and any(a.startswith("-o") for a in argv[1:]):
+        return False
+    if program == "uniq" and len(argv) > 2:
+        return False
+    if program == "awk":
+        return len(argv) >= 2 and bool(re.fullmatch(r"\{\s*print(?:\s+\$[0-9]+)?\s*\}", argv[1])) and all(not a.startswith("-") and "=" not in a for a in argv[2:])
+    return program in ("jj", "pwd", "ls", "cat", "head", "tail", "wc", "true", "false",
+                       "grep", "rg", "sort", "uniq", "echo", "printf", "test", "[",
+                       "fi", "done", "for", "in", "case", "esac", "do", "then", "else") and not any(
+                           a in (">", ">>", "-o", "-f", "--files0-from") or a.startswith((">", "--output")) or a == "--pre" or a.startswith("--pre=") for a in argv[1:])
+
+
 def judge_git(argv, prefix_env, exported, shell_vars, cwd, roots, needle_present):
     try:
         git_dir, work_tree, c_dirs, config, sub, sub_args = parse_git(argv)
-    except Unresolved:
-        raise Verdict(UNRESOLVED_RECOVERY % {"root": roots[0], "sub": "(unparsed options)"})
+    except Unresolved as error:
+        if store_context(cwd, dict(exported, **prefix_env), roots, needle_present):
+            raise unparsed("unrecognised git option " + str(error), roots)
+        return
     location_env = {}
     for key in GIT_LOCATION_ENV:
-        value = os.environ.get(key)
-        if key in exported:
-            value = exported[key]
+        value = exported.get(key)
         if key in prefix_env:
             value = prefix_env[key]
         if value is not None:
@@ -588,13 +626,15 @@ def judge_git(argv, prefix_env, exported, shell_vars, cwd, roots, needle_present
         location_env["GIT_WORK_TREE"] = work_tree
 
     flag = shallow_flag(sub_args) if sub in SHALLOW_SUBCOMMANDS else None
-    if flag is None and is_read_only(sub, sub_args, config):
+    if flag is None and "__APPENDS_ARGS" not in prefix_env and is_read_only(sub, sub_args, config):
         return
 
     try:
         targets = git_targets(sub, sub_args, git_dir, location_env, cwd, c_dirs, shell_vars)
-    except Unresolved:
-        raise Verdict(UNRESOLVED_RECOVERY % {"root": roots[0], "sub": sub})
+    except Unresolved as error:
+        if store_context(cwd, dict(exported, **prefix_env), roots, needle_present):
+            raise unparsed("unrecognised git option " + str(error), roots)
+        return
     unresolved = None
     for label, resolved in targets:
         if resolved is None:
@@ -615,16 +655,50 @@ def judge_command(command, cwd, exported, roots, needle_present, depth=0):
     and raise Verdict on the first git group that must be refused."""
     if depth > 4:
         raise Verdict(UNRESOLVED_RECOVERY % {"root": roots[0], "sub": "(nested shell)"})
-    shell_vars = {}
-    for group in command_groups(command):
+    exported = dict(exported)
+    shell_vars = dict(exported)
+    scopes = []
+    uncertain_flow = False
+    store_seen = False
+    for group in command_records(command):
+        involved = store_context(cwd, exported, roots, needle_present)
+        store_seen = store_seen or involved
+        if group.error:
+            if involved:
+                raise unparsed(group.error, roots)
+            continue
+        if group.boundary:
+            if group.boundary in ("&&", "||", "&") and store_seen:
+                uncertain_flow = True
+                needle_present = True
+                cwd = None
+            for boundary in group.boundary:
+                if boundary == "(":
+                    scopes.append((cwd, dict(exported), dict(shell_vars), uncertain_flow))
+                elif boundary == ")" and scopes:
+                    cwd, exported, shell_vars, uncertain_flow = scopes.pop()
+            continue
+        if not group:
+            continue
+        if group[0] in ("if", "elif", "else", "while", "until", "for", "case", "fi", "done", "esac"):
+            # Branches and loops can run zero or many times. Do not adopt a
+            # single branch's directory or exported environment as certain.
+            uncertain_flow = True
+        if uncertain_flow and involved:
+            needle_present = True
+            cwd = None
+        if uncertain_flow and involved and (group[0] == "unset" or any(ASSIGNMENT_RE.match(t) for t in group)):
+            raise unparsed("environment assignment in conditional control flow", roots)
         # Substitutions execute even inside assignments or read-only git arguments.
         if needle_present and any(re.search(r"(?:\$\(|`).*\bgit\b", token) for token in group):
             raise Verdict(UNRESOLVED_RECOVERY % {"root": roots[0], "sub": "(command substitution)"})
         prefix_env = {}
         try:
             argv = strip_prefixes(group, prefix_env, shell_vars)
-        except Unresolved:
-            raise Verdict(UNRESOLVED_RECOVERY % {"root": roots[0], "sub": "(unparsed wrapper)"})
+        except Unresolved as error:
+            if involved:
+                raise unparsed("unrecognised wrapper option " + str(error), roots)
+            continue
         if not argv:
             # Assignment-only group: `S=/path` persists for the rest of the command.
             for key, value in prefix_env.items():
@@ -632,10 +706,10 @@ def judge_command(command, cwd, exported, roots, needle_present, depth=0):
                     shell_vars[key] = expand(value, shell_vars)
                 except Unresolved:
                     shell_vars[key] = None
+                if key in exported:
+                    exported[key] = shell_vars[key]
             continue
         program = os.path.basename(argv[0])
-        if needle_present and program not in ("git", "jj", "eval") and any(os.path.basename(token) == "git" for token in argv[1:]):
-            raise Verdict(UNRESOLVED_RECOVERY % {"root": roots[0], "sub": "(unparsed shell)"})
         if program == "export":
             for token in argv[1:]:
                 assignment = ASSIGNMENT_RE.match(token)
@@ -662,6 +736,8 @@ def judge_command(command, cwd, exported, roots, needle_present, depth=0):
                 cwd = None
             else:
                 try:
+                    if (shell_vars.get("CDPATH") or prefix_env.get("CDPATH")) and not os.path.isabs(argv[1]):
+                        raise Unresolved("CDPATH")
                     cwd = resolve_dir(argv[1], cwd, shell_vars)
                 except Unresolved:
                     cwd = None
@@ -669,9 +745,11 @@ def judge_command(command, cwd, exported, roots, needle_present, depth=0):
         if program == "popd":
             cwd = None
             continue
+        if needle_present and program not in ("git", "jj", "eval", "cat") and program not in SHELLS and any(re.search(r"\bgit\b", token) for token in argv[1:]):
+            raise Verdict(UNRESOLVED_RECOVERY % {"root": roots[0], "sub": "(unparsed shell)"})
         if program != "git":
             for key in GIT_LOCATION_ENV:
-                value = prefix_env.get(key, exported.get(key, os.environ.get(key)))
+                value = prefix_env.get(key, exported.get(key))
                 if value is not None:
                     try:
                         target = resolve_dir(value, cwd, shell_vars)
@@ -679,9 +757,18 @@ def judge_command(command, cwd, exported, roots, needle_present, depth=0):
                         target = None
                     if (target and inside_store(target, roots)) or (target is None and needle_present):
                         raise Verdict(WRITE_RECOVERY % {"sub": "(indirect via " + program + ")", "root": roots[0], "target": target})
-            readers = ("jj", "pwd", "ls", "cat", "head", "tail", "wc", "true", "false", "fi", "done")
-            if ((cwd and inside_store(cwd, roots)) or (cwd is None and needle_present)) and program not in readers and program not in SHELLS:
-                raise Verdict(WRITE_RECOVERY % {"sub": "(indirect via " + program + ")", "root": roots[0], "target": cwd})
+            if ((cwd and inside_store(cwd, roots)) or (cwd is None and needle_present)) and not plain_reader(argv) and program not in SHELLS:
+                raise unparsed("program " + program + " is not a proven reader in the store working directory", roots)
+        if program == "jj" and any(a in ("exec", "fix", "run") for a in argv[1:]):
+            if "--" in argv:
+                judge_command(shlex.join(argv[argv.index("--") + 1:]), cwd, dict(exported), roots, needle_present, depth + 1)
+            elif involved:
+                raise unparsed("jj program launcher", roots)
+            continue
+        if re.fullmatch(r"(?:python[0-9.]*|perl|node|ruby)", program) and involved:
+            raise unparsed("interpreter code via " + program, roots)
+        if group.body and program != "cat" and involved:
+            raise unparsed("heredoc code via " + program, roots)
         if program in SHELLS:
             # `sh -c '<script>'` (also `-lc`, `-ec`, ...): judge the script
             # in the same directory and environment.
@@ -689,10 +776,17 @@ def judge_command(command, cwd, exported, roots, needle_present, depth=0):
                 if token.startswith("-") and not token.startswith("--") and "c" in token[1:]:
                     merged = dict(exported)
                     merged.update({k: v for k, v in prefix_env.items() if k in GIT_LOCATION_ENV})
-                    judge_command(argv[index + 1], cwd, merged, roots, needle_present, depth + 1)
+                    body_index = index + 1
+                    if argv[body_index] == "--":
+                        body_index += 1
+                    if body_index >= len(argv):
+                        if involved:
+                            raise unparsed("missing shell code", roots)
+                        break
+                    judge_command(argv[body_index], cwd, merged, roots, needle_present, depth + 1)
                     break
             else:
-                if (cwd and inside_store(cwd, roots)) or (cwd is None and needle_present):
+                if involved:
                     raise Verdict(WRITE_RECOVERY % {"sub": "(script)", "root": roots[0], "target": cwd})
             continue
         if program == "eval":
@@ -700,7 +794,7 @@ def judge_command(command, cwd, exported, roots, needle_present, depth=0):
             continue
         if program == "git":
             judge_git(argv, prefix_env, exported, shell_vars, cwd, roots, needle_present)
-        elif program != "jj" and (needle_present or (cwd and inside_store(cwd, roots))) and any(os.path.basename(token) == "git" or re.search(r"(?:\$\(|`).*\bgit\b", token) for token in argv):
+        elif program not in ("jj", "cat") and (needle_present or (cwd and inside_store(cwd, roots))) and any(re.search(r"\bgit\b", token) for token in argv):
             raise Verdict(UNRESOLVED_RECOVERY % {"root": roots[0], "sub": "(unparsed shell)"})
 
 
@@ -748,7 +842,7 @@ def main():
     needle_present = any(needle in command or needle in unescaped for needle in needles if needle)
 
     try:
-        judge_command(command, cwd, {}, roots, needle_present)
+        judge_command(command, cwd, dict(os.environ), roots, needle_present)
     except Verdict as verdict:
         emit("block", verdict.reason)
     emit("approve")
@@ -895,6 +989,44 @@ git fetch --depth=200 origin main
         )
         .unwrap();
         vec![
+            format!("bash <<'EOF'\ncd {store} && git fetch --depth=200 origin main\nEOF"),
+            format!("bash <<'EOF'\ngit -C {store} fetch --depth=200 origin main\nEOF"),
+            format!("echo 'cd {store} && git fetch --depth=200 origin main' | sh"),
+            format!("bash <<< 'git -C {store} fetch --depth=1'"),
+            format!("bash -c -- 'git -C {store} fetch --depth=1'"),
+            format!(r#"python3 -c "import subprocess; subprocess.run(['git','-C','{store}','fetch','--depth=1'])""#),
+            format!("jj util exec -- git -C {store} fetch --depth=200 origin main"),
+            format!("jj run -- git -C {store} fetch"),
+            format!("jj fix -- git -C {store} fetch"),
+            format!("cat > /tmp/x.sh <<'EOF'\ngit -C {store} fetch --depth=1\nEOF\nbash /tmp/x.sh"),
+            format!("cd {store} && (cd /tmp) && git fetch --depth=200 origin main"),
+            format!("cd {store}; if false; then cd /tmp; fi; git fetch --depth=200 origin main"),
+            format!("cd {store}; if false; then cd /tmp; fi; bash ci.sh"),
+            format!("cd {store}; false && cd /tmp; git fetch"),
+            format!("cd {store}; cd /tmp & git fetch"),
+            format!("export GIT_DIR=/tmp/scratch/.git; GIT_DIR={store}/.git; git fetch --depth=200 origin main"),
+            format!(
+                "export GIT_DIR=/tmp/scratch/.git; GIT_DIR={store}/.git; bash {}",
+                script.display()
+            ),
+            format!("git \\\n-C {store} fetch --depth=200 origin main"),
+            format!("GIT_DIR={store}/.git \\\ngit fetch --depth=200 origin main"),
+            format!("echo fetch --depth=200 origin main | xargs git -C {store}"),
+            format!("echo new-tag | xargs git -C {store} tag"),
+            format!("echo new-branch | xargs git -C {store} branch"),
+            format!("echo fetch | parallel git -C {store}"),
+            format!("builtin cd {store} && git fetch --depth=200 origin main"),
+            format!(
+                "CDPATH={}; cd flunge && git fetch --depth=200 origin main",
+                layout.repos_root.display()
+            ),
+            format!("cd {store} && sed -i s/a/b/ file"),
+            format!(r#"cd {store} && awk 'BEGIN {{system("git fetch")}}'"#),
+            format!("git -C {store} fetch 'unterminated"),
+            format!("git -C {store} fetch --upload-pack='first\nsecond'"),
+            format!("cd {store} && sort -ofile input"),
+            format!("cd {store} && uniq input output"),
+            format!("builtin pushd {store}; git fetch"),
             format!("(cd {store} && git fetch --depth=200 origin main)"),
             format!("(git -C {store} fetch --depth=200 origin main)"),
             format!("if true; then git -C {store} fetch --depth=1; fi"),
@@ -954,6 +1086,21 @@ git fetch --depth=200 origin main
         }
         let store = layout.store.display();
         for command in [
+            "git --no-advice status".to_owned(),
+            "git --glob-pathspecs status".to_owned(),
+            "env -C /tmp git --no-advice status".to_owned(),
+            format!("cd {store} && git log | grep x"),
+            format!("cd {store} && rg x"),
+            format!("cd {store} && sed -n '1,5p'"),
+            format!("cd {store} && awk '{{print $1}}'"),
+            format!("cd {store} && echo hello"),
+            format!("cat > /tmp/data <<'EOF'\ngit -C {store} fetch\nEOF"),
+            format!("(cd {store}); git fetch --depth=1"),
+        ] {
+            assert_approved(&layout, &command);
+        }
+
+        for command in [
             format!("git -C{store} log -1"),
             format!("git -C{store}/cli -C.. status"),
             format!("(git -C {store} log -1)"),
@@ -966,6 +1113,31 @@ git fetch --depth=200 origin main
         ] {
             assert_approved(&layout, &command);
         }
+    }
+
+    #[test]
+    fn inherited_export_reassignment_uses_the_current_value() {
+        let layout = cube_layout();
+        for suffix in ["git fetch --depth=1", "bash ci.sh"] {
+            let command = format!("GIT_DIR={}/.git; {suffix}", layout.store.display());
+            let (decision, reason) = decide_in(
+                &layout,
+                &command,
+                &layout.workspace,
+                &[("GIT_DIR", "/tmp/scratch/.git")],
+            );
+            assert_eq!(decision, "block", "{command}: {reason}");
+        }
+        for command in [
+            "if false; then unset GIT_DIR; fi; git fetch",
+            "(unset GIT_DIR); git fetch",
+        ] {
+            let git_dir = layout.store.join(".git").display().to_string();
+            let (decision, reason) = decide_in(&layout, command, &layout.workspace, &[("GIT_DIR", &git_dir)]);
+            assert_eq!(decision, "block", "{command}: {reason}");
+        }
+        let (decision, reason) = decide_in(&layout, "if false; then cd /tmp; fi; git fetch", &layout.store, &[]);
+        assert_eq!(decision, "block", "{reason}");
     }
 
     #[test]
