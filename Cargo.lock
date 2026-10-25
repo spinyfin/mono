@@ -1219,7 +1219,6 @@ name = "boss-spoke"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
  "boss-host-enrollment",
  "boss-protocol-spoke",
  "boss-spoke-journal",
@@ -1229,7 +1228,6 @@ dependencies = [
  "libc",
  "prost",
  "rcgen",
- "rusqlite",
  "tempfile",
  "tokio",
  "tokio-stream",

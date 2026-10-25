@@ -25,10 +25,18 @@ versions, changed hub authority/command journals, and missing replay history sto
 the process for reconciliation; network failures retry with shared exponential
 backoff and jitter. No retry resets a cursor or discards unacknowledged records.
 
+Commits use `synchronous=FULL` with `fullfsync` and `checkpoint_fullfsync` on, so
+that on macOS (where plain `fsync` does not flush the drive cache) a receipted
+record or command survives power loss; the pragmas are no-ops on Linux.
+
 The spool defaults to 8 GiB, reserving 64 MiB for lifecycle evidence. Captures
 stop at 75% and bulk records at 90% of ordinary capacity. Capacity admission
 stops at the ordinary ceiling. Receipted host-only records are retained for seven
-days; run records and command tombstones remain pinned. SQLite also has a page
+days. Run records remain pinned until a reconciliation API exists, and compaction
+removes only a contiguous prefix, so one pinned run record (including the
+rejection of a run-scoped command) pins every later record. An applied command is
+reduced to a tombstone (id, sequence, digest) that no longer holds its payload or
+counts against the spool. SQLite also has a page
 ceiling and a bounded checkpoint cadence. Queue accounting includes metadata
 overhead, but filesystem exhaustion can precede the configured ceiling and is
 reported as a storage failure. No indefinite offline retention is promised.

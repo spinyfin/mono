@@ -39,12 +39,3 @@ rust_test(
         normal_dev = True,
     ),
 )
-
-rust_test(
-    name = "spoke-stream_test",
-    size = "small",
-    crate = ":spoke-stream",
-    edition = "2024",
-    proc_macro_deps = all_crate_deps(proc_macro = True),
-    deps = ["//tools/boss/protocol-spoke"] + all_crate_deps(normal = True),
-)

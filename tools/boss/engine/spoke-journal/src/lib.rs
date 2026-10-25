@@ -117,7 +117,7 @@ impl Journal {
         let db_path = root.join("journal.db");
         private_file(&db_path)?;
         let mut db = Connection::open(db_path)?;
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=64; PRAGMA journal_size_limit=1048576;")?;
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON; PRAGMA wal_autocheckpoint=64; PRAGMA journal_size_limit=1048576;")?;
         schema::migrate(&mut db)?;
         let pages = (limits.spool_bytes / 4096).max(64);
         db.pragma_update(None, "max_page_count", pages)?;
@@ -209,10 +209,16 @@ impl Journal {
 
     pub fn receipt(&mut self, cursor: &Cursor) -> Result<()> {
         self.check_receipt(cursor)?;
-        self.db.execute(
+        // The hub's receipt is re-sent in every Welcome, so losing this write to a
+        // crash costs nothing. Skip the full-fsync barrier that record and command
+        // commits need, rather than paying it once per receipted record.
+        self.db.pragma_update(None, "synchronous", "NORMAL")?;
+        let updated = self.db.execute(
             "UPDATE identity SET acked_record=MAX(acked_record,?1)",
             [cursor.through],
-        )?;
+        );
+        self.db.pragma_update(None, "synchronous", "FULL")?;
+        updated?;
         Ok(())
     }
 

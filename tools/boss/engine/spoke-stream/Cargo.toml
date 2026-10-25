@@ -5,7 +5,6 @@ edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
-anyhow = { workspace = true }
 bon = { workspace = true }
 boss-host-enrollment = { path = "../host-enrollment" }
 boss-protocol-spoke = { path = "../../protocol-spoke" }
@@ -17,6 +16,7 @@ tonic = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+anyhow = { workspace = true }
 boss-spoke-journal = { path = "../spoke-journal" }
 boss-spoke-outbound = { path = "../spoke-outbound" }
 tempfile = { workspace = true }
