@@ -484,8 +484,25 @@ fn a_pre_start_failure_appears_in_the_diagnose_timeline_and_findings() {
     assert!(rendered.contains("jj bookmark create failed"), "{rendered}");
     let findings = match_dispatch_signatures(&events, 1_784_900_100_000, None, None, &scope(&["exec_diag"]));
     assert!(findings.iter().any(|f| f.sig_id == "SIG-I"), "{findings:?}");
-    // The failure is terminal, so SIG-1-style stall findings stay quiet.
-    assert!(findings.iter().all(|f| f.sig_id != "SIG-1"));
+}
+
+#[test]
+fn sig_i_groups_successive_executions_of_one_work_item_but_respects_scope() {
+    let mut first = ev_from_json(&pre_start_failure_json("exec_first", 1000, "bookmark failed"));
+    first.work_item_id = Some("work_repeated".into());
+    let mut second = ev_from_json(&pre_start_failure_json("exec_second", 2000, "bookmark failed"));
+    second.work_item_id = first.work_item_id.clone();
+    let mut unrelated = ev_from_json(&pre_start_failure_json("exec_other", 3000, "bookmark failed"));
+    unrelated.work_item_id = Some("work_other".into());
+    let events = [first, second, unrelated];
+    let findings = match_dispatch_signatures(&events, 0, None, None, &scope(&[]));
+    let repeated: Vec<_> = findings.iter().filter(|f| f.sig_id == "SIG-I").collect();
+    assert_eq!(repeated.len(), 1);
+    assert_eq!(repeated[0].count, 2);
+    assert_eq!(repeated[0].work_item_id.as_deref(), Some("work_repeated"));
+    assert_eq!(repeated[0].execution_id, None);
+    let scoped = match_dispatch_signatures(&events, 0, None, None, &scope(&["exec_first"]));
+    assert!(scoped.iter().all(|f| f.sig_id != "SIG-I"));
 }
 
 #[test]

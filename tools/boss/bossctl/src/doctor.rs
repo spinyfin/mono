@@ -1207,11 +1207,11 @@ fn match_sig_f_worker_parse(events: &[DispatchEvent], scope: &BTreeSet<String>) 
 
 // ── SIG-I ──────────────────────────────────────────────────────────────
 
-/// Minimum identical pre-start failures on one execution before SIG-I fires.
+/// Minimum identical pre-start failures for a work item before SIG-I fires.
 const SIG_I_MIN_REPEATS: usize = 2;
 
 /// The same pre-start failure (same reason, same error text) recorded
-/// repeatedly against one execution: the retry loop is not curing it, so
+/// repeatedly against a work item: the retry loop is not curing it, so
 /// the cause is environmental or a code defect rather than a transient.
 fn match_sig_i_repeated_pre_start_failure(events: &[DispatchEvent], scope: &BTreeSet<String>) -> Vec<Finding> {
     let mut groups: BTreeMap<(String, String, String), Vec<&DispatchEvent>> = BTreeMap::new();
@@ -1222,17 +1222,25 @@ fn match_sig_i_repeated_pre_start_failure(events: &[DispatchEvent], scope: &BTre
         let reason = event.details.get("reason").and_then(|v| v.as_str()).unwrap_or("");
         let error = event.error_message.as_deref().unwrap_or("");
         groups
-            .entry((event.execution_id.clone(), reason.to_owned(), error.to_owned()))
+            .entry((
+                work_item_of(event)
+                    .map(|id| format!("work:{id}"))
+                    .unwrap_or_else(|| format!("execution:{}", event.execution_id)),
+                reason.to_owned(),
+                error.to_owned(),
+            ))
             .or_default()
             .push(event);
     }
     let mut out = Vec::new();
-    for ((execution_id, reason, error), group) in groups {
+    for ((_, reason, error), group) in groups {
         if group.len() < SIG_I_MIN_REPEATS {
             continue;
         }
         let exhausted = events.iter().any(|e| {
-            e.execution_id == execution_id && e.stage == "pre_start_retries_exhausted" && e.outcome == "error"
+            group.iter().any(|failure| failure.execution_id == e.execution_id)
+                && e.stage == "pre_start_retries_exhausted"
+                && e.outcome == "error"
         });
         out.push(Finding {
             sig_id: "SIG-I".into(),
@@ -1243,7 +1251,10 @@ fn match_sig_i_repeated_pre_start_failure(events: &[DispatchEvent], scope: &BTre
                 group.len(),
                 if exhausted { ", retries exhausted" } else { "" }
             ),
-            execution_id: Some(execution_id),
+            execution_id: group
+                .iter()
+                .all(|e| e.execution_id == group[0].execution_id)
+                .then(|| group[0].execution_id.clone()),
             work_item_id: work_item_of(group[0]),
             count: group.len(),
             evidence: group.iter().map(|e| evidence_line(e)).collect(),

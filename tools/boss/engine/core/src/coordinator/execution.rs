@@ -7,6 +7,11 @@ use boss_protocol::ReviewBatchPhase;
 
 use super::*;
 
+/// The original dispatch failure is already visible in the event stream.
+#[derive(Debug, thiserror::Error)]
+#[error("pre-start failure bookkeeping failed")]
+pub(super) struct PreStartFailureReported;
+
 /// Where `cube workspace goto` should position the working copy: a PR
 /// branch head, or (for a post-merge review batch member) a frozen
 /// revision such as a merge commit SHA.
@@ -2392,7 +2397,7 @@ impl ExecutionCoordinator {
     ) -> Result<()> {
         let (attention_kind, attention_title) = attention;
         let error_text = format!("{error:#}");
-        let (execution, run, outcome) = self.work_db.record_pre_start_failure(
+        let transition = self.work_db.record_pre_start_failure(
             &execution.id,
             worker_id,
             cube_repo_id,
@@ -2409,7 +2414,26 @@ impl ExecutionCoordinator {
             } else {
                 &self.pre_start_retry_delays
             },
-        )?;
+        );
+        let (execution, run, outcome) = match transition {
+            Ok(recorded) => recorded,
+            Err(bookkeeping_error) => {
+                let mut event = DispatchEvent::new(Stage::PreStartFailure, DispatchOutcome::Error, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_worker(worker_id)
+                    .with_error(error)
+                    .with_details(serde_json::json!({
+                        "reason": attention_kind,
+                        "will_retry": false,
+                        "bookkeeping_error": format!("{bookkeeping_error:#}"),
+                    }));
+                if let Some(repo_id) = cube_repo_id {
+                    event = event.with_cube_repo(repo_id);
+                }
+                self.dispatch_events.emit(event).await;
+                return Err(bookkeeping_error.context(PreStartFailureReported));
+            }
+        };
 
         // The tracing log alone is not enough: `bossctl dispatch diagnose`
         // and the stage-stalled detector read the dispatch event stream, and

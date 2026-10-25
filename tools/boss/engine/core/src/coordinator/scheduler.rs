@@ -2340,8 +2340,11 @@ impl ExecutionCoordinator {
         if current.status != ExecutionStatus::Claimed {
             return;
         }
-        if let Err(record_err) = self
-            .record_start_failure(
+        // Do not record the same attempt again when its event was already emitted.
+        let recovery = if err.is::<super::execution::PreStartFailureReported>() {
+            Err(anyhow::anyhow!("pre-start failure already reported: {err:#}"))
+        } else {
+            self.record_start_failure(
                 Arc::clone(self),
                 &current,
                 worker_id,
@@ -2350,7 +2353,8 @@ impl ExecutionCoordinator {
                 err,
             )
             .await
-        {
+        };
+        if let Err(record_err) = recovery {
             tracing::error!(
                 execution_id = %current.id,
                 error = %record_err,

@@ -156,6 +156,85 @@ async fn retried_pre_start_failure_is_recorded_with_its_backoff() {
 }
 
 #[tokio::test]
+async fn bookkeeping_failure_is_terminal_and_recovery_does_not_record_it_twice() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("boss.db");
+    let db = Arc::new(WorkDb::open(path.clone()).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Bookkeeping failure");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let execution = db.list_executions(Some(&chore.id)).unwrap().remove(0);
+    db.claim_execution_for_dispatch(&execution.id).unwrap();
+    let execution = db.get_execution(&execution.id).unwrap();
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_failure BEFORE UPDATE OF pre_start_failure_count ON work_executions
+         BEGIN SELECT RAISE(ABORT, 'bookkeeping unavailable'); END;",
+        )
+        .unwrap();
+    let sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            Arc::new(FakeCubeClient::default()),
+            Arc::new(FakeExecutionRunner::default()),
+        )
+        .with_dispatch_events(sink.clone()),
+    );
+    let original = anyhow!("underlying bookmark error").context("bookmark creation failed");
+    let error = coordinator
+        .record_start_failure(
+            coordinator.clone(),
+            &execution,
+            "worker-1",
+            Some("mono"),
+            ("execution_bookmark_create_failed", "Bookmark failed"),
+            &original,
+        )
+        .await
+        .unwrap_err();
+    // Even if the database recovers, fallback must not count this attempt again.
+    connection.execute_batch("DROP TRIGGER reject_failure").unwrap();
+    coordinator
+        .recover_failed_dispatch(&execution, "worker-1", &error)
+        .await;
+    let events = sink.events_for(&execution.id).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    let failure = &events[0];
+    assert_eq!(failure.stage, "pre_start_failure");
+    assert_eq!(failure.outcome, "error");
+    assert_eq!(failure.worker_id.as_deref(), Some("worker-1"));
+    assert_eq!(failure.cube_repo_id.as_deref(), Some("mono"));
+    assert_eq!(
+        failure.error_message.as_deref(),
+        Some("bookmark creation failed: underlying bookmark error")
+    );
+    assert_eq!(failure.details["reason"], "execution_bookmark_create_failed");
+    assert_eq!(failure.details["will_retry"], false);
+    assert!(
+        failure.details["bookkeeping_error"]
+            .as_str()
+            .unwrap()
+            .contains("bookkeeping unavailable")
+    );
+    assert!(failure.details.get("pre_start_failure_count").is_none());
+    let after = db.get_execution(&execution.id).unwrap();
+    assert_eq!(after.pre_start_failure_count, 0);
+    assert_eq!(after.status, ExecutionStatus::Ready);
+    let timeline = crate::dispatch_reader::TimelineState::from_events(&events).unwrap();
+    assert!(!timeline.is_live());
+    let thresholds = crate::dispatch_reader::StageThresholds::new(Duration::from_secs(1));
+    assert!(
+        timeline
+            .stall_to_emit(&execution.id, u128::MAX / 2, &thresholds)
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn sweep_reports_real_unpushed_revisions_independent_of_original_workspace_and_ignores_empty_runs() {
     for original_state in ["released", "removed", "reused", "leased_elsewhere"] {
         for has_work in [false, true] {
