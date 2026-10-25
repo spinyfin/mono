@@ -371,3 +371,10 @@ fn pull_ref_ignores_a_github_remote_with_a_similar_repo_name() {
         crate::app::pr_bookmarks::resolve_pr_head(&runner, None, &f.ws, "example/repo", 1, &info, None).unwrap();
     assert_eq!(resolved.sha, head);
 }
+
+#[test]
+fn stale_remote_age_outlasts_every_network_attempt() {
+    let age = std::time::Duration::from_secs(crate::app::pr_bookmarks::stale_temp_remote_age_secs());
+    assert!(age > crate::app::jj::network_cmd_total_bound());
+    assert!(age >= std::time::Duration::from_secs(15 * 60));
+}

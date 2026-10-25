@@ -46,7 +46,7 @@ use git_utils::pr_bookmark;
 
 use crate::app::errors::{CubeError, Result};
 use crate::app::gh_pr;
-use crate::app::jj::{run_jj, run_jj_network_within};
+use crate::app::jj::{network_cmd_total_bound, run_jj, run_jj_network_within};
 use crate::command_runner::{CommandRunner, RealCommandRunner};
 
 /// How many commits unique to one side of a conflicted bookmark the safety
@@ -631,9 +631,18 @@ pub(super) fn resolve_pr_head(
 /// run can be told apart from one still in use.
 const TEMP_REMOTE_PREFIX: &str = "cube-pr-fetch-";
 
-/// A temporary remote older than this cannot belong to a live fetch: every
-/// network attempt is bounded well below it.
-const STALE_TEMP_REMOTE_AGE_SECS: u64 = 15 * 60;
+/// Floor for the age at which a temporary remote is presumed abandoned.
+const STALE_TEMP_REMOTE_MIN_AGE_SECS: u64 = 15 * 60;
+
+/// Margin added to the longest possible fetch for the work around it.
+const STALE_TEMP_REMOTE_MARGIN_SECS: u64 = 5 * 60;
+
+/// A temporary remote older than this cannot belong to a live fetch: it
+/// exceeds every attempt and retry at the configured network timeout, so a
+/// raised `CUBE_NETWORK_TIMEOUT_SECS` raises it too.
+pub(super) fn stale_temp_remote_age_secs() -> u64 {
+    (network_cmd_total_bound().as_secs() + STALE_TEMP_REMOTE_MARGIN_SECS).max(STALE_TEMP_REMOTE_MIN_AGE_SECS)
+}
 
 fn temp_remote_name(number: u64) -> String {
     let now = unix_now();
@@ -644,13 +653,14 @@ fn temp_remote_name(number: u64) -> String {
 /// `remote add` and `remote remove`. Their remote-tracking bookmarks would
 /// otherwise protect commits from collection forever. Run during normal GC
 /// sweeps and before adding a temporary remote. A
-/// remote younger than [`STALE_TEMP_REMOTE_AGE_SECS`] is left alone because a
+/// remote younger than [`stale_temp_remote_age_secs`] is left alone because a
 /// live fetch may own it.
 pub(super) fn prune_stale_temp_remotes(runner: &dyn CommandRunner, database_path: Option<&Path>, cwd: &Path) {
     let Ok(listing) = run(runner, database_path, cwd, &["git", "remote", "list"]) else {
         return;
     };
     let now = unix_now();
+    let max_age = stale_temp_remote_age_secs();
     for name in listing.lines().filter_map(|line| line.split_whitespace().next()) {
         let Some(rest) = name.strip_prefix(TEMP_REMOTE_PREFIX) else {
             continue;
@@ -658,7 +668,7 @@ pub(super) fn prune_stale_temp_remotes(runner: &dyn CommandRunner, database_path
         // `<n>-<unix seconds>-<uuid>`
         let created = rest.split('-').nth(1).and_then(|ts| ts.parse::<u64>().ok());
         // A name from before timestamps were added has no way to be live.
-        let stale = created.is_none_or(|ts| now.saturating_sub(ts) >= STALE_TEMP_REMOTE_AGE_SECS);
+        let stale = created.is_none_or(|ts| now.saturating_sub(ts) >= max_age);
         if !stale {
             continue;
         }

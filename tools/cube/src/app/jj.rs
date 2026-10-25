@@ -43,6 +43,12 @@ pub(super) fn network_cmd_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Longest a [`run_jj_network_within`] call can legitimately run without a
+/// caller deadline: every attempt, including retries, at the full timeout.
+pub(super) fn network_cmd_total_bound() -> Duration {
+    network_cmd_timeout() * (NETWORK_CMD_RETRIES + 1)
+}
+
 /// Default wall-clock bound for a single `jj git push` attempt. Larger than
 /// [`DEFAULT_NETWORK_CMD_TIMEOUT_SECS`] on purpose: a push against a store
 /// shared by many concurrent cube workspaces can legitimately queue for
