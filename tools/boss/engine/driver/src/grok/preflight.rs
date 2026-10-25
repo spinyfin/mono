@@ -11,11 +11,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 
 use super::environment::GrokProcessEnvironment;
+use super::oauth_refresh::{GROK_LOGIN_AFFIRMATION, with_credential_reprobe};
 
 /// Wall-clock limit for the OAuth-sensitive `grok models` probe.
 const GROK_MODELS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -124,10 +125,27 @@ fn render_command(command: &Command) -> String {
 /// [`boss_command_runner::output_blocking_timeout_in_group`]) so a chatty child
 /// cannot deadlock against a non-reading parent.
 pub(super) fn run_bounded(command: &mut Command, timeout: Duration) -> anyhow::Result<Output> {
-    run_bounded_in(&IN_FLIGHT, command, timeout)
+    run_bounded_in(&IN_FLIGHT, command, timeout, PREFLIGHT_FAILURE_PREFIX)
 }
 
-fn run_bounded_in(in_flight: &InFlight, command: &mut Command, timeout: Duration) -> anyhow::Result<Output> {
+/// Prefix on every preflight error, so a failure reads as what it is wherever
+/// it surfaces.
+const PREFLIGHT_FAILURE_PREFIX: &str = "Grok worker preflight failed";
+
+/// [`run_bounded`] for a caller that is not a worker preflight — same bound,
+/// same process-group kill, same in-flight registry (so an engine shutdown
+/// still reaps the child) — with `failure_prefix` naming that caller in the
+/// timeout error instead of the preflight.
+pub(super) fn run_bounded_as(command: &mut Command, timeout: Duration, failure_prefix: &str) -> anyhow::Result<Output> {
+    run_bounded_in(&IN_FLIGHT, command, timeout, failure_prefix)
+}
+
+fn run_bounded_in(
+    in_flight: &InFlight,
+    command: &mut Command,
+    timeout: Duration,
+    failure_prefix: &str,
+) -> anyhow::Result<Output> {
     let rendered = render_command(command);
     let registered = std::cell::Cell::new(None);
     let result = boss_command_runner::output_blocking_timeout_in_group(command, timeout, |pid| {
@@ -140,12 +158,12 @@ fn run_bounded_in(in_flight: &InFlight, command: &mut Command, timeout: Duration
     result.map_err(|err| {
         if err.kind() == std::io::ErrorKind::TimedOut {
             anyhow::anyhow!(
-                "Grok worker preflight failed: `{rendered}` did not complete within {}s and was killed \
+                "{failure_prefix}: `{rendered}` did not complete within {}s and was killed \
                  along with its process group",
                 timeout.as_secs()
             )
         } else {
-            anyhow::Error::new(err).context(format!("running Grok worker preflight capability `{rendered}`"))
+            anyhow::Error::new(err).context(format!("{failure_prefix}: running `{rendered}`"))
         }
     })
 }
@@ -237,24 +255,6 @@ fn assert_session_store_writable(
     Ok(())
 }
 
-/// Cheap, content-blind snapshot of the shared OAuth credential's on-disk
-/// state, used to detect whether a refresh rewrote the file during the
-/// probe. Never reads the credential bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AuthFingerprint {
-    modified: SystemTime,
-    len: u64,
-}
-
-fn fingerprint_auth_credential(auth_path: &Path) -> Option<AuthFingerprint> {
-    let metadata = std::fs::metadata(auth_path).ok()?;
-    let modified = metadata.modified().ok()?;
-    Some(AuthFingerprint {
-        modified,
-        len: metadata.len(),
-    })
-}
-
 /// Run the Grok OAuth probe and assert its affirmation, tolerating exactly
 /// one race: the probe's own invocation of `grok models` can refresh an
 /// expired-but-refreshable shared token as a side effect, so that first run
@@ -269,26 +269,17 @@ fn assert_grok_oauth_with_reprobe(
     workspace: &Path,
     environment: &GrokProcessEnvironment,
 ) -> anyhow::Result<()> {
-    let before = fingerprint_auth_credential(environment.auth_path());
-    let output = runner.run("grok", &["models"], workspace, environment)?;
-    if assert_grok_oauth(&output).is_ok() {
-        return Ok(());
-    }
-    let after = fingerprint_auth_credential(environment.auth_path());
-    if before.is_none() || before == after {
-        return assert_grok_oauth(&output);
-    }
-    tracing::info!(
-        auth_path = %environment.auth_path().display(),
-        "Grok OAuth credential was rewritten during the preflight probe (likely an expiry refresh); re-probing once"
-    );
-    let output = runner.run("grok", &["models"], workspace, environment)?;
+    let output = with_credential_reprobe(
+        environment.auth_path(),
+        || runner.run("grok", &["models"], workspace, environment),
+        |output| assert_grok_oauth(output).is_ok(),
+    )?;
     assert_grok_oauth(&output)
 }
 
 fn assert_grok_oauth(output: &PreflightOutput) -> anyhow::Result<()> {
     require_success("Grok OAuth", output)?;
-    if !output.stdout.contains("You are logged in with grok.com.") {
+    if !output.stdout.contains(GROK_LOGIN_AFFIRMATION) {
         bail!(
             "Grok worker preflight failed: Grok OAuth is unavailable; `grok models` did not affirm a grok.com login. {}",
             rendered_output(output)
@@ -664,9 +655,14 @@ mod tests {
         command.arg("60");
         let started = std::time::Instant::now();
         let registry = InFlight::default();
-        let error = run_bounded_in(&registry, &mut command, Duration::from_millis(300))
-            .unwrap_err()
-            .to_string();
+        let error = run_bounded_in(
+            &registry,
+            &mut command,
+            Duration::from_millis(300),
+            PREFLIGHT_FAILURE_PREFIX,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             started.elapsed() < Duration::from_secs(30),
             "timeout did not bound the call"
@@ -705,7 +701,14 @@ mod tests {
         let registry = std::sync::Arc::new(InFlight::default());
         let runner = {
             let registry = registry.clone();
-            std::thread::spawn(move || run_bounded_in(&registry, &mut command, Duration::from_secs(120)))
+            std::thread::spawn(move || {
+                run_bounded_in(
+                    &registry,
+                    &mut command,
+                    Duration::from_secs(120),
+                    PREFLIGHT_FAILURE_PREFIX,
+                )
+            })
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while registry.map().is_empty() && std::time::Instant::now() < deadline {
