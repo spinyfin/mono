@@ -600,7 +600,7 @@ pub async fn create_from(
             .map(str::to_owned)
             .unwrap_or_else(|| revision(&prior.base()))
     } else {
-        durable_baseline(jj, workspace).await?
+        baseline::durable_baseline(jj, workspace).await?
     };
     jj.run(workspace, &["bookmark", "create", &record.base(), "-r", &baseline])
         .await?;
@@ -614,36 +614,6 @@ pub async fn create_from(
     // Validate through the shared store, not the workspace we just positioned.
     diff(jj, &record).await?;
     Ok(record)
-}
-
-/// The commit a fresh baseline goes on: the parent of `@`, skipping empty
-/// undescribed positioning commits. Cube's `workspace goto` leaves `@` as
-/// an empty child of the PR head and `change create` adds the titled change
-/// on top, so `@-` is then a throwaway commit the worker will squash or
-/// abandon, and `jj abandon` deletes the bookmarks on the commit it drops.
-/// Skipping it changes nothing in `base..head` (it is empty) and puts the
-/// baseline on the commit cube actually positioned on.
-async fn durable_baseline(jj: &dyn Jj, workspace: &Path) -> Result<String> {
-    let output = jj
-        .run(
-            workspace,
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                "heads((::@-) ~ (empty() & description(exact:\"\")))",
-                "-T",
-                "commit_id ++ \"\\n\"",
-            ],
-        )
-        .await?;
-    let ids: Vec<_> = output.lines().filter(|s| !s.is_empty()).collect();
-    ensure!(
-        ids.len() == 1,
-        "expected exactly one durable baseline commit below @; found {}",
-        ids.len()
-    );
-    Ok(ids[0].to_owned())
 }
 
 async fn resolve_created_base(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
