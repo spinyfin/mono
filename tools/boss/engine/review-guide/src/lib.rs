@@ -222,9 +222,9 @@ pub fn render_source_context(packet: &SourcePacket) -> String {
 }
 
 const OMISSIONS_HEADER: &str = "### Capture diagnostics\n\n\
-These are capture-time packet diagnostics, not workspace source limitations. Notes that pinned source \
+These are capture-time packet diagnostics, not evidence that workspace reads will fail. Notes that pinned source \
 was collected instead of an API patch describe capture provenance only. Try the pinned checkout with \
-Read/Grep/Glob or read-only git show/git diff first; state a source limitation only if that read fails. \
+Read/Grep/Glob or read-only git show/git diff first. If essential source cannot be read, report a generation failure instead of submitting a guide. \
 Do not invent content.\n\n";
 const OMISSIONS_FOOTER: &str = "\n";
 
@@ -644,29 +644,50 @@ mod tests {
 
     #[test]
     fn prompts_do_not_ask_for_self_limits_or_missing_evidence_sections() {
-        // The guide reports the authors' work; it is not a validator and must
-        // not narrate its own limits. The prompts may only mention these
-        // phrases inside the explicit prohibition sentence.
-        for prompt in [PROMPT_TEMPLATE, update::UPDATE_PROMPT_TEMPLATE] {
+        let mut packet = packet();
+        packet.omissions.push(boss_pr_review_sources::SourceOmission {
+            path: Some("src/retry.rs".to_owned()),
+            side: None,
+            reason: "GitHub omitted the API patch; pinned source was collected instead".to_owned(),
+            terminal: true,
+        });
+        let metadata = PromptMetadata {
+            pr_url: &packet.canonical_pr_url,
+            repository: &packet.base_repository,
+            pr_title: &packet.title,
+            base_sha: &packet.merge_base_sha,
+            head_sha: &packet.head_sha,
+        };
+        for template in [
+            render_prompt(&metadata),
+            render_update_prompt(&metadata, &"b".repeat(40), "# Previous guide"),
+        ] {
+            let prompt = format!("{template}\n\n{}", render_source_context(&packet));
+            assert!(prompt.contains("### Capture diagnostics"));
+            assert!(prompt.contains("own limits, missing evidence"), "prohibition missing");
+            // Remove only exact prohibitions before checking case-insensitive
+            // stems, including instructions appended to either template.
+            let instructions = prompt
+                .replace("do not add sections or sentences about limits, missing evidence, unverified claims, or what the guide itself did or did not check.", "")
+                .replace("Do not narrate the guide's own limits, missing evidence, or what it did or did not verify, and use no first-person narration.", "")
+                .replace("do not include sections or phrasing about the guide's own limits, missing evidence, or what it did or did not verify.", "")
+                .to_ascii_lowercase();
             for banned in [
+                "limitation",
+                "missing evidence",
+                "own limits",
+                "metadata only",
+                "not verified",
                 "call out missing or partial evidence",
-                "specific limitations",
                 "what would be needed to close the gaps",
                 "or what evidence is missing",
-                "Do not claim to have executed tests",
-                "state the limitation",
-                "state the specific limitation",
+                "do not claim to have executed tests",
                 "identify missing or partial evidence",
-                "Explicitly assess whether the evidence",
-                "you have metadata only",
+                "explicitly assess whether the evidence",
                 "must not claim to have inspected",
             ] {
-                assert!(
-                    !prompt.contains(banned),
-                    "prompt still asks for self-narration: {banned}"
-                );
+                assert!(!instructions.contains(banned), "self-narration instruction: {banned}");
             }
-            assert!(prompt.contains("own limits, missing evidence"), "prohibition missing");
         }
     }
 
@@ -802,7 +823,8 @@ mod tests {
         assert!(context.contains("vendor/blob.bin"));
         assert!(context.contains("binary content not captured"));
         assert!(context.contains("Try the pinned checkout"));
-        assert!(context.contains("state a source limitation only if that read fails"));
+        assert!(context.contains("report a generation failure instead of submitting a guide"));
+        assert!(context.contains("Do not invent content"));
         assert!(!context.contains("source material could not be captured"));
     }
 
