@@ -68,6 +68,25 @@ pub fn proven_successor<E>(
     Ok(evolution_contains(&evolution, commit).then(|| candidate.to_owned()))
 }
 
+/// Whether `commit` is a rewrite (rebase, amend, conflict resolution) of any
+/// commit in `originals`: some recorded original appears in its evolution log.
+/// This is how a never-published intermediate (a conflicted rebase result) is
+/// tied back to the published head it was rewritten from. An evolog failure is
+/// returned as an error so the caller can say why.
+pub fn is_rewrite_of_any<E>(
+    mut run: impl FnMut(&[&str]) -> Result<String, E>,
+    commit: &str,
+    originals: &[String],
+) -> Result<bool, E> {
+    if originals.is_empty() {
+        return Ok(false);
+    }
+    let evolution = run(&["evolog", "--no-graph", "-r", commit, "-T", COMMIT_ID_LINES_TEMPLATE])?;
+    Ok(originals
+        .iter()
+        .any(|original| original != commit && evolution_contains(&evolution, original)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +108,16 @@ mod tests {
     fn evolution_contains_matches_whole_lines_only() {
         assert!(evolution_contains("new\nold\n", "old"));
         assert!(!evolution_contains("new\nolder\n", "old"));
+    }
+
+    #[test]
+    fn rewrite_of_any_requires_a_recorded_original_in_the_evolog() {
+        let run = |evolog: &'static str| move |_: &[&str]| -> Result<String, ()> { Ok(evolog.to_owned()) };
+        let recorded = vec!["orig".to_string()];
+        assert_eq!(is_rewrite_of_any(run("new\norig\n"), "new", &recorded), Ok(true));
+        assert_eq!(is_rewrite_of_any(run("new\nother\n"), "new", &recorded), Ok(false));
+        assert_eq!(is_rewrite_of_any(run("orig\n"), "orig", &recorded), Ok(false));
+        assert_eq!(is_rewrite_of_any(run("new\norig\n"), "new", &[]), Ok(false));
     }
 
     #[test]

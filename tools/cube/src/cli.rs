@@ -355,7 +355,7 @@ pub enum WorkspaceCommand {
     ///   - `REBASED_CLEAN`: rebase succeeded with no conflicts (and the boss
     ///     bookmark was advanced + pushed unless `--no-push`).
     ///   - `REBASED_WITH_CONFLICTS`: conflicts in working copy — resolve them,
-    ///     then push with `jj git push -b <bookmark>`.
+    ///     then publish with `cube workspace push --bookmark <bookmark>` (or `--pr <n>`).
     ///
     /// Run from inside the leased cube workspace directory.
     Rebase {

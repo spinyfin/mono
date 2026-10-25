@@ -86,8 +86,8 @@ fn ensure_pr_uses_body_file_flag_not_body_flag() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
-            "head",
+            &["log", "--no-graph", "-r", "abc123", "-T", r#"commit_id ++ "\n""#],
+            "abc123",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -105,7 +105,7 @@ fn ensure_pr_uses_body_file_flag_not_body_flag() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["bookmark", "set", "pr/99", "-r", "my-feature", "--allow-backwards"],
+            &["bookmark", "set", "pr/99", "-r", "abc123", "--allow-backwards"],
             "",
         ),
         ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
@@ -120,7 +120,7 @@ fn ensure_pr_uses_body_file_flag_not_body_flag() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "abc123",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -133,7 +133,20 @@ fn ensure_pr_uses_body_file_flag_not_body_flag() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "abc123",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/99")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "abc123",
         ),
     ]);
 
@@ -223,8 +236,8 @@ fn ensure_pr_created_json_has_action_url_number() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
-            "head",
+            &["log", "--no-graph", "-r", "abc123", "-T", r#"commit_id ++ "\n""#],
+            "abc123",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -242,7 +255,7 @@ fn ensure_pr_created_json_has_action_url_number() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["bookmark", "set", "pr/42", "-r", "my-feature", "--allow-backwards"],
+            &["bookmark", "set", "pr/42", "-r", "abc123", "--allow-backwards"],
             "",
         ),
         ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
@@ -257,7 +270,7 @@ fn ensure_pr_created_json_has_action_url_number() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "abc123",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -270,7 +283,20 @@ fn ensure_pr_created_json_has_action_url_number() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "abc123",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "abc123",
         ),
     ]);
 
@@ -334,8 +360,8 @@ fn ensure_pr_exists_json_has_action_url_number() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
-            "head",
+            &["log", "--no-graph", "-r", "abc123", "-T", r#"commit_id ++ "\n""#],
+            "abc123",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -353,7 +379,7 @@ fn ensure_pr_exists_json_has_action_url_number() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["bookmark", "set", "pr/7", "-r", "my-feature", "--allow-backwards"],
+            &["bookmark", "set", "pr/7", "-r", "abc123", "--allow-backwards"],
             "",
         ),
         ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
@@ -368,7 +394,7 @@ fn ensure_pr_exists_json_has_action_url_number() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "abc123",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -381,7 +407,20 @@ fn ensure_pr_exists_json_has_action_url_number() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "abc123",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/7")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "abc123",
         ),
     ]);
 
@@ -476,8 +515,8 @@ fn ensure_pr_pushes_to_github_remote_not_local_mirror() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
-            "head",
+            &["log", "--no-graph", "-r", "deadbeef", "-T", r#"commit_id ++ "\n""#],
+            "deadbeef",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -495,7 +534,7 @@ fn ensure_pr_pushes_to_github_remote_not_local_mirror() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["bookmark", "set", "pr/77", "-r", "my-feature", "--allow-backwards"],
+            &["bookmark", "set", "pr/77", "-r", "deadbeef", "--allow-backwards"],
             "",
         ),
         ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
@@ -510,7 +549,7 @@ fn ensure_pr_pushes_to_github_remote_not_local_mirror() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "deadbeef",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -523,7 +562,20 @@ fn ensure_pr_pushes_to_github_remote_not_local_mirror() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "deadbeef",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/77")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "deadbeef",
         ),
     ]);
 
@@ -681,8 +733,8 @@ fn ensure_pr_sets_pr_bookmark_on_create() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
-            "head",
+            &["log", "--no-graph", "-r", "abc123", "-T", r#"commit_id ++ "\n""#],
+            "abc123",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -700,7 +752,7 @@ fn ensure_pr_sets_pr_bookmark_on_create() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["bookmark", "set", "pr/55", "-r", "my-feature", "--allow-backwards"],
+            &["bookmark", "set", "pr/55", "-r", "abc123", "--allow-backwards"],
             "",
         ),
         ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
@@ -715,7 +767,7 @@ fn ensure_pr_sets_pr_bookmark_on_create() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "abc123",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -728,7 +780,20 @@ fn ensure_pr_sets_pr_bookmark_on_create() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "abc123",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/55")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "abc123",
         ),
     ]);
 
@@ -799,8 +864,8 @@ fn ensure_pr_sets_pr_bookmark_on_existing_pr() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
-            "head",
+            &["log", "--no-graph", "-r", "abc123", "-T", r#"commit_id ++ "\n""#],
+            "abc123",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -818,7 +883,7 @@ fn ensure_pr_sets_pr_bookmark_on_existing_pr() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["bookmark", "set", "pr/33", "-r", "my-feature", "--allow-backwards"],
+            &["bookmark", "set", "pr/33", "-r", "abc123", "--allow-backwards"],
             "",
         ),
         ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
@@ -833,7 +898,7 @@ fn ensure_pr_sets_pr_bookmark_on_existing_pr() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "abc123",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -846,7 +911,20 @@ fn ensure_pr_sets_pr_bookmark_on_existing_pr() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "abc123",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/33")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "abc123",
         ),
     ]);
 
@@ -1003,8 +1081,8 @@ fn pr_create_opens_pr_when_none_exists() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
-            "head",
+            &["log", "--no-graph", "-r", "abc123", "-T", r#"commit_id ++ "\n""#],
+            "abc123",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -1022,7 +1100,7 @@ fn pr_create_opens_pr_when_none_exists() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["bookmark", "set", "pr/42", "-r", "my-feature", "--allow-backwards"],
+            &["bookmark", "set", "pr/42", "-r", "abc123", "--allow-backwards"],
             "",
         ),
         ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
@@ -1037,7 +1115,7 @@ fn pr_create_opens_pr_when_none_exists() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "abc123",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -1050,7 +1128,20 @@ fn pr_create_opens_pr_when_none_exists() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "abc123",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "abc123",
         ),
     ]);
 
@@ -1086,12 +1177,24 @@ fn pr_create_is_idempotent_when_pr_already_exists() {
             r#"[{"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
         ),
         // No push, no `gh pr create` — only the local pr/<n> bookmark is set.
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "-r", "my-feature", "--no-graph", "-T", "commit_id"],
+            "published",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "gh",
+            &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
+            "published",
+        ),
         ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
-            "head",
+            &["log", "--no-graph", "-r", "published", "-T", r#"commit_id ++ "\n""#],
+            "published",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -1109,7 +1212,7 @@ fn pr_create_is_idempotent_when_pr_already_exists() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["bookmark", "set", "pr/7", "-r", "my-feature", "--allow-backwards"],
+            &["bookmark", "set", "pr/7", "-r", "published", "--allow-backwards"],
             "",
         ),
         ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
@@ -1124,7 +1227,7 @@ fn pr_create_is_idempotent_when_pr_already_exists() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "published",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -1137,7 +1240,20 @@ fn pr_create_is_idempotent_when_pr_already_exists() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "published",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/7")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "published",
         ),
     ]);
 
@@ -1212,8 +1328,8 @@ fn pr_update_pushes_when_pr_exists() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
-            "head",
+            &["log", "--no-graph", "-r", "abc123", "-T", r#"commit_id ++ "\n""#],
+            "abc123",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -1231,7 +1347,7 @@ fn pr_update_pushes_when_pr_exists() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["bookmark", "set", "pr/7", "-r", "my-feature", "--allow-backwards"],
+            &["bookmark", "set", "pr/7", "-r", "abc123", "--allow-backwards"],
             "",
         ),
         ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
@@ -1246,7 +1362,7 @@ fn pr_update_pushes_when_pr_exists() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "abc123",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -1259,7 +1375,20 @@ fn pr_update_pushes_when_pr_exists() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "abc123",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/7")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "abc123",
         ),
     ]);
 
@@ -1318,7 +1447,7 @@ fn pr_update_errors_when_no_pr_exists() {
 
 #[test]
 fn pr_update_refuses_when_working_copy_is_stale() {
-    // T2764 postmortem: a worker rebased the bookmark onto main but never
+    // Regression: a worker rebased the bookmark onto main but never
     // `jj edit`ed into it, so `@` stayed on the old tree while the
     // bookmark advanced. `cube pr update` must refuse before pushing —
     // and before even checking whether a PR exists — rather than ship a
@@ -1440,8 +1569,8 @@ fn pr_update_proceeds_when_working_copy_is_empty_child_of_branch_head() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
-            "head",
+            &["log", "--no-graph", "-r", "abc123", "-T", r#"commit_id ++ "\n""#],
+            "abc123",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -1459,7 +1588,7 @@ fn pr_update_proceeds_when_working_copy_is_empty_child_of_branch_head() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["bookmark", "set", "pr/7", "-r", "my-feature", "--allow-backwards"],
+            &["bookmark", "set", "pr/7", "-r", "abc123", "--allow-backwards"],
             "",
         ),
         ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
@@ -1474,7 +1603,7 @@ fn pr_update_proceeds_when_working_copy_is_empty_child_of_branch_head() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "abc123",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -1487,7 +1616,20 @@ fn pr_update_proceeds_when_working_copy_is_empty_child_of_branch_head() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "abc123",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/7")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "abc123",
         ),
     ]);
 
@@ -1549,8 +1691,8 @@ fn pr_update_allow_detached_push_skips_working_copy_check() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["log", "--no-graph", "-r", "my-feature", "-T", r#"commit_id ++ "\n""#],
-            "head",
+            &["log", "--no-graph", "-r", "abc123", "-T", r#"commit_id ++ "\n""#],
+            "abc123",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -1568,7 +1710,7 @@ fn pr_update_allow_detached_push_skips_working_copy_check() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["bookmark", "set", "pr/7", "-r", "my-feature", "--allow-backwards"],
+            &["bookmark", "set", "pr/7", "-r", "abc123", "--allow-backwards"],
             "",
         ),
         ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
@@ -1583,7 +1725,7 @@ fn pr_update_allow_detached_push_skips_working_copy_check() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "abc123",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -1596,7 +1738,20 @@ fn pr_update_allow_detached_push_skips_working_copy_check() {
                 "-T",
                 r#"commit_id ++ "\n""#,
             ],
-            "head",
+            "abc123",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/7")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "abc123",
         ),
     ]);
 
@@ -1677,4 +1832,97 @@ fn resolve_pr_body_is_none_when_neither_flag_supplied() {
     let resolved = crate::app::pr::resolve_pr_body(&args).unwrap();
     assert_eq!(resolved.text, None);
     assert_eq!(resolved.file_path, None);
+}
+
+#[test]
+fn publication_fails_if_bookmark_verification_observes_multiple_heads() {
+    let cwd = std::path::PathBuf::from("/repo");
+    let runner = FakeRunner::new(vec![
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "--no-graph", "-r", "published", "-T", r#"commit_id ++ "\n""#],
+            "published",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["bookmark", "set", "pr/42", "-r", "published", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "published",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "present(pr/42@git)",
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "published",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "publishedother",
+        ),
+    ]);
+    let error = crate::app::pr::record_published_pr_head(&runner, &cwd, "feature", Some(42), "published").unwrap_err();
+    assert!(error.to_string().contains("publication bookkeeping failed"));
+    assert!(error.to_string().contains("push succeeded"));
+    assert!(error.to_string().contains("cube pr create --branch feature"));
+    runner.assert_exhausted();
+}
+
+#[test]
+fn workspace_pr_lookup_failure_prevents_publication() {
+    let cwd = std::env::current_dir().unwrap();
+    let runner = FakeRunner::new(vec![super::rebase_tests::failing_cmd(
+        cwd.clone(),
+        "gh",
+        &["api", "repos/spinyfin/mono/pulls?head=spinyfin:feature&state=open"],
+        "GitHub unavailable",
+    )]);
+    let error =
+        crate::app::pr::resolve_workspace_pr_number(&runner, &cwd, "spinyfin/mono", "feature", None).unwrap_err();
+    assert!(error.to_string().contains("GitHub unavailable"));
+    runner.assert_exhausted();
 }
