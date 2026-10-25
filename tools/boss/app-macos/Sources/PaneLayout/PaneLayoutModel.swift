@@ -267,6 +267,9 @@ public struct PaneLayoutModel: Equatable, Sendable {
     /// Waiting members among the visible ones, whether or not they have a viewer.
     public var waitingCount: Int { visibleMembers().filter(\.isWaiting).count }
 
+    /// Members waiting on a declared job wait among the visible ones.
+    public var waitingOnJobCount: Int { visibleMembers().filter(\.isWaitingOnJob).count }
+
     /// Waiting members the filter hides, so a filter cannot silently bury one.
     public var hiddenWaitingCount: Int {
         members.values.filter { $0.isWaiting && !filter.admits($0) }.count

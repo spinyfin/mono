@@ -106,6 +106,36 @@ final class QueuedWaitTests: XCTestCase {
         ), "Queued — waiting for a dependency")
     }
 
+    func testCardSubtitleShowsDeclaredWaitIncludingCIRemediation() {
+        func live(_ activity: WorkerActivity, liveStatus: String?) -> WorkerLiveState {
+            WorkerLiveState(
+                slotId: 1, runId: "exec-1", model: "m", shellPid: 1, lastEventAt: nil,
+                currentTool: nil, lastToolEndedAt: nil, activity: activity,
+                liveStatus: liveStatus, liveStatusAt: nil, recoveryStatus: nil,
+                tmuxHosted: true, waitReason: "bazel test", waitExpiresAt: nil
+            )
+        }
+        var ciTask = task(status: "blocked")
+        ciTask.blockedReason = "ci_failure"
+        for status in [nil, "Waiting for user input"] {
+            XCTAssertEqual(WorkCardLiveStatus.resolve(
+                task: ciTask, column: .doing, runtime: nil, liveState: live(.idle, liveStatus: status)
+            ), "Waiting: bazel test")
+            XCTAssertEqual(WorkCardLiveStatus.resolve(
+                task: task(status: "active"), column: .doing, runtime: nil,
+                liveState: live(.idle, liveStatus: status)
+            ), "Waiting: bazel test")
+        }
+        // A mid-turn prompt (waitingForInput) is not a job wait.
+        XCTAssertNil(WorkCardLiveStatus.resolve(
+            task: ciTask, column: .doing, runtime: nil, liveState: live(.waitingForInput, liveStatus: nil)
+        ))
+        XCTAssertEqual(WorkCardLiveStatus.resolve(
+            task: task(status: "active"), column: .doing, runtime: nil,
+            liveState: live(.waitingForInput, liveStatus: "Waiting for user input")
+        ), "Waiting for user input")
+    }
+
     func testExistingHoldWordingIsPreserved() {
         let reason = "blocked by T\(42) 'Earlier review' on example/repo#42"
         let held = runtime(reason: reason)

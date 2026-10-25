@@ -254,6 +254,7 @@ final class AgentsGridModel: ObservableObject {
                 project: state.agentProject,
                 type: state.badgeType,
                 isWaiting: state.activity == .waitingForInput,
+                isWaitingOnJob: state.isWaitingOnJob,
                 hasViewer: viewers[state.runId]?.session != nil
             )
         }

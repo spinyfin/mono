@@ -30,6 +30,19 @@ final class PaneLayoutModelBoundaryTests: XCTestCase {
         ]
     }
 
+    // MARK: Waiting counts
+
+    func testJobWaitsCountSeparatelyFromNeedsInput() {
+        var model = F.model()
+        model.updateMembers([
+            PaneMember(runId: "a", startedAt: F.epoch, isWaitingOnJob: true),
+            PaneMember(runId: "b", startedAt: F.epoch.addingTimeInterval(1), isWaitingOnJob: true),
+            PaneMember(runId: "c", startedAt: F.epoch.addingTimeInterval(2), isWaiting: true),
+        ])
+        XCTAssertEqual(model.waitingOnJobCount, 2)
+        XCTAssertEqual(model.waitingCount, 1)
+    }
+
     // MARK: Filters
 
     func testTypeFilterNarrowsMembershipAndPacksTheFilteredRuns() throws {

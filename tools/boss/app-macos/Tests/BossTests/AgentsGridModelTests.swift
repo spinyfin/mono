@@ -23,6 +23,29 @@ final class AgentsGridModelTests: XCTestCase {
         XCTAssertNil(grid.layout.logicalCellIndex(ofRun: "remote-1"))
     }
 
+    func testJobWaitsAndNeedsInputAreCountedFromLiveStates() {
+        let grid = AgentsGridModel(isVisible: true)
+        grid.apply(
+            states: [
+                makeState(runId: "job-1", slotId: 1, activity: .idle, waitReason: "bazel test"),
+                makeState(runId: "job-2", slotId: 2, activity: .idle, waitReason: "ci"),
+                makeState(runId: "ask", slotId: 3, activity: .waitingForInput),
+                // Mid-turn prompt: the engine keeps waitingForInput and the reason.
+                makeState(runId: "mid-turn", slotId: 4, activity: .waitingForInput, waitReason: "bazel"),
+                // Resumed worker with a leftover wait is neither.
+                makeState(runId: "resumed", slotId: 5, activity: .working, waitReason: "bazel"),
+                makeState(runId: "plain-idle", slotId: 6, activity: .idle),
+            ],
+            viewers: [:],
+            interactivePoolSize: 16,
+            automationPoolSize: 8,
+            reviewPoolSize: 16,
+            feedUnavailable: false
+        )
+        XCTAssertEqual(grid.layout.waitingOnJobCount, 2)
+        XCTAssertEqual(grid.layout.waitingCount, 2)
+    }
+
     func testMissingHostIdDoesNotInventLocalMembership() {
         let grid = AgentsGridModel()
         grid.apply(
@@ -775,7 +798,8 @@ final class AgentsGridModelTests: XCTestCase {
         startedAt: String = "2026-10-09T00:00:00Z",
         pool: String? = "main",
         projectId: String? = nil,
-        projectName: String? = nil
+        projectName: String? = nil,
+        waitReason: String? = nil
     ) -> WorkerLiveState {
         WorkerLiveState(
             name: name,
@@ -791,6 +815,7 @@ final class AgentsGridModelTests: XCTestCase {
             liveStatusAt: nil,
             recoveryStatus: nil,
             tmuxHosted: true,
+            waitReason: waitReason,
             agentType: agentType,
             projectId: projectId,
             projectName: projectName,

@@ -155,12 +155,71 @@ final class AwaitingInputKanbanTests: XCTestCase {
         }
     }
 
+    func testMidTurnPromptWithDeclaredWaitStaysNeedsInput() {
+        // The engine keeps `.waitingForInput` (and `wait_reason`) for a
+        // prompt raised while the declaring turn is still running: that is
+        // a real ask of the owner, not a job wait.
+        let live = makeLiveState(
+            activity: .waitingForInput,
+            waitReason: "bazel build //...",
+            waitExpiresAt: "2026-10-24T19:08:33Z"
+        )
+        XCTAssertFalse(live.isWaitingOnJob)
+        let card = AgentActivityState.forDoingCard(
+            runtime: makeRuntime(waitingHuman: true),
+            liveState: live,
+            isDispatchPending: false,
+            isResolvingConflicts: false,
+            isRemediatingCI: false
+        )
+        let pane = AgentActivityState(runtime: makeRuntime(waitingHuman: true), liveState: live)
+        XCTAssertEqual(card, .waiting(reason: "Waiting on user input"))
+        XCTAssertEqual(pane, .waiting(reason: "Waiting on user input"))
+    }
+
+    func testDeclaredWaitWithIdleActivityRendersAsWaitingWithReason() {
+        let live = makeLiveState(
+            activity: .idle,
+            waitReason: "bazel build //... running in background",
+            waitExpiresAt: "2026-10-24T19:08:33Z"
+        )
+        XCTAssertTrue(live.isWaitingOnJob)
+        let card = AgentActivityState.forDoingCard(
+            runtime: makeRuntime(waitingHuman: true),
+            liveState: live,
+            isDispatchPending: false,
+            isResolvingConflicts: false,
+            isRemediatingCI: false
+        )
+        let pane = AgentActivityState(runtime: makeRuntime(waitingHuman: true), liveState: live)
+        for state in [card, pane] {
+            guard case let .waiting(reason) = state else {
+                return XCTFail("expected .waiting; got \(state)")
+            }
+            XCTAssertTrue(reason.hasPrefix("Waiting: bazel build //... running in background · until "), reason)
+            XCTAssertFalse(reason.lowercased().contains("input"))
+        }
+    }
+
+    func testBadgeLabelsSeparateJobWaitsFromNeedsInput() {
+        XCTAssertEqual(
+            AgentsBadge.labels(waitingOnJob: 2, needsInput: 0).map(\.text), ["Waiting 2"])
+        XCTAssertEqual(
+            AgentsBadge.labels(waitingOnJob: 0, needsInput: 1).map(\.text), ["Needs input 1"])
+        XCTAssertEqual(
+            AgentsBadge.labels(waitingOnJob: 2, needsInput: 1).map(\.text),
+            ["Waiting 2", "Needs input 1"])
+        XCTAssertTrue(AgentsBadge.labels(waitingOnJob: 0, needsInput: 0).isEmpty)
+    }
+
     // MARK: - Helpers
 
     private func makeLiveState(
         slotId: Int = 1,
         activity: WorkerActivity,
-        tmuxHosted: Bool? = nil
+        tmuxHosted: Bool? = nil,
+        waitReason: String? = nil,
+        waitExpiresAt: String? = nil
     ) -> WorkerLiveState {
         WorkerLiveState(
             slotId: slotId,
@@ -174,14 +233,16 @@ final class AwaitingInputKanbanTests: XCTestCase {
             liveStatus: "Waiting for user input",
             liveStatusAt: "2026-06-01T00:00:00Z",
             recoveryStatus: nil,
-            tmuxHosted: tmuxHosted
+            tmuxHosted: tmuxHosted,
+            waitReason: waitReason,
+            waitExpiresAt: waitExpiresAt
         )
     }
 
-    private func makeRuntime() -> WorkTaskRuntime {
+    private func makeRuntime(waitingHuman: Bool = false) -> WorkTaskRuntime {
         WorkTaskRuntime(
             workItemID: "task_1",
-            executionStatus: "running",
+            executionStatus: waitingHuman ? "waiting_human" : "running",
             runStatus: "active",
             executionID: "exec-1",
             dispatchRetryAt: nil,
