@@ -69,7 +69,7 @@ pub(super) fn compose_review_guide_prompt(work_db: &WorkDb, execution: &WorkExec
     if attachments.is_empty() {
         prompt.push_str("No screenshots are registered for this task or its revisions.\n");
     } else {
-        prompt.push_str("Screenshots registered for this task and its revisions (metadata only; captions are author descriptions, not verified image contents):\n\n");
+        prompt.push_str("Screenshots registered for this task and its revisions:\n\n");
         // Serialize only review metadata, never local paths or evidence URLs.
         // JSON quoting also keeps multiline captions from creating headings.
         let manifest: Vec<_> = attachments

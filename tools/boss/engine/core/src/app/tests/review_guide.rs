@@ -260,6 +260,9 @@ async fn guide_evidence_prompt_includes_root_and_revision_screenshots_without_ur
     let attempt = f.generate("screenshots", false).await;
     let prompt = f.prompt(&attempt.id).await;
     let manifest_text = prompt.split("### Registered screenshots").last().unwrap();
+    assert!(manifest_text.starts_with("\n\nScreenshots registered for this task and its revisions:\n\n"));
+    assert!(!manifest_text.contains("metadata only"));
+    assert!(!manifest_text.contains("not verified"));
     let manifest_start = manifest_text.find('[').unwrap();
     let manifest = serde_json::Deserializer::from_str(&manifest_text[manifest_start..])
         .into_iter::<serde_json::Value>()
