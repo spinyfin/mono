@@ -1030,7 +1030,10 @@ fn git_store_guard_is_armed_through_the_trace_shim_and_refuses_store_writes() {
         format!("GIT_DIR={store}/.git git fetch --depth=200 origin main"),
         format!("cd {store} && git fetch --depth=200 origin main"),
         format!("git -C {store} reset --hard origin/main"),
-    ] {
+    ]
+    .into_iter()
+    .chain(crate::git_store_guard::tests::bypass_commands(&layout))
+    {
         let (decision, reason) = run_codex_wrapper(&guard.command_path, &command, &layout.workspace);
         assert_eq!(decision, "block", "{command}: {reason}");
         assert!(reason.contains("jj"), "{command}: {reason}");

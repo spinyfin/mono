@@ -39,6 +39,8 @@
 //!   `--shallow-since`, `--shallow-exclude`, `--update-shallow`, `--deepen`,
 //!   `--unshallow`) that would touch the store — with its own message naming
 //!   the incident shape, because that is the one that took the fleet down.
+//! - Scripts or other programs with a shared-store git environment, and
+//!   non-reader programs launched from the shared store.
 //! - A mutating `git` whose target cannot be resolved (command substitution,
 //!   an unknown variable) when the command text names the repos root anyway.
 //!
@@ -119,7 +121,9 @@ import shlex
 import sys
 
 "##,
-    r##"
+    crate::render_command_tokenizer!(
+        "",
+        r##"
 
 MALFORMED = (
     "Blocked (fail-closed): the shared-source-store gate could not read this "
@@ -177,11 +181,6 @@ UNRESOLVED_RECOVERY = (
     "ls-files, merge-base, ...) is allowed. Do not work around this gate."
 )
 
-DELIMS = frozenset(("&&", "||", ";", "|", "&"))
-WRAPPERS = frozenset((
-    "env", "command", "exec", "nohup", "stdbuf", "setsid", "caffeinate",
-    "sudo", "time", "xargs", "nice", "ionice", "chronic",
-))
 SHELLS = frozenset(("sh", "bash", "zsh", "dash", "ksh"))
 ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.S)
 VARIABLE_RE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
@@ -202,8 +201,7 @@ READ_ONLY = frozenset((
     "count-objects", "var", "version", "help", "check-ignore", "check-attr",
     "check-ref-format", "check-mailmap", "verify-pack", "verify-commit",
     "verify-tag", "show-branch", "range-diff", "cherry", "get-tar-commit-id",
-    "patch-id", "stripspace", "mailinfo", "mailsplit", "interpret-trailers",
-    "credential-cache", "credential-store", "column",
+    "patch-id", "stripspace", "column",
 ))
 
 SHALLOW_SUBCOMMANDS = frozenset(("fetch", "pull", "clone"))
@@ -217,68 +215,6 @@ GIT_GLOBAL_VALUE_OPTIONS = frozenset((
     "-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix",
     "--config-env", "--attr-source", "--list-cmds",
 ))
-
-
-def heredoc_delim(line):
-    index = line.find("<<")
-    if index < 0:
-        return None
-    rest = line[index + 2:]
-    if rest.startswith("-"):
-        rest = rest[1:]
-    rest = rest.lstrip()
-    if not rest:
-        return None
-    quote = rest[0] if rest[0] in ("'", '"') else None
-    if quote:
-        rest = rest[1:]
-    end = 0
-    while end < len(rest) and (rest[end].isalnum() or rest[end] == "_"):
-        end += 1
-    word = rest[:end]
-    if not word:
-        return None
-    if quote and (end == len(rest) or rest[end] != quote):
-        return None
-    return word
-
-
-def command_groups(command):
-    """Split a (possibly multi-line) shell command into argv groups.
-
-    Same lexer configuration as the other Boss guards: shlex with
-    punctuation_chars so `a&&b` splits, commenters cleared so `#` inside a
-    word is not a comment, heredoc bodies skipped, one group per simple
-    command.
-    """
-    groups = []
-    heredoc_end = None
-    for line in command.split("\n"):
-        if heredoc_end is not None:
-            if line == heredoc_end:
-                heredoc_end = None
-            continue
-        delim = heredoc_delim(line)
-        if delim:
-            heredoc_end = delim
-        try:
-            lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|")
-            lexer.whitespace_split = True
-            lexer.commenters = ""
-            tokens = list(lexer)
-        except Exception:
-            tokens = line.split()
-        current = []
-        for token in tokens:
-            if token in DELIMS:
-                if current:
-                    groups.append(current)
-                current = []
-            else:
-                current.append(token)
-        if current:
-            groups.append(current)
-    return groups
 
 
 class Unresolved(Exception):
@@ -380,12 +316,25 @@ def strip_prefixes(group, prefix_env, shell_vars):
     index = 0
     while index < len(group):
         token = group[index]
+        if token in ("{", "}", "!", "if", "then", "else", "elif", "while", "until", "do", "time"):
+            index += 1
+            continue
         assignment = ASSIGNMENT_RE.match(token)
         if assignment:
             prefix_env[assignment.group(1)] = assignment.group(2)
             index += 1
             continue
         base = os.path.basename(token)
+        if base == "env":
+            index += 1
+            while index < len(group) and group[index].startswith("-"):
+                option = group[index]
+                index += 1
+                if option in ("-u", "--unset"):
+                    index += 1
+                elif option not in ("-i", "--ignore-environment", "--") and not option.startswith("--unset="):
+                    raise Unresolved(option)
+            continue
         if base in WRAPPERS:
             index += 1
             continue
@@ -393,7 +342,7 @@ def strip_prefixes(group, prefix_env, shell_vars):
             index += 2
             continue
         break
-    return group[index:]
+    return [token for token in group[index:] if token != "}"]
 
 
 def shallow_flag(args):
@@ -412,6 +361,37 @@ def positionals(args):
     return [arg for arg in args if not arg.startswith("-")]
 
 
+def clone_positionals(args):
+    values = {"--depth", "--branch", "-b", "--origin", "-o", "--upload-pack", "-u",
+              "--template", "--reference", "--reference-if-able", "--separate-git-dir",
+              "--config", "-c", "--shallow-since", "--shallow-exclude", "--jobs", "-j",
+              "--filter", "--server-option", "--revision", "--bundle-uri", "--ref-format"}
+    switches = {"--local", "-l", "--no-local", "--no-hardlinks", "--shared", "-s",
+                "--quiet", "-q", "--verbose", "-v", "--progress", "--no-checkout", "-n",
+                "--bare", "--mirror", "--single-branch", "--no-single-branch", "--no-tags",
+                "--shallow-submodules", "--remote-submodules", "--sparse", "--dissociate",
+                "--reject-shallow", "--no-reject-shallow", "--recurse-submodules",
+                "--recursive", "--also-filter-submodules", "--ipv4", "-4", "--ipv6", "-6"}
+    result = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            return result + args[index + 1:]
+        if arg in values:
+            index += 2
+            continue
+        if not arg.startswith("-"):
+            result.append(arg)
+        elif arg not in switches and arg.split("=", 1)[0] not in values:
+            attached = any(arg.startswith(short) and len(arg) > len(short)
+                           for short in values if short.startswith("-") and not short.startswith("--"))
+            if not attached and not arg.startswith(("--recurse-submodules=", "--recursive=")):
+                raise Unresolved(arg)
+        index += 1
+    return result
+
+
 def is_read_only(sub, args, global_config):
     """Is `git <sub> <args>` clearly a read of the repository?"""
     if sub is None:
@@ -419,40 +399,37 @@ def is_read_only(sub, args, global_config):
     if any(value.startswith("alias.") for value in global_config):
         return False  # `-c alias.show=fetch show`: the name lies.
     if sub in READ_ONLY:
-        return True
+        return not has_flag(args, ("--output", "--ext-diff", "--textconv"))
     pos = positionals(args)
     if sub == "branch":
         mutating = ("-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy",
                     "-u", "--set-upstream-to", "--unset-upstream", "--edit-description",
                     "-f", "--force", "--track", "--no-track")
-        listing = ("-l", "--list", "-a", "--all", "-r", "--remotes", "--show-current",
-                   "--contains", "--no-contains", "--merged", "--no-merged", "--points-at",
-                   "-v", "-vv", "--verbose")
-        if has_flag(args, mutating):
+        if has_flag(args, mutating) or any(re.match(r"^-[^-]*[dDmMcCuf]", arg) for arg in args):
             return False
-        return has_flag(args, listing) or not pos
+        return has_flag(args, ("--list", "-l", "--show-current", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at")) or not pos
     if sub == "tag":
         mutating = ("-d", "--delete", "-a", "--annotate", "-s", "--sign", "-u", "--local-user",
                     "-f", "--force", "-m", "--message", "-F", "--file", "-e", "--edit")
         listing = ("-l", "--list", "-n", "--contains", "--no-contains", "--points-at",
                    "--merged", "--no-merged")
-        if has_flag(args, mutating):
+        if has_flag(args, mutating) or any(re.match(r"^-[^-]*[dasufmFe]", arg) for arg in args):
             return False
         if any(re.fullmatch(r"-n[0-9]*", arg) for arg in args):
             return True
         return has_flag(args, listing) or not pos
     if sub == "remote":
-        return not args or args[0] in ("-v", "--verbose", "show", "get-url")
+        return not pos or pos[0] in ("show", "get-url")
     if sub == "config":
         getters = ("--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l",
-                   "--show-origin", "--show-scope", "--get-color", "--get-colorbool")
+                   "--get-color", "--get-colorbool")
         setters = ("--add", "--unset", "--unset-all", "--replace-all", "--rename-section",
                    "--remove-section", "--edit", "-e")
         return has_flag(args, getters) and not has_flag(args, setters)
     if sub == "stash":
         return bool(args) and args[0] in ("list", "show")
     if sub == "reflog":
-        return not args or args[0] not in ("expire", "delete")
+        return not args or args[0] in ("show", "exists") or args[0].startswith("refs/")
     if sub == "worktree":
         return bool(args) and args[0] == "list"
     if sub == "notes":
@@ -466,9 +443,9 @@ def is_read_only(sub, args, global_config):
     if sub == "sparse-checkout":
         return bool(args) and args[0] == "list"
     if sub == "hash-object":
-        return not has_flag(args, ("-w",))
+        return not any(arg.startswith("-") and not arg.startswith("--") and "w" in arg[1:] for arg in args)
     if sub == "apply":
-        return has_flag(args, ("--check", "--stat", "--numstat", "--summary"))
+        return has_flag(args, ("--check", "--stat", "--numstat", "--summary")) and not has_flag(args, ("--apply", "--reject", "--3way", "-3"))
     return False
 
 
@@ -496,7 +473,7 @@ def git_targets(sub, args, git_dir, location_env, cwd, c_dirs, shell_vars):
     if git_dir is not None:
         add("--git-dir / GIT_DIR", git_dir, effective)
     elif sub == "clone":
-        pos = positionals(args)
+        pos = clone_positionals(args)
         if len(pos) >= 2:
             add("clone destination", pos[1], effective)
         elif effective is None:
@@ -546,6 +523,9 @@ def parse_git(argv):
         if token == "-C" and index + 1 < len(argv):
             c_dirs.append(argv[index + 1])
             index += 2
+        elif token.startswith("-C") and len(token) > 2:
+            c_dirs.append(token[2:])
+            index += 1
         elif token.startswith("--git-dir="):
             git_dir = token[len("--git-dir="):]
             index += 1
@@ -564,6 +544,8 @@ def parse_git(argv):
         elif token in GIT_GLOBAL_VALUE_OPTIONS and index + 1 < len(argv):
             index += 2
         elif token.startswith("-"):
+            if token not in ("--no-pager", "--paginate", "-p", "-P", "--bare", "--no-replace-objects", "--literal-pathspecs", "--no-optional-locks", "--version", "-v", "--help", "-h"):
+                raise Unresolved(token)
             index += 1
         else:
             sub = token
@@ -587,7 +569,10 @@ class Verdict(Exception):
 
 
 def judge_git(argv, prefix_env, exported, shell_vars, cwd, roots, needle_present):
-    git_dir, work_tree, c_dirs, config, sub, sub_args = parse_git(argv)
+    try:
+        git_dir, work_tree, c_dirs, config, sub, sub_args = parse_git(argv)
+    except Unresolved:
+        raise Verdict(UNRESOLVED_RECOVERY % {"root": roots[0], "sub": "(unparsed options)"})
     location_env = {}
     for key in GIT_LOCATION_ENV:
         value = os.environ.get(key)
@@ -606,7 +591,10 @@ def judge_git(argv, prefix_env, exported, shell_vars, cwd, roots, needle_present
     if flag is None and is_read_only(sub, sub_args, config):
         return
 
-    targets = git_targets(sub, sub_args, git_dir, location_env, cwd, c_dirs, shell_vars)
+    try:
+        targets = git_targets(sub, sub_args, git_dir, location_env, cwd, c_dirs, shell_vars)
+    except Unresolved:
+        raise Verdict(UNRESOLVED_RECOVERY % {"root": roots[0], "sub": sub})
     unresolved = None
     for label, resolved in targets:
         if resolved is None:
@@ -626,11 +614,17 @@ def judge_command(command, cwd, exported, roots, needle_present, depth=0):
     """Walk one shell command string, tracking cd / assignments / exports,
     and raise Verdict on the first git group that must be refused."""
     if depth > 4:
-        return
+        raise Verdict(UNRESOLVED_RECOVERY % {"root": roots[0], "sub": "(nested shell)"})
     shell_vars = {}
     for group in command_groups(command):
+        # Substitutions execute even inside assignments or read-only git arguments.
+        if needle_present and any(re.search(r"(?:\$\(|`).*\bgit\b", token) for token in group):
+            raise Verdict(UNRESOLVED_RECOVERY % {"root": roots[0], "sub": "(command substitution)"})
         prefix_env = {}
-        argv = strip_prefixes(group, prefix_env, shell_vars)
+        try:
+            argv = strip_prefixes(group, prefix_env, shell_vars)
+        except Unresolved:
+            raise Verdict(UNRESOLVED_RECOVERY % {"root": roots[0], "sub": "(unparsed wrapper)"})
         if not argv:
             # Assignment-only group: `S=/path` persists for the rest of the command.
             for key, value in prefix_env.items():
@@ -640,6 +634,8 @@ def judge_command(command, cwd, exported, roots, needle_present, depth=0):
                     shell_vars[key] = None
             continue
         program = os.path.basename(argv[0])
+        if needle_present and program not in ("git", "jj", "eval") and any(os.path.basename(token) == "git" for token in argv[1:]):
+            raise Verdict(UNRESOLVED_RECOVERY % {"root": roots[0], "sub": "(unparsed shell)"})
         if program == "export":
             for token in argv[1:]:
                 assignment = ASSIGNMENT_RE.match(token)
@@ -659,6 +655,7 @@ def judge_command(command, cwd, exported, roots, needle_present, depth=0):
                 exported.pop(token, None)
             continue
         if program in ("cd", "pushd"):
+            argv = [argv[0]] + [a for a in argv[1:] if a not in ("-P", "-L", "--", "-n")]
             if len(argv) == 1:
                 cwd = os.path.expanduser("~")
             elif argv[1] == "-":
@@ -672,6 +669,19 @@ def judge_command(command, cwd, exported, roots, needle_present, depth=0):
         if program == "popd":
             cwd = None
             continue
+        if program != "git":
+            for key in GIT_LOCATION_ENV:
+                value = prefix_env.get(key, exported.get(key, os.environ.get(key)))
+                if value is not None:
+                    try:
+                        target = resolve_dir(value, cwd, shell_vars)
+                    except Unresolved:
+                        target = None
+                    if (target and inside_store(target, roots)) or (target is None and needle_present):
+                        raise Verdict(WRITE_RECOVERY % {"sub": "(indirect via " + program + ")", "root": roots[0], "target": target})
+            readers = ("jj", "pwd", "ls", "cat", "head", "tail", "wc", "true", "false", "fi", "done")
+            if ((cwd and inside_store(cwd, roots)) or (cwd is None and needle_present)) and program not in readers and program not in SHELLS:
+                raise Verdict(WRITE_RECOVERY % {"sub": "(indirect via " + program + ")", "root": roots[0], "target": cwd})
         if program in SHELLS:
             # `sh -c '<script>'` (also `-lc`, `-ec`, ...): judge the script
             # in the same directory and environment.
@@ -681,12 +691,17 @@ def judge_command(command, cwd, exported, roots, needle_present, depth=0):
                     merged.update({k: v for k, v in prefix_env.items() if k in GIT_LOCATION_ENV})
                     judge_command(argv[index + 1], cwd, merged, roots, needle_present, depth + 1)
                     break
+            else:
+                if (cwd and inside_store(cwd, roots)) or (cwd is None and needle_present):
+                    raise Verdict(WRITE_RECOVERY % {"sub": "(script)", "root": roots[0], "target": cwd})
             continue
         if program == "eval":
             judge_command(" ".join(argv[1:]), cwd, dict(exported), roots, needle_present, depth + 1)
             continue
         if program == "git":
             judge_git(argv, prefix_env, exported, shell_vars, cwd, roots, needle_present)
+        elif program != "jj" and (needle_present or (cwd and inside_store(cwd, roots))) and any(os.path.basename(token) == "git" or re.search(r"(?:\$\(|`).*\bgit\b", token) for token in argv):
+            raise Verdict(UNRESOLVED_RECOVERY % {"root": roots[0], "sub": "(unparsed shell)"})
 
 
 def main():
@@ -742,6 +757,7 @@ def main():
 if __name__ == "__main__":
     main()
 "##
+    )
 );
 
 #[cfg(test)]
@@ -867,6 +883,91 @@ pub(crate) mod tests {
         assert_eq!(decision, "approve", "must approve: {command} (reason: {reason})");
     }
 
+    /// Shared regression corpus exercised through each driver's installed hook.
+    pub(crate) fn bypass_commands(layout: &CubeLayout) -> Vec<String> {
+        let store = layout.store.display();
+        let script = layout.workspace.join("ci.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh
+git fetch --depth=200 origin main
+",
+        )
+        .unwrap();
+        vec![
+            format!("(cd {store} && git fetch --depth=200 origin main)"),
+            format!("(git -C {store} fetch --depth=200 origin main)"),
+            format!("if true; then git -C {store} fetch --depth=1; fi"),
+            format!("if false; then true; elif true; then git -C {store} push; else git -C {store} gc; fi"),
+            format!("for r in x; do git -C {store} push; done"),
+            format!("while true; do git -C {store} push; done"),
+            format!("until false; do git -C {store} push; done"),
+            format!("{{ cd {store}; git fetch --depth=1; }}"),
+            format!("! git -C {store} fetch"),
+            format!("time git -C {store} fetch"),
+            format!("echo $(git -C {store} fetch)"),
+            format!(r#"echo "$(git -C {store} fetch)""#),
+            format!(r#"X="$(git -C {store} fetch)""#),
+            format!(r#"export X="$(git -C {store} fetch)""#),
+            format!(r#"git -C {store} log "$(git -C {store} fetch)""#),
+            format!("bash ci.sh git -C {store} fetch"),
+            format!("echo `git -C {store} fetch`"),
+            format!("cd -P {store} && git fetch"),
+            format!("pushd -L {store}; git gc"),
+            format!("env -i GIT_DIR={store}/.git git fetch"),
+            format!("env --ignore-environment --unset=OTHER GIT_DIR={store}/.git git fetch"),
+            format!("GIT_DIR={store}/.git bash {}", script.display()),
+            format!("export GIT_DIR={store}/.git && ./ci.sh"),
+            format!("cd {store} && {}", script.display()),
+            format!("cd {store} && bash {}", script.display()),
+            format!("GIT_DIR={store}/.git make check"),
+            format!("GIT_WORK_TREE={store} python3 script.py"),
+            format!("GIT_COMMON_DIR={store}/.git make check"),
+            format!("GIT_OBJECT_DIRECTORY={store}/.git/objects make check"),
+            format!("git -C{store} fetch --depth=200"),
+            format!("git -C{store}/cli -C.. fetch"),
+            format!("git --git-dir-unknown={store}/.git fetch"),
+            format!("git clone --depth 200 https://example.com/x.git {store}/new"),
+            format!("git clone --branch main https://example.com/x.git {store}/new"),
+            format!("git clone --branch=main -- https://example.com/x.git {store}/new"),
+            format!("git -C {store} remote -v remove origin"),
+            format!("git -C {store} remote --verbose set-url origin https://example.com/x.git"),
+            format!("git -C {store} apply --stat --apply /tmp/x.patch"),
+            format!("git -C {store} apply --check --reject /tmp/x.patch"),
+            format!("git -C {store} config --show-origin core.bare true"),
+            format!("git -C {store} reflog write refs/heads/main old new"),
+            format!("git -C {store} interpret-trailers --in-place file"),
+            format!("git -C {store} diff --output=file"),
+            format!("git -C {store} branch -v new-branch"),
+            format!("git -C {store} branch -ld old-branch"),
+            format!("git clone --dep 200 https://example.com/x.git {store}/new"),
+            format!("git -C {store} tag -fm message tag"),
+            format!("git -C {store} hash-object -wt blob file"),
+        ]
+    }
+
+    #[test]
+    fn compound_syntax_scripts_and_option_bypasses_are_refused() {
+        let layout = cube_layout();
+        for command in bypass_commands(&layout) {
+            assert_blocked(&layout, &command);
+        }
+        let store = layout.store.display();
+        for command in [
+            format!("git -C{store} log -1"),
+            format!("git -C{store}/cli -C.. status"),
+            format!("(git -C {store} log -1)"),
+            format!("if true; then git -C {store} log -1; fi"),
+            format!("cd -P {store} && git log -1"),
+            format!("env -i GIT_DIR={store}/.git git log -1"),
+            format!("git -C {store} remote -v show origin"),
+            format!("git -C {store} apply --stat /tmp/x.patch"),
+            "git clone --depth 200 --branch main https://example.com/x.git /tmp/ci-repro".to_owned(),
+        ] {
+            assert_approved(&layout, &command);
+        }
+    }
+
     #[test]
     fn incident_shape_git_dir_env_prefix_with_shallow_fetch_is_refused() {
         let layout = cube_layout();
@@ -950,6 +1051,12 @@ pub(crate) mod tests {
         assert_eq!(decision, "block", "{reason}");
         let (decision, _) = decide_in(&layout, "git log -1", &layout.workspace, &[("GIT_DIR", git.as_str())]);
         assert_eq!(decision, "approve");
+        for command in ["bash ci.sh", "make check", "python3 script.py"] {
+            let (decision, reason) = decide_in(&layout, command, &layout.workspace, &[("GIT_DIR", git.as_str())]);
+            assert_eq!(decision, "block", "{command}: {reason}");
+            let (decision, reason) = decide_in(&layout, command, &layout.store, &[]);
+            assert_eq!(decision, "block", "{command}: {reason}");
+        }
     }
 
     #[test]

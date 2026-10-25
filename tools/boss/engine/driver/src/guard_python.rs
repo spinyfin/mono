@@ -1,13 +1,15 @@
-//! Shared Python fragments for Codex `PreToolUse` guards.
+//! Shared Python fragments for driver `PreToolUse` guards.
 
-/// Shell tokenizer shared by Codex guards that inspect `Bash` commands.
+/// Shell tokenizer shared by driver guards that inspect `Bash` commands.
 ///
 /// This matches the lexer used by the shared Claude guards, including
 /// heredoc handling, unspaced shell operators, per-line grouping, and
 /// launcher-prefix removal.
-pub const CODEX_COMMAND_TOKENIZER_PY: &str = r#"
+#[macro_export]
+macro_rules! render_command_tokenizer {
+    ($before:expr, $after:expr) => { concat!($before, r#"
 DELIMS = {"&&", "||", ";", "|", "&"}
-WRAPPERS = {"env", "command", "exec", "nohup", "stdbuf", "setsid", "caffeinate", "sudo", "time", "xargs"}
+WRAPPERS = {"env", "command", "exec", "nohup", "stdbuf", "setsid", "caffeinate", "sudo", "time", "xargs", "nice", "ionice", "chronic"}
 ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 def heredoc_delim(line):
@@ -45,7 +47,7 @@ def command_groups(command):
         if delim:
             heredoc_end = delim
         try:
-            lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|")
+            lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|()")
             lexer.whitespace_split = True
             lexer.commenters = ""
             tokens = list(lexer)
@@ -53,7 +55,7 @@ def command_groups(command):
             tokens = line.split()
         current = []
         for token in tokens:
-            if token in DELIMS:
+            if token in DELIMS or (token and all(c in "()" for c in token)):
                 if current:
                     groups.append(current)
                 current = []
@@ -76,7 +78,9 @@ def strip_prefixes(group):
             continue
         break
     return group[index:]
-"#;
+"#, $after) };
+}
+pub const CODEX_COMMAND_TOKENIZER_PY: &str = crate::render_command_tokenizer!("", "");
 
 /// Insert the shared tokenizer into a Python source template.
 pub fn with_command_tokenizer(template: &str) -> String {

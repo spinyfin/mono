@@ -33,7 +33,8 @@ use serde::{Deserialize, Serialize};
 
 mod decision;
 mod guard_chain;
-mod guard_python;
+use crate::guard_python;
+
 pub mod guard_trace;
 mod pane_monitor;
 mod progress;

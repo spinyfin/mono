@@ -20,8 +20,8 @@ use crate::work::{WorkDb, WorkExecution};
 ///
 /// `workspace_path` is the pinned read-only cube workspace; the prompt names
 /// its git object store explicitly (`git --git-dir <store> …`) because the
-/// worker environment no longer exports `GIT_DIR` — an ambient `GIT_DIR` at
-/// cube's shared store turned every bare `git` into a store operation.
+/// worker environment deliberately omits `GIT_DIR` — an ambient `GIT_DIR` at
+/// cube's shared store turns every bare `git` into a store operation.
 pub(super) fn compose_review_guide_prompt(
     work_db: &WorkDb,
     execution: &WorkExecution,
@@ -66,18 +66,15 @@ pub(super) fn compose_review_guide_prompt(
         })?
         .display()
         .to_string();
-    let metadata = boss_review_guide::PromptMetadata {
-        pr_url: &packet.canonical_pr_url,
-        repository: &packet.base_repository,
-        pr_title: &packet.title,
-        // Before-side links validate against `merge_base_sha`, not the
-        // observed base-branch tip. Advertising the merge base here is
-        // what lets a model following "Use revision-pinned source links"
-        // pass `reference_repository_matches`.
-        base_sha: &packet.merge_base_sha,
-        head_sha: &packet.head_sha,
-        git_dir: &git_dir,
-    };
+    let metadata = boss_review_guide::PromptMetadata::builder()
+        .pr_url(&packet.canonical_pr_url)
+        .repository(&packet.base_repository)
+        .pr_title(&packet.title)
+        // Source links use the comparison's merge base rather than the base tip.
+        .base_sha(&packet.merge_base_sha)
+        .head_sha(&packet.head_sha)
+        .git_dir(&git_dir)
+        .build();
     let mut prompt = match work_db.review_guide_update_context(&execution.id)? {
         Some((old_head, previous)) => boss_review_guide::render_update_prompt(&metadata, &old_head, &previous),
         None => boss_review_guide::render_prompt(&metadata),

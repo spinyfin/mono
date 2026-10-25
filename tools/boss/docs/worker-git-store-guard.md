@@ -63,13 +63,25 @@ find its repository the way git itself does:
   prefix assignment (`GIT_DIR=… git …`, `env GIT_DIR=… git …`), as an
   `export` earlier in the same command, or inherited from the hook's own
   environment;
-- `-C <dir>`, a preceding `cd`/`pushd`, and finally the tool call's working
+- `-C <dir>` or `-C<dir>` (resolved sequentially), a preceding `cd`/`pushd`, and finally the tool call's working
   directory (which persists across a worker's shell calls, so a `cd` into the
   store in an earlier call still counts);
 - single-level shell variables (`S=<store>; git -C "$S" …`) and
   `sh -c '…'` / `bash -c '…'` / `eval` bodies, which are inspected
   recursively;
 - for `clone`, `init` and `worktree`, the directories they create.
+
+The shared shell tokenizer separates subshell boundaries; the gate handles
+brace groups, conditionals, loops, negation, directory-change options and
+environment wrappers. An unjudged git token with a store reference is refused,
+as are unrecognized git location or clone options. Clone option values are
+consumed before identifying its destination.
+
+Scripts and other programs are refused when their effective git-location
+environment points into the store. From a store working directory, only
+read-only git, jj, plain readers and inspected shell bodies are permitted.
+Run CI scripts in a throwaway clone, even when the shell command itself
+contains no git invocation.
 
 It then refuses when any of those resolves under the repos root — as spelled
 or once symlinks are resolved — unless the subcommand is clearly read-only.
@@ -109,8 +121,8 @@ cannot run git).
 - Read-only git against the store, including the explicit form
   `git --git-dir <repos root>/<repo>/.git log -1` and `GIT_DIR=… git show …`.
 - `jj` — jj's own `git fetch` is how the store is meant to be synced. The
-  gate does not judge jj at all.
-- Any git whose repository resolves elsewhere: a throwaway clone under the
+  gate permits jj when no shared-store git environment is supplied.
+- Recognized git commands whose repository resolves elsewhere: a throwaway clone under the
   worker's temp dir (shallow or not), a bare `git status` from the workspace
   (which simply fails, as before), `git clone <store> "$TMPDIR/x"` (the store
   is only the _source_).
@@ -120,12 +132,12 @@ cannot run git).
 ## Review-guide workers
 
 `pr_review_guide` workers read pinned revisions from a read-only workspace.
-Instead of an exported `GIT_DIR`, the engine now passes the store as
+The engine passes the store as
 `BOSS_REVIEW_GUIDE_GIT_DIR` (and explicitly unsets `GIT_DIR`), and the prompt
 spells the two permitted reads out as
 `git --git-dir {{GIT_DIR}} show {{BASE_SHA}}:<path>` and
 `git --git-dir {{GIT_DIR}} diff --no-ext-diff --no-textconv {{BASE_SHA}} {{HEAD_SHA}} -- <path>`
-(prompt contract `review-guide-v9`, update contract `review-guide-update-v3`;
+(prompt contract `review-guide-v10`, update contract `review-guide-update-v4`;
 see `tools/boss/docs/designs/automatic-pr-review-guides.md`). The shared
 review-guide command guard accepts `--git-dir <path>` only when `<path>` is
 the engine-supplied store, and still pins the revisions; the shared-source-
@@ -134,11 +146,11 @@ store gate lets those reads through because `show` and `diff` are read-only.
 ## Where the pieces live
 
 - Script and decision matrix: `tools/boss/engine/driver/src/git_store_guard.rs`
-  (+ `git_store_guard_tests.rs`).
+  (including its inline `tests` module).
 - Content-addressed materialisation next to the worker settings file:
   `tools/boss/engine/core/src/worker_setup/git_store_guard.rs`; the
-  engine-side wiring tests are in
-  `tools/boss/engine/core/src/worker_setup_tests/git_store_guard.rs`.
+  engine-side wiring tests are in the `git_store_guard_tests` module of
+  `tools/boss/engine/core/src/worker_setup_tests/settings_hooks.rs`.
 - Per-driver arming: `claude.rs` (`tool_use_interception_wiring`),
   `codex.rs` (`materialize_guards`), `grok/hooks.rs` (`guard_commands`), each
   with an end-to-end refusal test through that driver's own hook path.

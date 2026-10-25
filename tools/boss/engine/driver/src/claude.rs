@@ -259,7 +259,7 @@ macro_rules! python_command_guard {
 /// sets `commenters=''` itself). This is the same lexer configuration used
 /// by `boss_engine::worker_setup`'s `PATH_GUARD_SCRIPT` for the
 /// `BOSS_DATA_DIR` path guard, and by
-/// `crate::codex::guard_python::CODEX_COMMAND_TOKENIZER_PY`'s
+/// `crate::guard_python::CODEX_COMMAND_TOKENIZER_PY`'s
 /// `command_groups` — the Codex-side copy of this fragment, spliced into
 /// both Codex guard scripts. It is kept separate only because this macro
 /// must expand to string literals for `concat!`.
@@ -1950,7 +1950,10 @@ mod tests {
             format!("cd {store} && git fetch --depth=200 origin main"),
             format!("git -C {store} push origin main"),
             format!("git --git-dir={store}/.git gc"),
-        ] {
+        ]
+        .into_iter()
+        .chain(crate::git_store_guard::tests::bypass_commands(&layout))
+        {
             let (decision, reason) = claude_git_store_guard_decision(&layout, &command);
             assert_eq!(decision, "block", "{command}: {reason}");
             assert!(reason.contains("jj"), "{command}: {reason}");

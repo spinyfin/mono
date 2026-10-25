@@ -6,7 +6,7 @@
 //! pulls them in with `use super::helpers::*;` and reaches the items under
 //! test with `use super::super::*;`.
 
-pub(crate) mod helpers;
+mod helpers;
 
 mod answer_agent;
 mod checkleft_guard;

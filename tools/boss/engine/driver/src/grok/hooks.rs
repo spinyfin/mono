@@ -623,7 +623,10 @@ mod tests {
             format!("GIT_DIR={store}/.git git fetch --depth=200 origin main"),
             format!("cd {store} && git fetch --depth=200 origin main"),
             format!("git -C {store} checkout main"),
-        ] {
+        ]
+        .into_iter()
+        .chain(crate::git_store_guard::tests::bypass_commands(&layout))
+        {
             let (decision, reason) = decide(command.clone());
             assert_eq!(decision, "deny", "{command}: {reason}");
             assert!(reason.contains("jj"), "{command}: {reason}");

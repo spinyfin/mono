@@ -1,5 +1,5 @@
 //! Read-only source inspection and literal submission allowlist for guide workers.
-use super::guard_python::with_command_tokenizer;
+use crate::guard_python::with_command_tokenizer;
 #[path = "review_guide_reads.rs"]
 mod reads;
 
@@ -88,7 +88,7 @@ else:
 /// The fragment avoids shell-sensitive quotes so Claude can embed it in python -c.
 #[macro_export]
 macro_rules! render_review_guide_guard {
-    ($before:literal, $after:literal) => {
+    ($before:expr, $after:expr) => {
         concat!(
             $before,
             r#"def review_guide_masked_command(command):

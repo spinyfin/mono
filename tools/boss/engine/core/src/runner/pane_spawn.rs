@@ -1062,14 +1062,9 @@ impl ExecutionRunner for PaneSpawnRunner {
                 ),
                 Set("BOSS_REVIEW_GUIDE_HEAD_SHA".into(), packet.head_sha),
                 Set("BOSS_REVIEW_GUIDE_BASE_SHA".into(), packet.merge_base_sha),
-                // The pinned object store the guide may read, named explicitly
-                // rather than exported as `GIT_DIR`. An ambient `GIT_DIR`
-                // pointing at cube's shared store made every bare `git` in the
-                // session a store operation — including the `git fetch
-                // --depth` shape that shallowed the store — so the prompt now
-                // spells `git --git-dir <this path> …` out, and the shared
-                // store gate (`boss-git-store-guard.py`) only lets read-only
-                // git through to it.
+                // Name the pinned store explicitly: an ambient GIT_DIR makes
+                // every bare git command a shared-store operation. The prompt
+                // uses --git-dir for reads, and the store gate refuses writes.
                 Set("BOSS_REVIEW_GUIDE_GIT_DIR".into(), git_dir.display().to_string()),
                 Unset("GIT_DIR".into()),
                 Set("GIT_PAGER".into(), "cat".into()),
