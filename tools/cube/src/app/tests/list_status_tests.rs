@@ -7,7 +7,7 @@ use crate::cli::Cli;
 
 use crate::app::dispatch::run_with_dependencies;
 use crate::app::errors::CubeError;
-use crate::app::util::current_epoch_s;
+use crate::app::util::{current_epoch_s, pin_clock};
 
 #[test]
 fn workspace_list_shows_health_status_in_effective_state() {
@@ -481,7 +481,12 @@ fn workspace_list_reports_retention_and_annotates_withheld_rows() {
     let (tempdir, database_path) = with_database_path();
     let workspace_root = tempdir.path().join("workspaces");
     seed_mono_repo(&workspace_root, &database_path);
+    // Pin "now" so the age `list` computes against the seeded
+    // `unhealthy_since` is exactly 3 days: the fixture and the command under
+    // test read the same instant instead of two wall-clock readings that a
+    // one-second tick can separate.
     let now = current_epoch_s().unwrap();
+    let _clock = pin_clock(now);
     seed_retention_pool(&database_path, &workspace_root, now);
 
     // The dirty-reclaim reason is what explains the row to an operator.
