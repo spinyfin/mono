@@ -1761,15 +1761,23 @@ mod tests {
         fs::create_dir_all(&locked).unwrap();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
 
-        let locked_restore = locked.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(80)).await;
-            fs::set_permissions(&locked_restore, fs::Permissions::from_mode(0o755)).unwrap();
-        });
-
-        let err = discover_candidate(&prepared, &mut running_halt(), Duration::from_millis(250))
-            .await
-            .expect_err("the empty root must expire the window");
+        // Restore access only after discovery has observed the failed scan.
+        // A timer can fire before spawn_blocking starts scanning on a busy host.
+        let mut restored = false;
+        let err = discover_candidate_observed(&prepared, &mut running_halt(), Duration::ZERO, |_, reason, _, _, _| {
+            let stop = restored;
+            if !restored {
+                assert!(
+                    reason.contains("last error:"),
+                    "the first scan must fail; got: {reason}"
+                );
+                fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+                restored = true;
+            }
+            async move { stop }
+        })
+        .await
+        .expect_err("the empty root must expire the window");
         assert!(
             err.starts_with("no file named"),
             "a later successful scan must not claim no scan completed; got: {err}"
