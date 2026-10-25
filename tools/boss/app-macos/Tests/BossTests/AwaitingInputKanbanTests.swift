@@ -236,6 +236,8 @@ final class AwaitingInputKanbanTests: XCTestCase {
             XCTAssertTrue(reason.contains("bazel build of merge resolution"), reason)
             XCTAssertFalse(reason.lowercased().contains("input"), reason)
         }
+        XCTAssertTrue(live.isWaitingOnJob)
+        XCTAssertTrue(WorkerSlotLiveSlice(live).isWaitingOnJob)
         XCTAssertFalse(WorkerActivity.waitingOnWork.needsHuman)
     }
 
@@ -252,6 +254,9 @@ final class AwaitingInputKanbanTests: XCTestCase {
             return XCTFail("expected .waiting; got \(state)")
         }
         XCTAssertTrue(reason.lowercased().contains("expired"), reason)
+        XCTAssertTrue(live.isWaitingOnJob)
+        XCTAssertTrue(WorkerSlotLiveSlice(live).isWaitingOnJob)
+        XCTAssertEqual(WorkerSlotLiveSlice(live).waitCaption, reason)
         XCTAssertFalse(WorkerActivity.waitOverdue.needsHuman)
     }
 

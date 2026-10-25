@@ -2545,12 +2545,7 @@ async fn serve_scoped(
                     now,
                 )
                 .await;
-                if !stalled.is_empty()
-                    || !downgraded.is_empty()
-                    || hung_changed
-                    || !wait_changed.is_empty()
-                {
-
+                if !stalled.is_empty() || !downgraded.is_empty() || hung_changed || !wait_changed.is_empty() {
                     server_clone.broadcast_live_worker_states().await;
                 }
             }

@@ -173,14 +173,11 @@ struct WorkerLiveState {
 }
 
 extension WorkerLiveState {
-    /// The worker declared a wait on a job and the owner is not needed.
-    /// The engine snapshot is authoritative: it normalizes a wait whose
-    /// declaring turn has ended to `.idle`, and keeps `.waitingForInput`
-    /// (which still carries `waitReason`) for a prompt raised mid-turn,
-    /// which is a real ask of the owner. So a job wait is exactly idle plus
-    /// a declared reason; any other activity is never a job wait.
+    /// Explicit wait states and legacy idle snapshots with a declared reason
+    /// are job waits. A blocking prompt still needs the owner.
     var isWaitingOnJob: Bool {
-        activity == .idle && !(waitReason ?? "").isEmpty
+        activity == .waitingOnWork || activity == .waitOverdue
+            || (activity == .idle && !(waitReason ?? "").isEmpty)
     }
 }
 
@@ -415,11 +412,8 @@ enum AgentActivityState: Equatable {
     ///    missing identity is an invariant failure, never a supported
     ///    local hosting mode. Remote workers (`tmuxHosted == nil`) skip
     ///    this rule.
-    /// 3. An idle worker with a declared wait (`waitReason`) reads as
-    ///    *waiting* with the wait caption, matching
-    ///    `init(runtime:liveState:)`. The engine normalizes a wait whose
-    ///    declaring turn has ended to idle; any other activity falls
-    ///    through even if the wait has not yet expired.
+    /// 3. Explicit wait states and legacy idle snapshots with a declared
+    ///    reason read as waiting, with expired waits called out separately.
     /// 4. A worker paused on a permission prompt
     ///    (`activity == .waitingForInput`, including a prompt raised
     ///    mid-turn while a wait is declared) reads as *waiting on the
@@ -451,7 +445,7 @@ enum AgentActivityState: Equatable {
         if liveState?.tmuxHosted == false {
             return .errored(reason: Self.identityUnavailableReason)
         }
-        if let liveState, liveState.isWaitingOnJob {
+        if let liveState, liveState.activity == .idle, liveState.isWaitingOnJob {
             return .waiting(reason: waitCaption(liveState))
         }
         if liveState?.activity == .waitingForInput {
@@ -497,7 +491,11 @@ enum AgentActivityState: Equatable {
     }
 
     static func overdueCaption(_ liveState: WorkerLiveState) -> String {
-        let reason = liveState.waitReason ?? "long-running job"
+        overdueCaption(reason: liveState.waitReason)
+    }
+
+    static func overdueCaption(reason: String?) -> String {
+        let reason = reason ?? "long-running job"
         return "Wait expired without a wake-up: \(reason)"
     }
 

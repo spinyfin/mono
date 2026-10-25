@@ -63,12 +63,16 @@ struct WorkerSlotLiveSlice: Equatable {
 
     /// Mirrors `WorkerLiveState.isWaitingOnJob`.
     var isWaitingOnJob: Bool {
-        activity == .idle && !(waitReason ?? "").isEmpty
+        activity == .waitingOnWork || activity == .waitOverdue
+            || (activity == .idle && !(waitReason ?? "").isEmpty)
     }
 
     /// "Waiting: <reason> · until <time>" while a job wait is active.
     var waitCaption: String? {
         guard isWaitingOnJob else { return nil }
+        if activity == .waitOverdue {
+            return AgentActivityState.overdueCaption(reason: waitReason)
+        }
         return AgentActivityState.waitCaption(reason: waitReason, expiresAt: waitExpiresAt)
     }
 }

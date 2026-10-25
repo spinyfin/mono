@@ -1785,6 +1785,14 @@ impl LiveWorkerStateRegistry {
         guard.get(&slot_id)?.meta.last_applied_ingress_seq
     }
 
+    /// Whether a permission or other blocking prompt still requires the owner.
+    pub fn has_blocking_prompt(&self, slot_id: u8) -> bool {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard
+            .get(&slot_id)
+            .is_some_and(|entry| entry.meta.blocking_prompt_pending)
+    }
+
     /// Ingress sequence of the newest `Stop` applied to `slot_id`, if any.
     pub fn last_stop_ingress_seq(&self, slot_id: u8) -> Option<u64> {
         let guard = self.inner.lock().expect("registry mutex poisoned");
