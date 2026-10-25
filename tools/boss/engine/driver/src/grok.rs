@@ -513,6 +513,11 @@ impl AgentDriver for GrokDriver {
             } else {
                 input.checkleft_guard_script.clone()
             },
+            git_store_guard_script: if input.is_remote {
+                None
+            } else {
+                input.git_store_guard_script.clone()
+            },
             is_revision: input.execution_kind == "revision_implementation"
                 || input.task_kind.as_deref() == Some("revision"),
             is_standard_worker: input.worker_kind == WorkerKind::Standard,
@@ -1938,6 +1943,7 @@ mod tests {
             is_remote: false,
             path_guard_script: None,
             checkleft_guard_script: None,
+            git_store_guard_script: None,
             codex_sandbox_enforced: false,
         };
         let err = GrokDriver::default()
@@ -1986,6 +1992,7 @@ mod tests {
             is_remote: false,
             path_guard_script: Some(path_guard_script),
             checkleft_guard_script: Some(checkleft_guard_script),
+            git_store_guard_script: None,
             codex_sandbox_enforced: false,
         };
 
@@ -2066,6 +2073,7 @@ mod tests {
             is_remote: false,
             path_guard_script: None,
             checkleft_guard_script: None,
+            git_store_guard_script: None,
             codex_sandbox_enforced: false,
         };
 
@@ -2179,6 +2187,7 @@ mod tests {
             is_remote: false,
             path_guard_script: None,
             checkleft_guard_script: None,
+            git_store_guard_script: None,
             codex_sandbox_enforced: false,
         };
 
@@ -2253,6 +2262,7 @@ mod tests {
             is_remote: true,
             path_guard_script: None,
             checkleft_guard_script: None,
+            git_store_guard_script: None,
             codex_sandbox_enforced: false,
         };
 
@@ -2376,6 +2386,7 @@ mod tests {
             is_remote: false,
             path_guard_script: None,
             checkleft_guard_script: None,
+            git_store_guard_script: None,
             codex_sandbox_enforced: false,
         };
         let artifacts = driver
@@ -2541,6 +2552,7 @@ mod tests {
             is_remote: false,
             path_guard_script: None,
             checkleft_guard_script: None,
+            git_store_guard_script: None,
             codex_sandbox_enforced: false,
         };
         let artifacts = driver
@@ -2662,6 +2674,7 @@ mod tests {
             is_remote: false,
             path_guard_script: None,
             checkleft_guard_script: None,
+            git_store_guard_script: None,
             codex_sandbox_enforced: false,
         };
         let artifacts = driver

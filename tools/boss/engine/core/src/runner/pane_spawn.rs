@@ -972,6 +972,17 @@ impl ExecutionRunner for PaneSpawnRunner {
                 )
             })?,
         );
+        // Every local worker kind — including review guides, whose pinned
+        // read-only git access is exactly the explicit `--git-dir` form this
+        // gate still permits — gets the shared-source-store write gate.
+        let git_store_guard_script = Some(
+            crate::worker_setup::ensure_git_store_guard_script_in(&settings_dir).with_context(|| {
+                format!(
+                    "materialising shared-source-store guard script for execution {}",
+                    execution.id
+                )
+            })?,
+        );
 
         // Permission artifacts (Codex: hooks + trust attest into CODEX_HOME;
         // Claude: empty — settings still come from worker_setup).
@@ -994,6 +1005,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             is_remote: false,
             path_guard_script: path_guard_script.clone(),
             checkleft_guard_script: checkleft_guard_script.clone(),
+            git_store_guard_script: git_store_guard_script.clone(),
             codex_sandbox_enforced: self.feature_flags.is_enabled("codex_sandbox_enforced"),
         };
         let permission_artifacts = driver
@@ -1050,7 +1062,16 @@ impl ExecutionRunner for PaneSpawnRunner {
                 ),
                 Set("BOSS_REVIEW_GUIDE_HEAD_SHA".into(), packet.head_sha),
                 Set("BOSS_REVIEW_GUIDE_BASE_SHA".into(), packet.merge_base_sha),
-                Set("GIT_DIR".into(), git_dir.display().to_string()),
+                // The pinned object store the guide may read, named explicitly
+                // rather than exported as `GIT_DIR`. An ambient `GIT_DIR`
+                // pointing at cube's shared store made every bare `git` in the
+                // session a store operation — including the `git fetch
+                // --depth` shape that shallowed the store — so the prompt now
+                // spells `git --git-dir <this path> …` out, and the shared
+                // store gate (`boss-git-store-guard.py`) only lets read-only
+                // git through to it.
+                Set("BOSS_REVIEW_GUIDE_GIT_DIR".into(), git_dir.display().to_string()),
+                Unset("GIT_DIR".into()),
                 Set("GIT_PAGER".into(), "cat".into()),
                 Set("RIPGREP_CONFIG_PATH".into(), "/dev/null".into()),
                 Set("GIT_NO_LAZY_FETCH".into(), "1".into()),

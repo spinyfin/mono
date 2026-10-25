@@ -1183,6 +1183,26 @@ fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> 
         });
     }
 
+    // 1b. Shared-source-store write gate — local workers of every kind. The
+    //     engine materialises the script outside CODEX_HOME (it is not
+    //     Codex-specific); the wrapper hands it the workspace so it can derive
+    //     cube's repos root. `Bash` only: it judges shell commands.
+    if let Some(guard_script) = &config.git_store_guard_script {
+        let mut extra_env = Vec::new();
+        if let Some(workspace) = &config.workspace_path {
+            extra_env.push((
+                crate::git_store_guard::GIT_STORE_GUARD_WORKSPACE_ENV,
+                workspace.display().to_string(),
+            ));
+        }
+        planned.push(Planned {
+            name: "git_store_guard",
+            source: GuardSource::Existing(guard_script.clone()),
+            matcher: "Bash",
+            extra_env,
+        });
+    }
+
     // 2. Boss-launch guard — always on. Materialise the Claude inline
     //    `python3 -c` body as a real .py so the trust gate can path-check it.
     planned.push(Planned {
@@ -1785,6 +1805,11 @@ impl AgentDriver for CodexDriver {
                 None
             } else {
                 input.checkleft_guard_script.clone()
+            },
+            git_store_guard_script: if input.is_remote {
+                None
+            } else {
+                input.git_store_guard_script.clone()
             },
             is_revision: input.execution_kind == "revision_implementation"
                 || input.task_kind.as_deref() == Some("revision"),

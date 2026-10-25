@@ -169,11 +169,11 @@ fn claude_settings_json_is_byte_identical_with_worker_settings_destination() {
         assert!(hooks.contains_key(name), "missing hook after destination field: {name}");
     }
     let pre = hooks["PreToolUse"].as_array().expect("PreToolUse array");
-    // sample_input is a standard local chore: shim + path guard + boss-launch
-    // + PR redirect + checkleft push = 5 PreToolUse entries.
+    // sample_input is a standard local chore: shim + path guard + git store
+    // guard + boss-launch + PR redirect + checkleft push = 6 PreToolUse entries.
     assert_eq!(
         pre.len(),
-        5,
+        6,
         "Claude PreToolUse composition must be unchanged after destination field: {pre:?}",
     );
     assert_eq!(parsed["permissions"]["defaultMode"], "auto");

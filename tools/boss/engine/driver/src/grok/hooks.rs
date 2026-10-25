@@ -164,6 +164,16 @@ fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
         });
     }
 
+    // 1b. Shared-source-store write gate (every local worker kind). Same
+    //     script and hook-command shape as Claude; the adapter canonicalises
+    //     Grok's payload into the Claude dialect the script reads.
+    if let Some(guard_script) = &config.git_store_guard_script {
+        out.push(Guard {
+            command: crate::git_store_guard::hook_command(guard_script, config.workspace_path.as_deref()),
+            matcher: "Bash",
+        });
+    }
+
     // 2. Boss-launch guard. Always on, all workers.
     out.push(Guard {
         command: BOSS_LAUNCH_GUARD_COMMAND.to_owned(),
@@ -508,6 +518,7 @@ mod tests {
             data_dir: None,
             path_guard_script: None,
             checkleft_guard_script: None,
+            git_store_guard_script: None,
             is_revision: false,
             is_standard_worker: true,
             is_reviewer: false,
@@ -543,6 +554,88 @@ mod tests {
         assert_eq!(guards[1].command, BOSS_LAUNCH_GUARD_COMMAND);
         assert_eq!(guards[2].command, PR_REDIRECT_GUARD_COMMAND);
         assert!(guards[3].command.contains("boss-checkleft-push-guard.py"));
+    }
+
+    #[test]
+    fn guard_commands_places_git_store_guard_after_the_path_guard() {
+        let config = interception_config(|c| {
+            c.data_dir = Some(PathBuf::from("/tmp/boss-data"));
+            c.path_guard_script = Some(PathBuf::from("/tmp/settings/boss-path-guard.py"));
+            c.git_store_guard_script = Some(PathBuf::from("/tmp/settings/boss-git-store-guard.py"));
+        });
+        let guards = guard_commands(&config);
+        assert_eq!(guards.len(), 4, "path + git store + launch + pr-redirect: {config:?}");
+        assert!(
+            guards[1].command.contains("BOSS_WORKSPACE='/tmp/ws'"),
+            "{}",
+            guards[1].command
+        );
+        assert!(
+            guards[1]
+                .command
+                .contains("python3 '/tmp/settings/boss-git-store-guard.py'"),
+            "{}",
+            guards[1].command
+        );
+        assert_eq!(guards[1].matcher, "Bash");
+        assert_eq!(guards[2].command, BOSS_LAUNCH_GUARD_COMMAND);
+    }
+
+    /// Acceptance: the shared-source-store gate, reached through the
+    /// unmodified Grok adapter with a raw `run_terminal_command` payload,
+    /// refuses the incident shapes and lets read-only git through.
+    #[test]
+    fn git_store_guard_refuses_store_writes_via_grok_payload() {
+        if !python3_available() {
+            eprintln!("python3 not available; skipping adapter acceptance test");
+            return;
+        }
+        let layout = crate::git_store_guard::tests::cube_layout();
+        let config = interception_config(|c| {
+            c.git_store_guard_script = Some(layout.script.clone());
+            c.workspace_path = Some(layout.workspace.clone());
+            c.is_standard_worker = false;
+        });
+        let guards = guard_commands(&config);
+        let guard = guards
+            .iter()
+            .find(|g| g.command.contains(crate::git_store_guard::GIT_STORE_GUARD_SCRIPT_NAME))
+            .expect("shared-source-store guard must be armed");
+        let adapter_path = write_adapter_script(layout.dir.path());
+        let store = layout.store.display().to_string();
+        let decide = |command: String| -> (String, String) {
+            let payload = json!({
+                "hookEventName": "pre_tool_use",
+                "sessionId": "s-1",
+                "cwd": layout.workspace.display().to_string(),
+                "toolName": "run_terminal_command",
+                "toolInput": {"command": command},
+            });
+            let (code, stdout, stderr) = run_adapter(&adapter_path, &guard.command, &payload, true);
+            assert_eq!(code, 0, "stderr={stderr}");
+            let decision: serde_json::Value = serde_json::from_str(&stdout).expect(&stdout);
+            (
+                decision["decision"].as_str().unwrap_or_default().to_owned(),
+                decision["reason"].as_str().unwrap_or_default().to_owned(),
+            )
+        };
+        for command in [
+            format!("GIT_DIR={store}/.git git fetch --depth=200 origin main"),
+            format!("cd {store} && git fetch --depth=200 origin main"),
+            format!("git -C {store} checkout main"),
+        ] {
+            let (decision, reason) = decide(command.clone());
+            assert_eq!(decision, "deny", "{command}: {reason}");
+            assert!(reason.contains("jj"), "{command}: {reason}");
+        }
+        for command in [
+            format!("git --git-dir {store}/.git log -1"),
+            format!("GIT_DIR={store}/.git git show HEAD:README.md"),
+            "jj git fetch".to_owned(),
+        ] {
+            let (decision, reason) = decide(command.clone());
+            assert_eq!(decision, "allow", "{command}: {reason}");
+        }
     }
 
     #[test]

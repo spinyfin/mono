@@ -1057,6 +1057,18 @@ impl AgentDriver for ClaudeDriver {
             }));
         }
 
+        // 1b. Shared-source-store write gate (every local worker kind).
+        //     Refuses raw git writes -- and any shallow fetch/pull/clone --
+        //     against cube's shared jj/git store, whichever way git is pointed
+        //     at it. Bash only: it judges shell commands. See
+        //     `crate::git_store_guard`.
+        if let Some(guard_script) = &config.git_store_guard_script {
+            hooks.push(serde_json::json!({
+                "matcher": "Bash",
+                "hooks": [{"type": "command", "command": crate::git_store_guard::hook_command(guard_script, config.workspace_path.as_deref())}],
+            }));
+        }
+
         // 2. Boss-launch guard (always on, all workers). Blocks the worker from
         //    starting the Boss macOS app or its bundled engine binary.
         hooks.push(serde_json::json!({
@@ -1729,6 +1741,7 @@ mod tests {
             data_dir: Some(PathBuf::from("/Library/Application Support/Boss")),
             path_guard_script: Some(PathBuf::from("/tmp/boss-settings/boss-path-guard.py")),
             checkleft_guard_script: Some(PathBuf::from("/tmp/boss-settings/boss-checkleft-push-guard.py")),
+            git_store_guard_script: Some(PathBuf::from("/tmp/boss-settings/boss-git-store-guard.py")),
             is_revision: false,
             is_standard_worker: true,
             is_reviewer: false,
@@ -1743,6 +1756,7 @@ mod tests {
             data_dir: None,
             path_guard_script: None,
             checkleft_guard_script: None,
+            git_store_guard_script: None,
             is_revision: false,
             is_standard_worker: true,
             is_reviewer: false,
@@ -1755,12 +1769,12 @@ mod tests {
     #[test]
     fn local_standard_worker_gets_all_five_guards() {
         let wiring = ClaudeDriver.tool_use_interception_wiring(&local_standard_config());
-        // path guard + boss-launch guard + PR redirect guard + checkleft guard = 4
+        // path guard + git store guard + boss-launch guard + PR redirect guard + checkleft guard = 5
         // (no revision guard since is_revision: false)
         assert_eq!(
             wiring.pre_tool_use_hooks.len(),
-            4,
-            "local standard non-revision worker must get exactly 4 guards: {:?}",
+            5,
+            "local standard non-revision worker must get exactly 5 guards: {:?}",
             wiring.pre_tool_use_hooks,
         );
     }
@@ -1770,11 +1784,11 @@ mod tests {
         let mut config = local_standard_config();
         config.is_revision = true;
         let wiring = ClaudeDriver.tool_use_interception_wiring(&config);
-        // path guard + boss-launch guard + PR redirect guard + checkleft guard + revision guard = 5
+        // path guard + git store guard + boss-launch guard + PR redirect guard + checkleft guard + revision guard = 6
         assert_eq!(
             wiring.pre_tool_use_hooks.len(),
-            5,
-            "local standard revision worker must get exactly 5 guards: {:?}",
+            6,
+            "local standard revision worker must get exactly 6 guards: {:?}",
             wiring.pre_tool_use_hooks,
         );
         let cmds: Vec<&str> = wiring
@@ -1834,6 +1848,126 @@ mod tests {
     }
 
     #[test]
+    fn git_store_guard_command_names_workspace_and_script() {
+        let mut config = local_standard_config();
+        config.workspace_path = Some(PathBuf::from("/tmp/ws"));
+        let wiring = ClaudeDriver.tool_use_interception_wiring(&config);
+        let entry = wiring
+            .pre_tool_use_hooks
+            .iter()
+            .find(|e| {
+                e["hooks"][0]["command"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains(crate::git_store_guard::GIT_STORE_GUARD_SCRIPT_NAME)
+            })
+            .expect("shared-source-store guard must be present for local workers");
+        let cmd = entry["hooks"][0]["command"].as_str().unwrap();
+        assert!(
+            cmd.contains("BOSS_WORKSPACE='/tmp/ws'"),
+            "must name the workspace: {cmd}"
+        );
+        assert!(
+            cmd.contains("python3 '/tmp/boss-settings/boss-git-store-guard.py'"),
+            "must invoke the materialised script: {cmd}"
+        );
+        assert_eq!(entry["matcher"], "Bash", "it judges shell commands only");
+        // Order: directly after the path guard, before the launch guard, so
+        // the two boundary gates come first in every driver's chain.
+        let position = wiring
+            .pre_tool_use_hooks
+            .iter()
+            .position(|e| std::ptr::eq(e, entry))
+            .unwrap();
+        assert_eq!(position, 1, "{:?}", wiring.pre_tool_use_hooks);
+    }
+
+    /// Run the exact hook command Claude's settings file would carry, with
+    /// a Claude-shaped PreToolUse payload, and return its decision.
+    fn claude_git_store_guard_decision(
+        layout: &crate::git_store_guard::tests::CubeLayout,
+        command: &str,
+    ) -> (String, String) {
+        let config = ToolUseInterceptionConfig {
+            data_dir: None,
+            path_guard_script: None,
+            checkleft_guard_script: None,
+            git_store_guard_script: Some(layout.script.clone()),
+            is_revision: false,
+            is_standard_worker: true,
+            is_reviewer: false,
+            is_review_guide: false,
+            run_id: None,
+            workspace_path: Some(layout.workspace.clone()),
+        };
+        let wiring = ClaudeDriver.tool_use_interception_wiring(&config);
+        let hook = wiring
+            .pre_tool_use_hooks
+            .iter()
+            .filter_map(|e| e["hooks"][0]["command"].as_str())
+            .find(|c| c.contains(crate::git_store_guard::GIT_STORE_GUARD_SCRIPT_NAME))
+            .expect("hook present")
+            .to_owned();
+        let payload = serde_json::json!({
+            "tool_name": "Bash",
+            "cwd": layout.workspace.display().to_string(),
+            "tool_input": {"command": command},
+        });
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&hook)
+            .env_remove("GIT_DIR")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start shared-source-store guard");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        drop(child.stdin.take());
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("decision JSON");
+        (
+            value["decision"].as_str().unwrap().to_owned(),
+            value["reason"].as_str().unwrap_or_default().to_owned(),
+        )
+    }
+
+    #[test]
+    fn git_store_guard_refuses_store_writes_through_the_claude_hook_command() {
+        // End-to-end through the Claude wiring: the incident shapes are
+        // refused with the redirection, read-only git and the ordinary
+        // workspace flow still pass.
+        let layout = crate::git_store_guard::tests::cube_layout();
+        let store = layout.store.display().to_string();
+        for command in [
+            format!("GIT_DIR={store}/.git git fetch --depth=200 origin main"),
+            format!("cd {store} && git fetch --depth=200 origin main"),
+            format!("git -C {store} push origin main"),
+            format!("git --git-dir={store}/.git gc"),
+        ] {
+            let (decision, reason) = claude_git_store_guard_decision(&layout, &command);
+            assert_eq!(decision, "block", "{command}: {reason}");
+            assert!(reason.contains("jj"), "{command}: {reason}");
+        }
+        for command in [
+            format!("GIT_DIR={store}/.git git log -1"),
+            format!("git --git-dir {store}/.git show HEAD:README.md"),
+            format!("git -C {store} diff --no-ext-diff abc def"),
+            "jj git fetch && jj new main@origin".to_owned(),
+            "git status".to_owned(),
+        ] {
+            let (decision, reason) = claude_git_store_guard_decision(&layout, &command);
+            assert_eq!(decision, "approve", "{command}: {reason}");
+        }
+    }
+
+    #[test]
     fn boss_launch_guard_is_always_present() {
         for config in [local_standard_config(), remote_standard_config()] {
             let wiring = ClaudeDriver.tool_use_interception_wiring(&config);
@@ -1855,6 +1989,7 @@ mod tests {
             data_dir: Some(PathBuf::from("/Library/Boss")),
             path_guard_script: Some(PathBuf::from("/tmp/boss-path-guard.py")),
             checkleft_guard_script: Some(PathBuf::from("/tmp/boss-checkleft-push-guard.py")),
+            git_store_guard_script: Some(PathBuf::from("/tmp/boss-git-store-guard.py")),
             is_revision: false,
             is_standard_worker: false,
             is_reviewer: true,
@@ -1863,11 +1998,11 @@ mod tests {
             workspace_path: None,
         };
         let wiring = ClaudeDriver.tool_use_interception_wiring(&config);
-        // path guard + boss-launch guard + static-analysis guard (no PR redirect, no checkleft)
+        // path guard + git store guard + boss-launch guard + static-analysis guard (no PR redirect, no checkleft)
         assert_eq!(
             wiring.pre_tool_use_hooks.len(),
-            3,
-            "reviewer worker must get exactly 3 guards: {:?}",
+            4,
+            "reviewer worker must get exactly 4 guards: {:?}",
             wiring.pre_tool_use_hooks,
         );
         let cmds: Vec<&str> = wiring

@@ -836,6 +836,7 @@ fn materialize_guards_writes_executables() {
         data_dir: Some(tmp.path().to_path_buf()),
         path_guard_script: Some(path_guard),
         checkleft_guard_script: None,
+        git_store_guard_script: None,
         is_revision: false,
         is_standard_worker: false,
         is_reviewer: false,
@@ -860,6 +861,7 @@ fn materialize_guards_adds_static_analysis_guard_for_reviewer() {
         data_dir: None,
         path_guard_script: None,
         checkleft_guard_script: None,
+        git_store_guard_script: None,
         is_revision: false,
         is_standard_worker: false,
         is_reviewer: true,
@@ -884,6 +886,8 @@ fn full_interception(tmp: &Path) -> (PathBuf, ToolUseInterceptionConfig) {
     fs::write(&path_guard, "print('ok')\n").unwrap();
     let checkleft = tmp.join("boss-checkleft-push-guard.py");
     fs::write(&checkleft, "print('ok')\n").unwrap();
+    let git_store = tmp.join(crate::git_store_guard::GIT_STORE_GUARD_SCRIPT_NAME);
+    fs::write(&git_store, crate::git_store_guard::GIT_STORE_GUARD_SCRIPT).unwrap();
     let home = tmp.join("home");
     fs::create_dir_all(&home).unwrap();
     (
@@ -892,6 +896,7 @@ fn full_interception(tmp: &Path) -> (PathBuf, ToolUseInterceptionConfig) {
             data_dir: Some(tmp.to_path_buf()),
             path_guard_script: Some(path_guard),
             checkleft_guard_script: Some(checkleft),
+            git_store_guard_script: Some(git_store),
             is_revision: true,
             is_standard_worker: true,
             is_reviewer: false,
@@ -937,6 +942,112 @@ fn every_guard_is_armed_through_the_trace_shim() {
             guard.command_path
         );
     }
+}
+
+/// Run a materialised Codex guard wrapper end-to-end (shim hash check,
+/// guard, trace record) with a Codex-shaped `PreToolUse` payload.
+fn run_codex_wrapper(wrapper: &Path, command: &str, cwd: &Path) -> (String, String) {
+    use std::io::Write as _;
+    let payload = serde_json::json!({
+        "tool_name": "Bash",
+        "cwd": cwd.display().to_string(),
+        "tool_input": {"command": command},
+    });
+    let mut child = std::process::Command::new("sh")
+        .arg(wrapper)
+        .env_remove("GIT_DIR")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("sh must be available");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if stdout.trim().is_empty() {
+        // The shim stays silent on approve (Codex treats an untranslated
+        // approve as a hook failure); silence with a clean exit is approval.
+        assert!(out.status.success(), "wrapper failed: {stderr}");
+        return ("approve".to_owned(), String::new());
+    }
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    (
+        value["decision"].as_str().unwrap_or("approve").to_owned(),
+        value["reason"].as_str().unwrap_or_default().to_owned(),
+    )
+}
+
+#[test]
+fn git_store_guard_is_armed_through_the_trace_shim_and_refuses_store_writes() {
+    // The incident this guard exists for, through the real Codex chain: the
+    // wrapper exports the workspace, the shim verifies and runs the shared
+    // script, and a shallow fetch at the shared store is refused while the
+    // read-only form the review guide relies on still passes.
+    let layout = crate::git_store_guard::tests::cube_layout();
+    let home = layout.dir.path().join("codex-home");
+    fs::create_dir_all(&home).unwrap();
+    let config = ToolUseInterceptionConfig {
+        data_dir: None,
+        path_guard_script: None,
+        checkleft_guard_script: None,
+        git_store_guard_script: Some(layout.script.clone()),
+        is_revision: false,
+        is_standard_worker: true,
+        is_reviewer: false,
+        is_review_guide: false,
+        run_id: Some("r".into()),
+        workspace_path: Some(layout.workspace.clone()),
+    };
+    let guards = materialize_guards(&home, &config).unwrap();
+    let guard = guards
+        .iter()
+        .find(|guard| guard.command_path.to_string_lossy().contains("git_store_guard"))
+        .expect("the shared-source-store guard must be materialised");
+    assert_eq!(guard.matcher, Some("Bash"));
+    let body = fs::read_to_string(&guard.command_path).unwrap();
+    assert!(
+        body.contains(&format!(
+            "export {}={}",
+            crate::git_store_guard::GIT_STORE_GUARD_WORKSPACE_ENV,
+            shell_quote(&layout.workspace.display().to_string())
+        )),
+        "wrapper must hand the script its workspace: {body}"
+    );
+    assert!(
+        body.contains(&layout.script.display().to_string()),
+        "wrapper must run the engine-materialised script, not a copy: {body}"
+    );
+
+    let store = layout.store.display().to_string();
+    for command in [
+        format!("GIT_DIR={store}/.git git fetch --depth=200 origin main"),
+        format!("cd {store} && git fetch --depth=200 origin main"),
+        format!("git -C {store} reset --hard origin/main"),
+    ] {
+        let (decision, reason) = run_codex_wrapper(&guard.command_path, &command, &layout.workspace);
+        assert_eq!(decision, "block", "{command}: {reason}");
+        assert!(reason.contains("jj"), "{command}: {reason}");
+    }
+    for command in [
+        format!("git --git-dir {store}/.git show HEAD:README.md"),
+        format!("GIT_DIR={store}/.git git log -1"),
+        "jj git fetch".to_owned(),
+    ] {
+        let (decision, reason) = run_codex_wrapper(&guard.command_path, &command, &layout.workspace);
+        assert_eq!(decision, "approve", "{command}: {reason}");
+    }
+    let trace = fs::read_to_string(guard_trace_path(&home)).unwrap();
+    assert!(
+        trace.lines().filter(|line| line.contains("git_store_guard")).count() >= 6,
+        "every decision must land in the guard trace: {trace}"
+    );
 }
 
 #[test]
@@ -1358,6 +1469,7 @@ fn guide_permission_materialization_requires_socket_and_writes_named_profile() {
         is_remote: false,
         path_guard_script: None,
         checkleft_guard_script: None,
+        git_store_guard_script: None,
         codex_sandbox_enforced: false,
     };
     let rt = tokio::runtime::Builder::new_current_thread()

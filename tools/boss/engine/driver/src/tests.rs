@@ -338,6 +338,7 @@ fn tool_use_interception_config_fields_are_accessible() {
         data_dir: Some(PathBuf::from("/Library/Boss")),
         path_guard_script: Some(PathBuf::from("/tmp/boss-path-guard.py")),
         checkleft_guard_script: Some(PathBuf::from("/tmp/boss-checkleft-push-guard.py")),
+        git_store_guard_script: None,
         is_revision: true,
         is_standard_worker: true,
         is_reviewer: false,

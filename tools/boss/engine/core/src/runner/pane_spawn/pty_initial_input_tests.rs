@@ -194,6 +194,7 @@ fn grok_initial_input_stays_under_the_limit_with_long_workspace_path_and_full_de
         is_remote: false,
         path_guard_script: None,
         checkleft_guard_script: None,
+        git_store_guard_script: None,
         codex_sandbox_enforced: false,
     };
     let dest_dir = TempDir::new().unwrap();

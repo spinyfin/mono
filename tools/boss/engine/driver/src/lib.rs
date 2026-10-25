@@ -20,6 +20,7 @@ use boss_protocol::{
     WorkerEvent,
 };
 
+pub mod git_store_guard;
 pub mod initial_prompt;
 pub mod transcript_store;
 
@@ -116,6 +117,10 @@ pub struct PermissionInput {
     /// Absolute path to the materialised `boss-checkleft-push-guard.py`
     /// script, when the local checkleft push guard applies. `None` for remote.
     pub checkleft_guard_script: Option<PathBuf>,
+    /// Absolute path to the materialised `boss-git-store-guard.py` script
+    /// (see [`git_store_guard`]), when the shared-source-store write gate
+    /// applies. `None` for remote workers: the script is never shipped.
+    pub git_store_guard_script: Option<PathBuf>,
     /// Codex-only: mirrors the `codex_sandbox_enforced` feature flag. When
     /// `false` (the flag's default), Codex's Standard/Triage/AnswerAgent
     /// workers get `--sandbox danger-full-access` instead of the OS-enforced
@@ -1448,6 +1453,13 @@ pub struct ToolUseInterceptionConfig {
     /// Absolute path to the `boss-checkleft-push-guard.py` script materialised
     /// next to the worker settings file. `None` for remote workers.
     pub checkleft_guard_script: Option<PathBuf>,
+    /// Absolute path to the `boss-git-store-guard.py` script materialised
+    /// next to the worker settings file (see [`git_store_guard`]). Armed for
+    /// every local worker kind: the shared store is a boundary like the Boss
+    /// data dir, not a posture. `None` for remote workers. The guard derives
+    /// cube's repos root from `workspace_path` (passed on the hook command as
+    /// `BOSS_WORKSPACE`) at decision time.
+    pub git_store_guard_script: Option<PathBuf>,
     /// Whether this is a revision execution. Revision workers must not open
     /// new PRs — the revision PR guard blocks `gh pr create`, `cube pr create`,
     /// and the deprecated `cube pr ensure`.

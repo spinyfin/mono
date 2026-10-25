@@ -5,6 +5,7 @@ edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
+bon = { workspace = true }
 boss-pr-review-sources = { path = "../pr-review-sources" }
 boss-pr-template = { path = "../pr-template" }
 regex = { workspace = true }

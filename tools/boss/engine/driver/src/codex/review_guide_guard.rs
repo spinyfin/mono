@@ -13,6 +13,11 @@ pub fn review_guide_allow_rules() -> Vec<String> {
         "Bash(git --no-pager show:*)".to_owned(),
         "Bash(git diff --no-ext-diff --no-textconv:*)".to_owned(),
         "Bash(git --no-pager diff --no-ext-diff --no-textconv:*)".to_owned(),
+        // The prompt names the pinned object store explicitly (`git --git-dir
+        // <store> show …`) instead of relying on an exported GIT_DIR; the
+        // shared command guard still pins the store path and the revisions.
+        "Bash(git --git-dir:*)".to_owned(),
+        "Bash(git --no-pager --git-dir:*)".to_owned(),
         "Bash(cat:*)".to_owned(),
         "Bash(nl:*)".to_owned(),
         "Bash(wc -l:*)".to_owned(),
@@ -232,6 +237,48 @@ mod tests {
         }
     }
 
+    /// The pinned object store the engine hands a guide worker as
+    /// `BOSS_REVIEW_GUIDE_GIT_DIR` (a fixed, nonexistent path: the guard
+    /// compares spellings, it never opens the store).
+    const PINNED_GIT_DIR: &str = "/repo-store/flunge/.git";
+
+    #[test]
+    fn explicit_git_dir_is_accepted_only_for_the_pinned_store() {
+        let base = "b".repeat(40);
+        let head = "a".repeat(40);
+        for command in [
+            format!("git --git-dir {PINNED_GIT_DIR} show {base}:src/a.rs"),
+            format!("git --no-pager --git-dir {PINNED_GIT_DIR} show {base}:src/a.rs"),
+            format!("git --git-dir {PINNED_GIT_DIR} diff --no-ext-diff --no-textconv {base} {head} -- src/a.rs"),
+            format!("git --git-dir /repo-store/flunge/../flunge/.git show {base}:src/a.rs"),
+        ] {
+            let payload = serde_json::json!({"tool_name":"Bash","cwd":"/repo","tool_input":{"command":command}});
+            assert_eq!(decide_with_source(payload, true).0, "approve", "{command}");
+        }
+        for command in [
+            // A foreign repository, the shared store's sibling, a relative
+            // spelling, the `=` form (not in the literal grammar), and a bare
+            // `--git-dir` with nothing after it.
+            format!("git --git-dir /repo-store/other/.git show {base}:src/a.rs"),
+            format!("git --git-dir /repo/.git show {base}:src/a.rs"),
+            format!("git --git-dir .git show {base}:src/a.rs"),
+            format!("git --git-dir={PINNED_GIT_DIR} show {base}:src/a.rs"),
+            "git --git-dir".to_owned(),
+            format!("git --git-dir {PINNED_GIT_DIR} fetch --depth=200"),
+            format!("git --git-dir {PINNED_GIT_DIR} show main:src/a.rs"),
+        ] {
+            let payload = serde_json::json!({"tool_name":"Bash","cwd":"/repo","tool_input":{"command":command}});
+            assert_eq!(decide_with_source(payload, true).0, "block", "{command}");
+        }
+    }
+
+    #[test]
+    fn allow_rules_cover_the_explicit_git_dir_form() {
+        let allow = review_guide_allow_rules();
+        assert!(allow.contains(&"Bash(git --git-dir:*)".into()));
+        assert!(allow.contains(&"Bash(git --no-pager --git-dir:*)".into()));
+    }
+
     fn decide(payload: serde_json::Value) -> (String, String) {
         decide_with_source(payload, false)
     }
@@ -256,6 +303,7 @@ mod tests {
             .env("BOSS_REVIEW_GUIDE_HEAD_SHA", "a".repeat(40))
             .env("BOSS_REVIEW_GUIDE_BASE_SHA", "b".repeat(40))
             .env("BOSS_REVIEW_GUIDE_PREVIOUS_HEAD_SHA", previous)
+            .env("BOSS_REVIEW_GUIDE_GIT_DIR", PINNED_GIT_DIR)
             .arg(script)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())

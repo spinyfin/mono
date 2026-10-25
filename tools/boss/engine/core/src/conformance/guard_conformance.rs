@@ -583,6 +583,7 @@ fn run_one_model_probe(model: &str, codex_bin: &Path, auth_source: &Path) {
             is_remote: false,
             path_guard_script: Some(path_guard_script.clone()),
             checkleft_guard_script: None,
+            git_store_guard_script: None,
             codex_sandbox_enforced: false,
         };
         let artifacts = driver

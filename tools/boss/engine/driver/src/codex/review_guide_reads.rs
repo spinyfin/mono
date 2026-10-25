@@ -81,6 +81,14 @@ def guide_read_stage(tokens, payload, piped):
             return False
         if args and args[0] == '--no-pager':
             args = args[1:]
+        # The pinned object store is named explicitly on the command, never
+        # exported as GIT_DIR. Only the engine-supplied store is accepted; any
+        # other --git-dir is a foreign repository.
+        if args and args[0] == '--git-dir':
+            pinned_dir = os.environ.get('BOSS_REVIEW_GUIDE_GIT_DIR', '')
+            if len(args) < 2 or not pinned_dir or os.path.realpath(args[1]) != os.path.realpath(pinned_dir):
+                return False
+            args = args[2:]
         revisions = {os.environ.get('BOSS_REVIEW_GUIDE_HEAD_SHA'), os.environ.get('BOSS_REVIEW_GUIDE_BASE_SHA'), os.environ.get('BOSS_REVIEW_GUIDE_PREVIOUS_HEAD_SHA')}
         def pinned(value):
             return bool(re.fullmatch('[0-9a-fA-F]{40}', value)) and value in revisions
