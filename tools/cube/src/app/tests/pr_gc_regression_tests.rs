@@ -183,7 +183,7 @@ fn base_repo_serving_only_a_pull_ref(f: &Fixture) -> String {
     std::fs::create_dir_all(&pull).unwrap();
     std::fs::write(pull.join("head"), format!("{head}\n")).unwrap();
     f.jj(&base, &["bookmark", "delete", "tip"]);
-    f.jj(&f.ws, &["git", "remote", "add", "origin", base.to_str().unwrap()]);
+    f.jj(&f.ws, &["git", "remote", "add", "origin", f.root.to_str().unwrap()]);
     head
 }
 
@@ -191,14 +191,29 @@ fn base_repo_serving_only_a_pull_ref(f: &Fixture) -> String {
 struct PrJsonOnly<'a> {
     jj: &'a DeclaredJj,
     pr_json: String,
+    base: PathBuf,
+    lookups: std::sync::atomic::AtomicUsize,
 }
 
 impl CommandRunner for PrJsonOnly<'_> {
     fn run(&self, invocation: &CommandInvocation) -> Result<String> {
         if invocation.program == "gh" {
+            self.lookups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return Ok(self.pr_json.clone());
         }
-        self.jj.run(invocation)
+        // Route the selected GitHub URL to the disposable base repository.
+        // Local origin stays untouched and cannot serve the missing pull ref.
+        let mut invocation = invocation.clone();
+        for arg in &mut invocation.args {
+            assert_ne!(
+                arg, "https://github.com/example/repo-tools",
+                "selected the wrong repository"
+            );
+            if arg == "https://github.com/example/repo" {
+                *arg = self.base.display().to_string();
+            }
+        }
+        self.jj.run(&invocation)
     }
 }
 
@@ -221,14 +236,15 @@ fn merged_pr_ref_is_collected_when_only_the_pull_ref_serves_the_head() {
         &f.ws,
         &["git", "remote", "add", &format!("cube-pr-fetch-9-{now}-live"), url],
     );
-    // The PR's base repository, as GitHub identifies it. Never contacted:
-    // `origin` (the local `base`) is what the pull-ref fetch uses.
+    // The GitHub upstream must be selected instead of the local mirror.
     f.jj(
         &f.ws,
         &["git", "remote", "add", "upstream", "https://github.com/example/repo"],
     );
     let runner = PrJsonOnly {
         jj: &f.runner,
+        base: f._dir.path().join("base"),
+        lookups: Default::default(),
         pr_json: format!(
             r#"{{"state":"closed","merged":true,"head":{{"ref":"deleted-branch","sha":"{head}","repo":null}}}}"#
         ),
@@ -254,11 +270,104 @@ fn unresolvable_head_is_not_looked_up_again_on_the_next_sweep() {
     );
     let runner = PrJsonOnly {
         jj: &f.runner,
+        base: f._dir.path().join("base"),
+        lookups: Default::default(),
         pr_json: r#"{"state":"closed","merged":true,"head":{"ref":"gone","sha":"0123456789abcdef0123456789abcdef01234567","repo":null}}"#
             .to_string(),
     };
     let deleted = crate::app::gc::gc_workspace_bookmarks(&runner, None, &f.ws, false, false).unwrap();
     assert!(!deleted.contains(&"pr/1".to_string()));
     assert!(crate::app::pr_bookmarks::recently_unresolved(&f.ws, 1));
+    assert_eq!(runner.lookups.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let deleted = crate::app::gc::gc_workspace_bookmarks(&runner, None, &f.ws, false, false).unwrap();
+    assert!(!deleted.contains(&"pr/1".to_string()));
+    assert_eq!(runner.lookups.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(f.pr_commits(1), vec![ancestor]);
+}
+
+#[test]
+fn repair_batches_rotate_past_twenty_unsafe_bookmarks() {
+    let f = Fixture::new();
+    let (old, head) = f.rewritten_feat_with_exported_pr_ref();
+    f.jj(&f.ws, &["bookmark", "delete", "pr/1"]);
+    f.jj(&f.ws, &["new", "main", "-m", "unique unpublished content"]);
+    std::fs::write(f.ws.join("unique.txt"), "keep this work").unwrap();
+    let unique = f.commit("@");
+    for number in 100..120 {
+        f.jj(&f.ws, &["bookmark", "create", &format!("pr/{number}"), "-r", &unique]);
+    }
+    f.jj(&f.ws, &["new", "main"]);
+    f.jj(&f.ws, &["bookmark", "create", "pr/999", "-r", &old]);
+    f.jj(
+        &f.ws,
+        &["git", "remote", "add", "upstream", "https://github.com/example/repo"],
+    );
+    let runner = PrJsonOnly {
+        jj: &f.runner,
+        base: f.root.clone(),
+        lookups: Default::default(),
+        pr_json: format!(r#"{{"state":"closed","merged":true,"head":{{"ref":"gone","sha":"{head}","repo":null}}}}"#),
+    };
+    let first = crate::app::gc::gc_workspace_bookmarks(&runner, None, &f.ws, false, false).unwrap();
+    assert!(!first.contains(&"pr/999".to_string()));
+    assert_eq!(runner.lookups.load(std::sync::atomic::Ordering::SeqCst), 20);
+    let second = crate::app::gc::gc_workspace_bookmarks(&runner, None, &f.ws, false, false).unwrap();
+    assert!(second.contains(&"pr/999".to_string()), "{second:?}");
+    for number in 100..120 {
+        assert_eq!(f.pr_commits(number), vec![unique.clone()]);
+    }
+    assert!(runner.lookups.load(std::sync::atomic::Ordering::SeqCst) <= 40);
+}
+
+#[test]
+fn normal_sweep_prunes_expired_fetch_remotes_without_fetching() {
+    let f = Fixture::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let stale = "cube-pr-fetch-9-100-killed";
+    let fresh = format!("cube-pr-fetch-9-{now}-live");
+    for name in [stale, &fresh] {
+        f.jj(&f.ws, &["git", "remote", "add", name, f.root.to_str().unwrap()]);
+        f.jj(&f.ws, &["git", "fetch", "--remote", name]);
+        assert!(!f.commit(&format!("remote_bookmarks(remote={name})")).is_empty());
+    }
+    crate::app::gc::gc_workspace_bookmarks(&f.runner, None, &f.ws, false, false).unwrap();
+    let remotes = f.jj(&f.ws, &["git", "remote", "list"]);
+    assert!(!remotes.contains(stale));
+    assert!(remotes.contains(&fresh));
+    let bookmarks = f.jj(&f.ws, &["bookmark", "list", "--all-remotes"]);
+    assert!(!bookmarks.contains(stale), "{bookmarks}");
+    assert!(bookmarks.contains(&fresh), "{bookmarks}");
+}
+
+#[test]
+fn pull_ref_ignores_a_github_remote_with_a_similar_repo_name() {
+    let f = Fixture::new();
+    let head = base_repo_serving_only_a_pull_ref(&f);
+    f.jj(
+        &f.ws,
+        &[
+            "git",
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/example/repo-tools",
+        ],
+    );
+    f.jj(
+        &f.ws,
+        &["git", "remote", "add", "upstream", "https://github.com/example/repo"],
+    );
+    let runner = PrJsonOnly {
+        jj: &f.runner,
+        base: f._dir.path().join("base"),
+        lookups: Default::default(),
+        pr_json: String::new(),
+    };
+    let info = serde_json::json!({"head": {"ref": "gone", "sha": head, "repo": null}});
+    let resolved =
+        crate::app::pr_bookmarks::resolve_pr_head(&runner, None, &f.ws, "example/repo", 1, &info, None).unwrap();
+    assert_eq!(resolved.sha, head);
 }

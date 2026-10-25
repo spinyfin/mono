@@ -577,7 +577,8 @@ fn sha_is_present(runner: &dyn CommandRunner, database_path: Option<&Path>, cwd:
 ///
 /// The caller has normally just fetched the base remote, so the common case is
 /// a single local lookup. When the commit is still missing, it is fetched from
-/// the head repository's branch through a temporary jj remote, and must then
+/// the head repository's branch through a temporary jj remote, falling back
+/// to the base repository's `refs/pull/<n>/head`. The fetched commit must
 /// equal `head.sha` exactly; a head that cannot be had is an error. Network
 /// work is bounded by `deadline` and runs before any PR-bookmark lock is taken.
 pub(super) fn resolve_pr_head(
@@ -635,27 +636,21 @@ const TEMP_REMOTE_PREFIX: &str = "cube-pr-fetch-";
 const STALE_TEMP_REMOTE_AGE_SECS: u64 = 15 * 60;
 
 fn temp_remote_name(number: u64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = unix_now();
     format!("{TEMP_REMOTE_PREFIX}{number}-{now}-{}", uuid::Uuid::new_v4())
 }
 
 /// Remove temporary fetch remotes left behind by a run that was killed between
 /// `remote add` and `remote remove`. Their remote-tracking bookmarks would
-/// otherwise protect commits from collection forever. Run before each new
-/// temporary remote is added, so leftovers never outlive the next fetch. A
+/// otherwise protect commits from collection forever. Run during normal GC
+/// sweeps and before adding a temporary remote. A
 /// remote younger than [`STALE_TEMP_REMOTE_AGE_SECS`] is left alone because a
 /// live fetch may own it.
 pub(super) fn prune_stale_temp_remotes(runner: &dyn CommandRunner, database_path: Option<&Path>, cwd: &Path) {
     let Ok(listing) = run(runner, database_path, cwd, &["git", "remote", "list"]) else {
         return;
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = unix_now();
     for name in listing.lines().filter_map(|line| line.split_whitespace().next()) {
         let Some(rest) = name.strip_prefix(TEMP_REMOTE_PREFIX) else {
             continue;
@@ -673,25 +668,20 @@ pub(super) fn prune_stale_temp_remotes(runner: &dyn CommandRunner, database_path
     }
 }
 
-/// URL of the base repository: the `origin` remote, else any remote naming
-/// `owner_repo`, else GitHub's canonical URL.
+/// URL of the matching GitHub repository, ignoring local mirrors and other
+/// repositories with similar names; use the canonical URL if none matches.
 fn base_repo_url(runner: &dyn CommandRunner, database_path: Option<&Path>, cwd: &Path, owner_repo: &str) -> String {
     let listing = run(runner, database_path, cwd, &["git", "remote", "list"]).unwrap_or_default();
-    let remotes: Vec<(&str, &str)> = listing
+    listing
         .lines()
-        .filter_map(|line| line.split_once(char::is_whitespace))
-        .map(|(name, url)| (name, url.trim()))
-        .collect();
-    let needle = owner_repo.to_ascii_lowercase();
-    remotes
-        .iter()
-        .find(|(name, _)| *name == "origin")
-        .or_else(|| {
-            remotes
-                .iter()
-                .find(|(_, url)| url.to_ascii_lowercase().contains(&needle))
+        .find_map(|line| {
+            let (_, slug) = git_utils::repo_slug::parse_github_remote(line)?;
+            if !slug.eq_ignore_ascii_case(owner_repo) {
+                return None;
+            }
+            line.split_once(char::is_whitespace)
+                .map(|(_, url)| url.trim().to_string())
         })
-        .map(|(_, url)| (*url).to_string())
         .unwrap_or_else(|| format!("https://github.com/{owner_repo}.git"))
 }
 

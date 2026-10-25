@@ -202,6 +202,7 @@ pub(super) fn release_runner_for(workspace_path: &std::path::Path) -> FakeRunner
             "",
         ),
         ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["new", "main@origin"], ""),
+        ExpectedCommand::ok((workspace_path).to_path_buf(), "jj", &["git", "remote", "list"], ""),
         gc_git_import_command(workspace_path),
         gc_noop_command(workspace_path),
         gc_pr_noop_command(workspace_path),

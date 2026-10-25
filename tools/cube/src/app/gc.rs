@@ -138,6 +138,7 @@ pub(super) fn gc_workspace_bookmarks(
     // until some unrelated command at the colocated root happens to import
     // them. A dry run must not write, so it sees only what jj already knows.
     if !dry_run {
+        pr_bookmarks::prune_stale_temp_remotes(runner, database_path, workspace_path);
         pr_bookmarks::import_git_refs(runner, database_path, workspace_path)?;
     }
 

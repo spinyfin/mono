@@ -47,6 +47,7 @@ fn workspace_gc_verb_forgets_consumed_bookmarks_on_free_workspaces() {
     // gc: ws1 is leased → skipped; ws2 is free → fetch + forget.
     let gc_runner = FakeRunner::new(vec![
         ExpectedCommand::ok(ws2_path.clone(), "jj", &["git", "fetch"], ""),
+        ExpectedCommand::ok(ws2_path.clone(), "jj", &["git", "remote", "list"], ""),
         gc_git_import_command(&ws2_path),
         gc_exec_sweep_command(&ws2_path, "boss/exec_dead_01"),
         gc_pr_noop_command(&ws2_path),
@@ -181,6 +182,7 @@ fn gc_forgets_pr_bookmark_no_workspace_is_positioned_on() {
 
     let mut commands = release_prefix_commands(&workspace_path);
     commands.extend([
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], ""),
         gc_git_import_command(&workspace_path),
         gc_noop_command(&workspace_path),
         gc_pr_sweep_command(&workspace_path, "pr/42\n"),
@@ -220,6 +222,7 @@ fn gc_retains_pr_bookmark_a_workspace_is_still_positioned_on() {
     commands.extend([
         // The revset excludes anything reachable from a working copy, so a
         // still-referenced pr/7 simply never appears here.
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], ""),
         gc_git_import_command(&workspace_path),
         gc_noop_command(&workspace_path),
         gc_pr_noop_command(&workspace_path),
@@ -257,6 +260,7 @@ fn gc_sweeps_an_accumulated_backlog_with_batched_local_commands_and_no_network()
     // Far apart in PR number, the way a long-lived pool accumulates them.
     let mut commands = release_prefix_commands(&workspace_path);
     commands.extend([
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], ""),
         gc_git_import_command(&workspace_path),
         gc_noop_command(&workspace_path),
         gc_pr_sweep_command(&workspace_path, "pr/1579\npr/2201\npr/2332\n"),
@@ -297,8 +301,8 @@ fn gc_sweeps_an_accumulated_backlog_with_batched_local_commands_and_no_network()
 /// The sweep is purely local, so it works with no GitHub remote and no
 /// network at all. Previously an unresolvable remote skipped the `pr/*`
 /// sweep entirely — an offline pool pruned nothing and grew unboundedly.
-/// Here the release issues no `jj git remote list` for the sweep and no `gh`
-/// call, and still forgets the unreferenced bookmark.
+/// Here the remote listing is empty and no `gh` call is needed to forget
+/// the unreferenced bookmark.
 #[test]
 fn gc_pr_sweep_runs_offline() {
     let (tempdir, database_path) = with_database_path();
@@ -311,6 +315,7 @@ fn gc_pr_sweep_runs_offline() {
 
     let mut commands = release_prefix_commands(&workspace_path);
     commands.extend([
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], ""),
         gc_git_import_command(&workspace_path),
         gc_noop_command(&workspace_path),
         gc_pr_sweep_command(&workspace_path, "pr/1586\n"),
@@ -351,6 +356,7 @@ fn gc_pr_sweep_ignores_co_located_bookmarks_in_other_namespaces() {
     let mut commands = release_prefix_commands(&workspace_path);
     commands.extend([
         // The exec half finds nothing consumed: this branch has not landed.
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], ""),
         gc_git_import_command(&workspace_path),
         gc_noop_command(&workspace_path),
         gc_pr_sweep_command(&workspace_path, "boss/exec_still_open_01\npr/2609\nmain\n"),
@@ -390,6 +396,7 @@ fn gc_release_records_an_audit_event_when_the_sweep_fails() {
 
     let mut commands = release_prefix_commands(&workspace_path);
     commands.extend([
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], ""),
         gc_git_import_command(&workspace_path),
         gc_noop_command(&workspace_path),
         ExpectedCommand {
@@ -734,6 +741,7 @@ fn workspace_gc_verb_runs_unhealthy_recycler() {
     let gc_runner = FakeRunner::new(vec![
         // gc_workspace_bookmarks
         ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "fetch"], ""),
+        ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "remote", "list"], ""),
         gc_git_import_command(&ws_path),
         gc_noop_command(&ws_path),
         gc_pr_noop_command(&ws_path),

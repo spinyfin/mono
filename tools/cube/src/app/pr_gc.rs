@@ -65,6 +65,24 @@ pub(super) struct Resolved {
     closed: bool,
 }
 
+/// Reserve a rotating batch under the store lock, then release it before
+/// network work. Advancing even when repair is unsafe prevents starvation.
+fn next_batch(runner: &dyn CommandRunner, cwd: &Path, names: &[String]) -> Result<Vec<String>> {
+    let _lock = runner.lock_pr_bookmarks(cwd)?;
+    let path = crate::lock::shared_repo_dir(cwd)?.join("cube-pr-gc-cursor");
+    let cursor = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut ordered = names.to_vec();
+    ordered.sort();
+    let start = ordered.partition_point(|name| name <= &cursor);
+    let count = ordered.len();
+    ordered.rotate_left(start % count);
+    ordered.truncate(MAX_REPAIRS_PER_SWEEP);
+    if let Some(last) = ordered.last() {
+        std::fs::write(path, last).map_err(super::errors::CubeError::Io)?;
+    }
+    Ok(ordered)
+}
+
 /// Network resolution runs without the store lock. Failures preserve the refs
 /// and identify what could not be checked rather than silently claiming success.
 pub(super) fn resolve_retained(
@@ -76,9 +94,16 @@ pub(super) fn resolve_retained(
     if names.is_empty() {
         return Vec::new();
     }
+    let names = match next_batch(runner, cwd, names) {
+        Ok(names) => names,
+        Err(error) => {
+            eprintln!("warning: cube could not schedule PR repairs: {error}");
+            return Vec::new();
+        }
+    };
     let mut resolved = Vec::new();
     let mut unknown = Vec::new();
-    for name in names {
+    for name in &names {
         let Ok(number) = name[3..].parse() else {
             eprintln!("warning: cube retained {name}: PR number is out of range");
             continue;
