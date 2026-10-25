@@ -495,6 +495,53 @@ async fn run_scope_denies_a_worker_reading_another_executions_runs() {
     assert_eq!(parsed["payload"]["type"], "runs_list");
 }
 
+/// A progression session reading another execution's runs is refused with its
+/// own tier's guidance, not the worker-only `boss propose blocked` recovery.
+#[tokio::test]
+async fn run_scope_refusal_for_progression_peers_is_typed_to_their_tier() {
+    let (state, _dir) = test_server_state();
+    state.feature_flags.set("worker_rpc_tier", false).unwrap();
+    let db = &state.work_db;
+    let product = crate::test_support::create_test_product(db);
+    let mine_chore = crate::test_support::create_test_chore(db, product.id.clone(), "Mine");
+    let mine_execution = crate::test_support::create_ready_chore_execution(db, mine_chore.id);
+    let other_chore = crate::test_support::create_test_chore(db, product.id, "Someone else's");
+    let other_execution = crate::test_support::create_ready_chore_execution(db, other_chore.id);
+    let other_run = db
+        .create_run(
+            boss_protocol::CreateRunInput::builder()
+                .agent_id("agent_1")
+                .execution_id(other_execution.id.clone())
+                .build(),
+        )
+        .unwrap();
+    let parent = crate::worker_registry::parent_pid(self_pid()).unwrap().unwrap();
+    state
+        .worker_registry
+        .register_progression(parent, &mine_execution.id, &state.work_db)
+        .unwrap();
+
+    for (verb, payload) in [
+        (
+            "ListRuns",
+            serde_json::json!({"type": "list_runs", "execution_id": other_execution.id}),
+        ),
+        ("GetRun", serde_json::json!({"type": "get_run", "id": other_run.id})),
+    ] {
+        let request = serde_json::json!({"request_id": "scope", "payload": payload}).to_string();
+        let parsed = round_trip(state.clone(), Some(self_pid()), &request).await;
+        assert_eq!(parsed["payload"]["type"], "worker_tier_denied", "{verb}");
+        let denial = &parsed["payload"]["denial"];
+        assert_eq!(denial["verb"], verb);
+        assert_eq!(denial["reason"], "progression_scope", "{verb}");
+        assert!(denial["use_instead"].is_null(), "{verb}: {denial}");
+        let message = denial["message"].as_str().unwrap();
+        assert!(!message.contains("boss propose blocked"), "{message}");
+        assert!(!message.contains("worker sessions"), "{message}");
+        assert!(message.contains("progression sessions"), "{message}");
+    }
+}
+
 #[tokio::test]
 async fn critical_update_handler_refuses_worker_and_accepts_human_peer() {
     let (state, _dir) = test_server_state();

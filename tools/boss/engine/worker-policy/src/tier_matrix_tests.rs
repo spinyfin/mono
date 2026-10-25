@@ -185,30 +185,182 @@ fn progression_allow_set_is_exactly_the_pinned_table() {
     }
 }
 
-#[test]
-fn every_policy_classified_verb_is_denied_to_progression_unless_in_the_table() {
-    // Coverage guard tied to the vocabulary: every `FrontendRequest::X` the
-    // exhaustive worker match names must either be in the pinned table or be
-    // one of the sanctioned writes / denied fixtures, which are exercised
-    // above. A table entry that names no real verb is a typo.
+/// Candidate JSON values tried, in order, for a field the synthesiser has to
+/// invent: whichever one the field's type accepts wins.
+fn candidate(index: usize) -> Option<serde_json::Value> {
+    [json!("x"), json!(0), json!(false), json!([]), json!({})]
+        .get(index)
+        .cloned()
+}
+
+fn upper_camel_to_snake(name: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in name.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.extend(c.to_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn object_at<'a>(
+    root: &'a mut serde_json::Value,
+    path: &[String],
+) -> &'a mut serde_json::Map<String, serde_json::Value> {
+    let mut node = root;
+    for key in path {
+        node = node.get_mut(key).expect("path exists");
+    }
+    node.as_object_mut().expect("path names an object")
+}
+
+/// The first backticked token after `expected`, for `unknown variant` errors.
+fn first_expected_variant(message: &str) -> Option<String> {
+    let rest = &message[message.find("expected")?..];
+    Some(rest.split('`').nth(1)?.to_owned())
+}
+
+/// Builds a minimal valid request for `variant` from nothing but the serde
+/// errors: each missing field is filled with the first candidate its type
+/// accepts, descending into nested structs it had to open as `{}`. This keeps
+/// the matrix one-row-per-variant without a hand-written payload for each of
+/// the request vocabulary's ~220 variants.
+/// Starting JSON for a variant: its wire tag, plus a value for each field whose
+/// type is a tagged enum the synthesiser cannot guess.
+fn seed(variant: &str) -> serde_json::Value {
+    let tag = upper_camel_to_snake(variant);
+    match variant {
+        "AnswerOperatorQuestion" => json!({"type": tag, "answer": {"kind": "yes_no", "value": true}}),
+        // `input` is flattened into the request, so its fields sit at the root.
+        "CreateAutomation" => json!({
+            "type": tag, "product_id": "p", "name": "n", "standing_instruction": "s",
+            "trigger": {"kind": "schedule", "cron": "0 0 * * *", "timezone": "UTC"},
+        }),
+        "EngineResponse" => json!({"type": tag, "response": {"kind": "focus_worker_pane", "result": {"Ok": {}}}}),
+        _ => json!({ "type": tag }),
+    }
+}
+
+fn synthesize(variant: &str) -> Result<FrontendRequest, String> {
+    let mut value = seed(variant);
+    // Objects the synthesiser can add fields to, innermost last: the root, then
+    // each `{}` it opens itself.
+    let mut objects: Vec<Vec<String>> = vec![vec![]];
+    // The field filled last: where it lives, its name, and the candidate used.
+    let mut last: Option<(Vec<String>, String, usize)> = None;
+    for _ in 0..400 {
+        let error = match serde_json::from_value::<FrontendRequest>(value.clone()) {
+            Ok(request) => return Ok(request),
+            Err(error) => error.to_string(),
+        };
+        if let Some(rest) = error.strip_prefix("missing field `") {
+            let field = rest.split('`').next().expect("field name").to_owned();
+            let path = objects
+                .iter()
+                .rev()
+                .find(|path| !object_at(&mut value, path).contains_key(&field))
+                .ok_or_else(|| format!("{variant}: cannot place missing field {field}: {error}"))?
+                .clone();
+            object_at(&mut value, &path).insert(field.clone(), candidate(0).expect("first candidate"));
+            last = Some((path, field, 0));
+            continue;
+        }
+        let (path, field, index) = last
+            .clone()
+            .ok_or_else(|| format!("{variant}: cannot synthesise a request: {error}"))?;
+        let next = if error.starts_with("unknown variant") {
+            first_expected_variant(&error).map(serde_json::Value::from)
+        } else {
+            candidate(index + 1)
+        };
+        let next = next.ok_or_else(|| format!("{variant}: no candidate fits field {field}: {error}"))?;
+        if next == json!({}) {
+            let mut inner = path.clone();
+            inner.push(field.clone());
+            objects.push(inner);
+        }
+        object_at(&mut value, &path).insert(field.clone(), next);
+        last = Some((path, field, index + 1));
+    }
+    Err(format!("{variant}: synthesis did not converge"))
+}
+
+/// Every verb the exhaustive worker match names. The match has no wildcard arm,
+/// so it lists the whole `FrontendRequest` vocabulary: a new variant fails to
+/// compile until classified, and then shows up here and needs no edit.
+fn classified_verbs() -> BTreeSet<String> {
     let source = include_str!("policy.rs");
-    let classified: BTreeSet<&str> = source
-        .split("FrontendRequest::")
+    let body = source
+        .split("fn worker_decision(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("worker_decision body");
+    body.split("FrontendRequest::")
         .skip(1)
         .filter_map(|rest| rest.split(|c: char| !c.is_alphanumeric()).next())
         .filter(|name| name.chars().next().is_some_and(char::is_uppercase))
-        .collect();
-    for verb in PROGRESSION_ALLOWED_VERBS {
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn every_frontend_request_variant_has_an_explicit_decision_for_both_tiers() {
+    let classified = classified_verbs();
+    assert!(
+        classified.len() > 200,
+        "vocabulary scan found only {}",
+        classified.len()
+    );
+
+    // Expected decisions, spelled out per tier. Workers are allowed exactly the
+    // progression table plus the sanctioned writes; progression is allowed
+    // exactly the table. Everything else is denied to both: deny is the default.
+    let progression_allowed: BTreeSet<String> = PROGRESSION_ALLOWED_VERBS.iter().map(|v| (*v).to_owned()).collect();
+    let sanctioned: BTreeSet<String> = sanctioned_write_fixtures().iter().map(variant_name).collect();
+    let worker_allowed: BTreeSet<String> = progression_allowed.union(&sanctioned).cloned().collect();
+    for verb in worker_allowed.iter() {
         assert!(
             classified.contains(verb),
             "{verb} is not a classified FrontendRequest verb"
         );
     }
-    for request in sanctioned_write_fixtures().iter().chain(&denied_for_both_fixtures()) {
-        let verb = variant_name(request);
-        assert!(classified.contains(verb.as_str()), "{verb} missing from policy");
-        assert!(!PROGRESSION_ALLOWED_VERBS.contains(&verb.as_str()), "{verb}");
+
+    let mut fixtures = BTreeSet::new();
+    let mut unsynthesised = Vec::new();
+    for verb in &classified {
+        let request = match synthesize(verb) {
+            Ok(request) => request,
+            Err(error) => {
+                unsynthesised.push(error);
+                continue;
+            }
+        };
+        assert_eq!(&variant_name(&request), verb, "fixture is for a different verb");
+        let worker = verb_decision(RpcTier::Worker, &request);
+        let progression = verb_decision(RpcTier::Progression, &request);
+        assert_eq!(worker.is_allowed(), worker_allowed.contains(verb), "{verb} / Worker");
+        assert_eq!(
+            progression.is_allowed(),
+            progression_allowed.contains(verb),
+            "{verb} / Progression"
+        );
+        if !progression.is_allowed() {
+            let denial = progression.denial().expect("denied");
+            assert_eq!(denial.reason, WorkerTierDenialReason::ProgressionScope, "{verb}");
+        }
+        for tier in [RpcTier::User, RpcTier::AppOrBoss, RpcTier::BossOnly] {
+            assert!(verb_decision(tier, &request).is_allowed(), "{verb} / {tier:?}");
+        }
+        fixtures.insert(verb.clone());
     }
+    assert!(unsynthesised.is_empty(), "{}", unsynthesised.join("\n"));
+    // One fixture per classified verb, no more and no fewer.
+    assert_eq!(fixtures, classified);
 }
 
 #[test]

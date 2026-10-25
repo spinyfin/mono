@@ -338,9 +338,16 @@ impl ServerState {
         if owning_execution_id == caller_execution_id {
             return None;
         }
-        Some(WorkerTierDenial::closed(
-            variant_name(request),
-            WorkerTierDenialReason::RuntimeIsolation,
-        ))
+        let verb = variant_name(request);
+        Some(if peer_class.is_progression() {
+            WorkerTierDenial::progression(
+                verb,
+                WorkerTierDenialReason::ProgressionScope,
+                "runs of other executions are out of scope; read only the runs of your own execution.",
+                None,
+            )
+        } else {
+            WorkerTierDenial::closed(verb, WorkerTierDenialReason::RuntimeIsolation)
+        })
     }
 }

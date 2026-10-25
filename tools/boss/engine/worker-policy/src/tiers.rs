@@ -39,10 +39,11 @@ use crate::WorkerVerbDecision;
 ///   confine the coordinator to worker tier.
 ///
 ///   The live connection-level gate that actually admits a connection
-///   to the worker verb policy ([`boss_engine_worker_policy`]) does
-///   not go through `authorize_rpc(Worker, ..)` — it calls
-///   [`ServerState::classify_peer`] once per connection and checks
-///   [`PeerClass::is_worker`] directly (`handle_frontend_connection`,
+///   to this crate's verb policy does not go through
+///   `authorize_rpc(Worker, ..)` — in the engine core crate's
+///   `app/trust.rs` it calls `ServerState::classify_peer` once per
+///   connection, then enforces `Worker` behind the `worker_rpc_tier`
+///   flag and `Progression` unconditionally (`handle_frontend_connection`,
 ///   `worker_tier_denial`). `authorize_rpc(Worker, ..)` delegates to
 ///   the same `classify_peer` call and exists for handlers or tests
 ///   that want to ask the classification question through the generic

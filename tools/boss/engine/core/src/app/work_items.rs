@@ -30,8 +30,15 @@ pub(super) fn resolve_write_actor(
     requested_priority: Option<&str>,
     current_priority: Option<&str>,
 ) -> anyhow::Result<&'static str> {
-    let peer_is_agent = server_state.classify_peer(peer_pid).is_agent();
-    crate::work::refuse_worker_critical_raise(requested_priority, current_priority, peer_is_agent)?;
+    let peer_class = server_state.classify_peer(peer_pid);
+    let agent_tier = if peer_class.is_progression() {
+        Some("progression")
+    } else if peer_class.is_worker() {
+        Some("worker")
+    } else {
+        None
+    };
+    crate::work::refuse_worker_critical_raise(requested_priority, current_priority, agent_tier)?;
     Ok(resolve_status_actor(server_state, peer_pid))
 }
 
