@@ -111,8 +111,9 @@ final class MarkdownFindState: ObservableObject {
     /// lives in the rendered document.
     func updateSource(_ source: String, baseURL: URL?, collapsibleHeadings: Set<String> = []) {
         let chunks = MarkdownHeadingSections.chunks(in: source, collapsibleHeadings: collapsibleHeadings)
-        chunkCorpora = chunks.map { chunk in
-            ChunkCorpus(chunk: chunk, plainText: CommentProjection.plainText(for: chunk.renderedText, baseURL: baseURL))
+        let parsed = MarkdownParsedDocument.parse(source: source, chunks: chunks, baseURL: baseURL)
+        chunkCorpora = zip(chunks, parsed).map { chunk, content in
+            ChunkCorpus(chunk: chunk, plainText: String(content.characters))
         }
         recomputeMatches()
     }

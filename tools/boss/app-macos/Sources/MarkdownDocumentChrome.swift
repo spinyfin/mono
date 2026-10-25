@@ -308,6 +308,7 @@ private struct MarkdownDocumentColumn: View {
     @State private var parseLogged = false
     /// Per-chunk comment-anchor partition, memoized across `body` evaluations.
     @State private var commentAnchorMapCache = MarkdownCommentAnchorMap.Cache()
+    @State private var parsedDocumentCache = MarkdownParsedDocument.Cache()
 
     /// Tokenized document ground, applied to the scrolling column only, so a
     /// sibling comment sidebar / questions panel keeps `windowBackgroundColor`.
@@ -396,6 +397,9 @@ private struct MarkdownDocumentColumn: View {
         .onChange(of: collapsedByDefaultHeadings) { _, headings in
             refreshCachedChunks(source: source, headings: headings)
             findState.updateSource(source, baseURL: baseURL, collapsibleHeadings: headings)
+        }
+        .onChange(of: baseURL) { _, url in
+            findState.updateSource(source, baseURL: url, collapsibleHeadings: collapsedByDefaultHeadings)
         }
         .onChange(of: commentedAnchors) { _, _ in highlightGeneration &+= 1 }
         .onChange(of: commentFlashAnchor) { _, _ in highlightGeneration &+= 1 }
@@ -545,14 +549,16 @@ private struct MarkdownDocumentColumn: View {
     }
 
     /// Splits `source` into chunks (see `MarkdownHeadingSections`) and builds
-    /// each chunk's own parser. The heading split is cached across `body`
-    /// evaluations; parsers are cheap to rebuild when highlight state changes.
+    /// each chunk's parser around cached, document-scoped content. Highlight
+    /// wrappers can be rebuilt without resolving Markdown again.
     private var renderedChunks: [RenderedMarkdownChunk] {
         let chunks = documentChunks
+        let parsed = parsedDocumentCache.parse(source: source, chunks: chunks, baseURL: baseURL)
         let anchorMap = commentAnchorMapCache.partition(
             source: source,
             headings: collapsedByDefaultHeadings,
             chunks: chunks,
+            parsed: parsed,
             highlighted: commentedAnchors,
             flashing: commentFlashAnchor,
             baseURL: baseURL
@@ -563,6 +569,7 @@ private struct MarkdownDocumentColumn: View {
                 chunk: chunk,
                 parser: markdownParser(
                     forChunkAt: index,
+                    content: parsed[index],
                     anchors: index < anchorMap.count ? anchorMap[index] : .empty
                 )
             )
@@ -593,16 +600,18 @@ private struct MarkdownDocumentColumn: View {
     /// relative links/images resolve.
     private func markdownParser(
         forChunkAt index: Int,
+        content: AttributedString,
         anchors: MarkdownCommentAnchorMap.ChunkAnchors
     ) -> any MarkupParser {
         let base: any MarkupParser
         if anchors.highlighted.isEmpty && anchors.flashing == nil {
-            base = AttributedStringMarkdownParser.markdown(baseURL: baseURL)
+            base = ParsedMarkdownChunkParser(content: content)
         } else {
             base = HighlightingMarkdownParser(
                 highlightedAnchors: anchors.highlighted,
                 flashingAnchor: anchors.flashing,
-                baseURL: baseURL
+                baseURL: baseURL,
+                parsedContent: content
             )
         }
         guard findState.isActive, !findState.query.isEmpty else { return base }
@@ -700,9 +709,10 @@ private struct RenderedMarkdownChunk: Identifiable {
 /// each block is styled in isolation, with no source range or sibling
 /// awareness). Splitting the *source text* before it ever reaches
 /// `StructuredText`, and rendering each collapsible chunk as its own
-/// independently-parsed `StructuredText` behind a native SwiftUI disclosure
-/// control, is the same shape `TranscriptView` already uses for its
-/// per-segment `DisclosureGroup`s.
+/// `StructuredText` behind a native SwiftUI disclosure control bounds layout.
+/// `MarkdownParsedDocument` parses the full source first and partitions its
+/// attributed content by these same source ranges, preserving document-wide
+/// reference definitions.
 enum MarkdownHeadingSections {
     /// A matched section spans from its heading's own line through the line
     /// immediately before the NEXT heading of *any* level — not the next
@@ -716,28 +726,33 @@ enum MarkdownHeadingSections {
     /// own prose, stopping at the very next heading" needs no notion of
     /// outline nesting at all.
     static func chunks(in source: String, collapsibleHeadings: Set<String>) -> [MarkdownDocumentChunk] {
-        let headings = headingLines(in: source)
-        guard !headings.isEmpty else { return [.plain(source)] }
+        sections(in: source, collapsibleHeadings: collapsibleHeadings).map { section in
+            let text = String(source[section.range])
+            if let heading = section.heading {
+                return .collapsible(heading: heading, body: text)
+            }
+            return .plain(text)
+        }
+    }
 
-        var chunks: [MarkdownDocumentChunk] = []
-        var cursor = source.startIndex
+    static func sections(
+        in source: String, collapsibleHeadings: Set<String>
+    ) -> [(heading: String?, range: Range<String.Index>)] {
+        let headings = headingLines(in: source)
+        guard !headings.isEmpty else { return [(nil, source.startIndex..<source.endIndex)] }
+        var sections: [(heading: String?, range: Range<String.Index>)] = []
+        if let first = headings.first, first.lineRange.lowerBound > source.startIndex {
+            sections.append((nil, source.startIndex..<first.lineRange.lowerBound))
+        }
         for (i, heading) in headings.enumerated() {
-            if heading.lineRange.lowerBound > cursor {
-                chunks.append(.plain(String(source[cursor..<heading.lineRange.lowerBound])))
-            }
-            let sectionEnd = (i + 1 < headings.count) ? headings[i + 1].lineRange.lowerBound : source.endIndex
+            let end = (i + 1 < headings.count) ? headings[i + 1].lineRange.lowerBound : source.endIndex
             if collapsibleHeadings.contains(heading.text) {
-                let body = String(source[heading.lineRange.upperBound..<sectionEnd])
-                chunks.append(.collapsible(heading: heading.text, body: body))
+                sections.append((heading.text, heading.lineRange.upperBound..<end))
             } else {
-                chunks.append(.plain(String(source[heading.lineRange.lowerBound..<sectionEnd])))
+                sections.append((nil, heading.lineRange.lowerBound..<end))
             }
-            cursor = sectionEnd
         }
-        if cursor < source.endIndex {
-            chunks.append(.plain(String(source[cursor...])))
-        }
-        return chunks
+        return sections
     }
 
     /// Whether `source` contains a markdown ATX heading whose exact text
