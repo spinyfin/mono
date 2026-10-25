@@ -1853,6 +1853,14 @@ impl LiveWorkerStateRegistry {
         guard.get(&slot_id)?.meta.last_stop_seq
     }
 
+    /// Whether a permission or other blocking prompt still requires the owner.
+    pub fn has_blocking_prompt(&self, slot_id: u8) -> bool {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard
+            .get(&slot_id)
+            .is_some_and(|entry| entry.meta.blocking_prompt_pending)
+    }
+
     /// Install the source parked workers' declared waits are read from.
     /// Called once, when the engine wires its wait registry.
     pub fn set_wait_source(&self, source: std::sync::Arc<dyn DeclaredWaitSource>) {
