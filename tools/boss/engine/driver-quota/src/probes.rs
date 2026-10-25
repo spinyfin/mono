@@ -589,7 +589,7 @@ pub mod grok {
         /// Ask the CLI to refresh, then re-read whatever it left on disk.
         /// `why` names the trigger in a failure reason ("has expired" or
         /// "was rejected by the Grok billing endpoint").
-        async fn refresh_via_cli(&self, why: &str) -> Result<Bearer, TokenError> {
+        async fn refresh_via_cli(&self, why: &str, rejected_token: Option<&str>) -> Result<Bearer, TokenError> {
             match self.refresher.refresh().await {
                 GrokRefreshOutcome::LoggedIn => match self.stored_credential()? {
                     StoredCredential::Live { bearer, refreshable } => Ok(Bearer {
@@ -607,11 +607,8 @@ pub mod grok {
                 },
                 GrokRefreshOutcome::NotLoggedIn { detail } => {
                     // A banner can describe the state before the CLI refreshed.
-                    if let Ok(StoredCredential::Live { bearer, refreshable }) = self.stored_credential() {
-                        return Ok(Bearer {
-                            token: bearer,
-                            refreshable,
-                        });
+                    if let Some(bearer) = self.rewritten_live_credential(rejected_token) {
+                        return Ok(bearer);
                     }
                     Err(TokenError {
                         kind: DriverQuotaFailureKind::NotAuthenticated,
@@ -620,12 +617,33 @@ pub mod grok {
                         ),
                     })
                 }
-                GrokRefreshOutcome::Failed { detail } => Err(TokenError {
-                    kind: DriverQuotaFailureKind::ProbeFailed,
-                    reason: format!(
-                        "stored Grok token {why} and the grok CLI could not be run to refresh it: {detail}"
-                    ),
-                }),
+                GrokRefreshOutcome::Failed { detail } => {
+                    // The CLI may have rewritten the credential before its
+                    // pass ran out of budget.
+                    if let Some(bearer) = self.rewritten_live_credential(rejected_token) {
+                        return Ok(bearer);
+                    }
+                    Err(TokenError {
+                        kind: DriverQuotaFailureKind::ProbeFailed,
+                        reason: format!(
+                            "stored Grok token {why} and the grok CLI could not be run to refresh it: {detail}"
+                        ),
+                    })
+                }
+            }
+        }
+
+        /// The stored credential, if it is live and is not the token the
+        /// billing endpoint already rejected.
+        fn rewritten_live_credential(&self, rejected_token: Option<&str>) -> Option<Bearer> {
+            match self.stored_credential() {
+                Ok(StoredCredential::Live { bearer, refreshable }) if rejected_token != Some(bearer.as_str()) => {
+                    Some(Bearer {
+                        token: bearer,
+                        refreshable,
+                    })
+                }
+                _ => None,
             }
         }
 
@@ -644,7 +662,7 @@ pub mod grok {
                 }),
                 StoredCredential::Expired { refreshable: true } => {
                     *refreshed = true;
-                    self.refresh_via_cli("has expired").await
+                    self.refresh_via_cli("has expired", None).await
                 }
             }
         }
@@ -706,7 +724,10 @@ pub mod grok {
                 && !refreshed
             {
                 refreshed = true;
-                match self.refresh_via_cli("was rejected by the Grok billing endpoint").await {
+                match self
+                    .refresh_via_cli("was rejected by the Grok billing endpoint", Some(&bearer.token))
+                    .await
+                {
                     Ok(renewed) => response = self.billing_request(&renewed.token).await,
                     Err(TokenError { kind, reason }) => return unavailable(kind, reason),
                 }
@@ -1040,9 +1061,8 @@ pub mod grok {
             }
         }
 
-        /// The stored access
-        /// token has expired but a refresh token sits beside it. The CLI
-        /// refreshes, the probe re-reads, and the panel gets the real figure.
+        /// The stored access token has expired but a refresh token sits beside it.
+        /// The CLI refreshes, the probe re-reads, and the panel gets the real figure.
         #[tokio::test]
         async fn expired_but_refreshable_token_is_refreshed_through_the_cli_and_read() {
             let dir = scratch("expired_but_refreshable_token_is_refreshed_through_the_cli_and_read");
@@ -1098,6 +1118,31 @@ pub mod grok {
             reading(probe.probe().await);
             assert_eq!(cli.calls.load(Ordering::SeqCst), 0);
             assert_eq!(server.bearers.lock().unwrap().as_slice(), ["live-token"]);
+        }
+
+        #[tokio::test]
+        async fn rejected_live_token_the_cli_leaves_unchanged_is_not_signed_in_after_one_request() {
+            let dir = scratch("rejected_live_token_the_cli_leaves_unchanged_is_not_signed_in_after_one_request");
+            let auth = write_auth(&dir, &doc(live_record("rejected-token", true)));
+            let cli = cli(
+                GrokRefreshOutcome::NotLoggedIn {
+                    detail: "You are not authenticated.".to_owned(),
+                },
+                None,
+            );
+            let server = endpoint(vec![(401, "{}")]).await;
+            let probe = GrokQuotaProbe::with_base_url(&auth, &server.base_url, cli.clone());
+
+            let (kind, reason) = failure(probe.probe().await);
+            assert_eq!(kind, DriverQuotaFailureKind::NotAuthenticated);
+            assert!(reason.contains("You are not authenticated."), "{reason}");
+            assert!(reason.contains("grok login"), "{reason}");
+            assert_eq!(cli.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                server.bearers.lock().unwrap().as_slice(),
+                ["rejected-token"],
+                "the rejected token must not be sent a second time"
+            );
         }
 
         #[tokio::test]

@@ -96,6 +96,10 @@ pub(super) fn with_credential_reprobe<T>(
     let before = fingerprint_auth_credential(auth_path);
     let output = run()?;
     if !affirmed(&output) && before != fingerprint_auth_credential(auth_path) {
+        tracing::info!(
+            auth_path = %auth_path.display(),
+            "Grok OAuth credential was rewritten during an unaffirmed `grok models` pass; re-probing once"
+        );
         return run();
     }
     Ok(output)
