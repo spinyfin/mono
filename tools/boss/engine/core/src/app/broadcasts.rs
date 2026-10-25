@@ -43,8 +43,7 @@ impl ServerState {
     /// `worker.live_states` topic. Called whenever the events-socket
     /// consumer or the spawn flow mutates the registry.
     pub async fn broadcast_live_worker_states(&self) {
-        let states = self.live_worker_states_snapshot();
-        let envelope = FrontendEventEnvelope::push(FrontendEvent::WorkerLiveStatesList { states });
+        let envelope = FrontendEventEnvelope::push(self.live_worker_board_snapshot());
         self.topic_broker.publish(TOPIC_WORKER_LIVE_STATES, envelope).await;
     }
 

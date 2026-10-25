@@ -1046,7 +1046,9 @@ final class EngineClient: @unchecked Sendable {
                 emit(.error(message: "worker_live_states_list contains duplicate ids"))
                 return
             }
-            emit(.workerLiveStatesList(states: states))
+            let rawSections = payload["doing_sections"] as? [String: String] ?? [:]
+            let sections = rawSections.compactMapValues(DoingSection.init(rawValue:))
+            emit(.workerLiveStatesList(states: states, doingSections: sections))
         case "live_status_disabled_slots_list":
             let raw = payload["slot_ids"] as? [Any] ?? []
             let slotIds = raw.compactMap { ($0 as? NSNumber)?.intValue }

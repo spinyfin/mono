@@ -1,10 +1,9 @@
 import XCTest
 @testable import Boss
 
-/// Covers Doing's "Needs Attention" section: a task a blocked worker parked
-/// with a typed question (`blocked_reason = awaiting_operator_answer` plus an
-/// engine-projected `operator_question`) routes to Doing, renders in its own
-/// section above everything else, and is answered with Yes/No from the card.
+/// A task parked with a typed operator question stays in Doing. Without a
+/// live worker it leads the Queued section, ordered oldest question first,
+/// and can still be answered with Yes/No from the card.
 @MainActor
 final class OperatorQuestionKanbanTests: XCTestCase {
 
@@ -225,55 +224,55 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         )
     }
 
-    // MARK: - needsAttentionSection
+    // MARK: - queuedSection
 
-    func testNeedsAttentionSectionIsNilForEmptyItems() {
-        XCTAssertNil(ChatViewModel.needsAttentionSection(items: []))
+    func testQueuedSectionIsNilForEmptyItems() {
+        XCTAssertNil(ChatViewModel.queuedSection(items: []))
     }
 
-    func testNeedsAttentionSectionShape() throws {
-        let section = try XCTUnwrap(ChatViewModel.needsAttentionSection(items: [awaiting(id: "task_a")]))
-        XCTAssertEqual(section.id, "doing-needs-attention")
-        XCTAssertEqual(section.title, "Needs Attention")
+    func testQueuedSectionShape() throws {
+        let section = try XCTUnwrap(ChatViewModel.queuedSection(items: [awaiting(id: "task_a")]))
+        XCTAssertEqual(section.id, "doing-queued")
+        XCTAssertEqual(section.title, "Queued")
         XCTAssertTrue(section.isCollapsible)
         XCTAssertTrue(section.defaultExpanded)
-        XCTAssertEqual(section.groupKey, .needsAttention)
+        XCTAssertNil(section.groupKey)
     }
 
-    func testNeedsAttentionSectionOrdersOldestQuestionFirst() throws {
+    func testQueuedSectionOrdersOldestQuestionFirst() throws {
         let newest = awaiting(id: "task_a", askedAt: "1790000300")
         let oldest = awaiting(id: "task_c", askedAt: "1790000100")
         let middle = awaiting(id: "task_b", askedAt: "1790000200")
 
-        let section = try XCTUnwrap(ChatViewModel.needsAttentionSection(items: [newest, oldest, middle]))
+        let section = try XCTUnwrap(ChatViewModel.queuedSection(items: [newest, oldest, middle]))
 
         XCTAssertEqual(section.items.map(\.id), ["task_c", "task_b", "task_a"])
     }
 
-    func testNeedsAttentionSectionComparesInstantsAcrossTimestampFormats() throws {
+    func testQueuedSectionComparesInstantsAcrossTimestampFormats() throws {
         // 2026-10-05T00:00:00Z is epoch 1791158400; the RFC 3339 row is
         // earlier than the epoch row despite sorting later as a string.
         let epoch = awaiting(id: "task_a", askedAt: "1791158500")
         let rfc = awaiting(id: "task_b", askedAt: "2026-10-05T00:00:00Z")
 
-        let section = try XCTUnwrap(ChatViewModel.needsAttentionSection(items: [epoch, rfc]))
+        let section = try XCTUnwrap(ChatViewModel.queuedSection(items: [epoch, rfc]))
 
         XCTAssertEqual(section.items.map(\.id), ["task_b", "task_a"])
     }
 
-    func testNeedsAttentionSectionBreaksTiesAndSortsUnparseableLastByTaskID() throws {
+    func testQueuedSectionBreaksTiesAndSortsUnparseableLastByTaskID() throws {
         let tieB = awaiting(id: "task_b", askedAt: "1790000100")
         let tieA = awaiting(id: "task_a", askedAt: "1790000100")
         let garbage = awaiting(id: "task_0", askedAt: "not-a-time")
 
-        let section = try XCTUnwrap(ChatViewModel.needsAttentionSection(items: [garbage, tieB, tieA]))
+        let section = try XCTUnwrap(ChatViewModel.queuedSection(items: [garbage, tieB, tieA]))
 
         XCTAssertEqual(section.items.map(\.id), ["task_a", "task_b", "task_0"])
     }
 
     // MARK: - workSections(in: .doing)
 
-    func testDoingFlatGroupingPutsNeedsAttentionAboveRemainingCards() {
+    func testDoingFlatGroupingQueuesQuestionsAndOtherCardsWithoutWorkers() {
         let model = makeModel()
         model.choresByProductID = ["prod_test": [
             awaiting(id: "task_q"),
@@ -282,12 +281,12 @@ final class OperatorQuestionKanbanTests: XCTestCase {
 
         let sections = model.workSections(in: .doing)
 
-        XCTAssertEqual(sections.map(\.title), ["Needs Attention", "Doing"])
-        XCTAssertEqual(sections[0].items.map(\.id), ["task_q"])
-        XCTAssertEqual(sections[1].items.map(\.id), ["task_active"])
+        XCTAssertEqual(sections.map(\.title), ["Queued"])
+        XCTAssertEqual(sections[0].items.map(\.id), ["task_q", "task_active"])
+        XCTAssertEqual(sections[0].items.count, 2)
     }
 
-    func testDoingSectionIsOmittedWhenNoTaskIsAwaitingAnAnswer() {
+    func testOrdinaryDoingCardWithoutWorkerRendersQueued() {
         let model = makeModel()
         model.choresByProductID = ["prod_test": [
             makeTask(id: "task_active", status: "active", reason: nil, question: nil),
@@ -296,20 +295,20 @@ final class OperatorQuestionKanbanTests: XCTestCase {
 
         let sections = model.workSections(in: .doing)
 
-        XCTAssertFalse(sections.contains { $0.title == "Needs Attention" })
+        XCTAssertEqual(sections.map(\.title), ["Queued"])
         XCTAssertEqual(sections.flatMap(\.items).map(\.id), ["task_active"])
     }
 
-    func testDoingWithOnlyAQuestionRendersJustTheNeedsAttentionSection() {
+    func testDoingWithOnlyAQuestionRendersQueued() {
         let model = makeModel()
         model.choresByProductID = ["prod_test": [awaiting(id: "task_q")]]
 
         let sections = model.workSections(in: .doing)
 
-        XCTAssertEqual(sections.map(\.title), ["Needs Attention"])
+        XCTAssertEqual(sections.map(\.title), ["Queued"])
     }
 
-    func testDoingProjectGroupingKeepsNeedsAttentionAboveProjectGroups() {
+    func testDoingProjectGroupingStillQueuesQuestionsAndOtherCardsWithoutWorkers() {
         let model = makeModel()
         model.workBoardGrouping = .project
         model.choresByProductID = ["prod_test": [
@@ -319,43 +318,22 @@ final class OperatorQuestionKanbanTests: XCTestCase {
 
         let sections = model.workSections(in: .doing)
 
-        XCTAssertEqual(sections.first?.title, "Needs Attention")
-        XCTAssertEqual(sections.first?.items.map(\.id), ["task_q"])
-        XCTAssertEqual(sections.dropFirst().map(\.title), ["No Project"])
-        XCTAssertEqual(
-            sections.dropFirst().flatMap(\.items).map(\.id), ["task_active"],
-            "the awaiting task must not also appear in a project group"
-        )
+        XCTAssertEqual(sections.map(\.title), ["Queued"])
+        XCTAssertEqual(sections[0].items.map(\.id), ["task_q", "task_active"])
+        XCTAssertEqual(sections[0].items.count, 2, "each card must appear exactly once")
     }
 
-    func testBoardGroupMapsAwaitingTaskToNeedsAttention() {
+    func testBoardGroupIsNilForDoingCards() {
         let model = makeModel()
         let task = awaiting(id: "task_q")
         let active = makeTask(id: "task_active", status: "active", reason: nil, question: nil)
         model.choresByProductID = ["prod_test": [task, active]]
 
-        XCTAssertEqual(model.boardGroup(for: task), .needsAttention)
+        XCTAssertNil(model.boardGroup(for: task))
         XCTAssertNil(model.boardGroup(for: active))
     }
 
     // MARK: - Wire
-
-    /// The engine's `BoardGroup` has no Needs Attention member, so a drop on
-    /// the section must name only the column.
-    func testMoveRequestNeverSendsTheClientOnlyNeedsAttentionGroup() {
-        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
-        var sent: [[String: Any]] = []
-        client.outboundRecorder = { sent.append($0) }
-
-        client.sendMoveWorkItemOnBoard(id: "task_a", column: .doing, group: .needsAttention)
-        client.sendMoveWorkItemOnBoard(id: "task_a", column: .done, group: .merging)
-
-        let targets = sent.compactMap { $0["target"] as? [String: Any] }
-        XCTAssertEqual(targets.count, 2)
-        XCTAssertEqual(targets[0]["column"] as? String, "doing")
-        XCTAssertNil(targets[0]["group"])
-        XCTAssertEqual(targets[1]["group"] as? String, "merging")
-    }
 
     func testAnswerOperatorQuestionRequestEncoding() throws {
         let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
@@ -486,7 +464,7 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         XCTAssertNil(model.operatorAnswerInFlightByTaskID["task_q"])
         XCTAssertNil(model.operatorAnswerErrorByTaskID["task_q"])
         XCTAssertEqual(model.task(withID: "task_q")?.boardColumn, .doing)
-        XCTAssertFalse(model.workSections(in: .doing).contains { $0.title == "Needs Attention" })
+        XCTAssertEqual(model.workSections(in: .doing).map(\.title), ["Queued"])
     }
 
     func testUnrelatedUpdateKeepsAnswerPendingUntilItsRefusalArrives() {
@@ -528,7 +506,7 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         var sent: [[String: Any]] = []
         model.engine.outboundRecorder = { sent.append($0) }
 
-        XCTAssertTrue(model.attemptDrop(task.id, onColumn: .doing, group: .needsAttention))
+        XCTAssertTrue(model.attemptDrop(task.id, onColumn: .doing, group: nil))
         XCTAssertTrue(sent.isEmpty)
         XCTAssertNil(model.optimisticColumnByTaskID[task.id])
         XCTAssertNil(model.pendingDragAdmissionCheck)

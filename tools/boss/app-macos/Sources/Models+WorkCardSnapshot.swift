@@ -299,7 +299,7 @@ struct WorkCardSnapshot: Equatable {
 
         // Gated on the effective column, not just the task: an optimistic
         // drag out of Doing must not leave answer buttons on a card that has
-        // visibly left Needs Attention.
+        // visibly left the Queued section.
         let operatorQuestion: OperatorQuestionPresentation? = {
             guard column == .doing, task.isAwaitingOperatorAnswer,
                   let question = task.operatorQuestion

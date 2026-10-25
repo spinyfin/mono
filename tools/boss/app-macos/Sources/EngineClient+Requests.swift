@@ -629,7 +629,7 @@ extension EngineClient {
         observedPauseSinceEpochS: UInt64? = nil
     ) {
         var target: [String: Any] = ["column": column.rawValue]
-        if let group, group.isEngineBoardGroup {
+        if let group {
             target["group"] = group.rawValue
         }
         var payload: [String: Any] = [
