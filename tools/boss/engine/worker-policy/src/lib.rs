@@ -40,7 +40,9 @@ mod tiers;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tier_matrix_tests;
 
-pub use policy::{WorkerVerbDecision, variant_name, verb_decision, worker_verb_decision};
+pub use policy::{PROGRESSION_ALLOWED_VERBS, WorkerVerbDecision, variant_name, verb_decision, worker_verb_decision};
 pub use sanitize::{SANITIZED_EXECUTION_FIELDS, sanitize_event_for_worker};
 pub use tiers::{RpcTier, proposal_kind_decision};

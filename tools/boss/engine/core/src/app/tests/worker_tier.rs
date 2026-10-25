@@ -85,6 +85,22 @@ async fn progression_gate_is_unconditional_and_precedes_proposal_dispatch() {
     );
     assert!(state.authorize_rpc(RpcTier::Progression, Some(self_pid())));
     assert!(!state.authorize_rpc(RpcTier::Worker, Some(self_pid())));
+    // Progression peers are agents: the critical-raise guard covers them and
+    // their writes are attributed to the progression actor, not `human`.
+    assert!(peer.is_agent());
+    assert!(!peer.is_worker());
+    assert_eq!(
+        resolve_status_actor(&state, Some(self_pid())),
+        boss_protocol::LAST_STATUS_ACTOR_PROGRESSION
+    );
+    assert!(work_items::resolve_write_actor(&state, Some(self_pid()), Some("critical"), Some("medium")).is_err());
+    assert_eq!(
+        work_items::resolve_write_actor(&state, Some(self_pid()), Some("high"), Some("medium")).unwrap(),
+        boss_protocol::LAST_STATUS_ACTOR_PROGRESSION
+    );
+    let denial = state.progression_scope_denial(&peer, "test", "outside").unwrap();
+    assert_eq!(denial.reason, WorkerTierDenialReason::ProgressionScope);
+    assert!(!denial.message.contains("boss propose blocked"), "{}", denial.message);
     assert!(state.progression_scope_denial(&peer, "test", &item.id).is_none());
     assert!(state.progression_scope_denial(&peer, "test", "outside").is_some());
     assert!(

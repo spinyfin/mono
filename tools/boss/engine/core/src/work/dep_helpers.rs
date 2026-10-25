@@ -659,13 +659,15 @@ pub(crate) fn maybe_engine_unblock_dependent(
     //
     // The actor test goes through `StatusActor::is_engine_cascade` rather
     // than a bare `== "engine"` so the rule lives in one place and adding a
-    // fifth actor fails to compile there until someone decides which side
-    // it belongs on. `'boothby'` deliberately answers `false`, alongside
-    // `'human'` / `'boss'`: a Boothby block is a per-row judgement, not
-    // cascade bookkeeping, so this sweep must leave it alone exactly as it
-    // leaves a human's alone. (In practice the branch is unreachable for
-    // Boothby anyway — `write_engine_project_status` / `write_engine_task_status`
-    // are the only auto-blockers and both hardcode `'engine'`.)
+    // new actor fails to compile there until someone decides which side it
+    // belongs on. `'boothby'` and `'progression'` deliberately answer
+    // `false`, alongside `'human'` / `'boss'`: a Boothby block is a per-row
+    // judgement and a progression decision is a scoped, autonomous one —
+    // neither is cascade bookkeeping, so this sweep must leave them alone
+    // exactly as it leaves a human's alone. (In practice the branch is
+    // unreachable for either — `write_engine_project_status` /
+    // `write_engine_task_status` are the only auto-blockers and both
+    // hardcode `'engine'`.)
     //
     // An actor outside the known vocabulary fails to parse and is treated
     // as not-engine-owned, preserving the exact behaviour of the `==

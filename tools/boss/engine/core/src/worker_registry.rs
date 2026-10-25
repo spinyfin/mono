@@ -133,15 +133,17 @@ impl WorkerRegistry {
 
     /// Record that pid is the worker process for run `run_id`. Called by
     /// the spawn flow once it has both the run id and the spawned pid.
+    ///
+    /// An existing progression registration for `pid` keeps its progression
+    /// bit: re-registering must never downgrade a confined peer to worker tier.
     pub fn register(&self, pid: libc::pid_t, run_id: impl Into<String>) {
         self.register_with_start(pid, run_id, process_start(pid).ok());
     }
 
     fn register_with_start(&self, pid: libc::pid_t, run_id: impl Into<String>, start: Option<ProcessStart>) {
-        self.inner.lock().expect("registry poisoned").pid_to_run.insert(
-            pid,
-            RegisteredPid { run_id: run_id.into(), start, progression: false },
-        );
+        let mut inner = self.inner.lock().expect("registry poisoned");
+        let progression = inner.pid_to_run.get(&pid).is_some_and(|entry| entry.start == start && entry.progression);
+        inner.pid_to_run.insert(pid, RegisteredPid { run_id: run_id.into(), start, progression });
     }
 
     /// Capture durable authority before exposing the progression identity.
@@ -489,6 +491,26 @@ pub fn parent_pid(_pid: libc::pid_t) -> io::Result<Option<libc::pid_t>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_after_register_progression_keeps_progression_tier() {
+        let reg = WorkerRegistry::new();
+        reg.inner
+            .lock()
+            .unwrap()
+            .pid_to_run
+            .insert(77, RegisteredPid { run_id: "run-p".to_owned(), start: process_start(77).ok(), progression: true });
+        reg.register(77, "run-p");
+        assert_eq!(
+            reg.lookup_classified_with_ancestor_walk(77),
+            Some(("run-p".to_owned(), true))
+        );
+        reg.register(78, "run-w");
+        assert_eq!(
+            reg.lookup_classified_with_ancestor_walk(78),
+            Some(("run-w".to_owned(), false))
+        );
+    }
 
     #[test]
     fn register_and_lookup() {

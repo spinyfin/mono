@@ -2389,7 +2389,8 @@ async fn handle_frontend_connection(
             session_id = %session_id,
             peer_pid = ?peer_pid,
             run_id = %run_id,
-            "frontend connection classified as worker tier",
+            tier = if peer_class.is_progression() { "progression" } else { "worker" },
+            "frontend connection classified as an agent tier",
         );
     }
     let peer_is_worker = peer_class.is_worker();
