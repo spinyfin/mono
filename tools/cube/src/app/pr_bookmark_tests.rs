@@ -130,6 +130,10 @@ fn exercise_publication(scenario: Scenario) {
     jj(&repo, &["workspace", "add", worker.to_str().unwrap(), "-r", "main"]);
     if scenario == Scenario::Divergent {
         jj(&worker, &["edit", &published_before]);
+        // Distinguish this rewrite before rebasing: identical metadata and
+        // trees can recreate the first conflicted commit within one timestamp
+        // tick, so resolving it would replace that side instead of diverging.
+        jj(&worker, &["describe", "-m", "independent resolution"]);
         jj(&worker, &["rebase", "-r", "@", "-d", "main"]);
     } else {
         jj(&worker, &["duplicate", "feature", "--insert-before", "@"]);
