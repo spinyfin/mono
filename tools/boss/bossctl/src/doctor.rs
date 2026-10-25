@@ -231,6 +231,7 @@ pub fn match_dispatch_signatures(
     findings.extend(match_sig_d_transient_exhausted(events, scope_execution_ids));
     findings.extend(match_sig_e_spawn_nack(events, scope_execution_ids));
     findings.extend(match_sig_f_worker_parse(events, scope_execution_ids));
+    findings.extend(match_sig_i_repeated_pre_start_failure(events, scope_execution_ids));
     // Fleet scan: a wedged husk breaker is a pool-level fact, and the
     // execution an operator diagnoses is usually the redispatch it blocked,
     // not one of the held-back runs.
@@ -1199,6 +1200,71 @@ fn match_sig_f_worker_parse(events: &[DispatchEvent], scope: &BTreeSet<String>) 
                        against historical pool-prefix bugs."
                 .into(),
             details: event.details.clone(),
+        });
+    }
+    out
+}
+
+// ── SIG-I ──────────────────────────────────────────────────────────────
+
+/// Minimum identical pre-start failures for a work item before SIG-I fires.
+const SIG_I_MIN_REPEATS: usize = 2;
+
+/// The same pre-start failure (same reason, same error text) recorded
+/// repeatedly against a work item: the retry loop is not curing it, so
+/// the cause is environmental or a code defect rather than a transient.
+fn match_sig_i_repeated_pre_start_failure(events: &[DispatchEvent], scope: &BTreeSet<String>) -> Vec<Finding> {
+    let mut groups: BTreeMap<(String, String, String), Vec<&DispatchEvent>> = BTreeMap::new();
+    for event in events {
+        if !in_scope(&event.execution_id, scope) || event.stage != "pre_start_failure" || event.outcome != "error" {
+            continue;
+        }
+        let reason = event.details.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+        let error = event.error_message.as_deref().unwrap_or("");
+        groups
+            .entry((
+                work_item_of(event)
+                    .map(|id| format!("work:{id}"))
+                    .unwrap_or_else(|| format!("execution:{}", event.execution_id)),
+                reason.to_owned(),
+                error.to_owned(),
+            ))
+            .or_default()
+            .push(event);
+    }
+    let mut out = Vec::new();
+    for ((_, reason, error), group) in groups {
+        if group.len() < SIG_I_MIN_REPEATS {
+            continue;
+        }
+        let exhausted = events.iter().any(|e| {
+            group.iter().any(|failure| failure.execution_id == e.execution_id)
+                && e.stage == "pre_start_retries_exhausted"
+                && e.outcome == "error"
+        });
+        out.push(Finding {
+            sig_id: "SIG-I".into(),
+            absence_based: false,
+            severity: if exhausted { Severity::P1 } else { Severity::P2 },
+            title: format!(
+                "Repeated pre-start failure ({reason}) x{}{}",
+                group.len(),
+                if exhausted { ", retries exhausted" } else { "" }
+            ),
+            execution_id: group
+                .iter()
+                .all(|e| e.execution_id == group[0].execution_id)
+                .then(|| group[0].execution_id.clone()),
+            work_item_id: work_item_of(group[0]),
+            count: group.len(),
+            evidence: group.iter().map(|e| evidence_line(e)).collect(),
+            recovery: format!(
+                "The same error recurred on every attempt, so retrying will not clear it: {error}. \
+                 Fix the cause named by `{reason}` (cube repo/workspace health, jj bookmark \
+                 state, host reachability) before re-dispatching; once retries are exhausted \
+                 the work item is bounced to the backlog with autostart cleared."
+            ),
+            details: serde_json::json!({ "reason": reason, "error": error, "retries_exhausted": exhausted }),
         });
     }
     out

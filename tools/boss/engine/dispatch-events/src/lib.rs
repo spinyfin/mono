@@ -180,6 +180,23 @@ pub enum Stage {
     /// occupant). Readers keying off `pane_spawned` — `bossctl doctor`'s
     /// SIG-B/SIG-F/SIG-H signatures — are unaffected.
     SpawnFailed,
+    /// A dispatch attempt failed before the run started and the engine
+    /// recorded it (`record_start_failure`): cube repo ensure, workspace
+    /// lease, change create, execution-bookmark creation or run start.
+    /// Emitted once per failure — including every failure that is about to
+    /// be retried — always with outcome `error`, so the failed stage is
+    /// terminal on the timeline and `stage_stalled` never fires for it.
+    /// `error_message` carries the full error chain; `details` carries
+    /// `reason` (the failure kind, e.g. `execution_bookmark_create_failed`),
+    /// `pre_start_failure_count`, `will_retry` and, when retrying,
+    /// `retry_delay_secs`.
+    PreStartFailure,
+    /// Pre-start retries are exhausted (or the failure kind is never
+    /// retried): the attempt failed for good. `details.reason` is the
+    /// failure kind, `details.pre_start_failure_count` the attempts spent
+    /// and `details.bounced_to_backlog` whether the work item was returned
+    /// to the backlog with autostart cleared. Always outcome `error`.
+    PreStartRetriesExhausted,
     /// The completion handler finished tearing down an execution it had
     /// just terminalized — pane released, driver state torn down, cube
     /// lease released (or its release timed out and was abandoned to cube's
@@ -839,7 +856,7 @@ pub enum TimelineStageClass {
 
 impl Stage {
     /// Every stable stage name, for exhaustive schema-contract tests.
-    pub const ALL: [Stage; 65] = [
+    pub const ALL: [Stage; 67] = [
         Stage::StatusTransition,
         Stage::RequestRecorded,
         Stage::WorkerClaimed,
@@ -857,6 +874,8 @@ impl Stage {
         Stage::PaneSpawned,
         Stage::ExecutionCancelled,
         Stage::SpawnFailed,
+        Stage::PreStartFailure,
+        Stage::PreStartRetriesExhausted,
         Stage::ExecutionFinalized,
         Stage::StageStalled,
         Stage::OrphanActiveRedispatch,
@@ -941,6 +960,8 @@ impl Stage {
             Stage::PaneSpawned => "pane_spawned",
             Stage::ExecutionCancelled => "execution_cancelled",
             Stage::SpawnFailed => "spawn_failed",
+            Stage::PreStartFailure => "pre_start_failure",
+            Stage::PreStartRetriesExhausted => "pre_start_retries_exhausted",
             Stage::ExecutionFinalized => "execution_finalized",
             Stage::StageStalled => "stage_stalled",
             Stage::OrphanActiveRedispatch => "orphan_active_redispatch",
@@ -1045,6 +1066,8 @@ impl Stage {
             | Stage::RunStarted
             | Stage::PaneSpawned
             | Stage::SpawnFailed
+            | Stage::PreStartFailure
+            | Stage::PreStartRetriesExhausted
             // Re-entry points: a fresh dispatch starts (or is re-driven)
             // from these, so what follows is pipeline progress.
             | Stage::OrphanActiveRedispatch
@@ -1841,6 +1864,8 @@ mod tests {
         assert_eq!(Stage::PaneSpawned.as_str(), "pane_spawned");
         assert_eq!(Stage::ExecutionCancelled.as_str(), "execution_cancelled");
         assert_eq!(Stage::SpawnFailed.as_str(), "spawn_failed");
+        assert_eq!(Stage::PreStartFailure.as_str(), "pre_start_failure");
+        assert_eq!(Stage::PreStartRetriesExhausted.as_str(), "pre_start_retries_exhausted");
         assert_eq!(Stage::StageStalled.as_str(), "stage_stalled");
         assert_eq!(Stage::OrphanActiveRedispatch.as_str(), "orphan_active_redispatch");
         assert_eq!(Stage::PrReviewDeadRecovery.as_str(), "pr_review_dead_recovery");

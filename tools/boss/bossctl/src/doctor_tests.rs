@@ -423,6 +423,88 @@ fn sig_d_wire_reasons_only() {
     assert_eq!(sigd[0].execution_id.as_deref(), Some("exec_sigd_indet"));
 }
 
+fn pre_start_failure_json(exec: &str, ts: u64, error: &str) -> String {
+    format!(
+        r#"{{"ts_epoch_ms":{ts},"stage":"pre_start_failure","outcome":"error","execution_id":"{exec}","error_message":"{error}","details":{{"reason":"execution_bookmark_create_failed","pre_start_failure_count":1,"will_retry":true}}}}"#
+    )
+}
+
+#[test]
+fn sig_i_flags_the_same_pre_start_failure_repeating() {
+    let same = "jj bookmark create failed";
+    let events = [
+        ev_from_json(&pre_start_failure_json("exec_sigi", 1_784_900_000_000, same)),
+        ev_from_json(&pre_start_failure_json("exec_sigi", 1_784_900_060_000, same)),
+        ev_from_json(
+            r#"{"ts_epoch_ms":1784900120000,"stage":"pre_start_retries_exhausted","outcome":"error","execution_id":"exec_sigi","details":{"reason":"execution_bookmark_create_failed","pre_start_failure_count":3,"bounced_to_backlog":true}}"#,
+        ),
+        // A different execution failing once, and one failing with a
+        // different error each time, must not match.
+        ev_from_json(&pre_start_failure_json("exec_once", 1_784_900_000_000, same)),
+        ev_from_json(&pre_start_failure_json("exec_varied", 1_784_900_000_000, "a")),
+        ev_from_json(&pre_start_failure_json("exec_varied", 1_784_900_060_000, "b")),
+    ];
+    let findings = match_dispatch_signatures(
+        &events,
+        0,
+        None,
+        None,
+        &scope(&["exec_sigi", "exec_once", "exec_varied"]),
+    );
+    let sig_i: Vec<_> = findings.iter().filter(|f| f.sig_id == "SIG-I").collect();
+    assert_eq!(sig_i.len(), 1, "{sig_i:?}");
+    assert_eq!(sig_i[0].execution_id.as_deref(), Some("exec_sigi"));
+    assert_eq!(sig_i[0].count, 2);
+    assert_eq!(sig_i[0].severity, Severity::P1);
+    assert_eq!(sig_i[0].details["error"], same);
+    assert_eq!(sig_i[0].details["retries_exhausted"], true);
+}
+
+/// A pre-start failure in the stream shows up in `diagnose` output: both in
+/// the rendered timeline and as a SIG-I finding once it repeats.
+#[test]
+fn a_pre_start_failure_appears_in_the_diagnose_timeline_and_findings() {
+    let events = [
+        ev_from_json(
+            r#"{"ts_epoch_ms":1784900000000,"stage":"cube_change_created","outcome":"ok","execution_id":"exec_diag"}"#,
+        ),
+        ev_from_json(&pre_start_failure_json(
+            "exec_diag",
+            1_784_900_001_000,
+            "jj bookmark create failed",
+        )),
+        ev_from_json(&pre_start_failure_json(
+            "exec_diag",
+            1_784_900_061_000,
+            "jj bookmark create failed",
+        )),
+    ];
+    let rendered = render_timeline(&events, &[], 1_784_900_100_000);
+    assert!(rendered.contains("pre_start_failure"), "{rendered}");
+    assert!(rendered.contains("jj bookmark create failed"), "{rendered}");
+    let findings = match_dispatch_signatures(&events, 1_784_900_100_000, None, None, &scope(&["exec_diag"]));
+    assert!(findings.iter().any(|f| f.sig_id == "SIG-I"), "{findings:?}");
+}
+
+#[test]
+fn sig_i_groups_successive_executions_of_one_work_item_but_respects_scope() {
+    let mut first = ev_from_json(&pre_start_failure_json("exec_first", 1000, "bookmark failed"));
+    first.work_item_id = Some("work_repeated".into());
+    let mut second = ev_from_json(&pre_start_failure_json("exec_second", 2000, "bookmark failed"));
+    second.work_item_id = first.work_item_id.clone();
+    let mut unrelated = ev_from_json(&pre_start_failure_json("exec_other", 3000, "bookmark failed"));
+    unrelated.work_item_id = Some("work_other".into());
+    let events = [first, second, unrelated];
+    let findings = match_dispatch_signatures(&events, 0, None, None, &scope(&[]));
+    let repeated: Vec<_> = findings.iter().filter(|f| f.sig_id == "SIG-I").collect();
+    assert_eq!(repeated.len(), 1);
+    assert_eq!(repeated[0].count, 2);
+    assert_eq!(repeated[0].work_item_id.as_deref(), Some("work_repeated"));
+    assert_eq!(repeated[0].execution_id, None);
+    let scoped = match_dispatch_signatures(&events, 0, None, None, &scope(&["exec_first"]));
+    assert!(scoped.iter().all(|f| f.sig_id != "SIG-I"));
+}
+
 #[test]
 fn sig_e_and_f() {
     let nack = ev_from_json(

@@ -2340,14 +2340,21 @@ impl ExecutionCoordinator {
         if current.status != ExecutionStatus::Claimed {
             return;
         }
-        if let Err(record_err) = self.record_start_failure(
-            Arc::clone(self),
-            &current,
-            worker_id,
-            current.cube_repo_id.as_deref(),
-            ("schedule_execution_error", "spawn failed after claim"),
-            err,
-        ) {
+        // Do not record the same attempt again when its event was already emitted.
+        let recovery = if err.is::<super::execution::PreStartFailureReported>() {
+            Err(anyhow::anyhow!("pre-start failure already reported: {err:#}"))
+        } else {
+            self.record_start_failure(
+                Arc::clone(self),
+                &current,
+                worker_id,
+                current.cube_repo_id.as_deref(),
+                ("schedule_execution_error", "spawn failed after claim"),
+                err,
+            )
+            .await
+        };
+        if let Err(record_err) = recovery {
             tracing::error!(
                 execution_id = %current.id,
                 error = %record_err,

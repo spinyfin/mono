@@ -37,6 +37,203 @@ async fn bookmark_creation_failure_is_recorded_before_a_worker_can_start() {
     );
 }
 
+async fn wait_for_stage(
+    sink: &crate::dispatch_events::RecordingDispatchEventSink,
+    execution_id: &str,
+    stage: &str,
+) -> Vec<crate::dispatch_events::DispatchEvent> {
+    for _ in 0..200 {
+        let events = sink.events_for(execution_id).await;
+        if events.iter().any(|event| event.stage == stage) {
+            return events;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "no `{stage}` event for {execution_id}; got {:?}",
+        sink.events_for(execution_id).await
+    );
+}
+
+/// The dispatch event stream, not just the tracing log, must record a
+/// pre-start failure. Without it the timeline stops at `cube_change_created
+/// ok`, `bossctl dispatch diagnose` shows no failure, and `stage_stalled`
+/// fires on a stage that had already failed.
+#[tokio::test]
+async fn bookmark_creation_failure_reaches_the_dispatch_event_stream() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Bookmark failure");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let cube = Arc::new(FakeCubeClient {
+        fail_bookmark_create: true,
+        ..Default::default()
+    });
+    let sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube,
+            Arc::new(FakeExecutionRunner::default()),
+        )
+        .with_pre_start_retry_delays(vec![])
+        .with_dispatch_events(sink.clone()),
+    );
+    coordinator.kick();
+    let id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+    let events = wait_for_stage(&sink, &id, "pre_start_retries_exhausted").await;
+
+    let failure = events
+        .iter()
+        .find(|event| event.stage == "pre_start_failure")
+        .expect("pre_start_failure event");
+    assert_eq!(failure.outcome, "error");
+    assert!(
+        failure
+            .error_message
+            .as_deref()
+            .is_some_and(|error| error.contains("jj bookmark create failed")),
+        "{failure:?}"
+    );
+    assert_eq!(
+        failure.details["reason"],
+        crate::execution_bookmark_recovery::CREATE_FAILED
+    );
+    assert_eq!(failure.details["will_retry"], false);
+
+    let exhausted = events
+        .iter()
+        .find(|event| event.stage == "pre_start_retries_exhausted")
+        .expect("pre_start_retries_exhausted event");
+    assert_eq!(exhausted.outcome, "error");
+    assert_eq!(exhausted.details["pre_start_failure_count"], 1);
+
+    // The failure is recorded as the timeline's terminal event, so the
+    // stalled-stage detector has nothing to flag — no detector special case.
+    let timeline = crate::dispatch_reader::TimelineState::from_events(&events).unwrap();
+    assert!(!timeline.is_live(), "failed pre-start stage must not stay live");
+    let thresholds = crate::dispatch_reader::StageThresholds::new(Duration::from_secs(1));
+    assert!(timeline.stall_to_emit(&id, u128::MAX / 2, &thresholds).is_none());
+}
+
+/// A failure that will be retried is recorded too, flagged `will_retry`
+/// with its backoff, and is not followed by a terminal "exhausted" event.
+#[tokio::test]
+async fn retried_pre_start_failure_is_recorded_with_its_backoff() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Bookmark failure");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let cube = Arc::new(FakeCubeClient {
+        fail_bookmark_create: true,
+        ..Default::default()
+    });
+    let sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube,
+            Arc::new(FakeExecutionRunner::default()),
+        )
+        .with_pre_start_retry_delays(vec![Duration::from_secs(3600)])
+        .with_dispatch_events(sink.clone()),
+    );
+    coordinator.kick();
+    let id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+    let events = wait_for_stage(&sink, &id, "pre_start_failure").await;
+    let failure = events.iter().find(|event| event.stage == "pre_start_failure").unwrap();
+    assert_eq!(failure.outcome, "error");
+    assert_eq!(failure.details["will_retry"], true);
+    assert_eq!(failure.details["retry_delay_secs"], 3600);
+    assert_eq!(failure.details["pre_start_failure_count"], 1);
+    assert!(events.iter().all(|event| event.stage != "pre_start_retries_exhausted"));
+}
+
+#[tokio::test]
+async fn bookkeeping_failure_is_terminal_and_recovery_does_not_record_it_twice() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("boss.db");
+    let db = Arc::new(WorkDb::open(path.clone()).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Bookkeeping failure");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let execution = db.list_executions(Some(&chore.id)).unwrap().remove(0);
+    db.claim_execution_for_dispatch(&execution.id).unwrap();
+    let execution = db.get_execution(&execution.id).unwrap();
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_failure BEFORE UPDATE OF pre_start_failure_count ON work_executions
+         BEGIN SELECT RAISE(ABORT, 'bookkeeping unavailable'); END;",
+        )
+        .unwrap();
+    let sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            Arc::new(FakeCubeClient::default()),
+            Arc::new(FakeExecutionRunner::default()),
+        )
+        .with_dispatch_events(sink.clone()),
+    );
+    let original = anyhow!("underlying bookmark error").context("bookmark creation failed");
+    let error = coordinator
+        .record_start_failure(
+            coordinator.clone(),
+            &execution,
+            "worker-1",
+            Some("mono"),
+            ("execution_bookmark_create_failed", "Bookmark failed"),
+            &original,
+        )
+        .await
+        .unwrap_err();
+    // Even if the database recovers, fallback must not count this attempt again.
+    connection.execute_batch("DROP TRIGGER reject_failure").unwrap();
+    coordinator
+        .recover_failed_dispatch(&execution, "worker-1", &error)
+        .await;
+    let events = sink.events_for(&execution.id).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    let failure = &events[0];
+    assert_eq!(failure.stage, "pre_start_failure");
+    assert_eq!(failure.outcome, "error");
+    assert_eq!(failure.worker_id.as_deref(), Some("worker-1"));
+    assert_eq!(failure.cube_repo_id.as_deref(), Some("mono"));
+    assert_eq!(
+        failure.error_message.as_deref(),
+        Some("bookmark creation failed: underlying bookmark error")
+    );
+    assert_eq!(failure.details["reason"], "execution_bookmark_create_failed");
+    assert_eq!(failure.details["will_retry"], false);
+    assert!(
+        failure.details["bookkeeping_error"]
+            .as_str()
+            .unwrap()
+            .contains("bookkeeping unavailable")
+    );
+    assert!(failure.details.get("pre_start_failure_count").is_none());
+    let after = db.get_execution(&execution.id).unwrap();
+    assert_eq!(after.pre_start_failure_count, 0);
+    assert_eq!(after.status, ExecutionStatus::Ready);
+    let timeline = crate::dispatch_reader::TimelineState::from_events(&events).unwrap();
+    assert!(!timeline.is_live());
+    let thresholds = crate::dispatch_reader::StageThresholds::new(Duration::from_secs(1));
+    assert!(
+        timeline
+            .stall_to_emit(&execution.id, u128::MAX / 2, &thresholds)
+            .is_none()
+    );
+}
+
 #[tokio::test]
 async fn sweep_reports_real_unpushed_revisions_independent_of_original_workspace_and_ignores_empty_runs() {
     for original_state in ["released", "removed", "reused", "leased_elsewhere"] {
