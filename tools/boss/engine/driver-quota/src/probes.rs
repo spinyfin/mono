@@ -345,12 +345,10 @@ pub mod codex {
 /// The CLI stores a short-lived access token (observed: six hours) beside a
 /// refresh token, and renews it lazily — on its next API call, never on a
 /// timer. Judged by `expires_at` alone, the stored token therefore reads as
-/// expired for most of any day on which the operator has not run `grok`,
-/// while the CLI itself would report (and be) logged in. Reporting "not
-/// signed in" from the file alone was wrong whenever a refresh token sat
-/// beside the expired access token; the refresh step is what makes the panel
-/// agree with the CLI. "Not signed in" is now reserved for the cases where it
-/// is true: no account, no refresh token, or a refresh the issuer rejected.
+/// expired for most of any day on which `grok` has not been run.
+/// The refresh step lets the CLI renew that token before the panel reports
+/// sign-in state. "Not signed in" means no account, no refresh token, or a
+/// refresh the issuer rejected.
 pub mod grok {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -407,7 +405,7 @@ pub mod grok {
         /// token the issuer no longer accepts.
         NotLoggedIn { detail: String },
         /// The CLI could not be run to completion (not installed, crashed,
-        /// timed out). Says nothing about whether the operator is signed in.
+        /// timed out). Says nothing about whether a login is available.
         Failed { detail: String },
     }
 
@@ -598,11 +596,8 @@ pub mod grok {
                         token: bearer,
                         refreshable,
                     }),
-                    // The CLI says signed in; the file still says expired. The
-                    // CLI's word wins on *sign-in state* — reporting "not
-                    // signed in" here would be the very bug this path fixes —
-                    // but there is no usable token, so the figure is
-                    // unavailable for a reason that is not the operator's.
+                    // The CLI affirms a login but there is no usable token,
+                    // so this is a check failure rather than a sign-out.
                     StoredCredential::Expired { .. } => Err(TokenError {
                         kind: DriverQuotaFailureKind::ProbeFailed,
                         reason: format!(
@@ -610,12 +605,21 @@ pub mod grok {
                         ),
                     }),
                 },
-                GrokRefreshOutcome::NotLoggedIn { detail } => Err(TokenError {
-                    kind: DriverQuotaFailureKind::NotAuthenticated,
-                    reason: format!(
-                        "stored Grok token {why} and the grok CLI could not refresh it ({detail}) — sign in with `grok login`"
-                    ),
-                }),
+                GrokRefreshOutcome::NotLoggedIn { detail } => {
+                    // A banner can describe the state before the CLI refreshed.
+                    if let Ok(StoredCredential::Live { bearer, refreshable }) = self.stored_credential() {
+                        return Ok(Bearer {
+                            token: bearer,
+                            refreshable,
+                        });
+                    }
+                    Err(TokenError {
+                        kind: DriverQuotaFailureKind::NotAuthenticated,
+                        reason: format!(
+                            "stored Grok token {why} and the grok CLI could not refresh it ({detail}) — sign in with `grok login`"
+                        ),
+                    })
+                }
                 GrokRefreshOutcome::Failed { detail } => Err(TokenError {
                     kind: DriverQuotaFailureKind::ProbeFailed,
                     reason: format!(
@@ -1036,7 +1040,7 @@ pub mod grok {
             }
         }
 
-        /// The bug this crate's refresh step exists for: the stored access
+        /// The stored access
         /// token has expired but a refresh token sits beside it. The CLI
         /// refreshes, the probe re-reads, and the panel gets the real figure.
         #[tokio::test]
@@ -1045,6 +1049,29 @@ pub mod grok {
             let auth = write_auth(&dir, &doc(expired_record("stale-token", true)));
             let cli = cli(
                 GrokRefreshOutcome::LoggedIn,
+                Some((auth.clone(), doc(live_record("fresh-token", true)))),
+            );
+            let server = endpoint(vec![(200, BILLING_OK)]).await;
+            let probe = GrokQuotaProbe::with_base_url(&auth, &server.base_url, cli.clone());
+
+            let reading = reading(probe.probe().await);
+            assert_eq!(reading.used_percent, 12.5);
+            assert_eq!(cli.calls.load(Ordering::SeqCst), 1, "exactly one CLI pass");
+            assert_eq!(
+                server.bearers.lock().unwrap().as_slice(),
+                ["fresh-token"],
+                "the request must carry the token the CLI wrote, never the stale one"
+            );
+        }
+
+        #[tokio::test]
+        async fn stale_signed_out_banner_with_live_rewrite_returns_usage() {
+            let dir = scratch("stale_signed_out_banner_with_live_rewrite_returns_usage");
+            let auth = write_auth(&dir, &doc(expired_record("stale-token", true)));
+            let cli = cli(
+                GrokRefreshOutcome::NotLoggedIn {
+                    detail: "You are not authenticated.".to_owned(),
+                },
                 Some((auth.clone(), doc(live_record("fresh-token", true)))),
             );
             let server = endpoint(vec![(200, BILLING_OK)]).await;

@@ -18,8 +18,9 @@
 //! inference call, and the same probe the worker preflight already relies on
 //! (see [`super::preflight`]). Observed on `grok 1.0.70`:
 //!
-//! - a usable or refreshable credential prints [`GROK_LOGIN_AFFIRMATION`]
-//!   and, if the token was expired, rewrites `auth.json` as a side effect;
+//! - a usable credential prints [`GROK_LOGIN_AFFIRMATION`]; an expired but
+//!   refreshable token is rewritten in `auth.json`, possibly with a stale
+//!   unauthenticated banner until the next invocation;
 //! - no credential, or a refresh token the issuer rejects, prints
 //!   "You are not authenticated." and exits 0 — it never opens a browser or
 //!   starts a device-code flow, so it is safe to run from a headless engine;
@@ -29,12 +30,13 @@
 //!
 //! # What this never does
 //!
-//! It never reads, parses, or writes the credential file. It only waits for
-//! the CLI's own refresh lock, runs the CLI, and reports the CLI's banner.
+//! It reads only credential metadata, never credential bytes, and never writes
+//! the file. It waits for the CLI's refresh lock and re-probes once if an
+//! unaffirmed pass changes that metadata, within the same time budget.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, bail};
 
@@ -66,6 +68,39 @@ pub enum GrokOauthLiveness {
     NotLoggedIn { detail: String },
 }
 
+/// Cheap, content-blind snapshot of the shared OAuth credential's on-disk
+/// state, used to detect whether a refresh rewrote the file during the
+/// probe. Never reads the credential bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AuthFingerprint {
+    modified: SystemTime,
+    len: u64,
+}
+
+fn fingerprint_auth_credential(auth_path: &Path) -> Option<AuthFingerprint> {
+    let metadata = std::fs::metadata(auth_path).ok()?;
+    let modified = metadata.modified().ok()?;
+    Some(AuthFingerprint {
+        modified,
+        len: metadata.len(),
+    })
+}
+
+/// Re-probe once when an unaffirmed pass changes the credential metadata.
+/// The CLI can render its banner before refreshing the credential.
+pub(super) fn with_credential_reprobe<T>(
+    auth_path: &Path,
+    mut run: impl FnMut() -> anyhow::Result<T>,
+    affirmed: impl Fn(&T) -> bool,
+) -> anyhow::Result<T> {
+    let before = fingerprint_auth_credential(auth_path);
+    let output = run()?;
+    if !affirmed(&output) && before != fingerprint_auth_credential(auth_path) {
+        return run();
+    }
+    Ok(output)
+}
+
 /// Ask the Grok CLI to exercise (and, if needed, refresh) the shared OAuth
 /// credential at `auth_path`, within `budget` of wall-clock time.
 ///
@@ -74,7 +109,7 @@ pub enum GrokOauthLiveness {
 /// Callers on an async runtime must use `spawn_blocking`. `Err` means the CLI
 /// could not be run to completion (not installed, non-zero exit, timed out,
 /// budget spent waiting on a live refresh lock) — it says nothing about
-/// whether the operator is signed in.
+/// whether a login is available.
 pub fn refresh_shared_oauth_credential_blocking(
     auth_path: &Path,
     budget: Duration,
@@ -95,17 +130,27 @@ fn refresh_with_program(program: &Path, auth_path: &Path, budget: Duration) -> a
         );
     }
 
-    let mut command = credential_pass_command(program, auth_path);
-    let output = run_bounded_as(&mut command, remaining, FAILURE_PREFIX)?;
-    classify(output.status.success(), &output.stdout, &output.stderr)
+    with_credential_reprobe(
+        auth_path,
+        || {
+            let remaining = budget.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                bail!("{FAILURE_PREFIX}: credential pass exhausted its time budget");
+            }
+            let mut command = credential_pass_command(program, auth_path);
+            let output = run_bounded_as(&mut command, remaining, FAILURE_PREFIX)?;
+            classify(output.status.success(), &output.stdout, &output.stderr)
+        },
+        |outcome| matches!(outcome, GrokOauthLiveness::LoggedIn),
+    )
 }
 
 /// `grok models` against the shared credential, OAuth only, no terminal.
 ///
 /// The working directory is `/`: it is never a Boss workspace, so the CLI
 /// picks up no project configuration, and it always exists. `HOME` and
-/// `GROK_HOME` are inherited on purpose — this is the operator's own CLI
-/// doing exactly what "run any grok command" would do in their shell.
+/// `GROK_HOME` are inherited so the pass refreshes the same credential as
+/// running `grok models` by hand.
 fn credential_pass_command(program: &Path, auth_path: &Path) -> Command {
     let mut command = Command::new(program);
     command.arg("models").current_dir("/").stdin(Stdio::null());
@@ -269,17 +314,73 @@ echo "Default model: grok-4.7""#,
     }
 
     #[test]
+    fn repeated_rewrites_do_not_trigger_a_third_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        fs::write(&auth, "{}").unwrap();
+        let mut calls = 0;
+        let outcome = with_credential_reprobe(
+            &auth,
+            || {
+                calls += 1;
+                fs::write(&auth, "x".repeat(calls + 2))?;
+                Ok(false)
+            },
+            |affirmed| *affirmed,
+        )
+        .unwrap();
+        assert!(!outcome);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn stale_banner_after_rewrite_is_reprobed_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        fs::write(&auth, "{}").unwrap();
+        let program = stub(
+            dir.path(),
+            "grok",
+            r#"
+echo call >> "$GROK_AUTH_PATH.calls"
+if [ "$(cat "$GROK_AUTH_PATH")" = "{}" ]; then
+    echo refreshed > "$GROK_AUTH_PATH"
+    echo "You are not authenticated."
+else
+    echo "You are logged in with grok.com."
+fi"#,
+        );
+        assert_eq!(
+            refresh_with_program(&program, &auth, Duration::from_secs(10)).unwrap(),
+            GrokOauthLiveness::LoggedIn
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("auth.json.calls")).unwrap(),
+            "call\ncall\n"
+        );
+    }
+
+    #[test]
     fn a_not_authenticated_pass_is_a_report_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let auth = dir.path().join("auth.json");
         fs::write(&auth, "{}").unwrap();
-        let program = stub(dir.path(), "grok", r#"echo "You are not authenticated.""#);
+        let program = stub(
+            dir.path(),
+            "grok",
+            r#"echo call >> "$GROK_AUTH_PATH.calls"
+echo "You are not authenticated.""#,
+        );
         let outcome = refresh_with_program(&program, &auth, Duration::from_secs(10)).unwrap();
         assert_eq!(
             outcome,
             GrokOauthLiveness::NotLoggedIn {
                 detail: "You are not authenticated.".to_owned()
             }
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("auth.json.calls")).unwrap(),
+            "call\n"
         );
     }
 

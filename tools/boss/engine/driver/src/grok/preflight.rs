@@ -11,12 +11,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 
 use super::environment::GrokProcessEnvironment;
-use super::oauth_refresh::GROK_LOGIN_AFFIRMATION;
+use super::oauth_refresh::{GROK_LOGIN_AFFIRMATION, with_credential_reprobe};
 
 /// Wall-clock limit for the OAuth-sensitive `grok models` probe.
 const GROK_MODELS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -255,24 +255,6 @@ fn assert_session_store_writable(
     Ok(())
 }
 
-/// Cheap, content-blind snapshot of the shared OAuth credential's on-disk
-/// state, used to detect whether a refresh rewrote the file during the
-/// probe. Never reads the credential bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AuthFingerprint {
-    modified: SystemTime,
-    len: u64,
-}
-
-fn fingerprint_auth_credential(auth_path: &Path) -> Option<AuthFingerprint> {
-    let metadata = std::fs::metadata(auth_path).ok()?;
-    let modified = metadata.modified().ok()?;
-    Some(AuthFingerprint {
-        modified,
-        len: metadata.len(),
-    })
-}
-
 /// Run the Grok OAuth probe and assert its affirmation, tolerating exactly
 /// one race: the probe's own invocation of `grok models` can refresh an
 /// expired-but-refreshable shared token as a side effect, so that first run
@@ -287,20 +269,11 @@ fn assert_grok_oauth_with_reprobe(
     workspace: &Path,
     environment: &GrokProcessEnvironment,
 ) -> anyhow::Result<()> {
-    let before = fingerprint_auth_credential(environment.auth_path());
-    let output = runner.run("grok", &["models"], workspace, environment)?;
-    if assert_grok_oauth(&output).is_ok() {
-        return Ok(());
-    }
-    let after = fingerprint_auth_credential(environment.auth_path());
-    if before.is_none() || before == after {
-        return assert_grok_oauth(&output);
-    }
-    tracing::info!(
-        auth_path = %environment.auth_path().display(),
-        "Grok OAuth credential was rewritten during the preflight probe (likely an expiry refresh); re-probing once"
-    );
-    let output = runner.run("grok", &["models"], workspace, environment)?;
+    let output = with_credential_reprobe(
+        environment.auth_path(),
+        || runner.run("grok", &["models"], workspace, environment),
+        |output| assert_grok_oauth(output).is_ok(),
+    )?;
     assert_grok_oauth(&output)
 }
 
