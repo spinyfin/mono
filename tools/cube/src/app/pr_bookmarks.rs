@@ -103,8 +103,8 @@ pub(super) fn delete_pr_bookmarks(
 /// e.g. `feature@github`) and leave jj and git agreeing about it.
 ///
 /// Every existing target, including a singleton stale ref, is replaced only
-/// when every conflicting side is an ancestor of the head or an obsolete
-/// predecessor of commits the head already contains. Otherwise this fails
+/// when every conflicting side is an ancestor of the head or recorded PR
+/// history, or a proven predecessor of commits the head contains. Otherwise this fails
 /// naming both commits; it never picks a side and never forgets-and-retries.
 pub(super) fn point_pr_bookmark(
     runner: &dyn CommandRunner,
@@ -112,6 +112,28 @@ pub(super) fn point_pr_bookmark(
     cwd: &Path,
     pr_number: u64,
     head_ref: &str,
+) -> Result<()> {
+    point_pr_bookmark_with_mode(runner, database_path, cwd, pr_number, head_ref, false)
+}
+
+/// Publication alone may discard conflicted rewrites of published PR history.
+pub(super) fn point_published_pr_bookmark(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    cwd: &Path,
+    pr_number: u64,
+    head_ref: &str,
+) -> Result<()> {
+    point_pr_bookmark_with_mode(runner, database_path, cwd, pr_number, head_ref, true)
+}
+
+fn point_pr_bookmark_with_mode(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    cwd: &Path,
+    pr_number: u64,
+    head_ref: &str,
+    publication: bool,
 ) -> Result<()> {
     let name = pr_bookmark::pr_bookmark_name(pr_number);
 
@@ -121,8 +143,11 @@ pub(super) fn point_pr_bookmark(
 
     let head = resolve_one_commit(runner, database_path, cwd, head_ref)?;
     let sides = bookmark_commits(runner, database_path, cwd, &name)?;
-    let recorded = recorded_heads(cwd, pr_number);
-    ensure_sides_are_obsolete(runner, database_path, cwd, &name, &head, &sides, &recorded)?;
+    let policy = RepairPolicy {
+        recorded_heads: recorded_heads(cwd, pr_number),
+        publication,
+    };
+    ensure_sides_are_obsolete(runner, database_path, cwd, &name, &head, &sides, &policy)?;
 
     run(
         runner,
@@ -134,7 +159,7 @@ pub(super) fn point_pr_bookmark(
 
     let mut after = bookmark_commits(runner, database_path, cwd, &name)?;
     if after != [head.clone()] {
-        ensure_sides_are_obsolete(runner, database_path, cwd, &name, &head, &after, &recorded)?;
+        ensure_sides_are_obsolete(runner, database_path, cwd, &name, &head, &after, &policy)?;
         run(
             runner,
             database_path,
@@ -227,17 +252,15 @@ fn distinct_lines(out: &str) -> Vec<String> {
         .collect()
 }
 
-/// Refuse to repair a conflicted `name` unless every side that is not the head
-/// carries nothing the head lacks.
-///
-/// A side is safe when every commit unique to it is an ancestor of the head,
-/// an ancestor of a head cube previously recorded for *this PR* (so it was the
-/// PR's own published content, however long ago GitHub's head moved on and
-/// whatever became of any branch it was pushed to), a recorded predecessor of a
-/// commit in the head's history, or a rewrite (per the evolution log) of a
-/// recorded head, such as the conflicted result of rebasing it. Matching change
-/// ids alone never establish provenance, and content that merely reached some other branch is
-/// not evidence of anything.
+/// Accept ancestors of the head or recorded PR heads, and proven predecessors
+/// of the head's history. Publication additionally accepts conflicted rewrites
+/// whose evolution reaches published PR history outside trunk. A clean amend
+/// may contain pending work and is never accepted by that additional rule.
+struct RepairPolicy {
+    recorded_heads: Vec<String>,
+    publication: bool,
+}
+
 fn ensure_sides_are_obsolete(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
@@ -245,9 +268,10 @@ fn ensure_sides_are_obsolete(
     name: &str,
     head: &str,
     sides: &[String],
-    recorded_heads: &[String],
+    policy: &RepairPolicy,
 ) -> Result<()> {
-    let recorded = recorded_heads
+    let recorded = policy
+        .recorded_heads
         .iter()
         .map(|h| format!("present({h})"))
         .collect::<Vec<_>>()
@@ -302,23 +326,37 @@ fn ensure_sides_are_obsolete(
             if proven {
                 continue;
             }
-            // A rebase that conflicts leaves `pr/<n>` on a rewrite of the
-            // published head that was never itself pushed, so it can never be
-            // recorded. It is still the PR's own content when it evolved from
-            // a head recorded for this PR.
-            let rewrite = git_utils::jj_provenance::is_rewrite_of_any(
-                |args| run(runner, database_path, cwd, args),
-                commit,
-                recorded_heads,
-            )
-            .map_err(|error| unsafe_repair(name, head, side, &format!("evolution unavailable: {error}")))?;
+            let conflicted = policy.publication
+                && !recorded.is_empty()
+                && !run(
+                    runner,
+                    database_path,
+                    cwd,
+                    &[
+                        "log",
+                        "--no-graph",
+                        "-r",
+                        &format!("{commit} & conflicts()"),
+                        "-T",
+                        "commit_id",
+                    ],
+                )?
+                .trim()
+                .is_empty();
+            let rewrite = conflicted
+                && git_utils::jj_provenance::is_rewrite_of_history(
+                    |args| run(runner, database_path, cwd, args),
+                    commit,
+                    &format!("::({recorded}) ~ ::trunk()"),
+                )
+                .map_err(|error| unsafe_repair(name, head, side, &format!("evolution unavailable: {error}")))?;
             if !rewrite {
                 return Err(unsafe_repair(
                     name,
                     head,
                     side,
                     &format!(
-                        "commit {commit} is neither an ancestor of a head recorded for this PR, a rewrite of one, \
+                        "commit {commit} is neither an ancestor of a head recorded for this PR, a conflicted rewrite of published PR history accepted during publication, \
                          nor a recorded predecessor of the head's history"
                     ),
                 ));

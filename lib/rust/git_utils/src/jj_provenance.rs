@@ -68,23 +68,33 @@ pub fn proven_successor<E>(
     Ok(evolution_contains(&evolution, commit).then(|| candidate.to_owned()))
 }
 
-/// Whether `commit` is a rewrite (rebase, amend, conflict resolution) of any
-/// commit in `originals`: some recorded original appears in its evolution log.
-/// This is how a never-published intermediate (a conflicted rebase result) is
-/// tied back to the published head it was rewritten from. An evolog failure is
-/// returned as an error so the caller can say why.
-pub fn is_rewrite_of_any<E>(
+/// Whether a predecessor in a commit's evolution belongs to the history revset.
+/// History can include ancestors of published tips while excluding trunk.
+pub fn is_rewrite_of_history<E>(
     mut run: impl FnMut(&[&str]) -> Result<String, E>,
     commit: &str,
-    originals: &[String],
+    history: &str,
 ) -> Result<bool, E> {
-    if originals.is_empty() {
+    let evolution = run(&["evolog", "--no-graph", "-r", commit, "-T", COMMIT_ID_LINES_TEMPLATE])?;
+    let predecessors = evolution
+        .lines()
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && *id != commit)
+        .map(|id| format!("present({id})"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if predecessors.is_empty() {
         return Ok(false);
     }
-    let evolution = run(&["evolog", "--no-graph", "-r", commit, "-T", COMMIT_ID_LINES_TEMPLATE])?;
-    Ok(originals
-        .iter()
-        .any(|original| original != commit && evolution_contains(&evolution, original)))
+    let matches = run(&[
+        "log",
+        "--no-graph",
+        "-r",
+        &format!("({predecessors}) & ({history})"),
+        "-T",
+        COMMIT_ID_LINES_TEMPLATE,
+    ])?;
+    Ok(!matches.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -111,13 +121,31 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_of_any_requires_a_recorded_original_in_the_evolog() {
-        let run = |evolog: &'static str| move |_: &[&str]| -> Result<String, ()> { Ok(evolog.to_owned()) };
-        let recorded = vec!["orig".to_string()];
-        assert_eq!(is_rewrite_of_any(run("new\norig\n"), "new", &recorded), Ok(true));
-        assert_eq!(is_rewrite_of_any(run("new\nother\n"), "new", &recorded), Ok(false));
-        assert_eq!(is_rewrite_of_any(run("orig\n"), "orig", &recorded), Ok(false));
-        assert_eq!(is_rewrite_of_any(run("new\norig\n"), "new", &[]), Ok(false));
+    fn rewrite_history_intersects_predecessors_with_published_ancestry() {
+        let found = is_rewrite_of_history(
+            |args: &[&str]| -> Result<String, ()> {
+                if args[0] == "evolog" {
+                    return Ok("new\nold\n".into());
+                }
+                assert_eq!(args[3], "(present(old)) & (::tip ~ ::trunk())");
+                Ok("old\n".into())
+            },
+            "new",
+            "::tip ~ ::trunk()",
+        );
+        assert_eq!(found, Ok(true));
+        assert_eq!(
+            is_rewrite_of_history(|_| Ok::<_, ()>("new\n".into()), "new", "::tip"),
+            Ok(false)
+        );
+        assert_eq!(
+            is_rewrite_of_history(
+                |args| Ok::<_, ()>(if args[0] == "evolog" { "new\nother\n" } else { "" }.into()),
+                "new",
+                "::tip"
+            ),
+            Ok(false)
+        );
     }
 
     #[test]

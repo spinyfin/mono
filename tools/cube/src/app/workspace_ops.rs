@@ -954,7 +954,7 @@ pub(super) fn rebase_workspace_branch(
 
     let push_cmd = match opts.explicit_pr {
         Some(n) => format!("cube workspace push --pr {n}"),
-        None => format!("cube workspace push --bookmark {boss_branch}"),
+        None => format!("cube pr update --branch {boss_branch}"),
     };
     if has_conflicts {
         // Best-effort: list conflicted files across every conflicted commit

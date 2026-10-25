@@ -334,8 +334,16 @@ pub(super) fn pr_create(args: PrCreateArgs, runner: &dyn CommandRunner) -> Resul
             branch = ctx.branch
         );
         let number = pr_number_from_url(&url);
-        let published = verify_push_reached_github(runner, &ctx.cwd, &ctx.owner_repo, &ctx.branch)?;
-        let pr_bookmark_name = record_published_pr_head(runner, &ctx.cwd, &ctx.branch, number, &published)?;
+        let local = jj_commit_id(runner, &ctx.cwd, &ctx.branch)?;
+        let published = fetch_github_sha(runner, &ctx.cwd, &ctx.owner_repo, &ctx.branch)?;
+        let published = published.trim();
+        if local.trim() != published {
+            return Err(CubeError::InvalidArgument(format!(
+                "local `{branch}` differs from GitHub's existing PR head; use `cube pr update --branch {branch}` to publish local commits",
+                branch = ctx.branch
+            )));
+        }
+        let pr_bookmark_name = record_published_pr_head(runner, &ctx.cwd, &ctx.branch, number, published)?;
         return RunResult::new(
             url.clone(),
             json!({"action": "already_exists", "url": url, "number": number, "pr_bookmark": pr_bookmark_name}),
@@ -432,15 +440,15 @@ pub(super) fn record_published_pr_head(
     number: Option<u64>,
     published: &str,
 ) -> Result<Option<String>> {
-    let retry = format!("cube pr create --branch {branch}");
+    let retry = format!("cube pr update --branch {branch}");
     let bookmark = write_pr_bookmark(runner, cwd, number, published).map_err(|e| {
         let hint = if crate::app::pr_bookmarks::is_unsafe_repair(&e) {
             format!(
                 "retrying `{retry}` will not help until the conflicted bookmark is resolved as described above; \
-                 then run it to repair bookkeeping without pushing"
+                 then run it to rerun publication bookkeeping"
             )
         } else {
-            format!("retry `{retry}` to repair bookkeeping without pushing")
+            format!("retry `{retry}` to rerun publication bookkeeping")
         };
         CubeError::InvalidArgument(format!(
             "push succeeded at {published}, but PR bookmark bookkeeping failed: {e}; {hint}"
@@ -456,7 +464,7 @@ pub(super) fn record_published_pr_head(
         if actual != published {
             return Err(CubeError::InvalidArgument(format!(
                 "push succeeded at {published}, but local bookmark `{name}` resolves to `{actual}`; \
-                 publication bookkeeping failed; retry `{retry}` without re-pushing"
+                 publication bookkeeping failed; retry `{retry}`"
             )));
         }
         eprintln!("cube: published PR bookmark `{name}` verified at {published}");
@@ -491,7 +499,7 @@ fn write_pr_bookmark(
     let bookmark_name = pr_bookmark::pr_bookmark_name(n);
     let _lock = runner.lock_pr_bookmarks(cwd)?;
     eprintln!("cube: synchronizing published PR bookmark `{bookmark_name}` to {revision}");
-    crate::app::pr_bookmarks::point_pr_bookmark(runner, None, cwd, n, revision)?;
+    crate::app::pr_bookmarks::point_published_pr_bookmark(runner, None, cwd, n, revision)?;
     Ok(Some(bookmark_name))
 }
 
