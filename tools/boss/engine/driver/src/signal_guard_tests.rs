@@ -211,6 +211,7 @@ fn claude_signal_guard_decisions() {
         data_dir: None,
         path_guard_script: None,
         checkleft_guard_script: None,
+        git_store_guard_script: None,
         is_revision: false,
         is_standard_worker: false,
         is_reviewer: false,
