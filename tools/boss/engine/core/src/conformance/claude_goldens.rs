@@ -72,7 +72,10 @@ fn normalize_host_paths(rendered: &str) -> String {
 /// content-addressed guard path compares equal across builds while still
 /// asserting that the hashed directory component is present.
 fn replace_content_addressed_guard_dirs(s: &str) -> String {
-    replace_kind_hash_dir(&replace_kind_hash_dir(s, "path-guard-"), "checkleft-push-guard-")
+    replace_kind_hash_dir(
+        &replace_kind_hash_dir(&replace_kind_hash_dir(s, "path-guard-"), "checkleft-push-guard-"),
+        "git-store-guard-",
+    )
 }
 
 fn replace_kind_hash_dir(s: &str, prefix: &str) -> String {

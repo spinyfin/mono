@@ -1199,6 +1199,7 @@ dependencies = [
 name = "boss-review-guide"
 version = "0.1.0"
 dependencies = [
+ "bon",
  "boss-pr-review-sources",
  "boss-pr-template",
  "regex",

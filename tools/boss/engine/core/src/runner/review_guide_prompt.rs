@@ -3,6 +3,10 @@
 //! addition reviewable on its own — see the design at
 //! `tools/boss/docs/designs/automatic-pr-review-guides.md`.
 
+use std::path::Path;
+
+use anyhow::Context as _;
+
 use crate::work::{WorkDb, WorkExecution};
 
 /// Compose the full review-guide prompt for a `pr_review_guide` execution:
@@ -13,7 +17,16 @@ use crate::work::{WorkDb, WorkExecution};
 /// a task — so this loads the immutable packet directly rather than going
 /// through the generic work-item path. No async work: the packet is already
 /// durably stored, so there is nothing left to fetch over the network.
-pub(super) fn compose_review_guide_prompt(work_db: &WorkDb, execution: &WorkExecution) -> anyhow::Result<String> {
+///
+/// `workspace_path` is the pinned read-only cube workspace; the prompt names
+/// its git object store explicitly (`git --git-dir <store> …`) because the
+/// worker environment deliberately omits `GIT_DIR` — an ambient `GIT_DIR` at
+/// cube's shared store turns every bare `git` into a store operation.
+pub(super) fn compose_review_guide_prompt(
+    work_db: &WorkDb,
+    execution: &WorkExecution,
+    workspace_path: &Path,
+) -> anyhow::Result<String> {
     let comparison_id = &execution.work_item_id;
     let capture = match work_db.get_pr_review_guide_comparison_by_id(comparison_id) {
         Ok(Some(capture)) => capture,
@@ -44,17 +57,24 @@ pub(super) fn compose_review_guide_prompt(work_db: &WorkDb, execution: &WorkExec
         }
     };
     let packet = capture.packet;
-    let metadata = boss_review_guide::PromptMetadata {
-        pr_url: &packet.canonical_pr_url,
-        repository: &packet.base_repository,
-        pr_title: &packet.title,
-        // Before-side links validate against `merge_base_sha`, not the
-        // observed base-branch tip. Advertising the merge base here is
-        // what lets a model following "Use revision-pinned source links"
-        // pass `reference_repository_matches`.
-        base_sha: &packet.merge_base_sha,
-        head_sha: &packet.head_sha,
-    };
+    let git_dir = crate::conflict_diagnosis::resolve_git_dir(workspace_path)
+        .with_context(|| {
+            format!(
+                "resolving the pinned git object store for review-guide workspace {}",
+                workspace_path.display()
+            )
+        })?
+        .display()
+        .to_string();
+    let metadata = boss_review_guide::PromptMetadata::builder()
+        .pr_url(&packet.canonical_pr_url)
+        .repository(&packet.base_repository)
+        .pr_title(&packet.title)
+        // Source links use the comparison's merge base rather than the base tip.
+        .base_sha(&packet.merge_base_sha)
+        .head_sha(&packet.head_sha)
+        .git_dir(&git_dir)
+        .build();
     let mut prompt = match work_db.review_guide_update_context(&execution.id)? {
         Some((old_head, previous)) => boss_review_guide::render_update_prompt(&metadata, &old_head, &previous),
         None => boss_review_guide::render_prompt(&metadata),

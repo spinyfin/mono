@@ -80,6 +80,8 @@ pub use deny_rules::{
     answer_agent_allow_rules, answer_agent_deny_rules, review_guide_allow_rules, review_guide_deny_rules,
     reviewer_deny_rules, triage_deny_rules,
 };
+mod git_store_guard;
+pub use git_store_guard::{ensure_git_store_guard_script_in, git_store_guard_script_path};
 
 // Re-export guard command constants so the test module (which uses `use
 // super::*;`) can run the Python scripts end-to-end and verify their behaviour.
@@ -481,6 +483,16 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
            - `{cube} pr update --branch <name>` — existing PR (pushes new commits to it)\n\
          - Never `jj git push --deleted` or `git push --delete`\n\
            without explicit user approval.\n\
+         - **Never run raw `git` against cube's shared source store** — the\n\
+           checkout your workspace's `.jj/repo` pointer names, under cube's repos\n\
+           root — whether by `cd`-ing into it or by pointing `GIT_DIR`, `--git-dir`\n\
+           or `-C` at it. A PreToolUse hook refuses every git write there and every\n\
+           shallow `fetch`/`pull`/`clone` (`--depth`, `--shallow-since`, …) that\n\
+           would touch it: one such fetch turns the shared store into a shallow\n\
+           clone and breaks every dispatch for that repository. Read-only git\n\
+           against the store (`log`, `show`, `diff`, `rev-parse`, …) is allowed.\n\
+           To reproduce a CI script that runs raw git, clone into a throwaway\n\
+           directory under your own temp dir and run it there.\n\
          - `{config_dir}/` is gitignored by the engine. Do not force-track\n\
            or commit anything inside it (no `--force`,\n\
            no `jj file track {config_dir}/...`).\n\
@@ -897,6 +909,11 @@ fn settings_value(
             },
             checkleft_guard_script: if sandbox == EngineDataDirSandbox::Enabled {
                 Some(checkleft_push_guard_script_path())
+            } else {
+                None
+            },
+            git_store_guard_script: if sandbox == EngineDataDirSandbox::Enabled {
+                Some(git_store_guard_script_path())
             } else {
                 None
             },
@@ -2429,6 +2446,7 @@ fn referenced_guard_dir_names(dir: &Path) -> Vec<String> {
         for token in text.split(|c: char| !c.is_ascii_alphanumeric() && c != '-') {
             if is_content_addressed_guard_dir_name(token, PATH_GUARD_KIND)
                 || is_content_addressed_guard_dir_name(token, CHECKLEFT_PUSH_GUARD_KIND)
+                || is_content_addressed_guard_dir_name(token, git_store_guard::GIT_STORE_GUARD_KIND)
             {
                 names.push(token.to_owned());
             }
@@ -2640,6 +2658,7 @@ pub fn write_workspace_files(
         // them whenever we materialise the settings file.
         ensure_path_guard_script_in(parent)?;
         ensure_checkleft_push_guard_script_in(parent)?;
+        ensure_git_store_guard_script_in(parent)?;
     }
     std::fs::write(&settings_path, render_settings_json(input, driver))?;
 
@@ -2745,6 +2764,13 @@ pub fn heal_worker_settings_json(settings_dir: &Path, new_boss_event_path: &Path
             dir = %settings_dir.display(),
             ?err,
             "failed to refresh checkleft push-guard script during settings heal",
+        );
+    }
+    if let Err(err) = ensure_git_store_guard_script_in(settings_dir) {
+        tracing::warn!(
+            dir = %settings_dir.display(),
+            ?err,
+            "failed to refresh shared-source-store guard script during settings heal",
         );
     }
 

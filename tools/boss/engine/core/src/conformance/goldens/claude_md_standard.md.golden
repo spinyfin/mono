@@ -144,6 +144,16 @@ Use `jj` for all VCS. Do not invoke `git` directly except via `gh`.
 - `"$CUBE_BIN" pr update --branch <name>` — existing PR (pushes new commits to it)
 - Never `jj git push --deleted` or `git push --delete`
 without explicit user approval.
+- **Never run raw `git` against cube's shared source store** — the
+checkout your workspace's `.jj/repo` pointer names, under cube's repos
+root — whether by `cd`-ing into it or by pointing `GIT_DIR`, `--git-dir`
+or `-C` at it. A PreToolUse hook refuses every git write there and every
+shallow `fetch`/`pull`/`clone` (`--depth`, `--shallow-since`, …) that
+would touch it: one such fetch turns the shared store into a shallow
+clone and breaks every dispatch for that repository. Read-only git
+against the store (`log`, `show`, `diff`, `rev-parse`, …) is allowed.
+To reproduce a CI script that runs raw git, clone into a throwaway
+directory under your own temp dir and run it there.
 - `.claude/` is gitignored by the engine. Do not force-track
 or commit anything inside it (no `--force`,
 no `jj file track .claude/...`).
