@@ -36,6 +36,7 @@ struct HighlightingMarkdownParser: MarkupParser {
     var highlightedAnchors: [CommentAnchor]
     var flashingAnchor: CommentAnchor?
     var baseURL: URL?
+    var parsedContent: AttributedString?
 
     private static let yellowColor = Color(nsColor: NSColor.systemYellow).opacity(0.45)
     private static let orangeColor = Color(nsColor: NSColor.systemOrange).opacity(0.55)
@@ -44,14 +45,15 @@ struct HighlightingMarkdownParser: MarkupParser {
     private static let yellowUnderline = Color(nsColor: NSColor.systemYellow).opacity(0.9)
     private static let orangeUnderline = Color(nsColor: NSColor.systemOrange).opacity(0.9)
 
-    init(highlightedAnchors: [CommentAnchor], flashingAnchor: CommentAnchor? = nil, baseURL: URL? = nil) {
+    init(highlightedAnchors: [CommentAnchor], flashingAnchor: CommentAnchor? = nil, baseURL: URL? = nil, parsedContent: AttributedString? = nil) {
         self.highlightedAnchors = highlightedAnchors
         self.flashingAnchor = flashingAnchor
         self.baseURL = baseURL
+        self.parsedContent = parsedContent
     }
 
     func attributedString(for input: String) throws -> AttributedString {
-        var result = try AttributedStringMarkdownParser.markdown(baseURL: baseURL).attributedString(for: input)
+        var result = try parsedContent ?? AttributedStringMarkdownParser.markdown(baseURL: baseURL).attributedString(for: input)
         let plain = String(result.characters)
 
         highlightLog.debug(
