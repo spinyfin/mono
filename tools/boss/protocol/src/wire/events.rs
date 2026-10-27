@@ -1602,7 +1602,7 @@ pub enum FrontendEvent {
         action: String,
     },
 
-    // --- Automation replies (maintenance-tasks.md T2) ---
+    // --- Automation replies ---
     /// Response to [`FrontendRequest::CreateAutomation`].
     AutomationCreated {
         automation: Automation,
