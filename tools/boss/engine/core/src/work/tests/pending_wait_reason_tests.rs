@@ -176,3 +176,36 @@ fn the_work_tree_ordinal_gate_costs_the_same_lookups_regardless_of_chain_length(
         "per-row lookups grew with chain length: {per_row_small} -> {per_row_large}"
     );
 }
+
+#[test]
+fn ordinal_chain_membership_advances_past_completed_tasks() {
+    let (db, product_id, first, second) = project_with_two_tasks();
+    let third = db
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product_id.clone())
+                .project_id(second.project_id.clone().unwrap())
+                .name("Third")
+                .build(),
+        )
+        .unwrap();
+    db.reconcile_product_executions(&product_id).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("UPDATE tasks SET status = ?1 WHERE id = ?2", params!["done", first.id])
+        .unwrap();
+    let tasks = list_tasks_for_product(&conn, &product_id).unwrap();
+    let (runtimes, _) =
+        collect_task_runtimes(&conn, &tasks, &[], boss_engine_utils::epoch_time::now_epoch_secs()).unwrap();
+    let head = runtimes
+        .iter()
+        .find(|runtime| runtime.work_item_id == second.id)
+        .unwrap();
+    assert_eq!(head.dispatch_wait_reason.as_deref(), Some("awaiting_reconcile"));
+    assert!(head.dispatch_wait_blocker.is_none());
+    let tail = runtimes
+        .iter()
+        .find(|runtime| runtime.work_item_id == third.id)
+        .unwrap();
+    assert_eq!(tail.dispatch_wait_reason.as_deref(), Some("ordinal_chain"));
+    assert_eq!(tail.dispatch_wait_blocker.as_ref().unwrap().work_item_id, second.id);
+}

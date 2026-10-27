@@ -36,7 +36,7 @@ pub(super) struct OrdinalChains {
 
 #[derive(Default)]
 struct ProjectChain {
-    order: Vec<String>,
+    blocked: HashSet<String>,
     first_accepting: Option<DispatchWaitBlocker>,
 }
 
@@ -70,8 +70,19 @@ impl OrdinalChains {
                             short_id: task.short_id,
                             kind: "task".into(),
                         });
-                let order = members.into_iter().map(|task| task.id.clone()).collect();
-                (project_id.to_owned(), ProjectChain { order, first_accepting })
+                let blocked = members
+                    .into_iter()
+                    .skip_while(|task| !task_accepts_execution(task))
+                    .skip(1)
+                    .map(|task| task.id.clone())
+                    .collect();
+                (
+                    project_id.to_owned(),
+                    ProjectChain {
+                        blocked,
+                        first_accepting,
+                    },
+                )
             })
             .collect();
         Self { projects }
@@ -99,16 +110,11 @@ impl OrdinalChains {
     /// The earlier task `task_id` waits behind, if any.
     fn blocker(&self, project_id: &str, task_id: &str) -> Option<&DispatchWaitBlocker> {
         let chain = self.projects.get(project_id)?;
-        let first = chain.first_accepting.as_ref()?;
-        for id in &chain.order {
-            if id == task_id {
-                return None;
-            }
-            if id == &first.work_item_id {
-                return Some(first);
-            }
+        if chain.blocked.contains(task_id) {
+            chain.first_accepting.as_ref()
+        } else {
+            None
         }
-        None
     }
 }
 
