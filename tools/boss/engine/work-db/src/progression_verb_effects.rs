@@ -169,6 +169,7 @@ pub(super) fn precursor(
             RELATION_BLOCKS,
             &now_string(),
             PROGRESSION,
+            &crate::dep_helpers::DependencyCancelOrigin::EngineInternal,
         ),
     )?;
     stage_task_board_change(pending, conn, &chore.id)?;
@@ -210,6 +211,7 @@ pub(super) fn depend(
             RELATION_BLOCKS,
             &now_string(),
             PROGRESSION,
+            &crate::dep_helpers::DependencyCancelOrigin::EngineInternal,
         ),
     )?;
     Ok(Applied {

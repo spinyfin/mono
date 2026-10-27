@@ -13,6 +13,7 @@ use boss_protocol::{CancelProvenance, CancelProvenanceError, CancelSource};
 pub(super) enum CancelRpcRefusal {
     MissingSource,
     EngineSubsystemSource(CancelSource),
+    UnrecognizedSource(String),
     MissingReason,
     MissingActor,
 }
@@ -30,6 +31,10 @@ impl CancelRpcRefusal {
                 "{rpc} refused: `source` `{source}` names an engine subsystem. Clients may only \
                  claim a client surface (app, boss_cli, bossctl)."
             ),
+            Self::UnrecognizedSource(raw) => format!(
+                "{rpc} refused: `source` `{raw}` is not a recognized client surface. \
+                 Accepted values: app, boss_cli, bossctl."
+            ),
             Self::MissingReason => format!(
                 "{rpc} refused: no `reason`. Every cancel must say why; the engine does not \
                  substitute a generic reason."
@@ -46,16 +51,24 @@ impl CancelRpcRefusal {
 ///
 /// The engine-attested caller tier and transport are always retained.
 /// Client-supplied identity is explicitly marked as a claim.
+///
+/// `source` is the raw wire spelling so a typo such as `boss-cli` can be
+/// echoed in the refusal instead of collapsing into [`CancelSource::Unrecognized`].
 pub(super) fn provenance_from_request(
-    source: Option<CancelSource>,
+    source: Option<&str>,
     reason: Option<&str>,
     actor: Option<&str>,
     observed_actor: &str,
 ) -> Result<CancelProvenance, CancelRpcRefusal> {
-    let source = source.ok_or(CancelRpcRefusal::MissingSource)?;
-    if !source.is_client_surface() {
-        return Err(CancelRpcRefusal::EngineSubsystemSource(source));
-    }
+    let raw = source
+        .map(str::trim)
+        .filter(|source| !source.is_empty())
+        .ok_or(CancelRpcRefusal::MissingSource)?;
+    let source = match raw.parse::<CancelSource>() {
+        Ok(source) if source.is_client_surface() => source,
+        Ok(source) => return Err(CancelRpcRefusal::EngineSubsystemSource(source)),
+        Err(_) => return Err(CancelRpcRefusal::UnrecognizedSource(raw.to_owned())),
+    };
     if observed_actor.trim().is_empty() {
         return Err(CancelRpcRefusal::MissingActor);
     }
@@ -64,7 +77,7 @@ pub(super) fn provenance_from_request(
         None => observed_actor.to_owned(),
     };
     CancelProvenance::new(source, actor, reason.unwrap_or_default()).map_err(|err| match err {
-        CancelProvenanceError::UnknownSource => CancelRpcRefusal::EngineSubsystemSource(source),
+        CancelProvenanceError::UnknownSource => CancelRpcRefusal::UnrecognizedSource(raw.to_owned()),
         CancelProvenanceError::BlankReason => CancelRpcRefusal::MissingReason,
         CancelProvenanceError::BlankActor => CancelRpcRefusal::MissingActor,
     })
@@ -77,7 +90,7 @@ mod tests {
     #[test]
     fn complete_request_yields_provenance() {
         let provenance = provenance_from_request(
-            Some(CancelSource::Bossctl),
+            Some("bossctl"),
             Some("wrong repo"),
             Some("operator"),
             "boss via non_app_client (peer pid 7)",
@@ -103,7 +116,7 @@ mod tests {
     fn engine_subsystem_source_is_refused() {
         assert_eq!(
             provenance_from_request(
-                Some(CancelSource::MergePollerParentMerged),
+                Some("merge_poller_parent_merged"),
                 Some("why"),
                 Some("me"),
                 "boss via non_app_client (peer pid 7)"
@@ -118,12 +131,7 @@ mod tests {
     fn missing_or_blank_reason_is_refused() {
         for reason in [None, Some(""), Some("   ")] {
             assert_eq!(
-                provenance_from_request(
-                    Some(CancelSource::App),
-                    reason,
-                    Some("me"),
-                    "boss via non_app_client (peer pid 7)"
-                ),
+                provenance_from_request(Some("app"), reason, Some("me"), "boss via non_app_client (peer pid 7)"),
                 Err(CancelRpcRefusal::MissingReason)
             );
         }
@@ -131,16 +139,11 @@ mod tests {
 
     #[test]
     fn absent_actor_falls_back_to_the_observed_peer_only() {
-        let observed = provenance_from_request(
-            Some(CancelSource::BossCli),
-            Some("why"),
-            None,
-            "human via mac_app (peer pid 42)",
-        )
-        .unwrap();
+        let observed =
+            provenance_from_request(Some("boss_cli"), Some("why"), None, "human via mac_app (peer pid 42)").unwrap();
         assert_eq!(observed.actor, "human via mac_app (peer pid 42)");
         assert_eq!(
-            provenance_from_request(Some(CancelSource::BossCli), Some("why"), Some("  "), ""),
+            provenance_from_request(Some("boss_cli"), Some("why"), Some("  "), ""),
             Err(CancelRpcRefusal::MissingActor)
         );
     }
@@ -156,6 +159,22 @@ mod tests {
             CancelRpcRefusal::MissingReason
                 .message("stop_run")
                 .contains("stop_run refused")
+        );
+        let unrecognized = CancelRpcRefusal::UnrecognizedSource("boss-cli".to_owned()).message("cancel_execution");
+        assert!(unrecognized.contains("`boss-cli`"));
+        assert!(unrecognized.contains("app, boss_cli, bossctl"));
+    }
+
+    #[test]
+    fn unrecognized_source_echoes_the_value_sent() {
+        assert_eq!(
+            provenance_from_request(
+                Some("boss-cli"),
+                Some("why"),
+                Some("me"),
+                "boss via non_app_client (peer pid 7)"
+            ),
+            Err(CancelRpcRefusal::UnrecognizedSource("boss-cli".to_owned()))
         );
     }
 }

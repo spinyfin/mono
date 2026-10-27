@@ -1018,7 +1018,7 @@ impl WorkDb {
                 }
             }
         }
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok(mint)
     }
 }
@@ -1302,7 +1302,7 @@ impl WorkDb {
         let updated = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let mut pending = PendingEvents::new();
         stage_execution_terminal(&mut pending, &tx, execution_id, &updated.work_item_id)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(Some(updated))
     }
 }

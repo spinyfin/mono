@@ -655,7 +655,7 @@ impl WorkDb {
             ItemKind::Product => bail!("cannot park product {id}: parking applies to tasks, chores and projects"),
             ItemKind::Comment | ItemKind::Comparison => bail!("{id} is not a task, chore or project"),
         };
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok((item, report))
     }
 

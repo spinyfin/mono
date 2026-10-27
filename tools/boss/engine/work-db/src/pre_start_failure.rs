@@ -335,7 +335,7 @@ impl WorkDb {
             );
             stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
         }
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         drop(conn);
         if matches!(outcome, PreStartFailureOutcome::PermanentFail)
             && execution.kind == ExecutionKind::PrReviewGuide

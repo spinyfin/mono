@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use boss_event_bus::{Event, EventBus};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
-use crate::event_publish::{PendingEvents, commit_and_publish};
+use crate::event_publish::PendingEvents;
 
 /// How long sqlite will internally retry on `SQLITE_BUSY` before
 /// surfacing the error to the caller. We funnel concurrent CLI writes
@@ -775,12 +775,22 @@ pub struct WorkDb {
     /// it via [`Self::with_event_bus`] so every clone shares the one
     /// instance subscribers attach to.
     event_bus: Arc<EventBus>,
+    /// Durable dispatch-event sink written post-commit next to the audit
+    /// log, so cancel provenance is not lost when the in-process bus
+    /// mailbox fills. Defaults to a no-op; production injects the JSONL
+    /// sink via [`Self::with_dispatch_events`].
+    #[builder(default = default_dispatch_events())]
+    dispatch_events: Arc<dyn boss_dispatch_events::DispatchEventSink>,
     persona_metrics: Arc<boss_metrics::Registry>,
     /// Produces coordinator handoff write ids and tmux spawn authorizations.
     /// Defaults to the shared utility generator; callers can inject a fixture
     /// or an alternate generator at the open boundary.
     #[builder(default = default_token_generator())]
     token_generator: Arc<dyn Fn() -> String + Send + Sync>,
+}
+
+pub(crate) fn default_dispatch_events() -> Arc<dyn boss_dispatch_events::DispatchEventSink> {
+    Arc::new(boss_dispatch_events::NoopDispatchEventSink)
 }
 
 impl Clone for WorkDb {
@@ -794,6 +804,7 @@ impl Clone for WorkDb {
             boothby_action: Arc::clone(&self.boothby_action),
             engine_rebase_holds: Arc::clone(&self.engine_rebase_holds),
             event_bus: Arc::clone(&self.event_bus),
+            dispatch_events: Arc::clone(&self.dispatch_events),
             persona_metrics: Arc::clone(&self.persona_metrics),
             token_generator: Arc::clone(&self.token_generator),
         }

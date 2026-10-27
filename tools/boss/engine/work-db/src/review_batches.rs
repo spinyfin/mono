@@ -1659,7 +1659,7 @@ impl WorkDb {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut pending = PendingEvents::new();
         let released = release_unstartable_pre_merge_review_reservations_in_tx(&tx, &mut pending)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(released)
     }
 
@@ -2690,7 +2690,7 @@ impl WorkDb {
                         .build(),
                 )?;
             }
-            commit_and_publish(tx, pending, &self.event_bus)?;
+            self.commit_pending(tx, pending)?;
             reaped.push(batch_id);
         }
         Ok(reaped)

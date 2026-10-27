@@ -580,6 +580,8 @@ mod probe_tests;
 #[cfg(test)]
 mod schedule_tests;
 #[cfg(test)]
+mod sweep_followup_tests;
+#[cfg(test)]
 mod sweep_tests;
 #[cfg(test)]
 mod unmergeable_reaction_tests;

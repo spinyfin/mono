@@ -842,7 +842,7 @@ fn answering_a_gated_revision_records_the_answer_and_waits_for_its_gate() {
             let mut pending = PendingEvents::default();
             {
                 let conn = db.connect().unwrap();
-                maybe_engine_block_dependent(&mut pending, &conn, &asking, &now_string()).unwrap();
+                maybe_engine_block_dependent(&mut pending, &conn, &asking, &now_string(), &DependencyCancelOrigin::EngineInternal).unwrap();
             }
             let other_name = match db.get_work_item(&other).unwrap() {
                 WorkItem::Task(t) | WorkItem::Chore(t) => t.name,

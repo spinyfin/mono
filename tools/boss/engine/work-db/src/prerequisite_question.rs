@@ -318,7 +318,15 @@ fn park_behind(
          blocked_detail = NULL, autostart = 1, last_status_actor = ?4, updated_at = ?3 WHERE id = ?1",
         params![task.id, description, now, actor],
     )?;
-    add_dependency_edge_in_tx(pending, conn, &task.id, &prerequisite.id, RELATION_BLOCKS, now)?;
+    add_dependency_edge_in_tx(
+        pending,
+        conn,
+        &task.id,
+        &prerequisite.id,
+        RELATION_BLOCKS,
+        now,
+        &DependencyCancelOrigin::EngineInternal,
+    )?;
     queue_gated_execution(conn, task, question)?;
     stamp_answered_waiting(conn, &task.id)?;
     operation.end()?;

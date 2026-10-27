@@ -284,7 +284,7 @@ impl WorkDb {
                     &now_string(),
                     "deletion signoff is required",
                 )?;
-                commit_and_publish(tx, pending, self.event_bus())?;
+                self.commit_pending(tx, pending)?;
             }
         }
 
@@ -552,7 +552,7 @@ impl WorkDb {
                     "its owning proposal is no longer the applied decision",
                 )?;
             }
-            commit_and_publish(tx, tombstone_pending, self.event_bus())?;
+            self.commit_pending(tx, tombstone_pending)?;
             return Ok(applied_ref);
         }
 
@@ -665,7 +665,7 @@ impl WorkDb {
             product_id,
             task_id: batch.cycle_root_id.clone(),
         });
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok(remediating_task_id.is_some().then_some(applied_ref))
     }
 
@@ -891,7 +891,7 @@ impl WorkDb {
             &now_string(),
             "its owning proposal is no longer the applied decision",
         )?;
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok(())
     }
 }

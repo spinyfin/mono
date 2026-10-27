@@ -1405,9 +1405,6 @@ impl ServerState {
         // event would ever reach a subscriber.
         let mut timeline = boss_engine_runtime::startup_timing::StartupTimeline::begin("server_state");
         let event_bus = Arc::new(EventBus::new());
-        let execution_decisions = event_bus.subscribe(boss_event_bus::TopicFilter::kind(
-            boss_event_bus::EventKind::ExecutionDecision,
-        ));
         // Engine counter-metrics registry. Built up front so it can be cloned
         // into ServerState and handed to WorkDb (persona overflow counter); the
         // registry is plumbed explicitly rather than stashed in a global per
@@ -1419,12 +1416,22 @@ impl ServerState {
             Some(db) => db,
             None => WorkDb::open(cfg.work.db_path.clone())?,
         };
+        let early_dispatch_event_root: PathBuf = cfg
+            .work
+            .db_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| cfg.work.cwd.clone());
+        let dispatch_events: Arc<dyn boss_dispatch_events::DispatchEventSink> =
+            Arc::new(boss_dispatch_events::JsonlFileSink::new(early_dispatch_event_root.clone()));
         let work_db = Arc::new(
             work_db
                 .with_event_bus(event_bus.clone())
                 .with_persona_metrics(metrics_registry.clone())
                 .with_token_generator(std::sync::Arc::new(boss_engine_runtime::engine_control::generate_token))
-                .with_engine_build_identity(boss_engine_runtime::build_info::build_identity()),
+                .with_engine_build_identity(boss_engine_runtime::build_info::build_identity())
+                .with_dispatch_events(dispatch_events.clone()),
         );
         timeline.mark("work_db_open");
         let anthropic_api_key = cfg.anthropic_api_key();
@@ -1634,9 +1641,8 @@ impl ServerState {
         let settings_for_state = settings.clone();
 
         // Dispatch-event JSONL stream lands next to state.db / events.sock
-        // under the same state root. Build it before the completion handler
-        // so merge-triggered cancellation and ordinary dispatch share one
-        // timeline sink.
+        // under the same state root. Built before WorkDb so post-commit
+        // cancel provenance writes the same sink the coordinator uses.
         let dispatch_event_root: PathBuf = state_root.clone();
         // Shared by `ServerState` and by the remote-host adapter provider, so
         // a remote worker's `BOSS.md` read hits the same sha-keyed body cache.
@@ -1645,12 +1651,6 @@ impl ServerState {
                 state_root.join(boss_engine_design_docs::BODY_CACHE_DIR_NAME),
             ))
         });
-        let dispatch_events: Arc<dyn boss_dispatch_events::DispatchEventSink> =
-            Arc::new(boss_dispatch_events::JsonlFileSink::new(dispatch_event_root.clone()));
-        boss_work_db::event_publish::forward_execution_decisions(
-            execution_decisions,
-            dispatch_events.clone(),
-        );
         let metrics_for_state = metrics_registry.clone();
         let metrics_for_dispatcher = metrics_registry.clone();
         let metrics_for_completion = metrics_registry.clone();

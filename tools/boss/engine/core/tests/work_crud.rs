@@ -926,7 +926,10 @@ fn unexpected_event(context: &str, event: FrontendEvent) -> anyhow::Error {
 }
 
 async fn add_dependency(client: &mut BossClient, input: AddDependencyInput) -> Result<WorkItemDependency> {
-    match client.send_request(&FrontendRequest::AddDependency { input }).await? {
+    match client
+        .send_request(&FrontendRequest::AddDependency { cancel: None, input })
+        .await?
+    {
         FrontendEvent::DependencyAdded { edge } => Ok(edge),
         other => Err(unexpected_event("add dependency", other)),
     }
@@ -1026,6 +1029,7 @@ async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
     // Cycle add returns a WorkError.
     let cycle = client
         .send_request(&FrontendRequest::AddDependency {
+            cancel: None,
             input: AddDependencyInput {
                 dependent: b.id.clone(),
                 prerequisite: a.id.clone(),
@@ -1146,6 +1150,7 @@ async fn dependency_rpcs_reject_archived_prereqs_and_remove_archived_edges() -> 
 
     match client
         .send_request(&FrontendRequest::AddDependency {
+            cancel: None,
             input: AddDependencyInput {
                 dependent: another_dependent.id,
                 prerequisite: archived_prereq.id.clone(),
