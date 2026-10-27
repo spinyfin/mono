@@ -97,6 +97,10 @@ fn queued_wait_payload_names_the_actual_revision_prerequisite() {
     assert_eq!(runtime.execution_status, Some(ExecutionStatus::WaitingDependency));
     let json = serde_json::to_value(&runtime).unwrap();
     assert_eq!(json["dispatch_wait_reason"], "waiting_dependency");
+    assert_eq!(
+        json["queued_display"]["text"],
+        format!("Queued — waiting for T{}", first.short_id.unwrap())
+    );
     assert_eq!(json["dispatch_wait_blocker"]["work_item_id"], first.id);
     assert_eq!(json["dispatch_wait_blocker"]["product_id"], product_id);
     assert_eq!(json["dispatch_wait_blocker"]["short_id"], first.short_id.unwrap());

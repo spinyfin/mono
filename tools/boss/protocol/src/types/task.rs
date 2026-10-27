@@ -1331,9 +1331,21 @@ pub struct TaskRuntime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_not_before: Option<String>,
 
+    /// Engine-selected queued label and absolute-time hover text. Absent for
+    /// live/terminal executions; clients render this without choosing hold precedence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_display: Option<QueuedDisplay>,
+
     /// Currently gating work item, resolved by the engine's dispatch rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_wait_blocker: Option<DispatchWaitBlocker>,
+}
+
+/// Display-ready pending status, refreshed by the engine as time advances.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueuedDisplay {
+    pub text: String,
+    pub tooltip: String,
 }
 
 /// A prerequisite selected by the same gating rules used for dispatch.

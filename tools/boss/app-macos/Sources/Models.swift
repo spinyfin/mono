@@ -639,6 +639,18 @@ extension WorkTask {
 
 }
 
+struct QueuedDisplay: Hashable {
+    let text: String
+    let tooltip: String
+
+    init?(_ payload: [String: Any]) {
+        guard let text = payload["text"] as? String,
+              let tooltip = payload["tooltip"] as? String else { return nil }
+        self.text = text
+        self.tooltip = tooltip
+    }
+}
+
 struct WorkTaskRuntime: Hashable {
     let workItemID: String
     let executionStatus: String?
@@ -660,6 +672,7 @@ struct WorkTaskRuntime: Hashable {
     let dispatchWaitSince: String?
     var dispatchNotBefore: String? = nil
     var dispatchWaitBlocker: DispatchWaitBlocker? = nil
+    var queuedDisplay: QueuedDisplay? = nil
 }
 
 /// One row from `work_item_dependencies` — the dependent is gated by

@@ -12,6 +12,8 @@ import SwiftUI
 /// non-empty live status; `nil` collapses the row.
 struct WorkBoardCardLiveStatusRowSlice: Equatable {
     let liveStatus: String
+    let tooltip: String
+    let lineLimit: Int
     let liveStatusActivity: WorkerActivity?
     let liveStatusLastEventAt: String?
     let blocker: DispatchWaitBlocker?
@@ -21,6 +23,8 @@ struct WorkBoardCardLiveStatusRowSlice: Equatable {
             return nil
         }
         self.liveStatus = liveStatus
+        self.tooltip = snapshot.liveStatusTooltip ?? liveStatus
+        self.lineLimit = snapshot.liveStatusTooltip == nil ? 2 : 4
         self.liveStatusActivity = snapshot.liveStatusActivity
         self.liveStatusLastEventAt = snapshot.liveStatusLastEventAt
         self.blocker = snapshot.dispatchWaitBlocker
@@ -48,16 +52,16 @@ struct WorkBoardCardLiveStatusRow: View, @MainActor Equatable {
                         statusText
                     }
                     .buttonStyle(.plain)
-                    .help("Reveal \(blocker.label)")
+                    .help("\(slice.tooltip)\nReveal \(blocker.label)")
                 } else {
                     statusText
                 }
             }
                 .font(.caption)
                 .foregroundStyle(liveStatusColor)
-                .lineLimit(2)
+                .lineLimit(slice.lineLimit)
                 .truncationMode(.tail)
-                .help(slice.liveStatus)
+                .help(slice.tooltip)
                 .accessibilityLabel("Live status: \(slice.liveStatus)")
         }
         .frame(maxWidth: .infinity, alignment: .leading)

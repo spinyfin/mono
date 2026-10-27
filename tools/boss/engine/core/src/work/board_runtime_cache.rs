@@ -194,6 +194,10 @@ fn runtime_bytes(runtime: &TaskRuntime) -> usize {
         + opt(&runtime.dispatch_wait_reason)
         + opt(&runtime.dispatch_wait_since)
         + opt(&runtime.dispatch_not_before)
+        + runtime
+            .queued_display
+            .as_ref()
+            .map_or(0, |display| display.text.len() + display.tooltip.len())
         + runtime.dispatch_wait_blocker.as_ref().map_or(0, |blocker| {
             blocker.work_item_id.len()
                 + blocker.product_id.len()

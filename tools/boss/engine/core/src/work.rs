@@ -666,11 +666,13 @@ mod progression_scope;
 mod project_postmortem;
 #[cfg(test)]
 mod project_postmortem_tests;
+mod queued_display;
 mod queued_wait;
 #[cfg(test)]
 mod read_only_tests;
 mod remediation_state;
 pub(crate) mod remote_input_cleanup;
+mod runtime_projection;
 pub(crate) use feedback_target::FeedbackTarget;
 mod connection_wait;
 pub(crate) mod db_diagnostics;
