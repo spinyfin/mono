@@ -9,7 +9,7 @@ its cost scales with, and what the 2026-10-21 sample found.
 
 ## Metrics
 
-Every sweep below publishes the same four series through the engine
+Every sweep below publishes duration, items and pass counts through the engine
 metrics registry (`bossctl metrics list --prefix <sweep>`; values flush to
 `state.db` every 30 s):
 
@@ -26,6 +26,18 @@ metrics registry (`bossctl metrics list --prefix <sweep>`; values flush to
 | `terminal_work_sweep`         | the candidate-gathering phase of one 60 s terminal-work pass                               | live worker slots inspected                                                        |
 | `agent_jsonl_stream`          | one 50 ms tail poll iteration of any live JSONL stream                                     | sessions-root revalidations (`lstat` + `canonicalize`) performed in that iteration |
 | `execution_bookmark_pointers` | one recovery-pointer snapshot or restore over a PR chain (mechanical / speculative rebase) | recovery-bookmark records covered                                                  |
+
+Only the singleton envelope and terminal-work sweeps publish tick intervals.
+Concurrent tails and bookmark operations have no shared cadence. Root
+revalidation counts are isolated per tail, excluding discovery and other tails.
+
+`dead_pane_terminal` measures the terminal execution scan and process probes;
+items count recent terminal rows.
+
+The periodic `speculative_conflict` sweep drives the pointer snapshot/restore
+series, as do mechanical rebases. The separate five-minute
+`abandoned_execution_bookmarks` pass is not part of the sampled pointer hotspot
+and is not represented by this series.
 
 Two extra counters:
 
@@ -80,8 +92,9 @@ restore reads the current pointers once, leaves unchanged ones alone, and
 groups the moved ones per target commit into one `bookmark set`.
 
 **Sweeps ran their SQLite work inline on tokio async worker threads.** The
-envelope watchdog's pass and the terminal-work sweep's gathering phase now
-run on the blocking pool via `db_diagnostics::spawn_blocking`.
+envelope watchdog's pass, deadline reconciliation and deadline handling,
+terminal-work gathering, dead-pane scans and probes, and PR-review recovery
+candidate reads run on the blocking pool via `db_diagnostics::spawn_blocking`.
 
 Sweep intervals, item limits and the review-badge projection are
 unchanged; the gauges above are what to read before changing any of them.

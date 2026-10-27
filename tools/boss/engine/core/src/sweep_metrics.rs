@@ -4,7 +4,6 @@
 //! Periodic singleton sweeps also report the interval between pass starts.
 //! Concurrent tails and rebase operations do not have a shared cadence.
 
-use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::metrics::{CounterHandle, GaugeHandle, Registry};
@@ -136,18 +135,24 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&EXECUTION_BOOKMARK_POINTERS_JJ_SPAWNS);
 }
 
-/// The four handles one sweep publishes, plus the start instant of its
-/// previous pass (for the tick-interval gauge). One static per sweep; a
+/// Handles published by one sweep. Cadence state is owned by its loop; a
 /// pass is bracketed by [`SweepTicker::begin`] / [`PassTimer::finish`].
 pub(crate) struct SweepTicker {
     pass_duration_ms: &'static GaugeHandle,
     items_per_pass: &'static GaugeHandle,
     tick_interval_ms: Option<&'static GaugeHandle>,
     passes: &'static CounterHandle,
-    last_pass_started: Mutex<Option<Instant>>,
 }
 
 impl SweepTicker {
+    /// Cadence belongs to one running loop, separate from phase timing.
+    pub(crate) fn record_tick(&self, registry: &Registry, previous: &mut Option<Instant>) {
+        let now = Instant::now();
+        if let (Some(last), Some(interval)) = (previous.replace(now), self.tick_interval_ms) {
+            interval.set(registry, saturating_ms(now.duration_since(last)));
+        }
+    }
+
     const fn new(
         pass_duration_ms: &'static GaugeHandle,
         items_per_pass: &'static GaugeHandle,
@@ -159,26 +164,12 @@ impl SweepTicker {
             items_per_pass,
             tick_interval_ms,
             passes,
-            last_pass_started: Mutex::new(None),
         }
     }
 
-    /// Mark the start of a pass. Records the gap since the previous pass
-    /// started (the observed tick interval) and returns the timer whose
-    /// [`PassTimer::finish`] records duration and item count.
-    pub(crate) fn begin(&'static self, registry: &Registry) -> PassTimer {
+    /// Start timing the measured phase of a pass.
+    pub(crate) fn begin(&'static self) -> PassTimer {
         let now = Instant::now();
-        let previous = if self.tick_interval_ms.is_some() {
-            let mut last = self
-                .last_pass_started
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            last.replace(now)
-        } else { None };
-        if let (Some(previous), Some(interval)) = (previous, self.tick_interval_ms) {
-            interval
-                .set(registry, saturating_ms(now.duration_since(previous)));
-        }
         PassTimer {
             ticker: self,
             started: now,
@@ -243,13 +234,16 @@ mod tests {
         let registry = Registry::new();
         register_metrics(&registry);
 
-        let first = ENVELOPE_WATCH.begin(&registry);
+        let mut previous = None;
+        ENVELOPE_WATCH.record_tick(&registry, &mut previous);
+        let first = ENVELOPE_WATCH.begin();
         first.finish(&registry, 3);
         assert_eq!(registry.gauge_value("envelope_watch.items_per_pass"), Some(3));
         assert_eq!(registry.counter_value("envelope_watch.passes"), Some(1));
         assert!(registry.gauge_value("envelope_watch.pass_duration_ms").is_some());
 
-        let second = ENVELOPE_WATCH.begin(&registry);
+        ENVELOPE_WATCH.record_tick(&registry, &mut previous);
+        let second = ENVELOPE_WATCH.begin();
         second.finish(&registry, 0);
         assert_eq!(registry.gauge_value("envelope_watch.items_per_pass"), Some(0));
         assert_eq!(registry.counter_value("envelope_watch.passes"), Some(2));
@@ -279,5 +273,20 @@ mod tests {
         ] {
             assert_eq!(registry.counter_value(name), Some(0), "{name}");
         }
+    }
+
+    #[test]
+    fn direct_passes_do_not_change_loop_cadence() {
+        let registry = Registry::new();
+        register_metrics(&registry);
+        let mut previous = Some(Instant::now() - std::time::Duration::from_secs(1));
+        ENVELOPE_WATCH.record_tick(&registry, &mut previous);
+        let interval = registry.gauge_value("envelope_watch.tick_interval_ms");
+        ENVELOPE_WATCH.begin().finish(&registry, 0);
+        ENVELOPE_WATCH.begin().finish(&registry, 0);
+        assert_eq!(registry.gauge_value("envelope_watch.tick_interval_ms"), interval);
+        let mut other_loop = None;
+        ENVELOPE_WATCH.record_tick(&registry, &mut other_loop);
+        assert_eq!(registry.gauge_value("envelope_watch.tick_interval_ms"), interval);
     }
 }

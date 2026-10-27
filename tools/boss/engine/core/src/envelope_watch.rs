@@ -167,7 +167,9 @@ pub fn spawn_loop(
     thresholds: EnvelopeThresholds,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
+    let mut previous_pass = None;
     crate::sweep_loop::spawn_sweep_loop(interval, move || {
+        crate::sweep_metrics::ENVELOPE_WATCH.record_tick(work_db.metrics_registry(), &mut previous_pass);
         let work_db = Arc::clone(&work_db);
         let live_states = Arc::clone(&live_states);
         async move {
@@ -201,7 +203,7 @@ pub fn run_one_pass(
     now_epoch_secs: i64,
 ) -> EnvelopeSweepOutcome {
     let registry = work_db.metrics_registry();
-    let timer = crate::sweep_metrics::ENVELOPE_WATCH.begin(registry);
+    let timer = crate::sweep_metrics::ENVELOPE_WATCH.begin();
     let mut outcome = EnvelopeSweepOutcome::default();
 
     let states = live_states.snapshot();
@@ -453,7 +455,8 @@ pub fn spawn_timer_subscriber(
             // otherwise deadlines would grow unbounded for the process
             // lifetime once scheduling runs continuously.
             let mut scheduled_ids: HashSet<String> = HashSet::new();
-            scheduled_ids = reconcile_on_blocking_pool(&work_db, &live_states, &timer_wheel, thresholds, scheduled_ids).await;
+            scheduled_ids =
+                reconcile_on_blocking_pool(&work_db, &live_states, &timer_wheel, thresholds, scheduled_ids).await;
 
             let mut reconcile_tick = tokio::time::interval(reconcile_interval);
             reconcile_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -501,7 +504,9 @@ async fn reconcile_on_blocking_pool(
     match crate::work::db_diagnostics::spawn_blocking(move || {
         reconcile_envelope_deadlines(&db, &states, &wheel, &thresholds, &mut next_ids);
         next_ids
-    }).await {
+    })
+    .await
+    {
         Ok(ids) => ids,
         Err(error) => {
             tracing::error!(?error, "envelope-watch: deadline reconciliation did not complete");

@@ -287,6 +287,127 @@ fn sweep_cost_baseline_full_projection_vs_narrow_reads() {
         }
     }
     eprintln!("sweep_cost_baseline: fixture built in {:?}", fixture_started.elapsed());
+    let states = crate::live_worker_state::LiveWorkerStateRegistry::new();
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let mut executions = Vec::new();
+    for (slot, id) in roots.iter().take(8).enumerate() {
+        let spawn_item = create_active_chore(&db, &product, &format!("slot {slot}"));
+        let execution = create_spawned_execution(&db, &spawn_item, 2_000_000_000);
+        // Model the post-publication state: the live execution is bound to
+        // an in-review root, which cannot accept a new implementation run.
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET work_item_id = ?1 WHERE id = ?2",
+                params![id, execution],
+            )
+            .unwrap();
+        states.register_spawn(
+            slot as u8,
+            &execution,
+            "test-model",
+            2_000_000_000,
+            Some(boss_protocol::WorkItemBinding {
+                work_item_id: id.clone(),
+                work_item_name: "measurement".into(),
+                execution_id: execution.clone(),
+            }),
+        );
+        states.set_activity_for_test(slot as u8, boss_protocol::WorkerActivity::Working);
+        executions.push(execution);
+    }
+    for pass in 0..3 {
+        let before = Instant::now();
+        for (execution, id) in executions.iter().zip(&roots) {
+            db.get_execution(execution).unwrap();
+            db.get_work_item(id).unwrap();
+        }
+        eprintln!(
+            "pass {pass}: old per-slot execution + full task reads (8 slots): {:?}",
+            before.elapsed()
+        );
+        let outcome = crate::envelope_watch::run_one_pass(
+            &db,
+            &states,
+            &crate::envelope_watch::EnvelopeThresholds::default(),
+            now,
+        );
+        assert_eq!(outcome.within_envelope, 8);
+        crate::terminal_work_sweep::gather_reap_candidates(
+            &db,
+            &states,
+            &crate::teardown_registry::TeardownRegistry::new(),
+        );
+        for prefix in ["envelope_watch", "terminal_work_sweep"] {
+            assert_eq!(
+                db.metrics_registry().gauge_value(&format!("{prefix}.items_per_pass")),
+                Some(8)
+            );
+            eprintln!(
+                "pass {pass}: {prefix}.pass_duration_ms={:?} items_per_pass=8",
+                db.metrics_registry().gauge_value(&format!("{prefix}.pass_duration_ms"))
+            );
+        }
+    }
+    for execution in &executions {
+        db.mark_execution_orphaned(execution, "measurement").unwrap();
+    }
+    for pass in 0..3 {
+        let before = Instant::now();
+        let conn = db.connect().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                    cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                    created_at, started_at, finished_at, pre_start_failure_count, dispatch_not_before,
+                    pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count,
+                    allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since,
+                    driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+             FROM work_executions
+             WHERE status IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+               AND EXISTS (
+                   SELECT 1 FROM work_runs r
+                   WHERE r.id = (SELECT latest.id FROM work_runs latest
+                       WHERE latest.execution_id = work_executions.id
+                       ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1)
+                     AND r.host_id = 'local' AND r.shell_pid > 0
+                     AND CAST(COALESCE(r.finished_at, r.created_at) AS INTEGER) >= ?1)
+             ORDER BY created_at ASC, id ASC",
+            )
+            .unwrap();
+        let rows: Vec<_> = stmt
+            .query_map(
+                [now - crate::durable_liveness::REDISPATCH_PID_TRUST_SECS],
+                map_execution,
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows.len(), 8);
+        drop(stmt);
+        drop(conn);
+        for execution in rows {
+            crate::durable_liveness::probe_execution_worker_within(
+                &db,
+                &execution.id,
+                crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
+                now,
+            );
+        }
+        eprintln!(
+            "pass {pass}: terminal full-row scan + probes (8 rows): {:?}",
+            before.elapsed()
+        );
+        assert!(crate::dead_pane_sweep::gather_live_terminal_candidates(&db, now).is_empty());
+        assert_eq!(
+            db.metrics_registry().gauge_value("dead_pane_terminal.items_per_pass"),
+            Some(8)
+        );
+        eprintln!(
+            "pass {pass}: dead_pane_terminal.pass_duration_ms={:?} items_per_pass=8",
+            db.metrics_registry().gauge_value("dead_pane_terminal.pass_duration_ms")
+        );
+    }
 
     // Full projection, one read per id: what every sweep did per slot.
     let full_started = Instant::now();
@@ -345,7 +466,13 @@ fn corrupt_effort_does_not_disable_other_slots() {
     let valid = create_active_chore(&db, &product, "valid");
     let corrupt = create_active_chore(&db, &product, "corrupt");
     set_effort(&db, &valid, EffortLevel::Small);
-    db.connect().unwrap().execute("UPDATE tasks SET effort_level = 'invalid' WHERE id = ?1", params![corrupt]).unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET effort_level = 'invalid' WHERE id = ?1",
+            params![corrupt],
+        )
+        .unwrap();
     let efforts = db.task_effort_levels(&[valid.clone(), corrupt.clone()]).unwrap();
     assert_eq!(efforts.get(&valid), Some(&EffortLevel::Small));
     assert!(!efforts.contains_key(&corrupt));

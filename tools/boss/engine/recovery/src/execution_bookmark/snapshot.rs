@@ -9,9 +9,7 @@ pub type PointerSnapshot = Vec<(String, Option<String>)>;
 ///
 /// Returns every visible commit each named bookmark points at (a conflicted
 /// bookmark lists more than one; an absent bookmark is missing from the
-/// map). One child process instead of one per bookmark: a pointer snapshot
-/// or restore over a PR chain used to spawn `jj` three times per record,
-/// and on a busy engine those spawns were a measurable share of its CPU.
+/// map). Each record uses one child process for all its bookmarks.
 ///
 /// Bookmark names are matched by the template's `name()` — the literal
 /// local bookmark name, never the decorated `name*` / `name??` rendering —

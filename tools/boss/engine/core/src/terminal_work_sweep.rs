@@ -230,7 +230,9 @@ pub fn spawn_loop(
     // `Arc<Mutex>` it can borrow each iteration — a single task ever holds
     // the lock, so there is no real contention.
     let seen_terminal: Arc<tokio::sync::Mutex<HashSet<String>>> = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+    let mut previous_pass = None;
     crate::sweep_loop::spawn_sweep_loop(interval, move || {
+        crate::sweep_metrics::TERMINAL_WORK_SWEEP.record_tick(work_db.metrics_registry(), &mut previous_pass);
         let work_db = Arc::clone(&work_db);
         let live_states = Arc::clone(&live_states);
         let reaper = Arc::clone(&reaper);
@@ -291,7 +293,7 @@ pub async fn run_one_pass(
 /// Everything the synchronous half of a pass produces: the per-slot
 /// counters so far and this pass's reap candidates, keyed on `run_id` for
 /// the two-pass confirmation helper.
-struct GatheredCandidates {
+pub(crate) struct GatheredCandidates {
     outcome: TerminalWorkSweepOutcome,
     candidates: Vec<(String, ReapCandidate)>,
 }
@@ -301,13 +303,13 @@ struct GatheredCandidates {
 /// here — one execution point-read per slot plus ONE batched status read
 /// for every bound task (see `work/sweep_reads.rs`). No
 /// awaits, so [`spawn_loop`] can run it on the blocking pool.
-fn gather_reap_candidates(
+pub(crate) fn gather_reap_candidates(
     work_db: &WorkDb,
     live_states: &LiveWorkerStateRegistry,
     teardown_registry: &TeardownRegistry,
 ) -> GatheredCandidates {
     let registry = work_db.metrics_registry();
-    let timer = crate::sweep_metrics::TERMINAL_WORK_SWEEP.begin(registry);
+    let timer = crate::sweep_metrics::TERMINAL_WORK_SWEEP.begin();
     let mut outcome = TerminalWorkSweepOutcome::default();
     if let Err(err) = work_db.reconcile_pr_review_guide_attempts() {
         tracing::warn!(?err, "terminal-work sweep: review-guide attempt reconcile failed",);

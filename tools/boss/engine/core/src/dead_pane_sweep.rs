@@ -188,7 +188,10 @@ pub async fn run_one_pass(
     let db = work_db.clone();
     let candidates = match crate::work::db_diagnostics::spawn_blocking(move || {
         db.list_non_terminal_executions_with_local_shell_pid()
-    }).await.unwrap_or_else(|error| Err(error.into())) {
+    })
+    .await
+    .unwrap_or_else(|error| Err(error.into()))
+    {
         Ok(rows) => rows,
         Err(err) => {
             tracing::warn!(
@@ -221,12 +224,13 @@ pub async fn run_one_pass(
     // probe is mandatory because convergence may signal the recorded process
     // group; an old recycled pid is not evidence.
     let db = work_db.clone();
-    let terminal_candidates = crate::work::db_diagnostics::spawn_blocking(move || {
-        gather_live_terminal_candidates(&db, now_epoch_secs)
-    }).await.unwrap_or_else(|error| {
-        tracing::error!(?error, "pane-death sweep: terminal gathering did not complete");
-        Vec::new()
-    });
+    let terminal_candidates =
+        crate::work::db_diagnostics::spawn_blocking(move || gather_live_terminal_candidates(&db, now_epoch_secs))
+            .await
+            .unwrap_or_else(|error| {
+                tracing::error!(?error, "pane-death sweep: terminal gathering did not complete");
+                Vec::new()
+            });
     for (execution, process) in terminal_candidates {
         tracing::warn!(
             execution_id = %execution.id,
@@ -257,20 +261,29 @@ pub(crate) fn gather_live_terminal_candidates(
     now_epoch_secs: i64,
 ) -> Vec<(crate::work::TerminalExecutionRef, WorkerProcess)> {
     let registry = work_db.metrics_registry();
-    let timer = crate::sweep_metrics::DEAD_PANE_TERMINAL.begin(registry);
-    let rows = work_db.list_recent_terminal_execution_refs_with_local_shell_pid(
-        crate::durable_liveness::REDISPATCH_PID_TRUST_SECS, now_epoch_secs,
-    ).unwrap_or_else(|error| {
-        tracing::warn!(?error, "pane-death sweep: could not list terminal candidates");
-        Vec::new()
-    });
+    let timer = crate::sweep_metrics::DEAD_PANE_TERMINAL.begin();
+    let rows = work_db
+        .list_recent_terminal_execution_refs_with_local_shell_pid(
+            crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
+            now_epoch_secs,
+        )
+        .unwrap_or_else(|error| {
+            tracing::warn!(?error, "pane-death sweep: could not list terminal candidates");
+            Vec::new()
+        });
     let count = rows.len();
-    let candidates = rows.into_iter().filter_map(|execution| {
-        let process = crate::durable_liveness::probe_execution_worker_within(
-            work_db, &execution.id, crate::durable_liveness::REDISPATCH_PID_TRUST_SECS, now_epoch_secs,
-        );
-        process.is_alive().then_some((execution, process))
-    }).collect();
+    let candidates = rows
+        .into_iter()
+        .filter_map(|execution| {
+            let process = crate::durable_liveness::probe_execution_worker_within(
+                work_db,
+                &execution.id,
+                crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
+                now_epoch_secs,
+            );
+            process.is_alive().then_some((execution, process))
+        })
+        .collect();
     timer.finish(registry, count);
     candidates
 }
@@ -337,7 +350,9 @@ pub(crate) async fn shell_pid_death_evidence(
     let execution_id = execution.id.clone();
     let process = crate::work::db_diagnostics::spawn_blocking(move || {
         crate::durable_liveness::probe_execution_worker(&db, &execution_id)
-    }).await.ok()?;
+    })
+    .await
+    .ok()?;
 
     // Corroborate a `Gone` verdict against the (in-memory) live-worker
     // registry before trusting it. Unlike `dead_pid_sweep`, this probe reads

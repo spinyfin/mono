@@ -81,7 +81,7 @@ impl WorkDb {
     ) -> Vec<(ExecutionBookmark, PointerSnapshot)> {
         use boss_engine_recovery::execution_bookmark::snapshot_pointers;
         let registry = self.metrics_registry();
-        let timer = crate::sweep_metrics::EXECUTION_BOOKMARK_POINTERS.begin(registry);
+        let timer = crate::sweep_metrics::EXECUTION_BOOKMARK_POINTERS.begin();
         let jj = CountingJj::new();
         let records = self.chain_bookmark_records(chain_root_id);
         let items = records.len();
@@ -104,7 +104,7 @@ impl WorkDb {
     pub(crate) async fn restore_rebase_pointers(&self, saved: &[(ExecutionBookmark, PointerSnapshot)]) -> bool {
         use boss_engine_recovery::execution_bookmark::restore_pointers;
         let registry = self.metrics_registry();
-        let timer = crate::sweep_metrics::EXECUTION_BOOKMARK_POINTERS.begin(registry);
+        let timer = crate::sweep_metrics::EXECUTION_BOOKMARK_POINTERS.begin();
         let jj = CountingJj::new();
         let mut restored = true;
         for (record, pointers) in saved {

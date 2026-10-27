@@ -1272,20 +1272,26 @@ impl StreamTelemetry {
     /// Bracket one poll iteration. Returns the pass timer plus the
     /// root-revalidation count at iteration start, so
     /// [`Self::finish_poll`] can record how many the iteration performed.
-    fn begin_poll(&self, root: &crate::agent_jsonl_discovery::VerifiedRoot) -> Option<(crate::sweep_metrics::PassTimer, u64)> {
-        let registry = self.registry.as_deref()?;
+    fn begin_poll(
+        &self,
+        root: &crate::agent_jsonl_discovery::VerifiedRoot,
+    ) -> Option<(crate::sweep_metrics::PassTimer, u64)> {
+        self.registry.as_deref()?;
         Some((
-            crate::sweep_metrics::AGENT_JSONL_STREAM.begin(registry),
+            crate::sweep_metrics::AGENT_JSONL_STREAM.begin(),
             root.revalidation_count(),
         ))
     }
 
-    fn finish_poll(&self, root: &crate::agent_jsonl_discovery::VerifiedRoot, poll: Option<(crate::sweep_metrics::PassTimer, u64)>) {
+    fn finish_poll(
+        &self,
+        root: &crate::agent_jsonl_discovery::VerifiedRoot,
+        poll: Option<(crate::sweep_metrics::PassTimer, u64)>,
+    ) {
         let (Some(registry), Some((timer, revalidations_before))) = (self.registry.as_deref(), poll) else {
             return;
         };
-        let revalidations =
-            root.revalidation_count().saturating_sub(revalidations_before);
+        let revalidations = root.revalidation_count().saturating_sub(revalidations_before);
         crate::sweep_metrics::AGENT_JSONL_STREAM_ROOT_REVALIDATIONS.inc_by(registry, revalidations);
         timer.finish(registry, usize::try_from(revalidations).unwrap_or(usize::MAX));
     }

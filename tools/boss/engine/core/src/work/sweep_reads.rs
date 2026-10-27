@@ -93,7 +93,8 @@ impl WorkDb {
             },
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        Ok(raw.into_iter()
+        Ok(raw
+            .into_iter()
             .filter_map(|(id, effort)| match effort.parse::<EffortLevel>() {
                 Ok(level) => Some((id, level)),
                 Err(error) => {

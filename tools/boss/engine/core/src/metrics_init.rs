@@ -77,9 +77,8 @@ pub fn init_all(registry: &Registry) {
     // Work DB lock-contention rollup: timing-event / busy-failure counters
     // and the longest-hold-per-minute gauge.
     crate::work::lock_stats::register_metrics(registry);
-    // Background-sweep pass telemetry: per-pass duration, items, and the
-    // observed tick interval for the envelope watchdog, terminal-work
-    // reconciler, agent-JSONL tail poll, and recovery-pointer passes.
+    // Background pass durations and item counts, plus loop-owned cadence
+    // for the singleton envelope and terminal-work sweeps.
     crate::sweep_metrics::register_metrics(registry);
 }
 
@@ -128,6 +127,7 @@ mod tests {
                 "database_backup.offsite.success_record_failed",
                 "db_lock.busy_failures",
                 "db_lock.timing_events",
+                "dead_pane_terminal.passes",
                 "dispatch.completed",
                 "dispatcher.hook_events.dropped_missing_run_id",
                 "dispatcher.hook_events.for_terminal_execution",
@@ -245,9 +245,10 @@ mod tests {
             vec![
                 "agent_jsonl_stream.items_per_pass",
                 "agent_jsonl_stream.pass_duration_ms",
-                "agent_jsonl_stream.tick_interval_ms",
                 "database_backup.offsite.last_success_age_secs",
                 "db_lock.longest_hold_ms",
+                "dead_pane_terminal.items_per_pass",
+                "dead_pane_terminal.pass_duration_ms",
                 "dependency_unblock.longest_stale_seconds",
                 "dispatch.drain_pass_duration_ms",
                 "dispatch.queue_depth.automation",
@@ -261,7 +262,6 @@ mod tests {
                 "envelope_watch.tick_interval_ms",
                 "execution_bookmark_pointers.items_per_pass",
                 "execution_bookmark_pointers.pass_duration_ms",
-                "execution_bookmark_pointers.tick_interval_ms",
                 "github_api.graphql.remaining",
                 "github_api.rest.remaining",
                 "merge_poller.adaptive_tracked",

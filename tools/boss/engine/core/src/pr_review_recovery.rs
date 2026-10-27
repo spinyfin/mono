@@ -102,7 +102,12 @@ pub fn spawn_loop(
         dispatch_events,
         interval,
         |work_db, coordinator, dispatch_events| {
-            Box::pin(run_one_pass(work_db, coordinator, dispatch_events, Arc::new(GhPrStateChecker)))
+            Box::pin(run_one_pass(
+                work_db,
+                coordinator,
+                dispatch_events,
+                Arc::new(GhPrStateChecker),
+            ))
         },
     )
 }
@@ -119,9 +124,7 @@ pub async fn run_one_pass(
     pr_checker: Arc<dyn PrStateChecker>,
 ) -> PrReviewRecoveryOutcome {
     let db = work_db.clone();
-    let gathered = crate::work::db_diagnostics::spawn_blocking(move || {
-        recover_reviews(&db, pr_checker.as_ref())
-    }).await;
+    let gathered = crate::work::db_diagnostics::spawn_blocking(move || recover_reviews(&db, pr_checker.as_ref())).await;
     let (outcome, events) = match gathered {
         Ok(result) => result,
         Err(error) => {
@@ -140,8 +143,7 @@ pub async fn run_one_pass(
 
 /// Read and settle durable review state off the async runtime, returning
 /// owned dispatch events for publication after the database phase.
-fn recover_reviews(work_db: &WorkDb, pr_checker: &dyn PrStateChecker)
-    -> (PrReviewRecoveryOutcome, Vec<DispatchEvent>) {
+fn recover_reviews(work_db: &WorkDb, pr_checker: &dyn PrStateChecker) -> (PrReviewRecoveryOutcome, Vec<DispatchEvent>) {
     let mut events = Vec::new();
     let mut outcome = PrReviewRecoveryOutcome::default();
 
@@ -181,8 +183,7 @@ fn recover_reviews(work_db: &WorkDb, pr_checker: &dyn PrStateChecker)
         // leaf would spawn a reviewer (and burn a review-pool slot and a
         // cube lease) for a PR that no longer needs one.
         // A narrow `pr_url` read (see `work/sweep_reads.rs`): the candidate
-        // query joins `tasks`, so this is always a task/chore row, and the
-        // full projection's badge/chain work was pure cost here.
+        // query joins `tasks`, so this is always a task/chore row.
         let pr_url = match work_db.task_pr_url(&work_item_id) {
             Ok(pr_url) => pr_url,
             Err(error) => {
@@ -336,14 +337,14 @@ fn recover_reviews(work_db: &WorkDb, pr_checker: &dyn PrStateChecker)
             Ok(RetryDeadReviewBatchMember::Retried(retry)) => {
                 file_dead_review_attention(work_db, &work_item_id, &dead_execution_id, dead_status.as_str());
                 events.push(
-                        DispatchEvent::new(Stage::PrReviewDeadRecovery, Outcome::Ok, &retry.id)
-                            .with_work_item(&work_item_id)
-                            .with_details(serde_json::json!({
-                                "dead_execution_id": dead_execution_id,
-                                "dead_execution_status": dead_status.as_str(),
-                                "recovery_mode": "review_batch_member",
-                            })),
-                    );
+                    DispatchEvent::new(Stage::PrReviewDeadRecovery, Outcome::Ok, &retry.id)
+                        .with_work_item(&work_item_id)
+                        .with_details(serde_json::json!({
+                            "dead_execution_id": dead_execution_id,
+                            "dead_execution_status": dead_status.as_str(),
+                            "recovery_mode": "review_batch_member",
+                        })),
+                );
                 tracing::warn!(
                     work_item_id = %work_item_id,
                     dead_execution_id = %dead_execution_id,
@@ -406,14 +407,14 @@ fn recover_reviews(work_db: &WorkDb, pr_checker: &dyn PrStateChecker)
             Ok(RetryDeadReviewBatchMember::Retried(retry)) => {
                 file_dead_review_attention(work_db, &work_item_id, &dead_execution_id, dead_status.as_str());
                 events.push(
-                        DispatchEvent::new(Stage::PrReviewDeadRecovery, Outcome::Ok, &retry.id)
-                            .with_work_item(&work_item_id)
-                            .with_details(serde_json::json!({
-                                "dead_execution_id": dead_execution_id,
-                                "dead_execution_status": dead_status.as_str(),
-                                "recovery_mode": "post_merge_review_batch_member",
-                            })),
-                    );
+                    DispatchEvent::new(Stage::PrReviewDeadRecovery, Outcome::Ok, &retry.id)
+                        .with_work_item(&work_item_id)
+                        .with_details(serde_json::json!({
+                            "dead_execution_id": dead_execution_id,
+                            "dead_execution_status": dead_status.as_str(),
+                            "recovery_mode": "post_merge_review_batch_member",
+                        })),
+                );
                 tracing::warn!(
                     work_item_id = %work_item_id,
                     dead_execution_id = %dead_execution_id,
@@ -543,13 +544,13 @@ fn recover_reviews(work_db: &WorkDb, pr_checker: &dyn PrStateChecker)
                 file_dead_review_attention(work_db, &work_item_id, &dead_execution_id, dead_status.as_str());
 
                 events.push(
-                        DispatchEvent::new(Stage::PrReviewDeadRecovery, Outcome::Ok, &execution.id)
-                            .with_work_item(&work_item_id)
-                            .with_details(serde_json::json!({
-                                "dead_execution_id": dead_execution_id,
-                                "dead_execution_status": dead_status.as_str(),
-                            })),
-                    );
+                    DispatchEvent::new(Stage::PrReviewDeadRecovery, Outcome::Ok, &execution.id)
+                        .with_work_item(&work_item_id)
+                        .with_details(serde_json::json!({
+                            "dead_execution_id": dead_execution_id,
+                            "dead_execution_status": dead_status.as_str(),
+                        })),
+                );
 
                 tracing::warn!(
                     work_item_id = %work_item_id,
@@ -684,7 +685,13 @@ mod tests {
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let checker = FakePrStateChecker::always(PrOpenState::Open);
 
-        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), Arc::new(checker.clone())).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            Arc::new(checker.clone()),
+        )
+        .await;
 
         assert_eq!(outcome.refired, 1, "dead review should have been auto-refired");
 
@@ -720,7 +727,13 @@ mod tests {
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let checker = FakePrStateChecker::always(PrOpenState::Merged);
 
-        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), Arc::new(checker.clone())).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            Arc::new(checker.clone()),
+        )
+        .await;
 
         assert_eq!(outcome.refired, 0);
         assert_eq!(outcome.pr_closed_skipped, 1);
@@ -751,7 +764,13 @@ mod tests {
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let checker = FakePrStateChecker::always(PrOpenState::Open);
 
-        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), Arc::new(checker.clone())).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            Arc::new(checker.clone()),
+        )
+        .await;
 
         assert_eq!(outcome.churn_skipped, 1, "churn guard should have fired");
         assert_eq!(outcome.refired, 0);
@@ -802,7 +821,13 @@ mod tests {
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let checker = FakePrStateChecker::always(PrOpenState::Open);
 
-        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), Arc::new(checker.clone())).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            Arc::new(checker.clone()),
+        )
+        .await;
 
         assert_eq!(
             outcome.churn_skipped, 1,
@@ -835,7 +860,13 @@ mod tests {
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let checker = FakePrStateChecker::always(PrOpenState::Open);
 
-        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), Arc::new(checker.clone())).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            Arc::new(checker.clone()),
+        )
+        .await;
         assert_eq!(outcome.churn_skipped, 1, "churn guard should have fired");
         assert_eq!(outcome.refired, 0);
 
@@ -855,7 +886,13 @@ mod tests {
         )
         .unwrap();
 
-        let outcome_after_drain = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), Arc::new(checker.clone())).await;
+        let outcome_after_drain = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            Arc::new(checker.clone()),
+        )
+        .await;
         assert_eq!(
             outcome_after_drain.refired, 1,
             "recovery sweep should auto-refire once the churn window drains"
@@ -903,7 +940,13 @@ mod tests {
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let checker = FakePrStateChecker::always(PrOpenState::Open);
 
-        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), Arc::new(checker.clone())).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            Arc::new(checker.clone()),
+        )
+        .await;
 
         assert_eq!(
             outcome.churn_skipped, 0,
@@ -982,7 +1025,13 @@ mod tests {
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let checker = FakePrStateChecker::always(PrOpenState::Open);
 
-        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), Arc::new(checker.clone())).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            Arc::new(checker.clone()),
+        )
+        .await;
 
         assert_eq!(
             outcome.refired, 0,
@@ -1265,7 +1314,13 @@ mod tests {
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let checker = FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha");
 
-        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), Arc::new(checker.clone())).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            Arc::new(checker.clone()),
+        )
+        .await;
 
         assert_eq!(outcome.refired, 1, "dead supervisor should have been retried once");
         assert_eq!(outcome.terminal_failed, 0);
@@ -1322,7 +1377,13 @@ mod tests {
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let checker = FakePrStateChecker::always(PrOpenState::Open).with_head_sha("new-head");
 
-        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), Arc::new(checker.clone())).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            Arc::new(checker.clone()),
+        )
+        .await;
 
         assert_eq!(outcome.refired, 0, "must not retry a supervisor against a moved head");
         assert_eq!(outcome.terminal_failed, 1);
@@ -1357,7 +1418,13 @@ mod tests {
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let checker = FakePrStateChecker::always(PrOpenState::Merged).with_head_sha("head-sha");
 
-        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), Arc::new(checker.clone())).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            Arc::new(checker.clone()),
+        )
+        .await;
 
         assert_eq!(outcome.refired, 0);
         assert_eq!(outcome.pr_closed_skipped, 0);
