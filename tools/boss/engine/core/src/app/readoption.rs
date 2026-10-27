@@ -420,7 +420,8 @@ impl ServerState {
                 }
             }
             // Durable pids can be recycled across restart. Process identity is
-            // registered by tmux adoption after observing the live pane pid.
+            // registered by tmux adoption (adopt_one, or the terminal-handoff
+            // branch of the session sweep) after observing the live pane pid.
             let binding =
                 self.work_db
                     .get_work_item(&restored.work_item_id)

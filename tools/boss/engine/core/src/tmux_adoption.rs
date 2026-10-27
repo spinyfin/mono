@@ -1118,6 +1118,10 @@ async fn classify_untracked_session<S>(
         ) {
             return;
         }
+        // The pid was just observed live in the tmux pane, so (unlike a durable
+        // pid) it is safe to trust. Register it before convergence returns the
+        // worker to Running so its requests are attributed and confined at once.
+        spawner.worker_registry().register(shell_pid, execution_id.clone());
         convergence
             .converge_live_worker(&execution_id, TERMINAL_HANDOFF_TRIGGER)
             .await;
@@ -2321,11 +2325,16 @@ mod tests {
         );
         assert_eq!(
             convergence.calls.lock().unwrap().as_slice(),
-            &[(execution_id, TERMINAL_HANDOFF_TRIGGER.to_owned())],
+            &[(execution_id.clone(), TERMINAL_HANDOFF_TRIGGER.to_owned())],
         );
         assert!(
             spawner.live_states.snapshot().is_empty(),
             "a terminal-status handoff must never rebuild live state directly",
+        );
+        assert_eq!(
+            spawner.registry.lookup_unverified(111),
+            Some(execution_id.clone()),
+            "terminal handoff must register the tmux-observed pane pid before the worker resumes",
         );
     }
 

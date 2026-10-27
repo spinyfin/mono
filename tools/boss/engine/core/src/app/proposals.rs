@@ -428,7 +428,34 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                         },
                     );
                 }
-                Ok(_) => {
+                Ok(Some(existing)) => {
+                    tracing::warn!(
+                        execution_id = %caller.execution_id,
+                        kind = %kind,
+                        idempotency_key = %idempotency_key,
+                        existing_kind = %existing.kind,
+                        "submit_proposal rejected: ended execution reused an idempotency_key across kinds",
+                    );
+                    return send_rejection(
+                        &sink,
+                        &request_id,
+                        ProposalSubmissionError::validation(vec![ProposalFieldError::new(
+                            "idempotency_key",
+                            format!(
+                                "idempotency_key `{idempotency_key}` was already used for a `{}` proposal (id {}); \
+                                 reuse it only for a genuine retry of the same submission, or choose a different key",
+                                existing.kind, existing.id
+                            ),
+                        )]),
+                    );
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        execution_id = %caller.execution_id,
+                        kind = %kind,
+                        idempotency_key = %idempotency_key,
+                        "submit_proposal rejected: execution has ended and only replays are accepted",
+                    );
                     return send_rejection(
                         &sink,
                         &request_id,
