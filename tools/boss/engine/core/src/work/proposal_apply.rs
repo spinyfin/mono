@@ -285,6 +285,31 @@ fn apply_review_report(
     }))
 }
 
+/// Canonicalize only newly accepted reports before their immutable proposal
+/// row is inserted. The persisted member role, never model output, owns ids.
+pub(super) fn assign_report_finding_ids(
+    tx: &Transaction<'_>,
+    execution_id: &str,
+    payload_json: &str,
+) -> Result<String> {
+    let mut payload: ReviewReportProposalPayload = serde_json::from_str(payload_json)?;
+    let role: String = tx.query_row(
+        "SELECT role FROM pr_review_batch_members WHERE execution_id = ?1 AND batch_id = ?2",
+        rusqlite::params![execution_id, payload.batch_id],
+        |row| row.get(0),
+    )?;
+    let role = match role.as_str() {
+        "claude_reviewer" => boss_pr_review::SupervisorSourceRole::Claude,
+        "codex_reviewer" => boss_pr_review::SupervisorSourceRole::Codex,
+        "grok_reviewer" => boss_pr_review::SupervisorSourceRole::Grok,
+        _ => anyhow::bail!("cannot assign leaf finding ids for member role `{role}`"),
+    };
+    let mut report: boss_pr_review::ReviewerReport = serde_json::from_value(payload.report)?;
+    report.assign_finding_ids(role);
+    payload.report = serde_json::to_value(report)?;
+    Ok(serde_json::to_string(&payload)?)
+}
+
 /// Check whether accepting a leaf report or a supervisor verdict just settled
 /// this batch's quorum, inside the same transaction the acceptance itself
 /// committed in. Best-effort: a failure here must never roll back (or even
@@ -486,6 +511,16 @@ fn review_verdict_unknown_source_reason(
     batch_id: &str,
     verdict: &boss_pr_review::SupervisorVerdict,
 ) -> Result<Option<String>> {
+    let errors = verdict.structural_errors();
+    if !errors.is_empty() {
+        return Ok(Some(
+            errors
+                .iter()
+                .map(|error| format!("verdict.{}: {}", error.path, error.message))
+                .collect::<Vec<_>>()
+                .join("; "),
+        ));
+    }
     if verdict.phase == boss_protocol::ReviewBatchPhase::PostMerge {
         return Ok(None);
     }
@@ -534,11 +569,10 @@ fn review_verdict_unknown_source_reason(
         }
     }
 
-    // Leaf finding ids are derived from each accepted report's role and
-    // finding order — the same derivation the supervisor prompt used — never
-    // read from the report body.
+    // Use ids persisted at acceptance, exactly as shown in the supervisor
+    // prompt. Historical reports remain unchanged and never get backfilled.
     let mut leaf_ids = Vec::new();
-    for (role, proposal_id) in &reported {
+    for (_, proposal_id) in &reported {
         let Some(proposal_id) = proposal_id else {
             continue;
         };
@@ -551,12 +585,14 @@ fn review_verdict_unknown_source_reason(
             .with_context(|| format!("parsing accepted review-report proposal {proposal_id} payload"))?;
         let report: boss_pr_review::ReviewerReport = serde_json::from_value(payload.report)
             .with_context(|| format!("parsing accepted review-report proposal {proposal_id} report body"))?;
-        let role = match role.as_str() {
-            "claude_reviewer" => boss_pr_review::SupervisorSourceRole::Claude,
-            "codex_reviewer" => boss_pr_review::SupervisorSourceRole::Codex,
-            _ => boss_pr_review::SupervisorSourceRole::Grok,
-        };
-        leaf_ids.extend(report.finding_ids(role));
+        for finding in report.findings {
+            let Some(id) = finding.id else {
+                return Ok(Some(format!(
+                    "accepted report `{proposal_id}` is legacy and has no leaf finding ids; start a new review batch"
+                )));
+            };
+            leaf_ids.push(id);
+        }
     }
     let errors = verdict.accounting_errors(&leaf_ids);
     if errors.is_empty() {

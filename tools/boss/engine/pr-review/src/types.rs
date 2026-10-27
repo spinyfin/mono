@@ -242,7 +242,7 @@ pub struct ReviewCoverage {
 pub struct ReviewerReportFinding {
     /// Engine-assigned id, unique within its report (`<role>-<n>`, see
     /// [`leaf_finding_id`]). Never trusted from the model: it is overwritten
-    /// by [`ReviewerReport::assign_finding_ids`] wherever a report is read.
+    /// by [`ReviewerReport::assign_finding_ids`] when a new report is accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     pub severity: ReviewFindingSeverity,
@@ -292,14 +292,6 @@ impl ReviewerReport {
         for (index, finding) in self.findings.iter_mut().enumerate() {
             finding.id = Some(leaf_finding_id(role, index + 1));
         }
-    }
-
-    /// The ids [`Self::assign_finding_ids`] would assign for `role`, without
-    /// mutating the report.
-    pub fn finding_ids(&self, role: SupervisorSourceRole) -> Vec<String> {
-        (1..=self.findings.len())
-            .map(|ordinal| leaf_finding_id(role, ordinal))
-            .collect()
     }
 }
 
@@ -706,7 +698,8 @@ mod tests {
         report.assign_finding_ids(SupervisorSourceRole::Codex);
         let ids: Vec<_> = report.findings.iter().map(|f| f.id.clone().unwrap()).collect();
         assert_eq!(ids, ["codex-1", "codex-2", "codex-3"]);
-        assert_eq!(report.finding_ids(SupervisorSourceRole::Codex), ids);
+        report.assign_finding_ids(SupervisorSourceRole::Codex);
+        assert_eq!(report.findings[0].id.as_deref(), Some("codex-1"));
         assert_eq!(leaf_finding_role("codex-3"), Some(SupervisorSourceRole::Codex));
         assert_eq!(leaf_finding_role("C1"), None);
         assert_eq!(leaf_finding_role("claude"), None);
@@ -720,4 +713,3 @@ mod tests {
         assert!(ReviewerReport::from_json(&json).is_ok());
     }
 }
-

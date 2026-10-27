@@ -236,11 +236,13 @@ impl SupervisorVerdict {
         serde_json::from_str(json)
     }
 
-    /// Whether this verdict predates finding ids: no consolidated finding
-    /// carries one and nothing is recorded as rejected. Legacy verdicts are
-    /// still readable and applicable, but are never backfilled.
+    /// Whether this verdict contains legacy findings: none carries an id
+    /// and nothing is recorded as rejected. An empty verdict alone cannot
+    /// establish its age. Legacy findings are never backfilled.
     pub fn is_legacy(&self) -> bool {
-        self.rejected.is_empty() && self.findings.iter().all(|finding| finding.id.is_none())
+        !self.findings.is_empty()
+            && self.rejected.is_empty()
+            && self.findings.iter().all(|finding| finding.id.is_none())
     }
 
     /// Rules that need only the verdict itself, applied to every new
@@ -291,7 +293,9 @@ impl SupervisorVerdict {
                 if post_merge && SupervisorSourceRole::parse(source).is_none() {
                     errors.push(VerdictIdError::new(
                         format!("findings[{index}].sources"),
-                        format!("`{source}` is not a reviewer role; a post-merge verdict cites its own role, e.g. `claude`"),
+                        format!(
+                            "`{source}` is not a reviewer role; a post-merge verdict cites its own role, e.g. `claude`"
+                        ),
                     ));
                 }
             }
@@ -343,7 +347,10 @@ impl SupervisorVerdict {
                 } else {
                     errors.push(VerdictIdError::new(
                         format!("findings[{index}].sources"),
-                        format!("cites unknown leaf finding id `{source}`; reported leaf finding ids are: {}", join_ids(leaf_ids)),
+                        format!(
+                            "cites unknown leaf finding id `{source}`; reported leaf finding ids are: {}",
+                            join_ids(leaf_ids)
+                        ),
                     ));
                 }
             }
@@ -354,7 +361,10 @@ impl SupervisorVerdict {
             if !known.contains(id) {
                 errors.push(VerdictIdError::new(
                     format!("rejected[{index}].leaf_finding_id"),
-                    format!("unknown leaf finding id `{id}`; reported leaf finding ids are: {}", join_ids(leaf_ids)),
+                    format!(
+                        "unknown leaf finding id `{id}`; reported leaf finding ids are: {}",
+                        join_ids(leaf_ids)
+                    ),
                 ));
                 continue;
             }
@@ -643,7 +653,10 @@ mod tests {
         let mut leafy = verdict.clone();
         leafy.findings[0].sources = vec!["claude-1".to_owned()];
         leafy.rejected = parsed_sample().rejected;
-        assert_eq!(paths(&leafy.structural_errors()), vec!["findings[0].sources", "rejected[0]"]);
+        assert_eq!(
+            paths(&leafy.structural_errors()),
+            vec!["findings[0].sources", "rejected[0]"]
+        );
     }
 
     #[test]
@@ -656,10 +669,7 @@ mod tests {
         verdict.findings.push(second);
         let rendered = crate::render_revision_instructions(
             &verdict.to_review_result(),
-            crate::ReviewOrigin {
-                task_short_id: Some(12),
-                pr_number: Some(7),
-            },
+            crate::ReviewOrigin { pr_number: Some(7) },
         );
         assert!(rendered.contains("**Finding id:** `C1`"), "{rendered}");
         assert!(rendered.contains("**Finding id:** `C2`"), "{rendered}");
@@ -673,13 +683,8 @@ mod tests {
         value["findings"][0].as_object_mut().unwrap().remove("id");
         value["findings"][0]["sources"] = serde_json::json!([]);
         let legacy = SupervisorVerdict::from_json(&value.to_string()).unwrap();
-        let rendered = crate::render_revision_instructions(
-            &legacy.to_review_result(),
-            crate::ReviewOrigin {
-                task_short_id: None,
-                pr_number: Some(7),
-            },
-        );
+        let rendered =
+            crate::render_revision_instructions(&legacy.to_review_result(), crate::ReviewOrigin { pr_number: Some(7) });
         assert!(!rendered.contains("Finding id"));
         assert!(!rendered.contains("**Sources:**"));
     }

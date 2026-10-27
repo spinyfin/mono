@@ -644,7 +644,10 @@ fn review_verdict_rejects_duplicate_ids_and_repeated_citations() {
         {"leaf_finding_id": "claude-2", "reason": "still not real"},
     ]);
     let errors = errs(ProposalKind::ReviewVerdict, payload);
-    assert!(message_for(&errors, "verdict.findings[1].id").contains("duplicate"), "{errors:?}");
+    assert!(
+        message_for(&errors, "verdict.findings[1].id").contains("duplicate"),
+        "{errors:?}"
+    );
     assert!(
         message_for(&errors, "verdict.findings[1].sources").contains("more than once"),
         "{errors:?}"
@@ -660,7 +663,9 @@ fn review_verdict_accepts_ids_sources_and_rejected_dispositions() {
     let mut payload = valid_payload_for(ProposalKind::ReviewVerdict);
     payload["verdict"]["findings"] = json!([verdict_finding(Some("C1"), json!(["claude-1", "codex-1"]))]);
     payload["verdict"]["rejected"] = json!([{"leaf_finding_id": "codex-2", "reason": "Re-read: not a defect."}]);
-    let canonical = validate_payload(ProposalKind::ReviewVerdict, &payload).expect("valid").canonical_json;
+    let canonical = validate_payload(ProposalKind::ReviewVerdict, &payload)
+        .expect("valid")
+        .canonical_json;
     let canonical: Value = serde_json::from_str(&canonical).unwrap();
     assert_eq!(canonical["verdict"]["findings"][0]["id"], "C1");
     assert_eq!(canonical["verdict"]["rejected"][0]["leaf_finding_id"], "codex-2");

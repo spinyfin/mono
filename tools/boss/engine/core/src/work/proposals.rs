@@ -184,6 +184,7 @@ impl WorkDb {
         &self,
         input: SubmitWorkerProposalInput<'_>,
     ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
+        let mut payload_json = input.payload_json.to_owned();
         let prepared_guide = (input.kind == ProposalKind::ReviewGuide)
             .then(|| super::review_guide_submission::prepare(self, input.execution_id, input.payload_json));
         // The transaction-holding half. Scoped to a block so the `conn`
@@ -312,6 +313,10 @@ impl WorkDb {
                 None => (ProposalState::Proposed, None, None, None, None, None, None),
             };
 
+            if input.kind == ProposalKind::ReviewReport && state == ProposalState::Applied {
+                payload_json = proposal_apply::assign_report_finding_ids(&tx, input.execution_id, &payload_json)?;
+            }
+
             tx.execute(
                 "INSERT INTO worker_proposals
                      (id, execution_id, work_item_id, kind, payload_json,
@@ -322,7 +327,7 @@ impl WorkDb {
                     input.execution_id,
                     input.work_item_id,
                     input.kind.as_str(),
-                    input.payload_json,
+                    payload_json,
                     input.idempotency_key,
                     state.as_str(),
                     applied_ref,
@@ -366,7 +371,7 @@ impl WorkDb {
                 .created_at(now)
                 .idempotency_key(input.idempotency_key)
                 .kind(input.kind)
-                .payload_json(input.payload_json)
+                .payload_json(payload_json)
                 .state(state)
                 .work_item_id(input.work_item_id)
                 .maybe_applied_ref(applied_ref)

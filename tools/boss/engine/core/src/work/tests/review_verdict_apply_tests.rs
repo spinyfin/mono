@@ -64,9 +64,10 @@ fn member(
 /// which the engine ids `<role>-1`. Verdict validation checks citations against
 /// those stored reports, so the fixture verdicts below cite `claude-1`.
 fn force_batch_supervising(db: &WorkDb, batch_id: &str) {
-    let conn = db.connect().unwrap();
     let batch = db.review_batch(batch_id).unwrap().unwrap();
-    for member in db.review_batch_members(batch_id).unwrap() {
+    let members = db.review_batch_members(batch_id).unwrap();
+    let conn = db.connect().unwrap();
+    for member in members {
         let (true, None, Some(execution_id)) = (
             member.status == ReviewBatchMemberStatus::Reported,
             member.report_proposal_id.as_ref(),
@@ -82,6 +83,7 @@ fn force_batch_supervising(db: &WorkDb, batch_id: &str) {
                 "phase": "pre_merge", "summary": "One defect.",
                 "coverage": {"files_inspected": [], "files_omitted": [], "limitations": []},
                 "findings": [{
+                    "id": format!("{}-1", member.role.as_str().trim_end_matches("_reviewer")),
                     "severity": "high", "category": "correctness", "confidence": "high",
                     "file": "src/lib.rs", "title": "Unchecked index", "problem": "p", "impact": "i",
                     "suggested_fix": "f", "static_evidence": "e", "needs_runtime_verification": false
@@ -756,8 +758,16 @@ fn qualifying_findings_on_an_open_origin_create_a_revision() {
     assert!(task.description.contains("finalising this revision"));
     // Consolidated finding ids and the leaf findings they merged reach the
     // revision worker, so downstream work can key on them.
-    assert!(task.description.contains("**Finding id:** `C1`"), "{}", task.description);
-    assert!(task.description.contains("**Sources:** `claude-1`"), "{}", task.description);
+    assert!(
+        task.description.contains("**Finding id:** `C1`"),
+        "{}",
+        task.description
+    );
+    assert!(
+        task.description.contains("**Sources:** `claude-1`"),
+        "{}",
+        task.description
+    );
     assert_eq!(
         db.review_batch(&batch_id).unwrap().unwrap().status,
         ReviewBatchStatus::Completed
@@ -882,6 +892,16 @@ fn qualifying_findings_on_a_merged_origin_create_a_followup() {
     let task = query_task(&db.connect().unwrap(), &created).unwrap().unwrap();
     assert_eq!(task.kind, TaskKind::Followup);
     assert_eq!(task.origin_pr_number, Some(42));
+    assert!(
+        task.description.contains("**Finding id:** `C1`"),
+        "{}",
+        task.description
+    );
+    assert!(
+        task.description.contains("**Sources:** `claude-1`"),
+        "{}",
+        task.description
+    );
     assert!(task.description.contains("closing this follow-up"));
     assert!(!task.description.contains("finalising this revision"));
     let parent = query_task(&db.connect().unwrap(), &cycle_root.id).unwrap().unwrap();
