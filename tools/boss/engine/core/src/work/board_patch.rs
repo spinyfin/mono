@@ -16,6 +16,7 @@
 use std::collections::BTreeSet;
 use std::time::Instant;
 
+use super::board_review_cache::BoardReviewCache;
 use super::*;
 use crate::population_timing::{PopulationTrace, elapsed_ms, segment};
 use boss_protocol::WorkRuntimePatchItem;
@@ -71,6 +72,7 @@ pub(super) fn attach_board_derivations(
     product_id: &str,
     caller: &str,
     trace: &mut PopulationTrace,
+    review_cache: Option<&BoardReviewCache>,
 ) -> Vec<Task> {
     // Compute revision projections (revision_seq, revision_parent_pr_url)
     // for every `kind = 'revision'` task. These are derived fields —
@@ -103,13 +105,17 @@ pub(super) fn attach_board_derivations(
     // badge) for every task and chore. Must run after the ai_reviewing
     // attach above (reads it) and after attach_revision_projections
     // above (reads revision_seq). Errors are non-fatal — log and leave
-    // the field at its default (no badge). Single batched `IN (...)`
-    // query against `pr_review_verdicts`.
+    // the field at its default (no badge). Resolved per PR owner, from
+    // the review cache when the caller has one; the segment records the
+    // cards resolved and the statements that took.
     let t = Instant::now();
-    if let Err(err) = attach_ai_review_state(conn, &mut tasks, chores) {
-        tracing::warn!(?err, "{caller}: failed to attach ai_review_state; ignoring");
+    match attach_ai_review_state_with(conn, &mut tasks, chores, review_cache.map(|cache| (cache, product_id))) {
+        Ok(stats) => trace.record_nplus1(segment::DB_AI_REVIEW_STATE, elapsed_ms(t), stats.cards, stats.queries),
+        Err(err) => {
+            tracing::warn!(?err, "{caller}: failed to attach ai_review_state; ignoring");
+            trace.record_plain(segment::DB_AI_REVIEW_STATE, elapsed_ms(t));
+        }
     }
-    trace.record_plain(segment::DB_AI_REVIEW_STATE, elapsed_ms(t));
 
     // Resolve which labelled Review-column section each card is grouped
     // under. Reads ready_for_review, has_in_progress_revision and
@@ -132,7 +138,8 @@ pub(super) fn attach_board_derivations(
     // Resolve review-guide lifecycle/readable-version for every PR-bearing
     // task/chore so the Review-card guide affordance renders without a
     // per-card query. Errors are non-fatal — log and leave the fields at
-    // their default (affordance hidden). Single batched `IN (...)` query.
+    // their default (affordance hidden). Board-sized sets join series by
+    // product; single-item chains keep a root-id list.
     let t = Instant::now();
     if let Err(err) = attach_review_guide_state(conn, &mut tasks, chores) {
         tracing::warn!(?err, "{caller}: failed to attach review_guide_state; ignoring");
@@ -227,6 +234,9 @@ impl WorkDb {
         }
 
         let mut trace = PopulationTrace::disabled();
+        // A patch names a few chains; recomputing their owners is cheaper
+        // than a cache pass, and keeps the patch a pure function of the
+        // snapshot.
         let tasks = attach_board_derivations(
             &conn,
             tasks,
@@ -234,6 +244,7 @@ impl WorkDb {
             product_id,
             "get_work_runtime_patch",
             &mut trace,
+            None,
         );
 
         let present: HashSet<&str> = tasks.iter().chain(chores.iter()).map(|t| t.id.as_str()).collect();

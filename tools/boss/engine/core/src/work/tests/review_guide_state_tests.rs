@@ -300,3 +300,22 @@ fn attach_review_guide_state_projects_latest_cancelled_attempt_error() {
     assert_eq!(summary.lifecycle, "failed");
     assert_eq!(summary.error.as_deref(), Some("attempt B cancelled"));
 }
+
+/// The board-sized lookup must be answered from the series root index and
+/// never read `tasks`, so its cost follows the board and not the product's
+/// task history.
+#[test]
+fn review_guide_card_states_plan_never_touches_tasks() {
+    let (_dir, db) = open_db();
+    let conn = db.connect().unwrap();
+    let plan: String = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {}", review_guide_card_states_sql()))
+        .unwrap()
+        .query_map(["[\"root\"]"], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+        .join("\n");
+    assert!(!plan.contains("tasks"), "{plan}");
+    assert!(plan.contains("pr_review_guide_source_series_observation_idx"), "{plan}");
+}

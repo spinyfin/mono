@@ -47,6 +47,34 @@ fn seed(conn: &Connection) {
     for i in 0..1818 {
         conn.execute("INSERT INTO pr_review_verdicts(id,execution_id,work_item_id,head_sha,gate_outcome,created_at) VALUES (?1,?2,?3,'synthetic-head','completed_clean','2')", params![format!("scale-verdict-{i}"),format!("scale-exec-{i}"),format!("scale-task-{}",i * 4)]).unwrap();
     }
+    // Guide history and epochs in another product must not enlarge a board
+    // or single-card lookup's result set.
+    for i in 0..2000 {
+        let root = format!("unrelated-task-{i}");
+        let series = format!("unrelated-series-{i}");
+        let comparison = format!("unrelated-comparison-{i}");
+        conn.execute(
+            "INSERT INTO tasks(id, product_id, kind, name, status, created_at, updated_at)
+             VALUES (?1, 'scale-product-1', 'chore', ?1, 'done', '1', '1')",
+            [&root],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pr_review_guide_source_series(id, root_task_id, canonical_pr_url, selected_comparison_id, guide_lifecycle, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'failed', '1', '1')",
+            params![series, root, format!("https://github.com/example/unrelated/pull/{i}"), comparison],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO pr_review_guide_source_comparisons(id, series_id, observation_sequence, observed_base_sha, merge_base_sha, head_sha, trigger, packet_hash, complete, captured_at)
+             VALUES (?1, ?2, 1, 'base', 'base', 'head', 'manual', 'hash', 1, '1')",
+            params![comparison, series],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO pr_review_guide_attempts(id, series_id, comparison_id, request_epoch, ordinal, status, prompt_version, error, created_at, finished_at)
+             VALUES (?1, ?2, ?3, 0, 1, 'failed', 'v1', 'unrelated failure', '1', '2')",
+            params![format!("unrelated-attempt-{i}"), series, comparison],
+        ).unwrap();
+    }
     conn.execute_batch("COMMIT").unwrap();
 }
 
@@ -57,7 +85,7 @@ fn work_tree_production_scale_measurement() {
     let conn = db.connect().unwrap();
     seed(&conn);
     for (table, expected) in [
-        ("tasks", 8030),
+        ("tasks", 10030),
         ("projects", 131),
         ("products", 5),
         ("work_executions", 21127),
@@ -65,6 +93,8 @@ fn work_tree_production_scale_measurement() {
         ("worker_proposals", 4131),
         ("pr_review_batches", 786),
         ("pr_review_verdicts", 1818),
+        ("pr_review_guide_source_series", 2000),
+        ("pr_review_guide_attempts", 2000),
     ] {
         let count: i64 = conn
             .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
@@ -72,6 +102,9 @@ fn work_tree_production_scale_measurement() {
         assert_eq!(count, expected, "{table}");
     }
     assert!(!conn.prepare("PRAGMA foreign_key_check").unwrap().exists([]).unwrap());
+    let keys = crate::work::board_review_cache::read_family_keys(&conn, &["scale-task-2".to_owned()]).unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys["scale-task-2"].len(), 2);
     drop(conn);
     measure(&db, "scale-product-0", Some(7585));
 }
@@ -113,6 +146,10 @@ fn measure(db: &WorkDb, product: &str, expected: Option<usize>) {
                 "scale runtime_queries={:?}",
                 trace.segment_counts(segment::DB_TASK_RUNTIMES)
             );
+            println!(
+                "scale review_guide_state={:?}",
+                trace.segment_counts(segment::DB_REVIEW_GUIDE_STATE)
+            );
             let hidden_revisions = tree
                 .tasks
                 .iter()
@@ -147,6 +184,113 @@ fn measure(db: &WorkDb, product: &str, expected: Option<usize>) {
         measure_runtime_patches(db, product);
         measure_deltas(db, product);
         measure_cached_runtimes(db, product, samples);
+        measure_cached_reviews(db, product, samples);
+    }
+}
+
+/// Per-owner review cache: the same assembly, with the verdict-derived review
+/// projection served from the epoch-validated cache. Pins the statement count
+/// of the `db.ai_review_state` segment so a regression back to per-card or
+/// per-board reads fails here, not on a laptop's CPU.
+fn measure_cached_reviews(db: &WorkDb, product: &str, samples: usize) {
+    use crate::work::board_caches::BoardCaches;
+    let assemble = |caches: Option<&BoardCaches>, label: &str| {
+        let start = Instant::now();
+        let mut trace = PopulationTrace::new(product, "scale-review-cache", None, start);
+        let tree = match caches {
+            Some(caches) => db.get_work_tree_cached(product, &mut trace, caches),
+            None => db.get_work_tree_instrumented(product, &mut trace),
+        }
+        .unwrap();
+        let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let (review_ms, cards, queries) = trace.segment_counts(segment::DB_AI_REVIEW_STATE).unwrap();
+        println!(
+            "scale review_cache pass={label} assemble_ms={total_ms:.3} ai_review_state_ms={review_ms:.3} \
+             review_cards={} review_queries={}",
+            cards.unwrap(),
+            queries.unwrap()
+        );
+        (tree, review_ms, queries.unwrap())
+    };
+    let cards = |tree: &boss_protocol::WorkTree| serde_json::to_value((&tree.tasks, &tree.chores)).unwrap();
+
+    let (reference, _, uncached_queries) = assemble(None, "uncached");
+    // Uncached: one owner-keyed state query, the live queued-review probe,
+    // and one owner-keyed history query for the badge-bearing owners.
+    assert_eq!(uncached_queries, 3, "uncached review statements");
+    let caches = BoardCaches::default();
+    let (cold, _, cold_queries) = assemble(Some(&caches), "cold");
+    assert_eq!(
+        cards(&cold),
+        cards(&reference),
+        "cold cached review projections diverged"
+    );
+    // Cold: the epoch read, the two owner-keyed miss queries, the live probe.
+    assert_eq!(cold_queries, 4, "cold review statements");
+    let stats = caches.reviews.stats();
+    println!(
+        "scale review_cache entries={} hits={} misses={}",
+        stats.entries, stats.hits, stats.misses
+    );
+    assert!(stats.misses > 0 && stats.hits == 0);
+
+    let mut warm = Vec::new();
+    let mut uncached = Vec::new();
+    for sample in 0..samples {
+        let misses_before = caches.reviews.stats().misses;
+        let (tree, review_ms, queries) = assemble(Some(&caches), &format!("warm-{sample}"));
+        assert_eq!(
+            cards(&tree),
+            cards(&reference),
+            "warm cached review projections diverged"
+        );
+        // Warm with nothing written: the epoch read and the live probe only.
+        assert_eq!(queries, 2, "warm review statements");
+        assert_eq!(
+            caches.reviews.stats().misses,
+            misses_before,
+            "a warm pass recomputes no owner"
+        );
+        warm.push(review_ms);
+        let (_, review_ms, _) = assemble(None, &format!("uncached-{sample}"));
+        uncached.push(review_ms);
+    }
+    let p50 = |values: &mut Vec<f64>| {
+        values.sort_by(f64::total_cmp);
+        values[(values.len() * 50).div_ceil(100) - 1]
+    };
+    println!(
+        "scale review_cache samples={samples} ai_review_state_ms p50 uncached={:.3} warm={:.3}",
+        p50(&mut uncached),
+        p50(&mut warm)
+    );
+
+    // Writing N verdicts recomputes exactly the N owners they belong to.
+    // Verdict `i` belongs to task `4 * i`, a distinct owner per verdict.
+    for count in [1usize, 10, 100] {
+        let conn = db.connect().unwrap();
+        for i in 0..count {
+            conn.execute(
+                "UPDATE pr_review_verdicts SET created_at = ?2 WHERE id = ?1",
+                params![format!("scale-verdict-{i}"), format!("{}", 3 + count)],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let misses_before = caches.reviews.stats().misses;
+        let (tree, _, queries) = assemble(Some(&caches), &format!("after-{count}-verdict-writes"));
+        let (reference, _, _) = assemble(None, &format!("uncached-after-{count}-verdict-writes"));
+        assert_eq!(
+            cards(&tree),
+            cards(&reference),
+            "{count} verdict writes: cached review projections diverged"
+        );
+        assert_eq!(
+            caches.reviews.stats().misses - misses_before,
+            count as u64,
+            "{count} verdict writes"
+        );
+        assert_eq!(queries, 4, "{count} verdict writes: statements");
     }
 }
 
@@ -154,8 +298,8 @@ fn measure(db: &WorkDb, product: &str, expected: Option<usize>) {
 /// epoch-validated cache. Every cached tree must equal the uncached one, so the
 /// timings below compare identical outputs.
 fn measure_cached_runtimes(db: &WorkDb, product: &str, samples: usize) {
-    use crate::work::board_runtime_cache::BoardRuntimeCache;
-    let assemble = |cache: Option<&BoardRuntimeCache>, label: &str| {
+    use crate::work::board_caches::BoardCaches;
+    let assemble = |cache: Option<&BoardCaches>, label: &str| {
         let start = Instant::now();
         let mut trace = PopulationTrace::new(product, "scale-cache", None, start);
         let tree = match cache {
@@ -175,10 +319,10 @@ fn measure_cached_runtimes(db: &WorkDb, product: &str, samples: usize) {
     let runtimes = |tree: &boss_protocol::WorkTree| serde_json::to_value(&tree.task_runtimes).unwrap();
 
     let (reference, _, _) = assemble(None, "uncached");
-    let cache = BoardRuntimeCache::default();
+    let cache = BoardCaches::default();
     let (cold, _, _) = assemble(Some(&cache), "cold");
     assert_eq!(runtimes(&cold), runtimes(&reference), "cold cached runtimes diverged");
-    let stats = cache.stats();
+    let stats = cache.runtimes.stats();
     println!(
         "scale runtime_cache entries={} approx_bytes={} hits={} misses={}",
         stats.entries, stats.approx_bytes, stats.hits, stats.misses
@@ -222,7 +366,7 @@ fn measure_cached_runtimes(db: &WorkDb, product: &str, samples: usize) {
             .unwrap();
         }
         drop(conn);
-        let misses_before = cache.stats().misses;
+        let misses_before = cache.runtimes.stats().misses;
         let (tree, _, _) = assemble(Some(&cache), &format!("after-{count}-writes"));
         let (reference, _, _) = assemble(None, &format!("uncached-after-{count}-writes"));
         assert_eq!(
@@ -230,7 +374,11 @@ fn measure_cached_runtimes(db: &WorkDb, product: &str, samples: usize) {
             runtimes(&reference),
             "{count} writes: cached runtimes diverged"
         );
-        assert_eq!(cache.stats().misses - misses_before, count as u64, "{count} writes");
+        assert_eq!(
+            cache.runtimes.stats().misses - misses_before,
+            count as u64,
+            "{count} writes"
+        );
     }
 }
 

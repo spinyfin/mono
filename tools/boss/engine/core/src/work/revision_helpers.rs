@@ -1,3 +1,4 @@
+use super::board_review_cache::BoardReviewCache;
 use super::*;
 use boss_protocol::ReviewStage;
 
@@ -484,64 +485,78 @@ pub(crate) fn attach_ready_for_review_flag(tasks: &mut [Task], chores: &mut [Tas
 
 // ── AI reviewing flag ────────────────────────────────────────────────────────
 
-/// Resolve the work-item id whose `pr_review` execution state should be
-/// attributed to `row` for the "AI reviewing" / "review queued" badges.
+/// Resolve each rendered row's review-execution target once per projection
+/// pass: the work-item ids whose `pr_review` execution state is attributed
+/// to the row for the "AI reviewing" / "review queued" badges.
 ///
 /// For a non-revision row this is its own id. A `revision` task held
 /// `active` pending a review pass checks its own id (legacy reviewers are
 /// created there) and the review cycle root (fan-out leaves are created
 /// against `pr_review_batches.cycle_root_id`), resolved by walking the full
-/// parent chain rather than trusting a single
-/// resolved by walking the full parent chain rather than trusting a single
-/// hop: most revisions parent directly to the chain root, but residual
-/// pre-flatten-migration rows can still nest a revision under another
-/// revision, and a single `parent_task_id` read would attribute the badge
-/// to that intermediate row instead of the actual review cycle root.
-/// Without this attribution a held revision derives `ai_reviewing = false`
-/// / `ai_review_state = None` even while the root has reviewer workers
-/// actively running against it, leaving the Doing card with no "reviewing"
-/// indicator at all.
+/// parent chain rather than trusting a single hop: most revisions parent
+/// directly to the chain root, but residual pre-flatten-migration rows can
+/// still nest a revision under another revision, and a single
+/// `parent_task_id` read would attribute the badge to that intermediate row
+/// instead of the actual review cycle root. Without this attribution a held
+/// revision derives `ai_reviewing = false` / `ai_review_state = None` even
+/// while the root has reviewer workers actively running against it.
 ///
-/// `None` for a revision not currently `active` (e.g. `todo`, or already
-/// `in_review`/`done`, which roll up into the parent's card instead — see
-/// `revision-tasks.md`) or when the chain root can't be resolved (broken
-/// chain; fails closed rather than guessing a root, while retaining the
-/// revision's own id for a legacy reviewer.
-fn review_execution_target_ids_for_row(conn: &Connection, row: &Task) -> Option<Vec<String>> {
-    if row.kind == TaskKind::Revision {
-        if row.status == TaskStatus::Active {
-            // A revision can own a legacy reviewer even though fan-out reviewers
-            // belong to the cycle root. Keep its own id and add only a resolved
-            // root; a broken chain therefore degrades to own-id attribution.
-            let mut ids = vec![row.id.clone()];
-            if let Some(root) = chain_root(conn, &row.id).ok().filter(|root| root != &row.id) {
-                ids.push(root);
-            }
-            Some(ids)
-        } else {
-            None
-        }
-    } else {
-        Some(vec![row.id.clone()])
-    }
-}
-
-/// Resolve each rendered row's review-execution target once per projection
-/// pass. A revision's chain walk is otherwise an avoidable query fan-out.
+/// A revision not currently `active` (`todo`, or already `in_review`/`done`,
+/// which roll up into the parent's card — see `revision-tasks.md`) has no
+/// entry. A broken chain fails closed to own-id attribution.
 fn review_execution_target_ids(
     conn: &Connection,
     tasks: &[Task],
     chores: &[Task],
 ) -> std::collections::HashMap<String, Vec<String>> {
+    let chains = BoardChains::index(tasks, chores);
+    review_execution_target_ids_with(conn, tasks, chores, &chains, &mut 0)
+}
+
+/// [`review_execution_target_ids`] resolving a held revision's cycle root
+/// from the board rows in `chains` first, so the `chain_root` query runs
+/// only for a chain that leaves the board. Every query is counted in
+/// `queries`.
+fn review_execution_target_ids_with(
+    conn: &Connection,
+    tasks: &[Task],
+    chores: &[Task],
+    chains: &BoardChains,
+    queries: &mut u64,
+) -> std::collections::HashMap<String, Vec<String>> {
     tasks
         .iter()
         .chain(chores.iter())
-        .filter_map(|row| review_execution_target_ids_for_row(conn, row).map(|targets| (row.id.clone(), targets)))
+        .filter_map(|row| {
+            let targets = if row.kind == TaskKind::Revision {
+                if row.status != TaskStatus::Active {
+                    return None;
+                }
+                // Same answer `chain_root` gives for a chain that is wholly
+                // on the board: the first non-revision ancestor, or the last
+                // revision when the chain ends without one.
+                let root = match chains.walk(&row.id) {
+                    ChainWalk::Owner(root) | ChainWalk::Headless(root) => Some(root.to_owned()),
+                    ChainWalk::Unknown => {
+                        *queries += 1;
+                        chain_root(conn, &row.id).ok()
+                    }
+                };
+                let mut ids = vec![row.id.clone()];
+                if let Some(root) = root.filter(|root| root != &row.id) {
+                    ids.push(root);
+                }
+                ids
+            } else {
+                vec![row.id.clone()]
+            };
+            Some((row.id.clone(), targets))
+        })
         .collect()
 }
 
 /// Set `ai_reviewing = true` on every task (and chore) whose
-/// [`review_execution_target_ids_for_row`] has a non-terminal `pr_review` execution,
+/// [`review_execution_target_ids_with`] has a non-terminal `pr_review` execution,
 /// restricted to rows in `active` (Doing, awaiting its first review before
 /// ever reaching `in_review`, OR a revision held pending its cycle root's
 /// review pass) or already `in_review` (Review, an automated review pass
@@ -784,11 +799,67 @@ pub(crate) const AI_REVIEW_STATE_REVIEW_NOT_REQUIRED: &str = "review_not_require
 pub(crate) const AI_REVIEW_STATE_NOT_REVIEWED: &str = "not_reviewed";
 pub(crate) const AI_REVIEW_STATE_REVIEWED_CLEAN_PENDING: &str = "reviewed_clean_pending";
 
+/// Statements and cardinality of one [`attach_ai_review_state_with`] pass,
+/// for the population trace's `db.ai_review_state` segment and the scale
+/// regression that pins the per-assembly query count.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReviewAttachStats {
+    /// Cards whose verdict-derived state was resolved (the lookup set).
+    pub cards: usize,
+    /// SQL statements the pass ran, counting a chain-root walk as one.
+    pub queries: u64,
+    /// PR owners whose projection the review cache served.
+    pub cache_hits: u64,
+    /// PR owners recomputed from the database (every owner when uncached).
+    pub cache_misses: u64,
+}
+
 /// Resolve the card's AI review from the PR owner's observed head and the
 /// verdict ledger across its revision chain. Revision status never proves
 /// that a head was reviewed. Live review executions take precedence.
-pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chores: &mut [Task]) -> Result<()> {
-    let review_targets = review_execution_target_ids(conn, tasks, chores);
+///
+/// Uncached: every owner is recomputed from the database (single-item
+/// projections, runtime patches, tests). The board assembly passes its
+/// [`BoardReviewCache`] through [`attach_ai_review_state_with`] instead.
+pub(crate) fn attach_ai_review_state(
+    conn: &Connection,
+    tasks: &mut [Task],
+    chores: &mut [Task],
+) -> Result<ReviewAttachStats> {
+    attach_ai_review_state_with(conn, tasks, chores, None)
+}
+
+/// [`attach_ai_review_state`] with an optional engine-wide review cache for
+/// `product_id`, returning what the pass cost.
+///
+/// The verdict-derived part of a card's review (current-head state, findings
+/// revision, badge evidence) belongs to its PR owner — the chain root — and
+/// is identical for every card of that family, so it is resolved per owner:
+///
+/// 1. Each card's owner is found in memory by walking `parent_task_id`
+///    through the board rows (`tasks` and `chores` carry whole revision
+///    chains). A card whose chain leaves the board (an archived or deleted
+///    ancestor) falls back to the card-keyed SQL ancestor walk
+///    (`ReviewKey::Card`).
+/// 2. With a cache, owners are probed by their family key: sorted member
+///    IDs and epochs from the full SQL family, including any findings
+///    revision a family verdict still names. Only misses are queried;
+///    without a cache, every owner is queried, but still by owner, so
+///    the queries read one `tasks` row per family rather than per card.
+/// 3. Running and queued reviews are read per pass from live executions and
+///    layered on top, so no cached value depends on execution liveness.
+pub(crate) fn attach_ai_review_state_with(
+    conn: &Connection,
+    tasks: &mut [Task],
+    chores: &mut [Task],
+    cache: Option<(&BoardReviewCache, &str)>,
+) -> Result<ReviewAttachStats> {
+    use super::review_badge::{OwnerReview, ReviewKey, fetch_badge_histories, fetch_current_heads};
+
+    let mut stats = ReviewAttachStats::default();
+    let chains = BoardChains::index(tasks, chores);
+    let review_targets = review_execution_target_ids_with(conn, tasks, chores, &chains, &mut stats.queries);
+
     // Only rows that can display a verdict badge need the batched lookup;
     // a revision carries no `pr_url` of its own (its chain root does).
     let lookup_ids: Vec<String> = tasks
@@ -801,14 +872,96 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
         })
         .map(|row| row.id.clone())
         .collect();
-    let verdicts = super::review_badge::current_head_review_states(conn, &lookup_ids)?;
+    stats.cards = lookup_ids.len();
+
+    // card -> owner for chains that resolve on the board; `headless` cards
+    // have no owner at all (a chain of revisions with no root); `fallback`
+    // cards need the SQL walk.
+    let mut owner_of: HashMap<String, String> = HashMap::new();
+    let mut fallback: Vec<String> = Vec::new();
+    for id in &lookup_ids {
+        match chains.walk(id) {
+            ChainWalk::Owner(owner) => {
+                owner_of.insert(id.clone(), owner.to_owned());
+            }
+            ChainWalk::Headless(_) => {}
+            ChainWalk::Unknown => fallback.push(id.clone()),
+        }
+    }
+    let owner_ids: Vec<String> = {
+        let mut ids: Vec<String> = owner_of.values().cloned().collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+
+    let mut owner_reviews: HashMap<String, std::sync::Arc<OwnerReview>> = HashMap::new();
+    if let Some((cache, product_id)) = cache {
+        let keys = super::board_review_cache::read_family_keys(conn, &owner_ids)?;
+        stats.queries += u64::from(!owner_ids.is_empty());
+        let probe: Vec<_> = owner_ids
+            .iter()
+            .map(|id| {
+                (
+                    id.as_str(),
+                    keys.get(id).cloned().unwrap_or_else(|| vec![(id.clone(), 0)]),
+                )
+            })
+            .collect();
+        let lookup = cache.lookup(product_id, &probe);
+        let misses: Vec<String> = probe
+            .iter()
+            .zip(&lookup.hits)
+            .filter(|(_, hit)| hit.is_none())
+            .map(|((id, _), _)| (*id).to_owned())
+            .collect();
+        stats.cache_hits = (probe.len() - misses.len()) as u64;
+        stats.cache_misses = misses.len() as u64;
+        for ((id, _), hit) in probe.iter().zip(lookup.hits) {
+            if let Some(review) = hit {
+                owner_reviews.insert((*id).to_owned(), review);
+            }
+        }
+        let mut fresh = Vec::with_capacity(misses.len());
+        if !misses.is_empty() {
+            let mut heads = fetch_current_heads(conn, &misses, ReviewKey::Owner)?;
+            let mut histories = fetch_badge_histories(conn, &misses, ReviewKey::Owner)?;
+            stats.queries += 2;
+            for id in misses {
+                let current_head = heads.remove(&id);
+                let history = histories
+                    .remove(&id)
+                    .map(|history| history.trimmed_for(current_head.as_ref().map(|head| head.state)));
+                let review = std::sync::Arc::new(OwnerReview { current_head, history });
+                owner_reviews.insert(id.clone(), std::sync::Arc::clone(&review));
+                fresh.push((id.clone(), keys[&id].clone(), review));
+            }
+        }
+        cache.complete(product_id, lookup.pass, fresh);
+    } else {
+        stats.cache_misses = owner_ids.len() as u64;
+        if !owner_ids.is_empty() {
+            let mut heads = fetch_current_heads(conn, &owner_ids, ReviewKey::Owner)?;
+            stats.queries += 1;
+            for id in &owner_ids {
+                let review = OwnerReview {
+                    current_head: heads.remove(id),
+                    history: None,
+                };
+                owner_reviews.insert(id.clone(), std::sync::Arc::new(review));
+            }
+        }
+    }
+    let fallback_heads = fetch_current_heads(conn, &fallback, ReviewKey::Card)?;
+    stats.queries += u64::from(!fallback.is_empty());
+
     // Queue lookup is for Active/InReview cards (`review_queued`), not the
     // verdict `lookup_ids` slice above. Scope to the tree being rendered
     // rather than every ready `pr_review` in the database. InReview is
     // included alongside Active because a row that has already reached
     // `in_review` can still have a freshly-enqueued review pass sitting in
     // `ready` before it starts running (see `request_pr_review_in_tx`). Keyed
-    // by [`review_execution_target_ids_for_row`], so either a legacy reviewer
+    // by [`review_execution_target_ids_with`], so either a legacy reviewer
     // on a held revision or a queued review-cycle-root batch is attributed.
     let mut queued_lookup_ids: Vec<String> = tasks
         .iter()
@@ -837,11 +990,25 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
         );
         let mut stmt = conn.prepare(&sql)?;
         let params: Vec<&dyn rusqlite::ToSql> = queued_lookup_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        stats.queries += 1;
         stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?
             .filter_map(|row| row.ok())
             .collect()
     };
 
+    // The owner's current-head verdict as this card shows it: a revision
+    // inherits the owner's verdict, but must not link to itself.
+    let current_head = |row: &Task| -> Option<(&'static str, Option<String>)> {
+        let head = match owner_of.get(&row.id) {
+            Some(owner) => owner_reviews.get(owner)?.current_head.as_ref()?,
+            None => fallback_heads.get(&row.id)?,
+        };
+        let revision = head
+            .findings_revision_id
+            .clone()
+            .filter(|revision_id| revision_id != &row.id);
+        Some((head.state, revision))
+    };
     let resolve = |row: &Task| -> (Option<&'static str>, Option<String>) {
         if task_kind_excluded_from_ai_review(&row.kind) {
             return (Some(AI_REVIEW_STATE_REVIEW_NOT_REQUIRED), None);
@@ -856,17 +1023,15 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
         match row.status {
             TaskStatus::Active | TaskStatus::InReview if row.ai_reviewing => (Some(AI_REVIEW_STATE_REVIEWING), None),
             TaskStatus::Active | TaskStatus::InReview if is_queued() => (Some(AI_REVIEW_STATE_REVIEW_QUEUED), None),
-            TaskStatus::Active | TaskStatus::InReview => verdicts
-                .get(&row.id)
-                .map(|(state, revision)| (Some(*state), revision.clone()))
+            TaskStatus::Active | TaskStatus::InReview => current_head(row)
+                .map(|(state, revision)| (Some(state), revision))
                 .unwrap_or((None, None)),
             // Closed work shows no badge unless a verdict matches the last
             // observed head; "not reviewed" is only meaningful while the PR
             // is still open (`pr_head_sha` is NULL for legacy merged cards).
-            TaskStatus::Done => verdicts
-                .get(&row.id)
+            TaskStatus::Done => current_head(row)
                 .filter(|(state, _)| *state != AI_REVIEW_STATE_NOT_REVIEWED)
-                .map(|(state, revision)| (Some(*state), revision.clone()))
+                .map(|(state, revision)| (Some(state), revision))
                 .unwrap_or((None, None)),
             _ => (None, None),
         }
@@ -882,7 +1047,101 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
         chore.ai_review_state = state.map(str::to_owned);
         chore.ai_review_findings_revision_id = revision_id;
     }
-    super::review_badge::attach_review_badges(conn, tasks, chores)
+
+    // Badge evidence: cached entries already carry their owner's history;
+    // the uncached path reads it only for the owners of cards that show a
+    // badge, and fallback cards keep the card-keyed query.
+    let wanting: Vec<&Task> = tasks
+        .iter()
+        .chain(chores.iter())
+        .filter(|row| super::review_badge::wants_review_badge(row))
+        .collect();
+    let mut owner_histories: HashMap<String, super::review_badge::ReviewBadgeHistory> = HashMap::new();
+    if cache.is_none() {
+        let mut ids: Vec<String> = wanting
+            .iter()
+            .filter_map(|row| owner_of.get(&row.id).cloned())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if !ids.is_empty() {
+            owner_histories = fetch_badge_histories(conn, &ids, ReviewKey::Owner)?;
+            stats.queries += 1;
+        }
+    }
+    let fallback_wanting: Vec<String> = wanting
+        .iter()
+        .filter(|row| !owner_of.contains_key(&row.id) && fallback.contains(&row.id))
+        .map(|row| row.id.clone())
+        .collect();
+    drop(wanting);
+    let fallback_histories = fetch_badge_histories(conn, &fallback_wanting, ReviewKey::Card)?;
+    stats.queries += u64::from(!fallback_wanting.is_empty());
+
+    super::review_badge::apply_review_badges(tasks, chores, |row| match owner_of.get(&row.id) {
+        Some(owner) if cache.is_some() => owner_reviews.get(owner).and_then(|review| review.history.as_ref()),
+        Some(owner) => owner_histories.get(owner),
+        None => fallback_histories.get(&row.id),
+    })?;
+    Ok(stats)
+}
+
+/// The revision-chain shape of the rows on a board, for walking a card to
+/// its PR owner without a query per card.
+pub(crate) struct BoardChains {
+    rows: HashMap<String, (bool, Option<String>)>,
+}
+
+/// Where an in-memory chain walk from a card ends.
+pub(crate) enum ChainWalk<'a> {
+    /// The first non-revision ancestor (the card itself when it is one).
+    Owner(&'a str),
+    /// A revision with no parent: the chain has no owner at all.
+    Headless(&'a str),
+    /// A parent is not on the board, or the walk hit the depth cap; only the
+    /// database can say what the chain root is.
+    Unknown,
+}
+
+impl BoardChains {
+    pub(crate) fn index(tasks: &[Task], chores: &[Task]) -> Self {
+        let rows = tasks
+            .iter()
+            .chain(chores.iter())
+            .map(|row| {
+                (
+                    row.id.clone(),
+                    (row.kind == TaskKind::Revision, row.parent_task_id.clone()),
+                )
+            })
+            .collect();
+        Self { rows }
+    }
+
+    /// Walk `id` up `parent_task_id` through revisions, with the same depth
+    /// cap as the SQL ancestor walk and `chain_root`.
+    pub(crate) fn walk<'s>(&'s self, id: &str) -> ChainWalk<'s> {
+        let Some((mut current, mut row)) = self.rows.get_key_value(id) else {
+            return ChainWalk::Unknown;
+        };
+        for _ in 0..=MAX_CHAIN_DEPTH {
+            let (is_revision, parent) = row;
+            if !is_revision {
+                return ChainWalk::Owner(current);
+            }
+            let Some(parent) = parent else {
+                return ChainWalk::Headless(current);
+            };
+            match self.rows.get_key_value(parent.as_str()) {
+                Some((next, next_row)) => {
+                    current = next;
+                    row = next_row;
+                }
+                None => return ChainWalk::Unknown,
+            }
+        }
+        ChainWalk::Unknown
+    }
 }
 
 /// Resolve every derived `Task::review_guide_*` projection (`lifecycle`,
@@ -897,14 +1156,14 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
 /// `None`. A revision row's own id is never a series key (the series
 /// belongs to the chain root), so this leaves a revision's fields `None`
 /// even when its root has a guide — matching the design's card placement
-/// (the affordance lives on the root's card, not a revision's). One batched
-/// `IN (...)` query, same shape as [`attach_ai_review_state`]'s verdict
-/// lookup.
+/// (the affordance lives on the root's card, not a revision's). One scan of
+/// the series table intersected with the board in memory (see
+/// [`query_review_guide_card_states`]).
 pub(crate) fn attach_review_guide_state(conn: &Connection, tasks: &mut [Task], chores: &mut [Task]) -> Result<()> {
-    let roots: Vec<(String, String)> = tasks
+    let roots: HashMap<&str, &str> = tasks
         .iter()
         .chain(chores.iter())
-        .filter_map(|task| task.pr_url.as_ref().map(|url| (task.id.clone(), url.clone())))
+        .filter_map(|task| task.pr_url.as_deref().map(|url| (task.id.as_str(), url)))
         .collect();
     if roots.is_empty() {
         return Ok(());
@@ -946,59 +1205,84 @@ struct ReviewGuideCardState {
     error: Option<String>,
 }
 
-/// Batched `root_task_id -> ReviewGuideCardState` lookup for
-/// [`attach_review_guide_state`]. A free function (not a `WorkDb` method)
-/// so a board/work-tree read can call it on its own already-open connection
-/// rather than opening a second one — matches
-/// `review_badge::current_head_review_states`. The `LEFT JOIN` against
+/// Raw `pr_review_guide_source_series` row, see [`review_guide_card_states_sql`].
+type ReviewGuideCardRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+fn map_review_guide_card_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewGuideCardRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+    ))
+}
+
+/// Constant SQL text for [`query_review_guide_card_states`]: root ids arrive
+/// as a JSON array bound to `?1`.
+pub(crate) fn review_guide_card_states_sql() -> String {
+    format!(
+        "SELECT s.root_task_id, s.guide_lifecycle, s.readable_version_id,
+                s.selected_comparison_id, v.comparison_id,
+                {REVIEW_GUIDE_LATEST_TERMINAL_ERROR_SQL}, s.canonical_pr_url
+         FROM pr_review_guide_source_series s
+         LEFT JOIN pr_review_guide_versions v ON v.id = s.readable_version_id
+         WHERE s.root_task_id IN (SELECT value FROM json_each(?1))
+         ORDER BY s.latest_observation_sequence DESC, s.id DESC"
+    )
+}
+
+/// `root_task_id -> ReviewGuideCardState` for every board root in `roots`,
+/// for [`attach_review_guide_state`]. A free function (not a `WorkDb`
+/// method) so a board/work-tree read can call it on its own already-open
+/// connection rather than opening a second one — matches
+/// `review_badge::fetch_current_heads`. The `LEFT JOIN` against
 /// `pr_review_guide_versions` resolves the readable version's own
 /// `comparison_id` so staleness can be derived without a second round trip.
 ///
-/// `roots` is `(root_task_id, current_pr_url)` — the series must match
+/// `roots` maps `root_task_id -> current_pr_url` — the series must match
 /// both. One series per canonical PR (UNIQUE on `canonical_pr_url`), but
 /// one root may own several series after a PR replacement, so a root-id
-/// lookup without the URL would pick a sibling. Ordering matches
+/// match without the URL would pick a sibling. Ordering matches
 /// `get_latest_pr_review_guide_source_capture` (`latest_observation_sequence
-/// DESC, id DESC`) so the two resolvers cannot disagree; first row per
-/// root wins.
+/// DESC, id DESC`) so the two resolvers cannot disagree; first matching row
+/// per root wins.
+///
+/// The root ids are bound as one JSON array and probed through
+/// `pr_review_guide_source_series_observation_idx`, once per board root.
+/// The statement text is constant (cached across assemblies) and never
+/// touches `tasks`, so the cost follows the board rather than the product's
+/// history. The URL comparison stays in memory so replaced PRs cannot
+/// select a sibling series.
 fn query_review_guide_card_states(
     conn: &Connection,
-    roots: &[(String, String)],
+    roots: &HashMap<&str, &str>,
 ) -> Result<std::collections::HashMap<String, ReviewGuideCardState>> {
-    let placeholders = roots
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("(?{}, ?{})", 2 * i + 1, 2 * i + 2))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT s.root_task_id, s.guide_lifecycle, s.readable_version_id,
-                s.selected_comparison_id, v.comparison_id,
-                {REVIEW_GUIDE_LATEST_TERMINAL_ERROR_SQL}
-         FROM pr_review_guide_source_series s
-         LEFT JOIN pr_review_guide_versions v ON v.id = s.readable_version_id
-         WHERE (s.root_task_id, s.canonical_pr_url) IN ({placeholders})
-         ORDER BY s.latest_observation_sequence DESC, s.id DESC"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(roots.len() * 2);
-    for (root_task_id, pr_url) in roots {
-        params.push(root_task_id);
-        params.push(pr_url);
+    if roots.is_empty() {
+        return Ok(HashMap::new());
     }
-    let rows = stmt.query_map(params.as_slice(), |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, Option<String>>(4)?,
-            row.get::<_, Option<String>>(5)?,
-        ))
-    })?;
+    let ids = serde_json::to_string(&roots.keys().collect::<Vec<_>>())?;
+    let mut stmt = conn.prepare_cached(&review_guide_card_states_sql())?;
+    let rows = stmt
+        .query_map([ids], map_review_guide_card_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut result = std::collections::HashMap::new();
-    for row in rows {
-        let (root_task_id, lifecycle, readable_version_id, selected_comparison_id, version_comparison_id, error) = row?;
+    for (root_task_id, lifecycle, readable_version_id, selected_comparison_id, version_comparison_id, error, pr_url) in
+        rows
+    {
+        if roots.get(root_task_id.as_str()).copied() != Some(pr_url.as_str()) {
+            continue;
+        }
         let stale_source = readable_version_id
             .is_some()
             .then(|| selected_comparison_id != version_comparison_id);
@@ -1024,8 +1308,54 @@ fn query_review_guide_card_states(
 /// are in `get_work_tree` — a side-query failure must not take down
 /// `GetWorkItem`. Chain loading errors (BFS / point reads) propagate:
 /// those are the same class of failure as the row read itself.
-pub(crate) fn attach_task_derived_projections(conn: &Connection, task: &mut Task) -> Result<()> {
+pub(crate) fn attach_task_derived_projections(conn: &Connection, task: &mut Task, caller: &str) -> Result<()> {
+    attach_task_derived_projections_labeled(conn, task, caller).1
+}
+
+fn attach_task_derived_projections_labeled(
+    conn: &Connection,
+    task: &mut Task,
+    caller: &str,
+) -> (crate::population_timing::PopulationTrace, Result<()>) {
+    use crate::population_timing::{PopulationTrace, elapsed_ms, global};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static INVOCATIONS: AtomicU64 = AtomicU64::new(0);
+    let invocation = INVOCATIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    let started = std::time::Instant::now();
+    let mut trace = PopulationTrace::new(
+        &task.product_id,
+        format!("single-item:{invocation}:{caller}"),
+        None,
+        started,
+    );
+    let result = attach_task_derived_projections_traced(conn, task, &mut trace);
+    trace.record_plain("single_item.total", elapsed_ms(started));
+    if let Some(log) = global() {
+        trace.flush(log);
+    }
+    (trace, result)
+}
+
+#[cfg(test)]
+pub(crate) fn attach_task_derived_projections_for_test(
+    conn: &Connection,
+    task: &mut Task,
+    caller: &str,
+) -> Result<crate::population_timing::PopulationTrace> {
+    let (trace, result) = attach_task_derived_projections_labeled(conn, task, caller);
+    result?;
+    Ok(trace)
+}
+
+/// Records one single-item derivation, including the loaded chain's size
+/// and the review stage's actual card and SQL statement counts.
+pub(crate) fn attach_task_derived_projections_traced(
+    conn: &Connection,
+    task: &mut Task,
+    trace: &mut crate::population_timing::PopulationTrace,
+) -> Result<()> {
     let (mut tasks, mut chores) = load_chain_slices_for_projection(conn, task)?;
+    trace.set_items(tasks.len() + chores.len());
     tasks = attach_revision_projections(tasks, &chores);
     attach_in_progress_revision_flag(&mut tasks, &mut chores);
     attach_ready_for_review_flag(&mut tasks, &mut chores);
@@ -1036,12 +1366,21 @@ pub(crate) fn attach_task_derived_projections(conn: &Connection, task: &mut Task
             "attach_task_derived_projections: ai_reviewing failed; ignoring"
         );
     }
-    if let Err(err) = attach_ai_review_state(conn, &mut tasks, &mut chores) {
-        tracing::warn!(
-            ?err,
-            task_id = %task.id,
-            "attach_task_derived_projections: ai_review_state failed; ignoring"
-        );
+    let started = std::time::Instant::now();
+    match attach_ai_review_state(conn, &mut tasks, &mut chores) {
+        Ok(stats) => trace.record_nplus1(
+            "single_item.ai_review_state",
+            crate::population_timing::elapsed_ms(started),
+            stats.cards,
+            stats.queries,
+        ),
+        Err(err) => {
+            trace.record_plain(
+                "single_item.ai_review_state",
+                crate::population_timing::elapsed_ms(started),
+            );
+            tracing::warn!(?err, task_id = %task.id, "attach_task_derived_projections: ai_review_state failed; ignoring");
+        }
     }
     // Reads `ai_review_state`, so it must follow attach_ai_review_state.
     attach_review_section(&mut tasks, &mut chores);

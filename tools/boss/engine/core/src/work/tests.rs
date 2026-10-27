@@ -616,6 +616,7 @@ mod updated_reply_projections;
 mod work_item_tags_tests;
 mod work_item_write_tests;
 
+mod board_review_cache_tests;
 mod board_runtime_cache_tests;
 mod work_tree_scale_tests;
 

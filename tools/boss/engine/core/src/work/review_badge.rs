@@ -1,5 +1,35 @@
+use std::collections::HashMap;
+
 use super::*;
 use boss_protocol::{AiReviewBadge, ReviewStage};
+
+/// What an id list handed to the review queries names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReviewKey {
+    /// Board cards: the query walks each card's revision chain up to its PR
+    /// owner (the first non-revision ancestor) and keys the result by card.
+    Card,
+    /// PR owners already resolved by the caller (non-revision rows): no
+    /// ancestor walk, result keyed by owner. A revision id yields nothing.
+    Owner,
+}
+
+/// The current-head verdict of one PR owner, before the per-card self-link
+/// filter: a revision never links to itself as its own findings revision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CurrentHeadReview {
+    pub state: &'static str,
+    pub findings_revision_id: Option<String>,
+}
+
+/// The verdict-derived review projection of one PR owner, shared by every
+/// card of its revision family. `current_head` is `None` for an owner with
+/// no bound PR; `history` is `None` when the caller did not need badges.
+#[derive(Clone, Debug)]
+pub(crate) struct OwnerReview {
+    pub current_head: Option<CurrentHeadReview>,
+    pub history: Option<ReviewBadgeHistory>,
+}
 
 /// Resolve against the observed PR head, across legacy revision-owned and
 /// modern cycle-root verdicts. Missing heads and late old-head results never
@@ -12,12 +42,15 @@ use boss_protocol::{AiReviewBadge, ReviewStage};
 /// resolves to `not_reviewed`, the same state a commit-based fix shows until
 /// its new head is reviewed. A newer verdict for the same head still wins
 /// because it is selected before this check.
-pub(super) fn current_head_review_states(
+///
+/// Only owners with a bound PR produce an entry.
+pub(super) fn fetch_current_heads(
     conn: &Connection,
     ids: &[String],
-) -> Result<std::collections::HashMap<String, (&'static str, Option<String>)>> {
+    key: ReviewKey,
+) -> Result<HashMap<String, CurrentHeadReview>> {
     if ids.is_empty() {
-        return Ok(Default::default());
+        return Ok(HashMap::new());
     }
     let placeholders = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
     let outcomes = super::review_verdicts::INFORMATIVE_GATE_OUTCOMES
@@ -25,7 +58,7 @@ pub(super) fn current_head_review_states(
         .map(|outcome| format!("'{outcome}'"))
         .collect::<Vec<_>>()
         .join(",");
-    let family = review_family_cte(&placeholders);
+    let family = review_family_cte(&placeholders, key);
     let sql = format!(
         "{family}
          SELECT o.card, v.gate_outcome, v.revision_task_id,
@@ -64,10 +97,10 @@ pub(super) fn current_head_review_states(
             row.get::<_, bool>(6)?,
         ))
     })?;
-    let mut result = std::collections::HashMap::new();
+    let mut result = HashMap::new();
     for row in rows {
         let (id, outcome, revision, ci, mergeable, pending_work, revision_delivered_unmoved) = row?;
-        let (state, revision) = match outcome.as_deref() {
+        let (state, findings_revision_id) = match outcome.as_deref() {
             Some(REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS) if revision_delivered_unmoved => {
                 (AI_REVIEW_STATE_NOT_REVIEWED, None)
             }
@@ -85,28 +118,27 @@ pub(super) fn current_head_review_states(
             }
             _ => (AI_REVIEW_STATE_NOT_REVIEWED, None),
         };
-        // A revision inherits the owner's verdict, but must not link to itself.
-        let revision = revision.filter(|revision_id| revision_id != &id);
-        result.insert(id, (state, revision));
+        result.insert(
+            id,
+            CurrentHeadReview {
+                state,
+                findings_revision_id,
+            },
+        );
     }
     Ok(result)
 }
 
 /// Keep historical evidence separate from current-head state: delivering a
-/// revision does not prove its fix has been reviewed. Fetch the entire visible
-/// Review slice in one query, including legacy revision-owned verdicts.
-pub(super) fn attach_review_badges(conn: &Connection, tasks: &mut [Task], chores: &mut [Task]) -> Result<()> {
-    for row in tasks.iter_mut().chain(chores.iter_mut()) {
-        row.ai_review_badge = None;
-    }
-    let ids: Vec<_> = tasks
-        .iter()
-        .chain(chores.iter())
-        .filter(|row| row.status == TaskStatus::InReview && row.ai_review_state.is_some())
-        .map(|row| row.id.clone())
-        .collect();
+/// revision does not prove its fix has been reviewed. Fetch the whole id
+/// list in one query, including legacy revision-owned verdicts.
+pub(super) fn fetch_badge_histories(
+    conn: &Connection,
+    ids: &[String],
+    key: ReviewKey,
+) -> Result<HashMap<String, ReviewBadgeHistory>> {
     if ids.is_empty() {
-        return Ok(());
+        return Ok(HashMap::new());
     }
     let placeholders = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
     let outcomes = super::review_verdicts::INFORMATIVE_GATE_OUTCOMES
@@ -114,7 +146,7 @@ pub(super) fn attach_review_badges(conn: &Connection, tasks: &mut [Task], chores
         .map(|value| format!("'{value}'"))
         .collect::<Vec<_>>()
         .join(",");
-    let family = review_family_cte(&placeholders);
+    let family = review_family_cte(&placeholders, key);
     let sql = format!(
         "{family}, ranked AS (
             SELECT o.card, v.*, ROW_NUMBER() OVER (
@@ -132,7 +164,7 @@ pub(super) fn attach_review_badges(conn: &Connection, tasks: &mut [Task], chores
                 r.status IN ('in_review', 'done') AND r.deleted_at IS NULL AND EXISTS(
                     SELECT 1 FROM work_executions e WHERE e.work_item_id = r.id
                     AND e.kind = 'revision_implementation' AND e.status = 'completed'),
-                COALESCE(r.id = o.card, 0), p.payload_json, r.description
+                r.id, p.payload_json, r.description
          FROM owners o JOIN tasks root ON root.id = o.id
          LEFT JOIN ranked v ON v.card = o.card AND v.rank = 1
          LEFT JOIN tasks r ON r.id = v.revision_task_id
@@ -140,11 +172,11 @@ pub(super) fn attach_review_badges(conn: &Connection, tasks: &mut [Task], chores
              AND p.kind = 'review_verdict' AND p.state = 'applied'"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(&ids), |row| {
+    let rows = stmt.query_map(rusqlite::params_from_iter(ids), |row| {
         Ok((
             row.get::<_, String>(0)?,
             ReviewBadgeHistory {
-                is_findings_revision: row.get(9)?,
+                findings_revision_id: row.get(9)?,
                 verdict_payload: row.get(10)?,
                 revision_description: row.get(11)?,
                 head: row.get(1)?,
@@ -160,19 +192,32 @@ pub(super) fn attach_review_badges(conn: &Connection, tasks: &mut [Task], chores
             },
         ))
     })?;
-    let history = rows.collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?;
+    Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
+}
+
+/// Cards that carry a review badge: in Review with a resolved review state.
+pub(super) fn wants_review_badge(row: &Task) -> bool {
+    row.status == TaskStatus::InReview && row.ai_review_state.is_some()
+}
+
+/// Set `ai_review_badge` on every row from its resolved `ai_review_state`
+/// and the history `history_for` supplies for it (none for rows whose owner
+/// could not be resolved). Must run after `ai_review_state` is attached.
+pub(super) fn apply_review_badges<'h>(
+    tasks: &mut [Task],
+    chores: &mut [Task],
+    history_for: impl Fn(&Task) -> Option<&'h ReviewBadgeHistory>,
+) -> Result<()> {
     for row in tasks.iter_mut().chain(chores.iter_mut()) {
-        row.ai_review_badge = if row.status == TaskStatus::InReview {
-            row.ai_review_state
-                .as_deref()
-                .map(|state| badge_presentation(state, row.ai_review_stage.as_deref(), history.get(&row.id)))
-        } else {
-            None
-        };
-        if row.ai_review_state.as_deref() == Some(AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS)
-            && let Some(badge) = &mut row.ai_review_badge
-        {
-            if let Some(history) = history.get(&row.id) {
+        row.ai_review_badge = None;
+        if !wants_review_badge(row) {
+            continue;
+        }
+        let history = history_for(row);
+        let state = row.ai_review_state.as_deref().expect("checked by wants_review_badge");
+        let mut badge = badge_presentation(state, row.ai_review_stage.as_deref(), history, &row.id);
+        if state == AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS {
+            if let Some(history) = history {
                 badge.findings_markdown = findings_markdown(history)?;
             }
             badge.tooltip.push_str(if row.ai_review_findings_revision_id.is_some() {
@@ -181,6 +226,7 @@ pub(super) fn attach_review_badges(conn: &Connection, tasks: &mut [Task], chores
                 "\nNo separate findings revision is available from this card."
             });
         }
+        row.ai_review_badge = Some(badge);
     }
     Ok(())
 }
@@ -202,19 +248,41 @@ fn findings_markdown(history: &ReviewBadgeHistory) -> Result<Option<String>> {
     Ok(history.revision_description.clone())
 }
 
-#[derive(bon::Builder)]
+/// One owner's badge evidence: the ranked verdict, the head it reviewed, and
+/// the findings revision it names. Identical for every card of the family;
+/// only the self-link (`findings_revision_id == card`) differs per card.
+#[derive(bon::Builder, Clone, Debug)]
 #[builder(on(String, into))]
-struct ReviewBadgeHistory {
+pub(crate) struct ReviewBadgeHistory {
     verdict_payload: Option<String>,
     revision_description: Option<String>,
-    is_findings_revision: bool,
+    /// `tasks.id` of the findings revision the ranked verdict names, when
+    /// that row still exists.
+    findings_revision_id: Option<String>,
     head: Option<String>,
     reviewed_sha: Option<String>,
     verdict: Option<(String, String, i64)>,
     revision: Option<(String, String, bool)>,
 }
 
-fn badge_presentation(state: &str, stage: Option<&str>, history: Option<&ReviewBadgeHistory>) -> AiReviewBadge {
+impl ReviewBadgeHistory {
+    /// Drop the findings text an owner in `state` will never render, so a
+    /// cached entry holds the tooltip evidence and not a verdict payload.
+    pub(super) fn trimmed_for(mut self, state: Option<&str>) -> Self {
+        if state != Some(AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS) {
+            self.verdict_payload = None;
+            self.revision_description = None;
+        }
+        self
+    }
+}
+
+fn badge_presentation(
+    state: &str,
+    stage: Option<&str>,
+    history: Option<&ReviewBadgeHistory>,
+    card_id: &str,
+) -> AiReviewBadge {
     let findings = history.and_then(|h| h.verdict.as_ref()).map(|v| v.2);
     let consolidating = stage.and_then(|stage| stage.parse().ok()) == Some(ReviewStage::Consolidation);
     let (label, icon, explanation) = match state {
@@ -297,7 +365,7 @@ fn badge_presentation(state: &str, stage: Option<&str>, history: Option<&ReviewB
             "blocked" => "Blocked",
             _ => status,
         };
-        if history.is_findings_revision {
+        if history.findings_revision_id.as_deref() == Some(card_id) {
             badge
                 .tooltip
                 .push_str(&format!("\nThis revision addresses the findings ({status_label})."));
@@ -324,9 +392,32 @@ fn badge_presentation(state: &str, stage: Option<&str>, history: Option<&ReviewB
     badge
 }
 
-fn review_family_cte(placeholders: &str) -> String {
-    format!(
-        "WITH RECURSIVE ancestors(card, id, depth) AS (
+/// The `family(root, id, depth)` CTE shared by the review projection and
+/// the board-review cache key read, expanded to a literal so both can be
+/// built with `concat!`. It seeds from an `owners(card, id)` CTE and walks
+/// revision children through the covering `idx_tasks_parent_kind_id`; the
+/// key read must see exactly the rows the projection reads, so there is one
+/// definition of the walk (kind filter, depth bound, seeding).
+macro_rules! family_recursive_sql {
+    () => {
+        "family(root, id, depth) AS (
+            SELECT DISTINCT id, id, 0 FROM owners
+            UNION ALL
+            SELECT f.root, t.id, f.depth + 1 FROM family f
+            JOIN tasks t INDEXED BY idx_tasks_parent_kind_id ON t.parent_task_id = f.id
+            WHERE t.kind = 'revision' AND f.depth < 64
+         )"
+    };
+}
+pub(super) use family_recursive_sql;
+
+/// The `owners(card, id)` and `family(root, id, depth)` CTEs both review
+/// queries select from. `Card` resolves each id's owner by walking up its
+/// revision chain; `Owner` takes the ids as the owners themselves.
+pub(super) fn review_family_cte(placeholders: &str, key: ReviewKey) -> String {
+    let owners = match key {
+        ReviewKey::Card => format!(
+            "ancestors(card, id, depth) AS (
             SELECT id, id, 0 FROM tasks WHERE id IN ({placeholders})
             UNION ALL
             SELECT a.card, t.parent_task_id, a.depth + 1
@@ -335,14 +426,15 @@ fn review_family_cte(placeholders: &str) -> String {
          ), owners AS (
             SELECT a.card, t.id FROM ancestors a JOIN tasks t ON t.id = a.id
             WHERE t.kind != 'revision'
-         ), family(root, id, depth) AS (
-            SELECT DISTINCT id, id, 0 FROM owners
-            UNION ALL
-            SELECT f.root, t.id, f.depth + 1 FROM family f
-            JOIN tasks t INDEXED BY idx_tasks_parent_task_id ON t.parent_task_id = f.id
-            WHERE t.kind = 'revision' AND f.depth < 64
          )"
-    )
+        ),
+        ReviewKey::Owner => format!(
+            "owners(card, id) AS (
+            SELECT id, id FROM tasks WHERE id IN ({placeholders}) AND kind != 'revision'
+         )"
+        ),
+    };
+    format!("WITH RECURSIVE {owners}, {}", family_recursive_sql!())
 }
 
 #[cfg(test)]

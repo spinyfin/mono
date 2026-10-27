@@ -3,7 +3,7 @@
 //! assembly equals an uncached assembly of the same database.
 use super::*;
 use crate::population_timing::{PopulationTrace, segment};
-use crate::work::board_runtime_cache::BoardRuntimeCache;
+use crate::work::board_caches::BoardCaches;
 use std::time::Instant;
 
 const FAR_FUTURE: &str = "4102444800";
@@ -11,7 +11,7 @@ const FAR_FUTURE: &str = "4102444800";
 struct Board {
     db: WorkDb,
     product_id: String,
-    cache: BoardRuntimeCache,
+    cache: BoardCaches,
 }
 
 impl Board {
@@ -27,7 +27,7 @@ impl Board {
         Self {
             db,
             product_id: product.id,
-            cache: BoardRuntimeCache::default(),
+            cache: BoardCaches::default(),
         }
     }
 
@@ -79,7 +79,7 @@ impl Board {
     /// [`assert_equivalent`] with both paths evaluated at the fixed instant
     /// `now`, so wall-clock deadlines are exercised without racing the clock.
     fn assert_equivalent_at(&self, now: i64) -> (u64, i64) {
-        let misses_before = self.cache.stats().misses;
+        let misses_before = self.cache.runtimes.stats().misses;
         let mut trace = PopulationTrace::new(self.product_id.clone(), "req", Some(1), Instant::now());
         let cached = self
             .db
@@ -92,7 +92,7 @@ impl Board {
             "cached assembly diverged from the uncached one"
         );
         let (_, _, queries) = trace.segment_counts(segment::DB_TASK_RUNTIMES).unwrap();
-        (self.cache.stats().misses - misses_before, queries.unwrap())
+        (self.cache.runtimes.stats().misses - misses_before, queries.unwrap())
     }
 
     fn runtime_of(&self, work_item_id: &str) -> serde_json::Value {
@@ -142,7 +142,7 @@ fn an_unchanged_board_reuses_every_runtime() {
     let (misses, queries) = board.assert_equivalent();
     assert_eq!(misses, 0, "nothing changed");
     assert_eq!(queries, 1, "only the epoch read remains");
-    assert_eq!(board.cache.stats().entries, 2);
+    assert_eq!(board.cache.runtimes.stats().entries, 2);
 }
 
 /// A named write to one runtime input and how many items it must recompute.
@@ -449,7 +449,7 @@ fn a_write_from_another_connection_is_seen_by_a_fresh_reader() {
             .unwrap()
     };
     let before = serde_json::to_value(&assemble(&board).task_runtimes).unwrap();
-    assert_eq!(board.cache.stats().entries, 1);
+    assert_eq!(board.cache.runtimes.stats().entries, 1);
 
     // Another process (a CLI command, say) updates the row directly.
     let other = rusqlite::Connection::open(&path).unwrap();
@@ -474,15 +474,22 @@ fn entries_follow_board_membership_and_stay_within_capacity() {
         board.execution(item, ExecutionStatus::Running);
     }
     board.assert_equivalent();
-    assert_eq!(board.cache.stats().entries, 3);
+    assert_eq!(board.cache.runtimes.stats().entries, 3);
 
     board.sql("UPDATE tasks SET status = 'archived' WHERE id = ?1", &[&items[0]]);
     board.assert_equivalent();
-    assert_eq!(board.cache.stats().entries, 2, "archived cards leave the cache");
+    assert_eq!(
+        board.cache.runtimes.stats().entries,
+        2,
+        "archived cards leave the cache"
+    );
 
-    board.cache = BoardRuntimeCache::with_capacity(1);
+    board.cache = BoardCaches {
+        runtimes: crate::work::board_runtime_cache::BoardRuntimeCache::with_capacity(1),
+        ..BoardCaches::default()
+    };
     board.assert_equivalent();
-    let stats = board.cache.stats();
+    let stats = board.cache.runtimes.stats();
     assert_eq!(stats.entries, 1, "the global capacity bounds the cache");
     assert!(stats.evictions >= 1);
     board.assert_equivalent();

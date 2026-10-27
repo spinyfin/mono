@@ -635,7 +635,7 @@ fn fresh_db_has_parent_task_id_column_and_index() {
         "tasks table must have parent_task_id column after fresh init; columns = {cols:?}"
     );
 
-    let index_exists: i64 = conn
+    let retired: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master
                  WHERE type = 'index' AND name = 'idx_tasks_parent_task_id'",
@@ -643,7 +643,20 @@ fn fresh_db_has_parent_task_id_column_and_index() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(index_exists, 1, "idx_tasks_parent_task_id must exist after fresh init");
+    assert_eq!(
+        retired, 0,
+        "idx_tasks_parent_task_id is superseded by idx_tasks_parent_kind_id"
+    );
+
+    let covering: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_tasks_parent_kind_id'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(covering, 1, "idx_tasks_parent_kind_id must exist after fresh init");
 }
 
 #[test]
