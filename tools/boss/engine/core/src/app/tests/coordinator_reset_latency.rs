@@ -71,10 +71,9 @@ fn report_stages(token: &str) {
     }
 }
 
-async fn slow_legacy_reset() {
-    let token = "latency-slow-legacy";
+async fn legacy_reset(token: &str, legacy_delay: Duration) {
     let (f, mut read, mut write, connection) = rpc_fixture(token).await;
-    *f.runner.legacy_delay.lock().unwrap() = Duration::from_secs(30);
+    *f.runner.legacy_delay.lock().unwrap() = legacy_delay;
     // The supervisor owns the lifecycle lock; app attach is next in its queue.
     let supervisor = f.state.coordinator_tmux_lock.lock().await;
     let attach = f.state.coordinator_tmux_lock.lock();
@@ -212,7 +211,12 @@ fn run_with_audit(future: impl std::future::Future<Output = ()>) {
 
 #[test]
 fn rpc_skips_slow_legacy_server_under_supervisor_and_attach_contention() {
-    run_with_audit(slow_legacy_reset());
+    run_with_audit(legacy_reset("latency-slow-legacy", Duration::from_secs(30)));
+}
+
+#[test]
+fn rpc_skips_absent_legacy_server_under_supervisor_and_attach_contention() {
+    run_with_audit(legacy_reset("latency-absent-legacy", Duration::ZERO));
 }
 
 #[test]
