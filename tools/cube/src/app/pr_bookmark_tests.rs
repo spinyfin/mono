@@ -354,6 +354,11 @@ fn exercise_publication(scenario: Scenario) {
     }
     published.unwrap();
     assert_eq!(heads.lines().collect::<Vec<_>>(), vec![pushed.as_str()]);
+    assert_eq!(
+        crate::app::pr_bookmarks::recorded_heads(&worker, 42),
+        vec![published_before, pushed.clone()],
+        "publication must retain both verified heads for later bookmark repair"
+    );
     jj(&repo, &["git", "export"]);
     jj(&repo, &["git", "import"]);
     assert_eq!(jj_commit_id(&runner, &repo, "pr/42").unwrap(), pushed);

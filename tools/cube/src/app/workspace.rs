@@ -1503,8 +1503,8 @@ pub(super) fn run_workspace(
                     force_reset,
                 ) {
                     Ok(ReleaseResetOutcome::Reset) => {
-                        // Forget consumed boss/exec_* bookmarks and pr/<n>
-                        // bookmarks no workspace is positioned on any more. The
+                        // Forget consumed boss/exec_* bookmarks and delete unused
+                        // pr/<n> bookmarks with proven published content. The
                         // fetch above already updated main, so do_fetch = false.
                         //
                         // The reset has just moved `@` off whatever branch this

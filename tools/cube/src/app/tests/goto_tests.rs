@@ -96,25 +96,24 @@ fn goto_set_pr_bookmark_cmds(pr: u64, head: &str) -> Vec<ExpectedCommand> {
 
 /// What `goto --pr` runs after GitHub's PR JSON: confirm `head` is in the
 /// store, then point the local branch bookmark at it.
-fn goto_pr_head_cmds(branch: &str, head: &str) -> Vec<ExpectedCommand> {
-    vec![
-        goto_jj(
-            &[
-                "log",
-                "--no-graph",
-                "-r",
-                &format!("present({head})"),
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            head,
-        ),
-        goto_jj(&["bookmark", "set", branch, "-r", head, "--allow-backwards"], ""),
-    ]
+fn goto_pr_head_cmds(head: &str) -> Vec<ExpectedCommand> {
+    vec![goto_jj(
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            &format!("present({head})"),
+            "-T",
+            r#"commit_id ++ "\n""#,
+        ],
+        head,
+    )]
 }
 
 fn goto_pr_json(branch: &str, head: &str) -> String {
-    format!(r#"{{"head":{{"ref":"{branch}","sha":"{head}"}},"state":"open","merged":false}}"#)
+    format!(
+        r#"{{"head":{{"repo":{{"full_name":"spinyfin/mono"}},"ref":"{branch}","sha":"{head}"}},"state":"open","merged":false}}"#
+    )
 }
 
 fn goto_pr_positioned_cmd(head: &str, out: &str) -> ExpectedCommand {
@@ -224,8 +223,12 @@ fn goto_pr_resolves_branch_and_sets_pr_bookmark() {
             &goto_pr_json(branch, "e42"),
         ),
     ];
-    cmds.extend(goto_pr_head_cmds(branch, "e42"));
+    cmds.extend(goto_pr_head_cmds("e42"));
     cmds.extend(goto_set_pr_bookmark_cmds(42, "e42"));
+    cmds.push(goto_jj(
+        &["bookmark", "set", branch, "-r", "e42", "--allow-backwards"],
+        "",
+    ));
     cmds.push(goto_pr_positioned_cmd("e42", ""));
     cmds.push(goto_jj(&["new", "e42"], ""));
     let runner = FakeRunner::new(cmds);
@@ -322,7 +325,7 @@ fn goto_pr_repairs_conflicted_bookmark_when_other_side_is_an_ancestor() {
             &goto_pr_json(branch, "e42"),
         ),
     ];
-    cmds.extend(goto_pr_head_cmds(branch, "e42"));
+    cmds.extend(goto_pr_head_cmds("e42"));
     cmds.extend(goto_pr_bookmark_prelude(42, "e42", "e42\nold1\n"));
     cmds.push(goto_jj(
         &[
@@ -338,6 +341,10 @@ fn goto_pr_repairs_conflicted_bookmark_when_other_side_is_an_ancestor() {
         "",
     ));
     cmds.extend(goto_pr_bookmark_set_cmds(42, "e42"));
+    cmds.push(goto_jj(
+        &["bookmark", "set", branch, "-r", "e42", "--allow-backwards"],
+        "",
+    ));
     cmds.push(goto_pr_positioned_cmd("e42", "e42"));
     let runner = FakeRunner::new(cmds);
     run_goto(&runner, None, Some(42)).expect("conflicted pr bookmark repaired");
@@ -359,7 +366,7 @@ fn goto_pr_refuses_conflicted_bookmark_with_unique_content() {
             &goto_pr_json(branch, "e42"),
         ),
     ];
-    cmds.extend(goto_pr_head_cmds(branch, "e42"));
+    cmds.extend(goto_pr_head_cmds("e42"));
     cmds.extend(goto_pr_bookmark_prelude(42, "e42", "e42\nuniq9\n"));
     cmds.push(goto_jj(
         &[

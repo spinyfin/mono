@@ -46,7 +46,7 @@ use git_utils::pr_bookmark;
 
 use crate::app::errors::{CubeError, Result};
 use crate::app::gh_pr;
-use crate::app::jj::{run_jj, run_jj_network_within};
+use crate::app::jj::{network_cmd_total_bound, run_jj, run_jj_network_within};
 use crate::command_runner::{CommandRunner, RealCommandRunner};
 
 /// How many commits unique to one side of a conflicted bookmark the safety
@@ -82,19 +82,31 @@ pub(super) fn delete_pr_bookmarks(
     if names.is_empty() {
         return Ok(());
     }
-    for name in names {
-        if !can_delete(runner, database_path, cwd, name)? {
-            return Err(CubeError::InvalidArgument(format!(
-                "refusing to delete {name}: a side is in use or has no remote protection"
-            )));
-        }
+    let eligible = crate::app::pr_gc::eligible(runner, database_path, cwd, names)?;
+    if eligible.len() != names.len() {
+        return Err(CubeError::InvalidArgument(
+            "refusing to delete PR bookmarks with in-use or unprotected sides".into(),
+        ));
     }
     let mut args: Vec<&str> = vec!["bookmark", "delete"];
     args.extend(names.iter().map(String::as_str));
     run(runner, database_path, cwd, &args)?;
     export_git_refs(runner, database_path, cwd)?;
-    for name in names {
-        verify_git_ref(runner, database_path, cwd, name, &[])?;
+    let refs = names
+        .iter()
+        .map(|name| format!("present({name}@git)"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let remaining = run(
+        runner,
+        database_path,
+        cwd,
+        &["log", "--no-graph", "-r", &refs, "-T", r#"commit_id ++ "\n""#],
+    )?;
+    if !remaining.trim().is_empty() {
+        return Err(CubeError::InvalidArgument(format!(
+            "deleted PR git refs remain: {remaining}"
+        )));
     }
     Ok(())
 }
@@ -148,7 +160,8 @@ fn point_pr_bookmark_with_mode(
         recorded_heads: recorded_heads(cwd, pr_number),
         publication,
     };
-    ensure_sides_are_obsolete(runner, database_path, cwd, &name, &head, &sides, &policy)?;
+    ensure_sides_are_obsolete(runner, database_path, cwd, &name, &head, &sides, &policy)
+        .map_err(|error| CubeError::InvalidArgument(format!("{error} Requested target came from `{head_ref}`.")))?;
 
     run(
         runner,
@@ -180,11 +193,6 @@ fn point_pr_bookmark_with_mode(
         )));
     }
     verify_git_ref(runner, database_path, cwd, &name, std::slice::from_ref(&head))?;
-    // Callers hold the PR-bookmark lock. A store that cannot hold the record
-    // loses only the durable proof, never the correctly written bookmark.
-    if let Err(error) = record_head(cwd, pr_number, &head) {
-        eprintln!("warning: cube could not record `{head}` as a head of PR {pr_number}: {error}");
-    }
     Ok(())
 }
 
@@ -204,6 +212,27 @@ fn bookmark_commits(
         &["log", "--no-graph", "-r", &revset, "-T", r#"commit_id ++ "\n""#],
     )?;
     Ok(distinct_lines(&out))
+}
+
+/// Read-only proof for the rare predecessor case that ancestry alone cannot
+/// classify. GC performs this work outside the store lock, then checks again
+/// when repairing. No network is needed for previously confirmed PR content.
+pub(super) fn obsolete_at_recorded_head(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    cwd: &Path,
+    number: u64,
+) -> Option<String> {
+    let recorded = recorded_heads(cwd, number);
+    let head = recorded.last()?;
+    let name = pr_bookmark::pr_bookmark_name(number);
+    let sides = bookmark_commits(runner, database_path, cwd, &name).ok()?;
+    let policy = RepairPolicy {
+        recorded_heads: recorded.clone(),
+        publication: false,
+    };
+    ensure_sides_are_obsolete(runner, database_path, cwd, &name, head, &sides, &policy).ok()?;
+    Some(head.clone())
 }
 
 /// [`bookmark_commits`] rendered for a diagnostic: never fails.
@@ -327,6 +356,11 @@ fn ensure_sides_are_obsolete(
             use git_utils::jj_provenance::{
                 COMMIT_ID_LINES_TEMPLATE, candidate_revset, evolution_contains, sole_candidate,
             };
+            let scope = if recorded.is_empty() {
+                format!("::{head}")
+            } else {
+                format!("::({head} | {recorded})")
+            };
             let candidates = run(
                 runner,
                 database_path,
@@ -335,7 +369,7 @@ fn ensure_sides_are_obsolete(
                     "log",
                     "--no-graph",
                     "-r",
-                    &candidate_revset(change, &format!("::{head}")),
+                    &candidate_revset(change, &scope),
                     "-T",
                     COMMIT_ID_LINES_TEMPLATE,
                 ],
@@ -453,8 +487,8 @@ pub(super) fn is_unsafe_repair(error: &CubeError) -> bool {
 
 fn unsafe_repair(name: &str, head: &str, side: &str, why: &str) -> CubeError {
     CubeError::InvalidArgument(format!(
-        "`{name}` is conflicted and {UNSAFE_REPAIR_PHRASE}: the GitHub head is {head} but the other side \
-         {side} has unique content ({why}). Inspect with `jj log -r 'bookmarks(exact:\"{name}\")'`; if {side} \
+        "cube cannot move `{name}` from {side} to requested target {head}: {UNSAFE_REPAIR_PHRASE} \
+         with unique content ({why}). Inspect with `jj log -r 'bookmarks(exact:\"{name}\")'`; if {side} \
          is really obsolete, resolve with `jj bookmark set {name} -r {head} --allow-backwards`."
     ))
 }
@@ -489,40 +523,14 @@ fn verify_git_ref(
     Ok(())
 }
 
-/// A bookmark can be collected only if all its sides are remotely protected
-/// and none is an ancestor of a working copy. @git is local, not protection.
-pub(super) fn can_delete(
-    runner: &dyn CommandRunner,
-    database_path: Option<&Path>,
-    cwd: &Path,
-    name: &str,
-) -> Result<bool> {
-    let unsafe_sides = run(
-        runner,
-        database_path,
-        cwd,
-        &[
-            "log",
-            "--no-graph",
-            "-r",
-            &format!(
-                r#"(bookmarks(exact:"{name}") & ::working_copies()) | (bookmarks(exact:"{name}") ~ ::remote_bookmarks())"#
-            ),
-            "-T",
-            r#"commit_id ++ "\n""#,
-        ],
-    )?;
-    Ok(unsafe_sides.trim().is_empty())
-}
-
 // ── A PR's authoritative head ───────────────────────────────────────────────
 //
 // The commit GitHub reports as `head.sha`, shared by `goto --pr` and
 // lease-time `pr/<n>` repair so the two cannot disagree about which commit is
 // the PR head. `resolve_pr_head` makes it present in the shared jj store
 // (fetching it from the head repository when the base remote lacks it). The
-// *recorded heads* of a PR are every commit cube successfully pointed `pr/<n>`
-// at, kept in a cube-owned file inside the shared store: a conflicting side
+// *recorded heads* of a PR are only heads confirmed published on GitHub,
+// kept in a cube-owned file inside the shared store: a conflicting side
 // whose unique commits are all ancestors of a recorded head was a head of
 // *this PR* and lost nothing when GitHub's head replaced it, however long ago
 // and whatever became of any branch it was pushed to.
@@ -569,7 +577,8 @@ fn sha_is_present(runner: &dyn CommandRunner, database_path: Option<&Path>, cwd:
 ///
 /// The caller has normally just fetched the base remote, so the common case is
 /// a single local lookup. When the commit is still missing, it is fetched from
-/// the head repository's branch through a temporary jj remote, and must then
+/// the head repository's branch through a temporary jj remote, falling back
+/// to the base repository's `refs/pull/<n>/head`. The fetched commit must
 /// equal `head.sha` exactly; a head that cannot be had is an error. Network
 /// work is bounded by `deadline` and runs before any PR-bookmark lock is taken.
 pub(super) fn resolve_pr_head(
@@ -585,7 +594,7 @@ pub(super) fn resolve_pr_head(
         .ok_or_else(|| CubeError::InvalidArgument(format!("PR {number} returned no head.sha")))?
         .to_string();
     let head_repo = head_repo_full_name(info);
-    let same_repo = head_repo.is_none_or(|name| name.eq_ignore_ascii_case(owner_repo));
+    let same_repo = head_repo.is_some_and(|name| name.eq_ignore_ascii_case(owner_repo));
     let head = PrHead {
         sha: sha.clone(),
         same_repo,
@@ -598,14 +607,141 @@ pub(super) fn resolve_pr_head(
     if sha_is_present(runner, database_path, cwd, &sha)? {
         return Ok(head);
     }
+    // The source branch is gone (deleted on merge) or its fork was deleted, but
+    // the base repository keeps `refs/pull/<n>/head` for the life of the PR.
+    let pull_error = fetch_pull_ref(runner, database_path, cwd, owner_repo, number, deadline);
+    if sha_is_present(runner, database_path, cwd, &sha)? {
+        return Ok(head);
+    }
+    let describe = |result: Result<()>, what: &str| match result {
+        Ok(()) => format!("fetching {what} did not bring it in (the PR head moved again)"),
+        Err(error) => format!("fetching {what} failed: {error}"),
+    };
     Err(CubeError::InvalidArgument(format!(
-        "PR {number}'s head {sha} (on {}) is not in the shared jj store{}",
+        "PR {number}'s head {sha} (on {}) is not in the shared jj store; {}; {}",
         head_repo.unwrap_or("an unknown repository"),
-        match fetch_error {
-            Ok(()) => " and fetching the head branch did not bring it in (the branch moved again)".to_string(),
-            Err(error) => format!(" and could not be fetched: {error}"),
-        }
+        describe(fetch_error, "the head branch"),
+        describe(pull_error, "the base repository's pull ref"),
     )))
+}
+
+/// Prefix of the temporary jj remotes used to bring a PR head in. The name is
+/// `cube-pr-fetch-<n>-<unix seconds>-<uuid>`: unique per call so concurrent
+/// fetches never share a remote, and timestamped so a leftover from a killed
+/// run can be told apart from one still in use.
+const TEMP_REMOTE_PREFIX: &str = "cube-pr-fetch-";
+
+/// Floor for the age at which a temporary remote is presumed abandoned.
+const STALE_TEMP_REMOTE_MIN_AGE_SECS: u64 = 15 * 60;
+
+/// Margin added to the longest possible fetch for the work around it.
+const STALE_TEMP_REMOTE_MARGIN_SECS: u64 = 5 * 60;
+
+/// A temporary remote older than this cannot belong to a live fetch: it
+/// exceeds every attempt and retry at the configured network timeout, so a
+/// raised `CUBE_NETWORK_TIMEOUT_SECS` raises it too.
+pub(super) fn stale_temp_remote_age_secs() -> u64 {
+    (network_cmd_total_bound().as_secs() + STALE_TEMP_REMOTE_MARGIN_SECS).max(STALE_TEMP_REMOTE_MIN_AGE_SECS)
+}
+
+fn temp_remote_name(number: u64) -> String {
+    let now = unix_now();
+    format!("{TEMP_REMOTE_PREFIX}{number}-{now}-{}", uuid::Uuid::new_v4())
+}
+
+/// Remove temporary fetch remotes left behind by a run that was killed between
+/// `remote add` and `remote remove`. Their remote-tracking bookmarks would
+/// otherwise protect commits from collection forever. Run during normal GC
+/// sweeps and before adding a temporary remote. A
+/// remote younger than [`stale_temp_remote_age_secs`] is left alone because a
+/// live fetch may own it.
+pub(super) fn prune_stale_temp_remotes(runner: &dyn CommandRunner, database_path: Option<&Path>, cwd: &Path) {
+    let Ok(listing) = run(runner, database_path, cwd, &["git", "remote", "list"]) else {
+        return;
+    };
+    let now = unix_now();
+    let max_age = stale_temp_remote_age_secs();
+    for name in listing.lines().filter_map(|line| line.split_whitespace().next()) {
+        let Some(rest) = name.strip_prefix(TEMP_REMOTE_PREFIX) else {
+            continue;
+        };
+        // `<n>-<unix seconds>-<uuid>`
+        let created = rest.split('-').nth(1).and_then(|ts| ts.parse::<u64>().ok());
+        // A name from before timestamps were added has no way to be live.
+        let stale = created.is_none_or(|ts| now.saturating_sub(ts) >= max_age);
+        if !stale {
+            continue;
+        }
+        if let Err(error) = run(runner, database_path, cwd, &["git", "remote", "remove", name]) {
+            eprintln!("warning: cube could not remove stale temporary remote {name}: {error}");
+        }
+    }
+}
+
+/// URL of the matching GitHub repository, ignoring local mirrors and other
+/// repositories with similar names; use the canonical URL if none matches.
+fn base_repo_url(runner: &dyn CommandRunner, database_path: Option<&Path>, cwd: &Path, owner_repo: &str) -> String {
+    let listing = run(runner, database_path, cwd, &["git", "remote", "list"]).unwrap_or_default();
+    listing
+        .lines()
+        .find_map(|line| {
+            let (_, slug) = git_utils::repo_slug::parse_github_remote(line)?;
+            if !slug.eq_ignore_ascii_case(owner_repo) {
+                return None;
+            }
+            line.split_once(char::is_whitespace)
+                .map(|(_, url)| url.trim().to_string())
+        })
+        .unwrap_or_else(|| format!("https://github.com/{owner_repo}.git"))
+}
+
+/// The git directory behind the shared jj store.
+fn store_git_dir(cwd: &Path) -> Result<PathBuf> {
+    let store = crate::lock::shared_repo_dir(cwd)?.join("store");
+    let target = std::fs::read_to_string(store.join("git_target")).map_err(CubeError::Io)?;
+    std::fs::canonicalize(store.join(target.trim())).map_err(CubeError::Io)
+}
+
+/// Fetch `refs/pull/<number>/head` of the base repository into the store.
+///
+/// jj itself only fetches branches, so the ref is fetched with git into a
+/// remote-tracking ref of a temporary jj remote and then imported; removing the
+/// remote afterwards leaves just the commits in the store.
+fn fetch_pull_ref(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    cwd: &Path,
+    owner_repo: &str,
+    number: u64,
+    deadline: Option<Instant>,
+) -> Result<()> {
+    let url = base_repo_url(runner, database_path, cwd, owner_repo);
+    let git_dir = store_git_dir(cwd)?;
+    prune_stale_temp_remotes(runner, database_path, cwd);
+    let remote = temp_remote_name(number);
+    run(runner, database_path, cwd, &["git", "remote", "add", &remote, &url])?;
+    let refspec = format!("+refs/pull/{number}/head:refs/remotes/{remote}/pull-{number}");
+    let fetched = run_jj_network_within(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(
+            cwd,
+            "git",
+            &[
+                "--git-dir",
+                &git_dir.display().to_string(),
+                "fetch",
+                "--no-tags",
+                "--no-write-fetch-head",
+                &url,
+                &refspec,
+            ],
+        ),
+        deadline,
+    );
+    let imported = fetched.and_then(|_| import_git_refs(runner, database_path, cwd));
+    let _ = run(runner, database_path, cwd, &["git", "remote", "remove", &remote]);
+    imported
 }
 
 fn fetch_head_from_head_repo(
@@ -626,10 +762,9 @@ fn fetch_head_from_head_repo(
         .map(str::to_string)
         .or_else(|| head_repo_full_name(info).map(|name| format!("https://github.com/{name}.git")))
         .ok_or_else(|| CubeError::InvalidArgument(format!("PR {number} reports no head repository")))?;
-    let remote = format!("cube-pr-fetch-{number}");
+    prune_stale_temp_remotes(runner, database_path, cwd);
+    let remote = temp_remote_name(number);
     let jj = |args: &[&str]| run_jj(runner, database_path, &RealCommandRunner::invocation(cwd, "jj", args));
-    // A leftover from an interrupted run; absent is the normal case.
-    let _ = jj(&["git", "remote", "remove", &remote]);
     jj(&["git", "remote", "add", &remote, &url])?;
     let fetched = run_jj_network_within(
         runner,
@@ -643,10 +778,11 @@ fn fetch_head_from_head_repo(
     fetched.map(|_| ())
 }
 
-/// `<shared jj repo>/cube-pr-heads/<n>`, one commit id per line, oldest first.
+/// `<shared jj repo>/cube-pr-heads/published/<n>`, one commit id per line, oldest first.
 fn heads_path(cwd: &Path, number: u64) -> Result<PathBuf> {
     Ok(crate::lock::shared_repo_dir(cwd)?
         .join("cube-pr-heads")
+        .join("published")
         .join(number.to_string()))
 }
 
@@ -669,6 +805,7 @@ pub(super) fn recorded_heads(cwd: &Path, number: u64) -> Vec<String> {
 
 /// Record `commit` as a head of PR `number`. Callers hold the PR-bookmark lock.
 pub(super) fn record_head(cwd: &Path, number: u64, commit: &str) -> Result<()> {
+    // Legacy records included unpushed tips and cannot prove publication.
     let path = heads_path(cwd, number)?;
     let mut heads = recorded_heads(cwd, number);
     heads.retain(|h| h != commit);
@@ -682,4 +819,57 @@ pub(super) fn record_head(cwd: &Path, number: u64, commit: &str) -> Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, heads.join("\n") + "\n").map_err(CubeError::Io)?;
     std::fs::rename(&tmp, &path).map_err(CubeError::Io)
+}
+
+/// Persist only a head confirmed by GitHub, while holding the bookmark lock.
+pub(super) fn record_published_head(cwd: &Path, number: u64, commit: &str) {
+    if let Err(error) = record_head(cwd, number, commit) {
+        eprintln!("warning: cube could not record published PR {number} head {commit}: {error}");
+    }
+}
+
+/// How long a PR bookmark whose head could not be resolved is left alone by
+/// the sweep before GitHub is asked about it again.
+const UNRESOLVED_RETRY_SECS: u64 = 60 * 60;
+
+fn unresolved_path(cwd: &Path, number: u64) -> Result<PathBuf> {
+    Ok(crate::lock::shared_repo_dir(cwd)?
+        .join("cube-pr-heads")
+        .join("unresolved")
+        .join(number.to_string()))
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Whether a sweep recently failed to resolve PR `number`'s head, so asking
+/// GitHub again now would only repeat the same round trip.
+pub(super) fn recently_unresolved(cwd: &Path, number: u64) -> bool {
+    let Ok(path) = unresolved_path(cwd, number) else {
+        return false;
+    };
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .is_some_and(|at| unix_now().saturating_sub(at) < UNRESOLVED_RETRY_SECS)
+}
+
+/// Remember (or, with `unresolved == false`, forget) a failed head resolution.
+/// Best-effort: losing the memory only costs one extra lookup.
+pub(super) fn set_unresolved(cwd: &Path, number: u64, unresolved: bool) {
+    let Ok(path) = unresolved_path(cwd, number) else {
+        return;
+    };
+    if unresolved {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, format!("{}\n", unix_now()));
+    } else {
+        let _ = std::fs::remove_file(path);
+    }
 }

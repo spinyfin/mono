@@ -21,6 +21,7 @@ mod jj;
 mod lease_reclaim;
 mod pr;
 mod pr_bookmarks;
+mod pr_gc;
 mod pr_rebase;
 mod provision;
 mod reclaim;

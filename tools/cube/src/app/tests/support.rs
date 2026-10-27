@@ -202,6 +202,7 @@ pub(super) fn release_runner_for(workspace_path: &std::path::Path) -> FakeRunner
             "",
         ),
         ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["new", "main@origin"], ""),
+        ExpectedCommand::ok((workspace_path).to_path_buf(), "jj", &["git", "remote", "list"], ""),
         gc_git_import_command(workspace_path),
         gc_noop_command(workspace_path),
         gc_pr_noop_command(workspace_path),
@@ -637,10 +638,10 @@ pub(super) fn gc_pr_safe_command(cwd: &std::path::Path, name: &str, output: &str
             "--no-graph",
             "-r",
             &format!(
-                r#"(bookmarks(exact:"{name}") & ::working_copies()) | (bookmarks(exact:"{name}") ~ ::remote_bookmarks())"#
+                r#"(bookmarks(exact:"{name}") & ::working_copies()) | (bookmarks(exact:"{name}") ~ ::(remote_bookmarks()))"#
             ),
             "-T",
-            r#"commit_id ++ "\n""#,
+            crate::app::gc::BOOKMARK_NAMES_TEMPLATE,
         ],
         output,
     )

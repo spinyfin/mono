@@ -8,15 +8,6 @@
 //! GraphQL budget never blocks these lookups — the separate, far-less-
 //! contended REST (`core`) quota serves them.
 //!
-//! Every remaining lookup here is about *one* PR the caller already has in
-//! hand. There is deliberately no bulk PR-state helper: the sole caller that
-//! ever wanted one was GC's closed-PR bookmark sweep, and that sweep no
-//! longer consults GitHub at all — it decides which `pr/<n>` bookmarks are
-//! still referenced from local workspace state instead (see
-//! [`crate::app::gc::collect_unreferenced_pr_bookmarks`]). Reintroducing a
-//! batch helper here would mean some caller is once again sizing a GitHub
-//! round trip by how much local bookkeeping has piled up, which is the shape
-//! that hung `cube workspace release` for 4-6+ minutes.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -37,6 +28,19 @@ pub(super) fn fetch_pr_json(runner: &dyn CommandRunner, cwd: &Path, owner_repo: 
     let json = runner
         .run(&RealCommandRunner::invocation(cwd, "gh", &["api", &api_path]))
         .map_err(|e| enrich_rate_limit_error(runner, cwd, e, RATE_LIMIT_HINT_TIMEOUT))?;
+    Ok(serde_json::from_str(&json)?)
+}
+
+/// Bounded REST lookup for maintenance passes with a shared network deadline.
+pub(super) fn fetch_pr_json_with_timeout(
+    runner: &dyn CommandRunner,
+    cwd: &Path,
+    owner_repo: &str,
+    pr_number: u64,
+    timeout: Duration,
+) -> Result<Value> {
+    let api_path = format!("repos/{owner_repo}/pulls/{pr_number}");
+    let json = runner.run_with_timeout(&RealCommandRunner::invocation(cwd, "gh", &["api", &api_path]), timeout)?;
     Ok(serde_json::from_str(&json)?)
 }
 
