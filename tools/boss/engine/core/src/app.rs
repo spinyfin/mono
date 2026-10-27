@@ -53,9 +53,9 @@ use crate::protocol::{
 use crate::repo_slug;
 use crate::runner::ExecutionRunner;
 use crate::work::{
-    ANSWER_AGENT_RUN_STATUS_FAILED, ActionedAttentionGroup, DuplicateTaskError, ExecutionKind, ExecutionStatus,
-    GhPrStateChecker, INTENT_QUESTION, ProducerConflictInsertInput, ReviseDocOutcome, SetRunTranscriptPathOutcome,
-    Task, TaskStatus, WorkComment, WorkDb, WorkItem,
+    ANSWER_AGENT_RUN_STATUS_FAILED, ANSWER_AGENT_RUN_STATUS_REPLIED, ActionedAttentionGroup, DuplicateTaskError,
+    ExecutionKind, ExecutionStatus, GhPrStateChecker, INTENT_QUESTION, ProducerConflictInsertInput, ReviseDocOutcome,
+    SetRunTranscriptPathOutcome, THREAD_ENTRY_KIND_ANSWER, Task, TaskStatus, WorkComment, WorkDb, WorkItem,
 };
 use crate::worker_registry::WorkerRegistry;
 use async_trait::async_trait;

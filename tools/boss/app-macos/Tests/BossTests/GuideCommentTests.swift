@@ -24,12 +24,18 @@ final class GuideCommentTests: XCTestCase {
             XCTAssertEqual(edit.canAct, state == "proposed")
             XCTAssertEqual(edit.proposal.replacements.first?.oldText, "delta-only")
             if state == "approved" { XCTAssertEqual(edit.stateLabel, "Approved · In Progress") }
+            let titles = ProposedEditCard.visibleActions(for: edit).map(\.rawValue)
+            switch state {
+            case "proposed":
+                XCTAssertEqual(titles, ["Approve as revision", "Edit then approve", "Dismiss"])
+            case "approved":
+                XCTAssertEqual(titles, ["Open revision"])
+            default:
+                XCTAssertEqual(titles, [], "dismissed and superseded cards hide actions")
+            }
             let view = NSHostingView(rootView: ProposedEditCard(entryID: entry.id, edit: edit, layer: layer))
             view.frame = NSRect(x: 0, y: 0, width: 640, height: 400)
             view.layoutSubtreeIfNeeded()
-            let bitmap = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
-            view.cacheDisplay(in: view.bounds, to: bitmap)
-            XCTAssertGreaterThan(bitmap.pixelsWide, 0)
         }
         XCTAssertTrue(layer.approveEdit(entryID: "answer", instruction: "Reviewer tweak"))
         XCTAssertEqual(backend.approvedEntry, "answer")

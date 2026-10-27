@@ -23,6 +23,14 @@ extension ChatViewModel {
     /// fire multiple times in a single main-actor drain (see file-level
     /// note); each call is one `EngineEvent` in arrival order.
     func bindEngineEventStream() {
+        commentBridge.onRevealRevision = { [weak self] id in
+            guard let self else { return }
+            guard let productID = self.task(withID: id)?.productID ?? self.currentSelectedProductID else {
+                self.workErrorMessage = "The revision is not loaded yet. Refresh the board and try again."
+                return
+            }
+            self.revealWorkCard(id, productID: productID)
+        }
         engine.onEvent = { [weak self] event in
             self?.handle(event)
         }

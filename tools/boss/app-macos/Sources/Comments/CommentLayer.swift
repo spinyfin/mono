@@ -804,16 +804,9 @@ final class CommentLayer: NSObject, ObservableObject {
         }
     }
 
-    /// The operator's reply in an `answered` bucket-2 thread. Engine-backed:
-    /// calls the real `CommentsPostFollowup` RPC, which appends the
-    /// `operator_followup` thread entry, transitions the comment to
-    /// `awaiting_followup`, and kicks off the async reclassifier server-side
-    /// — its loop-vs-bridge outcome arrives on the artifact's comment-topic
-    /// push, which `reload()` picks up, so no local mutation is needed here.
-    /// Artifact-less fallback (no engine to persist to): simulates the same
-    /// transition locally so that surface keeps working.
-    /// Returns whether the reply was accepted; the composer keeps its text
-    /// when it was not (retry queue full).
+    /// Approve a structured answer-agent proposal as a same-PR revision.
+    /// Returns whether the request was accepted; the inline editor keeps
+    /// its text when it was not (retry queue full).
     @discardableResult
     func approveEdit(entryID: String, instruction: String?) -> Bool {
         guard let backend, backend.canAcceptUserSubmission(describing: "Approve proposed edit") else { return false }
@@ -828,6 +821,17 @@ final class CommentLayer: NSObject, ObservableObject {
 
     func revealRevision(_ id: String) { backend?.revealRevision(id) }
 
+    /// The operator's reply in an `answered` bucket-2 thread. Engine-backed:
+    /// calls the real `CommentsPostFollowup` RPC, which appends the
+    /// `operator_followup` thread entry, transitions the comment to
+    /// `awaiting_followup`, and kicks off the async reclassifier server-side
+    /// — its loop-vs-bridge outcome arrives on the artifact's comment-topic
+    /// push, which `reload()` picks up, so no local mutation is needed here.
+    /// Artifact-less fallback (no engine to persist to): simulates the same
+    /// transition locally so that surface keeps working.
+    /// Returns whether the reply was accepted; the composer keeps its text
+    /// when it was not (retry queue full).
+    @discardableResult
     func postFollowup(body: String, for comment: Comment) -> Bool {
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, comment.status == .answered else { return false }

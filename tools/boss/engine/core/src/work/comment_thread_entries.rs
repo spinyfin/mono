@@ -15,6 +15,42 @@
 use super::*;
 use boss_protocol::{AnswerProposedEdit, ProposedEditInput, ProposedEditState};
 
+pub(crate) fn insert_comment_thread_entry_on(
+    conn: &Connection,
+    comment_id: &str,
+    entry_kind: &str,
+    author: &str,
+    body: &str,
+    revise_task_id: Option<&str>,
+    answer_agent_run_id: Option<&str>,
+) -> Result<CommentThreadEntry> {
+    match entry_kind {
+        THREAD_ENTRY_KIND_ANSWER | THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP => {}
+        other => bail!("invalid comment thread entry_kind: {other}"),
+    }
+    let id = next_id("cte");
+    let now = now_string();
+    conn.execute(
+        "INSERT INTO comment_thread_entries \
+         (id, comment_id, entry_kind, author, body, revise_task_id, answer_agent_run_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            id,
+            comment_id,
+            entry_kind,
+            author,
+            body,
+            revise_task_id,
+            answer_agent_run_id,
+            now
+        ],
+    )?;
+    let cols = comment_thread_entry_columns();
+    let sql = format!("SELECT {cols} FROM comment_thread_entries WHERE id = ?1");
+    conn.query_row(&sql, [&id], map_comment_thread_entry)
+        .map_err(Into::into)
+}
+
 /// Column list for every `comment_thread_entries` SELECT. Order must
 /// match [`map_comment_thread_entry`]. `pub(crate)` so callers that already
 /// hold a connection (e.g.
@@ -72,32 +108,16 @@ impl WorkDb {
         revise_task_id: Option<&str>,
         answer_agent_run_id: Option<&str>,
     ) -> Result<CommentThreadEntry> {
-        match entry_kind {
-            boss_protocol::THREAD_ENTRY_KIND_ANSWER | boss_protocol::THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP => {}
-            other => bail!("invalid comment thread entry_kind: {other}"),
-        }
         let conn = self.connect()?;
-        let id = next_id("cte");
-        let now = now_string();
-        conn.execute(
-            "INSERT INTO comment_thread_entries \
-             (id, comment_id, entry_kind, author, body, revise_task_id, answer_agent_run_id, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                id,
-                comment_id,
-                entry_kind,
-                author,
-                body,
-                revise_task_id,
-                answer_agent_run_id,
-                now
-            ],
-        )?;
-        let cols = comment_thread_entry_columns();
-        let sql = format!("SELECT {cols} FROM comment_thread_entries WHERE id = ?1");
-        conn.query_row(&sql, [&id], map_comment_thread_entry)
-            .map_err(Into::into)
+        insert_comment_thread_entry_on(
+            &conn,
+            comment_id,
+            entry_kind,
+            author,
+            body,
+            revise_task_id,
+            answer_agent_run_id,
+        )
     }
 
     /// List a comment's thread entries in chronological order, excluding
@@ -281,18 +301,16 @@ impl WorkDb {
             proposal.is_none() || comment.artifact_kind == "pr_review_guide",
             "proposed edits require a review-guide question"
         );
-        let now = now_string();
-        let updated = tx.execute(
-            "UPDATE answer_agent_runs SET status = 'replied', reply_body = ?4, completed_at = ?5
-             WHERE id = ?1 AND comment_id = ?2 AND status = 'running'
-               AND (execution_id = ?3 OR execution_id IS NULL)",
-            params![run_id, comment_id, execution_id, body, now],
+        super::answer_agent_runs::complete_answer_agent_run_on(
+            &tx,
+            run_id,
+            ANSWER_AGENT_RUN_STATUS_REPLIED,
+            Some(body),
+            None,
+            Some(comment_id),
+            Some(execution_id),
         )?;
-        anyhow::ensure!(
-            updated == 1,
-            "answer run is no longer running or belongs to another execution"
-        );
-        let proposal = proposal.map(|proposal| AnswerProposedEdit {
+        let stored_proposal = proposal.map(|proposal| AnswerProposedEdit {
             proposal,
             state: if comment.intent.as_deref() == Some("revision") {
                 ProposedEditState::Superseded
@@ -302,20 +320,27 @@ impl WorkDb {
             revision_id: None,
             revision_status: None,
         });
-        tx.execute(
-            "INSERT INTO comment_thread_entries
-            (id, comment_id, entry_kind, author, body, answer_agent_run_id, created_at, proposed_edit)
-            VALUES (?1, ?2, 'answer', 'engine', ?3, ?4, ?5, ?6)",
-            params![
-                next_id("cte"),
-                comment_id,
-                body,
-                run_id,
-                now,
-                proposal.map(|p| serde_json::to_string(&p)).transpose()?
-            ],
+        let entry = insert_comment_thread_entry_on(
+            &tx,
+            comment_id,
+            THREAD_ENTRY_KIND_ANSWER,
+            THREAD_ENTRY_AUTHOR_ENGINE,
+            body,
+            None,
+            Some(run_id),
         )?;
-        let comment = comments::transition_comment_to_answered_on(&tx, comment_id)?;
+        if let Some(proposal) = stored_proposal.as_ref() {
+            save_proposal(&tx, &entry.id, proposal)?;
+        }
+        // Keep the reply even when the comment left `answering` mid-run
+        // (resolved or dismissed while the agent was still writing). The run
+        // and thread entry still commit; the comment stays in its current
+        // status instead of rolling the whole write back.
+        let comment = if comment.status == COMMENT_STATUS_ANSWERING {
+            comments::transition_comment_to_answered_on(&tx, comment_id)?
+        } else {
+            comment
+        };
         tx.commit()?;
         Ok(comment)
     }
@@ -678,6 +703,43 @@ mod proposed_edit_tests {
             !task
                 .description
                 .contains("An earlier instruction that must not be replayed")
+        );
+    }
+
+    #[test]
+    fn resolving_an_answered_question_does_not_supersede_its_proposal() {
+        let (_dir, db) = open_db();
+        let (_, series) = seed_published_guide(&db, 9);
+        let (comment, _) = answer(&db, &series);
+        db.set_comment_status(&comment, COMMENT_STATUS_RESOLVED, Some("user"))
+            .unwrap();
+        assert_eq!(
+            db.get_comment(&comment).unwrap().unwrap().status,
+            COMMENT_STATUS_RESOLVED
+        );
+        assert_eq!(
+            db.list_comment_thread_entries(&comment).unwrap()[0]
+                .proposed_edit
+                .as_ref()
+                .unwrap()
+                .state,
+            ProposedEditState::Proposed
+        );
+    }
+
+    #[test]
+    fn follow_up_on_an_answered_question_supersedes_its_proposal() {
+        let (_dir, db) = open_db();
+        let (_, series) = seed_published_guide(&db, 9);
+        let (comment, _) = answer(&db, &series);
+        db.transition_comment_to_awaiting_followup(&comment).unwrap();
+        assert_eq!(
+            db.list_comment_thread_entries(&comment).unwrap()[0]
+                .proposed_edit
+                .as_ref()
+                .unwrap()
+                .state,
+            ProposedEditState::Superseded
         );
     }
 }

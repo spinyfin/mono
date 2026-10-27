@@ -314,8 +314,10 @@ async fn compose_guide_answer_prompt(
          {task_instruction} You may not edit, push, \
          or mutate any state. When you have a complete answer, post it with:\n\n\
          ```\n{cmd} --body \"<your comprehensive answer>\"\n```\n\n\
-         When recommending a change to this PR, add --proposed-edit with a single-quoted JSON object \
+         When recommending a change to this PR, add --proposed-edit with a JSON object \
          alongside --body: {{\"version\":1,\"title\":\"Short edit title\",\"instruction\":\"What to change, where, and why\",\"replacements\":[]}}. \
+         Prefer `--proposed-edit -` and pipe that JSON on stdin (not a file path). If you quote the JSON inline, \
+         escape each apostrophe as '\\'' so the single-quoted shell string does not end early. \
          Optional replacements contain path, old_text, and new_text strings; include them only when confident. \
          Keep the full prose answer in --body. The reviewer must approve the proposal; you must not edit the branch. \
          Post exactly one reply, then stop.\n",
@@ -397,6 +399,14 @@ mod tests {
         assert!(
             prompt.contains("why does this retry forever?"),
             "prompt must carry the comment body:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("--proposed-edit -"),
+            "prompt must tell the agent to pass proposal JSON on stdin:\n{prompt}",
+        );
+        assert!(
+            prompt.contains(r"'\''"),
+            "prompt must explain how to escape apostrophes in inline JSON:\n{prompt}"
         );
         // No `AnswerAgentRun` was ever stamped `workspace_positioned = true`
         // for this execution (the coordinator's dispatch/goto path never ran

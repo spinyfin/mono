@@ -346,6 +346,7 @@ pub enum FrontendRequest {
     /// App/Boss only. Atomically approve an answer proposal into the existing
     /// review-guide revision path. Repeated approval returns the same revision.
     CommentsApproveEdit {
+        #[serde(default)]
         entry_id: String,
         #[serde(default)]
         instruction: Option<String>,
@@ -379,6 +380,7 @@ pub enum FrontendRequest {
 
     /// App/Boss only. Keep the proposal for audit, removing its actions.
     CommentsDismissEdit {
+        #[serde(default)]
         entry_id: String,
     },
 

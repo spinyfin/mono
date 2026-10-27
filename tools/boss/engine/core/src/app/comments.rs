@@ -1845,7 +1845,10 @@ pub(super) async fn handle_comments_update_anchor(ctx: Dispatch, req: FrontendRe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boss_protocol::{ANSWER_AGENT_RUN_STATUS_SUPERSEDED, COMMENT_STATUS_IN_REVISION};
+    use boss_protocol::{
+        ANSWER_AGENT_RUN_STATUS_REPLIED, ANSWER_AGENT_RUN_STATUS_SUPERSEDED, COMMENT_STATUS_IN_REVISION,
+        COMMENT_STATUS_RESOLVED,
+    };
 
     fn test_server_state() -> (Arc<ServerState>, tempfile::TempDir) {
         let temp = tempfile::tempdir().unwrap();
@@ -2049,6 +2052,59 @@ mod tests {
             entries.len(),
             1,
             "the duplicate call must not post a second thread entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_answer_keeps_the_reply_when_the_comment_left_answering() {
+        let (server_state, _dir) = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        let (comment_id, execution_id) = seed_answering_comment(&work_db);
+
+        work_db
+            .set_comment_status(&comment_id, COMMENT_STATUS_RESOLVED, Some("user:me"))
+            .unwrap();
+        assert!(
+            work_db
+                .running_answer_agent_run_for_comment(&comment_id)
+                .unwrap()
+                .is_some(),
+            "this fixture leaves the run running so the late reply still matches"
+        );
+
+        handle_comments_post_answer(
+            dispatch_ctx(&server_state, &work_db, &sink),
+            FrontendRequest::CommentsPostAnswer {
+                proposed_edit: None,
+                run_id: execution_id,
+                body: "Answer after the question was resolved.".to_owned(),
+            },
+        )
+        .await;
+
+        let envelope = sink
+            .next()
+            .await
+            .expect("a response envelope should have been enqueued");
+        assert!(
+            matches!(envelope.payload, FrontendEvent::CommentResult { .. }),
+            "expected CommentResult when the comment left answering, got {:?}",
+            envelope.payload
+        );
+        let comment = work_db.get_comment(&comment_id).unwrap().unwrap();
+        assert_eq!(comment.status, COMMENT_STATUS_RESOLVED);
+        let entries = work_db.list_comment_thread_entries(&comment_id).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].body, "Answer after the question was resolved.");
+        let run = work_db
+            .latest_answer_agent_run_for_comment(&comment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, ANSWER_AGENT_RUN_STATUS_REPLIED);
+        assert_eq!(
+            run.reply_body.as_deref(),
+            Some("Answer after the question was resolved.")
         );
     }
 

@@ -610,3 +610,90 @@ private struct CommentRow: View {
         }
     }
 }
+
+/// Controls the proposal card shows for a durable proposal state.
+enum ProposedEditVisibleAction: String, Equatable {
+    case approveAsRevision = "Approve as revision"
+    case editThenApprove = "Edit then approve"
+    case dismiss = "Dismiss"
+    case openRevision = "Open revision"
+}
+
+/// All actions and editing stay in the comment thread; the engine owns the
+/// transition and returns the durable state through comment invalidation.
+struct ProposedEditCard: View {
+    let entryID: String
+    let edit: AnswerProposedEdit
+    @ObservedObject var layer: CommentLayer
+    @State private var editing = false
+    @State private var instruction = ""
+
+    static func visibleActions(for edit: AnswerProposedEdit) -> [ProposedEditVisibleAction] {
+        var actions: [ProposedEditVisibleAction] = []
+        if edit.canAct {
+            actions.append(contentsOf: [.approveAsRevision, .editThenApprove, .dismiss])
+        }
+        if edit.state == "approved", edit.revisionID != nil {
+            actions.append(.openRevision)
+        }
+        return actions
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(edit.stateLabel).font(.caption).foregroundStyle(.secondary)
+            Text(edit.proposal.title).font(.headline).fixedSize(horizontal: false, vertical: true)
+            Text(edit.proposal.instruction).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+            ForEach(Array(edit.proposal.replacements.enumerated()), id: \.offset) { _, replacement in
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(replacement.path).font(.caption)
+                    Text("− \(replacement.oldText)").foregroundStyle(.red)
+                    Text("+ \(replacement.newText)").foregroundStyle(.green)
+                }
+                .font(.system(.caption, design: .monospaced))
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+            }
+            if edit.canAct, editing {
+                TextEditor(text: $instruction).frame(minHeight: 80)
+                HStack {
+                    Button("Approve edited instruction") {
+                        if layer.approveEdit(entryID: entryID, instruction: instruction) { editing = false }
+                    }
+                    .disabled(instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button("Cancel") { editing = false }
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Self.visibleActions(for: edit), id: \.rawValue) { action in
+                        actionButton(action)
+                    }
+                }
+            }
+        }
+        .font(.caption)
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.accentColor.opacity(0.08)))
+    }
+
+    @ViewBuilder
+    private func actionButton(_ action: ProposedEditVisibleAction) -> some View {
+        switch action {
+        case .approveAsRevision:
+            Button(action.rawValue) { _ = layer.approveEdit(entryID: entryID, instruction: nil) }
+        case .editThenApprove:
+            Button(action.rawValue) {
+                instruction = edit.proposal.instruction
+                editing = true
+            }
+        case .dismiss:
+            Button(action.rawValue) { layer.dismissEdit(entryID: entryID) }
+        case .openRevision:
+            Button(action.rawValue) {
+                if let id = edit.revisionID { layer.revealRevision(id) }
+            }
+            .buttonStyle(.link)
+        }
+    }
+}

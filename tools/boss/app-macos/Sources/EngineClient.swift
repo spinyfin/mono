@@ -60,6 +60,7 @@ final class EngineClient: @unchecked Sendable {
         "unpopulate_project", "answer_attention", "dismiss_attention",
         "comments_create", "comments_set_status", "comments_set_intent",
         "comments_dismiss", "comments_post_followup", "comments_update_anchor",
+        "comments_approve_edit", "comments_dismiss_edit",
         "set_setting", "set_feature_flag", "set_dispatch_paused", "set_live_status_enabled",
         "set_driver_traffic_split", "set_offsite_backup", "set_product_editorial_rules",
         "set_product_external_tracker", "set_product_merge_mechanism", "set_host_enabled",
@@ -501,6 +502,10 @@ final class EngineClient: @unchecked Sendable {
 
     /// Test hooks.
     var unsentActionCountForTesting: Int { ledger.withLock { $0.unsent.count } }
+    var unsentPayloadsForTesting: [[String: Any]] {
+        let blobs = ledger.withLock { state in state.unsent.map(\.data) }
+        return blobs.compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
+    }
     var awaitingReplyCountForTesting: Int { ledger.withLock { $0.awaiting.count } }
     var uncertainActionsForTesting: [String: String] { ledger.withLock { $0.uncertain } }
     var failedWriteCompletionsForTesting: Int { failedWriteCompletions.withLock { $0 } }

@@ -51,7 +51,7 @@ const PROPOSED_EDIT_COLUMN_53: &str = "ALTER TABLE comment_thread_entries ADD CO
 
 const SUPERSEDE_ANSWER_PROPOSALS_53: &str = "CREATE TRIGGER IF NOT EXISTS supersede_answer_proposals
             AFTER UPDATE OF status ON work_comments
-            WHEN OLD.status = 'answered' AND NEW.status <> 'answered'
+            WHEN OLD.status = 'answered' AND NEW.status IN ('awaiting_followup', 'active')
             BEGIN
                 UPDATE comment_thread_entries
                 SET proposed_edit = json_set(proposed_edit, '$.state', 'superseded')
