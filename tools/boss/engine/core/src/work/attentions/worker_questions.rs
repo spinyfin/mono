@@ -50,6 +50,14 @@ pub(super) fn order_recovery_in_tx(
     recovery: &Task,
 ) -> Result<()> {
     let now = now_string();
+    let prefix = boss_protocol::CREATED_VIA_CONFLICT_RECOVERY_PREFIX;
+    if source.created_via.starts_with(CREATED_VIA_MERGE_CONFLICT_PREFIX) || source.created_via.starts_with(prefix) {
+        let source_id = source.created_via.strip_prefix(prefix).unwrap_or(&source.id);
+        conn.execute(
+            "UPDATE tasks SET created_via = ?2 WHERE id = ?1",
+            params![recovery.id, format!("{prefix}{source_id}")],
+        )?;
+    }
     for edge in deps::prerequisites_of(conn, &recovery.id, Some(RELATION_BLOCKS))? {
         deps::delete_edge(conn, &recovery.id, &edge.prerequisite_id, RELATION_BLOCKS)?;
     }

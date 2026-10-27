@@ -1,6 +1,8 @@
 //! Conflict revisions jump ahead of queued work within the create transaction.
 use super::*;
 
+use boss_protocol::CREATED_VIA_CONFLICT_RECOVERY_PREFIX;
+
 fn has_writer(conn: &Connection, task_id: &str) -> Result<bool> {
     let mut stmt = conn.prepare(
         "SELECT kind FROM work_executions
@@ -63,6 +65,14 @@ pub(crate) fn conflict_writer_gate(
     dependent_id: &str,
     prerequisite_id: &str,
 ) -> Result<Option<bool>> {
+    // Recovery keeps attention provenance rather than impersonating a conflict
+    // resolution attempt. Its inherited edges use the asking revision's order.
+    let source = query_task(conn, dependent_id)?.and_then(|task| {
+        task.created_via
+            .strip_prefix(CREATED_VIA_CONFLICT_RECOVERY_PREFIX)
+            .map(str::to_owned)
+    });
+    let dependent_id = source.as_deref().unwrap_or(dependent_id);
     if !is_conflict_revision(conn, dependent_id)?
         || chain_root(conn, dependent_id)? != chain_root(conn, prerequisite_id)?
     {
