@@ -882,11 +882,15 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             _ = tokio::time::sleep(timer_remaining) => (Trigger::PostToolUse, true),
         };
 
-        if !registry
-            .get(slot_id)
-            .is_some_and(|state| state.run_id == run_id && state.activity != WorkerActivity::Terminated)
-        {
+        let Some(state) = registry.get(slot_id).filter(|state| state.run_id == run_id) else {
             return;
+        };
+        if state.activity == WorkerActivity::Terminated {
+            // A driver SessionEnd can precede a resumed hook. Park until a
+            // new activity event; confirmed physical death fences those hooks
+            // in the registry and the resolver stops this loop permanently.
+            last_activity = WorkerActivity::Terminated;
+            continue;
         }
 
         let kind = trigger_kind(&trigger);
@@ -908,6 +912,16 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                 snap.last_real_trigger_at_epoch_s = Some(now_epoch);
             }
         });
+
+        // Literal status transitions also write live_status_at; they need
+        // the same liveness check as model-generated summaries.
+        if matches!(
+            trigger,
+            Trigger::ActivityChanged(WorkerActivity::Errored | WorkerActivity::WaitingForInput)
+        ) && !resolver.worker_can_refresh(&run_id).await
+        {
+            return;
+        }
 
         match trigger {
             Trigger::Shutdown => return,

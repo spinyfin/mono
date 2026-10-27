@@ -492,6 +492,7 @@ fn persist_semantic_progress(
     settled: Option<crate::semantic_progress::SemanticProgressCheckpoint>,
 ) {
     let result = match (outcome, settled) {
+        (Some(ApplyEventOutcome::ObservedDead), _) => return,
         (Some(ApplyEventOutcome::Stale { .. }), _) | (Some(ApplyEventOutcome::Applied { .. }), None) => {
             server_state.work_db.record_semantic_progress_stamp(run_id)
         }
@@ -760,6 +761,9 @@ pub(super) async fn dispatch_live_worker_state(
         &incoming.event,
     );
     persist_applied_semantic_progress(server_state, run_id, slot_id, incoming, &applied.outcome);
+    if applied.outcome == ApplyEventOutcome::ObservedDead {
+        return;
+    }
     let stale_event = matches!(applied.outcome, ApplyEventOutcome::Stale { .. });
     let changed = applied.repaired || matches!(applied.outcome, ApplyEventOutcome::Applied { changed: true });
     let new_state = server_state.live_worker_states.get(slot_id);

@@ -13,7 +13,7 @@ enum BossExitedWorkerCapture {
             lastEventAt: "2026-10-20T19:42:42Z", currentTool: nil, lastToolEndedAt: nil,
             activity: .terminated, liveStatus: "Running bazel test for github tracker",
             liveStatusAt: "2026-10-20T19:42:11Z", recoveryStatus: nil, tmuxHosted: true,
-            waitReason: nil, waitExpiresAt: nil, agentType: "codex", projectId: nil,
+            waitReason: nil, waitExpiresAt: nil, agentType: "coding", projectId: nil,
             projectName: "Boss", hostId: nil, startedAt: nil, pool: "interactive",
             viewerAttachError: nil
         )

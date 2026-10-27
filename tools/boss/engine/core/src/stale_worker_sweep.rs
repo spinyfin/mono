@@ -638,6 +638,7 @@ pub struct StaleWorkerSweepDeps {
     /// Forwarded to [`crate::dead_pid_sweep::reap_observed_worker_death`] so a
     /// tmux-confirmed dead pane can force-release its cube lease.
     pub cube_client: Arc<dyn CubeClient>,
+    pub broadcaster: Arc<dyn crate::live_status_loop::LiveStatusBroadcaster>,
 }
 
 /// Borrowed control collaborators for a single pass. Keeping teardown
@@ -690,6 +691,7 @@ pub fn spawn_loop(
         reaper,
         hold_registry,
         cube_client,
+        broadcaster,
     } = deps;
     crate::sweep_loop::spawn_sweep_loop(interval, move || {
         let work_db = Arc::clone(&work_db);
@@ -700,8 +702,10 @@ pub fn spawn_loop(
         let reaper = Arc::clone(&reaper);
         let hold_registry = Arc::clone(&hold_registry);
         let cube_client = Arc::clone(&cube_client);
+        let broadcaster = Arc::clone(&broadcaster);
         async move {
-            run_one_pass_with_terminal(
+            let before = live_states.snapshot();
+            let outcome = run_one_pass_with_terminal(
                 work_db.as_ref(),
                 live_states.as_ref(),
                 terminal_inspector.as_deref(),
@@ -717,7 +721,11 @@ pub fn spawn_loop(
                     auto_reap_threshold_secs,
                 },
             )
-            .await
+            .await;
+            if live_states.snapshot() != before {
+                broadcaster.broadcast_live_worker_states().await;
+            }
+            outcome
         }
     })
 }

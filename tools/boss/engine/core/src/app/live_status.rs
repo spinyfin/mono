@@ -79,8 +79,10 @@ pub(super) async fn handle_debug_live_status_pipeline(ctx: Dispatch, req: Fronte
 impl TranscriptPathResolver for ServerState {
     async fn worker_can_refresh(&self, run_id: &str) -> bool {
         use crate::stale_worker_sweep::{TerminalLiveness, TmuxWorkerTerminalInspector, WorkerTerminalInspector};
-        if let Ok(execution) = self.work_db.get_execution(run_id)
-            && execution.status.is_terminal()
+        let execution = self.work_db.get_execution(run_id).ok();
+        if execution
+            .as_ref()
+            .is_some_and(|execution| execution.status.is_terminal())
         {
             self.live_worker_states.mark_terminated(run_id);
             self.broadcast_live_worker_states().await;
@@ -89,16 +91,37 @@ impl TranscriptPathResolver for ServerState {
         if let Ok(tmux) = self.resolve_tmux() {
             let legacy = self.tmux_for_run(&tmux, boss_tmux::SERVER_LABEL).ok();
             let inspector = TmuxWorkerTerminalInspector::new(self.work_db.clone(), tmux, legacy);
-            if matches!(inspector.inspect(run_id).await, Ok(Some(TerminalLiveness::Dead { .. }))) {
-                self.live_worker_states.mark_terminated(run_id);
-                self.broadcast_live_worker_states().await;
-                return false;
+            match inspector.inspect(run_id).await {
+                Ok(Some(TerminalLiveness::Dead { .. })) => {
+                    self.live_worker_states.mark_terminated(run_id);
+                    self.broadcast_live_worker_states().await;
+                    return false;
+                }
+                // A live, token-matched pane outweighs a stale shell PID.
+                Ok(Some(TerminalLiveness::Alive { .. })) => return true,
+                Ok(None) | Err(_) => {}
             }
         }
-        !matches!(
-            crate::durable_liveness::probe_execution_worker(&self.work_db, run_id),
-            crate::durable_liveness::WorkerProcess::Gone { .. }
-        )
+        let process = crate::durable_liveness::probe_execution_worker(&self.work_db, run_id);
+        let process = match execution.and_then(|execution| execution.started_epoch()) {
+            Some(started) => {
+                crate::durable_liveness::corroborate_against_live_registry(
+                    process,
+                    &self.live_worker_states,
+                    run_id,
+                    started,
+                    boss_engine_utils::epoch_time::now_epoch_secs(),
+                )
+                .0
+            }
+            None => crate::durable_liveness::WorkerProcess::Unknown,
+        };
+        if matches!(process, crate::durable_liveness::WorkerProcess::Gone { .. }) {
+            self.live_worker_states.mark_terminated(run_id);
+            self.broadcast_live_worker_states().await;
+            return false;
+        }
+        true
     }
 
     async fn transcript_path(&self, run_id: &str) -> Option<std::path::PathBuf> {

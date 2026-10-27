@@ -15,9 +15,79 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 const RUN: &str = "summary-replay";
 
+#[tokio::test]
+async fn driver_session_end_can_resume_without_restarting_status_loop() {
+    let registry = Arc::new(LiveWorkerStateRegistry::new());
+    registry.register_spawn(1, RUN, "claude", 0, None);
+    registry.apply_event(
+        1,
+        &WorkerEvent::SessionEnd {
+            session_id: "session".into(),
+            reason: "driver session ended".into(),
+        },
+    );
+    let manager = LiveStatusManager::new();
+    manager.start_slot(
+        1,
+        LiveStatusRun::new(RUN, Arc::new(ClaudeDriver)),
+        Arc::new(crate::utility_model::AnthropicUtilityModel::from_lookup(None, |_| None)),
+        registry.clone(),
+        Arc::new(Broadcasts {
+            registry: registry.clone(),
+            summaries: StdMutex::new(Vec::new()),
+        }),
+        Arc::new(Resolver(PathBuf::new())),
+    );
+    manager.notify(1, Trigger::ActivityChanged(WorkerActivity::Terminated));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    registry.apply_event(
+        1,
+        &WorkerEvent::PreToolUse {
+            session_id: "session".into(),
+            tool_name: "Bash".into(),
+            tool_input: json!({}),
+        },
+    );
+    assert_eq!(registry.get(1).unwrap().activity, WorkerActivity::Working);
+    registry.set_activity_for_test(1, WorkerActivity::WaitingForInput);
+    manager.notify(1, Trigger::ActivityChanged(WorkerActivity::WaitingForInput));
+    await_summary(&registry, live_status::AWAITING_INPUT_LITERAL).await;
+    manager.stop_slot(1);
+}
+
 struct DeathResolver {
     path: PathBuf,
     alive: std::sync::atomic::AtomicBool,
+}
+
+#[tokio::test]
+async fn dead_session_rejects_literal_status_transitions() {
+    for activity in [WorkerActivity::Errored, WorkerActivity::WaitingForInput] {
+        let registry = Arc::new(LiveWorkerStateRegistry::new());
+        registry.register_spawn(1, RUN, "claude", 0, None);
+        registry.set_activity_for_test(1, activity);
+        let manager = LiveStatusManager::new();
+        manager.start_slot(
+            1,
+            LiveStatusRun::new(RUN, Arc::new(ClaudeDriver)),
+            Arc::new(crate::utility_model::AnthropicUtilityModel::from_lookup(None, |_| None)),
+            registry.clone(),
+            Arc::new(Broadcasts {
+                registry: registry.clone(),
+                summaries: StdMutex::new(Vec::new()),
+            }),
+            Arc::new(DeathResolver {
+                path: PathBuf::new(),
+                alive: std::sync::atomic::AtomicBool::new(false),
+            }),
+        );
+        manager.notify(1, Trigger::ActivityChanged(activity));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let state = registry.get(1).unwrap();
+        assert!(state.live_status.is_none(), "{activity:?}");
+        assert!(state.live_status_at.is_none(), "{activity:?}");
+        manager.stop_slot(1);
+    }
 }
 
 #[async_trait]
