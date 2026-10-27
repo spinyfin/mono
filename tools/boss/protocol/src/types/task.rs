@@ -1438,8 +1438,9 @@ pub struct TaskRuntime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_not_before: Option<String>,
 
-    /// Engine-selected queued label and absolute-time hover text. Absent for
-    /// live/terminal executions; clients render this without choosing hold precedence.
+    /// Engine-selected queued label and the absolute instants for its hover.
+    /// Absent for live/terminal executions; clients render `text` and localize
+    /// each `tooltip_times` epoch without choosing hold precedence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queued_display: Option<QueuedDisplay>,
 
@@ -1464,11 +1465,22 @@ pub struct DispatchFailureAttempt {
     pub happened_at: String,
 }
 
+/// One absolute instant the client localizes for the queued-status hover.
+/// `label` is the engine-chosen wording; `epoch` is Unix seconds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueuedTooltipTime {
+    pub epoch: i64,
+    pub label: String,
+}
+
 /// Display-ready pending status, refreshed by the engine as time advances.
+/// `text` is the card line. `tooltip_times` are absolute instants the client
+/// formats in the viewer's local timezone.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QueuedDisplay {
     pub text: String,
-    pub tooltip: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tooltip_times: Vec<QueuedTooltipTime>,
 }
 
 /// A prerequisite selected by the same gating rules used for dispatch.
