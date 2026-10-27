@@ -22,6 +22,7 @@ use boss_protocol::{
 
 use super::*;
 use crate::work::CancelExecutionOpts;
+use boss_protocol::StatusActor;
 
 /// Blocker codes that a plain (non-forced) `RequestExecution` has
 /// always bypassed regardless of `force` — see
@@ -263,6 +264,17 @@ impl ExecutionCoordinator {
             .insert(execution_id.to_string(), host_id);
     }
 
+    /// Whether `work_item_id` is a `todo` row flagged `autostart`: one that is
+    /// waiting to be auto-dispatched, so cancelling its only execution would
+    /// leave it stranded unless the cancel parks it.
+    fn work_item_is_dispatch_pending(&self, work_item_id: &str) -> bool {
+        matches!(
+            self.work_db.get_work_item(work_item_id),
+            Ok(crate::work::WorkItem::Task(task) | crate::work::WorkItem::Chore(task))
+                if task.status == boss_protocol::TaskStatus::Todo && task.autostart
+        )
+    }
+
     pub(super) fn take_requested_host(&self, execution_id: &str) -> Option<String> {
         self.requested_host_ids.lock().unwrap().remove(execution_id)
     }
@@ -417,14 +429,28 @@ impl ExecutionCoordinator {
             .clone()
             .unwrap_or_else(|| "blocked after the pause was set aside (reason not recorded)".to_string());
         if was_new {
-            let _ = self.work_db.cancel_execution_with(
+            let cancel_reason = format!("pause-only forced dispatch refused: {reason}");
+            if let Ok(cancelled) = self.work_db.cancel_execution_with_outcome(
                 &refreshed.id,
                 CancelExecutionOpts {
-                    reason: Some(format!("pause-only forced dispatch refused: {reason}")),
+                    // Records its own timeline event with richer context.
+                    caller_records_timeline: true,
+                    peer_pid: None,
+                    reason: Some(cancel_reason.clone()),
                     queued_only: true,
                     record_failure_reason: false,
+                    // "Leave no residue": a row that was not dispatch-pending
+                    // must not come out of this request parked under a cancel
+                    // stamp. A dispatch-pending row (`todo` + `autostart`)
+                    // would otherwise be left behind a cancelled execution
+                    // with nothing queued, so it is parked with this reason.
+                    keep_work_item_schedulable: !self.work_item_is_dispatch_pending(&work_item_id),
+                    actor: StatusActor::Engine,
                 },
-            );
+            ) {
+                self.record_engine_cancel(&cancelled, refreshed.status.clone(), &cancel_reason)
+                    .await;
+            }
             // This row can carry a `--host` routing constraint set by
             // `request_execution_via_db` just above; it will never drain
             // now, so drop the constraint rather than leaking it.
@@ -505,14 +531,23 @@ impl ExecutionCoordinator {
                 // execution message. The transaction above already
                 // committed a created/refreshed row for this status, so
                 // clean it up rather than leaving residue behind an error.
-                let _ = self.work_db.cancel_execution_with(
+                let cancel_reason = "--host only applies to a queued execution";
+                if let Ok(cancelled) = self.work_db.cancel_execution_with_outcome(
                     &execution.id,
                     CancelExecutionOpts {
-                        reason: Some("--host only applies to a queued execution".to_string()),
+                        // Records its own timeline event with richer context.
+                        caller_records_timeline: true,
+                        peer_pid: None,
+                        reason: Some(cancel_reason.to_string()),
                         queued_only: true,
                         record_failure_reason: false,
+                        // Same residue rule as the pause-refusal cleanup above.
+                        keep_work_item_schedulable: !self.work_item_is_dispatch_pending(&execution.work_item_id),
+                        actor: StatusActor::Engine,
                     },
-                );
+                ) {
+                    self.record_engine_cancel_detached(&cancelled, execution.status.clone(), cancel_reason);
+                }
                 bail!(
                     "{} resolved to execution {} in status `{}`; --host only applies to a queued execution",
                     execution.work_item_id,

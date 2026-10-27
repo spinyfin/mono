@@ -5,7 +5,9 @@ import XCTest
 final class QueuedWaitTests: XCTestCase {
     func testRecordedReasonLabels() {
         let labels = [
-            "unknown": "Queued — reason unknown",
+            "ordinal_chain": "Queued — waiting for the earlier project task",
+            "awaiting_scheduler": "Queued — waiting for the scheduler",
+            "awaiting_reconcile": "Queued — waiting for the engine to reconcile",
             "waiting_dependency": "Queued — waiting for a dependency",
             "dispatch_paused": "Queued — dispatch paused",
             "automation_paused": "Queued — automation paused",
@@ -28,7 +30,60 @@ final class QueuedWaitTests: XCTestCase {
             "Queued — not before \(date.formatted(date: .abbreviated, time: .shortened))"
         )
         pending.dispatchNotBefore = "bad"
-        XCTAssertEqual(WorkCardLiveStatus.queuedLabel(runtime: pending, now: Date()), "Queued — reason unknown")
+        XCTAssertEqual(
+            WorkCardLiveStatus.queuedLabel(runtime: pending, now: Date()),
+            "Queued — held until a scheduled time"
+        )
+    }
+
+    /// Every hold reason the engine can state for a `todo` + `autostart`
+    /// row with nothing queued maps to a specific line.
+    func testEngineHoldReasonsRenderSpecificLabels() {
+        let labels = [
+            "human_driven": "Held — human-driven; no worker will run",
+            "deferred": "Held — deferred until approved",
+            "pr_awaits_review": "Held — already has a PR; file a revision to change it",
+            "deliberately_parked": "Held — parked after its last run; start it to resume",
+            "repo_unresolved": "Held — no repository resolved for this item",
+            "awaiting_reconcile": "Queued — waiting for the engine to reconcile",
+            "no_execution_kind": "Held — this kind of item never runs on its own",
+            "no_project": "Held — not attached to a project",
+            "revision_parent_unresolved": "Held — the revised item cannot be found",
+            "revision_awaiting_parent_pr": "Held — waiting for the revised item to open a PR",
+            "blocked_reason": "Held — blocked until the worker failure or question is resolved",
+            "shadowed_pending_execution": "Held — an older queued run is still pending",
+            "some_future_gate": "Held — some_future_gate"
+        ]
+        for (reason, label) in labels {
+            var stranded = runtime(reason: nil, status: "cancelled")
+            stranded.dispatchHoldReason = reason
+            XCTAssertEqual(WorkCardLiveStatus.queuedLabel(runtime: stranded, now: Date()), label, reason)
+        }
+    }
+
+    /// A `todo` + `autostart` row whose only execution is `cancelled` renders
+    /// the engine's hold reason; with none stated the line claims nothing
+    /// beyond "Queued".
+    func testStrandedCancelledRowRendersTheEngineHoldReason() {
+        let stranded = runtime(reason: nil, status: "cancelled")
+        XCTAssertEqual(
+            WorkCardLiveStatus.resolve(task: task(status: "todo"), column: .doing, runtime: stranded, liveState: nil),
+            WorkCardLiveStatus.queuedWithoutReasonLabel
+        )
+        var reconciling = stranded
+        reconciling.dispatchHoldReason = "awaiting_reconcile"
+        XCTAssertEqual(
+            WorkCardLiveStatus.resolve(task: task(status: "todo"), column: .doing, runtime: reconciling, liveState: nil),
+            "Queued — waiting for the engine to reconcile"
+        )
+    }
+
+    func testOrdinalChainWaitNamesTheEarlierTask() {
+        let blocker = DispatchWaitBlocker(workItemID: "task_internal", productID: "product_test", shortID: 7)
+        XCTAssertEqual(
+            WorkCardLiveStatus.queuedLabel(runtime: runtime(reason: "ordinal_chain", blocker: blocker), now: Date()),
+            "Queued — waiting for \(blocker.label)"
+        )
     }
 
     func testRetryBackoffWinsOverNotBeforeWhenBothAreSet() {
@@ -99,7 +154,7 @@ final class QueuedWaitTests: XCTestCase {
         XCTAssertNil(old.dispatchWaitBlocker)
         XCTAssertEqual(WorkCardLiveStatus.resolve(
             task: task(status: "todo"), column: .doing, runtime: old, liveState: nil
-        ), "Queued — reason unknown")
+        ), WorkCardLiveStatus.queuedWithoutReasonLabel)
         let blocker = DispatchWaitBlocker(workItemID: "task_internal", productID: "product_test", shortID: nil)
         XCTAssertEqual(WorkCardLiveStatus.queuedLabel(
             runtime: runtime(reason: "waiting_dependency", blocker: blocker), now: Date()
@@ -146,7 +201,7 @@ final class QueuedWaitTests: XCTestCase {
         let stale = runtime(reason: "blocked by an earlier review", status: "completed")
         XCTAssertEqual(WorkCardLiveStatus.resolve(
             task: task(status: "todo"), column: .doing, runtime: stale, liveState: nil
-        ), "Queued — reason unknown")
+        ), WorkCardLiveStatus.queuedWithoutReasonLabel)
     }
 
     private func snapshot(_ model: ChatViewModel, _ task: WorkTask) -> WorkCardSnapshot {

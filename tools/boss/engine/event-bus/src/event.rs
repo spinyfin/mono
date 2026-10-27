@@ -19,6 +19,22 @@ pub enum Event {
         host_id: String,
         pool_claim: Option<String>,
     },
+    /// An execution was cancelled. Staged inside the cancelling
+    /// transaction and published only after it commits, so a rolled-back
+    /// cancel never announces itself. `on_timeline` is true when no
+    /// async caller puts this cancel on the dispatch timeline itself, so
+    /// the bus subscriber must.
+    ExecutionCancelled {
+        execution_id: String,
+        task_id: String,
+        from_status: String,
+        actor: String,
+        reason: String,
+        work_item_moved: bool,
+        queued_only: bool,
+        peer_pid: Option<i32>,
+        on_timeline: bool,
+    },
     /// A reconciler moved a not-yet-started execution between `queued`,
     /// `ready` and `waiting_dependency`. `status` is the new status.
     ExecutionStatusChanged {
@@ -60,6 +76,7 @@ pub enum EventKind {
     ProjectImplDrained,
     ExecutionTerminal,
     ExecutionStatusChanged,
+    ExecutionCancelled,
     PrMerged,
     HostDisabled,
     DependencyPrereqsSatisfied,
@@ -84,6 +101,7 @@ impl EventKind {
             EventKind::ProjectImplDrained => "project_impl_drained",
             EventKind::ExecutionTerminal => "execution_terminal",
             EventKind::ExecutionStatusChanged => "execution_status_changed",
+            EventKind::ExecutionCancelled => "execution_cancelled",
             EventKind::PrMerged => "pr_merged",
             EventKind::HostDisabled => "host_disabled",
             EventKind::DependencyPrereqsSatisfied => "dependency_prereqs_satisfied",
@@ -106,6 +124,7 @@ impl Event {
             Event::ProjectImplDrained { .. } => EventKind::ProjectImplDrained,
             Event::ExecutionTerminal { .. } => EventKind::ExecutionTerminal,
             Event::ExecutionStatusChanged { .. } => EventKind::ExecutionStatusChanged,
+            Event::ExecutionCancelled { .. } => EventKind::ExecutionCancelled,
             Event::PrMerged { .. } => EventKind::PrMerged,
             Event::HostDisabled { .. } => EventKind::HostDisabled,
             Event::DependencyPrereqsSatisfied { .. } => EventKind::DependencyPrereqsSatisfied,
@@ -134,6 +153,7 @@ impl Event {
             Event::ProjectImplDrained { project_id } => project_id.clone(),
             Event::ExecutionTerminal { execution_id, .. } => execution_id.clone(),
             Event::ExecutionStatusChanged { execution_id, .. } => execution_id.clone(),
+            Event::ExecutionCancelled { execution_id, .. } => execution_id.clone(),
             Event::PrMerged { pr_url, .. } => pr_url.clone(),
             Event::HostDisabled { host_id } => host_id.clone(),
             Event::DependencyPrereqsSatisfied { task_id } => task_id.clone(),

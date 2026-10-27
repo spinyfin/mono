@@ -26,73 +26,106 @@ pub struct ClearedExecutionWorkspace {
     pub workspace_path: Option<String>,
 }
 
+/// What a `cancel_running_execution*` call does to the owning task besides
+/// terminalizing the execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelTaskEffect {
+    /// Park the row on the halt surface when this was its governing
+    /// execution (`park_work_item_after_cancel`).
+    Park,
+    /// Demote an `active` row to `todo` first, then park as above.
+    DemoteAndPark,
+    /// Touch nothing on the task: the caller replaces the execution itself.
+    LeaveSchedulable,
+}
+
 #[work_db_boundary::instrument]
 impl WorkDb {
-    /// Atomically null out `cube_lease_id`, `cube_workspace_id`, and
-    /// `workspace_path` on `execution_id`. Returns the prior lease id
-    /// (and the workspace path as it stood before clearing) — `Some`
-    /// means the caller is responsible for issuing the cube `workspace
-    /// release`, `None` means there was nothing to release (already
-    /// cleared by an earlier path or never leased).
-    ///
-    /// Used by the engine-side release path (manual chore-done update,
-    /// `bossctl agents stop`) to claim ownership of the cube release
-    /// before calling out to the cube CLI, so two concurrent callers
-    /// don't issue duplicate releases against the same lease.
-    /// Atomically cancel a non-terminal execution and demote the owning
-    /// task from `active` back to `todo`. Called from the
-    /// `StopRun` / `force_stop_execution` path so that an explicitly
-    /// stopped worker does not leave an `active` task or a `running`
-    /// execution behind — both of which would cause the orphan sweep
-    /// or `reconcile_active_dispatch` to re-dispatch the work item
-    /// immediately.
-    ///
-    /// Idempotent: if the execution is already terminal the `UPDATE`
-    /// is a no-op; if the task is already out of `active` (e.g. moved
-    /// to `in_review` by `on_stop` in a concurrent path) the demote is
-    /// a no-op.
-    ///
-    /// The demote is ALSO a no-op when `execution_id` is not the work
-    /// item's current (latest) execution — i.e. it has been superseded by
-    /// a redispatch. Stopping a superseded execution must never drag the
-    /// row (and its live replacement worker) back to `todo` (defect 4).
-    ///
-    /// Returns `(execution_cancelled, task_demoted)` so callers can
-    /// log what actually changed.
-    /// Cancel a non-terminal execution without touching the task status.
-    /// Returns `true` if the execution was actually cancelled (was in a
-    /// non-terminal state), `false` if it was already terminal.
-    ///
-    /// Used by the `active` → Backlog kanban-drag path: the task status
-    /// has already been moved to `todo` by `update_work_item_as_actor`,
-    /// so we only need to mark the execution as cancelled before releasing
-    /// the pane and workspace.
+    /// Cancel a non-terminal execution without demoting its task. Returns
+    /// `false` (no error) when the row was already terminal, so teardown
+    /// cascades stay idempotent. When this was the row's governing
+    /// execution the row is parked on the halt surface
+    /// (`park_work_item_after_cancel`) so the board shows the stop instead
+    /// of a phantom "Queued" card.
     pub fn cancel_running_execution(&self, execution_id: &str) -> Result<bool> {
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        let now = now_string();
-        let cancelled = if !execution.status.is_terminal() {
-            let affected = tx.execute(
-                "UPDATE work_executions
-                 SET status      = 'cancelled',
-                     finished_at = COALESCE(finished_at, ?2)
-                 WHERE id = ?1",
-                params![execution_id, now],
-            )?;
-            affected > 0
-        } else {
-            false
-        };
-        let mut pending = PendingEvents::new();
-        if cancelled {
-            stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
-        }
-        commit_and_publish(tx, pending, &self.event_bus)?;
-        Ok(cancelled)
+        self.cancel_running_execution_with_reason(execution_id, StatusActor::Engine, "cancelled by an engine teardown")
+            .map(|(cancelled, _)| cancelled)
     }
 
+    /// [`Self::cancel_running_execution`] with the caller's own actor and
+    /// reason, which the park stamp renders on the card and in `boss task
+    /// show`. Returns `(execution_cancelled, work_item_parked)` so the
+    /// caller can put the same facts on the dispatch timeline.
+    pub fn cancel_running_execution_with_reason(
+        &self,
+        execution_id: &str,
+        actor: StatusActor,
+        reason: &str,
+    ) -> Result<(bool, bool)> {
+        self.cancel_running_execution_inner(execution_id, actor, reason, CancelTaskEffect::Park)
+    }
+
+    /// Cancel an execution the caller is about to replace in the same
+    /// breath (scheduler preemption re-queues the victim as a fresh
+    /// execution). The row's dispatch state is left untouched: parking it
+    /// would flip `autostart` off and show a Stopped banner on a card that
+    /// the scheduler is simply requeueing.
+    pub fn cancel_running_execution_for_requeue(&self, execution_id: &str) -> Result<bool> {
+        self.cancel_running_execution_inner(
+            execution_id,
+            StatusActor::Engine,
+            "preempted; requeued as a fresh execution",
+            CancelTaskEffect::LeaveSchedulable,
+        )
+        .map(|(cancelled, _)| cancelled)
+    }
+
+    /// Explicit stop (`bossctl agents stop`, the app's stop action, the
+    /// merge poller's stop-on-review): atomically cancel a non-terminal
+    /// execution and demote the owning task from `active` back to `todo`,
+    /// then park it on the halt surface when this was its governing
+    /// execution (an `in_review` task is left alone — a stop does not
+    /// retract a PR). Called from the `StopRun` / `force_stop_execution_as`
+    /// path so an explicitly stopped worker does not leave an `active` task
+    /// or a `running` execution behind — both of which would make the orphan
+    /// sweep or `reconcile_active_dispatch` re-dispatch the work item
+    /// immediately. Recorded as an explicit stop by a human;
+    /// [`Self::cancel_running_execution_and_demote_task_as`] takes the
+    /// caller's own actor and reason.
+    ///
+    /// Idempotent: if the execution is already terminal the `UPDATE` is a
+    /// no-op; if the task is already out of `active` (e.g. moved to
+    /// `in_review` by `on_stop` in a concurrent path) the demote is a no-op.
+    ///
+    /// The demote is also a no-op when `execution_id` is not the work item's
+    /// current (latest) execution — i.e. it has been superseded by a
+    /// redispatch. Stopping a superseded execution must never drag the row
+    /// (and its live replacement worker) back to `todo`.
+    ///
+    /// Returns `(execution_cancelled, task_moved)`, where `task_moved`
+    /// covers both the demote and the park.
     pub fn cancel_running_execution_and_demote_task(&self, execution_id: &str) -> Result<(bool, bool)> {
+        self.cancel_running_execution_and_demote_task_as(execution_id, StatusActor::Human, "explicit stop")
+    }
+
+    /// [`Self::cancel_running_execution_and_demote_task`] with the caller's
+    /// own actor and reason, rendered verbatim in the park text.
+    pub fn cancel_running_execution_and_demote_task_as(
+        &self,
+        execution_id: &str,
+        actor: StatusActor,
+        reason: &str,
+    ) -> Result<(bool, bool)> {
+        self.cancel_running_execution_inner(execution_id, actor, reason, CancelTaskEffect::DemoteAndPark)
+    }
+
+    fn cancel_running_execution_inner(
+        &self,
+        execution_id: &str,
+        actor: StatusActor,
+        reason: &str,
+        effect: CancelTaskEffect,
+    ) -> Result<(bool, bool)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
@@ -129,16 +162,66 @@ impl WorkDb {
         // row (and the live replacement) untouched.
         //
         // Shared with `cancel_execution_with`'s live path so the guard
-        // and `last_status_actor = 'engine'` stamp cannot drift.
-        let task_demoted = demote_active_if_latest_execution(&tx, &execution.work_item_id, execution_id, &now)?;
+        // and `last_status_actor = 'engine'` stamp cannot drift. The park
+        // below carries the same latest-execution guard plus a
+        // no-other-live-execution guard.
+        let task_demoted = if effect == CancelTaskEffect::DemoteAndPark {
+            demote_active_if_latest_execution(&tx, &execution.work_item_id, execution_id, &now)?
+        } else {
+            false
+        };
         let mut pending = PendingEvents::new();
+        let mut work_item_parked = false;
         if exec_cancelled {
+            if effect != CancelTaskEffect::LeaveSchedulable {
+                work_item_parked =
+                    park_work_item_after_cancel(&tx, &execution.work_item_id, execution_id, Some(actor), reason, &now)?;
+            }
+            stage_cancel_provenance(
+                &mut pending,
+                CancelProvenance {
+                    execution_id,
+                    work_item_id: &execution.work_item_id,
+                    from_status: execution.status.clone(),
+                    actor,
+                    reason,
+                    work_item_moved: task_demoted || work_item_parked,
+                    queued_only: false,
+                    peer_pid: None,
+                    // Every caller (`cancel_and_release`, `force_stop_execution_as`,
+                    // the preemption requeue) writes the timeline event itself.
+                    caller_records_timeline: true,
+                },
+            );
             stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
         }
         commit_and_publish(tx, pending, &self.event_bus)?;
-        Ok((exec_cancelled, task_demoted))
+        if exec_cancelled {
+            tracing::warn!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                from_status = %execution.status,
+                to_status = "cancelled",
+                actor = actor.as_str(),
+                reason = %reason,
+                work_item_parked,
+                "execution terminalized: cancel",
+            );
+        }
+        Ok((exec_cancelled, task_demoted || work_item_parked))
     }
 
+    /// Atomically null out `cube_lease_id`, `cube_workspace_id`, and
+    /// `workspace_path` on `execution_id`. Returns the prior lease id
+    /// (and the workspace path as it stood before clearing) — `Some`
+    /// means the caller is responsible for issuing the cube `workspace
+    /// release`, `None` means there was nothing to release (already
+    /// cleared by an earlier path or never leased).
+    ///
+    /// Used by the engine-side release path (manual chore-done update,
+    /// `bossctl agents stop`) to claim ownership of the cube release
+    /// before calling out to the cube CLI, so two concurrent callers
+    /// don't issue duplicate releases against the same lease.
     pub fn clear_execution_workspace(&self, execution_id: &str) -> Result<Option<ClearedExecutionWorkspace>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;

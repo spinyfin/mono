@@ -238,6 +238,13 @@ impl WorkDb {
 /// rows stamped before that inline clear existed, and for a start that
 /// happened while a previous engine process was running.
 ///
+/// An `execution_cancelled` stamp is never cleared here. It records a stop
+/// the row stays parked under (`autostart = 0`) until an explicit resume or
+/// start, and `start_execution_run_on_host` already clears it inline when a
+/// run starts. A run that merely shares the stamp's epoch second (an earlier
+/// execution that completed just before a later one was queued and cancelled)
+/// would otherwise erase the park while the row is still stopped.
+///
 /// Deliberately does **not** touch `tasks.updated_at`, matching the inline
 /// clear. Clearing the stamp is bookkeeping about a failure that is already
 /// over, not a state change an operator ordered, and `updated_at` is not
@@ -261,8 +268,9 @@ fn clear_stale_dispatch_failures(conn: &Connection) -> Result<usize> {
                WHERE e.work_item_id = tasks.id
                  AND r.started_at IS NOT NULL
                  AND CAST(r.started_at AS INTEGER) >= CAST(tasks.dispatch_failed_at AS INTEGER)
-           )",
-        [],
+           )
+           AND dispatch_failed_reason != ?1",
+        [crate::work::EXECUTION_CANCELLED_DISPATCH_FAILED_REASON],
     )?;
     if rows > 0 {
         tracing::info!(

@@ -2030,12 +2030,27 @@ impl ExecutionCoordinator {
             }
         };
 
-        if let Err(err) = self.work_db.cancel_running_execution(&victim.execution_id) {
-            tracing::warn!(
-                victim_execution_id = %victim.execution_id,
-                ?err,
-                "preemption: failed to cancel victim execution; requeueing anyway",
-            );
+        match self.work_db.cancel_running_execution_for_requeue(&victim.execution_id) {
+            Ok(true) => {
+                self.dispatch_events
+                    .emit(crate::work::execution_cancelled_event(
+                        &victim.execution_id,
+                        &victim_execution.work_item_id,
+                        victim_execution.status.clone(),
+                        boss_protocol::StatusActor::Engine,
+                        "preempted; requeued as a fresh execution",
+                        false,
+                    ))
+                    .await;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(
+                    victim_execution_id = %victim.execution_id,
+                    ?err,
+                    "preemption: failed to cancel victim execution; requeueing anyway",
+                );
+            }
         }
 
         if victim_execution.kind == ExecutionKind::AutomationTriage {

@@ -506,6 +506,9 @@ pub(crate) fn maybe_engine_block_dependent(
     Ok(None)
 }
 
+/// Cancel reason recorded when an engine dependency block ends a live run.
+const BLOCK_CANCEL_REASON: &str = "dependent transitioned to blocked";
+
 /// Cancel the live (`running` / `waiting_human`) execution attached to
 /// `work_item_id` as part of an engine block, returning the cancelled
 /// row (or `None` when no worker was attached).
@@ -540,6 +543,20 @@ fn cancel_live_execution_for_block_in_tx(
         execution_id = %live.id,
         "engine: cancelled live execution because its dependent transitioned to blocked",
     );
+    stage_cancel_provenance(
+        pending,
+        CancelProvenance {
+            execution_id: &live.id,
+            work_item_id,
+            from_status: live.status.clone(),
+            actor: StatusActor::Engine,
+            reason: BLOCK_CANCEL_REASON,
+            work_item_moved: false,
+            queued_only: false,
+            peer_pid: None,
+            caller_records_timeline: false,
+        },
+    );
     // Canonical terminalization trace — see `WorkDb::mark_execution_orphaned`
     // in executions_runs.rs. This cancels a genuinely *live* execution, so
     // it is exactly the shape of transition the ack-timeout / stale-reap
@@ -549,7 +566,7 @@ fn cancel_live_execution_for_block_in_tx(
         work_item_id = %work_item_id,
         from_status = %live.status,
         to_status = %updated.status,
-        reason = "dependent transitioned to blocked",
+        reason = BLOCK_CANCEL_REASON,
         "execution terminalized: block cancel",
     );
     Ok(Some(updated))

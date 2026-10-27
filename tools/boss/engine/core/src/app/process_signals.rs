@@ -105,6 +105,20 @@ pub(super) fn resolve_status_actor(server_state: &ServerState, peer_pid: Option<
     boss_protocol::LAST_STATUS_ACTOR_HUMAN
 }
 
+/// [`resolve_status_actor`] as a [`boss_protocol::StatusActor`], for the
+/// cancel paths that record who stopped an execution: `Boss` when the peer
+/// descends from the coordinator session, `Human` otherwise.
+pub(super) fn resolve_cancel_actor(
+    server_state: &ServerState,
+    peer_pid: Option<libc::pid_t>,
+) -> boss_protocol::StatusActor {
+    if resolve_status_actor(server_state, peer_pid) == boss_protocol::LAST_STATUS_ACTOR_BOSS {
+        boss_protocol::StatusActor::Boss
+    } else {
+        boss_protocol::StatusActor::Human
+    }
+}
+
 pub(super) fn current_parent_pid() -> Option<libc::pid_t> {
     // BOSS_APP_PID is the only signal we trust to identify the app
     // tier. The macOS app sets it to its own pid before spawning the

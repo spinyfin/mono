@@ -5,9 +5,8 @@ use super::*;
 /// [`collect_task_runtimes`] backed by the engine-wide [`BoardRuntimeCache`].
 /// Epochs are read in the same snapshot as the fallback computation, so a hit
 /// is exactly the value the uncached path would compute from that snapshot;
-/// only misses (changed, expired, never seen, or consulting other items) run
-/// the point queries. The returned statement count covers the misses plus the
-/// one epoch query, which keeps the population trace honest about what ran.
+/// misses recompute execution/run fields, while holds refresh on cache hits.
+/// The returned statement count includes both projections and the epoch query.
 pub(crate) fn collect_task_runtimes_cached(
     conn: &Connection,
     product_id: &str,
@@ -16,6 +15,7 @@ pub(crate) fn collect_task_runtimes_cached(
     cache: &BoardRuntimeCache,
     now: i64,
 ) -> Result<(Vec<TaskRuntime>, u64)> {
+    let chains = super::queued_wait::OrdinalChains::from_tasks(tasks.iter().chain(chores));
     let epochs = query_runtime_epochs(conn, product_id)?;
     let mut queries = 1u64;
     let items: Vec<(&str, i64)> = tasks
@@ -26,12 +26,34 @@ pub(crate) fn collect_task_runtimes_cached(
     let lookup = cache.lookup(product_id, &items, now);
     let mut runtimes = Vec::with_capacity(items.len());
     let mut fresh = Vec::new();
-    for ((id, epoch), hit) in items.iter().zip(lookup.hits) {
-        if let Some(runtime) = hit {
+    for (((id, epoch), hit), task) in items.iter().zip(lookup.hits).zip(tasks.iter().chain(chores)) {
+        if let Some(mut runtime) = hit {
+            // Hold reasons consult task, project and repository state outside
+            // execution epochs. Refresh that projection while retaining the
+            // epoch-validated execution/run fields.
+            if runtime
+                .execution_status
+                .as_ref()
+                .is_none_or(ExecutionStatus::is_terminal)
+            {
+                runtime.dispatch_hold_reason = if task.status == TaskStatus::Todo && task.autostart {
+                    let execution = super::db_diagnostics::count_queries(&mut queries, || {
+                        runtime
+                            .execution_id
+                            .as_deref()
+                            .map(|id| query_execution(conn, id))
+                            .transpose()
+                    })?
+                    .flatten();
+                    dispatch_hold_reason_for(conn, Some(task), execution.as_ref(), &mut queries)?
+                } else {
+                    None
+                };
+            }
             runtimes.push(runtime);
             continue;
         }
-        let computed = compute_task_runtime(conn, id, &mut queries, now)?;
+        let computed = compute_task_runtime(conn, id, Some(task), Some(&chains), &mut queries, now)?;
         if computed.cacheable {
             fresh.push((
                 (*id).to_owned(),

@@ -660,6 +660,13 @@ struct WorkTaskRuntime: Hashable {
     let dispatchWaitSince: String?
     var dispatchNotBefore: String? = nil
     var dispatchWaitBlocker: DispatchWaitBlocker? = nil
+    /// Why a `todo` + `autostart` row has nothing queued, stated by the
+    /// engine from its own decline-to-mint gates (`human_driven`, `deferred`,
+    /// `pr_awaits_review`, `deliberately_parked`, `repo_unresolved`,
+    /// `awaiting_reconcile`). `nil` whenever a pending execution exists —
+    /// `executionStatus` / `dispatchWaitReason` describe it then. Mirrors
+    /// `TaskRuntime.dispatch_hold_reason`.
+    var dispatchHoldReason: String? = nil
 }
 
 /// One row from `work_item_dependencies` — the dependent is gated by

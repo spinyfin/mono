@@ -19,6 +19,14 @@ struct WorkDispatchFailureBanner: View {
     /// framing differs: the row is not broken, so it must not read as a failure.
     private static let deliberateParkReason = "deliberate_park"
 
+    /// Mirrors `boss_engine_core::work::EXECUTION_CANCELLED_DISPATCH_FAILED_REASON`.
+    /// The row's governing execution was explicitly cancelled (a stop,
+    /// `bossctl executions cancel`, a drag back to Backlog, or an engine
+    /// transition) and the engine parked it so the board shows the stop
+    /// instead of a phantom "Queued" card. Not a failure: the stored text
+    /// names the execution, the cancel reason, and how to resume.
+    private static let executionCancelledReason = "execution_cancelled"
+
     /// Mirrors `boss_engine_core::work::DELIBERATE_PARK_CHURN_COMBINED_MARKER`.
     /// A deliberately parked row that has ALSO tripped the churn guard
     /// carries this exact substring in its `dispatch_failed_error` body
@@ -33,6 +41,10 @@ struct WorkDispatchFailureBanner: View {
         reason == Self.deliberateParkReason
     }
 
+    private var isExecutionCancelled: Bool {
+        reason == Self.executionCancelledReason
+    }
+
     private var reasonLabel: String {
         // Combined parks retain the human-only-clearable reason. Their stored
         // diagnostic text also names the churn guard, including older rows.
@@ -43,7 +55,9 @@ struct WorkDispatchFailureBanner: View {
     }
 
     var headline: String {
-        isDeliberatePark ? "Waiting on you — \(reasonLabel)" : "Failed to start — \(reasonLabel)"
+        if isDeliberatePark { return "Waiting on you — \(reasonLabel)" }
+        if isExecutionCancelled { return "Stopped — \(reasonLabel)" }
+        return "Failed to start — \(reasonLabel)"
     }
 
     var summary: String? {
@@ -55,15 +69,19 @@ struct WorkDispatchFailureBanner: View {
     /// and asserted from tests so a hard 1-line cap cannot hide behind a
     /// structurally-unlike control view.
     var summaryLineLimit: Int? {
-        isDeliberatePark ? nil : 3
+        (isDeliberatePark || isExecutionCancelled) ? nil : 3
     }
 
     private var tint: Color {
-        isDeliberatePark ? .blue : .red
+        if isDeliberatePark { return .blue }
+        if isExecutionCancelled { return .gray }
+        return .red
     }
 
     private var iconName: String {
-        isDeliberatePark ? "person.fill.questionmark" : "exclamationmark.triangle.fill"
+        if isDeliberatePark { return "person.fill.questionmark" }
+        if isExecutionCancelled { return "stop.circle.fill" }
+        return "exclamationmark.triangle.fill"
     }
 
     var body: some View {

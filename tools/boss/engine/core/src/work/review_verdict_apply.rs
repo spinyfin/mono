@@ -312,8 +312,9 @@ impl WorkDb {
             if let Some(ref existing_task) = existing {
                 let mut conn = self.connect()?;
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                tombstone_orphaned_remediation_in_tx(&tx, &existing_task.id, &now_string())?;
-                tx.commit()?;
+                let mut pending = PendingEvents::new();
+                tombstone_orphaned_remediation_in_tx(&tx, &mut pending, &existing_task.id, &now_string())?;
+                commit_and_publish(tx, pending, &self.event_bus)?;
             }
         }
 
@@ -477,6 +478,7 @@ impl WorkDb {
     ) -> Result<Option<String>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut pending = PendingEvents::new();
         let current_state: Option<String> = tx
             .query_row(
                 "SELECT state FROM worker_proposals WHERE id = ?1",
@@ -507,9 +509,9 @@ impl WorkDb {
             if current_state != ProposalState::Applied.as_str()
                 && let Some(task_id) = remediating_task_id
             {
-                tombstone_orphaned_remediation_in_tx(&tx, task_id, &now_string())?;
+                tombstone_orphaned_remediation_in_tx(&tx, &mut pending, task_id, &now_string())?;
             }
-            tx.commit()?;
+            commit_and_publish(tx, pending, &self.event_bus)?;
             return Ok(applied_ref);
         }
 
@@ -551,7 +553,6 @@ impl WorkDb {
         };
 
         let now = now_string();
-        let mut pending = PendingEvents::new();
         let batch_rows_changed = tx.execute(
             "UPDATE pr_review_batches
              SET status = 'completed', completed_at = ?2, updated_at = ?2
@@ -800,8 +801,9 @@ impl WorkDb {
     pub(crate) fn test_tombstone_orphaned_remediation(&self, task_id: &str) -> Result<()> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        tombstone_orphaned_remediation_in_tx(&tx, task_id, &now_string())?;
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        tombstone_orphaned_remediation_in_tx(&tx, &mut pending, task_id, &now_string())?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(())
     }
 }
@@ -818,6 +820,10 @@ fn parent_no_longer_revisable(error: &anyhow::Error) -> bool {
 /// Soft-delete a revision/follow-up this call materialised whose owning
 /// proposal turned out not to be the decision that stands (see the
 /// `current_state != Applied` guard in `commit_applied_review_verdict`).
+/// Reason recorded for executions retired with a tombstoned orphaned
+/// remediation.
+const TOMBSTONE_CANCEL_REASON: &str = "orphaned review remediation tombstoned";
+
 /// Soft-delete drops the task from every `tasks.deleted_at IS NULL` list
 /// query (including the `autostart` scheduler query). That is not enough
 /// for dispatch: `list_ready_executions` selects `work_executions` by
@@ -825,12 +831,31 @@ fn parent_no_longer_revisable(error: &anyhow::Error) -> bool {
 /// freshly minted autostart revision's `ready` row would otherwise stay
 /// on every drain until the start-time deleted-item guard fails it.
 /// Cancel the task's never-started executions in the same transaction so
-/// the orphan sweep and reconciler will not re-dispatch it.
-fn tombstone_orphaned_remediation_in_tx(tx: &rusqlite::Transaction<'_>, task_id: &str, now: &str) -> Result<()> {
+/// the orphan sweep and reconciler will not re-dispatch it. Each retired
+/// execution gets a cancel provenance record.
+fn tombstone_orphaned_remediation_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    pending: &mut PendingEvents,
+    task_id: &str,
+    now: &str,
+) -> Result<()> {
     tx.execute(
         "UPDATE tasks SET deleted_at = ?2, updated_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
         params![task_id, now],
     )?;
+    let pending_executions: Vec<WorkExecution> = {
+        let mut stmt = tx.prepare(
+            "SELECT id FROM work_executions
+             WHERE work_item_id = ?1
+               AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed')",
+        )?;
+        let ids = stmt
+            .query_map(params![task_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.iter()
+            .map(|id| query_execution(tx, id).require("execution", id))
+            .collect::<Result<Vec<_>>>()?
+    };
     tx.execute(
         "UPDATE work_executions
          SET status = 'cancelled',
@@ -839,6 +864,23 @@ fn tombstone_orphaned_remediation_in_tx(tx: &rusqlite::Transaction<'_>, task_id:
            AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed')",
         params![task_id, now],
     )?;
+    for execution in pending_executions {
+        stage_cancel_provenance(
+            pending,
+            CancelProvenance {
+                execution_id: &execution.id,
+                work_item_id: task_id,
+                from_status: execution.status.clone(),
+                actor: StatusActor::Engine,
+                reason: TOMBSTONE_CANCEL_REASON,
+                work_item_moved: false,
+                queued_only: false,
+                peer_pid: None,
+                caller_records_timeline: false,
+            },
+        );
+        stage_execution_terminal(pending, tx, &execution.id, task_id)?;
+    }
     Ok(())
 }
 

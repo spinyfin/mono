@@ -2,6 +2,21 @@ use super::*;
 use crate::test_support::log_capture;
 use crate::work::WorkDb;
 
+#[test]
+fn statement_count_includes_nested_helper_queries() {
+    use crate::test_support::{create_test_chore_manual, create_test_product};
+    let (_dir, db) = crate::test_support::open_db();
+    let product = create_test_product(&db);
+    let task = create_test_chore_manual(&db, product.id, "counted");
+    let reader = db.reader().unwrap();
+    for source in [&db, &reader] {
+        let conn = source.connect().unwrap();
+        let mut count = 0;
+        count_queries(&mut count, || crate::work::resolve_repo_for_work_item(&conn, &task.id)).unwrap();
+        assert_eq!(count, 2, "writer and independent reader count both nested statements");
+    }
+}
+
 #[tokio::test]
 async fn attributed_hold_excludes_non_sql_work_from_query_time() {
     let logs = log_capture::install();

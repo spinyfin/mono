@@ -1263,7 +1263,10 @@ async fn missing_session_stop_clears_identity_and_allows_retirement() {
     let (tmux, _) = super::tmux_stub::fake_tmux([super::tmux_stub::failure("session not found")]);
     server.set_tmux_override_for_test(tmux);
     // Exercise the same completion entry point as `bossctl agents stop`.
-    server.completion_handler.force_stop_execution(&run).await;
+    server
+        .completion_handler
+        .force_stop_execution_as(&run, boss_protocol::StatusActor::Human, "explicit stop")
+        .await;
     assert!(server.work_db.tmux_identity_for_execution(&run).unwrap().is_none());
     server.retire_pane(1).await.unwrap();
 }

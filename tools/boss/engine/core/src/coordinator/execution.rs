@@ -1,9 +1,10 @@
 //! Per-execution scheduling: work-item resolution, host selection, workspace
 //! leasing/recovery, and pre-start failure handling. Part of the `coordinator`
 //! module split; see [`super`] for the struct and shared types.
-use crate::work::CancelExecutionOpts;
+use crate::work::{CancelExecutionOpts, CancelledExecution};
 use anyhow::bail;
 use boss_protocol::ReviewBatchPhase;
+use boss_protocol::StatusActor;
 
 use super::*;
 
@@ -80,6 +81,50 @@ pub(crate) fn pr_number_for_workspace_goto(
 }
 
 impl ExecutionCoordinator {
+    /// Put an engine-decided cancel this coordinator just performed on the
+    /// execution's dispatch timeline (`execution_cancelled`: actor
+    /// `engine`, the reason, the status that was terminalized and whether
+    /// the owning row was parked). Every coordinator cancel path calls this
+    /// after its durable cancel succeeds, so `bossctl dispatch diagnose`
+    /// never shows a timeline that stops short of a `cancelled` row.
+    pub(crate) async fn record_engine_cancel(
+        &self,
+        cancelled: &CancelledExecution,
+        prior_status: ExecutionStatus,
+        reason: &str,
+    ) {
+        self.dispatch_events
+            .emit(crate::work::execution_cancelled_event(
+                &cancelled.execution.id,
+                &cancelled.execution.work_item_id,
+                prior_status,
+                StatusActor::Engine,
+                reason,
+                cancelled.work_item_parked,
+            ))
+            .await;
+    }
+
+    /// [`Self::record_engine_cancel`] for a synchronous caller: the emit is
+    /// handed to the task scope so the timeline still gets the event.
+    pub(crate) fn record_engine_cancel_detached(
+        &self,
+        cancelled: &CancelledExecution,
+        prior_status: ExecutionStatus,
+        reason: &str,
+    ) {
+        let sink = std::sync::Arc::clone(&self.dispatch_events);
+        let event = crate::work::execution_cancelled_event(
+            &cancelled.execution.id,
+            &cancelled.execution.work_item_id,
+            prior_status,
+            StatusActor::Engine,
+            reason,
+            cancelled.work_item_parked,
+        );
+        boss_task_scope::spawn(async move { sink.emit(event).await });
+    }
+
     /// Reject an explicit host request before the work DB can create or
     /// refresh an execution. This makes `bossctl ... --host` failures
     /// transactional from the operator's point of view: an unknown,
@@ -991,19 +1036,27 @@ impl ExecutionCoordinator {
             Ok(host) => host,
             Err(err) => {
                 if had_requested_host {
-                    match self.work_db.cancel_execution_with(
+                    let reason = format!("requested host became ineligible: {err:#}");
+                    match self.work_db.cancel_execution_with_outcome(
                         &execution.id,
                         CancelExecutionOpts {
-                            reason: Some(format!("requested host became ineligible: {err:#}")),
+                            // Records its own timeline event with richer context.
+                            caller_records_timeline: true,
+                            peer_pid: None,
+                            reason: Some(reason.clone()),
                             queued_only: true,
                             record_failure_reason: true,
+                            keep_work_item_schedulable: false,
+                            actor: StatusActor::Engine,
                         },
                     ) {
                         Ok(cancelled) => {
+                            self.record_engine_cancel(&cancelled, execution.status.clone(), &reason)
+                                .await;
                             // Terminal for this execution: drop the constraint so it
                             // cannot leak (selection no longer takes it itself).
                             self.take_requested_host(&execution.id);
-                            self.notify_review_guide_pre_start_failure(&cancelled);
+                            self.notify_review_guide_pre_start_failure(&cancelled.execution);
                         }
                         Err(cancel_err) => {
                             // The cancel is what makes this row terminal. If it
@@ -2717,17 +2770,24 @@ impl ExecutionCoordinator {
             );
         }
 
-        match self.work_db.cancel_execution_with(
+        let reason = format!("requested host dispatch failed during {stage}: {err:#}");
+        match self.work_db.cancel_execution_with_outcome(
             &execution.id,
             CancelExecutionOpts {
-                reason: Some(format!("requested host dispatch failed during {stage}: {err:#}")),
+                // Records its own timeline event with richer context.
+                caller_records_timeline: true,
+                peer_pid: None,
+                reason: Some(reason.clone()),
                 queued_only: true,
                 record_failure_reason: true,
+                keep_work_item_schedulable: false,
+                actor: StatusActor::Engine,
             },
         ) {
             Ok(cancelled) => {
+                self.record_engine_cancel_detached(&cancelled, execution.status.clone(), &reason);
                 self.take_requested_host(&execution.id);
-                self.notify_review_guide_pre_start_failure(&cancelled);
+                self.notify_review_guide_pre_start_failure(&cancelled.execution);
             }
             Err(cancel_err) => {
                 // The cancel is what makes this row terminal. If it failed,

@@ -223,7 +223,10 @@ impl WorkDb {
         let mut queries = 0u64;
         let mut runtimes = HashMap::new();
         for task in tasks.iter().chain(chores.iter()) {
-            runtimes.insert(task.id.clone(), query_task_runtime(&conn, &task.id, &mut queries)?);
+            runtimes.insert(
+                task.id.clone(),
+                query_task_runtime(&conn, &task.id, Some(task), &mut queries)?,
+            );
         }
 
         let mut trace = PopulationTrace::disabled();

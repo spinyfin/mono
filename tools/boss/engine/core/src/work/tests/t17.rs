@@ -170,10 +170,13 @@ fn queued_wait_payload_preserves_holds_and_clears_the_blocker() {
         )
         .unwrap();
     let cleared = db.get_task_runtime(&chore_id).unwrap();
-    assert!(cleared.dispatch_wait_reason.is_none());
+    assert_eq!(cleared.dispatch_wait_reason.as_deref(), Some("awaiting_scheduler"));
     assert!(cleared.dispatch_wait_blocker.is_none());
     db.clear_dispatch_wait_reason(&execution.id).unwrap();
-    assert!(db.get_task_runtime(&chore_id).unwrap().dispatch_wait_reason.is_none());
+    assert_eq!(
+        db.get_task_runtime(&chore_id).unwrap().dispatch_wait_reason.as_deref(),
+        Some("awaiting_scheduler")
+    );
 }
 
 #[test]
@@ -214,10 +217,11 @@ fn queued_wait_missing_execution_is_absent_and_missing_prerequisite_is_honest() 
     let (db, _, chore_id) = setup_product_and_chore();
     assert!(db.get_task_runtime(&chore_id).unwrap().dispatch_wait_reason.is_none());
     let execution = seed_ready_execution(&db, &chore_id);
-    // Nothing gates: do not invent a dependency wait.
+    // Nothing gates: do not invent a dependency wait; the row only awaits the
+    // readiness reconcile, and the engine says so.
     db.downgrade_ready_to_waiting_dependency(&execution.id).unwrap();
     let wait = db.get_task_runtime(&chore_id).unwrap();
-    assert!(wait.dispatch_wait_reason.is_none());
+    assert_eq!(wait.dispatch_wait_reason.as_deref(), Some("awaiting_reconcile"));
     assert!(wait.dispatch_wait_blocker.is_none());
     // An edge to a prerequisite row that no longer exists still gates, without a link.
     db.connect()
@@ -263,7 +267,12 @@ fn queued_wait_chain_hold_survives_claimed_blocker_and_clears_when_terminal() {
             )
             .unwrap();
         let wait = db.get_task_runtime(&chore_id).unwrap();
-        assert_eq!(wait.dispatch_wait_reason.is_some(), held, "reason in {status}");
+        let expected = if held {
+            Some("chain_serialized")
+        } else {
+            Some("awaiting_scheduler")
+        };
+        assert_eq!(wait.dispatch_wait_reason.as_deref(), expected, "reason in {status}");
         assert_eq!(wait.dispatch_wait_blocker.is_some(), held, "blocker in {status}");
     }
 }

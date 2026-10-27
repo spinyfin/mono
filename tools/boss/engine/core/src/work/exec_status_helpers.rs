@@ -1,3 +1,4 @@
+use super::dispatch_admission::{primary_pr_awaits_review, work_item_is_deliberately_parked};
 use super::*;
 
 /// The `ExecutionKind` a task's own primary-implementation execution would
@@ -207,6 +208,96 @@ pub(crate) fn demote_active_if_latest_execution(
                LIMIT 1
            )",
         params![work_item_id, now, execution_id],
+    )?;
+    Ok(affected > 0)
+}
+
+/// `dispatch_failed_error` body written by [`park_work_item_after_cancel`]
+/// (and by the reconciler's convergence of a legacy stranded row). Names the
+/// execution, who cancelled it (`None` is a cancel that predates provenance)
+/// and the reason the caller supplied, states plainly that the row will not
+/// restart by itself, and says how to resume it — the card's banner, `boss
+/// task show` and `bossctl agents status` print this verbatim.
+pub(crate) fn execution_cancelled_park_text(
+    work_item_id: &str,
+    execution_id: &str,
+    actor: Option<StatusActor>,
+    reason: &str,
+) -> String {
+    format!(
+        "Execution `{execution_id}` was cancelled by {who} ({reason}). This work item was moved to \
+         Backlog and will not restart on its own. Run `bossctl work start {work_item_id}` (or drag the \
+         card to Doing) to resume it.",
+        who = describe_cancel_actor(actor),
+    )
+}
+
+/// Park `work_item_id` in Backlog because `execution_id` — its governing
+/// execution — was cancelled: `status = todo`, `autostart = 0`, and the
+/// halt surface stamped with
+/// [`crate::work::EXECUTION_CANCELLED_DISPATCH_FAILED_REASON`] so the board
+/// and CLI show the stop and its reason. Returns `true` iff the row moved.
+///
+/// The reconciler never mints behind a terminal same-kind execution, so a
+/// cancelled never-started execution would otherwise leave a `todo` row with
+/// `autostart = 1` and nothing queued.
+///
+/// Only a `todo` row is parked. An `active` row whose never-started
+/// execution is cancelled stays `active`: a human put that card in Doing,
+/// and `cancel_execution_ready_does_not_demote_active_task` pins the
+/// decision that a cancel of a pending row must not yank it back (the
+/// orphan-active sweep re-dispatches it). A *live* cancel reaches here
+/// after [`demote_active_if_latest_execution`] has already moved the row to
+/// `todo`, so it is parked with its reason. `in_review` / `done` /
+/// `archived` / deleted rows are never touched — a cancel does not retract
+/// a PR or reopen closed work.
+///
+/// Two further guards keep this from touching a row a worker still owns,
+/// mirroring the demote: the cancelled execution must be the row's latest
+/// (a stale never-started duplicate shadowed by a newer row is not the
+/// governing execution), and no *other* non-terminal execution may exist
+/// for the row (a re-dispatch storm can leave the live run one row below a
+/// newer terminal one).
+pub(crate) fn park_work_item_after_cancel(
+    conn: &Connection,
+    work_item_id: &str,
+    execution_id: &str,
+    actor: Option<StatusActor>,
+    reason: &str,
+    now: &str,
+) -> Result<bool> {
+    let body = execution_cancelled_park_text(work_item_id, execution_id, actor, reason);
+    let affected = conn.execute(
+        "UPDATE tasks
+         SET status                 = 'todo',
+             autostart              = 0,
+             last_status_actor      = 'engine',
+             dispatch_failed_reason = ?3,
+             dispatch_failed_error  = ?4,
+             dispatch_failed_at     = ?5,
+             updated_at             = ?5
+         WHERE id              = ?1
+           AND status          = 'todo'
+           AND deleted_at      IS NULL
+           AND ?2 = (
+               SELECT id FROM work_executions
+               WHERE work_item_id = ?1
+               ORDER BY created_at DESC, id DESC
+               LIMIT 1
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM work_executions
+               WHERE work_item_id = ?1
+                 AND id != ?2
+                 AND status NOT IN ('completed', 'failed', 'cancelled', 'orphaned', 'abandoned')
+           )",
+        params![
+            work_item_id,
+            execution_id,
+            crate::work::EXECUTION_CANCELLED_DISPATCH_FAILED_REASON,
+            body,
+            now
+        ],
     )?;
     Ok(affected > 0)
 }
@@ -575,6 +666,196 @@ pub(crate) fn default_slug(base_slug: &str) -> String {
     } else {
         base_slug.to_owned()
     }
+}
+
+/// `TaskRuntime.dispatch_hold_reason`: why a `todo` row flagged `autostart`
+/// has nothing queued, stated by the engine from the same routing and gates
+/// `reconcile_product_executions` / `reconcile_work_item_execution` apply, in
+/// the same order. `None` whenever the row is not dispatch-pending (decided
+/// from the in-hand `task` before any query) or a non-terminal execution
+/// exists (then `dispatch_wait_reason` / `execution_status` describe it).
+/// The kanban card renders the code verbatim-mapped instead of guessing.
+/// `awaiting_reconcile` is reserved for a row the reconciler will mint for or
+/// park on its next pass (`converge_stranded_autostart_row`); every shape it
+/// never visits has its own code. `queries` is incremented once per
+/// statement actually executed.
+pub(super) fn dispatch_hold_reason_for(
+    conn: &Connection,
+    task: Option<&Task>,
+    execution: Option<&WorkExecution>,
+    queries: &mut u64,
+) -> Result<Option<String>> {
+    super::db_diagnostics::count_queries(queries, || dispatch_hold_reason_inner(conn, task, execution))
+}
+
+fn dispatch_hold_reason_inner(
+    conn: &Connection,
+    task: Option<&Task>,
+    execution: Option<&WorkExecution>,
+) -> Result<Option<String>> {
+    let Some(task) = task else {
+        return Ok(None);
+    };
+    if task.status != TaskStatus::Todo || !task.autostart {
+        return Ok(None);
+    }
+    if execution.is_some_and(|execution| !execution.status.is_terminal()) {
+        return Ok(None);
+    }
+    let work_item_id = task.id.as_str();
+    // Routing: which reconcile arm (if any) visits this kind of row.
+    let routing_hold = match task.kind {
+        TaskKind::Task => Some(DISPATCH_HOLD_NO_EXECUTION_KIND),
+        TaskKind::ProjectTask | TaskKind::Design if task.project_id.is_none() => Some(DISPATCH_HOLD_NO_PROJECT),
+        TaskKind::Revision => match get_chain_root_task(conn, work_item_id)? {
+            None => Some(DISPATCH_HOLD_REVISION_PARENT_UNRESOLVED),
+            Some(root) if root.pr_url.as_deref().is_none_or(str::is_empty) => {
+                Some(DISPATCH_HOLD_REVISION_AWAITING_PARENT_PR)
+            }
+            Some(_) => None,
+        },
+        _ => None,
+    };
+    if let Some(reason) = routing_hold {
+        return Ok(Some(reason.to_owned()));
+    }
+    if matches!(
+        task.blocked_reason.as_deref(),
+        Some("worker_failed" | "awaiting_operator_answer")
+    ) {
+        return Ok(Some(DISPATCH_HOLD_BLOCKED_REASON.to_owned()));
+    }
+    if work_item_is_human_driven(conn, work_item_id)? {
+        return Ok(Some(DISPATCH_HOLD_HUMAN_DRIVEN.to_owned()));
+    }
+    if work_item_is_deferred(conn, work_item_id)? {
+        return Ok(Some(DISPATCH_HOLD_DEFERRED.to_owned()));
+    }
+    // A cancelled never-started latest execution is parked by the reconciler
+    // before the mint gates below are consulted.
+    if execution
+        .is_some_and(|execution| execution.status == ExecutionStatus::Cancelled && execution.started_at.is_none())
+    {
+        let sibling_pending: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_executions
+             WHERE work_item_id = ?1
+               AND status NOT IN ('completed', 'failed', 'cancelled', 'orphaned', 'abandoned'))",
+            [work_item_id],
+            |row| row.get(0),
+        )?;
+        return Ok(Some(
+            if sibling_pending {
+                DISPATCH_HOLD_SHADOWED_PENDING_EXECUTION
+            } else {
+                DISPATCH_HOLD_AWAITING_RECONCILE
+            }
+            .to_owned(),
+        ));
+    }
+    if primary_pr_awaits_review(conn, work_item_id)? {
+        return Ok(Some(DISPATCH_HOLD_PR_AWAITS_REVIEW.to_owned()));
+    }
+    if work_item_is_deliberately_parked(conn, work_item_id)? {
+        return Ok(Some(DISPATCH_HOLD_DELIBERATELY_PARKED.to_owned()));
+    }
+    if resolve_repo_for_work_item(conn, work_item_id)?.is_none() {
+        return Ok(Some(DISPATCH_HOLD_REPO_UNRESOLVED.to_owned()));
+    }
+    Ok(Some(DISPATCH_HOLD_AWAITING_RECONCILE.to_owned()))
+}
+
+/// `TaskRuntime.dispatch_hold_reason` vocabulary. Mirrored by
+/// `WorkCardLiveStatus.dispatchHoldReasonLabel` in the macOS app, which
+/// renders each as a specific "Held — …" / "Queued — …" status line.
+pub(crate) const DISPATCH_HOLD_HUMAN_DRIVEN: &str = "human_driven";
+pub(crate) const DISPATCH_HOLD_DEFERRED: &str = "deferred";
+pub(crate) const DISPATCH_HOLD_PR_AWAITS_REVIEW: &str = "pr_awaits_review";
+pub(crate) const DISPATCH_HOLD_DELIBERATELY_PARKED: &str = "deliberately_parked";
+pub(crate) const DISPATCH_HOLD_REPO_UNRESOLVED: &str = "repo_unresolved";
+pub(crate) const DISPATCH_HOLD_AWAITING_RECONCILE: &str = "awaiting_reconcile";
+/// `TaskKind::Task` rows never receive a standalone execution.
+pub(crate) const DISPATCH_HOLD_NO_EXECUTION_KIND: &str = "no_execution_kind";
+/// A project task or design row with no project is skipped by the reconciler.
+pub(crate) const DISPATCH_HOLD_NO_PROJECT: &str = "no_project";
+/// A revision whose chain root cannot be resolved.
+pub(crate) const DISPATCH_HOLD_REVISION_PARENT_UNRESOLVED: &str = "revision_parent_unresolved";
+/// A revision whose chain root has not opened a PR yet.
+pub(crate) const DISPATCH_HOLD_REVISION_AWAITING_PARENT_PR: &str = "revision_awaiting_parent_pr";
+/// `blocked_reason` is `worker_failed` or `awaiting_operator_answer`.
+pub(crate) const DISPATCH_HOLD_BLOCKED_REASON: &str = "blocked_reason";
+/// The cancelled execution cannot be parked because an older non-terminal
+/// execution still exists for the row.
+pub(crate) const DISPATCH_HOLD_SHADOWED_PENDING_EXECUTION: &str = "shadowed_pending_execution";
+
+/// A `todo` row with `autostart = 1` asks to be auto-dispatched, yet its
+/// latest execution is terminal and no other execution is live: nothing is
+/// queued and nothing will be. Converge it, loudly, instead of leaving it
+/// stranded. Two shapes reach here and they mean opposite things:
+///
+/// - The execution **never started and was cancelled**. A cancel is a
+///   stop-until-asked decision, and `park_work_item_after_cancel` parks the
+///   row at cancel time, so this branch only sees rows whose cancel bypassed
+///   it (a raw status write). Park it on the halt surface with the one fact
+///   still known — that it was cancelled before it started — so the card
+///   reads "Stopped" with the resume instruction, and say in the log that the
+///   cancelling party was not recorded.
+/// - Anything else — an execution that **ran** to a terminal state, or a
+///   never-started row the engine dropped (`orphaned` at a restart,
+///   `abandoned`). `start_execution_run` consumes `autostart` the moment a
+///   run starts, so `autostart = 1` behind a started execution means a human
+///   or an engine path re-armed the row after it ended (a drag back, `boss
+///   task update --autostart`, a schema re-arm). Honour the request: mint a
+///   fresh execution exactly as if the row had none. `insert_fresh` applies
+///   every decline-to-mint gate (bound PR, deliberate park, unresolved repo)
+///   and returns whether it created a row.
+pub(super) fn converge_stranded_autostart_row(
+    conn: &Connection,
+    result: &mut ExecutionReconcileResult,
+    task: &Task,
+    latest: &WorkExecution,
+    insert_fresh: &dyn Fn(&mut ExecutionReconcileResult, Option<&WorkExecution>) -> Result<bool>,
+) -> Result<()> {
+    if latest.status == ExecutionStatus::Cancelled && latest.started_at.is_none() {
+        // The cancel itself is already on the execution's provenance trail
+        // when it went through a recording path; this row's cancel was not.
+        tracing::warn!(
+            work_item_id = %task.id,
+            execution_id = %latest.id,
+            execution_status = %latest.status,
+            task_status = %task.status,
+            autostart = task.autostart,
+            "reconcile: stranded dispatch-pending row — its only governing execution was cancelled \
+             before it started and no successor exists; parking it on the halt surface so the board \
+             shows the stop (the cancel reason was not recorded at the time)",
+        );
+        let parked = park_work_item_after_cancel(
+            conn,
+            &task.id,
+            &latest.id,
+            None,
+            "cancelled before it started; the engine did not record the cancel reason at the time",
+            &now_string(),
+        )?;
+        if !parked {
+            tracing::warn!(
+                work_item_id = %task.id,
+                execution_id = %latest.id,
+                "reconcile: stranded row could not be parked — another non-terminal execution exists \
+                 for it that is not the latest; leaving it for the next pass",
+            );
+        }
+        return Ok(());
+    }
+    if insert_fresh(result, Some(latest))? {
+        tracing::info!(
+            work_item_id = %task.id,
+            execution_id = %latest.id,
+            execution_status = %latest.status,
+            started = latest.started_at.is_some(),
+            "reconcile: dispatch-pending row re-armed behind a terminal execution — minted a replacement",
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

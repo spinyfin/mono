@@ -58,6 +58,55 @@ impl PendingEvents {
         self.0.is_empty()
     }
 
+    /// Persist timeline events in the same transaction as their cancel.
+    pub(crate) fn persist_cancels(&self, conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+        for event in &self.0 {
+            if let Some(event) = crate::cancel_timeline::timeline_event(event) {
+                let json = serde_json::to_string(&event).expect("dispatch event serializes");
+                conn.execute(
+                    "INSERT INTO execution_cancel_events (execution_id, event_json) VALUES (?1, ?2)",
+                    rusqlite::params![event.execution_id, json],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the `engine-audit.log` record for every staged
+    /// [`Event::ExecutionCancelled`]. Called only once the enclosing
+    /// transaction has committed, so the audit trail never names a cancel
+    /// that was rolled back.
+    pub fn record_audit(&self) {
+        for event in &self.0 {
+            if let Event::ExecutionCancelled {
+                execution_id,
+                task_id,
+                from_status,
+                actor,
+                reason,
+                work_item_moved,
+                queued_only,
+                peer_pid,
+                ..
+            } = event
+            {
+                crate::audit::record_event(
+                    "execution_cancelled",
+                    &serde_json::json!({
+                        "execution_id": execution_id,
+                        "work_item_id": task_id,
+                        "from_status": from_status,
+                        "actor": actor,
+                        "reason": reason,
+                        "work_item_moved": work_item_moved,
+                        "queued_only": queued_only,
+                        "peer_pid": peer_pid,
+                    }),
+                );
+            }
+        }
+    }
+
     /// Consume `self`, yielding every staged event. For the rare
     /// non-transactional producer that has no `Transaction` to hand
     /// [`commit_and_publish`] — its single `Connection::execute` write
@@ -78,8 +127,10 @@ pub fn commit_and_publish(
     pending: PendingEvents,
     bus: &EventBus,
 ) -> rusqlite::Result<()> {
+    pending.persist_cancels(&tx)?;
     tx.commit()?;
     tracing::debug!(target: "work_write_timing", boundary = "commit");
+    pending.record_audit();
     for event in pending.0 {
         bus.publish(event);
     }

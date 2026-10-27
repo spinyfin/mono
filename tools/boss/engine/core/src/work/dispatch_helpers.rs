@@ -1,87 +1,6 @@
 use super::dispatch_admission::{primary_pr_awaits_review, work_item_is_deliberately_parked};
 use super::*;
 
-/// Shared per-product short-id read-modify-write. Reads the current
-/// `next_value` from `table` for `product_id` (defaulting to 1 when no
-/// row exists yet), writes back `next_value + 1`, and returns the value
-/// just claimed. Must be called inside the same SQLite transaction as
-/// the row insert; SQLite serialises writers in WAL mode, so two
-/// concurrent inserts against the same product receive distinct ids.
-///
-/// `table` is a compile-time literal supplied by the three
-/// `pub(crate)` wrappers below (never caller/user input), so
-/// formatting it into the two SQL statements is not an injection
-/// surface.
-fn allocate_next_short_id(conn: &Connection, table: &str, product_id: &str) -> Result<i64> {
-    let current: i64 = conn
-        .query_row(
-            &format!("SELECT next_value FROM {table} WHERE product_id = ?1"),
-            [product_id],
-            |row| row.get(0),
-        )
-        .optional()?
-        .unwrap_or(1);
-    conn.execute(
-        &format!(
-            "INSERT INTO {table}(product_id, next_value) VALUES(?1, ?2)
-             ON CONFLICT(product_id) DO UPDATE SET next_value = excluded.next_value"
-        ),
-        params![product_id, current + 1],
-    )?;
-    Ok(current)
-}
-
-/// Allocate the next per-product `short_id` for a new `tasks` or
-/// `projects` row. Reads the current `next_value` from
-/// `short_id_sequences` for `product_id`, defaulting to 1 if no row
-/// exists yet, writes back `next_value + 1`, and returns the value
-/// just claimed. Must be called inside the same SQLite transaction as
-/// the row insert; SQLite serialises writers in WAL mode, so two
-/// concurrent inserts against the same product receive distinct ids.
-///
-/// See `tools/boss/docs/designs/friendly-numeric-ids-for-work-items.md`
-/// (Q3) for the reasoning behind the per-product scope and the
-/// in-transaction read-modify-write pattern.
-pub(crate) fn allocate_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
-    allocate_next_short_id(conn, "short_id_sequences", product_id)
-}
-
-/// Parallel to [`allocate_short_id`] for the `A<n>` automation namespace.
-/// Reads and advances `automation_short_id_sequences` for `product_id`.
-/// Must be called inside the same transaction as the `automations` row insert.
-/// See `tools/boss/docs/designs/maintenance-tasks.md` §"Short-id namespace".
-pub(crate) fn allocate_automation_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
-    allocate_next_short_id(conn, "automation_short_id_sequences", product_id)
-}
-
-/// Parallel to [`allocate_short_id`] for the attention-group `A<n>`
-/// namespace. Reads and advances `attention_group_short_id_sequences`
-/// for `product_id`. Must be called inside the same transaction as the
-/// `attention_groups` row insert. Attention groups get their own dense
-/// per-product counter (rather than sharing the tasks/projects sequence)
-/// so the first group in a busy product is `A1`, not `A<large>`.
-/// See `tools/boss/docs/designs/attentions.md` §"Schema and wire summary".
-pub(crate) fn allocate_attention_group_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
-    allocate_next_short_id(conn, "attention_group_short_id_sequences", product_id)
-}
-
-/// Parallel to [`allocate_short_id`] for the product-decision `D<n>`
-/// namespace. Reads and advances `decision_short_id_sequences` for
-/// `product_id`. Must be called inside the same transaction as the
-/// `product_decisions` row insert.
-pub(crate) fn allocate_decision_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
-    allocate_next_short_id(conn, "decision_short_id_sequences", product_id)
-}
-
-/// Parallel to [`allocate_short_id`] for the idea `I<n>` namespace. Reads
-/// and advances `idea_short_id_sequences` for `product_id`. Must be called
-/// inside the same transaction as the `ideas` row insert (own dense
-/// per-product counter, not the shared `short_id_sequences` tasks/chores/
-/// projects use).
-pub(crate) fn allocate_idea_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
-    allocate_next_short_id(conn, "idea_short_id_sequences", product_id)
-}
-
 /// Validate the `(execution_id, work_item_id)` discriminant on a
 /// `CreateAttentionItemInput` and return the canonical pair to write.
 /// Exactly one of the two must be set; both-set or neither-set is a
@@ -272,8 +191,8 @@ pub(crate) fn collect_product_dependencies(conn: &Connection, product_id: &str) 
 
 /// Hydrate the per-item runtime for every task and chore. This is the
 /// primary N+1 on the `get_work_tree` path: one call per work item, each
-/// running 1-4 point queries. Returns the runtimes alongside the total
-/// number of SQL statements executed, so [`crate::population_timing`] can
+/// running a handful of point queries. Returns the runtimes alongside the total
+/// number of database lookups made, so [`crate::population_timing`] can
 /// attribute the per-row subquery fan-out.
 pub(crate) fn collect_task_runtimes(
     conn: &Connection,
@@ -283,20 +202,28 @@ pub(crate) fn collect_task_runtimes(
 ) -> Result<(Vec<TaskRuntime>, u64)> {
     let mut runtimes = Vec::with_capacity(tasks.len() + chores.len());
     let mut queries = 0u64;
+    // The ordinal chain is the same for every row of a project; build it once
+    // from the tasks already in hand instead of re-reading siblings per row.
+    let chains = super::queued_wait::OrdinalChains::from_tasks(tasks.iter().chain(chores.iter()));
     for task in tasks.iter().chain(chores.iter()) {
-        runtimes.push(compute_task_runtime(conn, &task.id, &mut queries, now)?.runtime);
+        runtimes.push(compute_task_runtime(conn, &task.id, Some(task), Some(&chains), &mut queries, now)?.runtime);
     }
     Ok((runtimes, queries))
 }
 
-/// Runtime snapshot for a single work item. `queries` is incremented by the
-/// number of SQL statements this call actually executes (1-4, depending on
-/// whether a live-execution fallback, a non-abandoned-execution fallback for
-/// an all-abandoned work item, and a latest-run lookup are needed) so N+1
-/// callers can report an accurate aggregate subquery count.
-pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str, queries: &mut u64) -> Result<TaskRuntime> {
+/// Runtime snapshot for a single work item. `task` is the already-loaded row
+/// (`None` for a project or unknown id) so the dispatch-hold check can rule
+/// out non-pending rows without a query. The connection's SQLite statement
+/// observer counts every executed statement, including nested gate helpers,
+/// so the returned count measures SQL rather than helper invocations.
+pub(crate) fn query_task_runtime(
+    conn: &Connection,
+    work_item_id: &str,
+    task: Option<&Task>,
+    queries: &mut u64,
+) -> Result<TaskRuntime> {
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
-    Ok(compute_task_runtime(conn, work_item_id, queries, now)?.runtime)
+    Ok(compute_task_runtime(conn, work_item_id, task, None, queries, now)?.runtime)
 }
 
 /// A freshly computed runtime plus what the board runtime cache needs to know
@@ -328,14 +255,29 @@ pub(crate) struct ComputedRuntime {
 /// will serve it stale; `every_runtime_input_write_invalidates_exactly_its_item`
 /// in `work/tests/board_runtime_cache_tests.rs` is the net that catches a
 /// missed one, so a new runtime input needs a step added there.
-pub(crate) fn compute_task_runtime(
+pub(super) fn compute_task_runtime(
     conn: &Connection,
     work_item_id: &str,
+    task: Option<&Task>,
+    chains: Option<&super::queued_wait::OrdinalChains>,
+    queries: &mut u64,
+    now: i64,
+) -> Result<ComputedRuntime> {
+    super::db_diagnostics::count_queries(queries, || {
+        compute_task_runtime_inner(conn, work_item_id, task, chains, &mut 0, now)
+    })
+}
+
+fn compute_task_runtime_inner(
+    conn: &Connection,
+    work_item_id: &str,
+    task: Option<&Task>,
+    chains: Option<&super::queued_wait::OrdinalChains>,
     queries: &mut u64,
     now: i64,
 ) -> Result<ComputedRuntime> {
     let latest = query_latest_execution_for_work_item(conn, work_item_id)?;
-    *queries += 1;
+
     // `current_execution_id` (the operator-facing label for
     // `TaskRuntime.execution_id`) and the kanban card must follow the
     // execution a worker is actually attached to. A re-dispatch storm
@@ -354,7 +296,6 @@ pub(crate) fn compute_task_runtime(
     let execution = if latest_is_live {
         latest
     } else {
-        *queries += 1;
         match query_live_execution_for_work_item(conn, work_item_id)? {
             Some(live) => Some(live),
             // No live execution. If the latest row is an `abandoned`
@@ -366,16 +307,15 @@ pub(crate) fn compute_task_runtime(
             // execution for the item is abandoned. Steady state (latest is a
             // normal terminal / ready row) skips this extra lookup.
             None if latest_is_abandoned => {
-                *queries += 1;
                 query_last_non_abandoned_execution_for_work_item(conn, work_item_id)?.or(latest)
             }
             None => latest,
         }
     };
-    let wait = super::queued_wait::for_execution(conn, execution.as_ref(), now)?;
+    let wait = super::queued_wait::for_execution(conn, execution.as_ref(), task, chains, queries, now)?;
+    let dispatch_hold_reason = dispatch_hold_reason_for(conn, task, execution.as_ref(), queries)?;
     let (execution_status, run_status, execution_id, current_run_id, dispatch_retry_at, dispatch_wait_since) =
         if let Some(execution) = execution {
-            *queries += 1;
             let latest_run = query_latest_run(conn, &execution.id)?;
             let (run_status, run_id) = match latest_run {
                 Some((id, status)) => (Some(status), Some(id)),
@@ -418,10 +358,13 @@ pub(crate) fn compute_task_runtime(
         .maybe_dispatch_wait_since(dispatch_wait_since)
         .maybe_dispatch_not_before(wait.not_before)
         .maybe_dispatch_wait_blocker(wait.blocker)
+        .maybe_dispatch_hold_reason(dispatch_hold_reason)
         .build();
     Ok(ComputedRuntime {
-        runtime,
+        // The cache refreshes hold reasons on every hit; only execution/run
+        // fields and waits covered by the epoch can be reused.
         cacheable: !wait.reads_other_items,
+        runtime,
         expires_at,
     })
 }
@@ -595,26 +538,39 @@ pub(crate) fn reconcile_work_item_execution(
         );
         return Ok(());
     }
-    let insert_fresh = |result: &mut ExecutionReconcileResult, predecessor: Option<&WorkExecution>| -> Result<()> {
+    // Returns whether a row was minted: `false` when a decline-to-mint gate
+    // (bound PR, deliberate park, unresolved repo) applies.
+    let insert_fresh = |result: &mut ExecutionReconcileResult, predecessor: Option<&WorkExecution>| -> Result<bool> {
+        let declines = super::decline_log::DeclineLog::global();
+        let governing = predecessor.map(|execution| execution.id.as_str());
         if primary_pr_awaits_review(conn, work_item_id)? {
-            return Ok(());
+            if declines.entered(work_item_id, governing, DISPATCH_HOLD_PR_AWAITS_REVIEW) {
+                tracing::debug!(
+                    work_item_id,
+                    "reconcile: skipping execution mint — the row already has a PR awaiting review",
+                );
+            }
+            return Ok(false);
         }
         if work_item_is_deliberately_parked(conn, work_item_id)? {
-            tracing::info!(
-                work_item_id,
-                "reconcile: skipping execution mint — this row's run ended in a deliberate park \
-                 (`bossctl work start` resumes it)",
-            );
-            return Ok(());
+            if declines.entered(work_item_id, governing, DISPATCH_HOLD_DELIBERATELY_PARKED) {
+                tracing::info!(
+                    work_item_id,
+                    "reconcile: skipping execution mint — this row's run ended in a deliberate park \
+                     (`bossctl work start` resumes it)",
+                );
+            }
+            return Ok(false);
         }
         // Resolve through the single helper so per-row overrides beat the
         // product default (multi-repo design Q5). On a `None` we don't create
         // an execution row — instead a sticky `repo_unresolved` attention
         // item surfaces the problem in the kanban Attention lane.
+        declines.cleared(work_item_id);
         let Some(repo_remote_url) = resolve_repo_for_work_item(conn, work_item_id)? else {
             let label = repo_unresolved_kind_label(conn, work_item_id)?;
             record_repo_unresolved_attention(conn, work_item_id, label)?;
-            return Ok(());
+            return Ok(false);
         };
         // A merge-cancelled PR-review revision is converted to a followup in
         // place. Its exact prior workspace was persisted before teardown;
@@ -644,7 +600,8 @@ pub(crate) fn reconcile_work_item_execution(
                 .build(),
         )?;
         result.created.push(created);
-        Ok(())
+        declines.cleared(work_item_id);
+        Ok(true)
     };
 
     match query_latest_execution_for_work_item(conn, work_item_id)? {
@@ -677,9 +634,18 @@ pub(crate) fn reconcile_work_item_execution(
                 // scoped to the `Cancelled` case only — a completed or
                 // failed revision has no uncommitted edits worth reclaiming.
                 insert_fresh(result, Some(&execution))?;
+            } else if execution.status.is_terminal()
+                && query_live_execution_for_work_item(conn, work_item_id)?.is_none()
+                && let Some(task) = query_task(conn, work_item_id)?
+                && task.status == TaskStatus::Todo
+                && task.autostart
+            {
+                converge_stranded_autostart_row(conn, result, &task, &execution, &insert_fresh)?;
             }
         }
-        None => insert_fresh(result, None)?,
+        None => {
+            insert_fresh(result, None)?;
+        }
     }
 
     Ok(())
