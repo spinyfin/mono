@@ -932,7 +932,7 @@ impl ExecutionCoordinator {
         // main/automation rows are held. An `all_spawns` pause exempts
         // nothing, since dispatching a review would just burn another spawn
         // attempt against a spawn path that is suspect: the breaker's pause
-        // always has that scope (the app's spawn path itself is broken — see
+        // always has that scope (the engine's tmux spawn path itself is broken — see
         // `spawn_health.rs`), and an operator may choose it too.
         let pause = self.dispatch_pause();
         let paused = pause.is_some();

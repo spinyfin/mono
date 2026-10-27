@@ -636,9 +636,9 @@ impl ExecutionCoordinator {
     ///   keep that confirmation honest at the chokepoint rather than to
     ///   re-derive it.
     /// - [`DispatchAdmission::Critical`] — the human-only `critical`
-    ///   priority: admitted under an Operator-origin pause (that is the
+    ///   priority: admitted under a default-scope operator pause (that is the
     ///   pause the owner controls and the one the escape hatch exists to
-    ///   get past), held by a Breaker-origin pause exactly like
+    ///   get past), held by any all-spawns pause exactly like
     ///   [`DispatchAdmission::Queued`] — the spawn path is broken, so the
     ///   urgent row would only burn another attempt against it.
     pub fn dispatch_hold_for(&self, execution: &WorkExecution, admission: DispatchAdmission) -> Option<DispatchHold> {
@@ -705,12 +705,13 @@ impl ExecutionCoordinator {
                 ))
             }
             DispatchAdmission::Critical => {
-                if pause.origin == DispatchPauseOrigin::Operator {
+                if pause.accepts_pause_bypass() {
                     return None;
                 }
                 hold(format!(
-                    "dispatch is breaker-paused ({reason}) — a `critical` priority bypasses only an \
-                     operator pause, not a broken spawn path",
+                    "dispatch is paused (scope {scope}: {reason}) — a `critical` priority bypasses only \
+                     the default operator pause, not an all-spawns hold",
+                    scope = pause.scope.as_str(),
                     reason = pause.reason,
                 ))
             }

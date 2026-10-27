@@ -22,8 +22,6 @@ use boss_protocol::{DispatchPauseScope, ExecutionKind, PauseReason};
 use crate::dispatch_events::RecordingDispatchEventSink;
 use crate::spawn_health::{SpawnHealthTracker, TripSignal, maybe_admit_recovery_probe, trip_spawn_capability_circuit};
 
-const NOTHING_HAPPENS_WINDOW: Duration = Duration::from_millis(150);
-
 fn operator_pause(coordinator: &ExecutionCoordinator, scope: DispatchPauseScope) {
     coordinator.pause_dispatch_scoped(
         1_786_385_816,
@@ -34,6 +32,14 @@ fn operator_pause(coordinator: &ExecutionCoordinator, scope: DispatchPauseScope)
 }
 
 fn ready_review_pool_execution(db: &WorkDb, work_item_id: &str, kind: ExecutionKind) -> WorkExecution {
+    seed_local_claude_driver(db);
+    if kind == ExecutionKind::PrReviewGuide {
+        crate::test_support::insert_host_capability(db, "local", "driver=codex", "auto");
+        let (_, comparison) = seed_review_guide_series(db, work_item_id);
+        return db
+            .create_pr_review_guide_execution(&comparison, "https://github.com/test/repo")
+            .unwrap();
+    }
     db.create_execution(
         CreateExecutionInput::builder()
             .work_item_id(work_item_id.to_owned())
@@ -45,6 +51,40 @@ fn ready_review_pool_execution(db: &WorkDb, work_item_id: &str, kind: ExecutionK
 }
 
 const REVIEW_POOL_KINDS: [ExecutionKind; 2] = [ExecutionKind::PrReview, ExecutionKind::PrReviewGuide];
+
+#[tokio::test]
+async fn critical_admission_respects_operator_all_spawns_scope() {
+    let (_dir, db) = open_db();
+    let product = create_product(&db);
+    let work_item = create_active_chore(&db, &product, "Urgent repair");
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET priority = 'critical' WHERE id = ?1", [&work_item])
+        .unwrap();
+    let db = Arc::new(db);
+    let execution = create_ready_chore_execution(&db, &work_item);
+    let coordinator = make_dispatchable_coordinator(db.clone(), 4);
+
+    operator_pause(&coordinator, DispatchPauseScope::NewWork);
+    assert!(
+        coordinator
+            .dispatch_hold_for(&execution, DispatchAdmission::Critical)
+            .is_none()
+    );
+    operator_pause(&coordinator, DispatchPauseScope::AllSpawns);
+    let hold = coordinator
+        .dispatch_hold_for(&execution, DispatchAdmission::Critical)
+        .expect("critical priority cannot override an all-spawns hold");
+    assert!(hold.detail.contains("all_spawns"));
+    let admission = coordinator.evaluate_dispatch_admission(&work_item).await.unwrap();
+    assert!(admission.pause.active);
+    assert!(!admission.pause.overridable);
+    assert_eq!(admission.pause.scope, Some(DispatchPauseScope::AllSpawns));
+    coordinator.drain_ready_queue().await;
+    let held = db.get_execution(&execution.id).unwrap();
+    assert_eq!(held.status, ExecutionStatus::Ready);
+    assert_eq!(held.dispatch_wait_reason.as_deref(), Some("dispatch_paused"));
+}
 
 /// Drain-level: an all-spawns operator pause leaves a ready review-pool
 /// execution `ready` and un-spawned, for each review-pool kind.
@@ -66,9 +106,7 @@ async fn all_spawns_operator_pause_holds_ready_review_and_review_guide_execution
         let coordinator = Arc::new(coord);
 
         operator_pause(&coordinator, DispatchPauseScope::AllSpawns);
-        coordinator.kick();
-
-        sleep(NOTHING_HAPPENS_WINDOW).await;
+        coordinator.drain_ready_queue().await;
         assert_eq!(
             runner.calls.lock().await.len(),
             0,
@@ -84,46 +122,41 @@ async fn all_spawns_operator_pause_holds_ready_review_and_review_guide_execution
             "{kind:?}: a held execution must not lease a cube workspace"
         );
 
-        // It is held, not dropped: resume drains it. (Only a `pr_review` can
-        // actually spawn against these fakes — a review guide additionally
-        // needs a captured comparison — so the drain is asserted for it
-        // alone; the guide's hold is pinned at the chokepoint below.)
-        if kind == ExecutionKind::PrReview {
-            coordinator.resume_dispatch();
-            coordinator.kick();
-            wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
-        }
+        // Both review kinds drain once the operator resumes dispatch.
+        coordinator.resume_dispatch();
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
     }
 }
 
-/// The same pause with the default scope still lets a ready `pr_review`
-/// through the drain — the exemption is intentional and must not change. (The
-/// review guide's exemption is pinned at the chokepoint below.)
+/// The default scope lets both ready review kinds through the drain.
 #[tokio::test]
-async fn default_operator_pause_still_lets_a_ready_review_execution_through() {
-    let dir = tempdir().unwrap();
-    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-    let (_, chore_id) = make_pr_review_fixture(&db, None);
-    let execution = ready_review_pool_execution(&db, &chore_id, ExecutionKind::PrReview);
+async fn default_operator_pause_still_lets_ready_review_pool_executions_through() {
+    for kind in REVIEW_POOL_KINDS {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let (_, chore_id) = make_pr_review_fixture(&db, None);
+        let execution = ready_review_pool_execution(&db, &chore_id, kind);
 
-    let cube = Arc::new(FakeCubeClient::default());
-    let runner = Arc::new(FakeExecutionRunner {
-        pending: true,
-        ..FakeExecutionRunner::default()
-    });
-    let mut coord = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone());
-    coord.set_review_pool(WorkerPool::new_review(1));
-    let coordinator = Arc::new(coord);
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let mut coord = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone());
+        coord.set_review_pool(WorkerPool::new_review(1));
+        let coordinator = Arc::new(coord);
 
-    operator_pause(&coordinator, DispatchPauseScope::NewWork);
-    coordinator.kick();
-    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
+        operator_pause(&coordinator, DispatchPauseScope::NewWork);
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
 
-    assert_eq!(
-        runner.calls.lock().await.len(),
-        1,
-        "the default operator pause must keep exempting review-pool executions"
-    );
+        assert_eq!(
+            runner.calls.lock().await.len(),
+            1,
+            "the default operator pause must keep exempting review-pool executions"
+        );
+    }
 }
 
 /// Chokepoint-level: `dispatch_hold_for` — the single authority every spawn
@@ -209,7 +242,7 @@ async fn pause_bypass_override_is_refused_under_all_spawns_but_not_the_default_s
     assert!(!snapshot.accepts_pause_bypass());
 }
 
-/// **Item 4.** A breaker recovery probe must not be admitted under an
+/// A breaker recovery probe must not be admitted under an
 /// operator all-spawns pause — through the probe driver or the chokepoint —
 /// however long it has been since the last probe.
 #[tokio::test]

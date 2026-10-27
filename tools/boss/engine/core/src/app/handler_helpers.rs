@@ -63,7 +63,7 @@ pub(crate) const METADATA_KEY_DISPATCH_PAUSED_SINCE: &str = "dispatch_paused_sin
 pub(crate) const METADATA_KEY_DISPATCH_PAUSE_ORIGIN: &str = "dispatch_paused_origin";
 /// Metadata key storing the scope of the current pause — one of
 /// [`boss_protocol::DispatchPauseScope::as_str`]'s values — so a restart
-/// restores what the pause *held*, not just who paused. Absent or empty (a
+/// restores what the pause *held*, not just who paused. Absent (a
 /// pause persisted before this key existed) restores as the origin's default
 /// scope; an unrecognised value restores as the stricter `all_spawns` — see
 /// [`load_dispatch_pause_scope`]. `pub(crate)` for the same reason as the
@@ -493,7 +493,7 @@ pub(super) fn load_dispatch_paused_state(
     (paused, since_epoch_s, origin, reason)
 }
 
-/// Read the persisted scope of the dispatch pause. Absent or empty — a pause
+/// Read the persisted scope of the dispatch pause. Absent — a pause
 /// persisted before the scope key existed, which then behaved as its origin's
 /// default — restores as `origin`'s default scope. Anything else that is not
 /// a recognised scope restores as the stricter
@@ -505,8 +505,8 @@ pub(super) fn load_dispatch_pause_scope(
     origin: crate::coordinator::DispatchPauseOrigin,
 ) -> boss_protocol::DispatchPauseScope {
     match work_db.get_metadata(METADATA_KEY_DISPATCH_PAUSE_SCOPE).ok().flatten() {
-        Some(raw) if !raw.is_empty() => boss_protocol::DispatchPauseScope::from_persisted(&raw),
-        _ => origin.default_scope(),
+        Some(raw) => boss_protocol::DispatchPauseScope::from_persisted(&raw),
+        None => origin.default_scope(),
     }
 }
 

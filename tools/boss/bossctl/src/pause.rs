@@ -247,7 +247,7 @@ pub(super) fn dispatch_scope_lines(origin: &str, scope: DispatchPauseScope) -> V
     }
     lines.push("  bypass: `bossctl agents launch <id>` force-dispatches one execution through".to_owned());
     lines.push("          the pause — an explicit operator override, by design.".to_owned());
-    if reviews_exempt {
+    if scope == DispatchPauseScope::NewWork {
         lines.push("  bypass: work items at priority `critical` (human-set only) keep dispatching".to_owned());
         lines.push("          through an operator pause, and past the interactive concurrency cap.".to_owned());
     }

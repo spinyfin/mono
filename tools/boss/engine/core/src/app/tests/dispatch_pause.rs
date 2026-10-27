@@ -151,6 +151,36 @@ async fn default_pause_scope_keeps_reviews_exempt() {
     }
 }
 
+#[tokio::test]
+async fn explicit_scope_changes_an_existing_pause_without_resuming() {
+    let (state, _dir) = test_server_state();
+    pause_with_scope(&state, None).await;
+    for scope in [DispatchPauseScope::AllSpawns, DispatchPauseScope::NewWork] {
+        pause_with_scope(&state, Some(scope)).await;
+        let pause = state.execution_coordinator.dispatch_pause().expect("still paused");
+        assert_eq!(pause.scope, scope);
+        assert_eq!(pause.origin, DispatchPauseOrigin::Operator);
+        assert_eq!(
+            state
+                .work_db
+                .get_metadata(METADATA_KEY_DISPATCH_PAUSE_SCOPE)
+                .unwrap()
+                .as_deref(),
+            Some(scope.as_str())
+        );
+    }
+    // Taking ownership of a breaker hold must prevent automatic recovery.
+    state.execution_coordinator.pause_dispatch(
+        0,
+        DispatchPauseOrigin::Breaker,
+        boss_protocol::PauseReason::new("unhealthy spawn path").unwrap(),
+    );
+    pause_with_scope(&state, Some(DispatchPauseScope::AllSpawns)).await;
+    let pause = state.execution_coordinator.dispatch_pause().expect("still paused");
+    assert_eq!(pause.scope, DispatchPauseScope::AllSpawns);
+    assert_eq!(pause.origin, DispatchPauseOrigin::Operator);
+}
+
 /// A running engine reports no scope or origin, and resuming clears the
 /// persisted scope so a later pause cannot inherit it.
 #[tokio::test]
@@ -194,7 +224,7 @@ async fn resume_reports_no_scope_and_clears_persisted_scope() {
 #[tokio::test]
 async fn scope_survives_an_engine_restart_via_persisted_metadata() {
     for scope in [DispatchPauseScope::AllSpawns, DispatchPauseScope::NewWork] {
-        let (server_state, _dir) = test_server_state();
+        let (server_state, dir) = test_server_state();
         pause_with_scope(&server_state, Some(scope)).await;
         assert_eq!(
             server_state
@@ -205,13 +235,19 @@ async fn scope_survives_an_engine_restart_via_persisted_metadata() {
             Some(scope.as_str()),
         );
 
-        // "Restart": the in-memory pause is gone, the metadata is not.
-        server_state.execution_coordinator.resume_dispatch();
-        assert!(!server_state.execution_coordinator.is_dispatch_paused());
-        assert!(restore_persisted_dispatch_pause(
-            &server_state.work_db,
-            &server_state.execution_coordinator
+        // Reopen the database and construct a fresh server through the real
+        // startup path; no in-memory pause state survives.
+        drop(server_state);
+        let cfg = Arc::new(RuntimeConfig::from_parts(
+            crate::config::WorkConfig::builder()
+                .cwd(dir.path().to_path_buf())
+                .db_path(dir.path().join("state.db"))
+                .build(),
+            None,
         ));
+        let server_state =
+            ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, ServerStateOverrides::default())
+                .unwrap();
 
         let restored = server_state.execution_coordinator.dispatch_pause().expect("restored");
         assert_eq!(restored.scope, scope);
@@ -224,22 +260,23 @@ async fn scope_survives_an_engine_restart_via_persisted_metadata() {
 /// the review-exempt default, even for an operator-origin pause.
 #[tokio::test]
 async fn unrecognised_persisted_scope_restores_as_all_spawns() {
-    let (server_state, _dir) = test_server_state();
-    let db = &server_state.work_db;
-    db.set_metadata(METADATA_KEY_DISPATCH_PAUSED, "1").unwrap();
-    db.set_metadata(METADATA_KEY_DISPATCH_PAUSE_ORIGIN, "operator").unwrap();
-    db.set_metadata(METADATA_KEY_DISPATCH_PAUSE_SCOPE, "a_scope_from_the_future")
-        .unwrap();
+    for raw in ["a_scope_from_the_future", "", "   "] {
+        let (server_state, _dir) = test_server_state();
+        let db = &server_state.work_db;
+        db.set_metadata(METADATA_KEY_DISPATCH_PAUSED, "1").unwrap();
+        db.set_metadata(METADATA_KEY_DISPATCH_PAUSE_ORIGIN, "operator").unwrap();
+        db.set_metadata(METADATA_KEY_DISPATCH_PAUSE_SCOPE, raw).unwrap();
 
-    assert!(restore_persisted_dispatch_pause(
-        db,
-        &server_state.execution_coordinator
-    ));
+        assert!(restore_persisted_dispatch_pause(
+            db,
+            &server_state.execution_coordinator
+        ));
 
-    let restored = server_state.execution_coordinator.dispatch_pause().expect("restored");
-    assert_eq!(restored.origin, DispatchPauseOrigin::Operator);
-    assert_eq!(restored.scope, DispatchPauseScope::AllSpawns);
-    assert!(restored.reviews_held());
+        let restored = server_state.execution_coordinator.dispatch_pause().expect("restored");
+        assert_eq!(restored.origin, DispatchPauseOrigin::Operator);
+        assert_eq!(restored.scope, DispatchPauseScope::AllSpawns);
+        assert!(restored.reviews_held());
+    }
 }
 
 /// A pause persisted before the scope key existed behaved as its origin's

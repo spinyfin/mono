@@ -720,11 +720,18 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
     };
     {
         let coordinator = &server_state.execution_coordinator;
-        let already = coordinator.is_dispatch_paused();
-        if already == paused {
-            // Idempotent: no-op but still respond with the current state.
+        let current = coordinator.dispatch_pause();
+        let scope_changed = paused
+            && scope.is_some_and(|requested| {
+                current.as_ref().is_some_and(|pause| {
+                    pause.scope != requested || pause.origin != crate::coordinator::DispatchPauseOrigin::Operator
+                })
+            });
+        if current.is_some() == paused && !scope_changed {
+            // Repeating the same pause is idempotent. An explicit scope
+            // change replaces the pause without briefly resuming dispatch.
             tracing::debug!(paused, "set_dispatch_paused: idempotent no-op");
-            send_response(&sink, &request_id, dispatch_state_result(coordinator.dispatch_pause()));
+            send_response(&sink, &request_id, dispatch_state_result(current));
             return;
         }
         // A pause with no usable reason is rejected outright — dispatch must
