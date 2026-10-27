@@ -233,6 +233,7 @@ async fn deferred_admission_query_includes_a_prior_cycle_terminal_review() {
     .unwrap();
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::PrReview)
             .status(crate::work::ExecutionStatus::Completed)

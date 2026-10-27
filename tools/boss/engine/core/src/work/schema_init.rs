@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 55;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 56;
 
 /// Schema 43: the baseline commit a recovery record was created at, the
 /// pointer-reconciliation note for the worker prompt, and the retirement
@@ -338,6 +338,40 @@ const VERDICT_REVISION_INDEX_55: &str = "CREATE INDEX IF NOT EXISTS pr_review_ve
          WHERE revision_task_id IS NOT NULL AND revision_task_id != '';
      DROP INDEX IF EXISTS idx_tasks_parent_task_id;";
 
+/// Schema 56: execution creation provenance. Every `work_executions` insert
+/// names the code path (or external caller) that minted the row, so a
+/// surprising re-dispatch can be attributed without reading engine logs.
+pub(in crate::work) const EXECUTIONS_CREATED_VIA_56: &str = "ALTER TABLE work_executions ADD COLUMN created_via TEXT";
+
+/// Schema 56: why the engine last moved a task's `status`. Engine writers
+/// stamp it alongside `last_status_actor = 'engine'`; human/boss moves clear
+/// it so a value always describes the current status.
+pub(in crate::work) const TASKS_STATUS_REASON_56: &str = "ALTER TABLE tasks ADD COLUMN status_reason TEXT";
+
+/// Schema 56: the status-transition ledger and the trigger that feeds it.
+/// Trigger-fed on purpose: every `tasks.status` write — engine sweep,
+/// cascade, kanban drag, migration — is recorded with the actor and the
+/// writer's `status_reason`, so no code path can change a status without
+/// leaving a row here. Served by `FrontendRequest::ListTaskStatusTransitions`.
+pub(in crate::work) const TASK_STATUS_AUDIT_56: &str = "CREATE TABLE IF NOT EXISTS task_status_audit (
+         id          INTEGER PRIMARY KEY,
+         task_id     TEXT NOT NULL,
+         from_status TEXT NOT NULL,
+         to_status   TEXT NOT NULL,
+         actor       TEXT NOT NULL,
+         reason      TEXT,
+         changed_at  TEXT NOT NULL
+     );
+     CREATE INDEX IF NOT EXISTS task_status_audit_task_idx ON task_status_audit(task_id, id);
+     CREATE TRIGGER IF NOT EXISTS tasks_status_audit_trigger
+         AFTER UPDATE OF status ON tasks
+         WHEN OLD.status IS NOT NEW.status
+     BEGIN
+         INSERT INTO task_status_audit (task_id, from_status, to_status, actor, reason, changed_at)
+         VALUES (NEW.id, OLD.status, NEW.status, NEW.last_status_actor, NEW.status_reason,
+                 CAST(strftime('%s', 'now') AS TEXT));
+     END";
+
 // Derive requirements once from the fresh-database SQL, but check every DB.
 static BASELINE_OBJECTS: std::sync::LazyLock<Result<std::collections::BTreeSet<String>>> =
     std::sync::LazyLock::new(|| {
@@ -407,10 +441,6 @@ impl WorkDb {
         if version < 38 {
             tx.execute_batch("ALTER TABLE work_executions ADD COLUMN dispatch_wait_blocker_id TEXT")?;
         }
-        if version < 39 {
-            // Data only: restart items blocked by the false ancestry failure.
-            execution_recovery_rearm::migrate(&tx, execution_recovery_rearm::is_false_not_descended_blocker)?;
-        }
         if version < 40 {
             tx.execute_batch("ALTER TABLE ci_remediations ADD COLUMN queue_base_sha TEXT")?;
         }
@@ -422,11 +452,6 @@ impl WorkDb {
         }
         if version < 43 {
             tx.execute_batch(EXECUTION_BOOKMARK_COLUMNS_43)?;
-            // Restart items wedged by baseline loss or diverged pointers.
-            execution_recovery_rearm::migrate(
-                &tx,
-                boss_engine_recovery::execution_bookmark::is_legacy_reconcilable_blocker,
-            )?;
         }
         if version < 44 {
             tx.execute_batch(TASKS_PR_URL_INDEX_SQL)?;
@@ -468,6 +493,30 @@ impl WorkDb {
         }
         if version < 55 {
             tx.execute_batch(VERDICT_REVISION_INDEX_55)?;
+        }
+        // Column adds are guarded like schema 46: a replay against a database
+        // that already carries them must be a no-op.
+        if version < 56 {
+            if !table_has_column(&tx, "work_executions", "created_via")? {
+                tx.execute_batch(EXECUTIONS_CREATED_VIA_56)?;
+            }
+            if !table_has_column(&tx, "tasks", "status_reason")? {
+                tx.execute_batch(TASKS_STATUS_REASON_56)?;
+            }
+            tx.execute_batch(TASK_STATUS_AUDIT_56)?;
+        }
+        // Data repairs use current row mappers and writers, including provenance.
+        // Run them after the structural migrations while retaining their original gates.
+        if version < 39 {
+            // Data only: restart items blocked by the false ancestry failure.
+            execution_recovery_rearm::migrate(&tx, execution_recovery_rearm::is_false_not_descended_blocker)?;
+        }
+        if version < 43 {
+            // Restart items wedged by baseline loss or diverged pointers.
+            execution_recovery_rearm::migrate(
+                &tx,
+                boss_engine_recovery::execution_bookmark::is_legacy_reconcilable_blocker,
+            )?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
@@ -1072,6 +1121,11 @@ mod floor_tests {
             if version >= 55 {
                 conn.execute_batch(VERDICT_REVISION_INDEX_55).unwrap();
             }
+            if version >= 56 {
+                conn.execute_batch(EXECUTIONS_CREATED_VIA_56).unwrap();
+                conn.execute_batch(TASKS_STATUS_REASON_56).unwrap();
+                conn.execute_batch(TASK_STATUS_AUDIT_56).unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -1116,6 +1170,9 @@ mod floor_tests {
             expected.execute_batch(BOARD_REVIEW_EPOCH_53).unwrap();
             expected.execute_batch(TASKS_PARENT_KIND_INDEX_54).unwrap();
             expected.execute_batch(VERDICT_REVISION_INDEX_55).unwrap();
+            expected.execute_batch(EXECUTIONS_CREATED_VIA_56).unwrap();
+            expected.execute_batch(TASKS_STATUS_REASON_56).unwrap();
+            expected.execute_batch(TASK_STATUS_AUDIT_56).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

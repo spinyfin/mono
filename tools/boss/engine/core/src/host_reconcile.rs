@@ -435,6 +435,7 @@ mod tests {
         let execution_id = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(work_item_id)
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Ready)

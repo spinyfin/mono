@@ -25,6 +25,7 @@ fn seed_execution_for_chore(db: &WorkDb, product_id: &str, label: &str) -> Strin
     let chore = create_test_chore(db, product_id.to_owned(), label.to_owned());
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore.id)
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Ready)

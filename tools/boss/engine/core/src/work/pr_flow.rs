@@ -153,12 +153,23 @@ impl WorkDb {
             WorkerPrCompletionTarget::BlockedDeletionSignoff => Some(DELETION_SIGNOFF_BLOCKED_REASON),
             _ => None,
         };
+        // Status provenance for the audit ledger: which completion target
+        // produced this write. `PendingReview` leaves the status where it
+        // is (the hold), but the stamp still records that the row is now
+        // held for review rather than merely "active".
+        let status_reason = match target {
+            WorkerPrCompletionTarget::PendingReview => "pr_completion:pending_review_hold",
+            WorkerPrCompletionTarget::InReview => "pr_completion:in_review",
+            WorkerPrCompletionTarget::Done => "pr_completion:done",
+            WorkerPrCompletionTarget::BlockedDeletionSignoff => "pr_completion:blocked_deletion_signoff",
+        };
         tx.execute(
             "UPDATE tasks
              SET status             = ?2,
                  pr_url             = ?3,
                  updated_at         = ?4,
                  last_status_actor  = 'engine',
+                 status_reason      = ?6,
                  blocked_reason     = ?5,
                  blocked_attempt_id = NULL,
                  completed_at       = COALESCE(completed_at, CASE WHEN ?2 IN ('done','archived') THEN ?4 END)
@@ -168,7 +179,8 @@ impl WorkDb {
                 new_status.as_str(),
                 pr_url_for_task,
                 now,
-                blocked_reason_for_task
+                blocked_reason_for_task,
+                status_reason
             ],
         )?;
 
@@ -388,6 +400,7 @@ impl WorkDb {
              SET status             = ?2,
                  updated_at         = ?3,
                  last_status_actor  = 'engine',
+                 status_reason      = 'no_op_completion:no_changes_needed',
                  blocked_reason     = NULL,
                  blocked_attempt_id = NULL,
                  completed_at       = COALESCE(completed_at, CASE WHEN ?2 IN ('done','archived') THEN ?3 END)
@@ -583,7 +596,8 @@ impl WorkDb {
                 tx.execute(
                     "UPDATE tasks
                      SET status = 'blocked', blocked_reason = ?4, blocked_detail = ?2,
-                         autostart = 0, last_status_actor = 'engine', updated_at = ?3
+                         autostart = 0, last_status_actor = 'engine',
+                         status_reason = 'run_failed:blocked_for_human', updated_at = ?3
                      WHERE id = ?1 AND deleted_at IS NULL AND status IN ('active', 'todo')",
                     params![
                         work_item_id,
@@ -1023,7 +1037,8 @@ impl WorkDb {
             "UPDATE tasks
              SET status            = 'in_review',
                  updated_at        = ?2,
-                 last_status_actor = 'engine'
+                 last_status_actor = 'engine',
+                 status_reason     = 'review_hold_released:no_reviewer_enqueued'
              WHERE id = ?1
                AND status = 'active'
                AND pr_url IS NOT NULL
@@ -1076,7 +1091,8 @@ impl WorkDb {
             "UPDATE tasks
              SET status            = 'in_review',
                  updated_at        = ?2,
-                 last_status_actor = 'engine'
+                 last_status_actor = 'engine',
+                 status_reason     = 'review_hold_released:verdict_recorded'
              WHERE id = ?1
                AND status = 'active'
                AND pr_url IS NOT NULL
@@ -1125,6 +1141,7 @@ impl WorkDb {
                  pr_url            = ?2,
                  updated_at        = ?3,
                  last_status_actor = 'engine',
+                 status_reason     = 'late_pr_detected:bound',
                  blocked_reason    = NULL,
                  blocked_attempt_id = NULL
              WHERE id = ?1
@@ -1253,6 +1270,7 @@ impl WorkDb {
                  pr_url            = ?2,
                  updated_at        = ?3,
                  last_status_actor = 'engine',
+                 status_reason     = 'abandoned_branch_pr_sweep:bound',
                  blocked_reason    = NULL,
                  blocked_attempt_id = NULL
              WHERE id = ?1
@@ -1340,6 +1358,7 @@ impl WorkDb {
                  pr_url             = ?2,
                  updated_at         = ?3,
                  last_status_actor  = 'engine',
+                 status_reason      = 'pr_merged:done',
                  blocked_reason     = NULL,
                  blocked_attempt_id = NULL,
                  merge_queue_state  = NULL,
@@ -1444,6 +1463,7 @@ impl WorkDb {
              SET status             = 'done',
                  updated_at         = ?3,
                  last_status_actor  = 'engine',
+                 status_reason      = 'pr_closed_unmerged:done',
                  blocked_reason     = NULL,
                  blocked_attempt_id = NULL,
                  merge_queue_state  = NULL,
@@ -2353,7 +2373,7 @@ fn restart_after_answer(
     super::description_guard::validate_description_update(&task.description, &description, false)?;
     tx.execute(
         "UPDATE tasks SET description = ?2, status = 'todo', blocked_reason = NULL,
-         blocked_detail = NULL, autostart = 1, last_status_actor = 'human', updated_at = ?3 WHERE id = ?1",
+         blocked_detail = NULL, autostart = 1, last_status_actor = 'human', status_reason = NULL, updated_at = ?3 WHERE id = ?1",
         params![task.id, description, now],
     )?;
     let asking = query_execution(tx, &question.execution_id).require("execution", &question.execution_id)?;
@@ -2365,6 +2385,7 @@ fn restart_after_answer(
             .maybe_preferred_workspace_id(asking.preferred_workspace_id)
             .entry_point(DispatchAdmissionEntryPoint::OperatorAnswer)
             .explicit_start(true)
+            .created_via("operator_answer:restart")
             .build(),
         // Match request_execution's conservative behavior when
         // no live-worker oracle is supplied.

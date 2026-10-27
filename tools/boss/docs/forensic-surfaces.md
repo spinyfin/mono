@@ -178,6 +178,59 @@ Gap: review-findings follow-up work parented elsewhere links back via
 `tasks.origin_task_short_id` / `origin_pr_number`, populated on only
 27 / 4,132 rows in the measurement corpus.
 
+## 3. Execution creation provenance and task status transitions
+
+Two durable columns in `state.db` answer "which code path created this
+execution?" and "why did the engine move this row?" — the two questions
+that were unanswerable when completed revisions were observed being
+re-dispatched while held for review.
+
+### `work_executions.created_via`
+
+Every execution insert names its creator. Engine paths use their own
+name (`reconcile_revision_execution`, `reconcile_work_item_execution`,
+`orphan_sweep`, `rescan_active_dispatch`, `reconcile_active_dispatch`,
+`dispatch_failure_recovery_sweep`, `pr_completion:reviewer_enqueue`,
+`review_batch:leaf` / `:supervisor` / `:post_merge` /
+`:dead_member_retry`, `request_pr_review`, `transient_recovery:resume`,
+`scheduler:preemption_requeue`, `coordinator:slot_busy_requeue`,
+`operator_answer:*`, `schema_migration:execution_recovery_rearm`,
+`automation_schedule:triage`, `comment:answer_agent`,
+`review_guide:job`); the human-facing RPCs use `frontend:*`
+(`frontend:request_execution`, `frontend:update_work_item_status`,
+`frontend:create_automation_task`). A wire `CreateExecution` from a
+client that does not send the field records `unspecified`; rows that
+predate schema 53 read as null.
+
+Surfaced by `boss task executions --json` and in the `executions`
+array of `boss task show --json` (field `created_via`), and in the text
+history row.
+
+### `tasks.status_reason` and the `task_status_audit` ledger
+
+`tasks.status_reason` is the engine's stated basis for the row's
+current status (`execution_run_started`,
+`pr_completion:pending_review_hold`,
+`review_hold_released:verdict_recorded`,
+`dependency_cascade:prerequisites_satisfied`,
+`merge_conflict_detected`, `pr_merged:done`, …). Every engine status
+write stamps it; a human/boss move clears it, so a non-null value always
+describes the status the row is in now.
+
+`task_status_audit` is appended by a database trigger on every
+`tasks.status` change — engine sweep, cascade, kanban drag, migration —
+with the previous and new status, `last_status_actor`, the writer's
+`status_reason`, and the epoch time. Because it is trigger-fed, no code
+path can change a status without leaving a row. Surfaced as
+`status_transitions` in `boss task show --json` (and a "Status
+transitions" block in the text output), via
+`FrontendRequest::ListTaskStatusTransitions`.
+
+Reading an incident: a revision whose ledger shows `in_review → active`
+with reason `execution_run_started`, and whose newest execution's
+`created_via` is a sweep or reconciler rather than `frontend:*`, was
+re-opened by the engine, not by a person.
+
 ## Related
 
 - Lifecycle audit events: [`tools/boss/app-macos/README.md`](../app-macos/README.md)

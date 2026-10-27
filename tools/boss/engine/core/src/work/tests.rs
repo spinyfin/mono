@@ -88,6 +88,7 @@ fn product_task_execution_with_prefix(db: &WorkDb, worker_branch_prefix: Option<
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(task.id.clone())
                 .kind(ExecutionKind::TaskImplementation)
                 .status(ExecutionStatus::Ready)
@@ -194,6 +195,7 @@ fn seed_execution_for(db: &WorkDb, product_id: &str, project_id: &str) -> WorkEx
         .unwrap();
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(task.id)
             .kind(ExecutionKind::TaskImplementation)
             .status(ExecutionStatus::Ready)
@@ -278,6 +280,7 @@ fn make_waiting_human_chore(db: &WorkDb, label: &str) -> (String, String, String
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -489,6 +492,7 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
         human_driven: false,
         completion_summary: None,
         last_status_actor: "human".to_owned(),
+        status_reason: None,
         priority: "medium".to_owned(),
         created_via: "cli".to_owned(),
         repo_remote_url: None,
@@ -579,6 +583,7 @@ mod review_batches_tests;
 mod review_guide_state_tests;
 mod review_verdict_apply_tests;
 mod review_verdicts_tests;
+mod revision_redispatch_tests;
 mod revision_sequencing;
 mod semantic_progress_tests;
 mod short_id_alloc_tests;

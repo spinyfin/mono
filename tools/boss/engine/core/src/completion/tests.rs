@@ -769,6 +769,7 @@ fn ci_remediation_fixture(workspace_path: &Path) -> (TempDir, Arc<WorkDb>, Strin
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::CiRemediation)
                 .status(ExecutionStatus::Ready)
@@ -995,6 +996,7 @@ fn revision_fixture_no_execution_pr_url(
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -1030,6 +1032,7 @@ fn abandoned_execution_fixture() -> (TempDir, Arc<WorkDb>, String, String, Strin
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -1097,6 +1100,7 @@ fn revision_fixture(
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -1226,6 +1230,7 @@ fn pure_rebase_revision_fixture(
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -1410,6 +1415,7 @@ fn conflict_revision_fixture(
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -1520,6 +1526,7 @@ fn ci_revision_fixture_with_kind(
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -1696,6 +1703,7 @@ fn pr_review_exec_fixture_with_jsonl(
     let pr_review_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)

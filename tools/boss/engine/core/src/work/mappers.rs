@@ -238,6 +238,10 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // future spawn path must not source a work item from a list query.
         design_reasoning_effort_xhigh: false,
         last_status_actor: row.get(13)?,
+        status_reason: {
+            let index = row.as_ref().column_index("status_reason")?;
+            row.get::<_, Option<String>>(index)?.filter(|s| !s.is_empty())
+        },
         priority: row.get(14)?,
         created_via: row.get(15)?,
         blocked_reason: row.get(16)?,
@@ -623,6 +627,18 @@ pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
             .transpose()?,
         pr_head_after: row.get(29)?,
         last_error: row.get::<_, Option<String>>(30)?.filter(|s| !s.is_empty()),
+        // Looked up by name: the execution SELECT lists are hand-maintained
+        // and a few append join columns after `last_error`, so a positional
+        // read would alias the wrong column there. A SELECT that omits the
+        // column yields `None` (same as a pre-schema-53 row).
+        created_via: row
+            .as_ref()
+            .column_index("created_via")
+            .ok()
+            .map(|index| row.get::<_, Option<String>>(index))
+            .transpose()?
+            .flatten()
+            .filter(|s| !s.is_empty()),
     })
 }
 

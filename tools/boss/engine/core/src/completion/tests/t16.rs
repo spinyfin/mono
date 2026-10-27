@@ -718,6 +718,7 @@ fn add_predecessor_execution(db: &WorkDb, task_id: &str) -> String {
     let predecessor = db
         .create_execution(
             boss_protocol::CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(task_id)
                 .kind(boss_protocol::ExecutionKind::ChoreImplementation)
                 .status(boss_protocol::ExecutionStatus::Completed)

@@ -196,6 +196,7 @@ pub(crate) fn demote_active_if_latest_execution(
         "UPDATE tasks
          SET status             = 'todo',
              last_status_actor  = 'engine',
+             status_reason      = 'execution_stopped:demoted_to_backlog',
              updated_at         = ?2
          WHERE id              = ?1
            AND status          = 'active'

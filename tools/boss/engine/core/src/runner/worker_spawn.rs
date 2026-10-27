@@ -2785,6 +2785,7 @@ mod compose_worker_spawn_tests {
         let execution = db
             .create_execution(
                 crate::work::CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&chore.id)
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(ExecutionStatus::Ready)

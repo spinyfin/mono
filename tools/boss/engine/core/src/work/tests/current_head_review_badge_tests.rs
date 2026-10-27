@@ -14,6 +14,7 @@ fn verdict(db: &WorkDb, owner: &str, sha: &str, outcome: &'static str) -> String
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(owner)
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -294,6 +295,7 @@ fn complete_revision_execution(db: &WorkDb, revision: &str, head_after: Option<&
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision)
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)

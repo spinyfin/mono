@@ -705,6 +705,7 @@ impl WorkDb {
                  archived_by = ?28, archived_at = ?29, design_reasoning_effort_xhigh = ?30,
                  critical_set_by = ?31, critical_set_at = ?32,
                  last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END,
+                 status_reason = CASE WHEN ?8 = '' THEN status_reason ELSE NULL END,
                  completed_at = CASE
                      WHEN ?4 IN ('done', 'archived') THEN COALESCE(completed_at, ?7)
                      ELSE NULL

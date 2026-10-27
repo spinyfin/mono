@@ -547,6 +547,7 @@ async fn release_worker_pane_holds_the_pool_claim_when_the_app_never_confirms() 
         .work_db
         .create_execution(
             boss_protocol::CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(boss_protocol::ExecutionKind::ChoreImplementation)
                 .status(boss_protocol::ExecutionStatus::Completed)
@@ -619,6 +620,7 @@ async fn verify_sweep_handback(disconnected: bool) {
         .work_db
         .create_execution(
             boss_protocol::CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(boss_protocol::ExecutionKind::ChoreImplementation)
                 .status(boss_protocol::ExecutionStatus::Completed)

@@ -246,6 +246,9 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
         r @ FrontendRequest::ListRuns { .. } => Box::pin(executions::handle_list_runs(ctx, r)),
         r @ FrontendRequest::ListTasks { .. } => Box::pin(work_items::handle_list_tasks(ctx, r)),
         r @ FrontendRequest::ListRevisions { .. } => Box::pin(work_items::handle_list_revisions(ctx, r)),
+        r @ FrontendRequest::ListTaskStatusTransitions { .. } => {
+            Box::pin(work_items::handle_list_task_status_transitions(ctx, r))
+        }
         r @ FrontendRequest::ListWorkerLiveStates => Box::pin(panes::handle_list_worker_live_states(ctx, r)),
         r @ FrontendRequest::ListTmuxWorkerStatuses => Box::pin(panes::handle_list_tmux_worker_statuses(ctx, r)),
         r @ FrontendRequest::MarkCiRemediationFailed { .. } => {

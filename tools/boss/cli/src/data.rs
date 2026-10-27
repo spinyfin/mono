@@ -1699,9 +1699,10 @@ fn print_execution_history_row(detail: &ExecutionRuns) {
     let workspace = exec.cube_workspace_id.as_deref().unwrap_or("-");
     let started = exec.started_at.as_deref().unwrap_or("-");
     let finished = exec.finished_at.as_deref().unwrap_or("-");
+    let created_via = exec.created_via.as_deref().unwrap_or("-");
     println!(
-        "{}  [{}]  kind={}  workspace={}  created={}  started={}  finished={}",
-        exec.id, exec.status, exec.kind, workspace, exec.created_at, started, finished,
+        "{}  [{}]  kind={}  workspace={}  created={}  created_via={}  started={}  finished={}",
+        exec.id, exec.status, exec.kind, workspace, exec.created_at, created_via, started, finished,
     );
     if let Some(pr_url) = &exec.pr_url {
         println!("  pr_url: {pr_url}");

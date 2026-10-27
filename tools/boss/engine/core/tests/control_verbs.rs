@@ -1685,6 +1685,7 @@ async fn board_drop_inside_merging_group_does_not_complete_the_merge() -> Result
     )?;
     let attachment_execution = work_db.create_execution(
         boss_protocol::CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Ready)

@@ -107,6 +107,14 @@ fn ci_fix_revision_question_answered_yes_resumes_after_attempt_retired() {
     assert_eq!(after_answer.len(), 2, "{after_answer:?}");
     let (resume_exec, resume_status) = after_answer[1].clone();
     assert_eq!(resume_status, "ready");
+    assert_eq!(
+        db.get_execution(&resume_exec).unwrap().created_via.as_deref(),
+        Some("operator_answer:restart")
+    );
+    let transition = db.list_task_status_transitions(&revision_id).unwrap().pop().unwrap();
+    assert_eq!(transition.to_status, "todo");
+    assert_eq!(transition.actor, "human");
+    assert_eq!(transition.reason, None);
     let attempt = db.get_ci_remediation(&rem_id).unwrap().unwrap();
     assert_eq!(
         attempt.status, "pending",

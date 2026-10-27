@@ -272,6 +272,7 @@ pub async fn run_one_pass(
             &work_item_id,
             RequestExecutionInput::builder()
                 .work_item_id(work_item_id.clone())
+                .created_via("dispatch_failure_recovery_sweep")
                 .build(),
             is_live,
         ) {

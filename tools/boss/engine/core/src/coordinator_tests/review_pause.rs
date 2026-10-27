@@ -207,6 +207,7 @@ async fn pr_review_with_pr_url_positions_via_goto_not_create_change() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -267,6 +268,7 @@ async fn pr_review_lease_failure_records_start_failure() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -324,6 +326,7 @@ async fn pr_review_goto_failure_records_positioning_failed() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -381,6 +384,7 @@ async fn pr_review_without_pr_url_uses_create_change_path() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -440,6 +444,7 @@ async fn operator_pause_exempts_ready_pr_review_execution() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -536,6 +541,7 @@ async fn breaker_pause_holds_pr_review_execution_too() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)

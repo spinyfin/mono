@@ -2515,9 +2515,11 @@ PR #379. PR #379.";
                 "pr_url must NOT be stamped from description text — got {:?}",
                 t.pr_url,
             );
-            assert_ne!(
-                t.last_status_actor, "engine",
-                "engine must NOT be the last status actor when no PR was bound",
+            assert_eq!(t.last_status_actor, "engine");
+            assert_eq!(
+                t.status_reason.as_deref(),
+                Some("execution_run_started"),
+                "no PR completion transition may overwrite the run-start provenance",
             );
         }
         other => panic!("expected chore, got {other:?}"),

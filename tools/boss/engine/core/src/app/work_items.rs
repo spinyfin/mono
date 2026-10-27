@@ -148,6 +148,37 @@ pub(super) async fn handle_list_tasks(ctx: Dispatch, req: FrontendRequest) {
     }
 }
 
+pub(super) async fn handle_list_task_status_transitions(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::ListTaskStatusTransitions { id } = req else {
+        unreachable!()
+    };
+    let work_item_id = match server_state.resolve_work_item_id(&id).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
+    };
+    match work_db.list_task_status_transitions(&work_item_id) {
+        Ok(transitions) => send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::TaskStatusTransitions {
+                work_item_id,
+                transitions,
+            },
+        ),
+        Err(err) => send_work_error(&sink, &request_id, &err),
+    }
+}
+
 pub(super) async fn handle_list_revisions(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -939,6 +970,7 @@ pub(super) async fn apply_work_item_patch(
                             .bypass_dispatch_pause(true)
                             .explicit_start(true)
                             .entry_point(DispatchAdmissionEntryPoint::AppDrag)
+                            .created_via("frontend:update_work_item_status")
                             .maybe_observed_pause_since_epoch_s(bypass.observed_pause_since_epoch_s)
                             .build();
                         match coordinator
@@ -973,6 +1005,7 @@ pub(super) async fn apply_work_item_patch(
                         let dispatch_input = RequestExecutionInput::builder()
                             .work_item_id(work_item_id_for_event.clone())
                             .explicit_start(true)
+                            .created_via("frontend:update_work_item_status")
                             .build();
                         match work_db
                             .request_execution_with_live_check(dispatch_input, |run_id| live_states.is_run_live(run_id))

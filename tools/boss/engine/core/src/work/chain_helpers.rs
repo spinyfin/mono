@@ -157,6 +157,7 @@ pub(crate) fn flip_in_review_revisions_to_done(conn: &Connection, chain_root_id:
              SET status            = 'done',
                  updated_at        = ?2,
                  last_status_actor = 'engine',
+                 status_reason     = 'parent_pr_merged:revision_done',
                  blocked_reason    = NULL,
                  blocked_attempt_id = NULL,
                  completed_at      = COALESCE(completed_at, ?2)
@@ -328,6 +329,7 @@ pub(crate) fn archive_revision_task(
              archived_at       = ?2,
              archived_reason   = ?4,
              last_status_actor = 'engine',
+             status_reason     = 'revision_archived',
              updated_at        = ?2,
              completed_at      = COALESCE(completed_at, ?2),
              deleted_at        = ?2,
@@ -453,6 +455,7 @@ pub(crate) fn resolve_revision_on_parent_close(
                  SET status             = 'done',
                      updated_at         = ?2,
                      last_status_actor  = 'engine',
+                     status_reason      = 'parent_pr_merged:completed_revision_done',
                      blocked_reason     = NULL,
                      blocked_attempt_id = NULL,
                      merge_queue_state  = NULL,

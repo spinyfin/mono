@@ -1669,6 +1669,15 @@ pub enum FrontendRequest {
         include_deleted: bool,
     },
 
+    /// Read-only: every recorded `tasks.status` transition for one work
+    /// item, oldest first — the status-provenance ledger behind `boss task
+    /// show --json`'s `status_transitions`. Accepts a friendly short id or a
+    /// primary `task_…` id. Replies with
+    /// [`FrontendEvent::TaskStatusTransitions`].
+    ListTaskStatusTransitions {
+        id: String,
+    },
+
     /// Read tmux's current session evidence for every live worker. This is
     /// intentionally on-demand rather than part of the hook-driven live-state
     /// push, because every response shells out to tmux.

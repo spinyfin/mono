@@ -180,6 +180,54 @@ pub(crate) fn primary_pr_awaits_review(conn: &Connection, work_item_id: &str) ->
     }))
 }
 
+/// The revision counterpart of [`primary_pr_awaits_review`]: a `kind =
+/// 'revision'` row whose most recent `revision_implementation` execution
+/// reached `completed` has delivered its contribution to the chain root's
+/// PR. From that point its lifecycle is owned by review/merge handling —
+/// the `PendingReview` hold (row left `active` with a terminal execution
+/// while the reviewer batch runs against the *chain root*), the verdict
+/// that advances it to `in_review`, and the parent PR's merge that closes
+/// it — and **no automatic path may mint another implementation
+/// execution for it**. Doing so re-runs already-landed work and, when the
+/// run starts, `start_execution_run` pulls the row from `in_review` back
+/// to `active` (incident: completed revisions re-dispatched by the product
+/// reconciler while held for review).
+///
+/// What legitimately re-opens a delivered revision is an *explicit* start
+/// — a kanban drag to Doing, `bossctl work start`, or a Yes answer to its
+/// question — which goes through `request_execution_in_tx_with_live_check`
+/// and is deliberately not gated here. New review findings never re-open a
+/// revision either: they create a new sibling revision. A revision whose
+/// latest implementation execution ended any other way (`failed`,
+/// `orphaned`, `abandoned`, `cancelled`) is NOT delivered and stays
+/// eligible for the ordinary recovery sweeps.
+///
+/// Scoped to the latest `revision_implementation` row, not the latest row
+/// of any kind, so a later `pr_review` attached to the revision cannot mask
+/// the delivery. Takes `&Connection` so transactional callers need not
+/// re-lock the DB.
+pub(crate) fn revision_delivery_awaits_review(conn: &Connection, work_item_id: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM tasks t
+             JOIN work_executions latest ON latest.id = (
+                 SELECT id FROM work_executions
+                 WHERE work_item_id = t.id
+                   AND kind = 'revision_implementation'
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1
+             )
+             WHERE t.id = ?1
+               AND t.kind = 'revision'
+               AND t.deleted_at IS NULL
+               AND latest.status = 'completed'
+         )",
+        params![work_item_id],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(Into::into)
+}
+
 #[work_db_boundary::instrument]
 impl WorkDb {
     pub(crate) fn dispatch_admission_facts(&self, work_item_id: &str) -> Result<DispatchAdmissionFacts> {
@@ -432,6 +480,7 @@ mod deliberate_parked_fact_tests {
     fn abandoned_execution(db: &crate::work::WorkDb, work_item_id: &str) -> String {
         db.create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(work_item_id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Abandoned)

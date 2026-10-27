@@ -661,6 +661,7 @@ fn revision_execution_resolves_to_the_canonical_pr_root() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.id)
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)

@@ -39,6 +39,7 @@ impl Board {
         self.db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(work_item_id)
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(status)

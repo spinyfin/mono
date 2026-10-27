@@ -877,6 +877,7 @@ fn live_batch_supervisor() -> (Arc<ServerState>, tempfile::TempDir, String, Stri
         .work_db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(work_item_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)

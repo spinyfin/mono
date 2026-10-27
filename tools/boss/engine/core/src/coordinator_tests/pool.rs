@@ -460,6 +460,7 @@ async fn merge_conflict_revision_outranks_older_ready_chore_for_a_single_free_sl
     let revision_execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision_id)
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -566,6 +567,7 @@ async fn running_worker_is_never_preempted_by_a_higher_dispatch_class_arrival() 
     let revision_execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision_id)
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -1096,6 +1098,7 @@ async fn heal_ghost_active_demotes_chores_without_run_history() {
     let real_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(real.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -1347,6 +1350,7 @@ async fn worker_release_redispatches_active_chore_with_terminal_execution() {
     .unwrap();
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(stuck.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Failed)
@@ -1407,6 +1411,7 @@ async fn worker_release_skips_no_autostart_active_chore() {
     .unwrap();
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(parked.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Failed)
@@ -1639,6 +1644,7 @@ async fn force_dispatch_pr_review_claims_review_pool_worker_and_preserves_review
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id)
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -2473,6 +2479,7 @@ fn ready_chore_execution(db: &WorkDb, product_id: &str, name: &str, repo_remote_
     let chore = create_test_chore(db, product_id.to_owned(), name);
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Ready)
@@ -2625,6 +2632,7 @@ async fn duplicate_ready_rows_for_one_work_item_do_not_both_abandon() {
         ids.push(
             db.create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id.clone())
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(ExecutionStatus::Ready)
@@ -2731,6 +2739,7 @@ async fn a_chain_sibling_defers_behind_a_dispatch_still_in_flight() {
     let revision_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id("task_rev_inflight")
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -2742,6 +2751,7 @@ async fn a_chain_sibling_defers_behind_a_dispatch_still_in_flight() {
     let root_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root_id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)

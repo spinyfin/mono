@@ -185,6 +185,7 @@ pub const PROGRESSION_ALLOWED_VERBS: &[&str] = &[
     "ListDependenciesDetailed",
     "ListExecutions",
     "ListOperatorQuestions",
+    "ListTaskStatusTransitions",
     "ListProductDesignDocs",
     "ListProducts",
     "ListProjects",
@@ -216,6 +217,9 @@ fn worker_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         // An answer is operator authorization; a worker cannot grant its own.
         FrontendRequest::AnswerOperatorQuestion { .. } => coordinator(variant_name(request)),
         FrontendRequest::ListOperatorQuestions { .. } => Allow,
+        // Read-only status-provenance ledger; same exposure as the task row
+        // it describes.
+        FrontendRequest::ListTaskStatusTransitions { .. } => Allow,
         // ── Allowed: taxonomy reads ──────────────────────────────────────
         //
         // The model half of the isolation boundary. Nothing here mutates,

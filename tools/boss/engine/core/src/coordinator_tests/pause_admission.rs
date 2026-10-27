@@ -80,6 +80,7 @@ fn operator_pause(coordinator: &ExecutionCoordinator) {
 fn ready_pr_review_execution(db: &WorkDb, work_item_id: &str) -> WorkExecution {
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(work_item_id.to_owned())
             .kind(ExecutionKind::PrReview)
             .status(ExecutionStatus::Ready)

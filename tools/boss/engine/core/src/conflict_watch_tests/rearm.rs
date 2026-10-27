@@ -442,6 +442,7 @@ async fn rearm_supersedes_blocked_parent_when_revision_execution_died_in_restart
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(dead_revision.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Running)

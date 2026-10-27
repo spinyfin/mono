@@ -156,7 +156,8 @@ pub(crate) fn convert_revision_to_review_findings_followup(
              merge_queue_state    = NULL,
              merge_queue_detail   = NULL,
              completed_at         = NULL,
-             last_status_actor    = 'engine'
+             last_status_actor    = 'engine',
+             status_reason        = 'review_findings:converted_to_followup'
          WHERE id = ?1
            AND kind = 'revision'
            AND deleted_at IS NULL",

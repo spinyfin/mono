@@ -163,6 +163,7 @@ async fn execution_reconciler_persists_a_revision_capture_on_its_canonical_root(
     let execution = work_db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.id)
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -559,6 +560,7 @@ async fn revision_completion_coalesces_from_published_head_and_failure_keeps_pre
             let execution = db
                 .create_execution(
                     CreateExecutionInput::builder()
+                        .created_via("test")
                         .work_item_id(&revision.id)
                         .kind(ExecutionKind::RevisionImplementation)
                         .status(ExecutionStatus::Completed)

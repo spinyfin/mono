@@ -2063,6 +2063,7 @@ fn in_review_chore_execution_returns_execution_id_when_in_review() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(boss_protocol::ExecutionKind::ChoreImplementation)
                 .status(boss_protocol::ExecutionStatus::Ready)
@@ -2170,6 +2171,7 @@ fn active_to_todo_execution_returns_execution_id() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(boss_protocol::ExecutionKind::ChoreImplementation)
                 .status(boss_protocol::ExecutionStatus::Running)
@@ -2224,6 +2226,7 @@ fn live_execution_for_task_id_returns_execution_id_when_running() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(boss_protocol::ExecutionKind::ChoreImplementation)
                 .status(boss_protocol::ExecutionStatus::Running)
@@ -2251,6 +2254,7 @@ fn live_execution_for_task_id_returns_none_when_terminal() {
         let (_dir, db, _, chore_id) = make_work_db_with_chore();
         db.create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(boss_protocol::ExecutionKind::ChoreImplementation)
                 .status(status.clone())
@@ -2279,6 +2283,7 @@ fn live_execution_for_task_id_finds_execution_after_row_is_tombstoned() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(boss_protocol::ExecutionKind::ChoreImplementation)
                 .status(boss_protocol::ExecutionStatus::Running)
@@ -2321,6 +2326,7 @@ fn live_execution_for_task_id_returns_none_for_product() {
     let product = create_test_product_with_repo(&db, "Prod", Some("https://github.com/test/repo"));
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(product.id.clone())
             .kind(boss_protocol::ExecutionKind::ProductDesign)
             .status(boss_protocol::ExecutionStatus::Running)

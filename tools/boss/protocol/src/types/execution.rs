@@ -307,10 +307,32 @@ pub const EXECUTION_KIND_ANSWER_AGENT: &str = "answer_agent";
 /// attempt supersedes the verdict.
 pub const BLOCKED_REASON_CI_FLAKY_RETRIGGERED: &str = "ci_flaky_retriggered";
 
+/// `created_via` value stamped on an execution row whose creator did not
+/// say why it was inserted (a wire `CreateExecution` from a client that
+/// predates the field). Every engine-internal insert names its code path
+/// instead — the whole point of the column is that a re-dispatch can be
+/// traced to the code that minted it.
+pub const EXECUTION_CREATED_VIA_UNSPECIFIED: &str = "unspecified";
+
+fn default_execution_created_via() -> String {
+    EXECUTION_CREATED_VIA_UNSPECIFIED.to_owned()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct CreateExecutionInput {
     pub work_item_id: String,
+    /// Creation provenance: the code path (or caller) that inserted this
+    /// execution row, e.g. `reconcile_revision_execution`, `orphan_sweep`,
+    /// `frontend:request_execution`. Required at every engine construction
+    /// site so a surprising execution can always be traced back to the
+    /// path that minted it; defaults to
+    /// [`EXECUTION_CREATED_VIA_UNSPECIFIED`] only when deserialised from a
+    /// client that does not send it. Persisted as
+    /// `work_executions.created_via` and surfaced on
+    /// [`WorkExecution::created_via`].
+    #[serde(default = "default_execution_created_via")]
+    pub created_via: String,
     /// When `true`, cube will be invoked with `--allow-dirty` so it
     /// reclaims the preferred workspace with uncommitted work intact.
     /// Set on recovery redispatches and merge-cancelled review followups.
@@ -684,6 +706,15 @@ pub struct RequestExecutionInput {
     #[builder(default)]
     pub explicit_start: bool,
 
+    /// Creation provenance for the execution this request mints, copied
+    /// onto `work_executions.created_via` (see
+    /// [`CreateExecutionInput::created_via`]). Engine sweeps and handlers
+    /// name themselves here (`orphan_sweep`, `rescan_active_dispatch`,
+    /// `frontend:request_execution`, ...); `None` records the generic
+    /// `request_execution` label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_via: Option<String>,
+
     pub preferred_workspace_id: Option<String>,
     pub priority: Option<i64>,
     /// Host selected for this one dispatch request. This is intentionally
@@ -768,6 +799,15 @@ pub struct WorkExecution {
     /// starts. `None` when this execution has never failed to start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+
+    /// Creation provenance: which engine code path (or external caller)
+    /// inserted this execution row — see
+    /// [`CreateExecutionInput::created_via`]. `None` only for rows that
+    /// predate the column. Surfaced by `boss task executions --json` /
+    /// `boss task show --json` so a re-dispatch can be attributed to the
+    /// path that minted it without reading engine logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_via: Option<String>,
 
     /// When `true`, the cube workspace preference (`preferred_workspace_id`)
     /// is treated as a warmth hint only: if the preferred workspace is

@@ -24,6 +24,7 @@ fn seed_investigation_with_execution(db: &WorkDb) -> (Task, WorkExecution) {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(investigation.id.clone())
                 .kind(ExecutionKind::InvestigationImplementation)
                 .status(ExecutionStatus::Ready)

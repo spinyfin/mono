@@ -265,6 +265,7 @@ fn pr_review_executions_record_the_pool_driver_over_a_row_pin() {
     let review = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -311,6 +312,7 @@ fn conflict_resolution_and_ci_remediation_stay_on_claude_regardless_of_the_split
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id.clone())
                     .kind(kind.clone())
                     .status(ExecutionStatus::Ready)
@@ -356,6 +358,7 @@ fn conflict_resolution_and_ci_remediation_yield_a_codex_task_pin_to_claude() {
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id.clone())
                     .kind(kind.clone())
                     .status(ExecutionStatus::Ready)
@@ -403,6 +406,7 @@ fn conflict_resolution_and_ci_remediation_yield_a_codex_product_pin_to_claude() 
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id.clone())
                     .kind(kind.clone())
                     .status(ExecutionStatus::Ready)

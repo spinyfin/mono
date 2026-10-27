@@ -1083,6 +1083,7 @@ fn assert_started_execution_keeps_base_in_review(db: &WorkDb, base_id: &str) {
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(base_id.to_owned())
                 .kind(kind)
                 .status(ExecutionStatus::Ready)
@@ -1334,6 +1335,7 @@ fn redispatching_in_review_base_with_no_revision_stays_in_review() {
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(base_id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -1534,6 +1536,7 @@ fn live_execution_elsewhere_in_chain_finds_live_root_from_revision() {
     let root_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root_id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -1563,6 +1566,7 @@ fn live_execution_elsewhere_in_chain_finds_live_revision_from_root() {
     let rev_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::WaitingHuman)
@@ -1593,6 +1597,7 @@ fn live_execution_elsewhere_in_chain_ignores_self_and_terminal() {
     // from the root (it's the work item we're asking about).
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(root_id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Running)
@@ -1603,6 +1608,7 @@ fn live_execution_elsewhere_in_chain_ignores_self_and_terminal() {
     // A TERMINAL execution on the revision — must not count as live.
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(revision.id.clone())
             .kind(ExecutionKind::RevisionImplementation)
             .status(ExecutionStatus::Completed)
@@ -1627,6 +1633,7 @@ fn live_execution_elsewhere_in_chain_noop_for_choreless_chain() {
 
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore_id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Running)
@@ -1668,6 +1675,7 @@ fn reviewer_fallback_refuses_while_impl_exec_live() {
     // fallback candidate — but a live implementation resume is also present.
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore_id.clone())
             .kind(ExecutionKind::PrReview)
             .status(ExecutionStatus::Abandoned)
@@ -1676,6 +1684,7 @@ fn reviewer_fallback_refuses_while_impl_exec_live() {
     .unwrap();
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore_id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Running)
@@ -1703,6 +1712,7 @@ fn reviewer_fallback_keeps_live_reviewer_in_doing() {
 
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore_id.clone())
             .kind(ExecutionKind::PrReview)
             .status(ExecutionStatus::Running)
@@ -1734,6 +1744,7 @@ fn starting_pr_review_keeps_in_review_base_in_review() {
     let review = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -1784,6 +1795,7 @@ fn start_execution_run_pr_review_still_clears_autostart() {
     let review = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -1824,6 +1836,7 @@ fn start_execution_run_non_review_keeps_autostart_on_in_review_root() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -1963,6 +1976,7 @@ fn get_work_tree_instrumented_reports_task_runtime_nplus1() {
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id.clone())
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(ExecutionStatus::Running)
@@ -2160,6 +2174,7 @@ fn reconcile_does_not_create_duplicate_when_pr_review_live() {
     let pr_review = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Running)

@@ -326,13 +326,14 @@ pub fn create_test_chore_manual(db: &WorkDb, product_id: impl Into<String>, name
 /// `work_item_id` and return it.
 ///
 /// Replaces the byte-identical
-/// `create_execution(CreateExecutionInput::builder().work_item_id(..)
+/// `create_execution(CreateExecutionInput::builder().created_via("test").work_item_id(..)
 /// .kind(ChoreImplementation).status(Ready).build())` that the
 /// completion, runner, and coordinator test modules hand-roll ~33
 /// times, so a new field on [`CreateExecutionInput`] touches one site.
 pub fn create_ready_chore_execution(db: &WorkDb, work_item_id: impl Into<String>) -> WorkExecution {
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(work_item_id)
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Ready)

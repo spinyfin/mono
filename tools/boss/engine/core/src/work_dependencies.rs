@@ -351,6 +351,24 @@ fn same_revision_chain(conn: &Connection, a: &str, b: &str) -> Result<bool> {
     Ok(crate::work::chain_root(conn, a)? == crate::work::chain_root(conn, b)?)
 }
 
+/// Whether `task_id` has a `revision_implementation` execution that has not
+/// terminated — queued (`queued`/`ready`/`waiting_dependency`), claimed for
+/// spawn, or live. For an `in_review` revision this means it has been
+/// re-opened and is going to push to the chain's PR again.
+fn revision_has_pending_implementation(conn: &Connection, task_id: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM work_executions
+             WHERE work_item_id = ?1
+               AND kind = 'revision_implementation'
+               AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed', 'running', 'waiting_human')
+         )",
+        params![task_id],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(Into::into)
+}
+
 /// Return the prerequisite ids that currently *gate* `work_item_id`
 /// — `blocks` edges whose prereq has not reached a satisfied
 /// status. Used by both the dispatcher (to demote a gated dependent
@@ -385,11 +403,21 @@ pub fn gating_prereqs_for(conn: &Connection, work_item_id: &str) -> Result<Vec<S
                 // its own chain's open PR. A prerequisite outside that chain
                 // (an unrelated task linked by a prerequisite question) must
                 // actually land before the revision runs.
-                if dependent_kind.as_deref() == Some("revision")
-                    && s == "in_review"
-                    && !same_revision_chain(conn, work_item_id, &edge.prerequisite_id)?
-                {
-                    gating.push(edge.prerequisite_id);
+                if dependent_kind.as_deref() == Some("revision") && s == "in_review" {
+                    if !same_revision_chain(conn, work_item_id, &edge.prerequisite_id)? {
+                        gating.push(edge.prerequisite_id);
+                    } else if revision_has_pending_implementation(conn, &edge.prerequisite_id)? {
+                        // The prerequisite revision has been re-opened: a
+                        // queued or live `revision_implementation` execution
+                        // is about to rewrite the same branch this dependent
+                        // builds on. `in_review` describes what it delivered
+                        // *before* that re-open, so it no longer satisfies.
+                        // Without this the dependent runs first and the
+                        // prerequisite's re-run lands on top of it
+                        // (dependency inversion); with it the dependent waits
+                        // `waiting_dependency` until the re-run terminates.
+                        gating.push(edge.prerequisite_id);
+                    }
                 }
             }
             _ => gating.push(edge.prerequisite_id),

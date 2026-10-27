@@ -71,7 +71,7 @@ pub enum ReviewBatchDispatch {
         batch: ReviewBatch,
         executions: Vec<WorkExecution>,
     },
-    LegacyExecution(WorkExecution),
+    LegacyExecution(Box<WorkExecution>),
     /// The review pool's weighted reservation accounting (see
     /// [`can_admit_review_batch_in_tx`]) has no room for a new batch of this
     /// target's phase right now. No batch and no member executions were
@@ -1059,6 +1059,7 @@ pub(crate) fn try_advance_review_batch_quorum_in_tx(
                 let execution = insert_execution(
                     tx,
                     CreateExecutionInput::builder()
+                        .created_via("review_batch:supervisor")
                         .work_item_id(batch.cycle_root_id.clone())
                         .kind(ExecutionKind::PrReview)
                         .status(ExecutionStatus::Ready)
@@ -1324,7 +1325,7 @@ impl WorkDb {
                     );
                 }
                 tx.commit()?;
-                return Ok(ReviewBatchDispatch::LegacyExecution(execution));
+                return Ok(ReviewBatchDispatch::LegacyExecution(Box::new(execution)));
             }
         }
         // Checked here — after ExistingBatch/LegacyExecution, before the
@@ -1370,6 +1371,7 @@ impl WorkDb {
                 insert_execution(
                     &tx,
                     CreateExecutionInput::builder()
+                        .created_via("review_batch:leaf")
                         .work_item_id(input.cycle_root_id.clone())
                         .kind(ExecutionKind::PrReview)
                         .status(ExecutionStatus::Ready)
@@ -1429,6 +1431,7 @@ impl WorkDb {
         let execution = insert_execution(
             &tx,
             CreateExecutionInput::builder()
+                .created_via("review_batch:post_merge")
                 .work_item_id(input.cycle_root_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -1824,6 +1827,7 @@ impl WorkDb {
         let retry = insert_execution(
             &tx,
             CreateExecutionInput::builder()
+                .created_via("review_batch:dead_member_retry")
                 .work_item_id(dead.work_item_id)
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)

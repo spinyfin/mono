@@ -8,6 +8,7 @@ use super::*;
 fn seed_ready_execution(db: &WorkDb, chore_id: &str) -> WorkExecution {
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore_id)
             .kind(ExecutionKind::TaskImplementation)
             .status(ExecutionStatus::Ready)
@@ -105,6 +106,9 @@ fn queued_wait_payload_names_the_actual_revision_prerequisite() {
     let from_tree = tree.task_runtimes.iter().find(|r| r.work_item_id == second.id).unwrap();
     assert_eq!(serde_json::to_value(from_tree).unwrap(), json);
 
+    // Review status satisfies the edge only after its implementation finishes.
+    db.force_execution_status_for_test(&first.id, ExecutionStatus::Completed)
+        .unwrap();
     db.update_work_item(
         &first.id,
         WorkItemPatch {
@@ -133,6 +137,7 @@ fn queued_wait_payload_preserves_holds_and_clears_the_blocker() {
     let blocker_execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&blocker.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -240,6 +245,7 @@ fn queued_wait_chain_hold_survives_claimed_blocker_and_clears_when_terminal() {
     let blocker_execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&blocker.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)

@@ -776,6 +776,7 @@ pub async fn on_ci_failure_detected(
             if attempt.attempt_kind == "retrigger" {
                 match work_db.create_execution(
                     CreateExecutionInput::builder()
+                        .created_via("test")
                         .work_item_id(candidate.work_item_id.clone())
                         .kind(ExecutionKind::CiRemediation)
                         .status(ExecutionStatus::Ready)
@@ -2737,6 +2738,7 @@ pub async fn rescue_stranded_ci_remediation_attempt(
 ) -> bool {
     match work_db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(attempt.work_item_id.clone())
             .kind(ExecutionKind::CiRemediation)
             .status(ExecutionStatus::Ready)

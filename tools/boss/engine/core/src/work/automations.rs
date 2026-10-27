@@ -303,7 +303,7 @@ impl WorkDb {
                     ci_required_state, review_required_state, ci_required_detail,
                     review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha,
                     source_automation_id,
-                      (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
+                      (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question, tasks.status_reason AS status_reason
                FROM tasks
               WHERE source_automation_id = ?1
                 AND status IN ({OPEN_SIBLING_STATUSES})
@@ -454,7 +454,7 @@ impl WorkDb {
                     ci_required_state, review_required_state, ci_required_detail,
                     review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha,
                     source_automation_id,
-                      (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
+                      (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question, tasks.status_reason AS status_reason
                FROM tasks
               WHERE source_automation_id = ?1
                 AND deleted_at IS NULL
@@ -484,7 +484,7 @@ impl WorkDb {
                     ci_required_state, review_required_state, ci_required_detail,
                     review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha,
                     source_automation_id,
-                      (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
+                      (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question, tasks.status_reason AS status_reason
                FROM tasks
               WHERE product_id = ?1
                 AND source_automation_id IS NOT NULL
@@ -522,7 +522,7 @@ impl WorkDb {
                     ci_required_state, review_required_state, ci_required_detail,
                     review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha,
                     source_automation_id,
-                      (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
+                      (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question, tasks.status_reason AS status_reason
                FROM tasks
               WHERE product_id = ?1
                 AND source_automation_id IS NOT NULL
@@ -866,8 +866,8 @@ impl WorkDb {
                 id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at, prefer_is_soft, pr_url, worker_branch_prefix,
-                allow_dirty, branch_naming
-             ) VALUES (?1, ?2, ?3, 'ready', ?4, NULL, NULL, NULL, NULL, 0, NULL, ?5, NULL, NULL, 0, NULL, NULL, 0, ?6)",
+                allow_dirty, branch_naming, created_via
+             ) VALUES (?1, ?2, ?3, 'ready', ?4, NULL, NULL, NULL, NULL, 0, NULL, ?5, NULL, NULL, 0, NULL, NULL, 0, ?6, 'automation_schedule:triage')",
             params![
                 id,
                 automation_id,

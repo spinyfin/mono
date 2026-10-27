@@ -312,6 +312,7 @@ async fn damaged_historical_checkpoint_cannot_skip_retirement_or_deletion_signof
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&chore_id)
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(ExecutionStatus::Completed)
@@ -387,6 +388,7 @@ async fn speculative_rewrite_restores_original_baseline_before_next_goto() {
     let prior = db
         .create_execution(
             crate::work::CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id)
                 .kind(boss_protocol::ExecutionKind::ChoreImplementation)
                 .status(boss_protocol::ExecutionStatus::Completed)
@@ -475,6 +477,7 @@ mod rebase_adoption {
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&chore_id)
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(ExecutionStatus::Completed)
@@ -538,6 +541,7 @@ mod rebase_adoption {
             .db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(revision.id)
                     .kind(ExecutionKind::RevisionImplementation)
                     .status(ExecutionStatus::Completed)
@@ -745,6 +749,7 @@ mod rebase_adoption {
             .db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&fx.chore_id)
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(ExecutionStatus::Failed)
@@ -838,6 +843,7 @@ mod rebase_adoption {
             .db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(revision.id)
                     .kind(ExecutionKind::RevisionImplementation)
                     .status(ExecutionStatus::Running)

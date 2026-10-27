@@ -246,6 +246,7 @@ async fn sweep_reports_real_unpushed_revisions_independent_of_original_workspace
             let prior = db
                 .create_execution(
                     CreateExecutionInput::builder()
+                        .created_via("test")
                         .work_item_id(chore.id)
                         .kind(ExecutionKind::RevisionImplementation)
                         .status(ExecutionStatus::Ready)
@@ -337,6 +338,7 @@ async fn missing_pointer_is_reported_instead_of_skipped_by_the_sweep() {
     let prior = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)

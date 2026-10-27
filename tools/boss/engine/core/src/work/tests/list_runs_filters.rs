@@ -13,6 +13,7 @@ fn list_runs_includes_completed_row_under_running_execution_with_null_model() {
     let running = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -22,6 +23,7 @@ fn list_runs_includes_completed_row_under_running_execution_with_null_model() {
     let completed = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Completed)

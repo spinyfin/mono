@@ -927,6 +927,7 @@ async fn run_one_pass_filtered(
         let new_execution = match work_db.request_execution_with_live_check(
             RequestExecutionInput::builder()
                 .work_item_id(work_item_id.clone())
+                .created_via("orphan_sweep")
                 .build(),
             is_live,
         ) {
