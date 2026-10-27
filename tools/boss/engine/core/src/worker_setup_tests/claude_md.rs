@@ -12,6 +12,21 @@ fn claude_md_mentions_workspace_and_lease() {
 }
 
 #[test]
+fn claude_md_with_pr_created_seam_teaches_declaration_and_printed_url_redundancy() {
+    let mut input = sample_input();
+    input.pr_created_proposals_seam_enabled = true;
+    let rendered = claude_md_for(&input);
+    assert!(
+        rendered.contains("boss propose pr-created --url"),
+        "seam-on CLAUDE.md must teach the PR-created declaration",
+    );
+    assert!(
+        rendered.contains("Also print the PR URL on its own line"),
+        "seam-on CLAUDE.md must retain the printed-URL redundancy during the soak",
+    );
+}
+
+#[test]
 fn claude_md_explains_origin_is_the_real_github_upstream() {
     // Workers must be told that in a (shared-store) cube workspace `origin`
     // IS the real GitHub upstream, that `jj git push` reaches GitHub, and
