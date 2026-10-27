@@ -3,6 +3,7 @@
 // does.
 use super::*;
 mod invariant;
+mod recovery;
 
 /// A chore or followup worker that stops blocked on a human decision parks
 /// on a question card exactly like a task does: an `open` question row, the

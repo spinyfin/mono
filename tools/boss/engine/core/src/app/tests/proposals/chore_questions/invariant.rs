@@ -2,7 +2,7 @@ use super::*;
 use boss_protocol::{TaskKind, TaskStatus};
 use rusqlite::{OptionalExtension, params};
 
-fn fixture(
+pub(super) fn fixture(
     kind: &TaskKind,
     status: &TaskStatus,
     deleted: bool,
@@ -25,7 +25,7 @@ fn fixture(
                 &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
             )
             .unwrap();
-        if matches!(status, TaskStatus::Blocked | TaskStatus::Done | TaskStatus::Archived) {
+        if matches!(status, TaskStatus::Done | TaskStatus::Archived) {
             state
                 .work_db
                 .connect()
@@ -168,6 +168,17 @@ async fn exercise(kind: &TaskKind, status: &TaskStatus, payload: Value, answer: 
     let members = state.work_db.list_attentions_for_group(&group.id).unwrap();
     assert_eq!(members.len(), 1);
     let prompt = members[0].prompt_text.as_deref().unwrap();
+    let heading: String = state
+        .work_db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT 'Question from T' || short_id || ' ' || name FROM tasks WHERE id = ?1",
+            [&task],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(prompt.starts_with(&heading));
     assert!(prompt.contains(payload["question"]["explanation"].as_str().unwrap()));
     if prerequisite {
         assert!(prompt.contains("Fix the retention-cleanup fixture race"));
@@ -196,7 +207,7 @@ async fn exercise(kind: &TaskKind, status: &TaskStatus, payload: Value, answer: 
     assert!(description.contains(&format!("**Answer:** {answer}")));
     assert_eq!(
         produced_kind,
-        if *status == TaskStatus::InReview {
+        if *status == TaskStatus::InReview || (*kind == TaskKind::Revision && *status == TaskStatus::Blocked) {
             "revision"
         } else if group.association_project_id.is_some() {
             "design"
@@ -227,6 +238,27 @@ async fn exercise(kind: &TaskKind, status: &TaskStatus, payload: Value, answer: 
         assert_eq!(brief, "The shared fixture races retention cleanup. Fix it on main.");
     } else {
         assert!(deps.prerequisites.is_empty());
+    }
+    if *kind == TaskKind::Revision && *status == TaskStatus::Blocked {
+        let execution_status: String = state
+            .work_db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM work_executions WHERE work_item_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                [produced],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            execution_status,
+            if prerequisite && answer == "yes" {
+                "waiting_dependency"
+            } else {
+                "ready"
+            }
+        );
+        assert!(state.work_db.gating_prereqs_for(&task).unwrap().contains(produced));
     }
     let actual: String = state
         .work_db

@@ -886,12 +886,18 @@ fn action_question_group(
     {
         brief.push_str(&format!("\n## Original work: {}\n\n{}\n", task.name, task.description));
     }
+    let recovery_source = source.as_ref().filter(|task| {
+        group.grouping_key.starts_with("worker_question|")
+            && task.kind == TaskKind::Revision
+            && task.status == TaskStatus::Blocked
+    });
     let name = question_artifact_name(group);
 
     if let Some(parent_task_id) = group.source_task_id.as_deref().filter(|s| !s.is_empty()) {
         let input = CreateRevisionInput::builder()
             .parent_task_id(parent_task_id)
             .description(brief.clone())
+            .autostart(recovery_source.is_none())
             .name(name.clone())
             .created_via(CREATED_VIA_ATTENTION)
             // Deliberately left on the inherit side (unlike the
@@ -902,6 +908,9 @@ fn action_question_group(
             .build();
         match assert_parent_revisable_and_insert(pending, conn, input, pr_checker) {
             Ok(revision) => {
+                if let Some(source) = recovery_source {
+                    worker_questions::order_recovery_in_tx(pending, conn, source, &revision)?;
+                }
                 let reference = serde_json::json!({
                     "task_id": revision.id,
                     "short_id": revision.short_id,
@@ -1284,9 +1293,8 @@ impl WorkDb {
 }
 
 // ===========================================================================
-// attention_merges — provenance ledger (P1203 task 1). `AttentionMerge`
-// itself lives in `boss_protocol` so it can ride the wire (P1203 task 8 —
-// the Notifications UI reads it via `ListAttentionMerges`).
+// attention_merges — provenance ledger. AttentionMerge lives in boss_protocol
+// so the Notifications UI can read it through ListAttentionMerges.
 // ===========================================================================
 
 /// Input for inserting one `attention_merges` row.

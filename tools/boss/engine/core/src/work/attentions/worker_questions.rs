@@ -8,7 +8,13 @@ pub(crate) fn create_in_tx(
     execution_id: &str,
     question: &OperatorQuestion,
 ) -> Result<(Attention, AttentionGroup)> {
-    let mut prompt = format!("{}\n\n{}", question.text, question.explanation);
+    let mut prompt = format!(
+        "Question from {} {}\n\n{}\n\n{}",
+        task.short_label(),
+        task.name,
+        question.text,
+        question.explanation
+    );
     let (question_type, choices) = match &question.answer_type {
         OperatorAnswerType::YesNo => ("yes_no", None),
         OperatorAnswerType::MultipleChoice { choices } => ("multiple_choice", Some(serde_json::to_string(choices)?)),
@@ -31,6 +37,31 @@ pub(crate) fn create_in_tx(
             .prompt_text(prompt)
             .build(),
     )
+}
+
+/// Insert the answer consumer immediately before the blocked asking revision.
+/// The consumer inherits its prerequisites, while later revisions retain their
+/// existing order behind the source. The source's domain blocker is untouched.
+/// Creation uses autostart=false so no execution observes the temporary tail gate.
+pub(super) fn order_recovery_in_tx(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    source: &Task,
+    recovery: &Task,
+) -> Result<()> {
+    let now = now_string();
+    for edge in deps::prerequisites_of(conn, &recovery.id, Some(RELATION_BLOCKS))? {
+        deps::delete_edge(conn, &recovery.id, &edge.prerequisite_id, RELATION_BLOCKS)?;
+    }
+    for edge in deps::prerequisites_of(conn, &source.id, Some(RELATION_BLOCKS))? {
+        deps::insert_edge(conn, &recovery.id, &edge.prerequisite_id, RELATION_BLOCKS, &now)?;
+    }
+    deps::insert_edge(conn, &source.id, &recovery.id, RELATION_BLOCKS, &now)?;
+    conn.execute("UPDATE tasks SET autostart = 1 WHERE id = ?1", [&recovery.id])?;
+    maybe_engine_unblock_dependent(pending, conn, &recovery.id, &now)?;
+    let task = query_task(conn, &recovery.id).require("task", &recovery.id)?;
+    reconcile_revision_execution(pending, conn, &mut ExecutionReconcileResult::default(), &task)?;
+    Ok(())
 }
 
 /// Apply the original typed prerequisite to the successor, preserving the
@@ -82,6 +113,10 @@ pub(super) fn apply_prerequisite_in_tx(
             answered_at,
             &now,
         )?;
+        if task.kind == TaskKind::Revision {
+            let task = query_task(conn, id).require("task", id)?;
+            reconcile_revision_execution(pending, conn, &mut ExecutionReconcileResult::default(), &task)?;
+        }
     }
     Ok(())
 }

@@ -894,7 +894,7 @@ pub struct Task {
     /// the task falls back to rendering under Review. It is also forced to
     /// `None` (regardless of what GitHub still reports) whenever the same
     /// poll observes `ci_required_state == "fail"` while this field was
-    /// `Some("auto_merge_enabled")` (mono#2023 / T2675): GitHub keeps
+    /// `Some("auto_merge_enabled")` (mono#2023): GitHub keeps
     /// auto-merge armed on red required checks — that's what "merge when
     /// ready" means — so without this override a card can sit in Merging
     /// with a simultaneous red CI chip. This override is deliberately
@@ -942,7 +942,7 @@ pub struct Task {
     /// armed) while this reads `"conflicting"`: that combination means "GitHub
     /// will merge the moment the conflict clears," not "safe to merge now,"
     /// and client badge logic must check both before claiming mergeability
-    /// (T3271 / mono#2303 — a card previously rendered a green "mergeable"
+    /// (mono#2303 — a card previously rendered a green "mergeable"
     /// checkmark derived from CI alone while GitHub reported the PR
     /// CONFLICTING).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1070,13 +1070,13 @@ pub struct Task {
     /// Starts at 0; incremented after each `pr_review` execution finishes.
     /// The engine skips enqueueing a new reviewer pass when this value
     /// reaches `max_review_cycles` (config knob; default 3). Only
-    /// meaningful on tasks that carry a `pr_url`. P992 design §7.
+    /// meaningful on tasks that carry a `pr_url`.
     #[serde(default)]
     #[builder(default)]
     pub review_cycle: i64,
 
     /// HEAD SHA of the PR at the time the most recent reviewer pass
-    /// completed. Used by the no-op skip gate (P992 design §8, task 10)
+    /// completed. Used by the no-op skip gate
     /// to detect pure rebases and skip re-review when nothing meaningful
     /// changed since the last pass. `None` until at least one reviewer
     /// pass has finished.
@@ -1277,7 +1277,7 @@ pub struct Task {
 }
 
 impl Task {
-    /// Operator-facing short form (`"T2344"`) for embedding in human-readable
+    /// Operator-facing short form for embedding in human-readable
     /// text — never the canonical `task_*` id, which is an internal
     /// implementation detail. Falls back to a generic, non-identifying label
     /// on the (in-practice-unreachable) `short_id = None` case rather than
