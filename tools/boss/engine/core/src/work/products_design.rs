@@ -856,7 +856,7 @@ impl WorkDb {
 pub(crate) fn project_for_work_item_updated(conn: &Connection, task: &mut Task, caller: &str) {
     let mut doc_pointer_queries = 0u64;
     attach_task_doc_link_state(conn, task, caller, &mut doc_pointer_queries);
-    if let Err(err) = attach_task_derived_projections(conn, task) {
+    if let Err(err) = attach_task_derived_projections(conn, task, caller) {
         tracing::warn!(
             ?err,
             task_id = %task.id,

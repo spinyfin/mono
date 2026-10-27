@@ -362,6 +362,10 @@ impl PopulationTrace {
             .find(|s| s.segment == name)
             .map(|s| (s.duration_ms, s.rows, s.db_queries))
     }
+
+    pub(crate) fn request_id(&self) -> &str {
+        &self.ctx.request_id
+    }
 }
 
 /// Milliseconds elapsed since `start`, as an `f64` with sub-ms resolution.

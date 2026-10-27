@@ -17,7 +17,11 @@
 //! seen, and the reader folds the epochs in the same snapshot as the data it
 //! would otherwise recompute from. Each key contains sorted member IDs and
 //! epochs from the same full SQL family as the projection, including archived
-//! and deleted revisions. Membership and epoch changes both invalidate it.
+//! and deleted revisions, plus any findings revision a family verdict still
+//! names after that revision has left the family. Membership and epoch
+//! changes both invalidate it. The key read seeds owners from the bound ids
+//! and walks children through `idx_tasks_parent_kind_id` (schema 54) so a
+//! warm pass does not fetch `tasks` rows.
 //!
 //! Inputs that are not epoch-covered stay outside the cache: whether a
 //! review is running or queued is derived per pass from live executions, and
@@ -35,24 +39,44 @@ use super::review_badge::OwnerReview;
 /// Exact membership and input versions, ordered by member ID.
 pub(crate) type FamilyKey = Vec<(String, i64)>;
 
+/// Constant SQL for [`read_family_keys`]: owners from a JSON array (no
+/// `tasks` kind check), children via the covering parent/kind index, and
+/// verdict-referenced findings revisions folded into the same key.
+pub(crate) const FAMILY_KEY_SQL: &str = "
+    WITH RECURSIVE owners(card, id) AS (
+        SELECT value, value FROM json_each(?1)
+    ), family(root, id, depth) AS (
+        SELECT DISTINCT id, id, 0 FROM owners
+        UNION ALL
+        SELECT f.root, t.id, f.depth + 1 FROM family f
+        JOIN tasks t INDEXED BY idx_tasks_parent_kind_id ON t.parent_task_id = f.id
+        WHERE t.kind = 'revision' AND f.depth < 64
+    )
+    SELECT DISTINCT m.root, m.id, COALESCE(e.epoch, 0)
+    FROM (
+        SELECT f.root, f.id FROM family f
+        UNION
+        SELECT f.root, v.revision_task_id
+        FROM family f
+        JOIN pr_review_verdicts v ON v.work_item_id = f.id
+        WHERE v.revision_task_id IS NOT NULL AND v.revision_task_id != ''
+    ) m
+    LEFT JOIN board_review_epoch e ON e.work_item_id = m.id
+    ORDER BY m.root, m.id";
+
 /// Read only the requested owners' families, using the projection's own
-/// ancestry definition so off-board intermediates cannot hide input writes.
+/// ancestry definition so off-board intermediates cannot hide input writes,
+/// plus any findings revision a family verdict still names.
 pub(crate) fn read_family_keys(
     conn: &rusqlite::Connection,
     owners: &[String],
 ) -> anyhow::Result<HashMap<String, FamilyKey>> {
-    use super::review_badge::{ReviewKey, review_family_cte};
     if owners.is_empty() {
         return Ok(HashMap::new());
     }
-    let placeholders = vec!["?"; owners.len()].join(",");
-    let family = review_family_cte(&placeholders, ReviewKey::Owner);
-    let mut stmt = conn.prepare(&format!(
-        "{family} SELECT DISTINCT f.root, f.id, COALESCE(e.epoch, 0)
-         FROM family f LEFT JOIN board_review_epoch e ON e.work_item_id = f.id
-         ORDER BY f.root, f.id"
-    ))?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(owners), |row| {
+    let ids = serde_json::to_string(owners)?;
+    let mut stmt = conn.prepare_cached(FAMILY_KEY_SQL)?;
+    let rows = stmt.query_map([&ids], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,

@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 53;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 54;
 
 /// Schema 43: the baseline commit a recovery record was created at, the
 /// pointer-reconciliation note for the worker prompt, and the retirement
@@ -137,15 +137,17 @@ const BOARD_RUNTIME_EPOCH_49: &str = "CREATE TABLE IF NOT EXISTS board_runtime_e
 /// AI-review projection (`ai_review_state`, `ai_review_findings_revision_id`,
 /// `ai_review_badge`; see `review_badge::fetch_current_heads` and
 /// `review_badge::fetch_badge_histories` for the exact column list) is written.
-/// Those projections are derived per PR owner (chain root) from the root's row, every revision row under it, the family's
-/// `pr_review_verdicts`, the findings revision's `work_executions`, and the
-/// applied `worker_proposals` payload. Each trigger therefore bumps the
-/// written row's work item *and* that item's `parent_task_id` (a revision's
-/// chain root, since `insert_revision_in_tx` always parents a revision
-/// directly to the root). A root epoch alone does not cover descendants of
-/// off-board revisions in legacy chains. The reader therefore keys each
-/// family by member IDs and epochs from the full
-/// SQL family, including off-board ancestors in nested legacy chains.
+/// Those projections are derived per PR owner (chain root) from the
+/// root's row, every revision row under it, the family's
+/// `pr_review_verdicts`, the findings revision's `work_executions`,
+/// and the applied `worker_proposals` payload. Each trigger therefore
+/// bumps the written row's work item *and* that item's `parent_task_id`
+/// (a revision's chain root, since `insert_revision_in_tx` always
+/// parents a revision directly to the root). A root epoch alone does
+/// not cover descendants of off-board revisions in legacy chains. The
+/// reader therefore keys each family by member IDs and epochs from
+/// the full SQL family, including off-board ancestors in nested
+/// legacy chains.
 ///
 /// Same discipline as `board_runtime_epoch`: the bump is in the writer's own
 /// transaction, rows are never deleted, and `UPDATE OF` lists only the columns
@@ -305,6 +307,17 @@ const BOARD_REVIEW_EPOCH_53: &str = "CREATE TABLE IF NOT EXISTS board_review_epo
          ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
      END";
 
+/// Schema 54: covering index for the board-review family-key read.
+///
+/// The warm cache pass walks each on-board owner's revision children
+/// to assemble `(member_id, epoch)` keys. `idx_tasks_parent_task_id`
+/// covers only `parent_task_id`, so that walk fetched every member
+/// `tasks` row to test `kind`. This index covers
+/// `(parent_task_id, kind, id)`, so the recursive step answers from
+/// the index without touching `tasks` pages.
+const TASKS_PARENT_KIND_INDEX_54: &str =
+    "CREATE INDEX IF NOT EXISTS idx_tasks_parent_kind_id ON tasks(parent_task_id, kind, id)";
+
 // Derive requirements once from the fresh-database SQL, but check every DB.
 static BASELINE_OBJECTS: std::sync::LazyLock<Result<std::collections::BTreeSet<String>>> =
     std::sync::LazyLock::new(|| {
@@ -429,6 +442,9 @@ impl WorkDb {
         }
         if version < 53 {
             tx.execute_batch(BOARD_REVIEW_EPOCH_53)?;
+        }
+        if version < 54 {
+            tx.execute_batch(TASKS_PARENT_KIND_INDEX_54)?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
@@ -1026,6 +1042,9 @@ mod floor_tests {
             if version >= 53 {
                 conn.execute_batch(BOARD_REVIEW_EPOCH_53).unwrap();
             }
+            if version >= 54 {
+                conn.execute_batch(TASKS_PARENT_KIND_INDEX_54).unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -1068,6 +1087,7 @@ mod floor_tests {
                 .execute_batch("ALTER TABLE work_executions ADD COLUMN progression_neighbourhood TEXT")
                 .unwrap();
             expected.execute_batch(BOARD_REVIEW_EPOCH_53).unwrap();
+            expected.execute_batch(TASKS_PARENT_KIND_INDEX_54).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

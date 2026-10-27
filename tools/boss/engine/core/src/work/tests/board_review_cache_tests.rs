@@ -458,6 +458,94 @@ fn deleting_revision_cannot_alias_a_cached_family_key() {
     }
 }
 
+/// A findings verdict still names its revision after that revision is
+/// reparented to another owner. Later writes to the revision must miss
+/// the original owner's cache, not serve stale tooltip or findings state.
+#[test]
+fn reparented_findings_revision_writes_invalidate_the_original_owner() {
+    let board = Board::new("review-cache-reparented-findings");
+    let owner_a = board.in_review_chore(30);
+    let owner_b = board.in_review_chore(31);
+    board.observe(&owner_a, "h1", "success", "mergeable");
+    board.observe(&owner_b, "h2", "success", "mergeable");
+    let revision = board.revision(&owner_a);
+    board.sql(
+        "UPDATE tasks SET status = 'in_review', name = 'Fix findings' WHERE id = ?1",
+        &[&revision],
+    );
+    let findings = board.verdict(&owner_a, "h1", "completed_with_findings");
+    board
+        .db
+        .set_review_verdict_revision_task_id(&findings, &revision)
+        .unwrap();
+
+    assert_eq!(board.assert_equivalent().misses, 2);
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(
+        board.card(&owner_a).ai_review_state.as_deref(),
+        Some("reviewed_with_findings")
+    );
+
+    board.sql(
+        "UPDATE tasks SET parent_task_id = ?2 WHERE id = ?1",
+        &[&revision, &owner_b],
+    );
+    assert_eq!(board.assert_equivalent().misses, 2);
+    assert_eq!(board.assert_equivalent().misses, 0);
+
+    board.sql(
+        "UPDATE tasks SET description = 'Addressed the index without moving HEAD' WHERE id = ?1",
+        &[&revision],
+    );
+    // The revision now parents under B, so B's epoch moves; A's key still
+    // carries the verdict-referenced revision, so A is recomputed too.
+    assert_eq!(board.assert_equivalent().misses, 2);
+    assert_eq!(
+        board
+            .card(&owner_a)
+            .ai_review_badge
+            .unwrap()
+            .findings_markdown
+            .as_deref(),
+        Some("Addressed the index without moving HEAD")
+    );
+
+    let execution = board.execution(&revision, ExecutionKind::RevisionImplementation);
+    board.sql(
+        "UPDATE work_executions SET status = 'completed', finished_at = '5', pr_head_after = 'h1' WHERE id = ?1",
+        &[&execution],
+    );
+    board.sql("UPDATE tasks SET status = 'done' WHERE id = ?1", &[&revision]);
+    assert_eq!(board.assert_equivalent().misses, 2);
+    assert_eq!(board.card(&owner_a).ai_review_state.as_deref(), Some("not_reviewed"));
+}
+
+#[test]
+fn family_key_read_uses_the_covering_parent_kind_index() {
+    let board = Board::new("review-cache-key-plan");
+    let root = board.in_review_chore(32);
+    let _revision = board.revision(&root);
+    let conn = board.db.connect().unwrap();
+    let ids = serde_json::to_string(&[root]).unwrap();
+    let plan = conn
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            crate::work::board_review_cache::FAMILY_KEY_SQL
+        ))
+        .unwrap()
+        .query_map([&ids], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+        .join("\n");
+    assert!(
+        plan.contains("USING COVERING INDEX idx_tasks_parent_kind_id")
+            || plan.contains("USING INDEX idx_tasks_parent_kind_id"),
+        "{plan}"
+    );
+    assert!(!plan.contains("SCAN t"), "key read must not scan tasks rows: {plan}");
+}
+
 #[test]
 fn nested_off_board_revision_inputs_invalidate_both_owners_on_reparent() {
     for column in ["status = 'archived'", "deleted_at = '9'"] {
@@ -489,15 +577,28 @@ fn single_item_trace_counts_review_cards_and_queries() {
     board.observe(&root, "h1", "success", "mergeable");
     board.verdict(&root, "h1", "completed_clean");
     let mut card = board.card(&root);
-    let mut trace = PopulationTrace::new(&board.product_id, "single-test", None, Instant::now());
-    crate::work::revision_helpers::attach_task_derived_projections_traced(
+    let trace = crate::work::revision_helpers::attach_task_derived_projections_for_test(
         &board.db.connect().unwrap(),
         &mut card,
-        &mut trace,
+        "update_task",
     )
     .unwrap();
     let (duration, cards, queries) = trace.segment_counts("single_item.ai_review_state").unwrap();
     assert!(duration >= 0.0);
     assert_eq!(cards, Some(1));
     assert_eq!(queries, Some(3));
+    assert!(
+        trace.request_id().starts_with("single-item:") && trace.request_id().ends_with(":update_task"),
+        "trigger label must be the real caller, got {}",
+        trace.request_id()
+    );
+
+    let mut card = board.card(&root);
+    let trace = crate::work::revision_helpers::attach_task_derived_projections_for_test(
+        &board.db.connect().unwrap(),
+        &mut card,
+        "get_work_item",
+    )
+    .unwrap();
+    assert!(trace.request_id().ends_with(":get_work_item"), "{}", trace.request_id());
 }

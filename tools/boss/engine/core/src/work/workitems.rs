@@ -1319,7 +1319,7 @@ impl WorkDb {
                 // path propagates a projection failure: a read has no
                 // committed write to protect, so an error beats serving a row
                 // the client would take for truth.
-                attach_task_derived_projections(&conn, &mut task)?;
+                attach_task_derived_projections(&conn, &mut task, "get_work_item")?;
                 Ok(task_to_item(task))
             }
             // Answer-agent executions bind a comment id, but comments are not

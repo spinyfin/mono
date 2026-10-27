@@ -138,7 +138,8 @@ pub(super) fn attach_board_derivations(
     // Resolve review-guide lifecycle/readable-version for every PR-bearing
     // task/chore so the Review-card guide affordance renders without a
     // per-card query. Errors are non-fatal — log and leave the fields at
-    // their default (affordance hidden). Single batched `IN (...)` query.
+    // their default (affordance hidden). Board-sized sets join series by
+    // product; single-item chains keep a root-id list.
     let t = Instant::now();
     if let Err(err) = attach_review_guide_state(conn, &mut tasks, chores) {
         tracing::warn!(?err, "{caller}: failed to attach review_guide_state; ignoring");

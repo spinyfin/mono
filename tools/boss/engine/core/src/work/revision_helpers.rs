@@ -839,9 +839,12 @@ pub(crate) fn attach_ai_review_state(
 /// 1. Each card's owner is found in memory by walking `parent_task_id`
 ///    through the board rows (`tasks` and `chores` carry whole revision
 ///    chains). A card whose chain leaves the board (an archived or deleted
-///    ancestor) falls back to the card-keyed SQL ancestor walk (`ReviewKey::Card`).
-/// 2. With a cache, owners are probed by their family key: sorted member IDs
-///    and epochs from the full SQL family. Only misses are queried; without one, every owner is queried, but still by owner, so
+///    ancestor) falls back to the card-keyed SQL ancestor walk
+///    (`ReviewKey::Card`).
+/// 2. With a cache, owners are probed by their family key: sorted member
+///    IDs and epochs from the full SQL family, including any findings
+///    revision a family verdict still names. Only misses are queried;
+///    without a cache, every owner is queried, but still by owner, so
 ///    the queries read one `tasks` row per family rather than per card.
 /// 3. Running and queued reviews are read per pass from live executions and
 ///    layered on top, so no cached value depends on execution liveness.
@@ -896,7 +899,15 @@ pub(crate) fn attach_ai_review_state_with(
     if let Some((cache, product_id)) = cache {
         let keys = super::board_review_cache::read_family_keys(conn, &owner_ids)?;
         stats.queries += u64::from(!owner_ids.is_empty());
-        let probe: Vec<_> = owner_ids.iter().map(|id| (id.as_str(), keys[id].clone())).collect();
+        let probe: Vec<_> = owner_ids
+            .iter()
+            .map(|id| {
+                (
+                    id.as_str(),
+                    keys.get(id).cloned().unwrap_or_else(|| vec![(id.clone(), 0)]),
+                )
+            })
+            .collect();
         let lookup = cache.lookup(product_id, &probe);
         let misses: Vec<String> = probe
             .iter()
@@ -1157,7 +1168,20 @@ pub(crate) fn attach_review_guide_state(conn: &Connection, tasks: &mut [Task], c
     if roots.is_empty() {
         return Ok(());
     }
-    let states = query_review_guide_card_states(conn, &roots)?;
+    // Board-sized IN lists change the SQL text per assembly and materialise
+    // thousands of bound ids. A product join keeps the statement cached
+    // and lets the caller drop off-board series in memory. Chains at or
+    // under the ancestry depth cap keep the indexed id list.
+    let product_id = (roots.len() > super::chain_helpers::MAX_CHAIN_DEPTH)
+        .then(|| {
+            tasks
+                .iter()
+                .chain(chores.iter())
+                .next()
+                .map(|task| task.product_id.as_str())
+        })
+        .flatten();
+    let states = query_review_guide_card_states(conn, &roots, product_id)?;
     for task in tasks.iter_mut().chain(chores.iter_mut()) {
         if let Some(state) = states.get(&task.id) {
             task.review_guide_lifecycle = Some(state.lifecycle.clone());
@@ -1210,49 +1234,74 @@ struct ReviewGuideCardState {
 /// DESC, id DESC`) so the two resolvers cannot disagree; first matching row
 /// per root wins.
 ///
-/// SQL restricts the indexed root lookup to the requested cards; the URL
-/// comparison stays in memory so replaced PRs cannot select a sibling series.
+/// On a board-sized root set the lookup joins `tasks` on `product_id`
+/// (fixed SQL, statement-cached) and keeps matching roots in memory. A
+/// single-item chain keeps the indexed `root_task_id IN (...)` list.
+/// The URL comparison stays in memory so replaced PRs cannot select a
+/// sibling series.
+type ReviewGuideCardRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+fn map_review_guide_card_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewGuideCardRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+    ))
+}
+
 fn query_review_guide_card_states(
     conn: &Connection,
     roots: &HashMap<&str, &str>,
+    product_id: Option<&str>,
 ) -> Result<std::collections::HashMap<String, ReviewGuideCardState>> {
     if roots.is_empty() {
         return Ok(HashMap::new());
     }
-    let ids: Vec<_> = roots.keys().copied().collect();
-    let placeholders = vec!["?"; ids.len()].join(",");
-    let sql = format!(
+    let select = format!(
         "SELECT s.root_task_id, s.guide_lifecycle, s.readable_version_id,
                 s.selected_comparison_id, v.comparison_id,
                 {REVIEW_GUIDE_LATEST_TERMINAL_ERROR_SQL}, s.canonical_pr_url
          FROM pr_review_guide_source_series s
-         LEFT JOIN pr_review_guide_versions v ON v.id = s.readable_version_id
-         WHERE s.root_task_id IN ({placeholders})
-         ORDER BY s.latest_observation_sequence DESC, s.id DESC"
+         LEFT JOIN pr_review_guide_versions v ON v.id = s.readable_version_id"
     );
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(ids), |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, Option<String>>(4)?,
-            row.get::<_, Option<String>>(5)?,
-            row.get::<_, String>(6)?,
-        ))
-    })?;
+    let rows = if let Some(product_id) = product_id {
+        let sql = format!(
+            "{select}
+             JOIN tasks t ON t.id = s.root_task_id
+             WHERE t.product_id = ?1
+             ORDER BY s.latest_observation_sequence DESC, s.id DESC"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        stmt.query_map([product_id], map_review_guide_card_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        let ids: Vec<_> = roots.keys().copied().collect();
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let sql = format!(
+            "{select}
+             WHERE s.root_task_id IN ({placeholders})
+             ORDER BY s.latest_observation_sequence DESC, s.id DESC"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        stmt.query_map(rusqlite::params_from_iter(ids), map_review_guide_card_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
     let mut result = std::collections::HashMap::new();
-    for row in rows {
-        let (
-            root_task_id,
-            lifecycle,
-            readable_version_id,
-            selected_comparison_id,
-            version_comparison_id,
-            error,
-            pr_url,
-        ) = row?;
+    for (root_task_id, lifecycle, readable_version_id, selected_comparison_id, version_comparison_id, error, pr_url) in
+        rows
+    {
         if roots.get(root_task_id.as_str()).copied() != Some(pr_url.as_str()) {
             continue;
         }
@@ -1281,14 +1330,20 @@ fn query_review_guide_card_states(
 /// are in `get_work_tree` — a side-query failure must not take down
 /// `GetWorkItem`. Chain loading errors (BFS / point reads) propagate:
 /// those are the same class of failure as the row read itself.
-#[track_caller]
-pub(crate) fn attach_task_derived_projections(conn: &Connection, task: &mut Task) -> Result<()> {
+pub(crate) fn attach_task_derived_projections(conn: &Connection, task: &mut Task, caller: &str) -> Result<()> {
+    attach_task_derived_projections_labeled(conn, task, caller).1
+}
+
+fn attach_task_derived_projections_labeled(
+    conn: &Connection,
+    task: &mut Task,
+    caller: &str,
+) -> (crate::population_timing::PopulationTrace, Result<()>) {
     use crate::population_timing::{PopulationTrace, elapsed_ms, global};
     use std::sync::atomic::{AtomicU64, Ordering};
     static INVOCATIONS: AtomicU64 = AtomicU64::new(0);
     let invocation = INVOCATIONS.fetch_add(1, Ordering::Relaxed) + 1;
     let started = std::time::Instant::now();
-    let caller = std::panic::Location::caller();
     let mut trace = PopulationTrace::new(
         &task.product_id,
         format!("single-item:{invocation}:{caller}"),
@@ -1300,7 +1355,18 @@ pub(crate) fn attach_task_derived_projections(conn: &Connection, task: &mut Task
     if let Some(log) = global() {
         trace.flush(log);
     }
-    result
+    (trace, result)
+}
+
+#[cfg(test)]
+pub(crate) fn attach_task_derived_projections_for_test(
+    conn: &Connection,
+    task: &mut Task,
+    caller: &str,
+) -> Result<crate::population_timing::PopulationTrace> {
+    let (trace, result) = attach_task_derived_projections_labeled(conn, task, caller);
+    result?;
+    Ok(trace)
 }
 
 /// Records one single-item derivation, including the loaded chain's size

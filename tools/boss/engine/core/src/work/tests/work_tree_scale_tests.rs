@@ -146,6 +146,10 @@ fn measure(db: &WorkDb, product: &str, expected: Option<usize>) {
                 "scale runtime_queries={:?}",
                 trace.segment_counts(segment::DB_TASK_RUNTIMES)
             );
+            println!(
+                "scale review_guide_state={:?}",
+                trace.segment_counts(segment::DB_REVIEW_GUIDE_STATE)
+            );
             let hidden_revisions = tree
                 .tasks
                 .iter()

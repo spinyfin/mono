@@ -644,6 +644,16 @@ fn fresh_db_has_parent_task_id_column_and_index() {
         )
         .unwrap();
     assert_eq!(index_exists, 1, "idx_tasks_parent_task_id must exist after fresh init");
+
+    let covering: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_tasks_parent_kind_id'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(covering, 1, "idx_tasks_parent_kind_id must exist after fresh init");
 }
 
 #[test]
