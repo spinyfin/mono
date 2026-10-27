@@ -159,8 +159,15 @@ impl ExecutionCoordinator {
             tokio::time::sleep(interval).await;
             let interval_ms = interval.as_millis() as u64;
             let mut unexplained_waits = UnexplainedWaitWatch::default();
+            let mut queued_displays = std::collections::HashMap::new();
             loop {
                 coordinator.spawn_in_doubt_reconcile();
+                // A deadline can pass without a DB write (including while dispatch
+                // is paused). Publish changed engine projections, never ask clients
+                // to guess the next hold or run their own countdown timers.
+                coordinator
+                    .refresh_queued_displays(&mut queued_displays, boss_engine_utils::epoch_time::now_epoch_secs())
+                    .await;
                 let ready = match coordinator.work_db.list_ready_executions() {
                     Ok(rows) => rows,
                     Err(err) => {
@@ -215,6 +222,30 @@ impl ExecutionCoordinator {
                 tokio::time::sleep(interval).await;
             }
         })
+    }
+
+    /// Recompute pending queued labels as time advances. Callers publish only
+    /// displays that changed since the previous scan.
+    pub async fn refresh_queued_displays(
+        &self,
+        previous: &mut std::collections::HashMap<String, boss_protocol::QueuedDisplay>,
+        now: i64,
+    ) {
+        match self.work_db.queued_displays(now) {
+            Ok(displays) => {
+                let mut current = std::collections::HashMap::new();
+                for (product, item, display) in displays {
+                    if previous.get(&item) != Some(&display) {
+                        self.publisher
+                            .publish_work_item_runtime_changed(&product, &item, "queued_display_changed")
+                            .await;
+                    }
+                    current.insert(item, display);
+                }
+                *previous = current;
+            }
+            Err(err) => tracing::warn!(?err, "failed to refresh queued displays"),
+        }
     }
 
     /// Return every `ready` execution whose `created_at` is older than

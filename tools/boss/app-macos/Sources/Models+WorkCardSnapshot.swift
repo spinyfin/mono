@@ -142,6 +142,7 @@ struct WorkCardSnapshot: Equatable {
     let dispatchWaitBlocker: DispatchWaitBlocker?
     let dispatchFailures: [DispatchFailureAttempt]
     let liveStatus: String?
+    var liveStatusTooltip: String? = nil
     let liveStatusActivity: WorkerActivity?
     let liveStatusLastEventAt: String?
     let blockedBy: String?
@@ -405,6 +406,8 @@ struct WorkCardSnapshot: Equatable {
             dispatchWaitBlocker: context.dispatchWaitBlocker,
             dispatchFailures: context.dispatchFailures,
             liveStatus: liveStatus,
+            liveStatusTooltip: liveStatus == context.runtime?.queuedDisplay?.text
+                ? context.runtime?.queuedDisplay?.tooltip : nil,
             liveStatusActivity: liveStatusActivity,
             liveStatusLastEventAt: liveStatusLastEventAt,
             blockedBy: context.blockedBy,

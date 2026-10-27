@@ -667,6 +667,17 @@ extension WorkTask {
     }
 }
 
+struct QueuedDisplay: Hashable {
+    let text: String
+    let tooltip: String
+
+    init?(_ payload: [String: Any]) {
+        guard let text = payload["text"] as? String else { return nil }
+        self.text = text
+        self.tooltip = payload["tooltip"] as? String ?? text
+    }
+}
+
 struct WorkTaskRuntime: Hashable {
     let workItemID: String
     let executionStatus: String?
@@ -697,6 +708,8 @@ struct WorkTaskRuntime: Hashable {
     /// Failed attempts that produced a `failure_backoff` wait. Empty for
     /// every other reason. Newest last. Mirrors `TaskRuntime.dispatch_failures`.
     var dispatchFailures: [DispatchFailureAttempt] = []
+    /// Engine-selected queued label. The app paints `text` and uses `tooltip`.
+    var queuedDisplay: QueuedDisplay? = nil
 }
 
 /// One row from `work_item_dependencies` — the dependent is gated by

@@ -20,6 +20,9 @@ extension WorkCardLiveStatus {
     /// of its own; it formats the two deadlines the engine sends and renders
     /// the engine's phrase for everything else.
     static func queuedLabel(runtime: WorkTaskRuntime?, now: Date, lead: String = "Queued") -> String {
+        if let display = runtime?.queuedDisplay, lead == queuedLead {
+            return display.text
+        }
         let status = queuedStatus(runtime: runtime, now: now)
         return "\(status.lead == queuedLead ? lead : status.lead) — \(status.detail)"
     }
@@ -28,6 +31,14 @@ extension WorkCardLiveStatus {
     /// pool, say) stays visible after the marker; a card that is simply
     /// waiting for the dispatcher's next pass needs nothing after it.
     static func nextUpLabel(runtime: WorkTaskRuntime?, now: Date) -> String {
+        if let display = runtime?.queuedDisplay {
+            if runtime?.dispatchWaitReason == awaitingDispatchReason { return "Next up" }
+            let queuedPrefix = "Queued — "
+            if display.text.hasPrefix(queuedPrefix) {
+                return "Next up — \(display.text.dropFirst(queuedPrefix.count))"
+            }
+            return "Next up — \(display.text)"
+        }
         let status = queuedStatus(runtime: runtime, now: now)
         if status.isAwaitingDispatch { return "Next up" }
         return status.lead == queuedLead
@@ -77,10 +88,10 @@ extension WorkCardLiveStatus {
         if isPendingExecution(runtime) {
             if runtime?.dispatchWaitReason == failureBackoffReason,
                let label = runtime?.dispatchWaitLabel, !label.isEmpty,
-               let raw = runtime?.dispatchNotBefore, let date = AutomationTime.parse(raw) {
+               let raw = runtime?.dispatchNotBefore, let date = AutomationTime.parse(raw), date > now {
                 return QueuedStatus(lead: label, detail: notBeforeDetail(date))
             }
-            if let raw = runtime?.dispatchNotBefore, let date = AutomationTime.parse(raw) {
+            if let raw = runtime?.dispatchNotBefore, let date = AutomationTime.parse(raw), date > now {
                 if runtime?.dispatchWaitReason == hostLeaseParkReason,
                    let label = runtime?.dispatchWaitLabel, !label.isEmpty {
                     return QueuedStatus(

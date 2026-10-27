@@ -243,6 +243,19 @@ fn every_runtime_input_write_invalidates_exactly_its_item() {
             1,
         ),
         (
+            "run finished_at",
+            Box::new({
+                let first = first.clone();
+                move |b| {
+                    b.sql(
+                        "UPDATE work_runs SET finished_at = '8' WHERE execution_id = ?1",
+                        &[&first],
+                    )
+                }
+            }),
+            1,
+        ),
+        (
             "run created_at",
             Box::new({
                 let first = first.clone();

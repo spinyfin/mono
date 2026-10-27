@@ -484,7 +484,8 @@ extension EngineClient {
             dispatchWaitBlocker: (payload["dispatch_wait_blocker"] as? [String: Any]).flatMap(DispatchWaitBlocker.init),
             dispatchWaitLabel: payload["dispatch_wait_label"] as? String,
             dispatchFailures: (payload["dispatch_failures"] as? [[String: Any]] ?? [])
-                .compactMap(DispatchFailureAttempt.init)
+                .compactMap(DispatchFailureAttempt.init),
+            queuedDisplay: (payload["queued_display"] as? [String: Any]).flatMap(QueuedDisplay.init)
         )
     }
 

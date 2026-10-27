@@ -501,8 +501,8 @@ pub struct ComputedRuntime {
 /// board runtime cache (`board_runtime_epoch`, schema 49):
 /// - the item's `work_executions` rows: any insert, update or delete;
 /// - the chosen execution's latest `work_runs` row: insert, delete, or an
-///   update of `status`, `execution_id` or `created_at`;
-/// - `dispatch_not_before` against `now`: `expires_at`;
+///   update of `status`, `execution_id`, `created_at` or `finished_at`;
+/// - `dispatch_not_before` against `now` and relative display times: `expires_at`;
 /// - failure history (start events, run errors and attention bodies): not cached;
 /// - dependency gating, project order and chain-hold blockers: not
 ///   versioned, `cacheable` is false.
@@ -564,6 +564,10 @@ pub(crate) fn compute_task_runtime(
         }
     };
     let wait = super::queued_wait::for_execution_naming(conn, execution.as_ref(), now, review)?;
+    let mut display_expires_at = None;
+    let queued_display =
+        super::queued_display::for_execution(conn, execution.as_ref(), &wait, now, &mut display_expires_at)?;
+    *queries += u64::from(queued_display.is_some());
     let (execution_status, run_status, execution_id, current_run_id, dispatch_retry_at, dispatch_wait_since) =
         if let Some(execution) = execution {
             *queries += 1;
@@ -605,6 +609,7 @@ pub(crate) fn compute_task_runtime(
     let expires_at = [&dispatch_retry_at, &wait.not_before]
         .into_iter()
         .filter_map(|deadline| deadline.as_deref()?.parse::<i64>().ok())
+        .chain(display_expires_at)
         .min();
     let runtime = TaskRuntime::builder()
         .work_item_id(work_item_id)
@@ -618,6 +623,7 @@ pub(crate) fn compute_task_runtime(
         .maybe_dispatch_wait_since(dispatch_wait_since)
         .maybe_dispatch_not_before(wait.not_before)
         .maybe_dispatch_wait_blocker(wait.blocker)
+        .maybe_queued_display(queued_display)
         .dispatch_failures(wait.failures)
         .build();
     Ok(ComputedRuntime {
@@ -637,7 +643,7 @@ pub(crate) fn compute_task_runtime(
 ///
 /// `now_secs` is the instant the backoff window is judged against; the
 /// caller passes the live clock so tests can pin it.
-fn dispatch_retry_at_for_execution(execution: &WorkExecution, now_secs: i64) -> Option<String> {
+pub(crate) fn dispatch_retry_at_for_execution(execution: &WorkExecution, now_secs: i64) -> Option<String> {
     if execution.status != ExecutionStatus::Ready || execution.pre_start_failure_count <= 0 {
         return None;
     }
