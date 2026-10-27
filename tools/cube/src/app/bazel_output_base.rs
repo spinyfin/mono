@@ -283,10 +283,29 @@ pub(super) fn cleanup_output_base_for_workspace(
         return CleanupOutcome::RootUnknown;
     };
     let base = output_base_path(&root, workspace_path);
-    match remove_output_base(&base) {
+    let removing = root.join(format!("{}.cube-removing", hash_workspace_path(workspace_path)));
+    let result = (|| {
+        let base_removed = remove_output_base(&base)?;
+        let retired_removed = remove_output_base(&removing)?;
+        let owner_removed =
+            remove_owner_record(&root.join(format!("{}.cube-removing-owner", hash_workspace_path(workspace_path))))?;
+        Ok(base_removed || retired_removed || owner_removed)
+    })();
+    match result {
         Ok(true) => CleanupOutcome::Removed(base),
         Ok(false) => CleanupOutcome::NothingToRemove,
         Err(e) => CleanupOutcome::Failed(e),
+    }
+}
+
+fn remove_owner_record(path: &Path) -> Result<bool> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(CubeError::BazelOutputBaseRemove {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -348,11 +367,16 @@ pub(super) fn sweep_orphaned_output_bases(store: &Store, bazel_user_root: &Path,
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !is_output_base_dir_name(name) {
+        let hash = name
+            .strip_suffix(".cube-removing-owner")
+            .or_else(|| name.strip_suffix(".cube-removing"))
+            .unwrap_or(name);
+        if !is_output_base_dir_name(hash) {
             continue;
         }
         let Ok(file_type) = entry.file_type() else { continue };
-        if !file_type.is_dir() {
+        let owner = name.ends_with(".cube-removing-owner");
+        if !(if owner { file_type.is_file() } else { file_type.is_dir() }) {
             continue;
         }
         report.candidates_examined += 1;
@@ -362,7 +386,7 @@ pub(super) fn sweep_orphaned_output_bases(store: &Store, bazel_user_root: &Path,
         // workspace can be provisioned for the duration of a sweep over
         // hundreds of orphans, each removal taking 20-30s.
         let live = live_output_base_hashes(store);
-        if live.contains(name) {
+        if live.contains(hash) {
             report.skipped_now_live += 1;
             continue;
         }
@@ -372,7 +396,21 @@ pub(super) fn sweep_orphaned_output_bases(store: &Store, bazel_user_root: &Path,
             continue;
         }
 
-        match remove_output_base(&path) {
+        // Preserve ownership evidence if removal of the retired tree fails.
+        if owner && bazel_user_root.join(format!("{hash}.cube-removing")).exists() {
+            continue;
+        }
+        let result = if owner {
+            remove_owner_record(&path)
+        } else {
+            remove_output_base(&path).and_then(|removed| {
+                if name.ends_with(".cube-removing") {
+                    remove_owner_record(&bazel_user_root.join(format!("{hash}.cube-removing-owner")))?;
+                }
+                Ok(removed)
+            })
+        };
+        match result {
             Ok(true) => report.removed.push(path),
             Ok(false) => {}
             Err(e) => {

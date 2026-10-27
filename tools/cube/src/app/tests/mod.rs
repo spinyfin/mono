@@ -35,3 +35,5 @@ pub(super) fn with_checkleft_fixture<T>(run: impl FnOnce() -> T) -> T {
     let _env = checkleft_tests::CheckleftEnvGuard::with_gate_disabled();
     run()
 }
+
+mod cleanup_source_tests;

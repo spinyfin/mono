@@ -617,8 +617,11 @@ canonical source). Exit 0 is cleaned, exit 75 is "busy, nothing done", anything
 else (including 126/127) is a failure that stays withheld and is retried.
 The command must be idempotent.
 
-`CUBE_CLEANUP_ROOT` names the checkout that declared the cleanup step, which
-can be the repo source when the workspace predates the script. Use it to find
+`CUBE_CLEANUP_ROOT` names a temporary snapshot of fetched trunk's `.cube/`
+assets. Cube reads the registered repo's `<main_branch>@origin` revision in
+the shared store, independently of the source working copy. A missing trunk
+declaration never falls back to an unmerged branch; only repos without a
+registered source use the workspace declaration. Use it to find
 the script while keeping `CUBE_WORKSPACE` as the cleanup target. Cleanup alone
 runs in its own process group; its timeout covers output draining and kills
 the group. Both stdout and stderr are logged and audited on success or failure.
@@ -646,15 +649,40 @@ the group. Both stdout and stderr are logged and audited on success or failure.
   withheld in `cube workspace list`. Use `cube workspace gc --clear-failed-cleanup`
   (optionally with `--workspace`) to return failed workspaces to the pool as
   they are; `--dry-run` does not clear marks.
-- _Where it runs_: in the periodic pool-GC pass right after compaction, and
+- _Where it runs_: in an independent process launched by periodic pool GC after compaction, and
   from `cube workspace gc` (`--dry-run` lists the workspaces it would clean, in
   order, and why). Low free space also shortens the GC throttle from a day to
   five minutes, but only while the previous pass managed to clean something.
   A separate cleanup-pass lock serializes cleanup: manual gc waits for it,
-  while the periodic pass yields if another pass holds it.
+  while the periodic pass yields if another pass holds it. Detached pass output,
+  including startup failures and summaries, is appended to `periodic-cleanup.log`
+  beside the cube database.
 - _Accounting_: bytes freed is the change in the volume's free space across the
   command. Every cleanup is logged and audited (`workspace.cleanup`: workspace,
   outcome, reason, trigger, bytes freed, duration, the command's output).
+
+### Bazel cleanup and the existing reclaim command
+
+Mono's pressure hook discovers bases through workspace symlinks and verifies
+`DO_NOT_BUILD_HERE`. It atomically renames each base before removal, retaining
+an ownership record beside the renamed tree so an interrupted deletion can be
+finished without exposing a partial base to Bazel. Shutdown failure is busy,
+not a failed deletion. A legacy partial base without ownership evidence stays
+withheld and requires operator inspection.
+
+Cube also retains `bazel_output_base.rs` for explicit teardown (`workspace remove
+--expunge` and pool trimming) and `cube workspace reclaim-bazel-bases` for orphan
+sweeps. That older module derives workspace base names using path hashes; the
+pressure hook deliberately does not use that rule. These implementations coexist
+because the generic cleanup contract must not embed Bazel-specific discovery in
+Cube, while existing teardown and orphan-reclaim commands remain supported.
+The repo hook handles only bases linked from an existing workspace. Orphans are
+covered by `cube workspace reclaim-bazel-bases`, including interrupted
+`<hash>.cube-removing` trees and their ownership records. Both teardown and
+the sweep remove those leftovers, and the sweep preserves them for registered
+workspaces. There is no generic
+repo-level sweep hook yet. Neither path targets the shared download cache or
+the Bazel installation tree.
 
 Configure under `[pool]` in `cube.toml`:
 

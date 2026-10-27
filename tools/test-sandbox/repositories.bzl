@@ -31,6 +31,7 @@ _RUNTIME_TOOLS = [
     "ps",
     "pwd",
     "python3",
+    "readlink",
     "rm",
     "sed",
     "sh",

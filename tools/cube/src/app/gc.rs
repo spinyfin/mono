@@ -12,9 +12,7 @@ use crate::metadata::{WorkspaceHealth, WorkspaceRecord, WorkspaceState};
 use crate::store::{EffectiveState, Store, WorkspaceListFilter};
 use crate::{audit, config, paths};
 
-use crate::app::cleanup::{
-    CleanupOptions, CleanupTrigger, any_cleanup_awaiting_retry, any_volume_below_low_water, run_cleanup_pass,
-};
+use crate::app::cleanup::{any_cleanup_awaiting_retry, any_volume_below_low_water};
 use crate::app::disk::human_bytes;
 use crate::app::errors::Result;
 use crate::app::health::probe_workspace_reuse;
@@ -365,6 +363,15 @@ fn aged_unhealthy_since(record: &WorkspaceRecord, threshold_epoch_s: i64) -> Opt
 /// cannot leave `last_pool_gc_started_at` permanently ahead of
 /// `last_pool_gc_at`.
 pub(super) fn maybe_trigger_pool_gc(store: &mut Store, database_path: Option<&Path>, now_epoch_s: i64) -> Result<()> {
+    maybe_trigger_pool_gc_with_spawner(store, database_path, now_epoch_s, &crate::app::periodic_cleanup::spawn)
+}
+
+pub(super) fn maybe_trigger_pool_gc_with_spawner(
+    store: &mut Store,
+    database_path: Option<&Path>,
+    now_epoch_s: i64,
+    spawn_cleanup: &dyn Fn(Option<&Path>) -> std::io::Result<()>,
+) -> Result<()> {
     // Skip if a pass is already in progress (started within the safety-net timeout).
     let last_started = store.get_pool_metadata_i(POOL_GC_STARTED_AT_KEY)?;
     if last_started.is_some_and(|t| (now_epoch_s - t) < POOL_GC_IN_PROGRESS_TIMEOUT_SECS) {
@@ -403,7 +410,7 @@ pub(super) fn maybe_trigger_pool_gc(store: &mut Store, database_path: Option<&Pa
     let db_path_owned = database_path.map(Path::to_path_buf);
     let deadline = Instant::now() + POOL_GC_TIME_BUDGET;
     if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_pool_gc_background(db_path_owned, deadline);
+        run_pool_gc_background(db_path_owned, deadline, spawn_cleanup);
     })) {
         eprintln!("cube: auto gc: pass panicked: {panic:?}");
     }
@@ -416,7 +423,11 @@ pub(super) fn maybe_trigger_pool_gc(store: &mut Store, database_path: Option<&Pa
     Ok(())
 }
 
-pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, deadline: Instant) {
+fn run_pool_gc_background(
+    database_path: Option<std::path::PathBuf>,
+    deadline: Instant,
+    spawn_cleanup: &dyn Fn(Option<&Path>) -> std::io::Result<()>,
+) {
     let store = match database_path.as_deref() {
         Some(p) => Store::open_at(p),
         None => Store::open_default(),
@@ -464,29 +475,18 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
         }
     }
 
-    // Repo-declared workspace cleanup runs next, for the same reason
-    // compaction goes first: it is a disk-returning pass, and the passes below
-    // reclaim no bytes. It only does anything when free space is below the
-    // low-water mark (or to finish a cleanup that failed earlier), so on a
-    // healthy volume this is one `statvfs` per repo.
-    let cleanup = run_cleanup_pass(
-        &runner,
-        &store,
-        database_path.as_deref(),
-        &CleanupOptions {
-            repo: None,
-            workspace: None,
-            trigger: CleanupTrigger::Periodic,
-            dry_run: false,
-            deadline: Some(deadline),
-        },
-    );
-    if !cleanup.cleaned.is_empty() || !cleanup.failed.is_empty() {
-        eprintln!("cube: auto gc: workspace cleanup: {}", cleanup.summary());
+    // Repo commands have their own timeout and can take minutes. Launch them
+    // independently so lease dispatch never waits for shutdown or removal.
+    if any_volume_below_low_water(&store) || any_cleanup_awaiting_retry(&store) {
+        if let Err(error) = spawn_cleanup(database_path.as_deref()) {
+            eprintln!("cube: auto gc: cannot launch workspace cleanup: {error}");
+        }
+    } else {
+        // A healthy pass resets the signal so future pressure gets a chance.
+        let _ = store
+            .set_pool_metadata_i(POOL_GC_CLEANUP_PROGRESS_KEY, 1)
+            .map_err(|e| eprintln!("cube: auto gc: failed to record the cleanup outcome: {e}"));
     }
-    let _ = store
-        .set_pool_metadata_i(POOL_GC_CLEANUP_PROGRESS_KEY, i64::from(cleanup.made_progress()))
-        .map_err(|e| eprintln!("cube: auto gc: failed to record the cleanup outcome: {e}"));
 
     if Instant::now() >= deadline {
         eprintln!("cube: auto gc: time budget exhausted after compaction, deferring the rest to the next pass");

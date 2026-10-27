@@ -1175,7 +1175,8 @@ impl Store {
             .execute(
                 r#"
                 UPDATE workspaces
-                SET cleanup_status = NULL
+                SET cleanup_status = NULL,
+                    last_cleaned_at_epoch_s = CAST(strftime('%s', 'now') AS INTEGER)
                 WHERE cleanup_status = ?1 AND (?2 IS NULL OR workspace_id = ?2)
                 "#,
                 params![CleanupStatus::Failed.as_str(), workspace_id],

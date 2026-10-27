@@ -21,6 +21,41 @@ use crate::app::salvage::{
 };
 use crate::app::util::current_epoch_s;
 
+fn trunk_cleanup_revision(root: &std::path::Path) -> ExpectedCommand {
+    ExpectedCommand::ok(
+        root.join("source/mono"),
+        "jj",
+        &[
+            "--ignore-working-copy",
+            "log",
+            "-r",
+            "main@origin",
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ],
+        "abc1234",
+    )
+}
+
+fn trunk_cleanup_files(root: &std::path::Path) -> ExpectedCommand {
+    ExpectedCommand::ok(
+        root.join("source/mono"),
+        "jj",
+        &[
+            "--ignore-working-copy",
+            "file",
+            "list",
+            "-r",
+            "abc1234",
+            ".cube",
+            "-T",
+            "file_type ++ \"\\t\" ++ executable ++ \"\\t\" ++ path ++ \"\\n\"",
+        ],
+        "",
+    )
+}
+
 #[test]
 fn workspace_gc_verb_forgets_consumed_bookmarks_on_free_workspaces() {
     // Two workspaces: 001 gets leased (skipped by gc), 002 stays free (gc'd).
@@ -52,6 +87,8 @@ fn workspace_gc_verb_forgets_consumed_bookmarks_on_free_workspaces() {
         gc_exec_sweep_command(&ws2_path, "boss/exec_dead_01"),
         gc_pr_noop_command(&ws2_path),
         ExpectedCommand::ok(ws2_path.clone(), "jj", &["bookmark", "forget", "boss/exec_dead_01"], ""),
+        trunk_cleanup_revision(tempdir.path()),
+        trunk_cleanup_files(tempdir.path()),
     ]);
     let gc_result = run_with_dependencies(
         Cli::parse_from(["cube", "workspace", "gc"]),
@@ -111,6 +148,8 @@ fn workspace_gc_dry_run_lists_without_forgetting() {
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
         gc_exec_sweep_command(&workspace_path, "boss/exec_dry_01"),
         gc_pr_noop_command(&workspace_path),
+        trunk_cleanup_revision(tempdir.path()),
+        trunk_cleanup_files(tempdir.path()),
     ]);
     let gc_result = run_with_dependencies(
         Cli::parse_from(["cube", "workspace", "gc", "--dry-run"]),

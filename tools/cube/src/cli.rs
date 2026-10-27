@@ -13,6 +13,12 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Internal process entry point for periodic cleanup outside lease dispatch.
+    #[command(hide = true)]
+    PeriodicCleanup {
+        #[arg(long)]
+        database: Option<std::path::PathBuf>,
+    },
     Repo {
         #[command(subcommand)]
         command: RepoCommand,
