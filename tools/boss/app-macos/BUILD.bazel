@@ -143,8 +143,10 @@ sh_test(
 # //tools/boss/app-macos:BossTestsShard3`, then read the per-suite
 # "Test Suite '...' passed at" timestamps in bazel-testlogs/.../test.log.
 # Keep each shard's isolated local wall time well inside the 60 s budget.
-# Today the tightest shards land around 11–33 s locally (Render ~33 s,
-# Shard3 11–30 s, about 2× headroom).
+# Isolated uncached on this change: Shard3 7.7 / 11.4 / 37.5 s (typical
+# 8–11 s; 37.5 s was the first run after a three-target warm), Render
+# 17.3 / 19.0 / 24.7 s. Render's slowest sample is about 2.4× under the
+# 60 s budget; Shard3's slowest isolated sample is about 1.6×.
 #
 # The shared principal is compiled into every bundle: it is the bundle's
 # NSPrincipalClass, which XCTest instantiates before the first test runs, and
