@@ -4,7 +4,7 @@
 //!
 //! # Motivation
 //!
-//! The app-side diagnostics from investigation T2101 (PR #1697) proved the
+//! The app-side diagnostics from PR #1697 proved the
 //! client is not the bottleneck: for the ~1,949-item Boss product the
 //! `request` segment (RPC issue → reply off the socket) is ~7.1s p50 while
 //! decode+apply+render total ~0.6s. But that `request` segment was a black
@@ -406,8 +406,8 @@ static LOG: OnceLock<Option<PopulationTimingLog>> = OnceLock::new();
 ///
 /// Called once at engine startup with the directory the isolation guard
 /// resolved and gated (`IsolationPaths::resolve_diagnostics_dir`). Nothing
-/// here reads the environment or `$HOME`: a lazily-resolved default is what
-/// let a test-fixture engine write into production's `diagnostics/`. Returns
+/// here reads the environment or `$HOME`, so a fixture uses only its checked
+/// diagnostics directory. Returns
 /// `false`, leaving the first installation in place, when already installed.
 pub fn install_global(dir: Option<PathBuf>) -> bool {
     LOG.set(dir.map(PopulationTimingLog::new)).is_ok()

@@ -73,9 +73,8 @@ pub struct EnginePaths {
     pub control_token: Option<PathBuf>,
     pub tmux_socket: Option<PathBuf>,
     /// Directory the engine's day-rotated diagnostic JSONL files go under
-    /// (population timing). A directory, not a file, but it collides the
-    /// same way: a fixture appending to production's `diagnostics/` pollutes
-    /// the operator's real timeline.
+    /// (population timing). A fixture must not append to production's
+    /// diagnostics timeline.
     pub diagnostics_dir: Option<PathBuf>,
 }
 
@@ -300,12 +299,15 @@ impl IsolationPaths {
                 // A directory beside the fixture's other files
                 // (`<dir>/<stem>.diagnostics/`), under the same
                 // override-equality rule as the files above.
-                diagnostics_dir: derive_field(
-                    &overrides.diagnostics_dir,
-                    &production.diagnostics_dir,
-                    boss_log_files::DIAGNOSTICS_DIR,
-                    "diagnostics",
-                ),
+                diagnostics_dir: match &overrides.diagnostics_dir {
+                    Some(value)
+                        if !same_directory(value, production.diagnostics_dir.as_deref())
+                            && !is_production_shaped(value, boss_log_files::DIAGNOSTICS_DIR) =>
+                    {
+                        None
+                    }
+                    _ => Some(dir.join(format!("{stem}.diagnostics"))),
+                },
             },
             state_root: Some(dir),
             stem,
@@ -401,8 +403,12 @@ impl IsolationPaths {
             .zip(self.production.fields())
             .filter_map(|((what, env, actual), (_, _, production))| {
                 let actual = actual?;
-                same_path(actual, production)
-                    .then(|| format!("{what} ({env}) resolved to the production path {}", actual.display()))
+                let collides = if env == DIAGNOSTICS_DIR_ENV {
+                    same_directory(actual, production)
+                } else {
+                    same_path(actual, production)
+                };
+                collides.then(|| format!("{what} ({env}) resolved to the production path {}", actual.display()))
             })
             .collect();
 
@@ -446,6 +452,13 @@ fn is_test_fixture_socket(socket_path: &str, production: &EnginePaths) -> bool {
 fn same_path(a: &Path, b: Option<&Path>) -> bool {
     let Some(b) = b else { return false };
     resolve_for_compare(a) == resolve_for_compare(b)
+}
+
+/// Writers follow directory symlinks when opening files beneath them.
+fn same_directory(a: &Path, b: Option<&Path>) -> bool {
+    let Some(b) = b else { return false };
+    let resolve = |path: &Path| path.canonicalize().unwrap_or_else(|_| resolve_for_compare(path));
+    resolve(a) == resolve(b)
 }
 
 /// Does `path` have production's *shape* for `filename` — i.e. is it named

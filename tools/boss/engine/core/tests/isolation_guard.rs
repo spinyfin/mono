@@ -246,12 +246,8 @@ fn fixture_refuses_to_start_when_a_resolved_path_is_production() {
     );
 }
 
-/// The population-timing log used to resolve `<state root>/diagnostics` from
-/// `$HOME` regardless of isolation, so a fixture appended to production's
-/// `engine-population-timing-*.jsonl`. A fixture now resolves its own
-/// directory beside its other files — including over an inherited production
-/// `BOSS_ENGINE_DIAGNOSTICS_DIR` — while a deliberate private override and a
-/// production engine keep theirs.
+/// A fixture resolves diagnostics beside its other files, including over an
+/// inherited production override; private overrides and production keep theirs.
 #[test]
 fn diagnostics_dir_is_fixture_scoped_unless_deliberately_overridden() {
     let prod_diag = production().diagnostics_dir.unwrap();
@@ -964,5 +960,53 @@ async fn instance_lock_survives_serve_return_while_process_is_alive() -> Result<
         !second_socket.exists(),
         "refused start must not have bound a frontend socket"
     );
+    Ok(())
+}
+
+#[test]
+fn diagnostics_override_symlink_to_production_is_scoped_away() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let production_dir = temp.path().join("production");
+    std::fs::create_dir(&production_dir)?;
+    let alias = temp.path().join("private-looking");
+    std::os::unix::fs::symlink(&production_dir, &alias)?;
+    let prod = EnginePaths {
+        diagnostics_dir: Some(production_dir),
+        ..production()
+    };
+    let paths = IsolationPaths::derive_from(
+        FIXTURE_SOCKET,
+        &IsolationOverrides {
+            diagnostics_dir: Some(alias.clone()),
+            ..Default::default()
+        },
+        &prod,
+    );
+    assert_eq!(
+        paths.resolve_diagnostics_dir(Some(alias)),
+        Some(PathBuf::from("/tmp/boss-test-guard-1234.diagnostics"))
+    );
+    Ok(())
+}
+
+#[test]
+fn derived_diagnostics_symlink_to_production_is_refused() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let production_dir = temp.path().join("production");
+    std::fs::create_dir(&production_dir)?;
+    std::os::unix::fs::symlink(&production_dir, temp.path().join("fixture.diagnostics"))?;
+    let prod = EnginePaths {
+        diagnostics_dir: Some(production_dir),
+        ..production()
+    };
+    let paths = IsolationPaths::derive_from(
+        temp.path().join("fixture.sock").to_str().unwrap(),
+        &IsolationOverrides::default(),
+        &prod,
+    );
+    let err = paths
+        .ensure_isolated(&paths.derived)
+        .expect_err("must refuse before logger installation");
+    assert!(err.to_string().contains("BOSS_ENGINE_DIAGNOSTICS_DIR"));
     Ok(())
 }

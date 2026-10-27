@@ -1,5 +1,4 @@
-//! Resolution and isolation gating of the engine's state paths at startup,
-//! split out of `server.rs` so that file stays under the 3000-line size check.
+//! Resolution and isolation gating of the engine's state paths at startup.
 
 use super::*;
 
