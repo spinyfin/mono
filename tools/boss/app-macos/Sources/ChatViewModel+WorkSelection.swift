@@ -235,7 +235,11 @@ extension ChatViewModel {
             workErrorMessage = "Couldn't open the review findings: the revision is no longer available."
             return
         }
-        openTaskDescription(revision)
+        if let findingsMarkdown {
+            openLoadedMarkdown(title: "AI review findings", markdown: findingsMarkdown)
+        } else {
+            openTaskDescription(revision)
+        }
         switch revealWorkCard(revision.id, productID: revision.productID) {
         case .revealed, .deferred:
             break

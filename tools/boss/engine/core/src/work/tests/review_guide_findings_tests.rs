@@ -642,3 +642,69 @@ fn returning_to_an_earlier_head_enqueues_an_update_from_the_published_guide() {
     assert!(!db.review_guide_comparison_has_attempt(&a.comparison_id).unwrap());
     assert!(db.review_guide_comparison_has_attempt(&b.comparison_id).unwrap());
 }
+
+#[test]
+fn addendum_displays_rejections_with_and_without_kept_findings() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id, "review target");
+    bind_open_pr(&db, &root.id);
+    let revision = apply_findings(&db, &root.id, "head");
+    let conn = db.connect().unwrap();
+    let (proposal_id, json): (String, String) = conn.query_row(
+        "SELECT p.id, p.payload_json FROM worker_proposals p JOIN pr_review_verdicts v ON v.proposal_id = p.id WHERE v.revision_task_id = ?1",
+        [&revision], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    drop(conn);
+    let mut payload: serde_json::Value = serde_json::from_str(&json).unwrap();
+    payload["verdict"]["rejected"] = serde_json::json!([
+        {"leaf_finding_id": "codex-1", "reason": "Already guarded"}
+    ]);
+    for kept in [true, false] {
+        if !kept {
+            payload["verdict"]["findings"] = serde_json::json!([]);
+        }
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE worker_proposals SET payload_json = ?1 WHERE id = ?2",
+                params![payload.to_string(), proposal_id],
+            )
+            .unwrap();
+        let rendered = findings(&db, &root.id).unwrap();
+        assert!(rendered.addendum_markdown.contains("### Rejected leaf findings"));
+        assert!(rendered.addendum_markdown.contains(r"codex\-1: Already guarded"));
+        assert_eq!(rendered.addendum_markdown.contains("Unchecked index"), kept);
+        assert!(rendered.status_text.contains("0 open"));
+        assert!(rendered.status_text.ends_with("1 rejected leaf finding"));
+        assert!(
+            rendered
+                .addendum_markdown
+                .contains("Already guarded — reviewed head head")
+        );
+    }
+}
+
+#[test]
+fn repeated_leaf_ids_are_attributed_to_their_reviewed_heads() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id, "review rounds");
+    bind_open_pr(&db, &root.id);
+    for head in ["first", "second"] {
+        let revision = apply_findings(&db, &root.id, head);
+        db.connect().unwrap().execute(
+            "UPDATE worker_proposals SET payload_json = json_set(payload_json, '$.verdict.rejected', json(?1)) WHERE id = (SELECT proposal_id FROM pr_review_verdicts WHERE revision_task_id = ?2)",
+            params![r#"[{"leaf_finding_id":"codex-1","reason":"Already guarded"}]"#, revision],
+        ).unwrap();
+    }
+    let rendered = findings(&db, &root.id).unwrap();
+    for head in ["first", "second"] {
+        assert!(
+            rendered
+                .addendum_markdown
+                .contains(&format!(r"codex\-1: Already guarded — reviewed head {head}"))
+        );
+    }
+    assert!(rendered.status_text.ends_with("2 rejected leaf findings"));
+}

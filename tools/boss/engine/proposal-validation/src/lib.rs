@@ -235,13 +235,12 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
                         {
                             reader.error("verdict.batch_id", "must match `batch_id`");
                         }
-                        for (index, finding) in parsed.findings.iter().enumerate() {
-                            if finding.sources.is_empty() {
-                                reader.error(
-                                    &format!("verdict.findings[{index}].sources"),
-                                    "must name at least one source reviewer; a finding cannot be unattributed",
-                                );
-                            }
+                        // Ids, citations and `rejected` shape. Whether the cited leaf
+                        // ids exist, and whether every leaf finding is accounted for,
+                        // needs the batch's accepted reports and is checked by the
+                        // applier inside the submission transaction.
+                        for error in parsed.structural_errors() {
+                            reader.error(&format!("verdict.{}", error.path), error.message);
                         }
                         for (index, contradiction) in parsed.contradictions.iter().enumerate() {
                             // Grok stays readable for historical batches. The applier

@@ -60,9 +60,11 @@ pub use render::{
 };
 pub use supervisor_render::{SupervisorReportInput, render_supervisor_claude_md, render_supervisor_initial_prompt};
 pub use supervisor_types::{
-    ConsolidatedFinding, ReviewerPosition, SupervisorContradiction, SupervisorSourceRole, SupervisorVerdict,
+    ConsolidatedFinding, RejectedFinding, ReviewerPosition, SupervisorContradiction, SupervisorSourceRole,
+    SupervisorVerdict, VerdictIdError,
 };
 pub use types::{
     PrReviewContext, RegressionCheck, ReviewCoverage, ReviewFinding, ReviewFindingCategory, ReviewFindingConfidence,
-    ReviewFindingSeverity, ReviewResult, ReviewScope, ReviewerReport, ReviewerReportFinding,
+    ReviewFindingSeverity, ReviewResult, ReviewScope, ReviewerReport, ReviewerReportFinding, leaf_finding_id,
+    leaf_finding_role,
 };

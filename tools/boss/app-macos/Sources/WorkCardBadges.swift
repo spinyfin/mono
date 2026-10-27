@@ -823,7 +823,7 @@ struct AIReviewStateBadge: View {
             .truncationMode(.tail)
 
         Group {
-            if state == "reviewed_with_findings", let onRevealFindings {
+            if let onRevealFindings {
                 Button(action: onRevealFindings) { label }
                     .buttonStyle(.plain)
                     .pointerStyle(.link)

@@ -184,6 +184,7 @@ impl WorkDb {
         &self,
         input: SubmitWorkerProposalInput<'_>,
     ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
+        let mut payload_json = input.payload_json.to_owned();
         let prepared_guide = (input.kind == ProposalKind::ReviewGuide)
             .then(|| super::review_guide_submission::prepare(self, input.execution_id, input.payload_json));
         // The transaction-holding half. Scoped to a block so the `conn`
@@ -266,7 +267,7 @@ impl WorkDb {
                 ProposalApplyPolicy::AutoApply | ProposalApplyPolicy::Async => Some(apply_in_transaction(
                     &tx,
                     input.execution_id,
-                    input.payload_json,
+                    &mut payload_json,
                     input.kind,
                     &id,
                     prepared_guide.as_ref(),
@@ -322,7 +323,7 @@ impl WorkDb {
                     input.execution_id,
                     input.work_item_id,
                     input.kind.as_str(),
-                    input.payload_json,
+                    payload_json,
                     input.idempotency_key,
                     state.as_str(),
                     applied_ref,
@@ -366,7 +367,7 @@ impl WorkDb {
                 .created_at(now)
                 .idempotency_key(input.idempotency_key)
                 .kind(input.kind)
-                .payload_json(input.payload_json)
+                .payload_json(payload_json)
                 .state(state)
                 .work_item_id(input.work_item_id)
                 .maybe_applied_ref(applied_ref)

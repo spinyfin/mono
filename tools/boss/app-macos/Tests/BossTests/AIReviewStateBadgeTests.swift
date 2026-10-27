@@ -99,6 +99,25 @@ final class AIReviewStateBadgeTests: XCTestCase {
         XCTAssertNil(model.pendingRevealScrollID)
     }
 
+    func testPersistedVerdictIncludesRejectionsWhenRevisionExists() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        let parent = makeTask(id: "parent", kind: "chore")
+        var revision = makeTask(id: "revision", kind: "revision")
+        revision.parentTaskId = parent.id
+        revision.status = "active"
+        model.selectWorkProduct(parent.productID)
+        model.choresByProductID = [parent.productID: [parent, revision]]
+        model.asyncMarkdownViewerOpener = {}
+        let markdown = "### Rejected leaf findings\n\ncodex-1: Already guarded"
+        model.openAIReviewFindings(revisionID: revision.id, findingsMarkdown: markdown)
+        guard case .loaded(let title, let content, _) = model.asyncMarkdownViewerVM.state else {
+            return XCTFail("Expected the persisted verdict")
+        }
+        XCTAssertEqual(title, "AI review findings")
+        XCTAssertEqual(content, markdown)
+        XCTAssertEqual(model.selectedWorkCardID, revision.id)
+    }
+
     private func makeTask(id: String, kind: String) -> WorkTask {
         WorkTask(
             id: id, productID: "product", projectID: nil, kind: kind,

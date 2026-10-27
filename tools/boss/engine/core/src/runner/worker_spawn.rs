@@ -360,11 +360,8 @@ fn load_batch_leaf_reports(
 
     let mut reports = Vec::new();
     for member in &members {
-        let role = match member.role {
-            ReviewBatchMemberRole::ClaudeReviewer => crate::pr_review::SupervisorSourceRole::Claude,
-            ReviewBatchMemberRole::CodexReviewer => crate::pr_review::SupervisorSourceRole::Codex,
-            ReviewBatchMemberRole::GrokReviewer => crate::pr_review::SupervisorSourceRole::Grok,
-            ReviewBatchMemberRole::Supervisor | ReviewBatchMemberRole::PostMergeReviewer => continue,
+        let Some(role) = crate::pr_review::SupervisorSourceRole::from_member_role(member.role) else {
+            continue;
         };
         let Some(proposal_id) = member.report_proposal_id.as_deref() else {
             continue;
@@ -1028,14 +1025,7 @@ pub(crate) async fn compose_worker_spawn(
                     let mut configured_roles = work_db
                         .review_batch_members(&destination.batch_id)?
                         .iter()
-                        .filter_map(|member| match member.role {
-                            ReviewBatchMemberRole::ClaudeReviewer => {
-                                Some(crate::pr_review::SupervisorSourceRole::Claude)
-                            }
-                            ReviewBatchMemberRole::CodexReviewer => Some(crate::pr_review::SupervisorSourceRole::Codex),
-                            ReviewBatchMemberRole::GrokReviewer => Some(crate::pr_review::SupervisorSourceRole::Grok),
-                            _ => None,
-                        })
+                        .filter_map(|member| crate::pr_review::SupervisorSourceRole::from_member_role(member.role))
                         .collect::<Vec<_>>();
                     configured_roles.dedup();
                     crate::pr_review::render_supervisor_initial_prompt(

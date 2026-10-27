@@ -50,9 +50,9 @@ fn both_reports_dispatch_supervisor_and_grok_citations_are_rejected() {
             let mut payload: serde_json::Value = serde_json::from_str(&verdict_payload(&batch.id, "head-sha")).unwrap();
             if citation == "source" {
                 payload["verdict"]["findings"] = serde_json::json!([{
-                    "severity": "high", "category": "correctness", "confidence": "high",
+                    "id": "C1", "severity": "high", "category": "correctness", "confidence": "high",
                     "file": "src/lib.rs", "title": "Unchecked index", "detail": "Missing bounds check",
-                    "sources": ["grok"]
+                    "sources": ["grok-1"]
                 }]);
             } else {
                 payload["verdict"]["contradictions"] = serde_json::json!([{

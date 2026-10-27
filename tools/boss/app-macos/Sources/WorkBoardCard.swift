@@ -160,7 +160,8 @@ struct WorkBoardCardItem: View {
             staleSource: task.reviewGuideStaleSource ?? false,
             error: task.reviewGuideError
         )
-        let onRevealAIReviewFindings: (() -> Void)? = snapshot.aiReviewState == "reviewed_with_findings"
+        let onRevealAIReviewFindings: (() -> Void)? = (snapshot.aiReviewState == "reviewed_with_findings"
+            || snapshot.aiReviewBadge?.findingsMarkdown != nil)
             ? {
                 model.openAIReviewFindings(
                     revisionID: snapshot.aiReviewFindingsRevisionId,
