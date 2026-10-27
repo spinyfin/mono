@@ -87,8 +87,7 @@ fn used_memory_never_exceeds_the_physical_total() {
     assert_eq!(m.available_bytes, 0);
 }
 
-/// Scripted probe: each field is a closure-free queue so a test states
-/// exactly what the kernel "returned" on each tick.
+/// Scripted CPU ticks with fixed results for the other probe readings.
 #[derive(bon::Builder)]
 struct FakeProbe {
     cpus: Result<u32, ProbeError>,
@@ -103,19 +102,19 @@ struct FakeProbe {
 
 impl FakeProbe {
     fn healthy(ticks: Vec<CpuTicks>) -> Self {
-        Self {
-            cpus: Ok(12),
-            load: Ok([155.0, 170.5, 185.0]),
-            ticks: ticks.into_iter().map(Ok).collect(),
-            vm: Ok(vm()),
-            total: Ok(100_000 * 16_384),
-            level: Ok(7),
-            swap: Ok(SwapReading {
+        Self::builder()
+            .cpus(Ok(12))
+            .load(Ok([155.0, 170.5, 185.0]))
+            .ticks(ticks.into_iter().map(Ok).collect())
+            .vm(Ok(vm()))
+            .total(Ok(100_000 * 16_384))
+            .level(Ok(7))
+            .swap(Ok(SwapReading {
                 total_bytes: 12 << 30,
                 used_bytes: 10 << 30,
-            }),
-            cpu_calls: 0,
-        }
+            }))
+            .cpu_calls(0)
+            .build()
     }
 }
 

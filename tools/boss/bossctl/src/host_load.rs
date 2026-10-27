@@ -15,26 +15,13 @@ use boss_engine::host_load::{HostSample, format_local_ms};
 /// always returns every sample.
 const MAX_TEXT_ROWS: usize = 120;
 
-/// Parse `90s`, `30m`, `6h`, `2d` (a bare number is minutes) into
-/// milliseconds.
-pub(crate) fn parse_window_ms(text: &str) -> Result<i64> {
-    let text = text.trim();
-    let (digits, unit_ms) = match text.chars().last() {
-        Some('s') => (&text[..text.len() - 1], 1_000),
-        Some('m') => (&text[..text.len() - 1], 60_000),
-        Some('h') => (&text[..text.len() - 1], 3_600_000),
-        Some('d') => (&text[..text.len() - 1], 86_400_000),
-        Some(c) if c.is_ascii_digit() => (text, 60_000),
-        _ => bail!("invalid window {text:?}: use a number plus s/m/h/d, e.g. 30m, 6h, 2d"),
-    };
-    let n: i64 = digits
-        .parse()
-        .with_context(|| format!("invalid window {text:?}: use a number plus s/m/h/d, e.g. 30m, 6h, 2d"))?;
-    if n <= 0 {
-        bail!("invalid window {text:?}: must be positive");
+/// Validate the shared duration syntax and the window's storage bounds.
+pub(crate) fn window_duration_ms(text: &str) -> Result<i64> {
+    let millis = crate::dispatch_stats::parse_duration_ms("--window", text)?;
+    if millis == 0 {
+        bail!("invalid --window {text:?}: must be positive");
     }
-    n.checked_mul(unit_ms)
-        .with_context(|| format!("window {text:?} is too large"))
+    i64::try_from(millis).with_context(|| format!("window {text:?} is too large"))
 }
 
 /// The machine-readable shape. Pure so its field names are pinned by a
@@ -59,8 +46,8 @@ pub(crate) fn build_json(
 }
 
 pub(crate) fn host_load(json: bool, state_root: Option<PathBuf>, window: &str) -> Result<()> {
-    let window_ms = parse_window_ms(window)?;
-    let db = crate::open_state_db(state_root)?;
+    let window_ms = window_duration_ms(window)?;
+    let db = crate::open_state_db_read_only(state_root)?;
     let until_ms = crate::now_epoch_ms() as i64;
     let since_ms = until_ms - window_ms;
 
@@ -169,15 +156,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn windows_parse_with_units_and_default_to_minutes() {
-        assert_eq!(parse_window_ms("90s").unwrap(), 90_000);
-        assert_eq!(parse_window_ms("30m").unwrap(), 1_800_000);
-        assert_eq!(parse_window_ms("6h").unwrap(), 21_600_000);
-        assert_eq!(parse_window_ms("2d").unwrap(), 172_800_000);
-        assert_eq!(parse_window_ms("45").unwrap(), 2_700_000);
-        for bad in ["", "h", "abc", "-5m", "0h", "1.5h", "5w"] {
-            assert!(parse_window_ms(bad).is_err(), "{bad:?} should be rejected");
-        }
+    fn window_requires_positive_duration_fitting_signed_milliseconds() {
+        assert!(window_duration_ms("0s").unwrap_err().to_string().contains("positive"));
+        assert_eq!(
+            window_duration_ms("9223372036854775s").unwrap(),
+            9_223_372_036_854_775_000
+        );
+        assert!(
+            window_duration_ms("9223372036854776s")
+                .unwrap_err()
+                .to_string()
+                .contains("too large")
+        );
+        assert!(window_duration_ms("45").is_err());
     }
 
     #[test]
