@@ -2,9 +2,8 @@
 //! descriptor Bazel hands to the code generator (not a second parse of the
 //! source), so they hold for exactly what the generated types come from.
 //!
-//! buf's breaking check (`proto_breaking_test`) judges a change against the
-//! released contract. These rules cover what it cannot: properties every
-//! version of the schema must have, including the first.
+//! checkleft's `proto/breaking` judges a change against its base revision.
+//! These rules cover what it cannot: properties every version of the schema must have, including the first.
 
 use prost::Message;
 use prost_types::{FileDescriptorSet, field_descriptor_proto::Label};

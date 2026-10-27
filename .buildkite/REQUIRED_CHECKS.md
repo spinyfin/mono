@@ -35,6 +35,15 @@ The rename from the legacy `bazel-build` / `bazel-test` contexts to the consolid
 3. An operator with admin on `spinyfin/mono` flipped `required_status_checks` on 2026-07-13 to require `buildkite/mono/bazel-build-test`, `buildkite/mono/mac-app-build`, and `buildkite/mono/checks`; the two legacy contexts are no longer required.
 4. The `bazel-build-test` step's two legacy `notify` entries have been removed, since branch protection no longer requires them.
 
+## Protocol compatibility gate consolidation
+
+Protocol compatibility now runs as `proto/breaking` within `buildkite/mono/checks`.
+Protocol-spoke's build and Rust tests remain in the normal `//...` build/test step.
+The repo owner must remove `buildkite/mono/spoke-protocol-linux` and
+`buildkite/mono/spoke-protocol-macos` from GitHub branch protection if configured:
+the dedicated steps no longer emit these contexts. Keep `buildkite/mono/checks`
+required so breaking schema changes continue to block merge.
+
 ## Rename contract
 
 If you rename a step key in `pipeline.yml`:

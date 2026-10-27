@@ -7,8 +7,8 @@
 // instruction as a sequenced Command; each side acknowledges the other's
 // highest contiguous sequence (Cursor) once it is durable, never before.
 //
-// Evolution rules (enforced by the buf breaking check and the semantic peer
-// tests; see ../../../../README.md):
+// Evolution rules (enforced by the checkleft proto/breaking check and the
+// semantic peer tests; see ../../../../README.md):
 //   - Field numbers and enum numbers are permanent. A removed field or enum
 //     value must reserve both its number and its name.
 //   - A new field is optional with a documented default; a reader behaves
