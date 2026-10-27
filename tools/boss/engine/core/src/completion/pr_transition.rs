@@ -1018,7 +1018,15 @@ impl WorkerCompletionHandler {
             boss_task_scope::spawn(async move {
                 match probe.probe(&candidate.pr_url).await {
                     Ok(lifecycle_probe) => {
-                        update_pr_poll_state(&work_db, publisher.as_ref(), &candidate, &lifecycle_probe, None).await;
+                        update_pr_poll_state(
+                            &work_db,
+                            publisher.as_ref(),
+                            &candidate,
+                            &lifecycle_probe,
+                            None,
+                            "completion",
+                        )
+                        .await;
                     }
                     Err(err) => {
                         tracing::debug!(
