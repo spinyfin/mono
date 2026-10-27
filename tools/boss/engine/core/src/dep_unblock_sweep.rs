@@ -316,7 +316,6 @@ mod tests {
         let waiting = db
             .create_execution(
                 CreateExecutionInput::builder()
-                    .created_via("test")
                     .work_item_id(dep_id.clone())
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(ExecutionStatus::WaitingDependency)
@@ -600,7 +599,6 @@ mod tests {
         // directly insert a `running` execution as the engine would after dispatch.
         db.create_execution(
             crate::work::CreateExecutionInput::builder()
-                .created_via("test")
                 .work_item_id(dep_id.clone())
                 .kind(crate::work::ExecutionKind::ChoreImplementation)
                 .status(crate::work::ExecutionStatus::Running)
