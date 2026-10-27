@@ -272,6 +272,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alive_inspection_does_not_override_a_driver_session_end() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "session-end");
+        let pid = i64::from(std::process::id());
+        let execution_id = create_spawned_execution(&db, &work_item_id, pid);
+        let states = LiveWorkerStateRegistry::new();
+        register_working(&states, 1, &execution_id, &work_item_id, pid as i32);
+        states.apply_event(
+            1,
+            &WorkerEvent::SessionEnd {
+                session_id: "s".into(),
+                reason: "exit".into(),
+            },
+        );
+        assert_eq!(states.get(1).unwrap().activity, WorkerActivity::Terminated);
+        // A wrapper shell outliving the agent CLI keeps the pane alive.
+        let inspector = StaticInspector(TerminalLiveness::Alive {
+            session_name: "boss-worker".into(),
+            window_activity_epoch_secs: None,
+            pane_current_command: None,
+        });
+        let _ = evaluate(
+            &db,
+            &states,
+            Some(&inspector),
+            &execution_id,
+            boss_engine_utils::epoch_time::now_epoch_secs(),
+        )
+        .await;
+        assert_eq!(
+            states.get(1).unwrap().activity,
+            WorkerActivity::Terminated,
+            "pane presence must not override the hook stream's SessionEnd"
+        );
+    }
+
+    #[tokio::test]
     async fn gone_pid_without_recent_hooks_stops_and_fences() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);

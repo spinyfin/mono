@@ -257,6 +257,12 @@ struct SlotMeta {
     /// Ordinary buffered hooks never clear this flag.
     #[builder(default)]
     observed_dead: bool,
+    /// Set when the engine itself (not a driver `SessionEnd`) marked the slot
+    /// `Terminated` from liveness evidence. Only such terminations may be
+    /// revived by an `Alive` inspection; a hook-derived `Terminated` belongs
+    /// to the hook stream. Cleared by any accepted hook.
+    #[builder(default)]
+    inferred_terminated: bool,
     /// Set when a `Notification` hook arrives, cleared on the next `Stop`.
     /// Lets us turn a `Stop` into `WaitingForInput` rather than `Idle`
     /// when claude is paused on a permission prompt.
@@ -914,7 +920,7 @@ impl LiveWorkerStateRegistry {
                     // Same-run re-adoption is proof the worker survived an inferred
                     // or confirmed death. Clear the fence and restore activity from
                     // the in-memory semantic checkpoint; ordinary hooks cannot.
-                    if entry.meta.observed_dead || entry.state.activity == WorkerActivity::Terminated {
+                    if entry.meta.observed_dead || entry.meta.inferred_terminated {
                         revive_slot_entry(entry);
                     }
                     (true, repaired_shell_pid)
@@ -1813,6 +1819,8 @@ impl LiveWorkerStateRegistry {
         }
         let resumed_after = record_turn_progress(meta, ingress_seq, event, origin);
         let before = state.clone();
+        // An accepted hook hands the activity back to the hook stream.
+        meta.inferred_terminated = false;
 
         state.last_event_at = Some(now.clone());
         // Driver-originated only: this method is the hook/JSONL ingress.
@@ -1987,6 +1995,7 @@ impl LiveWorkerStateRegistry {
         if fence {
             entry.meta.observed_dead = true;
         }
+        entry.meta.inferred_terminated = true;
         let state = &mut entry.state;
         let changed = state.activity != WorkerActivity::Terminated;
         state.activity = WorkerActivity::Terminated;
@@ -2013,7 +2022,7 @@ impl LiveWorkerStateRegistry {
         let Some(entry) = guard.values_mut().find(|entry| entry.state.run_id == run_id) else {
             return false;
         };
-        if !entry.meta.observed_dead && entry.state.activity != WorkerActivity::Terminated {
+        if !entry.meta.observed_dead && !entry.meta.inferred_terminated {
             return false;
         }
         revive_slot_entry(entry)
@@ -2612,10 +2621,16 @@ fn activity_from_semantic(turn: SemanticTurnCondition, tool: SemanticToolConditi
 fn revive_slot_entry(entry: &mut SlotEntry) -> bool {
     let was_fenced = entry.meta.observed_dead;
     entry.meta.observed_dead = false;
+    entry.meta.inferred_terminated = false;
     let previous = entry.state.activity;
-    entry.state.activity =
+    // A pending notification survives termination: the worker was paused on
+    // a prompt, which the Stop arm would also report as awaiting input.
+    entry.state.activity = if entry.meta.notification_pending {
+        WorkerActivity::WaitingForInput
+    } else {
         activity_from_semantic(entry.meta.semantic_turn_condition, entry.meta.semantic_tool_condition)
-            .unwrap_or(WorkerActivity::Working);
+            .unwrap_or(WorkerActivity::Working)
+    };
     was_fenced || previous != entry.state.activity
 }
 

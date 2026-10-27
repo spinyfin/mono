@@ -878,10 +878,18 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
     let mut last_refresh_attempt = Instant::now();
     let mut last_activity = WorkerActivity::Spawning;
     let mut idle_since: Option<Instant> = None;
+    // A timer wake whose liveness check said `SkipThisCycle` leaves the
+    // activity deadline expired; without this the next wake clamps to 50ms
+    // and re-probes tmux and the durable PID in a hot loop. Real triggers
+    // still pre-empt the sleep.
+    let mut skip_retry_at: Option<Instant> = None;
 
     loop {
-        let timer_remaining =
-            compute_timer_delay(last_activity, Some(last_refresh_attempt), idle_since, Instant::now());
+        let now = Instant::now();
+        let mut timer_remaining = compute_timer_delay(last_activity, Some(last_refresh_attempt), idle_since, now);
+        if let Some(retry_at) = skip_retry_at {
+            timer_remaining = timer_remaining.max(retry_at.saturating_duration_since(now));
+        }
         let (trigger, synthetic) = tokio::select! {
             t = rx.recv() => match t {
                 Some(t) => (t, false),
@@ -919,6 +927,14 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             if last_activity == WorkerActivity::Terminated {
                 continue;
             }
+            idle_since = (last_activity == WorkerActivity::Idle).then(Instant::now);
+        } else if last_activity == WorkerActivity::Terminated {
+            // Parked on a Stop permit, but another path (sweep `Alive` arm,
+            // same-run re-adoption) restored the registry without sending
+            // this loop a transition. Resync from the registry on every
+            // wake so a worker that is visibly running again un-parks.
+            last_activity = state.activity;
+            idle_since = (last_activity == WorkerActivity::Idle).then(Instant::now);
         }
 
         let kind = trigger_kind(&trigger);
@@ -1016,8 +1032,12 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         }
 
         if permit != WorkerRefreshPermit::Refresh {
+            if synthetic {
+                skip_retry_at = Some(Instant::now() + WORKING_TIMER_FLOOR);
+            }
             continue;
         }
+        skip_retry_at = None;
 
         last_refresh_attempt = Instant::now();
 
@@ -1639,6 +1659,98 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             assert!(!mgr.has_slot(3));
         });
+    }
+
+    /// Resolver whose liveness permit is scripted and whose probes are counted.
+    struct ScriptedPermitResolver {
+        permit: std::sync::Mutex<WorkerRefreshPermit>,
+        probes: AtomicUsize,
+    }
+
+    impl ScriptedPermitResolver {
+        fn new(permit: WorkerRefreshPermit) -> Self {
+            Self {
+                permit: std::sync::Mutex::new(permit),
+                probes: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TranscriptPathResolver for ScriptedPermitResolver {
+        async fn transcript_path(&self, _run_id: &str) -> Option<PathBuf> {
+            None
+        }
+
+        async fn worker_can_refresh(&self, _run_id: &str) -> WorkerRefreshPermit {
+            self.probes.fetch_add(1, Ordering::Relaxed);
+            *self.permit.lock().unwrap()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skip_this_cycle_does_not_poll_liveness_at_the_floor() {
+        let mgr = LiveStatusManager::new();
+        let registry = Arc::new(LiveWorkerStateRegistry::new());
+        registry.register_spawn(11, "run-11", "claude-opus-4-7", 0, None);
+        registry.apply_event(
+            11,
+            &WorkerEvent::UserPromptSubmit {
+                session_id: "s".into(),
+                prompt: "go".into(),
+            },
+        );
+        let bc: Arc<dyn LiveStatusBroadcaster> = Arc::new(CountingBroadcaster::default());
+        let res = Arc::new(ScriptedPermitResolver::new(WorkerRefreshPermit::SkipThisCycle));
+        let res_dyn: Arc<dyn TranscriptPathResolver> = res.clone();
+        mgr.start_slot(11, live_run("run-11"), keyless_utility(), registry, bc, res_dyn);
+
+        // Pass the Working deadline, then sit well beyond it.
+        tokio::time::sleep(WORKING_TIMER_FLOOR + Duration::from_secs(1)).await;
+        let at_deadline = res.probes.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let after = res.probes.load(Ordering::Relaxed);
+        assert!(
+            after - at_deadline <= 1,
+            "a skipped cycle must not re-probe liveness every 50ms: {at_deadline} -> {after}"
+        );
+        mgr.stop_slot(11);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loop_parked_on_stop_resumes_after_external_revival() {
+        let mgr = LiveStatusManager::new();
+        let registry = Arc::new(LiveWorkerStateRegistry::new());
+        registry.register_spawn(12, "run-12", "claude-opus-4-7", 0, None);
+        registry.apply_event(
+            12,
+            &WorkerEvent::UserPromptSubmit {
+                session_id: "s".into(),
+                prompt: "go".into(),
+            },
+        );
+        let bc: Arc<dyn LiveStatusBroadcaster> = Arc::new(CountingBroadcaster::default());
+        let res = Arc::new(ScriptedPermitResolver::new(WorkerRefreshPermit::Stop));
+        let res_dyn: Arc<dyn TranscriptPathResolver> = res.clone();
+        mgr.start_slot(12, live_run("run-12"), keyless_utility(), registry, bc, res_dyn);
+        // The seeded activity wake parks the loop on the Stop permit.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(res.probes.load(Ordering::Relaxed) >= 1);
+
+        // Another path revived the worker (registry already Working); the
+        // loop is told nothing except an ordinary tool event.
+        *res.permit.lock().unwrap() = WorkerRefreshPermit::Refresh;
+        mgr.notify(12, Trigger::PostToolUse);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let before_timer = res.probes.load(Ordering::Relaxed);
+
+        // Timer-driven refresh must resume instead of parking for an hour.
+        tokio::time::sleep(WORKING_TIMER_FLOOR + Duration::from_secs(1)).await;
+        assert!(
+            res.probes.load(Ordering::Relaxed) > before_timer,
+            "the Working timer floor must fire again after external revival"
+        );
+        mgr.stop_slot(12);
     }
 
     #[tokio::test]
