@@ -699,7 +699,8 @@ private struct RenderedMarkdownChunk: Identifiable {
 /// so each section can be its own `StructuredText` (bounding layout
 /// recursion and making `LazyVStack` effective). Headings whose exact text
 /// (level markers and surrounding whitespace stripped) appears in
-/// `collapsibleHeadings` become `.collapsible` and include their descendants;
+/// `collapsibleHeadings` become `.collapsible`. Outline folds include descendants,
+/// while revision boilerplate stops before findings at the next heading;
 /// other top-level headings start `.plain` chunks with their heading line.
 /// A pure function over `String` —
 /// no Textual/StructuredText involvement — because Textual's block rendering
@@ -714,7 +715,8 @@ private struct RenderedMarkdownChunk: Identifiable {
 /// reference definitions.
 enum MarkdownHeadingSections {
     /// Fold a complete outline section, including deeper headings, up to the
-    /// next heading of the same or higher level. Plain sections remain lazy.
+    /// next heading of the same or higher level. Revision boilerplate folds only
+    /// its own content so findings and their summary remain visible.
     static func chunks(in source: String, collapsibleHeadings: Set<String>) -> [MarkdownDocumentChunk] {
         sections(in: source, collapsibleHeadings: collapsibleHeadings).map { section in
             let text = String(source[section.range])
@@ -738,7 +740,7 @@ enum MarkdownHeadingSections {
         while i < headings.count {
             let heading = headings[i]
             var next = i + 1
-            if collapsibleHeadings.contains(heading.text) {
+            if collapsibleHeadings.contains(heading.text), heading.text != RevisionBriefCollapsibleHeadings.hardRule {
                 while next < headings.count && headings[next].level > heading.level { next += 1 }
             }
             let end = next < headings.count ? headings[next].lineRange.lowerBound : source.endIndex
@@ -770,9 +772,31 @@ enum MarkdownHeadingSections {
         let lineRange: Range<String.Index>
     }
 
+    private final class HeadingIndex {
+        let headings: [HeadingLine]
+        init(_ headings: [HeadingLine]) { self.headings = headings }
+    }
+
+    // NSCache supports concurrent access; entries are immutable and bounded so
+    // find updates and default-fold detection reuse the same structural scan.
+    nonisolated(unsafe) private static let headingCache: NSCache<NSString, HeadingIndex> = {
+        let cache = NSCache<NSString, HeadingIndex>()
+        cache.countLimit = 32
+        cache.totalCostLimit = 4 * 1024 * 1024
+        return cache
+    }()
+
+    private static func headingLines(in source: String) -> [HeadingLine] {
+        let key = source as NSString
+        if let cached = headingCache.object(forKey: key) { return cached.headings }
+        let headings = parseHeadingLines(in: source)
+        headingCache.setObject(HeadingIndex(headings), forKey: key, cost: source.utf8.count)
+        return headings
+    }
+
     /// Use the CommonMark block tree so headings inside lists, block quotes,
     /// and fenced code cannot split a top-level paragraph or container.
-    private static func headingLines(in source: String) -> [HeadingLine] {
+    private static func parseHeadingLines(in source: String) -> [HeadingLine] {
         guard let document = try? AttributedString(
             markdown: source, options: .init(appliesSourcePositionAttributes: true)
         ) else { return [] }

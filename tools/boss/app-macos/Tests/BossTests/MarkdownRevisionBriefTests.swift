@@ -1,5 +1,3 @@
-import AppKit
-import SwiftUI
 import Textual
 import XCTest
 @testable import Boss
@@ -27,8 +25,7 @@ final class MarkdownRevisionBriefTests: XCTestCase {
     Fix: exclude proven trunk/upstream ancestry from the unique set (e.g. subtract
     `::main@<remote>` or otherwise separate base history).
 
-    ## Review summary
-    All findings require a fix.
+    **Review summary:** All findings require a fix.
     """
 
     func testWrappedParagraphsAndHardBreaksPreserveCommonMarkBlocks() throws {
@@ -47,14 +44,17 @@ final class MarkdownRevisionBriefTests: XCTestCase {
         XCTAssertTrue(paragraphs.contains { $0.hasPrefix("File:") && $0.contains("\nCategory: deferred_scope") })
     }
 
-    func testFoldContainsWholeParagraphsAndNestedHeadings() {
-        let chunks = MarkdownHeadingSections.chunks(in: Self.brief, collapsibleHeadings: [RevisionBriefCollapsibleHeadings.hardRule])
+    func testDefaultFoldPreservesWholeParagraphsAndLeavesFindingsAndSummaryVisible() {
+        let chunks = MarkdownHeadingSections.chunks(in: Self.brief, collapsibleHeadings: RevisionBriefCollapsibleHeadings.collapsedByDefault(in: Self.brief))
         XCTAssertEqual(chunks.count, 2)
         let parsed = MarkdownParsedDocument.parse(source: Self.brief, chunks: chunks, baseURL: nil)
         XCTAssertTrue(String(parsed[0].characters).contains("If — and only if"))
         XCTAssertTrue(String(parsed[0].characters).contains("The default is to do the work."))
-        XCTAssertTrue(String(parsed[0].characters).contains("[high] Base-only"))
-        XCTAssertEqual(String(parsed[1].characters), "Review summaryAll findings require a fix.")
+        XCTAssertFalse(String(parsed[0].characters).contains("[high] Base-only"))
+        XCTAssertFalse(String(parsed[0].characters).contains("Review summary:"))
+        guard case .plain = chunks[1] else { return XCTFail("findings must remain outside the fold") }
+        XCTAssertTrue(String(parsed[1].characters).hasPrefix("[high] Base-only"))
+        XCTAssertTrue(String(parsed[1].characters).hasSuffix("Review summary: All findings require a fix."))
     }
 
     func testOnlyTopLevelCommonMarkHeadingsDelimitSections() {
@@ -74,7 +74,7 @@ final class MarkdownRevisionBriefTests: XCTestCase {
         let windows = Self.brief.replacingOccurrences(of: "\n", with: "\r\n")
         let windowsChunks = MarkdownHeadingSections.chunks(in: windows, collapsibleHeadings: [RevisionBriefCollapsibleHeadings.hardRule])
         XCTAssertEqual(windowsChunks.count, 2)
-        XCTAssertTrue(windowsChunks[1].renderedText.hasPrefix("## Review summary"))
+        XCTAssertTrue(windowsChunks[1].renderedText.hasPrefix("### [high]"))
     }
 
     func testSetextFoldAndUnicodeWithinParagraph() {
@@ -83,34 +83,4 @@ final class MarkdownRevisionBriefTests: XCTestCase {
         XCTAssertEqual(chunks, [.collapsible(heading: "Title", body: "body\u{2028}continuation\n\n"), .plain("Peer\n====\nvisible")])
     }
 
-    func testCapture() throws {
-        let chunks = MarkdownHeadingSections.chunks(in: Self.brief, collapsibleHeadings: [])
-        let parsed = MarkdownParsedDocument.parse(source: Self.brief, chunks: chunks, baseURL: nil)
-        let view = VStack(alignment: .leading, spacing: 0) {
-            ForEach(chunks.indices, id: \.self) { index in
-                StructuredText(chunks[index].renderedText, parser: ParsedMarkdownChunkParser(content: parsed[index]))
-            }
-        }.bossMarkdown().padding(28)
-            .frame(width: 900, height: 1100, alignment: .topLeading)
-            .background(Color.white).environment(\.colorScheme, .light)
-        try capture(view, name: "revision-brief.png")
-        try capture(MarkdownDocumentChrome(title: "Revision brief", source: Self.brief,
-                    collapsedByDefaultHeadings: [RevisionBriefCollapsibleHeadings.hardRule]), name: "revision-brief-collapsed.png")
-    }
-
-    private func capture(_ view: some View, name: String) throws {
-        let hosting = NSHostingView(rootView: view)
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 1100), styleMask: [.titled], backing: .buffered, defer: false)
-        window.contentView = hosting
-        for _ in 0..<8 {
-            hosting.layoutSubtreeIfNeeded()
-            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
-        }
-        let bitmap = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
-        hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
-        let data = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
-        let directory = ProcessInfo.processInfo.environment["TEST_UNDECLARED_OUTPUTS_DIR"] ?? NSTemporaryDirectory()
-        try data.write(to: URL(fileURLWithPath: directory).appendingPathComponent(name))
-        window.orderOut(nil)
-    }
 }
