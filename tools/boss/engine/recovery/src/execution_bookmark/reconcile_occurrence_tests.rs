@@ -16,7 +16,9 @@ impl Jj for LargeHistory {
         if args.last().unwrap().contains("description") {
             return Ok("preserved work Unpublished work\n".into());
         }
-        Ok((0..200).map(|i| format!("change{i} commit{i}\n")).collect())
+        Ok((0..reconcile::MAX_PATCH_COMPARISONS + 1)
+            .map(|i| format!("change{i} commit{i}\n"))
+            .collect())
     }
 
     async fn shared_repo(&self, _workspace: &Path) -> Result<PathBuf> {
@@ -31,7 +33,10 @@ async fn large_patch_search_fails_closed_after_bounded_comparisons() {
         .await
         .unwrap();
     assert!(!result.is_contained());
-    assert_eq!(jj.0.load(std::sync::atomic::Ordering::Relaxed), 128);
+    assert_eq!(
+        jj.0.load(std::sync::atomic::Ordering::Relaxed),
+        reconcile::MAX_PATCH_COMPARISONS
+    );
 }
 
 /// A published add/revert pair cannot vouch for an unpublished re-add.

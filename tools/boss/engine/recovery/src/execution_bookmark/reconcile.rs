@@ -270,6 +270,9 @@ async fn same_patch(jj: &dyn Jj, repo: &Path, commit: &str, variant: &str) -> Re
         .is_empty())
 }
 
+/// Reaching this comparison limit fails closed with any unmatched work missing.
+pub(super) const MAX_PATCH_COMPARISONS: usize = 128;
+
 /// Is the preserved work of `head` already carried by `vouching`? Ancestry
 /// first; otherwise every non-empty preserved commit that is not an
 /// ancestor of `vouching` must have a visible commit with an equivalent
@@ -279,7 +282,7 @@ async fn same_patch(jj: &dyn Jj, repo: &Path, commit: &str, variant: &str) -> Re
 /// equivalence; identity alone cannot vouch for an unpublished amendment.
 /// Without a base only ancestry counts.
 ///
-/// Matches consume candidates in newest-first order. At most 128 interdiffs
+/// Matches consume candidates in newest-first order. At most `MAX_PATCH_COMPARISONS` interdiffs
 /// run per head; exhausting that limit fails closed with missing changes.
 pub(crate) async fn containment(
     jj: &dyn Jj,
@@ -338,7 +341,7 @@ pub(crate) async fn containment(
     for (change, commit, description) in change_commit_lines(&outside) {
         let mut variant = None;
         for (index, (published_change, candidate)) in published.iter().enumerate().skip(next_candidate) {
-            if comparisons == 128 {
+            if comparisons == MAX_PATCH_COMPARISONS {
                 break;
             }
             comparisons += 1;
