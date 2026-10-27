@@ -108,12 +108,29 @@ async fn legacy_reset(token: &str, legacy_delay: Duration) {
     let events = stages(token);
     for name in [
         "coordinator_reset_rpc_received",
+        "coordinator_reset_server_resolved",
         "coordinator_handoff_delivery_started",
         "coordinator_reset_lock_acquired",
         "coordinator_handoff_requested",
     ] {
         assert!(events.iter().any(|event| event["event"] == name), "missing {name}");
     }
+    let resolved = events
+        .iter()
+        .position(|e| e["event"] == "coordinator_reset_server_resolved")
+        .unwrap();
+    let received = events
+        .iter()
+        .position(|e| e["event"] == "coordinator_reset_rpc_received")
+        .unwrap();
+    let delivery = events
+        .iter()
+        .position(|e| e["event"] == "coordinator_handoff_delivery_started")
+        .unwrap();
+    assert!(received < resolved && resolved < delivery);
+    assert_eq!(events[resolved]["server"], "socket");
+    assert_eq!(events[resolved]["phase"], "delivery");
+    assert!(events[resolved]["elapsed_ms"].as_u64().unwrap() < 2_000);
     let attachment = read_frame_where(&mut read, |frame| {
         frame["payload"]["type"] == "engine_request"
             && frame["payload"]["request"]["kind"] == "attach_coordinator_pane"

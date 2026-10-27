@@ -721,7 +721,10 @@ async fn session_exists(tmux: &Tmux, name: &str) -> Result<bool> {
 
 /// Resolve which tmux server currently hosts the coordinator session:
 /// Prefer the durable socket when it has the coordinator session. Otherwise
-/// check for a surviving session on the pre-move legacy server.
+/// check for a surviving session on the pre-move legacy server. If both servers
+/// hold a coordinator, the durable socket wins without probing the legacy
+/// server, regardless of spawn tokens. This lookup does not reconcile duplicate
+/// sessions; subsequent lifecycle operations still validate the recorded token.
 ///
 /// Every coordinator lifecycle entry point (`ensure_for_attach`,
 /// `restart_if_dead`, `recreate_after_confirmation`) takes a single `&Tmux`
@@ -734,7 +737,7 @@ async fn session_exists(tmux: &Tmux, name: &str) -> Result<bool> {
 /// before invoking any lifecycle function, and passing its result through
 /// for that call routes every check (`session_exists`, `show_environment`,
 /// `kill_session_verified`, `new_session`) at the server that actually holds
-/// the session, so the legacy coordinator is recovered/replaced in place
+/// the session when only one exists, so a lone legacy coordinator is recovered/replaced in place
 /// rather than shadowed by a second one.
 ///
 /// `legacy_tmux` is `None` when the caller could not build a legacy handle
@@ -1791,6 +1794,22 @@ mod tests {
                 .iter()
                 .all(|call| call.get(2).map(String::as_str) == Some("list-sessions")),
             "resolution may probe the durable server but must not mutate it",
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_active_handle_prefers_socket_without_probing_legacy_when_both_exist() {
+        let (socket_tmux, socket_server) =
+            tmux_for(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("socket-token"), "0"));
+        let (legacy_tmux, legacy_server) =
+            legacy_tmux_for(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("legacy-token"), "0"));
+        let resolved = resolve_active_handle(&socket_tmux, Some(&legacy_tmux)).await;
+        assert!(std::ptr::eq(resolved, &socket_tmux));
+        assert_eq!(socket_server.calls().len(), 1);
+        assert_eq!(socket_server.calls()[0][2], "list-sessions");
+        assert!(
+            legacy_server.calls().is_empty(),
+            "duplicate legacy session must not be probed"
         );
     }
 

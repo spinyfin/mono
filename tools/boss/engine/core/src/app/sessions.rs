@@ -711,7 +711,18 @@ impl CoordinatorReset {
             // The lifecycle lock is held only for the validate-and-send phase
             // inside `request_and_wait`, so the supervisor stays free to recover
             // while we await a write.
+            let resolution_started = std::time::Instant::now();
             let active_tmux = crate::coordinator_tmux::resolve_active_handle(&tmux, legacy_tmux.as_ref()).await;
+            crate::audit::record_event(
+                "coordinator_reset_server_resolved",
+                &serde_json::json!({
+                    "ts_epoch_ms": boss_engine_utils::epoch_time::now_epoch_ms(),
+                    "spawn_token": expected_spawn_token,
+                    "elapsed_ms": resolution_started.elapsed().as_millis(),
+                    "server": if std::ptr::eq(active_tmux, &tmux) { "socket" } else { "legacy" },
+                    "phase": "delivery",
+                }),
+            );
             let fresh_handoff = match crate::coordinator_tmux::reset_handoff::request_and_wait(
                 crate::coordinator_tmux::reset_handoff::HandoffRequest::builder()
                     .work_db(server_state.work_db.as_ref())
