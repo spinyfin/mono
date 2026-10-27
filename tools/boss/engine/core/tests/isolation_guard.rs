@@ -42,12 +42,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use boss_client::wait_for_socket;
+use boss_client::{BossClient, wait_for_socket};
 use boss_engine::app::isolation::{EnginePaths, IsolationOverrides, IsolationPaths};
 use boss_engine::app::{process_is_alive, run, serve};
 use boss_engine::cli::Cli;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_engine::engine_control::ControlTokenFile;
+use boss_engine::protocol::{CreateProductInput, FrontendEvent, FrontendRequest, WorkItem};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -448,7 +449,7 @@ async fn production_and_test_fixture_engines_use_distinct_paths() -> Result<()> 
 /// incident: a worker-launched fixture engine that only sets
 /// `--socket-path` must resolve its own isolated token, never production's.
 #[tokio::test]
-async fn run_derives_isolated_token_path_for_test_fixture() -> Result<()> {
+async fn run_derives_isolated_token_and_diagnostics_paths_for_test_fixture() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let socket_path = temp.path().join("boss-test-token-iso.sock");
     // `.control-token`, not `.token`: every derived field is now named after
@@ -494,6 +495,55 @@ async fn run_derives_isolated_token_path_for_test_fixture() -> Result<()> {
             "test-fixture engine must NOT have written its pid to the production token path"
         );
     }
+
+    // Exercise the installed global logger through the real RPC path. Merely
+    // checking resolve_diagnostics_dir would miss startup forgetting to install it.
+    let mut client = BossClient::connect_socket(socket_path.to_str().unwrap()).await?;
+    let created = client
+        .send_request(&FrontendRequest::CreateProduct {
+            input: CreateProductInput::builder().name("Diagnostics isolation").build(),
+        })
+        .await?;
+    let FrontendEvent::WorkItemCreated {
+        item: WorkItem::Product(product),
+    } = created
+    else {
+        return Err(anyhow!("unexpected create_product response: {created:?}"));
+    };
+    let reply = client
+        .send_request(&FrontendRequest::GetWorkTree {
+            product_id: product.id.clone(),
+            fetch_seq: Some(17),
+            delta: false,
+        })
+        .await?;
+    assert!(matches!(reply, FrontendEvent::WorkTree { .. }), "{reply:?}");
+
+    let diagnostics = temp.path().join("boss-test-token-iso.diagnostics");
+    tokio::time::timeout(STARTUP_TIMEOUT, async {
+        loop {
+            let files = boss_log_files::day_rotated_files(&diagnostics, "engine-population-timing-");
+            for file in files {
+                let contents = std::fs::read_to_string(file)?;
+                if contents.lines().any(|line| {
+                    serde_json::from_str::<serde_json::Value>(line)
+                        .is_ok_and(|record| record["product_id"] == product.id && record["fetch_seq"] == 17)
+                }) {
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("population timing never reached the fixture directory")??;
+    assert!(
+        !boss_log_files::default_state_root()
+            .unwrap()
+            .join(boss_log_files::DIAGNOSTICS_DIR)
+            .exists(),
+        "fixture must not create production's diagnostics directory"
+    );
 
     join.abort();
     Ok(())
