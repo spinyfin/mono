@@ -361,7 +361,7 @@ fn format_dispatch_set_line_states_operator_all_spawns_scope() {
     };
     assert_eq!(
         pause::format_dispatch_set_line(&paused),
-        "dispatch paused — scope all_spawns: every spawn is held, PR reviews and review guides \
+        "dispatch paused — scope all_spawns: every spawn is held except explicit `bossctl agents launch` overrides, PR reviews and review guides \
          included — reason: spawn path suspect"
     );
 }
@@ -951,4 +951,28 @@ fn drop_closed_work_items_drops_terminal_work_items_and_keeps_open_or_unknown() 
         vec!["exec-open", "exec-none", "exec-unknown"],
         "closed work items are dropped; missing ids and unbound executions stay: {kept:?}"
     );
+}
+
+#[test]
+fn all_spawns_mutation_requires_explicit_operator_acknowledgment() {
+    for reviews_exempt in [true, false] {
+        let reply = boss_protocol::FrontendEvent::DispatchStateResult {
+            paused: true,
+            paused_since_epoch_s: Some(7),
+            reviews_exempt,
+            reason: Some("hold".into()),
+            scope: None,
+            origin: None,
+        };
+        assert!(pause::validate_dispatch_pause_reply(reply, true).is_err());
+    }
+    let reply = boss_protocol::FrontendEvent::DispatchStateResult {
+        paused: true,
+        paused_since_epoch_s: Some(7),
+        reviews_exempt: false,
+        reason: Some("hold".into()),
+        scope: Some(DispatchPauseScope::AllSpawns),
+        origin: Some("operator".into()),
+    };
+    assert!(pause::validate_dispatch_pause_reply(reply, true).is_ok());
 }

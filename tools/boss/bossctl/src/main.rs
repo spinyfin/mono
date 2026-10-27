@@ -193,7 +193,7 @@ enum Command {
         #[arg(long)]
         reason: Option<String>,
         /// Dispatch only: hold every spawn, PR reviews and review guides
-        /// included — see `bossctl dispatch pause --all-spawns`. Rejected
+        /// included, except explicit `bossctl agents launch` overrides. Rejected
         /// when dispatch is not among the systems being paused.
         #[arg(long)]
         all_spawns: bool,
@@ -539,7 +539,8 @@ enum DispatchAction {
         /// spawn path itself is suspect, so a review would only burn an
         /// attempt against it. The scope is persisted with the pause and
         /// survives an engine restart. Like every operator pause it is
-        /// manual-resume-only: no breaker recovery probe is admitted.
+        /// manual-resume-only: no breaker recovery probe is admitted. Explicit
+        /// `bossctl agents launch` overrides remain available.
         #[arg(long)]
         all_spawns: bool,
     },

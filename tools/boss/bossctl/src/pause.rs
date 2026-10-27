@@ -142,10 +142,26 @@ async fn set_dispatch_paused_raw(
         .send_request(&FrontendRequest::SetDispatchPaused {
             paused,
             reason,
-            scope: paused.then_some(scope),
+            scope: (paused && scope == DispatchPauseScope::AllSpawns).then_some(scope),
         })
         .await
         .context("sending SetDispatchPaused")?;
+    validate_dispatch_pause_reply(response, paused && scope == DispatchPauseScope::AllSpawns)
+}
+
+pub(super) fn validate_dispatch_pause_reply(
+    response: FrontendEvent,
+    require_all_spawns: bool,
+) -> Result<DispatchPauseState> {
+    if require_all_spawns
+        && !matches!(&response, FrontendEvent::DispatchStateResult {
+        paused: true, scope: Some(DispatchPauseScope::AllSpawns), origin: Some(origin), ..
+    } if origin == "operator")
+    {
+        bail!(
+            "engine did not confirm an operator all_spawns pause; update the running engine and retry --all-spawns, then verify with dispatch state"
+        );
+    }
     DispatchPauseState::from_event(response, "SetDispatchPaused")
 }
 
@@ -237,7 +253,10 @@ pub(super) fn dispatch_scope_lines(origin: &str, scope: DispatchPauseScope) -> V
         }
         (_, DispatchPauseScope::AllSpawns) => {
             lines.push("  origin: operator".to_owned());
-            lines.push(format!("  scope: {} — every spawn is held", scope.as_str()));
+            lines.push(format!(
+                "  scope: {} — every spawn is held except explicit agents launch overrides",
+                scope.as_str()
+            ));
             lines.push("  reviews: held — every pool is held, PR reviews and review guides included;".to_owned());
             lines.push("           the operator chose this scope because the spawn path itself is suspect".to_owned());
             lines.push("  recovery: no canary is admitted and nothing auto-resumes — an operator pause is".to_owned());
@@ -266,7 +285,7 @@ pub(super) fn format_dispatch_set_line(state: &DispatchPauseState) -> String {
             (_, DispatchPauseScope::NewWork) => " — PR reviews are exempt and keep dispatching",
             ("breaker", DispatchPauseScope::AllSpawns) => " — PR reviews are held too (spawn-capability breaker)",
             (_, DispatchPauseScope::AllSpawns) => {
-                " — scope all_spawns: every spawn is held, PR reviews and review guides included"
+                " — scope all_spawns: every spawn is held except explicit `bossctl agents launch` overrides, PR reviews and review guides included"
             }
         };
         // `bossctl agents launch` overrides any pause by design; see

@@ -414,7 +414,8 @@ struct FailureLog {
 /// counts distinct work items in-window. Cheap to share (`Arc`): a
 /// `std::sync::Mutex` guards the small vector and is never held across an
 /// `.await`.
-#[derive(Debug)]
+#[derive(Debug, bon::Builder)]
+#[builder(on(String, into), builder_type(vis = "pub(self)"), start_fn(vis = "pub(self)"))]
 pub struct SpawnHealthTracker {
     /// In-window failures — see [`FailureLog`].
     failures: FailureLog,
@@ -439,6 +440,8 @@ pub struct SpawnHealthTracker {
     /// path would otherwise re-signal (and raise a fresh durable attention
     /// item) on every single success/failure cycle.
     last_disabled_signal_at: AtomicI64,
+    /// Operator pause episode for which spawn failure attention was raised.
+    operator_pause_signaled: Mutex<Option<u64>>,
 }
 
 impl Default for SpawnHealthTracker {
@@ -459,16 +462,17 @@ impl SpawnHealthTracker {
     /// that exercise the disabled (observability-only) path must opt out
     /// explicitly via `.with_breaker_enabled(false)`.
     pub fn with_config(threshold: usize, window_secs: i64) -> Self {
-        Self {
-            failures: FailureLog::default(),
-            window: FailureWindowConfig {
+        Self::builder()
+            .failures(FailureLog::default())
+            .window(FailureWindowConfig {
                 threshold: threshold.max(1),
                 window_secs: window_secs.max(1),
-            },
-            probe: Mutex::new(ProbeState::default()),
-            breaker_enabled: DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER,
-            last_disabled_signal_at: AtomicI64::new(NO_DISABLED_SIGNAL_YET),
-        }
+            })
+            .probe(Mutex::new(ProbeState::default()))
+            .breaker_enabled(DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER)
+            .last_disabled_signal_at(AtomicI64::new(NO_DISABLED_SIGNAL_YET))
+            .operator_pause_signaled(Mutex::new(None))
+            .build()
     }
 
     /// Set whether a trip is allowed to actually pause dispatch. Consuming
@@ -1007,7 +1011,16 @@ pub async fn trip_spawn_capability_circuit(
             );
             return;
         }
-        operator_all_spawns_hold = existing.is_some_and(|p| p.reviews_held());
+        operator_all_spawns_hold = existing.as_ref().is_some_and(|p| p.reviews_held());
+        let mut signaled = spawn_health.operator_pause_signaled.lock().unwrap();
+        if let Some(pause) = existing.filter(|p| p.reviews_held()) {
+            if *signaled == Some(pause.since_epoch_s) {
+                return;
+            }
+            *signaled = Some(pause.since_epoch_s);
+        } else {
+            *signaled = None;
+        }
     }
     if breaker_enabled && operator_all_spawns_hold {
         tracing::debug!(
@@ -1178,7 +1191,8 @@ pub async fn trip_spawn_capability_circuit(
                     "distinct_work_items": distinct_work_items,
                     "window_secs": window_secs,
                     "breaker_enabled": breaker_enabled,
-                    "dispatch_paused": breaker_enabled,
+                    "dispatch_paused": coordinator.is_dispatch_paused(),
+                    "operator_all_spawns_hold": operator_all_spawns_hold,
                     "rule": rule,
                     "threshold": threshold,
                     "failure_classes": {

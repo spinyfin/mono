@@ -155,20 +155,19 @@ async fn default_pause_scope_keeps_reviews_exempt() {
 async fn explicit_scope_changes_an_existing_pause_without_resuming() {
     let (state, _dir) = test_server_state();
     pause_with_scope(&state, None).await;
-    for scope in [DispatchPauseScope::AllSpawns, DispatchPauseScope::NewWork] {
-        pause_with_scope(&state, Some(scope)).await;
-        let pause = state.execution_coordinator.dispatch_pause().expect("still paused");
-        assert_eq!(pause.scope, scope);
-        assert_eq!(pause.origin, DispatchPauseOrigin::Operator);
-        assert_eq!(
-            state
-                .work_db
-                .get_metadata(METADATA_KEY_DISPATCH_PAUSE_SCOPE)
-                .unwrap()
-                .as_deref(),
-            Some(scope.as_str())
-        );
-    }
+    let scope = DispatchPauseScope::AllSpawns;
+    pause_with_scope(&state, Some(scope)).await;
+    let pause = state.execution_coordinator.dispatch_pause().expect("still paused");
+    assert_eq!(pause.scope, scope);
+    assert_eq!(pause.origin, DispatchPauseOrigin::Operator);
+    assert_eq!(
+        state
+            .work_db
+            .get_metadata(METADATA_KEY_DISPATCH_PAUSE_SCOPE)
+            .unwrap()
+            .as_deref(),
+        Some(scope.as_str())
+    );
     // Taking ownership of a breaker hold must prevent automatic recovery.
     state.execution_coordinator.pause_dispatch(
         0,
@@ -339,9 +338,28 @@ async fn health_banner_states_the_pause_scope() {
     let (title, body) = banner(&server_state);
     assert!(title.contains("all spawns held, PR reviews included"), "{title}");
     assert!(body.contains("Scope: all spawns (operator)"), "{body}");
+    assert!(body.contains("except explicit `bossctl agents launch` overrides"));
 
     coordinator.pause_dispatch(0, DispatchPauseOrigin::Breaker, reason());
     let (title, body) = banner(&server_state);
     assert!(title.contains("all spawns held, PR reviews included"), "{title}");
     assert!(body.contains("Scope: all spawns (circuit breaker)"), "{body}");
+}
+
+#[tokio::test]
+async fn weaker_pause_requests_preserve_existing_full_holds() {
+    for origin in [DispatchPauseOrigin::Breaker, DispatchPauseOrigin::Operator] {
+        for scope in [None, Some(DispatchPauseScope::NewWork)] {
+            let (state, _dir) = test_server_state();
+            state.execution_coordinator.pause_dispatch_scoped(
+                42,
+                origin,
+                DispatchPauseScope::AllSpawns,
+                boss_protocol::PauseReason::new("existing hold").unwrap(),
+            );
+            let before = state.execution_coordinator.dispatch_pause();
+            pause_with_scope(&state, scope).await;
+            assert_eq!(state.execution_coordinator.dispatch_pause(), before);
+        }
+    }
 }

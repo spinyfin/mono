@@ -722,14 +722,16 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
         let coordinator = &server_state.execution_coordinator;
         let current = coordinator.dispatch_pause();
         let scope_changed = paused
-            && scope.is_some_and(|requested| {
-                current.as_ref().is_some_and(|pause| {
-                    pause.scope != requested || pause.origin != crate::coordinator::DispatchPauseOrigin::Operator
-                })
-            });
+            && scope
+                .filter(|s| *s == boss_protocol::DispatchPauseScope::AllSpawns)
+                .is_some_and(|requested| {
+                    current.as_ref().is_some_and(|pause| {
+                        pause.scope != requested || pause.origin != crate::coordinator::DispatchPauseOrigin::Operator
+                    })
+                });
         if current.is_some() == paused && !scope_changed {
-            // Repeating the same pause is idempotent. An explicit scope
-            // change replaces the pause without briefly resuming dispatch.
+            // Default and weaker requests preserve existing holds. Only an
+            // explicit all-spawns request can widen or take ownership of one.
             tracing::debug!(paused, "set_dispatch_paused: idempotent no-op");
             send_response(&sink, &request_id, dispatch_state_result(current));
             return;

@@ -1956,7 +1956,7 @@ impl DispatchPause {
                  review is the lifecycle of a change already in flight)"
             }
             (DispatchPauseOrigin::Operator, DispatchPauseScope::AllSpawns) => {
-                "every spawn is held, PR reviews and review guides included — the operator chose \
+                "every spawn is held except explicit `bossctl agents launch` overrides, PR reviews and review guides included — the operator chose \
                  the all-spawns scope because the spawn path itself is suspect; no recovery probe \
                  is admitted"
             }

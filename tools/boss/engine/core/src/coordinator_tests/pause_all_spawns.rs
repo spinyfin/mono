@@ -1,12 +1,7 @@
-//! The operator's `all_spawns` dispatch-pause scope: the explicit way to hold
-//! *every* spawn, PR reviews and review guides included, for when the spawn
-//! path itself is suspect (incident 007: the operator paused dispatch because
-//! the spawn path was broken, yet PR-review executions kept spawning through
-//! it because an operator pause exempts them).
-//!
-//! The default operator pause keeps that exemption — a review is the lifecycle
-//! of a change already in flight — and [`super::review_pause`] pins it. This
-//! module pins what the new scope adds:
+//! The `all_spawns` scope holds dispatch across every pool, including PR reviews
+//! and review guides, except explicit `bossctl agents launch` overrides.
+//! The default operator pause keeps reviews exempt (see [`super::review_pause`]).
+//! This module pins what the all_spawns scope guarantees:
 //!
 //! - the hold is at admission, in both the ready-queue drain and the
 //!   `schedule_execution` chokepoint ([`ExecutionCoordinator::dispatch_hold_for`]),
@@ -292,6 +287,7 @@ async fn breaker_trip_leaves_an_operator_all_spawns_pause_in_place() {
 
     let spawn_health = SpawnHealthTracker::with_config(3, 300).with_breaker_enabled(true);
     let sink = RecordingDispatchEventSink::new();
+    let second = create_ready_chore_execution(&db, &work_item_id);
     trip_spawn_capability_circuit(
         &db,
         &coordinator,
@@ -306,20 +302,62 @@ async fn breaker_trip_leaves_an_operator_all_spawns_pause_in_place() {
     )
     .await;
 
+    trip_spawn_capability_circuit(
+        &db,
+        &coordinator,
+        &sink,
+        &spawn_health,
+        TripSignal {
+            tripping_execution_id: &second.id,
+            tripping_work_item_id: &work_item_id,
+            distinct_work_items: 3,
+            now_epoch_secs: 2_000_000_000,
+        },
+    )
+    .await;
+
     assert_eq!(
         coordinator.dispatch_pause().expect("still paused"),
         before,
         "the operator's pause, origin and scope must be untouched"
     );
+    assert_eq!(db.list_attention_items(&execution.id).unwrap().len(), 1);
+    assert!(db.list_attention_items(&second.id).unwrap().is_empty());
     let events = sink.events().await;
     assert!(
-        events.iter().any(|e| e.stage == "spawn_capability_unhealthy"),
+        events
+            .iter()
+            .filter(|e| e.stage == "spawn_capability_unhealthy")
+            .count()
+            == 1,
         "the trip itself is still reported"
     );
     assert!(
         events.iter().all(|e| e.stage != "dispatch_paused"),
         "no breaker pause episode was started"
     );
+    assert!(events.iter().any(|e| e.details["operator_all_spawns_hold"] == true));
+    coordinator.resume_dispatch();
+    coordinator.pause_dispatch_scoped(
+        before.since_epoch_s + 1,
+        DispatchPauseOrigin::Operator,
+        DispatchPauseScope::AllSpawns,
+        PauseReason::new("another hold").unwrap(),
+    );
+    trip_spawn_capability_circuit(
+        &db,
+        &coordinator,
+        &sink,
+        &spawn_health,
+        TripSignal {
+            tripping_execution_id: &second.id,
+            tripping_work_item_id: &work_item_id,
+            distinct_work_items: 3,
+            now_epoch_secs: 2_000_000_001,
+        },
+    )
+    .await;
+    assert_eq!(db.list_attention_items(&second.id).unwrap().len(), 1);
 }
 
 /// The scope text names the scope for every origin/scope pairing, and agrees

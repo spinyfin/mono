@@ -210,7 +210,7 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
             }
             Some((DispatchPauseOrigin::Operator, DispatchPauseScope::AllSpawns)) => {
                 "Scope: all spawns (operator). The engine is not dispatching any execution from \
-                 any source, including PR reviews and review guides — the operator held every \
+                 any source except explicit `bossctl agents launch` overrides, including PR reviews and review guides — the operator held every \
                  spawn because the spawn path itself is suspect, and no recovery probe is \
                  admitted. Currently-running workers continue to completion. Run `bossctl \
                  dispatch resume` to restore normal dispatch."
