@@ -186,3 +186,21 @@ Sum `time.swift-frontend.*.user` and `.sys` in Boss statistics only.
 Use the profile's SwiftCompile action-processing duration, not total build
 time. Stats filenames identify the first primary file of each batch, not
 the CPU of an individual file. Add `-c opt` for the release configuration.
+
+## Validation on the updated base
+
+On 2026-10-27, after integrating main at `dd4935c4`, the full mac-app CI
+target set was validated again with normal Bazel caches:
+
+- `bazel build //tools/boss/app-macos/... //tools/boss/installer/...` passed.
+- `bazel test --test_output=errors //tools/boss/app-macos/... //tools/boss/installer/...`
+  passed all 14 targets (9 executed, 5 cached), including the reconnect
+  integration test and installer payload test.
+
+The build initially reported a missing remote-cache input for the unrelated
+`libsqlite3-sys` build script. The repository wrapper retried automatically
+and the build passed without changes or cache overrides. This is an
+environmental cache-availability failure, not a Swift compile failure.
+The host load averages sampled before compilation were 185.36, 192.48 and
+153.09; this validation does not supply the missing idle-host timings or
+replace the instrumented one-file experiment above.
