@@ -594,6 +594,8 @@ struct ServerStateOverrides {
     /// `CommandBranchVerifier` (shells out to `gh pr view`). Tests inject a
     /// stub here to fail the GitHub head-fetch deterministically.
     branch_verifier: Option<Arc<dyn BranchVerifier>>,
+    /// Workspace evidence for tests using a temporary directory instead of jj.
+    workspace_diff_verifier: Option<Arc<dyn crate::completion::WorkspaceDiffVerifier>>,
     /// Test-injected source-packet collector. `None` uses the GitHub-backed
     /// default on the completion handler.
     source_packet_collector: Option<crate::review_guide_capture::SourcePacketCollector>,
@@ -1263,6 +1265,7 @@ impl ServerState {
             execution_runner: execution_runner_override,
             worker_registry: worker_registry_override,
             branch_verifier: branch_verifier_override,
+            workspace_diff_verifier: workspace_diff_verifier_override,
             source_packet_collector: source_packet_collector_override,
             pr_detector: pr_detector_override,
             pr_state_checker: pr_state_checker_override,
@@ -1608,6 +1611,9 @@ impl ServerState {
         }
         if let Some(checker) = pr_state_checker_override {
             completion_handler_builder = completion_handler_builder.with_pr_state_checker(checker);
+        }
+        if let Some(verifier) = workspace_diff_verifier_override {
+            completion_handler_builder = completion_handler_builder.with_workspace_diff_verifier(verifier);
         }
         if let Some(collector) = source_packet_collector_override {
             completion_handler_builder = completion_handler_builder.with_source_packet_collector(collector);
