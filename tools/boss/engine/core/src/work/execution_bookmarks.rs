@@ -1,5 +1,39 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use super::*;
-use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, PointerSnapshot};
+use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, Jj, LocalJj, PointerSnapshot};
+
+/// [`LocalJj`] with a child-process count, so a pointer snapshot / restore
+/// pass can publish how many `jj` processes it spawned
+/// (`execution_bookmark_pointers.jj_spawns`). Spawns are the whole cost of
+/// these passes; the count is what makes a regression visible.
+struct CountingJj {
+    spawns: AtomicU64,
+}
+
+impl CountingJj {
+    fn new() -> Self {
+        Self {
+            spawns: AtomicU64::new(0),
+        }
+    }
+
+    fn spawns(&self) -> u64 {
+        self.spawns.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait::async_trait]
+impl Jj for CountingJj {
+    async fn run(&self, repo: &std::path::Path, args: &[&str]) -> Result<String> {
+        self.spawns.fetch_add(1, Ordering::Relaxed);
+        LocalJj.run(repo, args).await
+    }
+
+    async fn shared_repo(&self, workspace: &std::path::Path) -> Result<std::path::PathBuf> {
+        LocalJj.shared_repo(workspace).await
+    }
+}
 
 #[work_db_boundary::instrument]
 impl WorkDb {
@@ -45,30 +79,42 @@ impl WorkDb {
         &self,
         chain_root_id: &str,
     ) -> Vec<(ExecutionBookmark, PointerSnapshot)> {
-        use boss_engine_recovery::execution_bookmark::{LocalJj, snapshot_pointers};
+        use boss_engine_recovery::execution_bookmark::snapshot_pointers;
+        let registry = self.metrics_registry();
+        let timer = crate::sweep_metrics::EXECUTION_BOOKMARK_POINTERS.begin();
+        let jj = CountingJj::new();
+        let records = self.chain_bookmark_records(chain_root_id);
+        let items = records.len();
         let mut saved = Vec::new();
-        for record in self.chain_bookmark_records(chain_root_id) {
-            match snapshot_pointers(&LocalJj, &record).await {
+        for record in records {
+            match snapshot_pointers(&jj, &record).await {
                 Ok(pointers) => saved.push((record, pointers)),
                 Err(err) => {
                     tracing::warn!(execution_id = %record.execution_id, ?err, "cannot snapshot recovery pointers; leaving this record unprotected");
                 }
             }
         }
+        crate::sweep_metrics::EXECUTION_BOOKMARK_POINTERS_JJ_SPAWNS.inc_by(registry, jj.spawns());
+        timer.finish(registry, items);
         saved
     }
 
     /// Attempt every restore even if one repository is unavailable. A published
     /// rebase must still pass the deletion gate when maintenance fails.
     pub(crate) async fn restore_rebase_pointers(&self, saved: &[(ExecutionBookmark, PointerSnapshot)]) -> bool {
-        use boss_engine_recovery::execution_bookmark::{LocalJj, restore_pointers};
+        use boss_engine_recovery::execution_bookmark::restore_pointers;
+        let registry = self.metrics_registry();
+        let timer = crate::sweep_metrics::EXECUTION_BOOKMARK_POINTERS.begin();
+        let jj = CountingJj::new();
         let mut restored = true;
         for (record, pointers) in saved {
-            if let Err(err) = restore_pointers(&LocalJj, record, pointers).await {
+            if let Err(err) = restore_pointers(&jj, record, pointers).await {
                 restored = false;
                 tracing::error!(execution_id = %record.execution_id, ?err, "could not restore recovery pointers after cube rebase");
             }
         }
+        crate::sweep_metrics::EXECUTION_BOOKMARK_POINTERS_JJ_SPAWNS.inc_by(registry, jj.spawns());
+        timer.finish(registry, saved.len());
         restored
     }
 
@@ -83,7 +129,7 @@ impl WorkDb {
         pushed_branch: Option<&str>,
         trunk: &str,
     ) -> bool {
-        use boss_engine_recovery::execution_bookmark::{LocalJj, adopt_pushed_head, resolve_bookmark_commit};
+        use boss_engine_recovery::execution_bookmark::{adopt_pushed_head, resolve_bookmark_commit};
         // The branch moved with the rebase, so read it before restoring.
         let mut pushed = Vec::new();
         if let Some(branch) = pushed_branch {
@@ -116,7 +162,7 @@ impl WorkDb {
 
     /// Checkpoint intact records independently without changing ladder outcomes.
     pub(crate) async fn checkpoint_rewritten_baselines(&self, chain_root_id: &str) -> Result<()> {
-        use boss_engine_recovery::execution_bookmark::{LocalJj, checkpoint_baseline};
+        use boss_engine_recovery::execution_bookmark::checkpoint_baseline;
         for record in self.chain_bookmark_records(chain_root_id) {
             let result: Result<()> = async {
                 let base = checkpoint_baseline(&LocalJj, &record).await?;

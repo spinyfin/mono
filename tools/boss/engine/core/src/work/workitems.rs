@@ -1355,10 +1355,11 @@ impl WorkDb {
     pub fn is_bound_work_item_closed(&self, id: &str) -> Result<bool> {
         match classify_id(id)? {
             ItemKind::Product | ItemKind::Project | ItemKind::Comparison => Ok(false),
-            ItemKind::Task => Ok(matches!(
-                self.get_work_item(id)?,
-                WorkItem::Task(task) | WorkItem::Chore(task) if task.status.is_terminal()
-            )),
+            // A narrow status read, not the full `get_work_item` projection:
+            // the sweeps that call this once per live slot per pass only
+            // need the status column (see `work/sweep_reads.rs`). Same row
+            // visibility and the same `unknown task` error on a missing row.
+            ItemKind::Task => self.task_closed_state(id),
             ItemKind::Comment => {
                 let comment = self
                     .get_comment(id)?

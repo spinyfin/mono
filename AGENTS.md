@@ -69,6 +69,10 @@ root-cause rule as the section below.
   Bazel build in a worker, how the composed `PATH` is sealed across
   driver tool shells, and what that seal does not cover):
   [`tools/boss/docs/worker-tool-environment.md`](tools/boss/docs/worker-tool-environment.md)
+- Background-sweep telemetry (per-pass duration / items / tick-interval
+  metrics for the envelope watchdog, terminal-work sweep, JSONL tail poll
+  and recovery-pointer passes, and what each one's cost scales with):
+  [`tools/boss/docs/background-sweep-telemetry.md`](tools/boss/docs/background-sweep-telemetry.md)
 - Operator runbooks:
   [`tools/boss/docs/runbooks/`](tools/boss/docs/runbooks/)
 

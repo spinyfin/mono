@@ -133,6 +133,7 @@ pub(crate) struct VerifiedRoot {
     pub(crate) path: PathBuf,
     pub(crate) canonical: PathBuf,
     identity: FileIdentity,
+    revalidations: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl VerifiedRoot {
@@ -146,10 +147,21 @@ impl VerifiedRoot {
             path: path.to_owned(),
             canonical,
             identity: file_identity(&metadata),
+            revalidations: Arc::default(),
         })
     }
 
+    /// Give a tail its own accounting, excluding discovery and other tails.
+    pub(crate) fn isolate_revalidation_count(&mut self) {
+        self.revalidations = Arc::default();
+    }
+
+    pub(crate) fn revalidation_count(&self) -> u64 {
+        self.revalidations.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(crate) fn revalidate(&self) -> Result<(), String> {
+        self.revalidations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let metadata =
             fs::symlink_metadata(&self.path).map_err(|err| format!("stat {}: {err}", self.path.display()))?;
         if metadata.file_type().is_symlink()

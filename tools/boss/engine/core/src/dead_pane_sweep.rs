@@ -185,7 +185,13 @@ pub async fn run_one_pass(
     let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
     let live_states = coordinator.live_worker_states();
 
-    let candidates = match work_db.list_non_terminal_executions_with_local_shell_pid() {
+    let db = work_db.clone();
+    let candidates = match crate::work::db_diagnostics::spawn_blocking(move || {
+        db.list_non_terminal_executions_with_local_shell_pid()
+    })
+    .await
+    .unwrap_or_else(|error| Err(error.into()))
+    {
         Ok(rows) => rows,
         Err(err) => {
             tracing::warn!(
@@ -217,29 +223,15 @@ pub async fn run_one_pass(
     // clears), and hand the fact to the existing two-way policy. A bounded
     // probe is mandatory because convergence may signal the recorded process
     // group; an old recycled pid is not evidence.
-    let terminal_candidates = match work_db.list_recent_terminal_executions_with_local_shell_pid(
-        crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
-        now_epoch_secs,
-    ) {
-        Ok(rows) => rows,
-        Err(err) => {
-            tracing::warn!(
-                error = %format!("{err:#}"),
-                "pane-death sweep: failed to list terminal executions with recent pids; skipping terminal convergence",
-            );
-            Vec::new()
-        }
-    };
-    for execution in terminal_candidates {
-        let process = crate::durable_liveness::probe_execution_worker_within(
-            work_db,
-            &execution.id,
-            crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
-            now_epoch_secs,
-        );
-        if !process.is_alive() {
-            continue;
-        }
+    let db = work_db.clone();
+    let terminal_candidates =
+        crate::work::db_diagnostics::spawn_blocking(move || gather_live_terminal_candidates(&db, now_epoch_secs))
+            .await
+            .unwrap_or_else(|error| {
+                tracing::error!(?error, "pane-death sweep: terminal gathering did not complete");
+                Vec::new()
+            });
+    for (execution, process) in terminal_candidates {
         tracing::warn!(
             execution_id = %execution.id,
             work_item_id = %execution.work_item_id,
@@ -261,6 +253,39 @@ pub async fn run_one_pass(
     }
 
     outcome
+}
+
+/// Collect recent terminal rows with live local processes on the blocking pool.
+pub(crate) fn gather_live_terminal_candidates(
+    work_db: &WorkDb,
+    now_epoch_secs: i64,
+) -> Vec<(crate::work::TerminalExecutionRef, WorkerProcess)> {
+    let registry = work_db.metrics_registry();
+    let timer = crate::sweep_metrics::DEAD_PANE_TERMINAL.begin();
+    let rows = work_db
+        .list_recent_terminal_execution_refs_with_local_shell_pid(
+            crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
+            now_epoch_secs,
+        )
+        .unwrap_or_else(|error| {
+            tracing::warn!(?error, "pane-death sweep: could not list terminal candidates");
+            Vec::new()
+        });
+    let count = rows.len();
+    let candidates = rows
+        .into_iter()
+        .filter_map(|execution| {
+            let process = crate::durable_liveness::probe_execution_worker_within(
+                work_db,
+                &execution.id,
+                crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
+                now_epoch_secs,
+            );
+            process.is_alive().then_some((execution, process))
+        })
+        .collect();
+    timer.finish(registry, count);
+    candidates
 }
 
 /// Durable, restart-robust evidence that a LOCAL execution's worker shell pid
@@ -321,7 +346,13 @@ pub(crate) async fn shell_pid_death_evidence(
     // probe is still the right *read* here (this path's verb is "reconcile a
     // row", not "signal a process", and its failure direction is to decline);
     // corroboration is what stops a false `Gone` from becoming a false reap.
-    let process = crate::durable_liveness::probe_execution_worker(work_db, &execution.id);
+    let db = work_db.clone();
+    let execution_id = execution.id.clone();
+    let process = crate::work::db_diagnostics::spawn_blocking(move || {
+        crate::durable_liveness::probe_execution_worker(&db, &execution_id)
+    })
+    .await
+    .ok()?;
 
     // Corroborate a `Gone` verdict against the (in-memory) live-worker
     // registry before trusting it. Unlike `dead_pid_sweep`, this probe reads

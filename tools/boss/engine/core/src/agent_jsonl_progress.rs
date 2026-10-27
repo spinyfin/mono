@@ -522,6 +522,9 @@ pub struct AgentJsonlProgressManager {
     /// See [`DISCOVERY_OVERDUE_AFTER`]. A field so a test can drive the
     /// overdue path in milliseconds rather than minutes.
     discovery_overdue_after: Duration,
+    /// Per-poll telemetry sink for every tail this manager spawns; a
+    /// no-op unless [`Self::with_metrics`] was called.
+    telemetry: StreamTelemetry,
 }
 
 impl Default for AgentJsonlProgressManager {
@@ -529,6 +532,7 @@ impl Default for AgentJsonlProgressManager {
         Self {
             runs: Mutex::new(HashMap::new()),
             discovery_overdue_after: DISCOVERY_OVERDUE_AFTER,
+            telemetry: StreamTelemetry::default(),
         }
     }
 }
@@ -536,6 +540,14 @@ impl Default for AgentJsonlProgressManager {
 impl AgentJsonlProgressManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Publish each tail's per-poll duration, root-revalidation count and
+    /// observed poll interval into `registry` (the `agent_jsonl_stream.*`
+    /// metrics declared in [`crate::sweep_metrics`]).
+    pub fn with_metrics(mut self, registry: Arc<crate::metrics::Registry>) -> Self {
+        self.telemetry = StreamTelemetry::new(registry);
+        self
     }
 
     /// Report discovery as overdue after `after` instead of
@@ -720,16 +732,18 @@ impl AgentJsonlProgressManager {
         let (halt_tx, halt_rx) = watch::channel(StreamHalt::Running);
         let task_run_id = run_id.to_owned();
         let overdue_after = self.discovery_overdue_after;
+        let telemetry = self.telemetry.clone();
         boss_task_scope::spawn(async move {
             run_prepared(
                 task_run_id,
-                RunPreparedConfig {
-                    driver,
-                    prepared,
-                    sink,
-                    store,
-                    overdue_after,
-                },
+                RunPreparedConfig::builder()
+                    .driver(driver)
+                    .prepared(prepared)
+                    .sink(sink)
+                    .store(store)
+                    .overdue_after(overdue_after)
+                    .telemetry(telemetry)
+                    .build(),
                 start,
                 activate_rx,
                 halt_rx,
@@ -777,12 +791,14 @@ impl AgentJsonlProgressManager {
     }
 }
 
+#[derive(bon::Builder)]
 struct RunPreparedConfig<S> {
     driver: Arc<dyn AgentDriver>,
     prepared: PreparedSource,
     sink: S,
     store: Arc<dyn IngressCheckpointStore>,
     overdue_after: Duration,
+    telemetry: StreamTelemetry,
 }
 
 async fn run_prepared<S>(
@@ -800,6 +816,7 @@ async fn run_prepared<S>(
         sink,
         store,
         overdue_after,
+        telemetry,
     } = config;
     tokio::select! {
         result = &mut activate => {
@@ -926,7 +943,17 @@ async fn run_prepared<S>(
     let tail_source = prepared.clone();
     let tail_map = checkpointer.map.clone();
     let tail = boss_task_scope::spawn(async move {
-        if let Err(err) = stream_file_bytes(tail_source, candidate, start_offset, tail_map, writer, tail_halt).await {
+        if let Err(err) = stream_file_bytes(
+            tail_source,
+            candidate,
+            start_offset,
+            tail_map,
+            writer,
+            tail_halt,
+            telemetry,
+        )
+        .await
+        {
             tracing::warn!(%err, "agent JSONL progress: file tail ended with error");
         }
     });
@@ -1227,6 +1254,49 @@ fn revalidate_truncated_stream(
     Ok(())
 }
 
+/// Per-poll telemetry for one tail: the `agent_jsonl_stream.*` sweep
+/// metrics, or a no-op when the manager was built without a registry
+/// (unit tests, `spawn_flow` fixtures).
+#[derive(Clone, Default)]
+pub(crate) struct StreamTelemetry {
+    registry: Option<Arc<crate::metrics::Registry>>,
+}
+
+impl StreamTelemetry {
+    pub(crate) fn new(registry: Arc<crate::metrics::Registry>) -> Self {
+        Self {
+            registry: Some(registry),
+        }
+    }
+
+    /// Bracket one poll iteration. Returns the pass timer plus the
+    /// root-revalidation count at iteration start, so
+    /// [`Self::finish_poll`] can record how many the iteration performed.
+    fn begin_poll(
+        &self,
+        root: &crate::agent_jsonl_discovery::VerifiedRoot,
+    ) -> Option<(crate::sweep_metrics::PassTimer, u64)> {
+        self.registry.as_deref()?;
+        Some((
+            crate::sweep_metrics::AGENT_JSONL_STREAM.begin(),
+            root.revalidation_count(),
+        ))
+    }
+
+    fn finish_poll(
+        &self,
+        root: &crate::agent_jsonl_discovery::VerifiedRoot,
+        poll: Option<(crate::sweep_metrics::PassTimer, u64)>,
+    ) {
+        let (Some(registry), Some((timer, revalidations_before))) = (self.registry.as_deref(), poll) else {
+            return;
+        };
+        let revalidations = root.revalidation_count().saturating_sub(revalidations_before);
+        crate::sweep_metrics::AGENT_JSONL_STREAM_ROOT_REVALIDATIONS.inc_by(registry, revalidations);
+        timer.finish(registry, usize::try_from(revalidations).unwrap_or(usize::MAX));
+    }
+}
+
 async fn stream_file_bytes(
     prepared: PreparedSource,
     candidate: Candidate,
@@ -1234,6 +1304,7 @@ async fn stream_file_bytes(
     map: Arc<Mutex<StreamFileMap>>,
     writer: tokio::io::DuplexStream,
     halt: watch::Receiver<StreamHalt>,
+    telemetry: StreamTelemetry,
 ) -> Result<(), String> {
     stream_file_bytes_with_test_hooks(
         prepared,
@@ -1242,6 +1313,7 @@ async fn stream_file_bytes(
         map,
         writer,
         halt,
+        telemetry,
         |_| Ok(()),
         |_| Ok(()),
     )
@@ -1262,6 +1334,7 @@ async fn stream_file_bytes_with_test_hooks<F, G>(
     map: Arc<Mutex<StreamFileMap>>,
     mut writer: tokio::io::DuplexStream,
     mut halt: watch::Receiver<StreamHalt>,
+    telemetry: StreamTelemetry,
     mut before_descriptor_read: G,
     mut after_rotation_validation: F,
 ) -> Result<(), String>
@@ -1275,6 +1348,8 @@ where
         mut file,
         identity: mut opened_identity,
     } = candidate;
+    let mut prepared = prepared;
+    prepared.root.isolate_revalidation_count();
     let mut offset = start_offset;
     let mut buffer = vec![0u8; FILE_CHUNK_BYTES];
 
@@ -1282,18 +1357,22 @@ where
         if *halt.borrow() == StreamHalt::Cancel {
             return Ok(());
         }
-        prepared.root.revalidate()?;
+        let poll = telemetry.begin_poll(&prepared.root);
 
-        // Drain the descriptor that was securely opened and correlated by
-        // validate_candidate before consulting the pathname again. A rename
-        // after validation cannot substitute bytes from a second file.
-        validate_descriptor_before_publish(&prepared, &path, &file, opened_identity)?;
+        // The idle poll — nothing new on the descriptor, every 50ms per live
+        // worker — costs one fstat and one lstat. Every pathname-level
+        // check (root revalidation: lstat + canonicalize of the sessions
+        // directory, then the descriptor-vs-path identity re-walk) runs
+        // only on the iterations that are about to publish bytes or a
+        // delimiter, where it is what keeps a rename after validation from
+        // substituting a second file's bytes.
         before_descriptor_read(&path)?;
         let opened_metadata = file
             .metadata()
             .map_err(|err| format!("metadata {}: {err}", path.display()))?;
         let size = opened_metadata.len();
         if size < offset {
+            validate_descriptor_before_publish(&prepared, &path, &file, opened_identity)?;
             // Revalidate the restarted logical stream on this exact
             // descriptor before publishing either its prefix or a delimiter.
             revalidate_truncated_stream(&prepared, &path, &session_id, &mut file, opened_identity)?;
@@ -1302,9 +1381,15 @@ where
             record_delimiter(&map, 0, opened_identity)?;
             write_or_halt(&mut writer, b"\n", &mut halt).await?;
             offset = 0;
+            telemetry.finish_poll(&prepared.root, poll);
             continue;
         }
         if size > offset {
+            // Drain the descriptor that was securely opened and correlated
+            // by validate_candidate before consulting the pathname again. A
+            // rename after validation cannot substitute bytes from a second
+            // file: this runs before the read, and again after it below.
+            validate_descriptor_before_publish(&prepared, &path, &file, opened_identity)?;
             file.seek(SeekFrom::Start(offset))
                 .map_err(|err| format!("seek {}: {err}", path.display()))?;
             let read_len = usize::try_from((size - offset).min(FILE_CHUNK_BYTES as u64))
@@ -1330,6 +1415,7 @@ where
                 record_bytes(&map, offset, count as u64, opened_identity)?;
                 offset += count as u64;
                 write_or_halt(&mut writer, &buffer[..count], &mut halt).await?;
+                telemetry.finish_poll(&prepared.root, poll);
                 continue;
             }
         }
@@ -1337,6 +1423,7 @@ where
         let path_metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                telemetry.finish_poll(&prepared.root, poll);
                 tokio::select! {
                     _ = tokio::time::sleep(FILE_POLL) => continue,
                     changed = halt.changed() => {
@@ -1379,8 +1466,10 @@ where
             file = rotated.file;
             opened_identity = rotated.identity;
             offset = 0;
+            telemetry.finish_poll(&prepared.root, poll);
             continue;
         }
+        telemetry.finish_poll(&prepared.root, poll);
         tokio::select! {
             _ = tokio::time::sleep(FILE_POLL) => {}
             changed = halt.changed() => {

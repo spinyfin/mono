@@ -225,6 +225,7 @@ impl PrStateChecker for StaticPrStateChecker {
 
 /// Test double: returns a preset state for known PR URLs.
 #[cfg(test)]
+#[derive(Clone)]
 pub struct FakePrStateChecker {
     pub states: std::collections::HashMap<String, PrOpenState>,
     pub default: PrOpenState,

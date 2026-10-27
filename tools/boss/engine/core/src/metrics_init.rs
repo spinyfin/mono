@@ -77,6 +77,9 @@ pub fn init_all(registry: &Registry) {
     // Work DB lock-contention rollup: timing-event / busy-failure counters
     // and the longest-hold-per-minute gauge.
     crate::work::lock_stats::register_metrics(registry);
+    // Background pass durations and item counts, plus loop-owned cadence
+    // for the singleton envelope and terminal-work sweeps.
+    crate::sweep_metrics::register_metrics(registry);
 }
 
 #[cfg(test)]
@@ -100,6 +103,8 @@ mod tests {
         assert_eq!(
             counter_names,
             vec![
+                "agent_jsonl_stream.passes",
+                "agent_jsonl_stream.root_revalidations",
                 "answer_agent.enqueued",
                 "answer_agent.failed",
                 "answer_agent.queue_wait_ms",
@@ -122,6 +127,7 @@ mod tests {
                 "database_backup.offsite.success_record_failed",
                 "db_lock.busy_failures",
                 "db_lock.timing_events",
+                "dead_pane_terminal.passes",
                 "dispatch.completed",
                 "dispatcher.hook_events.dropped_missing_run_id",
                 "dispatcher.hook_events.for_terminal_execution",
@@ -133,6 +139,9 @@ mod tests {
                 "dispatcher.transcript_path_persist.noop",
                 "dispatcher.transcript_path_persist.row_missing",
                 "dispatcher.transcript_path_persist.updated",
+                "envelope_watch.passes",
+                "execution_bookmark_pointers.jj_spawns",
+                "execution_bookmark_pointers.passes",
                 "external_tracker.closed",
                 "external_tracker.fetch_failed",
                 "external_tracker.fetch_succeeded",
@@ -191,6 +200,7 @@ mod tests {
                 "speculative_conflict.clean",
                 "speculative_conflict.predicted",
                 "stacked_pr_structuring.offered",
+                "terminal_work_sweep.passes",
                 "trunk_queue_poller.attentions_filed",
                 "trunk_queue_poller.entry_lookups",
                 "trunk_queue_poller.evictions_detected",
@@ -233,8 +243,12 @@ mod tests {
         assert_eq!(
             gauge_names,
             vec![
+                "agent_jsonl_stream.items_per_pass",
+                "agent_jsonl_stream.pass_duration_ms",
                 "database_backup.offsite.last_success_age_secs",
                 "db_lock.longest_hold_ms",
+                "dead_pane_terminal.items_per_pass",
+                "dead_pane_terminal.pass_duration_ms",
                 "dependency_unblock.longest_stale_seconds",
                 "dispatch.drain_pass_duration_ms",
                 "dispatch.queue_depth.automation",
@@ -243,14 +257,23 @@ mod tests {
                 "dispatch.queue_oldest_wait_seconds.automation",
                 "dispatch.queue_oldest_wait_seconds.main",
                 "dispatch.queue_oldest_wait_seconds.review",
+                "envelope_watch.items_per_pass",
+                "envelope_watch.pass_duration_ms",
+                "envelope_watch.tick_interval_ms",
+                "execution_bookmark_pointers.items_per_pass",
+                "execution_bookmark_pointers.pass_duration_ms",
                 "github_api.graphql.remaining",
                 "github_api.rest.remaining",
                 "merge_poller.adaptive_tracked",
                 "review_pool.deferred_pre_merge",
                 "review_pool.reserved_units",
+                "terminal_work_sweep.items_per_pass",
+                "terminal_work_sweep.pass_duration_ms",
+                "terminal_work_sweep.tick_interval_ms",
             ],
             "init_all must register the dep_unblock gauge, the queue-level dispatch gauges, \
-             the GitHub remaining-quota gauges, and the adaptive-schedule size gauge",
+             the GitHub remaining-quota gauges, the adaptive-schedule size gauge, and the \
+             background-sweep pass gauges",
         );
     }
 }
