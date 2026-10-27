@@ -119,15 +119,13 @@ enum TrekIconAssets {
     /// neighbouring bust; those slivers are separate components and
     /// are removed here.
     ///
-    /// Components are built from horizontal runs of opaque pixels,
-    /// unioning each run with the runs it touches on the row above,
-    /// rather than flood-filling pixel by pixel. A bust is a handful of
-    /// runs per row, so the labelling touches hundreds of runs instead
-    /// of tens of thousands of pixels; the per-pixel work is one alpha
-    /// read through a raw pointer. The pixel flood fill this replaced
-    /// cost about half a second per portrait in an unoptimised test
-    /// build, which pushed the 56-portrait sweep in
-    /// TrekPortraitGridTests past its shard's one-minute budget.
+    /// Components are built from horizontal runs of opaque pixels
+    /// unioned with touching runs on the row above, rather than
+    /// per-pixel fills. Labelling touches hundreds of runs rather than
+    /// tens of thousands of pixels; the only per-pixel work is one
+    /// alpha read through a raw pointer. The raw-pointer style matters
+    /// because the test bundle is built without optimisation, where
+    /// per-element Swift array access is slow.
     static func keepLargestComponent(
         _ buffer: UnsafeMutableRawBufferPointer, width: Int, height: Int
     ) {
