@@ -42,12 +42,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use boss_client::wait_for_socket;
+use boss_client::{BossClient, wait_for_socket};
 use boss_engine::app::isolation::{EnginePaths, IsolationOverrides, IsolationPaths};
 use boss_engine::app::{process_is_alive, run, serve};
 use boss_engine::cli::Cli;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_engine::engine_control::ControlTokenFile;
+use boss_engine::protocol::{CreateProductInput, FrontendEvent, FrontendRequest, WorkItem};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -146,6 +147,7 @@ fn all_derived() -> EnginePaths {
         pid: Some(PathBuf::from("/tmp/boss-test-guard-1234.pid")),
         control_token: Some(PathBuf::from("/tmp/boss-test-guard-1234.control-token")),
         tmux_socket: Some(PathBuf::from("/tmp/boss-test-guard-1234.tmux.sock")),
+        diagnostics_dir: Some(PathBuf::from("/tmp/boss-test-guard-1234.diagnostics")),
     }
 }
 
@@ -160,7 +162,7 @@ fn derive_stands_down_entirely_for_the_production_socket() {
 }
 
 #[test]
-fn derive_isolates_all_five_paths_when_no_env_is_set() {
+fn derive_isolates_all_six_paths_when_no_env_is_set() {
     let paths = derive(IsolationOverrides::default());
     assert!(paths.is_test_fixture);
     assert_eq!(paths.derived, all_derived());
@@ -177,6 +179,7 @@ fn derive_ignores_env_that_merely_repeats_the_production_default() {
         events_socket: prod.events_socket,
         pid_path: prod.pid,
         control_token_path: prod.control_token,
+        diagnostics_dir: prod.diagnostics_dir,
     });
     assert_eq!(
         paths.derived,
@@ -229,6 +232,52 @@ fn fixture_refuses_to_start_when_a_resolved_path_is_production() {
         format!("{err}").contains("BOSS_ENGINE_CONTROL_TOKEN_PATH"),
         "must name the control-token env var; got: {err}"
     );
+
+    let stolen_diagnostics = EnginePaths {
+        diagnostics_dir: prod.diagnostics_dir,
+        ..all_derived()
+    };
+    let err = paths
+        .ensure_isolated(&stolen_diagnostics)
+        .expect_err("a fixture must never write into production's diagnostics directory");
+    assert!(
+        format!("{err}").contains("BOSS_ENGINE_DIAGNOSTICS_DIR"),
+        "must name the diagnostics env var; got: {err}"
+    );
+}
+
+/// A fixture resolves diagnostics beside its other files, including over an
+/// inherited production override; private overrides and production keep theirs.
+#[test]
+fn diagnostics_dir_is_fixture_scoped_unless_deliberately_overridden() {
+    let prod_diag = production().diagnostics_dir.unwrap();
+    let scoped = PathBuf::from("/tmp/boss-test-guard-1234.diagnostics");
+
+    assert_eq!(
+        derive(IsolationOverrides::default()).resolve_diagnostics_dir(None),
+        Some(scoped.clone())
+    );
+
+    let inherited = derive(IsolationOverrides {
+        diagnostics_dir: Some(prod_diag.clone()),
+        ..IsolationOverrides::default()
+    });
+    assert_eq!(inherited.resolve_diagnostics_dir(Some(prod_diag.clone())), Some(scoped));
+
+    let private = PathBuf::from("/tmp/my-private-diagnostics");
+    let deliberate = derive(IsolationOverrides {
+        diagnostics_dir: Some(private.clone()),
+        ..IsolationOverrides::default()
+    });
+    assert_eq!(deliberate.resolve_diagnostics_dir(Some(private.clone())), Some(private));
+
+    let production_socket = production_socket();
+    let production_engine = IsolationPaths::derive_from(
+        production_socket.to_str().unwrap(),
+        &IsolationOverrides::default(),
+        &production(),
+    );
+    assert_eq!(production_engine.resolve_diagnostics_dir(None), Some(prod_diag));
 }
 
 // ---------------------------------------------------------------------------
@@ -396,7 +445,7 @@ async fn production_and_test_fixture_engines_use_distinct_paths() -> Result<()> 
 /// incident: a worker-launched fixture engine that only sets
 /// `--socket-path` must resolve its own isolated token, never production's.
 #[tokio::test]
-async fn run_derives_isolated_token_path_for_test_fixture() -> Result<()> {
+async fn run_derives_isolated_token_and_diagnostics_paths_for_test_fixture() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let socket_path = temp.path().join("boss-test-token-iso.sock");
     // `.control-token`, not `.token`: every derived field is now named after
@@ -442,6 +491,55 @@ async fn run_derives_isolated_token_path_for_test_fixture() -> Result<()> {
             "test-fixture engine must NOT have written its pid to the production token path"
         );
     }
+
+    // Exercise the installed global logger through the real RPC path. Merely
+    // checking resolve_diagnostics_dir would miss startup forgetting to install it.
+    let mut client = BossClient::connect_socket(socket_path.to_str().unwrap()).await?;
+    let created = client
+        .send_request(&FrontendRequest::CreateProduct {
+            input: CreateProductInput::builder().name("Diagnostics isolation").build(),
+        })
+        .await?;
+    let FrontendEvent::WorkItemCreated {
+        item: WorkItem::Product(product),
+    } = created
+    else {
+        return Err(anyhow!("unexpected create_product response: {created:?}"));
+    };
+    let reply = client
+        .send_request(&FrontendRequest::GetWorkTree {
+            product_id: product.id.clone(),
+            fetch_seq: Some(17),
+            delta: false,
+        })
+        .await?;
+    assert!(matches!(reply, FrontendEvent::WorkTree { .. }), "{reply:?}");
+
+    let diagnostics = temp.path().join("boss-test-token-iso.diagnostics");
+    tokio::time::timeout(STARTUP_TIMEOUT, async {
+        loop {
+            let files = boss_log_files::day_rotated_files(&diagnostics, "engine-population-timing-");
+            for file in files {
+                let contents = std::fs::read_to_string(file)?;
+                if contents.lines().any(|line| {
+                    serde_json::from_str::<serde_json::Value>(line)
+                        .is_ok_and(|record| record["product_id"] == product.id && record["fetch_seq"] == 17)
+                }) {
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("population timing never reached the fixture directory")??;
+    assert!(
+        !boss_log_files::default_state_root()
+            .unwrap()
+            .join(boss_log_files::DIAGNOSTICS_DIR)
+            .exists(),
+        "fixture must not create production's diagnostics directory"
+    );
 
     join.abort();
     Ok(())
@@ -862,5 +960,53 @@ async fn instance_lock_survives_serve_return_while_process_is_alive() -> Result<
         !second_socket.exists(),
         "refused start must not have bound a frontend socket"
     );
+    Ok(())
+}
+
+#[test]
+fn diagnostics_override_symlink_to_production_is_scoped_away() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let production_dir = temp.path().join("production");
+    std::fs::create_dir(&production_dir)?;
+    let alias = temp.path().join("private-looking");
+    std::os::unix::fs::symlink(&production_dir, &alias)?;
+    let prod = EnginePaths {
+        diagnostics_dir: Some(production_dir),
+        ..production()
+    };
+    let paths = IsolationPaths::derive_from(
+        FIXTURE_SOCKET,
+        &IsolationOverrides {
+            diagnostics_dir: Some(alias.clone()),
+            ..Default::default()
+        },
+        &prod,
+    );
+    assert_eq!(
+        paths.resolve_diagnostics_dir(Some(alias)),
+        Some(PathBuf::from("/tmp/boss-test-guard-1234.diagnostics"))
+    );
+    Ok(())
+}
+
+#[test]
+fn derived_diagnostics_symlink_to_production_is_refused() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let production_dir = temp.path().join("production");
+    std::fs::create_dir(&production_dir)?;
+    std::os::unix::fs::symlink(&production_dir, temp.path().join("fixture.diagnostics"))?;
+    let prod = EnginePaths {
+        diagnostics_dir: Some(production_dir),
+        ..production()
+    };
+    let paths = IsolationPaths::derive_from(
+        temp.path().join("fixture.sock").to_str().unwrap(),
+        &IsolationOverrides::default(),
+        &prod,
+    );
+    let err = paths
+        .ensure_isolated(&paths.derived)
+        .expect_err("must refuse before logger installation");
+    assert!(err.to_string().contains("BOSS_ENGINE_DIAGNOSTICS_DIR"));
     Ok(())
 }

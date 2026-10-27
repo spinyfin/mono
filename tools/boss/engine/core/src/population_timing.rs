@@ -4,7 +4,7 @@
 //!
 //! # Motivation
 //!
-//! The app-side diagnostics from investigation T2101 (PR #1697) proved the
+//! The app-side diagnostics from PR #1697 proved the
 //! client is not the bottleneck: for the ~1,949-item Boss product the
 //! `request` segment (RPC issue → reply off the socket) is ~7.1s p50 while
 //! decode+apply+render total ~0.6s. But that `request` segment was a black
@@ -42,7 +42,10 @@
 //!   `<boss-state-root>/diagnostics/engine-population-timing-YYYY-MM-DD.jsonl`
 //!
 //! (`<boss-state-root>` = `~/Library/Application Support/Boss`, overridable
-//! for local runs / tests via `BOSS_ENGINE_DIAGNOSTICS_DIR`.) Rotation,
+//! via `BOSS_ENGINE_DIAGNOSTICS_DIR`; a test-fixture engine gets a directory
+//! beside its other files instead — see
+//! `IsolationPaths::resolve_diagnostics_dir`.) The directory is resolved once
+//! at startup and installed with [`install_global`]. Rotation,
 //! retention, and the background-writer task are the generic machinery in
 //! the generic `boss_engine_day_rotated_log` crate, shared with `crate::ipc_log`.
 //!
@@ -61,6 +64,7 @@
 //! background writer task. Nothing runs unless a `GetWorkTree` is served.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use serde::Serialize;
@@ -400,26 +404,35 @@ impl PopulationTimingLog {
     }
 }
 
-/// The process-wide logger, resolved once. `None` when no diagnostics
-/// directory can be determined (`HOME` unset and no env override) — in
-/// which case instrumentation silently does nothing.
-pub fn global() -> Option<&'static PopulationTimingLog> {
-    use std::sync::OnceLock;
-    static LOG: OnceLock<Option<PopulationTimingLog>> = OnceLock::new();
-    LOG.get_or_init(|| resolve_diagnostics_dir().map(PopulationTimingLog::new))
-        .as_ref()
+static LOG: OnceLock<Option<PopulationTimingLog>> = OnceLock::new();
+
+/// Install the process-wide logger, writing under `dir` (`None` disables it).
+///
+/// Called once at engine startup with the directory the isolation guard
+/// resolved and gated (`IsolationPaths::resolve_diagnostics_dir`). Nothing
+/// here reads the environment or `$HOME`, so a fixture uses only its checked
+/// diagnostics directory. Returns
+/// `false`, leaving the first installation in place, when already installed.
+pub fn install_global(dir: Option<PathBuf>) -> bool {
+    LOG.set(dir.map(PopulationTimingLog::new)).is_ok()
 }
 
-/// `<boss-state-root>/diagnostics`, or the `BOSS_ENGINE_DIAGNOSTICS_DIR`
-/// override when set to a non-empty (trimmed) value.
-fn resolve_diagnostics_dir() -> Option<PathBuf> {
-    if let Some(raw) = std::env::var_os(DIAGNOSTICS_DIR_ENV) {
-        let trimmed = raw.to_string_lossy().trim().to_owned();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed));
-        }
-    }
-    Some(boss_log_files::default_state_root()?.join("diagnostics"))
+/// The process-wide logger. `None` until [`install_global`] runs, and after it
+/// when no diagnostics directory could be determined — in which case
+/// instrumentation silently does nothing.
+pub fn global() -> Option<&'static PopulationTimingLog> {
+    LOG.get()?.as_ref()
+}
+
+/// The `BOSS_ENGINE_DIAGNOSTICS_DIR` override, when set to a non-empty
+/// (trimmed) value.
+pub fn diagnostics_dir_override() -> Option<PathBuf> {
+    parse_diagnostics_dir_override(std::env::var_os(DIAGNOSTICS_DIR_ENV))
+}
+
+fn parse_diagnostics_dir_override(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let trimmed = raw?.to_string_lossy().trim().to_owned();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
 }
 
 #[cfg(test)]
@@ -649,21 +662,14 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_dir_env_override_wins() {
-        // Serialize env mutation is unnecessary: this is the only test that
-        // reads this var, and it removes it afterwards.
-        unsafe {
-            std::env::set_var(DIAGNOSTICS_DIR_ENV, "  /tmp/boss-diag-test  ");
-        }
-        assert_eq!(resolve_diagnostics_dir(), Some(PathBuf::from("/tmp/boss-diag-test")));
-        unsafe {
-            std::env::set_var(DIAGNOSTICS_DIR_ENV, "   ");
-        }
-        // Empty override is ignored → falls back to state root (present in CI).
-        let fallback = resolve_diagnostics_dir();
-        assert_ne!(fallback, Some(PathBuf::from("")));
-        unsafe {
-            std::env::remove_var(DIAGNOSTICS_DIR_ENV);
-        }
+    fn diagnostics_dir_override_is_trimmed_and_blank_is_ignored() {
+        let parse = |raw: Option<&str>| parse_diagnostics_dir_override(raw.map(Into::into));
+        assert_eq!(
+            parse(Some("  /tmp/boss-diag-test  ")),
+            Some(PathBuf::from("/tmp/boss-diag-test"))
+        );
+        assert_eq!(parse(Some("   ")), None);
+        assert_eq!(parse(Some("")), None);
+        assert_eq!(parse(None), None);
     }
 }
