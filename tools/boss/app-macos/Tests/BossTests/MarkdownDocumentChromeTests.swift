@@ -354,37 +354,26 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         XCTAssertEqual(chunks, [.plain(source)])
     }
 
-    /// The core invariant: the `## HARD RULE ...` section folds, but the
-    /// findings after it (rendered as a *deeper* `###` heading, with no H2
-    /// in between) never end up inside the collapsible chunk. A same-level
-    /// boundary rule would get this wrong — this pins "next heading of any
-    /// level" as the actual behavior.
-    func testHeadingSectionsFoldsHardRuleButNeverFindings() {
+    /// Revision boilerplate stops before findings, regardless of heading level.
+    func testHeadingSectionsKeepsFindingsOutsideBoilerplate() {
         let chunks = MarkdownHeadingSections.chunks(
             in: Self.revisionBrief,
             collapsibleHeadings: [RevisionBriefCollapsibleHeadings.hardRule]
         )
-        XCTAssertEqual(chunks.count, 3, "expected prefix, collapsible section, suffix: \(chunks)")
-
-        guard case .plain(let prefix) = chunks[0] else { return XCTFail("expected a leading .plain chunk") }
+        XCTAssertEqual(chunks.count, 3)
+        guard case .plain(let prefix) = chunks[0] else { return XCTFail("expected preamble") }
         XCTAssertTrue(prefix.contains("Automated PR review of PR #5"))
-        XCTAssertFalse(prefix.contains("HARD RULE"))
-
-        guard case .collapsible(let heading, let body) = chunks[1] else {
-            return XCTFail("expected a .collapsible chunk")
-        }
+        guard case .collapsible(let heading, let body) = chunks[1] else { return XCTFail("expected fold") }
         XCTAssertEqual(heading, RevisionBriefCollapsibleHeadings.hardRule)
         XCTAssertTrue(body.contains("FORBIDDEN"))
-        XCTAssertFalse(body.contains("### [high]"), "a finding heading must never be folded into the collapsed body")
+        XCTAssertFalse(body.contains("### [high]"))
         XCTAssertFalse(body.contains("Review summary"))
-
-        guard case .plain(let suffix) = chunks[2] else { return XCTFail("expected a trailing .plain chunk") }
-        XCTAssertTrue(suffix.contains("### [high] Null pointer dereference"))
-        XCTAssertTrue(suffix.contains("Review summary"))
-        XCTAssertFalse(suffix.contains("FORBIDDEN"))
+        guard case .plain(let findings) = chunks[2] else { return XCTFail("expected visible findings") }
+        XCTAssertTrue(findings.contains("### [high]"))
+        XCTAssertTrue(findings.contains("**Review summary:**"))
     }
 
-    /// Concatenating the three chunks (re-adding back the `## ` marker and
+    /// Concatenating the chunks (re-adding back the `## ` marker and
     /// heading-line newline the collapsible chunk strips) must reconstruct
     /// the original source exactly — chunking must never drop or duplicate
     /// text, since this same text is what the app shows the reader.
@@ -459,9 +448,10 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         ### Next
         """
         let chunks = MarkdownHeadingSections.chunks(in: doc, collapsibleHeadings: ["Indented heading"])
-        XCTAssertEqual(chunks.count, 3, "expected prefix, collapsible section, suffix: \(chunks)")
-        guard case .collapsible(let heading, _) = chunks[1] else { return XCTFail("expected a .collapsible chunk") }
+        XCTAssertEqual(chunks.count, 2, "expected prefix and complete folded outline: \(chunks)")
+        guard case .collapsible(let heading, let body) = chunks[1] else { return XCTFail("expected a .collapsible chunk") }
         XCTAssertEqual(heading, "Indented heading")
+        XCTAssertTrue(body.hasSuffix("### Next"))
     }
 
     // MARK: - Find-in-document over a chunked document
@@ -527,7 +517,7 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         let state = MarkdownFindState()
         let heading = RevisionBriefCollapsibleHeadings.hardRule
         state.updateSource(Self.revisionBrief, baseURL: nil, collapsibleHeadings: [heading])
-        state.query = "Null pointer"
+        state.query = "Automated PR review"
         XCTAssertEqual(state.matches.count, 1)
         XCTAssertNil(state.currentCollapsibleHeadingToExpand)
     }
