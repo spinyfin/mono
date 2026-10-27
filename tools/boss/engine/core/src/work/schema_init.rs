@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 54;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 55;
 
 /// Schema 43: the baseline commit a recovery record was created at, the
 /// pointer-reconciliation note for the worker prompt, and the retirement
@@ -318,6 +318,26 @@ const BOARD_REVIEW_EPOCH_53: &str = "CREATE TABLE IF NOT EXISTS board_review_epo
 const TASKS_PARENT_KIND_INDEX_54: &str =
     "CREATE INDEX IF NOT EXISTS idx_tasks_parent_kind_id ON tasks(parent_task_id, kind, id)";
 
+/// Schema 55: partial covering index for the verdict arm of the
+/// board-review family-key read, and removal of the now-redundant
+/// `idx_tasks_parent_task_id`.
+///
+/// The key read folds in each family member's verdict-named findings
+/// revision. `pr_review_verdicts_work_item_idx (work_item_id, created_at)`
+/// does not hold `revision_task_id`, so every warm pass fetched every
+/// historical verdict row of every on-board family member. This index holds
+/// only the rows that name a revision, keyed by `(work_item_id,
+/// revision_task_id)`, so the arm is index-only and its cost follows the
+/// number of findings revisions rather than review history. The predicate
+/// matches the key read's `WHERE` verbatim, which SQLite needs to use it.
+/// `idx_tasks_parent_kind_id` (schema 54) starts with `parent_task_id`, so
+/// the single-column parent index served nothing it did not and only added
+/// write cost to every `tasks` update.
+const VERDICT_REVISION_INDEX_55: &str = "CREATE INDEX IF NOT EXISTS pr_review_verdicts_revision_idx
+         ON pr_review_verdicts(work_item_id, revision_task_id)
+         WHERE revision_task_id IS NOT NULL AND revision_task_id != '';
+     DROP INDEX IF EXISTS idx_tasks_parent_task_id;";
+
 // Derive requirements once from the fresh-database SQL, but check every DB.
 static BASELINE_OBJECTS: std::sync::LazyLock<Result<std::collections::BTreeSet<String>>> =
     std::sync::LazyLock::new(|| {
@@ -445,6 +465,9 @@ impl WorkDb {
         }
         if version < 54 {
             tx.execute_batch(TASKS_PARENT_KIND_INDEX_54)?;
+        }
+        if version < 55 {
+            tx.execute_batch(VERDICT_REVISION_INDEX_55)?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
@@ -966,6 +989,7 @@ mod floor_tests {
             44,
             45,
             51,
+            54,
             CURRENT_SCHEMA_VERSION,
             CURRENT_SCHEMA_VERSION + 1,
         ] {
@@ -1045,6 +1069,9 @@ mod floor_tests {
             if version >= 54 {
                 conn.execute_batch(TASKS_PARENT_KIND_INDEX_54).unwrap();
             }
+            if version >= 55 {
+                conn.execute_batch(VERDICT_REVISION_INDEX_55).unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -1088,6 +1115,7 @@ mod floor_tests {
                 .unwrap();
             expected.execute_batch(BOARD_REVIEW_EPOCH_53).unwrap();
             expected.execute_batch(TASKS_PARENT_KIND_INDEX_54).unwrap();
+            expected.execute_batch(VERDICT_REVISION_INDEX_55).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

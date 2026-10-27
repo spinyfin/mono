@@ -392,6 +392,25 @@ fn badge_presentation(
     badge
 }
 
+/// The `family(root, id, depth)` CTE shared by the review projection and
+/// the board-review cache key read, expanded to a literal so both can be
+/// built with `concat!`. It seeds from an `owners(card, id)` CTE and walks
+/// revision children through the covering `idx_tasks_parent_kind_id`; the
+/// key read must see exactly the rows the projection reads, so there is one
+/// definition of the walk (kind filter, depth bound, seeding).
+macro_rules! family_recursive_sql {
+    () => {
+        "family(root, id, depth) AS (
+            SELECT DISTINCT id, id, 0 FROM owners
+            UNION ALL
+            SELECT f.root, t.id, f.depth + 1 FROM family f
+            JOIN tasks t INDEXED BY idx_tasks_parent_kind_id ON t.parent_task_id = f.id
+            WHERE t.kind = 'revision' AND f.depth < 64
+         )"
+    };
+}
+pub(super) use family_recursive_sql;
+
 /// The `owners(card, id)` and `family(root, id, depth)` CTEs both review
 /// queries select from. `Card` resolves each id's owner by walking up its
 /// revision chain; `Owner` takes the ids as the owners themselves.
@@ -415,15 +434,7 @@ pub(super) fn review_family_cte(placeholders: &str, key: ReviewKey) -> String {
          )"
         ),
     };
-    format!(
-        "WITH RECURSIVE {owners}, family(root, id, depth) AS (
-            SELECT DISTINCT id, id, 0 FROM owners
-            UNION ALL
-            SELECT f.root, t.id, f.depth + 1 FROM family f
-            JOIN tasks t INDEXED BY idx_tasks_parent_task_id ON t.parent_task_id = f.id
-            WHERE t.kind = 'revision' AND f.depth < 64
-         )"
-    )
+    format!("WITH RECURSIVE {owners}, {}", family_recursive_sql!())
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ fn review_family_uses_parent_index_and_preserves_cycle_semantics() {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(
         "CREATE TABLE tasks(id TEXT PRIMARY KEY, kind TEXT, parent_task_id TEXT);
-        CREATE INDEX idx_tasks_parent_task_id ON tasks(parent_task_id);
+        CREATE INDEX idx_tasks_parent_kind_id ON tasks(parent_task_id, kind, id);
         INSERT INTO tasks VALUES ('root','project_task',NULL), ('child','revision','root'),
         ('grandchild','revision','child'), ('cycle-a','revision','cycle-b'),
         ('cycle-b','revision','cycle-a'), ('unrelated','project_task',NULL);",
@@ -27,7 +27,7 @@ fn review_family_uses_parent_index_and_preserves_cycle_semantics() {
     };
     assert_eq!(
         rows(&sql),
-        rows(&sql.replace(" INDEXED BY idx_tasks_parent_task_id", ""))
+        rows(&sql.replace(" INDEXED BY idx_tasks_parent_kind_id", ""))
     );
     assert_eq!(rows(&sql).len(), 3);
     let plan = conn
@@ -39,7 +39,7 @@ fn review_family_uses_parent_index_and_preserves_cycle_semantics() {
         .unwrap()
         .join("\n");
     assert!(
-        plan.contains("USING INDEX idx_tasks_parent_task_id (parent_task_id=?)"),
+        plan.contains("USING COVERING INDEX idx_tasks_parent_kind_id (parent_task_id=?"),
         "{plan}"
     );
 }
@@ -164,7 +164,7 @@ fn owner_keyed_family_matches_the_card_walk_for_resolved_owners() {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(
         "CREATE TABLE tasks(id TEXT PRIMARY KEY, kind TEXT, parent_task_id TEXT);
-        CREATE INDEX idx_tasks_parent_task_id ON tasks(parent_task_id);
+        CREATE INDEX idx_tasks_parent_kind_id ON tasks(parent_task_id, kind, id);
         INSERT INTO tasks VALUES ('root','project_task',NULL), ('child','revision','root'),
         ('grandchild','revision','child'), ('other','chore',NULL), ('other-rev','revision','other');",
     )

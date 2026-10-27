@@ -1168,20 +1168,7 @@ pub(crate) fn attach_review_guide_state(conn: &Connection, tasks: &mut [Task], c
     if roots.is_empty() {
         return Ok(());
     }
-    // Board-sized IN lists change the SQL text per assembly and materialise
-    // thousands of bound ids. A product join keeps the statement cached
-    // and lets the caller drop off-board series in memory. Chains at or
-    // under the ancestry depth cap keep the indexed id list.
-    let product_id = (roots.len() > super::chain_helpers::MAX_CHAIN_DEPTH)
-        .then(|| {
-            tasks
-                .iter()
-                .chain(chores.iter())
-                .next()
-                .map(|task| task.product_id.as_str())
-        })
-        .flatten();
-    let states = query_review_guide_card_states(conn, &roots, product_id)?;
+    let states = query_review_guide_card_states(conn, &roots)?;
     for task in tasks.iter_mut().chain(chores.iter_mut()) {
         if let Some(state) = states.get(&task.id) {
             task.review_guide_lifecycle = Some(state.lifecycle.clone());
@@ -1218,27 +1205,7 @@ struct ReviewGuideCardState {
     error: Option<String>,
 }
 
-/// `root_task_id -> ReviewGuideCardState` for every board root in `roots`,
-/// for [`attach_review_guide_state`]. A free function (not a `WorkDb`
-/// method) so a board/work-tree read can call it on its own already-open
-/// connection rather than opening a second one — matches
-/// `review_badge::fetch_current_heads`. The `LEFT JOIN` against
-/// `pr_review_guide_versions` resolves the readable version's own
-/// `comparison_id` so staleness can be derived without a second round trip.
-///
-/// `roots` maps `root_task_id -> current_pr_url` — the series must match
-/// both. One series per canonical PR (UNIQUE on `canonical_pr_url`), but
-/// one root may own several series after a PR replacement, so a root-id
-/// match without the URL would pick a sibling. Ordering matches
-/// `get_latest_pr_review_guide_source_capture` (`latest_observation_sequence
-/// DESC, id DESC`) so the two resolvers cannot disagree; first matching row
-/// per root wins.
-///
-/// On a board-sized root set the lookup joins `tasks` on `product_id`
-/// (fixed SQL, statement-cached) and keeps matching roots in memory. A
-/// single-item chain keeps the indexed `root_task_id IN (...)` list.
-/// The URL comparison stays in memory so replaced PRs cannot select a
-/// sibling series.
+/// Raw `pr_review_guide_source_series` row, see [`review_guide_card_states_sql`].
 type ReviewGuideCardRow = (
     String,
     String,
@@ -1261,43 +1228,54 @@ fn map_review_guide_card_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Review
     ))
 }
 
-fn query_review_guide_card_states(
-    conn: &Connection,
-    roots: &HashMap<&str, &str>,
-    product_id: Option<&str>,
-) -> Result<std::collections::HashMap<String, ReviewGuideCardState>> {
-    if roots.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let select = format!(
+/// Constant SQL text for [`query_review_guide_card_states`]: root ids arrive
+/// as a JSON array bound to `?1`.
+pub(crate) fn review_guide_card_states_sql() -> String {
+    format!(
         "SELECT s.root_task_id, s.guide_lifecycle, s.readable_version_id,
                 s.selected_comparison_id, v.comparison_id,
                 {REVIEW_GUIDE_LATEST_TERMINAL_ERROR_SQL}, s.canonical_pr_url
          FROM pr_review_guide_source_series s
-         LEFT JOIN pr_review_guide_versions v ON v.id = s.readable_version_id"
-    );
-    let rows = if let Some(product_id) = product_id {
-        let sql = format!(
-            "{select}
-             JOIN tasks t ON t.id = s.root_task_id
-             WHERE t.product_id = ?1
-             ORDER BY s.latest_observation_sequence DESC, s.id DESC"
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        stmt.query_map([product_id], map_review_guide_card_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    } else {
-        let ids: Vec<_> = roots.keys().copied().collect();
-        let placeholders = vec!["?"; ids.len()].join(",");
-        let sql = format!(
-            "{select}
-             WHERE s.root_task_id IN ({placeholders})
-             ORDER BY s.latest_observation_sequence DESC, s.id DESC"
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        stmt.query_map(rusqlite::params_from_iter(ids), map_review_guide_card_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
+         LEFT JOIN pr_review_guide_versions v ON v.id = s.readable_version_id
+         WHERE s.root_task_id IN (SELECT value FROM json_each(?1))
+         ORDER BY s.latest_observation_sequence DESC, s.id DESC"
+    )
+}
+
+/// `root_task_id -> ReviewGuideCardState` for every board root in `roots`,
+/// for [`attach_review_guide_state`]. A free function (not a `WorkDb`
+/// method) so a board/work-tree read can call it on its own already-open
+/// connection rather than opening a second one — matches
+/// `review_badge::fetch_current_heads`. The `LEFT JOIN` against
+/// `pr_review_guide_versions` resolves the readable version's own
+/// `comparison_id` so staleness can be derived without a second round trip.
+///
+/// `roots` maps `root_task_id -> current_pr_url` — the series must match
+/// both. One series per canonical PR (UNIQUE on `canonical_pr_url`), but
+/// one root may own several series after a PR replacement, so a root-id
+/// match without the URL would pick a sibling. Ordering matches
+/// `get_latest_pr_review_guide_source_capture` (`latest_observation_sequence
+/// DESC, id DESC`) so the two resolvers cannot disagree; first matching row
+/// per root wins.
+///
+/// The root ids are bound as one JSON array and probed through
+/// `pr_review_guide_source_series_observation_idx`, once per board root.
+/// The statement text is constant (cached across assemblies) and never
+/// touches `tasks`, so the cost follows the board rather than the product's
+/// history. The URL comparison stays in memory so replaced PRs cannot
+/// select a sibling series.
+fn query_review_guide_card_states(
+    conn: &Connection,
+    roots: &HashMap<&str, &str>,
+) -> Result<std::collections::HashMap<String, ReviewGuideCardState>> {
+    if roots.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let ids = serde_json::to_string(&roots.keys().collect::<Vec<_>>())?;
+    let mut stmt = conn.prepare_cached(&review_guide_card_states_sql())?;
+    let rows = stmt
+        .query_map([ids], map_review_guide_card_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut result = std::collections::HashMap::new();
     for (root_task_id, lifecycle, readable_version_id, selected_comparison_id, version_comparison_id, error, pr_url) in
         rows

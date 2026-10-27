@@ -34,38 +34,39 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::review_badge::OwnerReview;
+use super::review_badge::{OwnerReview, family_recursive_sql};
 
 /// Exact membership and input versions, ordered by member ID.
 pub(crate) type FamilyKey = Vec<(String, i64)>;
 
 /// Constant SQL for [`read_family_keys`]: owners from a JSON array (no
-/// `tasks` kind check), children via the covering parent/kind index, and
-/// verdict-referenced findings revisions folded into the same key.
-pub(crate) const FAMILY_KEY_SQL: &str = "
-    WITH RECURSIVE owners(card, id) AS (
+/// `tasks` kind check), the family walk shared with the projection
+/// ([`family_recursive_sql`]), and verdict-referenced findings revisions
+/// folded into the same key through the partial covering index
+/// `pr_review_verdicts_revision_idx`, so a warm pass reads only verdict rows
+/// that name a revision.
+pub(crate) const FAMILY_KEY_SQL: &str = concat!(
+    "WITH RECURSIVE owners(card, id) AS (
         SELECT value, value FROM json_each(?1)
-    ), family(root, id, depth) AS (
-        SELECT DISTINCT id, id, 0 FROM owners
-        UNION ALL
-        SELECT f.root, t.id, f.depth + 1 FROM family f
-        JOIN tasks t INDEXED BY idx_tasks_parent_kind_id ON t.parent_task_id = f.id
-        WHERE t.kind = 'revision' AND f.depth < 64
-    )
+    ), ",
+    family_recursive_sql!(),
+    "
     SELECT DISTINCT m.root, m.id, COALESCE(e.epoch, 0)
     FROM (
         SELECT f.root, f.id FROM family f
         UNION
         SELECT f.root, v.revision_task_id
         FROM family f
-        JOIN pr_review_verdicts v ON v.work_item_id = f.id
+        JOIN pr_review_verdicts v INDEXED BY pr_review_verdicts_revision_idx
+            ON v.work_item_id = f.id
         WHERE v.revision_task_id IS NOT NULL AND v.revision_task_id != ''
     ) m
     LEFT JOIN board_review_epoch e ON e.work_item_id = m.id
-    ORDER BY m.root, m.id";
+    ORDER BY m.root, m.id"
+);
 
 /// Read only the requested owners' families, using the projection's own
-/// ancestry definition so off-board intermediates cannot hide input writes,
+/// family walk so off-board intermediates cannot hide input writes,
 /// plus any findings revision a family verdict still names.
 pub(crate) fn read_family_keys(
     conn: &rusqlite::Connection,

@@ -546,6 +546,81 @@ fn family_key_read_uses_the_covering_parent_kind_index() {
     assert!(!plan.contains("SCAN t"), "key read must not scan tasks rows: {plan}");
 }
 
+/// Plan lines for `sql` bound with a JSON array of ids.
+fn plan_for(conn: &rusqlite::Connection, sql: &str, ids: &str) -> String {
+    conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap()
+        .query_map([ids], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+        .join("\n")
+}
+
+/// SQLite VM steps `sql` takes to run to completion with `ids` bound.
+fn vm_steps(conn: &rusqlite::Connection, sql: &str, ids: &str) -> i32 {
+    let mut stmt = conn.prepare(sql).unwrap();
+    let mut rows = stmt.query([ids]).unwrap();
+    while rows.next().unwrap().is_some() {}
+    drop(rows);
+    stmt.get_status(rusqlite::StatementStatus::VmStep)
+}
+
+#[test]
+fn family_key_verdict_arm_is_index_only() {
+    let board = Board::new("review-cache-verdict-plan");
+    let root = board.in_review_chore(33);
+    let _revision = board.revision(&root);
+    let conn = board.db.connect().unwrap();
+    let ids = serde_json::to_string(&[root]).unwrap();
+    let plan = plan_for(&conn, crate::work::board_review_cache::FAMILY_KEY_SQL, &ids);
+    assert!(
+        plan.contains("USING COVERING INDEX pr_review_verdicts_revision_idx"),
+        "verdict arm must be answered from the partial index: {plan}"
+    );
+}
+
+#[test]
+fn warm_key_read_work_does_not_grow_with_verdict_history() {
+    let board = Board::new("review-cache-history-steps");
+    let owners: Vec<String> = (40..46).map(|n| board.in_review_chore(n)).collect();
+    for owner in &owners {
+        board.revision(owner);
+        board.verdict(owner, "h0", "completed_clean");
+    }
+    let ids = serde_json::to_string(&owners).unwrap();
+    let sql = crate::work::board_review_cache::FAMILY_KEY_SQL;
+    let before = vm_steps(&board.db.connect().unwrap(), sql, &ids);
+    // Clean verdicts name no revision; insert them directly under one
+    // existing review execution per owner.
+    let writer = board.db.connect().unwrap();
+    for owner in &owners {
+        let execution: String = writer
+            .query_row(
+                "SELECT execution_id FROM pr_review_verdicts WHERE work_item_id = ?1",
+                [owner],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for n in 0..200 {
+            writer
+                .execute(
+                    "INSERT INTO pr_review_verdicts(id, execution_id, work_item_id, head_sha,
+                         findings_count, revision_warranted, gate_outcome, created_at)
+                     VALUES (?1, ?2, ?3, ?4, 0, 0, 'completed_clean', '2026-01-01T00:00:00Z')",
+                    rusqlite::params![format!("hist-{owner}-{n}"), execution, owner, format!("h{n}")],
+                )
+                .unwrap();
+        }
+    }
+    drop(writer);
+    let after = vm_steps(&board.db.connect().unwrap(), sql, &ids);
+    assert!(
+        after <= before + owners.len() as i32,
+        "same board, 200 more clean verdicts per owner: key read went from {before} to {after} VM steps"
+    );
+}
+
 #[test]
 fn nested_off_board_revision_inputs_invalidate_both_owners_on_reparent() {
     for column in ["status = 'archived'", "deleted_at = '9'"] {
