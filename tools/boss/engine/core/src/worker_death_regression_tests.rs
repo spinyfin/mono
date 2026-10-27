@@ -53,6 +53,10 @@ async fn missing_session_reconciles_without_a_final_transcript_event() {
                 assert_eq!(result.reaped, 0);
                 let after = states.get(4).unwrap();
                 assert_eq!(after.activity, WorkerActivity::Terminated);
+                assert!(
+                    !states.is_observed_dead(&execution_id),
+                    "a live PID must not set the permanent hook fence"
+                );
                 assert_eq!(after.last_event_at, before.last_event_at);
                 assert_eq!(after.live_status, before.live_status);
                 assert_eq!(after.live_status_at, before.live_status_at);
@@ -99,4 +103,85 @@ fn observed_death_freezes_summary_and_preserves_last_driver_event() {
     assert_eq!(after.live_status, before.live_status);
     assert_eq!(after.live_status_at, before.live_status_at);
     assert!(after.current_tool.is_none());
+}
+
+#[tokio::test]
+async fn alive_inspection_after_inferred_death_accepts_a_tool_event() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "session returns");
+    let pid = i64::from(std::process::id());
+    let db = Arc::new(db);
+    let execution_id = create_spawned_execution(&db, &work_item_id, pid);
+    let states = Arc::new(LiveWorkerStateRegistry::new());
+    register_slot(&states, 4, &execution_id, &work_item_id);
+    drive_to_working_tool_in_flight(&states, 4);
+    let inspector = StaticTerminalInspector(TerminalLiveness::Dead {
+        session_name: "missing-worker".into(),
+        evidence: DeadPaneEvidence::SessionAbsent,
+    });
+    let coordinator = make_coordinator(db.clone(), 4);
+    let reaper = RecordingReaper::new(coordinator.clone());
+    let sink = RecordingDispatchEventSink::new();
+    let holds = HoldRegistry::new();
+    let _ = run_one_pass_with_terminal(
+        &db,
+        &states,
+        Some(&inspector),
+        coordinator.clone(),
+        &sink,
+        StaleWorkerSweepControls {
+            reaper: &reaper,
+            hold_registry: &holds,
+            cube_client: &AlwaysSucceedsCube,
+        },
+        StaleWorkerThresholds {
+            stale_threshold_secs: NEVER_STALE,
+            auto_reap_threshold_secs: NEVER_STALE,
+        },
+    )
+    .await;
+    assert_eq!(states.get(4).unwrap().activity, WorkerActivity::Terminated);
+    assert!(!states.is_observed_dead(&execution_id));
+    let alive = StaticTerminalInspector(TerminalLiveness::Alive {
+        session_name: "missing-worker".into(),
+        window_activity_epoch_secs: None,
+        pane_current_command: None,
+    });
+    let _ = run_one_pass_with_terminal(
+        &db,
+        &states,
+        Some(&alive),
+        coordinator,
+        &sink,
+        StaleWorkerSweepControls {
+            reaper: &reaper,
+            hold_registry: &holds,
+            cube_client: &AlwaysSucceedsCube,
+        },
+        StaleWorkerThresholds {
+            stale_threshold_secs: NEVER_STALE,
+            auto_reap_threshold_secs: NEVER_STALE,
+        },
+    )
+    .await;
+    assert_eq!(states.get(4).unwrap().activity, WorkerActivity::Working);
+    assert_eq!(
+        states.apply_sequenced_event(
+            4,
+            Some(2),
+            &WorkerEvent::PreToolUse {
+                session_id: "s".into(),
+                tool_name: "Read".into(),
+                tool_input: serde_json::json!({}),
+            },
+        ),
+        crate::live_worker_state::ApplyEventOutcome::Applied { changed: true },
+    );
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let refresh = crate::worker_refresh_liveness::evaluate(&db, &states, Some(&alive), &execution_id, now).await;
+    assert_eq!(
+        refresh.permit,
+        crate::worker_refresh_liveness::WorkerRefreshPermit::Refresh
+    );
 }

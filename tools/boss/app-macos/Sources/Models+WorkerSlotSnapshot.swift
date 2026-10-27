@@ -148,14 +148,15 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
         return session != nil ? .terminal : .viewerMissing
     }
 
-    /// First titlebar line. A finished run never reads as working: the
-    /// placeholder text wins over any summary or task title.
+    /// First titlebar line. A terminated run never reads as working: the
+    /// exited label wins over any summary or task title. Errored is
+    /// non-terminal and can return to Working, so it keeps the summary.
     var headerTitle: String {
         let name = displayName
         if isPlaceholder {
             return "\(name) finished"
         }
-        if let activity = live?.activity, activity == .terminated || activity == .errored {
+        if let activity = live?.activity, activity == .terminated {
             return "\(name): \(activity.agentsPaneLabel)"
         }
         if let summary, !summary.isEmpty {

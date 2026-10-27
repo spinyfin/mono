@@ -1,9 +1,12 @@
-//! `FrontendRequest` handlers — live-status enable/disable and pipeline debug.
+//! Live-status frontend handlers and the production transcript-path resolver.
 //!
-//! Split out of `app.rs`; each handler is dispatched from the
-//! `handle_frontend_connection` match. Pure structural move — no
-//! behavioural change. See [`super::Dispatch`] for the per-request
-//! context every handler receives.
+//! The `FrontendRequest` handlers (enable/disable, pipeline debug) are a
+//! structural split from `app.rs`. [`TranscriptPathResolver`] for
+//! [`ServerState`] additionally consults
+//! [`crate::worker_refresh_liveness`]: the same confirmed-death predicate
+//! the stale-worker sweep uses, so a live-status refresh, a literal write,
+//! and an in-flight model result all apply one liveness standard.
+//! See [`super::Dispatch`] for the per-request context every handler receives.
 
 use super::*;
 
@@ -77,51 +80,26 @@ pub(super) async fn handle_debug_live_status_pipeline(ctx: Dispatch, req: Fronte
 
 #[async_trait]
 impl TranscriptPathResolver for ServerState {
-    async fn worker_can_refresh(&self, run_id: &str) -> bool {
-        use crate::stale_worker_sweep::{TerminalLiveness, TmuxWorkerTerminalInspector, WorkerTerminalInspector};
-        let execution = self.work_db.get_execution(run_id).ok();
-        if execution
-            .as_ref()
-            .is_some_and(|execution| execution.status.is_terminal())
-        {
-            self.live_worker_states.mark_terminated(run_id);
-            self.broadcast_live_worker_states().await;
-            return false;
-        }
-        if let Ok(tmux) = self.resolve_tmux() {
+    async fn worker_can_refresh(&self, run_id: &str) -> crate::worker_refresh_liveness::WorkerRefreshPermit {
+        use crate::stale_worker_sweep::{TmuxWorkerTerminalInspector, WorkerTerminalInspector};
+        let inspector = self.resolve_tmux().ok().map(|tmux| {
             let legacy = self.tmux_for_run(&tmux, boss_tmux::SERVER_LABEL).ok();
-            let inspector = TmuxWorkerTerminalInspector::new(self.work_db.clone(), tmux, legacy);
-            match inspector.inspect(run_id).await {
-                Ok(Some(TerminalLiveness::Dead { .. })) => {
-                    self.live_worker_states.mark_terminated(run_id);
-                    self.broadcast_live_worker_states().await;
-                    return false;
-                }
-                // A live, token-matched pane outweighs a stale shell PID.
-                Ok(Some(TerminalLiveness::Alive { .. })) => return true,
-                Ok(None) | Err(_) => {}
-            }
-        }
-        let process = crate::durable_liveness::probe_execution_worker(&self.work_db, run_id);
-        let process = match execution.and_then(|execution| execution.started_epoch()) {
-            Some(started) => {
-                crate::durable_liveness::corroborate_against_live_registry(
-                    process,
-                    &self.live_worker_states,
-                    run_id,
-                    started,
-                    boss_engine_utils::epoch_time::now_epoch_secs(),
-                )
-                .0
-            }
-            None => crate::durable_liveness::WorkerProcess::Unknown,
-        };
-        if matches!(process, crate::durable_liveness::WorkerProcess::Gone { .. }) {
-            self.live_worker_states.mark_terminated(run_id);
+            TmuxWorkerTerminalInspector::new(self.work_db.clone(), tmux, legacy)
+        });
+        let outcome = crate::worker_refresh_liveness::evaluate(
+            &self.work_db,
+            &self.live_worker_states,
+            inspector
+                .as_ref()
+                .map(|inspector| inspector as &dyn WorkerTerminalInspector),
+            run_id,
+            boss_engine_utils::epoch_time::now_epoch_secs(),
+        )
+        .await;
+        if outcome.broadcast {
             self.broadcast_live_worker_states().await;
-            return false;
         }
-        true
+        outcome.permit
     }
 
     async fn transcript_path(&self, run_id: &str) -> Option<std::path::PathBuf> {

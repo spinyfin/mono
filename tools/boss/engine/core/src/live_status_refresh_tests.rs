@@ -96,8 +96,12 @@ impl TranscriptPathResolver for DeathResolver {
         Some(self.path.clone())
     }
 
-    async fn worker_can_refresh(&self, _: &str) -> bool {
-        self.alive.load(std::sync::atomic::Ordering::SeqCst)
+    async fn worker_can_refresh(&self, _: &str) -> WorkerRefreshPermit {
+        if self.alive.load(std::sync::atomic::Ordering::SeqCst) {
+            WorkerRefreshPermit::Refresh
+        } else {
+            WorkerRefreshPermit::Stop
+        }
     }
 }
 

@@ -252,7 +252,9 @@ struct NotificationRepair {
 
 #[derive(bon::Builder)]
 struct SlotMeta {
-    /// Confirmed process/session death fences buffered transcript events until re-adoption.
+    /// Confirmed process/session death fences buffered transcript events until
+    /// same-run re-adoption or a later `Alive` inspection restores the slot.
+    /// Ordinary buffered hooks never clear this flag.
     #[builder(default)]
     observed_dead: bool,
     /// Set when a `Notification` hook arrives, cleared on the next `Stop`.
@@ -909,6 +911,12 @@ impl LiveWorkerStateRegistry {
                         entry.state.shell_pid = shell_pid;
                         previous_shell_pid
                     });
+                    // Same-run re-adoption is proof the worker survived an inferred
+                    // or confirmed death. Clear the fence and restore activity from
+                    // the in-memory semantic checkpoint; ordinary hooks cannot.
+                    if entry.meta.observed_dead || entry.state.activity == WorkerActivity::Terminated {
+                        revive_slot_entry(entry);
+                    }
                     (true, repaired_shell_pid)
                 }
                 _ => (false, None),
@@ -999,17 +1007,9 @@ impl LiveWorkerStateRegistry {
         // Codex background-terminal wait whose polls emit no events. The
         // turn condition is persisted from the reducer's own turn gate, so
         // `InTurn` holds from the first turn activity until a `Stop`.
-        match (checkpoint.turn_condition, checkpoint.tool_condition) {
-            (SemanticTurnCondition::InTurn, _) | (SemanticTurnCondition::Unknown, SemanticToolCondition::InFlight) => {
-                // An unbalanced tool call is itself in-turn evidence, so a
-                // row that predates the turn column still seeds `Working`
-                // when a tool was in flight.
-                entry.state.activity = WorkerActivity::Working;
-            }
-            (SemanticTurnCondition::Ended, _) => {
-                entry.state.activity = WorkerActivity::Idle;
-            }
-            (SemanticTurnCondition::Unknown, _) => {
+        match activity_from_semantic(checkpoint.turn_condition, checkpoint.tool_condition) {
+            Some(activity) => entry.state.activity = activity,
+            None => {
                 // No turn evidence. A balanced last tool boundary does not
                 // say the turn ended (the worker may be thinking or waiting
                 // on a background command), so no turn boundary is inferred
@@ -1960,19 +1960,63 @@ impl LiveWorkerStateRegistry {
         }
     }
 
-    /// Record observed death without inventing a driver event or refreshing its summary.
+    /// Record confirmed death without inventing a driver event or refreshing its summary.
+    ///
+    /// Sets the `observed_dead` fence so buffered hooks cannot restore the
+    /// slot; only [`Self::register_readoption`] (same-run) or
+    /// [`Self::revive_from_liveness_inference`] clears it.
     pub fn mark_terminated(&self, run_id: &str) -> bool {
+        self.terminate_run(run_id, true)
+    }
+
+    /// Show the slot as exited without fencing hooks or stopping later revival.
+    ///
+    /// Used for inferred tmux death that still has a live PID: the pane must
+    /// not display as working, but a subsequent `Alive` inspection or a
+    /// driver hook must still be able to recover the slot.
+    pub fn mark_terminated_display(&self, run_id: &str) -> bool {
+        self.terminate_run(run_id, false)
+    }
+
+    fn terminate_run(&self, run_id: &str, fence: bool) -> bool {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         let Some(entry) = guard.values_mut().find(|entry| entry.state.run_id == run_id) else {
             return false;
         };
+        let fenced = fence && !entry.meta.observed_dead;
+        if fence {
+            entry.meta.observed_dead = true;
+        }
         let state = &mut entry.state;
-        entry.meta.observed_dead = true;
         let changed = state.activity != WorkerActivity::Terminated;
         state.activity = WorkerActivity::Terminated;
         state.current_tool = None;
         state.recovery_status = None;
-        changed
+        fenced || changed
+    }
+
+    /// Whether confirmed death has fenced this run's hook stream.
+    pub fn is_observed_dead(&self, run_id: &str) -> bool {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard
+            .values()
+            .any(|entry| entry.state.run_id == run_id && entry.meta.observed_dead)
+    }
+
+    /// Clear the death fence and restore activity from driver/checkpoint
+    /// evidence. Ordinary buffered hooks cannot do this.
+    ///
+    /// Returns `true` when the slot changed (fence cleared and/or activity
+    /// restored), so callers can broadcast.
+    pub fn revive_from_liveness_inference(&self, run_id: &str) -> bool {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let Some(entry) = guard.values_mut().find(|entry| entry.state.run_id == run_id) else {
+            return false;
+        };
+        if !entry.meta.observed_dead && entry.state.activity != WorkerActivity::Terminated {
+            return false;
+        }
+        revive_slot_entry(entry)
     }
 
     /// Replace the live-status string for `slot_id` and stamp
@@ -2545,6 +2589,34 @@ fn current_iso8601() -> String {
 /// directly, with no date parsing.
 pub fn iso8601_utc(epoch_secs: i64) -> String {
     boss_engine_utils::iso8601::format_epoch_iso8601(epoch_secs)
+}
+
+/// Map a durable semantic checkpoint onto display activity.
+///
+/// `None` means there is no turn evidence: callers must not infer idle
+/// (or, on re-adoption of a live worker, must not leave the slot
+/// terminated).
+fn activity_from_semantic(turn: SemanticTurnCondition, tool: SemanticToolCondition) -> Option<WorkerActivity> {
+    match (turn, tool) {
+        (SemanticTurnCondition::InTurn, _) | (SemanticTurnCondition::Unknown, SemanticToolCondition::InFlight) => {
+            Some(WorkerActivity::Working)
+        }
+        (SemanticTurnCondition::Ended, _) => Some(WorkerActivity::Idle),
+        (SemanticTurnCondition::Unknown, _) => None,
+    }
+}
+
+/// Clear the death fence and restore activity from the slot's semantic
+/// checkpoint. A live worker with no turn evidence becomes `Working`
+/// rather than remaining `Terminated`.
+fn revive_slot_entry(entry: &mut SlotEntry) -> bool {
+    let was_fenced = entry.meta.observed_dead;
+    entry.meta.observed_dead = false;
+    let previous = entry.state.activity;
+    entry.state.activity =
+        activity_from_semantic(entry.meta.semantic_turn_condition, entry.meta.semantic_tool_condition)
+            .unwrap_or(WorkerActivity::Working);
+    was_fenced || previous != entry.state.activity
 }
 
 #[cfg(test)]

@@ -52,6 +52,8 @@ use crate::metrics::Registry;
 use crate::transcript_tail::TranscriptTail;
 use crate::utility_model::UtilityModel;
 
+pub use crate::worker_refresh_liveness::WorkerRefreshPermit;
+
 #[cfg(test)]
 #[path = "live_status_refresh_tests.rs"]
 mod refresh_tests;
@@ -486,8 +488,14 @@ pub trait TranscriptPathResolver: Send + Sync {
     async fn transcript_path(&self, run_id: &str) -> Option<PathBuf>;
 
     /// Check process/session liveness before reading a cached transcript.
-    async fn worker_can_refresh(&self, _run_id: &str) -> bool {
-        true
+    ///
+    /// Default is [`WorkerRefreshPermit::Refresh`]. Production consults
+    /// [`crate::worker_refresh_liveness::evaluate`] once per call; the
+    /// per-slot loop reuses that permit for the pre-model gates in a cycle
+    /// and re-checks only before publishing a model response. Confirmed
+    /// death parks the loop until a later Alive inspection or re-adoption.
+    async fn worker_can_refresh(&self, _run_id: &str) -> WorkerRefreshPermit {
+        WorkerRefreshPermit::Refresh
     }
 }
 
@@ -885,12 +893,32 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         let Some(state) = registry.get(slot_id).filter(|state| state.run_id == run_id) else {
             return;
         };
-        if state.activity == WorkerActivity::Terminated {
-            // A driver SessionEnd can precede a resumed hook. Park until a
-            // new activity event; confirmed physical death fences those hooks
-            // in the registry and the resolver stops this loop permanently.
+        // One inspection per wake: the three call sites below reuse this
+        // permit so a cycle does not spawn three tmux probes. Confirmed
+        // death still stops the loop; inferred death with a live PID skips
+        // the refresh without teardown.
+        let permit = resolver.worker_can_refresh(&run_id).await;
+        if permit == WorkerRefreshPermit::Stop {
+            // Confirmed death: stop refreshing, keep the task so a later
+            // Alive inspection or same-run re-adoption can unpark it.
             last_activity = WorkerActivity::Terminated;
             continue;
+        }
+        if state.activity == WorkerActivity::Terminated {
+            // A driver SessionEnd can precede a resumed hook. Park until a
+            // new activity event, unless this inspection just revived the
+            // slot (session reappeared / PID still live).
+            if permit != WorkerRefreshPermit::Refresh {
+                last_activity = WorkerActivity::Terminated;
+                continue;
+            }
+            last_activity = registry
+                .get(slot_id)
+                .map(|state| state.activity)
+                .unwrap_or(WorkerActivity::Terminated);
+            if last_activity == WorkerActivity::Terminated {
+                continue;
+            }
         }
 
         let kind = trigger_kind(&trigger);
@@ -918,9 +946,9 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         if matches!(
             trigger,
             Trigger::ActivityChanged(WorkerActivity::Errored | WorkerActivity::WaitingForInput)
-        ) && !resolver.worker_can_refresh(&run_id).await
+        ) && permit != WorkerRefreshPermit::Refresh
         {
-            return;
+            continue;
         }
 
         match trigger {
@@ -987,8 +1015,8 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             continue;
         }
 
-        if !resolver.worker_can_refresh(&run_id).await {
-            return;
+        if permit != WorkerRefreshPermit::Refresh {
+            continue;
         }
 
         last_refresh_attempt = Instant::now();
@@ -1162,11 +1190,19 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                     snap.last_success_at_epoch_s = Some(now_epoch);
                     snap.last_success_text = Some(preview);
                 });
-                if resolver.worker_can_refresh(&run_id).await
-                    && registry.get(slot_id).is_some_and(|state| state.run_id == run_id)
-                    && registry.set_live_status(slot_id, Some(text))
-                {
-                    broadcaster.broadcast_live_worker_states().await;
+                match resolver.worker_can_refresh(&run_id).await {
+                    WorkerRefreshPermit::Stop => {
+                        last_activity = WorkerActivity::Terminated;
+                        continue;
+                    }
+                    WorkerRefreshPermit::SkipThisCycle => {}
+                    WorkerRefreshPermit::Refresh
+                        if registry.get(slot_id).is_some_and(|state| state.run_id == run_id)
+                            && registry.set_live_status(slot_id, Some(text)) =>
+                    {
+                        broadcaster.broadcast_live_worker_states().await;
+                    }
+                    WorkerRefreshPermit::Refresh => {}
                 }
                 last_success_at = Some(Instant::now());
             }
