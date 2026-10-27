@@ -1,7 +1,7 @@
 //! Worker-facing writing contract for the existing question/explanation fields.
 
 pub(crate) const GUIDANCE: &str = r#"
-### Write questions for someone arriving cold
+## Write questions for someone arriving cold
 
 Assume the repo owner has not seen the PR, review, code, or your run. Use everyday words: no internal symbols, types, file names, API names, review jargon, or links in the question or Yes/No meanings. Keep technical evidence reachable in a separate Details section, not mixed into the decision.
 

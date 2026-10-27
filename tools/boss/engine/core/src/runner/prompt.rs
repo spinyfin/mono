@@ -338,6 +338,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         }
         ExecutionKind::InvestigationImplementation => {
             prompt.push_str(&compose_investigation_directive());
+            prompt.push_str(check_bypass_prohibition_text());
         }
         ExecutionKind::RevisionImplementation => {
             prompt.push_str(&compose_revision_directive(
@@ -388,6 +389,9 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
             prompt.push_str(
                 "Expected outcome for this run:\n- make concrete progress on the assigned work,\n- leave the workspace in a reviewable state,\n- stop with a concise review summary.\n",
             );
+            if execution.kind == ExecutionKind::ConflictResolution {
+                prompt.push_str(check_bypass_prohibition_text());
+            }
         }
     }
     // Issue #804: code-touching implementation chores were pushing to PR
@@ -441,30 +445,24 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         // Claude driver's fallback producer, and the `PostToolUse` capture of
         // `gh pr create` stdout remains as its hook-derived one.
         let pr_url_artifact = crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::PrUrl);
+        prompt.push_str("\nPublication context:\n");
         if let Some(pr_url) = existing_pr_url {
             let pr_number = boss_github::pr_url::pr_number_from_url(pr_url)
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "?".into());
+            let repo_slug = crate::completion::parse_repo_slug(&execution.repo_remote_url)
+                .unwrap_or_else(|_| "<owner/repo>".into());
             prompt.push_str(&format!(
-                "\nAcceptance criterion: when you believe the work is done, the deliverable is a PR URL.\n\
-                 - Push your commits to the existing PR branch with `{cube} pr update --branch <branch-name>` (see the ## RESUME EXISTING PR block above). Do NOT open a new PR.\n\
-                 - Confirm the PR is updated with `gh pr view {pr_number}` (pass `-R owner/repo` since bare gh calls need it in a jj workspace — use `jj git remote` to find the slug, or check the PR URL above).\n\
-                 - As soon as cube prints the PR URL, record it by writing the file `{pr_url_artifact}` with the contents `{{\"pr_url\": \"<the url>\"}}` (path also exported as `$BOSS_PR_URL_OUTPUT`). That path is outside the repo/workspace, so it never pollutes your PR, and it is the channel the engine reads first.\n\
-                 - Print the PR URL on its own line as the final thing in your final response as well, so the engine can still pick it up if that file write fails.\n\
-                 - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, you have made no changes — do NOT commit, push, or open a PR. Stop and explain what went wrong instead.\n",
+                "- Bound PR: {pr_url}; inspection command: `gh pr view {pr_number} -R {repo_slug}`.\n",
             ));
         } else {
             prompt.push_str(&format!(
-                "\nAcceptance criterion: when you believe the work is done, the deliverable is a PR URL.\n\
-                 - Use the engine-supplied branch name from the `expected branch name` line above (`{expected_branch}`) when advancing your bookmark — do NOT invent a different name.\n\
-                 - Push your branch (`jj bookmark set {expected_branch} -r @`) and open a PR with `{cube} pr create --branch {expected_branch}` which pushes the branch and opens the PR in one step (jj-aware, no GIT_DIR needed). It is safe to retry: if a prior call already created the PR (e.g. your tool killed an earlier invocation on a timeout but the push had actually landed), it returns that PR's URL instead of erroring. Use `{cube} pr update --branch {expected_branch}` only when you have new commits to push onto an already-open PR.\n\
-                 - **Never use `jj git push`, `git push`, or `gh pr create` directly** — always use `{cube} pr create` or `{cube} pr update`. A PreToolUse hook blocks direct push/PR-create attempts and redirects you to cube.\n\
-                 - If a PR already exists for this branch (e.g. you are resuming work or addressing review comments), push your new commits to update it instead of opening a duplicate. Check with `gh pr view` from inside the workspace.\n\
-                 - As soon as cube prints the PR URL, record it by writing the file `{pr_url_artifact}` with the contents `{{\"pr_url\": \"<the url>\"}}` (path also exported as `$BOSS_PR_URL_OUTPUT`). That path is outside the repo/workspace, so it never pollutes your PR, and it is the channel the engine reads first.\n\
-                 - Print the PR URL on its own line as the final thing in your final response as well, so the engine can still pick it up if that file write fails.\n\
-                 - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, you have made no changes — do NOT commit, push, or open a PR. Stop and explain what went wrong instead.\n",
+                "- Publication bookmark: `jj bookmark set {expected_branch} -r @`.\n"
             ));
         }
+        prompt.push_str(&format!(
+            "- Record the PR URL in `{pr_url_artifact}` as `{{\"pr_url\": \"<the url>\"}}` (also exported as `$BOSS_PR_URL_OUTPUT`). This external artifact is the engine's primary URL channel; the final-response URL in the generated rules is its fallback.\n",
+        ));
         // Warn that PR creation is terminal — the engine reaps the worker
         // immediately after the PR is opened. Workers must finish everything
         // BEFORE opening the PR; no followup turn is possible.
@@ -535,7 +533,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
     prompt.push_str("\nRespond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
     if let Some(details) = work_item_details(work_item) {
-        prompt.push_str("- details:\n");
+        prompt.push_str("\n## Task description\n\n- details:\n");
         prompt.push_str(details.trim_end());
         prompt.push('\n');
     }
@@ -1567,6 +1565,7 @@ fn compose_revision_directive(
     out.push_str("Expected outcome for this run:\n");
     out.push_str("- This is a **REVISION** task. Your deliverable is an update to an EXISTING pull request — typically a new commit on the PR branch, or a rebase if that is all that is needed. Do NOT open a new PR. The engine owns your `boss-recovery/exec_*` recovery bookmark; keep it advanced locally.\n");
     out.push_str(&format!("- The parent PR is #{pr_number} at {parent_pr_url}.\n"));
+    out.push_str("- Implement the requested changes in the Task description at the end of this prompt.\n");
     if let WorkItem::Task(task) | WorkItem::Chore(task) = work_item
         && task
             .created_via
@@ -1680,8 +1679,7 @@ fn compose_revision_directive(
     out.push('\n');
     out.push_str("6. **If this revision addresses automated review findings, post a findings-status summary comment on the PR.** This is a DIFFERENT artifact from the PR description in step 5, for a different reader: the description tells reviewers what the PR now does; this comment tells them what happened to each finding from the review pass that spawned this revision.\n");
     out.push_str(
-        "   a. This applies ONLY when this task's description (above, in \"What this revision \
-         should change\") enumerates review findings — look for one or more `### [<severity>] \
+        "   a. This applies ONLY when this task's description (the `- details:` block under \"Task description\" at the end of this prompt) enumerates review findings — look for one or more `### [<severity>] \
          <title>` sections, the shape an automated review pass renders. If this revision is \
          responding to a plain instruction from the repo owner with no such findings, SKIP the comment \
          entirely: do not post an empty table, and state in your final response that the \
@@ -1732,9 +1730,7 @@ fn compose_revision_directive(
     out.push_str(&format!(
         "7. Confirm the new commit is on the PR: `gh pr view {pr_number} -R {repo_slug}`\n"
     ));
-    out.push_str(&format!(
-        "8. Print the parent PR URL on its own line as the FINAL thing in your final response: {parent_pr_url}\n"
-    ));
+    out.push_str(&format!("Final-response PR URL: {parent_pr_url}\n"));
     out.push('\n');
     out.push_str("Preserve revision history — each revision is a new commit on the PR branch; never amend, squash, or rename existing commits on the branch.\n");
     out.push('\n');
@@ -1766,15 +1762,7 @@ fn compose_revision_directive(
     out.push_str(&revision_no_op_completion_directive(
         worker_signal_proposals_seam_enabled,
     ));
-    out.push_str(&format!(
-        "\nAcceptance criterion: when you believe the work is done, the deliverable is the parent PR URL. The post-push steps remain your responsibility: finish them before your final response. The engine treats the driver-resolved boundary after that response as the completion handshake; a push or staged PR URL alone does not mean the revision is done.\n\
-         - Push your changes to the parent branch (see step 4 above). Do NOT open a new PR.\n\
-         - Update the PR title and description per step 5 above — a stale or contradictory title or description is a defect. If this revision changes or overturns the PR's scope or conclusion, the title MUST reflect the final state.\n\
-         - If this revision addressed automated review findings, post the findings-status comment per step 6 above — every finding accounted for, one sentence each.\n\
-         - Confirm the parent PR shows your new commit with `gh pr view {pr_number} -R {repo_slug}`.\n\
-         - Print {parent_pr_url} on its own line as the final thing in your final response so the engine can pick it up.\n\
-         - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty and no rebase was needed, stop and explain.\n"
-    ));
+    out.push_str("The revision's post-push steps remain your responsibility: finish them before your final response; a push or staged PR URL alone does not mean the revision is done. The driver-resolved boundary after that response is the completion handshake.\n");
     if let Some(attempt) = conflict_attempt {
         out.push_str(&compose_conflict_resolution_fragment(attempt));
         out.push_str(&compose_merge_order_preservation_fragment(merge_order_preservation));

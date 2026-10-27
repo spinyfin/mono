@@ -262,6 +262,9 @@ pub struct WorkerSetupInput {
     /// decision-declaration mechanism is live.
     #[builder(default)]
     pub automation_outcome_proposals_seam_enabled: bool,
+    /// Whether the terminal proposal channel can carry operator questions.
+    #[builder(default)]
+    pub run_done_proposals_seam_enabled: bool,
     /// `true` when this [`WorkerKind::Reviewer`] execution is the batch's
     /// consolidating supervisor rather than a leaf reviewer — selects
     /// [`crate::pr_review::render_supervisor_claude_md`] over
@@ -305,7 +308,9 @@ pub struct WorkerSetupInput {
 /// instructions (reviewers never open or update PRs).
 pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &str) -> String {
     let mut rules = render_worker_rules_body(input, preamble, config_dir);
-    rules.push_str(operator_question::GUIDANCE);
+    if input.worker_kind == WorkerKind::Standard && input.run_done_proposals_seam_enabled {
+        rules.push_str(operator_question::GUIDANCE);
+    }
     rules.push('\n');
     rules
 }
@@ -405,6 +410,9 @@ fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir
            corrupts any body that contains inline code. Always write the body to\n\
            a file and use `--body-file` (see the recipe below).\n\
          - Print the PR URL on its own line as the last thing in your final response.\n\
+         - Confirm the published PR contains your commit with `gh pr view` and\n\
+           its head SHA; pass `-R owner/repo` in a jj workspace (resolve the slug\n\
+           from the PR URL or `jj git remote`).\n\
          - Before pushing, run `jj diff -r @`. If the diff is empty,\n\
            do NOT commit, push, or open a PR — stop and explain.\n\
          \n\
@@ -440,8 +448,13 @@ fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir
            that case you still get the last stored snapshot, never an error\n\
            or a hang. Never loop calling `--refresh` waiting for a state\n\
            change: the engine's own merge poller is what watches your PR to\n\
-           green after you push, not you — the same \"do not babysit CI\"\n\
-           principle your task prompt states applies here too.\n\
+           green after you push. Do not babysit CI with `gh pr checks` or\n\
+           `gh pr view` loops either. Finish required post-push artifacts, then\n\
+           complete the run using its enabled completion channel. Required checks\n\
+           are effectively green at SUCCESS, NEUTRAL, or SKIPPED; still-running\n\
+           and human-gated checks do not block completion. A genuinely failed\n\
+           check must be classified using the task prompt’s CI-failure rules;\n\
+           a CI-fix revision is no substitute for a fix you can make in this run.\n\
          - `{boss} pr body` — the PR title and body/description the\n\
            engine snapshotted when this run started, for a read-modify-write of\n\
            the description without a `gh pr view` round trip. If the\n\

@@ -439,12 +439,44 @@ fn implementation_brief_and_validation_exception_are_rendered_once() {
                 .build(),
         );
         assert_eq!(prompt.matches("Description here.").count(), 1);
+        assert!(prompt.contains("\n## Task description\n\n- details:"));
+        assert!(!prompt.contains("What this revision should change"));
         assert_eq!(prompt.matches("two or three attempts maximum").count(), 1);
         assert_eq!(prompt.matches("**Hard constraint").count(), 1);
         assert!(prompt.contains("if attribution remains unresolved, the failure still stands"));
         assert!(prompt.contains("a base reproduction, a passing rerun/isolation run"));
         assert!(prompt.contains("recording the target, failure, attempts and evidence"));
-        assert!(prompt.find("- details:").unwrap() > prompt.find("## Declaring your run finished").unwrap());
+        assert!(
+            prompt.find("\n## Task description\n").unwrap() > prompt.find("## Declaring your run finished").unwrap()
+        );
         assert!(!prompt.contains("Worked example"));
+    }
+}
+
+#[test]
+fn every_block_boundary_kind_emits_check_prohibition_once() {
+    for kind in [
+        ExecutionKind::TaskImplementation,
+        ExecutionKind::ChoreImplementation,
+        ExecutionKind::InvestigationImplementation,
+        ExecutionKind::RevisionImplementation,
+        ExecutionKind::ConflictResolution,
+    ] {
+        for enabled in [false, true] {
+            let mut execution = base_execution();
+            execution.kind = kind.clone();
+            execution.pr_url = Some("https://github.com/org/repo/pull/42".into());
+            let prompt = compose_execution_prompt(
+                ExecutionPromptParams::builder()
+                    .execution(&execution)
+                    .work_item(&chore_without_pr())
+                    .workspace_path(std::path::Path::new("/tmp/workspace"))
+                    .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                    .run_done_proposals_seam_enabled(enabled)
+                    .build(),
+            );
+            assert_eq!(prompt.matches("**Hard constraint").count(), 1, "{kind:?}");
+            assert!(prompt.contains("exclusions/allowlists"));
+        }
     }
 }

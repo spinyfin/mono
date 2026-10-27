@@ -278,8 +278,8 @@ mod tests {
                 "assembled worker prompt must embed the block-boundary fragment:\n{prompt}",
             );
             assert!(
-                prompt.contains("classify it per the CI-failure rules at the top of this prompt"),
-                "CI-monitoring failed-check sentence must point at the opening classification:\n{prompt}",
+                prompt.contains("Classify a CI failure by cause, then act"),
+                "the prompt must contain the CI classification referenced by generated rules:\n{prompt}",
             );
             assert!(
                 prompt.contains("[blocked] reason="),

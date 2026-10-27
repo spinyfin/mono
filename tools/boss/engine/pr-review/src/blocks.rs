@@ -25,7 +25,7 @@ pub fn render_supersession_flag_block(flag_lines: &[String]) -> String {
     let mut out = String::new();
     out.push_str("## Supersession-claim citation check (engine-flagged) — CRITICAL\n\n");
     out.push_str(
-        "Apply the Supersession / obsolescence claims rubric to EACH flagged phrase below: \
+        "For EACH flagged replacement or obsolescence claim below, require design authorization: \
          verify a specific design doc citation (path + section), read it, and raise a `regression` \
          finding if it is absent or does not support replacement. A clean build, apparent dead \
          code, or this PR removing the only caller is not authorization. Restore the removal \

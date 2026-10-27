@@ -860,7 +860,7 @@ pub(crate) fn render_rubric_section(scope: &ReviewScope) -> String {
                that a MERGED parent added and this resolution removes is a \
                regression **regardless of any \"supersedes\" narrative** — anchor \
                on the fact of the deletion, not the worker's stated purpose. \
-(`category: \
+               (`category: \
                \"regression\"`)\n\
              - **Supersession / obsolescence claims** *(first-class, explicit \
                check)* — if the PR body, a commit message, or a comment claims \
@@ -878,14 +878,14 @@ pub(crate) fn render_rubric_section(scope: &ReviewScope) -> String {
              - **Architectural issues** — wrong layer, missed reuse, abstraction \
                that fights the codebase's conventions. (`category: \
                \"architecture\"`)\n\
-             - **Reuse/duplication** — for every substantial new construct (HTTP/API client, external-service \
+             - **Reuse/duplication** *(first-class, explicit check)* — for every substantial new construct (HTTP/API client, external-service \
                endpoints/auth/version wiring, serialization helper, retry/backoff, utility module), search the WHOLE \
                repo: grep for distinctive strings (endpoints such as `api.anthropic.com`, headers, constants or \
                helper/module names). If one exists, name its file/module and recommend reuse or shared extraction. \
                Working in isolation does not justify duplication; a necessary exception must be explicitly justified in \
                the PR description. A missing justification is itself grounds for a `category: \"duplication\"` finding. \
                Every confirmed duplication finding forces a revision regardless of the severity.\n\
-             - **Deferred-scope hygiene** — use the Brief conformance comparison against **Task description**, or \
+             - **Deferred-scope hygiene** *(first-class, explicit check)* — use the Brief conformance comparison against **Task description**, or \
                **Chain-root brief** + **Revision ask**. Check (1) **Undeclared deferral**: requested scope absent from \
                the diff without a recorded `[deferred-scope] summary=\"...\" reason=\"...\"`; (2) **Misdeclared \
                deferral**: PR body, summary or commit prose (\"## Deferred\", \"left for a followup\", \"out of scope \
@@ -893,7 +893,7 @@ pub(crate) fn render_rubric_section(scope: &ReviewScope) -> String {
                record; (3) **Malformed markers**: missing `summary=`/`reason=` or improper quoting, even though \
                malformed markers are recorded with parse warnings. Require corrected grammar while the PR is open. \
                (`category: \"deferred_scope\"`) Every confirmed finding forces a revision regardless of the severity. \
-               See spinyfin/mono#1968 for prose-only scope loss.\n\
+               This is a process gap, not a style nit. See spinyfin/mono#1968 for prose-only scope loss.\n\
              **Exception — manual/interactive verification a headless worker cannot perform**: live GUI runs, \"spawn \
                real workers and watch the app\", screenshot-based checks, physical-device checks or other infeasible \
                interactive verification need only a precise prose Deferred/Validation note, which is acceptable and \
@@ -1225,6 +1225,18 @@ mod tests {
         // P3 authoritative supersession block.
         assert!(prompt.contains("Supersession-claim citation check (engine-flagged)"));
         assert!(prompt.contains("supersedes"));
+        let docs_prompt = render_reviewer_initial_prompt(
+            "Update design doc",
+            "Reconcile the design with shipped behavior.",
+            "https://github.com/org/repo/pull/753",
+            "/tmp/bwo/exec.json",
+            ReviewScope::DocsOnly,
+            Some(&ctx),
+            "org/repo",
+        );
+        assert!(docs_prompt.contains("require design authorization"));
+        assert!(docs_prompt.contains("verify a specific design doc citation"));
+        assert!(!docs_prompt.contains("Apply the Supersession / obsolescence claims rubric"));
     }
 
     #[test]

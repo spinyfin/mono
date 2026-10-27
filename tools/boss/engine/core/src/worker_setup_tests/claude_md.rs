@@ -445,9 +445,11 @@ fn claude_md_avoids_internal_vocabulary() {
 
 #[test]
 fn static_question_contract_lives_in_generated_rules() {
-    let rendered = claude_md_for(&sample_input());
+    let mut input = sample_input();
+    input.run_done_proposals_seam_enabled = true;
+    let rendered = claude_md_for(&input);
     for rule in [
-        "### Write questions for someone arriving cold",
+        "## Write questions for someone arriving cold",
         "Context:\n",
         "Yes:\n",
         "No:\n",
@@ -465,4 +467,42 @@ fn static_question_contract_lives_in_generated_rules() {
     assert!(!rendered.contains("Worked example"));
     assert!(!rendered.contains("## Running Boss itself"));
     assert!(!rendered.contains("bazel run //tools/boss/"));
+}
+
+#[test]
+fn question_contract_requires_standard_worker_and_enabled_channel() {
+    for kind in [
+        WorkerKind::Standard,
+        WorkerKind::Reviewer,
+        WorkerKind::Triage,
+        WorkerKind::AnswerAgent,
+        WorkerKind::ReviewGuide,
+    ] {
+        for enabled in [false, true] {
+            let mut input = sample_input();
+            input.worker_kind = kind.clone();
+            input.run_done_proposals_seam_enabled = enabled;
+            let rendered = claude_md_for(&input);
+            assert_eq!(
+                rendered.contains("## Write questions for someone arriving cold"),
+                kind == WorkerKind::Standard && enabled
+            );
+            assert!(!rendered.contains("### Write questions"));
+        }
+    }
+}
+
+#[test]
+fn shared_publication_and_ci_policy_lives_in_worker_rules() {
+    let rendered = claude_md_for(&sample_input());
+    for rule in [
+        "Do not babysit CI",
+        "SUCCESS, NEUTRAL, or SKIPPED",
+        "CI-fix revision is no substitute",
+        "jj diff -r @",
+        "Print the PR URL on its own line as the last thing in your final response",
+        "check must be classified using the task prompt’s CI-failure rules",
+    ] {
+        assert!(rendered.contains(rule), "missing shared policy: {rule}");
+    }
 }
