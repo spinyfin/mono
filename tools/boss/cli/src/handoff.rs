@@ -35,6 +35,9 @@ pub(crate) enum HandoffCommand {
 pub(crate) struct HandoffWriteArgs {
     /// Path to the handoff text, or `-` to read it from stdin.
     pub(crate) file: String,
+    /// Private authorization for the live coordinator session.
+    #[arg(long, default_value = "")]
+    pub(crate) authorization: String,
 }
 
 pub(crate) async fn run_handoff_command(command: HandoffCommand, ctx: &RunContext) -> Result<(), CliError> {
@@ -59,7 +62,7 @@ async fn run_write(ctx: &RunContext, args: HandoffWriteArgs) -> Result<(), CliEr
     let mut client = connect_for_work(ctx).await?;
     let handoff: CoordinatorHandoffView = rpc_call!(
         client,
-        FrontendRequest::SetCoordinatorHandoff { body },
+        FrontendRequest::SetCoordinatorHandoff { body, authorization: args.authorization },
         "handoff write",
         FrontendEvent::CoordinatorHandoffSet { handoff } => handoff,
     )?;
@@ -89,7 +92,7 @@ async fn run_show(ctx: &RunContext) -> Result<(), CliError> {
     print_entity(ctx, &serde_json::json!({ "handoff": handoff }), || match &handoff {
         None => println!(
             "No coordinator handoff is stored: no coordinator session has ever written one. \
-             Write one with `boss handoff write -` (stdin) or `boss handoff write <file>`."
+             Write one with `boss handoff write --authorization AUTHORIZATION -` (stdin) or `boss handoff write --authorization AUTHORIZATION <file>`."
         ),
         Some(handoff) => {
             let writer = if handoff.written_by_current_session {
@@ -114,4 +117,51 @@ async fn run_show(ctx: &RunContext) -> Result<(), CliError> {
             println!("{}", handoff.body);
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HandoffCommand;
+    use clap::Parser;
+
+    #[test]
+    fn absent_credential_reaches_engine_for_rejection_and_audit() {
+        let parsed = crate::Cli::try_parse_from(["boss", "handoff", "write", "-"]).unwrap();
+        let crate::Commands::Handoff {
+            command: HandoffCommand::Write(args),
+        } = parsed.command
+        else {
+            panic!("expected a handoff write");
+        };
+        assert_eq!(args.file, "-");
+        assert!(args.authorization.is_empty());
+    }
+
+    #[test]
+    fn delivered_prompt_commands_parse_with_authorization() {
+        for source in [
+            include_str!(env!("HANDOFF_SYSTEM_PROMPT")),
+            include_str!(env!("HANDOFF_RESET_PROMPT")),
+        ] {
+            let start = source.find("boss handoff write --authorization ").unwrap();
+            let command = source[start..]
+                .replace("{authorization}", "test-authorization")
+                .replace("AUTHORIZATION", "test-authorization");
+            let parsed = crate::Cli::try_parse_from(
+                command
+                    .split_whitespace()
+                    .take(6)
+                    .map(|word| word.trim_end_matches(['`', ','])),
+            )
+            .unwrap();
+            let crate::Commands::Handoff {
+                command: HandoffCommand::Write(args),
+            } = parsed.command
+            else {
+                panic!("expected a handoff write");
+            };
+            assert_eq!(args.authorization, "test-authorization");
+            assert_eq!(args.file, "-");
+        }
+    }
 }

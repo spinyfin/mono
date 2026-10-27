@@ -199,6 +199,7 @@ fn golden_deny_rules_standard_worker() {
         format!("Edit({boss_dir}/**)"),
         "Bash(bossctl)".to_owned(),
         "Bash(bossctl:*)".to_owned(),
+        "Bash(boss handoff:*)".to_owned(),
         "Bash(boss engine start)".to_owned(),
         "Bash(boss engine start:*)".to_owned(),
         "Bash(boss engine stop)".to_owned(),

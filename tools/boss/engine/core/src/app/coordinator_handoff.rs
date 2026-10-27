@@ -8,9 +8,8 @@
 //! write path (the coordinator itself, via the CLI) and the read-back path
 //! (`show`, e.g. after context compaction).
 //!
-//! Both are coordinator-only at the worker-tier gate
-//! (`boss_worker_policy::worker_verb_decision`); nothing here is
-//! peer-attributed beyond that.
+//! Writes require a session credential and coordinator process ancestry.
+//! Worker denial applies even with the general worker-tier flag disabled.
 
 use super::*;
 
@@ -25,16 +24,42 @@ fn current_spawn_token(work_db: &WorkDb) -> Result<Option<String>, String> {
         .map_err(|err| format!("failed to read the coordinator record: {err:#}"))
 }
 
+fn coordinator_peer(state: &ServerState, peer: Option<libc::pid_t>) -> bool {
+    !state.classify_peer(peer).is_agent()
+        && matches!((peer, state.current_boss_pid()), (Some(peer), Some(root)) if is_descendant_of_any(peer, &[root]))
+}
+
 pub(super) async fn handle_get_coordinator_handoff(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         work_db,
+        server_state,
         sink,
         request_id,
+        peer_pid,
         ..
     } = ctx;
     let FrontendRequest::GetCoordinatorHandoff = req else {
         unreachable!()
     };
+    if server_state.classify_peer(peer_pid).is_agent() {
+        let expected = work_db.coordinator_handoff_authorization().ok().flatten();
+        crate::audit::record_event(
+            "coordinator_handoff_rejected",
+            &serde_json::json!({
+                "pid": peer_pid,
+                "caller": rejected_caller(peer_pid, &[expected.as_deref().unwrap_or_default()]),
+                "reason": "handoff reads are unavailable to agents",
+            }),
+        );
+        return send_work_error(
+            &sink,
+            &request_id,
+            "coordinator handoff is unavailable to agents".to_owned(),
+        );
+    }
+    if coordinator_peer(&server_state, peer_pid) {
+        redeliver_authorization(server_state.clone());
+    }
     let current = match current_spawn_token(&work_db) {
         Ok(current) => current,
         Err(message) => {
@@ -69,17 +94,76 @@ pub(super) async fn handle_get_coordinator_handoff(ctx: Dispatch, req: FrontendR
     }
 }
 
+/// Never return the credential to the requesting process: a child can request
+/// recovery, but only the main coordinator's inbox receives the secret.
+fn redeliver_authorization(state: Arc<ServerState>) {
+    boss_task_scope::spawn(async move {
+        let result: anyhow::Result<()> = async {
+            let program = match &*state.tmux_preflight.read().map_err(|_| anyhow::anyhow!("tmux preflight lock poisoned"))? {
+                crate::tmux_preflight::TmuxPreflight::Ready { program, .. } => program.clone(),
+                crate::tmux_preflight::TmuxPreflight::Unavailable { reason } => anyhow::bail!("{reason}"),
+            };
+            let tmux = state.tmux_from_program(program)?;
+            let legacy = boss_tmux::Tmux::for_legacy_label_server(tmux.program().to_path_buf()).ok();
+            let guard = state.coordinator_tmux_lock.lock().await;
+            let tmux = crate::coordinator_tmux::resolve_active_handle(&tmux, legacy.as_ref()).await;
+            let record = state.work_db.coordinator_tmux_record()?.ok_or_else(|| anyhow::anyhow!("no coordinator session"))?;
+            let authorization = state.work_db.coordinator_handoff_authorization()?.ok_or_else(|| anyhow::anyhow!("no handoff authorization"))?;
+            let prompt = format!("[Boss handoff authorization] Use `boss handoff write --authorization {authorization} -` for rolling handoff writes. Keep this credential in the main session only; never delegate or archive it.");
+            drop(state.coordinator_handoff_delivery.deliver_locked(tmux, &record, &prompt, guard).await?);
+            Ok(())
+        }.await;
+        if let Err(error) = result {
+            tracing::error!(%error, "could not redeliver coordinator handoff authorization");
+        }
+    });
+}
+
 pub(super) async fn handle_set_coordinator_handoff(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         work_db,
         server_state,
         sink,
         request_id,
+        peer_pid,
         ..
     } = ctx;
-    let FrontendRequest::SetCoordinatorHandoff { body } = req else {
+    let FrontendRequest::SetCoordinatorHandoff { body, authorization } = req else {
         unreachable!()
     };
+    // Pin authorization and attribution to one coordinator generation.
+    let _lifecycle = server_state.coordinator_tmux_lock.lock().await;
+    let expected = work_db.coordinator_handoff_authorization().ok().flatten();
+    let coordinator_pid = server_state.current_boss_pid();
+    let permitted = coordinator_peer(&server_state, peer_pid)
+        && expected.as_ref().is_some_and(|expected| {
+            !expected.is_empty() && constant_time_eq(expected.as_bytes(), authorization.as_bytes())
+        });
+    if !permitted {
+        let reason = if coordinator_pid.is_none() {
+            "coordinator pid unknown"
+        } else {
+            "requires coordinator ancestry and the private session credential; agents are forbidden"
+        };
+        let caller = rejected_caller(
+            peer_pid,
+            &[authorization.as_str(), expected.as_deref().unwrap_or_default()],
+        );
+        crate::audit::record_event(
+            "coordinator_handoff_rejected",
+            &serde_json::json!({
+                "pid": peer_pid,
+                "coordinator_pid": coordinator_pid,
+                "caller": caller,
+                "reason": reason,
+            }),
+        );
+        return send_work_error(
+            &sink,
+            &request_id,
+            format!("handoff write rejected: {reason}; inherited BOSS_SPAWN_TOKEN grants no access"),
+        );
+    }
     let body = match validate_handoff_body(&body) {
         Ok(body) => body,
         Err(message) => {
@@ -96,6 +180,22 @@ pub(super) async fn handle_set_coordinator_handoff(ctx: Dispatch, req: FrontendR
     };
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
     let writer = current.as_deref().unwrap_or_default();
+    if let HandoffState::Present(previous) = work_db.coordinator_handoff_state()
+        && body.len().saturating_mul(5) < previous.body.len()
+    {
+        crate::audit::record_event(
+            "coordinator_handoff_shrink_warning",
+            &serde_json::json!({
+                "previous_bytes": previous.body.len(), "bytes": body.len(), "pid": peer_pid,
+                "writer_spawn_token": writer,
+            }),
+        );
+        tracing::warn!(
+            previous_bytes = previous.body.len(),
+            bytes = body.len(),
+            "coordinator handoff shrank by over 80 percent"
+        );
+    }
     match work_db.set_coordinator_handoff(&body, writer, now) {
         Ok(handoff) => {
             server_state.coordinator_handoff_written.notify_waiters();
@@ -103,6 +203,7 @@ pub(super) async fn handle_set_coordinator_handoff(ctx: Dispatch, req: FrontendR
                 "coordinator_handoff_written",
                 &serde_json::json!({
                     "bytes": handoff.body.len(),
+                    "pid": peer_pid,
                     "writer_spawn_token": handoff.writer_spawn_token,
                     "written_at": handoff.written_at,
                 }),
@@ -129,4 +230,32 @@ pub(super) async fn handle_set_coordinator_handoff(ctx: Dispatch, req: FrontendR
             );
         }
     }
+}
+
+/// Best-effort diagnostics only: authorization never trusts argv or environment.
+/// Bound the ancestry walk; redact the presented and real secrets
+/// even when they occur inside an ancestor shell's command string.
+pub(super) fn rejected_caller(peer: Option<libc::pid_t>, secrets: &[&str]) -> serde_json::Value {
+    let mut chain = Vec::new();
+    let mut next = peer;
+    while let Some(pid) = next {
+        if pid <= 0 || chain.contains(&pid) || chain.len() == 16 {
+            break;
+        }
+        chain.push(pid);
+        next = crate::worker_registry::parent_pid(pid).ok().flatten();
+    }
+    let mut argv = chain
+        .iter()
+        .map(|pid| {
+            let command = boss_engine_utils::process_args::command(*pid as u32)
+                .unwrap_or_else(|| "[argv unavailable]".to_owned());
+            format!("{pid}: {command}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        argv = argv.replace(secret, "[redacted]");
+    }
+    serde_json::json!({"parent_chain": chain, "argv": argv})
 }

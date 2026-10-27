@@ -367,6 +367,12 @@ macos_application(
     deps = [":boss_mac_app_lib"],
 )
 
+filegroup(
+    name = "handoff_prompt_source",
+    srcs = ["Sources/Ghostty/BossPaneModel.swift"],
+    visibility = ["//tools/boss/cli:__pkg__"],
+)
+
 # Production sources scanned by `//tools/boss/engine/core:tmux_only_surface_test`,
 # the architecture guard for the tmux-only local-pane invariant.
 filegroup(

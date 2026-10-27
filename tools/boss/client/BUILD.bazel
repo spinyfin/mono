@@ -26,6 +26,7 @@ rust_library(
     ],
     deps = [
         "//tools/boss/backoff",
+        "//tools/boss/engine/utils",
         "//tools/boss/log-files",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
@@ -42,6 +43,7 @@ rust_test(
     ),
     deps = [
         "//tools/boss/backoff",
+        "//tools/boss/engine/utils",
         "//tools/boss/log-files",
         "//tools/boss/protocol",
     ] + all_crate_deps(

@@ -441,13 +441,14 @@ pub(crate) fn existing_transcript_dir(working_directory: &Path) -> Option<PathBu
     dir.is_dir().then_some(dir)
 }
 
-/// Write the brief where the coordinator's launch command reads it from.
+/// Archive the non-secret brief for inspection in the session directory.
 /// Returns the absolute path written.
 pub(crate) fn write_start_brief(working_directory: &Path, brief: &str) -> Result<PathBuf> {
     let dir = working_directory.join(".claude");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(START_BRIEF_FILENAME);
-    std::fs::write(&path, brief).with_context(|| format!("writing session-start brief to {}", path.display()))?;
+    crate::driver::initial_prompt::write_private(&path, brief.as_bytes())
+        .with_context(|| format!("writing session-start brief to {}", path.display()))?;
     Ok(path)
 }
 

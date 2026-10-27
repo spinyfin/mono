@@ -204,15 +204,26 @@ async fn attach_coordinator_to_registered_app(server_state: Arc<ServerState>) {
     request_coordinator_attachment(server_state, &active_tmux, record).await;
 }
 
+pub(super) async fn refresh_coordinator_pid(
+    server_state: &ServerState,
+    tmux: &boss_tmux::Tmux,
+    record: &crate::work::CoordinatorTmuxRecord,
+) {
+    match crate::coordinator_tmux::pane_pid(tmux, record).await {
+        Ok(pid) => server_state.set_boss_pid(pid),
+        Err(error) => {
+            server_state.clear_boss_pid();
+            tracing::warn!(%error, "could not refresh coordinator trust-root pid");
+        }
+    }
+}
+
 pub(super) async fn request_coordinator_attachment(
     server_state: Arc<ServerState>,
     tmux: &boss_tmux::Tmux,
     record: crate::work::CoordinatorTmuxRecord,
 ) {
-    match crate::coordinator_tmux::pane_pid(tmux, &record).await {
-        Ok(pid) => server_state.set_boss_pid(pid),
-        Err(error) => tracing::warn!(%error, "could not refresh coordinator trust-root pid"),
-    }
+    refresh_coordinator_pid(&server_state, tmux, &record).await;
     let tmux_program = tmux.program().display().to_string();
     let Some(tmux_socket_path) = tmux.socket_path().map(|path| path.display().to_string()) else {
         tracing::error!("coordinator tmux attach skipped: handle has no socket path");

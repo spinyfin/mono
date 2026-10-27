@@ -1042,7 +1042,8 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
     insert_color_environment(&mut environment);
     // Keep one bounded input directory for this singleton session. The relay
     // loads the brief before the next coordinator can replace these files.
-    let input_dir = working_directory.join(".claude/coordinator-input");
+    let input_dir = working_directory.with_extension("coordinator-input");
+    std::fs::create_dir_all(&input_dir).context("creating private coordinator input home")?;
     crate::driver::initial_prompt::warm_preflight()
         .await
         .context("checking python3 for coordinator terminal input")?;
@@ -1157,7 +1158,7 @@ fn prepare_session_start_brief(
             "write_error": written.as_ref().err().map(|error| format!("{error:#}")),
         }),
     );
-    match written {
+    let mut delivered = match written {
         Ok(path) => {
             tracing::info!(
                 path = %path.display(),
@@ -1191,7 +1192,17 @@ fn prepare_session_start_brief(
                 state.audit_outcome()
             )
         }
+    };
+    match work_db.coordinator_handoff_authorization() {
+        Ok(Some(authorization)) => delivered.push_str(&format!(
+            "\nPrivate handoff write authorization: {authorization}\nUse `boss handoff write --authorization {authorization} -`. Never share this credential with subagents or store it in shared files. After compaction, run `boss handoff show` to request delivery to the main session inbox.\n"
+        )),
+        result => {
+            tracing::error!(?result, "coordinator handoff authorization unavailable");
+            delivered.push_str("\nHandoff authorization is unavailable; report this to the operator.\n");
+        }
     }
+    delivered
 }
 
 /// Parse `claude --version` stdout, e.g. `"2.1.237 (Claude Code)\n"` — the
@@ -1295,8 +1306,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".claude"), "not a directory").unwrap();
         let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
+        db.record_coordinator_tmux_spawn_intent("boss-coordinator", "fallback-token", "opus", None)
+            .unwrap();
         let prompt =
             prepare_session_start_brief(&db, dir.path(), None, CoordinatorStartReason::FirstCreation, &[], None);
+        assert!(prompt.contains(&db.coordinator_handoff_authorization().unwrap().unwrap()));
         assert!(prompt.contains("Product guidance was NOT delivered"), "{prompt}");
         assert!(
             prompt.contains("Before product-scoped work, run `boss guidance show`"),
@@ -2673,8 +2687,13 @@ mod tests {
         assert!(!command.contains("$(cat"), "{command}");
         assert!(!command.contains("NO HANDOFF"), "{command}");
         assert_eq!(
-            std::fs::read_to_string(dir.path().join(".claude/coordinator-input/initial-prompt.txt")).unwrap(),
-            start_brief(dir.path()),
+            std::fs::read_to_string(
+                dir.path()
+                    .with_extension("coordinator-input")
+                    .join("initial-prompt.txt")
+            )
+            .unwrap(),
+            prepare_session_start_brief(&db, dir.path(), None, CoordinatorStartReason::FirstCreation, &[], None),
         );
         let brief = start_brief(dir.path());
         assert!(
@@ -2682,6 +2701,41 @@ mod tests {
             "the very first session must not be told a handoff is missing, got {brief:?}"
         );
         assert!(brief.contains("first coordinator session on this engine"), "{brief}");
+        let authorization = db.coordinator_handoff_authorization().unwrap().unwrap();
+        assert!(!brief.contains(&authorization));
+        fn assert_no_credential(path: &Path, credential: &str) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    assert_no_credential(&path, credential);
+                } else {
+                    assert!(
+                        !std::fs::read_to_string(&path).unwrap().contains(credential),
+                        "{}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert_no_credential(dir.path(), &authorization);
+        assert!(
+            !server.calls().iter().flatten().any(|arg| arg.contains(&authorization)),
+            "credential must not be exported to tmux or launch arguments"
+        );
+        assert!(
+            !std::fs::read_to_string(dir.path().join(RENDERED_PROMPT_FILENAME))
+                .unwrap()
+                .contains(&authorization)
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let brief_path = dir
+            .path()
+            .join(".claude")
+            .join(coordinator_handoff::START_BRIEF_FILENAME);
+        assert_eq!(
+            std::fs::metadata(brief_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[tokio::test]

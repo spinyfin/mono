@@ -36,6 +36,28 @@ async fn request_and_wait(
 
 use tokio::sync::Notify;
 
+#[tokio::test]
+async fn missing_authorization_preserves_session_and_offers_forced_reset() {
+    let (db, tmux, _server, _dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
+    record(&db);
+    db.set_metadata("coordinator.handoff_authorization", "").unwrap();
+    let lock = tokio::sync::Mutex::new(());
+    let written = Notify::new();
+    let error = request_and_wait(&db, &tmux, &lock, &written, "token", false, Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .starts_with(super::reset_handoff::DELIVERY_FAILED_PREFIX)
+    );
+    assert!(
+        !request_and_wait(&db, &tmux, &lock, &written, "token", true, Duration::from_secs(1))
+            .await
+            .unwrap()
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_full_thirty_second_grace_period_starts_only_after_delivery() {
     struct DelayedDelivery(Notify);
@@ -426,7 +448,8 @@ async fn delivery_failure_leaves_the_session_and_reports_a_forceable_error() {
 
 #[test]
 fn handoff_request_expires_after_delivery_deadline() {
-    let prompt = super::reset_handoff::handoff_request_prompt(1000);
+    let prompt = super::reset_handoff::handoff_request_prompt(1000, "test-authorization");
+    assert!(prompt.contains("boss handoff write --authorization test-authorization -"));
     let expiry = 1000 + super::inbox::DELIVERY_TIMEOUT.as_secs() + 15;
     assert!(
         prompt.starts_with(&format!("[Boss reset request expires={expiry}]")),

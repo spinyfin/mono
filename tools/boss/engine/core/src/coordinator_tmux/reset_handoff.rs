@@ -14,10 +14,10 @@ pub(crate) const DELIVERY_FAILED_PREFIX: &str = "coordinator did not receive the
 /// held past the delivery deadline can be released later, after Boss has
 /// reported failure and no reset is pending; the coordinator ignores a request
 /// whose expiry has passed.
-pub(crate) fn handoff_request_prompt(now_epoch_secs: i64) -> String {
+pub(crate) fn handoff_request_prompt(now_epoch_secs: i64, authorization: &str) -> String {
     let expires = now_epoch_secs + (super::inbox::DELIVERY_TIMEOUT.as_secs() + 15) as i64;
     format!(
-        "[Boss reset request expires={expires}] Boss is about to reset this session on a user request. Write your handoff now with `boss handoff write -`, then stop. If `date +%s` is already past the expiry, the request was withdrawn: ignore it and continue your work."
+        "[Boss reset request expires={expires}] Boss is about to reset this session on a user request. Write your handoff now with `boss handoff write --authorization {authorization} -`, then stop. If `date +%s` is already past the expiry, the request was withdrawn: ignore it and continue your work."
     )
 }
 
@@ -105,8 +105,18 @@ pub(crate) async fn request_and_wait(request: HandoffRequest<'_>) -> Result<bool
         HandoffState::Present(h) => h.write_id,
         _ => String::new(),
     };
+    let authorization = work_db
+        .coordinator_handoff_authorization()
+        .with_context(|| format!("{DELIVERY_FAILED_PREFIX}: reading handoff authorization"))?
+        .filter(|authorization| !authorization.is_empty())
+        .ok_or_else(|| anyhow!("{DELIVERY_FAILED_PREFIX}: coordinator handoff authorization is unavailable"))?;
     let turn_ended = delivery
-        .deliver_locked(tmux, &record, &handoff_request_prompt(requested_at), guard)
+        .deliver_locked(
+            tmux,
+            &record,
+            &handoff_request_prompt(requested_at, &authorization),
+            guard,
+        )
         .await
         .map_err(|error| {
             audit::record_event(

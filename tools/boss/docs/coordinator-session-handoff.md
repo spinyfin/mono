@@ -35,7 +35,15 @@ The transcript cursor is captured before sending the frame, so completion before
 
 The handoff is written by the coordinator session itself. The engine never synthesizes one from logs or transcripts.
 
-### Where it lives
+### Write authorization
+
+Writes require both socket-peer ancestry to the engine-registered coordinator PID and a separate random session credential. The engine creates the credential atomically with the spawn intent, rotates it on replacement, and delivers it in the private initial input, kept outside the session working directory in the engine-owned sibling input home (file mode `0600`). The archived `.claude/handoff-brief.txt` contains no credential. Reset requests include the current credential; after compaction, `boss handoff show` from coordinator ancestry requests asynchronous re-delivery to the main session inbox, never to the CLI response. It is not exported in the environment, included in shared `CLAUDE.md`, or returned by `handoff show`. The CLI supplies it explicitly with `--authorization`; a child or subagent that merely inherits `BOSS_SPAWN_TOKEN` cannot write. Registered workers and progression agents are denied even with the correct credential, independently of the `worker_rpc_tier` flag. Worker command guards deny the entire `boss handoff` family.
+
+The old handler attributed every accepted write to the current database coordinator record without authenticating its writer. Consequently, identical `writer_spawn_token` audit values do **not** establish that the caller inherited that token, or even belonged to the coordinator's process tree. The October 2026 stub's actual author cannot be identified from those two old audit events alone. The new `coordinator_handoff_rejected` event records the caller PID, bounded parent chain and best-effort argv (credentials redacted). Missing identity or credentials fail closed. A reduction exceeding 80% emits `coordinator_handoff_shrink_warning` with old and new byte counts; a valid write still succeeds.
+
+Enforcement takes effect on engine deployment. A surviving coordinator launched before authorization existed must be reset to receive a credential; it cannot write during that transition. The operator can use “Reset anyway (no fresh handoff)” after preserving any unsaved context. New sessions receive a credential automatically. This mechanism prevents ambient environment inheritance from granting write access; it is not an OS sandbox against a same-user process deliberately stealing the private brief or a credential explicitly delegated by the coordinator.
+
+### Stored record
 
 One JSON value in the `metadata` table of the engine's own database, under the key `coordinator.handoff`:
 
@@ -49,13 +57,9 @@ Alongside it, the coordinator record now stamps `coordinator.tmux_spawned_at` (w
 
 ### How the incoming session consumes it
 
-Every _fresh_ coordinator session is launched with a **session-start brief** as `claude`'s positional initial prompt — the same mechanism worker panes use for their initial prompt. The engine composes the brief in `start_new` (`tools/boss/engine/core/src/coordinator_tmux.rs`, `prepare_session_start_brief`), writes it to `.claude/handoff-brief.txt` in the coordinator session directory, and launches:
+Every _fresh_ coordinator session receives a **session-start brief** through the terminal relay — the same mechanism worker panes use for their initial prompt. The engine composes the brief in `start_new` (`tools/boss/engine/core/src/coordinator_tmux.rs`, `prepare_session_start_brief`), archives its non-secret content at `.claude/handoff-brief.txt`, and provisions the full input including authorization in the engine-owned sibling input home outside the coordinator's working directory. The relay reads that private input and delivers it on the first turn; neither the credential nor the handoff appears in launch arguments or environment variables.
 
-```
-exec claude --model <model> --permission-mode auto --settings '{"crossSessionInbound":"accept"}' "$(cat '<session dir>/.claude/handoff-brief.txt')"
-```
-
-So the incoming session reads the handoff on its very first turn, before the operator types anything, with no pane injection to time and no dependence on the model choosing to open a file. If the brief file cannot be written, the engine launches with a short inline notice instead (naming the error and pointing at `boss handoff show`), never a bare session.
+If the archive cannot be written, the relay delivers a recovery notice pointing at `boss handoff show` plus the current authorization. An authorization lookup failure is explicitly logged and reported in the delivered notice. The engine refreshes its coordinator PID trust root during supervision even without app registration, and clears stale identity when the PID lookup fails.
 
 The brief also carries, after the handoff, a "Product coordinator guidance" section: every non-archived product's `BOSS_COORDINATOR.md`, read from GitHub at the default branch's HEAD and shown with the commit sha it was read at. That is a separate mechanism with its own states and audit event; see [coordinator-product-guidance.md](coordinator-product-guidance.md).
 
@@ -91,7 +95,7 @@ Prior sessions' Claude Code transcripts exist on disk under `~/.claude/projects/
 
 ```sh
 # Coordinator: rewrite the handoff (stdin, heredoc-friendly).
-boss handoff write - <<'HANDOFF'
+boss handoff write --authorization '<credential from this session-start brief>' - <<'HANDOFF'
 ## World state (operator-stated; timestamp each)
 - 2026-09-02 19:22 PDT: greyarea CI host is shut down. Do not attribute new failures to it.
 ## Do not
@@ -103,7 +107,7 @@ boss handoff show
 boss handoff show --json
 ```
 
-`write` and `show` are coordinator-only at the worker-tier gate: a cube worker calling either gets a `CoordinatorOnly` denial.
+`write` and `show` are coordinator-only at the worker-tier gate: a cube worker calling either gets a `CoordinatorOnly` denial. Other non-agent peers, including a human terminal, may read without coordinator ancestry; writes still require both ancestry and authorization. Omitting `--authorization` reaches the engine and produces a rejection audit event.
 
 ## Forensics
 

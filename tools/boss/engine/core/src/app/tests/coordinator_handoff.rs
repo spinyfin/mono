@@ -19,6 +19,11 @@ fn server_state() -> (Arc<ServerState>, tempfile::TempDir) {
     ));
     let state =
         ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, ServerStateOverrides::default()).unwrap();
+    state.set_boss_pid(std::process::id() as libc::pid_t);
+    state
+        .work_db
+        .record_coordinator_tmux_spawn_intent("boss-coordinator", "test-token", "opus", None)
+        .unwrap();
     (state, temp)
 }
 
@@ -31,6 +36,7 @@ fn dispatch(state: &Arc<ServerState>, sink: &Arc<SessionSink>) -> Dispatch {
         .request_id("req-1")
         .recv_instant(std::time::Instant::now())
         .decode_ms(0.0)
+        .peer_pid(std::process::id() as libc::pid_t)
         .build()
 }
 
@@ -52,7 +58,10 @@ async fn set(state: &Arc<ServerState>, body: &str) -> FrontendEvent {
     let sink = make_session_sink();
     coordinator_handoff::handle_set_coordinator_handoff(
         dispatch(state, &sink),
-        FrontendRequest::SetCoordinatorHandoff { body: body.to_owned() },
+        FrontendRequest::SetCoordinatorHandoff {
+            body: body.to_owned(),
+            authorization: state.work_db.coordinator_handoff_authorization().unwrap().unwrap(),
+        },
     )
     .await;
     sole_response(&sink).await
@@ -77,6 +86,164 @@ fn error_message(event: FrontendEvent) -> String {
         FrontendEvent::WorkError { message } => message,
         other => panic!("expected WorkError, got {other:?}"),
     }
+}
+
+async fn write_as(state: &Arc<ServerState>, peer: Option<libc::pid_t>, authorization: &str) -> FrontendEvent {
+    let sink = make_session_sink();
+    let mut ctx = dispatch(state, &sink);
+    ctx.peer_pid = peer;
+    coordinator_handoff::handle_set_coordinator_handoff(
+        ctx,
+        FrontendRequest::SetCoordinatorHandoff {
+            body: "unauthorized replacement".to_owned(),
+            authorization: authorization.to_owned(),
+        },
+    )
+    .await;
+    sole_response(&sink).await
+}
+
+#[tokio::test]
+async fn inherited_spawn_token_missing_and_stale_credentials_cannot_overwrite() {
+    let (state, _dir) = server_state();
+    set_view(set(&state, "preserve operator facts").await);
+    let stale = state.work_db.coordinator_handoff_authorization().unwrap().unwrap();
+    state
+        .work_db
+        .record_coordinator_tmux_spawn_intent("boss-coordinator", "new-spawn", "opus", None)
+        .unwrap();
+    for token in ["", "test-token", "new-spawn", stale.as_str()] {
+        let error = error_message(write_as(&state, Some(std::process::id() as libc::pid_t), token).await);
+        assert!(error.contains("private session credential"), "{error}");
+        assert_eq!(result_view(get(&state).await).unwrap().body, "preserve operator facts");
+    }
+}
+
+#[tokio::test]
+async fn valid_credential_does_not_authorize_missing_peer_or_unrelated_process() {
+    let (state, _dir) = server_state();
+    let token = state.work_db.coordinator_handoff_authorization().unwrap().unwrap();
+    for peer in [None, Some(1)] {
+        assert!(error_message(write_as(&state, peer, &token).await).contains("private session credential"));
+    }
+    assert!(result_view(get(&state).await).is_none());
+    *state.boss_pid.lock().unwrap() = None;
+    assert!(
+        error_message(write_as(&state, Some(std::process::id() as libc::pid_t), &token).await)
+            .contains("coordinator pid unknown")
+    );
+}
+
+#[tokio::test]
+async fn worker_with_valid_credential_is_denied_read_and_write() {
+    let (state, _dir) = server_state();
+    state.feature_flags.set("worker_rpc_tier", false).unwrap();
+    set_view(set(&state, "preserve operator facts").await);
+    let pid = std::process::id() as libc::pid_t;
+    state.worker_registry.register(pid, "worker-execution".to_owned());
+    let token = state.work_db.coordinator_handoff_authorization().unwrap().unwrap();
+    assert!(error_message(write_as(&state, Some(pid), &token).await).contains("private session credential"));
+    assert!(error_message(get(&state).await).contains("unavailable to agents"));
+    match state.work_db.coordinator_handoff_state() {
+        crate::coordinator_handoff::HandoffState::Present(handoff) => {
+            assert_eq!(handoff.body, "preserve operator facts")
+        }
+        other => panic!("lost handoff: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn subagent_or_child_with_only_inherited_environment_is_rejected() {
+    let (state, _dir) = server_state();
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("10")
+        .env("BOSS_SPAWN_TOKEN", "test-token")
+        .spawn()
+        .unwrap();
+    let result = write_as(&state, Some(child.id() as libc::pid_t), "").await;
+    let credential = state.work_db.coordinator_handoff_authorization().unwrap().unwrap();
+    // A normal coordinator CLI is also a child, but receives explicit authority
+    // for this invocation instead of inheriting it from its environment.
+    let authorized = write_as(&state, Some(child.id() as libc::pid_t), &credential).await;
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(error_message(result).contains("private session credential"));
+    assert!(matches!(authorized, FrontendEvent::CoordinatorHandoffSet { .. }));
+}
+
+#[test]
+fn shrink_and_rejected_caller_are_audited() {
+    let _audit = crate::audit::lock_audit_globals_for_tests();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let token = crate::engine_control::generate_token();
+    runtime.block_on(async {
+        let (state, _dir) = server_state();
+        state
+            .work_db
+            .record_coordinator_tmux_spawn_intent("boss-coordinator", &token, "opus", None)
+            .unwrap();
+        set_view(set(&state, &"a".repeat(1000)).await);
+        set_view(set(&state, &"b".repeat(200)).await); // Exactly 80% is not over 80%.
+        set_view(set(&state, &"c".repeat(39)).await);
+        assert_eq!(result_view(get(&state).await).unwrap().body.len(), 39);
+        assert!(matches!(
+            write_as(&state, Some(std::process::id() as libc::pid_t), "").await,
+            FrontendEvent::WorkError { .. }
+        ));
+        state.clear_boss_pid();
+        let authorization = state.work_db.coordinator_handoff_authorization().unwrap().unwrap();
+        assert!(
+            error_message(write_as(&state, Some(std::process::id() as libc::pid_t), &authorization).await)
+                .contains("coordinator pid unknown")
+        );
+        state
+            .worker_registry
+            .register(std::process::id() as libc::pid_t, "worker-execution".to_owned());
+        assert!(error_message(get(&state).await).contains("unavailable to agents"));
+    });
+    let log = std::fs::read_to_string(crate::audit::default_audit_log_path().unwrap()).unwrap();
+    let events: Vec<serde_json::Value> = log.lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == "coordinator_handoff_rejected"
+                && event["pid"] == std::process::id()
+                && event["reason"]
+                    == "requires coordinator ancestry and the private session credential; agents are forbidden"
+        }),
+        "a credential-free write must be audited by the engine"
+    );
+    assert!(events.iter().any(|event| {
+        event["event"] == "coordinator_handoff_rejected"
+            && event["pid"] == std::process::id()
+            && event["coordinator_pid"].is_null()
+            && event["reason"] == "coordinator pid unknown"
+    }));
+    let warnings: Vec<_> = events
+        .iter()
+        .filter(|event| event["event"] == "coordinator_handoff_shrink_warning" && event["writer_spawn_token"] == token)
+        .collect();
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0]["previous_bytes"], 200);
+    assert_eq!(warnings[0]["bytes"], 39);
+    let denial = events
+        .iter()
+        .rev()
+        .find(|event| event["event"] == "coordinator_handoff_rejected")
+        .unwrap();
+    assert_eq!(denial["pid"], std::process::id());
+    assert_eq!(denial["reason"], "handoff reads are unavailable to agents");
+    assert_eq!(denial["caller"]["parent_chain"][0], std::process::id());
+    assert!(denial["caller"]["argv"].is_string());
+    assert!(
+        denial["caller"]["argv"]
+            .as_str()
+            .unwrap()
+            .contains(&std::env::args().next().unwrap()),
+        "the caller's real argv must be captured inside the test sandbox: {denial}"
+    );
 }
 
 #[tokio::test]
@@ -151,4 +318,19 @@ async fn an_unreadable_stored_handoff_is_an_error_not_an_empty_result() {
     state.work_db.set_metadata(HANDOFF_METADATA_KEY, "{corrupt").unwrap();
     let message = error_message(get(&state).await);
     assert!(message.contains("not valid JSON"), "got: {message}");
+}
+
+#[tokio::test]
+async fn human_terminal_can_read_without_a_coordinator_pid() {
+    let (state, _dir) = server_state();
+    set_view(set(&state, "operator context").await);
+    state.clear_boss_pid();
+    let sink = make_session_sink();
+    let mut ctx = dispatch(&state, &sink);
+    ctx.peer_pid = Some(1);
+    coordinator_handoff::handle_get_coordinator_handoff(ctx, FrontendRequest::GetCoordinatorHandoff).await;
+    assert_eq!(
+        result_view(sole_response(&sink).await).unwrap().body,
+        "operator context"
+    );
 }
