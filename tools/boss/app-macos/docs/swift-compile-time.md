@@ -4,14 +4,16 @@
 
 Measured on 2026-10-12. The original investigation used main at
 `095e809a`, including the 185-file `boss_mac_app_lib` module (~58k lines).
-The revision measures a real one-file edit on the PR base, with Xcode 27.0
+The one-file edit experiment uses the PR base, with Xcode 27.0
 (27A266a), Swift 6.4, Apple M2 Max (12 cores). CI uses Xcode
 26.5.0.17F42, so these are not controlled cross-host comparisons.
 
 **Host contention is a plausible contributor, not a measured dominant cause.**
-The original 65–75 s idle estimate and 3x contention multiplier are withdrawn.
-No exclusive idle host was available: local load averages sampled during this
-revision ranged from 45 to 124. CPU time does not establish idle wall time.
+No idle-host estimate or contention multiplier is established.
+No exclusive idle host was available. One-minute load averages around the
+one-file experiment were 116.66, 45.76 and 47.59; later validation samples
+are listed with their respective runs below. CPU time does not establish idle
+wall time.
 Idle cold and incremental measurements still require an exclusive host; retain
 the normal Bazel caches and measure an ordinarily invalidated compile action.
 
@@ -28,8 +30,8 @@ two bazel-any). Overlapping jobs were:
 | mono 20481 mac-app-build                | anaplian.local-1     | 19:00:15    |
 | mono-integrity 6521 integrity-checkleft | anaplian.local-1-any | 19:00:21    |
 
-Correction: 20481 did **not** execute another Swift compile, as originally
-claimed. Its build summary reports zero workers; Swift actions were cached.
+Build 20481 executed no Swift compile. Its build summary reports zero
+workers; Swift actions were cached.
 Packaging/tests and other builds can still compete for resources, but job
 overlap is not a measurement of CPU contention.
 
@@ -81,9 +83,9 @@ The unconfigured fastbuild driver ran one emit-module job and eight batches
 sequentially. Eight jobs improved one local observation but were not validated
 on CI and oversubscribed Bazel's one-CPU action accounting.
 
-### Revision: real one-file incremental experiment
+### Real one-file incremental experiment
 
-The revision uses **two frontend jobs in fastbuild only**. Both measurements
+The experiment uses **two frontend jobs in fastbuild only**. Both measurements
 below use the same statistics and type-check flags, with normal caches enabled.
 The baseline compiled after the real BUILD change from eight to two jobs.
 Then only `Sources/ContentView.swift` changed: the modifier chain was divided
@@ -116,8 +118,8 @@ by the stats filename's first primary file:
 | RevealCardViewport.swift         | 3.30 s   |
 | ReleaseNotesContent.swift        | 4.43 s   |
 
-The baseline statistics directory was initially missing. JSON emission failed,
-but the successful compiler action retained its timing tables in stderr.
+Baseline timing evidence comes from compiler stderr because JSON statistics
+emission failed for a missing output directory; the compiler action succeeded.
 A subsequent cache hit recovered that stderr with the UI output cap removed;
 it was not counted as a new compile measurement.
 
@@ -138,7 +140,7 @@ claim of CI speedup; `--local_cpu_resources` does not constrain Swift's internal
 parallelism.
 
 The one-file experiment confirms that a source edit still rebuilds this whole
-module. A split could reduce that cost. However, the original type-reference
+module. No split benefit has been measured. The baseline type-reference
 graph found a 41-file strongly connected component spanning ChatViewModel,
 Models, EngineClient/EngineEvent, Comments and views; including references
 to ChatViewModel extension members expanded it to 174 of 185 files.
@@ -149,10 +151,12 @@ Concrete reverse dependencies include Models needing RevisionChainItem from
 TranscriptViewerView and AIReviewBadgePresentation from WorkCardBadges;
 Models+WorkBoard needing WorkBoardSectionCollapse from WorkBoardToolbar;
 and Models+Products needing CommentArtifactRef from Comments/CommentLayer.
-This makes a split invasive, not useless. Keep the module intact in this PR
-while fixing the small measured type-check hotspot. The earlier claim that a
-split could not improve the 243 s observation was unsupported. Reassess using
-idle measurements and representative edit costs on the CI toolchain.
+The module split is deferred: the large dependency cycle requires boundary
+refactoring, and even leaf extraction requires access-control and test-import
+changes. The shipped change addresses the measured type-check hotspot and
+keeps the module intact. Evaluating a split requires a leaf extraction with
+minimal target visibility, its consumer/test updates, and a new one-file edit
+measurement in the remaining module on the CI toolchain.
 
 ## CI operator recommendation
 
