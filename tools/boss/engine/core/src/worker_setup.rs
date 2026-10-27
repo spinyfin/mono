@@ -81,6 +81,7 @@ pub use deny_rules::{
     reviewer_deny_rules, triage_deny_rules,
 };
 mod git_store_guard;
+mod operator_question;
 pub use git_store_guard::{ensure_git_store_guard_script_in, git_store_guard_script_path};
 
 // Re-export guard command constants so the test module (which uses `use
@@ -303,6 +304,13 @@ pub struct WorkerSetupInput {
 /// that prominently states the read-only mandate and omits PR-creation
 /// instructions (reviewers never open or update PRs).
 pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &str) -> String {
+    let mut rules = render_worker_rules_body(input, preamble, config_dir);
+    rules.push_str(operator_question::GUIDANCE);
+    rules.push('\n');
+    rules
+}
+
+fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir: &str) -> String {
     if input.worker_kind == WorkerKind::Reviewer && input.is_review_supervisor {
         return crate::pr_review::render_supervisor_claude_md(
             &input.lease_id,
@@ -354,11 +362,6 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
     } else {
         String::new()
     };
-    // Sourced from //tools/boss/engine/core:engine_binary.bzl at build time
-    // (via the engine_lib rustc_env) so this advice can't drift from the
-    // real bazel target label the way the pre-crate-split
-    // `//tools/boss/engine:engine` string did.
-    let engine_bazel_run_command = env!("BOSS_ENGINE_BAZEL_RUN_COMMAND");
     format!(
         "# Worker rules\n\
          \n\
@@ -607,45 +610,6 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
            Never read, write, or touch it. Do not query the database\n\
            yourself; ask for any task or product context you need.\n\
            `bossctl` is not available to workers.\n\
-         \n\
-         ## Running Boss itself\n\
-         \n\
-         Never launch the installed `/Applications/Boss.app`, never `open -a\n\
-         Boss`, and never start an engine that can reach production state.\n\
-         This machine is someone's laptop: an unisolated app launch puts a\n\
-         window on their screen and terminates the engine they are using.\n\
-         Bare `bazel run //tools/boss/app-macos:Boss` (no isolation env) is\n\
-         also blocked.\n\
-         \n\
-         To exercise a real engine, start an isolated one:\n\
-         \n\
-         ```sh\n\
-         env -u BOSS_EVENTS_SOCKET {engine_bazel_run_command} -- \\\n\
-           --socket-path /tmp/boss-test-$(uuidgen).sock\n\
-         ```\n\
-         \n\
-         Any `--socket-path` other than the production socket puts the engine\n\
-         in test-fixture mode, where the db, events socket, pid file and\n\
-         control token are all derived from that socket's path — this\n\
-         includes the legacy `/tmp/boss-engine.sock`, which is a test\n\
-         fixture, not a safe alternative. Unset\n\
-         `BOSS_EVENTS_SOCKET` because your pane inherits one pointing at\n\
-         production. Point a client at the same `--socket-path` to drive it.\n\
-         \n\
-         To screenshot the real Boss UI quietly, launch an isolated capture\n\
-         instance (both env vars required):\n\
-         \n\
-         ```sh\n\
-         BOSS_SOCKET_PATH=/tmp/boss-shot-$(uuidgen).sock BOSS_ENGINE_AUTOSTART=0 \\\n\
-           bazel run //tools/boss/app-macos:Boss -- --capture-to /tmp/shot.png\n\
-         ```\n\
-         \n\
-         The instance renders itself in-process via `cacheDisplay` and exits;\n\
-         it never shows a window, never takes focus, and needs no\n\
-         screen-recording permission. Read the PNG back and state in the PR\n\
-         what you verified and what you could not.\n\
-         \n\
-         `bazel build` and `bazel test` are unaffected.\n\
          \n\
          ## Capturing a screenshot for your own verification\n\
          \n\

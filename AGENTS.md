@@ -105,3 +105,42 @@ Rules:
 - When calling `Option<String>` setter methods on a builder with `on(String, into)`: pass the inner string value directly (e.g. `.started_at("2026-01-01")`), **not** wrapped in `Some(...)`. To pass a dynamic `Option<&str>` or `Option<String>`, use the `maybe_field_name()` variant (e.g. `.maybe_repo_remote_url(repo)`).
 
 Structs currently on the builder pattern: `Task`, `WorkExecution`, `Product`, `Project` (all in `boss-protocol/src/types.rs`).
+
+## Running Boss itself
+
+Never launch the installed `/Applications/Boss.app`, never `open -a
+Boss`, and never start an engine that can reach production state.
+This machine is someone's laptop: an unisolated app launch puts a
+window on their screen and terminates the engine they are using.
+Bare `bazel run //tools/boss/app-macos:Boss` (no isolation env) is
+also blocked.
+
+To exercise a real engine, start an isolated one:
+
+```sh
+env -u BOSS_EVENTS_SOCKET bazel run //tools/boss/engine/core:engine -- \
+  --socket-path /tmp/boss-test-$(uuidgen).sock
+```
+
+Any `--socket-path` other than the production socket puts the engine
+in test-fixture mode, where the db, events socket, pid file and
+control token are all derived from that socket's path — this
+includes the legacy `/tmp/boss-engine.sock`, which is a test
+fixture, not a safe alternative. Unset
+`BOSS_EVENTS_SOCKET` because your pane inherits one pointing at
+production. Point a client at the same `--socket-path` to drive it.
+
+To screenshot the real Boss UI quietly, launch an isolated capture
+instance (both env vars required):
+
+```sh
+BOSS_SOCKET_PATH=/tmp/boss-shot-$(uuidgen).sock BOSS_ENGINE_AUTOSTART=0 \
+  bazel run //tools/boss/app-macos:Boss -- --capture-to /tmp/shot.png
+```
+
+The instance renders itself in-process via `cacheDisplay` and exits;
+it never shows a window, never takes focus, and needs no
+screen-recording permission. Read the PNG back and state in the PR
+what you verified and what you could not.
+
+`bazel build` and `bazel test` are unaffected.

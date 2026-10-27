@@ -16,7 +16,6 @@ use super::work_item::{project_details, work_item_details, work_item_name, work_
 mod block_boundary;
 mod ci_monitoring;
 mod design;
-mod operator_question;
 use block_boundary::block_boundary_fragment;
 use ci_monitoring::ci_monitoring_directive;
 use design::{compose_design_directive, compose_design_postmortem_directive};
@@ -303,11 +302,6 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
             prompt.push('\n');
         }
     }
-    if let Some(details) = work_item_details(work_item) {
-        prompt.push_str("- details:\n");
-        prompt.push_str(details.trim_end());
-        prompt.push('\n');
-    }
     prompt.push('\n');
     // Inject [editorial-rules] block when editorial controls are enabled (gated by
     // the `editorial_controls` feature flag — default OFF). When disabled the block
@@ -540,6 +534,11 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
     ));
     prompt.push_str("\nRespond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
+    if let Some(details) = work_item_details(work_item) {
+        prompt.push_str("- details:\n");
+        prompt.push_str(details.trim_end());
+        prompt.push('\n');
+    }
     prompt
 }
 
@@ -623,7 +622,7 @@ pub(crate) fn bazel_prepush_gate_text(worker_signal_seam_enabled: bool, run_done
     let background_wait = crate::prompt_fragments::background_wait_declaration("\"$BOSS_BIN\"");
     let failure_sentence = if run_done_seam_enabled {
         format!(
-            "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout. A command still producing output is slow, not wedged — wait for it. A command producing no output and no progress is wedged: re-run it wrapped in an explicit `timeout` so it returns a real result you can act on, rather than waiting on it or guessing. A failing or timed-out gate is a reason to stop without pushing only when the failure is reproducible AND attributable to your change — fix it. A timeout, a full-suite failure that passes in isolation, or a failure in untouched code is not by itself a reason to refuse the push: retry the specific Bazel target (two or three attempts maximum), and if it keeps failing, check whether it reproduces on an unmodified base revision. You MAY push with a still-red, evidence-backed-unattributable target — proceed only with evidence that the failure is pre-existing or environmental (a base reproduction, a passing rerun/isolation run, or a concrete code-path argument showing why your change cannot cause it), recording the target, failure, attempts and evidence in the PR body; merely calling it flaky is not evidence. See \"Declaring your run finished\" below for the matching terminal-outcome rule. If the failure is attributable to your change and you cannot fix it, do NOT push red code. {blocked_action}. Escalating a blocker is correct; pushing a known-broken branch you caused — or hanging on a wedged build — is not.\n"
+            "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout. A command still producing output is slow, not wedged — wait for it. A command producing no output and no progress is wedged: re-run it wrapped in an explicit `timeout` so it returns a real result you can act on, rather than waiting on it or guessing. For failure attribution, bounded retries, base reproduction, and the evidence-backed exception allowing a still-red target to be pushed, follow the validation-failure rule in \"Declaring your run finished\" below. That rule governs both this push and the terminal outcome. If the failure is attributable to your change and you cannot fix it, do NOT push red code. {blocked_action}. Escalating a blocker is correct; pushing a known-broken branch you caused — or hanging on a wedged build — is not.\n"
         )
     } else {
         format!(
@@ -703,9 +702,11 @@ pub(crate) fn bazel_conflict_resolution_gate_text(seam_enabled: bool) -> String 
 }
 
 /// Apply the cache policy to generic and separately composed worker prompts.
-pub(super) fn with_bazel_caching_rule(mut prompt: String) -> String {
-    prompt.push_str(bazel_caching_rule_text());
-    prompt
+pub(super) fn with_bazel_caching_rule(prompt: String) -> String {
+    match prompt.split_once('\n') {
+        Some((opening, rest)) => format!("{opening}\n{}{rest}", bazel_caching_rule_text()),
+        None => format!("{prompt}{}", bazel_caching_rule_text()),
+    }
 }
 
 fn bazel_caching_rule_text() -> &'static str {
@@ -728,14 +729,10 @@ pub(super) fn project_terms_directive() -> &'static str {
 /// Hard constraint text forbidding check/CI bypasses. Injected into every
 /// prompt surface where a worker might encounter a failing check or CI failure.
 fn check_bypass_prohibition_text() -> &'static str {
-    "\n**Hard constraint — fix failing checks at the root cause; never bypass them.**\n\n\
-     Forbidden moves (each is a bypass, not a fix — do NOT do any of them):\n\
-     - Adding a file to a check exclusion or allowlist (`CHECKS.yaml` `exclude_files`, checkleft excludes, lint-disable comments, etc.) to suppress the failure.\n\
-     - Setting `allow_bypass`, using an override flag, or invoking any bypass/override mechanism on a check.\n\
-     - Passing `--no-verify` / skipping git hooks; adding broad `#[allow(...)]` / `// swiftlint:disable` / `# noqa` annotations solely to suppress a warning or error.\n\
-     - Deleting, `#[ignore]`-ing, `xfail`-ing, skipping, or weakening assertions in a failing test to make it pass.\n\
-     - Raising a threshold or limit (e.g. `max_lines` in a file-size check) solely to accommodate the offending file without reducing its size.\n\n\
-     Required behavior: fix the real problem — split the oversized file, fix the lint/compile error, fix the test failure, resolve the root cause. If a check genuinely SHOULD be relaxed (a legitimately needed exclusion or threshold change), that is a human decision — STOP and surface it for approval by the repo owner with full justification. Use the typed question flags on a blocked declaration described in Declaring your run finished when that channel is enabled. Do not decide this autonomously.\n"
+    r#"
+**Hard constraint — fix failing checks at the root cause; never bypass them.**
+Do not suppress failures with exclusions/allowlists (`CHECKS.yaml`, checkleft), lint-disable comments, `allow_bypass` or override flags, `--no-verify` or skipped hooks, broad `#[allow(...)]` / `// swiftlint:disable` / `# noqa`, deleted/ignored/xfail/skipped tests, weakened assertions, or raised thresholds/limits. Fix the underlying code, tests, lint, or file size instead. A genuinely necessary check relaxation requires approval by the repo owner with full justification: STOP and surface it. Use the typed question flags on a blocked declaration when that channel is enabled; never decide autonomously.
+"#
 }
 
 /// Render the `[editorial-rules]` block for the worker prompt (chore #5).
@@ -861,35 +858,18 @@ fn render_editorial_rules_block(
 fn pr_terminal_directive(seam_enabled: bool) -> String {
     let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
     let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
-    let mut out = String::new();
-    if seam_enabled {
-        out.push_str("\n## Important: declaring done is your terminal act\n\n");
+    let terminal = if seam_enabled {
+        format!(
+            "## Important: declaring done is your terminal act\nFinish everything, open or update the PR with `{cube} pr create` / `{cube} pr update`, then call `{boss} propose done` as your last tool call. An accepted declaration ends the run immediately, before you see its response; PR creation/update still gives you a turn to declare. Never declare before pushing.\n"
+        )
     } else {
-        out.push_str("\n## Important: PR creation is your terminal act\n\n");
-    }
-    if seam_enabled {
-        out.push_str(&format!(
-            "Opening the PR is normally the LAST thing you do, and the engine may reap you \
-             immediately after the PR is created. But with your run-done declaration enabled, \
-             `{boss} propose done` (see below) is the thing that is ALWAYS terminal, and it ends \
-             your run the instant the engine accepts it — before you even see the response, with \
-             no turn boundary in between. So the order is: finish everything, open or update the \
-             PR with `{cube} pr create` / `{cube} pr update`, and only THEN declare done, as the \
-             very last tool call you make. Declaring before the push would end your run before you \
-             ever reach the push at all — do not do that.\n\n"
-        ));
-    } else {
-        out.push_str(
-            "Opening the PR is the LAST thing you do. The engine reaps you immediately after the PR is created.\n\n",
-        );
-    }
-    if seam_enabled {
-        out.push_str(&format!("You will NOT get another turn after `{boss} propose done` (see below) — not after `gh pr create` / `{cube} pr create` / `{cube} pr update` themselves, those still give you a turn so you can go on to declare done. Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR until every gate, build, test run, review and sub-agent run you started has returned its real result — the PR comes after those results, never in place of them.\n\n"));
-    } else {
-        out.push_str(&format!("You will NOT get another turn after `gh pr create` / `{cube} pr create` (or `{cube} pr update` for an existing PR). Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR until every gate, build, test run, review and sub-agent run you started has returned its real result — the PR comes after those results, never in place of them.\n\n"));
-    }
-    out.push_str("Therefore: finish everything — including consuming any review/self-review findings you started — BEFORE you open the PR. If a background review is still running and you care about its results, wait for it and address all findings FIRST, then open the PR. If you don't intend to wait, don't start the review.\n");
-    out
+        format!(
+            "## Important: PR creation is your terminal act\nOpening the PR is the LAST thing you do. You will NOT get another turn after `{cube} pr create` or `{cube} pr update`: the engine reaps you immediately.\n"
+        )
+    };
+    format!(
+        "\n{terminal}Do not plan followup commits or defer work until after the PR: do not open the PR until every gate, build, test run, review and sub-agent run you started has returned its real result. Consume review/self-review findings and address them before publishing. If you don't intend to wait for a review, don't start it.\n"
+    )
 }
 
 /// Worker Stop-boundary escalation/blocker protocol directive. `seam_enabled`
@@ -1130,7 +1110,7 @@ pub(crate) fn run_done_directive(
          credentials or authorization, genuine instruction conflicts or contradictory requirements."
             .to_string()
     };
-    let question_guidance = operator_question::GUIDANCE;
+    let question_guidance = "Follow the question-writing contract in the generated worker rules.";
     format!(
         "\n## Declaring your run finished\n\n\
      When your run is over, say so — as the ABSOLUTE LAST thing you do:\n\n\
@@ -1139,11 +1119,7 @@ pub(crate) fn run_done_directive(
      ```\n\n\
      **An accepted `delivered` or `blocked` declaration ends your run** — the engine tears your pane \
      down, with no turn after it, not even to see the response. Finish every other thing first, \
-     including opening or updating the PR; only declare once nothing is left to do. The engine no \
-     longer infers completion from PR state (a run dispatched against an already-open, already-green \
-     PR says nothing about whether you did anything — reading it as \"finished\" is how \
-     mid-investigation runs used to get terminated with their work lost); your declaration is what \
-     it acts on.\n\n\
+     including opening or updating the PR; only declare once nothing is left to do.\n\n\
      Pick the outcome that is true:\n\n\
      - `delivered` — the deliverable exists (you opened or pushed to the PR, wrote the review, \
      posted the reply).\n\
@@ -1576,10 +1552,6 @@ fn compose_revision_directive(
         run_done_proposals_seam_enabled,
     ) = recovery_and_proposals;
     let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
-    let description = match work_item {
-        WorkItem::Task(task) | WorkItem::Chore(task) => task.description.trim().to_owned(),
-        _ => String::new(),
-    };
     let parent_pr_url = execution.pr_url.as_deref().unwrap_or("(unknown)");
     let pr_number = boss_github::pr_url::pr_number_from_url(parent_pr_url)
         .map(|n| n.to_string())
@@ -1595,7 +1567,6 @@ fn compose_revision_directive(
     out.push_str("Expected outcome for this run:\n");
     out.push_str("- This is a **REVISION** task. Your deliverable is an update to an EXISTING pull request — typically a new commit on the PR branch, or a rebase if that is all that is needed. Do NOT open a new PR. The engine owns your `boss-recovery/exec_*` recovery bookmark; keep it advanced locally.\n");
     out.push_str(&format!("- The parent PR is #{pr_number} at {parent_pr_url}.\n"));
-    out.push_str(&format!("- What this revision should change: {description}\n"));
     if let WorkItem::Task(task) | WorkItem::Chore(task) = work_item
         && task
             .created_via

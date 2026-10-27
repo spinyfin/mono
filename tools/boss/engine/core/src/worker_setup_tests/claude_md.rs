@@ -436,17 +436,33 @@ fn claude_md_avoids_internal_vocabulary() {
         let mut input = sample_input();
         input.draft_pr_mode = draft_pr_mode;
         let rendered = claude_md_for(&input);
-        // The section on running the Boss application is about that product by
-        // name, so it legitimately says "Boss". It sits between these headings.
-        let (before, rest) = rendered
-            .split_once("## Running Boss itself")
-            .expect("rules describe how to run the app");
-        let (_, after) = rest
-            .split_once("## Capturing a screenshot")
-            .expect("rules describe how to capture a screenshot");
         crate::prose_vocabulary::assert_no_forbidden_prose(
             &format!("worker rules (draft_pr_mode={draft_pr_mode})"),
-            &format!("{before}{after}"),
+            &rendered,
         );
     }
+}
+
+#[test]
+fn static_question_contract_lives_in_generated_rules() {
+    let rendered = claude_md_for(&sample_input());
+    for rule in [
+        "### Write questions for someone arriving cold",
+        "Context:\n",
+        "Yes:\n",
+        "No:\n",
+        "Recommendation:\n",
+        "Details:\n",
+        "no internal symbols",
+        "rough size",
+        "No leaves the work blocked",
+        "Never truncate evidence",
+        "Before submitting",
+        "This writing contract does not change when a question is warranted",
+    ] {
+        assert!(rendered.contains(rule), "missing question rule: {rule}");
+    }
+    assert!(!rendered.contains("Worked example"));
+    assert!(!rendered.contains("## Running Boss itself"));
+    assert!(!rendered.contains("bazel run //tools/boss/"));
 }

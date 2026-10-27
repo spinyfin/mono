@@ -80,11 +80,7 @@ pub(super) fn block_boundary_fragment() -> &'static str {
      unrelated-and-not-trivial case). It is not a reason to punt a \
      failure you could fix in this run.\n\
      \n\
-     Do not disable, skip, `#[ignore]`, or delete a failing test; do not \
-     add a file to a check exclusion or allowlist, or add a lint-disable \
-     comment; do not mark a failure flaky and retry it without evidence; \
-     do not weaken assertions or raise thresholds; do not use \
-     `--no-verify` or otherwise bypass a gate.\n\n"
+     Do not mark a failure flaky and retry it without evidence. Follow the check-bypass prohibition below.\n\n"
 }
 
 #[cfg(test)]
@@ -218,12 +214,28 @@ mod tests {
                 && frag.contains("not a reason to punt"),
             "CI-fix revisions are the separate-change fallback, not a punt; got: {frag}",
         );
-        assert!(
-            frag.contains("or delete a failing test")
-                && frag.contains("check exclusion or allowlist")
-                && frag.contains("`--no-verify`"),
-            "must forbid skip/ignore/delete/exclusion/flaky-without-evidence/--no-verify; got: {frag}",
-        );
+        assert!(frag.contains("Do not mark a failure flaky and retry it without evidence"));
+        assert!(frag.contains("Follow the check-bypass prohibition below"));
+        let prompt = compose(&chore_without_pr());
+        for prohibition in [
+            "exclusions/allowlists",
+            "lint-disable",
+            "allow_bypass",
+            "override flags",
+            "--no-verify",
+            "skipped hooks",
+            "#[allow(...)]",
+            "swiftlint:disable",
+            "# noqa",
+            "deleted/ignored/xfail/skipped tests",
+            "weakened assertions",
+            "raised thresholds/limits",
+            "approval by the repo owner",
+            "full justification",
+            "STOP",
+        ] {
+            assert!(prompt.contains(prohibition), "missing prohibition: {prohibition}");
+        }
     }
 
     #[test]
