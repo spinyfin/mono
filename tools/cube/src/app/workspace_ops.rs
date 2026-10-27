@@ -866,15 +866,8 @@ pub(super) fn rebase_workspace_branch(
     // required because the boss commit is referenced via its immutable
     // `@<remote>` form.
     let main_ref = format!("{main_branch}@{github_remote}");
-    let rebase_out = run_jj(
-        runner,
-        database_path,
-        &RealCommandRunner::invocation(
-            cwd,
-            "jj",
-            &["rebase", "-b", &boss_branch, "-d", &main_ref, "--ignore-immutable"],
-        ),
-    )?;
+    let rebase_out =
+        super::pr_rebase::rebase_preserving_pr_bookmarks(runner, database_path, cwd, &boss_branch, &main_ref)?;
 
     // Check whether the rebase left any conflicts anywhere in the range of
     // commits this rebase will push — not just the working-copy tip. `@` is

@@ -16,6 +16,7 @@ mod lease_tests;
 mod list_status_tests;
 mod pr_bookmarks_tests;
 mod pr_push_tests;
+mod pr_rebase_tests;
 mod pr_tests;
 mod push_tests;
 mod quarantine_tests;

@@ -489,7 +489,7 @@ fn repairing_a_conflicted_bookmark_clears_the_cached_conflict_of_sibling_workspa
                 "-n",
                 "101",
                 "-r",
-                "(::old) ~ (::head)",
+                "(::old) ~ (::head) ~ ::(present(main@origin) | present(master@origin) | present(main@github) | present(master@github))",
                 "-T",
                 r#"change_id ++ "\t" ++ commit_id ++ "\n""#,
             ],

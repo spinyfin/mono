@@ -265,6 +265,8 @@ struct RepairPolicy {
 /// This permits clean rebased intermediates, but preserves clean unpublished
 /// amends. Matching change ids alone never establish provenance.
 /// If trunk resolves to root, the publication-only rule fails closed.
+/// Base-only siblings also qualify when every authored commit has an empty
+/// interdiff against its unique same-change counterpart in the head.
 fn ensure_sides_are_obsolete(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
@@ -281,7 +283,10 @@ fn ensure_sides_are_obsolete(
         .collect::<Vec<_>>()
         .join(" | ");
     for side in sides.iter().filter(|s| s.as_str() != head) {
-        let mut revset = format!("(::{side}) ~ (::{head})");
+        // Only fetched trunk refs establish base history, never local main.
+        let mut revset = format!(
+            "(::{side}) ~ (::{head}) ~ ::(present(main@origin) | present(master@origin) | present(main@github) | present(master@github))"
+        );
         if !recorded.is_empty() {
             revset = format!("({revset}) ~ ::({recorded})");
         }
@@ -319,14 +324,33 @@ fn ensure_sides_are_obsolete(
         }
 
         for (change, commit) in unique {
-            let proven = git_utils::jj_provenance::proven_successor(
-                |args| run(runner, database_path, cwd, args),
-                change,
-                &format!("::{head}"),
-                commit,
-            )
-            .map_err(|error| unsafe_repair(name, head, side, &format!("evolution unavailable: {error}")))?
-            .is_some();
+            use git_utils::jj_provenance::{
+                COMMIT_ID_LINES_TEMPLATE, candidate_revset, evolution_contains, sole_candidate,
+            };
+            let candidates = run(
+                runner,
+                database_path,
+                cwd,
+                &[
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    &candidate_revset(change, &format!("::{head}")),
+                    "-T",
+                    COMMIT_ID_LINES_TEMPLATE,
+                ],
+            )?;
+            let proven = if let Some(candidate) = sole_candidate(&candidates) {
+                let evolution = run(
+                    runner,
+                    database_path,
+                    cwd,
+                    &["evolog", "--no-graph", "-r", candidate, "-T", COMMIT_ID_LINES_TEMPLATE],
+                )?;
+                evolution_contains(&evolution, commit)
+            } else {
+                false
+            };
             if proven {
                 continue;
             }
@@ -363,7 +387,10 @@ fn ensure_sides_are_obsolete(
                     &format!("::({recorded}) ~ ::trunk()"),
                 )
                 .map_err(|error| unsafe_repair(name, head, side, &format!("evolution unavailable: {error}")))?;
-            if !rewrite {
+            let equivalent = rewrite
+                || equivalent_sibling(runner, database_path, cwd, commit, &candidates)
+                    .map_err(|error| unsafe_repair(name, head, side, &format!("interdiff unavailable: {error}")))?;
+            if !equivalent {
                 let publication_rule = if policy.publication {
                     ", nor part of a conflicted side rewritten from published PR history with a known trunk"
                 } else {
@@ -375,13 +402,44 @@ fn ensure_sides_are_obsolete(
                     side,
                     &format!(
                         "commit {commit} is neither an ancestor of a head recorded for this PR \
-                         nor a recorded predecessor of the head's history{publication_rule}"
+                         nor a recorded predecessor of the head's history, nor a content-equivalent same-change sibling{publication_rule}"
                     ),
                 ));
             }
         }
     }
     Ok(())
+}
+
+/// Compare patches on the same parents, so base-only sibling rewrites are safe.
+fn equivalent_sibling(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    cwd: &Path,
+    commit: &str,
+    candidates: &str,
+) -> Result<bool> {
+    let Some(candidate) = git_utils::jj_provenance::sole_candidate(candidates) else {
+        return Ok(false);
+    };
+    let diff = run(
+        runner,
+        database_path,
+        cwd,
+        &["interdiff", "--from", commit, "--to", candidate, "--summary"],
+    )?;
+    if !diff.trim().is_empty() {
+        return Ok(false);
+    }
+    eprintln!("cube: obsolete sibling {commit} of {candidate}: same change id and empty interdiff");
+    crate::audit!(
+        database_path,
+        "workspace.pr_obsolete_sibling",
+        obsolete_commit = commit,
+        published_commit = candidate,
+        reason = "same change id and empty interdiff",
+    );
+    Ok(true)
 }
 
 /// Wording shared by [`unsafe_repair`] and [`is_unsafe_repair`].
