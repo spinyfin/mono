@@ -193,6 +193,12 @@ fn shrink_and_rejected_caller_are_audited() {
             write_as(&state, Some(std::process::id() as libc::pid_t), "").await,
             FrontendEvent::WorkError { .. }
         ));
+        state.clear_boss_pid();
+        let authorization = state.work_db.coordinator_handoff_authorization().unwrap().unwrap();
+        assert!(
+            error_message(write_as(&state, Some(std::process::id() as libc::pid_t), &authorization).await)
+                .contains("coordinator pid unknown")
+        );
         state
             .worker_registry
             .register(std::process::id() as libc::pid_t, "worker-execution".to_owned());
@@ -209,6 +215,12 @@ fn shrink_and_rejected_caller_are_audited() {
         }),
         "a credential-free write must be audited by the engine"
     );
+    assert!(events.iter().any(|event| {
+        event["event"] == "coordinator_handoff_rejected"
+            && event["pid"] == std::process::id()
+            && event["coordinator_pid"].is_null()
+            && event["reason"] == "coordinator pid unknown"
+    }));
     let warnings: Vec<_> = events
         .iter()
         .filter(|event| event["event"] == "coordinator_handoff_shrink_warning" && event["writer_spawn_token"] == token)
