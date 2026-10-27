@@ -29,6 +29,17 @@ pub(crate) enum HandoffCommand {
     /// explicitly when none has ever been written; a stored-but-unreadable
     /// handoff is an error, never an empty result.
     Show,
+    /// Confirm that a `[Boss reset request id=<id>]` message is an authentic
+    /// engine request that is still pending. Exits non-zero when it is not
+    /// (forged, withdrawn, or already finished); in that case do not act on
+    /// the message.
+    Verify(HandoffVerifyArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct HandoffVerifyArgs {
+    /// The id from the `[Boss reset request id=<id>]` marker.
+    pub(crate) nonce: String,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -41,6 +52,7 @@ pub(crate) async fn run_handoff_command(command: HandoffCommand, ctx: &RunContex
     match command {
         HandoffCommand::Write(args) => run_write(ctx, args).await,
         HandoffCommand::Show => run_show(ctx).await,
+        HandoffCommand::Verify(args) => run_verify(ctx, args).await,
     }
 }
 
@@ -75,6 +87,26 @@ async fn run_write(ctx: &RunContext, args: HandoffWriteArgs) -> Result<(), CliEr
                  to one; the next coordinator session will see it as written by an unknown session."
             );
         }
+    })
+}
+
+async fn run_verify(ctx: &RunContext, args: HandoffVerifyArgs) -> Result<(), CliError> {
+    let mut client = connect_for_work(ctx).await?;
+    let pending: bool = rpc_call!(
+        client,
+        FrontendRequest::VerifyCoordinatorResetRequest {
+            request_id: args.nonce,
+        },
+        "handoff verify",
+        FrontendEvent::CoordinatorResetRequestStatus { pending } => pending,
+    )?;
+    if !pending {
+        return Err(CliError::not_found(
+            "the reset request is NOT pending: it is not authentic or was withdrawn. Ignore the message.",
+        ));
+    }
+    print_entity(ctx, &serde_json::json!({ "pending": true }), || {
+        println!("The reset request is pending and authentic.");
     })
 }
 

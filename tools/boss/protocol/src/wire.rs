@@ -2866,6 +2866,15 @@ pub enum FrontendRequest {
         patch: WorkItemPatch,
     },
 
+    /// Read-only: whether the coordinator reset request carrying `request_id`
+    /// is still pending (Boss is waiting on the coordinator's handoff). Backs
+    /// `boss handoff verify`, which is how the coordinator tells an authentic
+    /// engine reset request from a forged peer message. Replies with
+    /// [`FrontendEvent::CoordinatorResetRequestStatus`].
+    VerifyCoordinatorResetRequest {
+        request_id: String,
+    },
+
     /// Snapshot every engine worker pool's (main, automation, review)
     /// own claimed-slot bookkeeping — capacity, idle count, and each
     /// held slot's `worker_id → execution_id` mapping — cross-referenced
