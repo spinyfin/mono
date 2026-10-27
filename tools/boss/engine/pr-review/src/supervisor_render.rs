@@ -71,13 +71,10 @@ pub fn render_supervisor_claude_md(
 /// Render one leaf report as a labeled, embedded JSON block for the
 /// supervisor prompt.
 ///
-/// Finding ids are (re)assigned here from the leaf's role and report order —
-/// the same derivation the engine's verdict validation uses — so the ids the
-/// supervisor is told to cite always match the ids the engine will accept.
+/// Finding ids are persisted by the engine when a report is accepted.
+/// Render them unchanged; historical reports must not acquire invented ids.
 fn render_leaf_report_block(input: &SupervisorReportInput) -> String {
-    let mut report = input.report.clone();
-    report.assign_finding_ids(input.role);
-    let findings_json = serde_json::to_string_pretty(&report.findings).unwrap_or_else(|_| "[]".to_owned());
+    let findings_json = serde_json::to_string_pretty(&input.report.findings).unwrap_or_else(|_| "[]".to_owned());
     format!(
         "### {role} reviewer\n\
          \n\
@@ -332,6 +329,7 @@ mod tests {
                 )
                 .findings(vec![
                     ReviewerReportFinding::builder()
+                        .id(crate::leaf_finding_id(role, 1))
                         .severity(ReviewFindingSeverity::High)
                         .category(ReviewFindingCategory::Correctness)
                         .confidence(ReviewFindingConfidence::High)
@@ -346,6 +344,15 @@ mod tests {
                 ])
                 .build(),
         }
+    }
+
+    #[test]
+    fn rendering_a_legacy_report_does_not_backfill_finding_ids() {
+        let mut input = sample_report(SupervisorSourceRole::Claude);
+        input.report.findings[0].id = None;
+        let rendered = render_leaf_report_block(&input);
+        assert!(!rendered.contains("\"id\""), "{rendered}");
+        assert!(!rendered.contains("claude-1"), "{rendered}");
     }
 
     #[test]
