@@ -85,6 +85,7 @@ async fn background_notification_preserves_hang_deadline_through_ingress() {
             Some(&checkpoint),
             crate::driver::ProgressFidelity::Rich,
             false,
+            state.live_worker_states.tool_completed_since_prompt(SLOT),
             1900,
         ),
         Some(checkpoint.progress_at)
@@ -705,6 +706,34 @@ mod hung_workers {
         state.live_worker_states.release_slot(1);
         assert!(state.refresh_hung_workers(&mut previous));
         assert!(!state.refresh_hung_workers(&mut previous));
+    }
+
+    #[tokio::test]
+    async fn dismissed_warning_stays_dismissed_until_owner_recovers() {
+        let (state, _dir) = test_server_state();
+        let product = create_product(&state.work_db);
+        let item = create_active_chore(&state.work_db, &product, "dismissed warning");
+        seed(&state, &item, 1);
+        let mut previous = HashMap::new();
+        assert!(state.refresh_hung_workers(&mut previous));
+        // Hung warnings use legacy work-attention rows, not attention groups.
+        // Closing that row models dismissal before the next producer sweep.
+        state
+            .work_db
+            .resolve_external_tracker_attention(&item, HUNG_WORKER_ATTENTION_KIND)
+            .unwrap();
+        assert!(!state.refresh_hung_workers(&mut previous));
+        assert_eq!(open(&state), 0);
+        // A hung sibling changes the snapshot without starting a new owner episode.
+        seed(&state, &item, 2);
+        assert!(state.refresh_hung_workers(&mut previous));
+        assert_eq!(open(&state), 0);
+        state.live_worker_states.release_slot(1);
+        state.live_worker_states.release_slot(2);
+        assert!(state.refresh_hung_workers(&mut previous));
+        seed(&state, &item, 3);
+        assert!(state.refresh_hung_workers(&mut previous));
+        assert_eq!(open(&state), 1);
     }
 
     #[tokio::test]

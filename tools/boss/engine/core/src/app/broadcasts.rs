@@ -69,10 +69,11 @@ impl ServerState {
             }
         }
         for (owner, (since, run)) in hung {
-            if !changed
-                && open
-                    .iter()
-                    .any(|attention| attention.work_item_id.as_ref() == Some(&owner))
+            // Dismissal lasts for the owner's continuous hung episode.
+            // An empty restart cache still reconciles persisted warnings.
+            if previous
+                .values()
+                .any(|(item, since)| since.is_some() && self.work_db.owning_work_item_id(item) == owner)
             {
                 continue;
             }
@@ -132,6 +133,7 @@ impl ServerState {
                     .as_ref(),
                 self.live_worker_states.progress_fidelity_for_slot(state.slot_id),
                 self.hold_registry.is_held(&state.run_id),
+                self.live_worker_states.tool_completed_since_prompt(state.slot_id),
                 now,
             );
         }

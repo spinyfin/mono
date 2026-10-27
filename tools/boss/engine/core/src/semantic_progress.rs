@@ -62,9 +62,9 @@ impl SemanticToolCondition {
 /// Distinct from [`SemanticToolCondition`], which answers a narrower
 /// question — "is a tool call unbalanced right now?" — and which is `Idle`
 /// for most of an ordinary turn: between one tool's `PostToolUse` and the
-/// next tool's `PreToolUse`, while the model thinks, and for the whole of a
-/// Codex background-terminal wait (its continuation polls report control
-/// transfer without balancing the command). None of
+/// next tool's `PreToolUse`, while the model thinks. Codex background commands
+/// are `InFlight` while a poll blocks and `Yielded` after its result returns
+/// control to the model without balancing the command. None of
 /// those is "the worker has ended its turn", so the tool condition alone
 /// cannot decide whether a re-adopted slot is busy.
 ///

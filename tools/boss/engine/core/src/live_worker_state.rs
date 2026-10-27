@@ -265,6 +265,9 @@ struct SlotMeta {
     inferred_terminated: bool,
     /// Activity before the first engine termination, retained across repeated checks.
     activity_before_termination: Option<WorkerActivity>,
+    /// Selects the next-response deadline independently of the nudge watermark.
+    #[builder(default = false)]
+    tool_completed_since_prompt: bool,
     /// Set when a `Notification` hook arrives, cleared on the next `Stop`.
     /// Lets us turn a `Stop` into `WaitingForInput` rather than `Idle`
     /// when claude is paused on a permission prompt.
@@ -546,6 +549,14 @@ pub struct UnverifiedDriverStart {
 }
 
 impl LiveWorkerStateRegistry {
+    pub(crate) fn tool_completed_since_prompt(&self, slot_id: u8) -> bool {
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .get(&slot_id)
+            .is_some_and(|entry| entry.meta.tool_completed_since_prompt)
+    }
+
     /// Use durable persona leases for every production registration/release path.
     pub fn with_work_db(work_db: std::sync::Arc<crate::work::WorkDb>) -> Self {
         Self {
@@ -1011,8 +1022,9 @@ impl LiveWorkerStateRegistry {
         entry.meta.semantic_tool_condition = checkpoint.tool_condition;
         entry.meta.semantic_turn_condition = checkpoint.turn_condition;
         // The turn condition, not the tool condition, decides busy vs idle:
-        // the tool condition is `Idle` for most of a live turn, including a
-        // Codex background-terminal wait whose polls emit no events. The
+        // the tool condition is `Idle` while thinking between completed tools.
+        // Codex background commands are `InFlight` during blocking polls and
+        // `Yielded` after a poll returns control to the model. The
         // turn condition is persisted from the reducer's own turn gate, so
         // `InTurn` holds from the first turn activity until a `Stop`.
         match activity_from_semantic(checkpoint.turn_condition, checkpoint.tool_condition) {
@@ -1882,7 +1894,7 @@ impl LiveWorkerStateRegistry {
                 // degrades and no further hooks arrive.
             }
             WorkerEvent::UserPromptSubmit { .. } => {
-                state.last_tool_ended_at = None;
+                meta.tool_completed_since_prompt = false;
                 state.activity = WorkerActivity::Working;
                 state.current_tool = None;
             }
@@ -1895,6 +1907,9 @@ impl LiveWorkerStateRegistry {
             WorkerEvent::PostToolUse { .. } => {
                 state.current_tool = None;
                 state.last_tool_ended_at = state.last_event_at.clone();
+                if !origin.from_subagent {
+                    meta.tool_completed_since_prompt = true;
+                }
                 // Don't flip to Idle here — Stop is the authoritative
                 // turn boundary. Worker may chain multiple tools.
                 state.activity = WorkerActivity::Working;

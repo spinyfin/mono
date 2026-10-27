@@ -17,6 +17,7 @@ pub(crate) fn hung_since(
     checkpoint: Option<&SemanticProgressCheckpoint>,
     fidelity: ProgressFidelity,
     held: bool,
+    tool_completed_since_prompt: bool,
     now: i64,
 ) -> Option<String> {
     let checkpoint = checkpoint?;
@@ -31,7 +32,7 @@ pub(crate) fn hung_since(
     if checkpoint.turn_condition != SemanticTurnCondition::InTurn {
         return None;
     }
-    let threshold = if yielded || state.last_tool_ended_at.is_some() {
+    let threshold = if yielded || tool_completed_since_prompt {
         NEXT_RESPONSE_SECS
     } else {
         FIRST_RESPONSE_SECS
@@ -75,7 +76,9 @@ mod tests {
                 tool_response: serde_json::Value::Null,
             },
         );
-        assert!(registry.get(1).unwrap().last_tool_ended_at.is_some());
+        assert!(registry.tool_completed_since_prompt(1));
+        let watermark = registry.activity_watermark_for_run("run");
+        assert!(watermark.is_some());
         registry.apply_event(
             1,
             &WorkerEvent::UserPromptSubmit {
@@ -83,7 +86,22 @@ mod tests {
                 prompt: "next".into(),
             },
         );
-        assert!(registry.get(1).unwrap().last_tool_ended_at.is_none());
+        assert!(!registry.tool_completed_since_prompt(1));
+        assert_eq!(registry.activity_watermark_for_run("run"), watermark);
+        registry.apply_hook_event(
+            1,
+            crate::live_worker_state::HookOrigin {
+                ingress_seq: None,
+                from_subagent: true,
+            },
+            &WorkerEvent::PostToolUse {
+                session_id: "child".into(),
+                tool_name: "Bash".into(),
+                tool_input: serde_json::Value::Null,
+                tool_response: serde_json::Value::Null,
+            },
+        );
+        assert!(!registry.tool_completed_since_prompt(1));
     }
 
     #[test]
@@ -117,6 +135,7 @@ mod tests {
                 Some(&checkpoint),
                 ProgressFidelity::Rich,
                 false,
+                registry.tool_completed_since_prompt(1),
                 now + 899
             )
             .is_none()
@@ -127,6 +146,7 @@ mod tests {
                 Some(&checkpoint),
                 ProgressFidelity::Rich,
                 false,
+                registry.tool_completed_since_prompt(1),
                 now + 900
             )
             .is_some()
@@ -144,6 +164,7 @@ mod tests {
                 registry.semantic_progress_for_slot(1).as_ref(),
                 ProgressFidelity::Rich,
                 false,
+                registry.tool_completed_since_prompt(1),
                 now + 900
             )
             .is_none()
@@ -171,6 +192,7 @@ mod tests {
                 registry.semantic_progress_for_slot(1).as_ref(),
                 ProgressFidelity::Rich,
                 false,
+                registry.tool_completed_since_prompt(1),
                 now,
             )
         };
@@ -202,24 +224,23 @@ mod tests {
             tool_condition: SemanticToolCondition::Idle,
             turn_condition: SemanticTurnCondition::InTurn,
         };
-        let classify = |state: &LiveWorkerState, checkpoint: &SemanticProgressCheckpoint, now| {
-            hung_since(state, Some(checkpoint), ProgressFidelity::Rich, false, now)
+        let classify = |state: &LiveWorkerState, checkpoint: &SemanticProgressCheckpoint, completed, now| {
+            hung_since(state, Some(checkpoint), ProgressFidelity::Rich, false, completed, now)
         };
-        assert!(classify(&state, &checkpoint, 1599).is_none());
-        assert!(classify(&state, &checkpoint, 1600).is_some());
-        state.last_tool_ended_at = Some(checkpoint.progress_at.clone());
-        assert!(classify(&state, &checkpoint, 1899).is_none());
-        assert!(classify(&state, &checkpoint, 1900).is_some());
+        assert!(classify(&state, &checkpoint, false, 1599).is_none());
+        assert!(classify(&state, &checkpoint, false, 1600).is_some());
+        assert!(classify(&state, &checkpoint, true, 1899).is_none());
+        assert!(classify(&state, &checkpoint, true, 1900).is_some());
         checkpoint.tool_condition = SemanticToolCondition::InFlight;
-        assert!(classify(&state, &checkpoint, 10000).is_none());
+        assert!(classify(&state, &checkpoint, true, 10000).is_none());
         checkpoint.tool_condition = SemanticToolCondition::Idle;
         state.wait_reason = Some("long build".into());
-        assert!(classify(&state, &checkpoint, 10000).is_none());
+        assert!(classify(&state, &checkpoint, true, 10000).is_none());
         state.wait_reason = None;
-        assert!(hung_since(&state, Some(&checkpoint), ProgressFidelity::Rich, true, 10000).is_none());
+        assert!(hung_since(&state, Some(&checkpoint), ProgressFidelity::Rich, true, true, 10000).is_none());
         checkpoint.progress_at = crate::live_worker_state::iso8601_utc(9999);
-        assert!(classify(&state, &checkpoint, 10000).is_none());
+        assert!(classify(&state, &checkpoint, true, 10000).is_none());
         checkpoint.turn_condition = SemanticTurnCondition::Ended;
-        assert!(classify(&state, &checkpoint, 20000).is_none());
+        assert!(classify(&state, &checkpoint, true, 20000).is_none());
     }
 }
