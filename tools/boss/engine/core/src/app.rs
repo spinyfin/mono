@@ -2000,6 +2000,11 @@ impl ServerState {
         run_id: &str,
         remote_proven_dead: bool,
     ) -> PaneReleaseOutcome {
+        // Retrying a refused teardown must retain the pane/lease, but a
+        // terminal execution must no longer authorize calls from its process.
+        if self.execution_is_terminal(run_id) {
+            self.worker_registry.forget_run_pids(run_id);
+        }
         // Terminal status alone does not prove a remote worker has stopped.
         if self.execution_is_terminal(run_id)
             && self

@@ -280,6 +280,9 @@ impl ServerState {
     }
 
     fn finish_tmux_reap(&self, execution_id: &str, identity: &TmuxIdentity) -> TmuxTeardownOutcome {
+        // Process ownership is gone even if clearing the durable identity
+        // fails and teardown must retry. This also covers direct orphan reaps.
+        self.worker_registry.forget_run_pids(execution_id);
         match self
             .work_db
             .clear_tmux_identity_for_execution(execution_id, &identity.spawn_token)

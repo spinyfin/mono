@@ -193,6 +193,11 @@ pub(super) fn attribute_caller(
     claimed_run_id: &str,
 ) -> std::result::Result<AttributedCaller, ProposalSubmissionError> {
     let Some(peer_pid) = peer_pid else {
+        tracing::warn!(
+            claimed_run_id,
+            chain = "(empty)",
+            "proposal attribution rejected: no local peer"
+        );
         return Err(ProposalSubmissionError::new(
             ProposalErrorCode::NoLocalPeer,
             "this connection has no local socket peer, so the engine cannot verify which \
@@ -244,34 +249,59 @@ pub(super) fn attribute_caller(
             ),
         ));
     }
-    tracing::info!(
-        peer_pid,
-        claimed_run_id,
-        matched_pid,
-        resolved_run_id = %resolved_run_id,
-        %chain,
-        "proposal attribution resolved",
-    );
 
     match work_db.work_item_for_execution(&resolved_run_id) {
-        Ok(Some(work_item_id)) => Ok(AttributedCaller {
-            execution_id: resolved_run_id,
-            work_item_id,
-        }),
+        Ok(Some(work_item_id)) => {
+            let execution = work_db.get_execution(&resolved_run_id).map_err(|err| {
+                tracing::warn!(peer_pid, matched_pid, %resolved_run_id, %chain, ?err,
+                    "proposal attribution rejected: failed to read execution status");
+                ProposalSubmissionError::new(ProposalErrorCode::Internal, format!("failed to read execution: {err}"))
+            })?;
+            if execution.status.is_terminal() {
+                server_state.worker_registry.forget_run_pids(&resolved_run_id);
+                tracing::warn!(peer_pid, matched_pid, %resolved_run_id, %chain,
+                    "proposal attribution rejected: execution has ended");
+                return Err(ProposalSubmissionError::new(
+                    ProposalErrorCode::AttributionUnresolved,
+                    format!("execution `{resolved_run_id}` has ended and can no longer propose"),
+                ));
+            }
+
+            tracing::info!(
+                peer_pid,
+                claimed_run_id,
+                matched_pid,
+                resolved_run_id = %resolved_run_id,
+                %chain,
+                "proposal attribution resolved",
+            );
+            Ok(AttributedCaller {
+                execution_id: resolved_run_id,
+                work_item_id,
+            })
+        }
         // The registry still holds a pid for an execution the DB no longer
         // has — a pruned row, or a stale entry for a run that ended. Not the
         // caller's fault and not fixable by it, so it gets its own code
         // rather than being folded into the attribution failures above.
-        Ok(None) => Err(ProposalSubmissionError::new(
-            ProposalErrorCode::UnknownExecution,
-            format!(
-                "this connection resolves to run `{resolved_run_id}`, but no such execution \
+        Ok(None) => {
+            server_state.worker_registry.forget_run_pids(&resolved_run_id);
+            tracing::warn!(peer_pid, matched_pid, %resolved_run_id, %chain,
+                "proposal attribution rejected: unknown execution");
+            Err(ProposalSubmissionError::new(
+                ProposalErrorCode::UnknownExecution,
+                format!(
+                    "this connection resolves to run `{resolved_run_id}`, but no such execution \
                  exists — the run may have been pruned."
-            ),
-        )),
+                ),
+            ))
+        }
         Err(err) => {
             tracing::warn!(
                 run_id = %resolved_run_id,
+                peer_pid,
+                matched_pid,
+                %chain,
                 ?err,
                 "proposal attribution: failed to read the execution row",
             );
