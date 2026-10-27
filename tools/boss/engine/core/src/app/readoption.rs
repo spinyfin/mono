@@ -1040,7 +1040,14 @@ impl ServerState {
             self.decline_worker_pane_attach(run_id, reason).await;
             return false;
         }
-        self.reattach_one_worker_pane(&state).await == WorkerPaneAttachOutcome::Attached
+        match self.reattach_one_worker_pane(&state).await {
+            WorkerPaneAttachOutcome::Attached => true,
+            WorkerPaneAttachOutcome::Failed => {
+                self.schedule_worker_viewer_reattach_retry().await;
+                false
+            }
+            WorkerPaneAttachOutcome::Skipped => false,
+        }
     }
 
     async fn decline_worker_pane_attach(&self, run_id: &str, reason: &str) {

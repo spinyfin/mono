@@ -649,6 +649,48 @@ async fn execution_read_failure_schedules_a_retry() {
 }
 
 #[tokio::test]
+async fn app_requested_execution_read_failure_schedules_a_retry() {
+    let (state, _dir) = test_server_state();
+    let run_id = seed_tmux_hosted_live_run(&state, 1, "read-failure-session", "read-failure-token");
+    // Make the execution query fail, then restore the table to model recovery.
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("ALTER TABLE work_executions RENAME TO unavailable_executions;")
+        .unwrap();
+    let sink = make_session_sink();
+    state.register_app_session("session-app".into(), sink.clone()).await;
+    assert!(!state.viewer_reattach_retry_scheduled.load(Ordering::Relaxed));
+    assert_eq!(state.viewer_reattach_retry_attempt.load(Ordering::Relaxed), 0);
+    assert!(!state.reattach_worker_pane_for_run(&run_id).await);
+    assert!(
+        state.live_worker_states.snapshot()[0]
+            .viewer_attach_error
+            .as_deref()
+            .unwrap()
+            .starts_with("could not read the execution:")
+    );
+    assert!(
+        state
+            .viewer_reattach_retry_scheduled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    assert_eq!(
+        state
+            .viewer_reattach_retry_attempt
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("ALTER TABLE unavailable_executions RENAME TO work_executions;")
+        .unwrap();
+}
+
+#[tokio::test]
 async fn terminal_execution_does_not_schedule_a_retry() {
     let (state, _dir) = test_server_state();
     let run_id = seed_tmux_hosted_live_run(&state, 1, "terminal-session", "terminal-token");
@@ -714,6 +756,20 @@ async fn declined_live_attach_records_session_and_terminal_reasons() {
     assert_eq!(
         state.live_worker_states.snapshot()[0].viewer_attach_error.as_deref(),
         Some("the worker has exited")
+    );
+}
+
+#[tokio::test]
+async fn unset_tmux_hosting_records_missing_terminal_reason() {
+    let (state, _dir) = test_server_state();
+    state
+        .live_worker_states
+        .register_spawn(1, "unset-hosting", "claude-opus-4-7", 0, None);
+    assert_eq!(state.live_worker_states.get(1).unwrap().tmux_hosted, None);
+    assert!(!state.reattach_worker_pane_for_run("unset-hosting").await);
+    assert_eq!(
+        state.live_worker_states.get(1).unwrap().viewer_attach_error.as_deref(),
+        Some("no local tmux terminal is available for this worker")
     );
 }
 
