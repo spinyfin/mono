@@ -91,6 +91,20 @@ fn set_track_rebase_check_cmds(branch: &str, conflicted_commit_ids: &[&str]) -> 
             "",
         ),
         ExpectedCommand::ok(rebase_cwd(), "jj", &["bookmark", "track", &remote_ref], ""),
+        ExpectedCommand::ok(rebase_cwd(), "jj", &["git", "import"], ""),
+        ExpectedCommand::ok(
+            rebase_cwd(),
+            "jj",
+            &[
+                "bookmark",
+                "list",
+                "-r",
+                &format!("(main@github..{branch})::"),
+                "-T",
+                crate::app::pr_rebase::PR_TARGETS,
+            ],
+            "",
+        ),
         ExpectedCommand::ok(
             rebase_cwd(),
             "jj",

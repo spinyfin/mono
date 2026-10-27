@@ -371,3 +371,167 @@ fn exercise_publication(scenario: Scenario) {
     );
     assert_eq!(jj_commit_id(&runner, &next, "@-").unwrap(), pushed);
 }
+
+#[test]
+fn base_only_divergent_stack_resolves_to_published_head() {
+    exercise_siblings(None);
+}
+
+#[test]
+fn divergent_sibling_with_authored_content_is_refused() {
+    exercise_siblings(Some("extra-head"));
+}
+
+#[test]
+fn divergent_sibling_with_authored_ancestor_is_refused() {
+    exercise_siblings(Some("extra-parent"));
+}
+
+fn exercise_siblings(extra: Option<&str>) {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path();
+    let jj = |args: &[&str]| TestJj.run(&RealCommandRunner::invocation(repo, "jj", args)).unwrap();
+    jj(&["git", "init", "--colocate"]);
+    jj(&["config", "set", "--repo", "user.name", "Test"]);
+    jj(&["config", "set", "--repo", "user.email", "test@example.com"]);
+    std::fs::write(repo.join("base"), "base\n").unwrap();
+    jj(&["commit", "-m", "base"]);
+    let base = jj_commit_id(&TestJj, repo, "@-").unwrap();
+    std::fs::write(repo.join("parent"), "parent\n").unwrap();
+    jj(&["commit", "-m", "parent"]);
+    let parent = jj_commit_id(&TestJj, repo, "@-").unwrap();
+    std::fs::write(repo.join("head"), "head\n").unwrap();
+    jj(&["describe", "-m", "head"]);
+    let original = jj_commit_id(&TestJj, repo, "@").unwrap();
+    jj(&["bookmark", "set", "original", "-r", &original]);
+    jj(&["new", &base, "-m", "upstream"]);
+    std::fs::write(repo.join("base"), "new base\n").unwrap();
+    let upstream = jj_commit_id(&TestJj, repo, "@").unwrap();
+    jj(&["rebase", "-s", &parent, "-d", &upstream]);
+    let side = jj_commit_id(&TestJj, repo, "original").unwrap();
+    jj(&["bookmark", "set", "saved-side", "-r", &side]);
+    if let Some(file) = extra {
+        jj(&[
+            "edit",
+            if file == "extra-parent" {
+                "saved-side-"
+            } else {
+                "saved-side"
+            },
+        ]);
+        std::fs::write(repo.join(file), "unpublished\n").unwrap();
+        jj(&["status"]);
+    }
+    let side = jj_commit_id(&TestJj, repo, "saved-side").unwrap();
+    jj(&["new", &upstream, "-m", "later upstream"]);
+    std::fs::write(repo.join("base"), "latest base\n").unwrap();
+    let latest = jj_commit_id(&TestJj, repo, "@").unwrap();
+    jj(&["edit", &original]);
+    jj(&["describe", "-m", "independent published sibling"]);
+    jj(&["rebase", "-s", &parent, "-d", &latest]);
+    let head = jj_commit_id(&TestJj, repo, "@").unwrap();
+    jj(&["bookmark", "set", "pr/42", "-r", &side]);
+    let operation = jj(&["op", "log", "--no-graph", "--limit", "1", "-T", "id"]);
+    jj(&["bookmark", "set", "pr/42", "-r", &head, "--allow-backwards"]);
+    jj(&[
+        "--at-op",
+        operation.trim(),
+        "describe",
+        "-r",
+        &side,
+        "-m",
+        "local sibling",
+    ]);
+    // Reconcile operations to create the actual multi-target bookmark.
+    let sides = jj(&[
+        "log",
+        "-r",
+        "bookmarks(exact:\"pr/42\")",
+        "--no-graph",
+        "-T",
+        "commit_id ++ \"\\n\"",
+    ]);
+    assert_eq!(sides.lines().count(), 2);
+    let result = crate::app::pr_bookmarks::point_pr_bookmark(&TestJj, None, repo, 42, &head);
+    if extra.is_some() {
+        assert!(result.unwrap_err().to_string().contains("will not pick a side"));
+        assert_eq!(
+            jj(&[
+                "log",
+                "-r",
+                "bookmarks(exact:\"pr/42\")",
+                "--no-graph",
+                "-T",
+                "commit_id ++ \"\\n\""
+            ])
+            .lines()
+            .count(),
+            2
+        );
+    } else {
+        result.unwrap();
+        assert_eq!(jj_commit_id(&TestJj, repo, "pr/42").unwrap(), head);
+        assert_eq!(jj_commit_id(&TestJj, repo, "pr/42@git").unwrap(), head);
+    }
+}
+
+#[test]
+fn local_rebase_preserves_published_pr_pointers_on_clean_and_conflicted_stacks() {
+    exercise_local_rebase(false, false);
+    exercise_local_rebase(true, false);
+}
+
+#[test]
+fn failed_local_rebase_restores_published_pr_pointers() {
+    exercise_local_rebase(false, true);
+}
+
+struct FailRebase;
+
+impl CommandRunner for FailRebase {
+    fn run(&self, invocation: &crate::command_runner::CommandInvocation) -> Result<String> {
+        if invocation.args.first().is_some_and(|arg| arg == "rebase") {
+            return Err(crate::app::errors::CubeError::InvalidArgument(
+                "injected rebase failure".into(),
+            ));
+        }
+        TestJj.run(invocation)
+    }
+}
+
+fn exercise_local_rebase(conflict: bool, fail: bool) {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path();
+    let jj = |args: &[&str]| TestJj.run(&RealCommandRunner::invocation(repo, "jj", args)).unwrap();
+    jj(&["git", "init", "--colocate"]);
+    jj(&["config", "set", "--repo", "user.name", "Test"]);
+    jj(&["config", "set", "--repo", "user.email", "test@example.com"]);
+    std::fs::write(repo.join("file"), "base\n").unwrap();
+    jj(&["commit", "-m", "base"]);
+    jj(&["bookmark", "set", "base", "-r", "@-"]);
+    std::fs::write(repo.join("file"), "feature\n").unwrap();
+    jj(&["describe", "-m", "feature"]);
+    jj(&["bookmark", "set", "feature", "pr/42", "-r", "@"]);
+    let before = jj_commit_id(&TestJj, repo, "pr/42").unwrap();
+    jj(&["new", "@", "-m", "stacked PR"]);
+    std::fs::write(repo.join("stack"), "stack\n").unwrap();
+    jj(&["bookmark", "set", "pr/43", "stack", "-r", "@"]);
+    let stacked = jj_commit_id(&TestJj, repo, "pr/43").unwrap();
+    jj(&["new", "base", "-m", "upstream"]);
+    std::fs::write(repo.join(if conflict { "file" } else { "upstream" }), "upstream\n").unwrap();
+    jj(&["bookmark", "set", "main", "-r", "@"]);
+    let runner: &dyn CommandRunner = if fail { &FailRebase } else { &TestJj };
+    let result = crate::app::pr_rebase::rebase_preserving_pr_bookmarks(runner, None, repo, "feature", "main");
+    if fail {
+        assert!(result.unwrap_err().to_string().contains("injected rebase failure"));
+    } else {
+        result.unwrap();
+        assert_ne!(jj_commit_id(&TestJj, repo, "feature").unwrap(), before);
+        assert_ne!(jj_commit_id(&TestJj, repo, "stack").unwrap(), stacked);
+    }
+    jj(&["git", "import"]);
+    for (name, expected) in [("pr/42", before), ("pr/43", stacked)] {
+        assert_eq!(jj_commit_id(&TestJj, repo, name).unwrap(), expected);
+        assert_eq!(jj_commit_id(&TestJj, repo, &format!("{name}@git")).unwrap(), expected);
+    }
+}
