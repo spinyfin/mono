@@ -131,21 +131,23 @@ sh_test(
 # CommentsTests.swift + TranscriptViewTests.swift are split into their own
 # shard because CommentLayerTests alone accounts for ~85% of total XCTest
 # runtime (~12.8s of ~14.9s measured locally); bundling it with anything else
-# risks that shard alone approaching the timeout. The AppKit-hosted markdown
-# and revision-footer render suites form the Render shard: together they are
-# the heaviest remaining suites (about 25 s of XCTest wall time on an Apple
-# Silicon dev box in an unoptimised build). The remaining files are split
-# into the explicit source groups below plus a catch-all that is distributed
+# risks that shard alone approaching the timeout. MarkdownDocumentChromeTests
+# is its own shard: bundled with the other AppKit render suites it reached
+# 26.8 s of XCTest wall (57.0 s bazel wall) in an isolated uncached run, which
+# is too close to the 60 s budget. The remaining table-overflow and revision-
+# footer suites stay in the Render shard. The remaining files are split into
+# the explicit source groups below plus a catch-all that is distributed
 # across four further bundles. Every new test file is included automatically.
 #
 # When a shard creeps towards its budget, measure before moving files:
 # `bazel test --nocache_test_results --test_verbose_timeout_warnings
 # //tools/boss/app-macos:BossTestsShard3`, then read the per-suite
 # "Test Suite '...' passed at" timestamps in bazel-testlogs/.../test.log.
-# Keep each shard's isolated local wall time well inside the 60 s budget.
-# Isolated uncached on this change: Shard3 9.5 / 12.2 / 11.1 s, Render
-# 12.1 / 10.7 / 17.6 s. Slowest samples are about 4.9× (Shard3) and 3.4×
-# (Render) under the 60 s budget.
+# Keep each shard's isolated local wall time inside the 60 s budget with
+# enough slack that a slow sample still finishes. Isolated uncached in this
+# workspace: before splitting Chrome out of Render, Render was 19.8 / 57.0 /
+# 27.1 s. After the split: Chrome 12.2 / 13.5 / 18.3 s, Render 14.2 / 18.9 /
+# 11.8 s, Shard3 11.9 / 13.1 / 18.4 s.
 #
 # The shared principal is compiled into every bundle: it is the bundle's
 # NSPrincipalClass, which XCTest instantiates before the first test runs, and
@@ -155,8 +157,11 @@ _BOSS_TESTS_PRINCIPAL_SRCS = ["Tests/BossTests/BossTestsPrincipal.swift"]
 
 _BOSS_TESTS_INFOPLISTS = ["Tests/BossTests/Info.plist"]
 
-_RENDER_SHARD_SRCS = [
+_CHROME_SHARD_SRCS = [
     "Tests/BossTests/MarkdownDocumentChromeTests.swift",
+]
+
+_RENDER_SHARD_SRCS = [
     "Tests/BossTests/MarkdownTableOverflowTests.swift",
     "Tests/BossTests/RevisionFooterRenderTests.swift",
 ]
@@ -262,6 +267,26 @@ swift_library(
 )
 
 macos_unit_test(
+    name = "BossTestsChrome",
+    size = "small",
+    env = XCODE_TEST_ENV,
+    infoplists = _BOSS_TESTS_INFOPLISTS,
+    minimum_os_version = "15.0",
+    runner = "//tools/test-sandbox:macos_direct_test_runner",
+    deps = [":boss_mac_app_tests_chrome_lib"],
+)
+
+swift_library(
+    name = "boss_mac_app_tests_chrome_lib",
+    testonly = True,
+    srcs = _CHROME_SHARD_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
+    copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
+    linkopts = _COVERAGE_LINKOPTS,
+    module_name = "BossTestsChrome",
+    deps = [":boss_mac_app_lib"],
+)
+
+macos_unit_test(
     name = "BossTestsRender",
     size = "small",
     env = XCODE_TEST_ENV,
@@ -361,7 +386,7 @@ genrule(
 app_test_shards(
     srcs = glob(
         ["Tests/BossTests/**/*.swift"],
-        exclude = _RENDER_SHARD_SRCS + _COMMENTS_TRANSCRIPT_SHARD_SRCS + _SHARD1_SRCS + _SHARD2_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
+        exclude = _CHROME_SHARD_SRCS + _RENDER_SHARD_SRCS + _COMMENTS_TRANSCRIPT_SHARD_SRCS + _SHARD1_SRCS + _SHARD2_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
     ),
     linkopts = _COVERAGE_LINKOPTS,
     principal_srcs = _BOSS_TESTS_PRINCIPAL_SRCS,
