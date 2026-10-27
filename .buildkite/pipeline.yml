@@ -18,29 +18,6 @@ steps:
       - github_commit_status:
           context: "buildkite/mono/bazel-build-test"
 
-  - label: ":linux: spoke-protocol (linux)"
-    key: "spoke-protocol-linux"
-    command: ".buildkite/steps/spoke-protocol-test.sh"
-    artifact_paths:
-      - "bazel-testlogs/tools/boss/protocol-spoke/**/test.log"
-    agents:
-      queue: "${BUILDKITE_ANY_QUEUE:-bazel-any}"
-      os: linux
-    notify:
-      - github_commit_status:
-          context: "buildkite/mono/spoke-protocol-linux"
-
-  - label: ":apple: spoke-protocol (macos-arm64)"
-    key: "spoke-protocol-macos"
-    command: ".buildkite/steps/spoke-protocol-test.sh"
-    artifact_paths:
-      - "bazel-testlogs/tools/boss/protocol-spoke/**/test.log"
-    agents:
-      queue: "${BUILDKITE_MACOS_QUEUE:-macos-arm64}"
-    notify:
-      - github_commit_status:
-          context: "buildkite/mono/spoke-protocol-macos"
-
   - label: ":apple: mac-app-build"
     key: "mac-app-build"
     command: ".buildkite/steps/mac-app-build.sh"

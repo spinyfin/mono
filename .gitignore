@@ -32,7 +32,3 @@ node_modules/
 # repobin installs tool symlinks into bin/ at the workspace root; these are
 # local artifacts, not source files.
 /bin/
-
-# The boss.spoke.v1 schema baseline staged from a pull request's merge base by
-# .buildkite/steps/stage-spoke-proto-merge-base.sh; CI input, never committed.
-/tools/boss/protocol-spoke/compat/merge_base/

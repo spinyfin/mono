@@ -1,6 +1,6 @@
 //! Old/new peer compatibility.
 //!
-//! The descriptor check (`proto_breaking_test`) proves the schema only grows;
+//! checkleft's `proto/breaking` checks that the schema evolves compatibly;
 //! it cannot prove that a reader behaves correctly when it meets something it
 //! has never seen. These tests play both roles with hand-declared prost types:
 //! an "old peer" that knows only the stable handshake subset and a "new peer"

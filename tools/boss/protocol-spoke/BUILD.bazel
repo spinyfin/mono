@@ -2,8 +2,6 @@ load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_proto//proto:defs.bzl", "proto_library")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 load("@rules_rust_prost//:defs.bzl", "rust_prost_library")
-load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
-load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
 exports_files(["Cargo.toml"])
 
@@ -122,102 +120,4 @@ rust_test(
     data = ["//:Cargo.lock"],
     edition = "2024",
     env = {"CARGO_LOCK": "$(rootpath //:Cargo.lock)"},
-)
-
-# ---------------------------------------------------------------------------
-# Breaking-change gate (see README.md, "Evolution rules and the compatibility
-# gate"). buf is pinned per platform in MODULE.bazel.
-# ---------------------------------------------------------------------------
-
-config_setting(
-    name = "macos_arm64",
-    constraint_values = [
-        "@platforms//cpu:arm64",
-        "@platforms//os:macos",
-    ],
-)
-
-config_setting(
-    name = "linux_x86_64",
-    constraint_values = [
-        "@platforms//cpu:x86_64",
-        "@platforms//os:linux",
-    ],
-)
-
-config_setting(
-    name = "linux_arm64",
-    constraint_values = [
-        "@platforms//cpu:arm64",
-        "@platforms//os:linux",
-    ],
-)
-
-_BUF_COMPATIBLE = select({
-    ":linux_arm64": [],
-    ":linux_x86_64": [],
-    ":macos_arm64": [],
-    "//conditions:default": ["@platforms//:incompatible"],
-})
-
-# A filegroup rather than an alias so it can carry target_compatible_with:
-# on a platform without a pinned buf, `//...` skips it (and its dependents)
-# as incompatible instead of failing analysis.
-filegroup(
-    name = "buf",
-    srcs = select({
-        ":linux_arm64": ["@buf_aarch64_linux//:buf"],
-        ":linux_x86_64": ["@buf_x86_64_linux//:buf"],
-        ":macos_arm64": ["@buf_aarch64_macos//:buf"],
-        "//conditions:default": [],
-    }),
-    target_compatible_with = _BUF_COMPATIBLE,
-)
-
-_PROTO_ROOT = "tools/boss/protocol-spoke/proto"
-
-_BASELINE_ROOT = "tools/boss/protocol-spoke/compat/baseline"
-
-_MERGE_BASE_ROOT = "tools/boss/protocol-spoke/compat/merge_base"
-
-_COMPAT_DATA = [
-    ":buf",
-    "compat/baseline/boss/spoke/v1/spoke.proto",
-    "proto/boss/spoke/v1/spoke.proto",
-]
-
-# Fails when the schema drifted from the checked-in baseline, and, when CI has
-# staged the merge-base baseline under compat/merge_base/, when the schema is
-# not backward compatible with it.
-sh_test(
-    name = "proto_breaking_test",
-    size = "small",
-    srcs = ["compat/proto_compat.sh"],
-    args = [
-        "check",
-        "$(rootpath :buf)",
-        _PROTO_ROOT,
-        _BASELINE_ROOT,
-        _MERGE_BASE_ROOT,
-    ],
-    data = _COMPAT_DATA + glob(
-        ["compat/merge_base/**/*.proto"],
-        allow_empty = True,
-    ),
-    target_compatible_with = _BUF_COMPATIBLE,
-)
-
-# `bazel run //tools/boss/protocol-spoke:update_baseline` records a backward
-# compatible schema change; it refuses to cross a breaking one.
-sh_binary(
-    name = "update_baseline",
-    srcs = ["compat/proto_compat.sh"],
-    args = [
-        "update",
-        "$(rootpath :buf)",
-        _PROTO_ROOT,
-        _BASELINE_ROOT,
-    ],
-    data = _COMPAT_DATA,
-    target_compatible_with = _BUF_COMPATIBLE,
 )

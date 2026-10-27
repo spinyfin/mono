@@ -27,7 +27,6 @@ comment states the rules below in one place.
 | `src/negotiate.rs`                | Epoch and feature-revision selection for `Hello`, and the typed `Reject`.                          |
 | `src/worker_event.rs`             | `boss_protocol::WorkerEvent` ⇄ wire `WorkerEvent`.                                                 |
 | `src/identity.rs`                 | The `urn:boss:host:<id>` certificate identity and the rule that `Hello.host_id` must match it.     |
-| `compat/`                         | The released-schema baseline and the script behind the breaking-change gate.                       |
 | `tests/`                          | Old/new-peer semantics, mTLS duplex streaming, schema rules, toolchain coherence.                  |
 | `//third_party/prost`             | The Bazel prost/tonic codegen toolchain this package uses.                                         |
 
@@ -40,15 +39,14 @@ inputs and pinned tools: protoc is the prebuilt binary the `protobuf` module
 provides, the plugins are built by Bazel, and nothing reads an ambient `protoc`
 or runs a Cargo build script.
 
-| Piece                       | Pin                     | Where                                         |
-| --------------------------- | ----------------------- | --------------------------------------------- |
-| `rules_rust_prost`          | 0.70.0 (patched, below) | `MODULE.bazel`                                |
-| `protobuf` / `rules_proto`  | 34.0.bcr.1 / 7.1.0      | `MODULE.bazel`                                |
-| `prost`, `prost-build`      | 0.13.5                  | `Cargo.lock`                                  |
-| `tonic`, `tonic-build`      | 0.12.3                  | `Cargo.lock`                                  |
-| `protoc-gen-prost`          | 0.4.0                   | `Cargo.toml` (build-dependency), `Cargo.lock` |
-| `protoc-gen-tonic`          | 0.4.1                   | `Cargo.toml` (build-dependency), `Cargo.lock` |
-| `buf` (breaking check only) | 1.73.0, per platform    | `MODULE.bazel`                                |
+| Piece                      | Pin                     | Where                                         |
+| -------------------------- | ----------------------- | --------------------------------------------- |
+| `rules_rust_prost`         | 0.70.0 (patched, below) | `MODULE.bazel`                                |
+| `protobuf` / `rules_proto` | 34.0.bcr.1 / 7.1.0      | `MODULE.bazel`                                |
+| `prost`, `prost-build`     | 0.13.5                  | `Cargo.lock`                                  |
+| `tonic`, `tonic-build`     | 0.12.3                  | `Cargo.lock`                                  |
+| `protoc-gen-prost`         | 0.4.0                   | `Cargo.toml` (build-dependency), `Cargo.lock` |
+| `protoc-gen-tonic`         | 0.4.1                   | `Cargo.toml` (build-dependency), `Cargo.lock` |
 
 Three decisions are not obvious from the build files:
 
@@ -117,33 +115,26 @@ meets something it does not know.
 
 ### The compatibility gate
 
-`proto_breaking_test` runs a pinned `buf breaking` with FILE-level
-compatibility (wire, JSON and generated-source), plus the rule that deleting a
-field or enum value is allowed only if both its number and its name are
-reserved. Both sides are compiled by buf from source, so the check needs no
-protoc and no network. It fails in two situations:
+The root `CHECKS.yaml` enables checkleft's `proto/breaking` check for
+`tools/boss/protocol-spoke/proto/**/*.proto`. Run `checkleft run` with no flags
+(or `bin/checkleft run` to use the repo build). CI runs that repo build in the
+normal `checks` step; no separate tool release or protocol CI step is needed.
 
-1. **Drift.** The schema differs from `compat/baseline/`, the checked-in copy of
-   the released contract. A backward-compatible change is recorded with
-   `bazel run //tools/boss/protocol-spoke:update_baseline`, which first checks
-   the change against the old baseline and refuses a breaking one. Every wire
-   change therefore appears as a visible diff of `compat/baseline/`; review it as
-   a contract change.
-2. **Not compatible with the merge base.** For pull requests, CI stages the
-   baseline from the PR's merge base into `compat/merge_base/`
-   (`.buildkite/steps/stage-spoke-proto-merge-base.sh`) as an input file of the
-   test. This is what stops a pull request from making a breaking change and
-   regenerating the baseline to match. Staging fails closed: on pull-request
-   builds, a fetch or merge-base failure fails the job. The only way to proceed
-   without a merge-base baseline is a pull request that introduces the schema,
-   where the baseline is proven absent at the merge base. Non-PR builds check
-   the checked-in baseline.
+The check compares changed schemas with their content at the change's base
+revision. It rejects field renumbering, reuse, renaming, type or cardinality
+changes and oneof moves; enum renumbering; removed definitions; package changes;
+and changed RPC types or streaming modes. Removed fields and enum values must
+reserve both their names and numbers, and existing reservations must remain.
+New files pass; an unavailable base for a modified file is an error. Deleted
+files are checked too. Parsing happens in-process in the check's WASM sandbox.
+There is no checked-in baseline to regenerate or CI staging step.
 
-If a change is genuinely breaking, do not edit the baseline. Add the new shape
-in a new package (`boss.spoke.v2`) or keep the old field.
+Use change-scoped `checkleft run`: whole-repo mode (`--all`) has no base
+revision and does not run this comparison. For a genuinely breaking change,
+add a new package (`boss.spoke.v2`) or keep the old field.
 
-The gate proves the schema only grows. It cannot prove readers behave correctly
-when they meet the growth, which is what the peer tests are for.
+The gate checks schema evolution. The Rust peer tests below still verify
+reader behavior with unknown fields, enum values and variants.
 
 ## Contract helpers
 
@@ -181,8 +172,3 @@ test sandbox. Loopback TCP is allowed there, so the mTLS test is an ordinary
 | `mtls_duplex_test`         | A tonic hub and spoke over real mTLS: records and commands in both directions, refusal of missing, rogue and mismatched certificates, readable `Reject`, frame bound. |
 | `schema_rules_test`        | Rules every version must satisfy, on Bazel's own descriptor: proto3, `*_UNSPECIFIED = 0`, one `body` oneof on framing messages, the service shapes.                   |
 | `toolchain_coherence_test` | Generator and runtime come from the same prost/tonic releases.                                                                                                        |
-| `proto_breaking_test`      | The compatibility gate above.                                                                                                                                         |
-
-`buf` is pinned for macOS arm64 and Linux x86_64/arm64; on any other platform
-`proto_breaking_test`, `update_baseline` and the `buf` target are skipped as
-incompatible rather than failing analysis.
