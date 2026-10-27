@@ -65,9 +65,7 @@ enum MarkdownDocumentMeasure {
         return false
     }
 
-    /// Not `private`: `MarkdownHeadingSections.headingLines` (below) reuses
-    /// this exact fence toggle so a `# comment` line inside a fenced code
-    /// block isn't mistaken for a heading/section boundary either.
+    /// Fence detection for the lightweight table-width scan.
     static func isFenceDelimiter<S: StringProtocol>(_ line: S) -> Bool {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         return trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~")
@@ -701,8 +699,9 @@ private struct RenderedMarkdownChunk: Identifiable {
 /// so each section can be its own `StructuredText` (bounding layout
 /// recursion and making `LazyVStack` effective). Headings whose exact text
 /// (level markers and surrounding whitespace stripped) appears in
-/// `collapsibleHeadings` become `.collapsible`; every other heading stays
-/// `.plain` and includes its heading line. A pure function over `String` —
+/// `collapsibleHeadings` become `.collapsible` and include their descendants;
+/// other top-level headings start `.plain` chunks with their heading line.
+/// A pure function over `String` —
 /// no Textual/StructuredText involvement — because Textual's block rendering
 /// has no supported hook for grouping or hiding a run of blocks (see the
 /// `HeadingStyle`/`BlockStyleConfiguration` types in `BossMarkdownStyle.swift`:
@@ -714,17 +713,8 @@ private struct RenderedMarkdownChunk: Identifiable {
 /// attributed content by these same source ranges, preserving document-wide
 /// reference definitions.
 enum MarkdownHeadingSections {
-    /// A matched section spans from its heading's own line through the line
-    /// immediately before the NEXT heading of *any* level — not the next
-    /// heading of the *same* level. A revision brief's per-finding headings
-    /// render as `### [severity] ...` directly after the boilerplate's `##
-    /// HARD RULE ...` heading with no intervening heading in between; a
-    /// same-level rule would treat those (deeper) finding headings as
-    /// children of the H2 and fold them along with it — exactly the
-    /// "findings must never collapse" outcome this function exists to
-    /// avoid. Any-level is also simpler to reason about: "this heading's
-    /// own prose, stopping at the very next heading" needs no notion of
-    /// outline nesting at all.
+    /// Fold a complete outline section, including deeper headings, up to the
+    /// next heading of the same or higher level. Plain sections remain lazy.
     static func chunks(in source: String, collapsibleHeadings: Set<String>) -> [MarkdownDocumentChunk] {
         sections(in: source, collapsibleHeadings: collapsibleHeadings).map { section in
             let text = String(source[section.range])
@@ -744,19 +734,26 @@ enum MarkdownHeadingSections {
         if let first = headings.first, first.lineRange.lowerBound > source.startIndex {
             sections.append((nil, source.startIndex..<first.lineRange.lowerBound))
         }
-        for (i, heading) in headings.enumerated() {
-            let end = (i + 1 < headings.count) ? headings[i + 1].lineRange.lowerBound : source.endIndex
+        var i = 0
+        while i < headings.count {
+            let heading = headings[i]
+            var next = i + 1
+            if collapsibleHeadings.contains(heading.text) {
+                while next < headings.count && headings[next].level > heading.level { next += 1 }
+            }
+            let end = next < headings.count ? headings[next].lineRange.lowerBound : source.endIndex
             if collapsibleHeadings.contains(heading.text) {
                 sections.append((heading.text, heading.lineRange.upperBound..<end))
             } else {
                 sections.append((nil, heading.lineRange.lowerBound..<end))
             }
+            i = next
         }
         return sections
     }
 
-    /// Whether `source` contains a markdown ATX heading whose exact text
-    /// (level markers and surrounding whitespace stripped) is `text`. Uses
+    /// Whether `source` contains a top-level Markdown heading whose rendered
+    /// text is `text`. Uses
     /// the same heading scan as `chunks(in:collapsibleHeadings:)`, so a
     /// heading this reports present is one that scan will fold — and a
     /// look-alike inside a fenced code block counts for neither.
@@ -766,58 +763,48 @@ enum MarkdownHeadingSections {
 
     private struct HeadingLine {
         let text: String
+        let level: Int
         /// Spans the heading's own line, INCLUDING its trailing newline (or
         /// through end-of-source if the heading is the last line) — so a
         /// section's body starts exactly at `lineRange.upperBound`.
         let lineRange: Range<String.Index>
     }
 
-    /// Skips fenced code blocks via the same fence toggle
-    /// `MarkdownDocumentMeasure.containsTable` uses, so a `# comment` line
-    /// inside a ``` fence isn't mistaken for a heading/section boundary —
-    /// which would otherwise silently truncate a folded section and leave
-    /// the remainder of its body rendered unfolded.
+    /// Use the CommonMark block tree so headings inside lists, block quotes,
+    /// and fenced code cannot split a top-level paragraph or container.
     private static func headingLines(in source: String) -> [HeadingLine] {
+        guard let document = try? AttributedString(
+            markdown: source, options: .init(appliesSourcePositionAttributes: true)
+        ) else { return [] }
+        var starts = [source.startIndex]
+        for index in source.indices where source[index] == "\n" || source[index] == "\r" || source[index] == "\r\n" {
+            starts.append(source.index(after: index))
+        }
         var results: [HeadingLine] = []
-        var lineStart = source.startIndex
-        var inFencedCode = false
-        while lineStart < source.endIndex {
-            let newline = source[lineStart...].firstIndex(of: "\n")
-            let contentEnd = newline ?? source.endIndex
-            let lineEnd = newline.map(source.index(after:)) ?? source.endIndex
-            let line = source[lineStart..<contentEnd]
-            if MarkdownDocumentMeasure.isFenceDelimiter(line) {
-                inFencedCode.toggle()
-            } else if !inFencedCode, let text = headingText(in: line) {
-                results.append(HeadingLine(text: text, lineRange: lineStart..<lineEnd))
+        for (intent, range) in document.runs[\.presentationIntent] {
+            guard let intent, intent.components.count == 1,
+                  case .header(let level) = intent.components[0].kind else { continue }
+            let content = document[range]
+            let positions = content.runs.compactMap(\.markdownSourcePosition)
+            guard let first = positions.first, let last = positions.last,
+                  first.startLine > 0, last.endLine <= starts.count else { continue }
+            let start = starts[first.startLine - 1]
+            var endLine = last.endLine
+            // Setext heading source positions cover the title, not its underline.
+            let titleEnd = first.startLine < starts.count ? starts[first.startLine] : source.endIndex
+            let titleLine = String(source[start..<titleEnd])
+            let isATX = titleLine.range(of: #"^ {0,3}#{1,6}(?:[ \t\r\n]|$)"#, options: .regularExpression) != nil
+            if endLine < starts.count, !isATX {
+                let nextEnd = endLine + 1 < starts.count ? starts[endLine + 1] : source.endIndex
+                let underline = source[starts[endLine]..<nextEnd].trimmingCharacters(in: .whitespacesAndNewlines)
+                if !underline.isEmpty && (underline.allSatisfy { $0 == "=" } || underline.allSatisfy { $0 == "-" }) {
+                    endLine += 1
+                }
             }
-            lineStart = lineEnd
+            let end = endLine < starts.count ? starts[endLine] : source.endIndex
+            results.append(HeadingLine(text: String(content.characters), level: level, lineRange: start..<end))
         }
         return results
-    }
-
-    /// A markdown ATX heading (`^ {0,3}#{1,6}[ \t]+...`) — CommonMark permits
-    /// up to three leading spaces before the `#` markers, so an indented
-    /// heading is still recognized; returns its trimmed text with the
-    /// leading whitespace and `#` markers stripped, or `nil` if `line` isn't
-    /// a heading.
-    private static func headingText(in line: Substring) -> String? {
-        var index = line.startIndex
-        var leadingSpaces = 0
-        while index < line.endIndex, line[index] == " ", leadingSpaces < 3 {
-            leadingSpaces += 1
-            index = line.index(after: index)
-        }
-        var level = 0
-        while index < line.endIndex, line[index] == "#" {
-            level += 1
-            index = line.index(after: index)
-        }
-        guard level >= 1, level <= 6, index < line.endIndex, line[index] == " " || line[index] == "\t" else {
-            return nil
-        }
-        let text = line[index...].trimmingCharacters(in: .whitespaces)
-        return text.isEmpty ? nil : text
     }
 }
 

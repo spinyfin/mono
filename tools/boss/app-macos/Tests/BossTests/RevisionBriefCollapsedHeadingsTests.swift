@@ -103,8 +103,8 @@ final class RevisionBriefCollapsedHeadingsTests: XCTestCase {
         }
         XCTAssertTrue(preamble.hasPrefix("**Provenance:**"), "the preamble stays visible ahead of the fold")
         XCTAssertTrue(
-            chunks.contains { if case .plain(let text) = $0 { return text.hasPrefix("### [medium]") } else { return false } },
-            "findings must never fold: \(chunks)"
+            chunks.contains { if case .collapsible(_, let text) = $0 { return text.contains("### [medium]") } else { return false } },
+            "nested findings belong to the folded outline: \(chunks)"
         )
     }
 
