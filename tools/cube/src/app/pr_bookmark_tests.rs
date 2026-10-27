@@ -58,10 +58,18 @@ enum Scenario {
     AmbiguousRewrite,
     /// `pr/42` is conflicted against a commit unrelated to anything published.
     AmbiguousUnrelated,
-    /// The incident shape: the pre-rebase commit stays visible through another
+    /// A divergent change: the pre-rebase commit stays visible through another
     /// bookmark, and the pushed resolution shares a change id with the
     /// conflicted rebase result, evolved from the pre-rebase commit.
     Divergent,
+    /// Both rebased commits conflict; only the original tip was recorded.
+    DivergentStack,
+    /// Only the second commit conflicts after rebasing.
+    CleanIntermediate,
+    /// No default trunk bookmark exists; publication must fail closed.
+    UnknownTrunk,
+    /// A clean amend contains unpublished work.
+    UnpublishedAmend,
 }
 
 #[test]
@@ -84,7 +92,33 @@ fn unrelated_ambiguous_pr_bookmark_side_is_still_refused() {
     exercise_publication(Scenario::AmbiguousUnrelated);
 }
 
+#[test]
+fn divergent_two_commit_branch_records_only_the_tip() {
+    exercise_publication(Scenario::DivergentStack);
+}
+
+#[test]
+fn unpublished_amend_is_not_discarded_at_publication() {
+    exercise_publication(Scenario::UnpublishedAmend);
+}
+
+#[test]
+fn clean_rebased_intermediate_is_repaired_at_publication() {
+    exercise_publication(Scenario::CleanIntermediate);
+}
+
+#[test]
+fn publication_without_a_known_trunk_is_refused() {
+    exercise_publication(Scenario::UnknownTrunk);
+}
+
 fn exercise_publication(scenario: Scenario) {
+    let divergent = matches!(
+        scenario,
+        Scenario::Divergent | Scenario::DivergentStack | Scenario::CleanIntermediate
+    );
+    let stack = matches!(scenario, Scenario::DivergentStack | Scenario::CleanIntermediate);
+    let clean_first = scenario == Scenario::CleanIntermediate;
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
@@ -96,8 +130,17 @@ fn exercise_publication(scenario: Scenario) {
     std::fs::write(repo.join("file"), "base\n").unwrap();
     jj(&repo, &["commit", "-m", "base"]);
     jj(&repo, &["bookmark", "set", "base", "-r", "@-"]);
-    std::fs::write(repo.join("file"), "feature\n").unwrap();
+    std::fs::write(repo.join(if clean_first { "first" } else { "file" }), "feature\n").unwrap();
     jj(&repo, &["describe", "-m", "feature"]);
+    if stack {
+        jj(&repo, &["commit", "-m", "first feature commit"]);
+        std::fs::write(
+            repo.join(if clean_first { "file" } else { "second" }),
+            "second feature commit\n",
+        )
+        .unwrap();
+        jj(&repo, &["describe", "-m", "feature tip"]);
+    }
     jj(&repo, &["bookmark", "set", "pr/42", "feature", "-r", "@"]);
     let remote = temp.path().join("remote");
     std::fs::create_dir(&remote).unwrap();
@@ -113,13 +156,23 @@ fn exercise_publication(scenario: Scenario) {
     jj(&repo, &["new", "base", "-m", "upstream"]);
     std::fs::write(repo.join("file"), "upstream\n").unwrap();
     jj(&repo, &["bookmark", "set", "main", "-r", "@"]);
-    jj(&repo, &["rebase", "-r", "feature", "-d", "main"]);
+    if scenario != Scenario::UnknownTrunk {
+        jj(&repo, &["git", "push", "-b", "main", "--allow-new"]);
+    }
+    let first = jj_commit_id(&runner, &repo, if stack { "feature-" } else { "feature" }).unwrap();
+    jj(&repo, &["rebase", "-s", &first, "-d", "main"]);
     assert_eq!(
         jj(&repo, &["log", "-r", "pr/42", "--no-graph", "-T", "conflict"]).trim(),
         "true"
     );
+    if clean_first {
+        assert_eq!(
+            jj(&repo, &["log", "-r", "pr/42-", "--no-graph", "-T", "conflict"]).trim(),
+            "false"
+        );
+    }
     let conflicted = jj_commit_id(&runner, &repo, "pr/42").unwrap();
-    if scenario == Scenario::Divergent {
+    if divergent {
         // Recovery bookmarks keep the pre-rebase commit addressable next to
         // its conflicted rewrite.
         jj(&repo, &["bookmark", "set", "boss-base/test", "-r", &published_before]);
@@ -128,13 +181,26 @@ fn exercise_publication(scenario: Scenario) {
     // A revision stages its own history, preserving the old conflicted head.
     let worker = temp.path().join("worker");
     jj(&repo, &["workspace", "add", worker.to_str().unwrap(), "-r", "main"]);
-    if scenario == Scenario::Divergent {
-        jj(&worker, &["edit", &published_before]);
+    if divergent {
+        if stack {
+            jj(&worker, &["edit", &first]);
+            jj(&worker, &["describe", "-m", "independent first commit"]);
+            jj(&worker, &["rebase", "-r", "@", "-d", "main"]);
+            std::fs::write(worker.join("file"), "upstream and feature\n").unwrap();
+            let resolved_first = jj_commit_id(&runner, &worker, "@").unwrap();
+            jj(&worker, &["edit", &published_before]);
+            jj(&worker, &["describe", "-m", "independent tip"]);
+            jj(&worker, &["rebase", "-r", "@", "-d", &resolved_first]);
+        } else {
+            jj(&worker, &["edit", &published_before]);
+        }
         // Distinguish this rewrite before rebasing: identical metadata and
         // trees can recreate the first conflicted commit within one timestamp
         // tick, so resolving it would replace that side instead of diverging.
         jj(&worker, &["describe", "-m", "independent resolution"]);
-        jj(&worker, &["rebase", "-r", "@", "-d", "main"]);
+        if !stack {
+            jj(&worker, &["rebase", "-r", "@", "-d", "main"]);
+        }
     } else {
         jj(&worker, &["duplicate", "feature", "--insert-before", "@"]);
         jj(&worker, &["edit", "@-"]);
@@ -143,7 +209,7 @@ fn exercise_publication(scenario: Scenario) {
     jj(&worker, &["bookmark", "set", "feature", "-r", "@", "--allow-backwards"]);
     let pushed = jj_commit_id(&runner, &worker, "feature").unwrap();
     assert_ne!(pushed, conflicted);
-    if scenario == Scenario::Divergent {
+    if divergent {
         let change = jj(&repo, &["log", "-r", &conflicted, "--no-graph", "-T", "change_id"]);
         let same_change = jj(
             &repo,
@@ -160,19 +226,38 @@ fn exercise_publication(scenario: Scenario) {
         same_change.sort();
         let mut expected = vec![conflicted.as_str(), pushed.as_str()];
         expected.sort();
-        assert_eq!(same_change, expected, "expected the incident's divergent change");
+        assert_eq!(
+            same_change, expected,
+            "expected the conflicted rebase result and pushed commit to share a divergent change id"
+        );
     }
     assert_eq!(
         jj(&worker, &["log", "-r", &pushed, "--no-graph", "-T", "conflict"]).trim(),
         "false"
     );
 
-    let ambiguous = matches!(scenario, Scenario::AmbiguousRewrite | Scenario::AmbiguousUnrelated);
+    // Navigation and lease repair must refuse the same conflicted rewrite
+    // that publication is permitted to replace.
+    let before = jj_commit_id(&runner, &worker, "pr/42").unwrap();
+    let strict = crate::app::pr_bookmarks::point_pr_bookmark(&runner, None, &worker, 42, &pushed);
+    assert!(strict.is_err(), "launch-time repair must retain the conflicted side");
+    assert_eq!(jj_commit_id(&runner, &worker, "pr/42").unwrap(), before);
+    if scenario == Scenario::UnpublishedAmend {
+        jj(&repo, &["edit", &published_before]);
+        std::fs::write(repo.join("file"), "pending unpublished work\n").unwrap();
+        jj(&repo, &["bookmark", "set", "pr/42", "-r", "@", "--allow-backwards"]);
+    }
+
+    let retained = jj_commit_id(&runner, &worker, "pr/42").unwrap();
+    let ambiguous = matches!(
+        scenario,
+        Scenario::AmbiguousRewrite | Scenario::AmbiguousUnrelated | Scenario::CleanIntermediate
+    );
     if ambiguous {
         // Concurrent bookmark operations can leave two added targets. Publish
         // must resolve that ambiguity explicitly; launch must never pick one.
         let operation = jj(&repo, &["op", "log", "--no-graph", "--limit", "1", "-T", "id"]);
-        if scenario == Scenario::AmbiguousRewrite {
+        if matches!(scenario, Scenario::AmbiguousRewrite | Scenario::CleanIntermediate) {
             // The other target is a rewrite of the conflicted rebase result.
             jj(&repo, &["describe", "-r", &conflicted, "-m", "concurrent rewrite"]);
         } else {
@@ -222,8 +307,8 @@ fn exercise_publication(scenario: Scenario) {
         );
     }
 
-    // Exercise the command recommended by the conflict handoff, including
-    // its real push, verification and shared-bookmark synchronization.
+    // Exercise workspace publication, including its real push, verification
+    // and shared-bookmark synchronization.
     let published = crate::app::tests::with_checkleft_fixture(|| {
         let publisher = PublishFixture {
             worker: &worker,
@@ -249,11 +334,22 @@ fn exercise_publication(scenario: Scenario) {
             "commit_id ++ \"\\n\"",
         ],
     );
-    if scenario == Scenario::AmbiguousUnrelated {
+    if matches!(
+        scenario,
+        Scenario::AmbiguousUnrelated | Scenario::UnpublishedAmend | Scenario::UnknownTrunk
+    ) {
         let error = published.unwrap_err().to_string();
         assert!(error.contains("will not pick a side"), "{error}");
         assert!(error.contains("will not help"), "{error}");
-        assert_eq!(heads.lines().count(), 2, "an unrelated side must not be discarded");
+        assert!(error.contains("cube pr update --branch feature"), "{error}");
+        if !ambiguous {
+            assert_eq!(heads.trim(), retained);
+        }
+        assert_eq!(
+            heads.lines().count(),
+            if ambiguous { 2 } else { 1 },
+            "unpublished content must not be discarded"
+        );
         return;
     }
     published.unwrap();

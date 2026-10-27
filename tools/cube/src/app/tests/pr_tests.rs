@@ -1268,6 +1268,42 @@ fn pr_create_is_idempotent_when_pr_already_exists() {
 }
 
 #[test]
+fn pr_create_existing_pr_with_new_local_commits_recommends_update() {
+    let cwd = std::env::current_dir().unwrap();
+    let runner = FakeRunner::new(vec![
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["git", "remote", "list"],
+            "origin\tgit@github.com:spinyfin/mono.git\n",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "gh",
+            &["api", "repos/spinyfin/mono/pulls?head=spinyfin:my-feature&state=open"],
+            r#"[{"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "-r", "my-feature", "--no-graph", "-T", "commit_id"],
+            "local",
+        ),
+        ExpectedCommand::ok(
+            cwd,
+            "gh",
+            &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
+            "published",
+        ),
+    ]);
+    let cli = Cli::parse_from(["cube", "pr", "create", "--branch", "my-feature", "--title", "Update"]);
+    let error = run_with_dependencies(cli, None, &runner).unwrap_err().to_string();
+    runner.assert_exhausted();
+    assert!(error.contains("cube pr update --branch my-feature"), "{error}");
+    assert!(!error.contains("push did not reach"), "{error}");
+}
+
+#[test]
 fn pr_update_pushes_when_pr_exists() {
     // `cube pr update` pushes new commits to the existing PR's branch and
     // never calls `gh pr create`.
@@ -1908,7 +1944,7 @@ fn publication_fails_if_bookmark_verification_observes_multiple_heads() {
     let error = crate::app::pr::record_published_pr_head(&runner, &cwd, "feature", Some(42), "published").unwrap_err();
     assert!(error.to_string().contains("publication bookkeeping failed"));
     assert!(error.to_string().contains("push succeeded"));
-    assert!(error.to_string().contains("cube pr create --branch feature"));
+    assert!(error.to_string().contains("cube pr update --branch feature"));
     runner.assert_exhausted();
 }
 

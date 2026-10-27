@@ -476,7 +476,7 @@ fn rebase_conflicts_skip_push_and_name_the_bookmark() {
     assert_eq!(result.payload["conflicted_files"][0], "src/foo.rs");
     assert!(result.message.starts_with("REBASED_WITH_CONFLICTS"));
     assert!(
-        result.message.contains("cube workspace push --bookmark boss/exec_c"),
+        result.message.contains("cube pr update --branch boss/exec_c"),
         "conflict message names the exact push command: {}",
         result.message
     );
