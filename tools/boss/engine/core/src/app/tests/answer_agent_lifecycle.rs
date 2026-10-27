@@ -228,3 +228,57 @@ async fn an_agent_that_never_replied_still_completes_on_the_turn_boundary() {
         "an unanswered question must still leave the 'in flight' state, but must never read as answered",
     );
 }
+
+#[tokio::test]
+async fn answer_agent_bind_failure_records_cancellation_cause() {
+    let (state, dir) = test_server_state();
+    let db = &state.work_db;
+    let comment = db
+        .create_comment(boss_protocol::CreateCommentInput {
+            artifact_kind: "pr_doc".to_owned(),
+            artifact_id: "pr_doc:git@github.com:spinyfin/mono.git:main:docs/design.md".to_owned(),
+            doc_version: "v1".to_owned(),
+            anchor: boss_protocol::CommentAnchor {
+                exact: "quote".to_owned(),
+                prefix: String::new(),
+                suffix: String::new(),
+            },
+            body: "Why retry?".to_owned(),
+            author: "operator".to_owned(),
+            plain_text_projection_version: 0,
+        })
+        .unwrap();
+    db.set_comment_intent(&comment.id, boss_protocol::INTENT_QUESTION, 0.9)
+        .unwrap();
+    let comment = db.transition_comment_to_answering(&comment.id).unwrap();
+    let conn = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
+    conn.execute_batch("CREATE TRIGGER reject_answer_bind BEFORE UPDATE OF execution_id ON answer_agent_runs BEGIN SELECT RAISE(ABORT, 'injected bind failure'); END;").unwrap();
+    comments::finish_answer_agent_spawn(
+        &state,
+        db,
+        "session",
+        "request",
+        &comment,
+        "git@github.com:spinyfin/mono.git",
+        0,
+        "answer spawned",
+        WorkDb::transition_comment_answering_to_active,
+    )
+    .await;
+    let rows: Vec<_> = db
+        .list_executions(None)
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.work_item_id == comment.id)
+        .collect();
+    assert_eq!(rows.len(), 1);
+    crate::test_support::assert_cancel_provenance(
+        &rows[0],
+        boss_protocol::CancelSource::AnswerAgent,
+        "answer_agent_spawn",
+        &format!(
+            "answer-agent execution for comment {} could not be bound to its run",
+            comment.id
+        ),
+    );
+}

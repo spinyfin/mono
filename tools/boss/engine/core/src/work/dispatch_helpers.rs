@@ -1,4 +1,6 @@
-use super::dispatch_admission::{primary_pr_awaits_review, work_item_is_deliberately_parked};
+use super::dispatch_admission::{
+    dispatch_retry_at_for_execution, primary_pr_awaits_review, work_item_is_deliberately_parked,
+};
 use super::*;
 
 /// Shared per-product short-id read-modify-write. Reads the current
@@ -424,28 +426,6 @@ pub(crate) fn compute_task_runtime(
         cacheable: !wait.reads_other_items,
         expires_at,
     })
-}
-
-/// `TaskRuntime.dispatch_retry_at` for one execution: `Some(epoch_secs)`
-/// only while the execution is `ready` but withheld by
-/// `record_pre_start_failure`'s in-process backoff after a pre-spawn
-/// failure — i.e. it has failed at least once and `dispatch_not_before`
-/// is still in the future. `None` for a fresh `ready` execution (no
-/// failure yet — a genuine capacity wait) and once the backoff window
-/// has elapsed (the execution is a normal dispatch candidate again).
-///
-/// `now_secs` is the instant the backoff window is judged against; the
-/// caller passes the live clock so tests can pin it.
-fn dispatch_retry_at_for_execution(execution: &WorkExecution, now_secs: i64) -> Option<String> {
-    if execution.status != ExecutionStatus::Ready || execution.pre_start_failure_count <= 0 {
-        return None;
-    }
-    let dispatch_not_before: i64 = execution.dispatch_not_before.as_deref()?.parse().ok()?;
-    if dispatch_not_before > now_secs {
-        Some(dispatch_not_before.to_string())
-    } else {
-        None
-    }
 }
 
 pub(crate) fn query_latest_run(conn: &Connection, execution_id: &str) -> Result<Option<(String, String)>> {
@@ -1749,7 +1729,14 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                 );
                 return query_execution(conn, &existing.id).require("execution", &existing.id);
             } else {
-                abandon_stale_governing(pending, conn, &existing, &work_item_id)?;
+                abandon_stale_governing(
+                    pending,
+                    conn,
+                    &existing,
+                    &work_item_id,
+                    latest_id.as_deref(),
+                    live_id.as_deref(),
+                )?;
             }
         } else {
             tracing::info!(

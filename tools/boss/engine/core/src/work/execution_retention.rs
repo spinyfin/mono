@@ -316,7 +316,7 @@ mod tests {
             .request_execution(RequestExecutionInput::builder().work_item_id(work_item_id).build())
             .unwrap();
         let conn = db.connect().unwrap();
-        // Decision-terminal fixtures must stamp provenance: the schema-53
+        // Decision-terminal fixtures must stamp provenance: the schema-56
         // trigger refuses a `cancelled`/`abandoned` write that omits it.
         conn.execute(
             "UPDATE work_executions

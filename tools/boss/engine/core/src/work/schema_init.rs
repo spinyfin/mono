@@ -908,7 +908,7 @@ mod tests {
 
 /// Add the schema-56 `cancel_*` columns unless they are already there. The
 /// schema-43 recovery re-arm cancels executions while migrating an older
-/// database, before step 53 would add them, so it calls this first; step 53
+/// database, before step 56 would add them, so it calls this first; step 56
 /// calls it again and finds nothing left to do.
 pub(crate) fn ensure_cancel_provenance_columns(conn: &Connection) -> Result<()> {
     if !table_has_column(conn, "work_executions", "cancel_source")? {

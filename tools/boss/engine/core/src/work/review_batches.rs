@@ -1976,7 +1976,7 @@ impl WorkDb {
             .to_string();
         let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
         let sql = format!(
-            "SELECT b.id, b.cycle_root_id, b.pr_url, t.deleted_at
+            "SELECT b.id, b.cycle_root_id, b.pr_url, t.deleted_at, CASE WHEN t.deleted_at IS NOT NULL THEN 'root deleted' WHEN b.phase != 'post_merge' AND t.status IN ('done', 'archived') THEN 'root ' || t.status ELSE 'batch stale without live or retryable members' END
              FROM pr_review_batches b
              JOIN tasks t ON t.id = b.cycle_root_id
              WHERE b.status NOT IN ('completed', 'failed')
@@ -2014,7 +2014,7 @@ impl WorkDb {
              ORDER BY b.updated_at ASC, b.id ASC"
         );
         let mut conn = self.connect()?;
-        let rows: Vec<(String, String, String, Option<String>)> = {
+        let rows: Vec<(String, String, String, Option<String>, String)> = {
             let mut statement = conn.prepare(&sql)?;
             let mapped = statement.query_map(params![cutoff], |row| {
                 Ok((
@@ -2022,13 +2022,14 @@ impl WorkDb {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })?;
             mapped.collect::<rusqlite::Result<Vec<_>>>()?
         };
         let now = now_string();
         let mut reaped = Vec::new();
-        for (batch_id, cycle_root_id, pr_url, deleted_at) in rows {
+        for (batch_id, cycle_root_id, pr_url, deleted_at, cause) in rows {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let mut pending = PendingEvents::new();
             let changed = tx.execute(
@@ -2065,8 +2066,7 @@ impl WorkDb {
                 boss_protocol::CancelSource::ReviewBatch,
                 "reap_inert_review_batches",
                 format!(
-                    "review batch {batch_id} for cycle root {cycle_root_id} was reaped (root deleted, \
-                     settled, or the batch went stale), so its member reviewers were abandoned"
+                    "review batch {batch_id} for cycle root {cycle_root_id} was reaped ({cause}), so its member reviewers were abandoned"
                 ),
             );
             let members = capture_doomed(

@@ -522,7 +522,7 @@ pub enum FrontendRequest {
     /// [`FrontendEvent::AttentionCreated`].
     CreateAttention {
         #[serde(flatten)]
-        input: CreateAttentionInput,
+        input: Box<CreateAttentionInput>,
     },
 
     CreateAttentionItem {
@@ -674,6 +674,9 @@ pub enum FrontendRequest {
     },
 
     DeleteWorkItem {
+        /// Required when this mutation ends an execution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel: Option<crate::CancelProvenance>,
         id: String,
     },
 
@@ -2867,6 +2870,9 @@ pub enum FrontendRequest {
     /// and reported back so the operator decides what to do with them.
     /// Replies with [`FrontendEvent::UnpopulateProjectResult`].
     UnpopulateProject {
+        /// Required when this mutation ends an execution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel: Option<crate::CancelProvenance>,
         project_id: String,
         /// The `planner_runs.id` (`run_…`) to undo.
         run_id: String,
@@ -2891,8 +2897,11 @@ pub enum FrontendRequest {
     },
 
     UpdateWorkItem {
+        /// Required when this mutation ends an execution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel: Option<crate::CancelProvenance>,
         id: String,
-        patch: WorkItemPatch,
+        patch: Box<WorkItemPatch>,
     },
 
     /// Snapshot every engine worker pool's (main, automation, review)

@@ -13,8 +13,7 @@ use super::*;
 use boss_protocol::{
     BranchNaming, CoordinatorRecreateReason, CreateIdeaInput, ExecutionKind, ExecutionStatus, FrontendEvent,
     FrontendRequest, Idea, IdeaGraduationKind, IdeaPatch, IdeaStatus, Product, ProposalKind, Task, TaskKind,
-    TaskStatus, WorkExecution, WorkItemDependencyDetail, WorkItemPatch, WorkRun, WorkerContextBundle,
-    WorkerTierDenialReason,
+    TaskStatus, WorkExecution, WorkItemDependencyDetail, WorkRun, WorkerContextBundle, WorkerTierDenialReason,
 };
 use policy::variant_name;
 use serde_json::json;
@@ -301,8 +300,16 @@ fn mutating_taxonomy_verbs_are_denied_and_name_a_proposal_verb() {
     );
 
     let denial = assert_denied(FrontendRequest::UpdateWorkItem {
+        cancel: Some(
+            boss_protocol::CancelProvenance::new(
+                boss_protocol::CancelSource::Bossctl,
+                "requesting client",
+                "apply requested work item changes",
+            )
+            .unwrap(),
+        ),
         id: "task_1".into(),
-        patch: WorkItemPatch::default(),
+        patch: Box::default(),
     });
     assert_eq!(denial.reason, WorkerTierDenialReason::MutatingTaxonomy);
     assert!(denial.use_instead.is_some());
@@ -379,7 +386,17 @@ fn every_denial_tells_the_worker_what_to_do_next() {
                 .name("x")
                 .build(),
         },
-        FrontendRequest::DeleteWorkItem { id: "task_1".into() },
+        FrontendRequest::DeleteWorkItem {
+            cancel: Some(
+                boss_protocol::CancelProvenance::new(
+                    boss_protocol::CancelSource::Bossctl,
+                    "requesting client",
+                    "delete work item and its revision chain",
+                )
+                .unwrap(),
+            ),
+            id: "task_1".into(),
+        },
         FrontendRequest::GetDispatchState,
         FrontendRequest::ListHosts,
         FrontendRequest::TrunkStatus,

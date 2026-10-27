@@ -359,6 +359,28 @@ impl WorkDb {
     }
 }
 
+/// `TaskRuntime.dispatch_retry_at` for one execution: `Some(epoch_secs)`
+/// only while the execution is `ready` but withheld by
+/// `record_pre_start_failure`'s in-process backoff after a pre-spawn
+/// failure — i.e. it has failed at least once and `dispatch_not_before`
+/// is still in the future. `None` for a fresh `ready` execution (no
+/// failure yet — a genuine capacity wait) and once the backoff window
+/// has elapsed (the execution is a normal dispatch candidate again).
+///
+/// `now_secs` is the instant the backoff window is judged against; the
+/// caller passes the live clock so tests can pin it.
+pub(crate) fn dispatch_retry_at_for_execution(execution: &WorkExecution, now_secs: i64) -> Option<String> {
+    if execution.status != ExecutionStatus::Ready || execution.pre_start_failure_count <= 0 {
+        return None;
+    }
+    let dispatch_not_before: i64 = execution.dispatch_not_before.as_deref()?.parse().ok()?;
+    if dispatch_not_before > now_secs {
+        Some(dispatch_not_before.to_string())
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod churn_guard_parked_fact_tests {
     use crate::test_support::*;

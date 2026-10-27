@@ -2,7 +2,7 @@
 //!
 //! Every write that moves an execution to one of those statuses stamps
 //! `cancel_source` / `cancel_actor` / `cancel_reason` in the same `UPDATE`
-//! (the schema-53 trigger refuses the write otherwise) and then calls
+//! (the schema-56 trigger refuses the write otherwise) and then calls
 //! [`stage_decision_terminal`], which stages the `ExecutionTerminal` event
 //! and the matching `engine-audit.log` record to flush after commit.
 
@@ -11,8 +11,7 @@ use boss_protocol::{CancelProvenance, CancelSource, ExecutionStatus};
 use super::*;
 
 /// Caller context only the RPC layer knows, carried into the audit record so
-/// the extended `execution_cancelled` event keeps every field it had before
-/// provenance existed.
+/// `execution_cancelled` includes the request options and socket peer.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DecisionAuditContext {
     /// `Some` for a cancel that arrived as `CancelExecution`.
@@ -30,9 +29,8 @@ fn audit_event_name(status: &ExecutionStatus) -> &'static str {
     }
 }
 
-/// The audit payload for one execution ended by decision. Extends the
-/// original `execution_cancelled` record (`execution_id`, `work_item_id`,
-/// `from_status`, `reason`, `queued_only`, `peer_pid`) with who did it.
+/// The audit payload identifies the execution, status transition, caller,
+/// cause, request options and socket peer.
 pub(crate) fn decision_audit_payload(
     execution_id: &str,
     work_item_id: &str,
@@ -150,10 +148,14 @@ pub(crate) fn abandon_stale_governing(
     conn: &Connection,
     existing: &WorkExecution,
     work_item_id: &str,
+    latest_id: Option<&str>,
+    live_id: Option<&str>,
 ) -> Result<()> {
     tracing::info!(
         work_item_id = %work_item_id,
         governing_execution_id = %existing.id,
+        latest_execution_id = ?latest_id,
+        live_execution_id = ?live_id,
         governing_status = %existing.status,
         decision = "abandon_stale_and_redispatch",
         "dispatch_decision: governing execution not live (worker gone) — \
@@ -195,10 +197,7 @@ pub(crate) fn abandon_stale_governing(
     Ok(())
 }
 
-/// Like [`stage_doomed`], but stages only the audit records. For the sites
-/// that ended executions without ever publishing `ExecutionTerminal`: adding
-/// the event there would be a behaviour change this provenance work must not
-/// make, while the audit record is purely additive.
+/// These sites do not publish `ExecutionTerminal`; only provenance is staged.
 pub(crate) fn stage_doomed_audit_only(
     pending: &mut PendingEvents,
     doomed: &[DoomedExecution],

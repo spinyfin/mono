@@ -1030,8 +1030,8 @@ pub(super) async fn rpc_cancel_actor(
         "non_app_client"
     };
     match peer_pid {
-        Some(pid) => format!("{tier} via {via} (peer pid {pid})"),
-        None => format!("{tier} via {via} (peer pid not observed)"),
+        Some(pid) => format!("{tier} via {via} session {session_id} (peer pid {pid})"),
+        None => format!("{tier} via {via} session {session_id} (peer pid not observed)"),
     }
 }
 

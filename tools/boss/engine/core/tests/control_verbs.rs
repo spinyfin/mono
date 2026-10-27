@@ -167,11 +167,19 @@ async fn work_cancel_marks_execution_cancelled() -> Result<()> {
     // queued cancel leaves kanban alone — see work/tests).
     client
         .send_request(&FrontendRequest::UpdateWorkItem {
+            cancel: Some(
+                boss_protocol::CancelProvenance::new(
+                    boss_protocol::CancelSource::Bossctl,
+                    "requesting client",
+                    "apply requested work item changes",
+                )
+                .unwrap(),
+            ),
             id: work_item_id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 status: Some("active".to_owned()),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?;
     assert_eq!(fetch_task_status(&mut client, &work_item_id).await?, TaskStatus::Active);
@@ -205,7 +213,8 @@ async fn work_cancel_marks_execution_cancelled() -> Result<()> {
         .cancel_provenance
         .expect("cancel RPC must stamp provenance on the execution");
     assert_eq!(provenance.source, boss_protocol::CancelSource::Bossctl);
-    assert_eq!(provenance.actor, "control_verbs_test");
+    assert!(provenance.actor.contains("via non_app_client"), "{}", provenance.actor);
+    assert!(provenance.actor.contains("client claims control_verbs_test"));
     assert_eq!(provenance.reason, "operator cancelled from control-verbs test");
 
     // Live cancel of the current execution: active → todo so the kanban
@@ -1103,11 +1112,19 @@ async fn kanban_drag_to_doing_dispatches_autostart_false_chore() -> Result<()> {
     // — without it, the chore sat `active` with no execution.
     let updated = match client
         .send_request(&FrontendRequest::UpdateWorkItem {
+            cancel: Some(
+                boss_protocol::CancelProvenance::new(
+                    boss_protocol::CancelSource::Bossctl,
+                    "requesting client",
+                    "apply requested work item changes",
+                )
+                .unwrap(),
+            ),
             id: chore.id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 status: Some("active".to_owned()),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?
     {
@@ -1187,11 +1204,19 @@ async fn kanban_drag_to_doing_is_idempotent_on_repeat() -> Result<()> {
     // First drag: creates exec #1.
     let _ = client
         .send_request(&FrontendRequest::UpdateWorkItem {
+            cancel: Some(
+                boss_protocol::CancelProvenance::new(
+                    boss_protocol::CancelSource::Bossctl,
+                    "requesting client",
+                    "apply requested work item changes",
+                )
+                .unwrap(),
+            ),
             id: chore.id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 status: Some("active".to_owned()),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?;
     let after_first = list_executions_for(&mut client, &chore.id).await?;
@@ -1203,11 +1228,19 @@ async fn kanban_drag_to_doing_is_idempotent_on_repeat() -> Result<()> {
     // ready exec or insert a duplicate.
     let _ = client
         .send_request(&FrontendRequest::UpdateWorkItem {
+            cancel: Some(
+                boss_protocol::CancelProvenance::new(
+                    boss_protocol::CancelSource::Bossctl,
+                    "requesting client",
+                    "apply requested work item changes",
+                )
+                .unwrap(),
+            ),
             id: chore.id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 status: Some("active".to_owned()),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?;
     let after_second = list_executions_for(&mut client, &chore.id).await?;
@@ -1269,11 +1302,19 @@ async fn kanban_drag_emits_status_transition_event() -> Result<()> {
 
     let _ = client
         .send_request(&FrontendRequest::UpdateWorkItem {
+            cancel: Some(
+                boss_protocol::CancelProvenance::new(
+                    boss_protocol::CancelSource::Bossctl,
+                    "requesting client",
+                    "apply requested work item changes",
+                )
+                .unwrap(),
+            ),
             id: chore.id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 status: Some("active".to_owned()),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?;
 
@@ -1301,11 +1342,19 @@ async fn kanban_drag_emits_status_transition_event() -> Result<()> {
     // requires an actual transition.
     let _ = client
         .send_request(&FrontendRequest::UpdateWorkItem {
+            cancel: Some(
+                boss_protocol::CancelProvenance::new(
+                    boss_protocol::CancelSource::Bossctl,
+                    "requesting client",
+                    "apply requested work item changes",
+                )
+                .unwrap(),
+            ),
             id: chore.id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 status: Some("active".to_owned()),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?;
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1340,11 +1389,19 @@ async fn kanban_drag_to_doing_rejects_chore_with_no_resolvable_repo() -> Result<
     // status=active and only a tracing WARN records the failure.
     let response = client
         .send_request(&FrontendRequest::UpdateWorkItem {
+            cancel: Some(
+                boss_protocol::CancelProvenance::new(
+                    boss_protocol::CancelSource::Bossctl,
+                    "requesting client",
+                    "apply requested work item changes",
+                )
+                .unwrap(),
+            ),
             id: chore.id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 status: Some("active".to_owned()),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?;
     match response {
@@ -1414,11 +1471,19 @@ async fn kanban_drag_emits_status_transition_error_when_repo_unresolvable() -> R
 
     let _ = client
         .send_request(&FrontendRequest::UpdateWorkItem {
+            cancel: Some(
+                boss_protocol::CancelProvenance::new(
+                    boss_protocol::CancelSource::Bossctl,
+                    "requesting client",
+                    "apply requested work item changes",
+                )
+                .unwrap(),
+            ),
             id: chore.id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 status: Some("active".to_owned()),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?;
 
@@ -1505,11 +1570,19 @@ async fn seed_unresolvable_chore(client: &mut BossClient) -> Result<boss_protoco
     // matching the bossctl `product update --repo ""` clear path.
     match client
         .send_request(&FrontendRequest::UpdateWorkItem {
+            cancel: Some(
+                boss_protocol::CancelProvenance::new(
+                    boss_protocol::CancelSource::Bossctl,
+                    "requesting client",
+                    "apply requested work item changes",
+                )
+                .unwrap(),
+            ),
             id: product.id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 repo_remote_url: Some(String::new()),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?
     {
@@ -1706,12 +1779,20 @@ async fn board_drop_inside_merging_group_does_not_complete_the_merge() -> Result
     // open (`in_review`) and sitting in the merge queue.
     client
         .send_request(&FrontendRequest::UpdateWorkItem {
+            cancel: Some(
+                boss_protocol::CancelProvenance::new(
+                    boss_protocol::CancelSource::Bossctl,
+                    "requesting client",
+                    "apply requested work item changes",
+                )
+                .unwrap(),
+            ),
             id: chore.id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 status: Some("in_review".to_owned()),
                 pr_url: Some("https://github.com/spinyfin/mono/pull/1".to_owned()),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?;
     let work_db = WorkDb::open(engine.db_path.clone())?;
@@ -1894,12 +1975,20 @@ async fn board_drop_on_own_column_is_a_reorder_for_a_blocked_row() -> Result<()>
     // `blocked` for a non-review reason renders in Backlog.
     client
         .send_request(&FrontendRequest::UpdateWorkItem {
+            cancel: Some(
+                boss_protocol::CancelProvenance::new(
+                    boss_protocol::CancelSource::Bossctl,
+                    "requesting client",
+                    "apply requested work item changes",
+                )
+                .unwrap(),
+            ),
             id: chore.id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 status: Some("blocked".to_owned()),
                 blocked_reason: Some("waiting_on_human".to_owned()),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?;
     assert_eq!(fetch_task_status(&mut client, &chore.id).await?, TaskStatus::Blocked);
@@ -2047,11 +2136,19 @@ async fn board_drop_from_doing_to_backlog_clears_autostart_on_a_dispatch_pending
     };
     client
         .send_request(&FrontendRequest::UpdateWorkItem {
+            cancel: Some(
+                boss_protocol::CancelProvenance::new(
+                    boss_protocol::CancelSource::Bossctl,
+                    "requesting client",
+                    "apply requested work item changes",
+                )
+                .unwrap(),
+            ),
             id: chore.id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 autostart: Some(true),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?;
     let armed = fetch_task(&mut client, &chore.id).await?;
@@ -2072,5 +2169,163 @@ async fn board_drop_from_doing_to_backlog_clears_autostart_on_a_dispatch_pending
         !parked.autostart,
         "Doing → Backlog must clear autostart, or the card snaps back to Doing"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn stop_run_requires_source_and_records_attested_provenance() -> Result<()> {
+    let engine = spawn_engine().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let seeded = seed_execution(&mut client).await?;
+    let db = WorkDb::open(engine.db_path.clone())?;
+    db.start_execution_run(
+        &seeded.execution_id,
+        "test-worker",
+        "mono",
+        "lease",
+        "workspace",
+        "/tmp/workspace",
+    )?;
+    let response = client
+        .send_request(&FrontendRequest::StopRun {
+            run_id: seeded.execution_id.clone(),
+            source: None,
+            actor: Some("operator".to_owned()),
+            reason: Some("stop stuck worker".to_owned()),
+        })
+        .await?;
+    assert!(matches!(response, FrontendEvent::Error { message } if message.contains("no `source`")));
+    assert_eq!(db.get_execution(&seeded.execution_id)?.status, ExecutionStatus::Running);
+    let response = client
+        .send_request(&FrontendRequest::StopRun {
+            run_id: seeded.execution_id.clone(),
+            source: Some(boss_protocol::CancelSource::Bossctl),
+            actor: Some("operator".to_owned()),
+            reason: Some("stop stuck worker".to_owned()),
+        })
+        .await?;
+    assert!(matches!(response, FrontendEvent::RunStopped { .. }));
+    let execution = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let execution = db.get_execution(&seeded.execution_id)?;
+            if execution.status == ExecutionStatus::Cancelled {
+                return Ok::<_, anyhow::Error>(execution);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    let provenance = execution.cancel_provenance.unwrap();
+    assert_eq!(provenance.source, boss_protocol::CancelSource::Bossctl);
+    assert!(provenance.actor.contains("via non_app_client"));
+    assert!(provenance.actor.contains("client claims operator"));
+    assert_eq!(provenance.reason, "stop stuck worker");
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_backlog_and_delete_record_the_actual_request() -> Result<()> {
+    for delete in [false, true] {
+        let engine = spawn_engine().await?;
+        let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+        let seeded = seed_execution(&mut client).await?;
+        let db = WorkDb::open(engine.db_path.clone())?;
+        db.update_work_item(&seeded.work_item_id, WorkItemPatch::builder().status("active").build())?;
+        db.start_execution_run(
+            &seeded.execution_id,
+            "test-worker",
+            "mono",
+            "lease",
+            "workspace",
+            "/tmp/workspace",
+        )?;
+        let reason = if delete {
+            "delete obsolete task"
+        } else {
+            "return task to backlog for replanning"
+        };
+        let cancel = Some(boss_protocol::CancelProvenance::new(
+            boss_protocol::CancelSource::BossCli,
+            "operator",
+            reason,
+        )?);
+        let request = if delete {
+            FrontendRequest::DeleteWorkItem {
+                id: seeded.work_item_id.clone(),
+                cancel,
+            }
+        } else {
+            FrontendRequest::UpdateWorkItem {
+                id: seeded.work_item_id.clone(),
+                patch: Box::new(WorkItemPatch::builder().status("todo").build()),
+                cancel,
+            }
+        };
+        let response = client.send_request(&request).await?;
+        assert!(
+            !matches!(response, FrontendEvent::WorkError { .. } | FrontendEvent::Error { .. }),
+            "{response:?}"
+        );
+        let execution = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let execution = db.get_execution(&seeded.execution_id)?;
+                if execution.status == ExecutionStatus::Cancelled {
+                    return Ok::<_, anyhow::Error>(execution);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        let provenance = execution.cancel_provenance.unwrap();
+        assert_eq!(provenance.source, boss_protocol::CancelSource::BossCli);
+        assert!(provenance.actor.contains("via non_app_client"));
+        assert!(provenance.actor.contains("client claims operator"));
+        assert!(provenance.reason.ends_with(reason));
+        if !delete {
+            assert!(provenance.reason.contains("moved from active to todo"));
+        }
+        assert!(!provenance.reason.contains("kanban drag"));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn deferral_requires_and_preserves_caller_provenance() -> Result<()> {
+    let engine = spawn_engine().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let seeded = seed_execution(&mut client).await?;
+    let db = WorkDb::open(engine.db_path.clone())?;
+    let response = client
+        .send_request(&FrontendRequest::UpdateWorkItem {
+            id: seeded.work_item_id.clone(),
+            patch: Box::new(WorkItemPatch::builder().deferred(true).build()),
+            cancel: None,
+        })
+        .await?;
+    assert!(matches!(response, FrontendEvent::WorkError { message } if message.contains("requires cancel")));
+    assert!(db.get_execution(&seeded.execution_id)?.cancel_provenance.is_none());
+    let response = client
+        .send_request(&FrontendRequest::UpdateWorkItem {
+            id: seeded.work_item_id.clone(),
+            patch: Box::new(WorkItemPatch::builder().deferred(true).build()),
+            cancel: Some(boss_protocol::CancelProvenance::new(
+                boss_protocol::CancelSource::BossCli,
+                "operator",
+                "wait for the revised design",
+            )?),
+        })
+        .await?;
+    assert!(
+        matches!(response, FrontendEvent::WorkItemUpdated { .. }),
+        "{response:?}"
+    );
+    let row = db.get_execution(&seeded.execution_id)?;
+    assert_eq!(row.status, ExecutionStatus::Abandoned);
+    let provenance = row.cancel_provenance.unwrap();
+    assert_eq!(provenance.source, boss_protocol::CancelSource::BossCli);
+    assert!(provenance.actor.contains("via non_app_client"));
+    assert!(provenance.actor.contains("client claims operator"));
+    assert!(provenance.reason.contains("reclassified as deferred"));
+    assert!(provenance.reason.contains("wait for the revised design"));
     Ok(())
 }

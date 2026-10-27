@@ -75,30 +75,6 @@ impl WorkerCompletionHandler {
         self
     }
 
-    /// Record, in the dispatch timeline, that `execution_id` was cancelled by
-    /// decision and by whom. Emitted only after the durable cancellation
-    /// succeeded, for every cancel path that holds a completion handler; the
-    /// engine audit log and the execution row carry the same provenance for
-    /// the paths that do not.
-    pub(crate) async fn record_execution_cancelled(
-        &self,
-        execution_id: &str,
-        provenance: &boss_protocol::CancelProvenance,
-    ) {
-        let work_item_id = self.work_db.get_execution(execution_id).ok().map(|e| e.work_item_id);
-        let mut event = DispatchEvent::new(Stage::ExecutionCancelled, DispatchOutcome::Ok, execution_id);
-        if let Some(work_item_id) = &work_item_id {
-            event = event.with_work_item(work_item_id);
-        }
-        self.dispatch_events
-            .emit(event.with_details(serde_json::json!({
-                "source": provenance.source.as_str(),
-                "actor": &provenance.actor,
-                "reason": &provenance.reason,
-            })))
-            .await;
-    }
-
     /// Record the merge poller's intentional cancellation of a revision
     /// execution after its parent PR merged. This is emitted only after the
     /// durable cancellation succeeds.

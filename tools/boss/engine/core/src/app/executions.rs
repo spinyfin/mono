@@ -779,6 +779,7 @@ pub(super) async fn handle_stop_run(ctx: Dispatch, req: FrontendRequest) {
         sink,
         request_id,
         peer_pid,
+        session_id,
         ..
     } = ctx;
     let FrontendRequest::StopRun {
@@ -818,21 +819,25 @@ pub(super) async fn handle_stop_run(ctx: Dispatch, req: FrontendRequest) {
             );
             return;
         }
-        let provenance =
-            match super::cancel_rpc::provenance_from_request(source, reason.as_deref(), actor.as_deref(), peer_pid) {
-                Ok(provenance) => provenance,
-                Err(refusal) => {
-                    tracing::warn!(run_id = %run_id, ?refusal, "stop_run rejected: missing cancel provenance");
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::Error {
-                            message: refusal.message("stop_run"),
-                        },
-                    );
-                    return;
-                }
-            };
+        let provenance = match super::cancel_rpc::provenance_from_request(
+            source,
+            reason.as_deref(),
+            actor.as_deref(),
+            &rpc_cancel_actor(&server_state, &session_id, peer_pid).await,
+        ) {
+            Ok(provenance) => provenance,
+            Err(refusal) => {
+                tracing::warn!(run_id = %run_id, ?refusal, "stop_run rejected: missing cancel provenance");
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::Error {
+                        message: refusal.message("stop_run"),
+                    },
+                );
+                return;
+            }
+        };
         tracing::info!(
             run_id = %run_id,
             source = %provenance.source,
@@ -948,6 +953,7 @@ pub(super) async fn handle_cancel_execution(ctx: Dispatch, req: FrontendRequest)
         sink,
         request_id,
         peer_pid,
+        session_id,
         ..
     } = ctx;
     let FrontendRequest::CancelExecution {
@@ -978,25 +984,29 @@ pub(super) async fn handle_cancel_execution(ctx: Dispatch, req: FrontendRequest)
         }
         // A cancel with no recorded source, reason or actor never happens:
         // refuse before touching the row.
-        let provenance =
-            match super::cancel_rpc::provenance_from_request(source, reason.as_deref(), actor.as_deref(), peer_pid) {
-                Ok(provenance) => provenance,
-                Err(refusal) => {
-                    tracing::warn!(
-                        execution_id = %execution_id,
-                        ?refusal,
-                        "cancel_execution rejected: missing cancel provenance",
-                    );
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::Error {
-                            message: refusal.message("cancel_execution"),
-                        },
-                    );
-                    return;
-                }
-            };
+        let provenance = match super::cancel_rpc::provenance_from_request(
+            source,
+            reason.as_deref(),
+            actor.as_deref(),
+            &rpc_cancel_actor(&server_state, &session_id, peer_pid).await,
+        ) {
+            Ok(provenance) => provenance,
+            Err(refusal) => {
+                tracing::warn!(
+                    execution_id = %execution_id,
+                    ?refusal,
+                    "cancel_execution rejected: missing cancel provenance",
+                );
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::Error {
+                        message: refusal.message("cancel_execution"),
+                    },
+                );
+                return;
+            }
+        };
         let opts = crate::work::CancelExecutionOpts {
             queued_only,
             peer_pid,
@@ -1012,14 +1022,7 @@ pub(super) async fn handle_cancel_execution(ctx: Dispatch, req: FrontendRequest)
                     reason = %provenance.reason,
                     "cancel_execution: marked cancelled",
                 );
-                // The durable audit record (`execution_cancelled`, now with
-                // source / actor / reason alongside the original fields) is
-                // written by the work layer when the cancel commits, so every
-                // cancel path emits it rather than only this RPC.
-                server_state
-                    .completion_handler
-                    .record_execution_cancelled(&execution.id, &provenance)
-                    .await;
+                // The work layer publishes cancellation provenance after commit.
                 // Pane releases are keyed by run_id (the slot
                 // registry's key), not by execution_id — so
                 // walk the execution's still-active runs and

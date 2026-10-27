@@ -746,8 +746,16 @@ async fn create_chore(client: &mut BossClient, input: CreateChoreInput) -> Resul
 async fn update_work_item(client: &mut BossClient, id: &str, patch: WorkItemPatch) -> Result<WorkItem> {
     match client
         .send_request(&FrontendRequest::UpdateWorkItem {
+            cancel: Some(
+                boss_protocol::CancelProvenance::new(
+                    boss_protocol::CancelSource::Bossctl,
+                    "requesting client",
+                    "apply requested work item changes",
+                )
+                .unwrap(),
+            ),
             id: id.to_owned(),
-            patch,
+            patch: Box::new(patch),
         })
         .await?
     {
@@ -758,7 +766,17 @@ async fn update_work_item(client: &mut BossClient, id: &str, patch: WorkItemPatc
 
 async fn delete_work_item(client: &mut BossClient, id: &str) -> Result<()> {
     match client
-        .send_request(&FrontendRequest::DeleteWorkItem { id: id.to_owned() })
+        .send_request(&FrontendRequest::DeleteWorkItem {
+            cancel: Some(
+                boss_protocol::CancelProvenance::new(
+                    boss_protocol::CancelSource::Bossctl,
+                    "requesting client",
+                    "delete work item and its revision chain",
+                )
+                .unwrap(),
+            ),
+            id: id.to_owned(),
+        })
         .await?
     {
         FrontendEvent::WorkItemDeleted { .. } => Ok(()),

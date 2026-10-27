@@ -61,6 +61,16 @@ impl PendingEvents {
 
     /// Stage an engine-audit record to write once the transaction commits.
     pub fn push_audit(&mut self, event: &str, payload: serde_json::Value) {
+        if matches!(event, "execution_cancelled" | "execution_abandoned") {
+            self.push(Event::ExecutionDecision {
+                execution_id: payload["execution_id"].as_str().expect("execution id").to_owned(),
+                task_id: payload["work_item_id"].as_str().expect("work item id").to_owned(),
+                status: payload["to_status"].as_str().expect("terminal status").to_owned(),
+                source: payload["source"].as_str().expect("cancel source").to_owned(),
+                actor: payload["actor"].as_str().expect("cancel actor").to_owned(),
+                reason: payload["reason"].as_str().expect("cancel reason").to_owned(),
+            });
+        }
         self.audits.push((event.to_owned(), payload));
     }
 
@@ -106,6 +116,44 @@ pub fn commit_and_publish(
     Ok(())
 }
 
+/// Forward committed decision facts to the dispatch stream without triggering teardown.
+pub fn forward_execution_decisions(
+    mut subscription: boss_event_bus::Subscription,
+    sink: std::sync::Arc<dyn crate::dispatch_events::DispatchEventSink>,
+) {
+    // Synchronous inspection-only ServerState fixtures have no runtime.
+    // A running engine constructs its state inside the Tokio runtime.
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    boss_task_scope::spawn(async move {
+        while let Some(event) = subscription.recv().await {
+            if let Event::ExecutionDecision {
+                execution_id,
+                task_id,
+                status,
+                source,
+                actor,
+                reason,
+            } = event
+            {
+                sink.emit(
+                    crate::dispatch_events::DispatchEvent::new(
+                        crate::dispatch_events::Stage::ExecutionCancelled,
+                        crate::dispatch_events::Outcome::Ok,
+                        execution_id,
+                    )
+                    .with_work_item(task_id)
+                    .with_details(serde_json::json!({
+                        "to_status": status, "source": source, "actor": actor, "reason": reason,
+                    })),
+                )
+                .await;
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use boss_event_bus::TopicFilter;
@@ -118,6 +166,50 @@ mod tests {
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", [])
             .expect("create table");
         conn
+    }
+
+    #[tokio::test]
+    async fn decision_provenance_reaches_dispatch_only_after_commit() {
+        let mut conn = open_conn();
+        let bus = EventBus::new();
+        let sink = std::sync::Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        forward_execution_decisions(
+            bus.subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionDecision)),
+            sink.clone(),
+        );
+        let payload = serde_json::json!({
+            "execution_id": "exec-decision", "work_item_id": "task-decision",
+            "to_status": "abandoned", "source": "scheduler_preemption",
+            "actor": "scheduler", "reason": "higher priority work needs this slot",
+        });
+        {
+            let _tx = conn.transaction().unwrap();
+            let mut pending = PendingEvents::new();
+            pending.push_audit("execution_abandoned", payload.clone());
+        }
+        tokio::task::yield_now().await;
+        assert!(sink.events().await.is_empty(), "rolled-back provenance must not escape");
+        let tx = conn.transaction().unwrap();
+        let mut pending = PendingEvents::new();
+        pending.push_audit("execution_abandoned", payload);
+        commit_and_publish(tx, pending, &bus).unwrap();
+        let events = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let events = sink.events().await;
+                if !events.is_empty() {
+                    break events;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].execution_id, "exec-decision");
+        assert_eq!(events[0].details["source"], "scheduler_preemption");
+        assert_eq!(events[0].details["actor"], "scheduler");
+        assert_eq!(events[0].details["reason"], "higher priority work needs this slot");
+        assert_eq!(events[0].details["to_status"], "abandoned");
     }
 
     #[tokio::test]

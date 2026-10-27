@@ -276,9 +276,9 @@ impl WorkDb {
     pub fn abandon_stranded_executions_on_closed_work_items(&self) -> Result<Vec<AbandonedStrandedExecution>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let candidates: Vec<(String, String)> = {
+        let candidates: Vec<(String, String, String)> = {
             let mut stmt = tx.prepare(
-                "SELECT we.id, we.work_item_id
+                "SELECT we.id, we.work_item_id, CASE WHEN t.deleted_at IS NOT NULL THEN 'deleted' ELSE t.status END
                  FROM work_executions we
                  JOIN tasks t ON t.id = we.work_item_id
                  WHERE we.status IN ('queued', 'ready', 'waiting_dependency', 'claimed')
@@ -295,19 +295,25 @@ impl WorkDb {
                      )
                    )",
             )?;
-            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let now = now_string();
         let mut abandoned = Vec::new();
         let mut pending = PendingEvents::new();
-        for (execution_id, work_item_id) in candidates {
+        for (execution_id, work_item_id, closed_state) in candidates {
             let provenance = boss_protocol::CancelProvenance::engine(
                 boss_protocol::CancelSource::StrandedExecutionSweep,
                 "abandon_stranded_executions_on_closed_work_items",
                 format!(
                     "never-started execution against closed work item {work_item_id} \
-                     (done, archived, or deleted); it can never be dispatched"
+                     (state: {closed_state}); it can never be dispatched"
                 ),
             );
             let Some(doomed) = capture_doomed(
@@ -1698,9 +1704,10 @@ impl WorkDb {
                 reason = %provenance.reason,
                 "execution terminalized: mark redundant",
             );
-            crate::audit::record_event(
+            let mut pending = PendingEvents::new();
+            pending.push_audit(
                 "execution_abandoned",
-                &decision_audit_payload(
+                decision_audit_payload(
                     execution_id,
                     &existing.work_item_id,
                     existing.status.as_str(),
@@ -1709,6 +1716,9 @@ impl WorkDb {
                     &DecisionAuditContext::default(),
                 ),
             );
+            for event in pending.into_events() {
+                self.event_bus.publish(event);
+            }
             // No open `Transaction` here — `conn` auto-commits each
             // statement, so the UPDATE above is already durable and this
             // publish carries no rollback risk.

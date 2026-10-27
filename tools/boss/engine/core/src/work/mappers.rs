@@ -639,7 +639,12 @@ fn map_cancel_provenance(row: &Row<'_>, first: usize) -> rusqlite::Result<Option
     match (source, actor, reason) {
         (None, None, None) => Ok(None),
         (Some(source), Some(actor), Some(reason)) => {
-            let source = parse_text_column::<boss_protocol::CancelSource>(first, &source)?;
+            let source = source
+                .parse::<boss_protocol::CancelSource>()
+                .unwrap_or(boss_protocol::CancelSource::Unrecognized);
+            if source == boss_protocol::CancelSource::Unrecognized {
+                return Ok(Some(boss_protocol::CancelProvenance { source, actor, reason }));
+            }
             boss_protocol::CancelProvenance::new(source, actor, reason)
                 .map(Some)
                 .map_err(|err| {

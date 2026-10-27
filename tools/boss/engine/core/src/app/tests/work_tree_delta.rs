@@ -327,6 +327,14 @@ async fn release_and_unpopulate_invalidate_the_product_work_topic() {
     planner_ops::handle_unpopulate_project(
         dispatch("unpopulate"),
         FrontendRequest::UnpopulateProject {
+            cancel: Some(
+                boss_protocol::CancelProvenance::new(
+                    boss_protocol::CancelSource::Bossctl,
+                    "requesting client",
+                    "undo project population",
+                )
+                .unwrap(),
+            ),
             project_id: project.id.clone(),
             run_id: run.id.clone(),
         },
@@ -536,4 +544,89 @@ async fn work_tree_delta_handler_moves_deletes_and_recovers_full_snapshots() {
             .base_sequence
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn unpopulate_records_caller_for_cascade_deleted_live_revision() {
+    let (state, _dir) = test_server_state();
+    let db = state.work_db.clone();
+    let product = crate::test_support::create_test_product_named(&db, "unpopulate cancellation");
+    let project = db
+        .create_project(
+            boss_protocol::CreateProjectInput::builder()
+                .product_id(product.id.clone())
+                .name("Plan")
+                .goal("test cancellation")
+                .build(),
+        )
+        .unwrap();
+    let run = claim_planner_run(&db, &product.id, &project.id);
+    settle_planner_run(&db, &run.id, boss_protocol::PLANNER_OUTCOME_STAGED);
+    let parent = crate::test_support::create_test_chore_manual(&db, product.id.clone(), "Planned parent");
+    let revision = crate::test_support::create_test_chore_manual(&db, product.id.clone(), "Live revision");
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET planner_run_id = ?2, project_id = ?3 WHERE id = ?1",
+            rusqlite::params![parent.id, run.id, project.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET parent_task_id = ?2, kind = 'revision' WHERE id = ?1",
+            rusqlite::params![revision.id, parent.id],
+        )
+        .unwrap();
+    }
+    let execution = db
+        .create_execution(
+            boss_protocol::CreateExecutionInput::builder()
+                .work_item_id(revision.id.clone())
+                .kind(boss_protocol::ExecutionKind::RevisionImplementation)
+                .status(boss_protocol::ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.start_execution_run(&execution.id, "worker", "mono", "lease", "workspace", "/tmp/workspace")
+        .unwrap();
+    let sink = make_session_sink();
+    planner_ops::handle_unpopulate_project(
+        Dispatch::builder()
+            .server_state(state.clone())
+            .work_db(db.clone())
+            .sink(sink)
+            .session_id("operator-session")
+            .request_id("unpopulate")
+            .recv_instant(Instant::now())
+            .decode_ms(0.0)
+            .build(),
+        FrontendRequest::UnpopulateProject {
+            project_id: project.id,
+            run_id: run.id,
+            cancel: Some(
+                boss_protocol::CancelProvenance::new(
+                    boss_protocol::CancelSource::BossCli,
+                    "operator",
+                    "discard incorrect plan",
+                )
+                .unwrap(),
+            ),
+        },
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let row = db.get_execution(&execution.id).unwrap();
+            if row.status == boss_protocol::ExecutionStatus::Cancelled {
+                let provenance = row.cancel_provenance.unwrap();
+                assert_eq!(provenance.source, boss_protocol::CancelSource::BossCli);
+                assert!(provenance.actor.contains("session operator-session"));
+                assert!(provenance.actor.contains("client claims operator"));
+                assert_eq!(provenance.reason, "discard incorrect plan");
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
 }

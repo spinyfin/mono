@@ -313,7 +313,13 @@ impl WorkDb {
                 let mut conn = self.connect()?;
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let mut pending = PendingEvents::new();
-                tombstone_orphaned_remediation_in_tx(&mut pending, &tx, &existing_task.id, &now_string())?;
+                tombstone_orphaned_remediation_in_tx(
+                    &mut pending,
+                    &tx,
+                    &existing_task.id,
+                    &now_string(),
+                    "deletion signoff is required",
+                )?;
                 commit_and_publish(tx, pending, self.event_bus())?;
             }
         }
@@ -509,7 +515,13 @@ impl WorkDb {
             if current_state != ProposalState::Applied.as_str()
                 && let Some(task_id) = remediating_task_id
             {
-                tombstone_orphaned_remediation_in_tx(&mut tombstone_pending, &tx, task_id, &now_string())?;
+                tombstone_orphaned_remediation_in_tx(
+                    &mut tombstone_pending,
+                    &tx,
+                    task_id,
+                    &now_string(),
+                    "its owning proposal is no longer the applied decision",
+                )?;
             }
             commit_and_publish(tx, tombstone_pending, self.event_bus())?;
             return Ok(applied_ref);
@@ -803,7 +815,13 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let mut pending = PendingEvents::new();
-        tombstone_orphaned_remediation_in_tx(&mut pending, &tx, task_id, &now_string())?;
+        tombstone_orphaned_remediation_in_tx(
+            &mut pending,
+            &tx,
+            task_id,
+            &now_string(),
+            "its owning proposal is no longer the applied decision",
+        )?;
         commit_and_publish(tx, pending, self.event_bus())?;
         Ok(())
     }
@@ -834,6 +852,7 @@ fn tombstone_orphaned_remediation_in_tx(
     tx: &rusqlite::Transaction<'_>,
     task_id: &str,
     now: &str,
+    cause: &str,
 ) -> Result<()> {
     tx.execute(
         "UPDATE tasks SET deleted_at = ?2, updated_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
@@ -842,10 +861,7 @@ fn tombstone_orphaned_remediation_in_tx(
     let provenance = boss_protocol::CancelProvenance::engine(
         boss_protocol::CancelSource::ReviewVerdict,
         "review_verdict_apply",
-        format!(
-            "tombstoned remediation {task_id}: its owning proposal is no longer the applied \
-             decision, so its never-started executions must not dispatch"
-        ),
+        format!("tombstoned remediation {task_id}: {cause}, so its never-started executions must not dispatch"),
     );
     let doomed = capture_doomed(
         tx,

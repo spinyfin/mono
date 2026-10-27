@@ -40,8 +40,8 @@ pub fn test_cancel_provenance() -> CancelProvenance {
     CancelProvenance::engine(CancelSource::Bossctl, "test", "test cancel")
 }
 
-/// Assert a decision-terminal execution recorded the given source and actor.
-pub fn assert_cancel_provenance(execution: &WorkExecution, source: CancelSource, actor: &str) {
+/// Assert a decision-terminal execution recorded the given source, actor and reason.
+pub fn assert_cancel_provenance(execution: &WorkExecution, source: CancelSource, actor: &str, reason: &str) {
     assert_eq!(execution.status, ExecutionStatus::Cancelled);
     let provenance = execution
         .cancel_provenance
@@ -49,6 +49,11 @@ pub fn assert_cancel_provenance(execution: &WorkExecution, source: CancelSource,
         .expect("decision-terminal execution stamps cancel provenance");
     assert_eq!(provenance.source, source);
     assert_eq!(provenance.actor, actor);
+    assert!(
+        provenance.reason.contains(reason),
+        "unexpected reason: {}",
+        provenance.reason
+    );
 }
 
 /// Declare `no-changes-needed` the way a worker does: submit a real `run_done`

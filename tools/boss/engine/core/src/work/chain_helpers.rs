@@ -263,11 +263,24 @@ pub(crate) fn abandon_pending_executions(
     now: &str,
     why: &str,
 ) -> Result<usize> {
-    let provenance = boss_protocol::CancelProvenance::engine(
-        boss_protocol::CancelSource::WorkItemSettled,
-        "abandon_pending_executions",
-        format!("not-yet-live executions of {work_item_id} dropped: {why}"),
-    );
+    abandon_pending_executions_with_provenance(pending, conn, work_item_id, now, why, None)
+}
+
+pub(crate) fn abandon_pending_executions_with_provenance(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    work_item_id: &str,
+    now: &str,
+    why: &str,
+    supplied: Option<&boss_protocol::CancelProvenance>,
+) -> Result<usize> {
+    let provenance = supplied.cloned().unwrap_or_else(|| {
+        boss_protocol::CancelProvenance::engine(
+            boss_protocol::CancelSource::WorkItemSettled,
+            "abandon_pending_executions",
+            format!("not-yet-live executions of {work_item_id} dropped: {why}"),
+        )
+    });
     // Capture the ids/statuses of the rows about to be abandoned so the
     // canonical terminalization trace (see `WorkDb::mark_execution_orphaned`
     // in executions_runs.rs) can name each one individually, rather than

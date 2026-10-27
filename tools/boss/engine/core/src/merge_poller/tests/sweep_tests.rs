@@ -1312,6 +1312,7 @@ async fn merged_pr_redispatches_live_review_revision_as_followup_and_records_can
         &cancelled,
         boss_protocol::CancelSource::MergePollerParentMerged,
         "merge_poller",
+        "merged, so this revision execution is obsolete",
     );
     let followup = match db.get_work_item(&revision.id).unwrap() {
         WorkItem::Chore(task) => task,
@@ -2559,6 +2560,7 @@ async fn ci_resolved_stops_live_worker_and_keeps_task_in_review() {
         &stopped,
         boss_protocol::CancelSource::MergePollerReviewTransition,
         "merge_poller",
+        "review",
     );
     assert!(
         db.get_live_execution_for_work_item(&chore, "").unwrap().is_none(),

@@ -150,7 +150,7 @@ pub enum RetirePaneError {
     /// engine still considers active.
     #[error(
         "slot {slot_id} has a live engine-tracked run ({run_id}); \
-         use `bossctl agents stop {run_id}` instead of retire-pane"
+         use `bossctl agents stop {run_id} --reason 'reap stuck worker'` instead of retire-pane"
     )]
     LiveRunTracked { slot_id: u8, run_id: String },
     /// The engine's bookkeeping says this slot is finished, but the OS and
@@ -164,7 +164,7 @@ pub enum RetirePaneError {
     /// [`crate::husk_pane_sweep::live_process_evidence`].
     #[error(
         "slot {slot_id} holds a terminal entry for run {run_id}, but its worker process is still alive \
-         ({evidence}); refusing to retire — use `bossctl agents stop {run_id}` to tear it down deliberately"
+         ({evidence}); refusing to retire — use `bossctl agents stop {run_id} --reason 'reap stuck worker'` to tear it down deliberately"
     )]
     LiveProcessCorroborated {
         slot_id: u8,
@@ -178,7 +178,7 @@ pub enum RetirePaneError {
     /// release claims and detach the viewer of a worker that may still be live.
     #[error(
         "slot {slot_id} occupancy is inconclusive ({reason}); refusing to retire \
-         — resolve the probe failure, or use `bossctl agents stop <run_id>` for the recorded run, \
+         — resolve the probe failure, or use `bossctl agents stop <run_id> --reason 'reap stuck worker'` for the recorded run, \
          then `bossctl agents retire-pane {slot_id}`"
     )]
     OccupancyInconclusive { slot_id: u8, reason: String },
@@ -1135,7 +1135,7 @@ impl ServerState {
                 SlotOccupancy::inconclusive(
                     Some(execution_id),
                     format!(
-                        "recorded tmux session is missing; run `bossctl agents stop {execution_id}` to clear stale identity, then `bossctl agents retire-pane {slot_id}`"
+                        "recorded tmux session is missing; run `bossctl agents stop {execution_id} --reason 'reap stuck worker'` to clear stale identity, then `bossctl agents retire-pane {slot_id}`"
                     ),
                 )
             }

@@ -757,12 +757,18 @@ impl WorkDb {
         // (`running` / `waiting_human`) is left alone — it self-retires. The
         // reconcile guard (`work_item_is_deferred`) then keeps it parked.
         if patch.deferred == Some(true) {
-            abandon_pending_executions(
+            let cause = "the work item was reclassified as deferred and leaves the dispatch pool";
+            let mut provenance = patch.cancel_provenance.clone().unwrap_or_else(|| {
+                boss_protocol::CancelProvenance::engine(boss_protocol::CancelSource::WorkItemSettled, actor, cause)
+            });
+            provenance.reason = format!("{cause}; {}", provenance.reason);
+            abandon_pending_executions_with_provenance(
                 &mut pending,
                 &tx,
                 id,
                 &task.updated_at,
-                "the work item was reclassified as deferred and leaves the dispatch pool",
+                cause,
+                Some(&provenance),
             )?;
         }
 

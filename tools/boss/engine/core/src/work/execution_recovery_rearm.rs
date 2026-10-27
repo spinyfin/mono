@@ -82,8 +82,11 @@ pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool) -> Result
         if has_started_live {
             continue;
         }
-        // Schema-migration time: there is no running engine to audit this
-        // through, so the provenance on the row is the durable record.
+        // Historical schema-39/43 migrations run before the engine event bus
+        // and dispatch sink exist. Their surrounding schema transaction may
+        // still roll back, so emitting here would announce an uncommitted
+        // cancellation. These migration-only transitions retain provenance
+        // on the row; runtime transitions also publish after commit.
         let provenance = boss_protocol::CancelProvenance::engine(
             boss_protocol::CancelSource::SchemaMigration,
             "execution_recovery_rearm",

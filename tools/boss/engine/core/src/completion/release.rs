@@ -168,9 +168,6 @@ impl WorkerCompletionHandler {
                 false
             }
         };
-        if cancelled {
-            self.record_execution_cancelled(execution_id, &provenance).await;
-        }
         let outcome = self.force_release(execution_id).await;
         tracing::info!(
             work_item_id,
@@ -224,9 +221,6 @@ impl WorkerCompletionHandler {
             }
         };
 
-        if exec_cancelled {
-            self.record_execution_cancelled(execution_id, &provenance).await;
-        }
         if exec_cancelled || task_demoted {
             tracing::info!(
                 execution_id,

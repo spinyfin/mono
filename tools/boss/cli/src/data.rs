@@ -331,9 +331,15 @@ pub(crate) async fn unpopulate_project(
     project_id: &str,
     run_id: &str,
 ) -> Result<(Vec<String>, Vec<UnpopulatePreservedTask>), CliError> {
+    let cancel = boss_protocol::CancelProvenance::new(
+        boss_protocol::CancelSource::BossCli,
+        std::env::var("USER").unwrap_or_else(|_| "boss CLI".to_owned()),
+        "undo project population",
+    )
+    .unwrap();
     rpc_call!(
         client,
-        FrontendRequest::UnpopulateProject {
+        FrontendRequest::UnpopulateProject { cancel: Some(cancel),
             project_id: project_id.to_owned(),
             run_id: run_id.to_owned(),
         },
@@ -747,11 +753,20 @@ pub(crate) async fn update_work_item(
     id: &str,
     patch: WorkItemPatch,
 ) -> Result<WorkItem, CliError> {
+    let cancel = boss_protocol::CancelProvenance::new(
+        boss_protocol::CancelSource::BossCli,
+        std::env::var("USER").unwrap_or_else(|_| "boss CLI".to_owned()),
+        format!(
+            "boss task update {id}: status {:?}, deferred {:?}",
+            patch.status, patch.deferred
+        ),
+    )
+    .unwrap();
     rpc_call!(
         client,
-        FrontendRequest::UpdateWorkItem {
+        FrontendRequest::UpdateWorkItem { cancel: Some(cancel),
             id: id.to_owned(),
-            patch,
+            patch: Box::new(patch),
         },
         "work item update",
         FrontendEvent::WorkItemUpdated { item } => item,
@@ -1475,9 +1490,15 @@ pub(crate) fn validate_github_pr_url(raw: &str) -> Result<&str, CliError> {
 }
 
 pub(crate) async fn delete_work_item(client: &mut BossClient, id: &str) -> Result<(), CliError> {
+    let cancel = boss_protocol::CancelProvenance::new(
+        boss_protocol::CancelSource::BossCli,
+        std::env::var("USER").unwrap_or_else(|_| "boss CLI".to_owned()),
+        format!("boss task delete {id} and its revision chain"),
+    )
+    .unwrap();
     rpc_call!(
         client,
-        FrontendRequest::DeleteWorkItem { id: id.to_owned() },
+        FrontendRequest::DeleteWorkItem { cancel: Some(cancel), id: id.to_owned() },
         "work item delete",
         FrontendEvent::WorkItemDeleted { .. } => (),
     )
@@ -1911,7 +1932,7 @@ pub(crate) fn print_executions_section(executions: &[ExecutionRuns]) {
         }
         println!();
         if let Some(provenance) = &exec.cancel_provenance {
-            println!("    cancelled: {provenance}");
+            println!("    {}: {provenance}", exec.status);
         }
         print_run_history(&detail.runs, detail.runs_unavailable.as_ref(), "    ");
     }
