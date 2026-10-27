@@ -139,7 +139,10 @@ fn snapshot_indices_survive_pressure_eviction_and_readmission() {
 fn allowlisted_kinds_are_independent_and_correlated_replies_are_never_coalesced() {
     let snapshots = [
         auth_snapshot(0).payload,
-        FrontendEvent::WorkerLiveStatesList { states: vec![] },
+        FrontendEvent::WorkerLiveStatesList {
+            states: vec![],
+            doing_sections: Default::default(),
+        },
         FrontendEvent::EngineHealthResult {
             report: boss_protocol::EngineHealthReport::builder()
                 .anthropic_api_key_present(true)
@@ -212,6 +215,18 @@ fn row_events_and_control_requests_retain_each_envelope() {
         .status("open")
         .title("test")
         .build();
+    let attempt = |kind: &str, status: &str| {
+        boss_protocol::EngineAttemptListEntry::builder()
+            .id("attempt")
+            .product_id("product")
+            .created_at("0")
+            .extra(Default::default())
+            .kind(kind)
+            .pr_url("https://example.com/pr")
+            .status(status)
+            .work_item_id("item")
+            .build()
+    };
     let events = [
         FrontendEvent::WorkItemCreated { item: item.clone() },
         FrontendEvent::WorkItemUpdated { item: item.clone() },
@@ -226,12 +241,14 @@ fn row_events_and_control_requests_retain_each_envelope() {
         },
         FrontendEvent::AttentionItemUpdated { item: attention },
         FrontendEvent::ConflictResolutionStarted {
+            attempt: attempt("conflict", "running"),
             product_id: "product".into(),
             work_item_id: "item".into(),
             attempt_id: "attempt".into(),
             pr_url: "https://example.com/pr".into(),
         },
         FrontendEvent::CiRemediationSucceeded {
+            attempt: attempt("ci", "succeeded"),
             product_id: "product".into(),
             work_item_id: "item".into(),
             attempt_id: "attempt".into(),
