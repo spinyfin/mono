@@ -195,7 +195,7 @@ pub fn render_revision_instructions(result: &ReviewResult, origin: ReviewOrigin)
             ReviewFindingCategory::DeferredScope => "deferred_scope",
             ReviewFindingCategory::AgentIsms => "agent_isms",
         };
-        // Legacy findings (no id) render exactly as before.
+        // Findings without ids or sources get no identity or provenance lines.
         let id_line =
             f.id.as_deref()
                 .map(|id| format!("**Finding id:** `{id}`  \n"))
