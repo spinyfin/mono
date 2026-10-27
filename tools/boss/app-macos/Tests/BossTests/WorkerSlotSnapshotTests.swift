@@ -65,6 +65,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             slot: WorkerSlot(slotId: 1, runId: "run-hung"), liveState: recovered, liveStatusEnabled: true
         )
         XCTAssertFalse(recoveredSnapshot.showsStatusPill)
+        XCTAssertNotEqual(hungSnapshot, recoveredSnapshot)
         XCTAssertNotEqual(hung, recovered)
         XCTAssertNotEqual(WorkerSlotLiveSlice(hung), WorkerSlotLiveSlice(recovered))
         XCTAssertEqual(AgentActivityState(runtime: nil, liveState: recovered), .active)
@@ -171,12 +172,13 @@ final class WorkerSlotSnapshotTests: XCTestCase {
     // MARK: - Exhaustive WorkerLiveState stored-property classification
 
     /// Fields `WorkerSlotLiveSlice` reads. Each must have a case in
-    /// `testEveryRenderedLiveStateFieldFlipsSnapshotEquality`.
+    /// `testRenderedLiveStateFieldsFlipEquality` or the dedicated hung-warning test.
     private static let renderedLiveStateFieldNames: Set<String> = [
         "name",
         "activity",
         "liveStatus",
         "recoveryStatus",
+        "hungSince",
         "lastEventAt",
         "waitReason",
         "waitExpiresAt",
