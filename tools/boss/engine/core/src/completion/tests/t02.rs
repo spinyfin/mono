@@ -2905,6 +2905,7 @@ async fn revision_with_no_bound_pr_parks_instead_of_nudging_create() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)

@@ -4,6 +4,7 @@ fn apply_findings(db: &WorkDb, root: &str, sha: &str) -> String {
     let supervisor = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root)
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -13,6 +14,7 @@ fn apply_findings(db: &WorkDb, root: &str, sha: &str) -> String {
     let reviewer = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root)
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Completed)

@@ -4,7 +4,7 @@
 
 use anyhow::{Result, anyhow};
 use boss_client::BossClient;
-use boss_protocol::{CreateExecutionInput, CreateRunInput, ExecutionKind, ExecutionStatus};
+use boss_protocol::{CreateExecutionInput, CreateRunInput, ExecutionKind, ExecutionStatus, WorkItemPatch};
 use serde_json::Value;
 
 use common::{run_boss, run_boss_human};
@@ -48,6 +48,7 @@ async fn task_show_and_executions_surface_runs_for_running_and_completed_parents
 
     let running = db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Running)
@@ -55,6 +56,7 @@ async fn task_show_and_executions_surface_runs_for_running_and_completed_parents
     )?;
     let completed = db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Completed)
@@ -84,6 +86,15 @@ async fn task_show_and_executions_surface_runs_for_running_and_completed_parents
             .build(),
     )?;
 
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )?;
+    assert!(db.demote_active_work_item_to_todo(&chore.id)?);
+
     let show = run_boss(engine.socket_str(), &["task", "show", &chore.id])?;
     assert_run_surfaced(execution_json(&show, &running.id)?, &running_run.id, running_transcript)?;
     assert_run_surfaced(
@@ -91,6 +102,15 @@ async fn task_show_and_executions_surface_runs_for_running_and_completed_parents
         &completed_run.id,
         completed_transcript,
     )?;
+
+    assert_eq!(execution_json(&show, &running.id)?["created_via"], "test");
+    assert_eq!(show["status_reason"], "dispatch_failed:pane_spawn_demote");
+    let transitions = show["status_transitions"].as_array().expect("status transition ledger");
+    let last = transitions.last().expect("engine status transition");
+    assert_eq!(last["from_status"], "active");
+    assert_eq!(last["to_status"], "todo");
+    assert_eq!(last["actor"], "engine");
+    assert_eq!(last["reason"], "dispatch_failed:pane_spawn_demote");
 
     let ledger = run_boss(engine.socket_str(), &["task", "executions", &chore.id])?;
     assert_run_surfaced(
@@ -103,6 +123,8 @@ async fn task_show_and_executions_surface_runs_for_running_and_completed_parents
         &completed_run.id,
         completed_transcript,
     )?;
+
+    assert_eq!(execution_json(&ledger, &completed.id)?["created_via"], "test");
 
     let human = run_boss_human(engine.socket_str(), &["task", "show", &chore.id])?;
     assert!(

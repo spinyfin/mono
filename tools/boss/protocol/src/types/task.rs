@@ -703,6 +703,16 @@ pub struct Task {
     #[builder(default = default_human_actor())]
     pub last_status_actor: String,
 
+    /// Why the most recent *engine-initiated* status change happened —
+    /// the code path that wrote it (`execution_run_started`,
+    /// `pr_completion:pending_review_hold`, `dependency_cascade:unblocked`,
+    /// ...). Cleared to `None` by a human/boss status change, so a value
+    /// here always describes the current status. The full history, one row
+    /// per transition, is served by
+    /// `FrontendRequest::ListTaskStatusTransitions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
+
     pub name: String,
     /// One of `low` / `medium` / `high` / `critical`. The first three
     /// mirror `Project.priority` exactly so kanban surfaces can render
@@ -1442,4 +1452,27 @@ mod tests {
         let back: Task = serde_json::from_value(value).unwrap();
         assert_eq!(back.review_section, Some(ReviewSection::Ready));
     }
+}
+
+/// One recorded `tasks.status` transition — a row of the engine's
+/// `task_status_audit` ledger, written by a database trigger on every
+/// status change regardless of which code path performed the write, so no
+/// transition can go unrecorded. `reason` is the writer's
+/// [`Task::status_reason`] at the time of the change (`None` for a human
+/// move, or for a legacy engine writer that stamped no reason).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct TaskStatusTransition {
+    /// Monotonic ledger id; ascending order is chronological order.
+    pub id: i64,
+    pub task_id: String,
+    pub from_status: String,
+    pub to_status: String,
+    /// `tasks.last_status_actor` after the write (`human`, `boss`, `engine`,
+    /// `boothby`).
+    pub actor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Epoch seconds, as text — same encoding as `tasks.updated_at`.
+    pub changed_at: String,
 }

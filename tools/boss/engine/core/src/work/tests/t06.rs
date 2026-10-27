@@ -484,6 +484,7 @@ fn get_live_execution_returns_waiting_human_execution_for_work_item() {
     let exec_b = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -519,6 +520,7 @@ fn get_live_execution_returns_none_when_all_executions_are_terminal() {
     let exec_b = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -1631,6 +1633,7 @@ fn get_work_item_has_in_progress_revision() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(parent_id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)

@@ -96,6 +96,7 @@ fn seed_ready_revision(db: &WorkDb, label: &str) -> (String, String) {
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -566,6 +567,7 @@ fn merge_order_merged_siblings_is_empty_without_a_chain() {
 fn create_waiting_dependency_execution(db: &WorkDb, work_item_id: &str) -> WorkExecution {
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(work_item_id.to_owned())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::WaitingDependency)

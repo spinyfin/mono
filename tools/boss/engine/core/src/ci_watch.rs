@@ -38,6 +38,13 @@ use boss_protocol::{
     CREATED_VIA_CI_FIX_PREFIX, CreateAttentionItemInput, CreateRevisionInput, ExecutionKind, ExecutionStatus,
     FrontendEvent, ReasoningMode,
 };
+
+/// Provenance stamped on the bespoke `ci_remediation` execution a
+/// `retrigger` attempt parks so a worker can re-run CI without a commit.
+const CREATED_VIA_CI_WATCH_RETRIGGER: &str = "ci_watch:retrigger";
+/// Provenance stamped when the merge-poller re-emits an execution for a
+/// pending `ci_remediations` row that has no live executor.
+const CREATED_VIA_CI_WATCH_STRANDED_ATTEMPT_RESCUE: &str = "ci_watch:stranded_attempt_rescue";
 use serde::Serialize;
 
 use crate::blocking_signal::{self, SignalKind};
@@ -776,6 +783,7 @@ pub async fn on_ci_failure_detected(
             if attempt.attempt_kind == "retrigger" {
                 match work_db.create_execution(
                     CreateExecutionInput::builder()
+                        .created_via(CREATED_VIA_CI_WATCH_RETRIGGER)
                         .work_item_id(candidate.work_item_id.clone())
                         .kind(ExecutionKind::CiRemediation)
                         .status(ExecutionStatus::Ready)
@@ -2737,6 +2745,7 @@ pub async fn rescue_stranded_ci_remediation_attempt(
 ) -> bool {
     match work_db.create_execution(
         CreateExecutionInput::builder()
+            .created_via(CREATED_VIA_CI_WATCH_STRANDED_ATTEMPT_RESCUE)
             .work_item_id(attempt.work_item_id.clone())
             .kind(ExecutionKind::CiRemediation)
             .status(ExecutionStatus::Ready)

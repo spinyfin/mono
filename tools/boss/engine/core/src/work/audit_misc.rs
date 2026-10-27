@@ -340,6 +340,38 @@ pub(crate) fn task_to_item(task: Task) -> WorkItem {
     }
 }
 
+#[work_db_boundary::instrument]
+impl WorkDb {
+    /// The status-provenance ledger for one task: every recorded
+    /// `tasks.status` transition, oldest first. Rows come from the
+    /// `task_status_audit` table, which the `tasks_status_audit_trigger`
+    /// database trigger appends to on every status change regardless of the
+    /// writer — engine sweep, dependency cascade, kanban drag, PR
+    /// completion — so a move that no code path logged is still visible
+    /// here with its actor and, for engine writers, the stated reason.
+    pub fn list_task_status_transitions(&self, task_id: &str) -> Result<Vec<boss_protocol::TaskStatusTransition>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, task_id, from_status, to_status, actor, reason, changed_at
+             FROM task_status_audit
+             WHERE task_id = ?1
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([task_id], |row| {
+            Ok(boss_protocol::TaskStatusTransition {
+                id: row.get(0)?,
+                task_id: row.get(1)?,
+                from_status: row.get(2)?,
+                to_status: row.get(3)?,
+                actor: row.get(4)?,
+                reason: row.get::<_, Option<String>>(5)?.filter(|s| !s.is_empty()),
+                changed_at: row.get(6)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -647,6 +647,7 @@ mod tests {
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Orphaned)
@@ -930,6 +931,7 @@ mod tests {
         let execution = db
             .create_execution(
                 boss_protocol::CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Ready)
@@ -1005,6 +1007,7 @@ mod tests {
         let execution = db
             .create_execution(
                 boss_protocol::CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(work_item_id.to_owned())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Completed)
@@ -1101,6 +1104,7 @@ mod tests {
         let execution = db
             .create_execution(
                 boss_protocol::CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(work_item_id.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Completed)
@@ -1155,6 +1159,7 @@ mod tests {
         let execution = db
             .create_execution(
                 boss_protocol::CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(work_item_id.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Completed)
@@ -1183,6 +1188,7 @@ mod tests {
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(work_item_id.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Ready)

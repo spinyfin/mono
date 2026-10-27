@@ -51,6 +51,9 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
     // This RPC is the human-facing start verb (kanban drag, `bossctl work
     // start`); automatic recovery calls the DB layer directly.
     input.explicit_start = true;
+    if input.created_via.as_deref().is_none_or(str::is_empty) {
+        input.created_via = Some("frontend:request_execution".to_owned());
+    }
     input.work_item_id = match server_state.resolve_work_item_id(&input.work_item_id).await {
         Ok(id) => id,
         Err(err) => {

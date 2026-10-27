@@ -356,6 +356,7 @@ fn auto_pr_maintenance_reflects_explicit_toggle() {
 fn seed_execution(db: &WorkDb, work_item_id: &str, pr_url: Option<&str>) -> boss_protocol::WorkExecution {
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(work_item_id)
             .kind(ExecutionKind::TaskImplementation)
             .status(ExecutionStatus::Running)

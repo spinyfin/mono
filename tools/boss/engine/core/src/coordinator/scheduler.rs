@@ -2082,6 +2082,7 @@ impl ExecutionCoordinator {
         match self.work_db.request_execution(
             boss_protocol::RequestExecutionInput::builder()
                 .work_item_id(victim_execution.work_item_id.clone())
+                .created_via("scheduler:preemption_requeue")
                 .build(),
         ) {
             Ok(fresh) => {

@@ -887,6 +887,7 @@ impl WorkDb {
                     blocked_reason     = 'merge_conflict',
                     blocked_attempt_id = ?2,
                     last_status_actor  = 'engine',
+                    status_reason      = 'conflict_resolution:retry_reblocked',
                     updated_at         = ?3
               WHERE id = ?1
                 AND status = 'in_review'
@@ -1179,6 +1180,7 @@ impl WorkDb {
                         blocked_reason     = NULL,
                         blocked_attempt_id = NULL,
                         last_status_actor  = 'engine',
+                        status_reason      = 'conflict_resolution:succeeded',
                         updated_at         = ?2
                   WHERE id = ?1
                     AND status = 'blocked'

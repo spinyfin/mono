@@ -111,6 +111,7 @@ fn seed_parked_revision(server_state: &Arc<ServerState>, pr_url: &str, slot_id: 
     let execution = work_db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)

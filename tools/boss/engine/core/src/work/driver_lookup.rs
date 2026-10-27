@@ -621,6 +621,7 @@ mod tests {
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Ready)
@@ -760,6 +761,7 @@ mod tests {
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Ready)

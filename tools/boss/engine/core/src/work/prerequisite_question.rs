@@ -110,7 +110,10 @@ pub(super) fn approve_in_tx(
             request_execution_in_tx_with_live_check(
                 pending,
                 conn,
-                RequestExecutionInput::builder().work_item_id(&prerequisite.id).build(),
+                RequestExecutionInput::builder()
+                    .work_item_id(&prerequisite.id)
+                    .created_via("operator_answer:prerequisite_approved")
+                    .build(),
                 |_| false,
             )?;
         } else {
@@ -130,7 +133,7 @@ pub(super) fn approve_in_tx(
     // can later move it back to `todo` and dispatch it.
     conn.execute(
         "UPDATE tasks SET description = ?2, status = 'todo', blocked_reason = NULL,
-         blocked_detail = NULL, autostart = 1, last_status_actor = 'human', updated_at = ?3 WHERE id = ?1",
+         blocked_detail = NULL, autostart = 1, last_status_actor = 'human', status_reason = NULL, updated_at = ?3 WHERE id = ?1",
         params![task.id, description, now],
     )?;
     add_dependency_edge_in_tx(pending, conn, &task.id, &prerequisite.id, RELATION_BLOCKS, now)?;
@@ -179,6 +182,7 @@ fn queue_gated_execution(conn: &Connection, task: &Task, question: &OperatorQues
     insert_execution(
         conn,
         CreateExecutionInput::builder()
+            .created_via("operator_answer:prerequisite_gated_replacement")
             .work_item_id(&task.id)
             .kind(kind)
             .status(ExecutionStatus::WaitingDependency)

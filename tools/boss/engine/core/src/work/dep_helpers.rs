@@ -477,7 +477,13 @@ pub(crate) fn maybe_engine_block_dependent(
     if dependent_id.starts_with("proj_") {
         write_engine_project_status(conn, dependent_id, ProjectStatus::Blocked, now_epoch)?;
     } else if dependent_id.starts_with("task_") {
-        write_engine_task_status(conn, dependent_id, TaskStatus::Blocked, now_epoch)?;
+        write_engine_task_status(
+            conn,
+            dependent_id,
+            TaskStatus::Blocked,
+            now_epoch,
+            "dependency_cascade:gating_prerequisite_added",
+        )?;
     }
     // Stamp blocked_reason so the user-override path in
     // request_execution_in_tx_with_live_check can identify and clear
@@ -696,7 +702,13 @@ pub(crate) fn maybe_engine_unblock_dependent(
     if dependent_id.starts_with("proj_") {
         write_engine_project_status(conn, dependent_id, ProjectStatus::Planned, now_epoch)?;
     } else if dependent_id.starts_with("task_") {
-        write_engine_task_status(conn, dependent_id, TaskStatus::Todo, now_epoch)?;
+        write_engine_task_status(
+            conn,
+            dependent_id,
+            TaskStatus::Todo,
+            now_epoch,
+            "dependency_cascade:prerequisites_satisfied",
+        )?;
     }
     // Clear blocked_reason so it doesn't linger on a todo row.
     if dependent_id.starts_with("task_") {
@@ -887,17 +899,23 @@ pub(crate) fn write_engine_project_status(
 /// Task-table counterpart of [`write_engine_project_status`]. See that
 /// function's doc comment for why this is split by table and typed by
 /// [`TaskStatus`] rather than a bare `&str`.
+///
+/// `reason` is the engine's stated basis for the move, stored on
+/// `tasks.status_reason` and copied into the `task_status_audit` ledger by
+/// the status trigger — the task-side counterpart of the project writer's
+/// `status_basis`.
 pub(crate) fn write_engine_task_status(
     conn: &Connection,
     task_id: &str,
     new_status: TaskStatus,
     now_epoch: &str,
+    reason: &str,
 ) -> Result<()> {
     conn.execute(
         "UPDATE tasks
-         SET status = ?2, last_status_actor = 'engine', updated_at = ?3
+         SET status = ?2, last_status_actor = 'engine', updated_at = ?3, status_reason = ?4
          WHERE id = ?1 AND deleted_at IS NULL",
-        params![task_id, new_status.as_str(), now_epoch],
+        params![task_id, new_status.as_str(), now_epoch, reason],
     )?;
     Ok(())
 }

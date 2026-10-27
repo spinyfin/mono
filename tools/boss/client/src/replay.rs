@@ -201,6 +201,7 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::ListRevisions { .. }
         | FrontendRequest::ListRuns { .. }
         | FrontendRequest::ListTasks { .. }
+        | FrontendRequest::ListTaskStatusTransitions { .. }
         | FrontendRequest::ListTmuxWorkerStatuses
         | FrontendRequest::ListWorkerLiveStates
         | FrontendRequest::MarkCiRemediationSucceededViaRebase { .. }

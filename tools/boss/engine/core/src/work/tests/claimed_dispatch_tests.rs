@@ -284,6 +284,7 @@ fn merge_cancel_reconcile_does_not_mint_over_an_older_live_execution() {
     let live = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -293,6 +294,7 @@ fn merge_cancel_reconcile_does_not_mint_over_an_older_live_execution() {
     let cancelled = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Cancelled)

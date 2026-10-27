@@ -576,6 +576,7 @@ mod tests {
         let exec = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(task_id)
                     .kind(ExecutionKind::RevisionImplementation)
                     .status(ExecutionStatus::Ready)

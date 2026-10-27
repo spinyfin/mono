@@ -1337,6 +1337,7 @@ mod tests {
             let execution = db
                 .create_execution(
                     boss_protocol::CreateExecutionInput::builder()
+                        .created_via("test")
                         .work_item_id(cycle_root.id.clone())
                         .kind(boss_protocol::ExecutionKind::PrReview)
                         .status(boss_protocol::ExecutionStatus::Ready)

@@ -52,6 +52,7 @@ async fn merge_cancel_workspace_preference_is_ignored_without_dirty_reuse() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -104,6 +105,7 @@ async fn revision_resume_uses_fresh_scratch_without_workspace_pinning() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id)
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)

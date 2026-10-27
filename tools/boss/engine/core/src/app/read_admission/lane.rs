@@ -123,6 +123,7 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::ListRevisions { .. }
         | R::ListRuns { .. }
         | R::ListTasks { .. }
+        | R::ListTaskStatusTransitions { .. }
         | R::TailRunTranscript { .. }
         | R::GitHubAuthStatus
         | R::TrunkStatus

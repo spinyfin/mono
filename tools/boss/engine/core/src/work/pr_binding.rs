@@ -321,6 +321,7 @@ impl WorkDb {
                  archived_at        = NULL,
                  archived_reason    = NULL,
                  last_status_actor  = 'engine',
+                 status_reason      = 'pr_binding_repair:rebound_to_execution_branch_pr',
                  updated_at         = ?4
              WHERE id = ?1
                AND deleted_at IS NULL
@@ -370,6 +371,7 @@ impl WorkDb {
                  archived_at        = NULL,
                  archived_reason    = NULL,
                  last_status_actor  = 'engine',
+                 status_reason      = 'pr_binding_repair:foreign_pr_unbound',
                  updated_at         = ?5
              WHERE id = ?1
                AND deleted_at IS NULL

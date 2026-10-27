@@ -403,6 +403,7 @@ fn execution_in_workspace(
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(work_item_id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(status)
@@ -553,6 +554,7 @@ fn prior_execution(db: &WorkDb, work_item_id: &str, status: ExecutionStatus, pr_
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(work_item_id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(status)

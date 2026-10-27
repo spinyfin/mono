@@ -45,7 +45,7 @@ fn enforcing_state(run_id: &str) -> (Arc<ServerState>, tempfile::TempDir) {
 fn denied_request() -> FrontendRequest {
     FrontendRequest::UpdateWorkItem {
         id: "task_1".to_owned(),
-        patch: boss_protocol::WorkItemPatch::default(),
+        patch: Box::new(boss_protocol::WorkItemPatch::default()),
     }
 }
 
@@ -64,6 +64,7 @@ async fn progression_gate_is_unconditional_and_precedes_proposal_dispatch() {
         .work_db
         .create_execution(
             boss_protocol::CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&item.id)
                 .kind(boss_protocol::ExecutionKind::TaskImplementation)
                 .status(boss_protocol::ExecutionStatus::Ready)

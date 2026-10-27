@@ -1,4 +1,6 @@
-use super::dispatch_admission::{primary_pr_awaits_review, work_item_is_deliberately_parked};
+use super::dispatch_admission::{
+    primary_pr_awaits_review, revision_delivery_awaits_review, work_item_is_deliberately_parked,
+};
 use super::*;
 
 #[work_db_boundary::instrument]
@@ -112,6 +114,7 @@ impl WorkDb {
         let execution = insert_execution(
             &tx,
             CreateExecutionInput::builder()
+                .created_via("pr_completion:reviewer_enqueue")
                 .work_item_id(work_item_id.to_owned())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -218,6 +221,7 @@ impl WorkDb {
                 "UPDATE tasks
                  SET status = 'todo',
                      last_status_actor = 'engine',
+                     status_reason = 'ghost_active_healed:no_run_ever_recorded',
                      updated_at = ?2
                  WHERE id = ?1
                    AND status = 'active'
@@ -326,6 +330,7 @@ impl WorkDb {
             "UPDATE tasks
              SET status = 'todo',
                  last_status_actor = 'engine',
+                 status_reason = 'dispatch_failed:pane_spawn_demote',
                  updated_at = ?2
              WHERE id = ?1
                AND status = 'active'
@@ -400,6 +405,7 @@ impl WorkDb {
              SET status = 'todo',
                  autostart = 0,
                  last_status_actor = 'engine',
+                 status_reason = 'dispatch_failed:bounced_to_backlog',
                  dispatch_failed_reason = ?2,
                  dispatch_failed_error = ?3,
                  dispatch_failed_at = ?4,
@@ -583,7 +589,11 @@ impl WorkDb {
             //   - latest execution terminal → yes,
             //   - latest execution non-terminal but `is_live`
             //     reports the slot is gone → yes (stale row).
-            if primary_pr_awaits_review(&tx, &work_item_id)? {
+            if primary_pr_awaits_review(&tx, &work_item_id)? || revision_delivery_awaits_review(&tx, &work_item_id)? {
+                // A delivered row — a primary with its PR bound, or a
+                // revision whose implementation execution completed — is
+                // review/merge handling's, not a crashed dispatch. Its
+                // terminal latest execution is the delivery, not a death.
                 continue;
             }
             let existing = query_latest_execution_for_work_item(&tx, &work_item_id)?;
@@ -650,6 +660,7 @@ impl WorkDb {
                     .work_item_id(work_item_id.clone())
                     .maybe_preferred_workspace_id(preferred_workspace_id)
                     .allow_dirty(is_orphaned_predecessor)
+                    .created_via("reconcile_active_dispatch")
                     .build(),
                 |run_id| is_live(run_id),
             )?;
@@ -710,7 +721,7 @@ impl WorkDb {
             if !autostart {
                 continue;
             }
-            if primary_pr_awaits_review(&tx, &work_item_id)? {
+            if primary_pr_awaits_review(&tx, &work_item_id)? || revision_delivery_awaits_review(&tx, &work_item_id)? {
                 continue;
             }
             let needs_dispatch = match query_latest_execution_for_work_item(&tx, &work_item_id)? {
@@ -754,6 +765,7 @@ impl WorkDb {
                 &tx,
                 RequestExecutionInput::builder()
                     .work_item_id(work_item_id.clone())
+                    .created_via("rescan_active_dispatch")
                     .build(),
                 // `|_| true` keeps any non-terminal execution intact —
                 // the on-free rescan only ever fires this branch when
@@ -946,7 +958,12 @@ impl WorkDb {
             let id = row?;
             // A completed producer waiting for review admission is not
             // an orphan. Review recovery owns it, even without a batch.
-            if !primary_pr_awaits_review(&conn, &id)? {
+            // The same holds for a revision whose implementation execution
+            // completed: its commit is on the parent PR, and the batch
+            // exclusion above only masks it while a live pre-merge batch
+            // exists — a hold whose batch finished (or never formed) must
+            // not fall through to a redispatch of landed work.
+            if !primary_pr_awaits_review(&conn, &id)? && !revision_delivery_awaits_review(&conn, &id)? {
                 out.push(id);
             }
         }
@@ -1199,7 +1216,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, created_via
                  FROM work_executions
                  WHERE work_item_id = ?1
                  ORDER BY created_at ASC, id ASC",
@@ -1215,7 +1232,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, created_via
              FROM work_executions
              ORDER BY created_at ASC, id ASC",
         )?;
@@ -1238,7 +1255,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, created_via
                  FROM work_executions
                  WHERE work_item_id = ?1",
             )?;
@@ -1380,7 +1397,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, created_via
                  FROM work_executions
                  WHERE work_item_id = ?1
                    AND id != ?2
@@ -1409,7 +1426,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, created_via
              FROM work_executions
              WHERE work_item_id = ?1
                AND id != ?2
@@ -1583,7 +1600,7 @@ impl WorkDb {
                     "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                             cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                             created_at, started_at, finished_at,
-                            pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                            pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, created_via
                      FROM work_executions
                      WHERE work_item_id = ?1
                        AND status IN ('running', 'waiting_human')
@@ -1758,6 +1775,7 @@ impl WorkDb {
                 SET status             = 'in_review',
                     updated_at         = ?2,
                     last_status_actor  = 'engine',
+                    status_reason      = 'stale_revision_retired_before_dispatch',
                     blocked_reason     = NULL,
                     blocked_attempt_id = NULL
               WHERE id = ?1
@@ -1866,7 +1884,7 @@ fn review_guide_executions_for_task(conn: &Connection, task_id: &str) -> Result<
         "SELECT we.id, we.work_item_id, we.kind, we.status, we.repo_remote_url, we.cube_repo_id, we.cube_lease_id,
                 we.cube_workspace_id, we.workspace_path, we.priority, we.preferred_workspace_id,
                 we.created_at, we.started_at, we.finished_at,
-                we.pre_start_failure_count, we.dispatch_not_before, we.pr_url, we.pr_head_before, we.prefer_is_soft, we.worker_branch_prefix, we.transient_failure_count, we.allow_dirty, we.branch_naming, we.dispatch_wait_reason, we.dispatch_wait_since, we.driver_runtime_state, we.driver, we.model, we.effort_level, we.pr_head_after, we.last_error
+                we.pre_start_failure_count, we.dispatch_not_before, we.pr_url, we.pr_head_before, we.prefer_is_soft, we.worker_branch_prefix, we.transient_failure_count, we.allow_dirty, we.branch_naming, we.dispatch_wait_reason, we.dispatch_wait_since, we.driver_runtime_state, we.driver, we.model, we.effort_level, we.pr_head_after, we.last_error, we.created_via
          {REVIEW_GUIDE_EXECUTIONS_FOR_TASK_FROM}",
     ))?;
     let rows = stmt.query_map([task_id], map_execution)?;

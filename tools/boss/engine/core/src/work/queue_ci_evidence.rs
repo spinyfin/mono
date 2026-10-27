@@ -473,7 +473,8 @@ impl WorkDb {
         }
         let now = now_string();
         tx.execute(
-            "UPDATE tasks SET status = 'blocked', blocked_reason = 'ci_failure', updated_at = ?2 WHERE id = ?1",
+            "UPDATE tasks SET status = 'blocked', blocked_reason = 'ci_failure', last_status_actor = 'engine',
+                 status_reason = 'merge_queue_ci:verified_requeue_blocked', updated_at = ?2 WHERE id = ?1",
             params![attempt.work_item_id, now],
         )?;
         upsert_task_blocked_signal(&tx, &attempt.work_item_id, "ci_failure", Some(&attempt.id), &now)?;

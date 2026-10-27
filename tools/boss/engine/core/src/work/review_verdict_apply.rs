@@ -773,6 +773,7 @@ impl WorkDb {
                      blocked_reason     = ?3,
                      blocked_attempt_id = NULL,
                      last_status_actor  = 'engine',
+                     status_reason      = 'review_verdict:deletion_signoff_hold',
                      updated_at         = ?2
                  WHERE id = ?1
                    AND deleted_at IS NULL
@@ -893,6 +894,7 @@ fn advance_cycle_root_to_in_review_in_tx(
          SET status            = 'in_review',
              updated_at        = ?2,
              last_status_actor = 'engine',
+             status_reason     = 'review_verdict:advanced_to_in_review',
              blocked_reason    = NULL,
              blocked_attempt_id = NULL
          WHERE id = ?1

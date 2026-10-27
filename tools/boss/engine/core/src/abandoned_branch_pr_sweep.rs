@@ -807,6 +807,7 @@ mod tests {
         let exec = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id.clone())
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(ExecutionStatus::Ready)
@@ -858,6 +859,7 @@ mod tests {
         let exec = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore_id.to_owned())
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(ExecutionStatus::Ready)

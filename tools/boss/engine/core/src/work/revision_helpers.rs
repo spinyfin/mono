@@ -1764,14 +1764,21 @@ pub(crate) fn insert_execution(conn: &Connection, input: CreateExecutionInput) -
     // name from state.db alone, even after the product rule changes later.
     let branch_naming = resolve_execution_branch_naming(conn, &input.work_item_id)?;
     let branch_naming_json = serde_json::to_string(&branch_naming).unwrap_or_default();
+    // Creation provenance. Never NULL on a new row: an empty label is
+    // normalised to the explicit `unspecified` marker so a missing reason
+    // reads as "the caller did not say", not as a pre-column row.
+    let created_via = match input.created_via.trim() {
+        "" => boss_protocol::EXECUTION_CREATED_VIA_UNSPECIFIED.to_owned(),
+        label => label.to_owned(),
+    };
 
     conn.execute(
         "INSERT INTO work_executions (
             id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
             cube_workspace_id, workspace_path, priority, preferred_workspace_id,
             created_at, started_at, finished_at, prefer_is_soft, pr_url, worker_branch_prefix,
-            allow_dirty, branch_naming
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            allow_dirty, branch_naming, created_via
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         params![
             id,
             input.work_item_id,
@@ -1792,6 +1799,7 @@ pub(crate) fn insert_execution(conn: &Connection, input: CreateExecutionInput) -
             worker_branch_prefix,
             allow_dirty,
             branch_naming_json,
+            created_via,
         ],
     )?;
 

@@ -393,7 +393,7 @@ pub(super) async fn handle_create_attention(ctx: Dispatch, req: FrontendRequest)
             let _check_sensibility = server_state.feature_flags.is_enabled("notification_dedup_sensibility");
             // TODO(@brianduff,2026-12-31): build DedupInput, run decide_dedup, act on verdict.
         }
-        match work_db.create_attention(input) {
+        match work_db.create_attention(*input) {
             Ok((attention, group)) => {
                 // Live-update the Notifications window + doc viewer on
                 // the owning product's work-tree topic.

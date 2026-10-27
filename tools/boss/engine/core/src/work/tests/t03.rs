@@ -427,6 +427,7 @@ fn archiving_revision_prerequisite_cascades_to_waiting_dependent() {
     let waiting = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(dependent.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::WaitingDependency)

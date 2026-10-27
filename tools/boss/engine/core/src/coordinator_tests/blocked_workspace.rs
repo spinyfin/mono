@@ -7,6 +7,7 @@ pub(super) fn blocked_pair(path: &std::path::Path) -> (Arc<WorkDb>, WorkExecutio
     let prior = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&chore.id)
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -34,6 +35,7 @@ pub(super) fn blocked_pair(path: &std::path::Path) -> (Arc<WorkDb>, WorkExecutio
     let next = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id)
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -686,6 +688,7 @@ pub(super) async fn chain_harness(chain_root_pr: bool, origin: bool, conflict: b
     let prior = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&revision)
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)

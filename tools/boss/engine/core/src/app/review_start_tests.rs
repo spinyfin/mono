@@ -140,6 +140,7 @@ fn record_review(state: &ServerState, id: &str, head: &str) {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(id)
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Completed)

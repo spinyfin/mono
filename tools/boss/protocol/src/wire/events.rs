@@ -117,6 +117,12 @@ pub enum FrontendEvent {
     OperatorQuestionsList {
         questions: Vec<crate::OperatorQuestionRecord>,
     },
+    /// Reply for [`FrontendRequest::ListTaskStatusTransitions`](crate::FrontendRequest::ListTaskStatusTransitions):
+    /// the work item's status-transition ledger, oldest first.
+    TaskStatusTransitions {
+        work_item_id: String,
+        transitions: Vec<crate::TaskStatusTransition>,
+    },
     OperatorQuestionError {
         error: crate::OperatorQuestionError,
     },

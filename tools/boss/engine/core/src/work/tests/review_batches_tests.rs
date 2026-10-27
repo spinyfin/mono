@@ -169,6 +169,7 @@ fn quorum_dispatches_supervisor_once_all_three_leaves_report() {
         .map(|_| {
             db.create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(cycle_root.id.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Ready)
@@ -233,6 +234,7 @@ fn quorum_dispatches_supervisor_on_two_of_three_with_one_exhausted() {
         .map(|_| {
             db.create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(cycle_root.id.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Ready)
@@ -287,6 +289,7 @@ fn quorum_fails_the_batch_when_fewer_than_two_leaves_report() {
         .map(|_| {
             db.create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(cycle_root.id.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Ready)
@@ -347,6 +350,7 @@ fn quorum_fails_the_batch_when_zero_leaves_report() {
         .map(|_| {
             db.create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(cycle_root.id.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Ready)
@@ -416,6 +420,7 @@ fn quorum_is_a_noop_while_a_leaf_is_still_in_flight() {
         .map(|_| {
             db.create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(cycle_root.id.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Ready)
@@ -476,6 +481,7 @@ fn quorum_dispatch_is_idempotent_across_redundant_calls() {
         .map(|_| {
             db.create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(cycle_root.id.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Ready)
@@ -539,6 +545,7 @@ fn quorum_is_a_noop_when_supervisor_attempt_one_fails() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -577,6 +584,7 @@ fn quorum_fails_the_batch_when_the_supervisor_retry_is_exhausted() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -618,6 +626,7 @@ fn legacy_three_leaf_batch_round_trips_classification_and_member_policy() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -784,6 +793,7 @@ fn review_report_is_accepted_only_into_its_own_batch_member() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -820,6 +830,7 @@ fn review_report_rejections_preserve_batch_members() {
     let owner = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -829,6 +840,7 @@ fn review_report_rejections_preserve_batch_members() {
     let other = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -838,6 +850,7 @@ fn review_report_rejections_preserve_batch_members() {
     let failed_owner = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -963,6 +976,7 @@ fn missing_review_report_marks_only_its_member_failed() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -999,6 +1013,7 @@ fn review_verdict_stages_proposed_and_moves_the_batch_to_applying() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -1055,6 +1070,7 @@ fn a_second_review_verdict_from_the_same_supervisor_is_rejected() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -1122,6 +1138,7 @@ fn a_review_verdict_from_a_different_execution_is_rejected_even_after_completion
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -1131,6 +1148,7 @@ fn a_review_verdict_from_a_different_execution_is_rejected_even_after_completion
     let other_execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -1202,6 +1220,7 @@ fn review_verdict_is_rejected_while_batch_is_not_supervising() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -1362,6 +1381,7 @@ fn reported_live_leaf_is_graced_then_files_attention_from_both_recovery_paths() 
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -1435,6 +1455,7 @@ fn reported_live_supervisor() -> (WorkDb, String, String, String) {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -1597,6 +1618,7 @@ fn create_pre_merge_review_batch_prefers_existing_batch_over_a_partial_verdict()
     let leaf_execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Completed)
@@ -1642,6 +1664,7 @@ fn create_pre_merge_review_batch_defers_to_a_genuine_legacy_execution() {
     let legacy_execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -1749,6 +1772,7 @@ fn create_supervising_batch(
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -2267,6 +2291,7 @@ async fn reap_inert_review_batches_terminalizes_running_members_of_a_deleted_cyc
     let running_execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Running)
@@ -2379,6 +2404,7 @@ fn reap_inert_review_batches_does_not_reap_a_post_merge_batch_on_a_done_cycle_ro
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Running)
@@ -2457,6 +2483,7 @@ fn reap_inert_review_batches_reaps_a_stale_post_merge_batch_with_no_non_terminal
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -2601,6 +2628,7 @@ fn post_merge_verdict_stages_proposed_and_moves_the_batch_straight_to_applying()
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -2659,6 +2687,7 @@ fn post_merge_verdict_is_rejected_from_a_role_not_entitled_to_submit_one() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -2714,6 +2743,7 @@ fn dead_post_merge_reviewer_retries_once_then_fails_the_batch() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)

@@ -55,7 +55,8 @@ pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool) -> Result
         conn.execute(
             "UPDATE tasks
              SET status = 'todo', blocked_reason = NULL, blocked_detail = NULL, autostart = 1,
-                 last_status_actor = 'engine', updated_at = ?2
+                 last_status_actor = 'engine', status_reason = 'schema_migration:execution_recovery_rearm',
+                 updated_at = ?2
              WHERE id = ?1",
             params![id, now_string()],
         )?;
@@ -100,6 +101,7 @@ pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool) -> Result
         insert_execution(
             conn,
             CreateExecutionInput::builder()
+                .created_via("schema_migration:execution_recovery_rearm")
                 .work_item_id(id)
                 .kind(kind)
                 .status(ExecutionStatus::WaitingDependency)
@@ -271,6 +273,7 @@ mod tests {
                 let failed = db
                     .create_execution(
                         CreateExecutionInput::builder()
+                            .created_via("test")
                             .work_item_id(id.clone())
                             .kind(kind.clone())
                             .status(ExecutionStatus::Failed)
@@ -345,6 +348,7 @@ mod tests {
             let pending = db
                 .create_execution(
                     CreateExecutionInput::builder()
+                        .created_via("test")
                         .work_item_id(id.clone())
                         .kind(ExecutionKind::ChoreImplementation)
                         .status(ExecutionStatus::WaitingDependency)
@@ -354,6 +358,7 @@ mod tests {
             let failed = db
                 .create_execution(
                     CreateExecutionInput::builder()
+                        .created_via("test")
                         .work_item_id(id.clone())
                         .kind(ExecutionKind::ChoreImplementation)
                         .status(ExecutionStatus::Failed)

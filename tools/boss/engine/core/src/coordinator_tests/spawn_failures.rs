@@ -1352,6 +1352,7 @@ async fn revision_implementation_execution_advances_past_worker_claimed_to_lease
     let impl_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)

@@ -505,9 +505,12 @@ pub enum FrontendRequest {
     /// finds or creates the owning group based on the association and
     /// source fields in the input. Replies with
     /// [`FrontendEvent::AttentionCreated`].
+    /// Boxed: an inline `CreateAttentionInput` here would make this variant
+    /// far larger than its siblings (clippy::large_enum_variant) — serializes
+    /// identically.
     CreateAttention {
         #[serde(flatten)]
-        input: CreateAttentionInput,
+        input: Box<CreateAttentionInput>,
     },
 
     CreateAttentionItem {
@@ -1667,6 +1670,15 @@ pub enum FrontendRequest {
         /// callers omit the field and keep the historical live-only view.
         #[serde(default)]
         include_deleted: bool,
+    },
+
+    /// Read-only: every recorded `tasks.status` transition for one work
+    /// item, oldest first — the status-provenance ledger behind `boss task
+    /// show --json`'s `status_transitions`. Accepts a friendly short id or a
+    /// primary `task_…` id. Replies with
+    /// [`FrontendEvent::TaskStatusTransitions`].
+    ListTaskStatusTransitions {
+        id: String,
     },
 
     /// Read tmux's current session evidence for every live worker. This is
@@ -2861,9 +2873,12 @@ pub enum FrontendRequest {
         patch: IdeaPatch,
     },
 
+    /// Boxed: an inline `WorkItemPatch` here would make this variant far
+    /// larger than its siblings (clippy::large_enum_variant) — serializes
+    /// identically.
     UpdateWorkItem {
         id: String,
-        patch: WorkItemPatch,
+        patch: Box<WorkItemPatch>,
     },
 
     /// Snapshot every engine worker pool's (main, automation, review)

@@ -2020,6 +2020,7 @@ mod tests {
         let other_execution = work_db
             .create_execution(
                 crate::work::CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id.clone())
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(crate::work::ExecutionStatus::Ready)
@@ -2071,6 +2072,7 @@ mod tests {
         let execution = work_db
             .create_execution(
                 crate::work::CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id.clone())
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(crate::work::ExecutionStatus::Ready)
@@ -2751,6 +2753,7 @@ mod tests {
         let execution = work_db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(task_id)
                     .kind(ExecutionKind::RevisionImplementation)
                     .status(ExecutionStatus::Running)

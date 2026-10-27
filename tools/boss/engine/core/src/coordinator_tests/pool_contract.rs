@@ -34,6 +34,7 @@ async fn interactive_cap_only_holds_new_main_pool_admission() {
     let review = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id)
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)

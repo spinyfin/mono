@@ -61,6 +61,7 @@ fn insert_informative_verdict(db: &WorkDb, verdict_source_id: &str, head_sha: &s
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(verdict_source_id.to_owned())
                 .kind(ExecutionKind::PrReview)
                 .build(),

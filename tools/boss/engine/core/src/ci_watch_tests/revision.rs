@@ -250,6 +250,14 @@ async fn retrigger_creates_bespoke_execution_and_no_revision() {
         )
         .unwrap();
     assert_eq!(exec_count, 1, "retrigger must park a ci_remediation execution");
+    let created_via: String = conn
+        .query_row(
+            "SELECT created_via FROM work_executions WHERE work_item_id = ?1 AND kind = 'ci_remediation'",
+            rusqlite::params![&chore],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(created_via, "ci_watch:retrigger");
     let revisions: i64 = conn
         .query_row("SELECT COUNT(*) FROM tasks WHERE kind = 'revision'", [], |r| r.get(0))
         .unwrap();
@@ -257,6 +265,46 @@ async fn retrigger_creates_bespoke_execution_and_no_revision() {
 
     // Retrigger does not consume the fix budget.
     assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn stranded_attempt_rescue_stamps_created_via() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/103";
+    let (product, chore) = make_in_review(&db, "C-stranded-rescue", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    let rescued = rescue_stranded_ci_remediation_attempt(
+        &db,
+        pub_.as_ref(),
+        &crate::work::StrandedCiRemediationAttempt {
+            attempt_id: "crm_test".into(),
+            work_item_id: chore.clone(),
+            product_id: product,
+            pr_url: pr.into(),
+        },
+    )
+    .await;
+    assert!(rescued, "rescue must mint a ci_remediation execution");
+
+    let execs = db.list_executions(Some(&chore)).unwrap();
+    let rem = execs
+        .iter()
+        .find(|e| e.kind == ExecutionKind::CiRemediation)
+        .expect("rescue execution");
+    assert_eq!(rem.created_via.as_deref(), Some("ci_watch:stranded_attempt_rescue"));
+}
+
+#[test]
+fn production_ci_watch_execution_inserts_are_not_labelled_test() {
+    let src = include_str!("../ci_watch.rs");
+    assert!(
+        !src.contains(".created_via(\"test\")"),
+        "production ci_watch create_execution sites must not stamp created_via(\"test\")"
+    );
+    assert!(src.contains(".created_via(CREATED_VIA_CI_WATCH_RETRIGGER)"));
+    assert!(src.contains(".created_via(CREATED_VIA_CI_WATCH_STRANDED_ATTEMPT_RESCUE)"));
 }
 
 #[tokio::test]

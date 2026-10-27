@@ -427,6 +427,14 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "operator_questions_list",
         },
         TagCase {
+            label: "task_status_transitions",
+            event: FrontendEvent::TaskStatusTransitions {
+                work_item_id: String::new(),
+                transitions: vec![],
+            },
+            expected_tag: "task_status_transitions",
+        },
+        TagCase {
             label: "operator_question_error",
             event: FrontendEvent::OperatorQuestionError {
                 error: crate::OperatorQuestionError::NotFound,
@@ -2402,6 +2410,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::AttachmentsList { .. }
         | FrontendEvent::OperatorDecisionSnapshot { .. }
         | FrontendEvent::OperatorQuestionsList { .. }
+        | FrontendEvent::TaskStatusTransitions { .. }
         | FrontendEvent::OperatorQuestionError { .. } => {}
     }
 }

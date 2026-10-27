@@ -300,6 +300,7 @@ impl WorkDb {
                 SET status            = 'blocked',
                     blocked_reason    = 'merge_conflict',
                     last_status_actor = 'engine',
+                    status_reason     = 'merge_conflict_detected',
                     updated_at        = ?3
               WHERE id = ?1
                 AND status = 'in_review'
@@ -349,6 +350,7 @@ impl WorkDb {
                     blocked_attempt_id = NULL,
                     pr_url             = ?2,
                     last_status_actor  = 'engine',
+                    status_reason      = 'deletion_signoff_required',
                     updated_at         = ?3
               WHERE id = ?1
                 AND status = 'blocked'
@@ -392,6 +394,7 @@ impl WorkDb {
                     blocked_reason     = NULL,
                     blocked_attempt_id = NULL,
                     last_status_actor  = 'engine',
+                    status_reason      = 'merge_conflict_cleared',
                     updated_at         = ?3
               WHERE id = ?1
                 AND status = 'blocked'
@@ -444,6 +447,7 @@ impl WorkDb {
                     blocked_reason     = NULL,
                     blocked_attempt_id = NULL,
                     last_status_actor  = 'engine',
+                    status_reason      = 'merge_conflict_cleared:attempt_retired',
                     updated_at         = ?4
               WHERE id = ?1
                 AND status = 'blocked'
@@ -562,6 +566,7 @@ impl WorkDb {
                     blocked_reason    = 'ci_failure_exhausted',
                     ci_required_state = 'fail',
                     last_status_actor = 'engine',
+                    status_reason     = 'ci_failure_exhausted',
                     updated_at        = ?3
               WHERE id = ?1
                 AND pr_url = ?2
@@ -600,6 +605,7 @@ impl WorkDb {
                     blocked_attempt_id = COALESCE(?3, blocked_attempt_id),
                     ci_required_state  = 'fail',
                     last_status_actor  = 'engine',
+                    status_reason      = 'ci_failure_detected',
                     updated_at         = ?5
               WHERE id = ?1
                 AND status = 'in_review'
@@ -633,6 +639,7 @@ impl WorkDb {
                     blocked_reason     = NULL,
                     blocked_attempt_id = NULL,
                     last_status_actor  = 'engine',
+                    status_reason      = 'ci_failure_cleared',
                     updated_at         = ?3
               WHERE id = ?1
                 AND status = 'blocked'
@@ -1159,6 +1166,7 @@ impl WorkDb {
                         blocked_reason     = NULL,
                         blocked_attempt_id = NULL,
                         last_status_actor  = 'engine',
+                        status_reason      = 'ci_retry:exhaustion_cleared',
                         updated_at         = ?2
                   WHERE id = ?1
                     AND status = 'blocked'
@@ -1792,6 +1800,7 @@ impl WorkDb {
                     blocked_reason     = NULL,
                     blocked_attempt_id = NULL,
                     last_status_actor  = 'engine',
+                    status_reason      = 'ci_remediation:validated_green',
                     updated_at         = ?3
               WHERE id = ?1
                 AND status = 'blocked'

@@ -300,7 +300,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, created_via
              FROM work_executions
              WHERE work_item_id = ?1
              ORDER BY created_at DESC, id DESC
@@ -393,7 +393,7 @@ impl WorkDb {
                     review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha,
                     external_ref_kind, external_ref_canonical_id, external_ref_raw,
                     external_ref_synced_at, external_ref_unbound_at,
-                    (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
+                    (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question, tasks.status_reason AS status_reason
              FROM tasks
              WHERE id = ?1 AND deleted_at IS NULL",
             [id],
@@ -426,7 +426,7 @@ impl WorkDb {
                     review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha,
                     external_ref_kind, external_ref_canonical_id, external_ref_raw,
                     external_ref_synced_at, external_ref_unbound_at,
-                    (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
+                    (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question, tasks.status_reason AS status_reason
              FROM tasks
              WHERE external_ref_kind          = ?1
                AND external_ref_canonical_id  = ?2
@@ -529,6 +529,7 @@ impl WorkDb {
              SET status             = 'done',
                  updated_at         = ?2,
                  last_status_actor  = 'engine',
+                 status_reason      = 'external_tracker:closed',
                  blocked_reason     = NULL,
                  blocked_attempt_id = NULL,
                  completed_at       = COALESCE(completed_at, ?2),

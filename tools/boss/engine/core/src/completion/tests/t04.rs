@@ -680,6 +680,7 @@ async fn duplicate_pr_review_passes_on_same_head_mint_only_one_revision() {
     let pr_review_exec_b = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -792,6 +793,7 @@ async fn duplicate_head_review_with_no_findings_records_completed_clean() {
     let pr_review_exec_b = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -1427,6 +1429,7 @@ async fn full_produce_review_revise_re_review_loop_converges() {
     let rev_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision_task_id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -2063,6 +2066,7 @@ async fn pure_rebase_skip_gate_falls_through_when_no_attempt_row_exists() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -2326,6 +2330,7 @@ async fn on_stop_finalizes_satisfied_chore_when_pr_clean_and_sha_unchanged() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)

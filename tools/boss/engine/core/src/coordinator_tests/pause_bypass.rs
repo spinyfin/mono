@@ -453,6 +453,7 @@ async fn evaluate_dispatch_admission_exempts_pr_review_from_operator_pause() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
