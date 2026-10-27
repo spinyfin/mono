@@ -68,6 +68,7 @@ impl ProbeError {
     }
 
     /// `errno` as it stands right after a failed libc call.
+    #[cfg(target_os = "macos")]
     pub(crate) fn last_errno(call: &'static str) -> Self {
         Self::errno(call, std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
     }
