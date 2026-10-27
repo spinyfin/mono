@@ -26,6 +26,43 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const CHORE_LIKE_KINDS_SQL: &str =
     "'chore', 'project_task', 'design', 'investigation', 'followup', 'design_postmortem'";
 
+/// SQL boolean: `{alias}` is a live writer for the revision chain-tail gate
+/// and [`WorkDb::has_in_flight_ci_fix_revision`].
+///
+/// Live = `todo` / `active`, or `blocked` for a reason other than a
+/// terminal halt (`worker_failed`, `spawning_attempt_retired_unsuccessfully`),
+/// or those halt reasons while a non-terminal execution is still attached.
+/// A halted revision with no live execution is not a writer: gating a later
+/// revision on it queues forever, and the parent sits in Review ▸ Blocked.
+///
+/// `alias` is a compile-time table alias from the two callers (`t`, `next`);
+/// never user input.
+pub(crate) fn live_chain_writer_sql(alias: &str) -> String {
+    debug_assert!(
+        alias.chars().all(|c| c.is_ascii_alphabetic()),
+        "live_chain_writer_sql alias must be a SQL identifier, got {alias:?}"
+    );
+    format!(
+        "({alias}.status IN ('todo', 'active')
+          OR (
+              {alias}.status = 'blocked'
+              AND (
+                  COALESCE({alias}.blocked_reason, '') NOT IN (
+                      'worker_failed',
+                      'spawning_attempt_retired_unsuccessfully'
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM work_executions e
+                       WHERE e.work_item_id = {alias}.id
+                         AND e.status NOT IN (
+                             'completed', 'failed', 'abandoned', 'cancelled', 'orphaned'
+                         )
+                  )
+              )
+          ))"
+    )
+}
+
 /// Error of the single most recent terminal, non-superseded review-guide
 /// attempt (`failed` or `cancelled`). Both the card-state query and the
 /// summary query embed this so the two projections cannot drift. Empty

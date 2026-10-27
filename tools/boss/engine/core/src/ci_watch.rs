@@ -2184,10 +2184,11 @@ fn close_superseded_moot_revision(work_db: &WorkDb, work_item_id: &str, revision
 /// covers the head SHA having moved since the attempt ended.
 ///
 /// Only revisions stamped `ci-fix:` are touched (human-filed and
-/// review-finding revisions never are), and queue-side attempts are skipped
-/// because a green PR-head probe says nothing about them. A revision a
-/// worker is still live on is left alone by
-/// [`WorkDb::close_moot_revision_task`]. Returns the number closed.
+/// review-finding revisions never are). Queue-side attempts
+/// (`trunk_queue_eviction`, `merge_queue_rebounce`) are included once the
+/// attempt has ended: the revision is then a stranded writer, and a green
+/// PR head means it is moot. A revision a worker is still live on is left
+/// alone by [`WorkDb::close_moot_revision_task`]. Returns the number closed.
 pub(crate) fn retire_moot_ci_fix_revisions(
     work_db: &WorkDb,
     candidate: &PendingMergeCheck,

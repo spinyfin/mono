@@ -208,28 +208,38 @@ async fn human_filed_revision_is_untouched() {
     assert_eq!(task(&db, &review.id).status, TaskStatus::Blocked);
 }
 
+/// A queue-side attempt that has already ended (`abandoned`) leaves its
+/// CI-fix revision stranded. A green PR-head probe must close that
+/// revision; excluding `trunk_queue_eviction` / `merge_queue_rebounce`
+/// from the moot-close query used to pin the parent in Review ▸ Blocked.
 #[tokio::test]
-async fn queue_side_attempt_revision_is_not_closed_by_a_green_head_probe() {
-    let dir = tempdir().unwrap();
-    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
-    let pr = "https://github.com/foo/bar/pull/706";
-    let (product, chore) = make_in_review(&db, "C-stale-queue-side", pr);
-    let (attempt, revision) = spawn_ci_fix(&db, &product, &chore, pr, "head-1").await;
-    db.mark_ci_remediation_failed(&attempt, "worker_gave_up")
-        .unwrap()
-        .unwrap();
-    db.connect()
-        .unwrap()
-        .execute(
-            "UPDATE ci_remediations SET failure_kind = 'merge_queue_rebounce' WHERE id = ?1",
-            [&attempt],
-        )
-        .unwrap();
-    park_blocked(&db, &revision);
+async fn queue_side_abandoned_attempt_revision_is_closed_when_head_is_green() {
+    for (label, failure_kind) in [
+        ("C-stale-queue-side-trunk", "trunk_queue_eviction"),
+        ("C-stale-queue-side-rebounce", "merge_queue_rebounce"),
+    ] {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/706";
+        let (product, chore) = make_in_review(&db, label, pr);
+        let (attempt, revision) = spawn_ci_fix(&db, &product, &chore, pr, "head-1").await;
+        db.mark_ci_remediation_abandoned(&attempt, "queue_side_attempt_ended")
+            .unwrap()
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE ci_remediations SET failure_kind = ?2 WHERE id = ?1",
+                rusqlite::params![attempt, failure_kind],
+            )
+            .unwrap();
+        park_blocked(&db, &revision);
 
-    assert_eq!(
-        retire_moot_ci_fix_revisions(&db, &candidate(&product, &chore, pr), &[]),
-        0
-    );
-    assert_eq!(task(&db, &revision).status, TaskStatus::Blocked);
+        assert_eq!(
+            retire_moot_ci_fix_revisions(&db, &candidate(&product, &chore, pr), &[]),
+            1,
+            "{failure_kind} revision must close once the attempt has ended and the PR head is green"
+        );
+        assert_closed(&db, &revision);
+    }
 }

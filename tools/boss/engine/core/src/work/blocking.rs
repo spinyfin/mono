@@ -1442,9 +1442,14 @@ impl WorkDb {
 
     /// Returns `true` when there is at least one engine-triggered
     /// CI-fix revision (`created_via LIKE 'ci-fix:%'`) for the chore
-    /// `work_item_id` that is still in flight — i.e. its status is
-    /// `todo`, `active`, or `blocked` (waiting on a dependency that
-    /// is itself still running).
+    /// `work_item_id` that is still in flight — a live writer per
+    /// `live_chain_writer_sql` (`todo` / `active`, or `blocked`
+    /// waiting on a dependency or still holding a live execution).
+    /// A `blocked: worker_failed` or
+    /// `blocked: spawning_attempt_retired_unsuccessfully` revision
+    /// with no live execution is not in flight: its worker has
+    /// stopped, and treating it as a writer would strand the next
+    /// CI-fix behind a row that never runs again.
     ///
     /// Used by [`crate::ci_watch::on_ci_failure_detected`] as a
     /// secondary pre-flight gate: after the primary gate (based on
@@ -1457,14 +1462,17 @@ impl WorkDb {
     /// still running and has not yet pushed a fix commit).
     pub fn has_in_flight_ci_fix_revision(&self, work_item_id: &str) -> Result<bool> {
         let conn = self.connect()?;
+        let live = live_chain_writer_sql("t");
         let n: i64 = conn.query_row(
-            "SELECT COUNT(*)
+            &format!(
+                "SELECT COUNT(*)
              FROM tasks t
              WHERE t.parent_task_id = ?1
                AND t.kind = 'revision'
                AND t.created_via LIKE 'ci-fix:%'
-               AND t.status IN ('todo', 'active', 'blocked')
-               AND t.deleted_at IS NULL",
+               AND {live}
+               AND t.deleted_at IS NULL"
+            ),
             params![work_item_id],
             |row| row.get(0),
         )?;

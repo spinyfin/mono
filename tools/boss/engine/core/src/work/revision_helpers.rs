@@ -45,20 +45,26 @@ impl WorkDb {
 /// "tail" of the revision chain so the new revision can be automatically
 /// gated on it, serialising back-to-back revisions targeting the same PR.
 ///
-/// Live = `todo` / `active` / `blocked` — a worker is queued, running, or
-/// waiting on a prerequisite. `in_review` is **not** live: that worker
-/// already pushed and stopped, so gating a conflict- or CI-fix revision
-/// on it waits for the parent PR to merge, which a conflicting PR cannot
-/// do. `done` / `archived` are finished.
+/// Live writer = [`live_chain_writer_sql`]: `todo` / `active`, or `blocked`
+/// waiting on a prerequisite or other recoverable halt, including a
+/// terminal halt (`worker_failed`, `spawning_attempt_retired_unsuccessfully`)
+/// that still has a non-terminal execution. A halted revision with no live
+/// execution is skipped — gating a later revision on it queues forever.
+/// `in_review` is **not** live: that worker already pushed and stopped, so
+/// gating a conflict- or CI-fix revision on it waits for the parent PR to
+/// merge, which a conflicting PR cannot do. `done` / `archived` are finished.
 ///
 /// The recursive CTE walks `parent_task_id` links one level at a time,
 /// starting from direct children of `root_id`.  Depth is capped at 64 by
 /// the CTE's `UNION ALL` termination condition (no infinite loop in
 /// well-formed data; the engine never creates cycles).
 pub(crate) fn find_latest_active_revision_in_chain(conn: &Connection, root_id: &str) -> Result<Option<String>> {
+    let live = live_chain_writer_sql("t");
+    let live_successor = live_chain_writer_sql("next");
     let id: Option<String> = conn
         .query_row(
-            "WITH RECURSIVE chain(id) AS (
+            &format!(
+                "WITH RECURSIVE chain(id) AS (
                 SELECT id
                 FROM tasks
                 WHERE parent_task_id = ?1
@@ -74,16 +80,17 @@ pub(crate) fn find_latest_active_revision_in_chain(conn: &Connection, root_id: &
             SELECT c.id
             FROM chain c
             JOIN tasks t ON t.id = c.id
-            WHERE t.status IN ('todo', 'active', 'blocked')
+            WHERE {live}
               AND NOT EXISTS (
                   SELECT 1 FROM work_item_dependencies d
                   JOIN chain successor ON successor.id = d.dependent_id
                   JOIN tasks next ON next.id = successor.id
                   WHERE d.prerequisite_id = c.id AND d.relation = 'blocks'
-                    AND next.status IN ('todo', 'active', 'blocked')
+                    AND {live_successor}
               )
             ORDER BY c.id DESC
-            LIMIT 1",
+            LIMIT 1"
+            ),
             params![root_id],
             |row| row.get::<_, String>(0),
         )

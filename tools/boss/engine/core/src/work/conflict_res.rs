@@ -489,17 +489,12 @@ impl WorkDb {
     /// Provenance is double-checked on the revision itself
     /// (`created_via LIKE 'ci-fix:%'`), so a human-filed revision is never
     /// returned. Queue-side attempts (`merge_queue_rebounce`,
-    /// `trunk_queue_eviction`) are excluded: a green PR-head probe says
-    /// nothing about a failure that lived on the queue's synthetic commit.
+    /// `trunk_queue_eviction`) are included once the attempt has ended: the
+    /// revision is then a stranded writer, and a green PR head means it is
+    /// moot even if the original failure lived on a synthetic queue commit.
     pub fn open_ci_fix_revisions_of_ended_attempts(&self, work_item_id: &str) -> Result<Vec<String>> {
         let conn = self.connect()?;
-        open_revisions_of_ended_attempts(
-            &conn,
-            "ci_remediations",
-            CREATED_VIA_CI_FIX_PREFIX,
-            " AND (a.failure_kind IS NULL OR a.failure_kind NOT IN ('trunk_queue_eviction', 'merge_queue_rebounce'))",
-            work_item_id,
-        )
+        open_revisions_of_ended_attempts(&conn, "ci_remediations", CREATED_VIA_CI_FIX_PREFIX, "", work_item_id)
     }
 
     /// Merge-conflict counterpart of

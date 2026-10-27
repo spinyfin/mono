@@ -380,6 +380,14 @@ The seven questions this design originally raised have been resolved by the oper
 
 **As built:** `parent_task_id` is **always the chain root**, not the immediate revision the caller named. Filing `create-revision --parent <R2>` (or an automatic PR-review / CI / conflict producer against a revision work item) still resolves the gate against the root's PR, but the new row stores `parent_task_id = root`. Sequencing of back-to-back revisions is via dependency edges on the chain tail, not nested parents. Nested parentage hid later revisions from the UI rollup (which only surfaces direct children of the root). A startup migration flattens any pre-existing nested rows.
 
+**Live writer for the chain-tail gate.** The tail query (`find_latest_active_revision_in_chain` in `engine/core/src/work/revision_helpers.rs`) picks the latest _live writer_ on the chain, not merely the latest `todo` / `active` / `blocked` row. A live writer is:
+
+- `todo` or `active`, or
+- `blocked` for a reason other than `worker_failed` / `spawning_attempt_retired_unsuccessfully`, or
+- those two halt reasons while a non-terminal execution is still attached.
+
+A `blocked: worker_failed` or `blocked: spawning_attempt_retired_unsuccessfully` revision with no live execution is skipped, so a later revision is not gated on a sibling that will never finish, and the parent does not sit in Review ▸ Blocked waiting on it. `in_review` / `done` / `archived` remain non-live, as before. The same live-writer predicate is what `has_in_flight_ci_fix_revision` uses so a dead CI-fix does not block a new one.
+
 ### OQ3 — Permission scope / `gh pr create` guard
 
 **Decision: a Claude Code PreToolUse hook, not a `gh` wrapper.** A wrapper is heavy (a new binary, PATH injection); a hook can inspect the Bash command and reject `gh pr create` for `revision_implementation` executions without touching PATH or shipping anything. The hook matches the `Bash` tool, inspects the proposed command in `tool_input`, and denies any `gh pr create` invocation (tolerant of flags and `GIT_DIR=…` prefixes) with a message pointing at the revision contract. It is registered only for `revision_implementation`, so normal workers are unaffected (see Q4 § Permission hard-guard for the mechanism). _Why it matters: trusting the directive alone means one confused worker turn can open a duplicate PR — exactly the one-PR-per-task invariant ([[feedback_one_pr_per_task]]) this design is the sanctioned exception to. A stray second PR is the most damaging failure mode here._
