@@ -480,7 +480,7 @@ pub async fn run_one_pass_observed(
             work_db,
             &snapshot.results,
             &source_observation_sequences,
-            publisher,
+            (publisher, "full_sweep"),
             (cube_client, completion_handler, remediation),
             candidate,
             &mut outcome,
@@ -793,7 +793,7 @@ pub async fn reconcile_batch(
             work_db,
             &probe_results,
             &source_observation_sequences,
-            publisher,
+            (publisher, "adaptive_batch"),
             (cube_client, completion_handler, remediation),
             candidate,
             &mut outcome,
@@ -1314,7 +1314,7 @@ pub(crate) async fn sweep_one(
     work_db: &WorkDb,
     probe_results: &HashMap<String, std::result::Result<PrLifecycleProbe, String>>,
     source_observation_sequences: &HashMap<String, i64>,
-    publisher: &dyn ExecutionPublisher,
+    publication: (&dyn ExecutionPublisher, &'static str),
     // (cube_client, completion_handler, remediation) — bundled to keep the
     // parameter count under clippy::too_many_arguments.
     handlers: (
@@ -1325,6 +1325,7 @@ pub(crate) async fn sweep_one(
     candidate: &PendingMergeCheck,
     outcome: &mut SweepOutcome,
 ) {
+    let (publisher, caller) = publication;
     let (cube_client, completion_handler, remediation) = handlers;
     let probe_result = match probe_results.get(&candidate.pr_url) {
         Some(Ok(state)) => state.clone(),
@@ -1594,6 +1595,7 @@ pub(crate) async fn sweep_one(
             candidate,
             &probe_result,
             known_active_queue_failure.as_ref().map(|inner| inner.as_ref()),
+            caller,
         )
         .await;
         // Trunk merge-queue episodes Boss did not initiate. Runs for every
@@ -2249,6 +2251,7 @@ pub(crate) async fn update_pr_poll_state(
     candidate: &PendingMergeCheck,
     probe: &PrLifecycleProbe,
     known_active_queue_failure: Option<Option<&CiRemediation>>,
+    caller: &str,
 ) {
     let PrLifecycleState::Open(open) = &probe.state else {
         return;
@@ -2421,6 +2424,7 @@ pub(crate) async fn update_pr_poll_state(
     let outcome = match work_db.update_task_pr_poll_state(
         &candidate.work_item_id,
         PrPollStateInput {
+            caller,
             ci_required_state: ci_state,
             review_required_state: review_state,
             ci_required_detail: ci_detail.as_deref(),

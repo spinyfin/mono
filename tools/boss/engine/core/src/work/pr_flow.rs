@@ -28,6 +28,7 @@ pub struct DeferredReviewAdmissionCandidate {
 /// whether it changed anything.
 #[derive(Debug, PartialEq, Eq)]
 struct PrObservationColumns {
+    pr_url: Option<String>,
     pr_mergeable_state: Option<String>,
     pr_merge_state_status: Option<String>,
     pr_head_sha: Option<String>,
@@ -37,11 +38,12 @@ struct PrObservationColumns {
 /// `None` when the row is absent or deleted.
 fn read_pr_observation_columns(conn: &Connection, work_item_id: &str) -> Result<Option<PrObservationColumns>> {
     conn.query_row(
-        "SELECT pr_mergeable_state, pr_merge_state_status, pr_head_sha, ci_required_state
+        "SELECT pr_mergeable_state, pr_merge_state_status, pr_head_sha, ci_required_state, pr_url
          FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
         params![work_item_id],
         |row| {
             Ok(PrObservationColumns {
+                pr_url: row.get(4)?,
                 pr_mergeable_state: row.get(0)?,
                 pr_merge_state_status: row.get(1)?,
                 pr_head_sha: row.get(2)?,
@@ -51,6 +53,17 @@ fn read_pr_observation_columns(conn: &Connection, work_item_id: &str) -> Result<
     )
     .optional()
     .map_err(anyhow::Error::from)
+}
+
+/// GitHub's UNKNOWN means recomputation, not a new mergeability verdict.
+/// Share this rule with on-demand refreshes so either writer preserves facts.
+fn retain_known_poll_value<'a>(prior: Option<&'a str>, incoming: &'a str) -> &'a str {
+    if incoming.eq_ignore_ascii_case("unknown")
+        && let Some(known) = prior.filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("unknown"))
+    {
+        return known;
+    }
+    incoming
 }
 
 #[work_db_boundary::instrument]
@@ -1531,19 +1544,23 @@ impl WorkDb {
     /// `trunk_queue`-mechanism task (whose columns are owned by Trunk) and
     /// for the empty first GitHub observation of a per-row native merge
     /// intent. Neither case is evidence that the requested merge departed.
+    ///
+    /// UNKNOWN mergeability / merge-state status means GitHub is computing.
+    /// Retain each last known value before comparing the row, so a transient
+    /// observation neither moves Review cards nor publishes an invalidation.
     pub fn update_task_pr_poll_state(&self, work_item_id: &str, input: PrPollStateInput) -> Result<PrPollStateOutcome> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();
-        let prior_ci_state: Option<String> = tx
-            .query_row(
-                "SELECT ci_required_state FROM tasks
-                 WHERE id = ?1 AND deleted_at IS NULL",
-                params![work_item_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
+        let before = read_pr_observation_columns(&tx, work_item_id)?;
+        let prior_ci_state = before.as_ref().and_then(|row| row.ci_required_state.clone());
+        let prior_mergeable = before.as_ref().and_then(|row| row.pr_mergeable_state.as_deref());
+        let prior_merge_status = before.as_ref().and_then(|row| row.pr_merge_state_status.as_deref());
+        let mergeable = retain_known_poll_value(prior_mergeable, input.pr_mergeable_state);
+        let merge_status = input
+            .pr_merge_state_status
+            .map(|value| retain_known_poll_value(prior_merge_status, value))
+            .or(prior_merge_status);
         let prior_merge_queue_state: Option<String> = tx
             .query_row(
                 "SELECT merge_queue_state FROM tasks
@@ -1609,13 +1626,31 @@ impl WorkDb {
                 input.merge_queue_state,
                 input.merge_queue_detail,
                 preserve,
-                input.pr_mergeable_state,
-                input.pr_merge_state_status,
+                mergeable,
+                merge_status,
                 input.pr_head_sha,
                 input.pr_updated_at,
             ],
         )?;
         tx.commit()?;
+        if changed > 0
+            && (prior_ci_state.as_deref() != Some(input.ci_required_state)
+                || prior_mergeable != Some(mergeable)
+                || prior_merge_status != merge_status)
+        {
+            tracing::info!(
+                work_item_id,
+                pr_url = ?before.as_ref().and_then(|row| row.pr_url.as_deref()),
+                caller = input.caller,
+                old_ci_required_state = ?prior_ci_state,
+                new_ci_required_state = input.ci_required_state,
+                old_pr_mergeable_state = ?prior_mergeable,
+                new_pr_mergeable_state = mergeable,
+                old_pr_merge_state_status = ?prior_merge_status,
+                new_pr_merge_state_status = ?merge_status,
+                "PR poll state changed",
+            );
+        }
         Ok(PrPollStateOutcome {
             changed: changed > 0,
             prior_ci_state,
@@ -1692,6 +1727,16 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let before = read_pr_observation_columns(&tx, work_item_id)?;
+        let mergeable_state = retain_known_poll_value(
+            before.as_ref().and_then(|row| row.pr_mergeable_state.as_deref()),
+            mergeable_state,
+        );
+        let merge_state_status = merge_state_status.map(|value| {
+            retain_known_poll_value(
+                before.as_ref().and_then(|row| row.pr_merge_state_status.as_deref()),
+                value,
+            )
+        });
         tx.execute(
             "UPDATE tasks
              SET pr_mergeable_state    = ?2,
@@ -1776,6 +1821,9 @@ impl WorkDb {
 #[derive(Debug, Clone, Copy, Default, bon::Builder)]
 #[builder(on(String, into))]
 pub struct PrPollStateInput<'a> {
+    /// Origin of the observation, included in per-row state transition logs.
+    #[builder(default = "unspecified")]
+    pub caller: &'a str,
     pub ci_required_state: &'a str,
     pub review_required_state: &'a str,
     pub ci_required_detail: Option<&'a str>,
@@ -1792,7 +1840,8 @@ pub struct PrPollStateInput<'a> {
     /// GitHub's raw `mergeStateStatus` for this probe (`"CLEAN"`,
     /// `"DIRTY"`, `"BLOCKED"`, `"BEHIND"`, `"UNSTABLE"`, `"UNKNOWN"`) — see
     /// `tasks.pr_merge_state_status`'s migration doc for the stored column.
-    /// `None` when the probe didn't carry one (rare). Backs `boss pr status`.
+    /// `None` when the probe didn't carry one (rare). Missing / UNKNOWN
+    /// observations retain a known value. Backs `boss pr status`.
     pub pr_merge_state_status: Option<&'a str>,
     /// The PR's `headRefOid` at probe time. `None` when GitHub didn't
     /// report one. Backs `boss pr status`'s `head_sha` field with the

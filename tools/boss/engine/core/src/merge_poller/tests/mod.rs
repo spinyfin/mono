@@ -554,6 +554,7 @@ mod converted_followup_tests;
 mod deferred_review_admission_tests;
 mod merge_queue_tests;
 mod metrics_tests;
+mod poll_stability_tests;
 mod post_merge_review_trigger_tests;
 mod probe_snapshot_tests;
 mod probe_tests;

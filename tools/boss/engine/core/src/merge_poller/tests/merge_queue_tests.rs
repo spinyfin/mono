@@ -944,7 +944,7 @@ async fn mid_queue_member_leaving_renumbers_remaining_siblings_via_update_pr_pol
         product_id: product.id.clone(),
         pr_url: "https://github.com/foo/bar/pull/2".to_owned(),
     };
-    update_pr_poll_state(&db, &publisher, &candidate, &left_queue_probe, None).await;
+    update_pr_poll_state(&db, &publisher, &candidate, &left_queue_probe, None, "test").await;
 
     let (t2_state, t2_detail) = merge_queue_columns(&db, &t2);
     assert!(t2_state.is_none(), "T2 must leave the queued set once it's dequeued");
@@ -1003,7 +1003,7 @@ async fn update_pr_poll_state_demotes_merging_when_required_ci_fails() {
         pr_url: "https://github.com/foo/bar/pull/1".to_owned(),
     };
     let publisher = RecordingPublisher::default();
-    update_pr_poll_state(&db, &publisher, &candidate, &probe, None).await;
+    update_pr_poll_state(&db, &publisher, &candidate, &probe, None, "test").await;
 
     let (state, detail) = merge_queue_columns(&db, &t);
     assert!(
@@ -1045,7 +1045,7 @@ async fn update_pr_poll_state_restores_merging_once_ci_recovers() {
 
     let mut failing_probe = probe_with_queue_fields(false, None, None, None, true, Some("2026-07-10T11:54:54Z"));
     failing_probe.state = PrLifecycleState::Open(OpenPrStatus::ci_failing(vec![failure("ci/test", "FAILURE")]));
-    update_pr_poll_state(&db, &publisher, &candidate, &failing_probe, None).await;
+    update_pr_poll_state(&db, &publisher, &candidate, &failing_probe, None, "test").await;
     let (demoted_state, _) = merge_queue_columns(&db, &t);
     assert!(
         demoted_state.is_none(),
@@ -1055,7 +1055,7 @@ async fn update_pr_poll_state_restores_merging_once_ci_recovers() {
     // GitHub auto-merge is still armed on the next poll — same probe
     // flags — but required CI now reads clean.
     let recovered_probe = probe_with_queue_fields(false, None, None, None, true, Some("2026-07-10T11:54:54Z"));
-    update_pr_poll_state(&db, &publisher, &candidate, &recovered_probe, None).await;
+    update_pr_poll_state(&db, &publisher, &candidate, &recovered_probe, None, "test").await;
 
     let (state, detail) = merge_queue_columns(&db, &t);
     assert_eq!(
@@ -1096,7 +1096,7 @@ async fn update_pr_poll_state_leaves_queued_row_untouched_when_required_ci_fails
         pr_url: "https://github.com/foo/bar/pull/1".to_owned(),
     };
     let publisher = RecordingPublisher::default();
-    update_pr_poll_state(&db, &publisher, &candidate, &probe, None).await;
+    update_pr_poll_state(&db, &publisher, &candidate, &probe, None, "test").await;
 
     let (state, detail) = merge_queue_columns(&db, &t);
     assert_eq!(
@@ -1159,7 +1159,7 @@ async fn update_pr_poll_state_preserves_trunk_owned_merge_queue_state() {
         pr_url: "https://github.com/foo/bar/pull/1".to_owned(),
     };
     let publisher = RecordingPublisher::default();
-    update_pr_poll_state(&db, &publisher, &candidate, &probe, None).await;
+    update_pr_poll_state(&db, &publisher, &candidate, &probe, None, "test").await;
 
     let (state, stored_detail) = merge_queue_columns(&db, &t);
     assert_eq!(
@@ -1221,7 +1221,7 @@ async fn update_pr_poll_state_preserves_github_intent_through_empty_first_probe(
     let publisher = RecordingPublisher::default();
     let mut empty_probe = probe_with_queue_fields(false, None, None, None, false, None);
     empty_probe.head_ref_oid = Some("head-1".to_owned());
-    update_pr_poll_state(&db, &publisher, &candidate, &empty_probe, None).await;
+    update_pr_poll_state(&db, &publisher, &candidate, &empty_probe, None, "test").await;
 
     let (state, stored_detail) = merge_queue_columns(&db, &task);
     assert_eq!(state.as_deref(), Some("queued"));
@@ -1365,7 +1365,7 @@ async fn update_pr_poll_state_retires_github_intent_when_head_advances() {
     let mut probe = probe_with_queue_fields(false, None, None, None, false, None);
     probe.head_ref_oid = Some("head-5".to_owned());
     let publisher = RecordingPublisher::default();
-    update_pr_poll_state(&db, &publisher, &candidate, &probe, None).await;
+    update_pr_poll_state(&db, &publisher, &candidate, &probe, None, "test").await;
 
     assert!(
         db.get_active_github_merge_intent(&task, &candidate.pr_url)
@@ -1406,7 +1406,7 @@ async fn update_pr_poll_state_preserves_github_intent_when_probe_head_is_missing
     let probe = probe_with_queue_fields(false, None, None, None, false, None);
     assert!(probe.head_ref_oid.is_none());
     let publisher = RecordingPublisher::default();
-    update_pr_poll_state(&db, &publisher, &candidate, &probe, None).await;
+    update_pr_poll_state(&db, &publisher, &candidate, &probe, None, "test").await;
 
     assert!(
         db.get_active_github_merge_intent(&task, &candidate.pr_url)
@@ -1451,7 +1451,7 @@ async fn update_pr_poll_state_keeps_github_intent_queued_through_ci_fail_and_rec
     let mut failing_probe = probe_with_queue_fields(false, None, None, None, false, None);
     failing_probe.head_ref_oid = Some("head-7".to_owned());
     failing_probe.state = PrLifecycleState::Open(OpenPrStatus::ci_failing(vec![failure("ci/test", "FAILURE")]));
-    update_pr_poll_state(&db, &publisher, &candidate, &failing_probe, None).await;
+    update_pr_poll_state(&db, &publisher, &candidate, &failing_probe, None, "test").await;
     assert_eq!(
         merge_queue_columns(&db, &task).0.as_deref(),
         Some("queued"),
@@ -1468,7 +1468,7 @@ async fn update_pr_poll_state_keeps_github_intent_queued_through_ci_fail_and_rec
 
     let mut recovered_probe = probe_with_queue_fields(false, None, None, None, false, None);
     recovered_probe.head_ref_oid = Some("head-7".to_owned());
-    update_pr_poll_state(&db, &publisher, &candidate, &recovered_probe, None).await;
+    update_pr_poll_state(&db, &publisher, &candidate, &recovered_probe, None, "test").await;
     assert_eq!(
         merge_queue_columns(&db, &task).0.as_deref(),
         Some("queued"),
