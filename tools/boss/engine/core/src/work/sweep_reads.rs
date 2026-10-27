@@ -11,8 +11,8 @@ use super::*;
 /// the full projection on which rows exist.
 pub(crate) const VISIBLE_TASK_PREDICATE: &str = "(deleted_at IS NULL OR status = 'archived')";
 
-/// What the dispatch scheduler needs to name a chain sibling in an
-/// operator-facing wait reason: the `T<n>` label, the task name, and the
+/// What the dispatch scheduler needs to name a chain sibling in a
+/// wait-reason label: the `T<n>` label, the task name, and the
 /// chain root's `pr_url`. See `chain_serialized_wait_reason`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskWaitLabel {
@@ -22,14 +22,14 @@ pub struct TaskWaitLabel {
 }
 
 impl TaskWaitLabel {
-    /// The same operator-facing label `Task::short_label` renders.
+    /// The same wait-reason label `Task::short_label` renders.
     pub fn short_label(&self) -> String {
         boss_protocol::short_id_label(self.short_id).unwrap_or_else(|| "a task".to_owned())
     }
 }
 
 /// The three columns the pane-death sweep's terminal-convergence scan
-/// consumes, instead of a fully mapped [`WorkExecution`] per row.
+/// consumes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalExecutionRef {
     pub id: String,
@@ -160,9 +160,8 @@ impl WorkDb {
     /// `NULL`). `Err` (`unknown task: <id>`) when no visible row exists,
     /// matching [`Self::get_work_item`] on the same input.
     ///
-    /// The PR-review recovery sweep's replacement for a full
-    /// [`Self::get_work_item`] per dead batch leaf: it only needs the URL
-    /// to ask GitHub whether the PR is still open.
+    /// Used by PR-review recovery, which needs only the URL to ask GitHub
+    /// whether the PR is still open.
     pub fn task_pr_url(&self, id: &str) -> Result<Option<String>> {
         let conn = self.connect()?;
         let sql = format!("SELECT pr_url FROM tasks WHERE {VISIBLE_TASK_PREDICATE} AND id = ?1");
@@ -172,10 +171,9 @@ impl WorkDb {
     }
 
     /// The label fields for one visible task/chore (`None` when no visible
-    /// row exists). The dispatch scheduler's replacement for a full
-    /// [`Self::get_work_item`] per chain-serialized execution per drain
-    /// pass: it needs the `T<n>` label, the name, and the chain root's
-    /// `pr_url` to word the wait reason, nothing else.
+    /// row exists). Used by the dispatch scheduler to word a
+    /// chain-serialized wait reason: the `T<n>` label, the name, and the
+    /// chain root's `pr_url`.
     pub fn task_wait_label(&self, id: &str) -> Result<Option<TaskWaitLabel>> {
         let conn = self.connect()?;
         let sql = format!("SELECT short_id, name, pr_url FROM tasks WHERE {VISIBLE_TASK_PREDICATE} AND id = ?1");

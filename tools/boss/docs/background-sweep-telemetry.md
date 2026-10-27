@@ -24,15 +24,14 @@ metrics registry (`bossctl metrics list --prefix <sweep>`; values flush to
 | ----------------------------- | ------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------- |
 | `envelope_watch`              | one 60 s envelope-watchdog sweep                                                           | live worker slots evaluated                                                        |
 | `terminal_work_sweep`         | the candidate-gathering phase of one 60 s terminal-work pass                               | live worker slots inspected                                                        |
+| `dead_pane_terminal`          | the terminal execution scan plus the process probes of one pane-death sweep pass           | recent terminal execution rows probed                                              |
 | `agent_jsonl_stream`          | one 50 ms tail poll iteration of any live JSONL stream                                     | sessions-root revalidations (`lstat` + `canonicalize`) performed in that iteration |
 | `execution_bookmark_pointers` | one recovery-pointer snapshot or restore over a PR chain (mechanical / speculative rebase) | recovery-bookmark records covered                                                  |
 
 Only the singleton envelope and terminal-work sweeps publish tick intervals.
-Concurrent tails and bookmark operations have no shared cadence. Root
-revalidation counts are isolated per tail, excluding discovery and other tails.
-
-`dead_pane_terminal` measures the terminal execution scan and process probes;
-items count recent terminal rows.
+`dead_pane_terminal` has no `tick_interval_ms`. Concurrent tails and bookmark
+operations have no shared cadence. Root revalidation counts are isolated per
+tail, excluding discovery and other tails.
 
 The periodic `speculative_conflict` sweep drives the pointer snapshot/restore
 series, as do mechanical rebases. The separate five-minute
