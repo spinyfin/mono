@@ -182,6 +182,35 @@ final class AutomationHistoryTests: XCTestCase {
         XCTAssertEqual(recorder.historyIDs, ["a", "a", "b", "b"])
     }
 
+    func testManualRefreshRetriesOnlyOpenHistory() {
+        let (model, recorder) = makeModel()
+        model.selectedAutomationID = "a"
+        model.setAutomationsVisible(true)
+        recorder.sent.removeAll()
+        model.refreshVisibleAutomations()
+        XCTAssertEqual(recorder.sent.filter { $0["type"] as? String == "list_automations" }.count, 1)
+        XCTAssertEqual(recorder.historyIDs, ["a"])
+        model.setAutomationsVisible(false)
+        recorder.sent.removeAll()
+        model.refreshVisibleAutomations()
+        XCTAssertTrue(recorder.sent.isEmpty)
+    }
+
+    func testReconnectRefreshesOnceWithAndWithoutOwedResync() {
+        for owed in [false, true] {
+            for visible in [false, true] {
+                let (model, recorder) = makeModel()
+                model.selectedAutomationID = "a"
+                model.setAutomationsVisible(visible)
+                model.resyncOnlyReadsOwed = owed
+                recorder.sent.removeAll()
+                model.applyEventForTest(.connected)
+                XCTAssertEqual(recorder.sent.filter { $0["type"] as? String == "list_automations" }.count, visible ? 1 : 0)
+                XCTAssertEqual(recorder.historyIDs, visible ? ["a"] : [])
+            }
+        }
+    }
+
     func testPushSummariesPreserveCompleteHistoryWithoutRequests() {
         let (model, recorder) = makeModel()
         let history = [run("old", automationID: "a"), run("older", automationID: "a")]

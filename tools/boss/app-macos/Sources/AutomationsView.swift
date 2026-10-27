@@ -24,9 +24,6 @@ struct AutomationsView: View {
         .onChange(of: model.currentSelectedProductID) { _, _ in
             model.refreshAutomations()
         }
-        .onChange(of: model.isConnected) { _, connected in
-            if connected { model.setAutomationsVisible(true) }
-        }
     }
 }
 
@@ -89,7 +86,7 @@ private struct AutomationsSidebar: View {
 
             HStack {
                 Button {
-                    model.refreshAutomations()
+                    model.refreshVisibleAutomations()
                 } label: {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }

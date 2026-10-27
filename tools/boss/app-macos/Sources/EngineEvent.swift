@@ -337,7 +337,7 @@ enum EngineEvent {
     /// (rotated, GC'd, or never recorded). `reason` is human-readable and
     /// surfaced as a "transcript unavailable" state, never an error.
     case executionTranscriptUnavailable(executionId: String, reason: String)
-    // MARK: Automation events (maintenance-tasks.md T7)
+    // MARK: Automation events
     /// Response to `list_automations` — all automations for a product.
     /// `openTaskCounts` maps automation id → open-task count, batched inline.
     case automationsList(productID: String, automations: [AppAutomation], openTaskCounts: [String: Int], lastRuns: [String: AppAutomationRun] = [:])

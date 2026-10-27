@@ -12,6 +12,13 @@ extension ChatViewModel {
         }
     }
 
+    /// Refresh the mounted tab, including a retry of the open history read.
+    func refreshVisibleAutomations() {
+        guard automationsIsVisible else { return }
+        refreshAutomations()
+        if let id = visibleAutomationHistoryID { refreshVisibleAutomationHistory(id) }
+    }
+
     func showAutomationHistory(_ id: String?) {
         guard automationsIsVisible else { return }
         guard visibleAutomationHistoryID != id else { return }
