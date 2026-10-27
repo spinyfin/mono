@@ -138,6 +138,9 @@ const fn entry(kind: &'static str, cleared_by: ClearedBy, rationale: &'static st
     }
 }
 
+/// An answered question could not start its queued resume.
+pub const QUESTION_RESUME_DISPATCH_FAILED: &str = "question_resume_dispatch_failed";
+
 /// Every `work_attention_items.kind` the engine writes, with its clearing
 /// rule. Adding a kind without adding it here means the generic reconciler
 /// cannot see it, so filing runs a guard:
@@ -147,6 +150,11 @@ const fn entry(kind: &'static str, cleared_by: ClearedBy, rationale: &'static st
 /// `insert_attention_item_row`, and the two bespoke raw-INSERT helpers.
 /// `every_registered_kind_is_declared_once` below pins the table itself.
 pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
+    entry(
+        QUESTION_RESUME_DISPATCH_FAILED,
+        ClearedBy::WorkResumed,
+        "An answered question could not resume dispatch; a subsequent run starting proves the hold cleared.",
+    ),
     entry(
         crate::execution_bookmark_recovery::CREATE_FAILED,
         ClearedBy::WorkResumed,
@@ -683,6 +691,7 @@ mod tests {
     #[test]
     fn every_attention_kind_constant_in_the_crate_is_registered() {
         let declared: &[&str] = &[
+            QUESTION_RESUME_DISPATCH_FAILED,
             crate::pool_claim_sweep::TEARDOWN_ATTENTION_KIND,
             crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND,
             crate::work::DISPATCH_STAGE_STALLED_ATTENTION_KIND,
