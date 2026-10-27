@@ -147,8 +147,8 @@ sh_test(
 # enough slack that a slow sample still finishes. Isolated uncached in this
 # workspace after the Chrome split (`bazel test --nocache_test_results
 # --test_verbose_timeout_warnings`, PASSED-in test action wall, three
-# consecutive runs): Chrome 6.8 / 3.9 / 3.6 s, Render 6.1 / 6.3 / 6.1 s,
-# Shard3 6.3 / 6.7 / 11.2 s. Slowest sample 11.2 s (Shard3), about 5× under
+# consecutive runs): Chrome 4.0 / 3.3 / 3.2 s, Render 6.4 / 6.2 / 6.1 s,
+# Shard3 5.1 / 5.1 / 5.9 s. Slowest sample 6.4 s (Render), about 9× under
 # the 60 s budget.
 #
 # The shared principal is compiled into every bundle: it is the bundle's
