@@ -1542,6 +1542,14 @@ pub(crate) async fn run_show_leaf(
         FrontendEvent::OperatorQuestionsList { questions } => questions,
         other => return Err(unexpected_event("operator question history", &other)),
     };
+    let status_transitions = match client
+        .send_request(&FrontendRequest::ListTaskStatusTransitions { id: item.id.clone() })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::TaskStatusTransitions { transitions, .. } => transitions,
+        other => return Err(unexpected_event("status transition history", &other)),
+    };
     let attention_groups = list_attention_groups(client, &product.id, None, Some(item.id.clone()), None, None).await?;
     let field_audit = field_audit_from_reply(
         client
@@ -1565,6 +1573,12 @@ pub(crate) async fn run_show_leaf(
             "executions".to_owned(),
             serde_json::to_value(&execution_runs).map_err(CliError::internal)?,
         );
+        // Status provenance: every recorded `tasks.status` move with its actor
+        // and the engine's stated reason (see `Task::status_reason`).
+        map.insert(
+            "status_transitions".to_owned(),
+            serde_json::to_value(&status_transitions).map_err(CliError::internal)?,
+        );
         map.insert(
             "attention_items".to_owned(),
             serde_json::to_value(&attention_items).map_err(CliError::internal)?,
@@ -1585,6 +1599,19 @@ pub(crate) async fn run_show_leaf(
     }
     print_entity(ctx, &task_json, || {
         print_task_details(label_titlecase(label), &item, Some(&product), with_primary_id);
+        if !status_transitions.is_empty() {
+            println!("\nStatus transitions (oldest first):");
+            for transition in &status_transitions {
+                println!(
+                    "  {}  {} -> {}  actor={}  reason={}",
+                    transition.changed_at,
+                    transition.from_status,
+                    transition.to_status,
+                    transition.actor,
+                    transition.reason.as_deref().unwrap_or("-"),
+                );
+            }
+        }
         for record in &questions {
             for line in crate::operator_question_text::operator_question_lines(record) {
                 println!("{line}");

@@ -606,6 +606,7 @@ mod tests {
         let exec = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(task.id.clone())
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(ExecutionStatus::Ready)
@@ -1079,6 +1080,7 @@ mod tests {
         let exec = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(task_id)
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(ExecutionStatus::Completed)

@@ -135,6 +135,7 @@ async fn boss_propose_done_from_grok_process_home_via_boss_socket_path() -> Resu
     let chore = create_chore(&mut client, &product.id, "Sandbox propose done").await?;
     let execution = engine.db()?.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Ready)

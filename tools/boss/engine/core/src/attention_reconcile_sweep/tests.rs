@@ -94,6 +94,7 @@ fn start_run_at(db: &WorkDb, work_item_id: &str, started_at: i64) -> String {
 fn ready_execution(db: &WorkDb, work_item_id: &str, kind: ExecutionKind) -> String {
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(work_item_id.to_owned())
             .kind(kind)
             .status(ExecutionStatus::Ready)
@@ -150,6 +151,7 @@ fn completed_execution_at(db: &WorkDb, work_item_id: &str, kind: ExecutionKind, 
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(work_item_id.to_owned())
                 .kind(kind)
                 .status(ExecutionStatus::Ready)

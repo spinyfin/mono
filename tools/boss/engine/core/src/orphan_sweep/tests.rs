@@ -1763,6 +1763,7 @@ fn hold_with_completed_producer(db: &WorkDb, work_item_id: &str) {
     let execution = db
         .create_execution(
             crate::work::CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(work_item_id.to_owned())
                 .kind(boss_protocol::ExecutionKind::ChoreImplementation)
                 .build(),

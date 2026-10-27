@@ -131,6 +131,7 @@ async fn resolution_leaves_a_live_revision_task_alone() {
     };
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(revision_id.clone())
             .kind(ExecutionKind::RevisionImplementation)
             .status(ExecutionStatus::Running)
