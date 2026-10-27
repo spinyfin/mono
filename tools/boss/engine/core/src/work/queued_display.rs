@@ -1,9 +1,29 @@
+use std::collections::HashMap;
+
 use super::*;
-use boss_engine_utils::iso8601::{format_elapsed_ago, format_epoch_iso8601};
-use boss_protocol::QueuedDisplay;
+use boss_engine_utils::iso8601::format_elapsed_ago;
+use boss_protocol::{QueuedDisplay, QueuedTooltipTime};
+
+/// A predecessor execution that finished this long before the replacement
+/// was created is not treated as the cause of a restart. Same-execution
+/// retries skip this bound.
+const RESTART_PREFIX_MAX_AGE_SECS: i64 = 60 * 60;
+
+/// Cached heartbeat projection: reuse while the item's epoch and
+/// `expires_at` still match, so the 15s scan does not recompute every
+/// pending runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QueuedDisplaySnapshot {
+    pub product_id: String,
+    pub display: QueuedDisplay,
+    epoch: i64,
+    expires_at: Option<i64>,
+    cacheable: bool,
+}
 
 /// The engine selects precedence once; both the full tree and runtime patches
-/// carry the resulting prose. The app only paints it and the absolute tooltip.
+/// carry the resulting prose. The app paints `text` and localizes each
+/// `tooltip_times` epoch.
 pub(super) fn for_execution(
     conn: &Connection,
     execution: Option<&WorkExecution>,
@@ -21,7 +41,10 @@ pub(super) fn for_execution(
     };
     let mut tooltip_times = Vec::new();
     let hold = if let Some(deadline) = wait.not_before.as_deref().and_then(|s| s.parse::<i64>().ok()) {
-        tooltip_times.push(format!("Next dispatch attempt: {}", format_epoch_iso8601(deadline)));
+        tooltip_times.push(QueuedTooltipTime {
+            label: "Next dispatch attempt:".into(),
+            epoch: deadline,
+        });
         let remaining = deadline - now;
         let next_change = if remaining < 60 {
             deadline
@@ -39,7 +62,7 @@ pub(super) fn for_execution(
         if dispatch_helpers::dispatch_retry_at_for_execution(execution, now).is_some() {
             format!("Retrying dispatch — next attempt {relative}")
         } else {
-            format!("Queued — not before {relative}")
+            format!("Queued — next attempt {relative}")
         }
     } else {
         let reason = match wait.reason.as_deref() {
@@ -67,29 +90,17 @@ pub(super) fn for_execution(
             expire_elapsed(expires_at, since, now);
             if let Some(relative) = format_elapsed_ago(since, now) {
                 hold.push_str(&format!(" ({relative})"));
-                tooltip_times.push(format!("Waiting since: {}", format_epoch_iso8601(since)));
+                tooltip_times.push(QueuedTooltipTime {
+                    label: "Waiting since:".into(),
+                    epoch: since,
+                });
             }
         }
         hold
     };
 
-    // Include retries of the same execution as well as replacement executions.
-    // Select the immediately preceding outcome, not an arbitrary older failure.
-    let previous: Option<(String, Option<String>)> = conn
-        .query_row(
-            "SELECT COALESCE(r.status, e.status), COALESCE(r.finished_at, e.finished_at)
-         FROM work_executions e LEFT JOIN work_runs r ON r.execution_id = e.id
-         WHERE e.work_item_id = ?1 AND (e.id != ?2 OR r.id IS NOT NULL)
-           AND (e.created_at < ?3 OR (e.created_at = ?3 AND e.id <= ?2))
-         ORDER BY e.created_at DESC, e.id DESC, r.created_at DESC, r.id DESC LIMIT 1",
-            params![execution.work_item_id, execution.id, execution.created_at],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
     let mut text = hold;
-    if let Some((outcome, finished)) =
-        previous.filter(|(status, _)| matches!(status.as_str(), "orphaned" | "failed" | "cancelled"))
-    {
+    if let Some((outcome, finished)) = previous_abnormal_outcome(conn, execution)? {
         let verb = if outcome == "failed" {
             "failed".to_owned()
         } else {
@@ -101,16 +112,62 @@ pub(super) fn for_execution(
             if let Some(relative) = format_elapsed_ago(epoch, now) {
                 restart.push_str(&format!(" {relative}"));
             }
-            tooltip_times.push(format!("Previous run {verb} at {}", format_epoch_iso8601(epoch)));
+            tooltip_times.push(QueuedTooltipTime {
+                label: format!("Previous run {verb} at"),
+                epoch,
+            });
         }
         text = format!("{restart}. {text}");
     }
-    let tooltip = if tooltip_times.is_empty() {
-        text.clone()
-    } else {
-        format!("{text}\n{}", tooltip_times.join("\n"))
+    Ok(Some(QueuedDisplay { text, tooltip_times }))
+}
+
+/// Distinct predecessor executions use the execution row's terminal outcome.
+/// A pane-spawn run is marked `completed` while the execution stays live, so
+/// joining `work_runs` would hide later orphan/fail/cancel. Runs apply only
+/// to retries of the current pending execution.
+fn previous_abnormal_outcome(conn: &Connection, execution: &WorkExecution) -> Result<Option<(String, Option<String>)>> {
+    let current_run: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT status, finished_at FROM work_runs
+             WHERE execution_id = ?1
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            params![execution.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((status, finished_at)) = current_run {
+        return Ok(abnormal_outcome(status, finished_at));
+    }
+    let previous: Option<(String, Option<String>, String)> = conn
+        .query_row(
+            "SELECT e.status, e.finished_at, e.kind
+             FROM work_executions e
+             WHERE e.work_item_id = ?1 AND e.id != ?2
+               AND (e.created_at < ?3 OR (e.created_at = ?3 AND e.id < ?2))
+             ORDER BY e.created_at DESC, e.id DESC LIMIT 1",
+            params![execution.work_item_id, execution.id, execution.created_at],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((status, finished_at, kind)) = previous else {
+        return Ok(None);
     };
-    Ok(Some(QueuedDisplay { text, tooltip }))
+    if kind != execution.kind.as_str() {
+        return Ok(None);
+    }
+    let Some(finished) = finished_at.as_deref().and_then(|s| s.parse::<i64>().ok()) else {
+        return Ok(None);
+    };
+    let created = execution.created_at.parse::<i64>().unwrap_or(finished);
+    if created.saturating_sub(finished) > RESTART_PREFIX_MAX_AGE_SECS {
+        return Ok(None);
+    }
+    Ok(abnormal_outcome(status, finished_at))
+}
+
+fn abnormal_outcome(status: String, finished_at: Option<String>) -> Option<(String, Option<String>)> {
+    matches!(status.as_str(), "orphaned" | "failed" | "cancelled").then_some((status, finished_at))
 }
 
 fn expire_at(expires_at: &mut Option<i64>, deadline: i64) {
@@ -146,23 +203,53 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
 impl WorkDb {
     /// Heartbeat projection, including future deadlines that the dispatchable
     /// queue deliberately excludes. Callers publish only changed displays.
-    pub(crate) fn queued_displays(&self, now: i64) -> Result<Vec<(String, String, QueuedDisplay)>> {
+    /// Unexpired, same-epoch, cacheable snapshots from `previous` are reused.
+    pub(crate) fn queued_displays(
+        &self,
+        now: i64,
+        previous: &HashMap<String, QueuedDisplaySnapshot>,
+    ) -> Result<HashMap<String, QueuedDisplaySnapshot>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let items = {
             let mut stmt = tx.prepare(
-                "SELECT DISTINCT t.product_id, t.id FROM tasks t
+                "SELECT DISTINCT t.product_id, t.id, COALESCE(ep.epoch, 0)
+                 FROM tasks t
                  JOIN work_executions e ON e.work_item_id = t.id
+                 LEFT JOIN board_runtime_epoch ep ON ep.work_item_id = t.id
                  WHERE t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived')
                    AND e.status IN ('queued', 'ready', 'waiting_dependency')",
             )?;
-            collect_rows(stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?)?
+            collect_rows(stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?)?
         };
-        let mut displays = Vec::new();
-        for (product, id) in items {
-            let runtime = runtime_projection::compute_task_runtime(&tx, &id, &mut 0, now)?.runtime;
-            if let Some(display) = runtime.queued_display {
-                displays.push((product, id, display));
+        let mut displays = HashMap::new();
+        for (product_id, id, epoch) in items {
+            if let Some(prev) = previous.get(&id)
+                && prev.cacheable
+                && prev.epoch == epoch
+                && prev.expires_at.is_none_or(|expires| now < expires)
+            {
+                displays.insert(id, prev.clone());
+                continue;
+            }
+            let computed = runtime_projection::compute_task_runtime(&tx, &id, &mut 0, now)?;
+            if let Some(display) = computed.runtime.queued_display {
+                displays.insert(
+                    id,
+                    QueuedDisplaySnapshot {
+                        product_id,
+                        display,
+                        epoch,
+                        expires_at: computed.expires_at,
+                        cacheable: computed.cacheable,
+                    },
+                );
             }
         }
         Ok(displays)

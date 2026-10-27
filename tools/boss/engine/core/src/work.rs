@@ -674,6 +674,7 @@ mod remediation_state;
 pub(crate) mod remote_input_cleanup;
 mod runtime_projection;
 pub(crate) use feedback_target::FeedbackTarget;
+pub(crate) use queued_display::QueuedDisplaySnapshot;
 mod connection_wait;
 pub(crate) mod db_diagnostics;
 mod description_guard;

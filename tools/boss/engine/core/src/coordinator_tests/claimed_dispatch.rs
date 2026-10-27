@@ -311,23 +311,31 @@ async fn heartbeat_publishes_elapsed_deadline_without_a_database_write() {
         Arc::new(FakeExecutionRunner::default()),
         publisher.clone(),
     );
-    let mut previous = std::collections::HashMap::new();
+    let mut previous = None;
     coordinator.refresh_queued_displays(&mut previous, now).await;
-    assert!(previous[&chore.id].text.contains("not before"));
+    assert!(
+        previous.as_ref().unwrap()[&chore.id]
+            .display
+            .text
+            .contains("next attempt")
+    );
+    assert!(
+        publisher.events.lock().await.is_empty(),
+        "the first pass seeds without republishing the boot snapshot"
+    );
     coordinator.refresh_queued_displays(&mut previous, now + 1).await;
-    assert_eq!(
-        publisher.events.lock().await.len(),
-        1,
+    assert!(
+        publisher.events.lock().await.is_empty(),
         "unchanged text is not republished"
     );
     coordinator.refresh_queued_displays(&mut previous, now + 10).await;
-    assert_eq!(previous[&chore.id].text, "Queued — worker pool full");
     assert_eq!(
-        publisher.runtime_reasons().await,
-        vec!["queued_display_changed", "queued_display_changed"]
+        previous.as_ref().unwrap()[&chore.id].display.text,
+        "Queued — worker pool full"
     );
+    assert_eq!(publisher.runtime_reasons().await, vec!["queued_display_changed"]);
     assert_eq!(
-        publisher.events.lock().await[1],
+        publisher.events.lock().await[0],
         (product.id, chore.id, "queued_display_changed".into())
     );
 }

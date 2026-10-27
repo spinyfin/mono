@@ -1,5 +1,5 @@
 use super::*;
-use boss_protocol::QueuedDisplay;
+use boss_protocol::{QueuedDisplay, QueuedTooltipTime};
 
 const NOW: i64 = 1_800_000_000;
 
@@ -31,6 +31,16 @@ fn display(db: &WorkDb, item: &str, now: i64) -> QueuedDisplay {
         .unwrap()
 }
 
+fn clear_wait_since(db: &WorkDb, execution_id: &str) {
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET dispatch_wait_since = NULL WHERE id = ?1",
+            [execution_id],
+        )
+        .unwrap();
+}
+
 #[test]
 fn deadline_yields_to_live_cap_reason_without_a_write() {
     let (db, _, item) = setup_product_and_chore();
@@ -44,20 +54,25 @@ fn deadline_yields_to_live_cap_reason_without_a_write() {
         )
         .unwrap();
     let future = display(&db, &item, NOW);
-    assert_eq!(future.text, "Queued — not before in 2 min");
-    assert!(
-        future
-            .tooltip
-            .contains(&boss_engine_utils::iso8601::format_epoch_iso8601(NOW + 120))
+    assert_eq!(future.text, "Queued — next attempt in 2 min");
+    assert_eq!(
+        future.tooltip_times,
+        vec![QueuedTooltipTime {
+            label: "Next dispatch attempt:".into(),
+            epoch: NOW + 120,
+        }]
     );
-    let before = db.queued_displays(NOW).unwrap();
+    let before = db.queued_displays(NOW, &Default::default()).unwrap();
     for now in [NOW + 120, NOW + 121] {
         let elapsed = display(&db, &item, now);
         assert_eq!(elapsed.text, "Queued — Waiting for an available worker (11 working)");
-        assert!(!elapsed.tooltip.contains("not before"));
-        let after = db.queued_displays(now).unwrap();
-        assert_ne!(before, after, "heartbeat detects deadline expiry without a DB write");
-        assert_eq!(after[0].2, elapsed);
+        assert!(elapsed.tooltip_times.is_empty());
+        let after = db.queued_displays(now, &before).unwrap();
+        assert_ne!(
+            before[&item].display, after[&item].display,
+            "heartbeat detects deadline expiry without a DB write"
+        );
+        assert_eq!(after[&item].display, elapsed);
     }
 }
 
@@ -80,14 +95,7 @@ fn abnormal_previous_outcome_precedes_the_current_hold() {
             .unwrap();
         let current = pending(&db, &item);
         db.set_dispatch_wait_reason(&current.id, "pool_exhausted").unwrap();
-        // Fix the wait stamp so this test has no wall-clock dependency.
-        db.connect()
-            .unwrap()
-            .execute(
-                "UPDATE work_executions SET dispatch_wait_since = NULL WHERE id = ?1",
-                [&current.id],
-            )
-            .unwrap();
+        clear_wait_since(&db, &current.id);
         let result = display(&db, &item, NOW);
         if status == "completed" {
             assert_eq!(result.text, "Queued — worker pool full");
@@ -96,10 +104,12 @@ fn abnormal_previous_outcome_precedes_the_current_hold() {
                 result.text,
                 format!("Restarting after the previous run {verb} 1 minute ago. Queued — worker pool full")
             );
-            assert!(
-                result
-                    .tooltip
-                    .contains(&boss_engine_utils::iso8601::format_epoch_iso8601(NOW - 60))
+            assert_eq!(
+                result.tooltip_times,
+                vec![QueuedTooltipTime {
+                    label: format!("Previous run {verb} at"),
+                    epoch: NOW - 60,
+                }]
             );
         }
     }
@@ -144,7 +154,100 @@ fn retry_of_same_execution_uses_latest_run_and_then_clears_when_claimed() {
         )
         .unwrap();
     assert!(db.get_task_runtime(&item).unwrap().queued_display.is_none());
-    assert!(db.queued_displays(NOW).unwrap().is_empty());
+    assert!(db.queued_displays(NOW, &Default::default()).unwrap().is_empty());
+}
+
+#[test]
+fn spawn_completed_run_does_not_hide_orphaned_predecessor() {
+    let (db, _, item) = setup_product_and_chore();
+    let previous = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&item)
+                .kind(ExecutionKind::TaskImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (_running, run) = db
+        .start_execution_run(
+            &previous.id,
+            "agent",
+            "mono",
+            "lease-spawn",
+            "mono-agent-qd",
+            "/tmp/mono-agent-qd",
+        )
+        .unwrap();
+    finish_run_worker_pane_alive(&db, &previous.id, &run.id, Some("spawned pane"));
+    db.connect()
+        .unwrap()
+        .execute("UPDATE work_runs SET finished_at = '1000' WHERE id = ?1", [&run.id])
+        .unwrap();
+    let orphaned = db.mark_execution_orphaned(&previous.id, "worker died").unwrap();
+    let finished = orphaned.finished_at.clone().expect("orphan stamps finished_at");
+    let finished_epoch: i64 = finished.parse().unwrap();
+    assert_ne!(
+        finished, "1000",
+        "spawn-complete time must not be the execution terminal time"
+    );
+    let replacement = db
+        .request_resume_execution(&previous.id, 1, finished_epoch.saturating_sub(1), "worker died")
+        .unwrap();
+    db.set_dispatch_wait_reason(&replacement.id, "pool_exhausted").unwrap();
+    clear_wait_since(&db, &replacement.id);
+    let result = display(&db, &item, finished_epoch + 60);
+    assert_eq!(
+        result.text,
+        "Restarting after the previous run was orphaned 1 minute ago. Queued — worker pool full"
+    );
+    assert_eq!(
+        result.tooltip_times,
+        vec![QueuedTooltipTime {
+            label: "Previous run was orphaned at".into(),
+            epoch: finished_epoch,
+        }]
+    );
+}
+
+#[test]
+fn restart_prefix_skips_unrelated_or_stale_predecessors() {
+    let (db, _, item) = setup_product_and_chore();
+    let previous = pending(&db, &item);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET created_at = ?2, status = 'orphaned', finished_at = ?3,
+             kind = 'pr_review' WHERE id = ?1",
+            params![previous.id, (NOW - 300).to_string(), (NOW - 60).to_string()],
+        )
+        .unwrap();
+    let current = pending(&db, &item);
+    db.set_dispatch_wait_reason(&current.id, "pool_exhausted").unwrap();
+    clear_wait_since(&db, &current.id);
+    assert_eq!(
+        display(&db, &item, NOW).text,
+        "Queued — worker pool full",
+        "a later execution of a different kind is not a restart of the predecessor"
+    );
+
+    let (db, _, item) = setup_product_and_chore();
+    let previous = pending(&db, &item);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET created_at = ?2, status = 'cancelled', finished_at = ?3 WHERE id = ?1",
+            params![previous.id, (NOW - 200_000).to_string(), (NOW - 172_800).to_string()],
+        )
+        .unwrap();
+    let current = pending(&db, &item);
+    db.set_dispatch_wait_reason(&current.id, "pool_exhausted").unwrap();
+    clear_wait_since(&db, &current.id);
+    assert_eq!(
+        display(&db, &item, NOW).text,
+        "Queued — worker pool full",
+        "a same-kind predecessor that finished days earlier is not a restart"
+    );
 }
 
 #[test]
@@ -167,9 +270,14 @@ fn queued_variants_and_wait_age_are_engine_selected() {
                 params![execution.id, reason, (NOW - 60).to_string()],
             )
             .unwrap();
+        let result = display(&db, &item, NOW);
+        assert_eq!(result.text, format!("Queued — {expected} (1 minute ago)"));
         assert_eq!(
-            display(&db, &item, NOW).text,
-            format!("Queued — {expected} (1 minute ago)")
+            result.tooltip_times,
+            vec![QueuedTooltipTime {
+                label: "Waiting since:".into(),
+                epoch: NOW - 60,
+            }]
         );
     }
 }

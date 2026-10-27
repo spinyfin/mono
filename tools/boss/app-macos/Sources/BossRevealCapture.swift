@@ -139,7 +139,7 @@ enum BossRevealCapture {
             rows[1].name = "Resume the interrupted implementation"
             runtimes[0].queuedDisplay = QueuedDisplay([
                 "text": "Restarting after the previous run was orphaned 1 minute ago. Queued — Waiting for an available worker (11 working)",
-                "tooltip": "Previous run was orphaned at 2026-10-21T14:51:09Z"
+                "tooltip_times": [["label": "Previous run was orphaned at", "epoch": 1_766_058_669]]
             ])
             runtimes[0].dispatchWaitBlocker = nil
         }
