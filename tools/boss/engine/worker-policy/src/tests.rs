@@ -185,6 +185,7 @@ fn answer_agent_reply_stays_allowed() {
     // `boss comment reply`. The handler resolves comment and run from the
     // caller's own BOSS_RUN_ID, so it cannot target another thread.
     assert_allowed(FrontendRequest::CommentsPostAnswer {
+        proposed_edit: None,
         run_id: "exec_1".into(),
         body: "Here is the answer.".into(),
     });
@@ -718,5 +719,16 @@ fn idea_verbs_stay_closed_and_get_work_tree_stays_allowed() {
         delta: false,
         product_id: "prod_1".into(),
         fetch_seq: None,
+    });
+}
+
+#[test]
+fn answer_proposal_approval_and_dismissal_are_not_worker_actions() {
+    assert_denied(FrontendRequest::CommentsApproveEdit {
+        entry_id: "cte_example".into(),
+        instruction: None,
+    });
+    assert_denied(FrontendRequest::CommentsDismissEdit {
+        entry_id: "cte_example".into(),
     });
 }

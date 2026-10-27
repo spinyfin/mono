@@ -148,6 +148,10 @@ pub(crate) struct CommentRunsArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct CommentReplyArgs {
+    /// Versioned JSON object: version, title, instruction, optional replacements.
+    /// Pass `-` to read the JSON from stdin (not a file path).
+    #[arg(long)]
+    pub(crate) proposed_edit: Option<String>,
     /// The comprehensive answer to post. Pass the full text inline —
     /// there is deliberately no `--body-file` (a file-reading flag on this
     /// command would let a read-only session exfiltrate arbitrary file
@@ -170,4 +174,42 @@ pub(crate) struct CommentGuideOutcomeArgs {
     /// Request guide regeneration after a confirmed prose error.
     #[arg(long)]
     pub(crate) regenerate: bool,
+}
+
+/// Parse `--proposed-edit` JSON. `-` means stdin, never a file path.
+pub(crate) fn load_proposed_edit_arg(raw: Option<&str>) -> Result<Option<boss_protocol::ProposedEditInput>, CliError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if raw == "-" {
+        let json = std::io::read_to_string(std::io::stdin())
+            .map_err(|err| CliError::usage(format!("failed to read --proposed-edit from stdin: {err}")))?;
+        parse_proposed_edit_json(&json).map(Some)
+    } else {
+        parse_proposed_edit_json(raw).map(Some)
+    }
+}
+
+fn parse_proposed_edit_json(raw: &str) -> Result<boss_protocol::ProposedEditInput, CliError> {
+    serde_json::from_str(raw).map_err(|err| CliError::usage(format!("invalid --proposed-edit JSON: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_proposed_edit_json;
+
+    #[test]
+    fn proposed_edit_json_accepts_apostrophes_in_instruction() {
+        let json = r#"{"version":1,"title":"Don't flatten","instruction":"Replace 'delta-only' with change-proportional.","replacements":[]}"#;
+        let parsed = parse_proposed_edit_json(json).unwrap();
+        assert_eq!(parsed.version, 1);
+        assert_eq!(parsed.title, "Don't flatten");
+        assert!(parsed.instruction.contains("'delta-only'"));
+    }
+
+    #[test]
+    fn proposed_edit_json_rejects_invalid_payload() {
+        let err = parse_proposed_edit_json("not-json").unwrap_err();
+        assert!(format!("{err}").contains("invalid --proposed-edit JSON"));
+    }
 }

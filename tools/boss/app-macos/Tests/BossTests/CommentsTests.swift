@@ -708,6 +708,23 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertTrue(model.disconnectedActionNotice?.contains("Your follow-up reply was not saved") == true)
     }
 
+    @MainActor
+    func testDisconnectedApproveAndDismissAreRetainedForRetry() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        XCTAssertTrue(model.commentBridge.canAcceptUserSubmission(describing: "Approve proposed edit"))
+        model.commentBridge.approveEdit(entryID: "cte_approve", instruction: "Reviewer-edited instruction")
+        XCTAssertTrue(model.commentBridge.canAcceptUserSubmission(describing: "Dismiss proposed edit"))
+        model.commentBridge.dismissEdit(entryID: "cte_dismiss")
+        let payloads = model.engine.unsentPayloadsForTesting
+        XCTAssertEqual(payloads.count, 2)
+        XCTAssertEqual(payloads[0]["type"] as? String, "comments_approve_edit")
+        XCTAssertEqual(payloads[0]["entry_id"] as? String, "cte_approve")
+        XCTAssertEqual(payloads[0]["instruction"] as? String, "Reviewer-edited instruction")
+        XCTAssertEqual(payloads[1]["type"] as? String, "comments_dismiss_edit")
+        XCTAssertEqual(payloads[1]["entry_id"] as? String, "cte_dismiss")
+        XCTAssertNil(payloads[1]["instruction"])
+    }
+
     // MARK: - Engine-backed path
 
     func testConfigureRegistersAndListsWhenArtifactPresent() {
@@ -1234,6 +1251,9 @@ final class FakeCommentBackend: CommentBackend {
     func reviseDoc(artifactKind: String, artifactId: String) {
         reviseDocCalls.append((artifactKind, artifactId))
     }
+    func approveEdit(entryID: String, instruction: String?) {}
+    func dismissEdit(entryID: String) {}
+    func revealRevision(_ id: String) {}
     func postFollowup(commentId: String, body: String) {
         postFollowupCalls.append((commentId, body))
     }

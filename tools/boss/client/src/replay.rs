@@ -254,6 +254,8 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::CommentsRecordGuideOutcome { .. }
         | FrontendRequest::CommentsResolve { .. }
         | FrontendRequest::CommentsReviseDoc { .. }
+        | FrontendRequest::CommentsApproveEdit { .. }
+        | FrontendRequest::CommentsDismissEdit { .. }
         | FrontendRequest::CommentsSetIntent { .. }
         | FrontendRequest::CommentsSetStatus { .. }
         | FrontendRequest::CommentsUpdateAnchor { .. }

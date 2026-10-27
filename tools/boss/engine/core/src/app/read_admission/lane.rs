@@ -143,6 +143,8 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::CommentsCreate { .. }
         | R::CommentsDismiss { .. }
         | R::CommentsPostAnswer { .. }
+        | R::CommentsApproveEdit { .. }
+        | R::CommentsDismissEdit { .. }
         | R::CommentsPostFollowup { .. }
         | R::CommentsRecordGuideOutcome { .. }
         | R::CommentsResolve { .. }

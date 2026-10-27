@@ -804,6 +804,23 @@ final class CommentLayer: NSObject, ObservableObject {
         }
     }
 
+    /// Approve a structured answer-agent proposal as a same-PR revision.
+    /// Returns whether the request was accepted; the inline editor keeps
+    /// its text when it was not (retry queue full).
+    @discardableResult
+    func approveEdit(entryID: String, instruction: String?) -> Bool {
+        guard let backend, backend.canAcceptUserSubmission(describing: "Approve proposed edit") else { return false }
+        backend.approveEdit(entryID: entryID, instruction: instruction)
+        return true
+    }
+
+    func dismissEdit(entryID: String) {
+        guard let backend, backend.canAcceptUserSubmission(describing: "Dismiss proposed edit") else { return }
+        backend.dismissEdit(entryID: entryID)
+    }
+
+    func revealRevision(_ id: String) { backend?.revealRevision(id) }
+
     /// The operator's reply in an `answered` bucket-2 thread. Engine-backed:
     /// calls the real `CommentsPostFollowup` RPC, which appends the
     /// `operator_followup` thread entry, transitions the comment to

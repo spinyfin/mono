@@ -343,6 +343,14 @@ pub enum FrontendRequest {
         queue_ci_evidence: Option<crate::QueueCiEvidence>,
     },
 
+    /// App/Boss only. Atomically approve an answer proposal into the existing
+    /// review-guide revision path. Repeated approval returns the same revision.
+    CommentsApproveEdit {
+        #[serde(default)]
+        entry_id: String,
+        #[serde(default)]
+        instruction: Option<String>,
+    },
     /// Read-only summary of the `[Revise]` banner's state for an
     /// artifact: `{ revisable, unresolved_count, in_revision_count,
     /// doc_kind }`. A small companion read to `CommentsList` that lets a
@@ -368,6 +376,12 @@ pub enum FrontendRequest {
         comment_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<String>,
+    },
+
+    /// App/Boss only. Keep the proposal for audit, removing its actions.
+    CommentsDismissEdit {
+        #[serde(default)]
+        entry_id: String,
     },
 
     /// Read-only: fetch one comment by id together with its thread entries
@@ -403,6 +417,8 @@ pub enum FrontendRequest {
     CommentsPostAnswer {
         run_id: String,
         body: String,
+        #[serde(default)]
+        proposed_edit: Option<crate::ProposedEditInput>,
     },
 
     /// Operator-authored reply in a bucket-2 comment's thread (P3c "Follow-up

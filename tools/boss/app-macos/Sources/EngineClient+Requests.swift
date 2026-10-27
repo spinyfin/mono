@@ -1115,6 +1115,18 @@ extension EngineClient {
         ], queueIfDisconnected: true)
     }
 
+    /// Approve a proposed answer-agent edit as a same-PR revision.
+    func sendCommentsApproveEdit(entryID: String, instruction: String?) {
+        var request: [String: Any] = ["type": "comments_approve_edit", "entry_id": entryID]
+        if let instruction { request["instruction"] = instruction }
+        sendLine(request)
+    }
+
+    /// Dismiss a proposed answer-agent edit without creating a revision.
+    func sendCommentsDismissEdit(entryID: String) {
+        sendLine(["type": "comments_dismiss_edit", "entry_id": entryID])
+    }
+
     /// The `[Revise]`-banner action: batch-address every unaddressed
     /// `revision` comment on the artifact. Engine replies
     /// `comments_revise_doc_result`.

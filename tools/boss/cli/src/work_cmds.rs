@@ -1390,11 +1390,13 @@ pub(crate) async fn run_comment_reply(ctx: &RunContext, args: CommentReplyArgs) 
     if args.body.trim().is_empty() {
         return Err(CliError::usage("--body may not be empty"));
     }
+    let proposed_edit = load_proposed_edit_arg(args.proposed_edit.as_deref())?;
     let mut client = connect_for_work(ctx).await?;
     match client
         .send_request(&FrontendRequest::CommentsPostAnswer {
             run_id,
             body: args.body,
+            proposed_edit,
         })
         .await
         .map_err(CliError::internal)?

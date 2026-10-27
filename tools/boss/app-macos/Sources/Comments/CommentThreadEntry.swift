@@ -36,6 +36,7 @@ struct CommentThreadEntry: Identifiable, Equatable {
     /// entry ever carries a value here. See `Comment.reopenedAt` for the
     /// signal that actually drives the sidebar's `Reopened` chip today.
     var reviseTaskId: String? = nil
+    var proposedEdit: AnswerProposedEdit? = nil
     let createdAt: Date
 
     /// Map an engine wire entry into the UI type, keeping the engine's stable id.
@@ -51,7 +52,51 @@ struct CommentThreadEntry: Identifiable, Equatable {
             author: wire.author,
             body: wire.body,
             reviseTaskId: wire.reviseTaskId,
+            proposedEdit: wire.proposedEdit,
             createdAt: Comment.parseWireTimestamp(wire.createdAt)
         )
+    }
+}
+
+struct ProposedEditInput: Codable, Equatable, Sendable {
+    let version: Int
+    let title: String
+    let instruction: String
+    let replacements: [ProposedTextReplacement]
+}
+
+struct ProposedTextReplacement: Codable, Equatable, Sendable {
+    let path: String
+    let oldText: String
+    let newText: String
+
+    enum CodingKeys: String, CodingKey {
+        case path
+        case oldText = "old_text"
+        case newText = "new_text"
+    }
+}
+
+struct AnswerProposedEdit: Codable, Equatable, Sendable {
+    let proposal: ProposedEditInput
+    let state: String
+    let revisionID: String?
+    let revisionStatus: String?
+
+    var canAct: Bool { state == "proposed" && proposal.version == 1 }
+    var stateLabel: String {
+        switch state {
+        case "proposed": return proposal.version == 1 ? "Proposed edit" : "Unsupported proposal version"
+        case "approved": return "Approved · \(revisionStatus?.replacingOccurrences(of: "_", with: " ").capitalized ?? "Revision created")"
+        case "dismissed": return "Dismissed"
+        case "superseded": return "Superseded by a later conversation"
+        default: return "Unavailable"
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case proposal, state
+        case revisionID = "revision_id"
+        case revisionStatus = "revision_status"
     }
 }

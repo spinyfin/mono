@@ -20,6 +20,45 @@ use super::*;
 pub(crate) const ANSWER_AGENT_NO_REPLY_BODY: &str = "I wasn't able to finish answering this question — the session ended before \
      posting a reply. Please try again, or answer directly.";
 
+/// Complete a `running` answer-agent run on an already-open connection.
+/// Optional `comment_id` / `execution_id` add the same ownership guards the
+/// atomic answer write uses so a late reply from another execution cannot
+/// complete this row.
+pub(crate) fn complete_answer_agent_run_on(
+    conn: &Connection,
+    run_id: &str,
+    status: &str,
+    reply_body: Option<&str>,
+    error_kind: Option<&str>,
+    comment_id: Option<&str>,
+    execution_id: Option<&str>,
+) -> Result<AnswerAgentRun> {
+    let now = now_string();
+    let n = conn.execute(
+        "UPDATE answer_agent_runs \
+         SET status = ?2, reply_body = ?3, error_kind = ?4, completed_at = ?5 \
+         WHERE id = ?1 AND status = ?6 \
+           AND (?7 IS NULL OR comment_id = ?7) \
+           AND (?8 IS NULL OR execution_id = ?8 OR execution_id IS NULL)",
+        params![
+            run_id,
+            status,
+            reply_body,
+            error_kind,
+            now,
+            ANSWER_AGENT_RUN_STATUS_RUNNING,
+            comment_id,
+            execution_id
+        ],
+    )?;
+    if n == 0 {
+        bail!("answer-agent run {run_id} not found or already in a terminal state (expected running)");
+    }
+    let cols = answer_agent_run_columns();
+    let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE id = ?1");
+    conn.query_row(&sql, [run_id], map_answer_agent_run).map_err(Into::into)
+}
+
 /// Column list for every `answer_agent_runs` SELECT. Order must match
 /// [`map_answer_agent_run`]. `pub(crate)` so callers that already hold a
 /// connection (e.g. [`crate::work::answer_agent_runs::latest_answer_agent_run_for_comment_on`])
@@ -208,19 +247,7 @@ impl WorkDb {
         error_kind: Option<&str>,
     ) -> Result<AnswerAgentRun> {
         let conn = self.connect()?;
-        let now = now_string();
-        let n = conn.execute(
-            "UPDATE answer_agent_runs \
-             SET status = ?2, reply_body = ?3, error_kind = ?4, completed_at = ?5 \
-             WHERE id = ?1 AND status = 'running'",
-            params![run_id, status, reply_body, error_kind, now],
-        )?;
-        if n == 0 {
-            bail!("answer-agent run {run_id} not found or already in a terminal state (expected running)");
-        }
-        let cols = answer_agent_run_columns();
-        let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE id = ?1");
-        conn.query_row(&sql, [run_id], map_answer_agent_run).map_err(Into::into)
+        complete_answer_agent_run_on(&conn, run_id, status, reply_body, error_kind, None, None)
     }
 
     /// Stand a comment's in-flight answer-agent run down because the operator

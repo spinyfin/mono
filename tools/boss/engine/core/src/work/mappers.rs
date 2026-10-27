@@ -180,6 +180,14 @@ pub(crate) fn map_comment_thread_entry(row: &Row<'_>) -> rusqlite::Result<Commen
         revise_task_id: row.get::<_, Option<String>>(5)?.filter(|s| !s.is_empty()),
         answer_agent_run_id: row.get::<_, Option<String>>(6)?.filter(|s| !s.is_empty()),
         created_at: row.get(7)?,
+        proposed_edit: row
+            .get::<_, Option<String>>(8)?
+            .map(|raw| {
+                serde_json::from_str(&raw).map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(err))
+                })
+            })
+            .transpose()?,
     })
 }
 

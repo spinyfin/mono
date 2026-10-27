@@ -210,6 +210,7 @@ struct WireCommentThreadEntry: Codable, Equatable, Sendable {
     let body: String
     let reviseTaskId: String?
     let answerAgentRunId: String?
+    var proposedEdit: AnswerProposedEdit? = nil
     let createdAt: String
 
     enum CodingKeys: String, CodingKey {
@@ -220,6 +221,7 @@ struct WireCommentThreadEntry: Codable, Equatable, Sendable {
         case body
         case reviseTaskId = "revise_task_id"
         case answerAgentRunId = "answer_agent_run_id"
+        case proposedEdit = "proposed_edit"
         case createdAt = "created_at"
     }
 }

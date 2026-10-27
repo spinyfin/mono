@@ -4,6 +4,48 @@ import SwiftUI
 
 @MainActor
 final class GuideCommentTests: XCTestCase {
+    func testProposalWireMappingAndEachRenderedState() throws {
+        let layer = CommentLayer()
+        let backend = GuideCommentBackend()
+        layer.configure(source: "Same quote", baseURL: nil,
+                        artifact: .reviewGuide(seriesID: "series", versionID: "new"), backend: backend)
+        for state in ["proposed", "approved", "dismissed", "superseded"] {
+            let json = """
+            {"id":"answer","comment_id":"question","entry_kind":"answer","author":"engine",
+             "body":"Here is the answer","created_at":"2026-10-21T00:00:00Z",
+             "proposed_edit":{"proposal":{"version":1,"title":"Clarify cost","instruction":"Update the explanation",
+             "replacements":[{"path":"doc.md","old_text":"delta-only","new_text":"change-proportional"}]},
+             "state":"\(state)","revision_id":"revision","revision_status":"in_progress"}}
+            """
+            let wire = try JSONDecoder().decode(WireCommentThreadEntry.self, from: Data(json.utf8))
+            let entry = CommentThreadEntry.from(wire)
+            let edit = try XCTUnwrap(entry.proposedEdit)
+            XCTAssertEqual(entry.body, "Here is the answer")
+            XCTAssertEqual(edit.canAct, state == "proposed")
+            XCTAssertEqual(edit.proposal.replacements.first?.oldText, "delta-only")
+            if state == "approved" { XCTAssertEqual(edit.stateLabel, "Approved · In Progress") }
+            let titles = ProposedEditCard.visibleActions(for: edit).map(\.rawValue)
+            switch state {
+            case "proposed":
+                XCTAssertEqual(titles, ["Approve as revision", "Edit then approve", "Dismiss"])
+            case "approved":
+                XCTAssertEqual(titles, ["Open revision"])
+            default:
+                XCTAssertEqual(titles, [], "dismissed and superseded cards hide actions")
+            }
+            let view = NSHostingView(rootView: ProposedEditCard(entryID: entry.id, edit: edit, layer: layer))
+            view.frame = NSRect(x: 0, y: 0, width: 640, height: 400)
+            view.layoutSubtreeIfNeeded()
+        }
+        XCTAssertTrue(layer.approveEdit(entryID: "answer", instruction: "Reviewer tweak"))
+        XCTAssertEqual(backend.approvedEntry, "answer")
+        XCTAssertEqual(backend.approvedInstruction, "Reviewer tweak")
+        layer.dismissEdit(entryID: "answer")
+        XCTAssertEqual(backend.dismissedEntry, "answer")
+        layer.revealRevision("revision")
+        XCTAssertEqual(backend.revealedRevision, "revision")
+    }
+
     func testAuthoringUsesVersionAndOriginalProjection() {
         let layer = CommentLayer()
         let backend = GuideCommentBackend()
@@ -302,6 +344,16 @@ private final class GuideCommentBackend: CommentBackend {
     func updateAnchor(commentId: String, anchor: CommentAnchor, newDocVersion: String) {}
     func setIntent(commentId: String, intent: String) {}
     func fetchBannerState(artifactKind: String, artifactId: String) {}
+    var approvedEntry: String?
+    var approvedInstruction: String?
+    var dismissedEntry: String?
+    var revealedRevision: String?
+    func approveEdit(entryID: String, instruction: String?) {
+        approvedEntry = entryID
+        approvedInstruction = instruction
+    }
+    func dismissEdit(entryID: String) { dismissedEntry = entryID }
+    func revealRevision(_ id: String) { revealedRevision = id }
     func postFollowup(commentId: String, body: String) {}
     func reviseDoc(artifactKind: String, artifactId: String) { didRevise = true }
 }

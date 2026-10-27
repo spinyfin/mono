@@ -301,6 +301,25 @@ pub(crate) fn push_comment_directive_block(conn: &Connection, out: &mut String, 
         out.push('\n');
     }
     if let Ok(entries) = super::comment_thread_entries::list_comment_thread_entries_on(conn, &comment.id) {
+        for entry in &entries {
+            // Approval assigns the revision id after composing this directive
+            // in the same transaction. Older approvals are conversation history.
+            if let Some(edit) = &entry.proposed_edit
+                && edit.state == boss_protocol::ProposedEditState::Approved
+                && edit.revision_id.is_none()
+            {
+                out.push_str(&format!(
+                    "\nApproved proposed edit: {}\nOriginating comment: {} (answer {})\n{}\n",
+                    edit.proposal.title, comment.id, entry.id, edit.proposal.instruction
+                ));
+                for replacement in &edit.proposal.replacements {
+                    out.push_str(&format!(
+                        "\n{}\nOld text:\n{}\nNew text:\n{}\n",
+                        replacement.path, replacement.old_text, replacement.new_text
+                    ));
+                }
+            }
+        }
         for entry in entries
             .iter()
             .filter(|e| e.entry_kind == THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP)

@@ -37,6 +37,26 @@ impl WorkDb {
         input: ReviseDocInput,
         pr_checker: &dyn PrStateChecker,
     ) -> Result<ReviseDocOutcome> {
+        self.revise_guide_pr_with_proposal(input, pr_checker, None)
+    }
+
+    pub(super) fn revise_guide_pr_with_proposal(
+        &self,
+        input: ReviseDocInput,
+        pr_checker: &dyn PrStateChecker,
+        approval: Option<(&str, Option<String>)>,
+    ) -> Result<ReviseDocOutcome> {
+        if let Some((entry_id, _)) = &approval {
+            let conn = self.connect()?;
+            let entry = comment_thread_entries::load_entry(&conn, entry_id)?;
+            if let Some(proposal) = entry.proposed_edit
+                && proposal.state == boss_protocol::ProposedEditState::Approved
+            {
+                return Ok(ReviseDocOutcome::AlreadyInFlight {
+                    task_id: proposal.revision_id.context("approved proposal missing revision")?,
+                });
+            }
+        }
         let Some(FeedbackTarget::PullRequestImplementation {
             series_id,
             canonical_pr,
@@ -61,6 +81,19 @@ impl WorkDb {
 
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((entry_id, instruction)) = &approval {
+            // Recheck after taking the write lock: two approvals may have
+            // observed the same proposed state before either acquired it.
+            let entry = comment_thread_entries::load_entry(&tx, entry_id)?;
+            if let Some(proposal) = entry.proposed_edit
+                && proposal.state == boss_protocol::ProposedEditState::Approved
+            {
+                return Ok(ReviseDocOutcome::AlreadyInFlight {
+                    task_id: proposal.revision_id.context("approved proposal missing revision")?,
+                });
+            }
+            comment_thread_entries::prepare_approval(&tx, entry_id, instruction.clone())?;
+        }
         let candidates = comments::query_revisable_comments(
             &tx,
             &input.artifact_kind,
@@ -105,6 +138,12 @@ impl WorkDb {
                         .filter(|id| !addressed_comment_ids.contains(id))
                         .collect::<Vec<_>>();
                 let task_id = task.id.clone();
+                if let Some((entry_id, _)) = &approval {
+                    let entry = comment_thread_entries::load_entry(&tx, entry_id)?;
+                    let mut proposal = entry.proposed_edit.context("missing proposal")?;
+                    proposal.revision_id = Some(task_id.clone());
+                    comment_thread_entries::save_proposal(&tx, entry_id, &proposal)?;
+                }
                 commit_and_publish(tx, pending, self.event_bus())?;
                 Ok(ReviseDocOutcome::Created {
                     task_id,
