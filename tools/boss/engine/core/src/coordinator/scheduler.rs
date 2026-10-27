@@ -164,7 +164,15 @@ impl ExecutionCoordinator {
             // engine's own boot-time `kick()` (see `app.rs`).
             tokio::time::sleep(interval).await;
             let interval_ms = interval.as_millis() as u64;
+            let mut queued_displays = None;
             loop {
+                // A deadline can pass without a DB write (including while dispatch
+                // is paused). Publish changed engine projections, never ask clients
+                // to guess the next hold or run their own countdown timers.
+                coordinator
+                    .refresh_queued_displays(&mut queued_displays, boss_engine_utils::epoch_time::now_epoch_secs())
+                    .await;
+
                 let ready = match coordinator.work_db.list_ready_executions() {
                     Ok(rows) => rows,
                     Err(err) => {
@@ -206,6 +214,46 @@ impl ExecutionCoordinator {
                 tokio::time::sleep(interval).await;
             }
         })
+    }
+
+    pub(super) async fn refresh_queued_displays(
+        &self,
+        previous: &mut Option<std::collections::HashMap<String, crate::work::QueuedDisplaySnapshot>>,
+        now: i64,
+    ) {
+        let work_db = self.work_db.clone();
+        let previous_scan = previous.clone().unwrap_or_default();
+        let current =
+            match crate::work::db_diagnostics::spawn_blocking(move || work_db.queued_displays(now, &previous_scan))
+                .await
+            {
+                Ok(Ok(current)) => current,
+                Ok(Err(err)) => {
+                    tracing::warn!(?err, "failed to refresh queued displays");
+                    return;
+                }
+                Err(err) => {
+                    tracing::warn!(?err, "queued display refresh join failed");
+                    return;
+                }
+            };
+        match previous {
+            None => {
+                // First pass after boot: seed so later beats can diff, without
+                // republishing every queued card the tree already carried.
+                *previous = Some(current);
+            }
+            Some(prev) => {
+                for (item, snap) in &current {
+                    if prev.get(item).map(|s| &s.display) != Some(&snap.display) {
+                        self.publisher
+                            .publish_work_item_runtime_changed(&snap.product_id, item, "queued_display_changed")
+                            .await;
+                    }
+                }
+                *previous = Some(current);
+            }
+        }
     }
 
     /// Return every `ready` execution whose `created_at` is older than

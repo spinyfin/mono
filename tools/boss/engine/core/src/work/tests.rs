@@ -572,6 +572,7 @@ mod followup_membership_tests;
 mod human_driven_tests;
 mod idea_tests;
 mod project_membership_move_tests;
+mod queued_display_tests;
 mod remediation_state;
 mod resolve_repo_tests;
 mod review_batch_remint_tests;

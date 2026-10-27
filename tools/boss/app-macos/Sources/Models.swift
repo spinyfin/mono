@@ -639,6 +639,50 @@ extension WorkTask {
 
 }
 
+struct QueuedTooltipTime: Hashable {
+    let label: String
+    let epoch: Int64
+
+    init?(payload: [String: Any]) {
+        guard let label = payload["label"] as? String,
+              let epoch = Self.parseEpoch(payload["epoch"]) else { return nil }
+        self.label = label
+        self.epoch = epoch
+    }
+
+    var formatted: String {
+        Date(timeIntervalSince1970: TimeInterval(epoch))
+            .formatted(date: .abbreviated, time: .shortened)
+    }
+
+    private static func parseEpoch(_ value: Any?) -> Int64? {
+        switch value {
+        case let number as NSNumber: return number.int64Value
+        case let number as Int: return Int64(number)
+        case let number as Int64: return number
+        case let text as String: return Int64(text)
+        default: return nil
+        }
+    }
+}
+
+struct QueuedDisplay: Hashable {
+    let text: String
+    let tooltipTimes: [QueuedTooltipTime]
+
+    init?(_ payload: [String: Any]) {
+        guard let text = payload["text"] as? String else { return nil }
+        self.text = text
+        let raw = payload["tooltip_times"] as? [[String: Any]] ?? []
+        self.tooltipTimes = raw.compactMap { QueuedTooltipTime(payload: $0) }
+    }
+
+    var tooltip: String {
+        if tooltipTimes.isEmpty { return text }
+        return text + "\n" + tooltipTimes.map { "\($0.label) \($0.formatted)" }.joined(separator: "\n")
+    }
+}
+
 struct WorkTaskRuntime: Hashable {
     let workItemID: String
     let executionStatus: String?
@@ -660,6 +704,7 @@ struct WorkTaskRuntime: Hashable {
     let dispatchWaitSince: String?
     var dispatchNotBefore: String? = nil
     var dispatchWaitBlocker: DispatchWaitBlocker? = nil
+    var queuedDisplay: QueuedDisplay? = nil
 }
 
 /// One row from `work_item_dependencies` — the dependent is gated by

@@ -289,3 +289,53 @@ async fn spawn_panic_during_lease_reverts_claimed_to_ready() {
         db.get_execution(&execution_id).unwrap().status
     );
 }
+
+#[tokio::test]
+async fn heartbeat_publishes_elapsed_deadline_without_a_database_write() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Waiting for capacity");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let execution = db.list_executions(Some(&chore.id)).unwrap().remove(0);
+    db.connect().unwrap().execute(
+        "UPDATE work_executions SET dispatch_not_before = ?2, dispatch_wait_reason = 'pool_exhausted' WHERE id = ?1",
+        rusqlite::params![execution.id, (now + 10).to_string()],
+    ).unwrap();
+    let publisher = Arc::new(crate::test_support::RecordingPublisher::default());
+    let coordinator = ExecutionCoordinator::with_publisher(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeExecutionRunner::default()),
+        publisher.clone(),
+    );
+    let mut previous = None;
+    coordinator.refresh_queued_displays(&mut previous, now).await;
+    assert!(
+        previous.as_ref().unwrap()[&chore.id]
+            .display
+            .text
+            .contains("next attempt")
+    );
+    assert!(
+        publisher.events.lock().await.is_empty(),
+        "the first pass seeds without republishing the boot snapshot"
+    );
+    coordinator.refresh_queued_displays(&mut previous, now + 1).await;
+    assert!(
+        publisher.events.lock().await.is_empty(),
+        "unchanged text is not republished"
+    );
+    coordinator.refresh_queued_displays(&mut previous, now + 10).await;
+    assert_eq!(
+        previous.as_ref().unwrap()[&chore.id].display.text,
+        "Queued — worker pool full"
+    );
+    assert_eq!(publisher.runtime_reasons().await, vec!["queued_display_changed"]);
+    assert_eq!(
+        publisher.events.lock().await[0],
+        (product.id, chore.id, "queued_display_changed".into())
+    );
+}

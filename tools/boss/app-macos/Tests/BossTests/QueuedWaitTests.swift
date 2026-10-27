@@ -3,6 +3,57 @@ import XCTest
 
 @MainActor
 final class QueuedWaitTests: XCTestCase {
+    func testEngineDisplayVariantsReachCardAndAbsoluteHover() throws {
+        let labels = [
+            "Queued — reason unknown",
+            "Queued — waiting for a dependency",
+            "Queued — waiting for T\(42)",
+            "Queued — waiting for P\(7)",
+            "Queued — dispatch paused",
+            "Queued — automation paused",
+            "Queued — worker pool full",
+            "Queued — Waiting for an available worker (11 working)",
+            "Queued — blocked by an earlier review",
+            "Queued — next attempt in 2 min",
+            "Retrying dispatch — next attempt in 2 min",
+            "Queued — worker pool full (1 minute ago)",
+            "Restarting after the previous run was orphaned 1 minute ago. Queued — worker pool full",
+            "Restarting after the previous run failed 1 minute ago. Queued — worker pool full",
+            "Restarting after the previous run was cancelled 1 minute ago. Queued — worker pool full"
+        ]
+        let client = EngineClient(socketPath: "/tmp/queued-display-\(UUID().uuidString).sock")
+        let model = ChatViewModel(socketPath: "/tmp/queued-display-model-\(UUID().uuidString).sock")
+        let waiting = task(status: "active")
+        let epoch: Int64 = 1_766_058_669
+        let local = Date(timeIntervalSince1970: TimeInterval(epoch))
+            .formatted(date: .abbreviated, time: .shortened)
+        for label in labels {
+            let tooltip = label + "\nPrevious run finished at \(local)"
+            let pending = try XCTUnwrap(client.parseTaskRuntime([
+                "work_item_id": waiting.id, "execution_status": "ready",
+                "dispatch_not_before": "1", "dispatch_wait_reason": "stale raw reason",
+                "queued_display": [
+                    "text": label,
+                    "tooltip_times": [["label": "Previous run finished at", "epoch": epoch]]
+                ]
+            ]))
+            model.taskRuntimesByID = [waiting.id: pending]
+            let row = try XCTUnwrap(WorkBoardCardLiveStatusRowSlice(snapshot: snapshot(model, waiting)))
+            XCTAssertEqual(row.liveStatus, label)
+            XCTAssertEqual(row.tooltip, tooltip)
+        }
+    }
+
+    func testElapsedLegacyDeadlineNeverRendersNotBefore() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        for deadline in ["1799999999", "1800000000", "bad"] {
+            var pending = runtime(reason: "Waiting for an available worker (11 working)")
+            pending.dispatchNotBefore = deadline
+            XCTAssertEqual(WorkCardLiveStatus.queuedLabel(runtime: pending, now: now),
+                           "Queued — Waiting for an available worker (11 working)")
+        }
+    }
+
     func testRecordedReasonLabels() {
         let labels = [
             "unknown": "Queued — reason unknown",

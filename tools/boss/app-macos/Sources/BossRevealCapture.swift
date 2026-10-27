@@ -117,7 +117,7 @@ enum BossRevealCapture {
         }
         if state == "missing" { rows.removeAll { $0.id == targetID } }
         var runtimes: [WorkTaskRuntime] = []
-        if state == "queued" {
+        if state == "queued" || state == "queued-restart" {
             rows = Array(rows.suffix(2))
             rows[0].status = "active"
             rows[0].name = "Earlier review revision"
@@ -134,6 +134,14 @@ enum BossRevealCapture {
                     workItemID: rows[0].id, productID: product.id, shortID: rows[0].shortID
                 )
             )]
+        }
+        if state == "queued-restart" {
+            rows[1].name = "Resume the interrupted implementation"
+            runtimes[0].queuedDisplay = QueuedDisplay([
+                "text": "Restarting after the previous run was orphaned 1 minute ago. Queued — Waiting for an available worker (11 working)",
+                "tooltip_times": [["label": "Previous run was orphaned at", "epoch": 1_766_058_669]]
+            ])
+            runtimes[0].dispatchWaitBlocker = nil
         }
         if state == "doing-sections" {
             for index in rows.indices {

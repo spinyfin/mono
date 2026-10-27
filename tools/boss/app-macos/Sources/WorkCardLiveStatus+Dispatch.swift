@@ -16,6 +16,8 @@ extension WorkCardLiveStatus {
     /// The existing grey status line, fed only by the engine's current runtime.
     static func queuedLabel(runtime: WorkTaskRuntime?, now: Date) -> String {
         guard isPendingExecution(runtime) else { return "Queued — reason unknown" }
+        if let display = runtime?.queuedDisplay { return display.text }
+        // Compatibility with engines predating the display-ready field.
         if let blocker = runtime?.dispatchWaitBlocker,
            runtime?.dispatchWaitReason == "waiting_dependency" {
             return "Queued — waiting for \(blocker.label)"
@@ -23,7 +25,7 @@ extension WorkCardLiveStatus {
         if let raw = runtime?.dispatchRetryAt, let date = AutomationTime.parse(raw), date > now {
             return "Retrying dispatch — next attempt \(AutomationTime.relative(raw, now: now))"
         }
-        if let raw = runtime?.dispatchNotBefore, let date = AutomationTime.parse(raw) {
+        if let raw = runtime?.dispatchNotBefore, let date = AutomationTime.parse(raw), date > now {
             return "Queued — not before \(date.formatted(date: .abbreviated, time: .shortened))"
         }
         guard let reason = runtime?.dispatchWaitReason, !reason.isEmpty else {

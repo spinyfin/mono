@@ -1,5 +1,5 @@
 use super::board_runtime_cache::{BoardRuntimeCache, CachedRuntime};
-use super::dispatch_helpers::compute_task_runtime;
+use super::runtime_projection::compute_task_runtime;
 use super::*;
 
 /// [`collect_task_runtimes`] backed by the engine-wide [`BoardRuntimeCache`].

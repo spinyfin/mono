@@ -134,6 +134,7 @@ struct WorkCardSnapshot: Equatable {
     var assignedWorkerName: String? = nil
     let dispatchWaitBlocker: DispatchWaitBlocker?
     let liveStatus: String?
+    var liveStatusTooltip: String? = nil
     let liveStatusActivity: WorkerActivity?
     let liveStatusLastEventAt: String?
     let blockedBy: String?
@@ -399,6 +400,8 @@ struct WorkCardSnapshot: Equatable {
             assignedWorkerName: assignedSlotId == nil ? nil : context.liveState?.displayName,
             dispatchWaitBlocker: context.dispatchWaitBlocker,
             liveStatus: liveStatus,
+            liveStatusTooltip: liveStatus == context.runtime?.queuedDisplay?.text
+                ? context.runtime?.queuedDisplay?.tooltip : nil,
             liveStatusActivity: liveStatusActivity,
             liveStatusLastEventAt: liveStatusLastEventAt,
             blockedBy: context.blockedBy,

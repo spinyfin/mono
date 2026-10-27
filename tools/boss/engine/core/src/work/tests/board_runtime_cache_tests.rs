@@ -192,6 +192,19 @@ fn every_runtime_input_write_invalidates_exactly_its_item() {
             1,
         ),
         (
+            "run finished_at",
+            Box::new({
+                let first = first.clone();
+                move |b| {
+                    b.sql(
+                        "UPDATE work_runs SET finished_at = '8' WHERE execution_id = ?1",
+                        &[&first],
+                    )
+                }
+            }),
+            1,
+        ),
+        (
             "run created_at",
             Box::new({
                 let first = first.clone();
@@ -486,4 +499,43 @@ fn entries_follow_board_membership_and_stay_within_capacity() {
     assert_eq!(stats.entries, 1, "the global capacity bounds the cache");
     assert!(stats.evictions >= 1);
     board.assert_equivalent();
+}
+
+#[test]
+fn queued_relative_time_and_previous_finish_time_invalidate_cached_display() {
+    let board = board();
+    let item = board.chore("retry");
+    let exec = board.execution(&item, ExecutionStatus::Ready);
+    let run = board.run(&exec);
+    board.sql(
+        "UPDATE work_runs SET status = 'orphaned', finished_at = '1000' WHERE id = ?1",
+        &[&run],
+    );
+    board.sql("UPDATE work_executions SET status = 'ready' WHERE id = ?1", &[&exec]);
+    board.assert_equivalent_at(1060);
+    assert!(
+        board.runtime_of_at(&item, 1060)["queued_display"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("1 minute ago")
+    );
+    let (misses, _) = board.assert_equivalent_at(1119);
+    assert_eq!(misses, 0, "relative phrase stays cached until its next boundary");
+    let (misses, _) = board.assert_equivalent_at(1120);
+    assert_eq!(misses, 1);
+    assert!(
+        board.runtime_of_at(&item, 1120)["queued_display"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("2 minutes ago")
+    );
+    board.sql("UPDATE work_runs SET finished_at = '1060' WHERE id = ?1", &[&run]);
+    let (misses, _) = board.assert_equivalent_at(1120);
+    assert_eq!(misses, 1, "finish-only writes invalidate the pending card");
+    assert!(
+        board.runtime_of_at(&item, 1120)["queued_display"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("1 minute ago")
+    );
 }

@@ -46,11 +46,18 @@ final class RuntimePatchTests: XCTestCase {
             {"item":{"item_type":"task","id":"task_1","product_id":"prod_a","project_id":"proj_a1","kind":"project_task",\
             "name":"Task task_1","description":"","status":"todo","priority":"medium","created_at":"2026-07-10T00:00:00Z",\
             "updated_at":"2026-07-10T00:00:00Z","ci_required_state":"success"},\
-            "runtime":{"work_item_id":"task_1","execution_status":"ready","dispatch_wait_reason":"pool_exhausted"}}]}}
+            "runtime":{"work_item_id":"task_1","execution_status":"ready","dispatch_wait_reason":"pool_exhausted","queued_display":{"text":"Queued — worker pool full","tooltip_times":[{"label":"Waiting since:","epoch":1766058669}]}}}]}}
             """
         )
         await waitUntil { model.task(withID: "task_1")?.ciRequiredState == "success" }
 
+        XCTAssertEqual(model.taskRuntime(for: "task_1")?.queuedDisplay?.text, "Queued — worker pool full")
+        let waitingSince = Date(timeIntervalSince1970: 1_766_058_669)
+            .formatted(date: .abbreviated, time: .shortened)
+        XCTAssertEqual(
+            model.taskRuntime(for: "task_1")?.queuedDisplay?.tooltip,
+            "Queued — worker pool full\nWaiting since: \(waitingSince)"
+        )
         XCTAssertEqual(model.taskRuntime(for: "task_1")?.dispatchWaitReason, "pool_exhausted")
         XCTAssertEqual(model.taskRuntime(for: "task_1")?.executionStatus, "ready")
         XCTAssertEqual(model.boardReadFences["prod_a"]?.revision, 19)
