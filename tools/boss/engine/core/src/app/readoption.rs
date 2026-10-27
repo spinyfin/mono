@@ -1020,29 +1020,45 @@ impl ServerState {
             .snapshot()
             .into_iter()
             .find(|state| state.run_id == run_id);
-        let reason = match state.as_ref() {
-            None => Some("the worker is no longer live"),
-            Some(state) if state.activity.is_terminal() => Some("the worker has exited"),
-            Some(state) if state.tmux_hosted != Some(true) => {
-                Some("no local tmux terminal is available for this worker")
-            }
-            Some(_) if self.app_session.lock().await.is_none() => Some("no app session is registered"),
-            Some(_) => None,
+        let Some(state) = state else {
+            self.decline_worker_pane_attach(run_id, "the worker is no longer live")
+                .await;
+            return false;
+        };
+        let reason = if state.activity.is_terminal() {
+            Some("the worker has exited")
+        } else if state.tmux_hosted == Some(false) {
+            return false;
+        } else if state.tmux_hosted.is_none() {
+            Some("no local tmux terminal is available for this worker")
+        } else if self.app_session.lock().await.is_none() {
+            Some("no app session is registered")
+        } else {
+            None
         };
         if let Some(reason) = reason {
             self.decline_worker_pane_attach(run_id, reason).await;
             return false;
         }
-        self.reattach_one_worker_pane(&state.unwrap()).await == WorkerPaneAttachOutcome::Attached
+        self.reattach_one_worker_pane(&state).await == WorkerPaneAttachOutcome::Attached
     }
 
     async fn decline_worker_pane_attach(&self, run_id: &str, reason: &str) {
         tracing::info!(run_id, reason, "worker pane attach declined");
-        self.live_worker_states
+        let changed = self
+            .live_worker_states
             .set_viewer_attach_error(run_id, Some(reason.to_owned()));
         // Also publish when the run has disappeared: the app must release its
         // stale member rather than keep displaying a connecting card.
-        self.broadcast_live_worker_states().await;
+        if changed
+            || !self
+                .live_worker_states
+                .snapshot()
+                .iter()
+                .any(|state| state.run_id == run_id)
+        {
+            self.broadcast_live_worker_states().await;
+        }
     }
 
     pub(super) async fn schedule_worker_viewer_reattach_retry(&self) {
@@ -1102,13 +1118,21 @@ impl ServerState {
     /// cards explain that cleanup is pending until live membership is released.
     async fn reattach_one_worker_pane(&self, state: &LiveWorkerState) -> WorkerPaneAttachOutcome {
         let run_id = state.run_id.as_str();
-        if !matches!(self.work_db.find_execution(run_id), Ok(Some(run)) if !run.status.is_terminal()) {
-            self.decline_worker_pane_attach(
-                run_id,
-                "the execution has ended or is unavailable; waiting for engine cleanup",
-            )
-            .await;
-            return WorkerPaneAttachOutcome::Skipped;
+        match self.work_db.find_execution(run_id) {
+            Ok(Some(run)) if !run.status.is_terminal() => {}
+            Ok(_) => {
+                self.decline_worker_pane_attach(
+                    run_id,
+                    "the execution has ended or is unavailable; waiting for engine cleanup",
+                )
+                .await;
+                return WorkerPaneAttachOutcome::Skipped;
+            }
+            Err(err) => {
+                self.decline_worker_pane_attach(run_id, &format!("could not read the execution: {err:#}"))
+                    .await;
+                return WorkerPaneAttachOutcome::Failed;
+            }
         }
         let outcome = self.try_reattach_one_worker_pane(state).await;
         let changed = self

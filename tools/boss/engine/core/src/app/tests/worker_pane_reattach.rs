@@ -594,13 +594,58 @@ async fn app_requested_attach_ignores_runs_without_an_attachable_pane() {
         server_state.live_worker_states.snapshot()[0]
             .viewer_attach_error
             .as_deref(),
-        Some("no local tmux terminal is available for this worker")
+        None
     );
     let next = tokio::time::timeout(Duration::from_millis(200), sink.next()).await;
     assert!(
         next.is_err(),
         "no attach may be sent for an unattachable run, got {next:?}"
     );
+}
+
+#[tokio::test]
+async fn execution_read_failure_schedules_a_retry() {
+    let (state, _dir) = test_server_state();
+    seed_tmux_hosted_live_run(&state, 1, "read-failure-session", "read-failure-token");
+    // Make the execution query fail, then restore the table to model recovery.
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("ALTER TABLE work_executions RENAME TO unavailable_executions;")
+        .unwrap();
+    let sink = make_session_sink();
+    state.register_app_session("session-app".into(), sink.clone()).await;
+    let pass = tokio::spawn({
+        let state = state.clone();
+        async move { state.reattach_worker_panes_to_registered_app().await }
+    });
+    answer_list_hosted_panes(&state, &sink, vec![]).await;
+    pass.await.unwrap();
+    assert!(
+        state.live_worker_states.snapshot()[0]
+            .viewer_attach_error
+            .as_deref()
+            .unwrap()
+            .starts_with("could not read the execution:")
+    );
+    assert!(
+        state
+            .viewer_reattach_retry_scheduled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    assert_eq!(
+        state
+            .viewer_reattach_retry_attempt
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("ALTER TABLE unavailable_executions RENAME TO work_executions;")
+        .unwrap();
 }
 
 #[tokio::test]
@@ -658,6 +703,12 @@ async fn declined_live_attach_records_session_and_terminal_reasons() {
             if states.iter().any(|live| live.run_id == run_id
                 && live.viewer_attach_error.as_deref() == Some("no app session is registered"))
     ));
+    assert!(!state.reattach_worker_pane_for_run(&run_id).await);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), sink.next())
+            .await
+            .is_err()
+    );
     state.live_worker_states.mark_errored(1);
     assert!(!state.reattach_worker_pane_for_run(&run_id).await);
     assert_eq!(

@@ -529,6 +529,17 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         XCTAssertEqual(snapshot.viewerMissingMessage, "Worker exited")
     }
 
+    func testAttachedErroredMemberIsNotDimmedAsExited() {
+        let snapshot = WorkerSlotSnapshot.build(
+            slot: WorkerSlot(slotId: 1, session: Self.makeSession(id: "errored"), runId: "exec-1"),
+            liveState: Self.makeLiveState(activity: .errored, tmuxHosted: true),
+            liveStatusEnabled: true
+        )
+        XCTAssertEqual(snapshot.bodyKind, .terminal)
+        XCTAssertFalse(snapshot.isExited, "The header and attached terminal must retain full opacity")
+        XCTAssertTrue(snapshot.live?.isEngineTerminal == true)
+    }
+
     func testDeclinedMemberShowsReason() {
         for reason in ["the execution has ended or is unavailable; waiting for engine cleanup", "no app session is registered"] {
             let snapshot = WorkerSlotSnapshot.build(
