@@ -440,6 +440,53 @@ impl WorkDb {
             .collect())
     }
 
+    /// The newest `automation_runs` row for an automation, or `None` when it
+    /// has never fired. Same ordering as [`list_automation_runs`] but a single
+    /// indexed row with no retry-chain collapsing, so `repeat_count` is `1`.
+    /// Backs the last-run summary the engine attaches to automation pushes.
+    pub fn latest_automation_run(&self, automation_id: &str) -> Result<Option<boss_protocol::AutomationRun>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT id, automation_id, scheduled_for, started_at, finished_at,
+                    triage_execution_id, outcome, produced_task_id, detail,
+                    first_attempted_at
+               FROM automation_runs
+              WHERE automation_id = ?1
+              ORDER BY scheduled_for DESC, started_at DESC
+              LIMIT 1",
+            [automation_id],
+            map_automation_run,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// The newest `automation_runs` row of every automation in a product that
+    /// has fired, keyed by automation id. One query for the whole list, so the
+    /// automations list can carry each row's last-run summary without a
+    /// request per automation. Same ordering as [`latest_automation_run`].
+    pub fn latest_automation_runs_for_product(
+        &self,
+        product_id: &str,
+    ) -> Result<std::collections::HashMap<String, boss_protocol::AutomationRun>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT r.id, r.automation_id, r.scheduled_for, r.started_at, r.finished_at,
+                    r.triage_execution_id, r.outcome, r.produced_task_id, r.detail,
+                    r.first_attempted_at
+               FROM automations a
+               JOIN automation_runs r
+                 ON r.id = (SELECT r2.id FROM automation_runs r2
+                             WHERE r2.automation_id = a.id
+                             ORDER BY r2.scheduled_for DESC, r2.started_at DESC
+                             LIMIT 1)
+              WHERE a.product_id = ?1",
+        )?;
+        let rows = stmt.query_map([product_id], map_automation_run)?;
+        let runs: Vec<boss_protocol::AutomationRun> = collect_rows(rows)?;
+        Ok(runs.into_iter().map(|run| (run.automation_id.clone(), run)).collect())
+    }
+
     /// List tasks produced by an automation (`source_automation_id = ?`),
     /// ordered by `created_at DESC`. Includes non-deleted rows only.
     pub fn list_tasks_for_automation(&self, automation_id: &str) -> Result<Vec<boss_protocol::Task>> {

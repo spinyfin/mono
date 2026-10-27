@@ -251,8 +251,11 @@ final class ChatViewModel: ObservableObject {
     @Published var automationsFetchStateByProductID: [String: AutomationsFetchState] = [:]
     /// Open-task counts keyed by automation id. Refreshed alongside the list.
     @Published var openTaskCountByAutomationID: [String: Int] = [:]
-    /// Run history keyed by automation id. Fetched on selection and refreshed
-    /// when the automation's state changes (outcome updated, etc.).
+    /// Row summaries never replace the complete, collapsed run history.
+    @Published var latestRunByAutomationID: [String: AppAutomationRun] = [:]
+    var automationsIsVisible = false
+    var visibleAutomationHistoryID: String?
+    /// Run history is fetched only for the mounted detail row.
     @Published var automationRunsByID: [String: [AppAutomationRun]] = [:]
     /// The automation currently selected in the Automations tab detail pane.
     @Published var selectedAutomationID: String?

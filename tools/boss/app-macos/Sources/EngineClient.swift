@@ -1547,22 +1547,37 @@ final class EngineClient: @unchecked Sendable {
                 }
             }
             if !productID.isEmpty {
-                emit(.automationsList(productID: productID, automations: automations, openTaskCounts: openTaskCounts))
+                let lastRuns = (payload["last_runs"] as? [String: [String: Any]] ?? [:])
+                    .compactMapValues(parseAutomationRun)
+                emit(.automationsList(productID: productID, automations: automations,
+                                      openTaskCounts: openTaskCounts, lastRuns: lastRuns))
             }
         case "automation_created":
             if let automationPayload = payload["automation"] as? [String: Any],
                let automation = parseAutomation(automationPayload) {
-                emit(.automationCreated(automation: automation))
+                emit(.automationCreated(
+                    automation: automation,
+                    openTaskCount: (payload["open_task_count"] as? NSNumber)?.intValue,
+                    lastRun: (payload["last_run"] as? [String: Any]).flatMap(parseAutomationRun)
+                ))
             }
         case "automation_result":
             if let automationPayload = payload["automation"] as? [String: Any],
                let automation = parseAutomation(automationPayload) {
-                emit(.automationResult(automation: automation))
+                emit(.automationResult(
+                    automation: automation,
+                    openTaskCount: (payload["open_task_count"] as? NSNumber)?.intValue,
+                    lastRun: (payload["last_run"] as? [String: Any]).flatMap(parseAutomationRun)
+                ))
             }
         case "automation_updated":
             if let automationPayload = payload["automation"] as? [String: Any],
                let automation = parseAutomation(automationPayload) {
-                emit(.automationUpdated(automation: automation))
+                emit(.automationUpdated(
+                    automation: automation,
+                    openTaskCount: (payload["open_task_count"] as? NSNumber)?.intValue,
+                    lastRun: (payload["last_run"] as? [String: Any]).flatMap(parseAutomationRun)
+                ))
             }
         case "automation_deleted":
             let automationID = payload["automation_id"] as? String ?? ""

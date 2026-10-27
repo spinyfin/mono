@@ -182,6 +182,10 @@ extension ChatViewModel {
     /// cached driver quota and the open design docs. Their cached state and
     /// the open reader references survive a disconnect.
     func sendResyncOnlyReads() {
+        if automationsIsVisible {
+            refreshAutomations()
+            if let id = visibleAutomationHistoryID { refreshVisibleAutomationHistory(id) }
+        }
         if resyncQuotaReadOwed || isRefreshingDriverQuota || !driverQuota.neverChecked {
             engine.sendGetDriverQuotaUsage(refresh: false)
         }

@@ -16,6 +16,17 @@ struct AutomationsView: View {
                 AutomationsEmptyState(model: model)
             }
         }
+        .onAppear { model.setAutomationsVisible(true) }
+        .onDisappear { model.setAutomationsVisible(false) }
+        .onChange(of: model.selectedAutomation?.id) { _, id in
+            model.showAutomationHistory(id)
+        }
+        .onChange(of: model.currentSelectedProductID) { _, _ in
+            model.refreshAutomations()
+        }
+        .onChange(of: model.isConnected) { _, connected in
+            if connected { model.setAutomationsVisible(true) }
+        }
     }
 }
 
@@ -44,7 +55,7 @@ private struct AutomationsSidebar: View {
                             AutomationRowView(
                                 automation: automation,
                                 openCount: model.openTaskCountByAutomationID[automation.id],
-                                latestRun: model.automationRunsByID[automation.id]?.first
+                                latestRun: model.latestRunByAutomationID[automation.id]
                             )
                             .tag(automation.id)
                         }
@@ -65,7 +76,7 @@ private struct AutomationsSidebar: View {
                             AutomationRowView(
                                 automation: automation,
                                 openCount: model.openTaskCountByAutomationID[automation.id],
-                                latestRun: model.automationRunsByID[automation.id]?.first
+                                latestRun: model.latestRunByAutomationID[automation.id]
                             )
                             .tag(automation.id)
                         }
@@ -259,6 +270,10 @@ private struct AutomationDetailView: View {
         model.automationRunsByID[automation.id] ?? []
     }
 
+    private var latestRun: AppAutomationRun? {
+        model.latestRunByAutomationID[automation.id] ?? runs.first
+    }
+
     /// Whether `bossctl automation pause` is in effect. Derived from the
     /// engine's `automation_paused` health issue (same snapshot the
     /// toolbar toggle reads) — no second RPC, no local flag.
@@ -316,13 +331,13 @@ private struct AutomationDetailView: View {
                         LabeledContent("Last outcome", value: outcome)
                     }
                     // Level 2: show the why from the most recent run's detail.
-                    if let detail = runs.first?.detail, !detail.isEmpty {
+                    if let detail = latestRun?.detail, !detail.isEmpty {
                         LabeledContent("Reason") {
                             VStack(alignment: .trailing, spacing: 2) {
                                 Text(detail)
                                     .foregroundStyle(.secondary)
                                     .textSelection(.enabled)
-                                if let taskID = runs.first?.producedTaskID {
+                                if let taskID = latestRun?.producedTaskID {
                                     ProducedTaskLink(model: model, taskID: taskID)
                                 }
                             }

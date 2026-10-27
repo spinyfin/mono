@@ -1980,6 +1980,8 @@ fn tag_cases() -> Vec<TagCase> {
             label: "AutomationCreated",
             event: FrontendEvent::AutomationCreated {
                 automation: automation(),
+                open_task_count: None,
+                last_run: None,
             },
             expected_tag: "automation_created",
         },
@@ -1989,6 +1991,7 @@ fn tag_cases() -> Vec<TagCase> {
                 product_id: "prod_1".into(),
                 automations: vec![],
                 open_task_counts: std::collections::HashMap::new(),
+                last_runs: std::collections::HashMap::new(),
             },
             expected_tag: "automations_list",
         },
@@ -1996,6 +1999,8 @@ fn tag_cases() -> Vec<TagCase> {
             label: "AutomationResult",
             event: FrontendEvent::AutomationResult {
                 automation: automation(),
+                open_task_count: None,
+                last_run: None,
             },
             expected_tag: "automation_result",
         },
@@ -2003,6 +2008,8 @@ fn tag_cases() -> Vec<TagCase> {
             label: "AutomationUpdated",
             event: FrontendEvent::AutomationUpdated {
                 automation: automation(),
+                open_task_count: None,
+                last_run: None,
             },
             expected_tag: "automation_updated",
         },

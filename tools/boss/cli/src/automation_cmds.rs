@@ -144,7 +144,7 @@ pub(crate) async fn create_automation(
         client,
         FrontendRequest::CreateAutomation { input },
         "automation create",
-        FrontendEvent::AutomationCreated { automation } => automation,
+        FrontendEvent::AutomationCreated { automation, .. } => automation,
     )
 }
 
@@ -164,7 +164,7 @@ pub(crate) async fn get_automation(client: &mut BossClient, id: &str) -> Result<
         client,
         FrontendRequest::GetAutomation { id: id.to_owned() },
         "automation show",
-        FrontendEvent::AutomationResult { automation } => automation,
+        FrontendEvent::AutomationResult { automation, .. } => automation,
     )
 }
 
@@ -180,7 +180,7 @@ pub(crate) async fn update_automation(
             patch,
         },
         "automation update",
-        FrontendEvent::AutomationUpdated { automation } => automation,
+        FrontendEvent::AutomationUpdated { automation, .. } => automation,
     )
 }
 
@@ -189,7 +189,7 @@ pub(crate) async fn enable_automation(client: &mut BossClient, id: &str) -> Resu
         client,
         FrontendRequest::EnableAutomation { id: id.to_owned() },
         "automation enable",
-        FrontendEvent::AutomationUpdated { automation } => automation,
+        FrontendEvent::AutomationUpdated { automation, .. } => automation,
     )
 }
 
@@ -198,7 +198,7 @@ pub(crate) async fn disable_automation(client: &mut BossClient, id: &str) -> Res
         client,
         FrontendRequest::DisableAutomation { id: id.to_owned() },
         "automation disable",
-        FrontendEvent::AutomationUpdated { automation } => automation,
+        FrontendEvent::AutomationUpdated { automation, .. } => automation,
     )
 }
 
