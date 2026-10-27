@@ -145,9 +145,9 @@ sh_test(
 # "Test Suite '...' passed at" timestamps in bazel-testlogs/.../test.log.
 # Keep each shard's isolated local wall time inside the 60 s budget with
 # enough slack that a slow sample still finishes. Isolated uncached in this
-# workspace after the Chrome split: Chrome 10.9 / 15.3 / 14.0 s, Render 25.2 /
-# 23.8 / 17.7 s, Shard3 9.4 / 14.1 / 11.0 s. Slowest sample 25.2 s, about
-# 2.4× under the 60 s budget.
+# workspace after the Chrome split: Chrome 12.1 / 15.8 / 16.7 s, Render 39.4 /
+# 18.6 / 15.1 s, Shard3 7.6 / 9.5 / 7.5 s. Slowest sample 39.4 s (Render),
+# about 1.5× under the 60 s budget; Shard3 itself is 7.5–9.5 s.
 #
 # The shared principal is compiled into every bundle: it is the bundle's
 # NSPrincipalClass, which XCTest instantiates before the first test runs, and
