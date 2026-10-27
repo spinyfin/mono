@@ -77,6 +77,8 @@ pub fn init_all(registry: &Registry) {
     // Work DB lock-contention rollup: timing-event / busy-failure counters
     // and the longest-hold-per-minute gauge.
     crate::work::lock_stats::register_metrics(registry);
+    // Host-load sampler gauges (load average, CPU, memory, swap).
+    crate::host_load::register_metrics(registry);
 }
 
 #[cfg(test)]
@@ -245,12 +247,29 @@ mod tests {
                 "dispatch.queue_oldest_wait_seconds.review",
                 "github_api.graphql.remaining",
                 "github_api.rest.remaining",
+                "host.cpu_busy_pct_x100",
+                "host.cpu_idle_pct_x100",
+                "host.cpu_system_pct_x100",
+                "host.cpu_user_pct_x100",
+                "host.load_avg_15m_x100",
+                "host.load_avg_1m_x100",
+                "host.load_avg_5m_x100",
+                "host.logical_cpus",
+                "host.mem_available_bytes",
+                "host.mem_compressor_bytes",
+                "host.mem_free_bytes",
+                "host.mem_pressure_level_pct",
+                "host.mem_total_bytes",
+                "host.mem_used_bytes",
+                "host.swap_total_bytes",
+                "host.swap_used_bytes",
                 "merge_poller.adaptive_tracked",
                 "review_pool.deferred_pre_merge",
                 "review_pool.reserved_units",
             ],
             "init_all must register the dep_unblock gauge, the queue-level dispatch gauges, \
-             the GitHub remaining-quota gauges, and the adaptive-schedule size gauge",
+             the GitHub remaining-quota gauges, the 16 host-load gauges, and the \
+             adaptive-schedule size gauge",
         );
     }
 }

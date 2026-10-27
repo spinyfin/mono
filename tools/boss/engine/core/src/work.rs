@@ -677,6 +677,7 @@ pub(crate) mod db_diagnostics;
 mod description_guard;
 mod guide_comments;
 mod guide_feedback;
+mod host_load_db;
 mod host_reconcile_queries;
 mod ideas;
 mod insert_helpers;

@@ -2513,6 +2513,17 @@ async fn serve_scoped(
     // Once-a-minute work DB lock-contention summary (log line + metrics).
     let _db_lock_summary_handle = crate::work::lock_stats::spawn_summary_task(server_state.metrics.clone());
 
+    // Host-load sampler: direct syscalls once per interval (default 60s)
+    // into the `host.*` gauges and the retained `host_load_samples`
+    // series, so host contention is measured rather than inferred. Pure
+    // collection — nothing in dispatch reads it, and a sampler failure
+    // only logs.
+    let _host_load_handle = crate::host_load::spawn(
+        server_state.metrics.clone(),
+        server_state.work_db.clone(),
+        &server_state.settings,
+    );
+
     // Periodic stalled-spawn + stale-activity honesty timers. Two complementary
     // Spawning-lie fixes share one 10s tick so agents-list activity stays
     // trustworthy after events.sock degrades:
