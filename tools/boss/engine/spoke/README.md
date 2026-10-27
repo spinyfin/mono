@@ -53,6 +53,16 @@ changed request under the same ID is rejected. The executor persists an attempti
 phase before host effects and commits each result with its applied cursor. It
 runs independently of the stream, retaining a completed result while the spool
 is full. An interrupted mutation returns uncertainty instead of being repeated.
+PR positioning saves its pointer snapshot in the command journal before goto;
+restart restores those pointers before returning the interrupted result.
+Pre-effect authorization refusals and failed reads return rejected results.
+
+Journal schema 3 adds durable pointer snapshots and the last negotiated result
+bound. Result admission measures the encoded record with envelope overhead and
+replaces an oversized payload with a bounded diagnostic. Reads are rejected;
+operations that may have changed the host report uncertainty. A later negotiation
+too small for retained records or pending command identities is retried without
+discarding evidence. Older journal readers refuse schema 3.
 
 `--cube-bin` selects the host's cube executable (default `cube`). Commands cannot
 select an executable or filesystem path. Workspace IDs resolve through cube's

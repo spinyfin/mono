@@ -6,6 +6,22 @@ mod workspace {
     use boss_spoke_journal::Fault;
     use boss_spoke_outbound::SharedJournal;
 
+    struct AttemptJournal(SharedJournal);
+    impl boss_host_execution::workspace::RecoveryStore for AttemptJournal {
+        fn load(&self, sequence: u64) -> Result<Option<Vec<u8>>> {
+            self.0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+                .recovery_snapshot(sequence)
+        }
+        fn save(&self, sequence: u64, bytes: &[u8]) -> Result<()> {
+            self.0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("journal owner panicked"))?
+                .save_recovery_snapshot(sequence, bytes)
+        }
+    }
+
     /// One serialized executor survives network reconnects. Never hold the journal
     /// lock across a subprocess, and never re-execute an effect because result
     /// admission is temporarily full.
@@ -15,6 +31,7 @@ mod workspace {
         stamp: impl Fn() -> Result<Stamp>,
     ) -> Result<()> {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
             let pending = journal
@@ -25,7 +42,10 @@ mod workspace {
                 continue;
             };
             let observed = stamp()?;
-            let result = executor.execute(&command, interrupted, observed.wall_unix_ms).await;
+            let store = AttemptJournal(std::sync::Arc::clone(&journal));
+            let result = executor
+                .execute_with_store(&command, interrupted, observed.wall_unix_ms, Some(&store))
+                .await?;
             let observed = stamp()?;
             loop {
                 let completed = journal

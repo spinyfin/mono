@@ -244,7 +244,13 @@ mod session {
             welcome.received_records.as_ref().expect("validated receipt").through <= hello.last_record,
             "replay_gap: hub receipt exceeds advertised journal"
         );
-        locked(journal)?.welcome(&welcome)?;
+        locked(journal)?.welcome(&welcome).map_err(|error| {
+            if matches!(error.downcast_ref::<Fault>(), Some(Fault::TransportLimit)) {
+                network(error)
+            } else {
+                error
+            }
+        })?;
         let limits = Limits::default().negotiated(welcome.max_frame_bytes, welcome.max_inflight_bytes);
         let frame_limit = limits.max_frame_bytes as usize;
         let credit = limits.max_inflight_bytes as usize;
@@ -337,6 +343,9 @@ mod session {
                 *pending = None;
             }
             Err(error) if Fault::is_full(&error) => tracing::debug!("spool full; command admission deferred"),
+            Err(error) if matches!(error.downcast_ref::<Fault>(), Some(Fault::TransportLimit)) => {
+                return Err(network(error));
+            }
             Err(error) => return Err(error),
         }
         Ok(())
@@ -353,7 +362,11 @@ mod session {
             return Ok(None);
         };
         let bytes = record_frame(next.bytes);
-        ensure!(bytes.len() <= frame_limit, "outbound frame exceeds negotiated limit");
+        if bytes.len() > frame_limit {
+            return Err(network(
+                "retained record exceeds negotiated frame limit; hub must raise limit",
+            ));
+        }
         // The credit bounds bytes in flight, not the size of one record. Journal
         // admission accepts records up to the frame limit, and nothing may skip the
         // head of replay, so a lone oversized record is sent once nothing else is

@@ -585,3 +585,71 @@ printf '%s\n' '{"repos":[]}'
     connection.welcome(result_record.sequence - 1).await;
     assert_eq!(connection.next().await, spoke_frame::Body::Record(result_record));
 }
+
+#[tokio::test]
+async fn actual_daemon_bounds_large_result_and_replays_diagnostic() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut hub = Fixture::new().await;
+    let cube = hub.dir.path().join("cube-fixture");
+    std::fs::write(
+        &cube,
+        r#"#!/bin/sh
+[ "$*" = "--json repo list" ] || exit 9
+printf '%s\n' '{"repos":[]}'
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&cube, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let payload = format!(
+        r#"{{"repos":[{{"repo":"r","origin":"{}","main_branch":"main","workspace_root":"/unused","workspace_prefix":"worker"}}]}}"#,
+        "x".repeat(24000)
+    );
+    std::fs::write(&cube, format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", payload)).unwrap();
+    let daemon = hub.start_with_cube(&cube);
+    let mut connection = hub.connection().await;
+    connection
+        .send(hub_frame::Body::Welcome(v1::Welcome {
+            max_frame_bytes: 8192,
+            max_inflight_bytes: 4096,
+            ..connection.welcome_body(0)
+        }))
+        .await;
+    let request = v1::Command {
+        sequence: 1,
+        command_id: "list-repos".into(),
+        not_after_unix_ms: i64::MAX,
+        body: Some(command::Body::Workspace(v1::WorkspaceOp {
+            kind: v1::WorkspaceKind::ListRepos.into(),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    connection.send(hub_frame::Body::Command(request)).await;
+    let result_record = loop {
+        if let spoke_frame::Body::Record(record) = connection.next().await {
+            if matches!(record.body, Some(record::Body::Result(_))) {
+                break record;
+            }
+            connection.receipt(record.sequence).await;
+        }
+    };
+    let Some(record::Body::Result(result)) = &result_record.body else {
+        unreachable!()
+    };
+    assert_eq!(result.code, v1::ResultCode::Rejected as i32);
+    assert!(result.value.is_none());
+    assert!(result.reason.contains("exceeds negotiated"));
+    assert!(prost::Message::encoded_len(&result_record) + 16 <= 4096);
+    drop(connection);
+    drop(daemon);
+    let _daemon = hub.start_with_cube(&cube);
+    let mut connection = hub.connection().await;
+    connection
+        .send(hub_frame::Body::Welcome(v1::Welcome {
+            max_frame_bytes: 8192,
+            max_inflight_bytes: 4096,
+            ..connection.welcome_body(result_record.sequence - 1)
+        }))
+        .await;
+    assert_eq!(connection.next().await, spoke_frame::Body::Record(result_record));
+}

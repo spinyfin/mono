@@ -2732,19 +2732,16 @@ mod cube_budget_tests {
     use crate::ssh_transport::SSH_COMMAND_TIMEOUT;
     use boss_host_execution::cube_op_budget::*;
 
-    /// The whole point of the module: the transport bound must sit strictly
-    /// inside the outer bound, so the transport's better-attributed timeout
-    /// error is the one the operator sees.
+    /// The transport timeout precedes the outer timeout so callers receive
+    /// the diagnostic that identifies the failed command.
     #[test]
     fn transport_budgets_are_strictly_inside_their_outer_bounds() {
         assert!(lease_transport_budget() < LEASE);
         assert!(repo_ensure_transport_budget() < REPO_ENSURE);
     }
 
-    /// The regression this module exists to prevent. If a provisioning-class
-    /// budget ever collapses to (or below) the generic fast-command bound,
-    /// the remote path is back to the anaplian behaviour: the operation is
-    /// killed at 30s no matter what the dispatcher budgeted for it.
+    /// Provisioning budgets exceed the generic command timeout so setup and
+    /// network operations can use their full operation allowance.
     #[test]
     fn provisioning_budgets_exceed_the_generic_fast_command_bound() {
         assert!(
