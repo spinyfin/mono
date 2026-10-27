@@ -431,6 +431,23 @@ pub(super) fn run_cleanup_pass(
         }
     };
     let pool = config::load_config().unwrap_or_default().pool;
+    // Pressure exists even when no workspace is eligible or declares cleanup.
+    for repo in store.list_repos().unwrap_or_default() {
+        if opts.repo.is_some_and(|name| name != repo.repo) {
+            continue;
+        }
+        if let Ok(space) = DiskSpace::probe(&repo.workspace_root) {
+            let low = pool.free_space_floor_bytes(space.total_bytes);
+            if space.is_below(low) {
+                report.pressure.push(VolumePressure {
+                    workspace: repo.workspace_root.display().to_string(),
+                    available_bytes: space.available_bytes,
+                    low_water_bytes: low,
+                    high_water_bytes: pool.cleanup_high_water_bytes(space.total_bytes),
+                });
+            }
+        }
+    }
     let candidates = match collect_candidates(store, opts, now) {
         Ok(candidates) => candidates,
         Err(e) => {
@@ -479,12 +496,6 @@ pub(super) fn run_cleanup_pass(
                 human_bytes(low),
                 human_bytes(high),
             );
-            report.pressure.push(VolumePressure {
-                workspace: candidate.record.workspace_id.clone(),
-                available_bytes: space.available_bytes,
-                low_water_bytes: low,
-                high_water_bytes: high,
-            });
         } else {
             continue;
         }

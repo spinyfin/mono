@@ -176,7 +176,7 @@ ws="$(make_workspace mono-agent-001)"
 base="$(make_base aaaa "$ws")"
 pid="$(start_server "$base")"
 run_cleanup "$ws" FAKE_BAZEL_MODE=fail FAKE_SERVER_PID="$pid"
-assert_eq "$status" 1 "failed-shutdown cleanup exit"
+assert_eq "$status" 75 "failed-shutdown cleanup exit"
 assert_exists "$base/execroot" "a base whose server could not be shut down is not removed"
 
 # ── server that will not die: refuse to remove its base ─────────────────────
@@ -185,7 +185,7 @@ ws="$(make_workspace mono-agent-001)"
 base="$(make_base aaaa "$ws")"
 pid="$(start_server "$base")"
 run_cleanup "$ws" FAKE_BAZEL_MODE=idle-but-lingers FAKE_SERVER_PID="$pid" CUBE_CLEANUP_SERVER_EXIT_WAIT_SECONDS=1
-assert_eq "$status" 1 "lingering-server cleanup exit"
+assert_eq "$status" 75 "lingering-server cleanup exit"
 assert_exists "$base/execroot" "a base whose server is still running is not removed"
 
 # ── a base that belongs to another workspace is refused ─────────────────────
@@ -204,7 +204,7 @@ ws="$(make_workspace mono-agent-001)"
 mkdir -p "$base_root/cache/execroot/_main/bazel-out"
 ln -sfn "$base_root/cache/execroot/_main/bazel-out" "$ws/bazel-out"
 run_cleanup "$ws"
-assert_eq "$status" 0 "shared-cache cleanup declines without failing"
+assert_eq "$status" 1 "unmarked tree is withheld because partial removal cannot be ruled out"
 assert_exists "$base_root/cache/repos/archive.tar" "a bazel-* link into the shared cache never gets it removed"
 assert_exists "$base_root/cache/execroot" "the shared cache directory itself survives"
 
@@ -229,6 +229,47 @@ run_cleanup "$ws"
 assert_eq "$status" 0 "never-built cleanup exit"
 assert_exists "$other_base/execroot" "a workspace that never built removes nobody else's base"
 assert_shared_trees_intact "never-built cleanup"
+
+# A legacy interrupted in-place deletion must never be reported as clean.
+new_scenario
+ws="$(make_workspace mono-agent-001)"
+base="$(make_base aaaa "$ws")"
+chmod -R u+w "$base"
+mkdir -p "$base/external/repo"
+rm -rf "$base/execroot" "$base/DO_NOT_BUILD_HERE"
+run_cleanup "$ws"
+assert_eq "$status" 1 "unverifiable partial base remains withheld"
+assert_exists "$base/external/repo" "unverified tree is not removed"
+
+# A crash after atomic retirement leaves a retryable tree even if rm already
+# removed execroot and the internal ownership marker.
+new_scenario
+ws="$(make_workspace mono-agent-001)"
+base="$(make_base aaaa "$ws")"
+printf '%s\n' "$ws" >"$base.cube-removing-owner"
+mv "$base" "$base.cube-removing"
+chmod -R u+w "$base.cube-removing"
+mkdir -p "$base.cube-removing/external/repo"
+rm -rf "$base.cube-removing/execroot" "$base.cube-removing/DO_NOT_BUILD_HERE"
+run_cleanup "$ws"
+assert_eq "$status" 0 "interrupted retirement retry succeeds"
+assert_missing "$base" "partial base never reappears at Bazel's path"
+assert_missing "$base.cube-removing" "retry removes remaining external tree"
+assert_missing "$base.cube-removing-owner" "retry removes ownership record last"
+assert_shared_trees_intact "interrupted retirement"
+run_cleanup "$ws"
+assert_eq "$status" 0 "completed retirement retry is idempotent"
+
+# A retired tree with a different owner cannot be reclaimed by this workspace.
+new_scenario
+ws="$(make_workspace mono-agent-001)"
+other_ws="$(make_workspace mono-agent-002)"
+base="$(make_base aaaa "$ws")"
+mv "$base" "$base.cube-removing"
+printf '%s\n' "$other_ws" >"$base.cube-removing-owner"
+run_cleanup "$ws"
+assert_eq "$status" 1 "foreign retired tree stays withheld"
+assert_exists "$base.cube-removing/execroot" "foreign retired tree is untouched"
 
 if [ "$failures" -ne 0 ]; then
   echo "$failures assertion(s) failed" >&2

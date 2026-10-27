@@ -279,13 +279,11 @@ pub fn read_setup_config(workspace_path: &Path) -> Result<Option<SetupConfig>, C
 
 /// The cleanup step to run for a workspace of a repo, if the repo declares one.
 ///
-/// Read from the workspace's own checkout first, like setup steps. A free
-/// workspace can be sitting on a commit that predates the declaration, so the
-/// repo's canonical source checkout (`fallback`) is consulted when the
-/// workspace declares none — otherwise a workspace left on an old revision
-/// could never be cleaned.
+/// Prefer the canonical source so unattended cleanup does not execute a
+/// declaration left on an unmerged workspace branch. Use the workspace only
+/// when the source declares no cleanup.
 pub fn read_cleanup_step(workspace_path: &Path, fallback: Option<&Path>) -> Result<Option<CleanupStep>, CubeError> {
-    for root in std::iter::once(workspace_path).chain(fallback) {
+    for root in fallback.into_iter().chain(std::iter::once(workspace_path)) {
         if let Some(mut cleanup) = read_setup_config(root)?.and_then(|config| config.cleanup) {
             cleanup.root = Some(root.to_path_buf());
             return Ok(Some(cleanup));
@@ -538,7 +536,7 @@ steps:
     }
 
     #[test]
-    fn cleanup_step_falls_back_to_the_source_checkout() {
+    fn cleanup_step_prefers_the_source_checkout() {
         let workspace = TempDir::new().unwrap();
         let source = TempDir::new().unwrap();
         fs::create_dir_all(setup_config_path(source.path()).parent().unwrap()).unwrap();
@@ -558,7 +556,7 @@ steps:
             "the step remembers where it came from"
         );
 
-        // Its own declaration wins when it has one.
+        // An unmerged workspace declaration cannot override the source.
         fs::create_dir_all(setup_config_path(workspace.path()).parent().unwrap()).unwrap();
         fs::write(
             setup_config_path(workspace.path()),
@@ -567,6 +565,13 @@ steps:
         .unwrap();
         let found = read_cleanup_step(workspace.path(), Some(source.path())).unwrap();
         let found = found.unwrap();
+        assert_eq!(found.command, "from-source");
+        assert_eq!(found.root.as_deref(), Some(source.path()));
+
+        fs::write(setup_config_path(source.path()), "version: 1\nsteps: []\n").unwrap();
+        let found = read_cleanup_step(workspace.path(), Some(source.path()))
+            .unwrap()
+            .unwrap();
         assert_eq!(found.command, "from-workspace");
         assert_eq!(found.root.as_deref(), Some(workspace.path()));
 

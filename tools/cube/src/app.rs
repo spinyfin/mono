@@ -19,6 +19,7 @@ mod gh_pr;
 mod health;
 mod jj;
 mod lease_reclaim;
+mod periodic_cleanup;
 mod pr;
 mod pr_bookmarks;
 mod pr_gc;

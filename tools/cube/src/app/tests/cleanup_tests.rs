@@ -622,6 +622,64 @@ fn throttle_pool() -> Pool {
 }
 
 #[test]
+fn slow_periodic_cleanup_does_not_delay_a_lease_claim() {
+    let _env = super::support::ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let pool = Pool::seed(2);
+    write_setup_yaml(&pool.workspaces[0], "version: 1\ncleanup:\n  command: 'sleep 2'\n");
+    let start = std::time::Instant::now();
+    let mut command = std::process::Command::new(std::env::var_os("CUBE_TEST_BIN").unwrap());
+    command
+        .arg("periodic-cleanup")
+        .arg("--database")
+        .arg(&pool.database_path);
+    command.env("CUBE_CONFIG_DIR", pool.tempdir.path());
+    command.env("CUBE_POOL_MIN_FREE_BYTES", u64::MAX.to_string());
+    let mut child = crate::app::periodic_cleanup::spawn_command(&mut command).unwrap();
+    assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    while pool.cleanup_status(0) != Some(CleanupStatus::Running) {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "cleanup did not start"
+        );
+        assert!(child.try_wait().unwrap().is_none(), "cleanup exited before running");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let claim_started = std::time::Instant::now();
+    assert!(!pool.claim(0));
+    assert!(pool.claim(1));
+    assert!(claim_started.elapsed() < std::time::Duration::from_secs(1));
+    assert!(child.wait().unwrap().success());
+    assert_eq!(pool.cleanup_status(0), None);
+}
+
+#[test]
+fn gc_clear_failed_cleanup_under_pressure_does_not_run_cleanup_again() {
+    let pool = Pool::seed(1);
+    let (low, _) = marks();
+    let _volume = testing::with_reading(volume_with_free(low - GIB));
+    assert!(pool.store.begin_workspace_cleanup("mono", &pool.id(0), 1, 0).unwrap());
+    pool.store
+        .finish_workspace_cleanup("mono", &pool.id(0), CleanupResult::Failed, 1, 1)
+        .unwrap();
+    let workspace = &pool.workspaces[0];
+    let runner = FakeRunner::new(vec![
+        ExpectedCommand::ok(workspace.clone(), "jj", &["git", "fetch"], ""),
+        super::support::gc_git_import_command(workspace),
+        gc_exec_sweep_command(workspace, ""),
+        gc_pr_noop_command(workspace),
+    ]);
+    run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "gc", "--clear-failed-cleanup"]),
+        Some(&pool.database_path),
+        &runner,
+    )
+    .unwrap();
+    runner.assert_exhausted();
+    assert_eq!(pool.cleanup_status(0), None);
+    assert!(pool.claim(0));
+}
+
+#[test]
 fn low_free_space_retriggers_the_pool_gc_well_before_24h() {
     use crate::app::gc::{POOL_GC_LAST_AT_KEY, POOL_GC_STARTED_AT_KEY, maybe_trigger_pool_gc};
     let (low, _) = marks();
@@ -668,9 +726,14 @@ fn a_pass_that_could_not_clean_anything_does_not_pin_the_short_interval() {
     // The previous pass saw pressure and walked every candidate without being
     // able to clean one (all busy, all failing): retrying every five minutes
     // would buy nothing.
-    pool.store.set_pool_metadata_i(POOL_GC_CLEANUP_PROGRESS_KEY, 0).unwrap();
-
     let _low = testing::with_reading(volume_with_free(low - GIB));
+    let report = pool.pass(&FakeRunner::new(vec![]), false);
+    assert!(!report.pressure.is_empty());
+    assert!(!report.made_progress());
+    pool.store
+        .set_pool_metadata_i(POOL_GC_CLEANUP_PROGRESS_KEY, i64::from(report.made_progress()))
+        .unwrap();
+
     maybe_trigger_pool_gc(&mut pool.store, Some(&pool.database_path), now).expect("trigger");
 
     assert!(
