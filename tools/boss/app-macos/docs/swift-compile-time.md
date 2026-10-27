@@ -204,3 +204,10 @@ environmental cache-availability failure, not a Swift compile failure.
 The host load averages sampled before compilation were 185.36, 192.48 and
 153.09; this validation does not supply the missing idle-host timings or
 replace the instrumented one-file experiment above.
+
+A second validation in a fresh workspace on the same base passed the app and
+installer build (93.237 s total) and all 14 test targets (2 executed, 12
+cached; 26.707 s total). The reverse-dependency query for the app library
+confirmed its consumers are covered by these app and installer targets.
+The host load averages were 180.53, 219.06 and 205.95; cached results and
+these total invocation times are validation evidence, not compile timings.
