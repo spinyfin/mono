@@ -166,15 +166,24 @@ impl SessionQueue {
         }
 
         if env.request_id.is_none() {
-            let pending = topic_event_topic(&env.payload)
+            if let Some(idx) = topic_event_topic(&env.payload)
                 .and_then(|topic| self.pending_topics.get(&topic))
-                .or_else(|| snapshot_event_kind(&env.payload).and_then(|kind| self.pending_snapshots.get(kind)))
-                .copied();
-            if let Some(idx) = pending {
+                .copied()
+            {
                 debug_assert!(idx < self.items.len());
                 // Preserve the original instant and position. Topic invalidations
-                // merge their changes; full snapshots replace the stale payload.
+                // merge their changes into the pending envelope.
                 coalesce_topic_event(&mut self.items[idx].1, env);
+                return EnqueueOutcome::Coalesced;
+            }
+            if let Some(idx) = snapshot_event_kind(&env.payload)
+                .and_then(|kind| self.pending_snapshots.get(kind))
+                .copied()
+            {
+                debug_assert!(idx < self.items.len());
+                // Preserve the original instant and position. Full snapshots
+                // replace the stale payload in place.
+                replace_pending_snapshot(&mut self.items[idx].1, env);
                 return EnqueueOutcome::Coalesced;
             }
         }
@@ -196,6 +205,11 @@ impl SessionQueue {
             if let Some(kind) = snapshot_event_kind(&env.payload) {
                 self.pending_snapshots.insert(kind, idx);
             }
+        } else if let Some(kind) = snapshot_event_kind(&env.payload) {
+            // A correlated snapshot reply is a barrier: later uncorrelated
+            // pushes of this kind must append after it rather than replace
+            // an earlier pending snapshot sitting before the reply.
+            self.pending_snapshots.remove(kind);
         }
         self.items.push_back((Instant::now(), env));
     }
@@ -324,8 +338,20 @@ impl SessionQueue {
     }
 }
 
+/// Replace a pending unsent snapshot in place with a newer uncorrelated push
+/// of the same kind. Snapshots are complete state, so the newest payload is
+/// sufficient; the original enqueue instant and queue position stay put.
+/// Snapshot replacement stays off the topic-merge path so WorkInvalidated
+/// unioning cannot change snapshot semantics.
+fn replace_pending_snapshot(pending: &mut FrontendEventEnvelope, next: FrontendEventEnvelope) {
+    *pending = next;
+}
+
 /// Replace the unsent push `pending` with the newer `next` for the same topic
 /// without losing what `pending` told the app.
+///
+/// Used only for topic invalidations. Session-wide snapshots replace in place
+/// via [`replace_pending_snapshot`].
 ///
 /// A [`TopicEventPayload::WorkInvalidated`] carries the class of the change and
 /// the cards it names, and the app chooses its refetch from both. Replacing one

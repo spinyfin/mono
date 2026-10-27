@@ -176,13 +176,15 @@ fn allowlisted_kinds_are_independent_and_correlated_replies_are_never_coalesced(
         }
     }
     for payload in &snapshots {
+        // Correlated replies of a snapshot kind invalidate that kind's pending
+        // slot, so a later uncorrelated push appends after them.
         assert_eq!(
             q.enqueue(FrontendEventEnvelope::push(payload.clone())),
-            EnqueueOutcome::Coalesced
+            EnqueueOutcome::Enqueued
         );
     }
-    assert_eq!(q.stats().depth, snapshots.len() * 3);
-    for payload in snapshots {
+    assert_eq!(q.stats().depth, snapshots.len() * 4);
+    for payload in &snapshots {
         assert_payload(q.pop_front().unwrap(), FrontendEventEnvelope::push(payload.clone()));
         for request_id in ["reply-a", "reply-b"] {
             assert_payload(
@@ -191,6 +193,24 @@ fn allowlisted_kinds_are_independent_and_correlated_replies_are_never_coalesced(
             );
         }
     }
+    for payload in snapshots {
+        assert_payload(q.pop_front().unwrap(), FrontendEventEnvelope::push(payload));
+    }
+    assert!(q.pop_front().is_none());
+}
+
+#[test]
+fn later_snapshot_push_does_not_jump_ahead_of_a_correlated_reply() {
+    let mut q = SessionQueue::new();
+    assert_eq!(q.enqueue(auth_snapshot(1)), EnqueueOutcome::Enqueued);
+    let reply = FrontendEventEnvelope::response("auth-read", auth_snapshot(2).payload);
+    assert_eq!(q.enqueue(reply.clone()), EnqueueOutcome::Enqueued);
+    assert_eq!(q.enqueue(auth_snapshot(3)), EnqueueOutcome::Enqueued);
+    assert_eq!(q.enqueue(auth_snapshot(4)), EnqueueOutcome::Coalesced);
+    assert_eq!(q.stats().depth, 3);
+    assert_payload(q.pop_front().unwrap(), auth_snapshot(1));
+    assert_payload(q.pop_front().unwrap(), reply);
+    assert_payload(q.pop_front().unwrap(), auth_snapshot(4));
     assert!(q.pop_front().is_none());
 }
 
