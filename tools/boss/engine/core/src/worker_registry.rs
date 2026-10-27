@@ -70,6 +70,7 @@ impl Default for WorkerRegistry {
 
 #[derive(Default)]
 struct RegistryInner {
+    // Identity and progression classification are captured together.
     pid_to_run: HashMap<libc::pid_t, RegisteredPid>,
     run_to_slot: HashMap<String, RegisteredWorkerPane>,
 }
@@ -91,6 +92,7 @@ pub(crate) struct ProcessStart {
 struct RegisteredPid {
     run_id: String,
     start: Option<ProcessStart>,
+    progression: bool,
 }
 
 impl RegisteredPid {
@@ -131,18 +133,42 @@ impl WorkerRegistry {
 
     /// Record that pid is the worker process for run `run_id`. Called by
     /// the spawn flow once it has both the run id and the spawned pid.
+    ///
+    /// An existing progression registration for `pid` keeps its progression
+    /// bit: re-registering must never downgrade a confined peer to worker tier.
     pub fn register(&self, pid: libc::pid_t, run_id: impl Into<String>) {
         self.register_with_start(pid, run_id, process_start(pid).ok());
     }
 
     fn register_with_start(&self, pid: libc::pid_t, run_id: impl Into<String>, start: Option<ProcessStart>) {
-        self.inner.lock().expect("registry poisoned").pid_to_run.insert(
+        let mut inner = self.inner.lock().expect("registry poisoned");
+        let progression = inner.pid_to_run.get(&pid).is_some_and(|entry| {
+            entry.progression && !matches!((entry.start, start), (Some(old), Some(new)) if old != new)
+        });
+        inner.pid_to_run.insert(
             pid,
             RegisteredPid {
                 run_id: run_id.into(),
                 start,
+                progression,
             },
         );
+    }
+
+    /// Capture durable authority before exposing the progression identity.
+    pub fn register_progression(&self, pid: libc::pid_t, run_id: &str, db: &crate::work::WorkDb) -> anyhow::Result<()> {
+        db.capture_progression_neighbourhood(run_id)?;
+        let start = process_start(pid).ok();
+        let mut inner = self.inner.lock().expect("registry poisoned");
+        inner.pid_to_run.insert(
+            pid,
+            RegisteredPid {
+                run_id: run_id.to_owned(),
+                start,
+                progression: true,
+            },
+        );
+        Ok(())
     }
 
     /// Record the viewer slot id for `run_id` without a tmux session identity.
@@ -317,12 +343,29 @@ impl WorkerRegistry {
         self.resolve_with_ancestor_walk(pid).map(|(_, run_id)| run_id)
     }
 
-    /// [`Self::lookup_with_ancestor_walk`], also returning the registered
-    /// pid the walk matched, so a refusal can name the evidence it acted on.
-    pub fn resolve_with_ancestor_walk(&self, mut pid: libc::pid_t) -> Option<(libc::pid_t, String)> {
+    /// Also return the registered pid that supplied the identity.
+    pub fn resolve_with_ancestor_walk(&self, pid: libc::pid_t) -> Option<(libc::pid_t, String)> {
+        self.resolve_classified_with_ancestor_walk(pid)
+            .map(|(pid, entry)| (pid, entry.run_id))
+    }
+
+    /// Resolve identity and classification from the same registry entry.
+    pub(crate) fn lookup_classified_with_ancestor_walk(&self, pid: libc::pid_t) -> Option<(String, bool)> {
+        self.resolve_classified_with_ancestor_walk(pid)
+            .map(|(_, entry)| (entry.run_id, entry.progression))
+    }
+
+    fn resolve_classified_with_ancestor_walk(&self, mut pid: libc::pid_t) -> Option<(libc::pid_t, RegisteredPid)> {
         for _ in 0..ANCESTOR_WALK_DEPTH {
-            if let Some(run_id) = self.lookup(pid) {
-                return Some((pid, run_id));
+            let entry = self
+                .inner
+                .lock()
+                .expect("registry poisoned")
+                .pid_to_run
+                .get(&pid)
+                .cloned();
+            if let Some(entry) = entry.filter(|entry| entry.is_current(pid)) {
+                return Some((pid, entry));
             }
             pid = match parent_pid(pid) {
                 Ok(Some(parent)) => parent,
@@ -472,6 +515,34 @@ pub fn parent_pid(_pid: libc::pid_t) -> io::Result<Option<libc::pid_t>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_after_register_progression_keeps_progression_tier() {
+        let reg = WorkerRegistry::new();
+        reg.inner.lock().unwrap().pid_to_run.insert(
+            77,
+            RegisteredPid {
+                run_id: "run-p".to_owned(),
+                start: process_start(77).ok(),
+                progression: true,
+            },
+        );
+        reg.register(77, "run-p");
+        assert_eq!(
+            reg.lookup_classified_with_ancestor_walk(77),
+            Some(("run-p".to_owned(), true))
+        );
+        reg.register_with_start(77, "run-p", None);
+        assert_eq!(
+            reg.lookup_classified_with_ancestor_walk(77),
+            Some(("run-p".to_owned(), true))
+        );
+        reg.register(78, "run-w");
+        assert_eq!(
+            reg.lookup_classified_with_ancestor_walk(78),
+            Some(("run-w".to_owned(), false))
+        );
+    }
 
     #[test]
     fn register_and_lookup() {
@@ -658,11 +729,24 @@ mod tests {
             minor: live.minor,
         };
         reg.register_with_start(self_pid, "finished-run", Some(earlier));
+        reg.inner
+            .lock()
+            .unwrap()
+            .pid_to_run
+            .get_mut(&self_pid)
+            .unwrap()
+            .progression = true;
 
         assert_eq!(reg.lookup(self_pid), None);
         assert_eq!(reg.lookup_with_ancestor_walk(self_pid), None);
         assert_eq!(reg.resolve_with_ancestor_walk(self_pid), None);
+        assert_eq!(reg.lookup_classified_with_ancestor_walk(self_pid), None);
         assert!(!reg.registered_pids().contains(&self_pid));
+        reg.register(self_pid, "new-run");
+        assert_eq!(
+            reg.lookup_classified_with_ancestor_walk(self_pid),
+            Some(("new-run".to_owned(), false))
+        );
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

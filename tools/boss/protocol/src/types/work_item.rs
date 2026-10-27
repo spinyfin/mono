@@ -167,7 +167,7 @@ pub struct WorkItemPatch {
     /// Set or clear `archived_reason` on a task. `None` → leave unchanged.
     /// `Some("")` → clear (write NULL). A non-empty string is stored
     /// verbatim. Required when an automated actor (`boss`, `engine`,
-    /// `boothby`) moves the row to `archived`; optional for a human
+    /// `boothby`, `progression`) moves the row to `archived`; optional for a human
     /// archive. When the actor is `boothby` and this field is omitted,
     /// the engine fills it from the armed Boothby action's rationale.
     #[serde(default, skip_serializing_if = "Option::is_none")]

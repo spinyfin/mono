@@ -662,6 +662,7 @@ mod feedback_target;
 mod github_api_usage_db;
 mod github_merge_intents;
 pub(crate) mod personas;
+mod progression_scope;
 mod project_postmortem;
 #[cfg(test)]
 mod project_postmortem_tests;

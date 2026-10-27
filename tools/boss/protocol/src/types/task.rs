@@ -697,7 +697,7 @@ pub struct Task {
 
     pub kind: TaskKind,
     /// Who made the most recent status change — `'human'`, `'boss'`,
-    /// `'engine'`, or `'boothby'`. See `Project.last_status_actor` for
+    /// `'engine'`, `'boothby'`, or `'progression'`. See `Project.last_status_actor` for
     /// full semantics and [`StatusActor`] for the parsed vocabulary.
     #[serde(default = "default_human_actor")]
     #[builder(default = default_human_actor())]

@@ -68,27 +68,28 @@ pub fn authorize_priority_write(requested: &str, current: Option<&str>, actor: &
     Err(critical_refusal(actor))
 }
 
-/// Handler-side companion to [`authorize_priority_write`] for the one
-/// tier the DB layer cannot see: a socket peer the worker registry
-/// classifies as a worker pane. `resolve_status_actor` reports such a
-/// peer as `'human'` (worker panes are not descendants of the
+/// Handler-side companion to [`authorize_priority_write`] for the tiers
+/// the DB layer cannot see: a socket peer classified as a worker pane or
+/// a progression session. `agent_tier` names that tier (`"worker"` or
+/// `"progression"`), and is `None` for every other peer. A worker pane
+/// would otherwise resolve to `'human'` (it is not a descendant of the
 /// coordinator pid), so the handler must refuse before the actor string
-/// ever reaches the DB.
+/// ever reaches the DB; the refusal names the caller's actual tier.
 pub fn refuse_worker_critical_raise(
     requested: Option<&str>,
     current: Option<&str>,
-    peer_is_worker: bool,
+    agent_tier: Option<&str>,
 ) -> Result<()> {
-    if !peer_is_worker {
+    let Some(agent_tier) = agent_tier else {
         return Ok(());
-    }
+    };
     let Some(requested) = requested.map(|p| p.trim().to_ascii_lowercase()) else {
         return Ok(());
     };
     if !is_critical(&requested) || current.is_some_and(is_critical) {
         return Ok(());
     }
-    Err(critical_refusal("worker"))
+    Err(critical_refusal(agent_tier))
 }
 
 /// Priority for a row derived from `source` (a follow-up chore, a chore
@@ -269,15 +270,18 @@ mod tests {
 
     #[test]
     fn worker_peer_refusal_only_bites_on_a_raise_to_critical() {
-        assert!(refuse_worker_critical_raise(Some("critical"), Some("medium"), false).is_ok());
-        assert!(refuse_worker_critical_raise(Some("high"), Some("medium"), true).is_ok());
-        assert!(refuse_worker_critical_raise(None, Some("medium"), true).is_ok());
-        assert!(refuse_worker_critical_raise(Some("critical"), Some("critical"), true).is_ok());
-        assert!(refuse_worker_critical_raise(Some("high"), Some("critical"), true).is_ok());
-        let err = refuse_worker_critical_raise(Some(" Critical "), Some("high"), true).unwrap_err();
+        assert!(refuse_worker_critical_raise(Some("critical"), Some("medium"), None).is_ok());
+        assert!(refuse_worker_critical_raise(Some("high"), Some("medium"), Some("worker")).is_ok());
+        assert!(refuse_worker_critical_raise(None, Some("medium"), Some("worker")).is_ok());
+        assert!(refuse_worker_critical_raise(Some("critical"), Some("critical"), Some("worker")).is_ok());
+        assert!(refuse_worker_critical_raise(Some("high"), Some("critical"), Some("worker")).is_ok());
+        let err = refuse_worker_critical_raise(Some(" Critical "), Some("high"), Some("worker")).unwrap_err();
         assert!(err.to_string().contains("`worker`"), "{err}");
-        let err = refuse_worker_critical_raise(Some("critical"), None, true).unwrap_err();
+        let err = refuse_worker_critical_raise(Some("critical"), None, Some("worker")).unwrap_err();
         assert!(err.to_string().contains("`worker`"), "{err}");
+        let err = refuse_worker_critical_raise(Some("critical"), None, Some("progression")).unwrap_err();
+        assert!(err.to_string().contains("`progression`"), "{err}");
+        assert!(!err.to_string().contains("`worker`"), "{err}");
     }
 
     #[test]

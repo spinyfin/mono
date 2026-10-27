@@ -1,9 +1,9 @@
-//! The worker-tier verb policy: one deny-by-default decision per
+//! The agent-tier verb policy: one deny-by-default decision per
 //! [`FrontendRequest`].
 //!
 //! ## Deny by default, exhaustively
 //!
-//! [`worker_verb_decision`] is a single `match` with **no wildcard arm**.
+//! [`verb_decision`] classifies requests with **no wildcard arm**.
 //! That is deliberate and load-bearing: a verb added to `FrontendRequest`
 //! tomorrow will not compile until someone classifies it here. The
 //! alternative — a `_ => Allow` or `_ => Deny` catch-all — either quietly
@@ -28,8 +28,11 @@
 //!   `bossctl`-shaped verb stay denied.
 //!
 //! Writes are mediated: a worker submits proposals and the engine applies
-//! them. The narrow exceptions are enumerated in [`worker_verb_decision`]'s
-//! "sanctioned writes" arm, each with the reason it is sanctioned.
+//! them. Ordinary workers also have the narrow exceptions enumerated in
+//! [`worker_decision`]'s "sanctioned writes" arm. Progression has no
+//! exceptions: see [`PROGRESSION_ALLOWED_VERBS`].
+
+use crate::RpcTier;
 
 use boss_protocol::{FrontendRequest, WorkItemPatch, WorkerTierDenial, WorkerTierDenialReason};
 
@@ -127,6 +130,86 @@ fn coordinator(verb: String) -> WorkerVerbDecision {
 /// `boss-engine-core`'s `app/trust.rs`), ahead of the handler, denying a
 /// `GetRun`/`ListRuns` whose target execution is not the caller's own.
 pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
+    verb_decision(RpcTier::Worker, request)
+}
+
+/// Classify every request for the authenticated connection tier.
+///
+/// The two agent tiers are decided separately so neither can widen the other:
+///
+/// - **Worker** goes through [`worker_decision`], the exhaustive match below.
+/// - **Progression** is deny-by-default: it is allowed exactly the verbs named
+///   in [`PROGRESSION_ALLOWED_VERBS`] (taxonomy/attention/comment/run reads plus
+///   `SubmitProposal`) and nothing else, regardless of what the worker match
+///   allows. Adding an `Allow` to the worker match therefore never opens the
+///   progression tier; widening it is an explicit edit to that list.
+pub fn verb_decision(tier: RpcTier, request: &FrontendRequest) -> WorkerVerbDecision {
+    match tier {
+        RpcTier::User | RpcTier::AppOrBoss | RpcTier::BossOnly => WorkerVerbDecision::Allow,
+        RpcTier::Worker => worker_decision(request),
+        RpcTier::Progression => progression_decision(request),
+    }
+}
+
+/// The only verbs a progression session may call: reads of the work taxonomy
+/// and the caller's own run state, plus `SubmitProposal`. Every other verb —
+/// including the worker's sanctioned telemetry writes — is denied.
+pub const PROGRESSION_ALLOWED_VERBS: &[&str] = &[
+    "CommentsBannerState",
+    "CommentsGet",
+    "CommentsList",
+    "FindWorkItemsByPr",
+    "GetAttentionGroup",
+    "GetAttentionItem",
+    "GetDecision",
+    "GetEngineVersion",
+    "GetExecution",
+    "GetPrBody",
+    "GetPrStatus",
+    "GetProductDesignDoc",
+    "GetRun",
+    "GetWorkItem",
+    "GetWorkItemByShortId",
+    "GetWorkRuntimePatch",
+    "GetWorkTree",
+    "GetWorkerContext",
+    "ListAnswerAgentRuns",
+    "ListAttachments",
+    "ListAttentionGroups",
+    "ListAttentionItems",
+    "ListAttentionItemsForWorkItem",
+    "ListChores",
+    "ListDecisions",
+    "ListDeferredScopeAttentions",
+    "ListDependencies",
+    "ListDependenciesDetailed",
+    "ListExecutions",
+    "ListOperatorQuestions",
+    "ListProductDesignDocs",
+    "ListProducts",
+    "ListProjects",
+    "ListProposals",
+    "ListRevisions",
+    "ListRuns",
+    "ListTasks",
+    "ResolveProjectDesignDoc",
+    "SubmitProposal",
+];
+
+fn progression_decision(request: &FrontendRequest) -> WorkerVerbDecision {
+    let verb = variant_name(request);
+    if PROGRESSION_ALLOWED_VERBS.contains(&verb.as_str()) {
+        return WorkerVerbDecision::Allow;
+    }
+    WorkerVerbDecision::Deny(Box::new(WorkerTierDenial::progression(
+        verb,
+        WorkerTierDenialReason::ProgressionScope,
+        "progression sessions are limited to reads and enabled proposal kinds.",
+        None,
+    )))
+}
+
+fn worker_decision(request: &FrontendRequest) -> WorkerVerbDecision {
     use WorkerVerbDecision::Allow;
 
     match request {
@@ -226,7 +309,8 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         // proposal kind. Its confinement (the path must resolve inside the
         // peer-resolved execution's own workspace) is enforced in the
         // handler, not here, because this match is pure.
-        FrontendRequest::ListAttachments { .. } | FrontendRequest::SubmitAttachment { .. } => Allow,
+        FrontendRequest::ListAttachments { .. } => Allow,
+        FrontendRequest::SubmitAttachment { .. } => Allow,
 
         // ── Denied: app-only screenshot listing ────────────────────────────
         //

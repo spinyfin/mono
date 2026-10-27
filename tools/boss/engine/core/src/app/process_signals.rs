@@ -88,10 +88,14 @@ pub(super) fn register_app_session_trust_ok(
 
 /// Resolve the `last_status_actor` string for an RPC-driven status change.
 ///
-/// Returns `"boss"` when the caller's process ancestry matches the registered
-/// Boss-coordinator session pid; `"human"` otherwise. Engine-internal writers
+/// Returns `"progression"` for a registered progression session, `"boss"`
+/// when the caller's process ancestry matches the registered Boss-coordinator
+/// session pid; `"human"` otherwise. Engine-internal writers
 /// stamp `"engine"` directly in SQL and never call this function.
 pub(super) fn resolve_status_actor(server_state: &ServerState, peer_pid: Option<libc::pid_t>) -> &'static str {
+    if server_state.classify_peer(peer_pid).is_progression() {
+        return boss_protocol::LAST_STATUS_ACTOR_PROGRESSION;
+    }
     let boss_pid = server_state.current_boss_pid();
     if let (Some(boss_pid), Some(peer_pid)) = (boss_pid, peer_pid)
         && is_descendant_of_any(peer_pid, &[boss_pid])

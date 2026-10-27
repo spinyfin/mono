@@ -54,6 +54,101 @@ fn allowed_request() -> FrontendRequest {
     FrontendRequest::ListProducts
 }
 
+#[tokio::test]
+async fn progression_gate_is_unconditional_and_precedes_proposal_dispatch() {
+    let (state, _dir) = test_server_state();
+    state.feature_flags.set("worker_rpc_tier", false).unwrap();
+    let product = crate::test_support::create_test_product(&state.work_db);
+    let item = crate::test_support::create_test_chore_manual(&state.work_db, product.id, "Stuck");
+    let execution = state
+        .work_db
+        .create_execution(
+            boss_protocol::CreateExecutionInput::builder()
+                .work_item_id(&item.id)
+                .kind(boss_protocol::ExecutionKind::TaskImplementation)
+                .status(boss_protocol::ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    // Register an ancestor, exercising the same walk used for ordinary workers.
+    let parent = crate::worker_registry::parent_pid(self_pid()).unwrap().unwrap();
+    state
+        .worker_registry
+        .register_progression(parent, &execution.id, &state.work_db)
+        .unwrap();
+    let peer = state.classify_peer(Some(self_pid()));
+    assert_eq!(
+        peer,
+        PeerClass::Progression {
+            run_id: execution.id.clone()
+        }
+    );
+    assert!(state.authorize_rpc(RpcTier::Progression, Some(self_pid())));
+    assert!(!state.authorize_rpc(RpcTier::Worker, Some(self_pid())));
+    // Progression peers are agents: the critical-raise guard covers them and
+    // their writes are attributed to the progression actor, not `human`.
+    assert!(peer.is_agent());
+    assert!(!peer.is_worker());
+    assert_eq!(
+        resolve_status_actor(&state, Some(self_pid())),
+        boss_protocol::LAST_STATUS_ACTOR_PROGRESSION
+    );
+    assert!(work_items::resolve_write_actor(&state, Some(self_pid()), Some("critical"), Some("medium")).is_err());
+    assert_eq!(
+        work_items::resolve_write_actor(&state, Some(self_pid()), Some("high"), Some("medium")).unwrap(),
+        boss_protocol::LAST_STATUS_ACTOR_PROGRESSION
+    );
+    let denial = state.progression_scope_denial(&peer, "test", "outside").unwrap();
+    assert_eq!(denial.reason, WorkerTierDenialReason::ProgressionScope);
+    assert!(!denial.message.contains("boss propose blocked"), "{}", denial.message);
+    assert!(state.progression_scope_denial(&peer, "test", &item.id).is_none());
+    assert!(state.progression_scope_denial(&peer, "test", "outside").is_some());
+    assert!(
+        state
+            .progression_scope_denial(&PeerClass::Other, "test", &item.id)
+            .is_some()
+    );
+    for &kind in boss_protocol::ProposalKind::ALL {
+        let request = serde_json::json!({"request_id": "proposal", "payload": {
+            "type": "submit_proposal", "run_id": execution.id, "kind": kind,
+            "payload": {}
+        }})
+        .to_string();
+        let response = round_trip(state.clone(), Some(self_pid()), &request).await;
+        assert_eq!(response["payload"]["type"], "worker_tier_denied", "{kind}");
+        assert_eq!(response["payload"]["denial"]["verb"], format!("SubmitProposal:{kind}"));
+    }
+    let request =
+        r#"{"request_id":"write","payload":{"type":"update_work_item","id":"outside","patch":{"name":"No"}}}"#;
+    let response = round_trip(state.clone(), Some(self_pid()), request).await;
+    assert_eq!(response["payload"]["type"], "worker_tier_denied");
+    let request = r#"{"request_id":"read","payload":{"type":"list_products"}}"#;
+    let response = round_trip(state.clone(), Some(self_pid()), request).await;
+    assert_eq!(response["payload"]["type"], "products_list");
+    let run = state
+        .work_db
+        .create_run(
+            boss_protocol::CreateRunInput::builder()
+                .agent_id("progression_agent")
+                .execution_id(&execution.id)
+                .transcript_path("/tmp/progression-private.jsonl")
+                .build(),
+        )
+        .unwrap();
+    let request = serde_json::json!({"request_id": "runs", "payload": {
+        "type": "list_runs", "execution_id": execution.id
+    }})
+    .to_string();
+    let response = round_trip(state.clone(), Some(self_pid()), &request).await;
+    assert_eq!(response["payload"]["runs"][0]["id"], run.id);
+    assert!(response["payload"]["runs"][0]["transcript_path"].is_null());
+    let request = r#"{"request_id":"outside","payload":{"type":"list_runs","execution_id":"exec_other"}}"#;
+    let response = round_trip(state.clone(), Some(self_pid()), request).await;
+    assert_eq!(response["payload"]["type"], "worker_tier_denied");
+    state.worker_registry.unregister(parent);
+    assert_eq!(state.classify_peer(Some(self_pid())), PeerClass::Other);
+}
+
 // ── Classification ───────────────────────────────────────────────────────────
 
 #[test]
@@ -398,6 +493,53 @@ async fn run_scope_denies_a_worker_reading_another_executions_runs() {
     .to_string();
     let parsed = round_trip(server_state, Some(self_pid()), &own_request).await;
     assert_eq!(parsed["payload"]["type"], "runs_list");
+}
+
+/// A progression session reading another execution's runs is refused with its
+/// own tier's guidance, not the worker-only `boss propose blocked` recovery.
+#[tokio::test]
+async fn run_scope_refusal_for_progression_peers_is_typed_to_their_tier() {
+    let (state, _dir) = test_server_state();
+    state.feature_flags.set("worker_rpc_tier", false).unwrap();
+    let db = &state.work_db;
+    let product = crate::test_support::create_test_product(db);
+    let mine_chore = crate::test_support::create_test_chore(db, product.id.clone(), "Mine");
+    let mine_execution = crate::test_support::create_ready_chore_execution(db, mine_chore.id);
+    let other_chore = crate::test_support::create_test_chore(db, product.id, "Someone else's");
+    let other_execution = crate::test_support::create_ready_chore_execution(db, other_chore.id);
+    let other_run = db
+        .create_run(
+            boss_protocol::CreateRunInput::builder()
+                .agent_id("agent_1")
+                .execution_id(other_execution.id.clone())
+                .build(),
+        )
+        .unwrap();
+    let parent = crate::worker_registry::parent_pid(self_pid()).unwrap().unwrap();
+    state
+        .worker_registry
+        .register_progression(parent, &mine_execution.id, &state.work_db)
+        .unwrap();
+
+    for (verb, payload) in [
+        (
+            "ListRuns",
+            serde_json::json!({"type": "list_runs", "execution_id": other_execution.id}),
+        ),
+        ("GetRun", serde_json::json!({"type": "get_run", "id": other_run.id})),
+    ] {
+        let request = serde_json::json!({"request_id": "scope", "payload": payload}).to_string();
+        let parsed = round_trip(state.clone(), Some(self_pid()), &request).await;
+        assert_eq!(parsed["payload"]["type"], "worker_tier_denied", "{verb}");
+        let denial = &parsed["payload"]["denial"];
+        assert_eq!(denial["verb"], verb);
+        assert_eq!(denial["reason"], "progression_scope", "{verb}");
+        assert!(denial["use_instead"].is_null(), "{verb}: {denial}");
+        let message = denial["message"].as_str().unwrap();
+        assert!(!message.contains("boss propose blocked"), "{message}");
+        assert!(!message.contains("worker sessions"), "{message}");
+        assert!(message.contains("progression sessions"), "{message}");
+    }
 }
 
 #[tokio::test]

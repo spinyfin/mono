@@ -20,10 +20,13 @@
 //!
 //! ## The two halves
 //!
-//! - [`policy`] — [`worker_verb_decision`], a deny-by-default classification
+//! - [`policy`] — [`verb_decision`], a tier-keyed, deny-by-default classification
 //!   of every [`FrontendRequest`]. Deliberately an exhaustive `match` with no
 //!   wildcard arm: a newly added verb fails to compile here until someone
 //!   decides whether workers may call it. That compile error is the point.
+//! - [`proposal_kind_decision`] — an exhaustive second gate on proposal kinds.
+//!   Progression permits reads and proposal submission, but every kind stays
+//!   closed until its scoped mutation handler is implemented.
 //! - [`sanitize`] — [`sanitize_event_for_worker`], which strips runtime-half
 //!   fields from execution and run rows on their way out to a worker.
 //!
@@ -33,9 +36,13 @@
 
 mod policy;
 mod sanitize;
+mod tiers;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tier_matrix_tests;
 
-pub use policy::{WorkerVerbDecision, variant_name, worker_verb_decision};
+pub use policy::{PROGRESSION_ALLOWED_VERBS, WorkerVerbDecision, variant_name, verb_decision, worker_verb_decision};
 pub use sanitize::{SANITIZED_EXECUTION_FIELDS, sanitize_event_for_worker};
+pub use tiers::{RpcTier, proposal_kind_decision};

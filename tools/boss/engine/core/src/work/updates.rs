@@ -94,7 +94,7 @@ fn is_movable_project_membership_kind(kind: &TaskKind) -> bool {
 
 /// Stamp mechanism / time / reason when `update_task` first moves a row
 /// to `archived`. Human archives stay `manual_status_change` with an
-/// optional reason. Automated actors (`boss`, `engine`, `boothby`) must
+/// optional reason. Automated actors (`boss`, `engine`, `boothby`, `progression`) must
 /// record a non-empty reason — never a constant placeholder and never a
 /// blanket `None` that would wipe a caller-supplied value.
 fn apply_archive_transition_provenance(db: &WorkDb, task: &mut Task, actor: &str) -> Result<()> {
