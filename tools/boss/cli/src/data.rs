@@ -9,6 +9,31 @@ use boss_protocol::{WorkRun, WorkerTierDenial};
 // `items_after_test_module`).
 pub(crate) use boss_protocol::{WorkItemSelector, is_typed_work_item_id, parse_work_item_selector};
 
+fn cli_actor() -> String {
+    std::env::var("USER")
+        .ok()
+        .map(|user| user.trim().to_owned())
+        .filter(|user| !user.is_empty())
+        .unwrap_or_else(|| "boss CLI".to_owned())
+}
+
+fn cli_cancel_provenance(reason: impl AsRef<str>) -> Result<boss_protocol::CancelProvenance, CliError> {
+    boss_protocol::CancelProvenance::new(boss_protocol::CancelSource::BossCli, cli_actor(), reason.as_ref())
+        .map_err(|err| CliError::usage(err.to_string()))
+}
+
+fn update_cancel_reason(id: &str, patch: &WorkItemPatch) -> String {
+    match (patch.status.as_deref(), patch.deferred) {
+        (Some(status), None) => format!("boss task move {id} to {status}"),
+        (None, Some(true)) => format!("boss task defer {id}"),
+        (None, Some(false)) => format!("boss task undefer {id}"),
+        (Some(status), Some(deferred)) => {
+            format!("boss task update {id}: status {status}, deferred {deferred}")
+        }
+        (None, None) => format!("boss task update {id}"),
+    }
+}
+
 pub(crate) async fn connect_for_work(ctx: &RunContext) -> Result<BossClient, CliError> {
     BossClient::connect(&ctx.discovery)
         .await
@@ -331,12 +356,7 @@ pub(crate) async fn unpopulate_project(
     project_id: &str,
     run_id: &str,
 ) -> Result<(Vec<String>, Vec<UnpopulatePreservedTask>), CliError> {
-    let cancel = boss_protocol::CancelProvenance::new(
-        boss_protocol::CancelSource::BossCli,
-        std::env::var("USER").unwrap_or_else(|_| "boss CLI".to_owned()),
-        "undo project population",
-    )
-    .unwrap();
+    let cancel = cli_cancel_provenance("undo project population")?;
     rpc_call!(
         client,
         FrontendRequest::UnpopulateProject { cancel: Some(cancel),
@@ -753,15 +773,7 @@ pub(crate) async fn update_work_item(
     id: &str,
     patch: WorkItemPatch,
 ) -> Result<WorkItem, CliError> {
-    let cancel = boss_protocol::CancelProvenance::new(
-        boss_protocol::CancelSource::BossCli,
-        std::env::var("USER").unwrap_or_else(|_| "boss CLI".to_owned()),
-        format!(
-            "boss task update {id}: status {:?}, deferred {:?}",
-            patch.status, patch.deferred
-        ),
-    )
-    .unwrap();
+    let cancel = cli_cancel_provenance(update_cancel_reason(id, &patch))?;
     rpc_call!(
         client,
         FrontendRequest::UpdateWorkItem { cancel: Some(cancel),
@@ -1490,12 +1502,7 @@ pub(crate) fn validate_github_pr_url(raw: &str) -> Result<&str, CliError> {
 }
 
 pub(crate) async fn delete_work_item(client: &mut BossClient, id: &str) -> Result<(), CliError> {
-    let cancel = boss_protocol::CancelProvenance::new(
-        boss_protocol::CancelSource::BossCli,
-        std::env::var("USER").unwrap_or_else(|_| "boss CLI".to_owned()),
-        format!("boss task delete {id} and its revision chain"),
-    )
-    .unwrap();
+    let cancel = cli_cancel_provenance(format!("boss task delete {id} and its revision chain"))?;
     rpc_call!(
         client,
         FrontendRequest::DeleteWorkItem { cancel: Some(cancel), id: id.to_owned() },
@@ -1545,10 +1552,13 @@ pub(crate) async fn run_depend_command(
             let edge = add_dependency(
                 client,
                 AddDependencyInput {
-                    dependent,
+                    dependent: dependent.clone(),
                     prerequisite,
                     relation: Some(args.relation),
                 },
+                Some(cli_cancel_provenance(format!(
+                    "boss depend add: {dependent} is blocked by a new prerequisite"
+                ))?),
             )
             .await?;
             print_entity(ctx, &serde_json::json!({ "edge": edge }), || {
@@ -1611,10 +1621,11 @@ pub(crate) async fn run_depend_command(
 pub(crate) async fn add_dependency(
     client: &mut BossClient,
     input: AddDependencyInput,
+    cancel: Option<boss_protocol::CancelProvenance>,
 ) -> Result<WorkItemDependency, CliError> {
     rpc_call!(
         client,
-        FrontendRequest::AddDependency { input },
+        FrontendRequest::AddDependency { cancel, input },
         "dependency add",
         FrontendEvent::DependencyAdded { edge } => edge,
     )

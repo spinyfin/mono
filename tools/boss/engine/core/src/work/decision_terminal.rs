@@ -12,12 +12,17 @@ use super::*;
 
 /// Caller context only the RPC layer knows, carried into the audit record so
 /// `execution_cancelled` includes the request options and socket peer.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct DecisionAuditContext {
     /// `Some` for a cancel that arrived as `CancelExecution`.
     pub queued_only: Option<bool>,
     /// The socket peer that sent the request, when there was one.
     pub peer_pid: Option<i32>,
+    /// Chain root whose parent PR merged, when this cancel is a merge-poller
+    /// parent-merge retirement.
+    pub chain_root_id: Option<String>,
+    /// Execution status immediately before the merge-poller cancel.
+    pub prior_status: Option<String>,
 }
 
 /// The audit event name for a decision-terminal `status`.
@@ -49,6 +54,8 @@ pub(crate) fn decision_audit_payload(
         "actor": &provenance.actor,
         "queued_only": context.queued_only.unwrap_or(false),
         "peer_pid": context.peer_pid,
+        "chain_root_id": context.chain_root_id,
+        "prior_status": context.prior_status,
     })
 }
 
@@ -235,6 +242,8 @@ mod tests {
             &DecisionAuditContext {
                 queued_only: Some(false),
                 peer_pid: Some(42),
+                chain_root_id: None,
+                prior_status: None,
             },
         );
         // Every field the pre-provenance event carried is still present.

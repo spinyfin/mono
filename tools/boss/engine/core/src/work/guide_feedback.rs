@@ -105,7 +105,7 @@ impl WorkDb {
                         .filter(|id| !addressed_comment_ids.contains(id))
                         .collect::<Vec<_>>();
                 let task_id = task.id.clone();
-                commit_and_publish(tx, pending, self.event_bus())?;
+                self.commit_pending(tx, pending)?;
                 Ok(ReviseDocOutcome::Created {
                     task_id,
                     task_kind: "revision".to_owned(),

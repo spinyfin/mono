@@ -383,7 +383,7 @@ impl WorkDb {
         // Audit inside `tx`: the action row and the write it describes
         // commit together or not at all. Inert unless `actor` is Boothby.
         boothby::capture_project_update(&tx, self, actor, &before, &updated, &project.updated_at)?;
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok(WorkItem::Project(updated))
     }
 
@@ -758,10 +758,15 @@ impl WorkDb {
         // reconcile guard (`work_item_is_deferred`) then keeps it parked.
         if patch.deferred == Some(true) {
             let cause = "the work item was reclassified as deferred and leaves the dispatch pool";
-            let mut provenance = patch.cancel_provenance.clone().unwrap_or_else(|| {
-                boss_protocol::CancelProvenance::engine(boss_protocol::CancelSource::WorkItemSettled, actor, cause)
-            });
-            provenance.reason = format!("{cause}; {}", provenance.reason);
+            let provenance = match patch.cancel_provenance.clone() {
+                Some(mut client) => {
+                    client.reason = format!("{cause}; {}", client.reason);
+                    client
+                }
+                None => {
+                    boss_protocol::CancelProvenance::engine(boss_protocol::CancelSource::WorkItemSettled, actor, cause)
+                }
+            };
             abandon_pending_executions_with_provenance(
                 &mut pending,
                 &tx,
@@ -815,7 +820,7 @@ impl WorkDb {
         // Derived fields are not part of `task_image`, so projecting
         // before capture does not journal a no-op as a mutation.
         boothby::capture_task_update(&tx, self, actor, &before, &updated, &task.updated_at)?;
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok(task_to_item(updated))
     }
 }

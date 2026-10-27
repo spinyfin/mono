@@ -35,9 +35,9 @@ use boss_engine::work::WorkDb;
 use boss_engine::work::{PrOpenState, StaticPrStateChecker, SubmitAttachmentInput};
 use boss_engine_attachments::IngestedImage;
 use boss_protocol::{
-    AttachmentMediaType, BoardColumn, BoardDropTarget, BoardGroup, CreateChoreInput, CreateProductInput,
-    CreateRevisionInput, CreateRunInput, ExecutionKind, ExecutionStatus, FrontendEvent, FrontendRequest,
-    RequestExecutionInput, Task, TaskStatus, WorkItem, WorkItemPatch,
+    AddDependencyInput, AttachmentMediaType, BoardColumn, BoardDropTarget, BoardGroup, CreateChoreInput,
+    CreateProductInput, CreateRevisionInput, CreateRunInput, ExecutionKind, ExecutionStatus, FrontendEvent,
+    FrontendRequest, RequestExecutionInput, Task, TaskStatus, WorkItem, WorkItemPatch,
 };
 
 mod common;
@@ -197,7 +197,7 @@ async fn work_cancel_marks_execution_cancelled() -> Result<()> {
         .send_request(&FrontendRequest::CancelExecution {
             execution_id: execution_id.clone(),
             reason: Some("operator cancelled from control-verbs test".to_owned()),
-            source: Some(boss_protocol::CancelSource::Bossctl),
+            source: Some(boss_protocol::CancelSource::Bossctl.as_str().to_owned()),
             actor: Some("control_verbs_test".to_owned()),
             queued_only: false,
         })
@@ -228,7 +228,7 @@ async fn work_cancel_marks_execution_cancelled() -> Result<()> {
         .send_request(&FrontendRequest::CancelExecution {
             execution_id,
             reason: Some("operator cancelled from control-verbs test".to_owned()),
-            source: Some(boss_protocol::CancelSource::Bossctl),
+            source: Some(boss_protocol::CancelSource::Bossctl.as_str().to_owned()),
             actor: Some("control_verbs_test".to_owned()),
             queued_only: false,
         })
@@ -291,7 +291,7 @@ async fn work_cancel_unknown_execution_returns_clear_error() -> Result<()> {
         .send_request(&FrontendRequest::CancelExecution {
             execution_id: "exec_does_not_exist".to_owned(),
             reason: Some("does not exist".to_owned()),
-            source: Some(boss_protocol::CancelSource::Bossctl),
+            source: Some(boss_protocol::CancelSource::Bossctl.as_str().to_owned()),
             actor: Some("control_verbs_test".to_owned()),
             queued_only: false,
         })
@@ -324,7 +324,7 @@ async fn executions_cancel_queued_only_accepts_ready_refuses_running() -> Result
         .send_request(&FrontendRequest::CancelExecution {
             execution_id: ready_id.clone(),
             reason: Some("moot after work completed elsewhere".to_owned()),
-            source: Some(boss_protocol::CancelSource::Bossctl),
+            source: Some(boss_protocol::CancelSource::Bossctl.as_str().to_owned()),
             actor: Some("control_verbs_test".to_owned()),
             queued_only: true,
         })
@@ -356,7 +356,7 @@ async fn executions_cancel_queued_only_accepts_ready_refuses_running() -> Result
         .send_request(&FrontendRequest::CancelExecution {
             execution_id: running_id.clone(),
             reason: Some("should refuse".to_owned()),
-            source: Some(boss_protocol::CancelSource::Bossctl),
+            source: Some(boss_protocol::CancelSource::Bossctl.as_str().to_owned()),
             actor: Some("control_verbs_test".to_owned()),
             queued_only: true,
         })
@@ -706,7 +706,7 @@ async fn agents_stop_does_not_reject_local_caller_as_boss_only() -> Result<()> {
         .send_request(&FrontendRequest::StopRun {
             run_id: "run-does-not-exist".to_owned(),
             reason: Some("control-verbs stop of a missing run".to_owned()),
-            source: Some(boss_protocol::CancelSource::Bossctl),
+            source: Some(boss_protocol::CancelSource::Bossctl.as_str().to_owned()),
             actor: Some("control_verbs_test".to_owned()),
         })
         .await?;
@@ -2199,7 +2199,7 @@ async fn stop_run_requires_source_and_records_attested_provenance() -> Result<()
     let response = client
         .send_request(&FrontendRequest::StopRun {
             run_id: seeded.execution_id.clone(),
-            source: Some(boss_protocol::CancelSource::Bossctl),
+            source: Some(boss_protocol::CancelSource::Bossctl.as_str().to_owned()),
             actor: Some("operator".to_owned()),
             reason: Some("stop stuck worker".to_owned()),
         })
@@ -2281,11 +2281,125 @@ async fn cli_backlog_and_delete_record_the_actual_request() -> Result<()> {
         assert!(provenance.actor.contains("via non_app_client"));
         assert!(provenance.actor.contains("client claims operator"));
         assert!(provenance.reason.ends_with(reason));
-        if !delete {
+        if delete {
+            assert!(
+                provenance.reason.contains("cascade-deleted")
+                    && provenance.reason.contains("while a worker was active"),
+                "delete must prefix the cascade cause, got {}",
+                provenance.reason
+            );
+        } else {
             assert!(provenance.reason.contains("moved from active to todo"));
         }
         assert!(!provenance.reason.contains("kanban drag"));
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn ghost_active_todo_without_cancel_replies() -> Result<()> {
+    let engine = spawn_engine().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let seeded = seed_execution(&mut client).await?;
+    let db = WorkDb::open(engine.db_path.clone())?;
+    db.mark_execution_orphaned(&seeded.execution_id, "ghost-active latest execution already terminal")?;
+    db.update_work_item(&seeded.work_item_id, WorkItemPatch::builder().status("active").build())?;
+    let response = client
+        .send_request(&FrontendRequest::UpdateWorkItem {
+            id: seeded.work_item_id.clone(),
+            patch: Box::new(WorkItemPatch::builder().status("todo").build()),
+            cancel: None,
+        })
+        .await?;
+    assert!(
+        matches!(response, FrontendEvent::WorkItemUpdated { .. }),
+        "ghost-active todo with cancel=None must reply, got {response:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_dependency_cancel_records_client_provenance_and_refuses_without_source() -> Result<()> {
+    let engine = spawn_engine().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let seeded = seed_execution(&mut client).await?;
+    let product_id = fetch_task(&mut client, &seeded.work_item_id).await?.product_id;
+    let prereq = match client
+        .send_request(&FrontendRequest::CreateChore {
+            input: CreateChoreInput::builder()
+                .product_id(product_id)
+                .name("gating prereq")
+                .build(),
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemCreated {
+            item: boss_protocol::WorkItem::Chore(task) | boss_protocol::WorkItem::Task(task),
+        } => task,
+        other => return Err(anyhow!("unexpected CreateChore: {other:?}")),
+    };
+    let db = WorkDb::open(engine.db_path.clone())?;
+    db.update_work_item(&seeded.work_item_id, WorkItemPatch::builder().status("active").build())?;
+    db.start_execution_run(
+        &seeded.execution_id,
+        "test-worker",
+        "mono",
+        "lease",
+        "workspace",
+        "/tmp/workspace",
+    )?;
+    let refused = client
+        .send_request(&FrontendRequest::AddDependency {
+            cancel: None,
+            input: AddDependencyInput {
+                dependent: seeded.work_item_id.clone(),
+                prerequisite: prereq.id.clone(),
+                relation: None,
+            },
+        })
+        .await?;
+    assert!(
+        matches!(&refused, FrontendEvent::WorkError { message } if message.contains("requires cancel")),
+        "live cancel without source must refuse, got {refused:?}"
+    );
+    let cancel = Some(boss_protocol::CancelProvenance::new(
+        boss_protocol::CancelSource::BossCli,
+        "operator",
+        "gate this running task on a new prerequisite",
+    )?);
+    let response = client
+        .send_request(&FrontendRequest::AddDependency {
+            cancel,
+            input: AddDependencyInput {
+                dependent: seeded.work_item_id.clone(),
+                prerequisite: prereq.id.clone(),
+                relation: None,
+            },
+        })
+        .await?;
+    assert!(
+        matches!(response, FrontendEvent::DependencyAdded { .. }),
+        "add with cancel must succeed, got {response:?}"
+    );
+    let execution = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let execution = db.get_execution(&seeded.execution_id)?;
+            if execution.status == ExecutionStatus::Cancelled {
+                return Ok::<_, anyhow::Error>(execution);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    let provenance = execution.cancel_provenance.unwrap();
+    assert_eq!(provenance.source, boss_protocol::CancelSource::BossCli);
+    assert!(provenance.actor.contains("via non_app_client"));
+    assert!(provenance.reason.contains("blocks"));
+    assert!(
+        provenance
+            .reason
+            .contains("gate this running task on a new prerequisite")
+    );
     Ok(())
 }
 

@@ -233,6 +233,9 @@ pub enum FrontendRequest {
     /// Idempotent: re-adding an existing edge is a no-op. Cycles are
     /// rejected at the engine before insert.
     AddDependency {
+        /// Required when this mutation would cancel a live dependent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel: Option<crate::CancelProvenance>,
         #[serde(flatten)]
         input: AddDependencyInput,
     },
@@ -330,7 +333,7 @@ pub enum FrontendRequest {
         /// client surface (`app`, `boss_cli`, `bossctl`); the engine rejects
         /// a missing source or an engine-subsystem source.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        source: Option<crate::CancelSource>,
+        source: Option<String>,
         /// The human / session / worker identity behind the request, when
         /// the client knows one. When absent the engine records the peer it
         /// observed on the socket.
@@ -2674,7 +2677,7 @@ pub enum FrontendRequest {
         /// Which client surface is stopping the run. Required; must be a
         /// client surface.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        source: Option<crate::CancelSource>,
+        source: Option<String>,
         /// The identity behind the request, when the client knows one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<String>,

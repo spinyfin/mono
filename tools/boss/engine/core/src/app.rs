@@ -200,14 +200,14 @@ use handler_helpers::{
     METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE, TRANSCRIPT_NOT_YET_AVAILABLE_PREFIX,
     TranscriptResolution, active_chore_run_id, active_to_todo_execution, build_chore_update_message,
     build_effort_audit_report, build_engine_health_report, build_live_status_debug_report, duplicate_or_work_error,
-    handle_create_many, in_review_chore_execution, live_execution_for_task_id, load_automation_paused_state,
-    load_dispatch_concurrency_limit, load_dispatch_paused_state, load_live_status_disabled_slots,
-    open_review_terminal_async, persist_live_status_disabled_slots, publish_comment_invalidation,
-    publish_runtime_work_invalidation, publish_work_invalidation, read_transcript_tail, resolve_transcript_for_tail,
-    rpc_cancel_actor, segment_to_wire, send_push, send_response, send_response_with_revision, send_work_error,
-    tail_lines_from_content, task_name_description_for_id, task_status_for_id, task_transitioned_to_active,
-    terminal_chore_execution, transport_default_created_via, validate_external_tracker_config, work_item_id,
-    work_item_needs_dispatch,
+    handle_create_many, in_review_chore_execution, live_execution_for_active_card, live_execution_for_task_id,
+    load_automation_paused_state, load_dispatch_concurrency_limit, load_dispatch_paused_state,
+    load_live_status_disabled_slots, open_review_terminal_async, persist_live_status_disabled_slots,
+    publish_comment_invalidation, publish_runtime_work_invalidation, publish_work_invalidation, read_transcript_tail,
+    resolve_transcript_for_tail, rpc_cancel_actor, segment_to_wire, send_push, send_response,
+    send_response_with_revision, send_work_error, tail_lines_from_content, task_name_description_for_id,
+    task_status_for_id, task_transitioned_to_active, terminal_chore_execution, transport_default_created_via,
+    validate_external_tracker_config, work_item_id, work_item_needs_dispatch,
 };
 
 /// Per-request handler context: the connection-scoped state every
@@ -1285,9 +1285,6 @@ impl ServerState {
         // event would ever reach a subscriber.
         let mut timeline = crate::startup_timing::StartupTimeline::begin("server_state");
         let event_bus = Arc::new(EventBus::new());
-        let execution_decisions = event_bus.subscribe(boss_event_bus::TopicFilter::kind(
-            boss_event_bus::EventKind::ExecutionDecision,
-        ));
         // Engine counter-metrics registry. Built up front so it can be cloned
         // into ServerState and handed to WorkDb (persona overflow counter); the
         // registry is plumbed explicitly rather than stashed in a global per
@@ -1295,10 +1292,23 @@ impl ServerState {
         // Arc<ServerState> is in hand so a duplicate registration panics
         // during this boot path instead of inside the first increment.
         let metrics_registry = Arc::new(crate::metrics::Registry::new());
+        // Dispatch-event JSONL stream lands next to state.db. Built before
+        // WorkDb so post-commit cancel provenance writes the same sink the
+        // coordinator uses, without a bounded bus hop.
+        let dispatch_event_root: PathBuf = cfg
+            .work
+            .db_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| cfg.work.cwd.clone());
+        let dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink> =
+            Arc::new(crate::dispatch_events::JsonlFileSink::new(dispatch_event_root.clone()));
         let work_db = Arc::new(
             WorkDb::open(cfg.work.db_path.clone())?
                 .with_event_bus(event_bus.clone())
-                .with_persona_metrics(metrics_registry.clone()),
+                .with_persona_metrics(metrics_registry.clone())
+                .with_dispatch_events(dispatch_events.clone()),
         );
         timeline.mark("work_db_open");
         let anthropic_api_key = cfg.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
@@ -1495,14 +1505,6 @@ impl ServerState {
         }
         let settings_for_state = settings.clone();
 
-        // Dispatch-event JSONL stream lands next to state.db / events.sock
-        // under the same state root. Build it before the completion handler
-        // so merge-triggered cancellation and ordinary dispatch share one
-        // timeline sink.
-        let dispatch_event_root: PathBuf = state_root.clone();
-        let dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink> =
-            Arc::new(crate::dispatch_events::JsonlFileSink::new(dispatch_event_root.clone()));
-        crate::event_publish::forward_execution_decisions(execution_decisions, dispatch_events.clone());
         let metrics_for_state = metrics_registry.clone();
         let metrics_for_dispatcher = metrics_registry.clone();
         let metrics_for_completion = metrics_registry.clone();

@@ -34,6 +34,8 @@
 
 use boss_event_bus::{Event, EventBus};
 
+use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
+
 /// Events staged by a state-write path for publication once its enclosing
 /// DB transaction commits. Construct one per transaction, [`push`](Self::push)
 /// every event the write produces, then hand it to [`commit_and_publish`]
@@ -88,70 +90,59 @@ impl PendingEvents {
     /// Staged audit records are written here too: the caller's write has
     /// already committed, so there is nothing left to wait for.
     pub fn into_events(self) -> Vec<Event> {
+        let mut pending = self;
+        pending.flush_audits(&crate::dispatch_events::NoopDispatchEventSink);
+        pending.events
+    }
+
+    /// Write staged audits and dispatch events, then publish bus events.
+    /// Callers that already committed (or never had a transaction) use this
+    /// instead of [`commit_and_publish`].
+    pub fn flush(self, bus: &EventBus, sink: &dyn DispatchEventSink) {
+        let mut pending = self;
+        pending.flush_audits(sink);
+        for event in pending.events {
+            bus.publish(event);
+        }
+    }
+
+    fn flush_audits(&mut self, sink: &dyn DispatchEventSink) {
         for (event, payload) in &self.audits {
             crate::audit::record_event(event, payload);
+            if matches!(event.as_str(), "execution_cancelled" | "execution_abandoned") {
+                emit_decision_dispatch(sink, payload);
+            }
         }
-        self.events
     }
 }
 
+fn emit_decision_dispatch(sink: &dyn DispatchEventSink, payload: &serde_json::Value) {
+    let Some(execution_id) = payload.get("execution_id").and_then(|value| value.as_str()) else {
+        return;
+    };
+    let mut event =
+        DispatchEvent::new(Stage::ExecutionCancelled, Outcome::Ok, execution_id).with_details(payload.clone());
+    if let Some(work_item_id) = payload.get("work_item_id").and_then(|value| value.as_str()) {
+        event = event.with_work_item(work_item_id);
+    }
+    sink.emit_sync(event);
+}
+
 /// Commit `tx`, and only if the commit succeeds, publish every event staged
-/// in `pending` onto `bus`. Returns the commit's own `Result` unchanged —
-/// on `Err`, `pending` is dropped without publishing anything, exactly as a
-/// rolled-back transaction should never have announced a transition that
-/// didn't happen.
+/// in `pending` onto `bus` and write decision provenance to `sink`. Returns
+/// the commit's own `Result` unchanged — on `Err`, `pending` is dropped
+/// without publishing anything, exactly as a rolled-back transaction should
+/// never have announced a transition that didn't happen.
 pub fn commit_and_publish(
     tx: rusqlite::Transaction<'_>,
     pending: PendingEvents,
     bus: &EventBus,
+    sink: &dyn DispatchEventSink,
 ) -> rusqlite::Result<()> {
     tx.commit()?;
     tracing::debug!(target: "work_write_timing", boundary = "commit");
-    for (event, payload) in &pending.audits {
-        crate::audit::record_event(event, payload);
-    }
-    for event in pending.events {
-        bus.publish(event);
-    }
+    pending.flush(bus, sink);
     Ok(())
-}
-
-/// Forward committed decision facts to the dispatch stream without triggering teardown.
-pub fn forward_execution_decisions(
-    mut subscription: boss_event_bus::Subscription,
-    sink: std::sync::Arc<dyn crate::dispatch_events::DispatchEventSink>,
-) {
-    // Synchronous inspection-only ServerState fixtures have no runtime.
-    // A running engine constructs its state inside the Tokio runtime.
-    if tokio::runtime::Handle::try_current().is_err() {
-        return;
-    }
-    boss_task_scope::spawn(async move {
-        while let Some(event) = subscription.recv().await {
-            if let Event::ExecutionDecision {
-                execution_id,
-                task_id,
-                status,
-                source,
-                actor,
-                reason,
-            } = event
-            {
-                sink.emit(
-                    crate::dispatch_events::DispatchEvent::new(
-                        crate::dispatch_events::Stage::ExecutionCancelled,
-                        crate::dispatch_events::Outcome::Ok,
-                        execution_id,
-                    )
-                    .with_work_item(task_id)
-                    .with_details(serde_json::json!({
-                        "to_status": status, "source": source, "actor": actor, "reason": reason,
-                    })),
-                )
-                .await;
-            }
-        }
-    });
 }
 
 #[cfg(test)]
@@ -172,11 +163,7 @@ mod tests {
     async fn decision_provenance_reaches_dispatch_only_after_commit() {
         let mut conn = open_conn();
         let bus = EventBus::new();
-        let sink = std::sync::Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
-        forward_execution_decisions(
-            bus.subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionDecision)),
-            sink.clone(),
-        );
+        let sink = crate::dispatch_events::RecordingDispatchEventSink::new();
         let payload = serde_json::json!({
             "execution_id": "exec-decision", "work_item_id": "task-decision",
             "to_status": "abandoned", "source": "scheduler_preemption",
@@ -187,29 +174,48 @@ mod tests {
             let mut pending = PendingEvents::new();
             pending.push_audit("execution_abandoned", payload.clone());
         }
-        tokio::task::yield_now().await;
         assert!(sink.events().await.is_empty(), "rolled-back provenance must not escape");
         let tx = conn.transaction().unwrap();
         let mut pending = PendingEvents::new();
         pending.push_audit("execution_abandoned", payload);
-        commit_and_publish(tx, pending, &bus).unwrap();
-        let events = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let events = sink.events().await;
-                if !events.is_empty() {
-                    break events;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        commit_and_publish(tx, pending, &bus, &sink).unwrap();
+        let events = sink.events().await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].execution_id, "exec-decision");
         assert_eq!(events[0].details["source"], "scheduler_preemption");
         assert_eq!(events[0].details["actor"], "scheduler");
         assert_eq!(events[0].details["reason"], "higher priority work needs this slot");
         assert_eq!(events[0].details["to_status"], "abandoned");
+    }
+
+    #[tokio::test]
+    async fn every_decision_in_a_bulk_commit_reaches_the_sink() {
+        let mut conn = open_conn();
+        let bus = EventBus::new();
+        let sink = crate::dispatch_events::RecordingDispatchEventSink::new();
+        let tx = conn.transaction().unwrap();
+        let mut pending = PendingEvents::new();
+        // The in-process bus mailbox is 256; a post-commit sink must keep
+        // every decision even when a single commit stages more than that.
+        let count = 300;
+        for i in 0..count {
+            pending.push_audit(
+                "execution_cancelled",
+                serde_json::json!({
+                    "execution_id": format!("exec-{i}"),
+                    "work_item_id": format!("task-{i}"),
+                    "to_status": "cancelled",
+                    "source": "stranded_execution_sweep",
+                    "actor": "stranded_execution_sweep",
+                    "reason": format!("sweep item {i}"),
+                }),
+            );
+        }
+        commit_and_publish(tx, pending, &bus, &sink).unwrap();
+        let events = sink.events().await;
+        assert_eq!(events.len(), count);
+        assert_eq!(events[0].execution_id, "exec-0");
+        assert_eq!(events[count - 1].execution_id, format!("exec-{}", count - 1));
     }
 
     #[tokio::test]
@@ -222,7 +228,7 @@ mod tests {
         tx.execute("INSERT INTO t (id) VALUES (1)", []).expect("insert");
         let mut pending = PendingEvents::new();
         pending.push(Event::DispatchReady);
-        commit_and_publish(tx, pending, &bus).expect("commit");
+        commit_and_publish(tx, pending, &bus, &crate::dispatch_events::NoopDispatchEventSink).expect("commit");
 
         let event = sub.recv().await.expect("event delivered after commit");
         assert_eq!(event, Event::DispatchReady);
@@ -294,7 +300,7 @@ mod tests {
         let mut pending = PendingEvents::new();
         pending.push(Event::DispatchReady);
 
-        let result = commit_and_publish(tx, pending, &bus);
+        let result = commit_and_publish(tx, pending, &bus, &crate::dispatch_events::NoopDispatchEventSink);
         assert!(
             result.is_err(),
             "commit must fail: deferred FK violation is checked at COMMIT"

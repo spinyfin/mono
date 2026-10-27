@@ -14,9 +14,10 @@ pub(super) async fn handle_add_dependency(ctx: Dispatch, req: FrontendRequest) {
         sink,
         session_id,
         request_id,
+        peer_pid,
         ..
     } = ctx;
-    let FrontendRequest::AddDependency { mut input } = req else {
+    let FrontendRequest::AddDependency { mut input, cancel } = req else {
         unreachable!()
     };
     input.dependent = match server_state.resolve_work_item_id(&input.dependent).await {
@@ -40,7 +41,26 @@ pub(super) async fn handle_add_dependency(ctx: Dispatch, req: FrontendRequest) {
         }
     };
     {
-        match work_db.add_dependency_with_worker_reconcile(input) {
+        let client_cancel = if let Some(claim) = cancel {
+            let observed = rpc_cancel_actor(&server_state, &session_id, peer_pid).await;
+            match super::cancel_rpc::provenance_from_request(
+                Some(claim.source.as_str()),
+                Some(&claim.reason),
+                Some(&claim.actor),
+                &observed,
+            ) {
+                Ok(provenance) => Some(provenance),
+                Err(refusal) => {
+                    send_work_error(&sink, &request_id, refusal.message("add_dependency"));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        match work_db
+            .add_dependency_with_worker_reconcile(input, crate::work::DependencyCancelOrigin::ClientRpc(client_cancel))
+        {
             Ok((edge, reaped)) => {
                 // Defect #2: adding this edge may have pushed an
                 // actively-running dependent into `blocked`. The DB

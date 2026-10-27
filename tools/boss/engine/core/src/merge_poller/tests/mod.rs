@@ -561,6 +561,7 @@ mod probe_tests;
 mod remediation_tests;
 mod schedule_tests;
 mod stale_revision_sweep_tests;
+mod sweep_followup_tests;
 mod sweep_tests;
 mod unmergeable_reaction_tests;
 

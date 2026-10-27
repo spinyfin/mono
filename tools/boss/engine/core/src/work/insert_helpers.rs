@@ -252,9 +252,16 @@ pub(crate) fn apply_create_time_dependencies(
         // inner message into a single flat string so a rejection reason
         // set deeper in `add_dependency_edge_in_tx` actually reaches the
         // caller.
-        let (_, cancelled) =
-            add_dependency_edge_in_tx(&mut pending, conn, dependent_id, prerequisite_id, RELATION_BLOCKS, now)
-                .map_err(|err| anyhow::anyhow!("declaring create-time dependency on `{prerequisite_id}`: {err}"))?;
+        let (_, cancelled) = add_dependency_edge_in_tx(
+            &mut pending,
+            conn,
+            dependent_id,
+            prerequisite_id,
+            RELATION_BLOCKS,
+            now,
+            &DependencyCancelOrigin::EngineInternal,
+        )
+        .map_err(|err| anyhow::anyhow!("declaring create-time dependency on `{prerequisite_id}`: {err}"))?;
         debug_assert!(
             cancelled.is_none(),
             "freshly-created work item cannot have a live execution"

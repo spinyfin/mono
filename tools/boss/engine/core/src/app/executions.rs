@@ -820,7 +820,7 @@ pub(super) async fn handle_stop_run(ctx: Dispatch, req: FrontendRequest) {
             return;
         }
         let provenance = match super::cancel_rpc::provenance_from_request(
-            source,
+            source.as_deref(),
             reason.as_deref(),
             actor.as_deref(),
             &rpc_cancel_actor(&server_state, &session_id, peer_pid).await,
@@ -985,7 +985,7 @@ pub(super) async fn handle_cancel_execution(ctx: Dispatch, req: FrontendRequest)
         // A cancel with no recorded source, reason or actor never happens:
         // refuse before touching the row.
         let provenance = match super::cancel_rpc::provenance_from_request(
-            source,
+            source.as_deref(),
             reason.as_deref(),
             actor.as_deref(),
             &rpc_cancel_actor(&server_state, &session_id, peer_pid).await,

@@ -77,7 +77,7 @@ impl WorkDb {
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let mut pending = PendingEvents::new();
         let cancelled = cancel_non_terminal_in_tx(&tx, &mut pending, &execution, &provenance)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(cancelled)
     }
 
@@ -114,7 +114,7 @@ impl WorkDb {
         // Shared with `cancel_execution_with`'s live path so the guard
         // and `last_status_actor = 'engine'` stamp cannot drift.
         let task_demoted = demote_active_if_latest_execution(&tx, &execution.work_item_id, execution_id, &now)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok((exec_cancelled, task_demoted))
     }
 
@@ -522,7 +522,7 @@ impl WorkDb {
         if n > 0 {
             cascade_dependents_after_prereq_status_change(&mut pending, &tx, work_item_id, "done", &now)?;
         }
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(n > 0)
     }
 

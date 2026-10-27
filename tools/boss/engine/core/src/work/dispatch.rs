@@ -52,7 +52,7 @@ impl WorkDb {
         let tx = conn.transaction()?;
         let mut pending = PendingEvents::new();
         let execution = request_execution_in_tx_with_live_check(&mut pending, &tx, input, is_live)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(execution)
     }
 
@@ -248,7 +248,7 @@ impl WorkDb {
                 });
             }
         }
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(healed)
     }
 
@@ -356,7 +356,7 @@ impl WorkDb {
                 });
             }
         }
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(abandoned)
     }
 
@@ -593,7 +593,7 @@ impl WorkDb {
         }
         let mut pending = PendingEvents::new();
         let execution = request_execution_in_tx_with_live_check(&mut pending, &tx, input, is_live)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(Some(execution))
     }
 
@@ -710,7 +710,7 @@ impl WorkDb {
             )?;
             redispatched.push(work_item_id);
         }
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(redispatched)
     }
 
@@ -818,7 +818,7 @@ impl WorkDb {
             )?;
             redispatched.push(work_item_id);
         }
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(redispatched)
     }
 
@@ -1716,9 +1716,7 @@ impl WorkDb {
                     &DecisionAuditContext::default(),
                 ),
             );
-            for event in pending.into_events() {
-                self.event_bus.publish(event);
-            }
+            self.flush_pending(pending);
             // No open `Transaction` here — `conn` auto-commits each
             // statement, so the UPDATE above is already durable and this
             // publish carries no rollback risk.
@@ -1876,7 +1874,7 @@ impl WorkDb {
         if task_rows > 0 {
             cascade_dependents_after_prereq_status_change(&mut pending, &tx, task_id, "in_review", &now)?;
         }
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(task_rows > 0)
     }
 

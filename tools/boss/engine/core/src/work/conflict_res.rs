@@ -471,7 +471,7 @@ impl WorkDb {
         }
         cascade_dependents_after_prereq_status_change(&mut pending, &tx, &rev.id, "archived", &now)?;
         let updated = query_task(&tx, revision_task_id)?;
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok(updated)
     }
 

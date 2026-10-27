@@ -56,7 +56,7 @@ use boss_protocol::{
     ApplyResult, CreateInvestigationInput, CreateTaskInput, PlannerOutput, ProposedEdge, ProposedTask, TaskKind,
 };
 
-use crate::event_publish::{PendingEvents, commit_and_publish};
+use crate::event_publish::PendingEvents;
 use crate::work::{
     WorkDb, add_dependency_edge_in_tx, insert_investigation_in_tx, insert_task_in_tx, now_string, query_project,
 };
@@ -163,8 +163,16 @@ impl Materializer {
 
             // Count only genuinely-new insertions so re-apply reports 0.
             let already = query_edge(&tx, dependent_id, prerequisite_id, RELATION_BLOCKS)?.is_some();
-            add_dependency_edge_in_tx(&mut pending, &tx, dependent_id, prerequisite_id, RELATION_BLOCKS, &now)
-                .with_context(|| format!("materializer: wiring edge {} -> {}", edge.dependent, edge.prerequisite))?;
+            add_dependency_edge_in_tx(
+                &mut pending,
+                &tx,
+                dependent_id,
+                prerequisite_id,
+                RELATION_BLOCKS,
+                &now,
+                &crate::work::DependencyCancelOrigin::EngineInternal,
+            )
+            .with_context(|| format!("materializer: wiring edge {} -> {}", edge.dependent, edge.prerequisite))?;
             if !already {
                 edges_created += 1;
             }
@@ -219,7 +227,7 @@ impl Materializer {
             merge_order_edges_created += 1;
         }
 
-        commit_and_publish(tx, pending, db.event_bus())?;
+        db.commit_pending(tx, pending)?;
         Ok(ApplyResult {
             created,
             skipped,

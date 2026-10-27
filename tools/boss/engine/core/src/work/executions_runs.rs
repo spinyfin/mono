@@ -27,6 +27,9 @@ pub struct CancelExecutionOpts {
     pub record_failure_reason: bool,
     /// The socket peer behind an RPC-driven cancel, for the audit record.
     pub peer_pid: Option<i32>,
+    /// `(chain_root_id, prior_status)` when this cancel is a merge-poller
+    /// parent-merge retirement. Carried into the audit / dispatch payload.
+    pub parent_pr_merge: Option<(String, String)>,
 }
 
 impl CancelExecutionOpts {
@@ -37,13 +40,26 @@ impl CancelExecutionOpts {
             queued_only: false,
             record_failure_reason: false,
             peer_pid: None,
+            parent_pr_merge: None,
         }
     }
 
+    /// Record the merge-poller parent-PR-merged context on this cancel.
+    pub fn with_parent_pr_merge(mut self, chain_root_id: impl Into<String>, prior_status: impl Into<String>) -> Self {
+        self.parent_pr_merge = Some((chain_root_id.into(), prior_status.into()));
+        self
+    }
+
     fn audit_context(&self) -> DecisionAuditContext {
+        let (chain_root_id, prior_status) = match &self.parent_pr_merge {
+            Some((chain_root_id, prior_status)) => (Some(chain_root_id.clone()), Some(prior_status.clone())),
+            None => (None, None),
+        };
         DecisionAuditContext {
             queued_only: Some(self.queued_only),
             peer_pid: self.peer_pid,
+            chain_root_id,
+            prior_status,
         }
     }
 }
@@ -99,7 +115,7 @@ impl WorkDb {
         let reason = opts.provenance.reason.clone();
         let mut pending = PendingEvents::new();
         let updated = cancel_execution_in_tx(&tx, &mut pending, execution_id, opts)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         // `connect()` is a process-wide mutex; drop it before the review-guide
         // follow-up, which needs its own connection.
         drop(conn);
@@ -219,7 +235,7 @@ impl WorkDb {
         );
         let mut pending = PendingEvents::new();
         stage_execution_terminal(&mut pending, &tx, execution_id, &updated.work_item_id)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         drop(conn);
         if existing.kind == ExecutionKind::PrReviewGuide
             && let Err(err) = self.finish_pr_review_guide_attempt_for_terminal_execution(
@@ -443,7 +459,7 @@ impl WorkDb {
         // terminal would tell every subscriber the opposite of what happened.
         // The UI refresh is the caller's job via `publish_work_item_changed`,
         // the same layer that handles it for `force_stop_execution`.
-        commit_and_publish(tx, PendingEvents::new(), &self.event_bus)?;
+        self.commit_pending(tx, PendingEvents::new())?;
         Ok((updated, liveness_age_reset))
     }
 
@@ -775,7 +791,7 @@ impl WorkDb {
             && let Some(demoted) = update_execution_status(&tx, execution_id, ExecutionStatus::WaitingDependency)?
         {
             stage_execution_status_changed(&mut pending, &demoted);
-            commit_and_publish(tx, pending, self.event_bus())?;
+            self.commit_pending(tx, pending)?;
             return Ok(DispatchClaimOutcome::Rejected);
         }
         let updated = tx.execute(
@@ -1153,7 +1169,7 @@ impl WorkDb {
             }
         }
 
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok(result)
     }
 
@@ -1773,7 +1789,7 @@ impl WorkDb {
         );
         let mut pending = PendingEvents::new();
         stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok((execution, run))
     }
 
@@ -1896,7 +1912,7 @@ impl WorkDb {
             );
             stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
         }
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         drop(conn);
         if matches!(outcome, PreStartFailureOutcome::PermanentFail)
             && execution.kind == ExecutionKind::PrReviewGuide
@@ -2067,7 +2083,7 @@ impl WorkDb {
             );
             stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
         }
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         drop(conn);
         if fail_review_guide_attempt
             && let Some(reason) = normalized_error_text.as_deref()
@@ -2145,7 +2161,7 @@ impl WorkDb {
         let updated = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let mut pending = PendingEvents::new();
         stage_execution_terminal(&mut pending, &tx, execution_id, &updated.work_item_id)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(Some(updated))
     }
 
@@ -2263,7 +2279,7 @@ impl WorkDb {
         );
         let mut pending = PendingEvents::new();
         stage_execution_terminal(&mut pending, &tx, execution_id, &updated.work_item_id)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(Some(updated))
     }
 }
@@ -2286,7 +2302,7 @@ pub(super) fn cancel_execution_in_tx(
         if existing.status.is_live() {
             bail!(
                 "execution {execution_id} is `{}` (already started); \
-                     use `bossctl agents stop {execution_id} --reason 'stop stuck worker'` to stop a live worker — \
+                     use `bossctl agents stop {execution_id} --reason '<why this worker must stop>'` to stop a live worker — \
                      `executions cancel` only accepts never-started \
                      (queued/ready/waiting_dependency/claimed) rows",
                 existing.status
@@ -2295,7 +2311,7 @@ pub(super) fn cancel_execution_in_tx(
         bail!(
             "execution {execution_id} is `{}` and has already left the \
                  never-started set (queued/ready/waiting_dependency/claimed); \
-                 use `bossctl work cancel {execution_id} --reason 'stop stuck worker'` for any non-terminal \
+                 use `bossctl work cancel {execution_id} --reason '<why this worker must stop>'` for any non-terminal \
                  row, or `bossctl agents stop` if a live worker still backs it",
             existing.status
         );

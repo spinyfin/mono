@@ -355,7 +355,7 @@ impl WorkDb {
         }
         let attempt =
             query_pr_review_guide_attempt(&tx, &attempt_id).require("pr_review_guide_attempt", &attempt_id)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok((attempt, true))
     }
 

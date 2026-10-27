@@ -433,6 +433,11 @@ impl WorkDb {
         if version < 38 {
             tx.execute_batch("ALTER TABLE work_executions ADD COLUMN dispatch_wait_blocker_id TEXT")?;
         }
+        // Schema 39 (and 43) re-arm by cancelling shadowed executions, which
+        // reads and writes cancel_source/actor/reason. Those columns land in
+        // schema 56; add them first so a database at the compatibility floor
+        // (32–38) can open. Idempotent via table_has_column.
+        ensure_cancel_provenance_columns(&tx)?;
         if version < 39 {
             // Data only: restart items blocked by the false ancestry failure.
             execution_recovery_rearm::migrate(&tx, execution_recovery_rearm::is_false_not_descended_blocker)?;
@@ -449,7 +454,6 @@ impl WorkDb {
         if version < 43 {
             tx.execute_batch(EXECUTION_BOOKMARK_COLUMNS_43)?;
             // Restart items wedged by baseline loss or diverged pointers.
-            ensure_cancel_provenance_columns(&tx)?;
             execution_recovery_rearm::migrate(
                 &tx,
                 boss_engine_recovery::execution_bookmark::is_legacy_reconcilable_blocker,
@@ -631,6 +635,7 @@ impl WorkDb {
             conn: Arc::new(Mutex::new(conn)),
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
+            dispatch_events: Arc::new(crate::dispatch_events::NoopDispatchEventSink),
             persona_metrics: super::personas::new_metrics_registry(),
         })
     }
@@ -661,6 +666,7 @@ impl WorkDb {
             conn: Arc::new(Mutex::new(conn)),
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
+            dispatch_events: Arc::new(crate::dispatch_events::NoopDispatchEventSink),
             persona_metrics: super::personas::new_metrics_registry(),
         })
     }
@@ -907,9 +913,9 @@ mod tests {
 }
 
 /// Add the schema-56 `cancel_*` columns unless they are already there. The
-/// schema-43 recovery re-arm cancels executions while migrating an older
-/// database, before step 56 would add them, so it calls this first; step 56
-/// calls it again and finds nothing left to do.
+/// schema-39 and schema-43 recovery re-arms cancel executions while migrating
+/// an older database, before step 56 would add them, so `init` calls this
+/// before those steps; step 56 calls it again and finds nothing left to do.
 pub(crate) fn ensure_cancel_provenance_columns(conn: &Connection) -> Result<()> {
     if !table_has_column(conn, "work_executions", "cancel_source")? {
         conn.execute_batch(EXECUTIONS_CANCEL_PROVENANCE_56)?;

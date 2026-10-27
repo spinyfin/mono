@@ -143,7 +143,7 @@ pub(super) fn prioritize_conflict_revision(
         // Read-only reviews may still be attached to this row. They do not
         // own the branch and must not be cancelled by the task-status helper.
         if can_change && query_live_execution_for_work_item(conn, id)?.is_none() {
-            maybe_engine_block_dependent(pending, conn, id, now)?;
+            maybe_engine_block_dependent(pending, conn, id, now, &DependencyCancelOrigin::EngineInternal)?;
         }
         // Demote existing ready rows atomically; never mint a replacement
         // execution for a failed/parked revision merely because we reordered it.
@@ -162,7 +162,7 @@ pub(super) fn prioritize_conflict_revision(
             }
         }
     }
-    maybe_engine_block_dependent(pending, conn, revision_id, now)?;
+    maybe_engine_block_dependent(pending, conn, revision_id, now, &DependencyCancelOrigin::EngineInternal)?;
     Ok(())
 }
 

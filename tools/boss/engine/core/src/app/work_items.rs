@@ -508,7 +508,7 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
     if let Some(claim) = cancel {
         let observed = rpc_cancel_actor(&ctx.server_state, &ctx.session_id, ctx.peer_pid).await;
         match super::cancel_rpc::provenance_from_request(
-            Some(claim.source),
+            Some(claim.source.as_str()),
             Some(&claim.reason),
             Some(&claim.actor),
             &observed,
@@ -716,15 +716,17 @@ pub(super) async fn apply_work_item_patch(
         // projects have no execution lifecycle.
         let previous_task_status = task_status_for_id(&work_db, &id);
         let cancel_provenance = patch.cancel_provenance.clone();
-        let can_end_execution = (patch.status.as_deref() == Some("todo")
-            && previous_task_status == Some(TaskStatus::Active))
+        let active_to_todo_live = patch.status.as_deref() == Some("todo")
+            && live_execution_for_active_card(&work_db, &previous_task_status, &id).is_some();
+        let can_end_execution = active_to_todo_live
             || patch.deferred == Some(true)
             || matches!(patch.status.as_deref(), Some("done" | "archived"));
         if can_end_execution
             && cancel_provenance.is_none()
-            && work_db
-                .list_executions(Some(&id))
-                .is_ok_and(|rows| rows.iter().any(|e| !e.status.is_terminal()))
+            && (active_to_todo_live
+                || work_db
+                    .list_executions(Some(&id))
+                    .is_ok_and(|rows| rows.iter().any(|e| !e.status.is_terminal())))
         {
             send_work_error(
                 &sink,
@@ -888,15 +890,26 @@ pub(super) async fn apply_work_item_patch(
                 // autostart was cleared to 0 when the task first
                 // entered Doing, so it will not be re-dispatched.
                 if let Some(execution_id) = active_to_todo_execution(&work_db, &previous_task_status, &item) {
-                    let handler = server_state.completion_handler.clone();
-                    let id_for_cancel = id.clone();
-                    let mut provenance = cancel_provenance.clone().expect("validated cancellation context");
-                    provenance.reason = format!("work item {id} moved from active to todo; {}", provenance.reason);
-                    boss_task_scope::spawn(async move {
-                        handler
-                            .cancel_and_release(&id_for_cancel, &execution_id, provenance)
-                            .await;
-                    });
+                    match cancel_provenance.clone() {
+                        Some(mut provenance) => {
+                            let handler = server_state.completion_handler.clone();
+                            let id_for_cancel = id.clone();
+                            provenance.reason =
+                                format!("work item {id} moved from active to todo; {}", provenance.reason);
+                            boss_task_scope::spawn(async move {
+                                handler
+                                    .cancel_and_release(&id_for_cancel, &execution_id, provenance)
+                                    .await;
+                            });
+                        }
+                        None => {
+                            tracing::warn!(
+                                work_item_id = %id,
+                                execution_id,
+                                "active→todo teardown found a live execution without cancel provenance; skipping cancel"
+                            );
+                        }
+                    }
                 }
                 // Kanban drop-into-Doing (and any other human
                 // path that flips a task/chore to `active` via
@@ -1274,7 +1287,7 @@ pub(super) async fn handle_delete_work_item(ctx: Dispatch, req: FrontendRequest)
     };
     let observed = rpc_cancel_actor(&server_state, &session_id, peer_pid).await;
     let provenance = match super::cancel_rpc::provenance_from_request(
-        Some(claim.source),
+        Some(claim.source.as_str()),
         Some(&claim.reason),
         Some(&claim.actor),
         &observed,
@@ -1312,7 +1325,11 @@ pub(super) async fn handle_delete_work_item(ctx: Dispatch, req: FrontendRequest)
                     };
                     let handler = server_state.completion_handler.clone();
                     let id_for_cancel = tombstoned_id.clone();
-                    let provenance = provenance.clone();
+                    let mut provenance = provenance.clone();
+                    provenance.reason = format!(
+                        "work item {tombstoned_id} cascade-deleted with {id} while a worker was active; {}",
+                        provenance.reason
+                    );
                     boss_task_scope::spawn(async move {
                         handler
                             .cancel_and_release(&id_for_cancel, &execution_id, provenance)

@@ -1986,11 +1986,14 @@ fn blocking_a_running_dependent_cancels_its_execution() {
 
     // The gating edge lands while the worker is running.
     let (edge, reaped) = db
-        .add_dependency_with_worker_reconcile(AddDependencyInput {
-            dependent: dependent.id.clone(),
-            prerequisite: prereq.id.clone(),
-            relation: None,
-        })
+        .add_dependency_with_worker_reconcile(
+            AddDependencyInput {
+                dependent: dependent.id.clone(),
+                prerequisite: prereq.id.clone(),
+                relation: None,
+            },
+            crate::work::DependencyCancelOrigin::EngineInternal,
+        )
         .unwrap();
     assert_eq!(edge.dependent_id, dependent.id);
 
@@ -2062,11 +2065,14 @@ async fn blocking_a_running_dependent_publishes_execution_terminal() {
     ));
 
     let (_edge, reaped) = db
-        .add_dependency_with_worker_reconcile(AddDependencyInput {
-            dependent: dependent.id.clone(),
-            prerequisite: prereq.id.clone(),
-            relation: None,
-        })
+        .add_dependency_with_worker_reconcile(
+            AddDependencyInput {
+                dependent: dependent.id.clone(),
+                prerequisite: prereq.id.clone(),
+                relation: None,
+            },
+            crate::work::DependencyCancelOrigin::EngineInternal,
+        )
         .unwrap();
     let reaped = reaped.expect("blocking a running dependent must report the cancelled execution");
 

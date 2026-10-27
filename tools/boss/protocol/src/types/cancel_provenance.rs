@@ -29,12 +29,21 @@ pub enum CancelSource {
     BossCli,
     /// A `bossctl` verb (the coordinator's operator surface).
     Bossctl,
-    /// `UpdateWorkItem` moved an `active` card back to Backlog (the kanban
-    /// drag), tearing down its live worker.
+    /// Historical spelling written by earlier engines when a kanban drag
+    /// moved an `active` card back to Backlog. Current writes use the
+    /// client surface (`app` / `boss_cli` / `bossctl`) and prefix the
+    /// engine cause onto the client reason. Accepted when reading stored
+    /// rows.
     WorkItemMovedToBacklog,
-    /// `DeleteWorkItem` tombstoned a task that still had a live worker.
+    /// Historical spelling written by earlier engines when `DeleteWorkItem`
+    /// tombstoned a task that still had a live worker. Current writes use
+    /// the client surface and prefix the cascade cause onto the client
+    /// reason. Accepted when reading stored rows.
     WorkItemDeleted,
+    /// Historical spelling written by earlier engines when
     /// `UnpopulateProject` deleted a task that still had a live worker.
+    /// Current writes use the client surface and prefix the unpopulate
+    /// cause onto the client reason. Accepted when reading stored rows.
     ProjectUnpopulated,
     /// A `blocks` dependency edge landed on an actively-running dependent.
     DependencyBlock,

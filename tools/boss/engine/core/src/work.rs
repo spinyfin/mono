@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use boss_event_bus::{Event, EventBus};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
-use crate::event_publish::{PendingEvents, commit_and_publish};
+use crate::event_publish::PendingEvents;
 
 /// How long sqlite will internally retry on `SQLITE_BUSY` before
 /// surfacing the error to the caller. We funnel concurrent CLI writes
@@ -600,7 +600,17 @@ pub struct WorkDb {
     /// it via [`Self::with_event_bus`] so every clone shares the one
     /// instance subscribers attach to.
     event_bus: Arc<EventBus>,
+    /// Durable dispatch-event sink written post-commit next to the audit
+    /// log, so cancel provenance is not lost when the in-process bus
+    /// mailbox fills. Defaults to a no-op; production injects the JSONL
+    /// sink via [`Self::with_dispatch_events`].
+    #[builder(default = default_dispatch_events())]
+    dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink>,
     persona_metrics: Arc<crate::metrics::Registry>,
+}
+
+fn default_dispatch_events() -> Arc<dyn crate::dispatch_events::DispatchEventSink> {
+    Arc::new(crate::dispatch_events::NoopDispatchEventSink)
 }
 
 impl Clone for WorkDb {
@@ -611,6 +621,7 @@ impl Clone for WorkDb {
             conn: Arc::clone(&self.conn),
             boothby_action: Arc::clone(&self.boothby_action),
             event_bus: Arc::clone(&self.event_bus),
+            dispatch_events: Arc::clone(&self.dispatch_events),
             persona_metrics: Arc::clone(&self.persona_metrics),
         }
     }

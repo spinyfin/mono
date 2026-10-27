@@ -236,7 +236,7 @@ impl WorkDb {
         let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let updated_task = query_task(&tx, &work_item_id).require("task", &work_item_id)?;
         stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(Some(WorkerPrCompletion {
             execution: updated_execution,
             work_item: task_to_item(updated_task),
@@ -460,7 +460,7 @@ impl WorkDb {
         let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let updated_task = query_task(&tx, &work_item_id).require("task", &work_item_id)?;
         stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(Some(WorkerPrCompletion {
             execution: updated_execution,
             work_item: task_to_item(updated_task),
@@ -642,7 +642,7 @@ impl WorkDb {
         let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let mut pending = PendingEvents::new();
         stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(Some(WorkerFailureCompletion {
             execution: updated_execution,
             work_item: task.map(task_to_item),
@@ -1376,7 +1376,7 @@ impl WorkDb {
         comments::reconcile_comments_for_task(&tx, &task.id, comments::CommentReconcileOutcome::Resolved, &now)?;
         let updated =
             query_task(&tx, work_item_id)?.with_context(|| format!("unknown task after update: {work_item_id}"))?;
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok(Some(updated))
     }
 
@@ -1458,7 +1458,7 @@ impl WorkDb {
         block_pending_revisions_on_parent_close(&mut pending, &tx, &task.id, &now)?;
         let updated =
             query_task(&tx, work_item_id)?.with_context(|| format!("unknown task after update: {work_item_id}"))?;
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok(Some(updated))
     }
 
@@ -2308,7 +2308,7 @@ impl WorkDb {
 
         let mut updated = query_task(&tx, &task.id).require("task", &task.id)?;
         project_for_work_item_updated(&tx, &mut updated, "answer_operator_question");
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(OperatorAnswerOutcome {
             item: task_to_item(updated),
             minted_execution,

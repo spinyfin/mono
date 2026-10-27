@@ -151,6 +151,10 @@ mod tests {
         ALTER TABLE execution_bookmarks DROP COLUMN retired_at;
         ALTER TABLE execution_bookmarks DROP COLUMN retired_reason;
         ALTER TABLE tasks DROP COLUMN pr_updated_at;
+        DROP TRIGGER IF EXISTS work_executions_decision_requires_provenance;
+        ALTER TABLE work_executions DROP COLUMN cancel_source;
+        ALTER TABLE work_executions DROP COLUMN cancel_actor;
+        ALTER TABLE work_executions DROP COLUMN cancel_reason;
         UPDATE metadata SET value = '38' WHERE key = 'schema_version';";
 
     /// Undo later schema steps so reopening replays the schema 43 re-arm.
@@ -160,6 +164,10 @@ mod tests {
         ALTER TABLE execution_bookmarks DROP COLUMN retired_at;
         ALTER TABLE execution_bookmarks DROP COLUMN retired_reason;
         ALTER TABLE tasks DROP COLUMN pr_updated_at;
+        DROP TRIGGER IF EXISTS work_executions_decision_requires_provenance;
+        ALTER TABLE work_executions DROP COLUMN cancel_source;
+        ALTER TABLE work_executions DROP COLUMN cancel_actor;
+        ALTER TABLE work_executions DROP COLUMN cancel_reason;
         UPDATE metadata SET value = '42' WHERE key = 'schema_version';";
 
     /// Create a chore under a fresh product and park it the way the

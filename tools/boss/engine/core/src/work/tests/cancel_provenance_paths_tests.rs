@@ -113,11 +113,14 @@ fn blocking_a_running_dependent_records_dependency_block_provenance() {
     .unwrap();
 
     let (_, reaped) = db
-        .add_dependency_with_worker_reconcile(AddDependencyInput {
-            dependent: dependent.id.clone(),
-            prerequisite: prereq.id.clone(),
-            relation: None,
-        })
+        .add_dependency_with_worker_reconcile(
+            AddDependencyInput {
+                dependent: dependent.id.clone(),
+                prerequisite: prereq.id.clone(),
+                relation: None,
+            },
+            crate::work::DependencyCancelOrigin::EngineInternal,
+        )
         .unwrap();
     let reaped = reaped.expect("blocking a running dependent must cancel its execution");
     let provenance = reaped.cancel_provenance.expect("block-cancel stamps provenance");

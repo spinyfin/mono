@@ -933,14 +933,14 @@ pub(crate) async fn stop_active_revision_executions(
             "merge_poller",
             format!("parent PR of chain root {chain_root_id} merged, so this revision execution is obsolete"),
         );
-        let cancel_result =
-            work_db.cancel_execution_with(&execution.id, crate::work::CancelExecutionOpts::new(provenance.clone()));
+        let cancel_result = work_db.cancel_execution_with(
+            &execution.id,
+            crate::work::CancelExecutionOpts::new(provenance.clone())
+                .with_parent_pr_merge(chain_root_id, prior_status.as_str()),
+        );
         match &cancel_result {
-            Ok(cancelled) => {
+            Ok(_cancelled) => {
                 outcome.revision_invalidated += 1;
-                handler
-                    .record_parent_pr_merge_cancellation(cancelled, prior_status, chain_root_id, &provenance)
-                    .await;
             }
             Err(err) => {
                 // The execution may have already moved to a terminal state

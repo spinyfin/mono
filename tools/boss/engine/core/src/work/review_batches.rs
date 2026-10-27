@@ -20,8 +20,8 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehav
 
 use super::{
     CreateExecutionInput, DeadPrReviewCandidate, DecisionAuditContext, DoomedExecution, PendingEvents, WorkDb,
-    WorkExecution, capture_doomed, commit_and_publish, existing_nonterminal_pr_review_execution, insert_execution,
-    next_id, now_string, query_execution, stage_decision_terminal,
+    WorkExecution, capture_doomed, existing_nonterminal_pr_review_execution, insert_execution, next_id, now_string,
+    query_execution, stage_decision_terminal,
 };
 
 /// Inputs used to freeze an immutable review target before any member starts.
@@ -2125,7 +2125,7 @@ impl WorkDb {
                         .build(),
                 )?;
             }
-            commit_and_publish(tx, pending, &self.event_bus)?;
+            self.commit_pending(tx, pending)?;
             reaped.push(batch_id);
         }
         Ok(reaped)

@@ -1962,6 +1962,7 @@ fn cancel_execution_queued_only_accepts_ready_refuses_running() {
                 queued_only: true,
                 record_failure_reason: false,
                 peer_pid: None,
+                parent_pr_merge: None,
             },
         )
         .unwrap();
@@ -1985,6 +1986,7 @@ fn cancel_execution_queued_only_accepts_ready_refuses_running() {
                 queued_only: true,
                 record_failure_reason: true,
                 peer_pid: None,
+                parent_pr_merge: None,
             },
         )
         .unwrap();
@@ -2015,6 +2017,7 @@ fn cancel_execution_queued_only_accepts_ready_refuses_running() {
                 queued_only: true,
                 record_failure_reason: false,
                 peer_pid: None,
+                parent_pr_merge: None,
             },
         )
         .unwrap_err()

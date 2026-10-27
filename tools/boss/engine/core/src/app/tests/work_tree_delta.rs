@@ -621,7 +621,14 @@ async fn unpopulate_records_caller_for_cascade_deleted_live_revision() {
                 assert_eq!(provenance.source, boss_protocol::CancelSource::BossCli);
                 assert!(provenance.actor.contains("session operator-session"));
                 assert!(provenance.actor.contains("client claims operator"));
-                assert_eq!(provenance.reason, "discard incorrect plan");
+                assert!(
+                    provenance.reason.contains("cascade-deleted")
+                        && provenance.reason.contains("while unpopulating project")
+                        && provenance.reason.contains("planner run")
+                        && provenance.reason.contains("discard incorrect plan"),
+                    "unpopulate must prefix the planner-run cause, got {}",
+                    provenance.reason
+                );
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
