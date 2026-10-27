@@ -154,7 +154,6 @@ pub(super) async fn handle_get_pr_status(ctx: Dispatch, req: FrontendRequest) {
         server_state,
         work_db,
         sink,
-        session_id,
         request_id,
         peer_pid,
         ..
@@ -342,23 +341,19 @@ pub(super) async fn handle_get_pr_status(ctx: Dispatch, req: FrontendRequest) {
         Ok(true) => {
             // The observation moved a column the Review-column classifier
             // (`classify_review_section`) or the merge poller's changed-guard
-            // reads. The board only re-reads a card when it is told to, and
-            // the poller's next sweep will diff its probe against the row
-            // just written and find nothing new to announce — so this is the
-            // only place the invalidation can come from. Without it the card
-            // stays wherever the last published state put it (typically
-            // Pending, with mergeability still "unknown") while the engine
-            // classifies it Ready.
-            publish_work_invalidation(
-                &server_state,
-                &session_id,
-                &request_id,
-                vec![work_product_topic(&task.product_id)],
-                PR_STATUS_REFRESHED_REASON,
-                Some(task.product_id.clone()),
-                vec![effective.status_task_id.clone()],
-            )
-            .await;
+            // reads. The poller's next sweep will diff its probe against the
+            // row just written and find nothing new to announce, so this is
+            // the only place the invalidation can come from. Without it the
+            // app keeps the section it was last sent (typically Pending, with
+            // mergeability still "unknown") until some unrelated invalidation
+            // on the product topic triggers a tree refetch, while the engine
+            // classifies the card Ready. Published through the poller's own
+            // publisher: a read-oriented refresh must not run the
+            // frontend-mutation reconcile or kick the scheduler.
+            server_state
+                .publisher
+                .publish_work_item_changed(&task.product_id, &effective.status_task_id, PR_STATUS_REFRESHED_REASON)
+                .await;
         }
         Ok(false) => {}
         Err(err) => {

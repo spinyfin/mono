@@ -157,7 +157,7 @@ async fn clean_verdict_advances_the_origin_to_review_without_a_revision() {
     bind_open_pr(&db, &cycle_root.id);
     let publisher = std::sync::Arc::new(crate::test_support::RecordingPublisher::default());
     let notifications =
-        crate::review_verdict_apply_sweep::spawn_notifications(db.event_bus().clone(), publisher.clone());
+        crate::board_notification_bridge::spawn_notifications(db.event_bus().clone(), publisher.clone());
     let supervisor = db
         .create_execution(
             CreateExecutionInput::builder()

@@ -1405,4 +1405,41 @@ mod tests {
         let unique: std::collections::HashSet<_> = TaskKind::ALL.iter().collect();
         assert_eq!(unique.len(), TaskKind::ALL.len(), "TaskKind::ALL has a duplicate entry");
     }
+
+    fn bare_task() -> Task {
+        Task::builder()
+            .id("task_1")
+            .product_id("prod_1")
+            .kind(TaskKind::Chore)
+            .name("n")
+            .description("")
+            .status(TaskStatus::InReview)
+            .created_at("")
+            .updated_at("")
+            .build()
+    }
+
+    /// The macOS client tells an engine that predates `review_section` (key
+    /// absent) from a section-aware engine that sent a Review card with no
+    /// section (key `null`) by the key's presence. Re-adding
+    /// `skip_serializing_if` here would make every sectionless Review card
+    /// look like it came from an old engine and silence the client's defect
+    /// report.
+    #[test]
+    fn review_section_key_is_always_serialized() {
+        let mut task = bare_task();
+        task.review_section = None;
+        let value = serde_json::to_value(&task).unwrap();
+        assert_eq!(
+            value.as_object().unwrap().get("review_section"),
+            Some(&serde_json::Value::Null),
+            "a non-Review row must serialize review_section as null, not omit it",
+        );
+
+        task.review_section = Some(ReviewSection::Ready);
+        let value = serde_json::to_value(&task).unwrap();
+        assert_eq!(value["review_section"], serde_json::json!("ready"));
+        let back: Task = serde_json::from_value(value).unwrap();
+        assert_eq!(back.review_section, Some(ReviewSection::Ready));
+    }
 }

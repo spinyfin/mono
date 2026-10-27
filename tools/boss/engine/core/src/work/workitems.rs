@@ -1304,6 +1304,11 @@ impl WorkDb {
                 // revision, attachments, AI-review, ready-for-review, R-seq).
                 // Without this, WorkItemUpdated from a same-column drop would
                 // ship mapper zeros and the client would treat them as truth.
+                // Unlike `project_for_work_item_updated` (best-effort, for
+                // mutation replies whose write already committed), this read
+                // path propagates a projection failure: a read has no
+                // committed write to protect, so an error beats serving a row
+                // the client would take for truth.
                 attach_task_derived_projections(&conn, &mut task)?;
                 Ok(task_to_item(task))
             }
