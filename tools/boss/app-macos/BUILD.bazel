@@ -147,8 +147,8 @@ sh_test(
 # enough slack that a slow sample still finishes. Isolated uncached in this
 # workspace after the Chrome split (`bazel test --nocache_test_results
 # --test_verbose_timeout_warnings`, PASSED-in test action wall, three
-# consecutive runs): Chrome 2.9 / 2.9 / 2.9 s, Render 6.7 / 6.3 / 6.0 s,
-# Shard3 4.7 / 4.8 / 4.7 s. Slowest sample 6.7 s (Render first run), about
+# consecutive runs): Chrome 3.5 / 3.1 / 3.8 s, Render 6.5 / 6.2 / 6.3 s,
+# Shard3 4.9 / 4.8 / 5.3 s. Slowest sample 6.5 s (Render first run), about
 # 9× under the 60 s budget. That is the measured headroom, not a
 # half-budget cap.
 #
