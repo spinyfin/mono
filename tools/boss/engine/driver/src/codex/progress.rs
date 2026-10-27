@@ -382,6 +382,18 @@ impl CodexRolloutProgressSession {
                     // Benign bookkeeping envelope: per-turn token accounting,
                     // no progress or lifecycle signal to report.
                     "token_count" => Ok(Vec::new()),
+                    "agent_message" | "agent_reasoning" => {
+                        let has_output = payload
+                            .get("message")
+                            .or_else(|| payload.get("text"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.is_empty());
+                        Ok(if has_output {
+                            vec![WorkerEvent::ModelProgress { session_id }]
+                        } else {
+                            Vec::new()
+                        })
+                    }
                     _ => Err(NormalizeError::UnknownEvent(format!("event_msg/{event_type}"))),
                 }
             }
@@ -391,6 +403,30 @@ impl CodexRolloutProgressSession {
                     .and_then(Value::as_str)
                     .ok_or(NormalizeError::MissingField("payload.type"))?;
                 let session_id = self.session_id()?;
+                // Current rollouts carry model output as response items;
+                // older versions also emitted the event_msg forms above.
+                let model_message = item_type == "message"
+                    && payload.get("role").and_then(Value::as_str) == Some("assistant")
+                    && payload.get("content").and_then(Value::as_array).is_some_and(|blocks| {
+                        blocks.iter().any(|block| {
+                            block
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .is_some_and(|text| !text.is_empty())
+                        })
+                    });
+                let model_reasoning = item_type == "reasoning"
+                    && (payload
+                        .get("encrypted_content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+                        || payload
+                            .get("summary")
+                            .and_then(Value::as_array)
+                            .is_some_and(|summary| !summary.is_empty()));
+                if model_message || model_reasoning {
+                    return Ok(vec![WorkerEvent::ModelProgress { session_id }]);
+                }
                 if let Some((call_id, call)) = canonical_rollout_tool_call(item_type, payload) {
                     let session_id_for_failure = session_id.clone();
                     let event = WorkerEvent::PreToolUse {
@@ -2424,6 +2460,63 @@ mod tests {
                 .as_deref(),
             Some("/tmp/rollout-0160.jsonl")
         );
+    }
+
+    #[test]
+    fn model_output_is_progress_but_usage_retries_and_background_exits_are_not() {
+        let mut session = CodexRolloutProgressSession::new(Some("run-progress".into()), None, None);
+        session
+            .normalize_progress_events(&json!({
+                "type": "session_meta", "payload": {"id": "thread-progress"}
+            }))
+            .unwrap();
+        for payload in [
+            json!({"type": "agent_message", "message": "Working on the fix"}),
+            json!({"type": "agent_reasoning", "text": "Consider the pending request"}),
+        ] {
+            let events = session
+                .normalize_progress_events(&json!({"type": "event_msg", "payload": payload}))
+                .unwrap();
+            assert!(matches!(events.as_slice(), [WorkerEvent::ModelProgress { .. }]));
+        }
+        for payload in [
+            json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Working"}]}),
+            json!({"type": "reasoning", "encrypted_content": "opaque-model-output", "summary": []}),
+            json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": "Reasoning"}]}),
+        ] {
+            let events = session
+                .normalize_progress_events(&json!({"type": "response_item", "payload": payload}))
+                .unwrap();
+            assert!(matches!(events.as_slice(), [WorkerEvent::ModelProgress { .. }]));
+        }
+        for payload in [
+            json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Initial prompt"}]}),
+            json!({"type": "message", "role": "assistant", "content": []}),
+            json!({"type": "reasoning", "summary": [], "encrypted_content": null}),
+        ] {
+            assert!(matches!(
+                session.normalize_progress_events(&json!({"type": "response_item", "payload": payload})),
+                Err(NormalizeError::UnknownEvent(_))
+            ));
+        }
+        for payload in [
+            json!({"type": "token_count", "info": {"total_token_usage": {"output_tokens": 10}}}),
+            json!({"type": "token_count", "info": {"total_token_usage": {"output_tokens": 10}}}),
+            json!({"type": "agent_message", "message": ""}),
+        ] {
+            assert!(
+                session
+                    .normalize_progress_events(&json!({"type": "event_msg", "payload": payload}))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(matches!(
+            session.normalize_progress_events(&json!({
+                "type": "event_msg", "payload": {"type": "background_terminal_exit", "exit_code": 0}
+            })),
+            Err(NormalizeError::UnknownEvent(_))
+        ));
     }
 
     #[test]

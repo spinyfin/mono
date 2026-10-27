@@ -371,7 +371,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
             // fallback chrome.
             if let label = snapshot.statusPillLabel {
                 // Normal work needs no extra badge beside the agent kind.
-                if snapshot.isPlaceholder || snapshot.live?.activity != .working || snapshot.live?.isWaitingOnJob == true {
+                if snapshot.showsStatusPill {
                     statusPill(label, color: snapshot.isPlaceholder ? .secondary : liveActivityColor(snapshot.live))
                 }
             } else if let session = snapshot.session {
@@ -414,6 +414,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
 
     private func liveActivityColor(_ live: WorkerSlotLiveSlice?) -> Color {
         if live?.isWaitingOnJob == true { return .secondary }
+        if live?.hungSince != nil { return .orange }
         switch live?.activity {
         case .working: return .blue
         case .waitingForInput: return .orange
@@ -471,6 +472,10 @@ struct WorkerSlotView: View, @MainActor Equatable {
             Text("Exited")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+        } else if snapshot.live?.hungSince != nil {
+            Label("Hung — inspect or restart worker", systemImage: "hourglass")
+                .font(.caption2)
+                .foregroundStyle(.orange)
         } else if let recovering = snapshot.live?.recoveryStatus,
            !recovering.isEmpty
         {

@@ -18,6 +18,10 @@ use thiserror::Error;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkerEvent {
+    /// Actual model output, excluding usage bookkeeping and retries.
+    ModelProgress {
+        session_id: String,
+    },
     SessionStart {
         session_id: String,
         source: SessionStartSource,

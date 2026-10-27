@@ -154,7 +154,10 @@ pub fn tool_condition_signal(event: &WorkerEvent) -> Option<SemanticToolConditio
         WorkerEvent::PostToolUse { .. } | WorkerEvent::UserPromptSubmit { .. } | WorkerEvent::Stop { .. } => {
             Some(SemanticToolCondition::Idle)
         }
-        WorkerEvent::SessionStart { .. } | WorkerEvent::SessionEnd { .. } | WorkerEvent::Notification { .. } => None,
+        WorkerEvent::ModelProgress { .. }
+        | WorkerEvent::SessionStart { .. }
+        | WorkerEvent::SessionEnd { .. }
+        | WorkerEvent::Notification { .. } => None,
     }
 }
 
@@ -179,7 +182,10 @@ pub fn turn_condition_signal(event: &WorkerEvent) -> Option<SemanticTurnConditio
             Some(SemanticTurnCondition::InTurn)
         }
         WorkerEvent::Stop { .. } => Some(SemanticTurnCondition::Ended),
-        WorkerEvent::SessionStart { .. } | WorkerEvent::SessionEnd { .. } | WorkerEvent::Notification { .. } => None,
+        WorkerEvent::ModelProgress { .. }
+        | WorkerEvent::SessionStart { .. }
+        | WorkerEvent::SessionEnd { .. }
+        | WorkerEvent::Notification { .. } => None,
     }
 }
 

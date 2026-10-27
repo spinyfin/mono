@@ -2499,6 +2499,7 @@ async fn serve_scoped(
         let server_clone = Arc::clone(&server_state);
         boss_task_scope::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
+            let mut hung_workers = std::collections::HashMap::new();
             loop {
                 interval.tick().await;
                 let now = boss_engine_utils::epoch_time::now_epoch_secs();
@@ -2535,7 +2536,8 @@ async fn serve_scoped(
                          (last_event_at aged out — events stream silent after at least one hook)",
                     );
                 }
-                if !stalled.is_empty() || !downgraded.is_empty() {
+                let hung_changed = server_clone.refresh_hung_workers(&mut hung_workers);
+                if !stalled.is_empty() || !downgraded.is_empty() || hung_changed {
                     server_clone.broadcast_live_worker_states().await;
                 }
             }

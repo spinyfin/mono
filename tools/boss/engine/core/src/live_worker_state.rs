@@ -1896,6 +1896,7 @@ impl LiveWorkerStateRegistry {
                 // turn boundary. Worker may chain multiple tools.
                 state.activity = WorkerActivity::Working;
             }
+            WorkerEvent::ModelProgress { .. } => {}
             WorkerEvent::Notification { .. } => {
                 // Only trust this as an "awaiting human input" signal when
                 // the run's driver declared `Capability::AwaitingInputSignal`
@@ -2459,7 +2460,7 @@ fn record_turn_progress(
             meta.open_turn_boundary = Some(TurnBoundary { seq });
             None
         }
-        WorkerEvent::SessionEnd { .. } => None,
+        WorkerEvent::ModelProgress { .. } | WorkerEvent::SessionEnd { .. } => None,
         WorkerEvent::UserPromptSubmit { .. } | WorkerEvent::PreToolUse { .. } | WorkerEvent::PostToolUse { .. } => {
             if origin.from_subagent {
                 return None;
@@ -2496,6 +2497,7 @@ fn reconcile_late_event(
             meta.open_turn_boundary = Some(TurnBoundary { seq: Some(newest) });
             (None, repaired)
         }
+        WorkerEvent::ModelProgress { .. } => (None, false),
         WorkerEvent::SessionEnd { .. } => (None, consume_late_notification(state, meta, seq)),
         WorkerEvent::Notification { .. } if meta.awaiting_input_capable => {
             match meta
@@ -2589,6 +2591,7 @@ fn worker_event_name(event: &WorkerEvent) -> &'static str {
         WorkerEvent::PostToolUse { .. } => "PostToolUse",
         WorkerEvent::Stop { .. } => "Stop",
         WorkerEvent::Notification { .. } => "Notification",
+        WorkerEvent::ModelProgress { .. } => "ModelProgress",
         WorkerEvent::SessionEnd { .. } => "SessionEnd",
     }
 }

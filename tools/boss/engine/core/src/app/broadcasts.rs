@@ -10,6 +10,73 @@
 use super::*;
 
 impl ServerState {
+    /// Reconcile warning transitions without changing execution or tool state.
+    pub(super) fn refresh_hung_workers(
+        &self,
+        previous: &mut std::collections::HashMap<String, (String, Option<String>)>,
+    ) -> bool {
+        let current: std::collections::HashMap<_, _> = self
+            .live_worker_states_snapshot()
+            .into_iter()
+            .filter_map(|state| Some((state.run_id, (state.work_item_id?, state.hung_since))))
+            .collect();
+        if *previous == current {
+            return false;
+        }
+        let mut persisted = true;
+        for (run, (work_item, since)) in &current {
+            if previous.get(run) == Some(&(work_item.clone(), since.clone())) {
+                continue;
+            }
+            let owner = self.work_db.owning_work_item_id(work_item);
+            let Some(since) = since else {
+                if current
+                    .values()
+                    .any(|(item, since)| since.is_some() && self.work_db.owning_work_item_id(item) == owner)
+                {
+                    continue;
+                }
+                if let Err(error) = self.work_db.resolve_external_tracker_attention(&owner, "hung_worker") {
+                    persisted = false;
+                    tracing::warn!(run, ?error, "failed to resolve hung-worker warning");
+                }
+                continue;
+            };
+            let body = format!(
+                "Driver has made no observable progress since {since}, with no tool in flight or declared wait. This is a suspected hang, not a confirmed failure: provider retries can recover. Inspect the worker and interrupt or restart it if needed. Boss has not killed it. Execution: `{run}`."
+            );
+            if let Err(error) = self.work_db.upsert_external_tracker_attention(
+                &owner,
+                "hung_worker",
+                "Worker hung; inspect or restart",
+                &body,
+            ) {
+                persisted = false;
+                tracing::warn!(run, ?error, "failed to raise hung-worker warning");
+            }
+        }
+        for (run, (work_item, _)) in previous.iter() {
+            if current.contains_key(run) {
+                continue;
+            }
+            let owner = self.work_db.owning_work_item_id(work_item);
+            if current
+                .values()
+                .any(|(item, since)| since.is_some() && self.work_db.owning_work_item_id(item) == owner)
+            {
+                continue;
+            }
+            if let Err(error) = self.work_db.resolve_external_tracker_attention(&owner, "hung_worker") {
+                persisted = false;
+                tracing::warn!(run, ?error, "failed to resolve hung-worker warning");
+            }
+        }
+        if persisted {
+            *previous = current;
+        }
+        true
+    }
+
     /// Snapshot of every allocated worker slot's live runtime state.
     pub fn live_worker_states_snapshot(&self) -> Vec<crate::protocol::LiveWorkerState> {
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
@@ -35,6 +102,17 @@ impl ServerState {
                     }
                 }
             }
+        }
+        for state in &mut states {
+            state.hung_since = crate::hung_worker::hung_since(
+                state,
+                self.live_worker_states
+                    .semantic_progress_for_slot(state.slot_id)
+                    .as_ref(),
+                self.live_worker_states.progress_fidelity_for_slot(state.slot_id),
+                self.hold_registry.is_held(&state.run_id),
+                now,
+            );
         }
         states
     }

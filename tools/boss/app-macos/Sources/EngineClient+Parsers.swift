@@ -612,7 +612,8 @@ extension EngineClient {
             hostId: payload["host_id"] as? String,
             startedAt: payload["started_at"] as? String,
             pool: payload["pool"] as? String,
-            viewerAttachError: payload["viewer_attach_error"] as? String
+            viewerAttachError: payload["viewer_attach_error"] as? String,
+            hungSince: payload["hung_since"] as? String
         )
     }
 

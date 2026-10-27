@@ -355,6 +355,7 @@ message WorkerEvent {
     TurnStop stop = 14;
     string notification = 15;
     string session_end = 16;
+    bool model_progress = 17;
   }
 }
 enum StartSource {

@@ -38,6 +38,38 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         XCTAssertEqual(titled.headerTitle, "Dax: fix the scraper")
     }
 
+    func testHungWarningSurvivesSnapshotAndClearsOnRecovery() throws {
+        let client = EngineClient(socketPath: "/tmp/hung-worker-test.sock")
+        var payload: [String: Any] = [
+            "slot_id": 1, "run_id": "run-hung", "model": "codex", "activity": "working",
+            "hung_since": "2026-10-27T12:00:00Z",
+        ]
+        let hung = try XCTUnwrap(client.parseWorkerLiveState(payload))
+        XCTAssertNotNil(WorkerSlotLiveSlice(hung).hungSince)
+        let hungSnapshot = WorkerSlotSnapshot.build(
+            slot: WorkerSlot(slotId: 1, runId: "run-hung"), liveState: hung, liveStatusEnabled: true
+        )
+        XCTAssertEqual(hungSnapshot.statusPillLabel, "Hung")
+        XCTAssertTrue(hungSnapshot.showsStatusPill)
+        XCTAssertEqual(
+            AgentActivityState.forDoingCard(
+                runtime: nil, liveState: hung, isDispatchPending: false,
+                isResolvingConflicts: false, isRemediatingCI: false
+            ),
+            .waiting(reason: "Hung — driver has stopped responding")
+        )
+        payload.removeValue(forKey: "hung_since")
+        let recovered = try XCTUnwrap(client.parseWorkerLiveState(payload))
+        XCTAssertNil(recovered.hungSince)
+        let recoveredSnapshot = WorkerSlotSnapshot.build(
+            slot: WorkerSlot(slotId: 1, runId: "run-hung"), liveState: recovered, liveStatusEnabled: true
+        )
+        XCTAssertFalse(recoveredSnapshot.showsStatusPill)
+        XCTAssertNotEqual(hung, recovered)
+        XCTAssertNotEqual(WorkerSlotLiveSlice(hung), WorkerSlotLiveSlice(recovered))
+        XCTAssertEqual(AgentActivityState(runtime: nil, liveState: recovered), .active)
+    }
+
     func testEnginePersonaNamesAndPortraits() throws {
         let client = EngineClient(socketPath: "/tmp/persona-test-\(UUID().uuidString).sock")
         let cases: [(String?, String, Bool)] = [
