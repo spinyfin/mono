@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 52;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 53;
 
 /// Schema 43: the baseline commit a recovery record was created at, the
 /// pointer-reconciliation note for the worker prompt, and the retirement
@@ -252,6 +252,12 @@ impl WorkDb {
         }
         if version < 52 && !table_has_column(&tx, "work_executions", "progression_neighbourhood")? {
             tx.execute_batch("ALTER TABLE work_executions ADD COLUMN progression_neighbourhood TEXT")?;
+        }
+        if version < 53 {
+            // Blocked-PR sweep: diagnosis projection + remediation ledger
+            // (`work/blocked_pr.rs`). `IF NOT EXISTS` for the same
+            // replay-fixture reason as schema 46.
+            tx.execute_batch(blocked_pr::BLOCKED_PR_TABLES_53)?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
@@ -772,7 +778,9 @@ mod floor_tests {
             43,
             44,
             45,
+            49,
             51,
+            52,
             CURRENT_SCHEMA_VERSION,
             CURRENT_SCHEMA_VERSION + 1,
         ] {
@@ -846,6 +854,9 @@ mod floor_tests {
                 conn.execute_batch("ALTER TABLE work_executions ADD COLUMN progression_neighbourhood TEXT")
                     .unwrap();
             }
+            if version >= 53 {
+                conn.execute_batch(blocked_pr::BLOCKED_PR_TABLES_53).unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -887,6 +898,7 @@ mod floor_tests {
             expected
                 .execute_batch("ALTER TABLE work_executions ADD COLUMN progression_neighbourhood TEXT")
                 .unwrap();
+            expected.execute_batch(blocked_pr::BLOCKED_PR_TABLES_53).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

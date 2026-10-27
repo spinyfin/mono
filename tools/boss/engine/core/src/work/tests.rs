@@ -533,6 +533,8 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
         ready_for_review: false,
         review_section: None,
         pr_updated_at: None,
+        review_blocked_reason: None,
+        review_blocked_category: None,
         doc_link_state: None,
         review_guide_lifecycle: None,
         review_guide_readable_version_id: None,
@@ -622,3 +624,21 @@ mod work_tree_scale_tests;
 mod board_patch_tests;
 
 mod design_doc_contention_tests;
+
+#[cfg(test)]
+mod review_detail_tests {
+    use crate::merge_poller::review_detail_json;
+
+    #[test]
+    fn review_detail_json_none_when_empty() {
+        assert_eq!(review_detail_json(&[]), None);
+    }
+
+    #[test]
+    fn review_detail_json_serializes_logins() {
+        let reviewers = vec!["alice".to_owned(), "bob".to_owned()];
+        let json = review_detail_json(&reviewers).expect("non-empty → Some");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(parsed, serde_json::json!(["alice", "bob"]));
+    }
+}

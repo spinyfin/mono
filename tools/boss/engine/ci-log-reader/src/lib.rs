@@ -31,6 +31,8 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use tokio::process::Command;
 
+pub mod transient;
+
 pub use boss_github::CiProvider;
 
 /// Reader + retrigger surface for one CI provider's failing-job
@@ -491,12 +493,7 @@ const MAX_EVICTION_BUILD_SEARCH_PAGES: u32 = 3;
 /// Fetch every stable job identity in a build with one org-relative request.
 pub async fn fetch_buildkite_step_keys(binary: &str, url: &str) -> Result<std::collections::BTreeMap<String, String>> {
     let url = url.split('#').next().unwrap_or(url);
-    let path = url
-        .strip_prefix("https://buildkite.com/")
-        .context("invalid Buildkite URL")?;
-    let parts: Vec<_> = path.split('/').collect();
-    anyhow::ensure!(parts.len() == 4 && parts[2] == "builds", "invalid Buildkite build URL");
-    let endpoint = format!("/pipelines/{}/builds/{}", parts[1], parts[3]);
+    let endpoint = buildkite_build_api_path(url)?;
     let output = run_capture(binary, &["api", &endpoint]).await?;
     parse_buildkite_step_keys(&output, url)
 }
@@ -682,6 +679,135 @@ async fn run_capture(binary: &str, args: &[&str]) -> Result<String> {
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+// --------------------------------------------------------------------------
+// Buildkite build/job records and the per-job retry, via the `bk` CLI.
+//
+// The engine's transient-CI retry needs two things the log reader does
+// not give it: the structured job record (`state`, `exit_status`,
+// `signal_reason`, retry lineage, and the build's branch) and a way to
+// retry exactly one job. Both go through `bk api` / `bk job retry` on the
+// already-authenticated CLI, like every other Buildkite access in this
+// crate; no token handling lives here.
+// --------------------------------------------------------------------------
+
+/// One `jobs[]` entry of a Buildkite build, restricted to the fields the
+/// transient classifier and retry ledger consume.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BuildkiteJob {
+    pub id: String,
+    /// Display label (`:white_check_mark: checks`).
+    pub name: Option<String>,
+    /// Stable step key (`checks`), when the pipeline declares one.
+    pub step_key: Option<String>,
+    pub outcome: JobOutcome,
+    pub retry: JobRetry,
+}
+
+/// How a job ended: the structured fields the transient classifier reads
+/// before it looks at any log.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JobOutcome {
+    pub state: String,
+    pub exit_status: Option<i64>,
+    pub signal_reason: Option<String>,
+}
+
+/// A job's place in Buildkite's retry lineage.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JobRetry {
+    /// `true` once a newer job supersedes this one via retry.
+    pub superseded: bool,
+    /// The job this one is a retry of, when it is one.
+    pub source_job_id: Option<String>,
+}
+
+/// A Buildkite build as `bk api /pipelines/<slug>/builds/<n>` returns it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BuildkiteBuild {
+    pub number: u64,
+    pub branch: String,
+    pub state: String,
+    pub web_url: String,
+    pub jobs: Vec<BuildkiteJob>,
+}
+
+impl BuildkiteBuild {
+    pub fn job(&self, job_id: &str) -> Option<&BuildkiteJob> {
+        self.jobs.iter().find(|j| j.id == job_id)
+    }
+}
+
+/// `bk` is scoped to its configured organization, so the API path is
+/// org-relative: `/pipelines/<slug>/builds/<n>`. Accepts a build or job
+/// URL (`…/builds/<n>[#<job-uuid>]`).
+pub fn buildkite_build_api_path(url: &str) -> Result<String> {
+    let url = url.split('#').next().unwrap_or(url);
+    let path = url
+        .strip_prefix("https://buildkite.com/")
+        .context("invalid Buildkite URL")?;
+    let parts: Vec<_> = path.split('/').collect();
+    anyhow::ensure!(parts.len() == 4 && parts[2] == "builds", "invalid Buildkite build URL");
+    Ok(format!("/pipelines/{}/builds/{}", parts[1], parts[3]))
+}
+
+/// Fetch the build (with its job records) that `url` points at.
+pub async fn fetch_buildkite_build(binary: &str, url: &str) -> Result<BuildkiteBuild> {
+    let endpoint = buildkite_build_api_path(url)?;
+    let output = run_capture(binary, &["api", &endpoint]).await?;
+    parse_buildkite_build(&output, url)
+}
+
+/// Parse a build response, rejecting one from a different organization
+/// (the `web_url` echo must match the URL we asked about).
+pub fn parse_buildkite_build(output: &str, url: &str) -> Result<BuildkiteBuild> {
+    let build: serde_json::Value = serde_json::from_str(output).context("parsing `bk api` build response as JSON")?;
+    let requested = url.split('#').next().unwrap_or(url);
+    anyhow::ensure!(
+        build["web_url"].as_str() == Some(requested),
+        "Buildkite build URL differs from configured organization's response"
+    );
+    let jobs = build["jobs"]
+        .as_array()
+        .context("missing jobs")?
+        .iter()
+        .filter(|job| job["type"].as_str() == Some("script"))
+        .filter_map(|job| {
+            Some(BuildkiteJob {
+                id: job["id"].as_str()?.to_owned(),
+                name: job["name"].as_str().map(str::to_owned),
+                step_key: job["step_key"].as_str().map(str::to_owned),
+                outcome: JobOutcome {
+                    state: job["state"].as_str().unwrap_or_default().to_owned(),
+                    exit_status: job["exit_status"].as_i64(),
+                    signal_reason: job["signal_reason"].as_str().map(str::to_owned),
+                },
+                retry: JobRetry {
+                    superseded: job["retried"].as_bool().unwrap_or(false),
+                    source_job_id: job["retry_source"]["job_id"].as_str().map(str::to_owned),
+                },
+            })
+        })
+        .collect();
+    Ok(BuildkiteBuild {
+        number: build["number"].as_u64().unwrap_or(0),
+        branch: build["branch"].as_str().unwrap_or_default().to_owned(),
+        state: build["state"].as_str().unwrap_or_default().to_owned(),
+        web_url: requested.to_owned(),
+        jobs,
+    })
+}
+
+/// Retry exactly one job (`bk job retry <job-uuid>`), never the whole
+/// build. Returns the CLI's trimmed stdout (Buildkite echoes the new job's
+/// URL / id) for the ledger.
+pub async fn retry_buildkite_job(binary: &str, job_id: &str) -> Result<String> {
+    anyhow::ensure!(!job_id.trim().is_empty(), "empty Buildkite job id");
+    let out = run_capture(binary, &["job", "retry", "--yes", "--no-input", job_id])
+        .await
+        .map_err(|err| anyhow!("retrying Buildkite job {job_id}: {err:#}"))?;
+    Ok(out.trim().to_owned())
 }
 
 #[cfg(test)]
@@ -1392,5 +1518,109 @@ mod verification_identity_tests {
         assert_eq!(keys["failed"], "mac-app-build");
         assert!(!keys.contains_key("absent"));
         assert!(!keys.contains_key("unkeyed"));
+    }
+}
+
+#[cfg(test)]
+mod buildkite_build_tests {
+    use super::*;
+
+    fn write_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("write fake script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod fake script");
+        }
+        path
+    }
+
+    const BUILD_JSON: &str = r#"{
+        "number": 21619,
+        "branch": "boss/exec_18ded62e4bfc9058_21c",
+        "state": "running",
+        "web_url": "https://buildkite.com/flunge/mono/builds/21619",
+        "jobs": [
+            {"type": "waiter", "id": "w1"},
+            {"type": "script", "id": "01a15a8c-97ac-4218-a4c3-e2d4edcfa502", "name": ":white_check_mark: checks",
+             "step_key": "checks", "state": "failed", "exit_status": 1, "signal_reason": null,
+             "retried": true, "retries_count": 0, "retry_source": null},
+            {"type": "script", "id": "new-job", "name": ":white_check_mark: checks", "step_key": "checks",
+             "state": "running", "exit_status": null, "signal_reason": null, "retried": false,
+             "retries_count": 1, "retry_source": {"job_id": "01a15a8c-97ac-4218-a4c3-e2d4edcfa502", "retry_type": "manual"}},
+            {"type": "script", "id": "lost", "name": ":bazel: bazel-build-test", "state": "failed",
+             "exit_status": -1, "signal_reason": "agent_stop", "retried": false, "retries_count": 0}
+        ]
+    }"#;
+
+    #[test]
+    fn api_path_is_org_relative_and_drops_the_job_fragment() {
+        assert_eq!(
+            buildkite_build_api_path("https://buildkite.com/flunge/mono/builds/21619#job-uuid").unwrap(),
+            "/pipelines/mono/builds/21619"
+        );
+        assert!(buildkite_build_api_path("https://example.com/x").is_err());
+        assert!(buildkite_build_api_path("https://buildkite.com/flunge/mono/jobs/1").is_err());
+    }
+
+    #[test]
+    fn parse_build_keeps_script_jobs_with_structured_fields() {
+        let build =
+            parse_buildkite_build(BUILD_JSON, "https://buildkite.com/flunge/mono/builds/21619#new-job").unwrap();
+        assert_eq!(build.number, 21619);
+        assert_eq!(build.branch, "boss/exec_18ded62e4bfc9058_21c");
+        assert_eq!(build.jobs.len(), 3, "waiter jobs are dropped");
+        let original = build.job("01a15a8c-97ac-4218-a4c3-e2d4edcfa502").unwrap();
+        assert_eq!(original.outcome.state, "failed");
+        assert_eq!(original.outcome.exit_status, Some(1));
+        assert!(original.retry.superseded);
+        assert_eq!(original.step_key.as_deref(), Some("checks"));
+        let retry = build.job("new-job").unwrap();
+        assert!(!retry.retry.superseded);
+        assert_eq!(
+            retry.retry.source_job_id.as_deref(),
+            Some("01a15a8c-97ac-4218-a4c3-e2d4edcfa502")
+        );
+        let lost = build.job("lost").unwrap();
+        assert_eq!(lost.outcome.exit_status, Some(-1));
+        assert_eq!(lost.outcome.signal_reason.as_deref(), Some("agent_stop"));
+    }
+
+    #[test]
+    fn parse_build_rejects_another_organizations_echo() {
+        assert!(parse_buildkite_build(BUILD_JSON, "https://buildkite.com/other/mono/builds/21619").is_err());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn fetch_build_and_retry_job_drive_the_cli_with_exact_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+if [ "$1" = "api" ] && [ "$2" = "/pipelines/mono/builds/7" ]; then
+    printf '%s\n' '{"number":7,"branch":"feature","state":"failed","web_url":"https://buildkite.com/flunge/mono/builds/7","jobs":[{"type":"script","id":"j1","state":"failed","exit_status":3}]}'
+    exit 0
+fi
+if [ "$1" = "job" ] && [ "$2" = "retry" ] && [ "$3" = "--yes" ] && [ "$4" = "--no-input" ] && [ "$5" = "j1" ]; then
+    echo "Retried job j1 -> https://buildkite.com/flunge/mono/builds/7#j2"
+    exit 0
+fi
+echo "unhandled args: $@" 1>&2
+exit 2
+"#;
+        let path = write_script(dir.path(), "bk", script);
+        let binary = path.to_str().unwrap();
+        let build = fetch_buildkite_build(binary, "https://buildkite.com/flunge/mono/builds/7#j1")
+            .await
+            .unwrap();
+        assert_eq!(build.branch, "feature");
+        assert_eq!(build.job("j1").unwrap().outcome.exit_status, Some(3));
+
+        let out = retry_buildkite_job(binary, "j1").await.unwrap();
+        assert!(out.ends_with("#j2"), "{out}");
+        assert!(retry_buildkite_job(binary, "other").await.is_err());
+        assert!(retry_buildkite_job(binary, "  ").await.is_err());
     }
 }

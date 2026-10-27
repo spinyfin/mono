@@ -98,6 +98,7 @@ rust_library(
         "//tools/boss/engine/attachments",
         "//tools/boss/engine/automation-dedup",
         "//tools/boss/engine/automation-schedule",
+        "//tools/boss/engine/blocked-pr-diagnosis",
         "//tools/boss/engine/board-gesture",
         "//tools/boss/engine/ci-log-reader",
         "//tools/boss/engine/codex-rollout-retention",

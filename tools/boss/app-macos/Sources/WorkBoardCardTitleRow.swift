@@ -37,6 +37,11 @@ struct WorkBoardCardTitleRowSlice: Equatable {
             self.blockedBy = blockedBy
             self.blockedByPrefix = snapshot.status == "blocked"
                 ? "Blocked by" : "Waiting on:"
+        } else if let reason = snapshot.reviewBlockedReason, !reason.isEmpty {
+            // The engine's blocked-PR diagnosis: rendered verbatim, the
+            // engine already phrased it ("Needs you: …" / "CI retrying: …").
+            self.blockedBy = reason
+            self.blockedByPrefix = "Blocked:"
         } else {
             self.blockedBy = nil
             self.blockedByPrefix = nil
