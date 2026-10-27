@@ -474,7 +474,10 @@ fn review_badge_distinguishes_a_head_whose_reviewers_failed_to_start() {
         reviewed_sha: Some("fc68c6bfeab".into()),
         verdict: None,
         revision: None,
-        failed_to_start: Some((2, Some(long_error.clone()))),
+        failed_to_start: Some(FailedReviewStart {
+            generation: 2,
+            last_error: Some(long_error.clone()),
+        }),
     };
     let badge = badge_presentation("not_reviewed", None, Some(&history), "card");
     assert_eq!(badge.label, "AI review failed to start");

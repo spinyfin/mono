@@ -371,13 +371,7 @@ async fn composer_never_ready_persists_pane_spawn_failed_without_claiming_the_dr
     );
 }
 
-/// Poll `recording` until an event for `execution_id` matches `predicate`,
-/// returning it. Used by the spawn-abort tests below, which have to assert on
-/// what is visible at a specific instant *while the cube release is still
-/// parked* — a `wait_for_execution_status` would sail past that window,
-/// because the whole point of the fix is that the failure is reported long
-/// before the row is terminalized.
-/// Every pre-start failure is a `pre_start_failed` record in the dispatch
+/// Every pre-start failure is a `pre_start_failure` record in the dispatch
 /// stream at the moment it is classified: the error, the attempt number and
 /// what the engine decided (retry after backoff, or permanent). Before this
 /// record existed a failure in a stage with no stage-specific error event
@@ -414,7 +408,7 @@ async fn pre_start_failure_is_recorded_in_the_dispatch_stream_with_its_decision(
         &recording,
         &execution_id,
         |event| event.stage == "pre_start_failure" && event.details["decision"] == "permanent",
-        "permanent pre_start_failed",
+        "permanent pre_start_failure",
     )
     .await;
 
@@ -445,6 +439,12 @@ async fn pre_start_failure_is_recorded_in_the_dispatch_stream_with_its_decision(
     assert_eq!(db.get_execution(&execution_id).unwrap().pre_start_failure_count, 2);
 }
 
+/// Poll `recording` until an event for `execution_id` matches `predicate`,
+/// returning it. Used by the spawn-abort tests below, which have to assert on
+/// what is visible at a specific instant *while the cube release is still
+/// parked* — a `wait_for_execution_status` would sail past that window,
+/// because the whole point of the fix is that the failure is reported long
+/// before the row is terminalized.
 async fn wait_for_dispatch_event(
     recording: &crate::dispatch_events::RecordingDispatchEventSink,
     execution_id: &str,

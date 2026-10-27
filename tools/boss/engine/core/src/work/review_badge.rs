@@ -182,10 +182,10 @@ pub(super) fn apply_review_badges<'h>(
 /// its reviewers never started: the newest pre-merge batch for the owner's
 /// root targets the observed head, `failed` without a consolidated verdict,
 /// at or past the automatic generation cap, and no member execution of it
-/// ever reached `started_at`. Returns `(card, (generation, last pre-start
-/// error))`. A batch at a superseded head drops out on its own, since the
+/// ever reached `started_at`. Returns each card's generation and last pre-start
+/// error. A batch at a superseded head drops out on its own, since the
 /// new head gets a fresh generation-1 batch; so does a later explicit batch.
-fn failed_to_start_badges(conn: &Connection, ids: &[String]) -> Result<Vec<(String, (i64, Option<String>))>> {
+fn failed_to_start_badges(conn: &Connection, ids: &[String]) -> Result<Vec<(String, FailedReviewStart)>> {
     let placeholders = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
     let family = review_family_cte(&placeholders);
     let sql = format!(
@@ -216,7 +216,10 @@ fn failed_to_start_badges(conn: &Connection, ids: &[String]) -> Result<Vec<(Stri
     let rows = stmt.query_map(rusqlite::params_from_iter(ids), |row| {
         Ok((
             row.get::<_, String>(0)?,
-            (row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?),
+            FailedReviewStart {
+                generation: row.get(1)?,
+                last_error: row.get(2)?,
+            },
         ))
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -254,10 +257,16 @@ pub(crate) struct ReviewBadgeHistory {
     reviewed_sha: Option<String>,
     verdict: Option<(String, String, i64)>,
     revision: Option<(String, String, bool)>,
-    /// `(generation, last pre-start error)` when the current head's last
+    /// Details when the current head's last
     /// automatic review batch failed because no reviewer ever started; see
     /// [`failed_to_start_badges`].
-    failed_to_start: Option<(i64, Option<String>)>,
+    #[builder(required, default)]
+    failed_to_start: Option<FailedReviewStart>,
+}
+
+struct FailedReviewStart {
+    generation: i64,
+    last_error: Option<String>,
 }
 
 /// Longest `last_error` excerpt shown in a badge tooltip. Recovery errors
@@ -307,7 +316,8 @@ fn badge_presentation(
         AI_REVIEW_STATE_REVIEWING if consolidating => (
             "Consolidating review findings".into(),
             "arrow.triangle.merge",
-            "The reviewers have finished on this head; one agent is consolidating their findings into a single review.".into(),
+            "The reviewers have finished on this head; one agent is consolidating their findings into a single review."
+                .into(),
         ),
         AI_REVIEW_STATE_REVIEWING => ("AI reviewing…".into(), "brain", "An AI review pass is running.".into()),
         AI_REVIEW_STATE_REVIEW_QUEUED => (
@@ -340,7 +350,7 @@ fn badge_presentation(
         // start and the automatic generations are spent. Distinct from the
         // ordinary "not yet" so the card does not read as merely waiting.
         _ if failed_to_start.is_some() => {
-            let (generation, last_error) = failed_to_start.expect("checked");
+            let FailedReviewStart { generation, last_error } = failed_to_start.expect("checked");
             (
                 "AI review failed to start".into(),
                 "exclamationmark.triangle",

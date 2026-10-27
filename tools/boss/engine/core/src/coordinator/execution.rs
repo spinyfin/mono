@@ -2515,24 +2515,20 @@ impl ExecutionCoordinator {
     ) -> Result<()> {
         let (attention_kind, attention_title) = attention;
         let error_text = format!("{error:#}");
-        let transition = self.work_db.record_pre_start_failure(
-            &execution.id,
-            worker_id,
-            cube_repo_id,
-            &error_text,
-            if attention_kind == crate::execution_bookmark_recovery::RECOVERY_FAILED
-                && matches!(
-                    execution.kind,
-                    ExecutionKind::ChoreImplementation
-                        | ExecutionKind::TaskImplementation
-                        | ExecutionKind::RevisionImplementation
-                )
-            {
-                &[]
-            } else {
-                &self.pre_start_retry_delays
-            },
-        );
+        let retry_delays: &[Duration] = if attention_kind == crate::execution_bookmark_recovery::RECOVERY_FAILED
+            && matches!(
+                execution.kind,
+                ExecutionKind::ChoreImplementation
+                    | ExecutionKind::TaskImplementation
+                    | ExecutionKind::RevisionImplementation
+            ) {
+            &[]
+        } else {
+            &self.pre_start_retry_delays
+        };
+        let transition =
+            self.work_db
+                .record_pre_start_failure(&execution.id, worker_id, cube_repo_id, &error_text, retry_delays);
         let (execution, run, outcome) = match transition {
             Ok(recorded) => recorded,
             Err(bookkeeping_error) => {
@@ -2578,6 +2574,7 @@ impl ExecutionCoordinator {
                 "will_retry": will_retry,
                 "decision": if will_retry { "retry" } else { "permanent" },
                 "attempt": execution.pre_start_failure_count,
+                "max_attempts": retry_delays.len() + 1,
                 "attention_kind": attention_kind,
                 "retry_delay_secs": retry_delay_secs,
             })))

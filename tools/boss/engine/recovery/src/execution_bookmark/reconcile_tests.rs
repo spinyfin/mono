@@ -341,7 +341,7 @@ async fn pr_history_rewritten_under_new_change_ids_vouches_for_the_preserved_wor
             })
             .collect();
         pairs.sort();
-        let mut expected = vec![
+        let mut expected = [
             (
                 pr_head.as_str(),
                 reimported_base.as_str(),
