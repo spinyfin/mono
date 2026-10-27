@@ -184,12 +184,15 @@ async fn busy_reset(force: bool, recreation: bool, token: &str) {
             let mut line = String::new();
             read.read_line(&mut line).await.unwrap();
             let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
-            if frame["request_id"] == token
-                && frame["payload"]["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains("lifecycle busy"))
-            {
-                break frame;
+            if frame["request_id"] == token {
+                let message = frame["payload"]["message"].as_str().unwrap_or("");
+                assert!(
+                    !message.contains("Restarting with potentially missing context"),
+                    "missing-handoff warning must wait until recreation holds the lock: {message}"
+                );
+                if message.contains("lifecycle busy") {
+                    break frame;
+                }
             }
         }
     })

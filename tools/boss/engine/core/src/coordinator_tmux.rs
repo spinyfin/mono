@@ -719,6 +719,11 @@ async fn session_exists(tmux: &Tmux, name: &str) -> Result<bool> {
     Ok(tmux.list_sessions().await?.iter().any(|session| session.name == name))
 }
 
+/// Bound on probing the retired `-L boss` server. A hung legacy tmux must
+/// not hold `coordinator_tmux_lock` (supervisor recovery, reset recreation)
+/// indefinitely; timeout is treated as "not there".
+const LEGACY_SESSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Resolve which tmux server currently hosts the coordinator session:
 /// Prefer the durable socket when it has the coordinator session. Otherwise
 /// check for a surviving session on the pre-move legacy server. If both servers
@@ -752,7 +757,13 @@ pub(crate) async fn resolve_active_handle<'a>(socket_tmux: &'a Tmux, legacy_tmux
     if matches!(session_exists(socket_tmux, COORDINATOR_SESSION_NAME).await, Ok(true)) {
         return socket_tmux;
     }
-    match session_exists(legacy, COORDINATOR_SESSION_NAME).await {
+    match tokio::time::timeout(
+        LEGACY_SESSION_PROBE_TIMEOUT,
+        session_exists(legacy, COORDINATOR_SESSION_NAME),
+    )
+    .await
+    .unwrap_or_else(|_| Err(anyhow!("legacy -L boss server probe timed out")))
+    {
         Ok(true) => {
             tracing::warn!(
                 "coordinator tmux: a live coordinator session survives on the pre-move -L boss server; \
@@ -1515,11 +1526,17 @@ mod tests {
         send_keys_fails: bool,
         options: Mutex<BTreeMap<String, String>>,
         calls: Mutex<Vec<Vec<String>>>,
+        list_sessions_delay: Duration,
     }
 
     impl FakeTmux {
         fn new(sessions: Vec<&str>, token: Option<&str>, pane_dead: &str) -> Self {
             Self::with_send_keys_outcome(sessions, token, pane_dead, false)
+        }
+
+        fn delaying_list_sessions(mut self, delay: Duration) -> Self {
+            self.list_sessions_delay = delay;
+            self
         }
 
         fn with_send_keys_outcome(
@@ -1535,6 +1552,7 @@ mod tests {
                 send_keys_fails,
                 options: Mutex::new(BTreeMap::new()),
                 calls: Mutex::new(Vec::new()),
+                list_sessions_delay: Duration::ZERO,
             }
         }
         fn calls(&self) -> Vec<Vec<String>> {
@@ -1548,6 +1566,9 @@ mod tests {
             assert!(cwd.is_none());
             let args: Vec<String> = args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
             self.calls.lock().unwrap().push(args.clone());
+            if args.get(2).map(String::as_str) == Some("list-sessions") && !self.list_sessions_delay.is_zero() {
+                tokio::time::sleep(self.list_sessions_delay).await;
+            }
             let (success, stdout, stderr) = match args.get(2).map(String::as_str) {
                 Some("list-sessions") => (
                     true,
@@ -1818,6 +1839,22 @@ mod tests {
         let (socket_tmux, _socket_server) = tmux_for(FakeTmux::new(vec![], None, "0"));
         let resolved = resolve_active_handle(&socket_tmux, None).await;
         assert_eq!(resolved.operator_prefix(), socket_tmux.operator_prefix());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resolve_active_handle_times_out_a_hung_legacy_probe_when_socket_has_no_coordinator() {
+        let (socket_tmux, socket_server) = tmux_for(FakeTmux::new(vec![], None, "0"));
+        let (legacy_tmux, legacy_server) =
+            legacy_tmux_for(FakeTmux::new(vec![], None, "0").delaying_list_sessions(Duration::from_secs(30)));
+
+        let started = tokio::time::Instant::now();
+        let resolved = resolve_active_handle(&socket_tmux, Some(&legacy_tmux)).await;
+        assert!(std::ptr::eq(resolved, &socket_tmux));
+        assert_eq!(started.elapsed(), LEGACY_SESSION_PROBE_TIMEOUT);
+        assert_eq!(socket_server.calls().len(), 1);
+        assert_eq!(socket_server.calls()[0][2], "list-sessions");
+        assert_eq!(legacy_server.calls().len(), 1);
+        assert_eq!(legacy_server.calls()[0][2], "list-sessions");
     }
 
     /// A live coordinator surviving on the legacy server must be recovered
