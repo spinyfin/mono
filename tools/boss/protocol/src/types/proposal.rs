@@ -619,6 +619,18 @@ pub struct ProposalSubmissionError {
 }
 
 impl ProposalSubmissionError {
+    /// Reject a replay key that belongs to a different proposal kind.
+    pub fn idempotency_key_kind_mismatch(key: &str, existing: &WorkerProposal) -> Self {
+        Self::validation(vec![ProposalFieldError::new(
+            "idempotency_key",
+            format!(
+                "idempotency_key `{key}` was already used for a `{}` proposal (id {}); reuse it \
+                 only for a genuine retry of the same submission, or choose a different key",
+                existing.kind, existing.id
+            ),
+        )])
+    }
+
     /// A non-validation refusal: a code plus a human-readable explanation,
     /// with no per-field detail.
     pub fn new(code: ProposalErrorCode, message: impl Into<String>) -> Self {

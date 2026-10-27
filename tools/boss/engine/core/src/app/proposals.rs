@@ -439,14 +439,7 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                     return send_rejection(
                         &sink,
                         &request_id,
-                        ProposalSubmissionError::validation(vec![ProposalFieldError::new(
-                            "idempotency_key",
-                            format!(
-                                "idempotency_key `{idempotency_key}` was already used for a `{}` proposal (id {}); \
-                                 reuse it only for a genuine retry of the same submission, or choose a different key",
-                                existing.kind, existing.id
-                            ),
-                        )]),
+                        ProposalSubmissionError::idempotency_key_kind_mismatch(&idempotency_key, &existing),
                     );
                 }
                 Ok(None) => {
