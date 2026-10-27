@@ -18,6 +18,11 @@ use thiserror::Error;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkerEvent {
+    /// A yielded command returned control to the model, or a continuation began waiting.
+    ToolPoll {
+        session_id: String,
+        awaiting_model: bool,
+    },
     /// Actual model output, excluding usage bookkeeping and retries.
     ModelProgress {
         session_id: String,

@@ -8,6 +8,7 @@
 //! Split out of `app.rs`; pure structural move — no behavioural change.
 
 use super::*;
+use crate::hung_worker::HUNG_WORKER_ATTENTION_KIND;
 
 impl ServerState {
     /// Reconcile warning transitions without changing execution or tool state.
@@ -20,61 +21,81 @@ impl ServerState {
             .into_iter()
             .filter_map(|state| Some((state.run_id, (state.work_item_id?, state.hung_since))))
             .collect();
-        if *previous == current {
-            return false;
-        }
+        let mut changed = *previous != current;
         let mut persisted = true;
-        for (run, (work_item, since)) in &current {
-            if previous.get(run) == Some(&(work_item.clone(), since.clone())) {
-                continue;
+        // Persisted warnings outlive this cache. Protect executions still awaiting
+        // adoption, then reconcile warnings even when both snapshots are empty.
+        let open = self
+            .work_db
+            .list_open_attention_items_of_kind(HUNG_WORKER_ATTENTION_KIND);
+        let adopting = self.work_db.list_in_flight_executions();
+        let (open, adopting) = match (open, adopting) {
+            (Ok(open), Ok(adopting)) => (open, adopting),
+            (Err(error), _) | (_, Err(error)) => {
+                tracing::warn!(?error, "failed to load persisted hung warnings");
+                return false;
             }
-            let owner = self.work_db.owning_work_item_id(work_item);
-            let Some(since) = since else {
-                if current
-                    .values()
-                    .any(|(item, since)| since.is_some() && self.work_db.owning_work_item_id(item) == owner)
-                {
-                    continue;
+        };
+        let mut hung = std::collections::HashMap::new();
+        for (run, (item, since)) in &current {
+            if let Some(since) = since {
+                let owner = self.work_db.owning_work_item_id(item);
+                // Stable selection avoids rewriting an owner's warning as siblings
+                // change iteration order.
+                let candidate = (since, run);
+                let selected = hung.entry(owner).or_insert(candidate);
+                if candidate < *selected {
+                    *selected = candidate;
                 }
-                if let Err(error) = self.work_db.resolve_external_tracker_attention(&owner, "hung_worker") {
-                    persisted = false;
-                    tracing::warn!(run, ?error, "failed to resolve hung-worker warning");
-                }
-                continue;
-            };
-            let body = format!(
-                "Driver has made no observable progress since {since}, with no tool in flight or declared wait. This is a suspected hang, not a confirmed failure: provider retries can recover. Inspect the worker and interrupt or restart it if needed. Boss has not killed it. Execution: `{run}`."
-            );
-            if let Err(error) = self.work_db.upsert_external_tracker_attention(
-                &owner,
-                "hung_worker",
-                "Worker hung; inspect or restart",
-                &body,
-            ) {
-                persisted = false;
-                tracing::warn!(run, ?error, "failed to raise hung-worker warning");
             }
         }
-        for (run, (work_item, _)) in previous.iter() {
-            if current.contains_key(run) {
-                continue;
+        for attention in &open {
+            let Some(owner) = &attention.work_item_id else { continue };
+            let pending = adopting.iter().any(|execution| {
+                !current.contains_key(&execution.id)
+                    && self.work_db.owning_work_item_id(&execution.work_item_id) == *owner
+            });
+            if !hung.contains_key(owner) && !pending {
+                match self
+                    .work_db
+                    .resolve_external_tracker_attention(owner, HUNG_WORKER_ATTENTION_KIND)
+                {
+                    Ok(_) => changed = true,
+                    Err(error) => {
+                        persisted = false;
+                        tracing::warn!(?error, "failed to resolve hung warning");
+                    }
+                }
             }
-            let owner = self.work_db.owning_work_item_id(work_item);
-            if current
-                .values()
-                .any(|(item, since)| since.is_some() && self.work_db.owning_work_item_id(item) == owner)
+        }
+        for (owner, (since, run)) in hung {
+            if !changed
+                && open
+                    .iter()
+                    .any(|attention| attention.work_item_id.as_ref() == Some(&owner))
             {
                 continue;
             }
-            if let Err(error) = self.work_db.resolve_external_tracker_attention(&owner, "hung_worker") {
-                persisted = false;
-                tracing::warn!(run, ?error, "failed to resolve hung-worker warning");
+            let body = format!(
+                "Driver has made no observable progress since {since}, while awaiting model output with no blocking tool poll or declared wait. This is a suspected hang, not a confirmed failure: provider retries can recover. Inspect the worker and interrupt or restart it if needed. Boss has not killed it. Execution: `{run}`."
+            );
+            match self.work_db.upsert_external_tracker_attention(
+                &owner,
+                HUNG_WORKER_ATTENTION_KIND,
+                "Worker hung; inspect or restart",
+                &body,
+            ) {
+                Ok(_) => changed = true,
+                Err(error) => {
+                    persisted = false;
+                    tracing::warn!(?error, "failed to raise hung warning");
+                }
             }
         }
         if persisted {
             *previous = current;
         }
-        true
+        changed
     }
 
     /// Snapshot of every allocated worker slot's live runtime state.

@@ -39,6 +39,10 @@ A signal can be re-raised onto an already-open row instead of getting a fresh on
 
 Both apply the same rule, so the sweep is never doing anything the inline path would have disagreed with.
 
+| Producer-owned kind | Clearing evidence                                                                                                                                                       | Sweep                                         |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| `hung_worker`       | Progress resumed or no hung worker remains for the owner; persisted warnings are reconciled after restart while in-flight executions awaiting adoption remain protected | Live-worker activity sweep, every ten seconds |
+
 ## The fleet-level spawn-failure streak alert is not an attention item
 
 Attention items are scoped to one execution or one work item. A failure pattern that only exists _across_ executions has no row to live on, so it is raised as an engine-health issue instead.

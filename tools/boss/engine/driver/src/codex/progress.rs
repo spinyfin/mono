@@ -447,7 +447,10 @@ impl CodexRolloutProgressSession {
                         // command in every `PreToolUse` consumer — including
                         // the editorial audit, which writes a row per
                         // observed `gh pr`/`cube pr` invocation.
-                        Ok(CallDisposition::Continuation) => Ok(Vec::new()),
+                        Ok(CallDisposition::Continuation) => Ok(vec![WorkerEvent::ToolPoll {
+                            session_id: session_id_for_failure,
+                            awaiting_model: false,
+                        }]),
                         Err(err) => Ok(vec![correlation_failure_notification(&session_id_for_failure, &err)]),
                     };
                 }
@@ -464,7 +467,12 @@ impl CodexRolloutProgressSession {
                         // on a `wait`. Reporting the placeholder as this
                         // command's result is what made a still-running
                         // command look observed.
-                        Ok(OutputDisposition::StillRunning { .. }) => return Ok(Vec::new()),
+                        Ok(OutputDisposition::StillRunning { .. }) => {
+                            return Ok(vec![WorkerEvent::ToolPoll {
+                                session_id,
+                                awaiting_model: true,
+                            }]);
+                        }
                         Err(err) => return Ok(vec![correlation_failure_notification(&session_id, &err)]),
                     };
                     let mut events = vec![WorkerEvent::PostToolUse {
@@ -1410,15 +1418,21 @@ mod tests {
             session
                 .normalize_progress_events(&cell_yield_output("call-pr", 1))
                 .unwrap(),
-            Vec::new(),
+            vec![WorkerEvent::ToolPoll {
+                session_id: "thread-cell".into(),
+                awaiting_model: true
+            }],
             "a yield placeholder is not this command's result and must not be reported as one"
         );
         assert_eq!(
             session
                 .normalize_progress_events(&cell_wait_call("call-wait", 1))
                 .unwrap(),
-            Vec::new(),
-            "a wait poll re-announces nothing; the command was announced when its cell started"
+            vec![WorkerEvent::ToolPoll {
+                session_id: "thread-cell".into(),
+                awaiting_model: false
+            }],
+            "a wait poll reports control transfer without re-announcing the command"
         );
 
         let chunk = r#"{"chunk_id":"ab","exit_code":0,"output":"https://github.com/spinyfin/mono/pull/9\n"}"#;
@@ -1478,7 +1492,10 @@ mod tests {
             session
                 .normalize_progress_events(&cell_completed_output("call-p6-wait", P6_RUNNING_CHUNK))
                 .unwrap(),
-            Vec::new(),
+            vec![WorkerEvent::ToolPoll {
+                session_id: "thread-cell".into(),
+                awaiting_model: true
+            }],
             "a chunk with no exit code is not this command's result and must not be reported as one"
         );
 
@@ -2770,9 +2787,8 @@ mod tests {
 
         // The wait itself: the cell yields, then the model polls it again
         // (a real wait can last many minutes; three rounds here).
-        // Every record is silent — no PostToolUse (the command has
-        // not finished), no Stop (the turn has not ended), nothing that a
-        // reducer could read as idle.
+        // Poll records transfer control without PostToolUse (the command
+        // has not finished) or Stop (the turn has not ended).
         let mut quiet = Vec::new();
         quiet.extend(
             session
@@ -2790,8 +2806,14 @@ mod tests {
         }
         assert_eq!(
             quiet,
-            Vec::new(),
-            "a background wait is a continuation of the announced command and emits nothing: {quiet:?}"
+            std::iter::once(true)
+                .chain((0..3).flat_map(|_| [false, true]))
+                .map(|awaiting_model| WorkerEvent::ToolPoll {
+                    session_id: "thread-cell".into(),
+                    awaiting_model
+                })
+                .collect::<Vec<_>>(),
+            "poll boundaries track model control without balancing the command"
         );
         assert!(
             session.calls.has_open_calls(),

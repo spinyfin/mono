@@ -83,6 +83,10 @@ pub fn to_wire(event: &Domain) -> v1::WorkerEvent {
             }),
         ),
         Domain::Notification { session_id, message } => (session_id, Event::Notification(message.clone())),
+        Domain::ToolPoll {
+            session_id,
+            awaiting_model,
+        } => (session_id, Event::ToolPoll(*awaiting_model)),
         Domain::ModelProgress { session_id } => (session_id, Event::ModelProgress(true)),
         Domain::SessionEnd { session_id, reason } => (session_id, Event::SessionEnd(reason.clone())),
     };
@@ -123,6 +127,10 @@ pub fn from_wire(wire: v1::WorkerEvent) -> Result<Domain, ConversionError> {
             stop_reason: stop_reason_from_wire(stop.reason),
         },
         Event::Notification(message) => Domain::Notification { session_id, message },
+        Event::ToolPoll(awaiting_model) => Domain::ToolPoll {
+            session_id,
+            awaiting_model,
+        },
         Event::ModelProgress(_) => Domain::ModelProgress { session_id },
         Event::SessionEnd(reason) => Domain::SessionEnd { session_id, reason },
     })
@@ -197,6 +205,14 @@ mod tests {
     fn every_variant_round_trips_through_the_wire_form() {
         let events = [
             Domain::ModelProgress { session_id: "s".into() },
+            Domain::ToolPoll {
+                session_id: "s".into(),
+                awaiting_model: true,
+            },
+            Domain::ToolPoll {
+                session_id: "s".into(),
+                awaiting_model: false,
+            },
             Domain::SessionStart {
                 session_id: "s".into(),
                 source: SessionStartSource::Compact,

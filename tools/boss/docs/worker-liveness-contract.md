@@ -298,16 +298,24 @@ silence as a confirmed failure. The ten-second activity sweep reconciles the
 warning; resumed progress, a running tool, a declared wait, an operator hold,
 or release of the worker clears it.
 
-Only a Rich driver with a confirmed open turn and durably idle tool state is
-eligible. Unknown state, ended turns, permission waits, and tools still in
-flight are exempt. Codex's yielded command remains in flight across polls.
+Only a Rich driver with a confirmed open turn and an idle or yielded tool state is
+eligible. Unknown state, ended turns, permission waits, and blocking tool calls
+are exempt. Codex poll results persist a yielded checkpoint: the command is still
+running, but the model must respond within 900 seconds. Starting the next poll
+restores the blocking exemption until its result returns. Yielded commands remain
+protected from the destructive stale-worker sweep.
 Codex model-message/reasoning events advance progress, but `token_count`
-records do not, including unchanged usage during retries. Hook-only drivers
+records do not, including unchanged usage during retries. Notifications, including
+Grok background task completions, do not advance the semantic deadline. Hook-only drivers
 provide tool/turn boundaries rather than token-level output, so their warning
 is necessarily a suspicion based on that coarser evidence.
 
 The thresholds are 600 seconds before any tool has completed and 900 seconds
-after a tool completes. These are warning thresholds, not termination deadlines.
+after a tool completes within the current prompt; prompt submission resets the
+in-memory tool-completion marker. This threshold is approximate after restart:
+completed-tool history is not restored, so an idle checkpoint uses 600 seconds
+until another tool completes. A persisted yielded checkpoint always uses 900
+seconds. These are warning thresholds, not termination deadlines.
 They use the 2026-10-27 transcript measurement: 3,454 completed, never-reaped
 Codex sessions (September 10–October 27), 1,500 sampled Claude sessions out of
 3,829 (September 27–October 27), and 647 Grok sessions (September 10–October 27).

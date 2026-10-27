@@ -275,7 +275,10 @@ pub fn classify_semantic_staleness(
     now_epoch_secs: i64,
     stale_threshold_secs: i64,
 ) -> SemanticStaleness {
-    if tool_condition == SemanticToolCondition::InFlight {
+    if matches!(
+        tool_condition,
+        SemanticToolCondition::InFlight | SemanticToolCondition::Yielded
+    ) {
         return SemanticStaleness::Healthy;
     }
     let effective_at = progress_at.unwrap_or(started_at);
@@ -287,7 +290,9 @@ pub fn classify_semantic_staleness(
         return SemanticStaleness::DegradedEvidence(DegradedEvidenceReason::FidelityBelowRich);
     }
     match tool_condition {
-        SemanticToolCondition::InFlight => unreachable!("in_flight returned Healthy above"),
+        SemanticToolCondition::InFlight | SemanticToolCondition::Yielded => {
+            unreachable!("in_flight returned Healthy above")
+        }
         SemanticToolCondition::Unknown => {
             SemanticStaleness::DegradedEvidence(DegradedEvidenceReason::ToolConditionUnknown)
         }

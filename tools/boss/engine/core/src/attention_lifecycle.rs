@@ -153,6 +153,11 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         "The PR owner must acknowledge an unrecoverable revision blocking the chain; unrelated root PR review activity does not prove the blocked revision recovered.",
     ),
     entry(
+        crate::hung_worker::HUNG_WORKER_ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "The live-worker sweep resolves warnings when progress resumes or the owning item has no hung or adopting execution.",
+    ),
+    entry(
         crate::execution_bookmark_recovery::CREATE_FAILED,
         ClearedBy::WorkResumed,
         "Dispatch creates the execution recovery bookmark before starting a worker; a subsequent start proves creation succeeded.",
@@ -725,6 +730,7 @@ mod tests {
             crate::coordinator::ANSWER_AGENT_READY_AGE_ATTENTION_KIND,
             crate::local_worker_quarantine::ATTENTION_KIND,
             crate::stale_worker_sweep::STALE_WORKER_ATTENTION_KIND,
+            crate::hung_worker::HUNG_WORKER_ATTENTION_KIND,
             crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND,
             crate::work::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
             REVIEW_DESIGN_DOC_UNRESOLVED_ATTENTION_KIND,

@@ -532,7 +532,8 @@ impl Validate for v1::WorkerEvent {
             worker_event::Event::UserPrompt(text)
             | worker_event::Event::Notification(text)
             | worker_event::Event::SessionEnd(text) => bounded("event.text", text.len(), MAX_PAYLOAD_BYTES),
-            worker_event::Event::ModelProgress(_)
+            worker_event::Event::ToolPoll(_)
+            | worker_event::Event::ModelProgress(_)
             | worker_event::Event::SessionStart(_)
             | worker_event::Event::Stop(_) => Ok(()),
         }

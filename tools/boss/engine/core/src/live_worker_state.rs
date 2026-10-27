@@ -1827,7 +1827,9 @@ impl LiveWorkerStateRegistry {
         // Engine-synthesized display stamps (`mark_stalled_spawns`,
         // `mark_errored`) never reach here, so they cannot advance the
         // semantic checkpoint.
-        meta.semantic_progress_at = Some(now);
+        if !matches!(event, WorkerEvent::Notification { .. }) {
+            meta.semantic_progress_at = Some(now);
+        }
         meta.semantic_tool_condition = next_tool_condition(event, meta.semantic_tool_condition);
         // A subagent's tool hooks say nothing about the main session's turn:
         // they can land after the main session's `Stop`, and counting them
@@ -1880,6 +1882,7 @@ impl LiveWorkerStateRegistry {
                 // degrades and no further hooks arrive.
             }
             WorkerEvent::UserPromptSubmit { .. } => {
+                state.last_tool_ended_at = None;
                 state.activity = WorkerActivity::Working;
                 state.current_tool = None;
             }
@@ -1896,7 +1899,7 @@ impl LiveWorkerStateRegistry {
                 // turn boundary. Worker may chain multiple tools.
                 state.activity = WorkerActivity::Working;
             }
-            WorkerEvent::ModelProgress { .. } => {}
+            WorkerEvent::ToolPoll { .. } | WorkerEvent::ModelProgress { .. } => {}
             WorkerEvent::Notification { .. } => {
                 // Only trust this as an "awaiting human input" signal when
                 // the run's driver declared `Capability::AwaitingInputSignal`
@@ -2460,7 +2463,7 @@ fn record_turn_progress(
             meta.open_turn_boundary = Some(TurnBoundary { seq });
             None
         }
-        WorkerEvent::ModelProgress { .. } | WorkerEvent::SessionEnd { .. } => None,
+        WorkerEvent::ToolPoll { .. } | WorkerEvent::ModelProgress { .. } | WorkerEvent::SessionEnd { .. } => None,
         WorkerEvent::UserPromptSubmit { .. } | WorkerEvent::PreToolUse { .. } | WorkerEvent::PostToolUse { .. } => {
             if origin.from_subagent {
                 return None;
@@ -2497,7 +2500,7 @@ fn reconcile_late_event(
             meta.open_turn_boundary = Some(TurnBoundary { seq: Some(newest) });
             (None, repaired)
         }
-        WorkerEvent::ModelProgress { .. } => (None, false),
+        WorkerEvent::ToolPoll { .. } | WorkerEvent::ModelProgress { .. } => (None, false),
         WorkerEvent::SessionEnd { .. } => (None, consume_late_notification(state, meta, seq)),
         WorkerEvent::Notification { .. } if meta.awaiting_input_capable => {
             match meta
@@ -2591,6 +2594,7 @@ fn worker_event_name(event: &WorkerEvent) -> &'static str {
         WorkerEvent::PostToolUse { .. } => "PostToolUse",
         WorkerEvent::Stop { .. } => "Stop",
         WorkerEvent::Notification { .. } => "Notification",
+        WorkerEvent::ToolPoll { .. } => "ToolPoll",
         WorkerEvent::ModelProgress { .. } => "ModelProgress",
         WorkerEvent::SessionEnd { .. } => "SessionEnd",
     }
