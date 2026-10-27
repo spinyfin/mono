@@ -158,3 +158,39 @@ fn review_badge_unknown_head_and_clean_pending_have_distinct_explanations() {
     assert!(pending.tooltip.contains("AI review passed"));
     assert!(pending.tooltip.contains("prevent readiness"));
 }
+
+#[test]
+fn badge_displays_rejections_without_putting_them_in_revision_instructions() {
+    for kept in [true, false] {
+        let findings = if kept {
+            serde_json::json!([{
+                "id": "C1", "severity": "high", "category": "correctness",
+                "confidence": "high", "file": "src/lib.rs", "title": "Unchecked index",
+                "detail": "Out of bounds read.", "sources": ["claude-1"]
+            }])
+        } else {
+            serde_json::json!([])
+        };
+        let verdict: crate::pr_review::SupervisorVerdict = serde_json::from_value(serde_json::json!({
+            "batch_id": "batch", "pr_url": "https://github.com/spinyfin/mono/pull/1",
+            "target_sha": "head", "phase": "pre_merge", "summary": "Review complete",
+            "revision_warranted": kept, "findings": findings, "contradictions": [],
+            "rejected": [{"leaf_finding_id": "codex-1", "reason": "Already guarded"}]
+        }))
+        .unwrap();
+        let history = ReviewBadgeHistory::builder()
+            .verdict_payload(serde_json::json!({"batch_id": "batch", "verdict": verdict}).to_string())
+            .is_findings_revision(false)
+            .build();
+        let markdown = findings_markdown(&history).unwrap().unwrap();
+        assert!(markdown.contains("### Rejected leaf findings"));
+        assert!(markdown.contains(r"codex\-1: Already guarded"));
+        assert_eq!(markdown.contains("Unchecked index"), kept);
+        let instructions = crate::pr_review::render_revision_instructions(
+            &verdict.to_review_result(),
+            crate::pr_review::ReviewOrigin { pr_number: Some(1) },
+        );
+        assert!(!instructions.contains("Already guarded"));
+        assert!(!instructions.contains("Rejected leaf findings"));
+    }
+}

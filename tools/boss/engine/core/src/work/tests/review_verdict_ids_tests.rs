@@ -168,7 +168,10 @@ fn legacy_report_ids_are_not_backfilled_during_verdict_validation() {
         serde_json::json!([consolidated("C1", &["claude-1", "claude-2", "codex-1"])]),
         serde_json::json!([]),
     );
-    assert!(rejection_reason(&proposal).contains("legacy and has no leaf finding ids"));
+    let reason = rejection_reason(&proposal);
+    assert!(reason.contains("legacy and has no leaf finding ids"));
+    assert!(reason.contains("do not retry this verdict"));
+    assert!(reason.contains("Stop and report blocked"));
     assert_eq!(db.get_worker_proposal(&proposal_id).unwrap().payload_json, legacy_json);
 }
 

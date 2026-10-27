@@ -170,7 +170,7 @@ pub enum ApplyDecision {
 pub(super) fn apply_in_transaction(
     tx: &Transaction<'_>,
     execution_id: &str,
-    payload_json: &str,
+    payload_json: &mut String,
     kind: ProposalKind,
     proposal_id: &str,
     prepared_guide: Option<&Result<super::review_guide_submission::PreparedGuide>>,
@@ -206,15 +206,15 @@ pub(super) fn apply_in_transaction(
 fn apply_review_report(
     tx: &Transaction<'_>,
     execution_id: &str,
-    payload_json: &str,
+    payload_json: &mut String,
     proposal_id: &str,
 ) -> Result<ApplyDecision> {
-    let payload: ReviewReportProposalPayload = serde_json::from_str(payload_json)?;
-    let report: boss_pr_review::ReviewerReport = serde_json::from_value(payload.report.clone())?;
+    let mut payload: ReviewReportProposalPayload = serde_json::from_str(payload_json)?;
+    let mut report: boss_pr_review::ReviewerReport = serde_json::from_value(payload.report.clone())?;
     let member = tx
         .query_row(
             "SELECT members.id, members.status, members.report_proposal_id,
-                    batches.pr_url, batches.target_sha, batches.phase
+                    batches.pr_url, batches.target_sha, batches.phase, members.role
              FROM pr_review_batch_members AS members
              JOIN pr_review_batches AS batches ON batches.id = members.batch_id
              WHERE members.execution_id = ?1 AND members.batch_id = ?2",
@@ -227,6 +227,7 @@ fn apply_review_report(
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             },
         )
@@ -235,7 +236,7 @@ fn apply_review_report(
     // (`payload.batch_id`), so a returned row's batch membership is
     // guaranteed to match by construction — no separate mismatch check is
     // needed or possible here.
-    let Some((member_id, status, existing_report, pr_url, target_sha, phase)) = member else {
+    let Some((member_id, status, existing_report, pr_url, target_sha, phase, role)) = member else {
         return Ok(ApplyDecision::Rejected(format!(
             "this execution is not a member of review batch `{}`",
             payload.batch_id
@@ -270,6 +271,13 @@ fn apply_review_report(
         )));
     }
 
+    let role: ReviewBatchMemberRole = role.parse().map_err(anyhow::Error::msg)?;
+    let source = boss_pr_review::SupervisorSourceRole::from_member_role(role)
+        .context("only leaf reviewers can submit reports")?;
+    report.assign_finding_ids(source);
+    payload.report = serde_json::to_value(report)?;
+    *payload_json = serde_json::to_string(&payload)?;
+
     let now = now_string();
     tx.execute(
         "UPDATE pr_review_batch_members
@@ -283,31 +291,6 @@ fn apply_review_report(
         post_commit_audit_line: None,
         review_batch_quorum_outcome: quorum_outcome,
     }))
-}
-
-/// Canonicalize only newly accepted reports before their immutable proposal
-/// row is inserted. The persisted member role, never model output, owns ids.
-pub(super) fn assign_report_finding_ids(
-    tx: &Transaction<'_>,
-    execution_id: &str,
-    payload_json: &str,
-) -> Result<String> {
-    let mut payload: ReviewReportProposalPayload = serde_json::from_str(payload_json)?;
-    let role: String = tx.query_row(
-        "SELECT role FROM pr_review_batch_members WHERE execution_id = ?1 AND batch_id = ?2",
-        rusqlite::params![execution_id, payload.batch_id],
-        |row| row.get(0),
-    )?;
-    let role = match role.as_str() {
-        "claude_reviewer" => boss_pr_review::SupervisorSourceRole::Claude,
-        "codex_reviewer" => boss_pr_review::SupervisorSourceRole::Codex,
-        "grok_reviewer" => boss_pr_review::SupervisorSourceRole::Grok,
-        _ => anyhow::bail!("cannot assign leaf finding ids for member role `{role}`"),
-    };
-    let mut report: boss_pr_review::ReviewerReport = serde_json::from_value(payload.report)?;
-    report.assign_finding_ids(role);
-    payload.report = serde_json::to_value(report)?;
-    Ok(serde_json::to_string(&payload)?)
 }
 
 /// Check whether accepting a leaf report or a supervisor verdict just settled
@@ -534,11 +517,6 @@ fn review_verdict_unknown_source_reason(
         .query_map(rusqlite::params![batch_id], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let reported_roles: std::collections::HashSet<&str> = reported.iter().map(|(role, _)| role.as_str()).collect();
-    let member_role = |role: boss_pr_review::SupervisorSourceRole| match role {
-        boss_pr_review::SupervisorSourceRole::Claude => "claude_reviewer",
-        boss_pr_review::SupervisorSourceRole::Codex => "codex_reviewer",
-        boss_pr_review::SupervisorSourceRole::Grok => "grok_reviewer",
-    };
 
     let role_citations = verdict.contradictions.iter().flat_map(|contradiction| {
         contradiction
@@ -548,7 +526,7 @@ fn review_verdict_unknown_source_reason(
             .chain(contradiction.resolved_in_favor_of.as_ref())
     });
     for role in role_citations {
-        if !reported_roles.contains(member_role(*role)) {
+        if !reported_roles.contains(role.member_role().as_str()) {
             return Ok(Some(format!(
                 "verdict cites source `{role}` which has no accepted report in batch `{batch_id}`"
             )));
@@ -561,7 +539,7 @@ fn review_verdict_unknown_source_reason(
         .chain(verdict.rejected.iter().map(|rejected| &rejected.leaf_finding_id));
     for id in leaf_citations {
         if let Some(role) = boss_pr_review::leaf_finding_role(id)
-            && !reported_roles.contains(member_role(role))
+            && !reported_roles.contains(role.member_role().as_str())
         {
             return Ok(Some(format!(
                 "verdict cites leaf finding `{id}` whose reviewer `{role}` has no accepted report in batch `{batch_id}`"
@@ -588,7 +566,7 @@ fn review_verdict_unknown_source_reason(
         for finding in report.findings {
             let Some(id) = finding.id else {
                 return Ok(Some(format!(
-                    "accepted report `{proposal_id}` is legacy and has no leaf finding ids; start a new review batch"
+                    "accepted report `{proposal_id}` is legacy and has no leaf finding ids; do not retry this verdict. Stop and report blocked: a new review batch is required"
                 )));
             };
             leaf_ids.push(id);
@@ -1535,7 +1513,7 @@ mod tests {
         let err = apply_in_transaction(
             &tx,
             "exec_missing",
-            "{}",
+            &mut "{}".to_owned(),
             ProposalKind::FollowupTask,
             "prp_missing",
             None,

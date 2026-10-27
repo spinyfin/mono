@@ -36,6 +36,25 @@ pub enum SupervisorSourceRole {
 }
 
 impl SupervisorSourceRole {
+    pub fn from_member_role(role: boss_protocol::ReviewBatchMemberRole) -> Option<Self> {
+        use boss_protocol::ReviewBatchMemberRole::*;
+        match role {
+            ClaudeReviewer => Some(Self::Claude),
+            CodexReviewer => Some(Self::Codex),
+            GrokReviewer => Some(Self::Grok),
+            Supervisor | PostMergeReviewer => None,
+        }
+    }
+
+    pub fn member_role(self) -> boss_protocol::ReviewBatchMemberRole {
+        use boss_protocol::ReviewBatchMemberRole::*;
+        match self {
+            Self::Claude => ClaudeReviewer,
+            Self::Codex => CodexReviewer,
+            Self::Grok => GrokReviewer,
+        }
+    }
+
     /// Parse a role name as written by [`Self::as_str`].
     pub fn parse(value: &str) -> Option<Self> {
         match value {

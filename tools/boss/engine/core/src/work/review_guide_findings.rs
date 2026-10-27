@@ -70,6 +70,7 @@ fn query_findings(conn: &Connection, root_id: &str, pr_url: &str) -> Result<Opti
         let findings = if let Some(payload) = payload {
             let payload: boss_protocol::ReviewVerdictProposalPayload = serde_json::from_str(&payload)?;
             let verdict: boss_pr_review::SupervisorVerdict = serde_json::from_value(payload.verdict)?;
+            text.rejected.extend(rejected_finding_lines(&verdict));
             verdict
                 .findings
                 .into_iter()
@@ -98,7 +99,7 @@ fn query_findings(conn: &Connection, root_id: &str, pr_url: &str) -> Result<Opti
         }
     }
     let update = super::review_guide_jobs::guide_updates::status(conn, root_id, pr_url)?;
-    let mut findings = (!text.lines.is_empty()).then(|| text.finish());
+    let mut findings = (!text.lines.is_empty() || !text.rejected.is_empty()).then(|| text.finish());
     if let Some(update) = update {
         if let Some(findings) = &mut findings {
             findings.status_text = format!("{update} — {}", findings.status_text);
@@ -135,9 +136,11 @@ fn published_guide_contains_revision(conn: &Connection, revision_id: &str, pr_ur
     )?)
 }
 
-#[derive(Default)]
+#[derive(Default, bon::Builder)]
+#[builder(on(String, into))]
 struct FindingsText {
     lines: Vec<String>,
+    rejected: Vec<String>,
     fixed: usize,
     resolved: usize,
     in_progress: usize,
@@ -179,9 +182,20 @@ impl FindingsText {
         } else {
             String::new()
         };
+        let rejected_count = self.rejected.len();
+        let mut markdown = self.lines.join("\n");
+        if rejected_count > 0 {
+            markdown.push_str("\n\n### Rejected leaf findings\n\n");
+            markdown.push_str(&self.rejected.join("\n"));
+        }
+        let rejected_status = if rejected_count > 0 {
+            format!(", {rejected_count} rejected leaf findings")
+        } else {
+            String::new()
+        };
         ReviewGuideFindings {
             status_text: format!(
-                "{} finding{}: {} fixed on PR, {} in progress, {} open{resolved}",
+                "{} finding{}: {} fixed on PR, {} in progress, {} open{resolved}{rejected_status}",
                 self.lines.len(),
                 if self.lines.len() == 1 { "" } else { "s" },
                 self.fixed,
@@ -189,9 +203,24 @@ impl FindingsText {
                 self.open,
             ),
             // The viewer supplies the title in its disclosure label.
-            addendum_markdown: self.lines.join("\n"),
+            addendum_markdown: markdown,
         }
     }
+}
+
+/// Informational disposition ledger; never included in revision instructions.
+pub(super) fn rejected_finding_lines(verdict: &boss_pr_review::SupervisorVerdict) -> Vec<String> {
+    verdict
+        .rejected
+        .iter()
+        .map(|finding| {
+            format!(
+                "- {}: {}",
+                escape_markdown_line(&finding.leaf_finding_id),
+                escape_markdown_line(&finding.reason)
+            )
+        })
+        .collect()
 }
 
 /// Finding titles are untrusted prose, not Markdown instructions or links.

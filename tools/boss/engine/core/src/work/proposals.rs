@@ -267,7 +267,7 @@ impl WorkDb {
                 ProposalApplyPolicy::AutoApply | ProposalApplyPolicy::Async => Some(apply_in_transaction(
                     &tx,
                     input.execution_id,
-                    input.payload_json,
+                    &mut payload_json,
                     input.kind,
                     &id,
                     prepared_guide.as_ref(),
@@ -312,10 +312,6 @@ impl WorkDb {
                 ),
                 None => (ProposalState::Proposed, None, None, None, None, None, None),
             };
-
-            if input.kind == ProposalKind::ReviewReport && state == ProposalState::Applied {
-                payload_json = proposal_apply::assign_report_finding_ids(&tx, input.execution_id, &payload_json)?;
-            }
 
             tx.execute(
                 "INSERT INTO worker_proposals
