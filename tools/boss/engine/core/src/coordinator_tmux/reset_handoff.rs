@@ -157,7 +157,15 @@ pub(crate) async fn request_and_wait(request: HandoffRequest<'_>) -> Result<bool
                 GraceOutcome::TurnEndedWithoutWrite
             }
         }
-        () = tokio::time::sleep(timeout) => GraceOutcome::Expired,
+        () = tokio::time::sleep(timeout) => {
+            // A persisted write and the deadline can both be ready when this
+            // task is polled. Selection order must not label that write stale.
+            if fresh_write(work_db, expected_token, requested_at, &previous_write) {
+                GraceOutcome::Written
+            } else {
+                GraceOutcome::Expired
+            }
+        }
     };
     if outcome != GraceOutcome::Written {
         let (event, why) = match outcome {
