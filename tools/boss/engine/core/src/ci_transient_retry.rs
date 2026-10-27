@@ -619,7 +619,7 @@ mod tests {
 
     use super::*;
     use crate::ci_watch::on_ci_failure_detected_with;
-    use crate::merge_poller::{OpenPrStatus, PrLifecycleState, PrReviewState};
+    use crate::merge_poller::{OpenPrCiStatus, OpenPrStatus, PrLifecycleState, PrReviewState};
     use crate::test_support::*;
     use crate::work::{
         BlockedPrRemediation, FakePrStateChecker, PrOpenState, REMEDIATION_OUTCOME_BUDGET_EXHAUSTED, TaskStatus,
@@ -771,7 +771,12 @@ INFO: Build completed, 1 test FAILED, 2012 total actions
     fn pr_probe(pr_url: &str, head_sha: &str) -> PrLifecycleProbe {
         PrLifecycleProbe::builder()
             .url(pr_url.to_owned())
-            .state(PrLifecycleState::Open(OpenPrStatus::clean()))
+            .state(PrLifecycleState::Open(OpenPrStatus {
+                ci: OpenPrCiStatus::Failing {
+                    failures: checks_failure(),
+                },
+                ..OpenPrStatus::clean()
+            }))
             .base_ref_oid("base-1")
             .head_ref_oid(head_sha.to_owned())
             .head_ref_name(BRANCH)
@@ -1195,6 +1200,8 @@ INFO: Build completed, 1 test FAILED, 2012 total actions
         )
         .await;
         let fetched = *bk.fetches.lock().unwrap();
+        assert_eq!(fetched, 1, "the first pass classifies the failed job");
+        assert!(db.active_ci_remediation_for_work_item(&chore).unwrap().is_some());
         // While that revision runs, later passes (even with a different,
         // never-judged failure set) must not touch Buildkite.
         let other = vec![RequiredCheckFailure {
