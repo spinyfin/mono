@@ -1,4 +1,4 @@
-use super::board_runtime_cache::BoardRuntimeCache;
+use super::board_caches::BoardCaches;
 use super::*;
 
 use std::time::Instant;
@@ -1084,19 +1084,20 @@ impl WorkDb {
         self.assemble_work_tree(product_id, &mut trace, None, now)
     }
 
-    /// [`get_work_tree_instrumented`] reusing per-item runtimes from `cache`
-    /// instead of rebuilding every card's runtime from point queries. Returns
-    /// exactly the tree the uncached path would for the same snapshot.
+    /// [`get_work_tree_instrumented`] reusing per-item runtimes and
+    /// per-owner review projections from `caches` instead of rebuilding
+    /// them from point queries. Returns exactly the tree the uncached path
+    /// would for the same snapshot.
     pub(crate) fn get_work_tree_cached(
         &self,
         product_id: &str,
         trace: &mut PopulationTrace,
-        cache: &BoardRuntimeCache,
+        caches: &BoardCaches,
     ) -> Result<WorkTree> {
         self.get_work_tree_cached_at(
             product_id,
             trace,
-            cache,
+            caches,
             boss_engine_utils::epoch_time::now_epoch_secs(),
         )
     }
@@ -1106,19 +1107,21 @@ impl WorkDb {
         &self,
         product_id: &str,
         trace: &mut PopulationTrace,
-        cache: &BoardRuntimeCache,
+        caches: &BoardCaches,
         now: i64,
     ) -> Result<WorkTree> {
-        self.assemble_work_tree(product_id, trace, Some(cache), now)
+        self.assemble_work_tree(product_id, trace, Some(caches), now)
     }
 
     fn assemble_work_tree(
         &self,
         product_id: &str,
         trace: &mut PopulationTrace,
-        runtime_cache: Option<&BoardRuntimeCache>,
+        caches: Option<&BoardCaches>,
         now: i64,
     ) -> Result<WorkTree> {
+        let runtime_cache = caches.map(|caches| &caches.runtimes);
+        let review_cache = caches.map(|caches| &caches.reviews);
         let mut connection = self.connect()?;
         // All projections must describe one consistent database snapshot.
         let conn = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
@@ -1193,8 +1196,15 @@ impl WorkDb {
         // Derived per-card fields (revision projections, review/CI flags,
         // badges, doc links). Shared with the runtime patch so a patched
         // card is the card this tree would have produced.
-        let tasks =
-            super::board_patch::attach_board_derivations(&conn, tasks, &mut chores, product_id, "get_work_tree", trace);
+        let tasks = super::board_patch::attach_board_derivations(
+            &conn,
+            tasks,
+            &mut chores,
+            product_id,
+            "get_work_tree",
+            trace,
+            review_cache,
+        );
 
         let ideas = list_ideas_in_tx(&conn, product_id, None)?;
         let attention_items = super::attentions::reads::list_items(&conn, product_id)?;

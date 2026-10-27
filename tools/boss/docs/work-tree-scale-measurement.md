@@ -112,3 +112,45 @@ The delta sizes include the product ID, sequence/base, changed records and colle
 Validation covers exact snapshot equality, unchanged refreshes, product moves, deletion, full-response recovery, reconnects, unrelated global revisions, patch ordering and worker idea sanitization. The initial full-suite run exposed a benchmark-only pooled-connection deadlock: the mutation loop retained its connection guard while calling the tree reader. Releasing that guard before the read fixed the root cause; no assertion or ordinary test timeout was relaxed.
 
 A further 20-sample run after rebasing onto current main passed with identical snapshot and delta body sizes. DB assembly plus full serialization p50/p95 was 1,852.617 / 3,440.486 ms; review-state p50/p95 was 204.258 / 466.449 ms (10.7× faster p50 than the fresh baseline). The 1 / 10 / 100-record delta probes took 1,339.380 / 1,327.944 / 1,399.412 ms. The timing variation reinforces the uncontrolled-host-load caveat; byte counts remained exact. Final integration also clears the client's base on a new decode connection generation, preventing an old session's sequence from matching a new session after a lost reconnect snapshot.
+
+## Review projection cache
+
+A board assembly also resolves the AI-review projection (`ai_review_state`, `ai_review_findings_revision_id`, `ai_review_badge`) for every card that can show one. The lookup set is every active, in-review *and done* card with a PR, so on the synthetic fixture it is 7,067 of 7,585 cards, and both review queries were keyed by card: each walked the card's revision chain to its PR owner in SQL and then read the owner's `tasks` row. Those rows carry multi-kilobyte descriptions, so the pass was dominated by page reads of the `tasks` table — the `sqlite3VdbeExec` / `pread` profile of an engine that sits at a full core while the app refetches the board after every structural invalidation. The query plans themselves were already index-only (`EXPLAIN QUERY PLAN` shows no table scan; the recursive family walk uses `idx_tasks_parent_task_id` and the verdict probe uses `pr_review_verdicts_work_item_idx`); the cost was the number of rows the plans had to touch per assembly, which scaled with the board rather than with what changed.
+
+The projection is now resolved per PR owner and cached in the engine-wide `BoardReviewCache` (`tools/boss/engine/core/src/work/board_review_cache.rs`), validated by `board_review_epoch` (schema 53). SQLite triggers bump an item's epoch, and its parent's, inside the writer's transaction whenever a projection input is written: the listed `tasks` columns, any `pr_review_verdicts` row, the kind/status/head columns of `work_executions`, and `worker_proposals`. A pass reads the epoch table once, probes the cache by family key, and runs the two owner-keyed queries only for the owners whose key moved. Running and queued reviews stay a per-pass read of live executions. A card whose chain leaves the board (an archived ancestor) keeps the card-keyed SQL walk. The `db.ai_review_state` population segment now records the cards resolved (`rows`) and the statements run (`db_queries`), and `work_tree_production_scale_measurement` pins those statement counts: 2 on a warm pass, 4 after any number of verdict writes, with exactly one owner recomputed per written family.
+
+### Measurements on the synthetic fixture
+
+Measured on October 27 with the fastbuild configuration. The host was heavily loaded (other Bazel builds and the production engine), so absolute times in this run are 3–5× slower than the idle baseline below and only the interleaved comparisons within one run are meaningful. `measure_cached_reviews` alternates an uncached and a warm cached assembly for each sample, so the two columns of each row saw the same load.
+
+| `db.ai_review_state` per assembly                 | Uncached (owner-keyed, every owner) | Warm cache |
+| ------------------------------------------------- | ----------------------------------: | ---------: |
+| p50 over 5 interleaved samples, ms                |                               1,095 |        373 |
+| After 1 / 10 / 100 verdict writes, ms             |               1,184 / 1,438 / 1,140 | 352 / 44 / 119 |
+| Review statements                                 |                                   3 |          2 (4 after writes) |
+| Owners recomputed                                 |                       5,301 (all)   | 0 (1 / 10 / 100 after writes) |
+
+The unmodified engine resolved the same fixture in 222 ms per assembly on an idle host (one sample from the baseline run; whole warm assembly 567 ms), reading 7,067 owner rows by card. The pinned statement counts are the regression guard; the timings show the direction and the write-proportional recompute, not a stable absolute.
+
+### Isolated engine, before and after
+
+Two engine binaries — the unmodified `main` build and this change — were started as test fixtures (`--socket-path /tmp/boss-test-<uuid>.sock`, `BOSS_WORKER_POOL_SIZE=0`, no events socket) on fresh copies of the same seeded fixture database (schema 52; the changed engine migrated it to 53 at startup). A driver fetched the board once per second over the control socket with `delta: true`, writing one runtime-irrelevant `work_runs` column between fetches so every fetch assembled the tree, and `sample <pid> 5` was taken under that load. Runs alternated old/new/old/new on a heavily loaded host, so wall-clock latency varied several-fold between runs; engine CPU seconds per fetch is the comparable figure.
+
+| Run                | Fetches in 60 s | Engine CPU, s | CPU per fetch, s | Fetch latency p50, s |
+| ------------------ | --------------: | ------------: | ---------------: | -------------------: |
+| Before, run 1      |              19 |         15.93 |             0.84 |                 2.65 |
+| After, run 1       |               9 |          6.55 |             0.73 |                 7.12 |
+| Before, run 2      |               8 |          8.34 |             1.04 |                 6.62 |
+| After, run 2       |              16 |         11.10 |             0.69 |                 3.18 |
+
+Idle (no fetches) both engines sat at 0.3–2.7% of a core. The fixture's 24 MB of descriptions make tree serialization and delta diffing the bulk of a fetch here, which caps the per-fetch gain this harness can show; the sample attribution is the sharper signal. Attributing every `sqlite3_step` sample to its nearest engine caller, as in the original report:
+
+| Nearest engine caller under `sqlite3_step`          | Before | After (badge cache) | After (badge cache + guide scan) |
+| --------------------------------------------------- | -----: | ------------------: | -------------------------------: |
+| `review_badge` (current-head state, badge history)  |    932 |                   0 |                       0 |
+| `query_review_guide_card_states`                    |     95 |                 630 |                       0 |
+| `collect_rows` (the tasks lane read)                |     29 |                 319 |                       0 |
+| Total `sqlite3_step` samples in 5 s                 |  1,056 |                 996 |                      4 |
+
+With badge resolution cached, the review-guide lookup became the largest remaining SQLite cost: it bound every PR-bearing card as a `(root_task_id, canonical_pr_url)` row-value `IN` list, which SQLite answers by building a two-column ephemeral index of the whole board on every assembly (`balance_nonroot` dominated its stack). It now scans the small series table and intersects with the board in memory, the shape `attach_has_attachments_flag` already uses.
+

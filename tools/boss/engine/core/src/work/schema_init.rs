@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 52;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 53;
 
 /// Schema 43: the baseline commit a recovery record was created at, the
 /// pointer-reconciliation note for the worker prompt, and the retirement
@@ -128,6 +128,179 @@ const BOARD_RUNTIME_EPOCH_49: &str = "CREATE TABLE IF NOT EXISTS board_runtime_e
      BEGIN
          INSERT INTO board_runtime_epoch(work_item_id, epoch)
          SELECT work_item_id, 1 FROM work_executions WHERE id = OLD.execution_id
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+     END";
+
+/// Schema 53: per-item version counters for the board review-state cache.
+///
+/// `board_review_epoch.epoch` increases whenever an input of a card's
+/// AI-review projection (`ai_review_state`, `ai_review_findings_revision_id`,
+/// `ai_review_badge`; see `review_badge::fetch_owner_reviews` for the exact
+/// column list) is written. Those projections are derived per PR owner (chain
+/// root) from the root's row, every revision row under it, the family's
+/// `pr_review_verdicts`, the findings revision's `work_executions`, and the
+/// applied `worker_proposals` payload. Each trigger therefore bumps the
+/// written row's work item *and* that item's `parent_task_id` (a revision's
+/// chain root, since `insert_revision_in_tx` always parents a revision
+/// directly to the root), so a root's epoch alone summarises its whole
+/// family. The reader additionally folds in the epochs of the family members
+/// it sees on the board, so a nested legacy chain still invalidates.
+///
+/// Same discipline as `board_runtime_epoch`: the bump is in the writer's own
+/// transaction, rows are never deleted, and `UPDATE OF` lists only the columns
+/// the projection reads, so unrelated writes (poll timestamps, runtime
+/// bookkeeping) leave the cache warm.
+const BOARD_REVIEW_EPOCH_53: &str = "CREATE TABLE IF NOT EXISTS board_review_epoch (
+         work_item_id TEXT PRIMARY KEY NOT NULL,
+         epoch INTEGER NOT NULL
+     ) WITHOUT ROWID;
+     CREATE TRIGGER IF NOT EXISTS board_review_epoch_task_insert
+     AFTER INSERT ON tasks
+     BEGIN
+         INSERT INTO board_review_epoch(work_item_id, epoch) VALUES (NEW.id, 1)
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT NEW.parent_task_id, 1 WHERE NEW.parent_task_id IS NOT NULL
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+     END;
+     CREATE TRIGGER IF NOT EXISTS board_review_epoch_task_update
+     AFTER UPDATE OF kind, status, deleted_at, parent_task_id, pr_url, pr_head_sha,
+                     ci_required_state, pr_mergeable_state, last_reviewed_sha, name, description
+     ON tasks
+     BEGIN
+         INSERT INTO board_review_epoch(work_item_id, epoch) VALUES (NEW.id, 1)
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT NEW.parent_task_id, 1 WHERE NEW.parent_task_id IS NOT NULL
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT OLD.parent_task_id, 1
+         WHERE OLD.parent_task_id IS NOT NULL AND OLD.parent_task_id IS NOT NEW.parent_task_id
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+     END;
+     CREATE TRIGGER IF NOT EXISTS board_review_epoch_task_delete
+     AFTER DELETE ON tasks
+     BEGIN
+         INSERT INTO board_review_epoch(work_item_id, epoch) VALUES (OLD.id, 1)
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT OLD.parent_task_id, 1 WHERE OLD.parent_task_id IS NOT NULL
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+     END;
+     CREATE TRIGGER IF NOT EXISTS board_review_epoch_verdict_insert
+     AFTER INSERT ON pr_review_verdicts
+     BEGIN
+         INSERT INTO board_review_epoch(work_item_id, epoch) VALUES (NEW.work_item_id, 1)
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT parent_task_id, 1 FROM tasks WHERE id = NEW.work_item_id AND parent_task_id IS NOT NULL
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+     END;
+     CREATE TRIGGER IF NOT EXISTS board_review_epoch_verdict_update
+     AFTER UPDATE ON pr_review_verdicts
+     BEGIN
+         INSERT INTO board_review_epoch(work_item_id, epoch) VALUES (NEW.work_item_id, 1)
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT parent_task_id, 1 FROM tasks WHERE id = NEW.work_item_id AND parent_task_id IS NOT NULL
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT OLD.work_item_id, 1 WHERE OLD.work_item_id IS NOT NEW.work_item_id
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT parent_task_id, 1 FROM tasks
+         WHERE id = OLD.work_item_id AND parent_task_id IS NOT NULL AND OLD.work_item_id IS NOT NEW.work_item_id
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+     END;
+     CREATE TRIGGER IF NOT EXISTS board_review_epoch_verdict_delete
+     AFTER DELETE ON pr_review_verdicts
+     BEGIN
+         INSERT INTO board_review_epoch(work_item_id, epoch) VALUES (OLD.work_item_id, 1)
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT parent_task_id, 1 FROM tasks WHERE id = OLD.work_item_id AND parent_task_id IS NOT NULL
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+     END;
+     CREATE TRIGGER IF NOT EXISTS board_review_epoch_execution_insert
+     AFTER INSERT ON work_executions
+     BEGIN
+         INSERT INTO board_review_epoch(work_item_id, epoch) VALUES (NEW.work_item_id, 1)
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT parent_task_id, 1 FROM tasks WHERE id = NEW.work_item_id AND parent_task_id IS NOT NULL
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+     END;
+     CREATE TRIGGER IF NOT EXISTS board_review_epoch_execution_update
+     AFTER UPDATE OF work_item_id, kind, status, finished_at, pr_head_after ON work_executions
+     BEGIN
+         INSERT INTO board_review_epoch(work_item_id, epoch) VALUES (NEW.work_item_id, 1)
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT parent_task_id, 1 FROM tasks WHERE id = NEW.work_item_id AND parent_task_id IS NOT NULL
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT OLD.work_item_id, 1 WHERE OLD.work_item_id IS NOT NEW.work_item_id
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT parent_task_id, 1 FROM tasks
+         WHERE id = OLD.work_item_id AND parent_task_id IS NOT NULL AND OLD.work_item_id IS NOT NEW.work_item_id
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+     END;
+     CREATE TRIGGER IF NOT EXISTS board_review_epoch_execution_delete
+     AFTER DELETE ON work_executions
+     BEGIN
+         INSERT INTO board_review_epoch(work_item_id, epoch) VALUES (OLD.work_item_id, 1)
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT parent_task_id, 1 FROM tasks WHERE id = OLD.work_item_id AND parent_task_id IS NOT NULL
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+     END;
+     CREATE TRIGGER IF NOT EXISTS board_review_epoch_proposal_insert
+     AFTER INSERT ON worker_proposals
+     BEGIN
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT NEW.work_item_id, 1 WHERE NEW.work_item_id IS NOT NULL
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT parent_task_id, 1 FROM tasks WHERE id = NEW.work_item_id AND parent_task_id IS NOT NULL
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+     END;
+     CREATE TRIGGER IF NOT EXISTS board_review_epoch_proposal_update
+     AFTER UPDATE OF work_item_id, kind, state, payload_json ON worker_proposals
+     BEGIN
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT NEW.work_item_id, 1 WHERE NEW.work_item_id IS NOT NULL
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT parent_task_id, 1 FROM tasks WHERE id = NEW.work_item_id AND parent_task_id IS NOT NULL
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT OLD.work_item_id, 1
+         WHERE OLD.work_item_id IS NOT NULL AND OLD.work_item_id IS NOT NEW.work_item_id
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT v.work_item_id, 1 FROM pr_review_verdicts v WHERE v.proposal_id = NEW.id
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT t.parent_task_id, 1 FROM pr_review_verdicts v JOIN tasks t ON t.id = v.work_item_id
+         WHERE v.proposal_id = NEW.id AND t.parent_task_id IS NOT NULL
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+     END;
+     CREATE TRIGGER IF NOT EXISTS board_review_epoch_proposal_delete
+     AFTER DELETE ON worker_proposals
+     BEGIN
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT OLD.work_item_id, 1 WHERE OLD.work_item_id IS NOT NULL
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT parent_task_id, 1 FROM tasks WHERE id = OLD.work_item_id AND parent_task_id IS NOT NULL
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT v.work_item_id, 1 FROM pr_review_verdicts v WHERE v.proposal_id = OLD.id
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_review_epoch(work_item_id, epoch)
+         SELECT t.parent_task_id, 1 FROM pr_review_verdicts v JOIN tasks t ON t.id = v.work_item_id
+         WHERE v.proposal_id = OLD.id AND t.parent_task_id IS NOT NULL
          ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
      END";
 
@@ -252,6 +425,9 @@ impl WorkDb {
         }
         if version < 52 && !table_has_column(&tx, "work_executions", "progression_neighbourhood")? {
             tx.execute_batch("ALTER TABLE work_executions ADD COLUMN progression_neighbourhood TEXT")?;
+        }
+        if version < 53 {
+            tx.execute_batch(BOARD_REVIEW_EPOCH_53)?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
@@ -846,6 +1022,9 @@ mod floor_tests {
                 conn.execute_batch("ALTER TABLE work_executions ADD COLUMN progression_neighbourhood TEXT")
                     .unwrap();
             }
+            if version >= 53 {
+                conn.execute_batch(BOARD_REVIEW_EPOCH_53).unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -887,6 +1066,7 @@ mod floor_tests {
             expected
                 .execute_batch("ALTER TABLE work_executions ADD COLUMN progression_neighbourhood TEXT")
                 .unwrap();
+            expected.execute_batch(BOARD_REVIEW_EPOCH_53).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {
