@@ -114,6 +114,9 @@ pub struct WorkItemExternalRef {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct WorkItemPatch {
+    /// Engine-attested cancellation context for side effects of this patch.
+    #[serde(skip)]
+    pub cancel_provenance: Option<crate::CancelProvenance>,
     /// Flip the `autostart` flag. `None` → leave unchanged.
     /// `Some(true)` → enable auto-dispatch; `Some(false)` → disable.
     #[serde(default, skip_serializing_if = "Option::is_none")]

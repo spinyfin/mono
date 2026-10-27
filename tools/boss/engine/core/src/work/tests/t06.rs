@@ -514,7 +514,8 @@ fn get_live_execution_returns_none_when_all_executions_are_terminal() {
     let (_, chore_id, exec_a_id) = make_waiting_human_chore(&db, "live-exec-terminal");
 
     // Manually abandon exec_a.
-    db.mark_execution_redundant(&exec_a_id).unwrap();
+    db.mark_execution_redundant(&exec_a_id, test_cancel_provenance())
+        .unwrap();
 
     let exec_b = db
         .create_execution(
@@ -539,11 +540,17 @@ fn mark_execution_redundant_sets_status_abandoned() {
     let db = WorkDb::open(temp_db_path("mark-redundant")).unwrap();
     let (_, _, exec_a_id) = make_waiting_human_chore(&db, "mark-redundant");
 
-    db.mark_execution_redundant(&exec_a_id).unwrap();
+    db.mark_execution_redundant(&exec_a_id, test_cancel_provenance())
+        .unwrap();
 
     let exec = db.get_execution(&exec_a_id).unwrap();
     assert_eq!(exec.status, ExecutionStatus::Abandoned);
     assert!(exec.finished_at.is_some(), "finished_at must be set");
+    assert_eq!(
+        exec.cancel_provenance.as_ref().map(|p| p.source),
+        Some(boss_protocol::CancelSource::Bossctl),
+        "test helper provenance is what this call supplied"
+    );
 }
 
 #[test]

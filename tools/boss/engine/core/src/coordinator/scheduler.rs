@@ -2030,7 +2030,15 @@ impl ExecutionCoordinator {
             }
         };
 
-        if let Err(err) = self.work_db.cancel_running_execution(&victim.execution_id) {
+        let provenance = boss_protocol::CancelProvenance::engine(
+            boss_protocol::CancelSource::SchedulerPreemption,
+            "dispatch_scheduler",
+            format!(
+                "preempted to free a Lower Decks slot for mainline work (victim execution {}, work item {})",
+                victim.execution_id, victim_execution.work_item_id
+            ),
+        );
+        if let Err(err) = self.work_db.cancel_running_execution(&victim.execution_id, provenance) {
             tracing::warn!(
                 victim_execution_id = %victim.execution_id,
                 ?err,

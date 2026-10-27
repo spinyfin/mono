@@ -1161,11 +1161,12 @@ fn reaped_batch(db: &WorkDb, root_id: &str, pr_url: &str, target_sha: &str) -> S
         )
         .unwrap()
     {
-        crate::work::ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+        crate::work::ReviewBatchDispatch::Created { batch, executions } => (*batch, executions),
         other => panic!("expected a new batch, got {other:?}"),
     };
     for execution in &executions {
-        db.mark_execution_redundant(&execution.id).unwrap();
+        db.mark_execution_redundant(&execution.id, test_cancel_provenance())
+            .unwrap();
     }
     let conn = db.connect().unwrap();
     conn.execute(
@@ -1219,7 +1220,7 @@ fn deferred_admission_query_surfaces_an_in_review_root_whose_newest_batch_was_re
         )
         .unwrap()
     {
-        crate::work::ReviewBatchDispatch::Created { batch, .. } => batch,
+        crate::work::ReviewBatchDispatch::Created { batch, .. } => *batch,
         other => panic!("the reaped head must be re-minted, got {other:?}"),
     };
     assert_eq!(next.generation, 2);
@@ -1230,7 +1231,8 @@ fn deferred_admission_query_surfaces_an_in_review_root_whose_newest_batch_was_re
     // and the query must not keep costing a `gh pr view` every sweep.
     for execution in db.list_executions(Some(&root_id)).unwrap() {
         if execution.kind == ExecutionKind::PrReview && !execution.status.is_terminal() {
-            db.mark_execution_redundant(&execution.id).unwrap();
+            db.mark_execution_redundant(&execution.id, test_cancel_provenance())
+                .unwrap();
         }
     }
     db.connect()
@@ -1293,7 +1295,7 @@ fn deferred_admission_query_surfaces_a_root_whose_newest_verdict_was_stale_head(
         )
         .unwrap()
     {
-        crate::work::ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+        crate::work::ReviewBatchDispatch::Created { batch, executions } => (*batch, executions),
         other => panic!("expected a new batch, got {other:?}"),
     };
     let conn = db.connect().unwrap();
@@ -1341,7 +1343,7 @@ fn deferred_admission_query_surfaces_a_root_whose_newest_verdict_was_stale_head(
         )
         .unwrap()
     {
-        crate::work::ReviewBatchDispatch::Created { batch, .. } => batch,
+        crate::work::ReviewBatchDispatch::Created { batch, .. } => *batch,
         other => panic!("expected a new batch, got {other:?}"),
     };
     assert!(db.list_tasks_awaiting_pre_merge_review_admission().unwrap().is_empty());

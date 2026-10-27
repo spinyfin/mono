@@ -24,9 +24,9 @@ Compared to the other terminal statuses:
 
 - `completed` / `failed`: the worker finished its turn and the
   completion handler stamped the verdict.
-- `cancelled`: a human invoked `bossctl executions cancel <execution>`
-  (never-started rows only), `bossctl work cancel <execution>` (any
-  non-terminal row), or `bossctl agents stop <agent>` (live worker).
+- `cancelled`: a human invoked `bossctl executions cancel <execution> --reason 'cancel obsolete execution'`
+  (never-started rows only), `bossctl work cancel <execution> --reason 'reap stuck worker'` (any
+  non-terminal row), or `bossctl agents stop <agent> --reason 'reap stuck worker'` (live worker).
   Operator cancellation is distinct from the engine losing a run.
 - `abandoned`: the row never produced a `work_runs` entry (the engine
   crashed mid-dispatch, before the worker spawned).
@@ -119,7 +119,7 @@ bossctl executions cancel --work-item <id> --reason "…"
 ```
 
 `executions cancel` refuses rows that have already started and points
-at `bossctl agents stop` instead.
+at `bossctl agents stop <run> --reason 'reap stuck worker'` instead.
 
 ## What happens after reap
 

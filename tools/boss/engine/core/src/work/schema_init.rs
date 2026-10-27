@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 55;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 56;
 
 /// Schema 43: the baseline commit a recovery record was created at, the
 /// pointer-reconciliation note for the worker prompt, and the retirement
@@ -46,6 +46,32 @@ const TASKS_CRITICAL_PROVENANCE_46: &str = "ALTER TABLE tasks ADD COLUMN critica
 /// — comes back `Working` rather than `Idle`. NULL on every pre-existing row,
 /// which parses as `unknown`; see `semantic_progress::SemanticTurnCondition`.
 const WORK_RUNS_SEMANTIC_TURN_CONDITION_50: &str = "ALTER TABLE work_runs ADD COLUMN semantic_turn_condition TEXT";
+
+/// Schema 56: who ended an execution by decision, and why. The three
+/// columns are written in the same statement that moves a row to `cancelled`
+/// or `abandoned`; the trigger makes a decision-terminal write without all
+/// three structurally impossible, so a new cancel path that forgets
+/// provenance fails loudly instead of recording nothing. Rows already
+/// terminal when this lands keep NULLs (their `OLD.status` equals the new
+/// one, so the trigger never fires for them).
+pub(in crate::work) const EXECUTIONS_CANCEL_PROVENANCE_56: &str =
+    "ALTER TABLE work_executions ADD COLUMN cancel_source TEXT;
+     ALTER TABLE work_executions ADD COLUMN cancel_actor TEXT;
+     ALTER TABLE work_executions ADD COLUMN cancel_reason TEXT";
+
+/// Companion to [`EXECUTIONS_CANCEL_PROVENANCE_56`]. Kept apart because the
+/// trigger is `IF NOT EXISTS` and so is safe to replay on its own.
+pub(in crate::work) const EXECUTIONS_CANCEL_PROVENANCE_TRIGGER_56: &str =
+    "CREATE TRIGGER IF NOT EXISTS work_executions_decision_requires_provenance
+     BEFORE UPDATE OF status ON work_executions
+     WHEN NEW.status IN ('cancelled', 'abandoned')
+      AND OLD.status IS NOT NEW.status
+      AND (NEW.cancel_source IS NULL OR trim(NEW.cancel_source) = ''
+        OR NEW.cancel_actor IS NULL OR trim(NEW.cancel_actor) = ''
+        OR NEW.cancel_reason IS NULL OR trim(NEW.cancel_reason) = '')
+     BEGIN
+         SELECT RAISE(ABORT, 'execution cancel/abandon requires cancel_source, cancel_actor and cancel_reason');
+     END";
 
 /// Serves the shared-PR probes (`o.pr_url = t.pr_url`, `pr_url = ?`) so they
 /// are index lookups instead of full `tasks` scans.
@@ -367,6 +393,7 @@ impl WorkDb {
     /// Future migrations must use increasing versions above the floor and
     /// run here for both paths, advancing the marker only after success.
     pub(crate) fn init(&self) -> Result<()> {
+        let mut pending = PendingEvents::new();
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let has_schema: bool = tx.query_row(
@@ -407,9 +434,18 @@ impl WorkDb {
         if version < 38 {
             tx.execute_batch("ALTER TABLE work_executions ADD COLUMN dispatch_wait_blocker_id TEXT")?;
         }
+        // Schema 39 (and 43) re-arm by cancelling shadowed executions, which
+        // reads and writes cancel_source/actor/reason. Those columns land in
+        // schema 56; add them first so a database at the compatibility floor
+        // (32–38) can open. Idempotent via table_has_column.
+        ensure_cancel_provenance_columns(&tx)?;
         if version < 39 {
             // Data only: restart items blocked by the false ancestry failure.
-            execution_recovery_rearm::migrate(&tx, execution_recovery_rearm::is_false_not_descended_blocker)?;
+            execution_recovery_rearm::migrate(
+                &tx,
+                execution_recovery_rearm::is_false_not_descended_blocker,
+                &mut pending,
+            )?;
         }
         if version < 40 {
             tx.execute_batch("ALTER TABLE ci_remediations ADD COLUMN queue_base_sha TEXT")?;
@@ -426,6 +462,7 @@ impl WorkDb {
             execution_recovery_rearm::migrate(
                 &tx,
                 boss_engine_recovery::execution_bookmark::is_legacy_reconcilable_blocker,
+                &mut pending,
             )?;
         }
         if version < 44 {
@@ -469,6 +506,10 @@ impl WorkDb {
         if version < 55 {
             tx.execute_batch(VERDICT_REVISION_INDEX_55)?;
         }
+        if version < 56 {
+            ensure_cancel_provenance_columns(&tx)?;
+            tx.execute_batch(EXECUTIONS_CANCEL_PROVENANCE_TRIGGER_56)?;
+        }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
                 "UPDATE metadata SET value = ?1 WHERE key = 'schema_version'",
@@ -479,6 +520,7 @@ impl WorkDb {
         // discovery remains outside DB startup (no processes or network).
         crate::host_registry::ensure_local_host(&tx)?;
         tx.commit()?;
+        *self.migration_events.lock().unwrap() = pending;
         Ok(())
     }
 
@@ -600,6 +642,8 @@ impl WorkDb {
             conn: Arc::new(Mutex::new(conn)),
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
+            dispatch_events: Arc::new(crate::dispatch_events::NoopDispatchEventSink),
+            migration_events: Arc::new(Mutex::new(PendingEvents::new())),
             persona_metrics: super::personas::new_metrics_registry(),
         })
     }
@@ -630,6 +674,8 @@ impl WorkDb {
             conn: Arc::new(Mutex::new(conn)),
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
+            dispatch_events: Arc::new(crate::dispatch_events::NoopDispatchEventSink),
+            migration_events: Arc::new(Mutex::new(PendingEvents::new())),
             persona_metrics: super::personas::new_metrics_registry(),
         })
     }
@@ -875,6 +921,17 @@ mod tests {
     }
 }
 
+/// Add the schema-56 `cancel_*` columns unless they are already there. The
+/// schema-39 and schema-43 recovery re-arms cancel executions while migrating
+/// an older database, before step 56 would add them, so `init` calls this
+/// before those steps; step 56 calls it again and finds nothing left to do.
+pub(crate) fn ensure_cancel_provenance_columns(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "work_executions", "cancel_source")? {
+        conn.execute_batch(EXECUTIONS_CANCEL_PROVENANCE_56)?;
+    }
+    Ok(())
+}
+
 /// Whether `table` currently has a column named `column`. Used by the
 /// idempotent schema-46 migration in `init` and by migration tests.
 pub(crate) fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -990,6 +1047,7 @@ mod floor_tests {
             45,
             51,
             54,
+            55,
             CURRENT_SCHEMA_VERSION,
             CURRENT_SCHEMA_VERSION + 1,
         ] {
@@ -1034,6 +1092,9 @@ mod floor_tests {
             }
             if version >= 43 {
                 conn.execute_batch(EXECUTION_BOOKMARK_COLUMNS_43).unwrap();
+                // Production schema 43 adds these before recovery re-arm
+                // cancels; keep the seed in the same column order.
+                conn.execute_batch(EXECUTIONS_CANCEL_PROVENANCE_56).unwrap();
             }
             if version >= 44 {
                 conn.execute_batch(TASKS_PR_URL_INDEX_SQL).unwrap();
@@ -1072,6 +1133,9 @@ mod floor_tests {
             if version >= 55 {
                 conn.execute_batch(VERDICT_REVISION_INDEX_55).unwrap();
             }
+            if version >= 56 {
+                conn.execute_batch(EXECUTIONS_CANCEL_PROVENANCE_TRIGGER_56).unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -1102,6 +1166,7 @@ mod floor_tests {
                 .unwrap();
             review_guide_jobs::guide_updates::migrate(&expected).unwrap();
             expected.execute_batch(EXECUTION_BOOKMARK_COLUMNS_43).unwrap();
+            expected.execute_batch(EXECUTIONS_CANCEL_PROVENANCE_56).unwrap();
             expected.execute_batch(TASKS_PR_URL_INDEX_SQL).unwrap();
             expected.execute_batch(TASKS_PR_UPDATED_AT_45).unwrap();
             expected.execute_batch(TASKS_CRITICAL_PROVENANCE_46).unwrap();
@@ -1116,6 +1181,7 @@ mod floor_tests {
             expected.execute_batch(BOARD_REVIEW_EPOCH_53).unwrap();
             expected.execute_batch(TASKS_PARENT_KIND_INDEX_54).unwrap();
             expected.execute_batch(VERDICT_REVISION_INDEX_55).unwrap();
+            expected.execute_batch(EXECUTIONS_CANCEL_PROVENANCE_TRIGGER_56).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

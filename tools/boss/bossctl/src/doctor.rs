@@ -1946,6 +1946,13 @@ pub fn run_diagnose(
         }
     }
 
+    // Who ended each decision-terminal execution in scope, straight from the
+    // execution rows. Independent of the dispatch stream so a cancel path that
+    // wrote no dispatch event is still explained.
+    let cancel_provenance = db
+        .map(|work_db| crate::cancel_provenance_report::decision_terminals(work_db, &scope.execution_ids))
+        .unwrap_or_default();
+
     let mut findings = match_dispatch_signatures(&events, now_ms, Some(&fleet), Some(&db_facts), &scope_execs);
 
     match load_scope_trace_records(root, &scope_execs, &scope_items) {
@@ -2014,6 +2021,10 @@ pub fn run_diagnose(
             obj.insert("absence_findings_qualified".into(), Value::from(qualified));
         }
         payload.insert("stream_integrity".into(), integrity_json);
+        payload.insert(
+            "cancel_provenance".into(),
+            crate::cancel_provenance_report::to_json(&cancel_provenance),
+        );
         if scope.resolved_as == ResolvedAs::Execution {
             let exec_id = scope
                 .execution_ids
@@ -2087,6 +2098,10 @@ pub fn run_diagnose(
         }
     }
 
+    print!(
+        "{}",
+        crate::cancel_provenance_report::render_section(&cancel_provenance)
+    );
     println!();
     print!("{}", render_findings(&findings, &integrity));
     integrity.print_footer();

@@ -779,9 +779,16 @@ pub(super) async fn handle_stop_run(ctx: Dispatch, req: FrontendRequest) {
         sink,
         request_id,
         peer_pid,
+        session_id,
         ..
     } = ctx;
-    let FrontendRequest::StopRun { run_id } = req else {
+    let FrontendRequest::StopRun {
+        run_id,
+        reason,
+        source,
+        actor,
+    } = req
+    else {
         unreachable!()
     };
     {
@@ -812,7 +819,32 @@ pub(super) async fn handle_stop_run(ctx: Dispatch, req: FrontendRequest) {
             );
             return;
         }
-        tracing::info!(run_id = %run_id, "stop_run requested");
+        let provenance = match super::cancel_rpc::provenance_from_request(
+            source.as_deref(),
+            reason.as_deref(),
+            actor.as_deref(),
+            &rpc_cancel_actor(&server_state, &session_id, peer_pid).await,
+        ) {
+            Ok(provenance) => provenance,
+            Err(refusal) => {
+                tracing::warn!(run_id = %run_id, ?refusal, "stop_run rejected: missing cancel provenance");
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::Error {
+                        message: refusal.message("stop_run"),
+                    },
+                );
+                return;
+            }
+        };
+        tracing::info!(
+            run_id = %run_id,
+            source = %provenance.source,
+            actor = %provenance.actor,
+            reason = %provenance.reason,
+            "stop_run requested",
+        );
         let handler = server_state.completion_handler.clone();
         let run_id_for_release = run_id.clone();
         boss_task_scope::spawn(async move {
@@ -823,7 +855,7 @@ pub(super) async fn handle_stop_run(ctx: Dispatch, req: FrontendRequest) {
             // `reconcile_active_dispatch` cannot immediately
             // re-dispatch the work item the moment the worker
             // pool slot is freed.
-            handler.force_stop_execution(&run_id_for_release).await;
+            handler.force_stop_execution(&run_id_for_release, provenance).await;
         });
         send_response(&sink, &request_id, FrontendEvent::RunStopped { run_id });
     }
@@ -921,11 +953,14 @@ pub(super) async fn handle_cancel_execution(ctx: Dispatch, req: FrontendRequest)
         sink,
         request_id,
         peer_pid,
+        session_id,
         ..
     } = ctx;
     let FrontendRequest::CancelExecution {
         execution_id,
         reason,
+        source,
+        actor,
         queued_only,
     } = req
     else {
@@ -947,43 +982,47 @@ pub(super) async fn handle_cancel_execution(ctx: Dispatch, req: FrontendRequest)
             );
             return;
         }
-        // Snapshot from_status before the write so the audit event can
-        // record what the operator cancelled (the returned row is already
-        // `cancelled`).
-        let from_status = server_state
-            .work_db
-            .get_execution(&execution_id)
-            .ok()
-            .map(|e| e.status.as_str().to_owned());
+        // A cancel with no recorded source, reason or actor never happens:
+        // refuse before touching the row.
+        let provenance = match super::cancel_rpc::provenance_from_request(
+            source.as_deref(),
+            reason.as_deref(),
+            actor.as_deref(),
+            &rpc_cancel_actor(&server_state, &session_id, peer_pid).await,
+        ) {
+            Ok(provenance) => provenance,
+            Err(refusal) => {
+                tracing::warn!(
+                    execution_id = %execution_id,
+                    ?refusal,
+                    "cancel_execution rejected: missing cancel provenance",
+                );
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::Error {
+                        message: refusal.message("cancel_execution"),
+                    },
+                );
+                return;
+            }
+        };
         let opts = crate::work::CancelExecutionOpts {
-            reason: reason.clone(),
             queued_only,
-            record_failure_reason: false,
+            peer_pid,
+            ..crate::work::CancelExecutionOpts::new(provenance.clone())
         };
         match server_state.work_db.cancel_execution_with(&execution_id, opts) {
             Ok(execution) => {
                 tracing::info!(
                     execution_id = %execution_id,
                     queued_only,
-                    reason = reason.as_deref().unwrap_or("explicit cancel"),
+                    source = %provenance.source,
+                    actor = %provenance.actor,
+                    reason = %provenance.reason,
                     "cancel_execution: marked cancelled",
                 );
-                // Durable operator-facing audit trail: status `cancelled`
-                // already distinguishes deliberate cancel from `orphaned`
-                // / `abandoned`; the reason + from_status make the
-                // decision reconstructible months later from
-                // engine-audit.log alone.
-                crate::audit::record_event(
-                    "execution_cancelled",
-                    &serde_json::json!({
-                        "execution_id": &execution.id,
-                        "work_item_id": &execution.work_item_id,
-                        "from_status": from_status,
-                        "reason": reason.as_deref().unwrap_or("explicit cancel"),
-                        "queued_only": queued_only,
-                        "peer_pid": peer_pid,
-                    }),
-                );
+                // The work layer publishes cancellation provenance after commit.
                 // Pane releases are keyed by run_id (the slot
                 // registry's key), not by execution_id — so
                 // walk the execution's still-active runs and

@@ -273,7 +273,9 @@ fn every_runtime_input_write_invalidates_exactly_its_item() {
                 let target = target.clone();
                 move |b| {
                     b.sql(
-                        "UPDATE work_executions SET status = 'abandoned' WHERE work_item_id = ?1",
+                        "UPDATE work_executions SET status = 'abandoned',
+                         cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture'
+                         WHERE work_item_id = ?1",
                         &[&target],
                     )
                 }

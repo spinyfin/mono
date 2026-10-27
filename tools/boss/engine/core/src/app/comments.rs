@@ -525,7 +525,7 @@ async fn record_answer_agent_spawn_failure(
 /// either tracking-row creation step fails, mirroring the original
 /// [`spawn_answer_agent`]'s compensation behaviour.
 #[allow(clippy::too_many_arguments)]
-async fn finish_answer_agent_spawn(
+pub(super) async fn finish_answer_agent_spawn(
     server_state: &Arc<ServerState>,
     work_db: &Arc<WorkDb>,
     session_id: &str,
@@ -621,7 +621,17 @@ async fn finish_answer_agent_spawn(
         } else {
             crate::answer_agent_observability::record_failed(&server_state.metrics, "spawn_execution_bind_failed");
         }
-        if let Err(cancel_err) = work_db.cancel_execution(&execution.id) {
+        if let Err(cancel_err) = work_db.cancel_execution(
+            &execution.id,
+            boss_protocol::CancelProvenance::engine(
+                boss_protocol::CancelSource::AnswerAgent,
+                "answer_agent_spawn",
+                format!(
+                    "answer-agent execution for comment {} could not be bound to its run, so it was never usable",
+                    comment.id
+                ),
+            ),
+        ) {
             tracing::warn!(
                 comment_id = %comment.id,
                 execution_id = %execution.id,
@@ -1419,7 +1429,14 @@ async fn stand_down_answer_agent(server_state: &Arc<ServerState>, work_db: &Arc<
         }
     };
 
-    if let Err(err) = work_db.cancel_execution(&execution.id) {
+    if let Err(err) = work_db.cancel_execution(
+        &execution.id,
+        boss_protocol::CancelProvenance::engine(
+            boss_protocol::CancelSource::AnswerAgent,
+            "comment_reclassification",
+            format!("comment {comment_id} was reclassified away from `question`, so nobody will read the answer"),
+        ),
+    ) {
         tracing::debug!(
             comment_id,
             execution_id = %execution.id,
@@ -2497,9 +2514,20 @@ mod tests {
         );
 
         // 4. The bound execution is reaped rather than left running forever.
+        let execution = work_db.get_execution(&execution_id).unwrap();
         assert!(
-            work_db.get_execution(&execution_id).unwrap().status.is_terminal(),
+            execution.status.is_terminal(),
             "the answer-agent execution must not outlive the question it was answering",
+        );
+        let provenance = execution
+            .cancel_provenance
+            .expect("reclassifying a question must stamp cancel provenance on the answer-agent execution");
+        assert_eq!(provenance.source, boss_protocol::CancelSource::AnswerAgent);
+        assert_eq!(provenance.actor, "comment_reclassification");
+        assert!(
+            provenance.reason.contains(&comment_id),
+            "reason must name the reclassified comment, got {}",
+            provenance.reason
         );
     }
 

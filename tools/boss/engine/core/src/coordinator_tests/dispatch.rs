@@ -309,6 +309,68 @@ async fn requested_host_routes_one_dispatch_and_refuses_without_queueing() {
     assert!(db.list_executions(Some(&unknown.id)).unwrap().is_empty());
 }
 
+/// `--host` only applies to a queued (`ready`) execution. A request that
+/// reuses a never-started `claimed` row is cancelled in the same admission
+/// call so it does not leave a pinned residue.
+#[tokio::test]
+async fn requested_host_cancels_a_non_ready_row_with_dispatch_admission_provenance() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    db.add_host("zakalwe", "user@zakalwe", 1, &[]).unwrap();
+    crate::test_support::insert_host_capability(&db, "zakalwe", "driver=claude", "auto");
+    let product = create_test_product(&db);
+    let chore = create_test_chore_manual(&db, product.id, "Claimed host pin");
+    let existing = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'claimed' WHERE id = ?1",
+            rusqlite::params![existing.id],
+        )
+        .unwrap();
+    let coordinator = ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeExecutionRunner::default()),
+    );
+
+    let err = coordinator
+        .request_execution_via_db(
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .requested_host_id("zakalwe")
+                .build(),
+            Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new()),
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("--host only applies to a queued execution"),
+        "got: {err}"
+    );
+    let executions = db.list_executions(Some(&chore.id)).unwrap();
+    assert_eq!(
+        executions.len(),
+        1,
+        "the request must have reused the claimed row before cancelling it"
+    );
+    assert_eq!(executions[0].id, existing.id);
+    assert_eq!(executions[0].status, ExecutionStatus::Cancelled);
+    let provenance = executions[0]
+        .cancel_provenance
+        .as_ref()
+        .expect("--host admission cancel must stamp provenance");
+    assert_eq!(provenance.source, boss_protocol::CancelSource::DispatchAdmission);
+    assert_eq!(provenance.actor, "dispatch_admission");
+    assert!(
+        provenance.reason.contains("zakalwe") && provenance.reason.contains("claimed"),
+        "reason must name the requested host and the reused status, got {}",
+        provenance.reason
+    );
+}
+
 /// Requested-host admission must enforce the row/product driver's capability
 /// before it creates an execution, rather than accepting the pin and leaving
 /// scheduling to fail later with a host hold.
@@ -551,6 +613,13 @@ async fn requested_host_pre_start_failure_cancels_instead_of_retrying_elsewhere(
         "cancel must not leave a durable pin behind",
     );
     let cancelled = db.get_execution(&execution.id).unwrap();
+    crate::test_support::assert_cancel_provenance(
+        &cancelled,
+        boss_protocol::CancelSource::CoordinatorPreStart,
+        "execution_coordinator",
+        "requested host dispatch failed during host adapter build",
+    );
+
     assert!(
         cancelled.last_error.as_deref().is_some_and(|err| {
             err.contains("requested host dispatch failed during host adapter build")

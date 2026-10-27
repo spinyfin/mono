@@ -1243,7 +1243,7 @@ impl WorkDb {
         )?;
         let group = query_attention_group(&tx, &group.id)?
             .with_context(|| format!("missing attention group after action: {}", group.id))?;
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok(ActionedAttentionGroup {
             group,
             produced_work_item_ids,

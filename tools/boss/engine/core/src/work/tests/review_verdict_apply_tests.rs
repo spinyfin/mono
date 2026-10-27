@@ -1582,6 +1582,19 @@ fn tombstone_cancels_the_orphaned_revision_ready_execution() {
         after.iter().all(|e| e.status == ExecutionStatus::Cancelled),
         "tombstone must cancel never-started executions so list_ready_executions will not keep draining them"
     );
+    for execution in &after {
+        let provenance = execution
+            .cancel_provenance
+            .as_ref()
+            .expect("tombstone must stamp cancel provenance");
+        assert_eq!(provenance.source, boss_protocol::CancelSource::ReviewVerdict);
+        assert_eq!(provenance.actor, "review_verdict_apply");
+        assert!(
+            provenance.reason.contains(&created),
+            "reason must name the tombstoned remediation, got {}",
+            provenance.reason
+        );
+    }
     assert!(
         db.list_ready_executions()
             .unwrap()

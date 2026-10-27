@@ -33,7 +33,7 @@ pub(super) fn is_false_not_descended_blocker(detail: &str) -> bool {
 /// blocked. Rearmed items still run the integrity check, so a pointer that
 /// truly cannot be vouched for blocks again, loudly, with the new precise
 /// text that this recognizer does not match.
-pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool) -> Result<usize> {
+pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool, pending: &mut PendingEvents) -> Result<usize> {
     let candidates: Vec<(String, String)> = {
         let mut statement = conn.prepare(
             "SELECT id, blocked_detail FROM tasks
@@ -82,12 +82,32 @@ pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool) -> Result
         if has_started_live {
             continue;
         }
+        let doomed = capture_doomed(
+            conn,
+            "work_item_id = ?1 AND status NOT IN ('completed', 'failed', 'cancelled', 'orphaned', 'abandoned')",
+            [&id],
+        )?;
+        let provenance = boss_protocol::CancelProvenance::engine(
+            boss_protocol::CancelSource::SchemaMigration,
+            "execution_recovery_rearm",
+            "retired a never-started attempt shadowed by a terminal one while re-arming a \
+             work item wedged by a now-repairable recovery failure",
+        );
         conn.execute(
-            "UPDATE work_executions SET status = 'cancelled', finished_at = ?2
+            "UPDATE work_executions
+             SET status = 'cancelled', finished_at = ?2,
+                 cancel_source = ?3, cancel_actor = ?4, cancel_reason = ?5
              WHERE work_item_id = ?1
                AND status NOT IN ('completed', 'failed', 'cancelled', 'orphaned', 'abandoned')",
-            params![id, now_string()],
+            params![
+                id,
+                now_string(),
+                provenance.source.as_str(),
+                provenance.actor,
+                provenance.reason
+            ],
         )?;
+        stage_doomed_audit_only(pending, &doomed, &ExecutionStatus::Cancelled, &provenance);
         let kind = execution_kind_for_work_item(conn, &id)?;
         let pr_url = if kind == ExecutionKind::RevisionImplementation {
             get_chain_root_task(conn, &id)?.and_then(|root| root.pr_url)
@@ -132,6 +152,10 @@ mod tests {
         ALTER TABLE execution_bookmarks DROP COLUMN retired_at;
         ALTER TABLE execution_bookmarks DROP COLUMN retired_reason;
         ALTER TABLE tasks DROP COLUMN pr_updated_at;
+        DROP TRIGGER IF EXISTS work_executions_decision_requires_provenance;
+        ALTER TABLE work_executions DROP COLUMN cancel_source;
+        ALTER TABLE work_executions DROP COLUMN cancel_actor;
+        ALTER TABLE work_executions DROP COLUMN cancel_reason;
         UPDATE metadata SET value = '38' WHERE key = 'schema_version';";
 
     /// Undo later schema steps so reopening replays the schema 43 re-arm.
@@ -141,6 +165,10 @@ mod tests {
         ALTER TABLE execution_bookmarks DROP COLUMN retired_at;
         ALTER TABLE execution_bookmarks DROP COLUMN retired_reason;
         ALTER TABLE tasks DROP COLUMN pr_updated_at;
+        DROP TRIGGER IF EXISTS work_executions_decision_requires_provenance;
+        ALTER TABLE work_executions DROP COLUMN cancel_source;
+        ALTER TABLE work_executions DROP COLUMN cancel_actor;
+        ALTER TABLE work_executions DROP COLUMN cancel_reason;
         UPDATE metadata SET value = '42' WHERE key = 'schema_version';";
 
     /// Create a chore under a fresh product and park it the way the
@@ -197,9 +225,12 @@ mod tests {
         ];
 
         let conn = db.connect().unwrap();
-        assert_eq!(migrate(&conn, is_false_not_descended_blocker).unwrap(), 1);
         assert_eq!(
-            migrate(&conn, is_false_not_descended_blocker).unwrap(),
+            migrate(&conn, is_false_not_descended_blocker, &mut PendingEvents::new()).unwrap(),
+            1
+        );
+        assert_eq!(
+            migrate(&conn, is_false_not_descended_blocker, &mut PendingEvents::new()).unwrap(),
             0,
             "a second run is a no-op"
         );
@@ -325,8 +356,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rearm_replaces_an_older_pending_execution_shadowed_by_a_terminal_one() {
+    #[tokio::test]
+    async fn rearm_replaces_an_older_pending_execution_shadowed_by_a_terminal_one() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("work.db");
         let (product_id, id, pending_id, failed_id, prerequisite) = {
@@ -363,7 +394,18 @@ mod tests {
             db.connect().unwrap().execute_batch(RESET_TO_38).unwrap();
             (product_id, id, pending.id, failed.id, prerequisite)
         };
+        let sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
         let db = WorkDb::open(path).unwrap();
+        assert!(sink.events().await.is_empty());
+        let db = db.with_dispatch_events(sink.clone());
+        let events = sink.events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].execution_id, pending_id);
+        assert_eq!(events[0].details["source"], "schema_migration");
+        assert_eq!(events[0].details["actor"], "execution_recovery_rearm");
+        assert_eq!(events[0].details["from_status"], "waiting_dependency");
+        assert_eq!(events[0].details["to_status"], "cancelled");
+        assert!(events[0].details["reason"].as_str().unwrap().contains("re-arming"));
         let live = |db: &WorkDb| -> Vec<(String, ExecutionStatus)> {
             let conn = db.connect().unwrap();
             let mut statement = conn
@@ -392,6 +434,18 @@ mod tests {
             query_execution(&conn, &pending_id).unwrap().unwrap().status,
             ExecutionStatus::Cancelled
         );
+        let pending_exec = query_execution(&conn, &pending_id).unwrap().unwrap();
+        let provenance = pending_exec
+            .cancel_provenance
+            .expect("schema-migration re-arm must stamp cancel provenance");
+        assert_eq!(provenance.source, boss_protocol::CancelSource::SchemaMigration);
+        assert_eq!(provenance.actor, "execution_recovery_rearm");
+        assert!(
+            provenance.reason.contains("re-arming"),
+            "reason must name the re-arm, got {}",
+            provenance.reason
+        );
+        assert_eq!(pending_exec.status, ExecutionStatus::Cancelled);
         drop(conn);
 
         for _ in 0..2 {
@@ -409,6 +463,45 @@ mod tests {
             .unwrap();
         db.reconcile_product_executions(&product_id).unwrap();
         assert_eq!(live(&db), vec![(replacement.id, ExecutionStatus::Ready)]);
+    }
+
+    #[tokio::test]
+    async fn failed_upgrade_does_not_publish_cancellations() {
+        let db = WorkDb::open_in_memory().unwrap();
+        let product_id = product(&db);
+        let stale = format!("{NOT_DESCENDED_MESSAGE} boss-base/exec_failed");
+        let id = insert_blocked(&db, &product_id, "wedged", "execution_recovery_failed", &stale);
+        for status in [ExecutionStatus::WaitingDependency, ExecutionStatus::Failed] {
+            db.create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(&id)
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(status)
+                    .build(),
+            )
+            .unwrap();
+        }
+        db.connect().unwrap().execute_batch(RESET_TO_38).unwrap();
+        db.connect()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_replacement BEFORE INSERT ON work_executions
+             BEGIN SELECT RAISE(ABORT, 'replacement refused'); END;",
+            )
+            .unwrap();
+        let error = db.init().unwrap_err();
+        assert!(error.to_string().contains("replacement refused"), "{error:#}");
+        let sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        let db = db.with_dispatch_events(sink.clone());
+        assert!(sink.events().await.is_empty());
+        assert_eq!(state(&db, &id).0, "blocked");
+        db.connect()
+            .unwrap()
+            .execute_batch("DROP TRIGGER refuse_replacement")
+            .unwrap();
+        db.init().unwrap();
+        let _db = db.with_dispatch_events(sink.clone());
+        assert_eq!(sink.events().await.len(), 1);
     }
 
     #[test]
@@ -493,9 +586,12 @@ mod tests {
             ),
         ];
         let conn = db.connect().unwrap();
-        assert_eq!(migrate(&conn, is_legacy_reconcilable_blocker).unwrap(), 3);
         assert_eq!(
-            migrate(&conn, is_legacy_reconcilable_blocker).unwrap(),
+            migrate(&conn, is_legacy_reconcilable_blocker, &mut PendingEvents::new()).unwrap(),
+            3
+        );
+        assert_eq!(
+            migrate(&conn, is_legacy_reconcilable_blocker, &mut PendingEvents::new()).unwrap(),
             0,
             "a second run is a no-op"
         );

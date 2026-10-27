@@ -255,6 +255,11 @@ fn request_execution_marks_existing_stale_when_no_live_worker() {
         .unwrap();
     assert_eq!(stale_after.status, ExecutionStatus::Abandoned);
     assert!(stale_after.finished_at.is_some());
+    let provenance = stale_after
+        .cancel_provenance
+        .expect("stale redispatch stamps provenance");
+    assert_eq!(provenance.source, boss_protocol::CancelSource::StaleGoverningExecution);
+    assert_eq!(provenance.actor, "request_execution");
 }
 
 /// The `abandon_stale_and_redispatch` decision in
@@ -994,7 +999,7 @@ fn reconcile_does_not_inherit_workspace_from_non_orphaned_terminal() {
         "/tmp/mono-agent-006",
     )
     .unwrap();
-    db.cancel_execution(&execution.id).unwrap();
+    db.cancel_execution(&execution.id, test_cancel_provenance()).unwrap();
     // Cancel reset kanban → todo. Drive it back to active so
     // reconcile re-considers the work item.
     db.update_work_item(
@@ -1252,7 +1257,9 @@ fn cancel_running_execution_demotes_active_task() {
         .unwrap();
 
     // First call: should cancel execution + demote task.
-    let (cancelled, demoted) = db.cancel_running_execution_and_demote_task(&exec.id).unwrap();
+    let (cancelled, demoted) = db
+        .cancel_running_execution_and_demote_task(&exec.id, test_cancel_provenance())
+        .unwrap();
     assert!(cancelled, "execution must be marked cancelled");
     assert!(demoted, "task must be demoted from active to todo");
 
@@ -1265,7 +1272,9 @@ fn cancel_running_execution_demotes_active_task() {
     assert_eq!(updated_task.status, TaskStatus::Todo);
 
     // Second call: both ops must be no-ops (idempotent).
-    let (cancelled2, demoted2) = db.cancel_running_execution_and_demote_task(&exec.id).unwrap();
+    let (cancelled2, demoted2) = db
+        .cancel_running_execution_and_demote_task(&exec.id, test_cancel_provenance())
+        .unwrap();
     assert!(!cancelled2, "second call: execution already terminal");
     assert!(!demoted2, "second call: task already out of active");
 }
@@ -1324,7 +1333,9 @@ fn stopping_superseded_execution_does_not_demote_row() {
 
     // Stop the SUPERSEDED execution: it cancels, but the row must stay
     // `active` for the live replacement.
-    let (cancelled, demoted) = db.cancel_running_execution_and_demote_task(&exec_old.id).unwrap();
+    let (cancelled, demoted) = db
+        .cancel_running_execution_and_demote_task(&exec_old.id, test_cancel_provenance())
+        .unwrap();
     assert!(cancelled, "the superseded execution is non-terminal, so it cancels");
     assert!(!demoted, "stopping a superseded execution must NOT demote the row");
     assert_eq!(
@@ -1348,7 +1359,9 @@ fn stopping_superseded_execution_does_not_demote_row() {
 
     // Control: stopping the CURRENT execution DOES demote — the guard is
     // correctly keyed to the row's current execution, not a blanket skip.
-    let (cancelled2, demoted2) = db.cancel_running_execution_and_demote_task(&exec_new.id).unwrap();
+    let (cancelled2, demoted2) = db
+        .cancel_running_execution_and_demote_task(&exec_new.id, test_cancel_provenance())
+        .unwrap();
     assert!(cancelled2, "the current execution cancels");
     assert!(demoted2, "stopping the current execution still demotes the row");
     let task2 = match db.get_work_item(&chore.id).unwrap() {
@@ -1807,7 +1820,9 @@ fn cancel_exec_with_other_live_exec_does_not_demote_task() {
         )
         .unwrap();
 
-    let (cancelled, demoted) = db.cancel_running_execution_and_demote_task(&exec_a.id).unwrap();
+    let (cancelled, demoted) = db
+        .cancel_running_execution_and_demote_task(&exec_a.id, test_cancel_provenance())
+        .unwrap();
     assert!(cancelled, "exec_a must be cancelled");
     assert!(!demoted, "task must NOT be demoted — exec_b is still live");
 

@@ -76,6 +76,32 @@ final class TranscriptViewTests: XCTestCase {
         XCTAssertEqual(ordinaryRun?.workItemId, "task_root")
     }
 
+    func testExecutionVMDecodesCancelProvenance() {
+        let client = EngineClient(socketPath: "/tmp/boss-transcript-cancel-provenance-test.sock")
+        let cancelled = client.parseExecutionVM([
+            "id": "exec-cancelled",
+            "work_item_id": "task-cancelled",
+            "kind": "chore_implementation",
+            "status": "cancelled",
+            "cancel_provenance": [
+                "source": "bossctl",
+                "actor": "operator",
+                "reason": "wrong repo; stopping this run",
+            ],
+        ])
+        XCTAssertEqual(cancelled?.cancelProvenance?.source, "bossctl")
+        XCTAssertEqual(cancelled?.cancelProvenance?.actor, "operator")
+        XCTAssertEqual(cancelled?.cancelProvenance?.reason, "wrong repo; stopping this run")
+
+        let running = client.parseExecutionVM([
+            "id": "exec-running",
+            "work_item_id": "task-running",
+            "kind": "chore_implementation",
+            "status": "running",
+        ])
+        XCTAssertNil(running?.cancelProvenance, "a live execution has no cancel provenance")
+    }
+
     func testSegmentDecodesThinkingWithCollapseFlags() throws {
         let json = """
         {

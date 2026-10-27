@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use boss_event_bus::{Event, EventBus};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
-use crate::event_publish::{PendingEvents, commit_and_publish};
+use crate::event_publish::PendingEvents;
 
 /// How long sqlite will internally retry on `SQLITE_BUSY` before
 /// surfacing the error to the caller. We funnel concurrent CLI writes
@@ -600,7 +600,20 @@ pub struct WorkDb {
     /// it via [`Self::with_event_bus`] so every clone shares the one
     /// instance subscribers attach to.
     event_bus: Arc<EventBus>,
+    /// Durable dispatch-event sink written post-commit next to the audit
+    /// log, so cancel provenance is not lost when the in-process bus
+    /// mailbox fills. Defaults to a no-op; production injects the JSONL
+    /// sink via [`Self::with_dispatch_events`].
+    #[builder(default = default_dispatch_events())]
+    dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink>,
+    /// Committed schema decisions wait here until the production sink attaches.
+    #[builder(default)]
+    migration_events: Arc<Mutex<PendingEvents>>,
     persona_metrics: Arc<crate::metrics::Registry>,
+}
+
+fn default_dispatch_events() -> Arc<dyn crate::dispatch_events::DispatchEventSink> {
+    Arc::new(crate::dispatch_events::NoopDispatchEventSink)
 }
 
 impl Clone for WorkDb {
@@ -611,6 +624,8 @@ impl Clone for WorkDb {
             conn: Arc::clone(&self.conn),
             boothby_action: Arc::clone(&self.boothby_action),
             event_bus: Arc::clone(&self.event_bus),
+            dispatch_events: Arc::clone(&self.dispatch_events),
+            migration_events: Arc::clone(&self.migration_events),
             persona_metrics: Arc::clone(&self.persona_metrics),
         }
     }
@@ -643,6 +658,7 @@ mod coordinator_tmux;
 mod cost_report_db;
 mod create_entities;
 mod critical_priority;
+mod decision_terminal;
 mod decisions;
 mod dep_helpers;
 mod design_postmortem;
@@ -742,6 +758,7 @@ use board_notifications::stage_task_board_change;
 pub(crate) use cached_task_runtimes::*;
 pub(crate) use chain_helpers::*;
 use create_entities::create_project_in_tx;
+pub(crate) use decision_terminal::*;
 pub(crate) use dep_helpers::*;
 pub(crate) use dispatch_class::DispatchClass;
 pub(crate) use dispatch_helpers::*;
@@ -798,6 +815,7 @@ pub use audit_misc::canonicalize_worker_branch_prefix;
 pub use automations::AutomationFireRecord;
 pub use board_patch::WorkRuntimePatch;
 pub use boothby::{BoothbyActionContext, BoothbyActionGuard};
+pub use decision_terminal::DecisionAuditContext;
 pub use exec_tail::ClearedExecutionWorkspace;
 pub use execution_retention::{
     DEFAULT_RETENTION_KEEP_PER_WORK_ITEM, DEFAULT_RETENTION_MAX_AGE_SECS, ExecutionPruneOutcome,

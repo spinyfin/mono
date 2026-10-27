@@ -838,6 +838,24 @@ impl WorkDb {
         self.update_work_item_as_actor(id, patch, actor)
     }
 
+    /// Apply a peer's card edit and atomically cancel any active-to-Backlog
+    /// execution. Return the captured execution id for post-commit resource
+    /// release, including terminal ghosts. Internal status writers retain
+    /// their own lifecycle through `update_work_item_as_actor`.
+    pub fn update_work_item_with_teardown(
+        &self,
+        id: &str,
+        patch: WorkItemPatch,
+        actor: &str,
+    ) -> Result<(WorkItem, Option<String>)> {
+        if matches!(classify_id(id)?, ItemKind::Task) {
+            self.update_task_with_teardown(id, patch, actor)
+        } else {
+            self.update_work_item_as_actor(id, patch, actor)
+                .map(|item| (item, None))
+        }
+    }
+
     /// Like `update_work_item` but stamps `last_status_actor` with `actor`
     /// when the status actually changes. Engine-internal writers use direct
     /// SQL with `last_status_actor = 'engine'`; this path is for peer RPCs
@@ -1922,7 +1940,8 @@ impl WorkDb {
     /// column accepts any TEXT value at the schema level so future
     /// relation types can ship without a re-migration.
     pub fn add_dependency(&self, input: AddDependencyInput) -> Result<WorkItemDependency> {
-        self.add_dependency_with_worker_reconcile(input).map(|(edge, _)| edge)
+        self.add_dependency_with_worker_reconcile(input, DependencyCancelOrigin::EngineInternal)
+            .map(|(edge, _)| edge)
     }
 
     /// Like [`Self::add_dependency`], but also returns the live
@@ -1940,6 +1959,7 @@ impl WorkDb {
     pub fn add_dependency_with_worker_reconcile(
         &self,
         input: AddDependencyInput,
+        cancel_origin: DependencyCancelOrigin,
     ) -> Result<(WorkItemDependency, Option<WorkExecution>)> {
         let relation = input
             .relation
@@ -1960,9 +1980,16 @@ impl WorkDb {
         let tx = conn.transaction()?;
         let now = now_string();
         let mut pending = PendingEvents::new();
-        let (edge, reaped) =
-            add_dependency_edge_in_tx(&mut pending, &tx, dependent_id, prerequisite_id, relation, &now)?;
-        commit_and_publish(tx, pending, self.event_bus())?;
+        let (edge, reaped) = add_dependency_edge_in_tx(
+            &mut pending,
+            &tx,
+            dependent_id,
+            prerequisite_id,
+            relation,
+            &now,
+            &cancel_origin,
+        )?;
+        self.commit_pending(tx, pending)?;
         Ok((edge, reaped))
     }
 
@@ -1992,7 +2019,7 @@ impl WorkDb {
         let now = now_string();
         let mut pending = PendingEvents::new();
         maybe_engine_unblock_dependent(&mut pending, &tx, dependent_id, &now)?;
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok(removed)
     }
 
@@ -2043,7 +2070,7 @@ impl WorkDb {
         let now = now_string();
         let mut pending = PendingEvents::new();
         let unblocked = maybe_engine_unblock_dependent(&mut pending, &tx, work_item_id, &now)?;
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok(unblocked)
     }
 
@@ -2108,7 +2135,7 @@ impl WorkDb {
             &tx,
             None,
         )?);
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok(promoted)
     }
 

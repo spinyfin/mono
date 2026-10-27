@@ -623,7 +623,40 @@ pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
             .transpose()?,
         pr_head_after: row.get(29)?,
         last_error: row.get::<_, Option<String>>(30)?.filter(|s| !s.is_empty()),
+        cancel_provenance: map_cancel_provenance(row, 31)?,
     })
+}
+
+/// Read the three `cancel_*` columns starting at `first` into a provenance.
+/// All three NULL is a row that was never ended by decision (or predates
+/// provenance); a partial or unparseable triple is corruption the schema
+/// trigger should have made impossible, so it is an error rather than a
+/// silently dropped half-record.
+fn map_cancel_provenance(row: &Row<'_>, first: usize) -> rusqlite::Result<Option<boss_protocol::CancelProvenance>> {
+    let source: Option<String> = row.get(first)?;
+    let actor: Option<String> = row.get(first + 1)?;
+    let reason: Option<String> = row.get(first + 2)?;
+    match (source, actor, reason) {
+        (None, None, None) => Ok(None),
+        (Some(source), Some(actor), Some(reason)) => {
+            let source = source
+                .parse::<boss_protocol::CancelSource>()
+                .unwrap_or(boss_protocol::CancelSource::Unrecognized);
+            if source == boss_protocol::CancelSource::Unrecognized {
+                return Ok(Some(boss_protocol::CancelProvenance { source, actor, reason }));
+            }
+            boss_protocol::CancelProvenance::new(source, actor, reason)
+                .map(Some)
+                .map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(first + 1, rusqlite::types::Type::Text, Box::new(err))
+                })
+        }
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            first,
+            rusqlite::types::Type::Text,
+            "partial cancel provenance: source, actor and reason must be set together".into(),
+        )),
+    }
 }
 
 pub(crate) fn map_run(row: &Row<'_>) -> rusqlite::Result<WorkRun> {

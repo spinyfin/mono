@@ -457,11 +457,24 @@ pub(crate) fn compute_gated_work_item_ids(conn: &Connection) -> Result<HashSet<S
 /// The reverse (cascade-on-prereq-regression) deliberately does NOT
 /// call this — see the comment on
 /// [`cascade_dependents_after_prereq_status_change`].
+/// Who requested the new edge, for cancel provenance if a live worker
+/// on the dependent has to be reaped.
+#[derive(Debug, Clone)]
+pub enum DependencyCancelOrigin {
+    /// Materializer, create-time `--depends-on`, tests, and other engine
+    /// internals. A live cancel records [`CancelSource::DependencyBlock`].
+    EngineInternal,
+    /// Client RPC. A live cancel requires a client source and prefixes the
+    /// engine cause onto that reason.
+    ClientRpc(Option<boss_protocol::CancelProvenance>),
+}
+
 pub(crate) fn maybe_engine_block_dependent(
     pending: &mut PendingEvents,
     conn: &Connection,
     dependent_id: &str,
     now_epoch: &str,
+    cancel_origin: &DependencyCancelOrigin,
 ) -> Result<Option<WorkExecution>> {
     let gating = deps::gating_prereqs_for(conn, dependent_id)?;
     if gating.is_empty() {
@@ -501,7 +514,7 @@ pub(crate) fn maybe_engine_block_dependent(
         // returning the cancelled row tells it which execution to
         // reap. Projects (`proj_…`) have no executions, so this only
         // applies to tasks.
-        return cancel_live_execution_for_block_in_tx(pending, conn, dependent_id, now_epoch);
+        return cancel_live_execution_for_block_in_tx(pending, conn, dependent_id, &gating, now_epoch, cancel_origin);
     }
     Ok(None)
 }
@@ -520,21 +533,62 @@ fn cancel_live_execution_for_block_in_tx(
     pending: &mut PendingEvents,
     conn: &Connection,
     work_item_id: &str,
+    gating_prereqs: &[String],
     now_epoch: &str,
+    cancel_origin: &DependencyCancelOrigin,
 ) -> Result<Option<WorkExecution>> {
     let Some(live) = query_live_execution_for_work_item(conn, work_item_id)? else {
         return Ok(None);
     };
+    let engine_cause = format!(
+        "work item {work_item_id} cancelled because a `blocks` dependency on {} gated it while a worker was active",
+        gating_prereqs.join(", ")
+    );
+    let provenance = match cancel_origin {
+        DependencyCancelOrigin::EngineInternal => boss_protocol::CancelProvenance::engine(
+            boss_protocol::CancelSource::DependencyBlock,
+            "work_dependencies",
+            format!(
+                "dependent transitioned to blocked: a `blocks` dependency on {} gates it, \
+                 and a blocked work item must not have a live worker",
+                gating_prereqs.join(", ")
+            ),
+        ),
+        DependencyCancelOrigin::ClientRpc(Some(client)) => {
+            let mut provenance = client.clone();
+            provenance.reason = format!("{engine_cause}; {}", provenance.reason);
+            provenance
+        }
+        DependencyCancelOrigin::ClientRpc(None) => {
+            bail!("add_dependency requires cancel source, actor and reason when it would cancel a live execution");
+        }
+    };
     conn.execute(
         "UPDATE work_executions
          SET status = 'cancelled',
-             finished_at = ?2
+             finished_at = ?2,
+             cancel_source = ?3,
+             cancel_actor = ?4,
+             cancel_reason = ?5
          WHERE id = ?1",
-        params![live.id, now_epoch],
+        params![
+            live.id,
+            now_epoch,
+            provenance.source.as_str(),
+            provenance.actor,
+            provenance.reason
+        ],
     )?;
     let updated = query_execution(conn, &live.id)?
         .with_context(|| format!("execution vanished after block-cancel: {}", live.id))?;
-    stage_execution_terminal(pending, conn, &live.id, work_item_id)?;
+    stage_decision_terminal(
+        pending,
+        conn,
+        &DoomedExecution::new(&live.id, work_item_id, live.status.as_str()),
+        &boss_protocol::ExecutionStatus::Cancelled,
+        &provenance,
+        &DecisionAuditContext::default(),
+    )?;
     tracing::info!(
         work_item_id,
         execution_id = %live.id,
@@ -549,7 +603,9 @@ fn cancel_live_execution_for_block_in_tx(
         work_item_id = %work_item_id,
         from_status = %live.status,
         to_status = %updated.status,
-        reason = "dependent transitioned to blocked",
+        source = %provenance.source,
+        actor = %provenance.actor,
+        reason = %provenance.reason,
         "execution terminalized: block cancel",
     );
     Ok(Some(updated))
@@ -573,6 +629,7 @@ pub(crate) fn add_dependency_edge_in_tx(
     prerequisite_id: &str,
     relation: &str,
     now_epoch: &str,
+    cancel_origin: &DependencyCancelOrigin,
 ) -> Result<(WorkItemDependency, Option<WorkExecution>)> {
     if dependent_id == prerequisite_id {
         bail!("a work item cannot depend on itself: {dependent_id}");
@@ -614,7 +671,7 @@ pub(crate) fn add_dependency_edge_in_tx(
         deps::insert_edge(conn, dependent_id, prerequisite_id, relation, now_epoch)?;
     // Auto-block (Q4): if the new edge introduces a gating prereq, flip
     // the dependent to `blocked` and (defect #2) reap any live worker.
-    let reaped = maybe_engine_block_dependent(pending, conn, dependent_id, now_epoch)?;
+    let reaped = maybe_engine_block_dependent(pending, conn, dependent_id, now_epoch, cancel_origin)?;
     Ok((edge, reaped))
 }
 

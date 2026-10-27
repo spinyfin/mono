@@ -169,8 +169,16 @@ async fn measure(child_count: usize, boundaries: &archive_timing_support::Bounda
     let started = Instant::now();
     let reply = client
         .send_request(&FrontendRequest::UpdateWorkItem {
+            cancel: Some(
+                boss_protocol::CancelProvenance::new(
+                    boss_protocol::CancelSource::Bossctl,
+                    "requesting client",
+                    "apply requested work item changes",
+                )
+                .unwrap(),
+            ),
             id: seeded.project.id.clone(),
-            patch: WorkItemPatch::builder().status("archived").build(),
+            patch: Box::new(WorkItemPatch::builder().status("archived").build()),
         })
         .await?;
     let received = Instant::now();

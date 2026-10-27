@@ -106,7 +106,13 @@ fn dispatch_status_and_wait_reasons_never_invent_a_live_worker() {
             db.connect()
                 .unwrap()
                 .execute(
-                    "UPDATE work_executions SET status = ?1, dispatch_wait_reason = ?2 WHERE id = ?3",
+                    "UPDATE work_executions
+                     SET status = ?1,
+                         dispatch_wait_reason = ?2,
+                         cancel_source = CASE WHEN ?1 IN ('cancelled', 'abandoned') THEN 'bossctl' ELSE cancel_source END,
+                         cancel_actor = CASE WHEN ?1 IN ('cancelled', 'abandoned') THEN 'test' ELSE cancel_actor END,
+                         cancel_reason = CASE WHEN ?1 IN ('cancelled', 'abandoned') THEN 'doing_sections fixture' ELSE cancel_reason END
+                     WHERE id = ?3",
                     rusqlite::params![status.as_str(), reason, execution.id],
                 )
                 .unwrap();

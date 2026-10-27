@@ -1,4 +1,6 @@
-use super::dispatch_admission::{primary_pr_awaits_review, work_item_is_deliberately_parked};
+use super::dispatch_admission::{
+    dispatch_retry_at_for_execution, primary_pr_awaits_review, work_item_is_deliberately_parked,
+};
 use super::*;
 
 /// Shared per-product short-id read-modify-write. Reads the current
@@ -426,28 +428,6 @@ pub(crate) fn compute_task_runtime(
     })
 }
 
-/// `TaskRuntime.dispatch_retry_at` for one execution: `Some(epoch_secs)`
-/// only while the execution is `ready` but withheld by
-/// `record_pre_start_failure`'s in-process backoff after a pre-spawn
-/// failure — i.e. it has failed at least once and `dispatch_not_before`
-/// is still in the future. `None` for a fresh `ready` execution (no
-/// failure yet — a genuine capacity wait) and once the backoff window
-/// has elapsed (the execution is a normal dispatch candidate again).
-///
-/// `now_secs` is the instant the backoff window is judged against; the
-/// caller passes the live clock so tests can pin it.
-fn dispatch_retry_at_for_execution(execution: &WorkExecution, now_secs: i64) -> Option<String> {
-    if execution.status != ExecutionStatus::Ready || execution.pre_start_failure_count <= 0 {
-        return None;
-    }
-    let dispatch_not_before: i64 = execution.dispatch_not_before.as_deref()?.parse().ok()?;
-    if dispatch_not_before > now_secs {
-        Some(dispatch_not_before.to_string())
-    } else {
-        None
-    }
-}
-
 pub(crate) fn query_latest_run(conn: &Connection, execution_id: &str) -> Result<Option<(String, String)>> {
     conn.query_row(
         "SELECT id, status
@@ -470,7 +450,7 @@ pub(crate) fn query_latest_execution_for_work_item(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, cancel_source, cancel_actor, cancel_reason
          FROM work_executions
          WHERE work_item_id = ?1
          ORDER BY created_at DESC, id DESC
@@ -500,7 +480,7 @@ pub(crate) fn query_live_execution_for_work_item(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, cancel_source, cancel_actor, cancel_reason
          FROM work_executions
          WHERE work_item_id = ?1
            AND status IN ('running', 'waiting_human')
@@ -530,7 +510,7 @@ pub(crate) fn query_last_non_abandoned_execution_for_work_item(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, cancel_source, cancel_actor, cancel_reason
          FROM work_executions
          WHERE work_item_id = ?1
            AND status != 'abandoned'
@@ -940,7 +920,13 @@ pub(crate) fn reconcile_revision_execution(
 
         let now = now_string();
         // Drop any not-yet-live execution row before archiving the task.
-        abandon_pending_executions(pending, conn, &task.id, &now)?;
+        abandon_pending_executions(
+            pending,
+            conn,
+            &task.id,
+            &now,
+            "the parent PR closed, so the revision is resolved without a worker",
+        )?;
         resolve_revision_on_parent_close(
             pending,
             conn,
@@ -987,7 +973,16 @@ pub(crate) fn reconcile_revision_execution(
     // `blocked_detail` written below names that path.
     if let Some(attempt) = retired_spawning_attempt(conn, task)? {
         let now = now_string();
-        abandon_pending_executions(pending, conn, &task.id, &now)?;
+        abandon_pending_executions(
+            pending,
+            conn,
+            &task.id,
+            &now,
+            &format!(
+                "its spawning attempt {} was retired with status `{}`, so dispatch must not mint a fresh worker",
+                attempt.attempt_id, attempt.status
+            ),
+        )?;
         if query_live_execution_for_work_item(conn, &task.id)?.is_none() {
             let attempt_status = attempt.status.clone();
             let attempt_succeeded = attempt_status.as_str() == "succeeded";
@@ -1734,25 +1729,14 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                 );
                 return query_execution(conn, &existing.id).require("execution", &existing.id);
             } else {
-                tracing::info!(
-                    work_item_id = %work_item_id,
-                    governing_execution_id = %existing.id,
-                    governing_status = %existing.status,
-                    latest_execution_id = ?latest_id,
-                    live_execution_id = ?live_id,
-                    decision = "abandon_stale_and_redispatch",
-                    "dispatch_decision: governing execution not live (worker gone) — \
-                     abandoning it and creating a fresh ready execution",
-                );
-                let now = now_string();
-                conn.execute(
-                    "UPDATE work_executions
-                     SET status = 'abandoned',
-                         finished_at = COALESCE(finished_at, ?2)
-                     WHERE id = ?1",
-                    params![existing.id, now],
+                abandon_stale_governing(
+                    pending,
+                    conn,
+                    &existing,
+                    &work_item_id,
+                    latest_id.as_deref(),
+                    live_id.as_deref(),
                 )?;
-                stage_execution_terminal(pending, conn, &existing.id, &work_item_id)?;
             }
         } else {
             tracing::info!(

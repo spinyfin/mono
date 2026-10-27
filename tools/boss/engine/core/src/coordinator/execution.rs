@@ -612,7 +612,18 @@ impl ExecutionCoordinator {
                             live_execution_age_secs = ?live_age_secs,
                             "spawn_attempt: work already running in a live execution; skipping this fire (not an error)",
                         );
-                        if let Err(err) = self.work_db.mark_execution_redundant(&execution.id) {
+                        let redundant_provenance = boss_protocol::CancelProvenance::engine(
+                            boss_protocol::CancelSource::DoubleSpawnGuard,
+                            "execution_coordinator",
+                            format!(
+                                "redundant duplicate: live execution {} already holds work item {}",
+                                live.id, execution.work_item_id
+                            ),
+                        );
+                        if let Err(err) = self
+                            .work_db
+                            .mark_execution_redundant(&execution.id, redundant_provenance)
+                        {
                             tracing::error!(
                                 execution_id = %execution.id,
                                 ?err,
@@ -925,10 +936,20 @@ impl ExecutionCoordinator {
                         "spawn_attempt: merge-conflict revision's bound PR was already resolved \
                          before dispatch — retiring without spawning a worker",
                     );
-                    match self
-                        .work_db
-                        .retire_stale_revision_before_dispatch(&execution.id, &revision_task.id)
-                    {
+                    let retire_provenance = boss_protocol::CancelProvenance::engine(
+                        boss_protocol::CancelSource::StaleRevisionRetirement,
+                        "execution_coordinator",
+                        format!(
+                            "merge-conflict revision's bound PR was already resolved by attempt {} \
+                             before dispatch; no worker is needed",
+                            attempt.id
+                        ),
+                    );
+                    match self.work_db.retire_stale_revision_before_dispatch(
+                        &execution.id,
+                        &revision_task.id,
+                        retire_provenance,
+                    ) {
                         Ok(task_transitioned) => {
                             if task_transitioned {
                                 self.publisher
@@ -994,9 +1015,13 @@ impl ExecutionCoordinator {
                     match self.work_db.cancel_execution_with(
                         &execution.id,
                         CancelExecutionOpts {
-                            reason: Some(format!("requested host became ineligible: {err:#}")),
                             queued_only: true,
                             record_failure_reason: true,
+                            ..CancelExecutionOpts::new(boss_protocol::CancelProvenance::engine(
+                                boss_protocol::CancelSource::CoordinatorPreStart,
+                                "execution_coordinator",
+                                format!("requested host became ineligible: {err:#}"),
+                            ))
                         },
                     ) {
                         Ok(cancelled) => {
@@ -2720,9 +2745,13 @@ impl ExecutionCoordinator {
         match self.work_db.cancel_execution_with(
             &execution.id,
             CancelExecutionOpts {
-                reason: Some(format!("requested host dispatch failed during {stage}: {err:#}")),
                 queued_only: true,
                 record_failure_reason: true,
+                ..CancelExecutionOpts::new(boss_protocol::CancelProvenance::engine(
+                    boss_protocol::CancelSource::CoordinatorPreStart,
+                    "execution_coordinator",
+                    format!("requested host dispatch failed during {stage}: {err:#}"),
+                ))
             },
         ) {
             Ok(cancelled) => {

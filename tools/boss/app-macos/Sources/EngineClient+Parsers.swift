@@ -730,6 +730,20 @@ extension EngineClient {
         )
     }
 
+    func parseCancelProvenance(_ raw: Any?) -> CancelProvenanceVM? {
+        guard let payload = raw as? [String: Any],
+              let source = payload["source"] as? String,
+              !source.isEmpty,
+              let actor = payload["actor"] as? String,
+              !actor.isEmpty,
+              let reason = payload["reason"] as? String,
+              !reason.isEmpty
+        else {
+            return nil
+        }
+        return CancelProvenanceVM(source: source, actor: actor, reason: reason)
+    }
+
     func parseExecutionVM(_ payload: [String: Any]) -> ExecutionVM? {
         guard let id = payload["id"] as? String,
               !id.isEmpty,
@@ -756,7 +770,8 @@ extension EngineClient {
             effortLevel: payload["effort_level"] as? String,
             runId: payload["run_id"] as? String,
             startedAt: payload["started_at"] as? String,
-            endedAt: payload["ended_at"] as? String
+            endedAt: payload["ended_at"] as? String,
+            cancelProvenance: parseCancelProvenance(payload["cancel_provenance"])
         )
     }
 

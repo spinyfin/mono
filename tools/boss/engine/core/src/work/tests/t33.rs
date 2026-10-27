@@ -34,7 +34,7 @@ fn backdate_finished_at(db: &WorkDb, execution_id: &str, age_secs: i64) {
 /// every kanban status the sweep must (or must not) treat as recoverable.
 fn make_terminal_chore(db: &WorkDb, label: &str, task_status: &str, age_secs: i64) -> (String, String, String) {
     let (_product_id, chore_id, exec_id) = make_waiting_human_chore(db, label);
-    db.mark_execution_redundant(&exec_id).unwrap();
+    db.mark_execution_redundant(&exec_id, test_cancel_provenance()).unwrap();
     backdate_finished_at(db, &exec_id, age_secs);
     db.update_work_item(
         &chore_id,

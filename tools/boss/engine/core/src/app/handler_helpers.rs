@@ -1013,6 +1013,28 @@ pub(super) async fn transport_default_created_via(server_state: &Arc<ServerState
     }
 }
 
+/// The actor to record when an RPC cancels an execution as a side effect
+/// (a kanban drag back to Backlog, a work-item delete). Names the engine's
+/// resolved caller tier, whether the request arrived on the app's session,
+/// and the socket peer it observed — everything the engine can attest to
+/// about who sent the request, with no guessed identity.
+pub(super) async fn rpc_cancel_actor(
+    server_state: &Arc<ServerState>,
+    session_id: &str,
+    peer_pid: Option<libc::pid_t>,
+) -> String {
+    let tier = super::process_signals::resolve_status_actor(server_state, peer_pid);
+    let via = if transport_default_created_via(server_state, session_id).await == boss_protocol::CREATED_VIA_MAC_APP {
+        "mac_app"
+    } else {
+        "non_app_client"
+    };
+    match peer_pid {
+        Some(pid) => format!("{tier} via {via} session {session_id} (peer pid {pid})"),
+        None => format!("{tier} via {via} session {session_id} (peer pid not observed)"),
+    }
+}
+
 pub(super) fn work_item_id(item: &WorkItem) -> String {
     match item {
         WorkItem::Product(product) => product.id.clone(),
@@ -1160,43 +1182,6 @@ pub(super) fn in_review_chore_execution(work_db: &WorkDb, item: &WorkItem) -> Op
                 work_item_id = %task.id,
                 ?err,
                 "in_review_chore_execution: failed to look up latest execution",
-            );
-            None
-        }
-    }
-}
-
-/// If `item` is a task or chore whose status just changed from `active`
-/// to `todo` (i.e., the user dragged an agent-assigned Doing card back
-/// to Backlog), return the id of its most recent execution so the caller
-/// can cancel the worker and release its resources.
-///
-/// Returns `None` for non-task work items, when the current status is
-/// not `todo`, when the previous status was not `active`, and when the
-/// work item has no executions.
-pub(super) fn active_to_todo_execution(
-    work_db: &WorkDb,
-    previous_status: &Option<TaskStatus>,
-    item: &WorkItem,
-) -> Option<String> {
-    let task = match item {
-        WorkItem::Task(t) | WorkItem::Chore(t) => t,
-        _ => return None,
-    };
-    if task.status != TaskStatus::Todo {
-        return None;
-    }
-    if previous_status.as_ref() != Some(&TaskStatus::Active) {
-        return None;
-    }
-    match work_db.latest_execution_for_work_item(&task.id) {
-        Ok(Some(execution)) => Some(execution.id),
-        Ok(None) => None,
-        Err(err) => {
-            tracing::warn!(
-                work_item_id = %task.id,
-                ?err,
-                "active_to_todo_execution: failed to look up latest execution",
             );
             None
         }

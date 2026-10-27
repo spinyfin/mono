@@ -122,7 +122,9 @@ mod tests {
                 .unwrap();
             let conn = db.connect().unwrap();
             conn.execute(
-                "UPDATE work_executions SET status = 'abandoned', created_at = ?2 WHERE id = ?1",
+                "UPDATE work_executions SET status = 'abandoned', created_at = ?2,
+                 cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'retention fixture'
+                 WHERE id = ?1",
                 rusqlite::params![execution.id, very_old.to_string()],
             )
             .unwrap();

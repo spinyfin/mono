@@ -599,3 +599,45 @@ async fn critical_force_start_creates_execution_under_pause_and_full_cap() {
     assert!(!admission.pause.overridable);
     assert!(crate::coordinator::pause_bypass_decision(&admission, None).is_err());
 }
+
+#[tokio::test]
+async fn pause_override_without_a_free_slot_records_refusal_provenance() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    let chore = create_test_chore_manual(&db, product.id.clone(), "No free slots");
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeExecutionRunner::default()),
+    ));
+    coordinator.worker_pool().claim_worker("occupied", None).await.unwrap();
+    coordinator.pause_dispatch(
+        1_700_000_000,
+        DispatchPauseOrigin::Operator,
+        PauseReason::new("inspect worker failure").unwrap(),
+    );
+    let result = coordinator
+        .dispatch_with_pause_bypass(force_input(&chore.id, None), live_states())
+        .await;
+    assert!(result.is_err());
+    let executions = db.list_executions(Some(&chore.id)).unwrap();
+    assert_eq!(executions.len(), 1);
+    crate::test_support::assert_cancel_provenance(
+        &executions[0],
+        boss_protocol::CancelSource::DispatchAdmission,
+        "dispatch_admission",
+        "pause-only forced dispatch refused:",
+    );
+    assert!(
+        executions[0]
+            .cancel_provenance
+            .as_ref()
+            .unwrap()
+            .reason
+            .contains("pool"),
+        "{:?}",
+        executions[0].cancel_provenance
+    );
+}

@@ -14,6 +14,7 @@
 use super::*;
 
 use boss_engine::work::dispatch_halt_headline;
+use boss_protocol::CancelSource;
 
 /// Resolve a positional `agent` argument to a live worker entry.
 ///
@@ -694,7 +695,7 @@ pub(crate) async fn agents_list_live(socket_path: &Option<String>, json: bool, a
                 match &pane.state {
                     HostedPaneState::LiveProcessNoRegistry { evidence } => println!(
                         "slot {}  {}  run={}  TERMINAL ENTRY, LIVE PROCESS ({evidence}) — \
-                         `bossctl agents stop {}` or `bossctl agents retire-pane {}` to reap it",
+                         `bossctl agents stop {} --reason '<why this worker must stop>'` or `bossctl agents retire-pane {}` to reap it",
                         pane.slot_id, pane.crew_name, pane.run_id, pane.run_id, pane.slot_id,
                     ),
                     HostedPaneState::DurableOccupantNoRegistry { status } => {
@@ -702,7 +703,7 @@ pub(crate) async fn agents_list_live(socket_path: &Option<String>, json: bool, a
                     }
                     HostedPaneState::OccupancyInconclusive { evidence } => println!(
                         "slot {}  {}  run={}  OCCUPANCY INCONCLUSIVE ({evidence}) — \
-                         resolve the probe failure, or run `bossctl agents stop {}` then `bossctl agents retire-pane {}`",
+                         resolve the probe failure, or run `bossctl agents stop {} --reason '<why this worker must stop>'` then `bossctl agents retire-pane {}`",
                         pane.slot_id, pane.crew_name, pane.run_id, pane.run_id, pane.slot_id,
                     ),
                     HostedPaneState::Husk => println!(
@@ -859,7 +860,7 @@ fn looks_like_execution_id(reference: &str) -> bool {
 /// tree, detaching any app viewer. Other reference forms (crew name, slot id) still fail
 /// with the candidate list — a typo'd name must not be posted to the
 /// engine as a run id.
-pub(crate) async fn agents_stop(socket_path: &Option<String>, json: bool, agent: String) -> Result<()> {
+pub(crate) async fn agents_stop(socket_path: &Option<String>, json: bool, agent: String, reason: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
     let run_id = match resolve_agent_ref_or_work_item(&mut client, &agent, &states).await {
@@ -875,7 +876,12 @@ pub(crate) async fn agents_stop(socket_path: &Option<String>, json: bool, agent:
         Err(err) => return Err(err),
     };
     let response = client
-        .send_request(&FrontendRequest::StopRun { run_id: run_id.clone() })
+        .send_request(&FrontendRequest::StopRun {
+            run_id: run_id.clone(),
+            reason: Some(reason),
+            source: Some(CancelSource::Bossctl.as_str().to_owned()),
+            actor: cancel_actor(),
+        })
         .await
         .context("sending StopRun")?;
     match response {
@@ -1278,7 +1284,12 @@ pub(crate) async fn work_start(
     }
 }
 
-pub(crate) async fn work_cancel(socket_path: &Option<String>, json: bool, execution_id: String) -> Result<()> {
+pub(crate) async fn work_cancel(
+    socket_path: &Option<String>,
+    json: bool,
+    execution_id: String,
+    reason: String,
+) -> Result<()> {
     // Broad cancel: any non-terminal row (including running). For
     // never-started rows only, prefer `executions_cancel` /
     // `bossctl executions cancel`, which refuses live workers and
@@ -1287,7 +1298,7 @@ pub(crate) async fn work_cancel(socket_path: &Option<String>, json: bool, execut
         socket_path,
         json,
         execution_id,
-        /* reason */ None,
+        reason,
         /* queued_only */ false,
         "work cancel",
     )
@@ -1306,7 +1317,7 @@ pub(crate) async fn executions_cancel(
     json: bool,
     execution_id: Option<String>,
     work_item_id: Option<String>,
-    reason: Option<String>,
+    reason: String,
 ) -> Result<()> {
     match (execution_id, work_item_id) {
         (Some(execution_id), None) => {
@@ -1334,7 +1345,7 @@ async fn executions_cancel_for_work_item(
     socket_path: &Option<String>,
     json: bool,
     work_item_id: String,
-    reason: Option<String>,
+    reason: String,
 ) -> Result<()> {
     let mut client = connect(socket_path).await?;
     // Resolve typed friendly short ids to the canonical task id —
@@ -1399,7 +1410,9 @@ async fn executions_cancel_for_work_item(
         let response = client
             .send_request(&FrontendRequest::CancelExecution {
                 execution_id: exec.id.clone(),
-                reason: reason.clone(),
+                reason: Some(reason.clone()),
+                source: Some(CancelSource::Bossctl.as_str().to_owned()),
+                actor: cancel_actor(),
                 queued_only: true,
             })
             .await
@@ -1440,7 +1453,7 @@ async fn cancel_execution_rpc(
     socket_path: &Option<String>,
     json: bool,
     execution_id: String,
-    reason: Option<String>,
+    reason: String,
     queued_only: bool,
     verb_label: &str,
 ) -> Result<()> {
@@ -1448,7 +1461,9 @@ async fn cancel_execution_rpc(
     let response = client
         .send_request(&FrontendRequest::CancelExecution {
             execution_id: execution_id.clone(),
-            reason,
+            reason: Some(reason),
+            source: Some(CancelSource::Bossctl.as_str().to_owned()),
+            actor: cancel_actor(),
             queued_only,
         })
         .await
@@ -1845,7 +1860,7 @@ enum TmuxListEvidence<'a> {
 fn durable_occupant_list_line(pane: &HostedPaneStatus, status: &str) -> String {
     format!(
         "slot {}  {}  run={}  DURABLE OCCUPANT `{status}` WITH NO LIVE-STATE — \
-         run `bossctl agents stop {}`",
+         run `bossctl agents stop {} --reason '<why this worker must stop>'`",
         pane.slot_id, pane.crew_name, pane.run_id, pane.run_id,
     )
 }
@@ -1856,7 +1871,7 @@ fn durable_occupant_detail_lines(pane: &HostedPaneStatus, status: &str) -> Strin
     format!(
         "  state: durable occupant `{status}` with no live-state entry\n  \
          durable status says a worker should exist; no live-state entry.\n  \
-         run `bossctl agents stop {}`.",
+         run `bossctl agents stop {} --reason '<why this worker must stop>'`.",
         pane.run_id
     )
 }
@@ -1894,7 +1909,7 @@ fn print_hosted_pane_status(json: bool, pane: &HostedPaneStatus) {
             println!("  state: terminal entry, live process ({evidence})");
             println!("  the engine has no live run tracked for this worker, but its process is still running.");
             println!(
-                "  `bossctl agents stop {}` or `bossctl agents retire-pane {}` will reap it.",
+                "  `bossctl agents stop {} --reason '<why this worker must stop>'` or `bossctl agents retire-pane {}` will reap it.",
                 pane.run_id, pane.slot_id
             );
         }
@@ -1904,7 +1919,7 @@ fn print_hosted_pane_status(json: bool, pane: &HostedPaneStatus) {
         HostedPaneState::OccupancyInconclusive { evidence } => {
             println!("  state: occupancy inconclusive ({evidence})");
             println!(
-                "  resolve the probe failure, or run `bossctl agents stop {}` then `bossctl agents retire-pane {}`.",
+                "  resolve the probe failure, or run `bossctl agents stop {} --reason '<why this worker must stop>'` then `bossctl agents retire-pane {}`.",
                 pane.run_id, pane.slot_id
             );
         }
@@ -2001,6 +2016,20 @@ fn tmux_adoption_state_label(state: TmuxAdoptionState) -> &'static str {
         TmuxAdoptionState::TokenMismatch => "token_mismatch",
         TmuxAdoptionState::ProbeUnavailable => "probe_unavailable",
     }
+}
+
+/// The identity bossctl reports as the actor behind a cancel: the worker run
+/// that issued it when run from a worker pane, otherwise the invoking user.
+/// `None` when neither is known, in which case the engine records the socket
+/// peer it observed instead of a guessed name.
+fn cancel_actor() -> Option<String> {
+    if let Some(run) = std::env::var("BOSS_RUN_ID").ok().filter(|v| !v.trim().is_empty()) {
+        return Some(format!("worker run {run}"));
+    }
+    std::env::var("USER")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(|user| format!("user {user}"))
 }
 
 #[cfg(test)]

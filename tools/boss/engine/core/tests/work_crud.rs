@@ -746,8 +746,16 @@ async fn create_chore(client: &mut BossClient, input: CreateChoreInput) -> Resul
 async fn update_work_item(client: &mut BossClient, id: &str, patch: WorkItemPatch) -> Result<WorkItem> {
     match client
         .send_request(&FrontendRequest::UpdateWorkItem {
+            cancel: Some(
+                boss_protocol::CancelProvenance::new(
+                    boss_protocol::CancelSource::Bossctl,
+                    "requesting client",
+                    "apply requested work item changes",
+                )
+                .unwrap(),
+            ),
             id: id.to_owned(),
-            patch,
+            patch: Box::new(patch),
         })
         .await?
     {
@@ -758,7 +766,17 @@ async fn update_work_item(client: &mut BossClient, id: &str, patch: WorkItemPatc
 
 async fn delete_work_item(client: &mut BossClient, id: &str) -> Result<()> {
     match client
-        .send_request(&FrontendRequest::DeleteWorkItem { id: id.to_owned() })
+        .send_request(&FrontendRequest::DeleteWorkItem {
+            cancel: Some(
+                boss_protocol::CancelProvenance::new(
+                    boss_protocol::CancelSource::Bossctl,
+                    "requesting client",
+                    "delete work item and its revision chain",
+                )
+                .unwrap(),
+            ),
+            id: id.to_owned(),
+        })
         .await?
     {
         FrontendEvent::WorkItemDeleted { .. } => Ok(()),
@@ -902,7 +920,10 @@ fn unexpected_event(context: &str, event: FrontendEvent) -> anyhow::Error {
 }
 
 async fn add_dependency(client: &mut BossClient, input: AddDependencyInput) -> Result<WorkItemDependency> {
-    match client.send_request(&FrontendRequest::AddDependency { input }).await? {
+    match client
+        .send_request(&FrontendRequest::AddDependency { cancel: None, input })
+        .await?
+    {
         FrontendEvent::DependencyAdded { edge } => Ok(edge),
         other => Err(unexpected_event("add dependency", other)),
     }
@@ -1002,6 +1023,7 @@ async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
     // Cycle add returns a WorkError.
     let cycle = client
         .send_request(&FrontendRequest::AddDependency {
+            cancel: None,
             input: AddDependencyInput {
                 dependent: b.id.clone(),
                 prerequisite: a.id.clone(),
@@ -1122,6 +1144,7 @@ async fn dependency_rpcs_reject_archived_prereqs_and_remove_archived_edges() -> 
 
     match client
         .send_request(&FrontendRequest::AddDependency {
+            cancel: None,
             input: AddDependencyInput {
                 dependent: another_dependent.id,
                 prerequisite: archived_prereq.id.clone(),

@@ -4,7 +4,9 @@
 
 use anyhow::{Result, anyhow};
 use boss_client::BossClient;
-use boss_protocol::{CreateExecutionInput, CreateRunInput, ExecutionKind, ExecutionStatus};
+use boss_protocol::{
+    CancelProvenance, CancelSource, CreateExecutionInput, CreateRunInput, ExecutionKind, ExecutionStatus,
+};
 use serde_json::Value;
 
 use common::{run_boss, run_boss_human};
@@ -84,6 +86,18 @@ async fn task_show_and_executions_surface_runs_for_running_and_completed_parents
             .build(),
     )?;
 
+    let cancelled = db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::Running)
+            .build(),
+    )?;
+    db.cancel_execution(
+        &cancelled.id,
+        CancelProvenance::engine(CancelSource::Bossctl, "operator", "wrong repo; stopping this run"),
+    )?;
+
     let show = run_boss(engine.socket_str(), &["task", "show", &chore.id])?;
     assert_run_surfaced(execution_json(&show, &running.id)?, &running_run.id, running_transcript)?;
     assert_run_surfaced(
@@ -104,6 +118,14 @@ async fn task_show_and_executions_surface_runs_for_running_and_completed_parents
         completed_transcript,
     )?;
 
+    let cancelled_json = execution_json(&show, &cancelled.id)?;
+    assert_eq!(cancelled_json["cancel_provenance"]["source"].as_str(), Some("bossctl"));
+    assert_eq!(cancelled_json["cancel_provenance"]["actor"].as_str(), Some("operator"));
+    assert_eq!(
+        cancelled_json["cancel_provenance"]["reason"].as_str(),
+        Some("wrong repo; stopping this run")
+    );
+
     let human = run_boss_human(engine.socket_str(), &["task", "show", &chore.id])?;
     assert!(
         human.contains(&running_run.id),
@@ -112,6 +134,10 @@ async fn task_show_and_executions_surface_runs_for_running_and_completed_parents
     assert!(
         human.contains(&completed_run.id),
         "human task show must print the completed execution's run: {human}"
+    );
+    assert!(
+        human.contains("cancelled: bossctl by operator: wrong repo; stopping this run"),
+        "human task show must print cancel provenance: {human}"
     );
     Ok(())
 }

@@ -13,10 +13,11 @@ async fn retained_lease_of_cancelled_remote_worker_is_still_heartbeated() {
     let with_pid = create_test_chore(&db, &product_id, "chore with pid");
     let with_pid = running_execution_on_host_with_lease(&db, &with_pid.id, "lease-pid", "anaplian");
     db.set_run_remote_pid_for_execution(&with_pid, 4242).unwrap();
-    db.cancel_running_execution(&with_pid).unwrap();
+    db.cancel_running_execution(&with_pid, test_cancel_provenance())
+        .unwrap();
     let no_pid = create_test_chore(&db, &product_id, "chore without pid");
     let no_pid = running_execution_on_host_with_lease(&db, &no_pid.id, "lease-nopid", "anaplian");
-    db.cancel_running_execution(&no_pid).unwrap();
+    db.cancel_running_execution(&no_pid, test_cancel_provenance()).unwrap();
 
     let cubes = routing_cubes(&db, "anaplian");
     let sink = RecordingDispatchEventSink::new();

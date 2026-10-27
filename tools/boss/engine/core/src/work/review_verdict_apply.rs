@@ -312,8 +312,15 @@ impl WorkDb {
             if let Some(ref existing_task) = existing {
                 let mut conn = self.connect()?;
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                tombstone_orphaned_remediation_in_tx(&tx, &existing_task.id, &now_string())?;
-                tx.commit()?;
+                let mut pending = PendingEvents::new();
+                tombstone_orphaned_remediation_in_tx(
+                    &mut pending,
+                    &tx,
+                    &existing_task.id,
+                    &now_string(),
+                    "deletion signoff is required",
+                )?;
+                self.commit_pending(tx, pending)?;
             }
         }
 
@@ -504,12 +511,19 @@ impl WorkDb {
             // it so it never autostarts as the (wrong) chain head, rather
             // than leaving it live alongside whatever the corrected verdict
             // mints under its own `created_via` key.
+            let mut tombstone_pending = PendingEvents::new();
             if current_state != ProposalState::Applied.as_str()
                 && let Some(task_id) = remediating_task_id
             {
-                tombstone_orphaned_remediation_in_tx(&tx, task_id, &now_string())?;
+                tombstone_orphaned_remediation_in_tx(
+                    &mut tombstone_pending,
+                    &tx,
+                    task_id,
+                    &now_string(),
+                    "its owning proposal is no longer the applied decision",
+                )?;
             }
-            tx.commit()?;
+            self.commit_pending(tx, tombstone_pending)?;
             return Ok(applied_ref);
         }
 
@@ -622,7 +636,7 @@ impl WorkDb {
             product_id,
             task_id: batch.cycle_root_id.clone(),
         });
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok(remediating_task_id.is_some().then_some(applied_ref))
     }
 
@@ -800,8 +814,15 @@ impl WorkDb {
     pub(crate) fn test_tombstone_orphaned_remediation(&self, task_id: &str) -> Result<()> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        tombstone_orphaned_remediation_in_tx(&tx, task_id, &now_string())?;
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        tombstone_orphaned_remediation_in_tx(
+            &mut pending,
+            &tx,
+            task_id,
+            &now_string(),
+            "its owning proposal is no longer the applied decision",
+        )?;
+        self.commit_pending(tx, pending)?;
         Ok(())
     }
 }
@@ -826,19 +847,50 @@ fn parent_no_longer_revisable(error: &anyhow::Error) -> bool {
 /// on every drain until the start-time deleted-item guard fails it.
 /// Cancel the task's never-started executions in the same transaction so
 /// the orphan sweep and reconciler will not re-dispatch it.
-fn tombstone_orphaned_remediation_in_tx(tx: &rusqlite::Transaction<'_>, task_id: &str, now: &str) -> Result<()> {
+fn tombstone_orphaned_remediation_in_tx(
+    pending: &mut PendingEvents,
+    tx: &rusqlite::Transaction<'_>,
+    task_id: &str,
+    now: &str,
+    cause: &str,
+) -> Result<()> {
     tx.execute(
         "UPDATE tasks SET deleted_at = ?2, updated_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
         params![task_id, now],
     )?;
+    let provenance = boss_protocol::CancelProvenance::engine(
+        boss_protocol::CancelSource::ReviewVerdict,
+        "review_verdict_apply",
+        format!("tombstoned remediation {task_id}: {cause}, so its never-started executions must not dispatch"),
+    );
+    let doomed = capture_doomed(
+        tx,
+        "work_item_id = ?1 AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed')",
+        params![task_id],
+    )?;
     tx.execute(
         "UPDATE work_executions
          SET status = 'cancelled',
-             finished_at = ?2
+             finished_at = ?2,
+             cancel_source = ?3,
+             cancel_actor = ?4,
+             cancel_reason = ?5
          WHERE work_item_id = ?1
            AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed')",
-        params![task_id, now],
+        params![
+            task_id,
+            now,
+            provenance.source.as_str(),
+            provenance.actor,
+            provenance.reason
+        ],
     )?;
+    stage_doomed_audit_only(
+        pending,
+        &doomed,
+        &boss_protocol::ExecutionStatus::Cancelled,
+        &provenance,
+    );
     Ok(())
 }
 

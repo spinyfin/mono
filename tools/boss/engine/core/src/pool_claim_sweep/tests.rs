@@ -103,7 +103,10 @@ async fn frees_every_leaked_automation_claim_across_terminal_paths() {
     // Terminate the holders, one per terminal path, then age each
     // past the leak grace (the terminal paths stamp finished_at=now).
     db.mark_execution_orphaned(&exec_orphaned, "test orphan").unwrap();
-    assert!(db.cancel_running_execution(&exec_cancelled).unwrap());
+    assert!(
+        db.cancel_running_execution(&exec_cancelled, test_cancel_provenance())
+            .unwrap()
+    );
     force_completed(&db, &exec_completed);
     for exec in [&exec_orphaned, &exec_cancelled, &exec_completed] {
         age_finished_at(&db, exec, 300);

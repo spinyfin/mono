@@ -928,20 +928,19 @@ pub(crate) async fn stop_active_revision_executions(
         // already reached its parent-close state in the DB transaction, so
         // cancel's active-to-todo demotion does not overwrite that decision.
         let prior_status = execution.status.clone();
+        let provenance = boss_protocol::CancelProvenance::engine(
+            boss_protocol::CancelSource::MergePollerParentMerged,
+            "merge_poller",
+            format!("parent PR of chain root {chain_root_id} merged, so this revision execution is obsolete"),
+        );
         let cancel_result = work_db.cancel_execution_with(
             &execution.id,
-            crate::work::CancelExecutionOpts {
-                reason: Some("parent PR merged".to_owned()),
-                queued_only: false,
-                record_failure_reason: false,
-            },
+            crate::work::CancelExecutionOpts::new(provenance.clone())
+                .with_parent_pr_merge(chain_root_id, prior_status.as_str()),
         );
         match &cancel_result {
-            Ok(cancelled) => {
+            Ok(_cancelled) => {
                 outcome.revision_invalidated += 1;
-                handler
-                    .record_parent_pr_merge_cancellation(cancelled, prior_status, chain_root_id)
-                    .await;
             }
             Err(err) => {
                 // The execution may have already moved to a terminal state
@@ -1038,7 +1037,14 @@ pub(crate) async fn stop_worker_on_review_transition(
         work_item_id,
         "merge poller: stopping worker — task auto-transitioned to in_review (CI green)",
     );
-    handler.force_stop_execution(&execution.id).await;
+    let provenance = boss_protocol::CancelProvenance::engine(
+        boss_protocol::CancelSource::MergePollerReviewTransition,
+        "merge_poller",
+        format!(
+            "task {work_item_id} auto-transitioned to in_review (CI green); its worker is done and must free its slot"
+        ),
+    );
+    handler.force_stop_execution(&execution.id, provenance).await;
     outcome.worker_stopped_on_review += 1;
 }
 

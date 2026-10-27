@@ -500,12 +500,27 @@ pub(super) async fn handle_create_many_chores(ctx: Dispatch, req: FrontendReques
 
 #[tracing::instrument(name = "update_work_item", level = "debug", skip_all, fields(request_id = %ctx.request_id, item_id = tracing::field::Empty))]
 pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest) {
-    let FrontendRequest::UpdateWorkItem { id, patch } = req else {
+    let FrontendRequest::UpdateWorkItem { id, mut patch, cancel } = req else {
         unreachable!()
     };
     tracing::Span::current().record("item_id", &id);
     tracing::debug!(target: "work_write_timing", boundary = "handler_entry");
-    apply_work_item_patch(ctx, id, patch, None).await;
+    if let Some(claim) = cancel {
+        let observed = rpc_cancel_actor(&ctx.server_state, &ctx.session_id, ctx.peer_pid).await;
+        match super::cancel_rpc::provenance_from_request(
+            Some(claim.source.as_str()),
+            Some(&claim.reason),
+            Some(&claim.actor),
+            &observed,
+        ) {
+            Ok(provenance) => patch.cancel_provenance = Some(provenance),
+            Err(refusal) => {
+                send_work_error(&ctx.sink, &ctx.request_id, refusal.message("update_work_item"));
+                return;
+            }
+        }
+    }
+    apply_work_item_patch(ctx, id, *patch, None).await;
 }
 
 /// Confirmed pause-only override state carried from a `MoveWorkItemOnBoard`
@@ -624,7 +639,12 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
                     return;
                 }
             }
-            let patch = WorkItemPatch::builder().status(status.as_str()).build();
+            let mut patch = WorkItemPatch::builder().status(status.as_str()).build();
+            patch.cancel_provenance = Some(boss_protocol::CancelProvenance::engine(
+                boss_protocol::CancelSource::App,
+                &rpc_cancel_actor(&ctx.server_state, &ctx.session_id, ctx.peer_pid).await,
+                format!("board gesture moves {id} to {}", status.as_str()),
+            ));
             let pause_bypass = bypass_dispatch_pause.then_some(BoardDragPauseBypass {
                 observed_pause_since_epoch_s,
             });
@@ -695,6 +715,25 @@ pub(super) async fn apply_work_item_patch(
         // applies. We only care about task/chore — products and
         // projects have no execution lifecycle.
         let previous_task_status = task_status_for_id(&work_db, &id);
+        if (patch.deferred == Some(true) || matches!(patch.status.as_deref(), Some("done" | "archived")))
+            && patch.cancel_provenance.is_none()
+        {
+            match work_db.list_executions(Some(&id)) {
+                Ok(rows) if rows.iter().any(|execution| !execution.status.is_terminal()) => {
+                    send_work_error(
+                        &sink,
+                        &request_id,
+                        "update_work_item requires cancel source, actor and reason when ending executions",
+                    );
+                    return;
+                }
+                Err(err) => {
+                    send_work_error(&sink, &request_id, &err);
+                    return;
+                }
+                _ => {}
+            }
+        }
         let previous_block = work_db.get_work_item(&id).ok().and_then(|item| match item {
             WorkItem::Task(t) | WorkItem::Chore(t) => Some((t.blocked_reason, t.blocked_detail)),
             _ => None,
@@ -793,8 +832,8 @@ pub(super) async fn apply_work_item_patch(
                 return;
             }
         };
-        match work_db.update_work_item_as_actor(&id, patch, actor) {
-            Ok(mut item) => {
+        match work_db.update_work_item_with_teardown(&id, patch, actor) {
+            Ok((mut item, backlog_teardown)) => {
                 // Dispatch refusals roll back the move and return the engine reason.
                 let mut dispatch_failure_response: Option<String> = None;
                 // Set only inside the pause-bypass arm's genuine claim branch
@@ -840,25 +879,13 @@ pub(super) async fn apply_work_item_patch(
                         handler.force_release(&execution_id).await;
                     });
                 }
-                // If the user dragged an active task/chore back
-                // to Backlog (active → todo), stop the live
-                // worker: cancel its execution row (so the orphan
-                // sweep and reconciler won't re-dispatch it) and
-                // release its pane + cube workspace. The task
-                // status is already `todo` from the patch above;
-                // autostart was cleared to 0 when the task first
-                // entered Doing, so it will not be re-dispatched.
-                if let Some(execution_id) = active_to_todo_execution(&work_db, &previous_task_status, &item) {
+                // The card-update transaction already cancelled the live row.
+                // Release that exact execution, including any terminal ghost
+                // whose pane or workspace outlived its worker.
+                if let Some(execution_id) = backlog_teardown {
                     let handler = server_state.completion_handler.clone();
-                    let id_for_cancel = id.clone();
                     boss_task_scope::spawn(async move {
-                        handler
-                            .cancel_and_release(
-                                &id_for_cancel,
-                                &execution_id,
-                                "kanban drag: active → todo (dragged back to Backlog)",
-                            )
-                            .await;
+                        handler.force_release(&execution_id).await;
                     });
                 }
                 // Kanban drop-into-Doing (and any other human
@@ -1217,13 +1244,34 @@ pub(super) async fn handle_delete_work_item(ctx: Dispatch, req: FrontendRequest)
         peer_pid,
         ..
     } = ctx;
-    let FrontendRequest::DeleteWorkItem { id } = req else {
+    let FrontendRequest::DeleteWorkItem { id, cancel } = req else {
         unreachable!()
     };
     let id = match server_state.resolve_work_item_id(&id).await {
         Ok(id) => id,
         Err(err) => {
             send_work_error(&sink, &request_id, &err);
+            return;
+        }
+    };
+    let Some(claim) = cancel else {
+        send_work_error(
+            &sink,
+            &request_id,
+            "delete_work_item requires cancel source, actor and reason",
+        );
+        return;
+    };
+    let observed = rpc_cancel_actor(&server_state, &session_id, peer_pid).await;
+    let provenance = match super::cancel_rpc::provenance_from_request(
+        Some(claim.source.as_str()),
+        Some(&claim.reason),
+        Some(&claim.actor),
+        &observed,
+    ) {
+        Ok(value) => value,
+        Err(refusal) => {
+            send_work_error(&sink, &request_id, refusal.message("delete_work_item"));
             return;
         }
     };
@@ -1254,13 +1302,14 @@ pub(super) async fn handle_delete_work_item(ctx: Dispatch, req: FrontendRequest)
                     };
                     let handler = server_state.completion_handler.clone();
                     let id_for_cancel = tombstoned_id.clone();
+                    let mut provenance = provenance.clone();
+                    provenance.reason = format!(
+                        "work item {tombstoned_id} cascade-deleted with {id} while a worker was active; {}",
+                        provenance.reason
+                    );
                     boss_task_scope::spawn(async move {
                         handler
-                            .cancel_and_release(
-                                &id_for_cancel,
-                                &execution_id,
-                                "work item deleted while a worker was active",
-                            )
+                            .cancel_and_release(&id_for_cancel, &execution_id, provenance)
                             .await;
                     });
                 }

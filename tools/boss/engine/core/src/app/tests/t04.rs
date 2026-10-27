@@ -1,5 +1,6 @@
 use super::*;
 use crate::spawn_flow::WorkerSpawner;
+use crate::test_support::test_cancel_provenance;
 
 // Tests for `ServerState::retire_pane` / `ServerState::list_hosted_pane_statuses` —
 // the break-glass leftover-viewer path. Occupancy is resolved from live-state,
@@ -582,7 +583,7 @@ async fn list_hosted_pane_statuses_still_retires_a_lingering_shell_under_a_cance
     let product_id = create_product(db);
     let work_item_id = create_active_chore(db, &product_id, "test chore");
     let execution_id = create_spawned_execution(db, &work_item_id, i64::from(std::process::id()));
-    db.cancel_execution(&execution_id).unwrap();
+    db.cancel_execution(&execution_id, test_cancel_provenance()).unwrap();
 
     let sink = make_session_sink();
     server_state
@@ -1263,7 +1264,10 @@ async fn missing_session_stop_clears_identity_and_allows_retirement() {
     let (tmux, _) = super::tmux_stub::fake_tmux([super::tmux_stub::failure("session not found")]);
     server.set_tmux_override_for_test(tmux);
     // Exercise the same completion entry point as `bossctl agents stop`.
-    server.completion_handler.force_stop_execution(&run).await;
+    server
+        .completion_handler
+        .force_stop_execution(&run, test_cancel_provenance())
+        .await;
     assert!(server.work_db.tmux_identity_for_execution(&run).unwrap().is_none());
     server.retire_pane(1).await.unwrap();
 }

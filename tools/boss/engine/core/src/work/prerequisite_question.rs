@@ -133,7 +133,15 @@ pub(super) fn approve_in_tx(
          blocked_detail = NULL, autostart = 1, last_status_actor = 'human', updated_at = ?3 WHERE id = ?1",
         params![task.id, description, now],
     )?;
-    add_dependency_edge_in_tx(pending, conn, &task.id, &prerequisite.id, RELATION_BLOCKS, now)?;
+    add_dependency_edge_in_tx(
+        pending,
+        conn,
+        &task.id,
+        &prerequisite.id,
+        RELATION_BLOCKS,
+        now,
+        &DependencyCancelOrigin::EngineInternal,
+    )?;
     queue_gated_execution(conn, task, question)?;
     tracing::info!(
         work_item_id = %task.id,

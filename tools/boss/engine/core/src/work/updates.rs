@@ -383,11 +383,30 @@ impl WorkDb {
         // Audit inside `tx`: the action row and the write it describes
         // commit together or not at all. Inert unless `actor` is Boothby.
         boothby::capture_project_update(&tx, self, actor, &before, &updated, &project.updated_at)?;
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok(WorkItem::Project(updated))
     }
 
     pub(crate) fn update_task(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
+        self.update_task_impl(id, patch, actor, false).map(|(item, _)| item)
+    }
+
+    pub(crate) fn update_task_with_teardown(
+        &self,
+        id: &str,
+        patch: WorkItemPatch,
+        actor: &str,
+    ) -> Result<(WorkItem, Option<String>)> {
+        self.update_task_impl(id, patch, actor, true)
+    }
+
+    fn update_task_impl(
+        &self,
+        id: &str,
+        patch: WorkItemPatch,
+        actor: &str,
+        cancel_backlog: bool,
+    ) -> Result<(WorkItem, Option<String>)> {
         // Fail fast, before opening a transaction: validate the incoming
         // value only (never a value already sitting in a row from before
         // this limit existed — see `validate_blocked_reason_length`).
@@ -401,6 +420,27 @@ impl WorkDb {
         let mut pending = PendingEvents::new();
         let mut task = query_task(&tx, id).require("task", id)?;
         let previous_status = task.status.clone();
+        // Read and cancel under the same writer transaction as the card move.
+        // Return this exact row for resource teardown, including terminal ghosts.
+        let teardown = if cancel_backlog
+            && previous_status == TaskStatus::Active
+            && patch.status.as_deref() == Some("todo")
+        {
+            let execution = query_latest_execution_for_work_item(&tx, id)?;
+            if let Some(execution) = &execution
+                && !execution.status.is_terminal()
+            {
+                let mut provenance = patch.cancel_provenance.clone().ok_or_else(|| {
+                    anyhow::anyhow!("update_work_item requires cancel source, actor and reason when ending executions")
+                })?;
+                provenance.reason = format!("work item {id} moved from active to todo; {}", provenance.reason);
+                super::exec_tail::cancel_non_terminal_in_tx(&tx, &mut pending, execution, &provenance)?;
+            }
+            execution.map(|execution| execution.id)
+        } else {
+            None
+        };
+
         // Check this before the generic tombstone bail below: an
         // archived-and-tombstoned moot revision (see
         // `block_pending_revisions_on_parent_close`) is also a deleted
@@ -757,7 +797,24 @@ impl WorkDb {
         // (`running` / `waiting_human`) is left alone — it self-retires. The
         // reconcile guard (`work_item_is_deferred`) then keeps it parked.
         if patch.deferred == Some(true) {
-            abandon_pending_executions(&mut pending, &tx, id, &task.updated_at)?;
+            let cause = "the work item was reclassified as deferred and leaves the dispatch pool";
+            let provenance = match patch.cancel_provenance.clone() {
+                Some(mut client) => {
+                    client.reason = format!("{cause}; {}", client.reason);
+                    client
+                }
+                None => {
+                    boss_protocol::CancelProvenance::engine(boss_protocol::CancelSource::WorkItemSettled, actor, cause)
+                }
+            };
+            abandon_pending_executions_with_provenance(
+                &mut pending,
+                &tx,
+                id,
+                &task.updated_at,
+                cause,
+                Some(&provenance),
+            )?;
         }
 
         if status_changed && previous_status != task.status {
@@ -803,7 +860,7 @@ impl WorkDb {
         // Derived fields are not part of `task_image`, so projecting
         // before capture does not journal a no-op as a mutation.
         boothby::capture_task_update(&tx, self, actor, &before, &updated, &task.updated_at)?;
-        commit_and_publish(tx, pending, self.event_bus())?;
-        Ok(task_to_item(updated))
+        self.commit_pending(tx, pending)?;
+        Ok((task_to_item(updated), teardown))
     }
 }

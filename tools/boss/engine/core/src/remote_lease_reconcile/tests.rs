@@ -70,7 +70,7 @@ crate::stub_host_adapter! { StubAdapter {
     }
     async fn read_worker_log_tail(&self, workspace_path: &str, _max_bytes: u64) -> Result<Option<String>> {
         if let Some((db, id)) = self.cancel_on_log.lock().unwrap().take() {
-            db.cancel_running_execution(&id).unwrap();
+            db.cancel_running_execution(&id, test_cancel_provenance()).unwrap();
         }
         self.worker_log_reads.lock().unwrap().push(workspace_path.to_owned());
         if self.worker_log_fails {
@@ -456,7 +456,7 @@ async fn terminal_remote_persona_backstop_preserves_history_and_live_leases() {
     let live = start_remote_run(&db, &create_chore(&db), "anaplian", "live", None);
     let dead_name = db.persona_display_name(&dead).unwrap();
     let live_name = db.persona_display_name(&live).unwrap();
-    db.cancel_running_execution(&dead).unwrap();
+    db.cancel_running_execution(&dead, test_cancel_provenance()).unwrap();
     db.mark_remote_input_cleanup_pending("anaplian", "input_attempt_1", "/remote/mono-agent-004", &dead)
         .unwrap();
     let (adapter, provider) = provider("anaplian", Probe::Dead);
@@ -496,7 +496,7 @@ async fn cancelled_remote_worker_still_alive_keeps_lease_and_persona() {
     let (_d, db) = open_db_arc();
     db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
     let id = start_remote_run(&db, &create_chore(&db), "anaplian", "lease", Some(7));
-    db.cancel_running_execution(&id).unwrap();
+    db.cancel_running_execution(&id, test_cancel_provenance()).unwrap();
     let (adapter, provider) = provider("anaplian", Probe::Alive);
     reconcile_remote_leases(&db, &provider, &RecordingDispatchEventSink::new(), None).await;
     assert!(adapter.force_released.lock().unwrap().is_empty());
@@ -511,7 +511,7 @@ async fn terminal_remote_run_without_pid_releases_persona_but_leaves_lease_to_tt
     db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
     let id = start_remote_run(&db, &create_chore(&db), "anaplian", "lease", None);
     let name = db.persona_display_name(&id).unwrap();
-    db.cancel_running_execution(&id).unwrap();
+    db.cancel_running_execution(&id, test_cancel_provenance()).unwrap();
     let (adapter, provider) = provider("anaplian", Probe::Dead);
     reconcile_remote_leases(&db, &provider, &RecordingDispatchEventSink::new(), None).await;
     // No pid → nothing to probe: the cube lease is left to its TTL, but the
@@ -536,7 +536,7 @@ async fn terminal_persona_retention_is_bounded_without_releasing_remote_resource
             db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
         }
         let id = start_remote_run(&db, &create_chore(&db), "anaplian", "lease", Some(7));
-        db.cancel_running_execution(&id).unwrap();
+        db.cancel_running_execution(&id, test_cancel_provenance()).unwrap();
         if expired {
             db.connect()
                 .unwrap()
@@ -568,7 +568,7 @@ async fn mismatched_host_adapter_cannot_prove_death_or_release_resources() {
     let (_d, db) = open_db_arc();
     db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
     let id = start_remote_run(&db, &create_chore(&db), "anaplian", "lease", Some(7));
-    db.cancel_running_execution(&id).unwrap();
+    db.cancel_running_execution(&id, test_cancel_provenance()).unwrap();
     let (adapter, provider) = provider("wrong-host", Probe::Dead);
     reconcile_remote_leases(&db, &provider, &RecordingDispatchEventSink::new(), None).await;
     assert!(adapter.force_released.lock().unwrap().is_empty());
@@ -596,7 +596,8 @@ async fn pending_input_restart_requires_confirmed_death_and_preserves_new_attemp
         let chore = create_chore(&db);
         db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
         execution = start_remote_run(&db, &chore, "anaplian", "lease-1", None);
-        db.cancel_running_execution(&execution).unwrap();
+        db.cancel_running_execution(&execution, test_cancel_provenance())
+            .unwrap();
         db.mark_remote_input_cleanup_pending("anaplian", "attempt-old", "/remote/ws", &execution)
             .unwrap();
     }
@@ -644,7 +645,8 @@ async fn known_safe_input_retries_without_a_pid_and_stale_clear_preserves_marker
     let chore = create_chore(&db);
     db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
     let execution = start_remote_run(&db, &chore, "anaplian", "lease-1", None);
-    db.cancel_running_execution(&execution).unwrap();
+    db.cancel_running_execution(&execution, test_cancel_provenance())
+        .unwrap();
     let stale = db
         .mark_remote_input_cleanup_pending("anaplian", "old", "/remote/ws", &execution)
         .unwrap();

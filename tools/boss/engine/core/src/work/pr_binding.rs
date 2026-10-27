@@ -338,7 +338,7 @@ impl WorkDb {
         )?;
         let mut pending = PendingEvents::new();
         cascade_dependents_after_prereq_status_change(&mut pending, &tx, task_id, "in_review", &now)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(true)
     }
 
@@ -387,7 +387,7 @@ impl WorkDb {
         )?;
         let mut pending = PendingEvents::new();
         cascade_dependents_after_prereq_status_change(&mut pending, &tx, task_id, "blocked", &now)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(true)
     }
 }

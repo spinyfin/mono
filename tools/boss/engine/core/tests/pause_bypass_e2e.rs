@@ -142,6 +142,7 @@ async fn work_start_force_refuses_dependency_gated_item_no_residue() -> Result<(
 
     match client
         .send_request(&FrontendRequest::AddDependency {
+            cancel: None,
             input: AddDependencyInput {
                 dependent: dependent.id.clone(),
                 prerequisite: prereq.id.clone(),

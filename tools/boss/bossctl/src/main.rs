@@ -23,6 +23,7 @@ use anyhow::{Context, Result, bail};
 use boss_client::{BossClient, Discovery};
 
 mod agents;
+mod cancel_provenance_report;
 mod command_types;
 mod comments;
 mod dispatch_stats;
@@ -746,6 +747,11 @@ enum AgentsAction {
         /// unresolvable reference errors in terms of workers (live/
         /// tracked slots), not work items.
         agent: String,
+        /// Why the worker is being stopped. Required: the engine records
+        /// it, with the surface and actor, on the cancelled execution, and
+        /// refuses a stop that cannot say why.
+        #[arg(long)]
+        reason: String,
     },
     /// Place an explicit hold on a live worker, exempting it from the
     /// idle-park and auto-reap sweeps until released (`agents
@@ -907,7 +913,13 @@ enum WorkAction {
     /// For never-started rows only, prefer `bossctl executions cancel`,
     /// which refuses live workers (pointing at `agents stop`) and
     /// records an operator reason in the audit trail.
-    Cancel { execution_id: String },
+    Cancel {
+        execution_id: String,
+        /// Why the execution is being cancelled. Required: recorded on the
+        /// execution row and in the engine audit trail.
+        #[arg(long)]
+        reason: String,
+    },
     /// Full execution history for a work item — every `work_executions`
     /// row regardless of status, oldest first, with the host each one
     /// ran on. Reads `state.db` directly (same resolution as
@@ -1056,8 +1068,9 @@ enum ExecutionsAction {
     /// `bossctl work cancel`.
     ///
     /// Select either by execution id or by `--work-item` (cancels every
-    /// never-started execution currently on that item). Optional
-    /// `--reason` is recorded in the engine audit trail.
+    /// never-started execution currently on that item). `--reason` is
+    /// required and is recorded on the execution row and in the engine
+    /// audit trail.
     Cancel {
         /// Execution id to cancel (e.g. `exec_…`). Mutually exclusive
         /// with `--work-item`.
@@ -1066,10 +1079,11 @@ enum ExecutionsAction {
         /// (canonical id or short id as accepted by the engine).
         #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
         work_item: Option<String>,
-        /// Operator reason recorded in `engine-audit.log` and the
-        /// terminalization log line.
+        /// Why the execution is being cancelled. Required: recorded on the
+        /// execution row, in `engine-audit.log`, and in the terminalization
+        /// log line.
         #[arg(long)]
-        reason: Option<String>,
+        reason: String,
     },
     /// Delete never-started terminal (`abandoned` / `failed` / `orphaned` /
     /// `cancelled`) `work_executions` rows past the retention bound.
@@ -1229,8 +1243,8 @@ async fn dispatch(cli: Cli) -> Result<()> {
             action: AgentsAction::List { all },
         } => agents::agents_list_live(&cli.socket_path, cli.json, all).await,
         Command::Agents {
-            action: AgentsAction::Stop { agent },
-        } => agents::agents_stop(&cli.socket_path, cli.json, agent).await,
+            action: AgentsAction::Stop { agent, reason },
+        } => agents::agents_stop(&cli.socket_path, cli.json, agent, reason).await,
         Command::Agents {
             action: AgentsAction::Hold { agent, reason },
         } => agents::agents_hold(&cli.socket_path, cli.json, agent, reason).await,
@@ -1297,8 +1311,8 @@ async fn dispatch(cli: Cli) -> Result<()> {
             .await
         }
         Command::Work {
-            action: WorkAction::Cancel { execution_id },
-        } => agents::work_cancel(&cli.socket_path, cli.json, execution_id).await,
+            action: WorkAction::Cancel { execution_id, reason },
+        } => agents::work_cancel(&cli.socket_path, cli.json, execution_id, reason).await,
         Command::Work {
             action: WorkAction::Executions {
                 work_item_id,

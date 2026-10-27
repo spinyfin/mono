@@ -236,9 +236,15 @@ pub(super) async fn handle_unpopulate_project(ctx: Dispatch, req: FrontendReques
         sink,
         session_id,
         request_id,
+        peer_pid,
         ..
     } = ctx;
-    let FrontendRequest::UnpopulateProject { project_id, run_id } = req else {
+    let FrontendRequest::UnpopulateProject {
+        project_id,
+        run_id,
+        cancel,
+    } = req
+    else {
         unreachable!()
     };
 
@@ -278,6 +284,27 @@ pub(super) async fn handle_unpopulate_project(ctx: Dispatch, req: FrontendReques
         }
     };
 
+    let Some(claim) = cancel else {
+        send_work_error(
+            &sink,
+            &request_id,
+            "unpopulate_project requires cancel source, actor and reason",
+        );
+        return;
+    };
+    let observed = rpc_cancel_actor(&server_state, &session_id, peer_pid).await;
+    let provenance = match super::cancel_rpc::provenance_from_request(
+        Some(claim.source.as_str()),
+        Some(&claim.reason),
+        Some(&claim.actor),
+        &observed,
+    ) {
+        Ok(value) => value,
+        Err(refusal) => {
+            send_work_error(&sink, &request_id, refusal.message("unpopulate_project"));
+            return;
+        }
+    };
     let mut deleted = Vec::new();
     let mut preserved = Vec::new();
     for task_id in &task_ids {
@@ -328,13 +355,14 @@ pub(super) async fn handle_unpopulate_project(ctx: Dispatch, req: FrontendReques
                     };
                     let handler = server_state.completion_handler.clone();
                     let id_for_cancel = tombstoned_id.clone();
+                    let mut provenance = provenance.clone();
+                    provenance.reason = format!(
+                        "work item {tombstoned_id} cascade-deleted with {task_id} while unpopulating project {project_id} (planner run {run_id}); {}",
+                        provenance.reason
+                    );
                     boss_task_scope::spawn(async move {
                         handler
-                            .cancel_and_release(
-                                &id_for_cancel,
-                                &execution_id,
-                                "work item deleted while a worker was active",
-                            )
+                            .cancel_and_release(&id_for_cancel, &execution_id, provenance)
                             .await;
                     });
                 }

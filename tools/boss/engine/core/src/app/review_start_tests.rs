@@ -432,7 +432,7 @@ async fn completed_head_gets_new_generation_but_automatic_and_live_replays_do_no
         .create_pre_merge_review_batch_for_pool(input.clone(), "https://github.com/example/repo", 16)
         .unwrap()
     {
-        crate::work::ReviewBatchDispatch::ExistingBatch { batch, .. } => assert_eq!(batch, old_batch),
+        crate::work::ReviewBatchDispatch::ExistingBatch { batch, .. } => assert_eq!(*batch, old_batch),
         other => panic!("automatic start must reuse a completed batch: {other:?}"),
     }
     triggered(request(&state, 42, None, Ok(metadata("head"))).await);
@@ -452,7 +452,7 @@ async fn completed_head_gets_new_generation_but_automatic_and_live_replays_do_no
         .create_pre_merge_review_batch_for_pool(input, "https://github.com/example/repo", 16)
         .unwrap()
     {
-        crate::work::ReviewBatchDispatch::ExistingBatch { batch, .. } => assert_eq!(batch, second),
+        crate::work::ReviewBatchDispatch::ExistingBatch { batch, .. } => assert_eq!(*batch, second),
         other => panic!("automatic start must reuse the latest generation: {other:?}"),
     }
     assert_eq!(db.review_batches_for_cycle_root(&id).unwrap().len(), 2);
@@ -678,7 +678,7 @@ async fn explicit_admission_returns_the_persisted_batch() {
         panic!("explicit admission must create a batch");
     };
     assert!(batch.explicit);
-    assert_eq!(batch, db.review_batch(&batch.id).unwrap().unwrap());
+    assert_eq!(*batch, db.review_batch(&batch.id).unwrap().unwrap());
 }
 
 #[tokio::test]
