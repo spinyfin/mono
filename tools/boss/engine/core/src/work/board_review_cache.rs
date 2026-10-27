@@ -15,9 +15,9 @@
 //! written item's epoch and its parent's inside the writer's transaction
 //! (`schema_init`'s schema 53), so a write from any connection or process is
 //! seen, and the reader folds the epochs in the same snapshot as the data it
-//! would otherwise recompute from. The key of a family is the sum of its
-//! root's epoch and its on-board members' epochs; epochs only grow, so any
-//! bump changes the key and a key can never alias an older value.
+//! would otherwise recompute from. Each key contains sorted member IDs and
+//! epochs from the same full SQL family as the projection, including archived
+//! and deleted revisions. Membership and epoch changes both invalidate it.
 //!
 //! Inputs that are not epoch-covered stay outside the cache: whether a
 //! review is running or queued is derived per pass from live executions, and
@@ -31,6 +31,41 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::review_badge::OwnerReview;
+
+/// Exact membership and input versions, ordered by member ID.
+pub(crate) type FamilyKey = Vec<(String, i64)>;
+
+/// Read only the requested owners' families, using the projection's own
+/// ancestry definition so off-board intermediates cannot hide input writes.
+pub(crate) fn read_family_keys(
+    conn: &rusqlite::Connection,
+    owners: &[String],
+) -> anyhow::Result<HashMap<String, FamilyKey>> {
+    use super::review_badge::{ReviewKey, review_family_cte};
+    if owners.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = vec!["?"; owners.len()].join(",");
+    let family = review_family_cte(&placeholders, ReviewKey::Owner);
+    let mut stmt = conn.prepare(&format!(
+        "{family} SELECT DISTINCT f.root, f.id, COALESCE(e.epoch, 0)
+         FROM family f LEFT JOIN board_review_epoch e ON e.work_item_id = f.id
+         ORDER BY f.root, f.id"
+    ))?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(owners), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    let mut keys: HashMap<String, FamilyKey> = HashMap::new();
+    for row in rows {
+        let (owner, member, epoch) = row?;
+        keys.entry(owner).or_default().push((member, epoch));
+    }
+    Ok(keys)
+}
 
 /// Entries kept across all products. Far more owners than the largest
 /// measured product (about 8k cards) at a few hundred bytes each.
@@ -51,7 +86,7 @@ struct State {
 }
 
 struct Entry {
-    key: i64,
+    key: FamilyKey,
     product_id: String,
     pass: u64,
     review: Arc<OwnerReview>,
@@ -92,7 +127,7 @@ impl BoardReviewCache {
     /// Start a pass over `product_id`. `owners` pairs each chain-root id with
     /// its family key. A hit requires an exact key match; every hit is
     /// stamped into this pass so completion keeps it.
-    pub(crate) fn lookup(&self, product_id: &str, owners: &[(&str, i64)]) -> ReviewLookup {
+    pub(crate) fn lookup(&self, product_id: &str, owners: &[(&str, FamilyKey)]) -> ReviewLookup {
         let mut state = self.state.lock().expect("board review cache poisoned");
         state.next_pass += 1;
         let pass = state.next_pass;
@@ -118,12 +153,12 @@ impl BoardReviewCache {
     /// Finish the pass: store `fresh` projections (owner id, family key,
     /// value), prune this product's entries no pass at or after `pass`
     /// touched, and enforce the global capacity.
-    pub(crate) fn complete(&self, product_id: &str, pass: u64, fresh: Vec<(String, i64, Arc<OwnerReview>)>) {
+    pub(crate) fn complete(&self, product_id: &str, pass: u64, fresh: Vec<(String, FamilyKey, Arc<OwnerReview>)>) {
         let mut state = self.state.lock().expect("board review cache poisoned");
         for (id, key, review) in fresh {
             // A concurrent assembly on a newer snapshot may already have
-            // stored a later key; never move an entry backwards.
-            if state.entries.get(&id).is_some_and(|entry| entry.key > key) {
+            // completed a later pass; do not overwrite its entry.
+            if state.entries.get(&id).is_some_and(|entry| entry.pass > pass) {
                 continue;
             }
             state.entries.insert(
@@ -177,13 +212,17 @@ mod tests {
         })
     }
 
-    fn pass(cache: &BoardReviewCache, product: &str, owners: &[(&str, i64)]) -> Vec<bool> {
-        let lookup = cache.lookup(product, owners);
+    fn pass(cache: &BoardReviewCache, product: &str, versions: &[(&str, i64)]) -> Vec<bool> {
+        let owners: Vec<_> = versions
+            .iter()
+            .map(|(id, epoch)| (*id, vec![((*id).to_owned(), *epoch)]))
+            .collect();
+        let lookup = cache.lookup(product, &owners);
         let misses: Vec<_> = owners
             .iter()
             .zip(&lookup.hits)
             .filter(|(_, hit)| hit.is_none())
-            .map(|((id, key), _)| ((*id).to_owned(), *key, review()))
+            .map(|((id, key), _)| ((*id).to_owned(), key.clone(), review()))
             .collect();
         cache.complete(product, lookup.pass, misses);
         lookup.hits.iter().map(Option::is_some).collect()
@@ -195,7 +234,7 @@ mod tests {
         assert_eq!(pass(&cache, "p", &[("a", 0), ("b", 3)]), [false, false]);
         assert_eq!(pass(&cache, "p", &[("a", 0), ("b", 3)]), [true, true]);
         assert_eq!(pass(&cache, "p", &[("a", 0), ("b", 4)]), [true, false]);
-        // A key can only grow; a lower one is an older snapshot, not a hit.
+        // Any different key misses, regardless of ordering.
         assert_eq!(pass(&cache, "p", &[("a", 0), ("b", 3)]), [true, false]);
         assert_eq!(cache.stats().hits, 4);
         assert_eq!(cache.stats().misses, 4);
@@ -227,13 +266,13 @@ mod tests {
     }
 
     #[test]
-    fn completion_never_moves_an_entry_backwards() {
+    fn earlier_pass_cannot_overwrite_later_pass_with_a_lower_key() {
         let cache = BoardReviewCache::default();
-        let older = cache.lookup("p", &[("a", 1)]);
-        let newer = cache.lookup("p", &[("a", 2)]);
-        cache.complete("p", newer.pass, vec![("a".into(), 2, review())]);
-        cache.complete("p", older.pass, vec![("a".into(), 1, review())]);
-        assert_eq!(pass(&cache, "p", &[("a", 2)]), [true]);
-        assert_eq!(pass(&cache, "p", &[("a", 1)]), [false]);
+        let older = cache.lookup("p", &[("a", vec![("a".into(), 2)])]);
+        let newer = cache.lookup("p", &[("a", vec![("a".into(), 1)])]);
+        cache.complete("p", newer.pass, vec![("a".into(), vec![("a".into(), 1)], review())]);
+        cache.complete("p", older.pass, vec![("a".into(), vec![("a".into(), 2)], review())]);
+        assert_eq!(pass(&cache, "p", &[("a", 1)]), [true]);
+        assert_eq!(pass(&cache, "p", &[("a", 2)]), [false]);
     }
 }

@@ -112,10 +112,12 @@ impl Board {
             .get_work_tree_cached(&self.product_id, &mut trace, &self.caches)
             .unwrap();
         let uncached = self.db.get_work_tree(&self.product_id).unwrap();
-        let cards = |tree: &boss_protocol::WorkTree| {
-            serde_json::to_value((&tree.tasks, &tree.chores)).unwrap()
-        };
-        assert_eq!(cards(&cached), cards(&uncached), "cached board diverged from the uncached board");
+        let cards = |tree: &boss_protocol::WorkTree| serde_json::to_value((&tree.tasks, &tree.chores)).unwrap();
+        assert_eq!(
+            cards(&cached),
+            cards(&uncached),
+            "cached board diverged from the uncached board"
+        );
         let (_, _, queries) = trace.segment_counts(segment::DB_AI_REVIEW_STATE).unwrap();
         Pass {
             misses: self.caches.reviews.stats().misses - misses_before,
@@ -153,7 +155,10 @@ fn cached_board_matches_uncached_through_every_review_input() {
     // the live queued-review probe.
     assert_eq!(board.assert_equivalent().misses, 2);
     assert_eq!(board.assert_equivalent(), Pass { misses: 0, queries: 2 });
-    assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("reviewed_clean_pending"));
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("reviewed_clean_pending")
+    );
 
     // Non-inputs: poll bookkeeping on the root and a run under its revision.
     board.sql(
@@ -188,7 +193,10 @@ fn cached_board_matches_uncached_through_every_review_input() {
     // A findings verdict on the new head, then linked to its revision.
     let findings = board.verdict(&root, "h2", "completed_with_findings");
     assert_eq!(board.assert_equivalent().misses, 1);
-    board.db.set_review_verdict_revision_task_id(&findings, &revision).unwrap();
+    board
+        .db
+        .set_review_verdict_revision_task_id(&findings, &revision)
+        .unwrap();
     assert_eq!(board.assert_equivalent().misses, 1);
     let card = board.card(&root);
     assert_eq!(card.ai_review_state.as_deref(), Some("reviewed_with_findings"));
@@ -208,7 +216,10 @@ fn cached_board_matches_uncached_through_every_review_input() {
     // Not applied yet: the legacy fallback shows the revision's own brief.
     let markdown = board.card(&root).ai_review_badge.unwrap().findings_markdown;
     assert!(!markdown.unwrap_or_default().contains("Unchecked index"));
-    board.sql("UPDATE worker_proposals SET state = 'applied' WHERE id = 'proposal-1'", &[]);
+    board.sql(
+        "UPDATE worker_proposals SET state = 'applied' WHERE id = 'proposal-1'",
+        &[],
+    );
     assert_eq!(board.assert_equivalent().misses, 1);
     let markdown = board.card(&root).ai_review_badge.unwrap().findings_markdown.unwrap();
     assert!(markdown.contains("Unchecked index"));
@@ -241,7 +252,10 @@ fn cached_board_matches_uncached_through_every_review_input() {
     // Removing the revision from the board changes the family.
     board.sql("UPDATE tasks SET deleted_at = '9' WHERE id = ?1", &[&revision]);
     assert_eq!(board.assert_equivalent().misses, 1);
-    assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("reviewed_with_findings"));
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("reviewed_with_findings")
+    );
 
     // A brand-new revision joins the family through the insert trigger.
     let newer = board.revision(&root);
@@ -252,12 +266,18 @@ fn cached_board_matches_uncached_through_every_review_input() {
     // Closing the root keeps only a verdict that matches its last head.
     board.sql("UPDATE tasks SET status = 'done' WHERE id = ?1", &[&root]);
     assert_eq!(board.assert_equivalent().misses, 1);
-    assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("reviewed_with_findings"));
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("reviewed_with_findings")
+    );
     assert!(board.card(&root).ai_review_badge.is_none());
 
     // Throughout, the untouched owner (clean, green, no revisions) never
     // left the cache.
-    assert_eq!(board.card(&other).ai_review_state.as_deref(), Some("reviewed_all_clear"));
+    assert_eq!(
+        board.card(&other).ai_review_state.as_deref(),
+        Some("reviewed_all_clear")
+    );
     assert_eq!(board.assert_equivalent(), Pass { misses: 0, queries: 2 });
 }
 
@@ -275,7 +295,10 @@ fn live_review_executions_change_the_state_without_a_recompute() {
     // the state itself comes from the live probe.
     assert_eq!(board.assert_equivalent().misses, 1);
     assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("review_queued"));
-    board.sql("UPDATE work_executions SET status = 'running' WHERE id = ?1", &[&review]);
+    board.sql(
+        "UPDATE work_executions SET status = 'running' WHERE id = ?1",
+        &[&review],
+    );
     assert_eq!(board.assert_equivalent().misses, 1);
     assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("reviewing"));
     // A run under the reviewer moves nothing the projection reads.
@@ -305,14 +328,11 @@ fn chain_leaving_the_board_falls_back_to_the_sql_walk() {
     let revision = board.revision(&root);
     board.observe(&root, "h1", "success", "mergeable");
     board.verdict(&root, "h1", "completed_clean");
-    board.sql(
-        "UPDATE tasks SET status = 'archived' WHERE id = ?1",
-        &[&root],
-    );
+    board.sql("UPDATE tasks SET status = 'archived' WHERE id = ?1", &[&root]);
     board.sql("UPDATE tasks SET status = 'active' WHERE id = ?1", &[&revision]);
-    // No owner on the board: nothing to cache. The epoch read, the
-    // card-keyed state and history queries, and the live probe.
-    assert_eq!(board.assert_equivalent(), Pass { misses: 0, queries: 4 });
+    // No owner on the board: skip the epoch read. Only the card-keyed
+    // state and history queries and the live probe run.
+    assert_eq!(board.assert_equivalent(), Pass { misses: 0, queries: 3 });
     let card = board.card(&revision);
     assert_eq!(card.kind, TaskKind::Revision);
     assert_eq!(card.ai_review_state.as_deref(), Some("reviewed_clean_pending"));
@@ -329,18 +349,39 @@ fn review_epoch_triggers_cover_every_projection_input() {
 
     let revision = board.revision(&root);
     assert_eq!(board.epoch(&revision), 1, "a new revision starts at one");
-    assert_eq!(board.epoch(&root), root_after_create + 1, "a new revision bumps its root");
+    assert_eq!(
+        board.epoch(&root),
+        root_after_create + 1,
+        "a new revision bumps its root"
+    );
 
     let before = (board.epoch(&root), board.epoch(&revision));
     board.sql(
         "UPDATE tasks SET updated_at = 'x', pr_state_polled_at = 'y', ordinal = 7 WHERE id = ?1",
         &[&revision],
     );
-    assert_eq!((board.epoch(&root), board.epoch(&revision)), before, "non-input columns are silent");
+    assert_eq!(
+        (board.epoch(&root), board.epoch(&revision)),
+        before,
+        "non-input columns are silent"
+    );
 
-    for column in ["status", "pr_head_sha", "ci_required_state", "pr_mergeable_state", "last_reviewed_sha", "name", "description", "deleted_at", "pr_url"] {
+    for column in [
+        "status",
+        "pr_head_sha",
+        "ci_required_state",
+        "pr_mergeable_state",
+        "last_reviewed_sha",
+        "name",
+        "description",
+        "deleted_at",
+        "pr_url",
+    ] {
         let before = (board.epoch(&root), board.epoch(&revision));
-        board.sql(&format!("UPDATE tasks SET {column} = {column} WHERE id = ?1"), &[&revision]);
+        board.sql(
+            &format!("UPDATE tasks SET {column} = {column} WHERE id = ?1"),
+            &[&revision],
+        );
         assert_eq!(
             (board.epoch(&root), board.epoch(&revision)),
             (before.0 + 1, before.1 + 1),
@@ -352,7 +393,10 @@ fn review_epoch_triggers_cover_every_projection_input() {
     board.verdict(&revision, "h1", "completed_clean");
     // Execution insert, execution status update and verdict insert: three
     // bumps each on the revision and, through its parent, the root.
-    assert_eq!((board.epoch(&root), board.epoch(&revision)), (before.0 + 3, before.1 + 3));
+    assert_eq!(
+        (board.epoch(&root), board.epoch(&revision)),
+        (before.0 + 3, before.1 + 3)
+    );
 
     let before = (board.epoch(&root), board.epoch(&revision));
     board.sql(
@@ -360,17 +404,100 @@ fn review_epoch_triggers_cover_every_projection_input() {
          SELECT 'proposal-5', id, ?1, 'review_verdict', '{}', 'key-5', 'proposed', '1' FROM work_executions WHERE work_item_id = ?1",
         &[&revision],
     );
-    board.sql("UPDATE worker_proposals SET state = 'applied' WHERE id = 'proposal-5'", &[]);
-    board.sql("UPDATE worker_proposals SET decided_by = 'engine' WHERE id = 'proposal-5'", &[]);
-    assert_eq!((board.epoch(&root), board.epoch(&revision)), (before.0 + 2, before.1 + 2));
+    board.sql(
+        "UPDATE worker_proposals SET state = 'applied' WHERE id = 'proposal-5'",
+        &[],
+    );
+    board.sql(
+        "UPDATE worker_proposals SET decided_by = 'engine' WHERE id = 'proposal-5'",
+        &[],
+    );
+    assert_eq!(
+        (board.epoch(&root), board.epoch(&revision)),
+        (before.0 + 2, before.1 + 2)
+    );
 
     let before = (board.epoch(&root), board.epoch(&revision));
     board.sql("DELETE FROM worker_proposals WHERE id = 'proposal-5'", &[]);
     board.sql("DELETE FROM pr_review_verdicts WHERE work_item_id = ?1", &[&revision]);
     board.sql("DELETE FROM work_executions WHERE work_item_id = ?1", &[&revision]);
-    assert_eq!((board.epoch(&root), board.epoch(&revision)), (before.0 + 3, before.1 + 3));
+    assert_eq!(
+        (board.epoch(&root), board.epoch(&revision)),
+        (before.0 + 3, before.1 + 3)
+    );
 
     let before = board.epoch(&root);
     board.sql("DELETE FROM tasks WHERE id = ?1", &[&revision]);
     assert_eq!(board.epoch(&root), before + 1, "losing a member bumps the root");
+}
+
+#[test]
+fn deleting_revision_cannot_alias_a_cached_family_key() {
+    for member_epoch in [1, 4] {
+        let board = Board::new(&format!("review-cache-delete-{member_epoch}"));
+        let root = board.in_review_chore(20);
+        board.observe(&root, "h1", "success", "mergeable");
+        board.verdict(&root, "h1", "completed_clean");
+        let revision = board.revision(&root);
+        for _ in 1..member_epoch {
+            board.sql("UPDATE tasks SET name = name WHERE id = ?1", &[&revision]);
+        }
+        assert_eq!(board.epoch(&revision), member_epoch);
+        assert_eq!(board.assert_equivalent().misses, 1);
+        assert_eq!(board.assert_equivalent().misses, 0);
+        assert_eq!(
+            board.card(&root).ai_review_state.as_deref(),
+            Some("reviewed_clean_pending")
+        );
+        board.sql("UPDATE tasks SET deleted_at = '9' WHERE id = ?1", &[&revision]);
+        for _ in 1..member_epoch {
+            board.sql("UPDATE tasks SET name = name WHERE id = ?1", &[&root]);
+        }
+        assert_eq!(board.assert_equivalent().misses, 1);
+        assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("reviewed_all_clear"));
+    }
+}
+
+#[test]
+fn nested_off_board_revision_inputs_invalidate_both_owners_on_reparent() {
+    for column in ["status = 'archived'", "deleted_at = '9'"] {
+        let board = Board::new("review-cache-off-board");
+        let root = board.in_review_chore(21);
+        let other = board.in_review_chore(22);
+        board.observe(&root, "h1", "success", "mergeable");
+        board.observe(&other, "h1", "success", "mergeable");
+        let intermediate = board.revision(&root);
+        let nested = board.revision(&intermediate);
+        board.sql("UPDATE tasks SET status = 'in_review' WHERE id = ?1", &[&nested]);
+        board.sql(&format!("UPDATE tasks SET {column} WHERE id = ?1"), &[&intermediate]);
+        assert_eq!(board.assert_equivalent().misses, 2);
+        assert_eq!(board.assert_equivalent().misses, 0);
+        board.verdict(&nested, "h1", "completed_clean");
+        assert_eq!(board.assert_equivalent().misses, 1);
+        board.sql(
+            "UPDATE tasks SET parent_task_id = ?2 WHERE id = ?1",
+            &[&intermediate, &other],
+        );
+        assert_eq!(board.assert_equivalent().misses, 2);
+    }
+}
+
+#[test]
+fn single_item_trace_counts_review_cards_and_queries() {
+    let board = Board::new("review-single-trace");
+    let root = board.in_review_chore(23);
+    board.observe(&root, "h1", "success", "mergeable");
+    board.verdict(&root, "h1", "completed_clean");
+    let mut card = board.card(&root);
+    let mut trace = PopulationTrace::new(&board.product_id, "single-test", None, Instant::now());
+    crate::work::revision_helpers::attach_task_derived_projections_traced(
+        &board.db.connect().unwrap(),
+        &mut card,
+        &mut trace,
+    )
+    .unwrap();
+    let (duration, cards, queries) = trace.segment_counts("single_item.ai_review_state").unwrap();
+    assert!(duration >= 0.0);
+    assert_eq!(cards, Some(1));
+    assert_eq!(queries, Some(3));
 }

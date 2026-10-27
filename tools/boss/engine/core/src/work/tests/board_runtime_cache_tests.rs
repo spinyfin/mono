@@ -478,7 +478,11 @@ fn entries_follow_board_membership_and_stay_within_capacity() {
 
     board.sql("UPDATE tasks SET status = 'archived' WHERE id = ?1", &[&items[0]]);
     board.assert_equivalent();
-    assert_eq!(board.cache.runtimes.stats().entries, 2, "archived cards leave the cache");
+    assert_eq!(
+        board.cache.runtimes.stats().entries,
+        2,
+        "archived cards leave the cache"
+    );
 
     board.cache = BoardCaches {
         runtimes: crate::work::board_runtime_cache::BoardRuntimeCache::with_capacity(1),

@@ -16,8 +16,8 @@
 use std::collections::BTreeSet;
 use std::time::Instant;
 
-use super::*;
 use super::board_review_cache::BoardReviewCache;
+use super::*;
 use crate::population_timing::{PopulationTrace, elapsed_ms, segment};
 use boss_protocol::WorkRuntimePatchItem;
 

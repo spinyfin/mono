@@ -135,16 +135,16 @@ const BOARD_RUNTIME_EPOCH_49: &str = "CREATE TABLE IF NOT EXISTS board_runtime_e
 ///
 /// `board_review_epoch.epoch` increases whenever an input of a card's
 /// AI-review projection (`ai_review_state`, `ai_review_findings_revision_id`,
-/// `ai_review_badge`; see `review_badge::fetch_owner_reviews` for the exact
-/// column list) is written. Those projections are derived per PR owner (chain
-/// root) from the root's row, every revision row under it, the family's
+/// `ai_review_badge`; see `review_badge::fetch_current_heads` and
+/// `review_badge::fetch_badge_histories` for the exact column list) is written.
+/// Those projections are derived per PR owner (chain root) from the root's row, every revision row under it, the family's
 /// `pr_review_verdicts`, the findings revision's `work_executions`, and the
 /// applied `worker_proposals` payload. Each trigger therefore bumps the
 /// written row's work item *and* that item's `parent_task_id` (a revision's
 /// chain root, since `insert_revision_in_tx` always parents a revision
 /// directly to the root), so a root's epoch alone summarises its whole
-/// family. The reader additionally folds in the epochs of the family members
-/// it sees on the board, so a nested legacy chain still invalidates.
+/// family. The reader keys each family by member IDs and epochs from the full
+/// SQL family, including off-board ancestors in nested legacy chains.
 ///
 /// Same discipline as `board_runtime_epoch`: the bump is in the writer's own
 /// transaction, rows are never deleted, and `UPDATE OF` lists only the columns

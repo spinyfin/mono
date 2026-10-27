@@ -395,7 +395,7 @@ fn badge_presentation(
 /// The `owners(card, id)` and `family(root, id, depth)` CTEs both review
 /// queries select from. `Card` resolves each id's owner by walking up its
 /// revision chain; `Owner` takes the ids as the owners themselves.
-fn review_family_cte(placeholders: &str, key: ReviewKey) -> String {
+pub(super) fn review_family_cte(placeholders: &str, key: ReviewKey) -> String {
     let owners = match key {
         ReviewKey::Card => format!(
             "ancestors(card, id, depth) AS (

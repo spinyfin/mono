@@ -192,8 +192,18 @@ fn owner_keyed_family_matches_the_card_walk_for_resolved_owners() {
         family
     };
     assert_eq!(family(&by_card), family(&by_owner));
-    assert_eq!(by_card.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["grandchild"; 3].iter().chain(["other-rev"; 2].iter()).copied().collect::<Vec<_>>());
-    assert_eq!(by_owner.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["other", "other", "root", "root", "root"]);
+    assert_eq!(
+        by_card.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+        ["grandchild"; 3]
+            .iter()
+            .chain(["other-rev"; 2].iter())
+            .copied()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        by_owner.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+        ["other", "other", "root", "root", "root"]
+    );
     // A revision handed to the owner walk is not an owner and yields nothing.
     assert!(rows(ReviewKey::Owner, ["grandchild", "other-rev"]).is_empty());
 }
@@ -212,7 +222,11 @@ fn review_badge_self_link_is_decided_per_card() {
     let on_root = badge_presentation("reviewed_with_findings", None, Some(&history), "root");
     assert!(on_root.tooltip.contains("Findings revision: Fix findings (Doing)."));
     let on_revision = badge_presentation("reviewed_with_findings", None, Some(&history), "rev");
-    assert!(on_revision.tooltip.contains("This revision addresses the findings (Doing)."));
+    assert!(
+        on_revision
+            .tooltip
+            .contains("This revision addresses the findings (Doing).")
+    );
 }
 
 #[test]
@@ -227,7 +241,11 @@ fn trimming_keeps_findings_text_only_for_the_findings_state() {
     let kept = history().trimmed_for(Some(AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS));
     assert_eq!(kept.verdict_payload.as_deref(), Some("{}"));
     assert_eq!(kept.revision_description.as_deref(), Some("brief"));
-    for state in [Some(AI_REVIEW_STATE_NOT_REVIEWED), Some(AI_REVIEW_STATE_REVIEWED_ALL_CLEAR), None] {
+    for state in [
+        Some(AI_REVIEW_STATE_NOT_REVIEWED),
+        Some(AI_REVIEW_STATE_REVIEWED_ALL_CLEAR),
+        None,
+    ] {
         let trimmed = history().trimmed_for(state);
         assert!(trimmed.verdict_payload.is_none() && trimmed.revision_description.is_none());
         assert_eq!(trimmed.reviewed_sha.as_deref(), Some("abc"));

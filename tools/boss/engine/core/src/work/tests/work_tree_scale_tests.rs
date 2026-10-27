@@ -47,6 +47,34 @@ fn seed(conn: &Connection) {
     for i in 0..1818 {
         conn.execute("INSERT INTO pr_review_verdicts(id,execution_id,work_item_id,head_sha,gate_outcome,created_at) VALUES (?1,?2,?3,'synthetic-head','completed_clean','2')", params![format!("scale-verdict-{i}"),format!("scale-exec-{i}"),format!("scale-task-{}",i * 4)]).unwrap();
     }
+    // Guide history and epochs in another product must not enlarge a board
+    // or single-card lookup's result set.
+    for i in 0..2000 {
+        let root = format!("unrelated-task-{i}");
+        let series = format!("unrelated-series-{i}");
+        let comparison = format!("unrelated-comparison-{i}");
+        conn.execute(
+            "INSERT INTO tasks(id, product_id, kind, name, status, created_at, updated_at)
+             VALUES (?1, 'scale-product-1', 'chore', ?1, 'done', '1', '1')",
+            [&root],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pr_review_guide_source_series(id, root_task_id, canonical_pr_url, selected_comparison_id, guide_lifecycle, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'failed', '1', '1')",
+            params![series, root, format!("https://github.com/example/unrelated/pull/{i}"), comparison],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO pr_review_guide_source_comparisons(id, series_id, observation_sequence, observed_base_sha, merge_base_sha, head_sha, trigger, packet_hash, complete, captured_at)
+             VALUES (?1, ?2, 1, 'base', 'base', 'head', 'manual', 'hash', 1, '1')",
+            params![comparison, series],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO pr_review_guide_attempts(id, series_id, comparison_id, request_epoch, ordinal, status, prompt_version, error, created_at, finished_at)
+             VALUES (?1, ?2, ?3, 0, 1, 'failed', 'v1', 'unrelated failure', '1', '2')",
+            params![format!("unrelated-attempt-{i}"), series, comparison],
+        ).unwrap();
+    }
     conn.execute_batch("COMMIT").unwrap();
 }
 
@@ -57,7 +85,7 @@ fn work_tree_production_scale_measurement() {
     let conn = db.connect().unwrap();
     seed(&conn);
     for (table, expected) in [
-        ("tasks", 8030),
+        ("tasks", 10030),
         ("projects", 131),
         ("products", 5),
         ("work_executions", 21127),
@@ -65,6 +93,8 @@ fn work_tree_production_scale_measurement() {
         ("worker_proposals", 4131),
         ("pr_review_batches", 786),
         ("pr_review_verdicts", 1818),
+        ("pr_review_guide_source_series", 2000),
+        ("pr_review_guide_attempts", 2000),
     ] {
         let count: i64 = conn
             .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
@@ -72,6 +102,9 @@ fn work_tree_production_scale_measurement() {
         assert_eq!(count, expected, "{table}");
     }
     assert!(!conn.prepare("PRAGMA foreign_key_check").unwrap().exists([]).unwrap());
+    let keys = crate::work::board_review_cache::read_family_keys(&conn, &["scale-task-2".to_owned()]).unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys["scale-task-2"].len(), 2);
     drop(conn);
     measure(&db, "scale-product-0", Some(7585));
 }
@@ -183,7 +216,11 @@ fn measure_cached_reviews(db: &WorkDb, product: &str, samples: usize) {
     assert_eq!(uncached_queries, 3, "uncached review statements");
     let caches = BoardCaches::default();
     let (cold, _, cold_queries) = assemble(Some(&caches), "cold");
-    assert_eq!(cards(&cold), cards(&reference), "cold cached review projections diverged");
+    assert_eq!(
+        cards(&cold),
+        cards(&reference),
+        "cold cached review projections diverged"
+    );
     // Cold: the epoch read, the two owner-keyed miss queries, the live probe.
     assert_eq!(cold_queries, 4, "cold review statements");
     let stats = caches.reviews.stats();
@@ -198,10 +235,18 @@ fn measure_cached_reviews(db: &WorkDb, product: &str, samples: usize) {
     for sample in 0..samples {
         let misses_before = caches.reviews.stats().misses;
         let (tree, review_ms, queries) = assemble(Some(&caches), &format!("warm-{sample}"));
-        assert_eq!(cards(&tree), cards(&reference), "warm cached review projections diverged");
+        assert_eq!(
+            cards(&tree),
+            cards(&reference),
+            "warm cached review projections diverged"
+        );
         // Warm with nothing written: the epoch read and the live probe only.
         assert_eq!(queries, 2, "warm review statements");
-        assert_eq!(caches.reviews.stats().misses, misses_before, "a warm pass recomputes no owner");
+        assert_eq!(
+            caches.reviews.stats().misses,
+            misses_before,
+            "a warm pass recomputes no owner"
+        );
         warm.push(review_ms);
         let (_, review_ms, _) = assemble(None, &format!("uncached-{sample}"));
         uncached.push(review_ms);
@@ -236,7 +281,11 @@ fn measure_cached_reviews(db: &WorkDb, product: &str, samples: usize) {
             cards(&reference),
             "{count} verdict writes: cached review projections diverged"
         );
-        assert_eq!(caches.reviews.stats().misses - misses_before, count as u64, "{count} verdict writes");
+        assert_eq!(
+            caches.reviews.stats().misses - misses_before,
+            count as u64,
+            "{count} verdict writes"
+        );
         assert_eq!(queries, 4, "{count} verdict writes: statements");
     }
 }
@@ -321,7 +370,11 @@ fn measure_cached_runtimes(db: &WorkDb, product: &str, samples: usize) {
             runtimes(&reference),
             "{count} writes: cached runtimes diverged"
         );
-        assert_eq!(cache.runtimes.stats().misses - misses_before, count as u64, "{count} writes");
+        assert_eq!(
+            cache.runtimes.stats().misses - misses_before,
+            count as u64,
+            "{count} writes"
+        );
     }
 }
 
