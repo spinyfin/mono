@@ -606,6 +606,9 @@ pub struct WorkDb {
     /// sink via [`Self::with_dispatch_events`].
     #[builder(default = default_dispatch_events())]
     dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink>,
+    /// Committed schema decisions wait here until the production sink attaches.
+    #[builder(default)]
+    migration_events: Arc<Mutex<PendingEvents>>,
     persona_metrics: Arc<crate::metrics::Registry>,
 }
 
@@ -622,6 +625,7 @@ impl Clone for WorkDb {
             boothby_action: Arc::clone(&self.boothby_action),
             event_bus: Arc::clone(&self.event_bus),
             dispatch_events: Arc::clone(&self.dispatch_events),
+            migration_events: Arc::clone(&self.migration_events),
             persona_metrics: Arc::clone(&self.persona_metrics),
         }
     }

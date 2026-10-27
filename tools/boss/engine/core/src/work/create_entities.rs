@@ -96,6 +96,7 @@ impl WorkDb {
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
             dispatch_events: Arc::new(crate::dispatch_events::NoopDispatchEventSink),
+            migration_events: Arc::new(Mutex::new(PendingEvents::new())),
             persona_metrics: personas::new_metrics_registry(),
         };
         let init_started = std::time::Instant::now();
@@ -126,6 +127,7 @@ impl WorkDb {
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
             dispatch_events: Arc::new(crate::dispatch_events::NoopDispatchEventSink),
+            migration_events: Arc::new(Mutex::new(PendingEvents::new())),
             persona_metrics: personas::new_metrics_registry(),
         };
         db.init()?;
@@ -145,6 +147,8 @@ impl WorkDb {
     /// provenance is written to the same stream as live dispatch.
     pub fn with_dispatch_events(mut self, sink: Arc<dyn crate::dispatch_events::DispatchEventSink>) -> Self {
         self.dispatch_events = sink;
+        std::mem::take(&mut *self.migration_events.lock().unwrap())
+            .flush(&self.event_bus, self.dispatch_events.as_ref());
         self
     }
 

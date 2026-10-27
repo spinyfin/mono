@@ -63,16 +63,6 @@ impl PendingEvents {
 
     /// Stage an engine-audit record to write once the transaction commits.
     pub fn push_audit(&mut self, event: &str, payload: serde_json::Value) {
-        if matches!(event, "execution_cancelled" | "execution_abandoned") {
-            self.push(Event::ExecutionDecision {
-                execution_id: payload["execution_id"].as_str().expect("execution id").to_owned(),
-                task_id: payload["work_item_id"].as_str().expect("work item id").to_owned(),
-                status: payload["to_status"].as_str().expect("terminal status").to_owned(),
-                source: payload["source"].as_str().expect("cancel source").to_owned(),
-                actor: payload["actor"].as_str().expect("cancel actor").to_owned(),
-                reason: payload["reason"].as_str().expect("cancel reason").to_owned(),
-            });
-        }
         self.audits.push((event.to_owned(), payload));
     }
 

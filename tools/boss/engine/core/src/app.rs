@@ -198,16 +198,16 @@ use handler_helpers::{
     METADATA_KEY_AUTOMATION_PAUSE_REASON, METADATA_KEY_AUTOMATION_PAUSED, METADATA_KEY_AUTOMATION_PAUSED_SINCE,
     METADATA_KEY_DISPATCH_CONCURRENCY_LIMIT, METADATA_KEY_DISPATCH_PAUSE_ORIGIN, METADATA_KEY_DISPATCH_PAUSE_REASON,
     METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE, TRANSCRIPT_NOT_YET_AVAILABLE_PREFIX,
-    TranscriptResolution, active_chore_run_id, active_to_todo_execution, build_chore_update_message,
-    build_effort_audit_report, build_engine_health_report, build_live_status_debug_report, duplicate_or_work_error,
-    handle_create_many, in_review_chore_execution, live_execution_for_active_card, live_execution_for_task_id,
-    load_automation_paused_state, load_dispatch_concurrency_limit, load_dispatch_paused_state,
-    load_live_status_disabled_slots, open_review_terminal_async, persist_live_status_disabled_slots,
-    publish_comment_invalidation, publish_runtime_work_invalidation, publish_work_invalidation, read_transcript_tail,
-    resolve_transcript_for_tail, rpc_cancel_actor, segment_to_wire, send_push, send_response,
-    send_response_with_revision, send_work_error, tail_lines_from_content, task_name_description_for_id,
-    task_status_for_id, task_transitioned_to_active, terminal_chore_execution, transport_default_created_via,
-    validate_external_tracker_config, work_item_id, work_item_needs_dispatch,
+    TranscriptResolution, active_chore_run_id, build_chore_update_message, build_effort_audit_report,
+    build_engine_health_report, build_live_status_debug_report, duplicate_or_work_error, handle_create_many,
+    in_review_chore_execution, live_execution_for_task_id, load_automation_paused_state,
+    load_dispatch_concurrency_limit, load_dispatch_paused_state, load_live_status_disabled_slots,
+    open_review_terminal_async, persist_live_status_disabled_slots, publish_comment_invalidation,
+    publish_runtime_work_invalidation, publish_work_invalidation, read_transcript_tail, resolve_transcript_for_tail,
+    rpc_cancel_actor, segment_to_wire, send_push, send_response, send_response_with_revision, send_work_error,
+    tail_lines_from_content, task_name_description_for_id, task_status_for_id, task_transitioned_to_active,
+    terminal_chore_execution, transport_default_created_via, validate_external_tracker_config, work_item_id,
+    work_item_needs_dispatch,
 };
 
 /// Per-request handler context: the connection-scoped state every
@@ -1295,7 +1295,7 @@ impl ServerState {
         // Dispatch-event JSONL stream lands next to state.db. Built before
         // WorkDb so post-commit cancel provenance writes the same sink the
         // coordinator uses, without a bounded bus hop.
-        let dispatch_event_root: PathBuf = cfg
+        let state_root: PathBuf = cfg
             .work
             .db_path
             .parent()
@@ -1303,7 +1303,7 @@ impl ServerState {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| cfg.work.cwd.clone());
         let dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink> =
-            Arc::new(crate::dispatch_events::JsonlFileSink::new(dispatch_event_root.clone()));
+            Arc::new(crate::dispatch_events::JsonlFileSink::new(state_root.clone()));
         let work_db = Arc::new(
             WorkDb::open(cfg.work.db_path.clone())?
                 .with_event_bus(event_bus.clone())
@@ -1426,20 +1426,6 @@ impl ServerState {
         let staged_proposal_channel_errors =
             Arc::new(crate::proposal_channel_error::ProposalChannelErrorTracker::new());
         let staged_unobserved_commands = Arc::new(crate::codex_unobserved_command::UnobservedCommandTracker::new());
-
-        // Resolve the Boss state root early — both the feature-flags
-        // store (loaded below, before the completion handler is
-        // built) and the dispatch-event sink (set up further down)
-        // land next to `state.db` under the same root. Empty parent
-        // (test configs with `:memory:` for the DB path) falls back
-        // to `cwd` so test artifacts stay co-located.
-        let state_root: PathBuf = cfg
-            .work
-            .db_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| cfg.work.cwd.clone());
 
         // Load the feature-flags store from the on-disk file. A
         // missing or unreadable file is logged but does not block
@@ -1657,8 +1643,8 @@ impl ServerState {
         // `state.db`, so an install's data is one directory.
         let attachment_state_root: PathBuf = state_root.clone();
         let dispatch_events_for_state = dispatch_events.clone();
-        let dispatch_event_root_for_state = dispatch_event_root.clone();
-        let ipc_logger = IpcLogger::new(&dispatch_event_root);
+        let state_root_for_state = state_root.clone();
+        let ipc_logger = IpcLogger::new(&state_root);
 
         let completion_handler_for_coordinator = completion_handler.clone();
         // Distributed-execution PR3 inputs for the SSH-capable host-adapter
@@ -1756,7 +1742,7 @@ impl ServerState {
                 .merge_probe(merge_probe_for_state)
                 .direct_merge_executor(direct_merge_executor_for_state)
                 .dispatch_events(dispatch_events_for_state)
-                .dispatch_event_root(dispatch_event_root_for_state)
+                .dispatch_event_root(state_root_for_state)
                 .topic_broker(topic_broker)
                 .attachment_store(boss_engine_attachments::AttachmentStore::under_state_root(
                     &attachment_state_root,

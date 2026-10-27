@@ -2443,3 +2443,29 @@ async fn deferral_requires_and_preserves_caller_provenance() -> Result<()> {
     assert!(provenance.reason.contains("wait for the revised design"));
     Ok(())
 }
+
+#[tokio::test]
+async fn update_cancel_unknown_nested_source_lists_client_surfaces() -> Result<()> {
+    let engine = spawn_engine().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let seeded = seed_execution(&mut client).await?;
+    let cancel = serde_json::from_value(serde_json::json!({
+        "source": "boss-cli", "actor": "operator", "reason": "stop"
+    }))?;
+    let response = client
+        .send_request(&FrontendRequest::UpdateWorkItem {
+            id: seeded.work_item_id,
+            patch: Box::new(WorkItemPatch::builder().status("todo").build()),
+            cancel: Some(cancel),
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { message } => {
+            assert!(message.contains("unknown cancel source"), "{message}");
+            assert!(message.contains("app, boss_cli, bossctl"), "{message}");
+            assert!(!message.contains("`unrecognized`"), "{message}");
+        }
+        other => panic!("expected refusal, got {other:?}"),
+    }
+    Ok(())
+}

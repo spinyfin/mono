@@ -1188,55 +1188,6 @@ pub(super) fn in_review_chore_execution(work_db: &WorkDb, item: &WorkItem) -> Op
     }
 }
 
-/// If `item` is a task or chore whose status just changed from `active`
-/// to `todo` (i.e., the user dragged an agent-assigned Doing card back
-/// to Backlog), return the id of its most recent execution so the caller
-/// can cancel the worker and release its resources.
-///
-/// Returns `None` for non-task work items, when the current status is
-/// not `todo`, when the previous status was not `active`, when the work
-/// item has no executions, and when the latest execution is already
-/// terminal (a ghost-active card whose worker already finished).
-pub(super) fn active_to_todo_execution(
-    work_db: &WorkDb,
-    previous_status: &Option<TaskStatus>,
-    item: &WorkItem,
-) -> Option<String> {
-    let task = match item {
-        WorkItem::Task(t) | WorkItem::Chore(t) => t,
-        _ => return None,
-    };
-    if task.status != TaskStatus::Todo {
-        return None;
-    }
-    live_execution_for_active_card(work_db, previous_status, &task.id)
-}
-
-/// Latest non-terminal execution on an `active` card. Shared by the
-/// pre-commit `UpdateWorkItem` check and the post-commit teardown so both
-/// sides agree on whether a cancel is needed.
-pub(super) fn live_execution_for_active_card(
-    work_db: &WorkDb,
-    previous_status: &Option<TaskStatus>,
-    work_item_id: &str,
-) -> Option<String> {
-    if previous_status.as_ref() != Some(&TaskStatus::Active) {
-        return None;
-    }
-    match work_db.latest_execution_for_work_item(work_item_id) {
-        Ok(Some(execution)) if !execution.status.is_terminal() => Some(execution.id),
-        Ok(_) => None,
-        Err(err) => {
-            tracing::warn!(
-                work_item_id,
-                ?err,
-                "active_to_todo_execution: failed to look up latest execution",
-            );
-            None
-        }
-    }
-}
-
 /// If the task/chore named by `task_id` has a latest execution that is
 /// still live (non-terminal), return that execution's id so a caller
 /// deleting the work item can tear down the worker. A live execution

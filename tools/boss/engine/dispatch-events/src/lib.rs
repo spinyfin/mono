@@ -1489,7 +1489,10 @@ fn recreate_live_file(path: &Path) -> std::io::Result<()> {
 #[async_trait]
 impl DispatchEventSink for JsonlFileSink {
     async fn emit(&self, event: DispatchEvent) {
-        self.emit_sync(event);
+        let sink = self.clone();
+        if let Err(err) = tokio::task::spawn_blocking(move || sink.emit_sync(event)).await {
+            tracing::warn!(?err, "dispatch event append task failed");
+        }
     }
 
     fn emit_sync(&self, event: DispatchEvent) {

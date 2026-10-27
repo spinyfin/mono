@@ -658,7 +658,7 @@ pub(super) fn preserve_execution_workspace_preference(conn: &Connection, executi
 /// non-terminal, staging its terminal event and audit record. Returns whether
 /// it changed. Shared by the two `cancel_running_*` entry points so neither
 /// can cancel without recording who and why.
-fn cancel_non_terminal_in_tx(
+pub(super) fn cancel_non_terminal_in_tx(
     tx: &Connection,
     pending: &mut PendingEvents,
     execution: &WorkExecution,

@@ -2106,111 +2106,60 @@ fn in_review_chore_execution_returns_none_for_product() {
     );
 }
 
-// ---- active_to_todo_execution ----
-
+// The teardown decision belongs to the card-update transaction.
 #[test]
-fn active_to_todo_execution_returns_none_when_not_todo() {
-    use boss_protocol::WorkItemPatch;
-    let (_dir, db, _, chore_id) = make_work_db_with_chore();
-    let item = db
-        .update_work_item(
-            &chore_id,
-            WorkItemPatch {
-                status: Some("active".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    assert!(
-        active_to_todo_execution(&db, &Some(TaskStatus::Todo), &item).is_none(),
-        "must return None when the current status is not todo"
-    );
-}
-
-#[test]
-fn active_to_todo_execution_returns_none_when_prev_not_active() {
-    use boss_protocol::WorkItemPatch;
-    let (_dir, db, _, chore_id) = make_work_db_with_chore();
-    let item = db
-        .update_work_item(
-            &chore_id,
-            WorkItemPatch {
-                status: Some("todo".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    assert!(
-        active_to_todo_execution(&db, &Some(TaskStatus::Todo), &item).is_none(),
-        "must return None when the previous status was not active"
-    );
-    assert!(
-        active_to_todo_execution(&db, &None, &item).is_none(),
-        "must return None when there is no previous status"
-    );
-}
-
-#[test]
-fn active_to_todo_execution_returns_none_when_no_execution() {
-    use boss_protocol::WorkItemPatch;
-    let (_dir, db, _, chore_id) = make_work_db_with_chore();
-    let item = db
-        .update_work_item(
-            &chore_id,
-            WorkItemPatch {
-                status: Some("todo".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    assert!(
-        active_to_todo_execution(&db, &Some(TaskStatus::Active), &item).is_none(),
-        "must return None when the chore has no executions"
-    );
-}
-
-#[test]
-fn active_to_todo_execution_returns_execution_id() {
+fn backlog_teardown_only_returns_the_execution_for_an_active_to_todo_move() {
     use crate::work::CreateExecutionInput;
     use boss_protocol::WorkItemPatch;
-    let (_dir, db, _, chore_id) = make_work_db_with_chore();
-    let execution = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(chore_id.clone())
-                .kind(boss_protocol::ExecutionKind::ChoreImplementation)
-                .status(boss_protocol::ExecutionStatus::Running)
-                .build(),
-        )
-        .unwrap();
-    let item = db
-        .update_work_item(
-            &chore_id,
-            WorkItemPatch {
-                status: Some("todo".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    let found = active_to_todo_execution(&db, &Some(TaskStatus::Active), &item);
-    assert_eq!(
-        found.as_deref(),
-        Some(execution.id.as_str()),
-        "must return the execution id when the chore is moving from active to todo"
-    );
+    for (before, after, has_execution) in [
+        ("todo", "active", true),
+        ("todo", "todo", true),
+        ("active", "todo", false),
+        ("active", "todo", true),
+    ] {
+        let (_dir, db, _, chore_id) = make_work_db_with_chore();
+        db.update_work_item(&chore_id, WorkItemPatch::builder().status(before).build())
+            .unwrap();
+        let execution = has_execution.then(|| {
+            db.create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(&chore_id)
+                    .kind(boss_protocol::ExecutionKind::ChoreImplementation)
+                    .status(boss_protocol::ExecutionStatus::Running)
+                    .build(),
+            )
+            .unwrap()
+        });
+        let (_, teardown) = db
+            .update_work_item_with_teardown(
+                &chore_id,
+                WorkItemPatch {
+                    status: Some(after.into()),
+                    cancel_provenance: Some(crate::test_support::test_cancel_provenance()),
+                    ..Default::default()
+                },
+                "human",
+            )
+            .unwrap();
+        let expected = if before == "active" && after == "todo" {
+            execution.map(|execution| execution.id)
+        } else {
+            None
+        };
+        assert_eq!(teardown, expected);
+    }
 }
 
 #[test]
-fn active_to_todo_execution_returns_none_for_product() {
+fn backlog_teardown_returns_none_for_product() {
+    use boss_protocol::WorkItemPatch;
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("boss.db");
-    let db = Arc::new(WorkDb::open(path).unwrap());
-    let product_item = create_test_product_with_repo(&db, "Prod", None);
-    let item = WorkItem::Product(product_item);
-    assert!(
-        active_to_todo_execution(&db, &Some(TaskStatus::Active), &item).is_none(),
-        "must return None for non-task work items"
-    );
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let product = create_test_product_with_repo(&db, "Prod", None);
+    let (_, teardown) = db
+        .update_work_item_with_teardown(&product.id, WorkItemPatch::builder().name("renamed").build(), "human")
+        .unwrap();
+    assert!(teardown.is_none());
 }
 
 // ---- live_execution_for_task_id ----
@@ -2815,7 +2764,7 @@ fn duplicate_or_work_error_maps_other_error_to_work_error() {
     }
 }
 
-/// T267 outcome 2: a hook event that arrives for an execution the engine
+/// A hook event that arrives for an execution the engine
 /// already considers TERMINAL is the "a run we believe is dead is
 /// demonstrably alive" contradiction (its worker is still emitting
 /// hooks). `dispatch_live_worker_state` must surface it loudly — bumping
@@ -2930,5 +2879,50 @@ async fn hook_for_live_execution_without_slot_is_not_counted_as_reconcile() {
     assert_eq!(
         after, baseline,
         "a slotless hook for a live (non-terminal) execution must not be counted as a terminal reconcile",
+    );
+}
+
+#[tokio::test]
+async fn ghost_active_todo_releases_terminal_execution_workspace() {
+    use crate::test_support::*;
+    use boss_protocol::WorkItemPatch;
+    let (state, _dir) = test_server_state();
+    let db = &state.work_db;
+    let product_id = create_product(db);
+    let id = create_active_chore(db, &product_id, "ghost workspace");
+    let execution_id = create_spawned_execution(db, &id, 4_194_303);
+    super::tmux_stub::install_teardown(&state, &execution_id, 4_194_303);
+    db.mark_execution_orphaned(&execution_id, "worker finished").unwrap();
+    assert!(db.get_execution(&execution_id).unwrap().cube_lease_id.is_some());
+    let sink = make_session_sink();
+    let ctx = Dispatch::builder()
+        .server_state(state.clone())
+        .work_db(db.clone())
+        .sink(sink.clone())
+        .session_id("ghost-session")
+        .request_id("ghost-move")
+        .recv_instant(std::time::Instant::now())
+        .decode_ms(0.0)
+        .build();
+    crate::app::work_items::apply_work_item_patch(ctx, id, WorkItemPatch::builder().status("todo").build(), None).await;
+    sink.close();
+    assert!(matches!(
+        sink.next().await.unwrap().payload,
+        FrontendEvent::WorkItemUpdated { .. }
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let execution = db.get_execution(&execution_id).unwrap();
+            if execution.cube_lease_id.is_none() && execution.workspace_path.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        boss_protocol::ExecutionStatus::Orphaned
     );
 }

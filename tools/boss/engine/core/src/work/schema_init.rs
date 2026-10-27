@@ -393,6 +393,7 @@ impl WorkDb {
     /// Future migrations must use increasing versions above the floor and
     /// run here for both paths, advancing the marker only after success.
     pub(crate) fn init(&self) -> Result<()> {
+        let mut pending = PendingEvents::new();
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let has_schema: bool = tx.query_row(
@@ -440,7 +441,11 @@ impl WorkDb {
         ensure_cancel_provenance_columns(&tx)?;
         if version < 39 {
             // Data only: restart items blocked by the false ancestry failure.
-            execution_recovery_rearm::migrate(&tx, execution_recovery_rearm::is_false_not_descended_blocker)?;
+            execution_recovery_rearm::migrate(
+                &tx,
+                execution_recovery_rearm::is_false_not_descended_blocker,
+                &mut pending,
+            )?;
         }
         if version < 40 {
             tx.execute_batch("ALTER TABLE ci_remediations ADD COLUMN queue_base_sha TEXT")?;
@@ -457,6 +462,7 @@ impl WorkDb {
             execution_recovery_rearm::migrate(
                 &tx,
                 boss_engine_recovery::execution_bookmark::is_legacy_reconcilable_blocker,
+                &mut pending,
             )?;
         }
         if version < 44 {
@@ -514,6 +520,7 @@ impl WorkDb {
         // discovery remains outside DB startup (no processes or network).
         crate::host_registry::ensure_local_host(&tx)?;
         tx.commit()?;
+        *self.migration_events.lock().unwrap() = pending;
         Ok(())
     }
 
@@ -636,6 +643,7 @@ impl WorkDb {
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
             dispatch_events: Arc::new(crate::dispatch_events::NoopDispatchEventSink),
+            migration_events: Arc::new(Mutex::new(PendingEvents::new())),
             persona_metrics: super::personas::new_metrics_registry(),
         })
     }
@@ -667,6 +675,7 @@ impl WorkDb {
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
             dispatch_events: Arc::new(crate::dispatch_events::NoopDispatchEventSink),
+            migration_events: Arc::new(Mutex::new(PendingEvents::new())),
             persona_metrics: super::personas::new_metrics_registry(),
         })
     }

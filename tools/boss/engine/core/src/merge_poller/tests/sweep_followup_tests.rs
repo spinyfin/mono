@@ -112,12 +112,14 @@ async fn merged_pr_redispatches_live_review_revision_as_followup_and_records_can
     );
     assert_eq!(followup.product_id, product_id);
 
-    let cancellation = events
+    let cancellations: Vec<_> = events
         .events_for(&original.id)
         .await
         .into_iter()
-        .find(|event| event.stage == "execution_cancelled")
-        .expect("merge cancellation must be recorded in the dispatch timeline");
+        .filter(|event| event.stage == "execution_cancelled")
+        .collect();
+    assert_eq!(cancellations.len(), 1);
+    let cancellation = &cancellations[0];
     assert_eq!(cancellation.outcome, "ok");
     assert_eq!(cancellation.details["prior_status"], "running");
     assert_eq!(cancellation.details["chain_root_id"], parent_id);
@@ -130,7 +132,7 @@ async fn merged_pr_redispatches_live_review_revision_as_followup_and_records_can
         cancellation.details["reason"]
     );
     assert!(
-        crate::dispatch_reader::is_terminal_event(&cancellation),
+        crate::dispatch_reader::is_terminal_event(cancellation),
         "merge cancellation must close the original dispatch timeline",
     );
 }
