@@ -56,6 +56,7 @@ mod imp {
         /// Declared here because `libc` marks its binding deprecated in
         /// favour of the `mach2` crate, which this one call doesn't justify.
         fn mach_host_self() -> libc::mach_port_t;
+        fn host_page_size(host: libc::mach_port_t, size: *mut libc::vm_size_t) -> libc::kern_return_t;
     }
 
     /// `struct loadavg` from `<sys/sysctl.h>`: fixed-point averages and
@@ -124,7 +125,7 @@ mod imp {
         }
     }
 
-    /// The sysctl MIBs, each resolved once at construction.
+    /// The sysctl MIBs, resolved lazily and cached after successful resolution.
     struct Mibs {
         loadavg: Sysctl,
         swapusage: Sysctl,
@@ -143,9 +144,17 @@ mod imp {
         pub(super) fn new() -> Self {
             // SAFETY: plain Mach calls with no pointer arguments.
             let host = unsafe { mach_host_self() };
-            let page_size = match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
-                n if n > 0 => n as u64,
-                _ => 16384,
+            let mut kernel_page_size: libc::vm_size_t = 0;
+            // SAFETY: `host` is a valid host port and the size pointer is writable.
+            let kr = unsafe { host_page_size(host, &mut kernel_page_size) };
+            let page_size = if kr == 0 && kernel_page_size > 0 {
+                kernel_page_size as u64
+            } else {
+                // SAFETY: sysconf has no pointer arguments.
+                match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+                    n if n > 0 => n as u64,
+                    _ => 16384,
+                }
             };
             Self {
                 host,
@@ -250,6 +259,25 @@ mod imp {
             })
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        unsafe extern "C" {
+            static vm_kernel_page_size: libc::vm_size_t;
+        }
+
+        #[test]
+        fn vm_reading_uses_kernel_page_size() {
+            let mut probe = DarwinProbe::new();
+            let reading = probe.vm().expect("read host VM statistics");
+            // SAFETY: libSystem initializes this immutable page-size value.
+            let expected = unsafe { vm_kernel_page_size } as u64;
+            assert!(expected > 0);
+            assert_eq!(reading.page_size, expected);
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -257,7 +285,7 @@ mod imp {
     use crate::probe::{CpuTicks, HostProbe, ProbeError, SwapReading, VmReading};
 
     /// Host-load sampling is Darwin-only; elsewhere every call reports
-    /// `ENOSYS` (logged once each) and the series stays empty.
+    /// `ENOSYS` (logged once each); samples contain a timestamp and NULL measurements.
     pub(super) struct UnsupportedProbe;
 
     fn unsupported<T>(call: &'static str) -> Result<T, ProbeError> {
