@@ -15,6 +15,7 @@ pub const DEFAULT_RETENTION_DAYS: u64 = 7;
 /// Floor for the configured interval: faster than this buys nothing and
 /// would turn the recorder into a measurable load source.
 pub const MIN_INTERVAL_SECONDS: u64 = 5;
+pub const MIN_RETENTION_DAYS: u64 = 1;
 
 /// Retention is enforced about this often, regardless of the sample interval.
 const PRUNE_EVERY: Duration = Duration::from_secs(60 * 60);
@@ -41,7 +42,7 @@ impl LoopConfig {
     pub fn new(interval_seconds: u64, retention_days: u64) -> Self {
         Self {
             interval: Duration::from_secs(interval_seconds.max(MIN_INTERVAL_SECONDS)),
-            retention: Duration::from_secs(retention_days.max(1) * 24 * 60 * 60),
+            retention: Duration::from_secs(retention_days.max(MIN_RETENTION_DAYS) * 24 * 60 * 60),
         }
     }
 }

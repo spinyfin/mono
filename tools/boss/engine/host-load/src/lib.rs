@@ -1,8 +1,7 @@
 //! Host-load sampling for the engine: how busy is this machine, measured
 //! rather than inferred.
 //!
-//! A throughput analysis once had to *infer* host contention from slowdown
-//! because nothing recorded load. This crate is the recorder. Once per
+//! Records host load so contention can be correlated with execution timing. Once per
 //! interval (default 60 s) it takes one [`HostSample`] — load averages,
 //! CPU busy/user/system/idle percentages, memory and compressor sizes,
 //! swap, a memory-pressure indicator — hands it to an observer (the
@@ -37,8 +36,8 @@ pub use darwin::platform_probe;
 pub use local_time::format_local_ms;
 pub use probe::{CpuTicks, ErrorSource, HostProbe, ProbeError, SwapReading, VmReading};
 pub use run::{
-    DEFAULT_INTERVAL_SECONDS, DEFAULT_RETENTION_DAYS, LoopConfig, MIN_INTERVAL_SECONDS, SampleObserver, SampleStore,
-    spawn_sampler,
+    DEFAULT_INTERVAL_SECONDS, DEFAULT_RETENTION_DAYS, LoopConfig, MIN_INTERVAL_SECONDS, MIN_RETENTION_DAYS,
+    SampleObserver, SampleStore, spawn_sampler,
 };
 pub use sample::HostSample;
 pub use sampler::{CpuPercents, HostSampler, cpu_percent_delta, derive_memory};

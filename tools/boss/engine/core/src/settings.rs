@@ -127,15 +127,15 @@ pub const INT_REGISTRY: &[IntSettingSpec] = &[
     IntSettingSpec {
         key: "host_load.sample_interval_seconds",
         description: "Seconds between host-load samples (load average, CPU, memory, swap) recorded into the retained host_load_samples series.",
-        default: 60,
-        min: 5,
+        default: boss_engine_host_load::DEFAULT_INTERVAL_SECONDS as i64,
+        min: boss_engine_host_load::MIN_INTERVAL_SECONDS as i64,
         max: 3600,
     },
     IntSettingSpec {
         key: "host_load.retention_days",
         description: "Days of host-load samples kept in state.db before pruning.",
-        default: 7,
-        min: 1,
+        default: boss_engine_host_load::DEFAULT_RETENTION_DAYS as i64,
+        min: boss_engine_host_load::MIN_RETENTION_DAYS as i64,
         max: 365,
     },
 ];
