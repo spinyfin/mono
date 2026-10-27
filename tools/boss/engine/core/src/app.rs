@@ -2572,11 +2572,16 @@ async fn handle_frontend_connection(
             .worker_tier_denial(&peer_class, &request)
             .or(row_scope_denial)
         {
-            if let FrontendRequest::SetCoordinatorHandoff { authorization, .. } = &request {
+            let handoff_authorization = match &request {
+                FrontendRequest::SetCoordinatorHandoff { authorization, .. } => Some(authorization.as_str()),
+                FrontendRequest::GetCoordinatorHandoff => Some(""),
+                _ => None,
+            };
+            if let Some(authorization) = handoff_authorization {
                 let expected = server_state.work_db.coordinator_handoff_authorization().ok().flatten();
                 let caller = coordinator_handoff::rejected_caller(
                     peer_pid,
-                    &[authorization.as_str(), expected.as_deref().unwrap_or_default()],
+                    &[authorization, expected.as_deref().unwrap_or_default()],
                 );
                 crate::audit::record_event(
                     "coordinator_handoff_rejected",

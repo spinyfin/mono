@@ -2702,6 +2702,10 @@ mod tests {
                 .contains(&authorization)
         );
         use std::os::unix::fs::PermissionsExt;
+        let brief_path = dir
+            .path()
+            .join(".claude")
+            .join(coordinator_handoff::START_BRIEF_FILENAME);
         assert_eq!(
             std::fs::metadata(brief_path).unwrap().permissions().mode() & 0o777,
             0o600

@@ -42,6 +42,15 @@ pub(super) async fn handle_get_coordinator_handoff(ctx: Dispatch, req: FrontendR
         unreachable!()
     };
     if !coordinator_peer(&server_state, peer_pid) {
+        let expected = work_db.coordinator_handoff_authorization().ok().flatten();
+        crate::audit::record_event(
+            "coordinator_handoff_rejected",
+            &serde_json::json!({
+                "pid": peer_pid,
+                "caller": rejected_caller(peer_pid, &[expected.as_deref().unwrap_or_default()]),
+                "reason": "handoff read requires coordinator ancestry; workers are forbidden",
+            }),
+        );
         return send_work_error(
             &sink,
             &request_id,

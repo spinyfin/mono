@@ -193,6 +193,10 @@ fn shrink_and_rejected_caller_are_audited() {
             write_as(&state, Some(std::process::id() as libc::pid_t), "").await,
             FrontendEvent::WorkError { .. }
         ));
+        state
+            .worker_registry
+            .register(std::process::id() as libc::pid_t, "worker-execution".to_owned());
+        assert!(error_message(get(&state).await).contains("unavailable to workers"));
     });
     let log = std::fs::read_to_string(crate::audit::default_audit_log_path().unwrap()).unwrap();
     let events: Vec<serde_json::Value> = log.lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
@@ -209,6 +213,10 @@ fn shrink_and_rejected_caller_are_audited() {
         .find(|event| event["event"] == "coordinator_handoff_rejected")
         .unwrap();
     assert_eq!(denial["pid"], std::process::id());
+    assert_eq!(
+        denial["reason"],
+        "handoff read requires coordinator ancestry; workers are forbidden"
+    );
     assert_eq!(denial["caller"]["parent_chain"][0], std::process::id());
     assert!(denial["caller"]["argv"].is_string());
     assert!(
