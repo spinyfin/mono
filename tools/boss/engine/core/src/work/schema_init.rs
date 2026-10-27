@@ -142,8 +142,9 @@ const BOARD_RUNTIME_EPOCH_49: &str = "CREATE TABLE IF NOT EXISTS board_runtime_e
 /// applied `worker_proposals` payload. Each trigger therefore bumps the
 /// written row's work item *and* that item's `parent_task_id` (a revision's
 /// chain root, since `insert_revision_in_tx` always parents a revision
-/// directly to the root), so a root's epoch alone summarises its whole
-/// family. The reader keys each family by member IDs and epochs from the full
+/// directly to the root). A root epoch alone does not cover descendants of
+/// off-board revisions in legacy chains. The reader therefore keys each
+/// family by member IDs and epochs from the full
 /// SQL family, including off-board ancestors in nested legacy chains.
 ///
 /// Same discipline as `board_runtime_epoch`: the bump is in the writer's own
