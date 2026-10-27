@@ -283,7 +283,10 @@ fn ensure_sides_are_obsolete(
         .collect::<Vec<_>>()
         .join(" | ");
     for side in sides.iter().filter(|s| s.as_str() != head) {
-        let mut revset = format!("(::{side}) ~ (::{head})");
+        // Only fetched trunk refs establish base history, never local main.
+        let mut revset = format!(
+            "(::{side}) ~ (::{head}) ~ ::(present(main@origin) | present(master@origin) | present(main@github) | present(master@github))"
+        );
         if !recorded.is_empty() {
             revset = format!("({revset}) ~ ::({recorded})");
         }
@@ -321,21 +324,33 @@ fn ensure_sides_are_obsolete(
         }
 
         for (change, commit) in unique {
-            let mut candidates = String::new();
-            let proven = git_utils::jj_provenance::proven_successor(
-                |args| {
-                    let output = run(runner, database_path, cwd, args)?;
-                    if args[0] == "log" {
-                        candidates.clone_from(&output);
-                    }
-                    Ok::<_, CubeError>(output)
-                },
-                change,
-                &format!("::{head}"),
-                commit,
-            )
-            .map_err(|error| unsafe_repair(name, head, side, &format!("evolution unavailable: {error}")))?
-            .is_some();
+            use git_utils::jj_provenance::{
+                COMMIT_ID_LINES_TEMPLATE, candidate_revset, evolution_contains, sole_candidate,
+            };
+            let candidates = run(
+                runner,
+                database_path,
+                cwd,
+                &[
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    &candidate_revset(change, &format!("::{head}")),
+                    "-T",
+                    COMMIT_ID_LINES_TEMPLATE,
+                ],
+            )?;
+            let proven = if let Some(candidate) = sole_candidate(&candidates) {
+                let evolution = run(
+                    runner,
+                    database_path,
+                    cwd,
+                    &["evolog", "--no-graph", "-r", candidate, "-T", COMMIT_ID_LINES_TEMPLATE],
+                )?;
+                evolution_contains(&evolution, commit)
+            } else {
+                false
+            };
             if proven {
                 continue;
             }

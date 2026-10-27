@@ -6,7 +6,8 @@ use super::jj::run_jj;
 use super::pr_bookmarks::{export_git_refs, import_git_refs};
 use crate::command_runner::{CommandRunner, RealCommandRunner};
 
-pub(super) const PR_TARGETS: &str = r#"if(name.starts_with("pr/"), name ++ "\t" ++ normal_target.commit_id() ++ "\n")"#;
+pub(super) const PR_TARGETS: &str =
+    r#"if(!remote && name.starts_with("pr/") && normal_target, name ++ "\t" ++ normal_target.commit_id() ++ "\n")"#;
 
 pub(super) fn rebase_preserving_pr_bookmarks(
     runner: &dyn CommandRunner,
@@ -27,6 +28,8 @@ pub(super) fn rebase_preserving_pr_bookmarks(
         "-T",
         PR_TARGETS,
     ])?;
+    // Ambiguous locals stay attached for positioning to repair; remote rows
+    // must never be restored under a bare local name.
     let saved = targets
         .lines()
         .map(|line| {
@@ -55,9 +58,22 @@ pub(super) fn rebase_preserving_pr_bookmarks(
         .and_then(|()| run(&["rebase", "-b", branch, "-d", destination, "--ignore-immutable"]));
     // Restore on both success and failure. Publication advances these only
     // after a verified push; branch and recovery bookmarks keep local work.
+    let mut first_error = None;
+    let mut failed = Vec::new();
     for (name, commit) in saved {
-        run(&["bookmark", "set", name, "-r", commit, "--allow-backwards"])?;
+        if let Err(error) = run(&["bookmark", "set", name, "-r", commit, "--allow-backwards"]) {
+            failed.push(name);
+            first_error.get_or_insert(error);
+        }
     }
-    export_git_refs(runner, database_path, cwd)?;
+    if let Err(error) = export_git_refs(runner, database_path, cwd) {
+        first_error.get_or_insert(error);
+    }
+    if let Some(error) = first_error {
+        let detail = format!("PR bookmark restoration failed [{}]: {error}", failed.join(", "));
+        eprintln!("{detail}");
+        // Keep the primary rebase error, after reporting cleanup failures.
+        return result.and_then(|_| Err(CubeError::InvalidArgument(detail)));
+    }
     result
 }

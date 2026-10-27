@@ -374,20 +374,36 @@ fn exercise_publication(scenario: Scenario) {
 
 #[test]
 fn base_only_divergent_stack_resolves_to_published_head() {
-    exercise_siblings(None);
+    exercise_siblings(None, false, false);
 }
 
 #[test]
 fn divergent_sibling_with_authored_content_is_refused() {
-    exercise_siblings(Some("extra-head"));
+    exercise_siblings(Some("extra-head"), false, false);
 }
 
 #[test]
 fn divergent_sibling_with_authored_ancestor_is_refused() {
-    exercise_siblings(Some("extra-parent"));
+    exercise_siblings(Some("extra-parent"), false, false);
 }
 
-fn exercise_siblings(extra: Option<&str>) {
+#[test]
+fn newer_trunk_siblings_check_every_authored_commit_even_with_recorded_head() {
+    for recorded in [false, true] {
+        for extra in [None, Some("extra-head"), Some("extra-parent")] {
+            exercise_siblings(extra, true, recorded);
+        }
+    }
+}
+
+#[test]
+fn recorded_head_does_not_authorize_clean_unpublished_siblings() {
+    for extra in [None, Some("extra-head"), Some("extra-parent")] {
+        exercise_siblings(extra, false, true);
+    }
+}
+
+fn exercise_siblings(extra: Option<&str>, newer_side: bool, recorded: bool) {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path();
     let jj = |args: &[&str]| TestJj.run(&RealCommandRunner::invocation(repo, "jj", args)).unwrap();
@@ -404,10 +420,40 @@ fn exercise_siblings(extra: Option<&str>) {
     jj(&["describe", "-m", "head"]);
     let original = jj_commit_id(&TestJj, repo, "@").unwrap();
     jj(&["bookmark", "set", "original", "-r", &original]);
+    if recorded {
+        crate::app::pr_bookmarks::record_head(repo, 42, &original).unwrap();
+    }
     jj(&["new", &base, "-m", "upstream"]);
     std::fs::write(repo.join("base"), "new base\n").unwrap();
     let upstream = jj_commit_id(&TestJj, repo, "@").unwrap();
-    jj(&["rebase", "-s", &parent, "-d", &upstream]);
+    // More trunk commits than the authored-history safety limit.
+    for i in 0..101 {
+        jj(&["new", "-m", &format!("trunk {i}")]);
+    }
+    std::fs::write(repo.join("base"), "latest base\n").unwrap();
+    let latest = jj_commit_id(&TestJj, repo, "@").unwrap();
+    jj(&["bookmark", "set", "main", "-r", &latest]);
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote = remote_dir.path().join("remote");
+    std::fs::create_dir(&remote).unwrap();
+    TestJj
+        .run(&RealCommandRunner::invocation(&remote, "jj", &["git", "init"]))
+        .unwrap();
+    jj(&[
+        "git",
+        "remote",
+        "add",
+        "origin",
+        remote.join(".jj/repo/store/git").to_str().unwrap(),
+    ]);
+    jj(&["git", "push", "-b", "main", "--allow-new"]);
+    jj(&[
+        "rebase",
+        "-s",
+        &parent,
+        "-d",
+        if newer_side { &latest } else { &upstream },
+    ]);
     let side = jj_commit_id(&TestJj, repo, "original").unwrap();
     jj(&["bookmark", "set", "saved-side", "-r", &side]);
     if let Some(file) = extra {
@@ -423,12 +469,15 @@ fn exercise_siblings(extra: Option<&str>) {
         jj(&["status"]);
     }
     let side = jj_commit_id(&TestJj, repo, "saved-side").unwrap();
-    jj(&["new", &upstream, "-m", "later upstream"]);
-    std::fs::write(repo.join("base"), "latest base\n").unwrap();
-    let latest = jj_commit_id(&TestJj, repo, "@").unwrap();
     jj(&["edit", &original]);
     jj(&["describe", "-m", "independent published sibling"]);
-    jj(&["rebase", "-s", &parent, "-d", &latest]);
+    jj(&[
+        "rebase",
+        "-s",
+        &parent,
+        "-d",
+        if newer_side { &upstream } else { &latest },
+    ]);
     let head = jj_commit_id(&TestJj, repo, "@").unwrap();
     jj(&["bookmark", "set", "pr/42", "-r", &side]);
     let operation = jj(&["op", "log", "--no-graph", "--limit", "1", "-T", "id"]);
@@ -455,6 +504,8 @@ fn exercise_siblings(extra: Option<&str>) {
     let result = crate::app::pr_bookmarks::point_pr_bookmark(&TestJj, None, repo, 42, &head);
     if extra.is_some() {
         assert!(result.unwrap_err().to_string().contains("will not pick a side"));
+        let publication = crate::app::pr_bookmarks::point_published_pr_bookmark(&TestJj, None, repo, 42, &head);
+        assert!(publication.unwrap_err().to_string().contains("will not pick a side"));
         assert_eq!(
             jj(&[
                 "log",
@@ -477,13 +528,18 @@ fn exercise_siblings(extra: Option<&str>) {
 
 #[test]
 fn local_rebase_preserves_published_pr_pointers_on_clean_and_conflicted_stacks() {
-    exercise_local_rebase(false, false);
-    exercise_local_rebase(true, false);
+    exercise_local_rebase(false, false, false);
+    exercise_local_rebase(true, false, false);
 }
 
 #[test]
 fn failed_local_rebase_restores_published_pr_pointers() {
-    exercise_local_rebase(false, true);
+    exercise_local_rebase(false, true, false);
+}
+
+#[test]
+fn ambiguous_pr_pointer_does_not_block_local_rebase() {
+    exercise_local_rebase(false, false, true);
 }
 
 struct FailRebase;
@@ -499,7 +555,7 @@ impl CommandRunner for FailRebase {
     }
 }
 
-fn exercise_local_rebase(conflict: bool, fail: bool) {
+fn exercise_local_rebase(conflict: bool, fail: bool, ambiguous: bool) {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path();
     let jj = |args: &[&str]| TestJj.run(&RealCommandRunner::invocation(repo, "jj", args)).unwrap();
@@ -517,6 +573,51 @@ fn exercise_local_rebase(conflict: bool, fail: bool) {
     std::fs::write(repo.join("stack"), "stack\n").unwrap();
     jj(&["bookmark", "set", "pr/43", "stack", "-r", "@"]);
     let stacked = jj_commit_id(&TestJj, repo, "pr/43").unwrap();
+    let remote_dir = tempfile::tempdir().unwrap();
+    TestJj
+        .run(&RealCommandRunner::invocation(
+            remote_dir.path(),
+            "jj",
+            &["git", "init"],
+        ))
+        .unwrap();
+    jj(&[
+        "git",
+        "remote",
+        "add",
+        "origin",
+        remote_dir.path().join(".jj/repo/store/git").to_str().unwrap(),
+    ]);
+    jj(&["git", "push", "-b", "pr/43", "--allow-new"]);
+    let targets = jj(&[
+        "bookmark",
+        "list",
+        "--all-remotes",
+        "-T",
+        crate::app::pr_rebase::PR_TARGETS,
+    ]);
+    assert_eq!(
+        targets.lines().count(),
+        2,
+        "only local PR pointers are saved: {targets}"
+    );
+    if ambiguous {
+        jj(&["bookmark", "set", "pr/44", "-r", "base"]);
+        let operation = jj(&["op", "log", "--no-graph", "--limit", "1", "-T", "id"]);
+        jj(&["new", "feature", "-m", "other PR branch"]);
+        std::fs::write(repo.join("other"), "other\n").unwrap();
+        jj(&["bookmark", "set", "pr/44", "-r", "@"]);
+        jj(&["--at-op", operation.trim(), "bookmark", "set", "pr/44", "-r", "stack"]);
+        let targets = jj(&[
+            "bookmark",
+            "list",
+            "-r",
+            "feature::",
+            "-T",
+            crate::app::pr_rebase::PR_TARGETS,
+        ]);
+        assert!(!targets.contains("pr/44"), "{targets}");
+    }
     jj(&["new", "base", "-m", "upstream"]);
     std::fs::write(repo.join(if conflict { "file" } else { "upstream" }), "upstream\n").unwrap();
     jj(&["bookmark", "set", "main", "-r", "@"]);
@@ -530,6 +631,21 @@ fn exercise_local_rebase(conflict: bool, fail: bool) {
         assert_ne!(jj_commit_id(&TestJj, repo, "stack").unwrap(), stacked);
     }
     jj(&["git", "import"]);
+    if ambiguous {
+        let sides = jj(&[
+            "log",
+            "--no-graph",
+            "-r",
+            "bookmarks(exact:\"pr/44\")",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ]);
+        assert_eq!(
+            sides.lines().count(),
+            2,
+            "ambiguous pointer stays available for positioning"
+        );
+    }
     for (name, expected) in [("pr/42", before), ("pr/43", stacked)] {
         assert_eq!(jj_commit_id(&TestJj, repo, name).unwrap(), expected);
         assert_eq!(jj_commit_id(&TestJj, repo, &format!("{name}@git")).unwrap(), expected);
