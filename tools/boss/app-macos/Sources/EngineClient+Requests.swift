@@ -383,6 +383,7 @@ extension EngineClient {
     func sendUnpopulateProject(projectId: String, runId: String) -> String? {
         sendLine([
             "type": "unpopulate_project",
+            "cancel": ["source": "app", "actor": NSUserName(), "reason": "undo project population"],
             "project_id": projectId,
             "run_id": runId,
         ])
@@ -610,6 +611,7 @@ extension EngineClient {
     func sendUpdateWorkItem(id: String, patch: [String: Any]) -> String? {
         sendLine([
             "type": "update_work_item",
+            "cancel": ["source": "app", "actor": NSUserName(), "reason": "apply work item edits"],
             "id": id,
             "patch": patch,
         ])
@@ -729,6 +731,7 @@ extension EngineClient {
     func sendDeleteWorkItem(id: String) {
         sendLine([
             "type": "delete_work_item",
+            "cancel": ["source": "app", "actor": NSUserName(), "reason": "delete work item and its revision chain"],
             "id": id,
         ])
     }

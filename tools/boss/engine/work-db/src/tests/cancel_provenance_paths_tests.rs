@@ -1,7 +1,5 @@
-//! One test per decision-terminal path that stamps cancel provenance on
-//! the execution row. Each test drives the production function and
-//! asserts the recorded source, actor, and reason — there is no default
-//! and no placeholder.
+//! Persistence contracts for cancellation context and engine-selected causes.
+//! RPC and coordinator tests cover the caller-side provenance decisions.
 
 use super::*;
 use boss_protocol::CancelSource;
@@ -35,7 +33,7 @@ fn cancel_execution_records_the_supplied_provenance() {
 }
 
 #[test]
-fn cancel_running_execution_records_kanban_backlog_provenance() {
+fn cancel_running_execution_preserves_supplied_provenance() {
     let db = WorkDb::open(temp_db_path("cancel-prov-kanban")).unwrap();
     let (chore, execution) = seed_ready_chore(&db, "kanban cancel");
     db.start_execution_run(
@@ -60,8 +58,8 @@ fn cancel_running_execution_records_kanban_backlog_provenance() {
     assert_eq!(provenance_of(&db, &execution.id), provenance);
 }
 
-#[test]
-fn mark_execution_redundant_records_double_spawn_guard_provenance() {
+#[tokio::test]
+async fn mark_execution_redundant_preserves_supplied_provenance() {
     let db = WorkDb::open(temp_db_path("cancel-prov-redundant")).unwrap();
     let (_, execution) = seed_ready_chore(&db, "redundant");
     let provenance = boss_protocol::CancelProvenance::engine(
@@ -73,10 +71,28 @@ fn mark_execution_redundant_records_double_spawn_guard_provenance() {
         ),
     );
 
+    let mut decisions = db.event_bus().subscribe(boss_event_bus::TopicFilter::kind(
+        boss_event_bus::EventKind::ExecutionDecision,
+    ));
     db.mark_execution_redundant(&execution.id, provenance.clone()).unwrap();
     let after = db.get_execution(&execution.id).unwrap();
     assert_eq!(after.status, ExecutionStatus::Abandoned);
     assert_eq!(after.cancel_provenance.as_ref(), Some(&provenance));
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), decisions.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        event,
+        boss_event_bus::Event::ExecutionDecision {
+            execution_id: execution.id,
+            task_id: execution.work_item_id,
+            status: "abandoned".to_owned(),
+            source: provenance.source.as_str().to_owned(),
+            actor: provenance.actor,
+            reason: provenance.reason,
+        }
+    );
 }
 
 #[test]
@@ -162,6 +178,7 @@ fn stranded_sweep_records_stranded_execution_sweep_provenance() {
     let provenance = provenance_of(&db, &execution.id);
     assert_eq!(provenance.source, CancelSource::StrandedExecutionSweep);
     assert_eq!(provenance.actor, "abandon_stranded_executions_on_closed_work_items");
+    assert!(provenance.reason.contains("(state: done)"));
     assert!(provenance.reason.contains(&chore.id));
 }
 
@@ -194,7 +211,7 @@ fn request_execution_stale_redispatch_records_stale_governing_provenance() {
 }
 
 #[test]
-fn retire_stale_revision_records_stale_revision_retirement_provenance() {
+fn retire_stale_revision_preserves_supplied_provenance() {
     let db = WorkDb::open(temp_db_path("cancel-prov-retire")).unwrap();
     let product = make_revision_product(&db, "cancel-prov-retire");
     let root = make_chore_root(&db, &product, "cancel-prov-retire");
@@ -239,7 +256,7 @@ fn deferring_a_work_item_records_work_item_settled_provenance() {
     assert_eq!(after.status, ExecutionStatus::Abandoned);
     let provenance = after.cancel_provenance.expect("defer stamps provenance");
     assert_eq!(provenance.source, CancelSource::WorkItemSettled);
-    assert_eq!(provenance.actor, "abandon_pending_executions");
+    assert_eq!(provenance.actor, boss_protocol::LAST_STATUS_ACTOR_HUMAN);
     assert!(provenance.reason.contains("deferred"));
 }
 
@@ -276,4 +293,64 @@ fn decision_terminal_update_without_provenance_is_aborted() {
         ExecutionStatus::Ready,
         "the aborted writes must leave the row non-terminal"
     );
+}
+
+#[test]
+fn newer_cancel_source_does_not_break_execution_reads() {
+    let db = WorkDb::open(temp_db_path("cancel-prov-version-skew")).unwrap();
+    let (_, execution) = seed_ready_chore(&db, "future source");
+    db.cancel_execution(&execution.id, crate::test_support::test_cancel_provenance())
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET cancel_source = 'future_subsystem' WHERE id = ?1",
+            [&execution.id],
+        )
+        .unwrap();
+    let provenance = provenance_of(&db, &execution.id);
+    assert_eq!(provenance.source, CancelSource::Unrecognized);
+    assert_eq!(provenance.actor, "test");
+    assert_eq!(provenance.reason, "test cancel");
+    assert!(boss_protocol::CancelProvenance::new(CancelSource::Unrecognized, "test", "why").is_err());
+}
+
+#[test]
+fn schema_55_upgrade_adds_cancel_columns_and_guard() {
+    let (_dir, path) = disk_db_path("cancel-prov-schema-upgrade");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let (_, execution) = seed_ready_chore(&db, "upgrade");
+    db.connect()
+        .unwrap()
+        .execute_batch(
+            "DROP TRIGGER work_executions_decision_requires_provenance;
+         ALTER TABLE work_executions DROP COLUMN cancel_source;
+         ALTER TABLE work_executions DROP COLUMN cancel_actor;
+         ALTER TABLE work_executions DROP COLUMN cancel_reason;
+         UPDATE metadata SET value = '55' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    drop(db);
+    let db = WorkDb::open(path).unwrap();
+    let conn = db.connect().unwrap();
+    let version: String = conn
+        .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(version, "56");
+    let error = conn
+        .execute(
+            "UPDATE work_executions SET status = 'cancelled' WHERE id = ?1",
+            [&execution.id],
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("requires cancel_source"));
+    drop(conn);
+    db.cancel_execution(&execution.id, crate::test_support::test_cancel_provenance())
+        .unwrap();
+    let provenance = provenance_of(&db, &execution.id);
+    assert_eq!(provenance.source, CancelSource::Bossctl);
+    assert_eq!(provenance.actor, "test");
+    assert_eq!(provenance.reason, "test cancel");
 }

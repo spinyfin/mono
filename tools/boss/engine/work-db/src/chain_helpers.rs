@@ -296,7 +296,7 @@ pub(crate) fn abandon_pending_executions(
     now: &str,
     cause: crate::task_status_audit::AbandonCause<'_>,
 ) -> Result<usize> {
-    abandon_pending_executions_filtered(pending, conn, work_item_id, now, true, cause)
+    abandon_pending_executions_filtered(pending, conn, work_item_id, now, true, cause, None)
 }
 
 /// Like [`abandon_pending_executions`] but leaves queued `progression` runs
@@ -311,7 +311,18 @@ pub(crate) fn abandon_pending_item_work_executions(
     now: &str,
     cause: crate::task_status_audit::AbandonCause<'_>,
 ) -> Result<usize> {
-    abandon_pending_executions_filtered(pending, conn, work_item_id, now, false, cause)
+    abandon_pending_executions_filtered(pending, conn, work_item_id, now, false, cause, None)
+}
+
+pub(crate) fn abandon_pending_executions_with_provenance(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    work_item_id: &str,
+    now: &str,
+    cause: crate::task_status_audit::AbandonCause<'_>,
+    supplied: Option<&boss_protocol::CancelProvenance>,
+) -> Result<usize> {
+    abandon_pending_executions_filtered(pending, conn, work_item_id, now, true, cause, supplied)
 }
 
 fn abandon_pending_executions_filtered(
@@ -321,12 +332,20 @@ fn abandon_pending_executions_filtered(
     now: &str,
     include_progression: bool,
     cause: crate::task_status_audit::AbandonCause<'_>,
+    supplied: Option<&boss_protocol::CancelProvenance>,
 ) -> Result<usize> {
     let kind_filter = if include_progression {
         ""
     } else {
         " AND kind <> 'progression'"
     };
+    let provenance = supplied.cloned().unwrap_or_else(|| {
+        boss_protocol::CancelProvenance::engine(
+            cause.cancel_source(),
+            "abandon_pending_executions",
+            format!("work item {work_item_id}: {}", cause.detail),
+        )
+    });
     // Capture the ids/statuses of the rows about to be abandoned so the
     // canonical terminalization trace (see `WorkDb::mark_execution_orphaned`
     // in executions_runs.rs) can name each one individually, rather than
@@ -338,11 +357,6 @@ fn abandon_pending_executions_filtered(
         ),
         params![work_item_id],
     )?;
-    let provenance = boss_protocol::CancelProvenance::engine(
-        cause.cancel_source(),
-        "abandon_pending_executions",
-        format!("work item {work_item_id}: {}", cause.detail),
-    );
 
     let abandoned = crate::task_status_audit::abandon(
         conn,

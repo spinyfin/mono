@@ -525,7 +525,7 @@ async fn record_answer_agent_spawn_failure(
 /// either tracking-row creation step fails, mirroring the original
 /// [`spawn_answer_agent`]'s compensation behaviour.
 #[allow(clippy::too_many_arguments)]
-async fn finish_answer_agent_spawn(
+pub(super) async fn finish_answer_agent_spawn(
     server_state: &Arc<ServerState>,
     work_db: &Arc<WorkDb>,
     session_id: &str,

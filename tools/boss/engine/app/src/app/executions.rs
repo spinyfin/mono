@@ -840,6 +840,7 @@ pub(super) async fn handle_stop_run(ctx: Dispatch, req: FrontendRequest) {
         sink,
         request_id,
         peer_pid,
+        session_id,
         ..
     } = ctx;
     let FrontendRequest::StopRun {
@@ -879,21 +880,25 @@ pub(super) async fn handle_stop_run(ctx: Dispatch, req: FrontendRequest) {
             );
             return;
         }
-        let provenance =
-            match super::cancel_rpc::provenance_from_request(source, reason.as_deref(), actor.as_deref(), peer_pid) {
-                Ok(provenance) => provenance,
-                Err(refusal) => {
-                    tracing::warn!(run_id = %run_id, ?refusal, "stop_run rejected: missing cancel provenance");
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::Error {
-                            message: refusal.message("stop_run"),
-                        },
-                    );
-                    return;
-                }
-            };
+        let provenance = match super::cancel_rpc::provenance_from_request(
+            source,
+            reason.as_deref(),
+            actor.as_deref(),
+            &rpc_cancel_actor(&server_state, &session_id, peer_pid).await,
+        ) {
+            Ok(provenance) => provenance,
+            Err(refusal) => {
+                tracing::warn!(run_id = %run_id, ?refusal, "stop_run rejected: missing cancel provenance");
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::Error {
+                        message: refusal.message("stop_run"),
+                    },
+                );
+                return;
+            }
+        };
         tracing::info!(
             run_id = %run_id,
             source = %provenance.source,
@@ -1009,6 +1014,7 @@ pub(super) async fn handle_cancel_execution(ctx: Dispatch, req: FrontendRequest)
         sink,
         request_id,
         peer_pid,
+        session_id,
         ..
     } = ctx;
     let FrontendRequest::CancelExecution {
@@ -1039,25 +1045,29 @@ pub(super) async fn handle_cancel_execution(ctx: Dispatch, req: FrontendRequest)
         }
         // A cancel with no recorded source, reason or actor never happens:
         // refuse before touching the row.
-        let provenance =
-            match super::cancel_rpc::provenance_from_request(source, reason.as_deref(), actor.as_deref(), peer_pid) {
-                Ok(provenance) => provenance,
-                Err(refusal) => {
-                    tracing::warn!(
-                        execution_id = %execution_id,
-                        ?refusal,
-                        "cancel_execution rejected: missing cancel provenance",
-                    );
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::Error {
-                            message: refusal.message("cancel_execution"),
-                        },
-                    );
-                    return;
-                }
-            };
+        let provenance = match super::cancel_rpc::provenance_from_request(
+            source,
+            reason.as_deref(),
+            actor.as_deref(),
+            &rpc_cancel_actor(&server_state, &session_id, peer_pid).await,
+        ) {
+            Ok(provenance) => provenance,
+            Err(refusal) => {
+                tracing::warn!(
+                    execution_id = %execution_id,
+                    ?refusal,
+                    "cancel_execution rejected: missing cancel provenance",
+                );
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::Error {
+                        message: refusal.message("cancel_execution"),
+                    },
+                );
+                return;
+            }
+        };
         let opts = boss_work_db::CancelExecutionOpts {
             queued_only,
             peer_pid: peer_pid.map(|pid| pid as i32),

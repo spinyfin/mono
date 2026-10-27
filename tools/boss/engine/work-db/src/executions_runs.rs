@@ -2262,7 +2262,7 @@ pub(super) fn cancel_execution_in_tx(
         if existing.status.is_live() {
             bail!(
                 "execution {execution_id} is `{}` (already started); \
-                     use `bossctl agents stop {execution_id}` to stop a live worker — \
+                     use `bossctl agents stop {execution_id} --reason 'stop stuck worker'` to stop a live worker — \
                      `executions cancel` only accepts never-started \
                      (queued/ready/waiting_dependency/claimed) rows",
                 existing.status
@@ -2271,7 +2271,7 @@ pub(super) fn cancel_execution_in_tx(
         bail!(
             "execution {execution_id} is `{}` and has already left the \
                  never-started set (queued/ready/waiting_dependency/claimed); \
-                 use `bossctl work cancel {execution_id}` for any non-terminal \
+                 use `bossctl work cancel {execution_id} --reason 'stop stuck worker'` for any non-terminal \
                  row, or `bossctl agents stop` if a live worker still backs it",
             existing.status
         );

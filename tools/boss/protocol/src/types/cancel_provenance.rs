@@ -71,6 +71,9 @@ pub enum CancelSource {
     StaleRevisionRetirement,
     /// `request_execution` abandoned a governing execution whose worker is gone.
     StaleGoverningExecution,
+    /// A source written by a newer engine; accepted only when reading.
+    #[serde(other)]
+    Unrecognized,
 }
 
 impl CancelSource {
@@ -105,6 +108,7 @@ impl CancelSource {
     /// The stable wire / database spelling.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Unrecognized => "unrecognized",
             Self::App => "app",
             Self::BossCli => "boss_cli",
             Self::Bossctl => "bossctl",
@@ -172,6 +176,7 @@ impl std::str::FromStr for CancelSource {
 /// Why a [`CancelProvenance`] could not be built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelProvenanceError {
+    UnknownSource,
     BlankActor,
     BlankReason,
 }
@@ -179,6 +184,7 @@ pub enum CancelProvenanceError {
 impl std::fmt::Display for CancelProvenanceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnknownSource => f.write_str("cancel provenance requires a recognized source for writes"),
             Self::BlankActor => f.write_str("cancel provenance requires a non-blank actor"),
             Self::BlankReason => f.write_str("cancel provenance requires a non-blank reason"),
         }
@@ -207,6 +213,9 @@ impl CancelProvenance {
         actor: impl AsRef<str>,
         reason: impl AsRef<str>,
     ) -> Result<Self, CancelProvenanceError> {
+        if source == CancelSource::Unrecognized {
+            return Err(CancelProvenanceError::UnknownSource);
+        }
         let actor = actor.as_ref().trim();
         let reason = reason.as_ref().trim();
         if actor.is_empty() {
@@ -254,7 +263,10 @@ mod tests {
     #[test]
     fn unknown_source_is_rejected() {
         assert!("explicit_cancel".parse::<CancelSource>().is_err());
-        assert!(serde_json::from_str::<CancelSource>("\"unknown\"").is_err());
+        assert_eq!(
+            serde_json::from_str::<CancelSource>("\"unknown\"").unwrap(),
+            CancelSource::Unrecognized
+        );
     }
 
     #[test]

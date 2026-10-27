@@ -30,7 +30,7 @@ pub enum HostedPaneState {
     /// Durable execution status says a worker should exist (`claimed` /
     /// `running` / `waiting_human`) but the live-state registry has no
     /// entry. No process was probed. `status` is the durable
-    /// `work_executions.status` string. Use `bossctl agents stop <run>`
+    /// `work_executions.status` string. Use `bossctl agents stop <run> --reason 'reap stuck worker'`
     /// — `retire-pane` refuses this occupant.
     DurableOccupantNoRegistry { status: String },
     /// Durable occupancy of this slot could not be corroborated against

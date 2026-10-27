@@ -44,27 +44,27 @@ impl CancelRpcRefusal {
 
 /// Build the provenance for a cancel RPC, or say precisely what was missing.
 ///
-/// `actor` is the client-supplied identity. When the client did not send one
-/// the engine records the socket peer it observed (`peer pid N`), which is a
-/// fact rather than a placeholder; with neither, the request is refused.
+/// The engine-attested caller tier and transport are always retained.
+/// Client-supplied identity is explicitly marked as a claim.
 pub(super) fn provenance_from_request(
     source: Option<CancelSource>,
     reason: Option<&str>,
     actor: Option<&str>,
-    peer_pid: Option<libc::pid_t>,
+    observed_actor: &str,
 ) -> Result<CancelProvenance, CancelRpcRefusal> {
     let source = source.ok_or(CancelRpcRefusal::MissingSource)?;
     if !source.is_client_surface() {
         return Err(CancelRpcRefusal::EngineSubsystemSource(source));
     }
+    if observed_actor.trim().is_empty() {
+        return Err(CancelRpcRefusal::MissingActor);
+    }
     let actor = match actor.map(str::trim).filter(|actor| !actor.is_empty()) {
-        Some(actor) => actor.to_owned(),
-        None => match peer_pid {
-            Some(pid) => format!("peer pid {pid} (engine-observed)"),
-            None => return Err(CancelRpcRefusal::MissingActor),
-        },
+        Some(claim) => format!("{observed_actor}; client claims {claim}"),
+        None => observed_actor.to_owned(),
     };
     CancelProvenance::new(source, actor, reason.unwrap_or_default()).map_err(|err| match err {
+        CancelProvenanceError::UnknownSource => CancelRpcRefusal::EngineSubsystemSource(source),
         CancelProvenanceError::BlankReason => CancelRpcRefusal::MissingReason,
         CancelProvenanceError::BlankActor => CancelRpcRefusal::MissingActor,
     })
@@ -80,18 +80,21 @@ mod tests {
             Some(CancelSource::Bossctl),
             Some("wrong repo"),
             Some("operator"),
-            Some(7),
+            "boss via non_app_client (peer pid 7)",
         )
         .unwrap();
         assert_eq!(provenance.source, CancelSource::Bossctl);
-        assert_eq!(provenance.actor, "operator");
+        assert_eq!(
+            provenance.actor,
+            "boss via non_app_client (peer pid 7); client claims operator"
+        );
         assert_eq!(provenance.reason, "wrong repo");
     }
 
     #[test]
     fn missing_source_is_refused() {
         assert_eq!(
-            provenance_from_request(None, Some("why"), Some("me"), Some(7)),
+            provenance_from_request(None, Some("why"), Some("me"), "boss via non_app_client (peer pid 7)"),
             Err(CancelRpcRefusal::MissingSource)
         );
     }
@@ -103,7 +106,7 @@ mod tests {
                 Some(CancelSource::MergePollerParentMerged),
                 Some("why"),
                 Some("me"),
-                Some(7)
+                "boss via non_app_client (peer pid 7)"
             ),
             Err(CancelRpcRefusal::EngineSubsystemSource(
                 CancelSource::MergePollerParentMerged
@@ -115,7 +118,12 @@ mod tests {
     fn missing_or_blank_reason_is_refused() {
         for reason in [None, Some(""), Some("   ")] {
             assert_eq!(
-                provenance_from_request(Some(CancelSource::App), reason, Some("me"), Some(7)),
+                provenance_from_request(
+                    Some(CancelSource::App),
+                    reason,
+                    Some("me"),
+                    "boss via non_app_client (peer pid 7)"
+                ),
                 Err(CancelRpcRefusal::MissingReason)
             );
         }
@@ -123,10 +131,16 @@ mod tests {
 
     #[test]
     fn absent_actor_falls_back_to_the_observed_peer_only() {
-        let observed = provenance_from_request(Some(CancelSource::BossCli), Some("why"), None, Some(42)).unwrap();
-        assert_eq!(observed.actor, "peer pid 42 (engine-observed)");
+        let observed = provenance_from_request(
+            Some(CancelSource::BossCli),
+            Some("why"),
+            None,
+            "human via mac_app (peer pid 42)",
+        )
+        .unwrap();
+        assert_eq!(observed.actor, "human via mac_app (peer pid 42)");
         assert_eq!(
-            provenance_from_request(Some(CancelSource::BossCli), Some("why"), Some("  "), None),
+            provenance_from_request(Some(CancelSource::BossCli), Some("why"), Some("  "), ""),
             Err(CancelRpcRefusal::MissingActor)
         );
     }

@@ -613,6 +613,13 @@ async fn requested_host_pre_start_failure_cancels_instead_of_retrying_elsewhere(
         "cancel must not leave a durable pin behind",
     );
     let cancelled = db.get_execution(&execution.id).unwrap();
+    crate::test_support::assert_cancel_provenance(
+        &cancelled,
+        boss_protocol::CancelSource::CoordinatorPreStart,
+        "execution_coordinator",
+        "requested host dispatch failed during host adapter build",
+    );
+
     assert!(
         cancelled.last_error.as_deref().is_some_and(|err| {
             err.contains("requested host dispatch failed during host adapter build")

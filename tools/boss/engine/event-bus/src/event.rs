@@ -5,6 +5,15 @@
 /// add a variant here without touching unrelated topics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// Committed cancellation provenance, independent of resource teardown.
+    ExecutionDecision {
+        execution_id: String,
+        task_id: String,
+        status: String,
+        source: String,
+        actor: String,
+        reason: String,
+    },
     /// A committed task mutation changed inputs used by the work board.
     WorkItemChanged { product_id: String, task_id: String },
     /// A task reached a terminal status (`done`/`archived`).
@@ -55,6 +64,7 @@ pub enum Event {
 /// [`TopicFilter`](crate::TopicFilter) matches against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventKind {
+    ExecutionDecision,
     WorkItemChanged,
     TaskTerminal,
     ProjectImplDrained,
@@ -79,6 +89,7 @@ impl EventKind {
     /// metric-name-safe string. Snake_case mirror of the variant name.
     pub fn topic_name(&self) -> &'static str {
         match self {
+            EventKind::ExecutionDecision => "execution_decision",
             EventKind::WorkItemChanged => "work_item_changed",
             EventKind::TaskTerminal => "task_terminal",
             EventKind::ProjectImplDrained => "project_impl_drained",
@@ -101,6 +112,7 @@ impl EventKind {
 impl Event {
     pub fn kind(&self) -> EventKind {
         match self {
+            Event::ExecutionDecision { .. } => EventKind::ExecutionDecision,
             Event::WorkItemChanged { .. } => EventKind::WorkItemChanged,
             Event::TaskTerminal { .. } => EventKind::TaskTerminal,
             Event::ProjectImplDrained { .. } => EventKind::ProjectImplDrained,
@@ -129,6 +141,7 @@ impl Event {
     /// pending at a time.
     pub fn coalesce_key(&self) -> String {
         match self {
+            Event::ExecutionDecision { execution_id, .. } => execution_id.clone(),
             Event::WorkItemChanged { task_id, .. } => task_id.clone(),
             Event::TaskTerminal { task_id, .. } => task_id.clone(),
             Event::ProjectImplDrained { project_id } => project_id.clone(),

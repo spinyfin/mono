@@ -664,11 +664,26 @@ pub(super) async fn handle_create_many_chores(ctx: Dispatch, req: FrontendReques
 
 #[tracing::instrument(name = "update_work_item", level = "debug", skip_all, fields(request_id = %ctx.request_id, item_id = tracing::field::Empty))]
 pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest) {
-    let FrontendRequest::UpdateWorkItem { id, patch } = req else {
+    let FrontendRequest::UpdateWorkItem { id, mut patch, cancel } = req else {
         unreachable!()
     };
     tracing::Span::current().record("item_id", &id);
     tracing::debug!(target: "work_write_timing", boundary = "handler_entry");
+    if let Some(claim) = cancel {
+        let observed = rpc_cancel_actor(&ctx.server_state, &ctx.session_id, ctx.peer_pid).await;
+        match super::cancel_rpc::provenance_from_request(
+            Some(claim.source),
+            Some(&claim.reason),
+            Some(&claim.actor),
+            &observed,
+        ) {
+            Ok(provenance) => patch.cancel_provenance = Some(provenance),
+            Err(refusal) => {
+                send_work_error(&ctx.sink, &ctx.request_id, refusal.message("update_work_item"));
+                return;
+            }
+        }
+    }
     apply_work_item_patch(ctx, id, *patch, None).await;
 }
 
@@ -817,7 +832,12 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
                     return;
                 }
             }
-            let patch = WorkItemPatch::builder().status(status.as_str()).build();
+            let mut patch = WorkItemPatch::builder().status(status.as_str()).build();
+            patch.cancel_provenance = Some(boss_protocol::CancelProvenance::engine(
+                boss_protocol::CancelSource::App,
+                &rpc_cancel_actor(&ctx.server_state, &ctx.session_id, ctx.peer_pid).await,
+                format!("board gesture moves {id} to {}", status.as_str()),
+            ));
             let pause_bypass = bypass_dispatch_pause.then_some(BoardDragPauseBypass {
                 observed_pause_since_epoch_s,
             });
@@ -914,6 +934,25 @@ pub(super) async fn apply_work_item_patch_from(
         // applies. We only care about task/chore — products and
         // projects have no execution lifecycle.
         let previous_task_status = task_status_for_id(&work_db, &id);
+        let cancel_provenance = patch.cancel_provenance.clone();
+        let can_end_execution = (patch.status.as_deref() == Some("todo")
+            && previous_task_status == Some(TaskStatus::Active))
+            || patch.deferred == Some(true)
+            || matches!(patch.status.as_deref(), Some("done" | "archived"));
+        if can_end_execution
+            && cancel_provenance.is_none()
+            && work_db
+                .list_executions(Some(&id))
+                .is_ok_and(|rows| rows.iter().any(|e| !e.status.is_terminal()))
+        {
+            send_work_error(
+                &sink,
+                &request_id,
+                "update_work_item requires cancel source, actor and reason when ending executions",
+            );
+            return;
+        }
+
         let previous_block = work_db.get_work_item(&id).ok().and_then(|item| match item {
             WorkItem::Task(t) | WorkItem::Chore(t) => Some((t.blocked_reason, t.blocked_detail)),
             _ => None,
@@ -1097,11 +1136,8 @@ pub(super) async fn apply_work_item_patch_from(
                 {
                     let handler = server_state.completion_handler.clone();
                     let id_for_cancel = id.clone();
-                    let provenance = boss_protocol::CancelProvenance::engine(
-                        boss_protocol::CancelSource::WorkItemMovedToBacklog,
-                        &rpc_cancel_actor(&server_state, &session_id, peer_pid).await,
-                        format!("work item {id} moved from active back to todo (kanban drag to Backlog)"),
-                    );
+                    let mut provenance = cancel_provenance.clone().expect("validated cancellation context");
+                    provenance.reason = format!("work item {id} moved from active to todo; {}", provenance.reason);
                     boss_task_scope::spawn(async move {
                         handler
                             .cancel_and_release(&id_for_cancel, &execution_id, provenance)
@@ -1497,13 +1533,34 @@ pub(super) async fn handle_delete_work_item(ctx: Dispatch, req: FrontendRequest)
         peer_pid,
         ..
     } = ctx;
-    let FrontendRequest::DeleteWorkItem { id } = req else {
+    let FrontendRequest::DeleteWorkItem { id, cancel } = req else {
         unreachable!()
     };
     let id = match server_state.resolve_work_item_id(&id).await {
         Ok(id) => id,
         Err(err) => {
             send_work_error(&sink, &request_id, &err);
+            return;
+        }
+    };
+    let Some(claim) = cancel else {
+        send_work_error(
+            &sink,
+            &request_id,
+            "delete_work_item requires cancel source, actor and reason",
+        );
+        return;
+    };
+    let observed = rpc_cancel_actor(&server_state, &session_id, peer_pid).await;
+    let provenance = match super::cancel_rpc::provenance_from_request(
+        Some(claim.source),
+        Some(&claim.reason),
+        Some(&claim.actor),
+        &observed,
+    ) {
+        Ok(value) => value,
+        Err(refusal) => {
+            send_work_error(&sink, &request_id, refusal.message("delete_work_item"));
             return;
         }
     };
@@ -1534,15 +1591,7 @@ pub(super) async fn handle_delete_work_item(ctx: Dispatch, req: FrontendRequest)
                     };
                     let handler = server_state.completion_handler.clone();
                     let id_for_cancel = tombstoned_id.clone();
-                    let provenance = boss_protocol::CancelProvenance::engine(
-                        boss_protocol::CancelSource::WorkItemDeleted,
-                        &rpc_cancel_actor(&server_state, &session_id, peer_pid).await,
-                        if tombstoned_id == &id {
-                            format!("work item {id} deleted while a worker was active")
-                        } else {
-                            format!("work item {tombstoned_id} cascade-deleted with {id} while a worker was active")
-                        },
-                    );
+                    let provenance = provenance.clone();
                     boss_task_scope::spawn(async move {
                         handler
                             .cancel_and_release(&id_for_cancel, &execution_id, provenance)

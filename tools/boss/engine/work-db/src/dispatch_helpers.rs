@@ -698,6 +698,7 @@ pub(crate) fn dispatch_retry_at_for_execution(execution: &WorkExecution, now_sec
     }
 }
 
+
 pub(crate) fn query_latest_run(conn: &Connection, execution_id: &str) -> Result<Option<(String, String)>> {
     conn.prepare_cached(
         "SELECT id, status
@@ -2274,6 +2275,8 @@ fn request_execution_in_tx_body<F: FnOnce(&str) -> bool>(
                     &existing,
                     &work_item_id,
                     actor,
+                    latest_id.as_deref(),
+                    live_id.as_deref(),
                 )?;
             }
         } else {

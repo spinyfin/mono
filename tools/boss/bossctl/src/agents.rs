@@ -815,7 +815,7 @@ pub(crate) async fn agents_list_live(socket_path: &Option<String>, json: bool, a
                 match &pane.state {
                     HostedPaneState::LiveProcessNoRegistry { evidence } => println!(
                         "slot {}  {}  run={}  TERMINAL ENTRY, LIVE PROCESS ({evidence}) — \
-                         `bossctl agents stop {}` or `bossctl agents retire-pane {}` to reap it",
+                         `bossctl agents stop {} --reason 'reap stuck worker'` or `bossctl agents retire-pane {}` to reap it",
                         pane.slot_id, pane.crew_name, pane.run_id, pane.run_id, pane.slot_id,
                     ),
                     HostedPaneState::DurableOccupantNoRegistry { status } => {
@@ -823,7 +823,7 @@ pub(crate) async fn agents_list_live(socket_path: &Option<String>, json: bool, a
                     }
                     HostedPaneState::OccupancyInconclusive { evidence } => println!(
                         "slot {}  {}  run={}  OCCUPANCY INCONCLUSIVE ({evidence}) — \
-                         resolve the probe failure, or run `bossctl agents stop {}` then `bossctl agents retire-pane {}`",
+                         resolve the probe failure, or run `bossctl agents stop {} --reason 'reap stuck worker'` then `bossctl agents retire-pane {}`",
                         pane.slot_id, pane.crew_name, pane.run_id, pane.run_id, pane.slot_id,
                     ),
                     HostedPaneState::Husk => println!(
@@ -967,7 +967,7 @@ fn looks_like_execution_id(reference: &str) -> bool {
 /// covers a worker the engine has LOST TRACK of. That is not a
 /// hypothetical: a run whose execution was wrongly terminalized has its
 /// `LiveWorkerState` cleared while its process keeps running, so on
-/// 2026-07-28 `bossctl agents stop <exec-id>` answered `no live worker
+/// 2026-07-28 `bossctl agents stop <exec-id> --reason 'reap stuck worker'` answered `no live worker
 /// matches` for all six stranded workers and an operator had to `kill`
 /// them by pid. Being unable to reap a running worker is its own defect,
 /// independent of how it got stranded.
@@ -2031,7 +2031,7 @@ enum TmuxListEvidence<'a> {
 fn durable_occupant_list_line(pane: &HostedPaneStatus, status: &str) -> String {
     format!(
         "slot {}  {}  run={}  DURABLE OCCUPANT `{status}` WITH NO LIVE-STATE — \
-         run `bossctl agents stop {}`",
+         run `bossctl agents stop {} --reason 'reap stuck worker'`",
         pane.slot_id, pane.crew_name, pane.run_id, pane.run_id,
     )
 }
@@ -2042,7 +2042,7 @@ fn durable_occupant_detail_lines(pane: &HostedPaneStatus, status: &str) -> Strin
     format!(
         "  state: durable occupant `{status}` with no live-state entry\n  \
          durable status says a worker should exist; no live-state entry.\n  \
-         run `bossctl agents stop {}`.",
+         run `bossctl agents stop {} --reason 'reap stuck worker'`.",
         pane.run_id
     )
 }
@@ -2083,7 +2083,7 @@ fn hosted_pane_status_text(
             );
             outln!(
                 out,
-                "  `bossctl agents stop {}` or `bossctl agents retire-pane {}` will reap it.",
+                "  `bossctl agents stop {} --reason 'reap stuck worker'` or `bossctl agents retire-pane {}` will reap it.",
                 pane.run_id,
                 pane.slot_id
             );
@@ -2095,7 +2095,7 @@ fn hosted_pane_status_text(
             outln!(out, "  state: occupancy inconclusive ({evidence})");
             outln!(
                 out,
-                "  resolve the probe failure, or run `bossctl agents stop {}` then `bossctl agents retire-pane {}`.",
+                "  resolve the probe failure, or run `bossctl agents stop {} --reason 'reap stuck worker'` then `bossctl agents retire-pane {}`.",
                 pane.run_id,
                 pane.slot_id
             );

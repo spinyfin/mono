@@ -98,7 +98,7 @@ struct ExecutionRow: View {
                     .foregroundStyle(.tertiary)
             }
             if let provenance = exec.cancelProvenance {
-                Text("Cancelled: \(provenance.source) by \(provenance.actor) — \(provenance.reason)")
+                Text("\(exec.status.capitalized): \(provenance.source) by \(provenance.actor) — \(provenance.reason)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

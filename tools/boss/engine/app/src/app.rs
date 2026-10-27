@@ -1405,6 +1405,9 @@ impl ServerState {
         // event would ever reach a subscriber.
         let mut timeline = boss_engine_runtime::startup_timing::StartupTimeline::begin("server_state");
         let event_bus = Arc::new(EventBus::new());
+        let execution_decisions = event_bus.subscribe(boss_event_bus::TopicFilter::kind(
+            boss_event_bus::EventKind::ExecutionDecision,
+        ));
         // Engine counter-metrics registry. Built up front so it can be cloned
         // into ServerState and handed to WorkDb (persona overflow counter); the
         // registry is plumbed explicitly rather than stashed in a global per
@@ -1644,6 +1647,10 @@ impl ServerState {
         });
         let dispatch_events: Arc<dyn boss_dispatch_events::DispatchEventSink> =
             Arc::new(boss_dispatch_events::JsonlFileSink::new(dispatch_event_root.clone()));
+        boss_work_db::event_publish::forward_execution_decisions(
+            execution_decisions,
+            dispatch_events.clone(),
+        );
         let metrics_for_state = metrics_registry.clone();
         let metrics_for_dispatcher = metrics_registry.clone();
         let metrics_for_completion = metrics_registry.clone();
