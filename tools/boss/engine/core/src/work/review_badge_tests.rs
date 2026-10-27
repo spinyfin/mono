@@ -182,15 +182,56 @@ fn badge_displays_rejections_without_putting_them_in_revision_instructions() {
             .verdict_payload(serde_json::json!({"batch_id": "batch", "verdict": verdict}).to_string())
             .is_findings_revision(false)
             .build();
-        let markdown = findings_markdown(&history).unwrap().unwrap();
+        let markdown = findings_markdown(
+            &history,
+            if kept {
+                AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS
+            } else {
+                AI_REVIEW_STATE_REVIEWED_ALL_CLEAR
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert!(markdown.contains("### Rejected leaf findings"));
         assert!(markdown.contains(r"codex\-1: Already guarded"));
         assert_eq!(markdown.contains("Unchecked index"), kept);
+        if !kept {
+            for state in [
+                AI_REVIEW_STATE_REVIEWED_ALL_CLEAR,
+                AI_REVIEW_STATE_REVIEWED_CLEAN_PENDING,
+            ] {
+                let markdown = findings_markdown(&history, state).unwrap().unwrap();
+                assert!(markdown.starts_with("Review complete"));
+                assert!(!markdown.contains("requiring attention"));
+                assert!(!markdown.contains("HARD RULE"));
+            }
+        }
         let instructions = crate::pr_review::render_revision_instructions(
             &verdict.to_review_result(),
             crate::pr_review::ReviewOrigin { pr_number: Some(1) },
         );
         assert!(!instructions.contains("Already guarded"));
         assert!(!instructions.contains("Rejected leaf findings"));
+    }
+}
+
+#[test]
+fn clean_badges_without_rejections_have_no_findings_document() {
+    let history = ReviewBadgeHistory::builder()
+        .verdict_payload(
+            serde_json::json!({"batch_id": "batch", "verdict": {
+                "batch_id": "batch", "pr_url": "https://github.com/spinyfin/mono/pull/1",
+                "target_sha": "head", "phase": "pre_merge", "summary": "Review complete",
+                "revision_warranted": false, "findings": [], "contradictions": [], "rejected": []
+            }})
+            .to_string(),
+        )
+        .is_findings_revision(false)
+        .build();
+    for state in [
+        AI_REVIEW_STATE_REVIEWED_ALL_CLEAR,
+        AI_REVIEW_STATE_REVIEWED_CLEAN_PENDING,
+    ] {
+        assert_eq!(findings_markdown(&history, state).unwrap(), None);
     }
 }

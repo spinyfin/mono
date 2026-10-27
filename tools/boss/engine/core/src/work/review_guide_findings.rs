@@ -70,7 +70,11 @@ fn query_findings(conn: &Connection, root_id: &str, pr_url: &str) -> Result<Opti
         let findings = if let Some(payload) = payload {
             let payload: boss_protocol::ReviewVerdictProposalPayload = serde_json::from_str(&payload)?;
             let verdict: boss_pr_review::SupervisorVerdict = serde_json::from_value(payload.verdict)?;
-            text.rejected.extend(rejected_finding_lines(&verdict));
+            text.rejected.extend(
+                rejected_finding_lines(&verdict)
+                    .into_iter()
+                    .map(|line| format!("{line} — reviewed head {}", escape_markdown_line(&verdict.target_sha))),
+            );
             verdict
                 .findings
                 .into_iter()
@@ -189,7 +193,10 @@ impl FindingsText {
             markdown.push_str(&self.rejected.join("\n"));
         }
         let rejected_status = if rejected_count > 0 {
-            format!(", {rejected_count} rejected leaf findings")
+            format!(
+                ", {rejected_count} rejected leaf finding{}",
+                if rejected_count == 1 { "" } else { "s" }
+            )
         } else {
             String::new()
         };
