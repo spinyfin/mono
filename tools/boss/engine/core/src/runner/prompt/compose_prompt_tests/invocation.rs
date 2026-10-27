@@ -8,6 +8,56 @@ use super::{
 };
 use boss_protocol::ExecutionKind;
 
+#[test]
+fn design_workers_receive_ci_classification_once_with_either_completion_channel() {
+    use crate::driver::{AgentDriver, ClaudeDriver};
+    use crate::worker_setup::{WorkerSetupInput, render_claude_md, worker_kind_for_execution};
+    for postmortem in [false, true] {
+        for seam in [false, true] {
+            let mut execution = base_execution();
+            execution.kind = ExecutionKind::ProjectDesign;
+            let mut item = design_task();
+            if postmortem {
+                let crate::work::WorkItem::Task(task) = &mut item else {
+                    panic!("expected design task")
+                };
+                task.kind = boss_protocol::TaskKind::DesignPostmortem;
+            }
+            let input = WorkerSetupInput::builder()
+                .run_id(execution.id.clone())
+                .lease_id("lease-design")
+                .workspace_path(std::path::PathBuf::from("/tmp/workspace"))
+                .events_socket_path(std::path::PathBuf::from("/tmp/events.sock"))
+                .boss_event_path(std::path::PathBuf::from("/tmp/boss-event"))
+                .execution_kind(execution.kind.as_str())
+                .worker_kind(worker_kind_for_execution(&execution.kind))
+                .run_done_proposals_seam_enabled(seam)
+                .build();
+            let rules = render_claude_md(&input, ClaudeDriver.agent_rules_preamble(), ".claude");
+            let prompt = compose_execution_prompt(
+                ExecutionPromptParams::builder()
+                    .execution(&execution)
+                    .work_item(&item)
+                    .workspace_path(&input.workspace_path)
+                    .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                    .run_done_proposals_seam_enabled(seam)
+                    .build(),
+            );
+            let assembled = format!("{rules}\n{prompt}");
+            for instruction in [
+                "Classify a CI failure by cause, then act",
+                "Caused by your change: fix it",
+                "Unrelated to your change AND trivial",
+                "Unrelated AND not trivial",
+                "which category you judged the failure into",
+            ] {
+                assert_eq!(assembled.matches(instruction).count(), 1, "{instruction}");
+            }
+            assert!(!assembled.contains("task prompt’s CI-failure rules"));
+        }
+    }
+}
+
 /// Reject backtick-wrapped `boss ` / `cube ` invocations. The PreToolUse
 /// launch guard blocks on the first token, so any remaining verb (not just
 /// `propose` / `pr`) wastes a round trip. Shape-based so a new verb cannot
@@ -439,7 +489,11 @@ fn implementation_brief_and_validation_exception_are_rendered_once() {
                 .build(),
         );
         assert_eq!(prompt.matches("Description here.").count(), 1);
-        assert!(prompt.contains("\n## Task description\n\n- details:"));
+        assert!(
+            prompt.contains(
+                "## Open Questions\n\nThe task you were assigned follows.\n\n## Task description\n\n- details:"
+            )
+        );
         assert!(!prompt.contains("What this revision should change"));
         assert_eq!(prompt.matches("two or three attempts maximum").count(), 1);
         assert_eq!(prompt.matches("**Hard constraint").count(), 1);

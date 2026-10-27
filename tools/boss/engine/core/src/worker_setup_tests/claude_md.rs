@@ -501,7 +501,7 @@ fn shared_publication_and_ci_policy_lives_in_worker_rules() {
         "CI-fix revision is no substitute",
         "jj diff -r @",
         "Print the PR URL on its own line as the last thing in your final response",
-        "check must be classified using the task prompt’s CI-failure rules",
+        "check must be classified using the CI failure classification below",
     ] {
         assert!(rendered.contains(rule), "missing shared policy: {rule}");
     }

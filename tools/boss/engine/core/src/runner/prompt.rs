@@ -533,7 +533,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
     prompt.push_str("\nRespond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
     if let Some(details) = work_item_details(work_item) {
-        prompt.push_str("\n## Task description\n\n- details:\n");
+        prompt.push_str("\nThe task you were assigned follows.\n\n## Task description\n\n- details:\n");
         prompt.push_str(details.trim_end());
         prompt.push('\n');
     }

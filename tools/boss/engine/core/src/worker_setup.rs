@@ -80,6 +80,7 @@ pub use deny_rules::{
     answer_agent_allow_rules, answer_agent_deny_rules, review_guide_allow_rules, review_guide_deny_rules,
     reviewer_deny_rules, triage_deny_rules,
 };
+pub(crate) mod ci_failure;
 mod git_store_guard;
 mod operator_question;
 pub use git_store_guard::{ensure_git_store_guard_script_in, git_store_guard_script_path};
@@ -308,6 +309,9 @@ pub struct WorkerSetupInput {
 /// instructions (reviewers never open or update PRs).
 pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &str) -> String {
     let mut rules = render_worker_rules_body(input, preamble, config_dir);
+    if input.worker_kind == WorkerKind::Standard {
+        rules.push_str(ci_failure::GUIDANCE);
+    }
     if input.worker_kind == WorkerKind::Standard && input.run_done_proposals_seam_enabled {
         rules.push_str(operator_question::GUIDANCE);
     }
@@ -453,7 +457,7 @@ fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir
            complete the run using its enabled completion channel. Required checks\n\
            are effectively green at SUCCESS, NEUTRAL, or SKIPPED; still-running\n\
            and human-gated checks do not block completion. A genuinely failed\n\
-           check must be classified using the task prompt’s CI-failure rules;\n\
+           check must be classified using the CI failure classification below;\n\
            a CI-fix revision is no substitute for a fix you can make in this run.\n\
          - `{boss} pr body` — the PR title and body/description the\n\
            engine snapshotted when this run started, for a read-modify-write of\n\
