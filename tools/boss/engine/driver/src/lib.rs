@@ -2359,3 +2359,6 @@ pub mod test_support;
 mod tests;
 
 mod guard_python;
+
+#[cfg(test)]
+mod signal_guard_tests;

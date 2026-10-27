@@ -265,9 +265,12 @@ macro_rules! shell_command_tokenizer_fragment {
 }
 
 /// Inline Python decision hook that blocks workers from launching the Boss
-/// macOS app or a Boss engine. Always applied (matcher `Bash`).
+/// macOS app or a Boss engine, or signalling processes by name, pattern,
+/// process group, or dynamically selected PID. Always applied (matcher `Bash`)
+/// by Claude, Codex, and Grok, including remote and reviewer workers.
 ///
-/// **This is the advisory layer, not the control.** It fails in-session, with
+/// For app launches, this is the advisory layer; signal restrictions are
+/// enforced here before the worker shell runs. It fails in-session, with
 /// a message the worker can act on immediately, which the engine-side gate
 /// (`boss_engine::app::agent_launch_guard`) cannot do — by the time that gate
 /// fires the worker has already spent a build. But a text matcher only
@@ -318,6 +321,7 @@ macro_rules! shell_command_tokenizer_fragment {
 /// win if the launcher ever slipped.
 pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     shell_command_tokenizer_fragment!(),
+    include_str!("signal_guard.py"),
     "PROD='/tmp/boss-engine.sock'\n",
     "ASSIGN=re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)=(.*)$', re.S)\n",
     // Resolve single-level shell variables. Assignments are collected as the
