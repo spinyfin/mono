@@ -51,7 +51,8 @@ impl Journal {
     }
 
     /// Only a contiguous, receipted host-only prefix older than seven days.
-    /// Run records remain pinned until a future assignment reconciliation API.
+    /// Run records remain pinned until a future assignment reconciliation API,
+    /// and a pinned record also pins every record after it.
     pub fn compact(&mut self, now_ms: i64) -> Result<()> {
         const WEEK_MS: i64 = 7 * 24 * 60 * 60 * 1000;
         let tx = self.db.transaction()?;

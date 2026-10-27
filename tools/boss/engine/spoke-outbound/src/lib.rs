@@ -113,7 +113,7 @@ mod session {
     use anyhow::{Result, bail, ensure};
     use boss_protocol_spoke::{
         Validate,
-        limits::{MAX_FRAME_BYTES, MAX_INFLIGHT_BYTES},
+        limits::{Limits, MAX_FRAME_BYTES},
         v1::{self, hub_frame, spoke_frame},
     };
     use boss_spoke_journal::Fault;
@@ -225,8 +225,9 @@ mod session {
             "replay_gap: hub receipt exceeds advertised journal"
         );
         locked(journal)?.welcome(&welcome)?;
-        let frame_limit = downward(welcome.max_frame_bytes, MAX_FRAME_BYTES);
-        let credit = downward(welcome.max_inflight_bytes, MAX_INFLIGHT_BYTES);
+        let limits = Limits::default().negotiated(welcome.max_frame_bytes, welcome.max_inflight_bytes);
+        let frame_limit = limits.max_frame_bytes as usize;
+        let credit = limits.max_inflight_bytes as usize;
         let mut window = Window::new(welcome.received_records.as_ref().expect("validated receipt").through);
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         let mut last_read = tokio::time::Instant::now();
@@ -333,13 +334,14 @@ mod session {
         };
         let bytes = record_frame(next.bytes);
         ensure!(bytes.len() <= frame_limit, "outbound frame exceeds negotiated limit");
-        ensure!(bytes.len() <= credit, "record exceeds negotiated send credit");
-        Ok((window.outstanding + bytes.len() <= credit).then_some((next.sequence, bytes)))
+        // The credit bounds bytes in flight, not the size of one record. Journal
+        // admission accepts records up to the frame limit, and nothing may skip the
+        // head of replay, so a lone oversized record is sent once nothing else is
+        // outstanding rather than wedging the session.
+        let fits = window.outstanding == 0 || window.outstanding + bytes.len() <= credit;
+        Ok(fits.then_some((next.sequence, bytes)))
     }
 
-    fn downward(peer: u32, local: u32) -> usize {
-        (if peer == 0 { local } else { local.min(peer) }) as usize
-    }
     fn control(body: spoke_frame::Body) -> Vec<u8> {
         v1::SpokeFrame { body: Some(body) }.encode_to_vec()
     }
@@ -453,7 +455,12 @@ pub(crate) fn status(error: tonic::Status) -> anyhow::Error {
         | tonic::Code::Cancelled
         | tonic::Code::DeadlineExceeded
         | tonic::Code::Unknown
-        | tonic::Code::ResourceExhausted => network(error),
+        | tonic::Code::ResourceExhausted
+        // Admission races the hub expects a contender to retry: a changed
+        // connection ("reconnect") and a pending host challenge. A genuine duplicate
+        // daemon is refused on every attempt and never displaces the live stream.
+        | tonic::Code::Aborted
+        | tonic::Code::AlreadyExists => network(error),
         _ => error.into(),
     }
 }

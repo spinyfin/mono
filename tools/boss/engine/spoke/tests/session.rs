@@ -412,14 +412,53 @@ mod flow {
         let mut hub = Fixture::refusing(2).await;
         let mut daemon = hub.start();
         let mut connection = hub.connection().await;
-        let identity = connection.hello.journal_id.clone();
         connection.welcome(0).await;
         let spoke_frame::Body::Record(record) = connection.next().await else {
             panic!("expected the journaled capacity record");
         };
         assert_eq!(record.sequence, 1);
         assert!(daemon.running(), "shedding must not stop the daemon");
-        assert_eq!(connection.hello.journal_id, identity);
+        let refused = hub.refused.lock().unwrap().clone();
+        assert_eq!(refused.len(), 2, "both refusals were observed");
+        assert!(
+            refused.iter().all(|id| *id == connection.hello.journal_id),
+            "every retry presents the same journal"
+        );
+    }
+
+    #[tokio::test]
+    async fn hub_admission_races_are_retried_by_the_same_daemon() {
+        let mut hub = Fixture::shedding(vec![tonic::Code::Aborted, tonic::Code::AlreadyExists]).await;
+        let mut daemon = hub.start();
+        let mut connection = hub.connection().await;
+        connection.welcome(0).await;
+        let spoke_frame::Body::Record(record) = connection.next().await else {
+            panic!("expected the journaled capacity record");
+        };
+        assert_eq!(record.sequence, 1);
+        assert!(daemon.running(), "admission races must not stop the daemon");
+        assert_eq!(hub.refused.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn record_larger_than_the_send_credit_is_still_sent_alone() {
+        let mut hub = Fixture::new().await;
+        let mut journal = Journal::open(&hub.root(), "host", Limits::default()).unwrap();
+        journal.append(filler(4096, now_ms()), Admission::Capacity).unwrap();
+        let (_shared, task) = session(&hub, journal);
+        let mut connection = hub.connection().await;
+        connection
+            .send(hub_frame::Body::Welcome(v1::Welcome {
+                max_inflight_bytes: 1024,
+                ..connection.welcome_body(0)
+            }))
+            .await;
+        let spoke_frame::Body::Record(record) = connection.next().await else {
+            panic!("expected the oversized record");
+        };
+        assert_eq!(record.sequence, 1);
+        assert!(!task.is_finished(), "an oversized record must not end the session");
+        task.abort();
     }
 
     #[tokio::test]

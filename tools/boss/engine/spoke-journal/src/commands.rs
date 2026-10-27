@@ -29,13 +29,16 @@ impl Journal {
         ensure!(journal.is_some(), "command before Welcome");
         let previous: Option<Vec<u8>> = tx
             .query_row(
-                "SELECT bytes FROM commands WHERE sequence=?1 OR command_id=?2",
+                "SELECT digest FROM commands WHERE sequence=?1 OR command_id=?2",
                 params![command.sequence, command.command_id],
                 |r| r.get(0),
             )
             .optional()?;
         if let Some(previous) = previous {
-            ensure!(previous == bytes, "command identity reused with different bytes");
+            ensure!(
+                previous[..] == Sha256::digest(bytes)[..],
+                "command identity reused with different bytes"
+            );
             return Ok(through);
         }
         ensure!(command.sequence == through + 1, "command sequence gap");
@@ -82,7 +85,13 @@ impl Journal {
             ..Default::default()
         };
         records::insert(&tx, &mut result, Admission::Lifecycle, self.limits)?;
-        tx.execute("UPDATE commands SET applied=1 WHERE sequence=?1", [sequence])?;
+        // Shrink the applied command to a tombstone (id, sequence, digest) so its
+        // payload stops counting against the spool.
+        tx.execute("UPDATE identity SET queued_bytes=queued_bytes-?1", [bytes.len() as u64])?;
+        tx.execute(
+            "UPDATE commands SET applied=1,bytes=zeroblob(0) WHERE sequence=?1",
+            [sequence],
+        )?;
         tx.execute("UPDATE identity SET applied_command=?1", [sequence])?;
         tx.commit()?;
         Ok(true)

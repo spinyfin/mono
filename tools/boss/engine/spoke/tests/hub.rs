@@ -8,12 +8,10 @@ use rcgen::{
     PKCS_ECDSA_P256_SHA256, SanType,
 };
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::sync::mpsc;
@@ -41,8 +39,8 @@ impl Connection {
             .await
             .unwrap();
     }
-    pub async fn welcome(&self, through: u64) {
-        self.send(hub_frame::Body::Welcome(v1::Welcome {
+    pub fn welcome_body(&self, through: u64) -> v1::Welcome {
+        v1::Welcome {
             epoch: 1,
             features: boss_spoke_outbound::contracts().features,
             hub_id: "hub".into(),
@@ -54,8 +52,10 @@ impl Connection {
             }),
             command_journal_id: "commands".into(),
             ..Default::default()
-        }))
-        .await;
+        }
+    }
+    pub async fn welcome(&self, through: u64) {
+        self.send(hub_frame::Body::Welcome(self.welcome_body(through))).await;
     }
     pub async fn next(&mut self) -> spoke_frame::Body {
         tokio::time::timeout(STEP, self.incoming.message())
@@ -77,8 +77,10 @@ impl Connection {
 
 struct Hub {
     connections: mpsc::Sender<Connection>,
-    /// Connects still to be shed with `ResourceExhausted` before one is admitted.
-    refusals: AtomicUsize,
+    /// Statuses the next connects are shed with, in order, before one is admitted.
+    refusals: Mutex<VecDeque<tonic::Code>>,
+    /// Journal identity from the Hello of every refused attempt.
+    refused: Arc<Mutex<Vec<String>>>,
 }
 #[tonic::async_trait]
 impl SpokeHub for Hub {
@@ -88,17 +90,15 @@ impl SpokeHub for Hub {
         request: Request<Streaming<v1::SpokeFrame>>,
     ) -> Result<Response<Self::ConnectStream>, Status> {
         assert!(request.peer_certs().is_some(), "mTLS client certificate required");
-        if self
-            .refusals
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
-        {
-            return Err(Status::resource_exhausted("connection limit"));
-        }
         let mut incoming = request.into_inner();
         let Some(spoke_frame::Body::Hello(hello)) = incoming.message().await?.and_then(|f| f.body) else {
             return Err(Status::invalid_argument("Hello required"));
         };
+        let refusal = self.refusals.lock().unwrap().pop_front();
+        if let Some(code) = refusal {
+            self.refused.lock().unwrap().push(hello.journal_id);
+            return Err(Status::new(code, "refused before admission"));
+        }
         let (outgoing, rx) = mpsc::channel(8);
         self.connections
             .send(Connection {
@@ -116,6 +116,8 @@ pub struct Fixture {
     pub dir: tempfile::TempDir,
     pub endpoint: String,
     pub connections: mpsc::Receiver<Connection>,
+    /// Journal identity advertised by each refused attempt.
+    pub refused: Arc<Mutex<Vec<String>>>,
     server: tokio::task::JoinHandle<()>,
 }
 impl Drop for Fixture {
@@ -126,15 +128,21 @@ impl Drop for Fixture {
 
 impl Fixture {
     pub async fn new() -> Self {
-        Self::refusing(0).await
+        Self::shedding(vec![]).await
     }
 
     /// A hub that sheds the first `refusals` connects with `ResourceExhausted`.
+    pub async fn refusing(refusals: usize) -> Self {
+        Self::shedding(vec![tonic::Code::ResourceExhausted; refusals]).await
+    }
+
+    /// A hub that refuses the first connects with `codes`, in order, before
+    /// admitting one.
     ///
     /// The client leaf is issued by the hub's real enrollment authority, so the
     /// daemon is exercised against the certificate shape production issues. The
     /// hub's server certificate comes from a separate CA the daemon trusts.
-    pub async fn refusing(refusals: usize) -> Self {
+    pub async fn shedding(codes: Vec<tonic::Code>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let authority = dir.path().join("authority");
         std::fs::create_dir(&authority).unwrap();
@@ -176,6 +184,8 @@ impl Fixture {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("https://{}", listener.local_addr().unwrap());
         let (tx, connections) = mpsc::channel(8);
+        let refused = Arc::new(Mutex::new(Vec::new()));
+        let hub_refused = Arc::clone(&refused);
         let server = tokio::spawn(async move {
             Server::builder()
                 .initial_stream_window_size(1024)
@@ -183,7 +193,8 @@ impl Fixture {
                 .unwrap()
                 .add_service(SpokeHubServer::new(Hub {
                     connections: tx,
-                    refusals: AtomicUsize::new(refusals),
+                    refusals: Mutex::new(codes.into()),
+                    refused: hub_refused,
                 }))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
@@ -193,6 +204,7 @@ impl Fixture {
             dir,
             endpoint,
             connections,
+            refused,
             server,
         }
     }
