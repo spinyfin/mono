@@ -77,6 +77,8 @@ pub(super) struct Observation {
 }
 
 thread_local! {
+    // SQLite emits one STMT event per execution, including nested helpers.
+    static STATEMENTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     // A connection guard cannot migrate between threads. Avoid a global lock
     // for every returned row; only writer transitions and BUSY touch the registry.
     static ACTIVE: RefCell<HashMap<usize, Rc<Observation>>> = RefCell::default();
@@ -123,6 +125,21 @@ pub(super) fn start(
     );
     ACTIVE.with_borrow_mut(|active| active.insert(id, observation.clone()));
     (id, observation)
+}
+
+fn count_statement(event: rusqlite::trace::TraceEvent<'_>) {
+    if matches!(event, rusqlite::trace::TraceEvent::Stmt(..)) {
+        STATEMENTS.set(STATEMENTS.get() + 1);
+    }
+}
+
+/// Count actual statements in a synchronous projection, including SQL in
+/// helpers. The connection guard and this scope stay on the same thread.
+pub(super) fn count_queries<T>(queries: &mut u64, project: impl FnOnce() -> T) -> T {
+    let before = STATEMENTS.get();
+    let result = project();
+    *queries += STATEMENTS.get() - before;
+    result
 }
 
 /// Independent WorkDb connections (notably backups) need the same observations.
@@ -207,6 +224,10 @@ impl Observation {
 /// Called once a write actually changes a row, including autocommit writes
 /// that may still be executing when another connection reports BUSY.
 pub(super) fn install_update_observer(conn: &rusqlite::Connection) {
+    conn.trace_v2(
+        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(count_statement),
+    );
     // SAFETY: callbacks run synchronously on this connection's thread. The
     // progress callback only inspects transaction state; it never executes SQL.
     let id = unsafe { conn.handle() } as usize;

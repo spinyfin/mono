@@ -72,4 +72,40 @@ mod tests {
         log.cleared("task_1");
         assert!(log.entered("task_1", None, "pr_awaits_review"));
     }
+
+    #[test]
+    fn unchanged_reconcile_does_not_reenter_the_decline() {
+        use crate::test_support::{create_test_chore_manual, create_test_product};
+        use crate::work::*;
+        let logs = crate::test_support::log_capture::install();
+        let db = WorkDb::open_in_memory().unwrap();
+        let product = create_test_product(&db);
+        let task = create_test_chore_manual(&db, product.id, "review hold");
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET autostart = 1, pr_url = 'https://github.com/example/repo/pull/1' WHERE id = ?1",
+            [&task.id],
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let mut result = ExecutionReconcileResult::default();
+            reconcile_work_item_execution(
+                &conn,
+                &mut result,
+                &task.id,
+                ExecutionKind::ChoreImplementation,
+                ExecutionStatus::Ready,
+            )
+            .unwrap();
+            assert!(!DeclineLog::global().entered(&task.id, None, DISPATCH_HOLD_PR_AWAITS_REVIEW));
+            assert!(query_latest_execution_for_work_item(&conn, &task.id).unwrap().is_none());
+        }
+        let text = String::from_utf8_lossy(&logs.lock()).into_owned();
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.contains(&task.id) && line.contains("skipping execution mint"))
+                .count(),
+            1
+        );
+    }
 }

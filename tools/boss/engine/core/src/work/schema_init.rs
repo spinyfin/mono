@@ -17,7 +17,14 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 52;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 53;
+const CANCEL_EVENTS_53: &str = "CREATE TABLE IF NOT EXISTS execution_cancel_events (
+    execution_id TEXT PRIMARY KEY NOT NULL REFERENCES work_executions(id) ON DELETE CASCADE,
+    event_json TEXT NOT NULL,
+    delivered INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS execution_cancel_events_pending_idx
+ON execution_cancel_events(execution_id) WHERE delivered = 0";
 
 /// Schema 43: the baseline commit a recovery record was created at, the
 /// pointer-reconciliation note for the worker prompt, and the retirement
@@ -268,6 +275,10 @@ impl WorkDb {
         // Required runtime data, not a historical migration. Capability
         // discovery remains outside DB startup (no processes or network).
         crate::host_registry::ensure_local_host(&tx)?;
+        if version < 53 {
+            tx.execute_batch(CANCEL_EVENTS_53)?;
+        }
+        pending.persist_cancels(&tx)?;
         tx.commit()?;
         pending.record_audit();
         Ok(())
@@ -385,6 +396,7 @@ impl WorkDb {
         let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening existing database {} for inspection", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_millis(250))?;
+        super::db_diagnostics::install_update_observer(&conn);
         Ok(Self {
             path,
             memory: None,
@@ -853,6 +865,9 @@ mod floor_tests {
                 conn.execute_batch("ALTER TABLE work_executions ADD COLUMN progression_neighbourhood TEXT")
                     .unwrap();
             }
+            if version >= 53 {
+                conn.execute_batch(CANCEL_EVENTS_53).unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -891,6 +906,7 @@ mod floor_tests {
             expected.execute_batch(BOARD_RUNTIME_EPOCH_49).unwrap();
             expected.execute_batch(WORK_RUNS_SEMANTIC_TURN_CONDITION_50).unwrap();
             ci_failure_identity::migrate(&expected).unwrap();
+            expected.execute_batch(CANCEL_EVENTS_53).unwrap();
             expected
                 .execute_batch("ALTER TABLE work_executions ADD COLUMN progression_neighbourhood TEXT")
                 .unwrap();

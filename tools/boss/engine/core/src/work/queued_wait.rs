@@ -37,7 +37,7 @@ pub(super) struct OrdinalChains {
 #[derive(Default)]
 struct ProjectChain {
     order: Vec<String>,
-    first_accepting: Option<String>,
+    first_accepting: Option<DispatchWaitBlocker>,
 }
 
 impl OrdinalChains {
@@ -60,10 +60,16 @@ impl OrdinalChains {
                         &b.id,
                     ))
                 });
-                let first_accepting = members
-                    .iter()
-                    .find(|task| task_accepts_execution(task))
-                    .map(|task| task.id.clone());
+                let first_accepting =
+                    members
+                        .iter()
+                        .find(|task| task_accepts_execution(task))
+                        .map(|task| DispatchWaitBlocker {
+                            work_item_id: task.id.clone(),
+                            product_id: task.product_id.clone(),
+                            short_id: task.short_id,
+                            kind: "task".into(),
+                        });
                 let order = members.into_iter().map(|task| task.id.clone()).collect();
                 (project_id.to_owned(), ProjectChain { order, first_accepting })
             })
@@ -74,32 +80,31 @@ impl OrdinalChains {
     /// One project's chain, read from the database. Used only by the
     /// single-item lookup, which has no pre-loaded task list; every
     /// statement it runs is counted.
-    fn load_project(conn: &Connection, project_id: &str, queries: &mut u64) -> Result<Self> {
+    fn load_project(conn: &Connection, project_id: &str) -> Result<Self> {
         let mut stmt = conn.prepare(
             "SELECT id FROM tasks
              WHERE project_id = ?1 AND deleted_at IS NULL AND kind IN ('project_task', 'design')",
         )?;
-        *queries += 1;
+
         let ids = stmt
             .query_map([project_id], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut tasks = Vec::with_capacity(ids.len());
         for id in ids {
-            *queries += 1;
             tasks.extend(query_task(conn, &id)?);
         }
         Ok(Self::from_tasks(&tasks))
     }
 
     /// The earlier task `task_id` waits behind, if any.
-    fn blocker_id(&self, project_id: &str, task_id: &str) -> Option<&str> {
+    fn blocker(&self, project_id: &str, task_id: &str) -> Option<&DispatchWaitBlocker> {
         let chain = self.projects.get(project_id)?;
-        let first = chain.first_accepting.as_deref()?;
+        let first = chain.first_accepting.as_ref()?;
         for id in &chain.order {
             if id == task_id {
                 return None;
             }
-            if id == first {
+            if id == &first.work_item_id {
                 return Some(first);
             }
         }
@@ -115,15 +120,24 @@ impl OrdinalChains {
 /// gates have all cleared. A `waiting_dependency` row never takes a scheduler
 /// stamp: the scheduler does not drain that status, so a stamp left over
 /// from an earlier `ready` period would outlive the gate that now holds the
-/// row. `queries` counts every database lookup this makes (a lookup can run
-/// more than one statement). `chains` is the pre-built ordinal chain, or
-/// `None` to read the row's project from the database.
+/// row. The SQLite observer counts the statements, including nested
+/// dependency queries. `chains` is precomputed for whole-tree reads.
 pub(super) fn for_execution(
     conn: &Connection,
     execution: Option<&WorkExecution>,
     task: Option<&Task>,
     chains: Option<&OrdinalChains>,
     queries: &mut u64,
+    now: i64,
+) -> Result<DispatchWait> {
+    super::db_diagnostics::count_queries(queries, || for_execution_inner(conn, execution, task, chains, now))
+}
+
+fn for_execution_inner(
+    conn: &Connection,
+    execution: Option<&WorkExecution>,
+    task: Option<&Task>,
+    chains: Option<&OrdinalChains>,
     now: i64,
 ) -> Result<DispatchWait> {
     let Some(execution) = execution else {
@@ -133,7 +147,7 @@ pub(super) fn for_execution(
     match execution.status {
         ExecutionStatus::WaitingDependency => {
             wait.reads_other_items = true;
-            waiting_dependency(conn, execution, task, chains, queries, &mut wait)?;
+            waiting_dependency(conn, execution, task, chains, &mut wait)?;
             return Ok(wait);
         }
         ExecutionStatus::Queued | ExecutionStatus::Ready => {}
@@ -153,7 +167,7 @@ pub(super) fn for_execution(
         .filter(|reason| !reason.trim().is_empty())
     {
         wait.reason = Some(reason.clone());
-        *queries += 1;
+
         let blocker_id: Option<String> = conn.query_row(
             "SELECT dispatch_wait_blocker_id FROM work_executions WHERE id = ?1",
             [&execution.id],
@@ -163,9 +177,9 @@ pub(super) fn for_execution(
             wait.reads_other_items = true;
             // A persisted chain hold is only current while its named writer/reviewer is live.
             // Do not carry its prose or link through the gap before the next scheduler pass.
-            *queries += 1;
+
             if blocker_is_live(conn, &id)? {
-                wait.blocker = blocker_for(conn, &id, queries)?;
+                wait.blocker = blocker_for(conn, &id)?;
             } else {
                 wait.reason = None;
             }
@@ -186,20 +200,17 @@ fn waiting_dependency(
     execution: &WorkExecution,
     task: Option<&Task>,
     chains: Option<&OrdinalChains>,
-    queries: &mut u64,
     wait: &mut DispatchWait,
 ) -> Result<()> {
-    *queries += 1;
     if let Some(id) = deps::gating_prereqs_for(conn, &execution.work_item_id)?.first() {
         wait.reason = Some("waiting_dependency".into());
-        wait.blocker = blocker_for(conn, id, queries)?;
+        wait.blocker = blocker_for(conn, id)?;
         return Ok(());
     }
     let loaded;
     let task = match task {
         Some(task) => Some(task),
         None => {
-            *queries += 1;
             loaded = query_task(conn, &execution.work_item_id)?;
             loaded.as_ref()
         }
@@ -212,17 +223,24 @@ fn waiting_dependency(
         let chains = match chains {
             Some(chains) => chains,
             None => {
-                loaded_chains = OrdinalChains::load_project(conn, project_id, queries)?;
+                loaded_chains = OrdinalChains::load_project(conn, project_id)?;
                 &loaded_chains
             }
         };
-        if let Some(blocker) = chains.blocker_id(project_id, &task.id) {
+        if let Some(blocker) = chains.blocker(project_id, &task.id) {
             wait.reason = Some(WAIT_ORDINAL_CHAIN.into());
-            wait.blocker = blocker_for(conn, blocker, queries)?;
+            wait.blocker = Some(blocker.clone());
             return Ok(());
         }
     }
-    if task.is_some_and(|task| !task_accepts_execution(task)) {
+    let repairable = task.is_some_and(|task| {
+        task_accepts_execution(task)
+            || (task.kind == TaskKind::Revision
+                && task.status == TaskStatus::InReview
+                && task.deleted_at.is_none()
+                && execution.kind == ExecutionKind::RevisionImplementation)
+    });
+    if !repairable {
         // The reconciler only promotes rows that accept an execution, so this
         // shape will not repair itself on the next pass.
         warn_unexplained_once(execution);
@@ -268,8 +286,7 @@ fn blocker_is_live(conn: &Connection, work_item_id: &str) -> Result<bool> {
     )?)
 }
 
-fn blocker_for(conn: &Connection, id: &str, queries: &mut u64) -> Result<Option<DispatchWaitBlocker>> {
-    *queries += 1;
+fn blocker_for(conn: &Connection, id: &str) -> Result<Option<DispatchWaitBlocker>> {
     if let Some(task) = query_task(conn, id)? {
         return Ok(Some(DispatchWaitBlocker {
             work_item_id: task.id,
@@ -278,7 +295,7 @@ fn blocker_for(conn: &Connection, id: &str, queries: &mut u64) -> Result<Option<
             kind: "task".into(),
         }));
     }
-    *queries += 1;
+
     Ok(query_project(conn, id)?.map(|project| DispatchWaitBlocker {
         work_item_id: project.id,
         product_id: project.product_id,

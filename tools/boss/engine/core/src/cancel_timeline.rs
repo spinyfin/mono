@@ -1,14 +1,8 @@
-//! Puts engine-side cancels on the execution's dispatch timeline.
+//! Publishes transactionally persisted cancels to the dispatch timeline.
 //!
-//! A cancel committed deep inside the work DB (a dependency block, a
-//! tombstoned remediation, a review-guide replacement, any caller with no
-//! dispatch sink of its own) stages an [`Event::ExecutionCancelled`] that is
-//! published only after its transaction commits. This subscriber turns each
-//! one flagged `on_timeline` into the `execution_cancelled` dispatch event
-//! `bossctl dispatch diagnose` reads, so the timeline never stops short of a
-//! `cancelled` row. Callers that record the event themselves set
-//! [`crate::work::CancelExecutionOpts::caller_records_timeline`] and are
-//! skipped here, so a cancel is never recorded twice.
+//! Startup drains recovery-migration cancels, and a periodic drain covers
+//! dropped bus notifications. A crash after append but before acknowledgement
+//! can repeat an event; the durable record retains its original timestamp.
 
 use std::sync::Arc;
 
@@ -47,19 +41,55 @@ pub fn timeline_event(event: &Event) -> Option<DispatchEvent> {
     )
 }
 
-/// Subscribe to cancels and write each one to `dispatch_events`.
+/// Read committed cancels that still need their timeline mirror.
+#[work_db_boundary::instrument]
+impl crate::work::WorkDb {
+    pub(crate) fn pending_cancel_events(&self) -> anyhow::Result<Vec<DispatchEvent>> {
+        let conn = self.connect()?;
+        let mut stmt =
+            conn.prepare("SELECT event_json FROM execution_cancel_events WHERE delivered = 0 ORDER BY execution_id")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    fn acknowledge_cancel_event(&self, id: &str) -> anyhow::Result<()> {
+        self.connect()?.execute(
+            "UPDATE execution_cancel_events SET delivered = 1 WHERE execution_id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+}
+
+/// Drain durable cancels through the same sink read by dispatch diagnose.
+pub(crate) async fn drain(db: &crate::work::WorkDb, sink: &dyn DispatchEventSink) -> anyhow::Result<()> {
+    for event in db.pending_cancel_events()? {
+        let id = event.execution_id.clone();
+        sink.emit(event).await;
+        db.acknowledge_cancel_event(&id)?;
+    }
+    Ok(())
+}
+
+/// Subscribe before the first drain so startup and live cancels share one path.
 pub fn spawn_subscriber(
+    db: Arc<crate::work::WorkDb>,
     dispatch_events: Arc<dyn DispatchEventSink>,
     event_bus: Arc<EventBus>,
 ) -> tokio::task::JoinHandle<()> {
     boss_event_bus::spawn_supervised("cancel_timeline", move || {
+        let db = Arc::clone(&db);
         let dispatch_events = Arc::clone(&dispatch_events);
-        let event_bus = Arc::clone(&event_bus);
+        let mut subscription = event_bus.subscribe(TopicFilter::kind(EventKind::ExecutionCancelled));
         async move {
-            let mut subscription = event_bus.subscribe(TopicFilter::kind(EventKind::ExecutionCancelled));
-            while let Some(event) = subscription.recv().await {
-                if let Some(timeline) = timeline_event(&event) {
-                    dispatch_events.emit(timeline).await;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                if let Err(error) = drain(&db, dispatch_events.as_ref()).await {
+                    tracing::warn!(%error, "could not publish committed cancels");
+                }
+                tokio::select! {
+                    _ = interval.tick() => {},
+                    event = subscription.recv() => { if event.is_none() { break; } },
                 }
             }
         }
@@ -69,7 +99,6 @@ pub fn spawn_subscriber(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatch_events::RecordingDispatchEventSink;
 
     fn cancelled(on_timeline: bool) -> Event {
         Event::ExecutionCancelled {
@@ -92,23 +121,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_published_cancel_lands_on_the_execution_timeline() {
-        let bus = Arc::new(EventBus::new());
-        let sink = Arc::new(RecordingDispatchEventSink::new());
-        let _handle = spawn_subscriber(sink.clone(), bus.clone());
-        // The subscription is created inside the spawned task; publish until
-        // it is live (the bus has no replay).
-        for _ in 0..200 {
-            bus.publish(cancelled(true));
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            if !sink.events_for("exec_1").await.is_empty() {
-                break;
+    async fn a_committed_cancel_is_readable_by_dispatch_diagnose() {
+        use crate::test_support::{create_ready_chore_execution, create_test_chore_manual, create_test_product};
+        let db = Arc::new(crate::work::WorkDb::open_in_memory().unwrap());
+        let product = create_test_product(&db);
+        let id = create_test_chore_manual(&db, product.id, "cancel").id;
+        let execution = create_ready_chore_execution(&db, id);
+        db.cancel_execution(&execution.id).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(crate::dispatch_events::JsonlFileSink::new(dir.path()));
+        let handle = spawn_subscriber(db.clone(), sink, db.event_bus().clone());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !db.pending_cancel_events().unwrap().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-        }
-        let events = sink.events_for("exec_1").await;
-        assert!(!events.is_empty(), "the cancel reached the timeline");
+        })
+        .await
+        .unwrap();
+        handle.abort();
+        let events = crate::dispatch_reader::read_execution(dir.path(), &execution.id)
+            .unwrap()
+            .events;
+        assert_eq!(events.len(), 1);
         assert_eq!(events[0].stage, Stage::ExecutionCancelled.as_str());
         assert_eq!(events[0].details["actor"], "engine");
         assert_eq!(events[0].details["prior_status"], "ready");
+        assert!(db.pending_cancel_events().unwrap().is_empty());
     }
 }

@@ -19,6 +19,9 @@
 //! - Other items' state (dependency gating and chain-hold blockers): runtimes
 //!   that consulted another item are never cached; the caller recomputes them.
 //!
+//! Hold reasons are refreshed separately by the caller on every hit because
+//! their task, project and repository inputs are outside execution epochs.
+//!
 //! Lifecycle: every assembly is a pass over one product. Entries a pass does
 //! not touch (item archived, deleted or moved out) are pruned when it
 //! completes, and a global capacity evicts the least recently touched passes.

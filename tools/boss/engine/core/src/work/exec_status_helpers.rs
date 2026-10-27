@@ -685,6 +685,14 @@ pub(super) fn dispatch_hold_reason_for(
     execution: Option<&WorkExecution>,
     queries: &mut u64,
 ) -> Result<Option<String>> {
+    super::db_diagnostics::count_queries(queries, || dispatch_hold_reason_inner(conn, task, execution))
+}
+
+fn dispatch_hold_reason_inner(
+    conn: &Connection,
+    task: Option<&Task>,
+    execution: Option<&WorkExecution>,
+) -> Result<Option<String>> {
     let Some(task) = task else {
         return Ok(None);
     };
@@ -699,16 +707,13 @@ pub(super) fn dispatch_hold_reason_for(
     let routing_hold = match task.kind {
         TaskKind::Task => Some(DISPATCH_HOLD_NO_EXECUTION_KIND),
         TaskKind::ProjectTask | TaskKind::Design if task.project_id.is_none() => Some(DISPATCH_HOLD_NO_PROJECT),
-        TaskKind::Revision => {
-            *queries += 1;
-            match get_chain_root_task(conn, work_item_id)? {
-                None => Some(DISPATCH_HOLD_REVISION_PARENT_UNRESOLVED),
-                Some(root) if root.pr_url.as_deref().is_none_or(str::is_empty) => {
-                    Some(DISPATCH_HOLD_REVISION_AWAITING_PARENT_PR)
-                }
-                Some(_) => None,
+        TaskKind::Revision => match get_chain_root_task(conn, work_item_id)? {
+            None => Some(DISPATCH_HOLD_REVISION_PARENT_UNRESOLVED),
+            Some(root) if root.pr_url.as_deref().is_none_or(str::is_empty) => {
+                Some(DISPATCH_HOLD_REVISION_AWAITING_PARENT_PR)
             }
-        }
+            Some(_) => None,
+        },
         _ => None,
     };
     if let Some(reason) = routing_hold {
@@ -720,11 +725,9 @@ pub(super) fn dispatch_hold_reason_for(
     ) {
         return Ok(Some(DISPATCH_HOLD_BLOCKED_REASON.to_owned()));
     }
-    *queries += 1;
     if work_item_is_human_driven(conn, work_item_id)? {
         return Ok(Some(DISPATCH_HOLD_HUMAN_DRIVEN.to_owned()));
     }
-    *queries += 1;
     if work_item_is_deferred(conn, work_item_id)? {
         return Ok(Some(DISPATCH_HOLD_DEFERRED.to_owned()));
     }
@@ -733,7 +736,6 @@ pub(super) fn dispatch_hold_reason_for(
     if execution
         .is_some_and(|execution| execution.status == ExecutionStatus::Cancelled && execution.started_at.is_none())
     {
-        *queries += 1;
         let sibling_pending: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM work_executions
              WHERE work_item_id = ?1
@@ -750,15 +752,12 @@ pub(super) fn dispatch_hold_reason_for(
             .to_owned(),
         ));
     }
-    *queries += 1;
     if primary_pr_awaits_review(conn, work_item_id)? {
         return Ok(Some(DISPATCH_HOLD_PR_AWAITS_REVIEW.to_owned()));
     }
-    *queries += 1;
     if work_item_is_deliberately_parked(conn, work_item_id)? {
         return Ok(Some(DISPATCH_HOLD_DELIBERATELY_PARKED.to_owned()));
     }
-    *queries += 1;
     if resolve_repo_for_work_item(conn, work_item_id)?.is_none() {
         return Ok(Some(DISPATCH_HOLD_REPO_UNRESOLVED.to_owned()));
     }

@@ -498,6 +498,11 @@ fn dispatch_hold_recomputes_when_task_changes_without_execution_write() {
     );
     board.assert_equivalent();
     assert!(board.runtime_of(&chore)["dispatch_hold_reason"].is_string());
+    assert_eq!(
+        board.assert_equivalent().0,
+        0,
+        "hold refresh retains cached execution fields"
+    );
     board.sql("UPDATE tasks SET autostart = 0 WHERE id = ?1", &[&chore]);
     board.assert_equivalent();
     assert!(board.runtime_of(&chore)["dispatch_hold_reason"].is_null());

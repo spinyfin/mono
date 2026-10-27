@@ -89,6 +89,7 @@ pub fn describe_cancel_actor(actor: Option<StatusActor>) -> &'static str {
         Some(StatusActor::Boss) => "the coordinator",
         Some(StatusActor::Engine) => "the engine",
         Some(StatusActor::Boothby) => "Boothby",
+        Some(StatusActor::Progression) => "the progression engine",
         None => "a party the engine did not record",
     }
 }
@@ -96,6 +97,7 @@ pub fn describe_cancel_actor(actor: Option<StatusActor>) -> &'static str {
 /// Everything one cancel records. Built by every path that terminalizes an
 /// execution as `cancelled` and handed to [`stage_cancel_provenance`].
 #[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub(crate) struct CancelProvenance<'a> {
     pub execution_id: &'a str,
     pub work_item_id: &'a str,

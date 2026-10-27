@@ -213,15 +213,9 @@ pub(crate) fn collect_task_runtimes(
 
 /// Runtime snapshot for a single work item. `task` is the already-loaded row
 /// (`None` for a project or unknown id) so the dispatch-hold check can rule
-/// out non-pending rows without a query. `queries` is incremented once per
-/// database lookup this call makes — the execution lookups (a live-execution
-/// fallback and a non-abandoned fallback for an all-abandoned work item), the
-/// queued-wait lookups, a latest-run lookup, and, only for a dispatch-pending
-/// `todo` row with nothing queued, each gate lookup of
-/// [`dispatch_hold_reason_for`]. A lookup helper may itself run more than one
-/// SQL statement (`work_item_is_deliberately_parked`, the repo and chain-root
-/// resolvers), so this is a lookup count, not a statement count: N+1 callers
-/// get a stable measure of per-row fan-out, not an exact statement total.
+/// out non-pending rows without a query. The connection's SQLite statement
+/// observer counts every executed statement, including nested gate helpers,
+/// so the returned count measures SQL rather than helper invocations.
 pub(crate) fn query_task_runtime(
     conn: &Connection,
     work_item_id: &str,
@@ -261,7 +255,20 @@ pub(crate) struct ComputedRuntime {
 /// will serve it stale; `every_runtime_input_write_invalidates_exactly_its_item`
 /// in `work/tests/board_runtime_cache_tests.rs` is the net that catches a
 /// missed one, so a new runtime input needs a step added there.
-pub(crate) fn compute_task_runtime(
+pub(super) fn compute_task_runtime(
+    conn: &Connection,
+    work_item_id: &str,
+    task: Option<&Task>,
+    chains: Option<&super::queued_wait::OrdinalChains>,
+    queries: &mut u64,
+    now: i64,
+) -> Result<ComputedRuntime> {
+    super::db_diagnostics::count_queries(queries, || {
+        compute_task_runtime_inner(conn, work_item_id, task, chains, &mut 0, now)
+    })
+}
+
+fn compute_task_runtime_inner(
     conn: &Connection,
     work_item_id: &str,
     task: Option<&Task>,
@@ -270,7 +277,7 @@ pub(crate) fn compute_task_runtime(
     now: i64,
 ) -> Result<ComputedRuntime> {
     let latest = query_latest_execution_for_work_item(conn, work_item_id)?;
-    *queries += 1;
+
     // `current_execution_id` (the operator-facing label for
     // `TaskRuntime.execution_id`) and the kanban card must follow the
     // execution a worker is actually attached to. A re-dispatch storm
@@ -289,7 +296,6 @@ pub(crate) fn compute_task_runtime(
     let execution = if latest_is_live {
         latest
     } else {
-        *queries += 1;
         match query_live_execution_for_work_item(conn, work_item_id)? {
             Some(live) => Some(live),
             // No live execution. If the latest row is an `abandoned`
@@ -301,7 +307,6 @@ pub(crate) fn compute_task_runtime(
             // execution for the item is abandoned. Steady state (latest is a
             // normal terminal / ready row) skips this extra lookup.
             None if latest_is_abandoned => {
-                *queries += 1;
                 query_last_non_abandoned_execution_for_work_item(conn, work_item_id)?.or(latest)
             }
             None => latest,
@@ -311,7 +316,6 @@ pub(crate) fn compute_task_runtime(
     let dispatch_hold_reason = dispatch_hold_reason_for(conn, task, execution.as_ref(), queries)?;
     let (execution_status, run_status, execution_id, current_run_id, dispatch_retry_at, dispatch_wait_since) =
         if let Some(execution) = execution {
-            *queries += 1;
             let latest_run = query_latest_run(conn, &execution.id)?;
             let (run_status, run_id) = match latest_run {
                 Some((id, status)) => (Some(status), Some(id)),
@@ -357,7 +361,9 @@ pub(crate) fn compute_task_runtime(
         .maybe_dispatch_hold_reason(dispatch_hold_reason)
         .build();
     Ok(ComputedRuntime {
-        cacheable: !wait.reads_other_items && runtime.dispatch_hold_reason.is_none(),
+        // The cache refreshes hold reasons on every hit; only execution/run
+        // fields and waits covered by the epoch can be reused.
+        cacheable: !wait.reads_other_items,
         runtime,
         expires_at,
     })
@@ -560,6 +566,7 @@ pub(crate) fn reconcile_work_item_execution(
         // product default (multi-repo design Q5). On a `None` we don't create
         // an execution row — instead a sticky `repo_unresolved` attention
         // item surfaces the problem in the kanban Attention lane.
+        declines.cleared(work_item_id);
         let Some(repo_remote_url) = resolve_repo_for_work_item(conn, work_item_id)? else {
             let label = repo_unresolved_kind_label(conn, work_item_id)?;
             record_repo_unresolved_attention(conn, work_item_id, label)?;

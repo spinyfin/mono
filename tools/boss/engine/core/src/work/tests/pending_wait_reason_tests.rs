@@ -152,7 +152,19 @@ fn the_work_tree_ordinal_gate_costs_the_same_lookups_regardless_of_chain_length(
         db.reconcile_product_executions(&product_id).unwrap();
         let conn = db.connect().unwrap();
         let tasks = list_tasks_for_product(&conn, &product_id).unwrap();
-        let (_runtimes, queries) = collect_task_runtimes(&conn, &tasks, &[]).unwrap();
+        let (_runtimes, queries) =
+            collect_task_runtimes(&conn, &tasks, &[], boss_engine_utils::epoch_time::now_epoch_secs()).unwrap();
+        let cache = crate::work::board_runtime_cache::BoardRuntimeCache::default();
+        let (_, cached_queries) = crate::work::cached_task_runtimes::collect_task_runtimes_cached(
+            &conn,
+            &product_id,
+            &tasks,
+            &[],
+            &cache,
+            boss_engine_utils::epoch_time::now_epoch_secs(),
+        )
+        .unwrap();
+        assert_eq!(cached_queries, queries + 1, "cold cache adds only the epoch query");
         (queries, tasks.len() as u64)
     };
     let (small_queries, small_rows) = lookups(0);

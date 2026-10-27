@@ -106,6 +106,7 @@ async fn a_dependency_block_cancel_reaches_the_timeline_publisher() {
     })
     .unwrap();
 
+    assert_cancel_diagnose(&db, &execution.id).await;
     let event = next_cancel_event(&mut sub).await;
     let timeline = crate::cancel_timeline::timeline_event(&event).expect("no caller records this cancel");
     assert_eq!(timeline.execution_id, execution.id);
@@ -124,6 +125,7 @@ async fn a_remediation_tombstone_cancel_reaches_the_timeline_publisher() {
 
     db.test_tombstone_orphaned_remediation(&chore_id).unwrap();
 
+    assert_cancel_diagnose(&db, &execution.id).await;
     let event = next_cancel_event(&mut sub).await;
     let timeline = crate::cancel_timeline::timeline_event(&event).expect("no caller records this cancel");
     assert_eq!(timeline.execution_id, execution.id);
@@ -167,8 +169,8 @@ fn a_caller_recorded_cancel_keeps_queued_only_and_peer_pid_in_the_audit_record()
 
 /// The recovery re-arm retires shadowed executions with a stated reason on
 /// the row and an audit record, written once the migration commits.
-#[test]
-fn recovery_rearm_cancels_record_a_reason_on_the_execution() {
+#[tokio::test]
+async fn recovery_rearm_cancels_record_a_reason_on_the_execution() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("work.db");
     let (id, pending_id) = {
@@ -218,20 +220,62 @@ fn recovery_rearm_cancels_record_a_reason_on_the_execution() {
             .unwrap();
         (chore.id, pending.id)
     };
+    let db = {
+        let _audit = crate::audit::lock_audit_globals_for_tests();
+        let db = WorkDb::open(path).unwrap();
+        let conn = db.connect().unwrap();
+        let row = query_execution(&conn, &pending_id).unwrap().unwrap();
+        assert_eq!(row.status, ExecutionStatus::Cancelled);
+        assert!(
+            row.last_error
+                .as_deref()
+                .is_some_and(|text| text.contains("recovery re-arm")),
+            "the retired row says why: {:?} ({id})",
+            row.last_error
+        );
+        drop(conn);
+        let records = audit_records_for(&pending_id);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0]["actor"], "engine");
+        assert_eq!(records[0]["from_status"], "waiting_dependency");
+        db
+    };
+    assert_cancel_diagnose(&db, &pending_id).await;
+}
+
+async fn assert_cancel_diagnose(db: &WorkDb, execution_id: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = crate::dispatch_events::JsonlFileSink::new(dir.path());
+    crate::cancel_timeline::drain(db, &sink).await.unwrap();
+    let events = crate::dispatch_reader::read_execution(dir.path(), execution_id)
+        .unwrap()
+        .events;
+    assert_eq!(events.len(), 1, "committed cancel is on the diagnostic read surface");
+    assert_eq!(events[0].stage, "execution_cancelled");
+    assert_eq!(events[0].details["actor"], "engine");
+    assert!(!events[0].details["reason"].as_str().unwrap().is_empty());
+}
+
+#[test]
+fn rolled_back_cancel_leaves_no_audit_or_durable_event() {
     let _audit = crate::audit::lock_audit_globals_for_tests();
-    let db = WorkDb::open(path).unwrap();
-    let conn = db.connect().unwrap();
-    let row = query_execution(&conn, &pending_id).unwrap().unwrap();
-    assert_eq!(row.status, ExecutionStatus::Cancelled);
-    assert!(
-        row.last_error
-            .as_deref()
-            .is_some_and(|text| text.contains("recovery re-arm")),
-        "the retired row says why: {:?} ({id})",
-        row.last_error
-    );
-    let records = audit_records_for(&pending_id);
-    assert_eq!(records.len(), 1, "{records:?}");
-    assert_eq!(records[0]["actor"], "engine");
-    assert_eq!(records[0]["from_status"], "waiting_dependency");
+    let (db, _, chore_id) = setup_product_and_chore();
+    let execution = create_ready_chore_execution(&db, chore_id);
+    {
+        let mut conn = db.connect().unwrap();
+        let tx = conn.transaction().unwrap();
+        let mut pending = PendingEvents::new();
+        crate::work::executions_runs::cancel_execution_in_tx(
+            &tx,
+            &mut pending,
+            &execution.id,
+            CancelExecutionOpts::default(),
+        )
+        .unwrap();
+        pending.persist_cancels(&tx).unwrap();
+        // Dropping the transaction must discard both state and provenance.
+    }
+    assert_eq!(db.get_execution(&execution.id).unwrap().status, ExecutionStatus::Ready);
+    assert!(db.pending_cancel_events().unwrap().is_empty());
+    assert!(audit_records_for(&execution.id).is_empty());
 }

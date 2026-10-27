@@ -41,8 +41,8 @@ pub(super) fn is_false_not_descended_blocker(detail: &str) -> bool {
 /// Each shadowed execution it retires is staged on `pending` so the caller
 /// writes its `engine-audit.log` cancel record once the migration commits.
 /// The migration runs at database open, before the engine has a dispatch
-/// timeline sink, so the cancel also lands on the row's own `last_error`,
-/// where `boss task show` reads it.
+/// timeline sink; its durable event is drained at startup. The reason also
+/// lands on the row's `last_error`, where `boss task show` reads it.
 pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool, pending: &mut PendingEvents) -> Result<usize> {
     let candidates: Vec<(String, String)> = {
         let mut statement = conn.prepare(
@@ -125,7 +125,7 @@ pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool, pending: 
                     work_item_moved: false,
                     queued_only: false,
                     peer_pid: None,
-                    caller_records_timeline: true,
+                    caller_records_timeline: false,
                 },
             );
         }
