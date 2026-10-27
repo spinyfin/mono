@@ -2,7 +2,7 @@
 // is chosen, and the engine records exactly that string.
 use super::*;
 
-fn multiple_choice_payload() -> Value {
+pub(super) fn multiple_choice_payload() -> Value {
     json!({"outcome":"blocked", "summary":"Two rollouts fit the brief", "question":{
         "text":"Which rollout should I use?",
         "answer_type":{"kind":"multiple_choice", "choices":["Gradual", "All at once", "Behind a flag"]},

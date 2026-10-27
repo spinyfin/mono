@@ -39,18 +39,28 @@ pub enum TaskStatus {
     Archived,
 }
 
-impl TaskStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Todo => "todo",
-            Self::Active => "active",
-            Self::Blocked => "blocked",
-            Self::InReview => "in_review",
-            Self::Done => "done",
-            Self::Archived => "archived",
+macro_rules! task_status_variants {
+    ($($variant:ident => $str:literal),+ $(,)?) => {
+        impl TaskStatus {
+            /// Every persisted status, sharing the exhaustive string mapping.
+            pub const ALL: &'static [TaskStatus] = &[$(TaskStatus::$variant),+];
+            pub fn as_str(&self) -> &'static str {
+                match self { $(Self::$variant => $str),+ }
+            }
         }
-    }
+    };
+}
 
+task_status_variants! {
+    Todo => "todo",
+    Active => "active",
+    Blocked => "blocked",
+    InReview => "in_review",
+    Done => "done",
+    Archived => "archived",
+}
+
+impl TaskStatus {
     /// True for statuses that represent terminal/closed states where no further
     /// engine action is expected.
     pub fn is_terminal(&self) -> bool {

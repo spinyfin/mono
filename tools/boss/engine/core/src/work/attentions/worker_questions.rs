@@ -1,0 +1,87 @@
+//! Questions from workers whose parent lifecycle cannot be parked.
+use super::*;
+use boss_protocol::{OperatorAnswerType, OperatorQuestion};
+
+pub(crate) fn create_in_tx(
+    conn: &Connection,
+    task: &Task,
+    execution_id: &str,
+    question: &OperatorQuestion,
+) -> Result<(Attention, AttentionGroup)> {
+    let mut prompt = format!("{}\n\n{}", question.text, question.explanation);
+    let (question_type, choices) = match &question.answer_type {
+        OperatorAnswerType::YesNo => ("yes_no", None),
+        OperatorAnswerType::MultipleChoice { choices } => ("multiple_choice", Some(serde_json::to_string(choices)?)),
+        OperatorAnswerType::CreatePrerequisiteTask { name, brief } => {
+            prompt.push_str(&format!("\n\nPrerequisite: {name}\n\n{brief}\n\nYes creates or links this prerequisite for the work that handles this answer."));
+            ("yes_no", None)
+        }
+    };
+    create_attention_in_tx(
+        conn,
+        CreateAttentionInput::builder()
+            .kind("question")
+            .group_key(format!("worker_question|{execution_id}"))
+            .maybe_association_project_id(task.project_id.clone())
+            .maybe_association_task_id(task.project_id.is_none().then(|| task.id.clone()))
+            .source_task_id(&task.id)
+            .source_kind("task_transcript")
+            .question_type(question_type)
+            .maybe_choice_options(choices)
+            .prompt_text(prompt)
+            .build(),
+    )
+}
+
+/// Apply the original typed prerequisite to the successor, preserving the
+/// source parent's merge/block/terminal lifecycle. This shares the ordinary
+/// question approval's deduplication, dependency and dispatch behavior.
+pub(super) fn apply_prerequisite_in_tx(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    group: &AttentionGroup,
+    members: &[Attention],
+    produced_ids: &[String],
+) -> Result<()> {
+    let Some(execution_id) = group.grouping_key.strip_prefix("worker_question|") else {
+        return Ok(());
+    };
+    if !members
+        .iter()
+        .any(|m| m.answer_state == "answered" && m.answer.as_deref() == Some("yes"))
+    {
+        return Ok(());
+    }
+    let record = conn
+        .query_row(
+            &format!(
+                "{} WHERE execution_id = ?1",
+                super::super::pr_flow::OPERATOR_QUESTION_RECORD_SELECT
+            ),
+            [execution_id],
+            super::super::pr_flow::map_question,
+        )
+        .optional()?;
+    let Some(record) = record else {
+        return Ok(());
+    };
+    let OperatorAnswerType::CreatePrerequisiteTask { name, brief } = &record.question.answer_type else {
+        return Ok(());
+    };
+    let now = now_string();
+    let answered_at = chrono::DateTime::from_timestamp(now.parse::<i64>()?, 0)
+        .context("answer timestamp is outside the supported range")?;
+    for id in produced_ids {
+        let task = query_task(conn, id).require("task", id)?;
+        super::super::prerequisite_question::approve_in_tx(
+            pending,
+            conn,
+            &task,
+            &record.question,
+            (name, brief),
+            answered_at,
+            &now,
+        )?;
+    }
+    Ok(())
+}
