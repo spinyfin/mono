@@ -22,6 +22,7 @@ const TOKEN: &str = "token";
 /// records every call, and adopts the spawn token of a `new-session` so a
 /// replacement is observable the way a real server would show it.
 struct LiveCoordinatorRunner {
+    pane_pid: StdMutex<String>,
     token: StdMutex<String>,
     options: StdMutex<BTreeMap<String, String>>,
     calls: StdMutex<Vec<Vec<String>>>,
@@ -30,6 +31,7 @@ struct LiveCoordinatorRunner {
 impl Default for LiveCoordinatorRunner {
     fn default() -> Self {
         Self {
+            pane_pid: StdMutex::new(std::process::id().to_string()),
             token: StdMutex::new(TOKEN.to_owned()),
             options: StdMutex::default(),
             calls: StdMutex::default(),
@@ -47,6 +49,7 @@ impl CommandRunner for LiveCoordinatorRunner {
             Some("list-sessions") => "boss-coordinator\t\n".to_owned(),
             Some("show-environment") => format!("BOSS_SPAWN_TOKEN={}\n", self.token.lock().unwrap()),
             Some("display-message") => match args.last().map(String::as_str) {
+                Some("#{pane_pid}") => self.pane_pid.lock().unwrap().clone(),
                 Some("#{pane_id}") => "%7\n".to_owned(),
                 _ => "0\n".to_owned(),
             },
@@ -197,6 +200,57 @@ async fn fixture(timeout: Duration) -> Fixture {
         session_dir,
         _dir: temp,
     }
+}
+
+#[tokio::test]
+async fn coordinator_pid_refresh_works_without_app_and_clears_stale_pid() {
+    let f = fixture(Duration::from_secs(1)).await;
+    *f.state.app_session.lock().await = None;
+    f.state.clear_boss_pid();
+    let tmux = f.state.tmux_from_program("/usr/bin/tmux".into()).unwrap();
+    let record = f.state.work_db.coordinator_tmux_record().unwrap().unwrap();
+    sessions::refresh_coordinator_pid(&f.state, &tmux, &record).await;
+    assert_eq!(f.state.current_boss_pid(), Some(std::process::id() as libc::pid_t));
+    let mut ctx = dispatch(&f.state, &f.sink, "write-without-app");
+    ctx.peer_pid = Some(std::process::id() as libc::pid_t);
+    coordinator_handoff::handle_set_coordinator_handoff(
+        ctx,
+        FrontendRequest::SetCoordinatorHandoff {
+            body: "preserve context while the app is closed".to_owned(),
+            authorization: f.state.work_db.coordinator_handoff_authorization().unwrap().unwrap(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        next_event(&f.sink).await.1,
+        FrontendEvent::CoordinatorHandoffSet { .. }
+    ));
+    *f.runner.pane_pid.lock().unwrap() = "0".to_owned();
+    sessions::refresh_coordinator_pid(&f.state, &tmux, &record).await;
+    assert_eq!(f.state.current_boss_pid(), None);
+}
+
+#[tokio::test]
+async fn handoff_show_recovers_authorization_only_through_main_session_inbox() {
+    let f = fixture(Duration::from_secs(1)).await;
+    f.state.set_boss_pid(std::process::id() as libc::pid_t);
+    let authorization = f.state.work_db.coordinator_handoff_authorization().unwrap().unwrap();
+    let mut ctx = dispatch(&f.state, &f.sink, "read-handoff");
+    ctx.peer_pid = Some(std::process::id() as libc::pid_t);
+    coordinator_handoff::handle_get_coordinator_handoff(ctx, FrontendRequest::GetCoordinatorHandoff).await;
+    let (_, response) = next_event(&f.sink).await;
+    assert!(matches!(
+        response,
+        FrontendEvent::CoordinatorHandoffResult { handoff: None }
+    ));
+    assert!(!format!("{response:?}").contains(&authorization));
+    wait_for_prompt(&f.runner).await;
+    assert!(
+        f.runner
+            .calls()
+            .iter()
+            .any(|call| call.first().is_some_and(|v| v == "inbox") && call[1].contains(&authorization))
+    );
 }
 
 fn dispatch(state: &Arc<ServerState>, sink: &Arc<SessionSink>, request_id: &str) -> Dispatch {
@@ -401,10 +455,16 @@ async fn handoff_write_through_the_handler_replaces_the_coordinator() {
         "the new session must be launched with the brief as its initial prompt"
     );
 
-    assert_eq!(
-        std::fs::read_to_string(session_dir.join(".claude/coordinator-input/initial-prompt.txt")).unwrap(),
-        brief,
-    );
+    let delivered = std::fs::read_to_string(
+        session_dir
+            .with_extension("coordinator-input")
+            .join("initial-prompt.txt"),
+    )
+    .unwrap();
+    assert!(delivered.starts_with(&brief));
+    let authorization = state.work_db.coordinator_handoff_authorization().unwrap().unwrap();
+    assert!(delivered.contains(&authorization));
+    assert!(!brief.contains(&authorization));
 
     // The app acknowledging the viewer completes the reset, with no error.
     state

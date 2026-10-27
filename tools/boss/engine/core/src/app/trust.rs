@@ -103,6 +103,10 @@ impl ServerState {
         *self.boss_pid.lock().expect("boss_pid mutex poisoned")
     }
 
+    pub(super) fn clear_boss_pid(&self) {
+        *self.boss_pid.lock().expect("boss_pid mutex poisoned") = None;
+    }
+
     /// The pid currently trusted as the macOS app (the `RegisterAppSession`
     /// / RPC-auth trust root). `None` in test mode (no trust root).
     pub fn current_app_pid(&self) -> Option<libc::pid_t> {

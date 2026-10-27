@@ -5,6 +5,12 @@ load("//tools/test-sandbox:defs.bzl", "network_enabled_rust_test")
 load(":codex_cli_version.bzl", "CODEX_CLI_VERSION")
 load(":engine_binary.bzl", "ENGINE_BINARY_BAZEL_RUN_COMMAND", "ENGINE_BINARY_NAME", "ENGINE_BINARY_TARGET")
 
+filegroup(
+    name = "handoff_reset_prompt_source",
+    srcs = ["src/coordinator_tmux/reset_handoff.rs"],
+    visibility = ["//tools/boss/cli:__pkg__"],
+)
+
 rust_library(
     name = "engine_lib",
     srcs = glob(

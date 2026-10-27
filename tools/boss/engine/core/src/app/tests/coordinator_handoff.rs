@@ -114,7 +114,7 @@ async fn inherited_spawn_token_missing_and_stale_credentials_cannot_overwrite() 
         .unwrap();
     for token in ["", "test-token", "new-spawn", stale.as_str()] {
         let error = error_message(write_as(&state, Some(std::process::id() as libc::pid_t), token).await);
-        assert!(error.contains("private session authorization"), "{error}");
+        assert!(error.contains("private session credential"), "{error}");
         assert_eq!(result_view(get(&state).await).unwrap().body, "preserve operator facts");
     }
 }
@@ -124,13 +124,13 @@ async fn valid_credential_does_not_authorize_missing_peer_or_unrelated_process()
     let (state, _dir) = server_state();
     let token = state.work_db.coordinator_handoff_authorization().unwrap().unwrap();
     for peer in [None, Some(1)] {
-        assert!(error_message(write_as(&state, peer, &token).await).contains("private session authorization"));
+        assert!(error_message(write_as(&state, peer, &token).await).contains("private session credential"));
     }
     assert!(result_view(get(&state).await).is_none());
     *state.boss_pid.lock().unwrap() = None;
     assert!(
         error_message(write_as(&state, Some(std::process::id() as libc::pid_t), &token).await)
-            .contains("private session authorization")
+            .contains("coordinator pid unknown")
     );
 }
 
@@ -142,8 +142,8 @@ async fn worker_with_valid_credential_is_denied_read_and_write() {
     let pid = std::process::id() as libc::pid_t;
     state.worker_registry.register(pid, "worker-execution".to_owned());
     let token = state.work_db.coordinator_handoff_authorization().unwrap().unwrap();
-    assert!(error_message(write_as(&state, Some(pid), &token).await).contains("private session authorization"));
-    assert!(error_message(get(&state).await).contains("unavailable to workers"));
+    assert!(error_message(write_as(&state, Some(pid), &token).await).contains("private session credential"));
+    assert!(error_message(get(&state).await).contains("unavailable to agents"));
     match state.work_db.coordinator_handoff_state() {
         crate::coordinator_handoff::HandoffState::Present(handoff) => {
             assert_eq!(handoff.body, "preserve operator facts")
@@ -167,7 +167,7 @@ async fn subagent_or_child_with_only_inherited_environment_is_rejected() {
     let authorized = write_as(&state, Some(child.id() as libc::pid_t), &credential).await;
     child.kill().unwrap();
     child.wait().unwrap();
-    assert!(error_message(result).contains("private session authorization"));
+    assert!(error_message(result).contains("private session credential"));
     assert!(matches!(authorized, FrontendEvent::CoordinatorHandoffSet { .. }));
 }
 
@@ -196,10 +196,19 @@ fn shrink_and_rejected_caller_are_audited() {
         state
             .worker_registry
             .register(std::process::id() as libc::pid_t, "worker-execution".to_owned());
-        assert!(error_message(get(&state).await).contains("unavailable to workers"));
+        assert!(error_message(get(&state).await).contains("unavailable to agents"));
     });
     let log = std::fs::read_to_string(crate::audit::default_audit_log_path().unwrap()).unwrap();
     let events: Vec<serde_json::Value> = log.lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == "coordinator_handoff_rejected"
+                && event["pid"] == std::process::id()
+                && event["reason"]
+                    == "requires coordinator ancestry and the private session credential; agents are forbidden"
+        }),
+        "a credential-free write must be audited by the engine"
+    );
     let warnings: Vec<_> = events
         .iter()
         .filter(|event| event["event"] == "coordinator_handoff_shrink_warning" && event["writer_spawn_token"] == token)
@@ -213,10 +222,7 @@ fn shrink_and_rejected_caller_are_audited() {
         .find(|event| event["event"] == "coordinator_handoff_rejected")
         .unwrap();
     assert_eq!(denial["pid"], std::process::id());
-    assert_eq!(
-        denial["reason"],
-        "handoff read requires coordinator ancestry; workers are forbidden"
-    );
+    assert_eq!(denial["reason"], "handoff reads are unavailable to agents");
     assert_eq!(denial["caller"]["parent_chain"][0], std::process::id());
     assert!(denial["caller"]["argv"].is_string());
     assert!(
@@ -300,4 +306,19 @@ async fn an_unreadable_stored_handoff_is_an_error_not_an_empty_result() {
     state.work_db.set_metadata(HANDOFF_METADATA_KEY, "{corrupt").unwrap();
     let message = error_message(get(&state).await);
     assert!(message.contains("not valid JSON"), "got: {message}");
+}
+
+#[tokio::test]
+async fn human_terminal_can_read_without_a_coordinator_pid() {
+    let (state, _dir) = server_state();
+    set_view(set(&state, "operator context").await);
+    state.clear_boss_pid();
+    let sink = make_session_sink();
+    let mut ctx = dispatch(&state, &sink);
+    ctx.peer_pid = Some(1);
+    coordinator_handoff::handle_get_coordinator_handoff(ctx, FrontendRequest::GetCoordinatorHandoff).await;
+    assert_eq!(
+        result_view(sole_response(&sink).await).unwrap().body,
+        "operator context"
+    );
 }

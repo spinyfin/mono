@@ -885,6 +885,16 @@ async fn serve_scoped(
                         .coordinator_tmux_record()
                         .ok()
                         .flatten();
+                    if let Some(record) = record.as_ref() {
+                        crate::app::sessions::refresh_coordinator_pid(
+                            &coordinator_supervisor_state,
+                            &active_tmux,
+                            record,
+                        )
+                        .await;
+                    } else {
+                        coordinator_supervisor_state.clear_boss_pid();
+                    }
                     if let (true, Some(record)) = (app_registered, record) {
                         let attached = coordinator_supervisor_state
                             .coordinator_attached_spawn_token

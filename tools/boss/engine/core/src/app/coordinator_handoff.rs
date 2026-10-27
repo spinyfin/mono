@@ -25,7 +25,7 @@ fn current_spawn_token(work_db: &WorkDb) -> Result<Option<String>, String> {
 }
 
 fn coordinator_peer(state: &ServerState, peer: Option<libc::pid_t>) -> bool {
-    !state.classify_peer(peer).is_worker()
+    !state.classify_peer(peer).is_agent()
         && matches!((peer, state.current_boss_pid()), (Some(peer), Some(root)) if is_descendant_of_any(peer, &[root]))
 }
 
@@ -41,21 +41,24 @@ pub(super) async fn handle_get_coordinator_handoff(ctx: Dispatch, req: FrontendR
     let FrontendRequest::GetCoordinatorHandoff = req else {
         unreachable!()
     };
-    if !coordinator_peer(&server_state, peer_pid) {
+    if server_state.classify_peer(peer_pid).is_agent() {
         let expected = work_db.coordinator_handoff_authorization().ok().flatten();
         crate::audit::record_event(
             "coordinator_handoff_rejected",
             &serde_json::json!({
                 "pid": peer_pid,
                 "caller": rejected_caller(peer_pid, &[expected.as_deref().unwrap_or_default()]),
-                "reason": "handoff read requires coordinator ancestry; workers are forbidden",
+                "reason": "handoff reads are unavailable to agents",
             }),
         );
         return send_work_error(
             &sink,
             &request_id,
-            "coordinator handoff requires live coordinator process ancestry and is unavailable to workers".to_owned(),
+            "coordinator handoff is unavailable to agents".to_owned(),
         );
+    }
+    if coordinator_peer(&server_state, peer_pid) {
+        redeliver_authorization(server_state.clone());
     }
     let current = match current_spawn_token(&work_db) {
         Ok(current) => current,
@@ -91,6 +94,31 @@ pub(super) async fn handle_get_coordinator_handoff(ctx: Dispatch, req: FrontendR
     }
 }
 
+/// Never return the credential to the requesting process: a child can request
+/// recovery, but only the main coordinator's inbox receives the secret.
+fn redeliver_authorization(state: Arc<ServerState>) {
+    boss_task_scope::spawn(async move {
+        let result: anyhow::Result<()> = async {
+            let program = match &*state.tmux_preflight.read().map_err(|_| anyhow::anyhow!("tmux preflight lock poisoned"))? {
+                crate::tmux_preflight::TmuxPreflight::Ready { program, .. } => program.clone(),
+                crate::tmux_preflight::TmuxPreflight::Unavailable { reason } => anyhow::bail!("{reason}"),
+            };
+            let tmux = state.tmux_from_program(program)?;
+            let legacy = boss_tmux::Tmux::for_legacy_label_server(tmux.program().to_path_buf()).ok();
+            let guard = state.coordinator_tmux_lock.lock().await;
+            let tmux = crate::coordinator_tmux::resolve_active_handle(&tmux, legacy.as_ref()).await;
+            let record = state.work_db.coordinator_tmux_record()?.ok_or_else(|| anyhow::anyhow!("no coordinator session"))?;
+            let authorization = state.work_db.coordinator_handoff_authorization()?.ok_or_else(|| anyhow::anyhow!("no handoff authorization"))?;
+            let prompt = format!("[Boss handoff authorization] Use `boss handoff write --authorization {authorization} -` for rolling handoff writes. Keep this credential in the main session only; never delegate or archive it.");
+            drop(state.coordinator_handoff_delivery.deliver_locked(tmux, &record, &prompt, guard).await?);
+            Ok(())
+        }.await;
+        if let Err(error) = result {
+            tracing::error!(%error, "could not redeliver coordinator handoff authorization");
+        }
+    });
+}
+
 pub(super) async fn handle_set_coordinator_handoff(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         work_db,
@@ -112,6 +140,11 @@ pub(super) async fn handle_set_coordinator_handoff(ctx: Dispatch, req: FrontendR
             !expected.is_empty() && constant_time_eq(expected.as_bytes(), authorization.as_bytes())
         });
     if !permitted {
+        let reason = if coordinator_pid.is_none() {
+            "coordinator pid unknown"
+        } else {
+            "requires coordinator ancestry and the private session credential; agents are forbidden"
+        };
         let caller = rejected_caller(
             peer_pid,
             &[authorization.as_str(), expected.as_deref().unwrap_or_default()],
@@ -122,11 +155,14 @@ pub(super) async fn handle_set_coordinator_handoff(ctx: Dispatch, req: FrontendR
                 "pid": peer_pid,
                 "coordinator_pid": coordinator_pid,
                 "caller": caller,
-                "reason": "requires coordinator ancestry and the private session credential; workers are forbidden",
+                "reason": reason,
             }),
         );
-        return send_work_error(&sink, &request_id,
-            "handoff write requires the live coordinator and its private session authorization; inherited BOSS_SPAWN_TOKEN grants no access. Restart a coordinator launched before handoff authorization was installed.".to_owned());
+        return send_work_error(
+            &sink,
+            &request_id,
+            format!("handoff write rejected: {reason}; inherited BOSS_SPAWN_TOKEN grants no access"),
+        );
     }
     let body = match validate_handoff_body(&body) {
         Ok(body) => body,
