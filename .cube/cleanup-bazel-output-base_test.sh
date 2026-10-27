@@ -271,6 +271,64 @@ run_cleanup "$ws"
 assert_eq "$status" 1 "foreign retired tree stays withheld"
 assert_exists "$base.cube-removing/execroot" "foreign retired tree is untouched"
 
+# An empty or partial legacy ownership write can use the still-intact marker.
+for partial in '' '/'; do
+  new_scenario
+  ws="$(make_workspace mono-agent-001)"
+  base="$(make_base aaaa "$ws")"
+  printf '%s' "$partial" >"$base.cube-removing-owner"
+  run_cleanup "$ws"
+  assert_eq "$status" 0 "partial initial ownership record recovers"
+  assert_missing "$base" "intact marker allows retirement"
+done
+
+# Simulate ENOSPC at publication: the base and old record remain untouched.
+new_scenario
+ws="$(make_workspace mono-agent-001)"
+base="$(make_base aaaa "$ws")"
+# Inject a failing printf that leaves partial bytes in the temporary record.
+printf '%s\n' 'printf() { builtin printf /; return 1; }' >"$root/fail-write.sh"
+run_cleanup "$ws" BASH_ENV="$root/fail-write.sh"
+assert_eq "$status" 1 "partial temporary record write withholds"
+assert_exists "$base/DO_NOT_BUILD_HERE" "partial write leaves marker intact"
+assert_missing "$base.cube-removing-owner" "partial bytes never become final record"
+printf '%s\n' '#!/bin/sh' 'exit 1' >"$fakebin/mv"
+chmod +x "$fakebin/mv"
+run_cleanup "$ws"
+assert_eq "$status" 1 "failed record publication withholds"
+assert_exists "$base/DO_NOT_BUILD_HERE" "failed write leaves base intact"
+assert_missing "$base.cube-removing-owner" "failed write never publishes partial record"
+rm "$fakebin/mv"
+run_cleanup "$ws"
+assert_eq "$status" 0 "retry after publication failure succeeds"
+
+# Retry must not rewrite a verified record even when writes would fail.
+new_scenario
+ws="$(make_workspace mono-agent-001)"
+base="$(make_base aaaa "$ws")"
+printf '%s\n' "$ws" >"$base.cube-removing-owner"
+chmod 0444 "$base.cube-removing-owner"
+mv "$base" "$base.cube-removing"
+rm "$base.cube-removing/DO_NOT_BUILD_HERE"
+printf '%s\n' '#!/bin/sh' 'exit 1' >"$fakebin/rm"
+chmod +x "$fakebin/rm"
+run_cleanup "$ws"
+assert_eq "$status" 1 "interrupted retry withholds"
+assert_eq "$(cat "$base.cube-removing-owner")" "$ws" "retry preserves sole ownership evidence"
+/bin/rm "$fakebin/rm"
+run_cleanup "$ws"
+assert_eq "$status" 0 "retry finishes without rewriting read-only record"
+
+# No Python is required to recognize already-cleaned dangling links.
+printf '%s\n' '#!/bin/sh' 'exit 1' >"$fakebin/python3"
+chmod +x "$fakebin/python3"
+run_cleanup "$ws"
+assert_eq "$status" 0 "dangling links need no Python"
+printf '%s\n' '#!/bin/sh' 'exit 1' >"$fakebin/readlink"
+chmod +x "$fakebin/readlink"
+run_cleanup "$ws"
+assert_eq "$status" 0 "unreadable dangling links are skipped"
+
 if [ "$failures" -ne 0 ]; then
   echo "$failures assertion(s) failed" >&2
   exit 1

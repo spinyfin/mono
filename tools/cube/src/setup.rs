@@ -41,17 +41,16 @@ pub const CLEANUP_BUSY_EXIT_CODE: i32 = 75;
 /// command must be idempotent: a cleanup that was interrupted is re-run from
 /// the top.
 ///
-/// The declaration may have been read from the repo's source checkout rather
-/// than the workspace (see [`read_cleanup_step`]), and a workspace on an older
+/// The declaration and its .cube assets are exported from fetched trunk,
+/// independently of the source working copy, and a workspace on an older
 /// revision may not contain the files the command refers to. cube therefore
-/// exports `CUBE_CLEANUP_ROOT`, the checkout the declaration came from, so a
+/// exports `CUBE_CLEANUP_ROOT`, the snapshot the declaration came from, so a
 /// command can address its own assets as `"$CUBE_CLEANUP_ROOT/.cube/..."`
-/// whichever checkout declared it.
+/// without depending on its own branch.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct CleanupStep {
     pub command: String,
-    /// The checkout whose `.cube/setup.yaml` declared this step. Set by
-    /// [`read_cleanup_step`], never by the file.
+    /// The root containing the cleanup declaration and assets, set by cube.
     #[serde(skip)]
     pub root: Option<PathBuf>,
 }
@@ -277,21 +276,6 @@ pub fn read_setup_config(workspace_path: &Path) -> Result<Option<SetupConfig>, C
     Ok(Some(config))
 }
 
-/// The cleanup step to run for a workspace of a repo, if the repo declares one.
-///
-/// Prefer the canonical source so unattended cleanup does not execute a
-/// declaration left on an unmerged workspace branch. Use the workspace only
-/// when the source declares no cleanup.
-pub fn read_cleanup_step(workspace_path: &Path, fallback: Option<&Path>) -> Result<Option<CleanupStep>, CubeError> {
-    for root in fallback.into_iter().chain(std::iter::once(workspace_path)) {
-        if let Some(mut cleanup) = read_setup_config(root)?.and_then(|config| config.cleanup) {
-            cleanup.root = Some(root.to_path_buf());
-            return Ok(Some(cleanup));
-        }
-    }
-    Ok(None)
-}
-
 /// The environment cube gives every repo-declared command it runs against a
 /// workspace (setup steps and the cleanup step alike).
 pub fn workspace_step_env(workspace_path: &Path, source: Option<&Path>) -> Vec<(String, String)> {
@@ -451,8 +435,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        FingerprintInput, RunPolicy, SetupConfig, SetupStep, compute_fingerprint, decide_action, read_cleanup_step,
-        read_setup_config, setup_config_path,
+        FingerprintInput, RunPolicy, SetupConfig, SetupStep, compute_fingerprint, decide_action, read_setup_config,
+        setup_config_path,
     };
     use crate::store::WorkspaceSetupState;
 
@@ -533,53 +517,6 @@ steps:
         .unwrap();
         let err = read_setup_config(temp.path()).unwrap_err();
         assert!(err.to_string().contains("cleanup step has an empty command"));
-    }
-
-    #[test]
-    fn cleanup_step_prefers_the_source_checkout() {
-        let workspace = TempDir::new().unwrap();
-        let source = TempDir::new().unwrap();
-        fs::create_dir_all(setup_config_path(source.path()).parent().unwrap()).unwrap();
-        fs::write(
-            setup_config_path(source.path()),
-            "version: 1\ncleanup:\n  command: from-source\n",
-        )
-        .unwrap();
-
-        // The workspace declares nothing (e.g. it sits on an older commit).
-        let found = read_cleanup_step(workspace.path(), Some(source.path())).unwrap();
-        let found = found.unwrap();
-        assert_eq!(found.command, "from-source");
-        assert_eq!(
-            found.root.as_deref(),
-            Some(source.path()),
-            "the step remembers where it came from"
-        );
-
-        // An unmerged workspace declaration cannot override the source.
-        fs::create_dir_all(setup_config_path(workspace.path()).parent().unwrap()).unwrap();
-        fs::write(
-            setup_config_path(workspace.path()),
-            "version: 1\ncleanup:\n  command: from-workspace\n",
-        )
-        .unwrap();
-        let found = read_cleanup_step(workspace.path(), Some(source.path())).unwrap();
-        let found = found.unwrap();
-        assert_eq!(found.command, "from-source");
-        assert_eq!(found.root.as_deref(), Some(source.path()));
-
-        fs::write(setup_config_path(source.path()), "version: 1\nsteps: []\n").unwrap();
-        let found = read_cleanup_step(workspace.path(), Some(source.path()))
-            .unwrap()
-            .unwrap();
-        assert_eq!(found.command, "from-workspace");
-        assert_eq!(found.root.as_deref(), Some(workspace.path()));
-
-        assert!(
-            read_cleanup_step(source.path().join("missing").as_path(), None)
-                .unwrap()
-                .is_none()
-        );
     }
 
     #[test]

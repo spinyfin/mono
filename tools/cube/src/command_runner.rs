@@ -20,6 +20,15 @@ pub struct CommandInvocation {
 }
 
 pub trait CommandRunner {
+    /// Export command output without stripping whitespace or decoding bytes.
+    fn run_to_file(
+        &self,
+        invocation: &CommandInvocation,
+        destination: &Path,
+        timeout: Duration,
+    ) -> Result<(), CubeError> {
+        std::fs::write(destination, self.run_with_timeout(invocation, timeout)?).map_err(CubeError::Io)
+    }
     /// Shared-store critical section for PR bookmark writes and GC.
     fn lock_pr_bookmarks(&self, cwd: &Path) -> Result<crate::lock::RepoLock, CubeError> {
         crate::lock::RepoLock::for_workspace(cwd)
@@ -96,6 +105,29 @@ impl RealCommandRunner {
 }
 
 impl CommandRunner for RealCommandRunner {
+    fn run_to_file(
+        &self,
+        invocation: &CommandInvocation,
+        destination: &Path,
+        timeout: Duration,
+    ) -> Result<(), CubeError> {
+        let output = self
+            .run_with_timeout_capturing_output(invocation, &[], timeout)?
+            .ok_or_else(|| CubeError::CommandTimedOut {
+                program: invocation.program.clone(),
+                args: invocation.args.clone(),
+                timeout_secs: timeout.as_secs(),
+            })?;
+        if !output.status.success() {
+            return Err(CubeError::CommandFailed {
+                program: invocation.program.clone(),
+                args: invocation.args.clone(),
+                status: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+        std::fs::write(destination, output.stdout).map_err(CubeError::Io)
+    }
     fn run(&self, invocation: &CommandInvocation) -> Result<String, CubeError> {
         let mut cmd = Command::new(&invocation.program);
         cmd.args(&invocation.args).current_dir(&invocation.cwd);

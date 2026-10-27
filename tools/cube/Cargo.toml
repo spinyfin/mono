@@ -22,7 +22,7 @@ thiserror = { workspace = true }
 toml = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 which = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 boss-engine-test-git = { path = "../boss/engine/test-git" }
-tempfile = { workspace = true }

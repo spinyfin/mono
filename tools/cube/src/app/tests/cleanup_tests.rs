@@ -624,7 +624,9 @@ fn throttle_pool() -> Pool {
 #[test]
 fn slow_periodic_cleanup_does_not_delay_a_lease_claim() {
     let _env = super::support::ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let pool = Pool::seed(2);
+    let mut pool = Pool::seed(2);
+    let (low, _) = marks();
+    let _volume = testing::with_reading(volume_with_free(low - GIB));
     write_setup_yaml(&pool.workspaces[0], "version: 1\ncleanup:\n  command: 'sleep 2'\n");
     let start = std::time::Instant::now();
     let mut command = std::process::Command::new(std::env::var_os("CUBE_TEST_BIN").unwrap());
@@ -634,7 +636,24 @@ fn slow_periodic_cleanup_does_not_delay_a_lease_claim() {
         .arg(&pool.database_path);
     command.env("CUBE_CONFIG_DIR", pool.tempdir.path());
     command.env("CUBE_POOL_MIN_FREE_BYTES", u64::MAX.to_string());
-    let mut child = crate::app::periodic_cleanup::spawn_command(&mut command).unwrap();
+    let log = pool.tempdir.path().join("periodic-cleanup.log");
+    let child = std::cell::RefCell::new(None);
+    let command = std::cell::RefCell::new(command);
+    crate::app::gc::maybe_trigger_pool_gc_with_spawner(
+        &mut pool.store,
+        Some(&pool.database_path),
+        crate::app::util::current_epoch_s().unwrap(),
+        &|database| {
+            assert_eq!(database, Some(pool.database_path.as_path()));
+            *child.borrow_mut() = Some(crate::app::periodic_cleanup::spawn_command(
+                &mut command.borrow_mut(),
+                &log,
+            )?);
+            Ok(())
+        },
+    )
+    .unwrap();
+    let mut child = child.into_inner().expect("pool GC requested cleanup");
     assert!(start.elapsed() < std::time::Duration::from_secs(1));
     while pool.cleanup_status(0) != Some(CleanupStatus::Running) {
         assert!(
@@ -650,6 +669,11 @@ fn slow_periodic_cleanup_does_not_delay_a_lease_claim() {
     assert!(claim_started.elapsed() < std::time::Duration::from_secs(1));
     assert!(child.wait().unwrap().success());
     assert_eq!(pool.cleanup_status(0), None);
+    assert!(
+        std::fs::read_to_string(log)
+            .unwrap()
+            .contains("cube: auto gc: workspace cleanup:")
+    );
 }
 
 #[test]
@@ -682,6 +706,7 @@ fn gc_clear_failed_cleanup_under_pressure_does_not_run_cleanup_again() {
 #[test]
 fn low_free_space_retriggers_the_pool_gc_well_before_24h() {
     use crate::app::gc::{POOL_GC_LAST_AT_KEY, POOL_GC_STARTED_AT_KEY, maybe_trigger_pool_gc};
+    crate::app::periodic_cleanup::SPAWN_REQUESTS.with(|requests| requests.borrow_mut().clear());
     let (low, _) = marks();
     let mut pool = throttle_pool();
     let now = crate::app::util::current_epoch_s().unwrap();
@@ -710,6 +735,9 @@ fn low_free_space_retriggers_the_pool_gc_well_before_24h() {
         Some(now),
         "disk pressure should force a pass despite being < 24h since the last one"
     );
+    crate::app::periodic_cleanup::SPAWN_REQUESTS.with(|requests| {
+        assert_eq!(*requests.borrow(), vec![Some(pool.database_path.clone())]);
+    });
 }
 
 #[test]
@@ -803,43 +831,6 @@ fn real_commands_run_in_the_workspace_and_exit_statuses_map_to_outcomes() {
         .find(|e| e["event"] == "workspace.cleanup" && e["workspace_id"] == "mono-agent-003")
         .unwrap();
     assert!(failure["output"].as_str().unwrap().contains("disk on fire"));
-}
-
-/// The fallback case: only the repo's source checkout has the script, the
-/// workspace (on an older revision) does not. The command finds it through
-/// `CUBE_CLEANUP_ROOT`, and the workspace is cleaned rather than withheld.
-#[test]
-fn a_cleanup_script_only_the_source_checkout_has_is_found_through_cleanup_root() {
-    use crate::command_runner::RealCommandRunner;
-
-    // Spawns real processes: keep PATH-mutating tests out while it does.
-    let _env = super::support::ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-
-    let (low, _) = marks();
-    let pool = Pool::seed(1);
-    let source = pool.tempdir.path().join("source");
-    std::fs::create_dir_all(&source).unwrap();
-    std::fs::write(source.join("clean.sh"), "touch \"$CUBE_WORKSPACE/cleaned.marker\"\n").unwrap();
-    write_setup_yaml(
-        &source,
-        "version: 1\ncleanup:\n  command: 'sh \"$CUBE_CLEANUP_ROOT/clean.sh\"'\n",
-    );
-    // The workspace predates the declaration; the repo's source is the fallback.
-    write_setup_yaml(&pool.workspaces[0], "version: 1\nsteps: []\n");
-    let mut repo = pool.store.get_repo("mono").unwrap().unwrap();
-    repo.source = Some(source.clone());
-    pool.store.upsert_repo(&repo).unwrap();
-    let _volume = testing::with_reading(volume_with_free(low - GIB));
-
-    let report = pool.pass(&RealCommandRunner, false);
-
-    assert!(report.failed.is_empty(), "{:?}", report.failed);
-    assert_eq!(report.cleaned.len(), 1);
-    assert!(
-        pool.workspaces[0].join("cleaned.marker").exists(),
-        "the script ran against the workspace though only the source has it"
-    );
-    assert_eq!(pool.cleanup_status(0), None);
 }
 
 /// Shell errors may follow partial cleanup and must keep the mark.

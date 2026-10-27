@@ -48,7 +48,7 @@
 //!   per-repo lease lock, so leases never wait on it) across its free-space
 //!   decisions, the commands and the measurements. A manual pass waits its turn
 //!   and then re-reads free space, so it cleans nothing the pass before it
-//!   already made unnecessary; the periodic pass, which runs inside a lease,
+//!   already made unnecessary; the periodic pass, running in a detached process,
 //!   skips itself when another is running.
 //! - **Not workspaces holding recoverable work.** Dirty, conflicted and
 //!   quarantined workspaces are skipped: a recovery lease (`--allow-dirty`) must
@@ -79,7 +79,8 @@ use crate::command_runner::{CommandInvocation, CommandRunner};
 use crate::config;
 use crate::lock::RepoLock;
 use crate::metadata::{RepoRecord, WorkspaceHealth, WorkspaceRecord, WorkspaceState};
-use crate::setup::{CLEANUP_BUSY_EXIT_CODE, CleanupStep, read_cleanup_step, workspace_step_env};
+use crate::setup::{CLEANUP_BUSY_EXIT_CODE, CleanupStep, workspace_step_env};
+use crate::setup_cleanup::{ResolvedCleanup, read_cleanup_step};
 use crate::store::{CleanupResult, CleanupStatus, Store, WorkspaceCleanupState, WorkspaceListFilter};
 
 use crate::app::disk::{DiskSpace, human_bytes};
@@ -108,7 +109,7 @@ const AUDIT_OUTPUT_LIMIT: usize = 2048;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum CleanupTrigger {
-    /// The pool GC pass that runs from `cube workspace lease`.
+    /// The detached `cube periodic-cleanup` pass triggered by pool GC.
     Periodic,
     /// An explicit `cube workspace gc` invocation.
     Manual,
@@ -292,7 +293,7 @@ struct Candidate {
     repo: RepoRecord,
     /// `None` only for a workspace that still carries a mark although its repo
     /// no longer declares a cleanup step; the unresolved failure stays withheld.
-    step: Option<CleanupStep>,
+    step: Option<ResolvedCleanup>,
     reason: CleanupReason,
 }
 
@@ -304,7 +305,12 @@ struct Candidates {
     by_lru: Vec<Candidate>,
 }
 
-fn collect_candidates(store: &Store, opts: &CleanupOptions<'_>, now_epoch_s: i64) -> Result<Candidates> {
+fn collect_candidates(
+    runner: &dyn CommandRunner,
+    store: &Store,
+    opts: &CleanupOptions<'_>,
+    now_epoch_s: i64,
+) -> Result<Candidates> {
     let repos: HashMap<String, RepoRecord> = store
         .list_repos()?
         .into_iter()
@@ -363,7 +369,12 @@ fn collect_candidates(store: &Store, opts: &CleanupOptions<'_>, now_epoch_s: i64
                 (CleanupReason::LowDisk, false)
             }
         };
-        let step = match read_cleanup_step(&record.workspace_path, repo.source.as_deref()) {
+        let step = match read_cleanup_step(
+            runner,
+            &record.workspace_path,
+            repo.source.as_deref(),
+            &repo.main_branch,
+        ) {
             Ok(Some(step)) => Some(step),
             Ok(None) if retry => None,
             Ok(None) => continue,
@@ -448,7 +459,7 @@ pub(super) fn run_cleanup_pass(
             }
         }
     }
-    let candidates = match collect_candidates(store, opts, now) {
+    let candidates = match collect_candidates(runner, store, opts, now) {
         Ok(candidates) => candidates,
         Err(e) => {
             eprintln!("cube: cleanup: failed to list workspaces: {e}");
@@ -505,8 +516,8 @@ pub(super) fn run_cleanup_pass(
 }
 
 /// The lock that keeps cleanup passes from overlapping. A dry run changes
-/// nothing and needs none. The periodic pass runs inside a lease and must not
-/// make it wait on a cleanup command, so it yields; a manual pass waits.
+/// nothing and needs none. The detached periodic pass yields because the next
+/// trigger will retry; a manual pass waits.
 fn acquire_pass_lock(database_path: Option<&Path>, opts: &CleanupOptions<'_>) -> Result<Option<Option<RepoLock>>> {
     if opts.dry_run {
         return Ok(Some(None));
