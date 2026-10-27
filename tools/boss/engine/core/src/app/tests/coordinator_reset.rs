@@ -18,6 +18,9 @@ use boss_protocol::CoordinatorRecreateReason;
 
 const TOKEN: &str = "token";
 
+#[path = "coordinator_reset_latency.rs"]
+mod latency;
+
 /// Models a live coordinator tmux server: answers the read-only probes,
 /// records every call, and adopts the spawn token of a `new-session` so a
 /// replacement is observable the way a real server would show it.
@@ -25,6 +28,7 @@ struct LiveCoordinatorRunner {
     token: StdMutex<String>,
     options: StdMutex<BTreeMap<String, String>>,
     calls: StdMutex<Vec<Vec<String>>>,
+    legacy_delay: StdMutex<Duration>,
 }
 
 impl Default for LiveCoordinatorRunner {
@@ -33,6 +37,7 @@ impl Default for LiveCoordinatorRunner {
             token: StdMutex::new(TOKEN.to_owned()),
             options: StdMutex::default(),
             calls: StdMutex::default(),
+            legacy_delay: StdMutex::default(),
         }
     }
 }
@@ -41,6 +46,17 @@ impl Default for LiveCoordinatorRunner {
 impl CommandRunner for LiveCoordinatorRunner {
     async fn run(&self, _: &Path, args: &[OsString], _: Option<&Path>) -> std::io::Result<CommandOutput> {
         let args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        if args.first().map(String::as_str) == Some("-L") {
+            let delay = *self.legacy_delay.lock().unwrap();
+            tokio::time::sleep(delay).await;
+            self.calls.lock().unwrap().push(args);
+            return Ok(CommandOutput {
+                success: false,
+                code: Some(1),
+                stdout: String::new(),
+                stderr: "no server running".into(),
+            });
+        }
         let mut success = true;
         let mut stderr = String::new();
         let stdout = match args.get(2).map(String::as_str) {

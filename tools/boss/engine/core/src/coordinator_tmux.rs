@@ -720,9 +720,8 @@ async fn session_exists(tmux: &Tmux, name: &str) -> Result<bool> {
 }
 
 /// Resolve which tmux server currently hosts the coordinator session:
-/// `socket_tmux` (the durable `-S` socket) unless a live
-/// [`COORDINATOR_SESSION_NAME`] session survives on the pre-move `-L boss`
-/// server, in which case `legacy_tmux`.
+/// Prefer the durable socket when it has the coordinator session. Otherwise
+/// check for a surviving session on the pre-move legacy server.
 ///
 /// Every coordinator lifecycle entry point (`ensure_for_attach`,
 /// `restart_if_dead`, `recreate_after_confirmation`) takes a single `&Tmux`
@@ -745,6 +744,11 @@ pub(crate) async fn resolve_active_handle<'a>(socket_tmux: &'a Tmux, legacy_tmux
     let Some(legacy) = legacy_tmux else {
         return socket_tmux;
     };
+    // Once the durable server has the coordinator, an unrelated retired
+    // server must not delay reset, supervisor recovery or app attachment.
+    if matches!(session_exists(socket_tmux, COORDINATOR_SESSION_NAME).await, Ok(true)) {
+        return socket_tmux;
+    }
     match session_exists(legacy, COORDINATOR_SESSION_NAME).await {
         Ok(true) => {
             tracing::warn!(
@@ -1782,8 +1786,11 @@ mod tests {
             "a coordinator surviving on -L boss must be routed to instead of the durable socket",
         );
         assert!(
-            socket_server.calls().is_empty(),
-            "resolving which handle to use must never itself probe the socket server",
+            socket_server
+                .calls()
+                .iter()
+                .all(|call| call.get(2).map(String::as_str) == Some("list-sessions")),
+            "resolution may probe the durable server but must not mutate it",
         );
     }
 

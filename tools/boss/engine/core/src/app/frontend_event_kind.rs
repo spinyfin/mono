@@ -135,6 +135,7 @@ pub(super) fn kind(event: &FrontendEvent) -> &'static str {
         FrontendEvent::PrBodyResult { .. } => "PrBodyResult",
         FrontendEvent::CoordinatorHandoffResult { .. } => "CoordinatorHandoffResult",
         FrontendEvent::CoordinatorHandoffSet { .. } => "CoordinatorHandoffSet",
+        FrontendEvent::CoordinatorResetRequestStatus { .. } => "CoordinatorResetRequestStatus",
         FrontendEvent::CoordinatorGuidanceList { .. } => "CoordinatorGuidanceList",
         FrontendEvent::UnpopulateProjectResult { .. } => "UnpopulateProjectResult",
         FrontendEvent::FeatureFlagsList { .. } => "FeatureFlagsList",

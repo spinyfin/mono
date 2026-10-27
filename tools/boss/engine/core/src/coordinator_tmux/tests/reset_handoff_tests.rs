@@ -534,8 +534,8 @@ async fn a_lifecycle_lock_held_too_long_fails_the_reset_loudly_instead_of_stalli
     .unwrap_err();
     let message = format!("{error:#}");
     assert!(
-        message.starts_with(crate::coordinator_tmux::reset_handoff::DELIVERY_FAILED_PREFIX),
-        "the app keeps the reset UI open and offers a forced reset: {message}"
+        !message.contains(crate::coordinator_tmux::reset_handoff::DELIVERY_FAILED_PREFIX),
+        "contention must not offer a futile forced reset: {message}"
     );
     assert!(
         server.calls().is_empty(),
