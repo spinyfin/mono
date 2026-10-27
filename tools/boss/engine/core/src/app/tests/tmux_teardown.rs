@@ -80,7 +80,7 @@ async fn no_such_session_releases_the_pool_slot_after_a_refused_reap() {
 }
 
 #[tokio::test]
-async fn terminal_run_loses_attribution_even_when_teardown_is_refused() {
+async fn terminal_run_retains_confinement_when_teardown_is_refused() {
     let (state, _dir) = test_server_state();
     let product = create_product(&state.work_db);
     let item = create_active_chore(&state.work_db, &product, "finished worker");
@@ -94,7 +94,8 @@ async fn terminal_run_loses_attribution_even_when_teardown_is_refused() {
 
     assert_eq!(state.release_worker_pane(&exec).await, PaneReleaseOutcome::NoLiveWorker);
     assert_eq!(state.worker_registry.slot_for_run(&exec), Some(1));
-    assert_eq!(state.worker_registry.lookup_with_ancestor_walk(peer_pid), None);
+    assert_eq!(state.worker_registry.lookup_with_ancestor_walk(peer_pid), Some(exec));
+    assert!(state.classify_peer(Some(peer_pid)).is_worker());
 }
 
 /// The cardinal case: live token matches, so the pane pid's process group

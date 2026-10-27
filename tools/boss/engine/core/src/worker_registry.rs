@@ -13,8 +13,8 @@
 //!
 //! # Identity, not just a pid
 //!
-//! A bare pid is not an identity: the kernel recycles pids, and this
-//! machine wraps its counter within minutes under load. Every entry is
+//! A bare pid is not an identity: the kernel recycles pids, and a busy
+//! host can wrap its pid counter within minutes under load. Every entry is
 //! therefore keyed by the pid *and* the process start time captured at
 //! registration. An ancestor-walk hit only counts when the live process at
 //! that pid still has the registered start time; a mismatch means the

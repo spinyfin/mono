@@ -419,9 +419,8 @@ impl ServerState {
                     self.worker_registry.register_run_slot(run_id.to_owned(), slot_id);
                 }
             }
-            if let Some(shell_pid) = observed_shell_pid {
-                self.worker_registry.register(shell_pid, run_id.to_owned());
-            }
+            // Durable pids can be recycled across restart. Process identity is
+            // registered by tmux adoption after observing the live pane pid.
             let binding =
                 self.work_db
                     .get_work_item(&restored.work_item_id)

@@ -1,9 +1,9 @@
 //! `FrontendRequest` handlers — the mediated worker→engine proposal API.
 //!
 //! Two verbs: `SubmitProposal` (write) and `ListProposals` (read). Both are
-//! attributed the same way and both refuse the same way, so the attribution
-//! step lives in one place ([`attribute_caller`]) rather than being spelled
-//! twice with a chance of drifting.
+//! attributed from the same verified process identity. Ended executions
+//! cannot read context or submit new work, but may replay a persisted
+//! proposal with the same idempotency key.
 //!
 //! ## Attribution is derived, never declared
 //!
@@ -192,6 +192,17 @@ pub(super) fn attribute_caller(
     peer_pid: Option<libc::pid_t>,
     claimed_run_id: &str,
 ) -> std::result::Result<AttributedCaller, ProposalSubmissionError> {
+    attribute_peer(server_state, work_db, peer_pid, claimed_run_id, false)
+}
+
+// Submission may identify an ended peer only for a durable replay lookup.
+fn attribute_peer(
+    server_state: &ServerState,
+    work_db: &WorkDb,
+    peer_pid: Option<libc::pid_t>,
+    claimed_run_id: &str,
+    allow_replay_lookup: bool,
+) -> std::result::Result<AttributedCaller, ProposalSubmissionError> {
     let Some(peer_pid) = peer_pid else {
         tracing::warn!(
             claimed_run_id,
@@ -257,8 +268,7 @@ pub(super) fn attribute_caller(
                     "proposal attribution rejected: failed to read execution status");
                 ProposalSubmissionError::new(ProposalErrorCode::Internal, format!("failed to read execution: {err}"))
             })?;
-            if execution.status.is_terminal() {
-                server_state.worker_registry.forget_run_pids(&resolved_run_id);
+            if execution.status.is_terminal() && !allow_replay_lookup {
                 tracing::warn!(peer_pid, matched_pid, %resolved_run_id, %chain,
                     "proposal attribution rejected: execution has ended");
                 return Err(ProposalSubmissionError::new(
@@ -285,7 +295,6 @@ pub(super) fn attribute_caller(
         // caller's fault and not fixable by it, so it gets its own code
         // rather than being folded into the attribution failures above.
         Ok(None) => {
-            server_state.worker_registry.forget_run_pids(&resolved_run_id);
             tracing::warn!(peer_pid, matched_pid, %resolved_run_id, %chain,
                 "proposal attribution rejected: unknown execution");
             Err(ProposalSubmissionError::new(
@@ -338,7 +347,7 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
         unreachable!()
     };
 
-    let caller = match attribute_caller(&server_state, &work_db, peer_pid, &run_id) {
+    let caller = match attribute_peer(&server_state, &work_db, peer_pid, &run_id, true) {
         Ok(caller) => caller,
         Err(error) => {
             tracing::warn!(
@@ -404,6 +413,55 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
         }
         None => derive_idempotency_key(&caller.execution_id, kind, &validated.canonical_json),
     };
+
+    // Ended peers may recover an acknowledgement, but cannot create new work.
+    match work_db.get_execution(&caller.execution_id) {
+        Ok(execution) if execution.status.is_terminal() => {
+            match work_db.find_worker_proposal_by_idempotency_key(&caller.execution_id, &idempotency_key) {
+                Ok(Some(proposal)) if proposal.kind == kind => {
+                    return send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::ProposalSubmitted {
+                            proposal,
+                            already_submitted: true,
+                        },
+                    );
+                }
+                Ok(_) => {
+                    return send_rejection(
+                        &sink,
+                        &request_id,
+                        ProposalSubmissionError::new(
+                            ProposalErrorCode::AttributionUnresolved,
+                            "execution has ended and can only replay existing proposals",
+                        ),
+                    );
+                }
+                Err(error) => {
+                    return send_rejection(
+                        &sink,
+                        &request_id,
+                        ProposalSubmissionError::new(
+                            ProposalErrorCode::Internal,
+                            format!("failed to look up proposal replay: {error}"),
+                        ),
+                    );
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            return send_rejection(
+                &sink,
+                &request_id,
+                ProposalSubmissionError::new(
+                    ProposalErrorCode::Internal,
+                    format!("failed to read execution: {error}"),
+                ),
+            );
+        }
+    }
 
     // Serialise the whole wait submission per execution (replay lookup,
     // budget check, DB acceptance, grant commit) so concurrent declarations

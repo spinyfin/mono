@@ -723,6 +723,13 @@ async fn readoption_registers_the_durable_tmux_session_name() {
         "the readopted slot must carry the durable tmux session name",
     );
     assert!(server_state.pane_write_transport_ready(&execution_id).is_ok());
+    assert_eq!(
+        server_state
+            .worker_registry
+            .lookup_with_ancestor_walk(std::process::id() as i32),
+        None,
+        "a durable pid alone must not grant process attribution after restart",
+    );
 
     // Readoption restores live-state via the spawn entry, which leaves
     // activity at `Spawning`. Typed input is accepted only at Idle /

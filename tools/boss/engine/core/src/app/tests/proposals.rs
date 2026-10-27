@@ -1105,7 +1105,7 @@ async fn a_replayed_review_report_acceptance_still_reaches_the_finalizer() {
     let payload = review_report_payload(&batch_id, "head-sha");
 
     // Simulate the crash after persistence and before the RPC handler calls
-    // the finalizer. The execution must still be live for an attributed retry.
+    // the finalizer. This retry must still finish the live execution.
     let persisted = server_state
         .work_db
         .submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
@@ -1152,7 +1152,7 @@ async fn a_replayed_review_report_acceptance_still_reaches_the_finalizer() {
             .status
             .is_terminal()
     );
-    let late = rejected(
+    let (late, already) = submitted(
         call_with_peer(
             &server_state,
             Some(peer_pid),
@@ -1165,7 +1165,8 @@ async fn a_replayed_review_report_acceptance_still_reaches_the_finalizer() {
         )
         .await,
     );
-    assert_eq!(late.code, ProposalErrorCode::AttributionUnresolved);
+    assert!(already);
+    assert_eq!(late.id, first.id);
 }
 
 /// A leaf with a real durable `shell_pid` must be genuinely reaped by the
@@ -2224,7 +2225,7 @@ async fn a_peer_resolving_to_a_pruned_execution_is_refused() {
 // ── Rate caps ────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn terminal_execution_is_refused_and_its_pid_is_forgotten() {
+async fn terminal_execution_is_refused_and_its_peer_stays_confined() {
     let fx = WorkerFixture::new();
     fx.server_state
         .work_db
@@ -2239,10 +2240,11 @@ async fn terminal_execution_is_refused_and_its_pid_is_forgotten() {
             .is_terminal()
     );
     let error = rejected(submit(&fx, ProposalKind::Blocked, json!({"reason": "late call"})).await);
+    assert!(fx.server_state.classify_peer(Some(fx.peer_pid)).is_worker());
     assert_eq!(error.code, ProposalErrorCode::AttributionUnresolved);
     assert_eq!(
         fx.server_state.worker_registry.lookup_with_ancestor_walk(fx.peer_pid),
-        None
+        Some(fx.execution_id.clone())
     );
 }
 
@@ -2751,11 +2753,13 @@ async fn review_guide_submission_publishes_for_its_attributed_codex_execution() 
         .unwrap();
     assert_eq!(version.markdown, guide);
     assert!(db.get_execution(&execution.id).unwrap().status.is_terminal());
-    // Even a stale registration cannot authorize a finished execution.
+    // The same key recovers its acknowledgement after finalization.
     state.worker_registry.register(pid, execution.id.clone());
     let replay = call_with_peer(&state, Some(pid), request()).await;
-    assert_eq!(rejected(replay).code, ProposalErrorCode::AttributionUnresolved);
-    assert_eq!(state.worker_registry.lookup_with_ancestor_walk(pid), None);
+    let (replayed, already) = submitted(replay);
+    assert!(already);
+    assert_eq!(replayed.id, proposal.id);
+    assert_eq!(state.worker_registry.lookup_with_ancestor_walk(pid), Some(execution.id));
 }
 
 #[tokio::test]
