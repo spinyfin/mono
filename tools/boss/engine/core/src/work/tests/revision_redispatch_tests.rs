@@ -66,11 +66,10 @@ fn run_revision_to_pending_review_hold(db: &WorkDb, revision_id: &str, pr_url: &
     exec.id
 }
 
-/// The incident sequence, step for step: a completed revision held for
-/// review is `active` with a terminal execution and no live execution of
-/// its own (the reviewer runs against the chain root). The product-wide
-/// reconciler used to read that as "needs dispatch" and mint a fresh
-/// `revision_implementation` that redid the landed work.
+/// A completed revision held for review is `active` with a terminal
+/// execution and no live execution; the product-wide reconciler must not
+/// treat it as needing dispatch, so no new `revision_implementation` is
+/// minted.
 #[test]
 fn product_reconcile_does_not_remint_a_delivered_revision_held_for_review() {
     let (db, product_id, _root_id, revision_id, pr_url) = seed_delivered_revision("delivered-hold-reconcile");
@@ -426,4 +425,130 @@ fn status_moves_record_reason_and_transition_ledger() {
     );
     assert_eq!(last.actor, "human");
     assert_eq!(last.reason, None);
+}
+
+/// An abandoned never-started `revision_implementation` created after
+/// delivery must not shadow the completed sibling: the product reconciler,
+/// startup/on-release rescans, and the orphan candidate query leave the
+/// delivered revision alone.
+#[test]
+fn abandoned_duplicate_after_delivery_does_not_remint() {
+    let (db, product_id, _root_id, revision_id, pr_url) = seed_delivered_revision("abandoned-after-delivery");
+    let completed_id = run_revision_to_pending_review_hold(&db, &revision_id, pr_url, "5f5f46ab");
+
+    let duplicate = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .created_via("test:abandoned_duplicate")
+                .work_item_id(&revision_id)
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    assert!(duplicate.started_at.is_none());
+    db.mark_execution_redundant(&duplicate.id).unwrap();
+    assert_eq!(
+        executions_for(&db, &revision_id),
+        vec![
+            (completed_id.clone(), "completed".to_owned()),
+            (duplicate.id.clone(), "abandoned".to_owned())
+        ]
+    );
+
+    let result = db.reconcile_product_executions(&product_id).unwrap();
+    assert!(
+        result.created.is_empty(),
+        "reconcile must not remint after an abandoned duplicate; created={:?}",
+        result.created.iter().map(|e| (&e.id, &e.kind)).collect::<Vec<_>>()
+    );
+    assert!(
+        db.reconcile_active_dispatch(|_| false).unwrap().is_empty(),
+        "startup reconcile must not remint after an abandoned duplicate"
+    );
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET autostart = 1 WHERE id = ?1", [&revision_id])
+        .unwrap();
+    assert!(
+        db.rescan_active_dispatch().unwrap().is_empty(),
+        "on-release rescan must not remint after an abandoned duplicate"
+    );
+    db.force_updated_at_for_test(&revision_id, boss_engine_utils::epoch_time::now_epoch_secs() - 600)
+        .unwrap();
+    assert!(
+        db.list_orphan_active_candidates(0).unwrap().is_empty(),
+        "orphan sweep must not treat a delivered revision as an orphan after an abandoned duplicate"
+    );
+    assert_eq!(
+        executions_for(&db, &revision_id),
+        vec![
+            (completed_id, "completed".to_owned()),
+            (duplicate.id, "abandoned".to_owned())
+        ]
+    );
+    assert_eq!(task_status(&db, &revision_id), "active");
+}
+
+/// Engine-initiated status changes through `update_work_item_as_actor`
+/// persist a reason on the row and in the transition ledger. The two
+/// production engine actors on this path are recovery-pointer damage
+/// and a dispatch-refusal revert.
+#[test]
+fn engine_actor_status_changes_record_reason() {
+    let db = WorkDb::open(temp_db_path("engine-status-reason")).unwrap();
+    let product = create_test_product_with_repo(&db, "Prod-engine-reason", Some("git@github.com:foo/bar.git"));
+    let chore = create_test_chore(&db, product.id.clone(), "engine-reason");
+
+    let blocked = db
+        .update_work_item_as_actor(
+            &chore.id,
+            WorkItemPatch::builder()
+                .status("blocked")
+                .blocked_reason("execution_recovery_failed")
+                .blocked_detail("recovery bookmark missing")
+                .autostart(false)
+                .status_reason("execution_recovery_failed:pointer_damaged")
+                .build(),
+            boss_protocol::LAST_STATUS_ACTOR_ENGINE,
+        )
+        .unwrap();
+    let blocked = match blocked {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task,
+        other => panic!("engine status patch must return a task row, got {}", other.primary_id()),
+    };
+    assert_eq!(blocked.status, TaskStatus::Blocked);
+    assert_eq!(
+        blocked.status_reason.as_deref(),
+        Some("execution_recovery_failed:pointer_damaged")
+    );
+    let last = db.list_task_status_transitions(&chore.id).unwrap().pop().unwrap();
+    assert_eq!(last.actor, "engine");
+    assert_eq!(
+        last.reason.as_deref(),
+        Some("execution_recovery_failed:pointer_damaged")
+    );
+
+    let reverted = db
+        .update_work_item_as_actor(
+            &chore.id,
+            WorkItemPatch::builder()
+                .status("todo")
+                .status_reason("dispatch_refused:status_reverted")
+                .build(),
+            boss_protocol::LAST_STATUS_ACTOR_ENGINE,
+        )
+        .unwrap();
+    let reverted = match reverted {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task,
+        other => panic!("engine status patch must return a task row, got {}", other.primary_id()),
+    };
+    assert_eq!(reverted.status, TaskStatus::Todo);
+    assert_eq!(
+        reverted.status_reason.as_deref(),
+        Some("dispatch_refused:status_reverted")
+    );
+    let last = db.list_task_status_transitions(&chore.id).unwrap().pop().unwrap();
+    assert_eq!(last.actor, "engine");
+    assert_eq!(last.reason.as_deref(), Some("dispatch_refused:status_reverted"));
 }

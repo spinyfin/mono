@@ -285,6 +285,16 @@ pub struct WorkItemPatch {
     pub project_id: Option<String>,
     pub repo_remote_url: Option<String>,
     pub status: Option<String>,
+    /// Why an engine-initiated status change is happening. Honoured only
+    /// when `actor` is `engine` *and* `status` actually changes; stored on
+    /// `tasks.status_reason` and copied into `task_status_audit`. Human,
+    /// boss, boothby and progression status moves ignore this field and
+    /// clear `status_reason` so a value always describes the current
+    /// status. `None` on an engine status change still clears the column
+    /// (the engine caller should pass a reason). `Some("")` is treated as
+    /// omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
     /// Product-level worker branch-name prefix. Only honoured on
     /// product-targeted updates; ignored when patching a task / chore /
     /// project. `None` → leave unchanged. `Some("")` → clear (write

@@ -200,7 +200,9 @@ name (`reconcile_revision_execution`, `reconcile_work_item_execution`,
 (`frontend:request_execution`, `frontend:update_work_item_status`,
 `frontend:create_automation_task`). A wire `CreateExecution` from a
 client that does not send the field records `unspecified`; rows that
-predate schema 53 read as null.
+predate schema 56 read as null. CI-watch retrigger and stranded-attempt
+rescue executions stamp `ci_watch:retrigger` and
+`ci_watch:stranded_attempt_rescue`.
 
 Surfaced by `boss task executions --json` and in the `executions`
 array of `boss task show --json` (field `created_via`), and in the text

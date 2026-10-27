@@ -198,14 +198,22 @@ pub(crate) fn primary_pr_awaits_review(conn: &Connection, work_item_id: &str) ->
 /// question — which goes through `request_execution_in_tx_with_live_check`
 /// and is deliberately not gated here. New review findings never re-open a
 /// revision either: they create a new sibling revision. A revision whose
-/// latest implementation execution ended any other way (`failed`,
-/// `orphaned`, `abandoned`, `cancelled`) is NOT delivered and stays
-/// eligible for the ordinary recovery sweeps.
+/// latest *non-abandoned* implementation execution ended any other way
+/// (`failed`, `orphaned`, `cancelled`) is NOT delivered and stays eligible
+/// for the ordinary recovery sweeps.
 ///
-/// Scoped to the latest `revision_implementation` row, not the latest row
-/// of any kind, so a later `pr_review` attached to the revision cannot mask
-/// the delivery. Takes `&Connection` so transactional callers need not
-/// re-lock the DB.
+/// Abandoned rows are skipped when selecting the latest implementation,
+/// matching [`super::dispatch_helpers::query_last_non_abandoned_execution_for_work_item`]:
+/// an `abandoned` execution is a redundant duplicate
+/// (`mark_execution_redundant`) or a dropped pending row
+/// (`abandon_pending_executions`) that never did the work, so it must not
+/// shadow a genuinely completed sibling. A never-started abandoned row
+/// created after delivery therefore still counts as delivered.
+///
+/// Scoped to the latest non-abandoned `revision_implementation` row, not
+/// the latest row of any kind, so a later `pr_review` attached to the
+/// revision cannot mask the delivery. Takes `&Connection` so transactional
+/// callers need not re-lock the DB.
 pub(crate) fn revision_delivery_awaits_review(conn: &Connection, work_item_id: &str) -> Result<bool> {
     conn.query_row(
         "SELECT EXISTS (
@@ -214,6 +222,7 @@ pub(crate) fn revision_delivery_awaits_review(conn: &Connection, work_item_id: &
                  SELECT id FROM work_executions
                  WHERE work_item_id = t.id
                    AND kind = 'revision_implementation'
+                   AND status != 'abandoned'
                  ORDER BY created_at DESC, id DESC
                  LIMIT 1
              )

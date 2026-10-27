@@ -1567,6 +1567,7 @@ impl ExecutionCoordinator {
                             .blocked_reason("execution_recovery_failed")
                             .blocked_detail(format!("{err:#}"))
                             .autostart(false)
+                            .status_reason("execution_recovery_failed:pointer_damaged")
                             .build(),
                         "engine",
                     )?;

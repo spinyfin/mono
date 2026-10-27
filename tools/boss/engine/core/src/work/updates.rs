@@ -685,6 +685,23 @@ impl WorkDb {
         } else {
             ""
         };
+        // Engine status changes write `patch.status_reason` (or NULL when
+        // the caller omitted one). Human/boss/boothby/progression moves
+        // always clear it so a stored reason always describes the current
+        // status. No status change (`actor_stamp` empty) leaves the column
+        // alone.
+        let status_reason_value: Option<String> = if actor_stamp.is_empty() {
+            None
+        } else if actor == boss_protocol::LAST_STATUS_ACTOR_ENGINE {
+            patch
+                .status_reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        } else {
+            None
+        };
         if status_changed && previous_status != task.status && task.status == TaskStatus::Archived {
             apply_archive_transition_provenance(self, &mut task, actor)?;
         }
@@ -705,7 +722,7 @@ impl WorkDb {
                  archived_by = ?28, archived_at = ?29, design_reasoning_effort_xhigh = ?30,
                  critical_set_by = ?31, critical_set_at = ?32,
                  last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END,
-                 status_reason = CASE WHEN ?8 = '' THEN status_reason ELSE NULL END,
+                 status_reason = CASE WHEN ?8 = '' THEN status_reason ELSE ?33 END,
                  completed_at = CASE
                      WHEN ?4 IN ('done', 'archived') THEN COALESCE(completed_at, ?7)
                      ELSE NULL
@@ -744,6 +761,7 @@ impl WorkDb {
                 task.design_reasoning_effort_xhigh as i64,
                 task.critical_set_by,
                 task.critical_set_at,
+                status_reason_value,
             ],
         )?;
 

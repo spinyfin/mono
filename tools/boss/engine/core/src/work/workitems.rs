@@ -839,10 +839,12 @@ impl WorkDb {
     }
 
     /// Like `update_work_item` but stamps `last_status_actor` with `actor`
-    /// when the status actually changes. Engine-internal writers use direct
-    /// SQL with `last_status_actor = 'engine'`; this path is for peer RPCs
-    /// where the caller tier has already been resolved to `"human"` or
-    /// `"boss"`.
+    /// when the status actually changes. Engine-internal writers that go
+    /// through this path (recovery-pointer damage, dispatch-refusal
+    /// revert) pass [`WorkItemPatch::status_reason`] so the move is
+    /// attributable; human/boss/boothby/progression actors always clear
+    /// `status_reason`. Dedicated engine SQL writers still stamp
+    /// `last_status_actor = 'engine'` directly.
     pub fn update_work_item_as_actor(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
         match classify_id(id)? {
             ItemKind::Product => self.update_product(id, patch, actor),

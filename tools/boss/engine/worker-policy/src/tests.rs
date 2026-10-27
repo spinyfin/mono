@@ -302,7 +302,7 @@ fn mutating_taxonomy_verbs_are_denied_and_name_a_proposal_verb() {
 
     let denial = assert_denied(FrontendRequest::UpdateWorkItem {
         id: "task_1".into(),
-        patch: WorkItemPatch::default(),
+        patch: Box::new(WorkItemPatch::default()),
     });
     assert_eq!(denial.reason, WorkerTierDenialReason::MutatingTaxonomy);
     assert!(denial.use_instead.is_some());

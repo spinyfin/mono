@@ -45,7 +45,7 @@ fn enforcing_state(run_id: &str) -> (Arc<ServerState>, tempfile::TempDir) {
 fn denied_request() -> FrontendRequest {
     FrontendRequest::UpdateWorkItem {
         id: "task_1".to_owned(),
-        patch: boss_protocol::WorkItemPatch::default(),
+        patch: Box::new(boss_protocol::WorkItemPatch::default()),
     }
 }
 

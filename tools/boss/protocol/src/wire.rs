@@ -505,9 +505,12 @@ pub enum FrontendRequest {
     /// finds or creates the owning group based on the association and
     /// source fields in the input. Replies with
     /// [`FrontendEvent::AttentionCreated`].
+    /// Boxed: an inline `CreateAttentionInput` here would make this variant
+    /// far larger than its siblings (clippy::large_enum_variant) — serializes
+    /// identically.
     CreateAttention {
         #[serde(flatten)]
-        input: CreateAttentionInput,
+        input: Box<CreateAttentionInput>,
     },
 
     CreateAttentionItem {
@@ -2870,9 +2873,12 @@ pub enum FrontendRequest {
         patch: IdeaPatch,
     },
 
+    /// Boxed: an inline `WorkItemPatch` here would make this variant far
+    /// larger than its siblings (clippy::large_enum_variant) — serializes
+    /// identically.
     UpdateWorkItem {
         id: String,
-        patch: WorkItemPatch,
+        patch: Box<WorkItemPatch>,
     },
 
     /// Snapshot every engine worker pool's (main, automation, review)

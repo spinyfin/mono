@@ -536,7 +536,7 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
     };
     tracing::Span::current().record("item_id", &id);
     tracing::debug!(target: "work_write_timing", boundary = "handler_entry");
-    apply_work_item_patch(ctx, id, patch, None).await;
+    apply_work_item_patch(ctx, id, *patch, None).await;
 }
 
 /// Confirmed pause-only override state carried from a `MoveWorkItemOnBoard`
@@ -1049,6 +1049,7 @@ pub(super) async fn apply_work_item_patch(
                                 .status(prev_status.as_str())
                                 .maybe_blocked_reason(blocked_reason)
                                 .maybe_blocked_detail(blocked_detail)
+                                .status_reason("dispatch_refused:status_reverted")
                                 .build();
                             match work_db.update_work_item_as_actor(
                                 &work_item_id_for_event,

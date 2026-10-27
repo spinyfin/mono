@@ -168,10 +168,10 @@ async fn work_cancel_marks_execution_cancelled() -> Result<()> {
     client
         .send_request(&FrontendRequest::UpdateWorkItem {
             id: work_item_id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 status: Some("active".to_owned()),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?;
     assert_eq!(fetch_task_status(&mut client, &work_item_id).await?, TaskStatus::Active);
@@ -1048,10 +1048,10 @@ async fn kanban_drag_to_doing_dispatches_autostart_false_chore() -> Result<()> {
     let updated = match client
         .send_request(&FrontendRequest::UpdateWorkItem {
             id: chore.id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 status: Some("active".to_owned()),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?
     {
@@ -1132,10 +1132,10 @@ async fn kanban_drag_to_doing_is_idempotent_on_repeat() -> Result<()> {
     let _ = client
         .send_request(&FrontendRequest::UpdateWorkItem {
             id: chore.id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 status: Some("active".to_owned()),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?;
     let after_first = list_executions_for(&mut client, &chore.id).await?;
@@ -1148,10 +1148,10 @@ async fn kanban_drag_to_doing_is_idempotent_on_repeat() -> Result<()> {
     let _ = client
         .send_request(&FrontendRequest::UpdateWorkItem {
             id: chore.id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 status: Some("active".to_owned()),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?;
     let after_second = list_executions_for(&mut client, &chore.id).await?;
@@ -1214,10 +1214,10 @@ async fn kanban_drag_emits_status_transition_event() -> Result<()> {
     let _ = client
         .send_request(&FrontendRequest::UpdateWorkItem {
             id: chore.id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 status: Some("active".to_owned()),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?;
 
@@ -1246,10 +1246,10 @@ async fn kanban_drag_emits_status_transition_event() -> Result<()> {
     let _ = client
         .send_request(&FrontendRequest::UpdateWorkItem {
             id: chore.id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 status: Some("active".to_owned()),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?;
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1285,10 +1285,10 @@ async fn kanban_drag_to_doing_rejects_chore_with_no_resolvable_repo() -> Result<
     let response = client
         .send_request(&FrontendRequest::UpdateWorkItem {
             id: chore.id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 status: Some("active".to_owned()),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?;
     match response {
@@ -1359,10 +1359,10 @@ async fn kanban_drag_emits_status_transition_error_when_repo_unresolvable() -> R
     let _ = client
         .send_request(&FrontendRequest::UpdateWorkItem {
             id: chore.id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 status: Some("active".to_owned()),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?;
 
@@ -1450,10 +1450,10 @@ async fn seed_unresolvable_chore(client: &mut BossClient) -> Result<boss_protoco
     match client
         .send_request(&FrontendRequest::UpdateWorkItem {
             id: product.id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 repo_remote_url: Some(String::new()),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?
     {
@@ -1651,11 +1651,11 @@ async fn board_drop_inside_merging_group_does_not_complete_the_merge() -> Result
     client
         .send_request(&FrontendRequest::UpdateWorkItem {
             id: chore.id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 status: Some("in_review".to_owned()),
                 pr_url: Some("https://github.com/spinyfin/mono/pull/1".to_owned()),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?;
     let work_db = WorkDb::open(engine.db_path.clone())?;
@@ -1840,11 +1840,11 @@ async fn board_drop_on_own_column_is_a_reorder_for_a_blocked_row() -> Result<()>
     client
         .send_request(&FrontendRequest::UpdateWorkItem {
             id: chore.id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 status: Some("blocked".to_owned()),
                 blocked_reason: Some("waiting_on_human".to_owned()),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?;
     assert_eq!(fetch_task_status(&mut client, &chore.id).await?, TaskStatus::Blocked);
@@ -1993,10 +1993,10 @@ async fn board_drop_from_doing_to_backlog_clears_autostart_on_a_dispatch_pending
     client
         .send_request(&FrontendRequest::UpdateWorkItem {
             id: chore.id.clone(),
-            patch: WorkItemPatch {
+            patch: Box::new(WorkItemPatch {
                 autostart: Some(true),
                 ..WorkItemPatch::default()
-            },
+            }),
         })
         .await?;
     let armed = fetch_task(&mut client, &chore.id).await?;
