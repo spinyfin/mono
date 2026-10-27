@@ -688,6 +688,7 @@ fn gc_clear_failed_cleanup_under_pressure_does_not_run_cleanup_again() {
     let workspace = &pool.workspaces[0];
     let runner = FakeRunner::new(vec![
         ExpectedCommand::ok(workspace.clone(), "jj", &["git", "fetch"], ""),
+        ExpectedCommand::ok(workspace.clone(), "jj", &["git", "remote", "list"], ""),
         super::support::gc_git_import_command(workspace),
         gc_exec_sweep_command(workspace, ""),
         gc_pr_noop_command(workspace),
