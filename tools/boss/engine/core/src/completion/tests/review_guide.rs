@@ -58,14 +58,14 @@ async fn finalize_review_guide_publishes_a_valid_guide_and_advances_the_readable
         &db,
         workspace.path(),
         &execution_id,
-        "# Unsubmitted draft\n\n## Problem\n## Implementation\n## Example\n## Review\n",
+        "# Unsubmitted draft\n\n## Problem\n## Implementation\n## Example\n## Review\n## Evidence\nNo validation reported.\n",
     );
     let proposal = submit_guide(
         &db,
         &execution_id,
-        "# The Guide\n\n## Problem\n## Implementation\n## Example\n## Review\n",
+        "# The Guide\n\n## Problem\n## Implementation\n## Example\n## Review\n## Evidence\nNo validation reported.\n",
     );
-    assert_eq!(proposal.state, boss_protocol::ProposalState::Applied);
+    assert_eq!(proposal.state, boss_protocol::ProposalState::Applied, "{proposal:?}");
     let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None)).handler;
     let execution = db.get_execution(&execution_id).unwrap();
 
@@ -83,7 +83,7 @@ async fn finalize_review_guide_publishes_a_valid_guide_and_advances_the_readable
     let version = db.get_pr_review_guide_version(&version_id).unwrap().unwrap();
     assert_eq!(
         version.markdown,
-        "# The Guide\n\n## Problem\n## Implementation\n## Example\n## Review"
+        "# The Guide\n\n## Problem\n## Implementation\n## Example\n## Review\n## Evidence\nNo validation reported."
     );
     assert_eq!(
         db.get_execution(&execution_id).unwrap().status,

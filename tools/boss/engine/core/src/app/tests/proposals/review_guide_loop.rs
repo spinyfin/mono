@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 async fn comment_request(state: &Arc<ServerState>, req: FrontendRequest) -> FrontendEvent {
     let sink = make_session_sink();
-    let ctx = dispatch_with_peer(state, &sink, None);
+    let ctx = dispatch_with_peer(state, &sink, Some(std::process::id() as libc::pid_t));
     match req {
         r @ FrontendRequest::CommentsCreate { .. } => comments::handle_comments_create(ctx, r).await,
         r @ FrontendRequest::CommentsReviseDoc { .. } => comments::handle_comments_revise_doc(ctx, r).await,
@@ -25,6 +25,7 @@ async fn comment_request(state: &Arc<ServerState>, req: FrontendRequest) -> Fron
 #[tokio::test]
 async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedback() {
     let (state, dir) = test_server_state_with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::Open)));
+    *state.app_pid.lock().unwrap() = Some(std::process::id() as libc::pid_t);
     let db = &state.work_db;
     let (root, series) = seed_published_guide(db, 9);
     let pr_url = "https://github.com/acme/widget/pull/9";
@@ -42,6 +43,8 @@ async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedbac
         .readable_version_id
         .unwrap();
     let old_version = db.get_pr_review_guide_version(&old_id).unwrap().unwrap();
+    let product_id = db.get_work_item(&root).unwrap().product_id().to_owned();
+    let tasks_before_save = db.list_tasks(&product_id, None, None, false).unwrap().len();
     let response = comment_request(
         &state,
         FrontendRequest::CommentsCreate {
@@ -67,6 +70,10 @@ async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedbac
     let original_context = comment.guide_context.clone().unwrap();
     db.set_comment_intent(&comment.id, "revision", 1.0).unwrap();
     // Saving the comment alone must not create a revision.
+    assert_eq!(
+        db.list_tasks(&product_id, None, None, false).unwrap().len(),
+        tasks_before_save
+    );
     assert!(db.get_comment(&comment.id).unwrap().unwrap().revise_task_id.is_none());
     // Submit through the production Revise PR handler (app authority).
     let response = comment_request(
@@ -189,7 +196,7 @@ async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedbac
     );
     let pid = std::process::id() as libc::pid_t;
     state.worker_registry.register(pid, guide_execution.to_owned());
-    let guide = "# Revised retry guide\n## Problem\nPermission errors used to retry.\n## Implementation\nStop immediately.\n## Example\nA permission error returns once.\n## Review\nCheck the regression test.";
+    let guide = "# Revised retry guide\n## Changed since the previous version\nPermission errors now stop immediately.\n## Problem\nPermission errors used to retry.\n## Implementation\nStop immediately.\n## Example\nA permission error returns once.\n## Review\nCheck the regression test.\n## Evidence\nThe revision added a permission-error regression test.";
     let (proposal, _) = submitted(
         call_with_peer(
             &state,
@@ -202,7 +209,7 @@ async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedbac
         )
         .await,
     );
-    assert_eq!(proposal.state, ProposalState::Applied);
+    assert_eq!(proposal.state, ProposalState::Applied, "{proposal:?}");
     assert_eq!(
         db.get_execution(guide_execution).unwrap().status,
         ExecutionStatus::Completed

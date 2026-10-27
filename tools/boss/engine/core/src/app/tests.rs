@@ -97,13 +97,7 @@ pub(super) fn test_server_state_with_fakes() -> (Arc<ServerState>, tempfile::Tem
     (state, temp)
 }
 
-/// Like [`test_server_state_with_fakes`], but also swaps in a fake
-/// [`crate::completion::BranchVerifier`] so a test that drives a real
-/// `ServerState` through the production events-socket dispatch path (rather
-/// than calling a completion-handler method directly) can make the GitHub
-/// head-fetch fail deterministically. This reproduces an unreachable
-/// completion seam without a live network call and without relying on the
-/// test sandbox's `gh` process-exec denial to fail the call for us.
+/// Build a server with deterministic PR state for comment submission.
 pub(super) fn test_server_state_with_pr_state_checker(
     checker: Arc<dyn crate::work::PrStateChecker>,
 ) -> (Arc<ServerState>, tempfile::TempDir) {
@@ -130,6 +124,13 @@ pub(super) fn test_server_state_with_pr_state_checker(
     (state, temp)
 }
 
+/// Like [`test_server_state_with_fakes`], but also swaps in a fake
+/// [`crate::completion::BranchVerifier`] so a test that drives a real
+/// `ServerState` through the production events-socket dispatch path (rather
+/// than calling a completion-handler method directly) can make the GitHub
+/// head-fetch fail deterministically. This reproduces an unreachable
+/// completion seam without a live network call and without relying on the
+/// test sandbox's `gh` process-exec denial to fail the call for us.
 pub(super) fn test_server_state_with_source_collector(
     collector: crate::review_guide_capture::SourcePacketCollector,
     branch_verifier: Arc<dyn crate::completion::BranchVerifier>,
