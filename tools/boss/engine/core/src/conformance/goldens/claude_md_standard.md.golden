@@ -45,6 +45,9 @@ evaluates backticks and `$(...)` inside double-quoted strings, which
 corrupts any body that contains inline code. Always write the body to
 a file and use `--body-file` (see the recipe below).
 - Print the PR URL on its own line as the last thing in your final response.
+- Confirm the published PR contains your commit with `gh pr view` and
+its head SHA; pass `-R owner/repo` in a jj workspace (resolve the slug
+from the PR URL or `jj git remote`).
 - Before pushing, run `jj diff -r @`. If the diff is empty,
 do NOT commit, push, or open a PR — stop and explain.
 
@@ -80,8 +83,13 @@ in the response) if the engine-wide budget is exhausted — in
 that case you still get the last stored snapshot, never an error
 or a hang. Never loop calling `--refresh` waiting for a state
 change: the engine's own merge poller is what watches your PR to
-green after you push, not you — the same "do not babysit CI"
-principle your task prompt states applies here too.
+green after you push. Do not babysit CI with `gh pr checks` or
+`gh pr view` loops either. Finish required post-push artifacts, then
+complete the run using its enabled completion channel. Required checks
+are effectively green at SUCCESS, NEUTRAL, or SKIPPED; still-running
+and human-gated checks do not block completion. A genuinely failed
+check must be classified using the CI failure classification below;
+a CI-fix revision is no substitute for a fix you can make in this run.
 - `"$BOSS_BIN" pr body` — the PR title and body/description the
 engine snapshotted when this run started, for a read-modify-write of
 the description without a `gh pr view` round trip. If the
@@ -269,45 +277,6 @@ Never read, write, or touch it. Do not query the database
 yourself; ask for any task or product context you need.
 `bossctl` is not available to workers.
 
-## Running Boss itself
-
-Never launch the installed `/Applications/Boss.app`, never `open -a
-Boss`, and never start an engine that can reach production state.
-This machine is someone's laptop: an unisolated app launch puts a
-window on their screen and terminates the engine they are using.
-Bare `bazel run //tools/boss/app-macos:Boss` (no isolation env) is
-also blocked.
-
-To exercise a real engine, start an isolated one:
-
-```sh
-env -u BOSS_EVENTS_SOCKET bazel run //tools/boss/engine/core:engine -- \
---socket-path /tmp/boss-test-$(uuidgen).sock
-```
-
-Any `--socket-path` other than the production socket puts the engine
-in test-fixture mode, where the db, events socket, pid file and
-control token are all derived from that socket's path — this
-includes the legacy `/tmp/boss-engine.sock`, which is a test
-fixture, not a safe alternative. Unset
-`BOSS_EVENTS_SOCKET` because your pane inherits one pointing at
-production. Point a client at the same `--socket-path` to drive it.
-
-To screenshot the real Boss UI quietly, launch an isolated capture
-instance (both env vars required):
-
-```sh
-BOSS_SOCKET_PATH=/tmp/boss-shot-$(uuidgen).sock BOSS_ENGINE_AUTOSTART=0 \
-bazel run //tools/boss/app-macos:Boss -- --capture-to /tmp/shot.png
-```
-
-The instance renders itself in-process via `cacheDisplay` and exits;
-it never shows a window, never takes focus, and needs no
-screen-recording permission. Read the PNG back and state in the PR
-what you verified and what you could not.
-
-`bazel build` and `bazel test` are unaffected.
-
 ## Capturing a screenshot for your own verification
 
 **Do not commit capture PNGs** — and do not delete them either.
@@ -344,3 +313,18 @@ reference.
 
 Messages may arrive between turns. Treat them as questions from a
 human reviewer — short, specific answers.
+
+## CI failure classification
+
+Classify a CI failure by cause, then act — do not park, and do not leave "someone else will handle it" as an available excuse:
+- Caused by your change: fix it. No judgement call, not grounds to block, no handoff.
+- Unrelated to your change AND trivial: fix it inline — that is what a human would do.
+- Unrelated AND not trivial: do not absorb it into this PR. Do not silently expand this PR into repairing someone else's breakage — that makes the diff unreviewable and couples two unrelated changes. This is the case where stopping to escalate can be legitimate. Flag it, stating whether the remedy is a separate fix or reverting the offending commit, and why. "CI is red" is not an escalation; name the specific problem and the proposed remedy.
+
+Whichever branch you take, the PR description must say which category you judged the failure into and on what basis. A silent inline fix of an unrelated failure is nearly as bad as ignoring it, because nobody can review a decision they cannot see.
+
+Trivial means the correct fix is mechanical and obviously correct — the canonical case is `main` adding a required `is_review_supervisor` field to `StartWorkerInput` after a test was written, breaking clippy on an unrelated PR's merge-queue synthetic commit. One line, mechanical. A failing test whose correct behaviour you would have to reason about, or a failure whose cause you cannot identify, is not trivial, regardless of how few lines the fix looks.
+
+The engine already mints CI-fix revisions. That path is the fallback for failures that genuinely need a separate change (the unrelated-and-not-trivial case). It is not a reason to punt a failure you could fix in this run.
+
+

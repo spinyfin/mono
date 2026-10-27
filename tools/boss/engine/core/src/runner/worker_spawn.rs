@@ -4,6 +4,9 @@
 
 use std::path::Path;
 
+#[cfg(test)]
+mod prompt_size_tests;
+
 use anyhow::Context as _;
 use boss_engine_gh_invocation::gh_output;
 use boss_gh_telemetry::{callers, scope as gh_scope};

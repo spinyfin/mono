@@ -1290,6 +1290,10 @@ impl HostAdapter for SshHostAdapter {
         //    path so the remote worker gets a byte-identical brief to a
         //    local one (same task framing, branch name, acceptance
         //    criterion, effort addendum, product preamble).
+        // Keep prompt and generated-rules feature gates on the same values.
+        let spawn_opts = WorkerSpawnOpts::builder()
+            .max_embed_diff_lines(self.cfg.work.max_review_embed_diff_lines)
+            .build();
         let ComposedWorkerSpawn {
             mut prompt_text,
             spawn_config,
@@ -1338,9 +1342,7 @@ impl HostAdapter for SshHostAdapter {
             // affected today; wiring feature flags into the remote path
             // MUST land before remote bring-up if that seam is on.
             // Every seam flag is left at its builder default (`false`).
-            WorkerSpawnOpts::builder()
-                .max_embed_diff_lines(self.cfg.work.max_review_embed_diff_lines)
-                .build(),
+            spawn_opts,
         )
         .await?;
         // The shared composer runs on the engine and therefore embeds its own
@@ -1407,6 +1409,7 @@ impl HostAdapter for SshHostAdapter {
             // so a reviewer/triage/answer-agent dispatched remotely still gets
             // its reduced surface instead of silently becoming Standard.
             .worker_kind(crate::worker_setup::worker_kind_for_execution(&execution.kind))
+            .run_done_proposals_seam_enabled(spawn_opts.run_done_proposals_seam_enabled)
             .is_review_supervisor(is_review_supervisor)
             .is_post_merge_reviewer(is_post_merge_reviewer)
             // Mirrors `WorkerSpawnOpts` above: a remotely dispatched triage
@@ -1450,7 +1453,7 @@ impl HostAdapter for SshHostAdapter {
 
         // Budget only the launch command and environment against the remote
         // exec limits. The brief is read by the terminal launcher, never argv.
-        let worker_kind = settings_input.worker_kind;
+        let worker_kind = &settings_input.worker_kind;
         let driver_binary = driver.descriptor().binary.to_owned();
         let driver_spawn_plan = driver.spawn_invocation(crate::driver::SpawnRequest {
             model: &spawn_config.model,
@@ -1462,6 +1465,7 @@ impl HostAdapter for SshHostAdapter {
         });
         let engine_socket = self.events_socket_path.display().to_string();
         let stage = async {
+            stage_remote_agent_rules(&self.transport, &settings_input, driver.as_ref()).await?;
             let command = stage_remote_initial_input(
                 &self.transport,
                 &run_id,
@@ -2173,6 +2177,26 @@ pub(crate) async fn resolve_host_adapter(
 }
 
 /// Stage the real launch artifacts through the same injectable transport as spawn.
+pub(crate) async fn stage_remote_agent_rules(
+    transport: &dyn crate::ssh_spawn::SshExec,
+    input: &WorkerSetupInput,
+    driver: &dyn crate::driver::AgentDriver,
+) -> Result<()> {
+    let path = driver.agent_rules_destination(&input.workspace_path, &input.run_id);
+    let parent = path.parent().context("remote agent rules have no parent directory")?;
+    let rules =
+        crate::worker_setup::render_claude_md(input, driver.agent_rules_preamble(), driver.descriptor().config_dir);
+    ship_file(
+        transport,
+        &input.run_id,
+        &parent.to_string_lossy(),
+        &path.to_string_lossy(),
+        &rules,
+        "agent-rules",
+    )
+    .await
+}
+
 pub(crate) async fn stage_remote_initial_input(
     transport: &dyn crate::ssh_spawn::SshExec,
     run_id: &str,

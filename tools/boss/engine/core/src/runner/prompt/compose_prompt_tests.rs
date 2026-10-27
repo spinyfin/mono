@@ -145,8 +145,8 @@ fn acceptance_criterion_names_the_pr_url_artifact_and_keeps_the_final_line() {
             "prompt must name the env var carrying that path:\n{prompt}",
         );
         assert!(
-            prompt.contains("Print the PR URL on its own line"),
-            "the final-message fallback convention must survive:\n{prompt}",
+            prompt.contains("the final-response URL in the generated rules is its fallback"),
+            "the prompt must refer to the canonical fallback convention:\n{prompt}",
         );
         for banned in ["`Write` tool", "run_in_background", "subagent"] {
             assert!(
@@ -348,7 +348,7 @@ fn acceptance_criterion_references_existing_pr_when_pr_url_set() {
             .build(),
     );
     assert!(
-        prompt.contains("Do NOT open a new PR"),
+        prompt.contains("Do not open a parallel PR"),
         "acceptance criterion should prohibit opening a new PR:\n{prompt}",
     );
     assert!(
@@ -392,34 +392,9 @@ fn execution_for_remote(remote: &str) -> WorkExecution {
 }
 
 #[test]
-fn ci_monitoring_directive_present_for_implementation_chore() {
-    // Issue #899: the worker must be told not to poll CI forever, and
-    // that the engine auto-transitions to Review once CI is effectively
-    // green. This general guidance applies regardless of org.
-    let prompt = compose_execution_prompt(
-        ExecutionPromptParams::builder()
-            .execution(&base_execution())
-            .work_item(&chore_without_pr())
-            .workspace_path(std::path::Path::new("/tmp/workspace"))
-            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
-            .build(),
-    );
-    assert!(
-        prompt.contains("do not babysit CI"),
-        "missing CI-monitoring directive:\n{prompt}",
-    );
-    assert!(
-        prompt.contains("effectively green"),
-        "directive should reference the engine's effectively-green definition:\n{prompt}",
-    );
-    assert!(
-        prompt.contains("classify it per the CI-failure rules at the top of this prompt"),
-        "a failed required check must point at the opening CI classification, not a vague escalate:\n{prompt}",
-    );
-    assert!(
-        prompt.contains("Waiting for a CI-fix revision is not a substitute"),
-        "CI-fix revisions must not be a licence to punt a failure this run could fix:\n{prompt}",
-    );
+fn ci_monitoring_directive_omits_shared_policy() {
+    let execution = base_execution();
+    assert!(ci_monitoring_directive(&execution).is_empty());
 }
 
 #[test]
@@ -448,8 +423,8 @@ fn ci_monitoring_directive_names_human_gated_checks_for_linkedin_org() {
 
 #[test]
 fn ci_monitoring_directive_omits_human_gated_names_for_plain_org() {
-    // A non-LinkedIn org has no review-signal rules; the directive's
-    // general guidance stands alone without naming any check.
+    // A non-LinkedIn org has no review-signal rules; shared guidance lives
+    // in generated worker rules, so no CI directive is needed here.
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
             .execution(&execution_for_remote("git@github.com:org/repo.git"))
@@ -459,8 +434,8 @@ fn ci_monitoring_directive_omits_human_gated_names_for_plain_org() {
             .build(),
     );
     assert!(
-        prompt.contains("do not babysit CI"),
-        "general directive should still be present:\n{prompt}",
+        !prompt.contains("do not babysit CI"),
+        "shared policy belongs in generated rules:\n{prompt}",
     );
     assert!(
         !prompt.contains("Owner Approval"),
@@ -2627,6 +2602,8 @@ fn design_discipline_block_present_in_both_design_directives() {
     assert!(design.contains("Every rejection must be checkable"), "{design}");
 
     let postmortem = compose_design_postmortem_directive(None, "/tmp/followups.json", None);
+    assert!(postmortem.contains("`- details:` task description at the end of this prompt"));
+    assert!(!postmortem.contains("details above"));
     assert!(
         postmortem.contains("Name the contested property up front"),
         "{postmortem}"

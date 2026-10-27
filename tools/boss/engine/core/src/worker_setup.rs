@@ -80,7 +80,9 @@ pub use deny_rules::{
     answer_agent_allow_rules, answer_agent_deny_rules, review_guide_allow_rules, review_guide_deny_rules,
     reviewer_deny_rules, triage_deny_rules,
 };
+pub(crate) mod ci_failure;
 mod git_store_guard;
+mod operator_question;
 pub use git_store_guard::{ensure_git_store_guard_script_in, git_store_guard_script_path};
 
 // Re-export guard command constants so the test module (which uses `use
@@ -261,6 +263,9 @@ pub struct WorkerSetupInput {
     /// decision-declaration mechanism is live.
     #[builder(default)]
     pub automation_outcome_proposals_seam_enabled: bool,
+    /// Whether the terminal proposal channel can carry operator questions.
+    #[builder(default)]
+    pub run_done_proposals_seam_enabled: bool,
     /// `true` when this [`WorkerKind::Reviewer`] execution is the batch's
     /// consolidating supervisor rather than a leaf reviewer — selects
     /// [`crate::pr_review::render_supervisor_claude_md`] over
@@ -303,6 +308,18 @@ pub struct WorkerSetupInput {
 /// that prominently states the read-only mandate and omits PR-creation
 /// instructions (reviewers never open or update PRs).
 pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &str) -> String {
+    let mut rules = render_worker_rules_body(input, preamble, config_dir);
+    if input.worker_kind == WorkerKind::Standard {
+        rules.push_str(ci_failure::GUIDANCE);
+    }
+    if input.worker_kind == WorkerKind::Standard && input.run_done_proposals_seam_enabled {
+        rules.push_str(operator_question::GUIDANCE);
+    }
+    rules.push('\n');
+    rules
+}
+
+fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir: &str) -> String {
     if input.worker_kind == WorkerKind::Reviewer && input.is_review_supervisor {
         return crate::pr_review::render_supervisor_claude_md(
             &input.lease_id,
@@ -354,11 +371,6 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
     } else {
         String::new()
     };
-    // Sourced from //tools/boss/engine/core:engine_binary.bzl at build time
-    // (via the engine_lib rustc_env) so this advice can't drift from the
-    // real bazel target label the way the pre-crate-split
-    // `//tools/boss/engine:engine` string did.
-    let engine_bazel_run_command = env!("BOSS_ENGINE_BAZEL_RUN_COMMAND");
     format!(
         "# Worker rules\n\
          \n\
@@ -402,6 +414,9 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
            corrupts any body that contains inline code. Always write the body to\n\
            a file and use `--body-file` (see the recipe below).\n\
          - Print the PR URL on its own line as the last thing in your final response.\n\
+         - Confirm the published PR contains your commit with `gh pr view` and\n\
+           its head SHA; pass `-R owner/repo` in a jj workspace (resolve the slug\n\
+           from the PR URL or `jj git remote`).\n\
          - Before pushing, run `jj diff -r @`. If the diff is empty,\n\
            do NOT commit, push, or open a PR — stop and explain.\n\
          \n\
@@ -437,8 +452,13 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
            that case you still get the last stored snapshot, never an error\n\
            or a hang. Never loop calling `--refresh` waiting for a state\n\
            change: the engine's own merge poller is what watches your PR to\n\
-           green after you push, not you — the same \"do not babysit CI\"\n\
-           principle your task prompt states applies here too.\n\
+           green after you push. Do not babysit CI with `gh pr checks` or\n\
+           `gh pr view` loops either. Finish required post-push artifacts, then\n\
+           complete the run using its enabled completion channel. Required checks\n\
+           are effectively green at SUCCESS, NEUTRAL, or SKIPPED; still-running\n\
+           and human-gated checks do not block completion. A genuinely failed\n\
+           check must be classified using the CI failure classification below;\n\
+           a CI-fix revision is no substitute for a fix you can make in this run.\n\
          - `{boss} pr body` — the PR title and body/description the\n\
            engine snapshotted when this run started, for a read-modify-write of\n\
            the description without a `gh pr view` round trip. If the\n\
@@ -607,45 +627,6 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
            Never read, write, or touch it. Do not query the database\n\
            yourself; ask for any task or product context you need.\n\
            `bossctl` is not available to workers.\n\
-         \n\
-         ## Running Boss itself\n\
-         \n\
-         Never launch the installed `/Applications/Boss.app`, never `open -a\n\
-         Boss`, and never start an engine that can reach production state.\n\
-         This machine is someone's laptop: an unisolated app launch puts a\n\
-         window on their screen and terminates the engine they are using.\n\
-         Bare `bazel run //tools/boss/app-macos:Boss` (no isolation env) is\n\
-         also blocked.\n\
-         \n\
-         To exercise a real engine, start an isolated one:\n\
-         \n\
-         ```sh\n\
-         env -u BOSS_EVENTS_SOCKET {engine_bazel_run_command} -- \\\n\
-           --socket-path /tmp/boss-test-$(uuidgen).sock\n\
-         ```\n\
-         \n\
-         Any `--socket-path` other than the production socket puts the engine\n\
-         in test-fixture mode, where the db, events socket, pid file and\n\
-         control token are all derived from that socket's path — this\n\
-         includes the legacy `/tmp/boss-engine.sock`, which is a test\n\
-         fixture, not a safe alternative. Unset\n\
-         `BOSS_EVENTS_SOCKET` because your pane inherits one pointing at\n\
-         production. Point a client at the same `--socket-path` to drive it.\n\
-         \n\
-         To screenshot the real Boss UI quietly, launch an isolated capture\n\
-         instance (both env vars required):\n\
-         \n\
-         ```sh\n\
-         BOSS_SOCKET_PATH=/tmp/boss-shot-$(uuidgen).sock BOSS_ENGINE_AUTOSTART=0 \\\n\
-           bazel run //tools/boss/app-macos:Boss -- --capture-to /tmp/shot.png\n\
-         ```\n\
-         \n\
-         The instance renders itself in-process via `cacheDisplay` and exits;\n\
-         it never shows a window, never takes focus, and needs no\n\
-         screen-recording permission. Read the PNG back and state in the PR\n\
-         what you verified and what you could not.\n\
-         \n\
-         `bazel build` and `bazel test` are unaffected.\n\
          \n\
          ## Capturing a screenshot for your own verification\n\
          \n\

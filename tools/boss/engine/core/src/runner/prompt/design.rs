@@ -139,7 +139,7 @@ pub(super) fn compose_design_directive(parent_project: Option<&Project>, design_
     out.push_str("  - when analysis of the requested change surfaces work that is deliberately out of scope for v1, include those items as their own entries (tagged `Scope: deferred (future / not a v1 blocker)`, see above) rather than silently omitting a decision the design already made — silent omissions force a reviewer to guess what was considered and rejected. Do not invent deferred rows for topics the change never needed; do not drop a real deferred decision just because it is deferred — the scope tag is what lets a genuine deferral stay visible without being auto-started.\n");
     out.push_str("  - This section is what the design doc's auto-populate step will consume to materialise dependent tasks with edges, so completeness matters.\n");
     out.push_str(&design_questions_manifest_block());
-    out.push_str("- when the doc is ready for review, push it and open a PR (see the acceptance criterion below). Do not start implementation tasks — those come from follow-up tasks the human files after the design is approved.\n");
+    out.push_str("- when the doc is ready for review, push it and open a PR (see the publication context below). Do not start implementation tasks — those come from follow-up tasks the human files after the design is approved.\n");
     out
 }
 
@@ -148,7 +148,7 @@ pub(super) fn compose_design_directive(parent_project: Option<&Project>, design_
 /// drains to zero. Deliberately the mirror image of
 /// [`compose_design_directive`]: that one says "author a new doc"; this one
 /// says "reconcile the existing doc against what actually shipped." The
-/// task's own `description` (rendered above this block via
+/// task's own `description` (rendered in the `- details:` block at the end of the prompt via
 /// `work_item_details`) already carries the remit brief — the project's
 /// design-doc path/branch and the enumerated merged PRs to review — so this
 /// block only needs to state the doc-only scope constraint and the update
@@ -172,7 +172,7 @@ pub(super) fn compose_design_postmortem_directive(
     }
     out.push_str(&doc_structure_conventions_block());
     out.push_str(&design_discipline_block());
-    out.push_str("- review each merged PR listed in the details above (`gh pr view`/`gh pr diff`) alongside the current doc, and update the doc to reflect **as-built reality**:\n");
+    out.push_str("- review each merged PR listed in the `- details:` task description at the end of this prompt (`gh pr view`/`gh pr diff`) alongside the current doc, and update the doc to reflect **as-built reality**:\n");
     out.push_str("  - decisions that diverged from what the doc originally said, and why (as best you can tell from the PR/commit history).\n");
     out.push_str("  - scope that was added or dropped relative to the doc's plan.\n");
     out.push_str("  - contracts, interfaces, or data models that evolved during implementation.\n");

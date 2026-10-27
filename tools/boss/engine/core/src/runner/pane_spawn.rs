@@ -1234,6 +1234,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .driver(driver.clone())
                 .tmux_host(tmux_host.clone())
                 .automation_outcome_proposals_seam_enabled(automation_outcome_proposals_seam_enabled)
+                .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
                 .is_review_supervisor(is_review_supervisor)
                 .is_post_merge_reviewer(is_post_merge_reviewer)
                 .checkout_positioned_on_pr_head(checkout_positioned_on_pr_head)

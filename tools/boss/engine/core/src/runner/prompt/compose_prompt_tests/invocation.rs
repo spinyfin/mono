@@ -8,6 +8,56 @@ use super::{
 };
 use boss_protocol::ExecutionKind;
 
+#[test]
+fn design_workers_receive_ci_classification_once_with_either_completion_channel() {
+    use crate::driver::{AgentDriver, ClaudeDriver};
+    use crate::worker_setup::{WorkerSetupInput, render_claude_md, worker_kind_for_execution};
+    for postmortem in [false, true] {
+        for seam in [false, true] {
+            let mut execution = base_execution();
+            execution.kind = ExecutionKind::ProjectDesign;
+            let mut item = design_task();
+            if postmortem {
+                let crate::work::WorkItem::Task(task) = &mut item else {
+                    panic!("expected design task")
+                };
+                task.kind = boss_protocol::TaskKind::DesignPostmortem;
+            }
+            let input = WorkerSetupInput::builder()
+                .run_id(execution.id.clone())
+                .lease_id("lease-design")
+                .workspace_path(std::path::PathBuf::from("/tmp/workspace"))
+                .events_socket_path(std::path::PathBuf::from("/tmp/events.sock"))
+                .boss_event_path(std::path::PathBuf::from("/tmp/boss-event"))
+                .execution_kind(execution.kind.as_str())
+                .worker_kind(worker_kind_for_execution(&execution.kind))
+                .run_done_proposals_seam_enabled(seam)
+                .build();
+            let rules = render_claude_md(&input, ClaudeDriver.agent_rules_preamble(), ".claude");
+            let prompt = compose_execution_prompt(
+                ExecutionPromptParams::builder()
+                    .execution(&execution)
+                    .work_item(&item)
+                    .workspace_path(&input.workspace_path)
+                    .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                    .run_done_proposals_seam_enabled(seam)
+                    .build(),
+            );
+            let assembled = format!("{rules}\n{prompt}");
+            for instruction in [
+                "Classify a CI failure by cause, then act",
+                "Caused by your change: fix it",
+                "Unrelated to your change AND trivial",
+                "Unrelated AND not trivial",
+                "which category you judged the failure into",
+            ] {
+                assert_eq!(assembled.matches(instruction).count(), 1, "{instruction}");
+            }
+            assert!(!assembled.contains("task prompt’s CI-failure rules"));
+        }
+    }
+}
+
 /// Reject backtick-wrapped `boss ` / `cube ` invocations. The PreToolUse
 /// launch guard blocks on the first token, so any remaining verb (not just
 /// `propose` / `pr`) wastes a round trip. Shape-based so a new verb cannot
@@ -182,16 +232,7 @@ fn run_done_seam_on_worker_signal_seam_off_teaches_summary_not_blocked_verb() {
     );
     assert!(prompt.contains("--answer-type multiple-choice --choices \"Gradual\" \"All at once\""));
     assert!(prompt.contains("your next run's task description ends with a `## Recorded answer` section"));
-    assert!(prompt.contains("### Write questions for someone arriving cold"));
-    assert!(prompt.contains("Context:\n"));
-    assert!(prompt.contains("Yes:\n"));
-    assert!(prompt.contains("No:\n"));
-    assert!(prompt.contains("Recommendation:\n"));
-    assert!(prompt.contains("Details:\n"));
-    assert!(prompt.contains("Worked example — bad"));
-    assert!(prompt.contains("Worked example — plain rewrite"));
-    assert!(prompt.contains("Only resend actions that definitely never left the app?"));
-    assert!(prompt.contains("This writing contract does not change when a question is warranted"));
+    assert!(prompt.contains("Follow the question-writing contract in the generated worker rules."));
     assert!(prompt.contains("Use the typed question flags on a blocked declaration"));
     assert!(prompt.contains("Yes appends authorization and restarts in the preserved workspace"));
     assert!(prompt.contains("No leaves the task blocked."));
@@ -286,8 +327,8 @@ fn bazel_prepush_gate_allows_evidenced_unattributable_push_when_run_done_seam_on
         "chore on a Bazel workspace must still render the pre-push gate:\n{gate}",
     );
     assert!(
-        gate.contains("You MAY push with a still-red, evidence-backed-unattributable target"),
-        "run_done seam on: the gate itself must authorize an evidenced unattributable push:\n{gate}",
+        gate.contains("evidence-backed exception allowing a still-red target to be pushed"),
+        "run_done seam on: the gate must reference the canonical exception:\n{gate}",
     );
     assert!(
         gate.contains("unless a still-red target is evidence-backed as pre-existing or environmental"),
@@ -346,8 +387,8 @@ fn revision_prepush_gate_allows_evidenced_unattributable_push_when_run_done_seam
         .next()
         .expect("run_done section must follow the revision gate");
     assert!(
-        gate.contains("You MAY push with a still-red, evidence-backed-unattributable target"),
-        "run_done seam on: a non-conflict revision gate must authorize an evidenced unattributable push:\n{gate}",
+        gate.contains("evidence-backed exception allowing a still-red target to be pushed"),
+        "run_done seam on: the revision gate must reference the canonical exception:\n{gate}",
     );
     assert!(
         !prompt.contains("propose blocked"),
@@ -394,7 +435,7 @@ fn conflict_revision_keeps_absolute_compile_stop_when_run_done_seam_on() {
         "run_done seam on: conflict gate's absolute do-NOT-push wording must be preserved verbatim:\n{gate}",
     );
     assert!(
-        !gate.contains("You MAY push with a still-red, evidence-backed-unattributable target"),
+        !gate.contains("evidence-backed exception allowing a still-red target to be pushed"),
         "run_done seam on: the conflict gate itself must not grow the unattributable-push exception:\n{gate}",
     );
     assert!(
@@ -426,4 +467,70 @@ fn conflict_revision_keeps_absolute_compile_stop_when_run_done_seam_on() {
         !prompt.contains("Timeouts and the full test suite are not a precondition"),
         "conflict prompt must not exempt build timeouts from the compile gate:\n{prompt}",
     );
+}
+
+#[test]
+fn implementation_brief_and_validation_exception_are_rendered_once() {
+    let ws = bazel_workspace();
+    for kind in [
+        ExecutionKind::ChoreImplementation,
+        ExecutionKind::RevisionImplementation,
+    ] {
+        let mut execution = base_execution();
+        execution.kind = kind;
+        execution.pr_url = Some("https://github.com/org/repo/pull/42".into());
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&execution)
+                .work_item(&chore_without_pr())
+                .workspace_path(ws.path())
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .run_done_proposals_seam_enabled(true)
+                .build(),
+        );
+        assert_eq!(prompt.matches("Description here.").count(), 1);
+        assert!(
+            prompt.contains(
+                "## Open Questions\n\nThe task you were assigned follows.\n\n## Task description\n\n- details:"
+            )
+        );
+        assert!(!prompt.contains("What this revision should change"));
+        assert_eq!(prompt.matches("two or three attempts maximum").count(), 1);
+        assert_eq!(prompt.matches("**Hard constraint").count(), 1);
+        assert!(prompt.contains("if attribution remains unresolved, the failure still stands"));
+        assert!(prompt.contains("a base reproduction, a passing rerun/isolation run"));
+        assert!(prompt.contains("recording the target, failure, attempts and evidence"));
+        assert!(
+            prompt.find("\n## Task description\n").unwrap() > prompt.find("## Declaring your run finished").unwrap()
+        );
+        assert!(!prompt.contains("Worked example"));
+    }
+}
+
+#[test]
+fn every_block_boundary_kind_emits_check_prohibition_once() {
+    for kind in [
+        ExecutionKind::TaskImplementation,
+        ExecutionKind::ChoreImplementation,
+        ExecutionKind::InvestigationImplementation,
+        ExecutionKind::RevisionImplementation,
+        ExecutionKind::ConflictResolution,
+    ] {
+        for enabled in [false, true] {
+            let mut execution = base_execution();
+            execution.kind = kind.clone();
+            execution.pr_url = Some("https://github.com/org/repo/pull/42".into());
+            let prompt = compose_execution_prompt(
+                ExecutionPromptParams::builder()
+                    .execution(&execution)
+                    .work_item(&chore_without_pr())
+                    .workspace_path(std::path::Path::new("/tmp/workspace"))
+                    .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                    .run_done_proposals_seam_enabled(enabled)
+                    .build(),
+            );
+            assert_eq!(prompt.matches("**Hard constraint").count(), 1, "{kind:?}");
+            assert!(prompt.contains("exclusions/allowlists"));
+        }
+    }
 }

@@ -860,8 +860,7 @@ pub(crate) fn render_rubric_section(scope: &ReviewScope) -> String {
                that a MERGED parent added and this resolution removes is a \
                regression **regardless of any \"supersedes\" narrative** — anchor \
                on the fact of the deletion, not the worker's stated purpose. \
-               This is the T793 / incident-002 check: a live feature silently \
-               removed during a forward-port must be caught. (`category: \
+               (`category: \
                \"regression\"`)\n\
              - **Supersession / obsolescence claims** *(first-class, explicit \
                check)* — if the PR body, a commit message, or a comment claims \
@@ -879,88 +878,29 @@ pub(crate) fn render_rubric_section(scope: &ReviewScope) -> String {
              - **Architectural issues** — wrong layer, missed reuse, abstraction \
                that fights the codebase's conventions. (`category: \
                \"architecture\"`)\n\
-             - **Reuse/duplication** *(first-class, explicit check)* — for \
-               every substantial new construct the PR introduces (an \
-               HTTP/API client, external-service wiring such as endpoints, \
-               auth headers, or version constants, a serialization helper, \
-               retry/backoff logic, or a utility module), search the WHOLE \
-               repo — not just the changed files — for an existing \
-               equivalent before accepting the new code as necessary: grep \
-               for distinctive strings (the exact endpoint URL, header name, \
-               version constant, or a crate-typical helper/module name). If \
-               an equivalent already exists, raise a finding naming the \
-               existing file/module and recommending reuse or extraction of \
-               a shared module — do not let a plausible-looking \
-               reimplementation pass just because it works in isolation. \
-               Example: a new `api.anthropic.com` HTTP client in a repo that \
-               already has five hand-rolled Anthropic clients is a \
-               duplication finding regardless of how well the new one is \
-               written. A justified exception (duplication that really is \
-               necessary) must be explicitly explained in the PR \
-               description; its absence there is itself grounds for the \
-               finding. (`category: \"duplication\"`) Any confirmed \
-               duplication finding forces a revision regardless of the \
-               severity you assign it — the same treatment as a regression \
-               finding, not an advisory suggestion.\n\
-             - **Deferred-scope hygiene** *(first-class, explicit check)* — \
-               compare the PR's delivered changes against the owning work \
-               item's brief (given above in **Task description** for an \
-               ordinary item, or **Chain-root brief** + **Revision ask** for \
-               a revision) and check for three distinct failure modes:\n\
-               (1) **Undeclared deferral** — the brief asked for scope that \
-               the diff does not deliver, and no `[deferred-scope] \
-               summary=\"...\" reason=\"...\"` marker (recorded by the \
-               engine from the worker's final response) covers the gap. The \
-               worker narrowed scope without declaring it anywhere the \
-               engine can see.\n\
-               (2) **Misdeclared deferral** — the PR body, summary, or a \
-               commit message contains prose deferral language (a \
-               \"## Deferred\" section, \"left for a followup\", \"out of \
-               scope for this PR\", \"will address later\", etc.) that has \
-               no matching `[deferred-scope]` marker backing it. Prose alone \
-               creates no engine-tracked record, so the deferred work is \
-               silently lost. Live example: PR spinyfin/mono#1968 declared \
-               two deferred items only in a prose section — nothing was \
-               recorded, and the coordinator had to hand-file T2576 after \
-               the fact to recover the lost scope.\n\
-               (3) **Malformed markers** — a `[deferred-scope]` marker is \
-               present but missing `summary=`/`reason=` or improperly \
-               quoted. Flag it so the worker fixes the marker's grammar \
-               while the PR is still open; the engine records malformed \
-               markers with a parse warning, but a clean marker is the \
-               contract.\n\
-               **Exception — manual/interactive verification a headless \
-               worker cannot perform**: none of the three failure modes \
-               above apply when the deferred item is manual, interactive, \
-               or display-requiring verification — live GUI runs, \
-               \"spawn real workers and watch the app\", screenshot-based \
-               checks, physical-device tests, or anything else that needs an \
-               interactive session with a display. A worker running headless \
-               has no way to do this, so do NOT raise a `deferred_scope` \
-               finding demanding a `[deferred-scope]` marker for it, and do \
-               NOT demand the worker actually perform the manual \
-               verification. A prose \"## Deferred\" / \"Validation\" note \
-               describing exactly this kind of deferral is acceptable and \
-               expected — that is the normal, correct way to surface it. \
-               This carve-out is narrow: it keys on infeasibility for a \
-               headless agent, not on the word \"testing\" in general. \
-               Deferring work the agent COULD do headlessly — code changes, \
-               follow-up fixes, or unit/integration tests runnable without a \
-               display — still requires the `[deferred-scope]` marker exactly \
-               as in (1)/(2) above; this exception does not weaken the \
-               spinyfin/mono#1968 lesson that prose deferrals of trackable \
-               work get silently lost; it only narrows the marker \
-               requirement for work no marker could make trackable anyway \
-               (an agent still can't run it after filing a followup). If \
-               it's cheap to do so, you may still mention in the overall \
-               `summary` field that live verification remains outstanding, so \
-               the operator sees it — but do not add it to `findings` and do \
-               not let it affect `revision_warranted`.\n\
-               (`category: \"deferred_scope\"`) Any confirmed finding in \
-               this dimension forces a revision regardless of the severity \
-               you assign it — the same treatment as a regression or \
-               duplication finding: an undeclared or unrecorded deferral is \
-               a process gap, not a style nit.\n\
+             - **Reuse/duplication** *(first-class, explicit check)* — for every substantial new construct (HTTP/API client, external-service \
+               endpoints/auth/version wiring, serialization helper, retry/backoff, utility module), search the WHOLE \
+               repo: grep for distinctive strings (endpoints such as `api.anthropic.com`, headers, constants or \
+               helper/module names). If one exists, name its file/module and recommend reuse or shared extraction. \
+               Working in isolation does not justify duplication; a necessary exception must be explicitly justified in \
+               the PR description. A missing justification is itself grounds for a `category: \"duplication\"` finding. \
+               Every confirmed duplication finding forces a revision regardless of the severity.\n\
+             - **Deferred-scope hygiene** *(first-class, explicit check)* — use the Brief conformance comparison against **Task description**, or \
+               **Chain-root brief** + **Revision ask**. Check (1) **Undeclared deferral**: requested scope absent from \
+               the diff without a recorded `[deferred-scope] summary=\"...\" reason=\"...\"`; (2) **Misdeclared \
+               deferral**: PR body, summary or commit prose (\"## Deferred\", \"left for a followup\", \"out of scope \
+               for this PR\", \"will address later\") without a matching recorded marker; prose creates no tracked \
+               record; (3) **Malformed markers**: missing `summary=`/`reason=` or improper quoting, even though \
+               malformed markers are recorded with parse warnings. Require corrected grammar while the PR is open. \
+               (`category: \"deferred_scope\"`) Every confirmed finding forces a revision regardless of the severity. \
+               This is a process gap, not a style nit. See spinyfin/mono#1968 for prose-only scope loss.\n\
+             **Exception — manual/interactive verification a headless worker cannot perform**: live GUI runs, \"spawn \
+               real workers and watch the app\", screenshot-based checks, physical-device checks or other infeasible \
+               interactive verification need only a precise prose Deferred/Validation note, which is acceptable and \
+               expected. Do NOT demand performance or a marker; do NOT raise a `deferred_scope` finding or affect \
+               `revision_warranted`; optionally mention outstanding live verification in `summary`. This narrow \
+               exception does not exempt headlessly feasible code, fixes or unit/integration tests merely because they \
+               are called testing.\n\
              - **Agent-isms in code comments and PR descriptions** *(first-class, \
                explicit check)* — read every new or changed comment in the diff, \
                plus the PR title and description (fetch with `gh pr view` — \
@@ -1285,6 +1225,18 @@ mod tests {
         // P3 authoritative supersession block.
         assert!(prompt.contains("Supersession-claim citation check (engine-flagged)"));
         assert!(prompt.contains("supersedes"));
+        let docs_prompt = render_reviewer_initial_prompt(
+            "Update design doc",
+            "Reconcile the design with shipped behavior.",
+            "https://github.com/org/repo/pull/753",
+            "/tmp/bwo/exec.json",
+            ReviewScope::DocsOnly,
+            Some(&ctx),
+            "org/repo",
+        );
+        assert!(docs_prompt.contains("require design authorization"));
+        assert!(docs_prompt.contains("verify a specific design doc citation"));
+        assert!(!docs_prompt.contains("Apply the Supersession / obsolescence claims rubric"));
     }
 
     #[test]

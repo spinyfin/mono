@@ -1094,6 +1094,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_agent_rules_deliver_publication_ci_and_gated_questions() {
+        use crate::driver::{AgentDriver, ClaudeDriver};
+        use crate::worker_setup::{WorkerSetupInput, render_claude_md};
+        for kind in ["chore_implementation", "revision_implementation"] {
+            for seam in [false, true] {
+                let exec = FakeExec::new(0, "");
+                let input = WorkerSetupInput::builder()
+                    .run_id("run-remote-rules")
+                    .lease_id("lease-remote-rules")
+                    .workspace_path(std::path::PathBuf::from("/remote/work space"))
+                    .events_socket_path(std::path::PathBuf::from("/tmp/remote-events.sock"))
+                    .boss_event_path(std::path::PathBuf::from("/remote/bin/boss-event"))
+                    .execution_kind(kind)
+                    .run_done_proposals_seam_enabled(seam)
+                    .build();
+                crate::host_adapter::stage_remote_agent_rules(&exec, &input, &ClaudeDriver)
+                    .await
+                    .unwrap();
+                let calls = exec.calls();
+                let destination = ClaudeDriver.agent_rules_destination(&input.workspace_path, &input.run_id);
+                let expected = render_claude_md(&input, ClaudeDriver.agent_rules_preamble(), ".claude");
+                assert!(calls.iter().any(|call| matches!(call, Call::Push(path, body)
+                    if path == &destination.to_string_lossy() && body == &expected)));
+                for rule in [
+                    "pr create",
+                    "pr update",
+                    "Do not babysit CI",
+                    "CI failure classification",
+                ] {
+                    assert!(expected.contains(rule), "missing {rule}");
+                }
+                assert_eq!(expected.contains("Write questions for someone arriving cold"), seam);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn remote_initial_input_is_private_and_uses_an_absolute_launcher() {
         use crate::driver::AgentDriver;
         let exec = FakeExec::new(0, "boss-remote-run: starting run_id=run-1 version=eng-x pid=4242\n");

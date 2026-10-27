@@ -495,12 +495,16 @@ async fn implementation_prompt_states_pr_url_acceptance_criterion() {
     let workspace = TempDir::new().unwrap();
     let _spawner = run_once(&workspace, None).await.unwrap();
     let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
+    let rules = std::fs::read_to_string(
+        crate::driver::ClaudeDriver.agent_rules_destination(workspace.path(), &sample_execution_id(workspace.path())),
+    )
+    .unwrap();
     assert!(
-        prompt.contains("the deliverable is a PR URL"),
+        rules.contains("A task is not complete until a PR exists"),
         "implementation prompt must state the PR-URL acceptance criterion: {prompt}",
     );
     assert!(
-        prompt.contains("on its own line"),
+        rules.contains("on its own line"),
         "implementation prompt must tell the worker to print the URL on its own line: {prompt}",
     );
     assert!(
@@ -511,7 +515,7 @@ async fn implementation_prompt_states_pr_url_acceptance_criterion() {
         "implementation prompt must mention gh pr commands or cube pr create: {prompt}",
     );
     assert!(
-        prompt.contains("jj diff -r @"),
+        rules.contains("jj diff -r @"),
         "implementation prompt must tell the worker to verify the diff before pushing: {prompt}",
     );
 }
@@ -1791,9 +1795,13 @@ async fn spawn_prompt_for_auto_design_task_states_design_only_directive() {
 
     // The PR-URL acceptance criterion still applies to design
     // runs — they produce a PR, it just contains the doc only.
+    let rules = std::fs::read_to_string(
+        crate::driver::ClaudeDriver.agent_rules_destination(workspace.path(), &sample_execution_id(workspace.path())),
+    )
+    .unwrap();
     assert!(
-        prompt.contains("the deliverable is a PR URL"),
-        "design prompt must keep the PR-URL acceptance criterion:\n{prompt}",
+        rules.contains("A task is not complete until a PR exists"),
+        "design worker rules must keep the PR-URL acceptance criterion: {rules}",
     );
 
     // Deliverable 2 — the breakdown sizing contract: the design worker

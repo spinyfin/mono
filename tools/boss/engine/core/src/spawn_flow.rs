@@ -553,6 +553,9 @@ pub struct StartWorkerInput {
     /// unless `worker_kind` is [`WorkerKind::Triage`].
     #[builder(default)]
     pub automation_outcome_proposals_seam_enabled: bool,
+    /// Forwarded to worker rules to gate operator question guidance.
+    #[builder(default)]
+    pub run_done_proposals_seam_enabled: bool,
     /// Forwarded to `WorkerSetupInput` — see that field's doc. Ignored
     /// unless `worker_kind` is [`WorkerKind::Reviewer`].
     #[builder(default)]
@@ -813,6 +816,7 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
         .maybe_task_kind(input.task_kind.clone())
         .worker_kind(input.worker_kind.clone())
         .automation_outcome_proposals_seam_enabled(input.automation_outcome_proposals_seam_enabled)
+        .run_done_proposals_seam_enabled(input.run_done_proposals_seam_enabled)
         .is_review_supervisor(input.is_review_supervisor)
         .is_post_merge_reviewer(input.is_post_merge_reviewer)
         .checkout_positioned_on_pr_head(input.checkout_positioned_on_pr_head)
@@ -1239,6 +1243,7 @@ mod tests {
                 "boss-3-run-test".into(),
             ),
             automation_outcome_proposals_seam_enabled: false,
+            run_done_proposals_seam_enabled: false,
             is_review_supervisor: false,
             is_post_merge_reviewer: false,
             checkout_positioned_on_pr_head: false,
