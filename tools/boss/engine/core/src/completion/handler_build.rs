@@ -354,7 +354,7 @@ impl WorkerCompletionHandler {
     /// Whether the rung-1 engine-direct mechanical rebase is enabled on the
     /// conflict-watch path. Read by the merge poller's conflict sweep to
     /// decide whether to hand `on_conflict_detected` a live `CubeClient` for
-    /// the escalation ladder. Default OFF (see the flag registry).
+    /// the escalation ladder. Enabled by default; the flag remains an operator kill switch.
     pub fn mechanical_rebase_enabled(&self) -> bool {
         self.feature_flags.is_enabled("conflict_ladder_mechanical_rebase")
     }

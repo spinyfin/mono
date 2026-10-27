@@ -1790,6 +1790,9 @@ async fn pure_rebase_skip_gate_skips_conflict_resolution_with_identical_diff() {
         .handler
         .with_branch_verifier(verifier.clone())
         .with_pr_state_checker(open_pr_checker())
+        .with_merge_probe(Arc::new(FixedMergeabilityProbe {
+            mergeability: crate::merge_poller::OpenPrMergeability::Clean,
+        }))
         .with_enable_revision_triggered_reviews(true);
 
     let outcome = handler.on_stop(&execution_id).await;
@@ -1860,6 +1863,9 @@ async fn pure_rebase_skip_gate_does_not_skip_when_content_differs() {
         .handler
         .with_branch_verifier(verifier)
         .with_pr_state_checker(open_pr_checker())
+        .with_merge_probe(Arc::new(FixedMergeabilityProbe {
+            mergeability: crate::merge_poller::OpenPrMergeability::Clean,
+        }))
         .with_enable_revision_triggered_reviews(true);
 
     let outcome = handler.on_stop(&execution_id).await;
@@ -2159,6 +2165,9 @@ async fn pure_rebase_skip_gate_ignores_attempt_row_not_owned_by_this_revision() 
         .handler
         .with_branch_verifier(verifier.clone())
         .with_pr_state_checker(open_pr_checker())
+        .with_merge_probe(Arc::new(FixedMergeabilityProbe {
+            mergeability: crate::merge_poller::OpenPrMergeability::Clean,
+        }))
         .with_enable_revision_triggered_reviews(true);
 
     let outcome = handler.on_stop(&execution_id).await;

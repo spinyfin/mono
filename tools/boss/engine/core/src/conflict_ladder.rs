@@ -527,8 +527,8 @@ pub(crate) async fn run_rung1_in_lease(
         // "did not resolve every residual file" message previously
         // misdiagnosed a resolved-but-push-rejected result as an unresolved
         // one.
-        // Any non-fall-through outcome means rung 0 pushed its resolution.
-        let pushed = !matches!(rung0_outcome, LadderOutcome::FellThrough { .. });
+        // Only a retired or signoff-held resolution was pushed.
+        let pushed = matches!(rung0_outcome, LadderOutcome::Retired | LadderOutcome::HaltedForSignoff);
         finish_rebase_pointers(work_db, &saved, attempt, candidate, pushed).await;
         match rung0_outcome {
             LadderOutcome::FellThrough { reason, .. } => reason,
@@ -659,7 +659,7 @@ pub(crate) async fn attempt_rung0(
         })
         .collect();
 
-    let registry = ResolverRegistry::with_builtins();
+    let registry = ResolverRegistry::with_builtins_from_base(&format!("{}@origin", attempt.base_branch));
     let resolved: Vec<ResolvedFile> = match registry.resolve_all(&lease.workspace_path, &files).await {
         RegistryResolution::AllResolved(resolved) => resolved,
         RegistryResolution::Declined {
@@ -718,6 +718,14 @@ pub(crate) async fn attempt_rung0(
                 "rung 0 attempted but a resolver failed operationally (environment/tooling issue, \
                  not a decline)"
             };
+            if files
+                .iter()
+                .all(|file| boss_deterministic_resolvers::is_generated_lockfile(&file.path))
+            {
+                tracing::warn!(attempt_id = %attempt.id, %reason,
+                    "generated lockfile regeneration failed; retaining mechanical remediation, no model worker");
+                return LadderOutcome::MechanicalRungsUnavailable;
+            }
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,
                 reason,

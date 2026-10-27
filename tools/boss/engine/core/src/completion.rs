@@ -82,6 +82,7 @@ use boss_github::pr_url::pr_number_from_url;
 // methods to the same type; the handler struct, shared types, traits, and free
 // helpers stay in this parent module and reach the submodules via `use super`.
 mod attention;
+mod conflict_delivery_gate;
 mod contribution_gate;
 mod execution_started;
 mod finalize_passes;

@@ -39,6 +39,7 @@ pub use resolvers::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictClass {
     CargoLock,
+    GeneratedLock,
     BazelModuleLock,
     RegistryAppendUnion,
     /// Resolved by a [`RecipeResolver`] — a user-configured declarative
@@ -50,6 +51,7 @@ pub enum ConflictClass {
 impl ConflictClass {
     pub fn as_str(&self) -> &'static str {
         match self {
+            ConflictClass::GeneratedLock => "generated_lock",
             ConflictClass::CargoLock => "cargo_lock",
             ConflictClass::BazelModuleLock => "bazel_module_lock",
             ConflictClass::RegistryAppendUnion => "registry_append_union",
@@ -118,3 +120,8 @@ mod tests {
         assert_eq!(ConflictClass::RegistryAppendUnion.as_str(), "registry_append_union");
     }
 }
+
+pub use resolvers::is_generated_lockfile;
+
+#[cfg(test)]
+mod lockfile_base_tests;

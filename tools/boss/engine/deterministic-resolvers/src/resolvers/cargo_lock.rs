@@ -16,18 +16,29 @@ use crate::{ConflictClass, ConflictedFile, DeterministicResolver, ResolveOutcome
 /// `docs/designs/merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`.
 pub struct CargoLockResolver {
     runner: Arc<dyn CommandRunner>,
+    base_revision: Option<String>,
 }
 
 impl CargoLockResolver {
     pub fn new() -> Self {
         Self {
             runner: Arc::new(RealCommandRunner),
+            base_revision: None,
         }
+    }
+
+    /// Seed regeneration from the PR base, preserving its pinned dependencies.
+    pub fn with_base_revision(mut self, revision: String) -> Self {
+        self.base_revision = Some(revision);
+        self
     }
 
     #[cfg(test)]
     pub(crate) fn with_runner(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            base_revision: None,
+        }
     }
 }
 
@@ -55,6 +66,7 @@ impl DeterministicResolver for CargoLockResolver {
             "Cargo.toml",
             "cargo",
             &["generate-lockfile"],
+            self.base_revision.as_deref(),
         )
         .await
     }

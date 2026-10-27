@@ -1979,6 +1979,17 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
     );
     out.push_str(&compose_conflict_ground_truth_fragment(attempt));
     out.push_str(
+        "### Generated lockfiles\n\n\
+         Never hand-merge generated lockfiles or ask a model to choose their entries. \
+         First reconcile the source manifests, then restore only the lockfile from the PR's \
+         base branch and regenerate it with its owning tool against those merged inputs. \
+         For `MODULE.bazel.lock`, run `bazel mod deps --lockfile_mode=update`; for `Cargo.lock`, \
+         use Cargo's lockfile generator through the repository's supported tooling. Apply the same \
+         base-and-regenerate rule to other package-manager lockfiles. A tool failure is a tooling \
+         blocker, never permission to hand-edit the generated result. Verify GitHub reports the \
+         bound PR `MERGEABLE` after pushing; a local clean tree or a moved head is insufficient.\n\n",
+    );
+    out.push_str(
         "### Preservation rule (HARD CONSTRAINT — read before resolving)\n\n\
          A merge/forward-port resolution is a **reconciliation**, not an authoring surface. \
          Its only correct default is **preserve both sides**:\n\n\

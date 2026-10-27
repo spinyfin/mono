@@ -644,6 +644,15 @@ pub async fn on_conflict_detected_with(
         }
     };
 
+    // Another row in the revision family can observe this same PR, and an
+    // ended attempt can still have a live worker. Do not mint a competitor.
+    if work_db
+        .has_live_conflict_revision_for_pr(&candidate.pr_url)
+        .unwrap_or(true)
+    {
+        return false;
+    }
+
     // Trunk merge-queue coordination (design §"Coordination with
     // conflict_watch / ci_watch"): a conflict detected while a Trunk merge
     // intent is still live in the queue is real — Trunk will fail it too —
@@ -1033,6 +1042,13 @@ fn supersede_if_stale(
     active_crz: &crate::work::ConflictResolution,
 ) -> bool {
     let current_head_sha = probe.head_ref_oid.as_deref();
+    // A push can change the head while the existing worker is still
+    // resolving it. Head movement must not replace a live fix vehicle.
+    if let Some(revision) = active_crz.revision_task_id.as_deref()
+        && work_db.is_conflict_resolution_revision_live(revision).unwrap_or(true)
+    {
+        return false;
+    }
     let head_sha_stale = match current_head_sha {
         Some(current) => active_crz
             .head_sha_before
@@ -1389,6 +1405,12 @@ async fn maybe_spawn_conflict_revision(
     attempt: &crate::work::ConflictResolution,
     use_small_agent_profile: bool,
 ) -> bool {
+    if work_db
+        .has_live_conflict_revision_for_pr(&candidate.pr_url)
+        .unwrap_or(true)
+    {
+        return false;
+    }
     let base_branch = probe
         .base_ref_name
         .as_deref()

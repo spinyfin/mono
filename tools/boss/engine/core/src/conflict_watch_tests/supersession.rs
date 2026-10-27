@@ -38,6 +38,13 @@ async fn stale_head_sha_supersedes_pending_crz() {
         .expect("crz must exist after first detection");
     assert_eq!(original_crz.head_sha_before.as_deref(), Some("head-A"));
     let original_id = original_crz.id.clone();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'abandoned' WHERE work_item_id = ?1",
+            rusqlite::params![original_crz.revision_task_id],
+        )
+        .unwrap();
 
     // Simulate: revision pushed (head moves to "head-B"), exec abandoned.
     // We leave the crz as `pending` with `revision_task_id` set (the orphan
@@ -122,6 +129,13 @@ async fn terminal_revision_supersedes_pending_crz_even_without_head_move() {
         .unwrap()
         .expect("crz must exist after first detection");
     let original_id = original_crz.id.clone();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'abandoned' WHERE work_item_id = ?1",
+            rusqlite::params![original_crz.revision_task_id],
+        )
+        .unwrap();
     let revision_id = original_crz.revision_task_id.clone().expect("revision must be spawned");
 
     // Simulate: revision task completed (e.g. moved to in_review) but the
@@ -227,6 +241,13 @@ async fn stale_head_sha_and_base_advance_supersedes_pending_crz() {
     assert_eq!(original_crz.head_sha_before.as_deref(), Some("head-A"));
     assert_eq!(original_crz.base_sha_at_trigger.as_deref(), Some("base-1"));
     let original_id = original_crz.id.clone();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'abandoned' WHERE work_item_id = ?1",
+            rusqlite::params![original_crz.revision_task_id],
+        )
+        .unwrap();
 
     // Simulate: revision pushed (head moves to "head-B"), exec abandoned;
     // meanwhile main advanced to "base-2".  The crz stays `pending` with
@@ -327,6 +348,13 @@ async fn stale_head_sha_supersede_tombstones_the_superseded_revision() {
         .unwrap()
         .expect("crz must exist after first detection");
     let original_revision_id = original_crz.revision_task_id.clone().expect("revision must be spawned");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'abandoned' WHERE work_item_id = ?1",
+            rusqlite::params![original_revision_id],
+        )
+        .unwrap();
 
     let second = on_conflict_detected(
         &db,
@@ -372,9 +400,8 @@ async fn stale_head_sha_supersede_tombstones_the_superseded_revision() {
 
 #[tokio::test]
 async fn stale_head_sha_supersede_leaves_a_live_worker_alone() {
-    // Race guard: a worker still genuinely running the superseded revision
-    // must not be yanked out from under it — the tombstone waits for the
-    // worker's own on-Stop completion to settle the row instead.
+    // Head movement while the worker is running must neither supersede its
+    // attempt nor spawn a competing resolution.
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("boss.db");
     let db = WorkDb::open(db_path.clone()).unwrap();
@@ -426,9 +453,18 @@ async fn stale_head_sha_supersede_leaves_a_live_worker_alone() {
         &probe_with_head(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()), "head-B"),
     )
     .await;
-    assert!(
-        second,
-        "second probe with new head SHA must still re-detect (return true)"
+    assert!(!second, "head movement must not replace a live worker");
+    assert_eq!(
+        db.active_conflict_resolution_for_work_item(&chore).unwrap().unwrap().id,
+        original_crz.id,
+        "the original attempt must remain active"
+    );
+    assert_eq!(
+        db.list_conflict_resolutions(None, &[], Some(&chore), None)
+            .unwrap()
+            .len(),
+        1,
+        "no competing attempt may be created"
     );
 
     let old_revision = task(&db, &original_revision_id);

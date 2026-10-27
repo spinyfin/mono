@@ -692,6 +692,24 @@ fn write_resolvable_cargo_lock_fixture(ws: &std::path::Path, package_name: &str)
     .unwrap();
     std::fs::create_dir(ws.join("src")).unwrap();
     std::fs::write(ws.join("src").join("lib.rs"), "").unwrap();
+    std::fs::write(ws.join("Cargo.lock"), "version = 4\n").unwrap();
+    let jj = std::env::var_os("BOSS_JJ_BIN").expect("Bazel supplies jj");
+    let jj = std::fs::canonicalize(jj).unwrap();
+    for args in [
+        vec!["git", "init"],
+        vec!["describe", "-m", "Base manifest"],
+        vec!["bookmark", "set", "main"],
+        vec!["git", "remote", "add", "origin", ".jj/repo/store/git"],
+        vec!["git", "export"],
+        vec!["git", "fetch"],
+    ] {
+        let output = std::process::Command::new(&jj)
+            .args(args)
+            .current_dir(ws)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
     std::fs::write(
         ws.join("Cargo.lock"),
         "<<<<<<< ours\ngarbage\n=======\n>>>>>>> theirs\n",
@@ -859,6 +877,28 @@ async fn rung0_declined_file_falls_through_without_pushing() {
     let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
     assert_eq!(row.status, "pending");
     assert_eq!(row.resolved_by_rung, None);
+}
+
+#[tokio::test]
+async fn lockfile_only_tool_failure_stays_mechanical_without_pushing_or_worker_fallback() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, _) = blocked_with_attempt(&db);
+    let publisher = Arc::new(RecordingPublisher::default());
+    let workspace = tempdir().unwrap();
+    // A cold workspace without the owning manifest cannot regenerate this file.
+    // This must remain an explicit tooling failure, never an invitation to hand-merge it.
+    std::fs::write(workspace.path().join("MODULE.bazel.lock"), "<<<<<<< conflict\n").unwrap();
+    let cube = ScriptCube::with_workspace_path(
+        Script::Conflicts(vec!["MODULE.bazel.lock".into()]),
+        workspace.path().to_path_buf(),
+    );
+    let outcome = try_mechanical_rungs(&db, publisher.as_ref(), &cube, &candidate, &attempt).await;
+    assert_eq!(outcome, LadderOutcome::MechanicalRungsUnavailable);
+    assert!(cube.pushes.lock().await.is_empty());
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "pending");
+    assert!(row.revision_task_id.is_none());
 }
 
 #[tokio::test]

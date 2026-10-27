@@ -145,6 +145,20 @@ async fn rearm_invalidates_stale_success_when_head_unchanged_and_breaks_wedge() 
     // head advancing (head_sha_after stays NULL) — exactly the premature
     // retire the signal-cleared gate used to record on mergeable=UNKNOWN.
     db.mark_conflict_resolution_succeeded(&first_attempt.id, None).unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed' WHERE work_item_id = ?1",
+            rusqlite::params![first_attempt.revision_task_id],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+            rusqlite::params![first_attempt.revision_task_id],
+        )
+        .unwrap();
     db.clear_merge_conflict_signal_only(&chore).unwrap();
     let succeeded = db.get_conflict_resolution(&first_attempt.id).unwrap().unwrap();
     assert_eq!(succeeded.status, "succeeded");

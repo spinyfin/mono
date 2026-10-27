@@ -362,7 +362,8 @@ impl WorkerCompletionHandler {
     ///
     /// Mirrors [`Self::finalize_pr_transition`]'s termination write and
     /// teardown exactly. The only inline network calls are the bounded
-    /// branch check and branch-keyed detection the resolver performs — see
+    /// branch check, branch-keyed detection, and conflict-resolution mergeability
+    /// verification — see
     /// the module doc. Every other network-touching step that function
     /// layers on top (reviewer-batch enqueue, doc-link detection) runs in
     /// [`Self::spawn_declared_delivery_post_effects`], the same best-effort,
@@ -393,6 +394,10 @@ impl WorkerCompletionHandler {
             return self
                 .refuse_foreign_pr_binding(execution, &pr_url, &conflict, "run_done")
                 .await;
+        }
+
+        if !merged && let Some(outcome) = self.conflict_delivery_failure(execution, &pr_url).await {
+            return outcome;
         }
 
         // Captured before `record_worker_pr_completion` nulls

@@ -251,6 +251,13 @@ impl WorkerCompletionHandler {
             self.record_mid_turn_reap(execution, source).await;
         }
 
+        if !merged
+            && let Ok(execution) = execution_result.as_ref()
+            && let Some(outcome) = self.conflict_delivery_failure(execution, &pr_url).await
+        {
+            return outcome;
+        }
+
         // Forensic teardown head — captured before any durable reviewer
         // enqueue or terminalization write. Fail-open: this snapshot is not
         // consulted by the mid-turn guard, so a transient `gh` failure or an

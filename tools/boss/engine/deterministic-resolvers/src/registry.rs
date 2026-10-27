@@ -83,6 +83,20 @@ impl ResolverRegistry {
         registry
     }
 
+    /// Built-ins for a rebased PR: regenerate lockfiles from its base version.
+    pub fn with_builtins_from_base(revision: &str) -> Self {
+        let mut registry = Self::empty();
+        registry.register(Box::new(crate::resolvers::GeneratedLockResolver {
+            base_revision: revision.into(),
+        }));
+        registry.register(Box::new(CargoLockResolver::new().with_base_revision(revision.into())));
+        registry.register(Box::new(
+            BazelModuleLockResolver::new().with_base_revision(revision.into()),
+        ));
+        registry.register(Box::new(RegistryAppendUnionResolver::new()));
+        registry
+    }
+
     pub fn register(&mut self, resolver: Box<dyn DeterministicResolver>) {
         self.resolvers.push(resolver);
     }

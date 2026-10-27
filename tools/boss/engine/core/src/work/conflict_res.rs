@@ -67,6 +67,25 @@ impl WorkDb {
         Ok(count > 0)
     }
 
+    /// A live revision owns resolution for its PR even if its attempt ended.
+    pub fn has_live_conflict_revision_for_pr(&self, pr_url: &str) -> Result<bool> {
+        let revisions: Vec<String> = {
+            let conn = self.connect()?;
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT revision_task_id FROM conflict_resolutions
+                 WHERE pr_url = ?1 AND revision_task_id IS NOT NULL",
+            )?;
+            stmt.query_map(params![pr_url], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for revision in revisions {
+            if self.is_conflict_resolution_revision_live(&revision)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Insert a `conflict_resolutions` row with `status='pending'`
     /// alongside a `tasks.blocked_attempt_id` pointer to the new
     /// attempt id. `(work_item_id, base_sha_at_trigger, head_sha_before)`
