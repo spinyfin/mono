@@ -206,9 +206,8 @@ fn failed_to_start_badges(conn: &Connection, ids: &[String]) -> Result<Vec<(Stri
            AND b.generation >= {cap}
            AND NOT EXISTS (SELECT 1 FROM pr_review_verdicts v
                            WHERE v.batch_id = b.id AND v.gate_outcome != '{stale_head}')
-           AND NOT EXISTS (SELECT 1 FROM pr_review_batch_members m
-                           JOIN work_executions we ON we.id = m.execution_id
-                           WHERE m.batch_id = b.id AND we.started_at IS NOT NULL)",
+           AND {none_started}",
+        none_started = super::review_batches::NO_BATCH_MEMBER_STARTED,
         cap = super::review_batches::MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS,
         stale_head = super::review_verdicts::REVIEW_GATE_OUTCOME_STALE_HEAD,
     );
@@ -260,7 +259,6 @@ pub(crate) struct ReviewBadgeHistory {
     /// Details when the current head's last
     /// automatic review batch failed because no reviewer ever started; see
     /// [`failed_to_start_badges`].
-    #[builder(required, default)]
     failed_to_start: Option<FailedReviewStart>,
 }
 

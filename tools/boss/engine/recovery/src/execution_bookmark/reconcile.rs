@@ -26,12 +26,10 @@
 //! references move.
 //!
 //! "Already in it" is decided per preserved change, by content: a change is
-//! carried when the vouching history has a commit with the same change id
-//! and an equivalent patch, or, failing that, any commit with an equivalent
-//! patch under a different change id. The second form is what a git-side
+//! carried when the vouching history has a distinct commit with an equivalent
+//! patch, in the same order, even under a different change id. The latter is what a git-side
 //! rebase, cherry-pick or force-push leaves behind (jj assigns the imported
-//! commits fresh change ids), and it was the shape of the mono#3201 PR whose
-//! rewritten history made every later recovery of its records fail forever.
+//! commits fresh change ids); see mono#3201.
 //! Identity alone never vouches: a same-change-id commit with a different
 //! patch is an unpublished amendment and stays missing.
 use super::*;
@@ -275,16 +273,14 @@ async fn same_patch(jj: &dyn Jj, repo: &Path, commit: &str, variant: &str) -> Re
 /// Is the preserved work of `head` already carried by `vouching`? Ancestry
 /// first; otherwise every non-empty preserved commit that is not an
 /// ancestor of `vouching` must have a visible commit with an equivalent
-/// patch in the vouching history: the commit with the same change id when
-/// there is one, else any commit of that history (a git-side rebase or
+/// patch in the vouching history, preserving occurrence order (a git-side rebase or
 /// cherry-pick gives the re-imported commit a fresh change id, so the patch
 /// is the only identity that survives). An empty interdiff proves
 /// equivalence; identity alone cannot vouch for an unpublished amendment.
 /// Without a base only ancestry counts.
 ///
-/// Cost: one interdiff per same-change-id candidate, then one per vouching
-/// commit for each preserved change still unmatched. The vouching range is
-/// the PR's own history above the baseline, so this stays small.
+/// Matches consume candidates in newest-first order. At most 128 interdiffs
+/// run per head; exhausting that limit fails closed with missing changes.
 pub(crate) async fn containment(
     jj: &dyn Jj,
     repo: &Path,
@@ -323,7 +319,7 @@ pub(crate) async fn containment(
                         "log",
                         "--no-graph",
                         "-r",
-                        &format!("{} ~ empty()", vouching_range(base, vouching, trunk)),
+                        &format!("({} ~ ::({head})) ~ empty()", vouching_range(base, vouching, trunk)),
                         "-T",
                         "change_id ++ \" \" ++ commit_id ++ \"\\n\"",
                     ],
@@ -337,21 +333,22 @@ pub(crate) async fn containment(
     };
     let mut matched = Vec::new();
     let mut missing = Vec::new();
+    let mut next_candidate = 0;
+    let mut comparisons = 0;
     for (change, commit, description) in change_commit_lines(&outside) {
         let mut variant = None;
-        if let Some((_, same_change)) = published
-            .iter()
-            .find(|(published_change, _)| published_change == change)
-            && same_patch(jj, repo, commit, same_change).await?
-        {
-            variant = Some((same_change.clone(), None));
-        }
-        if variant.is_none() {
-            for (published_change, candidate) in &published {
-                if published_change != change && same_patch(jj, repo, commit, candidate).await? {
-                    variant = Some((candidate.clone(), Some(published_change.clone())));
-                    break;
-                }
+        for (index, (published_change, candidate)) in published.iter().enumerate().skip(next_candidate) {
+            if comparisons == 128 {
+                break;
+            }
+            comparisons += 1;
+            if same_patch(jj, repo, commit, candidate).await? {
+                next_candidate = index + 1;
+                variant = Some((
+                    candidate.clone(),
+                    (published_change != change).then(|| published_change.clone()),
+                ));
+                break;
             }
         }
         match variant {

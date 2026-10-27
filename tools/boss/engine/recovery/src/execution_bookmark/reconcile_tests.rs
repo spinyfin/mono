@@ -1,6 +1,9 @@
 use super::*;
 use boss_engine_test_git::jj::JjRepo;
 
+#[path = "reconcile_occurrence_tests.rs"]
+mod occurrence_tests;
+
 /// `(commit id)` of the single commit `revset` names.
 pub(super) fn one(repo: &std::path::Path, revset: &str) -> String {
     let out = JjRepo::run(

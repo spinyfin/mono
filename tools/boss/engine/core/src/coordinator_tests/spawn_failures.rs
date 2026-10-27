@@ -371,12 +371,9 @@ async fn composer_never_ready_persists_pane_spawn_failed_without_claiming_the_dr
     );
 }
 
-/// Every pre-start failure is a `pre_start_failure` record in the dispatch
-/// stream at the moment it is classified: the error, the attempt number and
-/// what the engine decided (retry after backoff, or permanent). Before this
-/// record existed a failure in a stage with no stage-specific error event
-/// (bookmark recovery, change create, run start) left the timeline stopped
-/// at the last successful stage with the error only on `last_error`.
+/// Every pre-start failure, including stages without a stage-specific error
+/// event, carries the error, attempt number and retry/permanent decision
+/// in a `pre_start_failure` dispatch record.
 #[tokio::test]
 async fn pre_start_failure_is_recorded_in_the_dispatch_stream_with_its_decision() {
     let dir = tempdir().unwrap();

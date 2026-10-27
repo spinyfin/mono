@@ -797,6 +797,11 @@ pub enum RetryDeadReviewBatchMember {
     BatchFailed,
 }
 
+/// SQL predicate shared by attention and badge queries; the batch alias is `b`.
+pub(super) const NO_BATCH_MEMBER_STARTED: &str = "NOT EXISTS (SELECT 1 FROM pr_review_batch_members m
+                 JOIN work_executions we ON we.id = m.execution_id
+                 WHERE m.batch_id = b.id AND we.started_at IS NOT NULL)";
+
 /// A failed leaf whose latest attempt never reached a review session: the
 /// member's execution has no `started_at`, so it died in pre-start dispatch
 /// (workspace lease, bookmark recovery, change create, spawn) and
@@ -807,10 +812,8 @@ struct NeverStartedLeaf {
     last_error: Option<String>,
 }
 
-/// `(leaves whose latest attempt failed, those among them that never
-/// started)`, over the leaf roles the batch actually has.
-fn failed_leaves(tx: &Transaction<'_>, members: &[ReviewBatchMember]) -> Result<(usize, Vec<NeverStartedLeaf>)> {
-    let mut failed = 0usize;
+/// Failed leaves whose latest attempt never started, over the batch leaf roles.
+fn failed_leaves(tx: &Transaction<'_>, members: &[ReviewBatchMember]) -> Result<Vec<NeverStartedLeaf>> {
     let mut never_started = Vec::new();
     for role in LEAF_REVIEWER_ROLES {
         let Some(member) = latest_attempt_for_role(members, role) else {
@@ -819,7 +822,6 @@ fn failed_leaves(tx: &Transaction<'_>, members: &[ReviewBatchMember]) -> Result<
         if member.status != ReviewBatchMemberStatus::Failed {
             continue;
         }
-        failed += 1;
         let Some(execution_id) = member.execution_id.as_deref() else {
             continue;
         };
@@ -833,20 +835,20 @@ fn failed_leaves(tx: &Transaction<'_>, members: &[ReviewBatchMember]) -> Result<
             });
         }
     }
-    Ok((failed, never_started))
+    Ok(never_started)
 }
 
 /// Title and body of the `pr_review_quorum_failed` attention for a batch
-/// whose leaves settled with fewer than two reports. Two facts the plain
-/// "insufficient quorum" wording hid are spelled out when they hold:
+/// whose leaves settled with fewer than two reports. Explains these conditions
+/// when they hold:
 ///
-/// - every failed reviewer died before a review session began (a dispatch
+/// - no member of the batch ever started a review session (a dispatch
 ///   problem, not a verdict), with each role's last pre-start error; and
 /// - this batch is the last generation the engine mints on its own for
 ///   this head ([`MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS`]), so nothing
 ///   will review the head again without a human.
 ///
-/// The second fact is also what the card's review badge keys off
+/// Both conditions also determine the card's failed-to-start review badge
 /// (`review_badge::failed_to_start_badges`), so the item carries the state
 /// rather than only the attention list.
 fn insufficient_quorum_attention(
@@ -854,8 +856,12 @@ fn insufficient_quorum_attention(
     batch: &ReviewBatch,
     members: &[ReviewBatchMember],
 ) -> Result<(String, String)> {
-    let (failed, never_started) = failed_leaves(tx, members)?;
-    let none_started = failed > 0 && never_started.len() == failed;
+    let never_started = failed_leaves(tx, members)?;
+    let none_started: bool = tx.query_row(
+        &format!("SELECT {NO_BATCH_MEMBER_STARTED} FROM pr_review_batches b WHERE b.id = ?1"),
+        [&batch.id],
+        |row| row.get(0),
+    )?;
     let mut title = "Automated reviewer: insufficient quorum".to_owned();
     let mut body = format!(
         "Fewer than two independent reviewers reported for {} (batch `{}`) — the remaining \
