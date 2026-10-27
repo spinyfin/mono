@@ -2204,7 +2204,7 @@ fn blocking_a_running_dependent_cancels_its_execution() {
                 prerequisite: prereq.id.clone(),
                 relation: None,
             },
-            crate::work::DependencyCancelOrigin::EngineInternal,
+            crate::DependencyCancelOrigin::EngineInternal,
         )
         .unwrap();
     assert_eq!(edge.dependent_id, dependent.id);
@@ -2283,7 +2283,7 @@ async fn blocking_a_running_dependent_publishes_execution_terminal() {
                 prerequisite: prereq.id.clone(),
                 relation: None,
             },
-            crate::work::DependencyCancelOrigin::EngineInternal,
+            crate::DependencyCancelOrigin::EngineInternal,
         )
         .unwrap();
     let reaped = reaped.expect("blocking a running dependent must report the cancelled execution");

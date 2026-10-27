@@ -869,6 +869,36 @@ impl WorkDb {
         self.update_work_item_as_actor(id, patch, actor)
     }
 
+    /// Apply a peer's card edit and atomically cancel any active-to-Backlog
+    /// execution. Return the captured execution id for post-commit resource
+    /// release, including terminal ghosts. Internal status writers retain
+    /// their own lifecycle through `update_work_item_as_actor`.
+    pub fn update_work_item_with_teardown(
+        &self,
+        id: &str,
+        patch: WorkItemPatch,
+        actor: &str,
+    ) -> Result<(WorkItem, Option<String>)> {
+        self.update_work_item_with_teardown_on_basis(id, patch, actor, crate::updates::DEFAULT_UPDATE_BASIS)
+    }
+
+    /// [`Self::update_work_item_with_teardown`] recording `basis` in the
+    /// field-change ledger for every column the patch changes.
+    pub fn update_work_item_with_teardown_on_basis(
+        &self,
+        id: &str,
+        patch: WorkItemPatch,
+        actor: &str,
+        basis: &str,
+    ) -> Result<(WorkItem, Option<String>)> {
+        if matches!(classify_id(id)?, ItemKind::Task) {
+            self.update_task_with_teardown(id, patch, actor, basis)
+        } else {
+            self.update_work_item_with_basis(id, patch, actor, basis)
+                .map(|item| (item, None))
+        }
+    }
+
     /// Like `update_work_item` but stamps `last_status_actor` with `actor`
     /// when the status actually changes. Engine-internal writers use direct
     /// SQL with `last_status_actor = 'engine'`; this path is for peer RPCs

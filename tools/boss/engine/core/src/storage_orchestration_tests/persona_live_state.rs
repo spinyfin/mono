@@ -44,7 +44,8 @@ fn terminal_state_holds_persona_until_live_slot_release() {
             reason: "ended".into(),
         },
     );
-    db.cancel_running_execution(&first.id, test_cancel_provenance()).unwrap();
+    db.cancel_running_execution(&first.id, test_cancel_provenance())
+        .unwrap();
     assert!(states.get(8).unwrap().activity.is_terminal());
     let (_, second) = start(&db, "local");
     assert_eq!(second.persona.as_deref(), Some("Data"));

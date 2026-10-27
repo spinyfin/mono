@@ -32,6 +32,7 @@
 //! `stage_execution_terminal` and commit via [`commit_and_publish`];
 //! host-disable transitions publish directly (no enclosing transaction).
 
+use std::cell::RefCell;
 use std::sync::OnceLock;
 
 use boss_dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
@@ -50,6 +51,20 @@ pub(crate) fn emit_engine_audit(event: &str, payload: &serde_json::Value) {
     if let Some(sink) = ENGINE_AUDIT_SINK.get() {
         sink(event, payload);
     }
+}
+
+thread_local! {
+    static INIT_PENDING: RefCell<PendingEvents> = RefCell::new(PendingEvents::new());
+}
+
+/// Stage schema-startup decisions until `WorkDb::init` commits.
+pub(crate) fn with_init_pending<T>(f: impl FnOnce(&mut PendingEvents) -> T) -> T {
+    INIT_PENDING.with(|slot| f(&mut slot.borrow_mut()))
+}
+
+/// Take staged schema-startup decisions. Empty if init did not commit.
+pub(crate) fn take_init_pending() -> PendingEvents {
+    INIT_PENDING.with(|slot| slot.replace(PendingEvents::new()))
 }
 
 /// Events staged by a state-write path for publication once its enclosing
@@ -79,16 +94,6 @@ impl PendingEvents {
 
     /// Stage an engine-audit record to write once the transaction commits.
     pub fn push_audit(&mut self, event: &str, payload: serde_json::Value) {
-        if matches!(event, "execution_cancelled" | "execution_abandoned") {
-            self.push(Event::ExecutionDecision {
-                execution_id: payload["execution_id"].as_str().expect("execution id").to_owned(),
-                task_id: payload["work_item_id"].as_str().expect("work item id").to_owned(),
-                status: payload["to_status"].as_str().expect("terminal status").to_owned(),
-                source: payload["source"].as_str().expect("cancel source").to_owned(),
-                actor: payload["actor"].as_str().expect("cancel actor").to_owned(),
-                reason: payload["reason"].as_str().expect("cancel reason").to_owned(),
-            });
-        }
         self.audits.push((event.to_owned(), payload));
     }
 
@@ -136,8 +141,11 @@ fn emit_decision_dispatch(sink: &dyn DispatchEventSink, payload: &serde_json::Va
     let Some(execution_id) = payload.get("execution_id").and_then(|value| value.as_str()) else {
         return;
     };
-    let mut event =
-        DispatchEvent::new(Stage::ExecutionCancelled, Outcome::Ok, execution_id).with_details(payload.clone());
+    let mut details = payload.clone();
+    if details.get("chain_root_id").and_then(|value| value.as_str()).is_some() {
+        details["reason"] = serde_json::json!("parent_pr_merged");
+    }
+    let mut event = DispatchEvent::new(Stage::ExecutionCancelled, Outcome::Ok, execution_id).with_details(details);
     if let Some(work_item_id) = payload.get("work_item_id").and_then(|value| value.as_str()) {
         event = event.with_work_item(work_item_id);
     }

@@ -310,7 +310,7 @@ fn mutating_taxonomy_verbs_are_denied_and_name_a_proposal_verb() {
             .unwrap(),
         ),
         id: "task_1".into(),
-        patch: Box::new(WorkItemPatch::default()),
+        patch: Box::new(boss_protocol::WorkItemPatch::default()),
     });
     assert_eq!(denial.reason, WorkerTierDenialReason::MutatingTaxonomy);
     assert_eq!(
@@ -320,19 +320,21 @@ fn mutating_taxonomy_verbs_are_denied_and_name_a_proposal_verb() {
 
     let denial = assert_denied(FrontendRequest::UpdateWorkItem {
         id: "task_1".into(),
-        patch: Box::new(WorkItemPatch {
+        patch: Box::new(boss_protocol::WorkItemPatch {
             pr_url: Some("https://example/pr/1".into()),
-            ..WorkItemPatch::default()
+            ..boss_protocol::WorkItemPatch::default()
         }),
+        cancel: None,
     });
     assert_eq!(denial.use_instead.as_deref(), Some("boss propose pr-created"));
 
     let denial = assert_denied(FrontendRequest::UpdateWorkItem {
         id: "task_1".into(),
-        patch: Box::new(WorkItemPatch {
+        patch: Box::new(boss_protocol::WorkItemPatch {
             effort_level: Some("large".into()),
-            ..WorkItemPatch::default()
+            ..boss_protocol::WorkItemPatch::default()
         }),
+        cancel: None,
     });
     assert_eq!(denial.use_instead.as_deref(), Some("boss propose effort-escalation"));
 }

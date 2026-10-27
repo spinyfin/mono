@@ -553,7 +553,7 @@ async fn work_tree_delta_handler_moves_deletes_and_recovers_full_snapshots() {
 async fn unpopulate_records_caller_for_cascade_deleted_live_revision() {
     let (state, _dir) = test_server_state();
     let db = state.work_db.clone();
-    let product = crate::test_support::create_test_product_named(&db, "unpopulate cancellation");
+    let product = boss_engine_runtime::test_support::create_test_product_named(&db, "unpopulate cancellation");
     let project = db
         .create_project(
             boss_protocol::CreateProjectInput::builder()
@@ -565,8 +565,9 @@ async fn unpopulate_records_caller_for_cascade_deleted_live_revision() {
         .unwrap();
     let run = claim_planner_run(&db, &product.id, &project.id);
     settle_planner_run(&db, &run.id, boss_protocol::PLANNER_OUTCOME_STAGED);
-    let parent = crate::test_support::create_test_chore_manual(&db, product.id.clone(), "Planned parent");
-    let revision = crate::test_support::create_test_chore_manual(&db, product.id.clone(), "Live revision");
+    let parent = boss_engine_runtime::test_support::create_test_chore_manual(&db, product.id.clone(), "Planned parent");
+    let revision =
+        boss_engine_runtime::test_support::create_test_chore_manual(&db, product.id.clone(), "Live revision");
     {
         let conn = db.connect().unwrap();
         conn.execute(

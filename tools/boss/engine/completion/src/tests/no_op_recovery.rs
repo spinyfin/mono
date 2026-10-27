@@ -117,7 +117,8 @@ async fn applied_revision_no_op_with_body_edit_finishes_before_ci_and_releases_n
                 .any(|execution| execution.work_item_id == next.id)
         );
         assert_eq!(
-            db.cancel_running_execution_and_demote_task(&execution_id, test_cancel_provenance()).unwrap(),
+            db.cancel_running_execution_and_demote_task(&execution_id, test_cancel_provenance())
+                .unwrap(),
             (false, false)
         );
         assert_eq!(task(&db, &revision_id).status, TaskStatus::Done);

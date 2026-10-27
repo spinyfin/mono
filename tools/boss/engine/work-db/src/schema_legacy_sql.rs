@@ -5,8 +5,7 @@
 /// migration `20261118_1800_cancel_provenance` installs these; v039/v043/v059
 /// recovery re-arm also call `ensure_cancel_provenance_columns` so a
 /// floor-era database can stamp provenance while those older steps run.
-pub(super) const EXECUTIONS_CANCEL_PROVENANCE_SQL: &str =
-    "ALTER TABLE work_executions ADD COLUMN cancel_source TEXT;
+pub(super) const EXECUTIONS_CANCEL_PROVENANCE_SQL: &str = "ALTER TABLE work_executions ADD COLUMN cancel_source TEXT;
      ALTER TABLE work_executions ADD COLUMN cancel_actor TEXT;
      ALTER TABLE work_executions ADD COLUMN cancel_reason TEXT";
 

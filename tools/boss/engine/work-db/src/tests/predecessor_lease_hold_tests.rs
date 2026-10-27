@@ -1,5 +1,5 @@
-use crate::test_support::test_cancel_provenance;
 use super::*;
+use crate::test_support::test_cancel_provenance;
 use boss_engine_recovery::execution_bookmark::PreservedTip;
 
 /// A finished predecessor that still records the cube lease it ran under, and

@@ -282,7 +282,7 @@ async fn answer_agent_bind_failure_records_cancellation_cause() {
         .filter(|row| row.work_item_id == comment.id)
         .collect();
     assert_eq!(rows.len(), 1);
-    crate::test_support::assert_cancel_provenance(
+    boss_work_db::test_support::assert_cancel_provenance(
         &rows[0],
         boss_protocol::CancelSource::AnswerAgent,
         "answer_agent_spawn",

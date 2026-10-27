@@ -217,7 +217,9 @@ mod work {
                         .event_bus()
                         .subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionTerminal));
 
-                    let cancelled = db.cancel_running_execution(&execution.id, test_cancel_provenance()).unwrap();
+                    let cancelled = db
+                        .cancel_running_execution(&execution.id, test_cancel_provenance())
+                        .unwrap();
                     assert!(cancelled, "a non-terminal execution must be cancelled");
 
                     let event = sub
@@ -264,7 +266,9 @@ mod work {
                         .event_bus()
                         .subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionTerminal));
 
-                    let (cancelled, demoted) = db.cancel_running_execution_and_demote_task(&execution.id, test_cancel_provenance()).unwrap();
+                    let (cancelled, demoted) = db
+                        .cancel_running_execution_and_demote_task(&execution.id, test_cancel_provenance())
+                        .unwrap();
                     assert!(cancelled, "a non-terminal execution must be cancelled");
                     assert!(demoted, "the active task must be demoted to todo");
 

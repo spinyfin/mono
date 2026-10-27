@@ -73,7 +73,13 @@ pub(super) fn all() -> Vec<Migration> {
                 // cancel-provenance migration, which sorts after this frozen id.
                 ensure_cancel_provenance_columns(conn)?;
                 // Data only: restart items blocked by the false ancestry failure.
-                execution_recovery_rearm::migrate(conn, execution_recovery_rearm::is_false_not_descended_blocker)?;
+                crate::event_publish::with_init_pending(|pending| {
+                    execution_recovery_rearm::migrate(
+                        conn,
+                        execution_recovery_rearm::is_false_not_descended_blocker,
+                        pending,
+                    )
+                })?;
                 Ok(())
             },
         },
@@ -108,10 +114,13 @@ pub(super) fn all() -> Vec<Migration> {
                 conn.execute_batch(EXECUTION_BOOKMARK_COLUMNS_43)?;
                 ensure_cancel_provenance_columns(conn)?;
                 // Restart items wedged by baseline loss or diverged pointers.
-                execution_recovery_rearm::migrate(
-                    conn,
-                    boss_engine_recovery::execution_bookmark::is_legacy_reconcilable_blocker,
-                )?;
+                crate::event_publish::with_init_pending(|pending| {
+                    execution_recovery_rearm::migrate(
+                        conn,
+                        boss_engine_recovery::execution_bookmark::is_legacy_reconcilable_blocker,
+                        pending,
+                    )
+                })?;
                 Ok(())
             },
         },
@@ -246,10 +255,13 @@ pub(super) fn all() -> Vec<Migration> {
             legacy_version: Some(59),
             apply: |conn| {
                 ensure_cancel_provenance_columns(conn)?;
-                execution_recovery_rearm::migrate(
-                    conn,
-                    execution_recovery_rearm::is_legacy_pr_anchor_blocker,
-                )?;
+                crate::event_publish::with_init_pending(|pending| {
+                    execution_recovery_rearm::migrate(
+                        conn,
+                        execution_recovery_rearm::is_legacy_pr_anchor_blocker,
+                        pending,
+                    )
+                })?;
                 Ok(())
             },
         },

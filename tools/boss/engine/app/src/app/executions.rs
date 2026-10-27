@@ -1070,7 +1070,7 @@ pub(super) async fn handle_cancel_execution(ctx: Dispatch, req: FrontendRequest)
         };
         let opts = boss_work_db::CancelExecutionOpts {
             queued_only,
-            peer_pid: peer_pid.map(|pid| pid as i32),
+            peer_pid,
             ..boss_work_db::CancelExecutionOpts::new(provenance.clone())
         };
         match server_state.work_db.cancel_execution_with(&execution_id, opts) {

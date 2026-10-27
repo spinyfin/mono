@@ -157,7 +157,8 @@ async fn post_lease_chain_sibling_refusal_releases_lease_and_redispatch_succeeds
 
     // The sibling finishes; the same execution now dispatches.
     let sibling_id = sibling.lock().unwrap().clone().expect("sibling went live");
-    db.cancel_running_execution(&sibling_id, test_cancel_provenance()).unwrap();
+    db.cancel_running_execution(&sibling_id, test_cancel_provenance())
+        .unwrap();
     let after = db.get_execution(&revision.id).unwrap();
     schedule(&coordinator, &after).await.expect("re-dispatch succeeds");
     wait_for_runner_calls(&runner, 1).await;

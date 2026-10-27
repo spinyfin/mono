@@ -675,6 +675,7 @@ pub fn add_dependency_edge_in_tx(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // cancel_origin is the provenance the edge must stamp when it cancels a live dependent
 pub(crate) fn add_dependency_edge_in_tx_as_actor(
     pending: &mut PendingEvents,
     conn: &Connection,

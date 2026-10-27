@@ -31,6 +31,9 @@ impl CancelRpcRefusal {
                 "{rpc} refused: `source` `{source}` names an engine subsystem. Clients may only \
                  claim a client surface (app, boss_cli, bossctl)."
             ),
+            Self::UnrecognizedSource(raw) if raw == "unrecognized" => {
+                format!("{rpc} refused: unknown cancel source. Accepted values: app, boss_cli, bossctl.")
+            }
             Self::UnrecognizedSource(raw) => format!(
                 "{rpc} refused: `source` `{raw}` is not a recognized client surface. \
                  Accepted values: app, boss_cli, bossctl."

@@ -74,7 +74,14 @@ fn retired_conflict_revision_awaiting_answer(label: &str) -> RetiredConflictRevi
         let conn = db.connect().unwrap();
         deps::insert_edge(&conn, &dependent_id, &revision_id, RELATION_BLOCKS, &now_string()).unwrap();
         let mut pending = PendingEvents::default();
-        maybe_engine_block_dependent(&mut pending, &conn, &dependent_id, &now_string(), &DependencyCancelOrigin::EngineInternal).unwrap();
+        maybe_engine_block_dependent(
+            &mut pending,
+            &conn,
+            &dependent_id,
+            &now_string(),
+            &DependencyCancelOrigin::EngineInternal,
+        )
+        .unwrap();
     }
     assert_eq!(task_status(&db, &dependent_id), "blocked");
     RetiredConflictRevision {

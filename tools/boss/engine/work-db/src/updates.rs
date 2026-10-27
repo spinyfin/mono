@@ -391,7 +391,8 @@ impl WorkDb {
     }
 
     pub fn update_task(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
-        self.update_task_with_basis(id, patch, actor, DEFAULT_UPDATE_BASIS)
+        self.update_task_impl(id, patch, actor, DEFAULT_UPDATE_BASIS, false)
+            .map(|(item, _)| item)
     }
 
     /// [`Self::update_task`] recording `basis` in the field-change ledger for
@@ -399,6 +400,28 @@ impl WorkDb {
     /// A caller that can name the code path or the socket peer it is acting
     /// for passes that here; `update_task` is the unattributed default.
     pub fn update_task_with_basis(&self, id: &str, patch: WorkItemPatch, actor: &str, basis: &str) -> Result<WorkItem> {
+        self.update_task_impl(id, patch, actor, basis, false)
+            .map(|(item, _)| item)
+    }
+
+    pub(crate) fn update_task_with_teardown(
+        &self,
+        id: &str,
+        patch: WorkItemPatch,
+        actor: &str,
+        basis: &str,
+    ) -> Result<(WorkItem, Option<String>)> {
+        self.update_task_impl(id, patch, actor, basis, true)
+    }
+
+    fn update_task_impl(
+        &self,
+        id: &str,
+        patch: WorkItemPatch,
+        actor: &str,
+        basis: &str,
+        cancel_backlog: bool,
+    ) -> Result<(WorkItem, Option<String>)> {
         // Fail fast, before opening a transaction: validate the incoming
         // value only (never a value already sitting in a row from before
         // this limit existed — see `validate_blocked_reason_length`).
@@ -412,6 +435,26 @@ impl WorkDb {
         let mut pending = PendingEvents::new();
         let mut task = query_task(&tx, id).require("task", id)?;
         let previous_status = task.status.clone();
+        // Read and cancel under the same writer transaction as the card move.
+        // Return this exact row for resource teardown, including terminal ghosts.
+        let teardown = if cancel_backlog
+            && previous_status == TaskStatus::Active
+            && patch.status.as_deref() == Some("todo")
+        {
+            let execution = query_latest_execution_for_work_item(&tx, id)?;
+            if let Some(execution) = &execution
+                && !execution.status.is_terminal()
+            {
+                let mut provenance = patch.cancel_provenance.clone().ok_or_else(|| {
+                    anyhow::anyhow!("update_work_item requires cancel source, actor and reason when ending executions")
+                })?;
+                provenance.reason = format!("work item {id} moved from active to todo; {}", provenance.reason);
+                super::exec_tail::cancel_non_terminal_in_tx(&tx, &mut pending, execution, &provenance)?;
+            }
+            execution.map(|execution| execution.id)
+        } else {
+            None
+        };
         // Check this before the generic tombstone bail below: an
         // archived-and-tombstoned moot revision (see
         // `block_pending_revisions_on_parent_close`) is also a deleted
@@ -851,6 +894,6 @@ impl WorkDb {
         // for the 150 ms until the invalidation refetch lands.
         project_for_work_item_updated(&tx, &mut updated, "update_task");
         self.commit_pending(tx, pending)?;
-        Ok(task_to_item(updated))
+        Ok((task_to_item(updated), teardown))
     }
 }

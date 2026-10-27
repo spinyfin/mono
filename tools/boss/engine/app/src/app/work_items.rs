@@ -934,25 +934,24 @@ pub(super) async fn apply_work_item_patch_from(
         // applies. We only care about task/chore — products and
         // projects have no execution lifecycle.
         let previous_task_status = task_status_for_id(&work_db, &id);
-        let cancel_provenance = patch.cancel_provenance.clone();
-        let active_to_todo_live = patch.status.as_deref() == Some("todo")
-            && live_execution_for_active_card(&work_db, &previous_task_status, &id).is_some();
-        let can_end_execution = active_to_todo_live
-            || patch.deferred == Some(true)
-            || matches!(patch.status.as_deref(), Some("done" | "archived"));
-        if can_end_execution
-            && cancel_provenance.is_none()
-            && (active_to_todo_live
-                || work_db
-                    .list_executions(Some(&id))
-                    .is_ok_and(|rows| rows.iter().any(|e| !e.status.is_terminal())))
+        if (patch.deferred == Some(true) || matches!(patch.status.as_deref(), Some("done" | "archived")))
+            && patch.cancel_provenance.is_none()
         {
-            send_work_error(
-                &sink,
-                &request_id,
-                "update_work_item requires cancel source, actor and reason when ending executions",
-            );
-            return;
+            match work_db.list_executions(Some(&id)) {
+                Ok(rows) if rows.iter().any(|execution| !execution.status.is_terminal()) => {
+                    send_work_error(
+                        &sink,
+                        &request_id,
+                        "update_work_item requires cancel source, actor and reason when ending executions",
+                    );
+                    return;
+                }
+                Err(err) => {
+                    send_work_error(&sink, &request_id, &err);
+                    return;
+                }
+                _ => {}
+            }
         }
 
         let previous_block = work_db.get_work_item(&id).ok().and_then(|item| match item {
@@ -1067,15 +1066,15 @@ pub(super) async fn apply_work_item_patch_from(
         let applied = if patch.parked.is_some() || patch.parked_reason.is_some() {
             work_db
                 .apply_parking_patch_reporting(&id, &patch, actor)
-                .map(|(item, report)| (item, Some(report)))
+                .map(|(item, report)| (item, Some(report), None))
         } else {
             let basis = resolve_write_basis(&server_state, peer_pid, &session_id, &request_id, source).await;
             work_db
-                .update_work_item_with_basis(&id, patch, actor, &basis)
-                .map(|item| (item, None))
+                .update_work_item_with_teardown_on_basis(&id, patch, actor, &basis)
+                .map(|(item, teardown)| (item, None, teardown))
         };
         match applied {
-            Ok((mut item, unpark_report)) => {
+            Ok((mut item, unpark_report, backlog_teardown)) => {
                 // Dispatch refusals roll back the move and return the engine reason.
                 let mut dispatch_failure: Option<(anyhow::Error, BoardRefusalCode)> = None;
                 let mut dispatch_failure_response: Option<BoardRefusal> = None;
@@ -1125,37 +1124,14 @@ pub(super) async fn apply_work_item_patch_from(
                         handler.force_release(&execution_id).await;
                     });
                 }
-                // If the user dragged an active task/chore back
-                // to Backlog (active → todo), stop the live
-                // worker: cancel its execution row (so the orphan
-                // sweep and reconciler won't re-dispatch it) and
-                // release its pane + cube workspace. The task
-                // status is already `todo` from the patch above;
-                // autostart was cleared to 0 when the task first
-                // entered Doing, so it will not be re-dispatched.
-                if !parking_only
-                    && let Some(execution_id) = active_to_todo_execution(&work_db, &previous_task_status, &item)
-                {
-                    match cancel_provenance.clone() {
-                        Some(mut provenance) => {
-                            let handler = server_state.completion_handler.clone();
-                            let id_for_cancel = id.clone();
-                            provenance.reason =
-                                format!("work item {id} moved from active to todo; {}", provenance.reason);
-                            boss_task_scope::spawn(async move {
-                                handler
-                                    .cancel_and_release(&id_for_cancel, &execution_id, provenance)
-                                    .await;
-                            });
-                        }
-                        None => {
-                            tracing::warn!(
-                                work_item_id = %id,
-                                execution_id,
-                                "active→todo teardown found a live execution without cancel provenance; skipping cancel"
-                            );
-                        }
-                    }
+                // The card-update transaction already cancelled the live row.
+                // Release that exact execution, including any terminal ghost
+                // whose pane or workspace outlived its worker.
+                if !parking_only && let Some(execution_id) = backlog_teardown {
+                    let handler = server_state.completion_handler.clone();
+                    boss_task_scope::spawn(async move {
+                        handler.force_release(&execution_id).await;
+                    });
                 }
                 // Kanban drop-into-Doing (and any other human
                 // path that flips a task/chore to `active` via

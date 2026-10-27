@@ -302,7 +302,8 @@ impl CommandRunner for CapturingSpawner {
             Some("send-keys") => {
                 self.sent_keys.lock().unwrap().push(args.last().unwrap().clone());
                 if let Some((db, execution_id)) = self.cancel_on_send_keys.lock().unwrap().take() {
-                    db.cancel_running_execution(&execution_id, test_cancel_provenance()).unwrap();
+                    db.cancel_running_execution(&execution_id, test_cancel_provenance())
+                        .unwrap();
                 }
                 if self.accept_prompt_on_resubmit.load(std::sync::atomic::Ordering::SeqCst) {
                     for state in self.live_states.snapshot() {

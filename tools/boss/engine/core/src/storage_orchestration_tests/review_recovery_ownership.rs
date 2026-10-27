@@ -175,7 +175,8 @@ async fn memberless_failed_review_does_not_preempt_stale_batch_readmission() {
         panic!("expected new batch");
     };
     for execution in &executions {
-        db.mark_execution_redundant(&execution.id, test_cancel_provenance()).unwrap();
+        db.mark_execution_redundant(&execution.id, test_cancel_provenance())
+            .unwrap();
     }
     raw(&db)
         .execute(

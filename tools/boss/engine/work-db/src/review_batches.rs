@@ -20,8 +20,8 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehav
 
 use super::{
     CreateExecutionInput, DeadPrReviewCandidate, DecisionAuditContext, DoomedExecution, PendingEvents, WorkDb,
-    WorkExecution, capture_doomed, commit_and_publish, existing_nonterminal_pr_review_execution, insert_execution,
-    next_id, now_string, query_execution, stage_decision_terminal, stage_execution_terminal,
+    WorkExecution, capture_doomed, existing_nonterminal_pr_review_execution, insert_execution, next_id, now_string,
+    query_execution, stage_decision_terminal, stage_execution_terminal,
 };
 
 /// Inputs used to freeze an immutable review target before any member starts.
@@ -1112,9 +1112,7 @@ fn release_unstartable_pre_merge_review_reservations_in_tx(
         let provenance = boss_protocol::CancelProvenance::engine(
             boss_protocol::CancelSource::ReviewBatch,
             "release_unstartable_pre_merge_review_reservations",
-            format!(
-                "pre-merge review batch {batch_id} could not start; member reservations released"
-            ),
+            format!("pre-merge review batch {batch_id} could not start; member reservations released"),
         );
         crate::task_status_audit::abandon(
             tx,

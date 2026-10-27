@@ -698,7 +698,6 @@ pub(crate) fn dispatch_retry_at_for_execution(execution: &WorkExecution, now_sec
     }
 }
 
-
 pub(crate) fn query_latest_run(conn: &Connection, execution_id: &str) -> Result<Option<(String, String)>> {
     conn.prepare_cached(
         "SELECT id, status

@@ -781,6 +781,9 @@ pub struct WorkDb {
     /// sink via [`Self::with_dispatch_events`].
     #[builder(default = default_dispatch_events())]
     dispatch_events: Arc<dyn boss_dispatch_events::DispatchEventSink>,
+    /// Committed schema decisions wait here until the production sink attaches.
+    #[builder(default)]
+    migration_events: Arc<Mutex<PendingEvents>>,
     persona_metrics: Arc<boss_metrics::Registry>,
     /// Produces coordinator handoff write ids and tmux spawn authorizations.
     /// Defaults to the shared utility generator; callers can inject a fixture
@@ -805,6 +808,7 @@ impl Clone for WorkDb {
             engine_rebase_holds: Arc::clone(&self.engine_rebase_holds),
             event_bus: Arc::clone(&self.event_bus),
             dispatch_events: Arc::clone(&self.dispatch_events),
+            migration_events: Arc::clone(&self.migration_events),
             persona_metrics: Arc::clone(&self.persona_metrics),
             token_generator: Arc::clone(&self.token_generator),
         }
@@ -1104,12 +1108,12 @@ pub use automations::AutomationFireRecord;
 pub use board_patch::WorkRuntimePatch;
 pub use boothby::{BoothbyActionContext, BoothbyActionGuard};
 pub use decision_terminal::DecisionAuditContext;
+pub use event_publish::set_engine_audit_sink;
 pub use exec_tail::ClearedExecutionWorkspace;
 pub use execution_retention::{
     DEFAULT_RETENTION_KEEP_PER_WORK_ITEM, DEFAULT_RETENTION_MAX_AGE_SECS, ExecutionPruneOutcome,
     ExecutionRetentionPolicy,
 };
-pub use event_publish::set_engine_audit_sink;
 pub use executions_runs::CancelExecutionOpts;
 pub use github_api_usage_db::{GithubApiCallRow, GithubApiUsageBucket};
 pub use github_merge_intents::{GithubMergeIntent, GithubMergeIntentInsertInput, GithubMergeIntentRecordOutcome};

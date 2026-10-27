@@ -1,19 +1,95 @@
 use super::*;
+use crate::work::test_support::assert_cancel_provenance;
+use crate::work::{LatePrCandidate, ReviewBatchDispatch, TaskStatus};
+use boss_observation_contracts::{CompletionRequests, ReviewBatchEnqueuer, StopOutcome};
+use boss_protocol::{CancelProvenance, ExecutionStatus as WireExecutionStatus, TaskKind, WorkExecution};
+
+/// Completion handler that only unblocks `stop_active_revision_executions`.
+/// Lease release is a no-op: the cancel itself is owned by work-db.
+struct ReleaseOnlyHandler {
+    enqueuer: NoopBatchEnqueuer,
+}
+
+struct NoopBatchEnqueuer;
+
+#[async_trait]
+impl ReviewBatchEnqueuer for NoopBatchEnqueuer {
+    async fn enqueue(
+        &self,
+        _work_db: &WorkDb,
+        _work_item_id: &str,
+        _repo_remote_url: &str,
+        _pr_url: &str,
+        _review_pool_size: usize,
+    ) -> Result<ReviewBatchDispatch> {
+        panic!("parent-merge followup test must not enqueue a review batch")
+    }
+}
+
+#[async_trait]
+impl CompletionRequests for ReleaseOnlyHandler {
+    fn review_guide_source_capture_enabled(&self) -> bool {
+        false
+    }
+    fn pending_background_nudge_execution_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
+    async fn recheck_background_nudge(&self, _execution_id: &str) -> Option<StopOutcome> {
+        None
+    }
+    fn review_batch_fanout_enabled(&self) -> bool {
+        false
+    }
+    fn review_pool_size(&self) -> usize {
+        0
+    }
+    async fn force_release(&self, _execution_id: &str) {}
+    async fn record_parent_pr_merge_cancellation(
+        &self,
+        _execution: &WorkExecution,
+        _prior_status: WireExecutionStatus,
+        _chain_root_id: &str,
+        _provenance: &CancelProvenance,
+    ) {
+    }
+    async fn force_stop_execution(&self, _execution_id: &str, _provenance: CancelProvenance) {}
+    async fn recheck_for_pr(&self, _execution_id: &str) -> StopOutcome {
+        StopOutcome::DbError
+    }
+    async fn recheck_for_pr_late(&self, _candidate: &LatePrCandidate) -> StopOutcome {
+        StopOutcome::DbError
+    }
+    fn reconcile_review_guide_source_from_probe(
+        &self,
+        _root_task_id: &str,
+        _pr_url: &str,
+        _base_sha: &str,
+        _head_sha: &str,
+        _observation_sequence: i64,
+    ) {
+    }
+    fn speculative_conflict_prediction_enabled(&self) -> bool {
+        false
+    }
+    fn stacked_pr_auto_structuring_enabled(&self) -> bool {
+        false
+    }
+    fn mechanical_rebase_enabled(&self) -> bool {
+        false
+    }
+    fn review_batch_enqueuer(&self) -> &dyn ReviewBatchEnqueuer {
+        &self.enqueuer
+    }
+}
 
 /// A PR-review revision whose target merges while its worker is live must
 /// cross execution families automatically: cancel the obsolete
 /// revision_implementation, preserve the work item as an autostart followup,
 /// and enqueue a chore_implementation without any manual start.
-/// The cancellation must also close the original dispatch timeline.
 #[tokio::test]
 async fn merged_pr_redispatches_live_review_revision_as_followup_and_records_cancel() {
     let dir = tempdir().unwrap();
-    let events = Arc::new(RecordingDispatchEventSink::new());
-    let db = Arc::new(
-        WorkDb::open(dir.path().join("boss.db"))
-            .unwrap()
-            .with_dispatch_events(events.clone()),
-    );
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let pr = "https://github.com/foo/bar/pull/1501";
     let (product_id, parent_id) = make_chore_in_review(&db, "merged-review-followup", pr);
     let checker = crate::work::FakePrStateChecker::always(crate::work::PrOpenState::Open);
@@ -51,15 +127,9 @@ async fn merged_pr_redispatches_live_review_revision_as_followup_and_records_can
     }
 
     let publisher = Arc::new(RecordingPublisher::default());
-    let handler = WorkerCompletionHandler::new(
-        db.clone(),
-        Arc::new(FixedPrDetector(None)),
-        Arc::new(NoopCubeClient),
-        publisher.clone(),
-        Arc::new(NoopPaneReleaser),
-        Arc::new(NoopProbeQueuer),
-    )
-    .with_dispatch_events(events.clone());
+    let handler = ReleaseOnlyHandler {
+        enqueuer: NoopBatchEnqueuer,
+    };
     let probe = StubProbe::new();
     probe.set(pr, PrLifecycleState::Merged);
 
@@ -111,26 +181,4 @@ async fn merged_pr_redispatches_live_review_revision_as_followup_and_records_can
         "an unavailable preferred workspace must fall back to a fresh workspace",
     );
     assert_eq!(followup.product_id, product_id);
-
-    let cancellation = events
-        .events_for(&original.id)
-        .await
-        .into_iter()
-        .find(|event| event.stage == "execution_cancelled")
-        .expect("merge cancellation must be recorded in the dispatch timeline");
-    assert_eq!(cancellation.outcome, "ok");
-    assert_eq!(cancellation.details["prior_status"], "running");
-    assert_eq!(cancellation.details["chain_root_id"], parent_id);
-    assert!(
-        cancellation.details["reason"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("parent PR of chain root"),
-        "dispatch cancel reason must be the merge-poller cause, got {:?}",
-        cancellation.details["reason"]
-    );
-    assert!(
-        crate::dispatch_reader::is_terminal_event(&cancellation),
-        "merge cancellation must close the original dispatch timeline",
-    );
 }

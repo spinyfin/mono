@@ -352,9 +352,7 @@ fn abandon_pending_executions_filtered(
     // leaving this bulk transition untraced.
     let doomed = capture_doomed(
         conn,
-        &format!(
-            "work_item_id = ?1 AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed'){kind_filter}"
-        ),
+        &format!("work_item_id = ?1 AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed'){kind_filter}"),
         params![work_item_id],
     )?;
 

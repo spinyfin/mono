@@ -51,6 +51,7 @@ impl WorkDb {
     /// Bootstrap integer history once, then apply missing named migrations.
     /// Schema changes and their ledger entries commit atomically.
     pub fn init(&self) -> Result<()> {
+        let _ = crate::event_publish::take_init_pending();
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let has_schema: bool = tx.query_row(
@@ -93,6 +94,7 @@ impl WorkDb {
         super::progression_candidates::migrate_views(&tx)?;
         refresh_query_planner_stats(&tx)?;
         tx.commit()?;
+        *self.migration_events.lock().unwrap() = crate::event_publish::take_init_pending();
         Ok(())
     }
 
@@ -217,6 +219,7 @@ impl WorkDb {
             engine_rebase_holds: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
             dispatch_events: super::default_dispatch_events(),
+            migration_events: Arc::new(Mutex::new(PendingEvents::new())),
             persona_metrics: super::personas::new_metrics_registry(),
             engine_build_identity: None,
             token_generator: super::default_token_generator(),
@@ -252,6 +255,7 @@ impl WorkDb {
             engine_rebase_holds: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
             dispatch_events: super::default_dispatch_events(),
+            migration_events: Arc::new(Mutex::new(PendingEvents::new())),
             persona_metrics: super::personas::new_metrics_registry(),
             engine_build_identity: None,
             token_generator: super::default_token_generator(),

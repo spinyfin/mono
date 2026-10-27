@@ -60,7 +60,10 @@ fn cancel_running_execution_preserves_supplied_provenance() {
 
 #[tokio::test]
 async fn mark_execution_redundant_preserves_supplied_provenance() {
-    let db = WorkDb::open(temp_db_path("cancel-prov-redundant")).unwrap();
+    let sink = std::sync::Arc::new(boss_dispatch_events::RecordingDispatchEventSink::new());
+    let db = WorkDb::open(temp_db_path("cancel-prov-redundant"))
+        .unwrap()
+        .with_dispatch_events(sink.clone());
     let (_, execution) = seed_ready_chore(&db, "redundant");
     let provenance = boss_protocol::CancelProvenance::engine(
         CancelSource::DoubleSpawnGuard,
@@ -71,28 +74,19 @@ async fn mark_execution_redundant_preserves_supplied_provenance() {
         ),
     );
 
-    let mut decisions = db.event_bus().subscribe(boss_event_bus::TopicFilter::kind(
-        boss_event_bus::EventKind::ExecutionDecision,
-    ));
     db.mark_execution_redundant(&execution.id, provenance.clone()).unwrap();
     let after = db.get_execution(&execution.id).unwrap();
     assert_eq!(after.status, ExecutionStatus::Abandoned);
     assert_eq!(after.cancel_provenance.as_ref(), Some(&provenance));
-    let event = tokio::time::timeout(std::time::Duration::from_secs(5), decisions.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        event,
-        boss_event_bus::Event::ExecutionDecision {
-            execution_id: execution.id,
-            task_id: execution.work_item_id,
-            status: "abandoned".to_owned(),
-            source: provenance.source.as_str().to_owned(),
-            actor: provenance.actor,
-            reason: provenance.reason,
-        }
-    );
+    let events = sink.events().await;
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event.execution_id, execution.id);
+    assert_eq!(event.details["work_item_id"], execution.work_item_id);
+    assert_eq!(event.details["to_status"], "abandoned");
+    assert_eq!(event.details["source"], provenance.source.as_str());
+    assert_eq!(event.details["actor"], provenance.actor);
+    assert_eq!(event.details["reason"], provenance.reason);
 }
 
 #[test]
@@ -119,7 +113,7 @@ fn blocking_a_running_dependent_records_dependency_block_provenance() {
                 prerequisite: prereq.id.clone(),
                 relation: None,
             },
-            crate::work::DependencyCancelOrigin::EngineInternal,
+            crate::DependencyCancelOrigin::EngineInternal,
         )
         .unwrap();
     let reaped = reaped.expect("blocking a running dependent must cancel its execution");
@@ -319,29 +313,23 @@ fn newer_cancel_source_does_not_break_execution_reads() {
 }
 
 #[test]
-fn schema_55_upgrade_adds_cancel_columns_and_guard() {
+fn schema_upgrade_adds_cancel_columns_and_guard() {
     let (_dir, path) = disk_db_path("cancel-prov-schema-upgrade");
     let db = WorkDb::open(path.clone()).unwrap();
     let (_, execution) = seed_ready_chore(&db, "upgrade");
     db.connect()
         .unwrap()
         .execute_batch(
-            "DROP TRIGGER work_executions_decision_requires_provenance;
+            "DROP TRIGGER IF EXISTS work_executions_decision_requires_provenance;
          ALTER TABLE work_executions DROP COLUMN cancel_source;
          ALTER TABLE work_executions DROP COLUMN cancel_actor;
          ALTER TABLE work_executions DROP COLUMN cancel_reason;
-         UPDATE metadata SET value = '55' WHERE key = 'schema_version';",
+         DELETE FROM schema_migrations WHERE id = '20261118_1800_cancel_provenance';",
         )
         .unwrap();
     drop(db);
     let db = WorkDb::open(path).unwrap();
     let conn = db.connect().unwrap();
-    let version: String = conn
-        .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(version, "56");
     let error = conn
         .execute(
             "UPDATE work_executions SET status = 'cancelled' WHERE id = ?1",
@@ -356,4 +344,38 @@ fn schema_55_upgrade_adds_cancel_columns_and_guard() {
     assert_eq!(provenance.source, CancelSource::Bossctl);
     assert_eq!(provenance.actor, "test");
     assert_eq!(provenance.reason, "test cancel");
+}
+
+#[test]
+fn execution_created_after_card_precheck_cannot_escape_backlog_cancel_validation() {
+    let db = WorkDb::open_in_memory().unwrap();
+    let product = create_test_product(&db);
+    let task = create_test_chore_manual(&db, product.id, "backlog interleaving");
+    db.update_work_item(&task.id, WorkItemPatch::builder().status("active").build())
+        .unwrap();
+    // Deterministically reproduce the old gap: the caller observes no execution,
+    // then another writer creates one before the status transaction starts.
+    assert!(db.latest_execution_for_work_item(&task.id).unwrap().is_none());
+    let execution = create_ready_chore_execution(&db, task.id.clone());
+    let result = db.update_work_item_with_teardown(&task.id, WorkItemPatch::builder().status("todo").build(), "human");
+    assert!(result.unwrap_err().to_string().contains("requires cancel source"));
+    assert_eq!(db.get_execution(&execution.id).unwrap().status, ExecutionStatus::Ready);
+    assert!(matches!(db.get_work_item(&task.id).unwrap(),
+        WorkItem::Task(task) | WorkItem::Chore(task) if task.status == TaskStatus::Active));
+    let (_, teardown) = db
+        .update_work_item_with_teardown(
+            &task.id,
+            WorkItemPatch {
+                status: Some("todo".into()),
+                cancel_provenance: Some(crate::test_support::test_cancel_provenance()),
+                ..Default::default()
+            },
+            "human",
+        )
+        .unwrap();
+    assert_eq!(teardown, Some(execution.id.clone()));
+    assert_eq!(
+        db.get_execution(&execution.id).unwrap().status,
+        ExecutionStatus::Cancelled
+    );
 }

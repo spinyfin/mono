@@ -24,12 +24,12 @@ use boss_host_execution::types::{
 use boss_protocol::WorkExecution;
 
 pub use crate::work::test_support::{
-    TEST_REPO_REMOTE_URL, create_active_chore, create_execution_started_now, create_execution_started_secs_ago,
-    create_old_execution, create_product, create_ready_chore_execution, create_spawned_execution, create_test_chore,
-    create_test_chore_manual, create_test_product, create_test_product_named, create_test_product_with_repo,
-    finish_run_worker_pane_alive, insert_host_capability, log_capture, review_guide_source_packet,
-    seed_daily_automation, seed_published_guide, seed_review_guide_series, seed_review_guide_series_for_pr,
-    start_tmux_run, test_cancel_provenance, assert_cancel_provenance,
+    TEST_REPO_REMOTE_URL, assert_cancel_provenance, create_active_chore, create_execution_started_now,
+    create_execution_started_secs_ago, create_old_execution, create_product, create_ready_chore_execution,
+    create_spawned_execution, create_test_chore, create_test_chore_manual, create_test_product,
+    create_test_product_named, create_test_product_with_repo, finish_run_worker_pane_alive, insert_host_capability,
+    log_capture, review_guide_source_packet, seed_daily_automation, seed_published_guide, seed_review_guide_series,
+    seed_review_guide_series_for_pr, start_tmux_run, test_cancel_provenance,
 };
 
 /// Open a fresh file-backed [`WorkDb`] under a throwaway [`TempDir`], stamped

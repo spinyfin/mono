@@ -8,7 +8,12 @@ use super::*;
 #[tokio::test]
 async fn merged_pr_redispatches_live_review_revision_as_followup_and_records_cancel() {
     let dir = tempdir().unwrap();
-    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let events = Arc::new(RecordingDispatchEventSink::new());
+    let db = Arc::new(
+        WorkDb::open(dir.path().join("boss.db"))
+            .unwrap()
+            .with_dispatch_events(events.clone()),
+    );
     let pr = "https://github.com/foo/bar/pull/1501";
     let (product_id, parent_id) = make_chore_in_review(&db, "merged-review-followup", pr);
     let checker = crate::work::FakePrStateChecker::always(crate::work::PrOpenState::Open);
@@ -45,7 +50,6 @@ async fn merged_pr_redispatches_live_review_revision_as_followup_and_records_can
         .unwrap();
     }
 
-    let events = Arc::new(RecordingDispatchEventSink::new());
     let publisher = Arc::new(RecordingPublisher::default());
     let handler = WorkerCompletionHandler::new(
         db.clone(),
@@ -72,9 +76,11 @@ async fn merged_pr_redispatches_live_review_revision_as_followup_and_records_can
 
     assert_eq!(outcome.merged, 1);
     assert_eq!(outcome.revision_invalidated, 1);
-    assert_eq!(
-        db.get_execution(&original.id).unwrap().status,
-        ExecutionStatus::Cancelled
+    crate::test_support::assert_cancel_provenance(
+        &db.get_execution(&original.id).unwrap(),
+        boss_protocol::CancelSource::MergePollerParentMerged,
+        "merge_poller",
+        "merged, so this revision execution is obsolete",
     );
     let followup = match db.get_work_item(&revision.id).unwrap() {
         WorkItem::Chore(task) => task,

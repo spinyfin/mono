@@ -22,8 +22,8 @@
 //!   8. a ghost-active heal of a never-started autostart item is reminted
 //!      once the item is runnable again.
 
-use crate::test_support::test_cancel_provenance;
 use super::*;
+use crate::test_support::test_cancel_provenance;
 
 /// Read the raw `deferred` column for a task id.
 fn deferred_flag(db: &WorkDb, id: &str) -> i64 {
@@ -673,7 +673,8 @@ fn reconcile_does_not_remint_beside_a_live_or_claimed_execution() {
                 params![duplicate.id],
             )
             .unwrap();
-        db.mark_execution_redundant(&duplicate.id, test_cancel_provenance()).unwrap();
+        db.mark_execution_redundant(&duplicate.id, test_cancel_provenance())
+            .unwrap();
 
         for _ in 0..3 {
             db.reconcile_product_executions(&product.id).unwrap();

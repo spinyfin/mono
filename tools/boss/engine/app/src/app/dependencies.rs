@@ -59,7 +59,7 @@ pub(super) async fn handle_add_dependency(ctx: Dispatch, req: FrontendRequest) {
             None
         };
         match work_db
-            .add_dependency_with_worker_reconcile(input, crate::work::DependencyCancelOrigin::ClientRpc(client_cancel))
+            .add_dependency_with_worker_reconcile(input, boss_work_db::DependencyCancelOrigin::ClientRpc(client_cancel))
         {
             Ok((edge, reaped)) => {
                 // Defect #2: adding this edge may have pushed an

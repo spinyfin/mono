@@ -319,7 +319,8 @@ fn a_reminted_generation_keeps_the_launched_revision_it_reviews_for() {
     let db = &cycle.db;
     let (failed, executions) = created(cycle.admit_for_revision("head-a"));
     for execution in &executions {
-        db.mark_execution_redundant(&execution.id, test_cancel_provenance()).unwrap();
+        db.mark_execution_redundant(&execution.id, test_cancel_provenance())
+            .unwrap();
     }
     sql(
         db,

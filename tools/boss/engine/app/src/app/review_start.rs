@@ -120,12 +120,14 @@ async fn handle_trigger_pr_review_with<F, Fut>(
         .and_then(|admission| {
             use boss_engine_completion::review_admission::ReviewAdmission;
             match admission {
-                ReviewAdmission::Legacy(execution) => Ok(ReviewStartOutcome::Legacy(execution)),
+                ReviewAdmission::Legacy(execution) => Ok(ReviewStartOutcome::Legacy(Box::new(execution))),
                 ReviewAdmission::Batch(boss_work_db::ReviewBatchDispatch::Created { batch, executions }) => {
-                    BatchOutcome::new(*batch, executions, false).map(ReviewStartOutcome::Batch)
+                    BatchOutcome::new(*batch, executions, false)
+                        .map(|outcome| ReviewStartOutcome::Batch(Box::new(outcome)))
                 }
                 ReviewAdmission::Batch(boss_work_db::ReviewBatchDispatch::ExistingBatch { batch, executions }) => {
-                    BatchOutcome::new(*batch, executions, true).map(ReviewStartOutcome::Batch)
+                    BatchOutcome::new(*batch, executions, true)
+                        .map(|outcome| ReviewStartOutcome::Batch(Box::new(outcome)))
                 }
                 ReviewAdmission::Batch(other) => {
                     anyhow::bail!("cannot start review batch: unexpected admission outcome {other:?}")
@@ -228,8 +230,8 @@ impl BatchOutcome {
 /// admission (`review_batch_fanout` on) or the unchanged legacy single
 /// execution (flag off).
 enum ReviewStartOutcome {
-    Batch(BatchOutcome),
-    Legacy(boss_work_db::WorkExecution),
+    Batch(Box<BatchOutcome>),
+    Legacy(Box<boss_work_db::WorkExecution>),
 }
 
 impl ReviewStartOutcome {
@@ -240,7 +242,7 @@ impl ReviewStartOutcome {
     fn execution(&self) -> boss_work_db::WorkExecution {
         match self {
             Self::Batch(outcome) => outcome.executions[0].clone(),
-            Self::Legacy(execution) => execution.clone(),
+            Self::Legacy(execution) => execution.as_ref().clone(),
         }
     }
 

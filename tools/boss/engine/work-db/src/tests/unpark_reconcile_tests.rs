@@ -1,6 +1,6 @@
-use crate::test_support::test_cancel_provenance;
 use super::*;
 use crate::parking_reconcile::{BASIS_UNPARK_CLEARED_HALT_STAMP, HaltStamp, KeptHold, UnparkReport};
+use crate::test_support::test_cancel_provenance;
 use boss_protocol::{CreateProjectInput, CreateTaskInput, OperatorQuestion};
 
 // The database half of the un-park reconciliation sequence
