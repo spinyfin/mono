@@ -97,6 +97,33 @@ pub(super) fn test_server_state_with_fakes() -> (Arc<ServerState>, tempfile::Tem
     (state, temp)
 }
 
+/// Build a server with deterministic PR state for comment submission.
+pub(super) fn test_server_state_with_pr_state_checker(
+    checker: Arc<dyn crate::work::PrStateChecker>,
+) -> (Arc<ServerState>, tempfile::TempDir) {
+    let temp = tempfile::tempdir().unwrap();
+    let cfg = Arc::new(RuntimeConfig::from_parts(
+        crate::config::WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(temp.path().join("state.db"))
+            .build(),
+        None,
+    ));
+    let state = ServerState::new_arc_with_app_pid_and_merge_probe(
+        cfg,
+        None,
+        None,
+        ServerStateOverrides {
+            cube_client: Some(Arc::new(crate::test_support::AlwaysSucceedsCube)),
+            execution_runner: Some(Arc::new(crate::test_support::AlwaysSucceedsRunner)),
+            pr_state_checker: Some(checker),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    (state, temp)
+}
+
 /// Like [`test_server_state_with_fakes`], but also swaps in a fake
 /// [`crate::completion::BranchVerifier`] so a test that drives a real
 /// `ServerState` through the production events-socket dispatch path (rather
@@ -493,6 +520,7 @@ mod proposals;
 mod resumed_turn_activity;
 mod reveal_deadline;
 mod review_guide;
+mod review_guide_viewer;
 mod revision_no_op_live_seam_reproduction;
 mod selected_product;
 mod semantic_progress_ingress;
