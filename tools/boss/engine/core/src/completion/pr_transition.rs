@@ -253,7 +253,7 @@ impl WorkerCompletionHandler {
 
         if !merged
             && let Ok(execution) = execution_result.as_ref()
-            && let Some(outcome) = self.conflict_delivery_failure(execution, &pr_url).await
+            && let Some(outcome) = self.conflict_delivery_failure(execution, Some(&pr_url)).await
         {
             return outcome;
         }

@@ -32,10 +32,10 @@ const LINEARIZE_MAX_ROUNDS_FACTOR: usize = 2;
 /// The `runner` / `database_path` / `cwd` triple every `jj` call in this
 /// module threads through. Bundled so the collapse helpers take a single
 /// context argument instead of repeating the same three parameters.
-struct JjCtx<'a> {
-    runner: &'a dyn CommandRunner,
-    database_path: Option<&'a Path>,
-    cwd: &'a Path,
+pub(super) struct JjCtx<'a> {
+    pub(super) runner: &'a dyn CommandRunner,
+    pub(super) database_path: Option<&'a Path>,
+    pub(super) cwd: &'a Path,
 }
 
 impl JjCtx<'_> {
@@ -189,13 +189,25 @@ type VettedTarget = std::result::Result<String, LinearizeDecline>;
 /// jj workspaces sharing one repo and one operation log, so restoring global
 /// state would revert every concurrent sibling worker's bookmark moves,
 /// working-copy pointers, and fetches.
-fn try_linearize_replay_conflicts(ctx: &JjCtx<'_>, main_ref: &str, boss_branch: &str) -> Result<LinearizeOutcome> {
+fn try_linearize_replay_conflicts(
+    ctx: &JjCtx<'_>,
+    main_ref: &str,
+    boss_branch: &str,
+    bookmark_policy: BookmarkPolicy<'_>,
+) -> Result<LinearizeOutcome> {
     // Operations this attempt issued that rewrote history, oldest first. Only
     // these are ever undone — never anything a sibling workspace landed.
     let mut issued_ops: Vec<String> = Vec::new();
     let mut descriptions: Vec<String> = Vec::new();
 
-    let attempt = collapse_and_verify(ctx, main_ref, boss_branch, &mut issued_ops, &mut descriptions);
+    let attempt = collapse_and_verify(
+        ctx,
+        main_ref,
+        boss_branch,
+        bookmark_policy,
+        &mut issued_ops,
+        &mut descriptions,
+    );
 
     let outcome = match attempt {
         Ok(outcome) => outcome,
@@ -244,6 +256,7 @@ fn collapse_and_verify(
     ctx: &JjCtx<'_>,
     main_ref: &str,
     boss_branch: &str,
+    bookmark_policy: BookmarkPolicy<'_>,
     issued_ops: &mut Vec<String>,
     descriptions: &mut Vec<String>,
 ) -> Result<LinearizeOutcome> {
@@ -278,7 +291,7 @@ fn collapse_and_verify(
     // those declines owe no rollback at all.
     let mut vetted: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for target in &initial {
-        match vet_collapse_target(ctx, target)? {
+        match vet_collapse_target(ctx, target, bookmark_policy)? {
             Ok(child) => {
                 vetted.insert(target.clone(), child);
             }
@@ -311,7 +324,7 @@ fn collapse_and_verify(
         // and the rollback above is what makes it safe.
         let child = match vetted.get(&target) {
             Some(child) => child.clone(),
-            None => match vet_collapse_target(ctx, &target)? {
+            None => match vet_collapse_target(ctx, &target, bookmark_policy)? {
                 Ok(child) => child,
                 Err(decline) => return Ok(LinearizeOutcome::Declined(decline)),
             },
@@ -413,8 +426,8 @@ fn current_operation_id(ctx: &JjCtx<'_>) -> Result<String> {
 /// it, and rewriting it would silently move that PR's head. No child (the
 /// head itself) or more than one (a fork) means there is no single
 /// unambiguous place for the content to go.
-fn vet_collapse_target(ctx: &JjCtx<'_>, target: &str) -> Result<VettedTarget> {
-    if commit_has_bookmark(ctx, target)? {
+fn vet_collapse_target(ctx: &JjCtx<'_>, target: &str, bookmark_policy: BookmarkPolicy<'_>) -> Result<VettedTarget> {
+    if commit_has_blocking_bookmark(ctx, target, bookmark_policy)? {
         return Ok(Err(LinearizeDecline::BookmarkedAncestor));
     }
     let children = ctx.run(&[
@@ -446,6 +459,27 @@ fn conflicted_in_range(ctx: &JjCtx<'_>, revset: &str) -> Result<Vec<String>> {
 /// Whether `revision` itself carries jj's conflict flag.
 fn commit_is_conflicted(ctx: &JjCtx<'_>, revision: &str) -> Result<bool> {
     Ok(!conflicted_in_range(ctx, revision)?.is_empty())
+}
+
+/// Which bookmarks on a conflicted ancestor count as a stacked-PR boundary.
+#[derive(Clone, Copy)]
+enum BookmarkPolicy<'a> {
+    /// Any bookmark blocks the collapse (the rebase path).
+    Strict,
+    /// The push path: the branch about to be advanced to `@` and the engine's
+    /// own `boss-recovery/` / `boss-base/` pointers are not stack boundaries.
+    /// Anything else (notably a published `pr/<n>` pointer) still blocks.
+    PushBranch(&'a str),
+}
+
+fn commit_has_blocking_bookmark(ctx: &JjCtx<'_>, revision: &str, policy: BookmarkPolicy<'_>) -> Result<bool> {
+    let BookmarkPolicy::PushBranch(branch) = policy else {
+        return commit_has_bookmark(ctx, revision);
+    };
+    let out = ctx.run(&["bookmark", "list", "-r", revision, "-T", r#"if(!remote, name ++ "\n")"#])?;
+    Ok(out.lines().map(str::trim).any(|name| {
+        !name.is_empty() && name != branch && !name.starts_with("boss-recovery/") && !name.starts_with("boss-base/")
+    }))
 }
 
 /// Whether any bookmark points at `revision` — the stacked-PR guard.
@@ -928,7 +962,7 @@ pub(super) fn rebase_workspace_branch(
             database_path,
             cwd,
         };
-        match try_linearize_replay_conflicts(&ctx, &main_ref, &boss_branch)? {
+        match try_linearize_replay_conflicts(&ctx, &main_ref, &boss_branch, BookmarkPolicy::Strict)? {
             LinearizeOutcome::Collapsed { commits, descriptions } => {
                 linearized_commits = commits;
                 linearized_descriptions = descriptions;
@@ -1097,6 +1131,32 @@ pub(super) fn rebase_workspace_branch(
     )
 }
 
+/// Collapse conflicted ancestors of a resolved `@` into their children, over
+/// the range `jj git push` would send (`remote_bookmarks()..@`). Best effort:
+/// a decline leaves history exactly as it was.
+pub(super) fn collapse_resolved_ancestors(ctx: &JjCtx<'_>, boss_branch: &str) {
+    match conflicted_in_range(ctx, "remote_bookmarks()..@") {
+        Ok(conflicted) if conflicted.is_empty() => return,
+        Ok(_) => {}
+        Err(err) => {
+            eprintln!("cube: workspace push: could not probe ancestors for conflicts: {err}");
+            return;
+        }
+    }
+    match try_linearize_replay_conflicts(ctx, "remote_bookmarks()", "@", BookmarkPolicy::PushBranch(boss_branch)) {
+        Ok(LinearizeOutcome::Collapsed { commits, .. }) => eprintln!(
+            "cube: workspace push: {boss_branch}: {commits} resolved-over conflicted ancestor(s) collapsed \
+             forward; pushed tree verified byte-identical"
+        ),
+        Ok(LinearizeOutcome::Declined(decline)) => eprintln!(
+            "cube: workspace push: {boss_branch}: conflicted ancestors not collapsed (`{}`: {})",
+            decline.slug(),
+            decline.explain()
+        ),
+        Err(err) => eprintln!("cube: workspace push: ancestor collapse failed: {err}"),
+    }
+}
+
 /// `cube workspace push`: advance this workspace's `boss/exec_*` branch
 /// bookmark to `@` and push it to GitHub, without re-running a rebase.
 ///
@@ -1146,6 +1206,14 @@ pub(super) fn workspace_push_at(
                 .to_string(),
         ));
     }
+
+    // A lockfile-only conflict is resolved by rewriting the file at `@`, which
+    // is a child of the (rebased, still conflicted) PR commit. `@` is clean
+    // but its ancestor keeps jj's conflict flag, and `jj git push` rejects the
+    // whole unpublished range. Collapse those ancestors forward when the
+    // pushed tree provably does not change; otherwise fall through and let the
+    // push report the real refusal.
+    collapse_resolved_ancestors(&ctx, &boss_branch);
 
     // `jj git push` refuses to push a commit with an empty description. This
     // command lands whatever is already resolved in the working copy without

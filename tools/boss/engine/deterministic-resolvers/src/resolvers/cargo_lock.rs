@@ -8,9 +8,16 @@ use crate::lockfile::regenerate_lockfile;
 use crate::{ConflictClass, ConflictedFile, DeterministicResolver, ResolveOutcome};
 
 /// Regenerates `Cargo.lock` from the (already merged) sibling
-/// `Cargo.toml` via `cargo generate-lockfile`. Both sides' manifest edits
+/// `Cargo.toml` via `cargo update --workspace`. Both sides' manifest edits
 /// are represented in the regenerated lockfile because it resolves
 /// against the merged manifest, not either parent's lockfile.
+///
+/// `cargo update --workspace` is used rather than `cargo generate-lockfile`
+/// because the former keeps every locked third-party version (it only
+/// reconciles workspace members and newly added dependencies), while the
+/// latter rebuilds the lockfile at the latest available version of every
+/// package and would turn a lockfile conflict into an unrelated dependency
+/// upgrade.
 ///
 /// See rung 0 in
 /// `docs/designs/merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`.
@@ -27,7 +34,8 @@ impl CargoLockResolver {
         }
     }
 
-    /// Seed regeneration from the PR base, preserving its pinned dependencies.
+    /// Seed regeneration from the PR base's lockfile, so `cargo update
+    /// --workspace` keeps its pinned dependencies.
     pub fn with_base_revision(mut self, revision: String) -> Self {
         self.base_revision = Some(revision);
         self
@@ -65,7 +73,7 @@ impl DeterministicResolver for CargoLockResolver {
             file,
             "Cargo.toml",
             "cargo",
-            &["generate-lockfile"],
+            &["update", "--workspace"],
             self.base_revision.as_deref(),
         )
         .await
@@ -109,7 +117,30 @@ mod tests {
         let calls = runner.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "cargo");
-        assert_eq!(calls[0].1, vec!["generate-lockfile".to_owned()]);
+        assert_eq!(calls[0].1, vec!["update".to_owned(), "--workspace".to_owned()]);
+    }
+
+    /// The command must honour the lockfile seeded from the PR base:
+    /// `generate-lockfile` would re-resolve every package to its latest
+    /// version, so a pinned third-party dependency would be bumped.
+    #[tokio::test]
+    async fn resolve_uses_a_lock_preserving_command_that_keeps_pinned_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let pinned = "[[package]]\nname = \"serde\"\nversion = \"1.0.100\"\n";
+        let runner = Arc::new(FakeCommandRunner::success_writing_file("Cargo.lock", pinned));
+        let resolver = CargoLockResolver::with_runner(runner.clone());
+
+        let outcome = resolver.resolve(dir.path(), &file("Cargo.lock")).await;
+
+        assert!(matches!(outcome, ResolveOutcome::Resolved { .. }));
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls[0].1.iter().any(|arg| arg == "generate-lockfile"),
+            "must not rebuild the lockfile from scratch: {:?}",
+            calls[0].1
+        );
+        assert_eq!(std::fs::read_to_string(dir.path().join("Cargo.lock")).unwrap(), pinned);
     }
 
     #[tokio::test]

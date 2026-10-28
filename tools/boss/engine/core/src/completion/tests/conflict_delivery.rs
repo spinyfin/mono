@@ -98,6 +98,48 @@ async fn conflict_delivery_fails_closed_when_github_is_unavailable() {
     assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
 }
 
+struct MergedProbe;
+
+#[async_trait]
+impl MergeProbe for MergedProbe {
+    async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
+        Ok(PrLifecycleProbe::builder()
+            .url(url.to_owned())
+            .state(PrLifecycleState::Merged)
+            .labels(Vec::new())
+            .review(crate::merge_poller::PrReviewState::Unknown)
+            .build())
+    }
+}
+
+#[tokio::test]
+async fn conflict_delivery_gate_treats_a_merged_pr_as_moot_not_a_delivery_failure() {
+    let workspace = tempdir().unwrap();
+    let pr = "https://github.com/spinyfin/mono/pull/2070";
+    let (_dir, db, _, _, _, execution_id, _) = conflict_revision_fixture(workspace.path(), pr, "old-head");
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_merge_probe(Arc::new(MergedProbe));
+    let execution = db.get_execution(&execution_id).unwrap();
+    assert!(handler.conflict_delivery_failure(&execution, Some(pr)).await.is_none());
+    assert_ne!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
+}
+
+#[tokio::test]
+async fn conflict_delivery_gate_reports_a_missing_bound_pr_url_specifically() {
+    let workspace = tempdir().unwrap();
+    let pr = "https://github.com/spinyfin/mono/pull/2070";
+    let (_dir, db, _, _, _, execution_id, _) = conflict_revision_fixture(workspace.path(), pr, "old-head");
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None)).handler;
+    let execution = db.get_execution(&execution_id).unwrap();
+    let outcome = handler.conflict_delivery_failure(&execution, None).await;
+    assert!(
+        matches!(outcome, Some(StopOutcome::RunDoneDeclaredWithoutDelivery { ref detail }) if detail.contains("no bound PR URL")),
+        "{outcome:?}"
+    );
+    assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
+}
+
 #[tokio::test]
 async fn another_work_item_cannot_start_conflict_resolution_while_revision_is_live() {
     let workspace = tempdir().unwrap();
@@ -141,4 +183,26 @@ async fn another_work_item_cannot_start_conflict_resolution_while_revision_is_li
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn blocked_revision_with_a_finished_execution_does_not_suppress_conflict_handling() {
+    let workspace = tempdir().unwrap();
+    let pr = "https://github.com/spinyfin/mono/pull/2070";
+    let (_dir, db, _, _, revision, execution_id, _) = conflict_revision_fixture(workspace.path(), pr, "head");
+    assert!(
+        db.has_live_conflict_revision_for_pr(pr).unwrap(),
+        "a running revision must still suppress a competitor"
+    );
+    {
+        let conn = db.connect().unwrap();
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?1", [&revision])
+            .unwrap();
+        conn.execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            [&execution_id],
+        )
+        .unwrap();
+    }
+    assert!(!db.has_live_conflict_revision_for_pr(pr).unwrap());
 }

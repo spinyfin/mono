@@ -76,23 +76,29 @@ impl ResolverRegistry {
     }
 
     pub fn with_builtins() -> Self {
-        let mut registry = Self::empty();
-        registry.register(Box::new(CargoLockResolver::new()));
-        registry.register(Box::new(BazelModuleLockResolver::new()));
-        registry.register(Box::new(RegistryAppendUnionResolver::new()));
-        registry
+        Self::builtins(None)
     }
 
     /// Built-ins for a rebased PR: regenerate lockfiles from its base version.
     pub fn with_builtins_from_base(revision: &str) -> Self {
+        Self::builtins(Some(revision))
+    }
+
+    /// The one built-in registration list. With a `base_revision`, each
+    /// lockfile resolver seeds regeneration from that revision's lockfile.
+    fn builtins(base_revision: Option<&str>) -> Self {
         let mut registry = Self::empty();
         registry.register(Box::new(crate::resolvers::GeneratedLockResolver {
-            base_revision: revision.into(),
+            base_revision: base_revision.map(str::to_owned),
         }));
-        registry.register(Box::new(CargoLockResolver::new().with_base_revision(revision.into())));
-        registry.register(Box::new(
-            BazelModuleLockResolver::new().with_base_revision(revision.into()),
-        ));
+        let mut cargo = CargoLockResolver::new();
+        let mut bazel = BazelModuleLockResolver::new();
+        if let Some(revision) = base_revision {
+            cargo = cargo.with_base_revision(revision.into());
+            bazel = bazel.with_base_revision(revision.into());
+        }
+        registry.register(Box::new(cargo));
+        registry.register(Box::new(bazel));
         registry.register(Box::new(RegistryAppendUnionResolver::new()));
         registry
     }
@@ -574,7 +580,7 @@ mod tests {
 
     #[tokio::test]
     async fn cargo_lock_and_bazel_module_lock_both_resolve_deterministically_together() {
-        // Regression coverage for spinyfin/mono#2032 (chore T2680): a
+        // Regression coverage for spinyfin/mono#2032 : a
         // conflicted-file set that is exactly {Cargo.lock, MODULE.bazel.lock}
         // must resolve as a single AllResolved batch — proving the two
         // built-in resolvers dispatch independently and don't interfere

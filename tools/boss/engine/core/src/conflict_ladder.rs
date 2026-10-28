@@ -122,7 +122,22 @@ pub(crate) enum LadderOutcome {
     /// rung on a pure infra failure is exactly the bug this variant exists
     /// to close. The attempt stays `pending` with no `revision_task_id`, so
     /// the ladder is retried in full on the next `conflict_watch` tick.
+    ///
+    /// Only the lease failure produces this; a resolver that ran and failed
+    /// is deterministic for the (base, head) pair and is reported through
+    /// [`Self::LockfileRegenerationFailed`] instead, so it cannot retry
+    /// silently forever.
     MechanicalRungsUnavailable,
+    /// Every residual conflicted file was a generated lockfile, but its
+    /// regeneration failed operationally (tool missing from `PATH`, no
+    /// network, the tool itself erroring, the lockfile absent on the base).
+    /// The attempt has been marked `failed` with the specific resolver
+    /// reason, an attention item names it, and the parent stays
+    /// `blocked: merge_conflict`. The caller must NOT spawn a worker (the
+    /// failure is environmental, not a semantic conflict) and must not
+    /// retry: the terminal attempt row is keyed on the (base, head) pair, so
+    /// a new attempt only starts once either moves.
+    LockfileRegenerationFailed,
 }
 
 /// Emits the single canonical decision line for a conflicted-PR
@@ -138,7 +153,7 @@ pub(crate) enum LadderOutcome {
 /// - `"generic"` — no mechanical rung applied; a full (or small-agent,
 ///   rung 2) worker revision will be spawned.
 /// - `"skip"` — the ladder was never attempted at all (e.g. the
-///   `conflict_ladder_mechanical_rebase` feature flag is off).
+///   `conflict_ladder_mechanical_rebase` feature flag was set to `false`).
 pub(crate) fn log_routing_verdict(
     work_item_id: &str,
     pr: Option<u64>,
@@ -578,6 +593,68 @@ pub(crate) async fn run_rung1_in_lease(
     }
 }
 
+/// Attention kind filed when a lockfile-only conflict could not be
+/// regenerated mechanically.
+pub(crate) const LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND: &str = "conflict_lockfile_regeneration_failed";
+
+/// Terminate a lockfile-only attempt whose regeneration failed operationally:
+/// stamp the attempt `failed` with the specific resolver reason (which also
+/// ends the per-tick retry, since the row owns the (base, head) key), and
+/// file an attention item. The parent stays `blocked: merge_conflict`.
+async fn halt_attempt_for_lockfile_failure(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    attempt: &ConflictResolution,
+    conflicted_files: &[String],
+    reason: &str,
+) {
+    tracing::warn!(
+        work_item_id = %candidate.work_item_id,
+        attempt_id = %attempt.id,
+        %reason,
+        "conflict_ladder: generated lockfile regeneration failed; attempt marked failed, no worker spawned",
+    );
+    log_routing_verdict(
+        &candidate.work_item_id,
+        stored_pr_number(&candidate.pr_url).map(|n| n as u64),
+        conflicted_files,
+        "deterministic",
+        "lockfile-only conflict: regeneration failed operationally; attempt failed, no worker spawned",
+    );
+    if let Err(err) =
+        work_db.mark_conflict_resolution_failed(&attempt.id, &format!("lockfile_regeneration_failed: {reason}"))
+    {
+        tracing::warn!(attempt_id = %attempt.id, ?err, "conflict_ladder: failed to stamp lockfile-regeneration failure");
+    }
+    let files = conflicted_files
+        .iter()
+        .map(|f| format!("- `{f}`"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _ = work_db.create_attention_item(CreateAttentionItemInput {
+        work_item_id: Some(candidate.work_item_id.clone()),
+        kind: LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND.to_owned(),
+        title: "Lockfile conflict could not be regenerated automatically".to_owned(),
+        body_markdown: format!(
+            "PR {} conflicts only in generated lockfiles, but regenerating them failed:\n\n{files}\n\n\
+             Reason: {reason}\n\nThe attempt is marked failed and will not retry until the PR's head or \
+             base moves. Fix the resolver environment and retry the attempt, or resolve the lockfile by hand.",
+            candidate.pr_url
+        ),
+        execution_id: None,
+        status: None,
+        resolved_at: None,
+    });
+    publisher
+        .publish_work_item_changed(
+            &candidate.product_id,
+            &candidate.work_item_id,
+            "conflict_lockfile_regeneration_failed",
+        )
+        .await;
+}
+
 /// Close the pointer-protection window opened before cube's goto/rebase:
 /// restore the saved recovery pointers and, when the operation pushed a PR
 /// head, adopt it for every record whose work it already carries.
@@ -722,9 +799,14 @@ pub(crate) async fn attempt_rung0(
                 .iter()
                 .all(|file| boss_deterministic_resolvers::is_generated_lockfile(&file.path))
             {
-                tracing::warn!(attempt_id = %attempt.id, %reason,
-                    "generated lockfile regeneration failed; retaining mechanical remediation, no model worker");
-                return LadderOutcome::MechanicalRungsUnavailable;
+                let specific = failed
+                    .first()
+                    .map(|f| format!("{}: {}", f.path, f.reason))
+                    .or_else(|| declined.first().map(|d| format!("{}: {}", d.path, d.reason)))
+                    .unwrap_or_else(|| reason.to_owned());
+                halt_attempt_for_lockfile_failure(work_db, publisher, candidate, attempt, residual_paths, &specific)
+                    .await;
+                return LadderOutcome::LockfileRegenerationFailed;
             }
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,

@@ -396,7 +396,7 @@ impl WorkerCompletionHandler {
                 .await;
         }
 
-        if !merged && let Some(outcome) = self.conflict_delivery_failure(execution, &pr_url).await {
+        if !merged && let Some(outcome) = self.conflict_delivery_failure(execution, Some(&pr_url)).await {
             return outcome;
         }
 

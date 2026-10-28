@@ -143,8 +143,8 @@ impl WorkerCompletionHandler {
             }
         };
         if self.is_merge_conflict_revision(execution) {
-            let pr_url = self.resolve_bound_pr_url(execution).unwrap_or_default();
-            if let Some(outcome) = self.conflict_delivery_failure(execution, &pr_url).await {
+            let pr_url = self.resolve_bound_pr_url(execution);
+            if let Some(outcome) = self.conflict_delivery_failure(execution, pr_url.as_deref()).await {
                 return outcome;
             }
         }

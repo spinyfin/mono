@@ -8,7 +8,7 @@
 //! its [`ResolverRegistry`], which is the extension seam the design calls
 //! out: built-ins today, plus [`RecipeResolver`] — the declarative
 //! recipe mechanism (design §"Extension mechanism — declarative
-//! resolution recipes", tracked as T13) — for user-configured formulas
+//! resolution recipes") — for user-configured formulas
 //! that don't warrant a compiled-in resolver. See [`recipe_config`] for
 //! the recipe format and its boss-side config file. This crate is
 //! standalone and unit-tested against fixture conflicts; it is wired into
@@ -18,6 +18,8 @@
 
 mod command;
 mod lockfile;
+#[cfg(test)]
+mod lockfile_base_tests;
 mod recipe_config;
 mod registry;
 mod resolvers;
@@ -31,6 +33,7 @@ pub use recipe_config::{ConflictRecipe, ConflictRecipesStore};
 pub use registry::{DeclinedFile, FailedFile, RegistryResolution, ResolvedFile, ResolverRegistry};
 pub use resolvers::{
     BazelModuleLockResolver, CargoLockResolver, InvalidRecipe, RecipeResolver, RegistryAppendUnionResolver,
+    is_generated_lockfile,
 };
 
 /// Coarse classification of a conflicted file's resolution strategy, kept
@@ -120,8 +123,3 @@ mod tests {
         assert_eq!(ConflictClass::RegistryAppendUnion.as_str(), "registry_append_union");
     }
 }
-
-pub use resolvers::is_generated_lockfile;
-
-#[cfg(test)]
-mod lockfile_base_tests;

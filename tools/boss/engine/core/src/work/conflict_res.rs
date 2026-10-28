@@ -4,7 +4,7 @@ use super::*;
 /// mechanical rebase) and rung 0 (deterministic resolvers,
 /// `crate::conflict_ladder::attempt_rung0`, live by default as of
 /// `RUNG0_APPLY_LIVE`) are both live on the `conflict_watch` path when the
-/// `conflict_ladder_mechanical_rebase` feature flag is enabled; rung 2 (the
+/// `conflict_ladder_mechanical_rebase` feature flag is enabled (its default); rung 2 (the
 /// small pre-staged agent) is also live, bounded to a single residual file
 /// (the single-residual-file bound for rung 2 is specified in
 /// `merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`).
@@ -12,6 +12,10 @@ use super::*;
 /// ladder itself is disabled — still falls through to a full worker doing
 /// the whole job by hand.
 const RUNG_FULL_WORKER: i64 = 3;
+
+/// How long a conflict revision that has no execution yet still counts as
+/// queued for its first dispatch.
+const UNDISPATCHED_REVISION_GRACE_SECS: i64 = 30 * 60;
 
 /// One candidate row read by
 /// [`WorkDb::reconcile_orphaned_conflict_ladder_attempts`]:
@@ -67,7 +71,10 @@ impl WorkDb {
         Ok(count > 0)
     }
 
-    /// A live revision owns resolution for its PR even if its attempt ended.
+    /// A revision that is genuinely running or queued owns resolution for its
+    /// PR even if its attempt ended. A revision parked in `blocked`, or whose
+    /// executions have all finished, does not: counting those would suppress
+    /// conflict handling for the PR indefinitely.
     pub fn has_live_conflict_revision_for_pr(&self, pr_url: &str) -> Result<bool> {
         let revisions: Vec<String> = {
             let conn = self.connect()?;
@@ -79,11 +86,51 @@ impl WorkDb {
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         for revision in revisions {
-            if self.is_conflict_resolution_revision_live(&revision)? {
+            if self.is_conflict_revision_running_or_queued(&revision)? {
                 return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    /// `todo`/`active` revision with a non-terminal execution (running or
+    /// queued), or one created moments ago that has not been dispatched yet.
+    /// Stricter than [`Self::is_conflict_resolution_revision_live`], which
+    /// also treats `blocked` tasks and cleanly finished executions as live.
+    fn is_conflict_revision_running_or_queued(&self, revision_task_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT status, created_at FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+                params![revision_task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((status, created_at)) = row else {
+            return Ok(false);
+        };
+        if !matches!(status.as_str(), "todo" | "active") {
+            return Ok(false);
+        }
+        let (non_terminal, any): (bool, bool) = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_executions
+                            WHERE work_item_id = ?1
+                              AND status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')),
+                    EXISTS(SELECT 1 FROM work_executions WHERE work_item_id = ?1)",
+            params![revision_task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if non_terminal {
+            return Ok(true);
+        }
+        if any {
+            return Ok(false);
+        }
+        // Never dispatched: queued for its first dispatch, but only for a
+        // grace window so an undispatchable revision cannot wedge the PR.
+        let created: i64 = created_at.parse().unwrap_or(0);
+        let now: i64 = now_string().parse().unwrap_or(0);
+        Ok(now - created <= UNDISPATCHED_REVISION_GRACE_SECS)
     }
 
     /// Insert a `conflict_resolutions` row with `status='pending'`

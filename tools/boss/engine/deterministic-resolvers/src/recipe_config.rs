@@ -1,8 +1,7 @@
 //! Declarative resolution recipes — the rung-0 extension mechanism
 //! described in the design's "Extension mechanism — declarative
 //! resolution recipes" section
-//! (`docs/designs/merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`,
-//! tracked as T13).
+//! (`docs/designs/merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`).
 //!
 //! A recipe is a data-driven `DeterministicResolver`: a file-glob
 //! paired with a resolution formula ("discard the conflicted file, run

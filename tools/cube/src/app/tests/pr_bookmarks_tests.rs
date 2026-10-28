@@ -20,9 +20,9 @@ mod regression;
 
 /// Runs `jj` invocations with the Bazel-declared binary and a fixed identity,
 /// so the fixture needs no global jj config and cannot read the host's.
-struct DeclaredJj {
-    binary: PathBuf,
-    config: PathBuf,
+pub(super) struct DeclaredJj {
+    pub(super) binary: PathBuf,
+    pub(super) config: PathBuf,
 }
 
 impl CommandRunner for DeclaredJj {

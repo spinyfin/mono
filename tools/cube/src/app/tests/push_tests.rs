@@ -33,6 +33,19 @@ fn workspace_push_happy_path_advances_and_pushes() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
+            &[
+                "log",
+                "-r",
+                "remote_bookmarks()..@",
+                "--no-graph",
+                "-T",
+                CONFLICT_COMMITS_TMPL,
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
             &["log", "-r", "@", "--no-graph", "-T", "description"],
             "",
         ),
@@ -106,6 +119,19 @@ fn workspace_push_pr_arg_resolves_head_branch_from_github() {
             cwd.clone(),
             "jj",
             &["log", "-r", "@", "--no-graph", "-T", CONFLICT_COMMITS_TMPL],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                "remote_bookmarks()..@",
+                "--no-graph",
+                "-T",
+                CONFLICT_COMMITS_TMPL,
+            ],
             "",
         ),
         ExpectedCommand::ok(
@@ -247,6 +273,19 @@ fn workspace_push_describes_an_undescribed_working_copy_before_pushing() {
             &["log", "-r", "@", "--no-graph", "-T", CONFLICT_COMMITS_TMPL],
             "",
         ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                "remote_bookmarks()..@",
+                "--no-graph",
+                "-T",
+                CONFLICT_COMMITS_TMPL,
+            ],
+            "",
+        ),
         // Blank description (only whitespace) — must still trigger `jj describe`.
         ExpectedCommand::ok(
             cwd.clone(),
@@ -324,6 +363,19 @@ fn workspace_push_leaves_an_existing_description_untouched() {
             cwd.clone(),
             "jj",
             &["log", "-r", "@", "--no-graph", "-T", CONFLICT_COMMITS_TMPL],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                "remote_bookmarks()..@",
+                "--no-graph",
+                "-T",
+                CONFLICT_COMMITS_TMPL,
+            ],
             "",
         ),
         ExpectedCommand::ok(
@@ -411,6 +463,19 @@ fn workspace_push_failure_surfaces_clear_error() {
             cwd.clone(),
             "jj",
             &["log", "-r", "@", "--no-graph", "-T", CONFLICT_COMMITS_TMPL],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                "remote_bookmarks()..@",
+                "--no-graph",
+                "-T",
+                CONFLICT_COMMITS_TMPL,
+            ],
             "",
         ),
         ExpectedCommand::ok(

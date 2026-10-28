@@ -114,9 +114,9 @@ fn auto_pr_maintenance_disabled(work_db: &WorkDb, candidate: &PendingMergeCheck,
 /// first attempts the engine-direct mechanical rebase (rung 1) before spawning
 /// a worker — see [`crate::conflict_ladder`]. A clean rebase resolves and
 /// pushes the PR with no agent; the harness retires the attempt and this
-/// returns early. `None` (the default at call sites, and whenever the
-/// `conflict_ladder_mechanical_rebase` flag is off) preserves the pre-ladder
-/// worker-only path exactly.
+/// returns early. `None` (passed whenever the
+/// `conflict_ladder_mechanical_rebase` flag, enabled by default, has been set
+/// to `false`) takes the worker-only path.
 pub async fn on_conflict_detected(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -650,6 +650,16 @@ pub async fn on_conflict_detected_with(
         .has_live_conflict_revision_for_pr(&candidate.pr_url)
         .unwrap_or(true)
     {
+        tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            "conflict_watch: a conflict revision for this PR is still running or queued; \
+             not minting another",
+        );
+        // The parent may have just been flipped to blocked above; surface it.
+        publisher
+            .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "blocked_merge_conflict")
+            .await;
         return false;
     }
 
@@ -879,6 +889,19 @@ pub async fn on_conflict_detected_with(
                         );
                         return true;
                     }
+                    conflict_ladder::LadderOutcome::LockfileRegenerationFailed => {
+                        // Lockfile regeneration failed in the environment.
+                        // The attempt is terminal (`failed`, reason
+                        // recorded, attention item filed), so there is
+                        // nothing to retry and no worker would do better.
+                        tracing::warn!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            attempt_id = %a.id,
+                            "conflict_watch: lockfile regeneration failed; attempt failed, no worker spawned",
+                        );
+                        return true;
+                    }
                     conflict_ladder::LadderOutcome::FellThrough {
                         residual_conflict_files,
                         ..
@@ -907,7 +930,7 @@ pub async fn on_conflict_detected_with(
                     }
                 }
             } else {
-                // No cube client → the mechanical-rebase flag is off, so the
+                // No cube client → the mechanical-rebase flag was set to false, so the
                 // escalation ladder (rungs 0/1, including the deterministic
                 // lockfile resolver) is not attempted this dispatch at all.
                 // This used to be a debug-only line, invisible in the
@@ -1008,18 +1031,22 @@ pub async fn on_conflict_detected_with(
 }
 
 /// Is `active_crz` (an in-flight attempt with a linked revision) stale?
-/// A crz is stale when either:
+/// A linked revision that is still live (see
+/// [`WorkDb::is_conflict_resolution_revision_live`]) is never superseded,
+/// even when the PR head has moved: a push can land while the worker is
+/// still resolving, and head movement must not replace a live fix vehicle.
+/// Otherwise the crz is stale when either:
 ///   (a) the probe head SHA has moved since the crz was created — the
 ///       revision pushed a commit but didn't resolve the conflict, then its
 ///       exec was abandoned by the orphan sweep (not NudgeBreakerParked, so
 ///       finalize_conflict_resolution_attempt never ran), leaving the crz
 ///       `pending` with `revision_task_id` set against an old head; or
-///   (b) the linked revision task is dead — either it reached a terminal
-///       status (in_review/done/archived) without the crz ever being
-///       finalised (same orphan-sweep abandonment scenario, head SHA
-///       unchanged), or its execution died outright (e.g. an engine
-///       restart) while the task itself never progressed past a live
-///       status.
+///   (b) a revision is linked (and, having passed the liveness check above,
+///       is dead) — it reached a terminal status (in_review/done/archived)
+///       without the crz ever being finalised (same orphan-sweep
+///       abandonment scenario, head SHA unchanged), or its execution died
+///       outright (e.g. an engine restart) while the task itself never
+///       progressed past a live status.
 /// Mirrors ci_watch's stale-head supersede logic.
 ///
 /// When stale, abandons the row (nullifying `base_sha_at_trigger` when the
@@ -1057,11 +1084,9 @@ fn supersede_if_stale(
             .unwrap_or(false),
         None => false, // can't compare — conservative: don't supersede
     };
-    let revision_dead = active_crz
-        .revision_task_id
-        .as_deref()
-        .map(|rid| !work_db.is_conflict_resolution_revision_live(rid).unwrap_or(true))
-        .unwrap_or(false);
+    // The liveness check above already returned for a live revision, so any
+    // linked revision that reaches here is dead.
+    let revision_dead = active_crz.revision_task_id.is_some();
     if !(head_sha_stale || revision_dead) {
         return false;
     }
@@ -1409,6 +1434,13 @@ async fn maybe_spawn_conflict_revision(
         .has_live_conflict_revision_for_pr(&candidate.pr_url)
         .unwrap_or(true)
     {
+        tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            attempt_id = %attempt.id,
+            "conflict_watch: a conflict revision for this PR is still running or queued; \
+             not spawning another",
+        );
         return false;
     }
     let base_branch = probe

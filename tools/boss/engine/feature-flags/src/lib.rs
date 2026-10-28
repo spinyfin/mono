@@ -201,7 +201,7 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         name: "conflict_ladder_mechanical_rebase",
         description: "Run engine-direct rebase and deterministic generated-lockfile regeneration before \
              worker fallback. Enabled by default so lockfile-only conflicts use their owning tools. \
-             Disable only as an operator kill switch for mechanical remediation.",
+             Set to false to disable all mechanical remediation, including lockfile regeneration.",
         category: "conflict",
         default_enabled: true,
         capability_id: None,

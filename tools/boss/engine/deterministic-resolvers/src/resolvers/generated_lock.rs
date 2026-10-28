@@ -8,7 +8,7 @@ use crate::{ConflictClass, ConflictedFile, DeterministicResolver, ResolveOutcome
 
 /// Other supported package-manager lockfiles use the same base-and-regenerate contract.
 pub(crate) struct GeneratedLockResolver {
-    pub base_revision: String,
+    pub base_revision: Option<String>,
 }
 
 fn recipe(path: &str) -> Option<(&'static str, &'static str, &'static [&'static str])> {
@@ -61,7 +61,7 @@ impl DeterministicResolver for GeneratedLockResolver {
             manifest,
             program,
             args,
-            Some(&self.base_revision),
+            self.base_revision.as_deref(),
         )
         .await
     }
