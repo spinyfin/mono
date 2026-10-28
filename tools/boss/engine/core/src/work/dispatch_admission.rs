@@ -180,6 +180,22 @@ pub(crate) fn primary_pr_awaits_review(conn: &Connection, work_item_id: &str) ->
     }))
 }
 
+/// Completed revision work belongs to completion/review handling. A review
+/// execution (including one on the chain root) must not hide that completion.
+/// Explicit starts create a newer implementation and remain allowed.
+pub(crate) fn revision_implementation_completed(conn: &Connection, work_item_id: &str) -> Result<bool> {
+    let status: Option<String> = conn
+        .query_row(
+            "SELECT e.status FROM work_executions e JOIN tasks t ON t.id = e.work_item_id
+         WHERE e.work_item_id = ?1 AND t.kind = 'revision' AND e.kind = 'revision_implementation'
+         ORDER BY e.created_at DESC, e.id DESC LIMIT 1",
+            [work_item_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(status.as_deref() == Some("completed"))
+}
+
 #[work_db_boundary::instrument]
 impl WorkDb {
     pub(crate) fn dispatch_admission_facts(&self, work_item_id: &str) -> Result<DispatchAdmissionFacts> {

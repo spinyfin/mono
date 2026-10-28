@@ -95,19 +95,28 @@ fn goto_set_pr_bookmark_cmds(pr: u64, head: &str) -> Vec<ExpectedCommand> {
 }
 
 /// What `goto --pr` runs after GitHub's PR JSON: confirm `head` is in the
-/// store, then point the local branch bookmark at it.
-fn goto_pr_head_cmds(head: &str) -> Vec<ExpectedCommand> {
-    vec![goto_jj(
-        &[
-            "log",
-            "--no-graph",
-            "-r",
-            &format!("present({head})"),
-            "-T",
-            r#"commit_id ++ "\n""#,
-        ],
-        head,
-    )]
+/// store and check whether the working copy is already on it (`positioned`
+/// is that probe's output; empty means `jj new` follows). The bookmarks are
+/// set only after the working copy has moved.
+fn goto_pr_head_cmds(head: &str, positioned: &str) -> Vec<ExpectedCommand> {
+    let mut cmds = vec![
+        goto_jj(
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                &format!("present({head})"),
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            head,
+        ),
+        goto_pr_positioned_cmd(head, positioned),
+    ];
+    if positioned.is_empty() {
+        cmds.push(goto_jj(&["new", head], ""));
+    }
+    cmds
 }
 
 fn goto_pr_json(branch: &str, head: &str) -> String {
@@ -181,9 +190,9 @@ fn goto_bookmark_not_yet_positioned_creates_new_commit() {
         goto_remote_list_cmd(),
         goto_fetch_cmd(),
         goto_exists_cmd(branch, "abc1"),
-        goto_set_bookmark_cmd(branch),
         goto_positioned_cmd(branch, ""), // not yet positioned
         goto_new_cmd(branch),
+        goto_set_bookmark_cmd(branch),
     ];
     let runner = FakeRunner::new(cmds);
     let result = run_goto(&runner, Some(branch), None).expect("goto succeeds");
@@ -199,9 +208,9 @@ fn goto_bookmark_already_positioned_skips_jj_new() {
         goto_remote_list_cmd(),
         goto_fetch_cmd(),
         goto_exists_cmd(branch, "def2"),
-        goto_set_bookmark_cmd(branch),
         goto_positioned_cmd(branch, "def2"), // already positioned
-                                             // no jj new expected
+        goto_set_bookmark_cmd(branch),
+        // no jj new expected
     ];
     let runner = FakeRunner::new(cmds);
     let result = run_goto(&runner, Some(branch), None).expect("idempotent goto");
@@ -223,14 +232,12 @@ fn goto_pr_resolves_branch_and_sets_pr_bookmark() {
             &goto_pr_json(branch, "e42"),
         ),
     ];
-    cmds.extend(goto_pr_head_cmds("e42"));
+    cmds.extend(goto_pr_head_cmds("e42", ""));
     cmds.extend(goto_set_pr_bookmark_cmds(42, "e42"));
     cmds.push(goto_jj(
         &["bookmark", "set", branch, "-r", "e42", "--allow-backwards"],
         "",
     ));
-    cmds.push(goto_pr_positioned_cmd("e42", ""));
-    cmds.push(goto_jj(&["new", "e42"], ""));
     let runner = FakeRunner::new(cmds);
     let result = run_goto(&runner, None, Some(42)).expect("pr goto");
     runner.assert_exhausted();
@@ -325,7 +332,7 @@ fn goto_pr_repairs_conflicted_bookmark_when_other_side_is_an_ancestor() {
             &goto_pr_json(branch, "e42"),
         ),
     ];
-    cmds.extend(goto_pr_head_cmds("e42"));
+    cmds.extend(goto_pr_head_cmds("e42", "e42"));
     cmds.extend(goto_pr_bookmark_prelude(42, "e42", "e42\nold1\n"));
     cmds.push(goto_jj(
         &[
@@ -345,7 +352,6 @@ fn goto_pr_repairs_conflicted_bookmark_when_other_side_is_an_ancestor() {
         &["bookmark", "set", branch, "-r", "e42", "--allow-backwards"],
         "",
     ));
-    cmds.push(goto_pr_positioned_cmd("e42", "e42"));
     let runner = FakeRunner::new(cmds);
     run_goto(&runner, None, Some(42)).expect("conflicted pr bookmark repaired");
     runner.assert_exhausted();
@@ -366,7 +372,7 @@ fn goto_pr_refuses_conflicted_bookmark_with_unique_content() {
             &goto_pr_json(branch, "e42"),
         ),
     ];
-    cmds.extend(goto_pr_head_cmds("e42"));
+    cmds.extend(goto_pr_head_cmds("e42", "e42"));
     cmds.extend(goto_pr_bookmark_prelude(42, "e42", "e42\nuniq9\n"));
     cmds.push(goto_jj(
         &[

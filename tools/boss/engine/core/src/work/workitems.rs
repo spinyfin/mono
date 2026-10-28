@@ -218,6 +218,22 @@ impl WorkDb {
         title: &str,
         body_markdown: &str,
     ) -> Result<()> {
+        self.upsert_refreshing_work_item_attention(work_item_id, kind, title, body_markdown)
+    }
+
+    /// Create an attention item of `kind` for `work_item_id` unless one is
+    /// already open; when one is, re-raise it and refresh its title and body
+    /// to the latest text. Idempotent. The kind-agnostic filer behind
+    /// [`Self::upsert_external_tracker_attention`], so non-tracker alerts can
+    /// share the refresh-on-re-raise behaviour without depending on a helper
+    /// named for external-tracker reconciliation.
+    pub(crate) fn upsert_refreshing_work_item_attention(
+        &self,
+        work_item_id: &str,
+        kind: &str,
+        title: &str,
+        body_markdown: &str,
+    ) -> Result<()> {
         warn_if_lifecycle_undeclared(kind);
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
