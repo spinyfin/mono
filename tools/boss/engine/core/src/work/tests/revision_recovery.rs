@@ -44,6 +44,10 @@ fn completed_revision_is_not_redispatched_while_new_head_review_is_running() {
             db.reconcile_product_executions(&product).unwrap();
             assert!(db.reconcile_active_dispatch(|id| id == review.id).unwrap().is_empty());
             assert!(db.rescan_active_dispatch().unwrap().is_empty());
+            assert!(
+                !db.list_orphan_active_candidates(0).unwrap().contains(&revision),
+                "the orphan sweep must not offer a completed revision for redispatch"
+            );
             let implementations: Vec<_> = db
                 .list_executions(Some(&revision))
                 .unwrap()

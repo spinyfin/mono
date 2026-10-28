@@ -52,7 +52,7 @@ use crate::app::reset::{
 };
 use crate::app::salvage::list_salvage_records;
 use crate::app::util::{current_epoch_s, holder_identity, repo_lock_path, resolve_release_lease};
-use crate::app::workspace_ops::{workspace_goto, workspace_push, workspace_rebase};
+use crate::app::workspace_ops::{workspace_goto, workspace_push, workspace_rebase, workspace_repair_pr_bookmark};
 
 /// Default lease TTL: 24 hours from acquisition.
 ///
@@ -2328,6 +2328,9 @@ pub(super) fn run_workspace(
             pr,
             revision,
         } => workspace_goto(database_path, runner, workspace, bookmark, pr, revision),
+        WorkspaceCommand::RepairPrBookmark { workspace, pr } => {
+            workspace_repair_pr_bookmark(database_path, runner, workspace, pr)
+        }
         WorkspaceCommand::Rebase { bookmark, pr, no_push } => {
             workspace_rebase(&mut store, database_path, runner, bookmark, pr, no_push)
         }

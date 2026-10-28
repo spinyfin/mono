@@ -660,10 +660,11 @@ pub(super) fn workspace_goto(
 
     let _pr_lock = runner.lock_pr_bookmarks(&cwd)?;
 
-    // Move the working copy first and set the bookmarks last: workspace gc
-    // forgets a `pr/<n>` alias that nothing references, so setting the alias
-    // and only then running `jj new` leaves a window in which it can be
-    // forgotten before the new working copy keeps it alive.
+    // Move the working copy first and set the bookmarks last. Workspace gc
+    // deletes an unreferenced `pr/<n>` alias under the same PR-bookmark lock
+    // held here, so it cannot run between the steps below; ordering them this
+    // way as well means the alias never exists unreferenced, even for a
+    // reader that does not take the lock.
     // Idempotency check: if @ already has <remote_ref> as a direct parent,
     // skip `jj new` — the workspace is already positioned correctly.
     let already_positioned = runner
@@ -722,6 +723,32 @@ pub(super) fn workspace_goto(
             "remote_ref": remote_ref,
             "already_positioned": already_positioned,
         }),
+    )
+}
+
+/// `cube workspace repair-pr-bookmark --pr N`: point the shared `pr/<N>` alias
+/// at the PR's current GitHub head without touching any working copy. Uses the
+/// guarded writer behind `goto --pr` and lease repair, so it serializes with
+/// workspace GC and other alias writes, refuses to override a conflicted side
+/// holding unique content, and leaves jj and git agreeing about the alias.
+pub(super) fn workspace_repair_pr_bookmark(
+    database_path: Option<&Path>,
+    runner: &dyn CommandRunner,
+    workspace: Option<String>,
+    pr: u64,
+) -> Result<RunResult> {
+    let cwd: PathBuf = match workspace {
+        Some(ref p) => PathBuf::from(p),
+        None => std::env::current_dir().map_err(CubeError::Io)?,
+    };
+    let name = git_utils::pr_bookmark::pr_bookmark_name(pr);
+    let repair = crate::app::health::repair_pr_bookmarks(runner, database_path, &cwd, std::slice::from_ref(&name))?;
+    if let Some((_, why)) = repair.failures.into_iter().next() {
+        return Err(CubeError::InvalidArgument(format!("cannot repair `{name}`: {why}")));
+    }
+    RunResult::new(
+        format!("Repaired {name} from GitHub."),
+        json!({ "pr": pr, "bookmark": name }),
     )
 }
 

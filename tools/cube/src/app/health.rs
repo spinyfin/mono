@@ -210,6 +210,8 @@ fn is_shared_pointer_bookmark(bookmark: &str) -> bool {
 #[derive(Debug, Default)]
 pub(super) struct BookmarkRepair {
     pub(super) unrepaired: Vec<String>,
+    /// Each unrepaired bookmark with the reason it was left untouched.
+    pub(super) failures: Vec<(String, String)>,
 }
 
 /// Repair each conflicted bookmark so the workspace no longer reports
@@ -269,16 +271,29 @@ pub(super) fn repair_conflicted_bookmarks(
             },
         )?;
     }
+    repair_pr_bookmarks(runner, database_path, workspace_path, &pr_bookmarks)
+}
+
+/// Point each `pr/<n>` bookmark in `names` (missing, conflicted or
+/// stale) at its PR's authoritative GitHub head through the guarded writer
+/// shared with `goto --pr`: the store-wide PR-bookmark lock, the
+/// conflicted-side policy and the git import/export. Best-effort per
+/// bookmark; every bookmark left untouched is reported in the result with
+/// its reason. Network work runs before the lock is taken.
+pub(super) fn repair_pr_bookmarks(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    workspace_path: &Path,
+    names: &[String],
+) -> Result<BookmarkRepair> {
     let mut outcome = BookmarkRepair::default();
-    if pr_bookmarks.is_empty() {
+    if names.is_empty() {
         return Ok(outcome);
     }
 
     let skip = |outcome: &mut BookmarkRepair, bookmark: &str, why: &str| {
         let sides = pr_bookmarks::bookmark_commits_best_effort(runner, database_path, workspace_path, bookmark);
-        eprintln!(
-            "warning: cube left conflicted bookmark `{bookmark}` (commits: {sides}) untouched during lease: {why}"
-        );
+        eprintln!("warning: cube left PR bookmark `{bookmark}` (commits: {sides}) untouched: {why}");
         audit!(
             database_path,
             "workspace.pr_bookmark_repair_skipped",
@@ -288,13 +303,14 @@ pub(super) fn repair_conflicted_bookmarks(
             reason = why,
         );
         outcome.unrepaired.push(bookmark.to_string());
+        outcome.failures.push((bookmark.to_string(), why.to_string()));
     };
 
     // Phase 1, no lock: everything that talks to the network.
     let mut heads: Vec<(String, u64, String)> = Vec::new();
     match crate::app::reset::resolve_github_remote_for_workspace(runner, database_path, workspace_path) {
         Err(error) => {
-            for bookmark in &pr_bookmarks {
+            for bookmark in names {
                 skip(
                     &mut outcome,
                     bookmark,
@@ -313,7 +329,7 @@ pub(super) fn repair_conflicted_bookmarks(
                 // Not fatal: the head commit may already be in the shared store.
                 eprintln!("warning: cube could not fetch `{remote}` before repairing PR bookmarks: {error}");
             }
-            for bookmark in &pr_bookmarks {
+            for bookmark in names {
                 match resolve_lease_pr_head(runner, database_path, workspace_path, &repo, bookmark, deadline) {
                     Ok((number, sha)) => heads.push((bookmark.clone(), number, sha)),
                     Err(error) => skip(&mut outcome, bookmark, &error.to_string()),

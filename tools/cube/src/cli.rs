@@ -357,6 +357,23 @@ pub enum WorkspaceCommand {
         #[arg(long, conflicts_with_all = ["bookmark", "pr"])]
         revision: Option<String>,
     },
+    /// Repair the shared `pr/<n>` alias from GitHub's current head for PR N.
+    ///
+    /// Recreates a missing alias, or repairs a conflicted one, through the
+    /// same guarded writer `goto --pr` uses: the store-wide PR-bookmark lock,
+    /// the refusal to pick a side of a conflict that holds unique content, and
+    /// the git import/export. A fork-headed PR is fetched from its head
+    /// repository. Never moves any working copy. Fails loudly when the alias
+    /// cannot be repaired.
+    RepairPrBookmark {
+        /// Absolute path of a workspace or the shared source checkout. If
+        /// omitted, uses the current directory.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// PR number whose alias to repair.
+        #[arg(long)]
+        pr: u64,
+    },
     /// Rebase the current workspace's boss branch onto the repo's integration branch.
     ///
     /// Fetches the latest integration branch (e.g. `main`, `master`, `trunk`)
@@ -1260,6 +1277,29 @@ mod tests {
             }
             _ => panic!("expected workspace reconcile command"),
         }
+    }
+
+    #[test]
+    fn workspace_repair_pr_bookmark_requires_a_pr_and_accepts_a_workspace() {
+        let cli = Cli::parse_from([
+            "cube",
+            "workspace",
+            "repair-pr-bookmark",
+            "--workspace",
+            "/store",
+            "--pr",
+            "139",
+        ]);
+        match cli.command {
+            Command::Workspace {
+                command: WorkspaceCommand::RepairPrBookmark { workspace, pr },
+            } => {
+                assert_eq!(workspace.as_deref(), Some("/store"));
+                assert_eq!(pr, 139);
+            }
+            _ => panic!("expected workspace repair-pr-bookmark command"),
+        }
+        assert!(Cli::try_parse_from(["cube", "workspace", "repair-pr-bookmark"]).is_err());
     }
 
     #[test]

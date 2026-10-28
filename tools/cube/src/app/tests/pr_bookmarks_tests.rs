@@ -482,6 +482,79 @@ fn lease_succeeds_and_leaves_a_conflict_with_unique_content_untouched() {
     assert_eq!(f.git_ref(1), Some(other));
 }
 
+fn repair_command(f: &Fixture, runner: &LeaseRunner) -> Result<crate::app::errors::RunResult> {
+    let result =
+        crate::app::workspace_ops::workspace_repair_pr_bookmark(None, runner, Some(f.ws.display().to_string()), 1);
+    runner.assert_no_network_while_locked();
+    result
+}
+
+fn head_json(head: &str) -> String {
+    format!(r#"{{"state":"open","head":{{"ref":"feat","sha":"{head}"}}}}"#)
+}
+
+/// The engine's recovery repair goes through this command: a missing alias is
+/// recreated under the PR-bookmark lock and exported to git, and no working
+/// copy moves.
+#[test]
+fn repair_command_recreates_a_deleted_alias_under_the_lock() {
+    let f = Fixture::new();
+    let (head, _) = conflicted_pr_bookmark(&f, false);
+    f.jj(&f.ws, &["bookmark", "delete", "pr/1"]);
+    f.root_write();
+    assert!(f.pr_commits(1).is_empty(), "precondition: the alias is gone");
+    let working_copy = f.commit("@");
+    let runner = LeaseRunner::with_pr_json(&f.runner, head_json(&head));
+
+    repair_command(&f, &runner).expect("missing alias is repaired");
+
+    assert_eq!(f.pr_commits(1), vec![head.clone()]);
+    assert_eq!(f.git_ref(1), Some(head));
+    assert_eq!(f.commit("@"), working_copy, "the working copy does not move");
+    assert!(
+        runner.events.borrow().contains(&"lock"),
+        "the guarded writer takes the lock"
+    );
+}
+
+#[test]
+fn repair_command_repairs_an_obsolete_conflict() {
+    let f = Fixture::new();
+    let (head, _) = conflicted_pr_bookmark(&f, false);
+    let runner = LeaseRunner::with_pr_json(&f.runner, head_json(&head));
+    repair_command(&f, &runner).expect("obsolete conflict is repaired");
+    assert_eq!(f.pr_commits(1), vec![head.clone()]);
+    assert_eq!(f.git_ref(1), Some(head));
+}
+
+/// Unlike lease repair, which never fails a lease, the command fails loudly
+/// and names the refusal, and leaves the unique side untouched.
+#[test]
+fn repair_command_refuses_a_conflict_with_unique_content() {
+    let f = Fixture::new();
+    let (head, other) = conflicted_pr_bookmark(&f, true);
+    let runner = LeaseRunner::with_pr_json(&f.runner, head_json(&head));
+    let err = repair_command(&f, &runner).expect_err("unique side must not be overridden");
+    assert!(
+        err.to_string().contains(git_utils::pr_bookmark::UNSAFE_REPAIR_PHRASE),
+        "{err}"
+    );
+    assert_eq!(f.pr_commits(1).len(), 2, "still conflicted, no side picked");
+    assert_eq!(f.git_ref(1), Some(other));
+}
+
+#[test]
+fn repair_command_reports_a_response_without_a_head_sha() {
+    let f = Fixture::new();
+    let _ = conflicted_pr_bookmark(&f, false);
+    let runner = LeaseRunner::with_pr_json(&f.runner, r#"{"state":"open","head":{"ref":"feat"}}"#.to_string());
+    let err = repair_command(&f, &runner).expect_err("no head.sha");
+    assert!(
+        err.to_string().contains(git_utils::pr_bookmark::NO_PR_HEAD_PHRASE),
+        "{err}"
+    );
+}
+
 #[test]
 fn lease_repairs_from_head_sha_when_the_source_branch_is_gone() {
     let f = Fixture::new();

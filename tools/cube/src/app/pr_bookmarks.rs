@@ -42,7 +42,7 @@ use std::time::Instant;
 
 use serde_json::Value;
 
-use git_utils::pr_bookmark;
+use git_utils::pr_bookmark::{self, NO_PR_HEAD_PHRASE, UNSAFE_REPAIR_PHRASE};
 
 use crate::app::errors::{CubeError, Result};
 use crate::app::gh_pr;
@@ -476,9 +476,6 @@ fn equivalent_sibling(
     Ok(true)
 }
 
-/// Wording shared by [`unsafe_repair`] and [`is_unsafe_repair`].
-const UNSAFE_REPAIR_PHRASE: &str = "cube will not pick a side";
-
 /// Whether `error` is the deterministic refusal to repair a conflicted
 /// bookmark, which no plain retry can get past.
 pub(super) fn is_unsafe_repair(error: &CubeError) -> bool {
@@ -591,7 +588,7 @@ pub(super) fn resolve_pr_head(
     deadline: Option<Instant>,
 ) -> Result<PrHead> {
     let sha = gh_pr::head_sha(info)
-        .ok_or_else(|| CubeError::InvalidArgument(format!("PR {number} returned no head.sha")))?
+        .ok_or_else(|| CubeError::InvalidArgument(format!("PR {number} {NO_PR_HEAD_PHRASE}")))?
         .to_string();
     let head_repo = head_repo_full_name(info);
     let same_repo = head_repo.is_some_and(|name| name.eq_ignore_ascii_case(owner_repo));
