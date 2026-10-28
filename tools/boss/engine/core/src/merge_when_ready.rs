@@ -65,7 +65,14 @@ pub struct DirectMergeSuccess {
 /// the `gh` error message when the merge was rejected (conflicts, auth
 /// failure, PR not open, etc.).
 pub async fn gh_merge_when_ready(pr_url: &str) -> Result<DirectMergeSuccess> {
+    let started = std::time::Instant::now();
     let head_sha = probe_head_sha(pr_url).await?;
+    tracing::info!(
+        pr_url,
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "merge request head probe completed"
+    );
+    let command_started = std::time::Instant::now();
     let output = gh_scope(
         callers::MERGE_WHEN_READY,
         gh_output(&[
@@ -80,6 +87,12 @@ pub async fn gh_merge_when_ready(pr_url: &str) -> Result<DirectMergeSuccess> {
     )
     .await
     .map_err(|e| anyhow!("failed to spawn `gh pr merge`: {e}"))?;
+    tracing::info!(
+        pr_url,
+        elapsed_ms = command_started.elapsed().as_secs_f64() * 1000.0,
+        success = output.status.success(),
+        "merge request GitHub command completed"
+    );
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

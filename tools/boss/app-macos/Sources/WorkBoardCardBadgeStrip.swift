@@ -111,6 +111,7 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
     var onOpenTerminal: (() -> Void)? = nil
     /// Merge-when-ready confirm; also gated by `slice.showsMergeWhenReady`.
     var onMergeWhenReady: (() -> Void)? = nil
+    var isRequestingMerge = false
     /// Open the review guide; gated by `slice.reviewGuidePresentation`
     /// having a readable version to show.
     var onOpenReviewGuide: (() -> Void)? = nil
@@ -129,6 +130,7 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.slice == rhs.slice && lhs.aiReviewFindingsTooltipNote == rhs.aiReviewFindingsTooltipNote
+            && lhs.isRequestingMerge == rhs.isRequestingMerge
     }
 
     var body: some View {
@@ -267,7 +269,7 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
                 )
             }
             if slice.showsMergeWhenReady {
-                MergeWhenReadyControl(onConfirm: { onMergeWhenReady?() })
+                MergeWhenReadyControl(isRequesting: isRequestingMerge, onConfirm: { onMergeWhenReady?() })
             }
             if slice.showsDeferredScopeBadge {
                 DeferredScopeCardBadge(

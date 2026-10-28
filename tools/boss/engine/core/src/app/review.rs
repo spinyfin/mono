@@ -13,6 +13,7 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
         work_db,
         sink,
         request_id,
+        recv_instant,
         ..
     } = ctx;
     let FrontendRequest::MergeWhenReady {
@@ -22,6 +23,7 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
     else {
         unreachable!()
     };
+    tracing::info!(%request_id, %work_item_id, elapsed_ms = recv_instant.elapsed().as_secs_f64() * 1000.0, "merge request handler entered");
     let work_item_id = match server_state.resolve_work_item_id(&work_item_id).await {
         Ok(id) => id,
         Err(err) => {
@@ -138,14 +140,18 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 let product_slug = product.slug.clone();
                 let publisher = server_state.publisher.clone();
                 let product_id2 = product_id.clone();
+                tracing::info!(%request_id, elapsed_ms = recv_instant.elapsed().as_secs_f64() * 1000.0, "merge request preflight completed");
                 boss_task_scope::spawn(async move {
                     tracing::info!(
                         work_item_id = %work_item_id2,
                         pr_url = %pr_url2,
                         "merge_when_ready: requesting GitHub-native merge",
                     );
+                    let external_started = std::time::Instant::now();
                     match direct_merge_executor.execute(&pr_url2).await {
                         Ok(success) => {
+                            tracing::info!(request_id = %request_id2, elapsed_ms = external_started.elapsed().as_secs_f64() * 1000.0, "merge request external operation completed");
+                            let record_started = std::time::Instant::now();
                             // `gh pr merge --auto --squash` has accepted a
                             // merge request for this exact head. GitHub's
                             // queue/auto-merge projection lags that command,
@@ -201,27 +207,29 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                                 action = merge_when_ready::MergeAction::Requested.as_str(),
                                 "merge_when_ready: GitHub merge request recorded",
                             );
+                            tracing::info!(request_id = %request_id2, elapsed_ms = record_started.elapsed().as_secs_f64() * 1000.0, "merge request durable write completed");
+                            // Acknowledge durable acceptance before publication takes
+                            // the shared decision-feed lock or wakes board readers.
+                            send_response(
+                                &sink2,
+                                &request_id2,
+                                FrontendEvent::MergeWhenReadyAccepted {
+                                    work_item_id: work_item_id2.clone(),
+                                    pr_url: pr_url2.clone(),
+                                    action: merge_when_ready::MergeAction::Requested.as_str().to_owned(),
+                                },
+                            );
+                            tracing::info!(request_id = %request_id2, elapsed_ms = recv_instant.elapsed().as_secs_f64() * 1000.0, "merge request acknowledgement enqueued");
+                            event_bus.publish(Event::PrReconcileRequested {
+                                pr_url: pr_url2.clone(),
+                            });
+                            let publication_started = std::time::Instant::now();
                             if record.merge_queue_state_changed {
                                 publisher
                                     .publish_work_item_changed(&product_id2, &work_item_id2, "gh_merge_queue_submitted")
                                     .await;
                             }
-                            // Publish the targeted reconcile only after the
-                            // durable intent and its optimistic projection are
-                            // committed. The periodic timer and adaptive
-                            // per-PR schedule remain the backstop.
-                            event_bus.publish(Event::PrReconcileRequested {
-                                pr_url: pr_url2.clone(),
-                            });
-                            send_response(
-                                &sink2,
-                                &request_id2,
-                                FrontendEvent::MergeWhenReadyAccepted {
-                                    work_item_id: work_item_id2,
-                                    pr_url: pr_url2,
-                                    action: merge_when_ready::MergeAction::Requested.as_str().to_owned(),
-                                },
-                            );
+                            tracing::info!(request_id = %request_id2, elapsed_ms = publication_started.elapsed().as_secs_f64() * 1000.0, "merge request board publication completed");
                         }
                         Err(err) => {
                             let message = format!("{err:#}");
@@ -442,16 +450,13 @@ async fn handle_trunk_queue_merge(
                 // own `work_item_changed` publish to reach the Merging UI —
                 // nothing else emits one for this write.
                 let detail = crate::trunk_merge::optimistic_pending_detail_json();
-                if let Err(err) = work_db.set_task_merge_queue_state(&work_item_id, Some("queued"), Some(&detail)) {
+                let recorded = work_db.set_task_merge_queue_state(&work_item_id, Some("queued"), Some(&detail));
+                if let Err(err) = &recorded {
                     tracing::error!(
                         %work_item_id,
                         ?err,
                         "merge_when_ready: trunk submit succeeded but optimistic merge_queue_state write failed",
                     );
-                } else {
-                    publisher
-                        .publish_work_item_changed(&product_id, &work_item_id, "trunk_merge_submitted")
-                        .await;
                 }
                 tracing::info!(
                     %work_item_id,
@@ -464,11 +469,16 @@ async fn handle_trunk_queue_merge(
                     &sink,
                     &request_id,
                     FrontendEvent::MergeWhenReadyAccepted {
-                        work_item_id,
-                        pr_url,
+                        work_item_id: work_item_id.clone(),
+                        pr_url: pr_url.clone(),
                         action: merge_when_ready::MergeAction::TrunkEnqueued.as_str().to_owned(),
                     },
                 );
+                if recorded.is_ok() {
+                    publisher
+                        .publish_work_item_changed(&product_id, &work_item_id, "trunk_merge_submitted")
+                        .await;
+                }
             }
             Err(err) => {
                 // Loud, no fallback to `gh pr merge`: no intent row
@@ -990,8 +1000,16 @@ mod trunk_queue_tests {
         )
         .await;
 
-        // The topic push is enqueued (and awaited) before the RPC response
-        // in `handle_trunk_queue_merge`, so it arrives first.
+        // Durable acceptance reaches the caller before board invalidation.
+        let envelope = sink.next().await.expect("a response should be enqueued");
+        match envelope.payload {
+            FrontendEvent::MergeWhenReadyAccepted { action, pr_url, .. } => {
+                assert_eq!(action, "trunk_enqueued");
+                assert_eq!(pr_url, "https://github.com/brianduff/flunge/pull/978");
+            }
+            other => panic!("expected MergeWhenReadyAccepted, got {other:?}"),
+        }
+
         let invalidation = sink.next().await.expect("a work-item-changed push should be enqueued");
         match invalidation.payload {
             FrontendEvent::TopicEvent {
@@ -1002,15 +1020,6 @@ mod trunk_queue_tests {
                 assert_eq!(item_ids, vec![work_item_id.clone()]);
             }
             other => panic!("expected a WorkInvalidated topic push naming the work item, got {other:?}"),
-        }
-
-        let envelope = sink.next().await.expect("a response should be enqueued");
-        match envelope.payload {
-            FrontendEvent::MergeWhenReadyAccepted { action, pr_url, .. } => {
-                assert_eq!(action, "trunk_enqueued");
-                assert_eq!(pr_url, "https://github.com/brianduff/flunge/pull/978");
-            }
-            other => panic!("expected MergeWhenReadyAccepted, got {other:?}"),
         }
 
         let intent = state
@@ -1631,6 +1640,9 @@ mod trunk_queue_tests {
             .subscribe("s1", &[crate::protocol::work_product_topic(&product.id)])
             .await;
 
+        let broker = state.topic_broker.clone();
+        let decision_guard = broker.decision_snapshot.lock().await;
+        let started = std::time::Instant::now();
         handle_merge_when_ready(
             dispatch_ctx(&state, &sink),
             FrontendRequest::MergeWhenReady {
@@ -1639,6 +1651,21 @@ mod trunk_queue_tests {
             },
         )
         .await;
+
+        let envelope = tokio::time::timeout(Duration::from_secs(2), sink.next())
+            .await
+            .expect("acknowledgement must not wait on the decision-feed lock")
+            .expect("a response should be enqueued");
+        match envelope.payload {
+            FrontendEvent::MergeWhenReadyAccepted { action, .. } => assert_eq!(action, "merge_requested"),
+            other => panic!("expected MergeWhenReadyAccepted, got {other:?}"),
+        }
+
+        println!(
+            "merge acknowledgement while publication lock remains held: {:?}",
+            started.elapsed()
+        );
+        drop(decision_guard);
 
         let invalidation = sink.next().await.expect("a work-item-changed push should be enqueued");
         match invalidation.payload {
@@ -1650,12 +1677,6 @@ mod trunk_queue_tests {
                 assert_eq!(item_ids, vec![chore.id.clone()]);
             }
             other => panic!("expected a WorkInvalidated topic push naming the work item, got {other:?}"),
-        }
-
-        let envelope = sink.next().await.expect("a response should be enqueued");
-        match envelope.payload {
-            FrontendEvent::MergeWhenReadyAccepted { action, .. } => assert_eq!(action, "merge_requested"),
-            other => panic!("expected MergeWhenReadyAccepted, got {other:?}"),
         }
 
         let item = state.work_db.get_work_item(&chore.id).unwrap();

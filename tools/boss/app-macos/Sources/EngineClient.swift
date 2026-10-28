@@ -298,6 +298,9 @@ final class EngineClient: @unchecked Sendable {
     @discardableResult
     func sendLine(_ payload: [String: Any], queueIfDisconnected: Bool = false, reportIfDisconnected: Bool = true, envelopeRequestId: String = UUID().uuidString) -> String? {
         outboundRecorder?(payload)
+        if payload["type"] as? String == "merge_when_ready" {
+            Self.log.info("merge RPC scheduled: request=\(envelopeRequestId, privacy: .public)")
+        }
 
         // Log outbound engine_response messages so both sides of every
         // IPC round-trip have a disk record.
@@ -578,6 +581,10 @@ final class EngineClient: @unchecked Sendable {
             ]
             var data = try JSONSerialization.data(withJSONObject: envelope, options: [])
             data.append(0x0A)
+
+            if payload["type"] as? String == "merge_when_ready" {
+                Self.log.info("merge RPC socket write: request=\(envelopeRequestId, privacy: .public)")
+            }
 
             if payload["type"] as? String == "recreate_coordinator" {
                 IpcLog.shared.log(requestId: envelopeRequestId, direction: "app→engine",
@@ -1475,6 +1482,7 @@ final class EngineClient: @unchecked Sendable {
             }
             emit(.mergeConfirmationRequired(workItemID: workItemID, revisions: revisions))
         case "merge_when_ready_accepted":
+            Self.log.info("merge RPC acknowledgement received: request=\(envelopeRequestId ?? "unknown", privacy: .public)")
             let workItemID = payload["work_item_id"] as? String ?? ""
             let prURL = payload["pr_url"] as? String ?? ""
             let action = payload["action"] as? String ?? ""
