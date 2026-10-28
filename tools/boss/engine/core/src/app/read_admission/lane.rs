@@ -87,6 +87,7 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::GetWorkerContext { .. }
         | R::GetWorkItem { .. }
         | R::GetWorkItemByShortId { .. }
+        | R::GetStuckReport { .. }
         | R::GetWorkItemCostReport { .. }
         | R::GetWorkRuntimePatch { .. }
         | R::GetWorkTree { .. }

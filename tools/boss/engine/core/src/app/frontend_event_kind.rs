@@ -117,6 +117,7 @@ pub(super) fn kind(event: &FrontendEvent) -> &'static str {
         FrontendEvent::CiNeverStartsAlert { .. } => "CiNeverStartsAlert",
         FrontendEvent::EffortAuditReport { .. } => "EffortAuditReport",
         FrontendEvent::EffortEscalationRecorded { .. } => "EffortEscalationRecorded",
+        FrontendEvent::StuckReport { .. } => "StuckReport",
         FrontendEvent::WorkItemCostReport { .. } => "WorkItemCostReport",
         FrontendEvent::CostWindowReport { .. } => "CostWindowReport",
         FrontendEvent::TopCostConsumers { .. } => "TopCostConsumers",

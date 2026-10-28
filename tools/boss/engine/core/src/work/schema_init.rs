@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 59;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 60;
 
 /// Schema 43: the baseline commit a recovery record was created at, the
 /// pointer-reconciliation note for the worker prompt, and the retirement
@@ -480,6 +480,9 @@ impl WorkDb {
                 &tx,
                 boss_engine_recovery::execution_bookmark::is_legacy_pr_anchor_blocker,
             )?;
+        }
+        if version < 60 {
+            task_status_audit::migrate(&tx)?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
@@ -1004,6 +1007,7 @@ mod floor_tests {
             54,
             55,
             56,
+            58,
             CURRENT_SCHEMA_VERSION,
             CURRENT_SCHEMA_VERSION + 1,
         ] {
@@ -1089,6 +1093,9 @@ mod floor_tests {
             if version >= 56 {
                 super::super::board_projection_schema::migrate(&conn).unwrap();
             }
+            if version >= 59 {
+                task_status_audit::migrate(&conn).unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -1134,6 +1141,7 @@ mod floor_tests {
             expected.execute_batch(TASKS_PARENT_KIND_INDEX_54).unwrap();
             expected.execute_batch(VERDICT_REVISION_INDEX_55).unwrap();
             super::super::board_projection_schema::migrate(&expected).unwrap();
+            task_status_audit::migrate(&expected).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

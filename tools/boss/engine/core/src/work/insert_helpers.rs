@@ -205,8 +205,8 @@ pub(crate) fn insert_task_in_tx_as_actor(conn: &Connection, input: CreateTaskInp
     let driver = normalize_model_override(input.driver);
     let short_id = allocate_short_id(conn, &input.product_id)?;
 
-    conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, deferred, human_driven, effort_matched_rule, effort_reasons)
+    crate::work::task_status_audit::execute(conn, "insert_task_in_tx_as_actor", actor,
+            "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, deferred, human_driven, effort_matched_rule, effort_reasons)
          VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, deferred_value, human_driven_value, effort_matched_rule, effort_reasons],
     )?;
@@ -335,8 +335,8 @@ fn insert_chore_with_project_in_tx_as_actor(
     let driver = normalize_model_override(input.driver);
     let short_id = allocate_short_id(conn, &input.product_id)?;
 
-    conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, origin_task_short_id, origin_pr_number, deferred, human_driven, effort_matched_rule, effort_reasons)
+    crate::work::task_status_audit::execute(conn, "insert_chore_with_project_in_tx_as_actor", actor,
+            "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, origin_task_short_id, origin_pr_number, deferred, human_driven, effort_matched_rule, effort_reasons)
          VALUES (?1, ?2, ?22, ?3, ?4, ?5, 'todo', ?23, NULL, NULL, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
         params![id, input.product_id, kind_str, input.name, description, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, input.origin_task_short_id, input.origin_pr_number, deferred_value, human_driven_value, effort_matched_rule, effort_reasons, project_id, ordinal],
     )?;
@@ -396,8 +396,8 @@ pub(crate) fn insert_investigation_in_tx_as_actor(
     let reasoning = seed_reasoning(input.reasoning, &TaskKind::Investigation, input.effort_level);
     let driver = normalize_model_override(input.driver);
     let short_id = allocate_short_id(conn, &input.product_id)?;
-    conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, deferred, human_driven, effort_matched_rule, effort_reasons)
+    crate::work::task_status_audit::execute(conn, "insert_investigation_in_tx_as_actor", actor,
+            "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, deferred, human_driven, effort_matched_rule, effort_reasons)
          VALUES (?1, ?2, ?3, 'investigation', ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             id, input.product_id, input.project_id, input.name, description, now,

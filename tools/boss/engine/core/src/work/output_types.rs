@@ -215,7 +215,7 @@ pub struct HostBoundExecution {
 
 /// Result of a successful [`WorkDb::record_worker_pr_completion`] call (also
 /// reused by [`WorkDb::record_worker_no_op_completion`] and
-/// [`WorkDb::record_worker_failure`], which finalize an execution
+/// [`WorkDb::record_worker_failure_with_basis`], which finalize an execution
 /// the same lease/pane-releasing way without a fresh PR). Carries the cube
 /// lease/workspace ids that were attached to the execution so the caller can
 /// drive cube release out-of-band.
@@ -232,7 +232,7 @@ pub struct WorkerPrCompletion {
     pub filed_attention_item: Option<WorkAttentionItem>,
 }
 
-/// Result of a successful [`WorkDb::record_worker_failure`] call.
+/// Result of a successful [`WorkDb::record_worker_failure_with_basis`] call.
 /// Distinct from [`WorkerPrCompletion`] because the failure path must
 /// free the execution's lease/pane even when the task/chore row has been
 /// hard-deleted out from under a still-live execution — `work_item` is

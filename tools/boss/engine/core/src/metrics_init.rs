@@ -49,6 +49,7 @@ pub fn init_all(registry: &Registry) {
     // Queue-level dispatch telemetry: per-pool depth/oldest-wait gauges,
     // dispatch-completed counter, drain-pass-duration gauge.
     crate::dispatch_metrics::register_metrics(registry);
+    crate::stuck_metrics::register_metrics(registry);
     // Trunk merge-queue poller: probe/lookup volume, state writes, intent
     // retirements, and attention items.
     crate::trunk_queue_poller::init(registry);
@@ -267,13 +268,18 @@ mod tests {
                 "merge_poller.adaptive_tracked",
                 "review_pool.deferred_pre_merge",
                 "review_pool.reserved_units",
+                "task_stuck.engine_stuck",
+                "task_stuck.engine_stuck_max_age_seconds",
+                "task_stuck.waiting_on_capacity",
+                "task_stuck.waiting_on_dependency",
+                "task_stuck.waiting_on_human",
                 "terminal_work_sweep.items_per_pass",
                 "terminal_work_sweep.pass_duration_ms",
                 "terminal_work_sweep.tick_interval_ms",
             ],
             "init_all must register the dep_unblock gauge, the queue-level dispatch gauges, \
              the GitHub remaining-quota gauges, the adaptive-schedule size gauge, and the \
-             background-sweep pass gauges",
+             background-sweep pass gauges, and the daily stuck-report gauges",
         );
     }
 }

@@ -994,7 +994,10 @@ pub(crate) fn reconcile_revision_execution(
             let attempt_status = attempt.status.clone();
             let attempt_succeeded = attempt_status.as_str() == "succeeded";
             let settled = if attempt_succeeded {
-                conn.execute(
+                crate::work::task_status_audit::execute(
+                    conn,
+                    "reconcile_revision_execution",
+                    "engine",
                     "UPDATE tasks
                      SET status = 'in_review',
                          last_status_actor = 'engine',
@@ -1006,7 +1009,10 @@ pub(crate) fn reconcile_revision_execution(
                 )?
             } else {
                 let detail = spawning_attempt_retired_blocked_detail(&attempt);
-                conn.execute(
+                crate::work::task_status_audit::execute(
+                    conn,
+                    "reconcile_revision_execution",
+                    "engine",
                     "UPDATE tasks
                      SET status = 'blocked',
                          blocked_reason = ?3,
@@ -1387,7 +1393,10 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
     // Only applies to task_ ids; projects don't carry blocked_reason.
     if work_item_id.starts_with("task_") {
         let now = now_string();
-        let rows_cleared = conn.execute(
+        let rows_cleared = crate::work::task_status_audit::execute(
+            conn,
+            "status_ineligibility",
+            "engine",
             "UPDATE tasks
              SET status            = 'todo',
                  blocked_reason    = NULL,
@@ -1419,7 +1428,10 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         // it's safe to clear the stale error here unconditionally: this
         // attempt gets to prove itself again, and `record_start_failure`
         // will re-stamp the fields if it fails the same way.
-        conn.execute(
+        crate::work::task_status_audit::execute(
+            conn,
+            "status_ineligibility",
+            "engine",
             "UPDATE tasks
              SET dispatch_failed_reason = NULL,
                  dispatch_failed_error  = NULL,
@@ -1450,7 +1462,10 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         // retains the explanation, while the new attempt starts without a stale
         // failure blocker. Automatic reconciliation cannot reach this clear.
         super::pr_flow::withdraw_questions(conn, &work_item_id, "restarted_without_answer")?;
-        conn.execute(
+        crate::work::task_status_audit::execute(
+            conn,
+            "status_ineligibility",
+            "engine",
             "UPDATE tasks SET status = 'todo', blocked_reason = NULL, blocked_detail = NULL,
                  last_status_actor = 'engine', updated_at = ?2
              WHERE id = ?1 AND status = 'blocked' AND blocked_reason IN ('worker_failed', 'awaiting_operator_answer')",
@@ -1504,7 +1519,10 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
             // that gate left behind so `start_execution_run` can advance
             // the row to `active`.
             let reopened = reopen_retired_spawning_attempt(conn, &task)?;
-            let unblocked = conn.execute(
+            let unblocked = crate::work::task_status_audit::execute(
+                conn,
+                "status_ineligibility",
+                "engine",
                 "UPDATE tasks SET status = 'todo', blocked_reason = NULL, blocked_detail = NULL,
                      last_status_actor = 'engine', updated_at = ?2
                  WHERE id = ?1 AND status = 'blocked' AND blocked_reason = ?3 AND deleted_at IS NULL",
@@ -1679,7 +1697,10 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                 // (the UI set it before firing RequestExecution), so the
                 // WHERE guard is a no-op.
                 let now = now_string();
-                let rows_cleared = conn.execute(
+                let rows_cleared = crate::work::task_status_audit::execute(
+                    conn,
+                    "status_ineligibility",
+                    "engine",
                     "UPDATE tasks
                      SET status             = 'todo',
                          blocked_reason     = NULL,

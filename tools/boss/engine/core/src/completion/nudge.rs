@@ -638,7 +638,10 @@ impl WorkerCompletionHandler {
              {nudge_count} nudges: {detail}. {pr_clause} No automatic replacement will be started.",
             execution.id
         );
-        if !self.finalize_worker_failure(execution, &reason).await {
+        if !self
+            .finalize_worker_failure(execution, &reason, crate::work::WorkerFailureBasis::NudgeBreaker)
+            .await
+        {
             return StopOutcome::DbError;
         }
 
@@ -676,8 +679,14 @@ impl WorkerCompletionHandler {
 
     /// Commit the durable failure before resource teardown and publication.
     /// A database error must not be reported to the caller as successful completion.
-    pub(super) async fn finalize_worker_failure(&self, execution: &crate::work::WorkExecution, detail: &str) -> bool {
-        self.finalize_worker_failure_or_question(execution, detail, None).await
+    pub(super) async fn finalize_worker_failure(
+        &self,
+        execution: &crate::work::WorkExecution,
+        detail: &str,
+        basis: crate::work::WorkerFailureBasis,
+    ) -> bool {
+        self.finalize_worker_failure_or_question(execution, detail, None, basis)
+            .await
     }
 
     pub(super) async fn finalize_worker_failure_or_question(
@@ -685,6 +694,7 @@ impl WorkerCompletionHandler {
         execution: &crate::work::WorkExecution,
         detail: &str,
         question: Option<&boss_protocol::OperatorQuestion>,
+        basis: crate::work::WorkerFailureBasis,
     ) -> bool {
         // Captured before `record_worker_failure` below nulls
         // `workspace_path` in the same transaction that terminalizes the
@@ -697,7 +707,9 @@ impl WorkerCompletionHandler {
             Some(question) => self
                 .work_db
                 .record_worker_awaiting_operator_answer(&execution.id, detail, question),
-            None => self.work_db.record_worker_failure(&execution.id, detail),
+            None => self
+                .work_db
+                .record_worker_failure_with_basis(&execution.id, detail, basis),
         };
         let completion = match recorded {
             Ok(Some(completion)) => completion,

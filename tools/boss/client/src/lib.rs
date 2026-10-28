@@ -12,6 +12,7 @@ mod replay;
 mod retry;
 #[cfg(test)]
 mod retry_tests;
+pub mod stuck_report;
 
 use std::io;
 use std::path::{Path, PathBuf};

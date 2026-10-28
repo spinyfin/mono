@@ -2476,6 +2476,9 @@ async fn serve_scoped(
     let _metrics_flush_handle =
         crate::metrics::spawn_flush_task(server_state.metrics.clone(), server_state.work_db.clone());
 
+    // Daily stuck-state measurements, independent of progression dispatch.
+    let _stuck_snapshot_handle =
+        crate::stuck_metrics::spawn(server_state.metrics.clone(), server_state.work_db.clone());
     // Once-a-minute work DB lock-contention summary (log line + metrics).
     let _db_lock_summary_handle = crate::work::lock_stats::spawn_summary_task(server_state.metrics.clone());
 

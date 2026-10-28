@@ -1574,7 +1574,10 @@ impl WorkDb {
     pub fn mark_task_done_for_test_no_cascade(&self, task_id: &str) -> Result<()> {
         let conn = self.connect()?;
         let now = now_string();
-        conn.execute(
+        crate::work::task_status_audit::execute(
+            &conn,
+            "mark_task_done_for_test_no_cascade",
+            "engine",
             "UPDATE tasks
              SET status = 'done', last_status_actor = 'engine', updated_at = ?2
              WHERE id = ?1 AND deleted_at IS NULL",
@@ -1609,7 +1612,10 @@ impl WorkDb {
     #[cfg(test)]
     pub fn force_task_status_for_test(&self, task_id: &str, status: &str) -> Result<()> {
         let conn = self.connect()?;
-        conn.execute(
+        crate::work::task_status_audit::execute(
+            &conn,
+            "force_task_status_for_test",
+            "engine",
             "UPDATE tasks SET status = ?2 WHERE id = ?1 AND deleted_at IS NULL",
             params![task_id, status],
         )?;

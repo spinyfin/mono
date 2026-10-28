@@ -628,3 +628,6 @@ mod design_doc_contention_tests;
 
 mod board_projection_scale;
 mod board_projection_tests;
+
+mod task_status_audit_tests;
+mod task_status_write_sites;

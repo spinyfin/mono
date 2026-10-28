@@ -247,7 +247,10 @@ impl WorkDb {
 /// and would do so only on the sweep path, leaving the same logical
 /// operation with two different row outcomes depending on which path ran.
 fn clear_stale_dispatch_failures(conn: &Connection) -> Result<usize> {
-    let rows = conn.execute(
+    let rows = crate::work::task_status_audit::execute(
+        conn,
+        "clear_stale_dispatch_failures",
+        "engine",
         "UPDATE tasks
          SET dispatch_failed_reason = NULL,
              dispatch_failed_error  = NULL,

@@ -793,6 +793,10 @@ pub(crate) use schema_init::table_exists;
 use schema_init::table_has_column;
 mod semantic_progress;
 mod sweep_reads;
+pub(crate) mod task_status_audit;
+mod task_status_backfill;
+pub use task_status_audit::WorkerFailureBasis;
+mod stuck_report;
 mod task_targets;
 #[cfg(test)]
 mod tests;

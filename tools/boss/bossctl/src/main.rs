@@ -443,6 +443,11 @@ enum LiveStatusAction {
 
 #[derive(Subcommand, Debug)]
 enum DispatchAction {
+    /// Items without live work, grouped by the reason they are waiting.
+    Stuck {
+        #[arg(long, default_value = "7d")]
+        since: String,
+    },
     /// Print recent dispatch events from `current.jsonl`. Filterable
     /// by stage / outcome. Defaults to the last 50 events.
     Tail {
@@ -1366,6 +1371,18 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Doctor {
             action: DoctorAction::Tmux,
         } => doctor::run_tmux_preflight(cli.json).await,
+        Command::Dispatch {
+            action: DispatchAction::Stuck { since },
+        } => {
+            let mut client = connect(&cli.socket_path).await?;
+            let report = boss_client::stuck_report::fetch(&mut client, &since).await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", boss_client::stuck_report::render(&report));
+            }
+            Ok(())
+        }
         Command::Dispatch {
             action:
                 DispatchAction::Tail {

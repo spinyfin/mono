@@ -2557,7 +2557,7 @@ pub enum StopOutcome {
     /// `active`/`todo`, record `blocked:worker_failed` before releasing the
     /// lease and pane; neither creates a deliberate park. A parent already
     /// in `in_review` or a domain-owned blocked reason is left in that
-    /// recovery state — see [`crate::work::WorkDb::record_worker_failure`].
+    /// recovery state — see [`crate::work::WorkDb::record_worker_failure_with_basis`].
     /// `delivered` with a resolvable PR instead reaches [`Self::PrDetected`],
     /// and `no_changes_needed` reaches [`Self::NoChangesNeeded`] — both
     /// existing variants, reused because their semantics already fit.

@@ -153,7 +153,10 @@ impl WorkDb {
             WorkerPrCompletionTarget::BlockedDeletionSignoff => Some(DELETION_SIGNOFF_BLOCKED_REASON),
             _ => None,
         };
-        tx.execute(
+        crate::work::task_status_audit::execute(
+            &tx,
+            "record_worker_pr_completion",
+            "engine",
             "UPDATE tasks
              SET status             = ?2,
                  pr_url             = ?3,
@@ -383,7 +386,10 @@ impl WorkDb {
         } else {
             TaskStatus::Done
         };
-        tx.execute(
+        crate::work::task_status_audit::execute(
+            &tx,
+            "record_worker_no_op_completion_inner",
+            "engine",
             "UPDATE tasks
              SET status             = ?2,
                  updated_at         = ?3,
@@ -481,8 +487,18 @@ impl WorkDb {
     /// diagnostic is folded into `blocked_detail` when a blocked reason
     /// already exists. Resources are released even for a deleted task. A
     /// repeated call is a no-op. Explicit retries retain workspace recovery.
+    #[cfg(test)]
     pub fn record_worker_failure(&self, execution_id: &str, detail: &str) -> Result<Option<WorkerFailureCompletion>> {
-        self.record_worker_failure_or_question(execution_id, detail, None)
+        self.record_worker_failure_with_basis(execution_id, detail, WorkerFailureBasis::DeclaredBlocked)
+    }
+
+    pub fn record_worker_failure_with_basis(
+        &self,
+        execution_id: &str,
+        detail: &str,
+        basis: WorkerFailureBasis,
+    ) -> Result<Option<WorkerFailureCompletion>> {
+        self.record_worker_failure_or_question(execution_id, detail, None, basis)
     }
 
     pub fn record_worker_awaiting_operator_answer(
@@ -491,7 +507,12 @@ impl WorkDb {
         detail: &str,
         question: &boss_protocol::OperatorQuestion,
     ) -> Result<Option<WorkerFailureCompletion>> {
-        self.record_worker_failure_or_question(execution_id, detail, Some(question))
+        self.record_worker_failure_or_question(
+            execution_id,
+            detail,
+            Some(question),
+            WorkerFailureBasis::DeclaredBlocked,
+        )
     }
 
     fn record_worker_failure_or_question(
@@ -499,6 +520,7 @@ impl WorkDb {
         execution_id: &str,
         detail: &str,
         question: Option<&boss_protocol::OperatorQuestion>,
+        basis: WorkerFailureBasis,
     ) -> Result<Option<WorkerFailureCompletion>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -580,7 +602,10 @@ impl WorkDb {
                         |row| row.get::<_, bool>(0),
                     )? => {}
             Some(task) if matches!(task.status, TaskStatus::Active | TaskStatus::Todo) => {
-                tx.execute(
+                crate::work::task_status_audit::execute(
+                    &tx,
+                    basis.as_str(),
+                    "engine",
                     "UPDATE tasks
                      SET status = 'blocked', blocked_reason = ?4, blocked_detail = ?2,
                          autostart = 0, last_status_actor = 'engine', updated_at = ?3
@@ -598,15 +623,20 @@ impl WorkDb {
                 )?;
             }
             Some(task)
-                if task.status == TaskStatus::Blocked && task.blocked_reason.is_some() && !trimmed.is_empty() =>
+                if task.status == TaskStatus::Blocked
+                    && task.blocked_reason.is_some()
+                    && (!trimmed.is_empty() || task.blocked_reason.as_deref() == Some("worker_failed")) =>
             {
                 let folded = match task.blocked_detail.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                     Some(existing) => format!("{existing}\n\n{trimmed}"),
                     None => trimmed.to_owned(),
                 };
-                tx.execute(
+                crate::work::task_status_audit::execute(
+                    &tx,
+                    basis.as_str(),
+                    "engine",
                     "UPDATE tasks
-                     SET blocked_detail = ?2, updated_at = ?3
+                     SET blocked_detail = ?2, updated_at = ?3, blocked_reason = blocked_reason
                      WHERE id = ?1 AND deleted_at IS NULL AND status = 'blocked' AND blocked_reason IS NOT NULL",
                     params![work_item_id, folded, now],
                 )?;
@@ -1030,7 +1060,10 @@ impl WorkDb {
         work_item_id: &str,
         now: &str,
     ) -> Result<bool> {
-        let rows_changed = conn.execute(
+        let rows_changed = crate::work::task_status_audit::execute(
+            conn,
+            "advance_held_pending_review_task_to_in_review_in_tx",
+            "engine",
             "UPDATE tasks
              SET status            = 'in_review',
                  updated_at        = ?2,
@@ -1083,8 +1116,12 @@ impl WorkDb {
         now: &str,
     ) -> Result<bool> {
         let review_result_outcomes = super::review_verdicts::review_result_gate_outcomes_sql();
-        let sql = format!(
-            "UPDATE tasks
+        let rows_changed = crate::work::task_status_audit::execute(
+            conn,
+            "advance_pending_review_task_to_in_review_with_verdict_source",
+            "engine",
+            &format!(
+                "UPDATE tasks
              SET status            = 'in_review',
                  updated_at        = ?2,
                  last_status_actor = 'engine'
@@ -1113,8 +1150,9 @@ impl WorkDb {
                    AND we.status IN ('running', 'waiting_human')
                    AND we.kind != 'pr_review'
                )"
-        );
-        let rows_changed = conn.execute(&sql, params![work_item_id, now, verdict_source_id])?;
+            ),
+            params![work_item_id, now, verdict_source_id],
+        )?;
         Ok(rows_changed > 0)
     }
 
@@ -1130,7 +1168,10 @@ impl WorkDb {
     pub fn bind_pr_to_active_task_from_terminal_execution(&self, work_item_id: &str, pr_url: &str) -> Result<bool> {
         let conn = self.connect()?;
         let now = now_string();
-        let rows_changed = conn.execute(
+        let rows_changed = crate::work::task_status_audit::execute(
+            &conn,
+            "bind_pr_to_active_task_from_terminal_execution",
+            "engine",
             "UPDATE tasks
              SET status            = 'in_review',
                  pr_url            = ?2,
@@ -1258,7 +1299,10 @@ impl WorkDb {
     pub fn bind_pr_to_task_from_terminal_execution(&self, work_item_id: &str, pr_url: &str) -> Result<bool> {
         let conn = self.connect()?;
         let now = now_string();
-        let rows_changed = conn.execute(
+        let rows_changed = crate::work::task_status_audit::execute(
+            &conn,
+            "bind_pr_to_task_from_terminal_execution",
+            "engine",
             "UPDATE tasks
              SET status            = 'in_review',
                  pr_url            = ?2,
@@ -1345,7 +1389,10 @@ impl WorkDb {
         // `isInMergingSection` (see `Models.swift`) misroute the task into
         // the kanban's "Merging" section instead of the normal Done/recency
         // buckets.
-        tx.execute(
+        crate::work::task_status_audit::execute(
+            &tx,
+            "mark_chore_pr_merged",
+            "engine",
             "UPDATE tasks
              SET status             = 'done',
                  pr_url             = ?2,
@@ -1450,7 +1497,10 @@ impl WorkDb {
         // ever correct them — leaving a `done` row that the client's
         // `isInMergingSection` (see `Models.swift`) still routes into the
         // kanban's "Merging" section.
-        tx.execute(
+        crate::work::task_status_audit::execute(
+            &tx,
+            "mark_chore_pr_closed_unmerged",
+            "engine",
             "UPDATE tasks
              SET status             = 'done',
                  updated_at         = ?3,
@@ -2114,10 +2164,15 @@ pub(super) fn insert_question(
         return Ok(());
     };
     let parkable = task.deleted_at.is_none() && matches!(task.status, TaskStatus::Active | TaskStatus::Todo);
+    let stuck_classification = if task.blocked_reason.is_some() || task.dispatch_failed_reason.is_some() {
+        super::stuck_report::classification(conn, &task, None)?
+    } else {
+        "S8_operator_question".to_owned()
+    };
     conn.execute(
         "INSERT INTO operator_questions
-         (id, work_item_id, execution_id, proposal_id, question_json, status, withdrawn_reason, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         (id, work_item_id, execution_id, proposal_id, question_json, status, withdrawn_reason, created_at, stuck_classification)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             next_id("oq"),
             task.id,
@@ -2126,7 +2181,8 @@ pub(super) fn insert_question(
             serde_json::to_string(question)?,
             if parkable { "open" } else { "withdrawn" },
             if parkable { None } else { Some("task_not_parkable") },
-            now_string()
+            now_string(),
+            stuck_classification
         ],
     )?;
     Ok(())
@@ -2307,7 +2363,10 @@ impl WorkDb {
                     question.question.explanation,
                     summary
                 );
-                tx.execute(
+                crate::work::task_status_audit::execute(
+                    &tx,
+                    WorkerFailureBasis::OperatorNo.as_str(),
+                    "human",
                     "UPDATE tasks SET blocked_reason = 'worker_failed', blocked_detail = ?2,
                      last_status_actor = 'human', updated_at = ?3 WHERE id = ?1",
                     params![task.id, detail, now],
@@ -2362,7 +2421,10 @@ fn restart_after_answer(
 ) -> Result<()> {
     let description = format!("{}{block}", task.description);
     super::description_guard::validate_description_update(&task.description, &description, false)?;
-    tx.execute(
+    crate::work::task_status_audit::execute(
+        tx,
+        "restart_after_answer",
+        "human",
         "UPDATE tasks SET description = ?2, status = 'todo', blocked_reason = NULL,
          blocked_detail = NULL, autostart = 1, last_status_actor = 'human', updated_at = ?3 WHERE id = ?1",
         params![task.id, description, now],

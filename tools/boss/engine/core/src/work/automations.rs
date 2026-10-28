@@ -811,7 +811,10 @@ impl WorkDb {
         status: &str,
     ) -> Result<()> {
         let conn = self.connect()?;
-        conn.execute(
+        crate::work::task_status_audit::execute(
+            &conn,
+            "stamp_task_source_automation_for_test",
+            "engine",
             "UPDATE tasks SET source_automation_id = ?2, status = ?3
               WHERE id = ?1 AND deleted_at IS NULL",
             params![task_id, automation_id, status],

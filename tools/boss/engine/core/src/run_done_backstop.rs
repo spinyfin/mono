@@ -58,9 +58,9 @@
 //!    that knows whether it is finished, and the entire point of the
 //!    declaration is to stop the engine guessing on its behalf.
 //! 4. **Escalates** when the ask goes unanswered. The existing circuit
-//!    breaker bounds the asking and parks the execution for a human. A
-//!    parked run is `waiting_human` with an attention item — never
-//!    `completed`. That is the defined, visible outcome a missing
+//!    breaker bounds the asking and fails the execution. The task records
+//!    `blocked: worker_failed` with an attention item — never a successful
+//!    `completed` run. That is the defined, visible outcome a missing
 //!    declaration must have; it is emphatically not a silent success.
 //!
 //! Safety property preserved: nothing here reaps a worker. Step 1 is the

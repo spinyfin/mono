@@ -1611,7 +1611,10 @@ pub(crate) fn insert_revision_in_tx(
         .map(str::to_owned)
         .unwrap_or_else(|| revision_name_from_description(&description));
     let autostart_value: i64 = if input.autostart { 1 } else { 0 };
-    conn.execute(
+    crate::work::task_status_audit::execute(
+        conn,
+        "insert_revision_in_tx",
+        "engine",
         "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, \
          pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, \
          effort_level, model_override, reasoning, driver, short_id, parent_task_id, repo_remote_url, effort_matched_rule, effort_reasons) \
@@ -1681,8 +1684,8 @@ pub(crate) fn insert_design_task_for_project_in_tx(
     let autostart_value: i64 = if autostart { 1 } else { 0 };
     let name = format!("Design {project_name}");
     let short_id = allocate_short_id(conn, product_id)?;
-    conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, short_id, design_reasoning_effort_xhigh)
+    crate::work::task_status_audit::execute(conn, "insert_design_task_for_project_in_tx", "engine",
+            "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, short_id, design_reasoning_effort_xhigh)
          VALUES (?1, ?2, ?3, 'design', ?7, ?10, 'todo', 0, NULL, NULL, ?4, ?4, ?5, 'medium', ?6, ?8, ?9)",
         params![
             id,

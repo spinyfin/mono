@@ -472,7 +472,10 @@ impl WorkDb {
             return Ok(false);
         }
         let now = now_string();
-        tx.execute(
+        crate::work::task_status_audit::execute(
+            &tx,
+            "rearm_audited_queue_failure",
+            "engine",
             "UPDATE tasks SET status = 'blocked', blocked_reason = 'ci_failure', updated_at = ?2 WHERE id = ?1",
             params![attempt.work_item_id, now],
         )?;

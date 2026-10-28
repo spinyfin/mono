@@ -379,7 +379,10 @@ impl WorkDb {
         )?;
         // Reverse a demote, under the same latest-execution guard the demote
         // itself uses.
-        tx.execute(
+        crate::work::task_status_audit::execute(
+            &tx,
+            "readopt_inferred_terminal_execution",
+            "engine",
             "UPDATE tasks
              SET status            = 'active',
                  last_status_actor = 'engine',
@@ -1294,7 +1297,10 @@ impl WorkDb {
         // old blanket guard's incidental loop-halt for that specific
         // failure mode is given up in exchange for the live worker
         // actually showing on the kanban), not a defect in this query.
-        tx.execute(
+        crate::work::task_status_audit::execute(
+            &tx,
+            "start_execution_run_on_host_with_tmux_hosting",
+            "engine",
             "UPDATE tasks
              SET status = 'active',
                  updated_at = ?2
@@ -1333,7 +1339,10 @@ impl WorkDb {
         // sanctioned to start against *this* row, so `autostart` must stay
         // intact for it too. The guards differ only in the `pr_review`
         // disjunct and must remain symmetric.
-        tx.execute(
+        crate::work::task_status_audit::execute(
+            &tx,
+            "start_execution_run_on_host_with_tmux_hosting",
+            "engine",
             "UPDATE tasks
              SET autostart = 0,
                  updated_at = ?2
@@ -1376,7 +1385,10 @@ impl WorkDb {
         // which lane the card sits in. `crate::attention_reconcile_sweep`
         // runs the same clear as a periodic backstop, for rows stamped by an
         // engine process that predates this call.
-        tx.execute(
+        crate::work::task_status_audit::execute(
+            &tx,
+            "start_execution_run_on_host_with_tmux_hosting",
+            "engine",
             "UPDATE tasks
              SET dispatch_failed_reason = NULL,
                  dispatch_failed_error  = NULL,
