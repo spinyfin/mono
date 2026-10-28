@@ -567,9 +567,8 @@ async fn app_requested_attach_sends_attach_worker_pane_for_a_live_run() {
     );
 }
 
-/// Runs with nothing to attach are ignored without touching the app: an
-/// unknown run, and a local run whose durable tmux stamp is missing (its
-/// card already reads as identity unavailable).
+/// Runs with nothing to attach publish membership or a decline reason
+/// without sending an attach request to the app.
 #[tokio::test]
 async fn app_requested_attach_ignores_runs_without_an_attachable_pane() {
     let (server_state, _dir) = test_server_state();
@@ -591,11 +590,104 @@ async fn app_requested_attach_ignores_runs_without_an_attachable_pane() {
 
     assert!(!server_state.reattach_worker_pane_for_run("exec-unknown").await);
     assert!(!server_state.reattach_worker_pane_for_run("exec-no-identity").await);
+    assert_eq!(
+        server_state.live_worker_states.snapshot()[0]
+            .viewer_attach_error
+            .as_deref(),
+        None
+    );
     let next = tokio::time::timeout(Duration::from_millis(200), sink.next()).await;
     assert!(
         next.is_err(),
         "no attach may be sent for an unattachable run, got {next:?}"
     );
+}
+
+#[tokio::test]
+async fn execution_read_failure_schedules_a_retry() {
+    let (state, _dir) = test_server_state();
+    seed_tmux_hosted_live_run(&state, 1, "read-failure-session", "read-failure-token");
+    // Make the execution query fail, then restore the table to model recovery.
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("ALTER TABLE work_executions RENAME TO unavailable_executions;")
+        .unwrap();
+    let sink = make_session_sink();
+    state.register_app_session("session-app".into(), sink.clone()).await;
+    let pass = tokio::spawn({
+        let state = state.clone();
+        async move { state.reattach_worker_panes_to_registered_app().await }
+    });
+    answer_list_hosted_panes(&state, &sink, vec![]).await;
+    pass.await.unwrap();
+    assert!(
+        state.live_worker_states.snapshot()[0]
+            .viewer_attach_error
+            .as_deref()
+            .unwrap()
+            .starts_with("could not read the execution:")
+    );
+    assert!(
+        state
+            .viewer_reattach_retry_scheduled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    assert_eq!(
+        state
+            .viewer_reattach_retry_attempt
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("ALTER TABLE unavailable_executions RENAME TO work_executions;")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn app_requested_execution_read_failure_schedules_a_retry() {
+    let (state, _dir) = test_server_state();
+    let run_id = seed_tmux_hosted_live_run(&state, 1, "read-failure-session", "read-failure-token");
+    // Make the execution query fail, then restore the table to model recovery.
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("ALTER TABLE work_executions RENAME TO unavailable_executions;")
+        .unwrap();
+    let sink = make_session_sink();
+    state.register_app_session("session-app".into(), sink.clone()).await;
+    assert!(!state.viewer_reattach_retry_scheduled.load(Ordering::Relaxed));
+    assert_eq!(state.viewer_reattach_retry_attempt.load(Ordering::Relaxed), 0);
+    assert!(!state.reattach_worker_pane_for_run(&run_id).await);
+    assert!(
+        state.live_worker_states.snapshot()[0]
+            .viewer_attach_error
+            .as_deref()
+            .unwrap()
+            .starts_with("could not read the execution:")
+    );
+    assert!(
+        state
+            .viewer_reattach_retry_scheduled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    assert_eq!(
+        state
+            .viewer_reattach_retry_attempt
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("ALTER TABLE unavailable_executions RENAME TO work_executions;")
+        .unwrap();
 }
 
 #[tokio::test]
@@ -611,6 +703,10 @@ async fn terminal_execution_does_not_schedule_a_retry() {
     });
     answer_list_hosted_panes(&state, &sink, vec![]).await;
     pass.await.unwrap();
+    assert_eq!(
+        state.live_worker_states.snapshot()[0].viewer_attach_error.as_deref(),
+        Some("the execution has ended or is unavailable; waiting for engine cleanup")
+    );
     assert!(
         !state
             .viewer_reattach_retry_scheduled
@@ -622,6 +718,76 @@ async fn terminal_execution_does_not_schedule_a_retry() {
             .load(std::sync::atomic::Ordering::Relaxed),
         0
     );
+}
+
+#[tokio::test]
+async fn declined_live_attach_records_session_and_terminal_reasons() {
+    let (state, _dir) = test_server_state();
+    let run_id = seed_tmux_hosted_live_run(&state, 1, "declined-session", "declined-token");
+    let sink = make_session_sink();
+    state.topic_broker.register_session("observer", sink.clone()).await;
+    state
+        .topic_broker
+        .subscribe("observer", &[TOPIC_WORKER_LIVE_STATES.to_owned()])
+        .await;
+    assert!(!state.reattach_worker_pane_for_run(&run_id).await);
+    assert_eq!(
+        state.live_worker_states.snapshot()[0].viewer_attach_error.as_deref(),
+        Some("no app session is registered")
+    );
+    let event = tokio::time::timeout(Duration::from_secs(2), sink.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        event.payload,
+        FrontendEvent::WorkerLiveStatesList { states, .. }
+            if states.iter().any(|live| live.run_id == run_id
+                && live.viewer_attach_error.as_deref() == Some("no app session is registered"))
+    ));
+    assert!(!state.reattach_worker_pane_for_run(&run_id).await);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), sink.next())
+            .await
+            .is_err()
+    );
+    state.live_worker_states.mark_errored(1);
+    assert!(!state.reattach_worker_pane_for_run(&run_id).await);
+    assert_eq!(
+        state.live_worker_states.snapshot()[0].viewer_attach_error.as_deref(),
+        Some("the worker has exited")
+    );
+}
+
+#[tokio::test]
+async fn unset_tmux_hosting_records_missing_terminal_reason() {
+    let (state, _dir) = test_server_state();
+    state
+        .live_worker_states
+        .register_spawn(1, "unset-hosting", "claude-opus-4-7", 0, None);
+    assert_eq!(state.live_worker_states.get(1).unwrap().tmux_hosted, None);
+    assert!(!state.reattach_worker_pane_for_run("unset-hosting").await);
+    assert_eq!(
+        state.live_worker_states.get(1).unwrap().viewer_attach_error.as_deref(),
+        Some("no local tmux terminal is available for this worker")
+    );
+}
+
+#[tokio::test]
+async fn unknown_attach_request_publishes_membership_to_remove_stale_cards() {
+    let (state, _dir) = test_server_state();
+    let sink = make_session_sink();
+    state.topic_broker.register_session("observer", sink.clone()).await;
+    state
+        .topic_broker
+        .subscribe("observer", &[TOPIC_WORKER_LIVE_STATES.to_owned()])
+        .await;
+    assert!(!state.reattach_worker_pane_for_run("released-run").await);
+    let event = tokio::time::timeout(Duration::from_secs(2), sink.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(event.payload, FrontendEvent::WorkerLiveStatesList { states, .. } if states.is_empty()));
 }
 
 #[tokio::test]

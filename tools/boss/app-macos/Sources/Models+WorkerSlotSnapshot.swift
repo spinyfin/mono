@@ -11,7 +11,7 @@ import PaneLayout
 
 /// Slim live-state slice that the Agents slot header actually paints.
 /// `WorkerLiveState` carries extra fields (`model`, `shellPid`,
-/// `currentTool`, `tmuxHosted`, …) the slot view never reads; folding
+/// `currentTool`, …) the slot view never reads; folding
 /// the whole struct into the snapshot would re-evaluate every slot on
 /// those unused writes.
 struct WorkerSlotLiveSlice: Equatable {
@@ -55,6 +55,7 @@ struct WorkerSlotLiveSlice: Equatable {
     var badgeType: AgentType { AgentType.fromWire(agentType) }
     var badgeLabel: String { badgeType.badgeLabel(reviewStage: reviewStage) }
     var isExited: Bool { activity == .terminated }
+    var isEngineTerminal: Bool { activity == .terminated || activity == .errored }
 
     /// Mirrors `WorkerLiveState.isWaitingOnJob`.
     var isWaitingOnJob: Bool {
@@ -113,7 +114,7 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
     /// the engine knows went wrong is shown instead, most specific first,
     /// so a failed attach is never dressed up as still connecting.
     var viewerMissingMessage: String {
-        if isExited { return "Worker exited" }
+        if live?.isEngineTerminal == true { return "Worker exited" }
         if let viewerAttachFailure, !viewerAttachFailure.isEmpty {
             return "Couldn't attach the terminal: \(viewerAttachFailure)"
         }
@@ -130,7 +131,7 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
     /// failure is known on either side. The view asks the engine for the
     /// viewer in this state when the pane comes into view.
     var isViewerConnecting: Bool {
-        isViewerMissing && !isExited && viewerAttachFailure == nil && live?.viewerAttachError == nil && live?.tmuxHosted != false
+        isViewerMissing && live?.isEngineTerminal != true && viewerAttachFailure == nil && live?.viewerAttachError == nil && live?.tmuxHosted != false
     }
 
     /// What the slot body draws. A released run is always the finished card,

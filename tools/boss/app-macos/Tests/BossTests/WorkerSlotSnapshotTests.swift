@@ -547,6 +547,39 @@ final class WorkerSlotSnapshotTests: XCTestCase {
 
     // MARK: - Viewer-missing card
 
+    func testErroredMemberDoesNotConnect() {
+        let snapshot = WorkerSlotSnapshot.build(
+            slot: WorkerSlot(slotId: 1, runId: "exec-1"),
+            liveState: Self.makeLiveState(activity: .errored, tmuxHosted: true),
+            liveStatusEnabled: true
+        )
+        XCTAssertFalse(snapshot.isViewerConnecting)
+        XCTAssertEqual(snapshot.viewerMissingMessage, "Worker exited")
+    }
+
+    func testAttachedErroredMemberIsNotDimmedAsExited() {
+        let snapshot = WorkerSlotSnapshot.build(
+            slot: WorkerSlot(slotId: 1, session: Self.makeSession(id: "errored"), runId: "exec-1"),
+            liveState: Self.makeLiveState(activity: .errored, tmuxHosted: true),
+            liveStatusEnabled: true
+        )
+        XCTAssertEqual(snapshot.bodyKind, .terminal)
+        XCTAssertFalse(snapshot.isExited, "The header and attached terminal must retain full opacity")
+        XCTAssertTrue(snapshot.live?.isEngineTerminal == true)
+    }
+
+    func testDeclinedMemberShowsReason() {
+        for reason in ["the execution has ended or is unavailable; waiting for engine cleanup", "no app session is registered"] {
+            let snapshot = WorkerSlotSnapshot.build(
+                slot: WorkerSlot(slotId: 1, runId: "exec-1"),
+                liveState: Self.makeLiveState(tmuxHosted: true, viewerAttachError: reason),
+                liveStatusEnabled: true
+            )
+            XCTAssertFalse(snapshot.isViewerConnecting)
+            XCTAssertEqual(snapshot.viewerMissingMessage, "Couldn't attach the terminal: \(reason)")
+        }
+    }
+
     /// A live member with no viewer and no known failure is still
     /// connecting; the card must say so rather than "not attached".
     func testViewerMissingCardReadsConnectingWhileNothingHasFailed() {

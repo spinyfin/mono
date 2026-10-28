@@ -58,7 +58,7 @@ public enum AgentProject: Hashable, Sendable {
 /// Identity is the run id. Layout inputs are deliberately limited to what
 /// ordering, filtering, and counting need: the model never sees slot, persona,
 /// or screen position. `hasViewer` is carried through to the cells so the view
-/// can draw a terminal or a "Viewer not attached" card without a second join,
+/// can draw a terminal or a viewer-missing card without a second join,
 /// but it has no effect on layout: a worker without a viewer occupies a cell,
 /// consumes capacity, and is filtered and counted like any other member.
 public struct PaneMember: Equatable, Sendable, Identifiable {

@@ -763,7 +763,8 @@ final class AgentsGridModelTests: XCTestCase {
             states: [
                 makeState(runId: "shown", projectId: "visible"),
                 makeState(runId: "hidden", slotId: 2, projectId: "hidden"),
-                makeState(runId: "exited", slotId: 3, activity: .terminated)
+                makeState(runId: "exited", slotId: 3, activity: .terminated),
+                makeState(runId: "errored", slotId: 4, activity: .errored)
             ], viewers: [:],
             interactivePoolSize: 16, automationPoolSize: 8, reviewPoolSize: 16, feedUnavailable: false
         )
@@ -775,6 +776,7 @@ final class AgentsGridModelTests: XCTestCase {
         grid.requestViewersForVisiblePage()
         XCTAssertEqual(requests, ["shown", "hidden"])
         XCTAssertFalse(grid.viewerlessRunIdsOnSelectedPage.contains("exited"))
+        XCTAssertFalse(grid.viewerlessRunIdsOnSelectedPage.contains("errored"))
     }
 
     private func makeAttach(runId: String, slot: Int) -> EngineAttachRequest {
