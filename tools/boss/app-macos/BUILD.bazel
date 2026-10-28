@@ -147,10 +147,10 @@ sh_test(
 # enough slack that a slow sample still finishes. Isolated uncached in this
 # workspace after the Chrome split (`bazel test --nocache_test_results
 # --test_verbose_timeout_warnings`, PASSED-in test action wall, three
-# consecutive runs): Chrome 5.8 / 7.6 / 16.7 s, Render 10.5 / 11.1 / 14.0 s,
-# Shard3 8.8 / 7.9 / 8.2 s. Slowest dedicated-shard sample 16.7 s (Chrome
-# third run), about 3.6× under the 60 s budget. That is the measured
-# headroom, not a half-budget cap.
+# consecutive runs): Chrome 6.2 / 8.0 / 12.3 s, Render 11.2 / 10.4 / 12.4 s,
+# Shard3 8.0 / 7.3 / 6.6 s, Shard5 12.0 / 16.1 / 12.3 s. Slowest dedicated-shard
+# sample 16.1 s (Shard5 second run), about 3.7× under the 60 s budget. That is
+# the measured headroom, not a half-budget cap.
 #
 # The shared principal is compiled into every bundle: it is the bundle's
 # NSPrincipalClass, which XCTest instantiates before the first test runs, and
