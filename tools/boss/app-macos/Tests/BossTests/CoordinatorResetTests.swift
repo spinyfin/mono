@@ -32,6 +32,7 @@ final class CoordinatorResetTests: XCTestCase {
         model.applyEventForTest(.error(message: "recreate_coordinator: coordinator did not receive the handoff request: delivery timed out. The coordinator session is still running."))
         XCTAssertFalse(model.coordinatorResetWaiting)
         XCTAssertTrue(model.coordinatorResetDeliveryFailed)
+        XCTAssertEqual(model.coordinatorResetDeliveryFailureReason, "delivery timed out")
         XCTAssertNil(model.workErrorMessage)
         // Force must retain the confirmed token, even if the attached session changed.
         model.engine.simulateConnectedForTesting = true
@@ -43,6 +44,43 @@ final class CoordinatorResetTests: XCTestCase {
         XCTAssertEqual(requests.last?["expected_spawn_token"] as? String, "original")
         XCTAssertEqual(requests.last?["force_without_handoff"] as? Bool, true)
         XCTAssertEqual(requests.last?["reason"] as? String, "operator_reset")
+    }
+
+    func testDeliveryFailureShowsTheEngineReasonAndClearsItWithTheBanner() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        model.engine.simulateConnectedForTesting = true
+        model.attachedCoordinatorSpawnToken = "original"
+        model.resetCoordinator()
+        let engineMessage = "recreate_coordinator: coordinator did not receive the handoff request: inbox delivery failed: coordinator prompt delivery deadline (15s) expired after the request was written to the coordinator's inbox: the coordinator did not accept it as input before the deadline (it is mid-turn, or its inbound policy is holding cross-session messages). The coordinator session is still running."
+        model.applyEventForTest(.error(message: engineMessage))
+        XCTAssertTrue(model.coordinatorResetDeliveryFailed)
+        XCTAssertEqual(
+            model.coordinatorResetDeliveryFailureReason,
+            "inbox delivery failed: coordinator prompt delivery deadline (15s) expired after the request was written to the coordinator's inbox: the coordinator did not accept it as input before the deadline (it is mid-turn, or its inbound policy is holding cross-session messages)"
+        )
+        // Keeping the session dismisses the banner and its reason together.
+        model.clearCoordinatorReset()
+        XCTAssertFalse(model.coordinatorResetDeliveryFailed)
+        XCTAssertNil(model.coordinatorResetDeliveryFailureReason)
+
+        // A credential-step failure is reported as such, not as a transport problem.
+        model.resetCoordinator()
+        model.applyEventForTest(.error(message: "recreate_coordinator: coordinator did not receive the handoff request: the handoff credential for this session could not be minted (coordinator spawn token does not match the live record). The coordinator session is still running."))
+        XCTAssertEqual(
+            model.coordinatorResetDeliveryFailureReason,
+            "the handoff credential for this session could not be minted (coordinator spawn token does not match the live record)"
+        )
+        // Forcing the reset clears the reason with the failure state.
+        model.forceCoordinatorReset()
+        XCTAssertNil(model.coordinatorResetDeliveryFailureReason)
+        XCTAssertFalse(model.coordinatorResetDeliveryFailed)
+    }
+
+    func testDeliveryFailureWithoutAReasonShowsNoEmptyLine() {
+        XCTAssertNil(ChatViewModel.coordinatorHandoffDeliveryFailureReason(
+            from: "recreate_coordinator: coordinator did not receive the handoff request. The coordinator session is still running."
+        ))
+        XCTAssertNil(ChatViewModel.coordinatorHandoffDeliveryFailureReason(from: "recreate_coordinator: something else"))
     }
 
     func testDisconnectedResetRetainsContextUntilDiscard() {

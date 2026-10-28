@@ -4,6 +4,7 @@
 //! message. A correlated transcript input or delivered receipt confirms delivery.
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -44,13 +45,43 @@ pub(crate) trait HandoffDelivery: Send + Sync {
     async fn turn_ended(&self, _tmux: &Tmux, _record: &CoordinatorTmuxRecord) {
         std::future::pending::<()>().await
     }
+
+    /// Deliver a prompt whose acceptance matters now but whose confirmation
+    /// may legitimately outlast [`DELIVERY_TIMEOUT`]: the coordinator reads
+    /// its inbox at an input boundary, so a request it made itself mid-turn
+    /// (`boss handoff show`) is only confirmed when that turn ends. Resolves
+    /// once the inbox has accepted the frame, releasing `guard`, and returns
+    /// the confirmation for the caller to await separately. Implementations
+    /// without a separate acceptance step confirm in full before returning.
+    async fn deliver_accepted<'a>(
+        &'a self,
+        tmux: &'a Tmux,
+        record: &'a CoordinatorTmuxRecord,
+        prompt: &str,
+        guard: tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<PendingConfirmation> {
+        self.deliver(tmux, record, prompt).await?;
+        drop(guard);
+        Ok(Box::pin(std::future::ready(Ok(()))))
+    }
 }
+
+/// Confirmation of a delivery whose frame the coordinator's inbox has already
+/// accepted; see [`HandoffDelivery::deliver_accepted`].
+pub type PendingConfirmation = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'static>>;
 
 /// Bound on registration lookup, connect and delivery confirmation. Delivery
 /// has its own deadline and never consumes the handoff grace period. It is
 /// deliberately generous: a coordinator mid-turn may hold the message until
 /// the turn reaches an input boundary.
 pub const DELIVERY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Bound on confirming a credential delivery after its frame was accepted
+/// (see [`HandoffDelivery::deliver_accepted`]). A coordinator that requested
+/// the credential itself mid-turn reads it only when that turn ends, so this
+/// is far longer than [`DELIVERY_TIMEOUT`]; expiry is audited, never retried
+/// blindly.
+pub const AUTHORIZATION_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// `--settings` JSON the production coordinator launches with. Delivery
 /// confirms only when the coordinator accepts cross-session input, so this is
@@ -155,25 +186,29 @@ async fn read_registration(
 #[async_trait::async_trait]
 impl HandoffDelivery for ClaudeInbox {
     async fn deliver(&self, tmux: &Tmux, record: &CoordinatorTmuxRecord, prompt: &str) -> Result<()> {
-        tokio::time::timeout(DELIVERY_TIMEOUT, async {
+        let stages = Arc::new(Stages::new());
+        let delivery = async {
             let (pid, config, registration) = read_registration(tmux, record).await?;
-            deliver(
+            stages.reached("registration_read");
+            inject(
                 &registration.messaging_socket_path,
                 pid,
                 &registration.session_id,
                 prompt,
                 &crate::coordinator_handoff::transcript_projects_dir_in_config(&config, &registration.cwd)
                     .join(format!("{}.jsonl", registration.session_id)),
+                stages.clone(),
+                || {},
             )
+            .await?
+            .confirm()
             .await
-        })
-        .await
-        .with_context(|| {
-            format!(
-                "coordinator prompt delivery was not acknowledged within {}s; grace period has not started",
-                DELIVERY_TIMEOUT.as_secs()
-            )
-        })?
+            .map(|_| ())
+        };
+        match tokio::time::timeout(DELIVERY_TIMEOUT, delivery).await {
+            Ok(result) => result,
+            Err(_) => Err(stages.expiry_error()),
+        }
     }
 
     async fn deliver_locked<'a>(
@@ -183,27 +218,124 @@ impl HandoffDelivery for ClaudeInbox {
         prompt: &str,
         guard: tokio::sync::MutexGuard<'_, ()>,
     ) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>> {
-        let started = std::time::Instant::now();
-        let observer = tokio::time::timeout(DELIVERY_TIMEOUT, async {
+        let stages = Arc::new(Stages::new());
+        let delivery = async {
             let (pid, config, registration) = read_registration(tmux, record).await?;
-            delivery_stage("registration_read", started);
-            deliver_observed(
+            stages.reached("registration_read");
+            inject(
                 &registration.messaging_socket_path,
                 pid,
                 &registration.session_id,
                 prompt,
                 &crate::coordinator_handoff::transcript_projects_dir_in_config(&config, &registration.cwd)
                     .join(format!("{}.jsonl", registration.session_id)),
+                stages.clone(),
                 || {
                     drop(guard);
-                    delivery_stage("lifecycle_lock_released", started);
+                    stages.reached("lifecycle_lock_released");
+                },
+            )
+            .await?
+            .confirm()
+            .await
+        };
+        let observer = match tokio::time::timeout(DELIVERY_TIMEOUT, delivery).await {
+            Ok(result) => result?,
+            Err(_) => return Err(stages.expiry_error()),
+        };
+        Ok(Box::pin(observer.wait()))
+    }
+
+    async fn deliver_accepted<'a>(
+        &'a self,
+        tmux: &'a Tmux,
+        record: &'a CoordinatorTmuxRecord,
+        prompt: &str,
+        guard: tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<PendingConfirmation> {
+        let stages = Arc::new(Stages::new());
+        let acceptance = async {
+            let (pid, config, registration) = read_registration(tmux, record).await?;
+            stages.reached("registration_read");
+            inject(
+                &registration.messaging_socket_path,
+                pid,
+                &registration.session_id,
+                prompt,
+                &crate::coordinator_handoff::transcript_projects_dir_in_config(&config, &registration.cwd)
+                    .join(format!("{}.jsonl", registration.session_id)),
+                stages.clone(),
+                || {
+                    drop(guard);
+                    stages.reached("lifecycle_lock_released");
                 },
             )
             .await
-        })
-        .await
-        .context("coordinator prompt delivery deadline expired")??;
-        Ok(Box::pin(observer.wait()))
+        };
+        let injected = match tokio::time::timeout(DELIVERY_TIMEOUT, acceptance).await {
+            Ok(result) => result?,
+            Err(_) => return Err(stages.expiry_error()),
+        };
+        Ok(Box::pin(async move { injected.confirm().await.map(|_| ()) }))
+    }
+}
+
+/// Records each delivery stage for audit and remembers the last one reached,
+/// so a deadline expiry can say where delivery stopped instead of only that
+/// it did.
+struct Stages {
+    started: std::time::Instant,
+    last: std::sync::Mutex<Option<&'static str>>,
+}
+
+impl Stages {
+    fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            last: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn reached(&self, stage: &'static str) {
+        crate::audit::record_event(
+            "coordinator_inbox_delivery_stage",
+            &json!({"stage": stage, "elapsed_ms": self.started.elapsed().as_millis(), "ts_epoch_ms": boss_engine_utils::epoch_time::now_epoch_ms()}),
+        );
+        tracing::info!(
+            stage,
+            elapsed_ms = self.started.elapsed().as_millis(),
+            "coordinator inbox delivery"
+        );
+        if let Ok(mut last) = self.last.lock() {
+            *last = Some(stage);
+        }
+    }
+
+    fn last(&self) -> Option<&'static str> {
+        self.last.lock().ok().and_then(|last| *last)
+    }
+
+    /// The error for a [`DELIVERY_TIMEOUT`] expiry, naming the furthest stage
+    /// reached so the operator learns which step stalled.
+    fn expiry_error(&self) -> anyhow::Error {
+        anyhow::anyhow!(
+            "coordinator prompt delivery deadline ({}s) expired {}",
+            DELIVERY_TIMEOUT.as_secs(),
+            expiry_location(self.last())
+        )
+    }
+}
+
+/// Where a delivery stood when its deadline expired, in operator terms.
+fn expiry_location(last_stage: Option<&str>) -> &'static str {
+    match last_stage {
+        None => "before the coordinator's Claude inbox registration could be read",
+        Some("registration_read") => "while connecting to the coordinator's inbox socket",
+        Some("connected") => "while writing the request to the coordinator's inbox",
+        Some("frame_written" | "lifecycle_lock_released") => {
+            "after the request was written to the coordinator's inbox: the coordinator did not accept it as input before the deadline (it is mid-turn, or its inbound policy is holding cross-session messages)"
+        }
+        Some(_) => "after the request was written to the coordinator's inbox",
     }
 }
 
@@ -246,18 +378,6 @@ pub async fn deliver_with_turn(
     deliver_observed(path, pid, session_id, prompt, transcript, || {}).await
 }
 
-fn delivery_stage(stage: &str, started: std::time::Instant) {
-    crate::audit::record_event(
-        "coordinator_inbox_delivery_stage",
-        &json!({"stage": stage, "elapsed_ms": started.elapsed().as_millis(), "ts_epoch_ms": boss_engine_utils::epoch_time::now_epoch_ms()}),
-    );
-    tracing::info!(
-        stage,
-        elapsed_ms = started.elapsed().as_millis(),
-        "coordinator inbox delivery"
-    );
-}
-
 async fn deliver_observed(
     path: &Path,
     pid: libc::pid_t,
@@ -266,7 +386,56 @@ async fn deliver_observed(
     transcript: &Path,
     sent: impl FnOnce() + Send,
 ) -> Result<TurnObserver> {
-    let started = std::time::Instant::now();
+    inject(path, pid, session_id, prompt, transcript, Arc::new(Stages::new()), sent)
+        .await?
+        .confirm()
+        .await
+}
+
+/// A frame the coordinator's inbox has accepted but not yet confirmed as
+/// input. [`Self::confirm`] waits for the correlated transcript record or
+/// receipt; dropping it withdraws nothing (the message stays queued).
+struct Injected {
+    transcript: TranscriptCursors,
+    stream: UnixStream,
+    receipt: ReceiptListener,
+    frame: FrameIdentity,
+    stages: Arc<Stages>,
+}
+
+/// Two reads of the transcript positioned at the pre-injection cursor: one
+/// consumed by delivery confirmation, one kept for turn completion.
+struct TranscriptCursors {
+    confirmation: tokio::fs::File,
+    turn: tokio::fs::File,
+}
+
+/// The private receipt socket the frame named as its reply address, removed
+/// when dropped.
+struct ReceiptListener {
+    listener: UnixListener,
+    _cleanup: ReceiptSocket,
+}
+
+/// What a confirmation must correlate with: the unpredictable message id,
+/// the exact prompt, and the pid the frame was written to.
+struct FrameIdentity {
+    message_id: String,
+    prompt: String,
+    pid: libc::pid_t,
+}
+
+/// Capture the transcript cursor, connect to the inbox and write the frame.
+/// `sent` runs once the frame is written, before any confirmation wait.
+async fn inject(
+    path: &Path,
+    pid: libc::pid_t,
+    session_id: &str,
+    prompt: &str,
+    transcript: &Path,
+    stages: Arc<Stages>,
+    sent: impl FnOnce() + Send,
+) -> Result<Injected> {
     let mut transcript_file = tokio::fs::File::open(transcript)
         .await
         .context("opening coordinator transcript for delivery confirmation")?;
@@ -286,7 +455,7 @@ async fn deliver_observed(
         bail!("coordinator inbox peer does not match the live pane pid");
     }
 
-    delivery_stage("connected", started);
+    stages.reached("connected");
     let token = crate::engine_control::generate_token();
     let message_id = format!(
         "{}-{}-4{}-8{}-{}",
@@ -298,7 +467,7 @@ async fn deliver_observed(
     );
     let receipt_path = directory.join(format!("{}.sock", &message_id[..8]));
     let listener = UnixListener::bind(&receipt_path)?;
-    let _cleanup = ReceiptSocket(receipt_path.clone());
+    let cleanup = ReceiptSocket(receipt_path.clone());
     std::fs::set_permissions(&receipt_path, std::fs::Permissions::from_mode(0o600))?;
     let frame = json!({
         "msgV": 1,
@@ -311,26 +480,67 @@ async fn deliver_observed(
         "priority": "now",
     });
     stream.write_all(format!("{frame}\n").as_bytes()).await?;
-    delivery_stage("frame_written", started);
+    stages.reached("frame_written");
     sent();
-    // Match Claude's macOS transport: immediate half-close can lose the last frame.
-    #[cfg(target_os = "macos")]
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    // The receiver may close after consuming the newline-framed message.
-    // A closed write half is harmless; confirmation below still decides success.
-    if let Err(error) = stream.shutdown().await
-        && error.kind() != std::io::ErrorKind::NotConnected
-    {
-        return Err(error).context("closing the coordinator inbox write half");
-    }
-    tokio::select! {
-        result = wait_for_input_record(transcript_file, &message_id, prompt) => { delivery_stage(if result.is_ok() { "transcript_confirmed" } else { "transcript_failed" }, started); result },
-        result = wait_for_receipt(listener, pid, &message_id) => { delivery_stage(if result.is_ok() { "receipt_confirmed" } else { "receipt_failed" }, started); result },
-    }?;
-    Ok(TurnObserver {
-        file: turn_file,
-        message_id,
+    Ok(Injected {
+        transcript: TranscriptCursors {
+            confirmation: transcript_file,
+            turn: turn_file,
+        },
+        stream,
+        receipt: ReceiptListener {
+            listener,
+            _cleanup: cleanup,
+        },
+        frame: FrameIdentity {
+            message_id,
+            prompt: prompt.to_owned(),
+            pid,
+        },
+        stages,
     })
+}
+
+impl Injected {
+    /// Wait for the coordinator to take the frame as input: a correlated
+    /// transcript record or a `delivered` receipt. Only an explicit,
+    /// correlated non-delivery receipt fails.
+    async fn confirm(self) -> Result<TurnObserver> {
+        let Injected {
+            transcript:
+                TranscriptCursors {
+                    confirmation: transcript_file,
+                    turn: turn_file,
+                },
+            mut stream,
+            receipt: ReceiptListener { listener, _cleanup },
+            frame:
+                FrameIdentity {
+                    message_id,
+                    prompt,
+                    pid,
+                },
+            stages,
+        } = self;
+        // Match Claude's macOS transport: immediate half-close can lose the last frame.
+        #[cfg(target_os = "macos")]
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // The receiver may close after consuming the newline-framed message.
+        // A closed write half is harmless; confirmation below still decides success.
+        if let Err(error) = stream.shutdown().await
+            && error.kind() != std::io::ErrorKind::NotConnected
+        {
+            return Err(error).context("closing the coordinator inbox write half");
+        }
+        tokio::select! {
+            result = wait_for_input_record(transcript_file, &message_id, &prompt) => { stages.reached(if result.is_ok() { "transcript_confirmed" } else { "transcript_failed" }); result },
+            result = wait_for_receipt(listener, pid, &message_id) => { stages.reached(if result.is_ok() { "receipt_confirmed" } else { "receipt_failed" }); result },
+        }?;
+        Ok(TurnObserver {
+            file: turn_file,
+            message_id,
+        })
+    }
 }
 
 async fn wait_for_input_record(file: tokio::fs::File, message_id: &str, prompt: &str) -> Result<()> {

@@ -26,6 +26,9 @@ struct LiveCoordinatorRunner {
     token: StdMutex<String>,
     options: StdMutex<BTreeMap<String, String>>,
     calls: StdMutex<Vec<Vec<String>>>,
+    /// When set, every inbox delivery fails with this reason, the way a
+    /// missing registration or an expired delivery deadline would.
+    fail_delivery: StdMutex<Option<String>>,
 }
 
 impl Default for LiveCoordinatorRunner {
@@ -35,6 +38,7 @@ impl Default for LiveCoordinatorRunner {
             token: StdMutex::new(TOKEN.to_owned()),
             options: StdMutex::default(),
             calls: StdMutex::default(),
+            fail_delivery: StdMutex::default(),
         }
     }
 }
@@ -122,6 +126,13 @@ impl CommandRunner for LiveCoordinatorRunner {
 #[async_trait::async_trait]
 impl crate::coordinator_tmux::inbox::HandoffDelivery for LiveCoordinatorRunner {
     async fn deliver(&self, _: &Tmux, _: &crate::work::CoordinatorTmuxRecord, prompt: &str) -> anyhow::Result<()> {
+        if let Some(reason) = self.fail_delivery.lock().unwrap().clone() {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(vec!["inbox".into(), prompt.into(), "failed".into()]);
+            anyhow::bail!("{reason}");
+        }
         self.calls
             .lock()
             .unwrap()
@@ -131,10 +142,24 @@ impl crate::coordinator_tmux::inbox::HandoffDelivery for LiveCoordinatorRunner {
 }
 
 impl LiveCoordinatorRunner {
-    fn prompted(&self) -> bool {
+    /// Delivered inbox prompts that begin with `marker`.
+    fn inbox_prompts(&self, marker: &str) -> Vec<String> {
         self.calls()
             .iter()
-            .any(|c| c.first().map(String::as_str) == Some("inbox"))
+            .filter(|c| c.first().map(String::as_str) == Some("inbox") && c[2] == "delivered")
+            .map(|c| c[1].clone())
+            .filter(|prompt| prompt.starts_with(marker))
+            .collect()
+    }
+
+    /// The reset request reached the coordinator's inbox.
+    fn prompted(&self) -> bool {
+        !self.inbox_prompts("[Boss reset request").is_empty()
+    }
+
+    /// The handoff write credential reached the coordinator's inbox.
+    fn credential_prompted(&self) -> bool {
+        !self.inbox_prompts("[Boss handoff authorization]").is_empty()
     }
 
     fn calls(&self) -> Vec<Vec<String>> {
@@ -239,12 +264,17 @@ async fn handoff_show_recovers_authorization_only_through_main_session_inbox() {
     ctx.peer_pid = Some(std::process::id() as libc::pid_t);
     coordinator_handoff::handle_get_coordinator_handoff(ctx, FrontendRequest::GetCoordinatorHandoff).await;
     let (_, response) = next_event(&f.sink).await;
-    assert!(matches!(
-        response,
-        FrontendEvent::CoordinatorHandoffResult { handoff: None }
-    ));
+    let FrontendEvent::CoordinatorHandoffResult {
+        handoff: None,
+        authorization_delivery: Some(delivery),
+    } = &response
+    else {
+        panic!("expected an empty handoff with a delivery report, got {response:?}");
+    };
+    assert!(delivery.requested, "{delivery:?}");
+    assert!(delivery.detail.contains("inbox accepted"), "{delivery:?}");
     assert!(!format!("{response:?}").contains(&authorization));
-    wait_for_prompt(&f.runner).await;
+    wait_for_credential_prompt(&f.runner).await;
     assert!(
         f.runner
             .calls()
@@ -289,6 +319,49 @@ async fn wait_for_prompt(runner: &LiveCoordinatorRunner) {
     })
     .await
     .expect("the reset must send its handoff prompt");
+}
+
+async fn wait_for_credential_prompt(runner: &LiveCoordinatorRunner) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !runner.credential_prompted() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the credential must reach the coordinator's inbox");
+}
+
+async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}"));
+}
+
+/// Answers the app-side attach request a coordinator attach sends, so the
+/// attach flow under test completes the way it does with a live app.
+async fn acknowledge_attach(state: &Arc<ServerState>, sink: &SessionSink) -> String {
+    let (request_id, event) = next_event(sink).await;
+    let FrontendEvent::EngineRequest {
+        request_id,
+        request: EngineToAppRequest::AttachCoordinatorPane(attach),
+    } = event
+    else {
+        panic!("expected the coordinator attach request (reply {request_id}), got {event:?}")
+    };
+    state
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::AttachCoordinatorPane {
+                result: Ok(boss_protocol::AttachCoordinatorPaneResult {}),
+            },
+        )
+        .await;
+    attach.spawn_token
 }
 
 #[tokio::test]
@@ -384,15 +457,28 @@ async fn handoff_show_mints_authorization_for_a_surviving_pre_auth_coordinator()
     coordinator_handoff::handle_get_coordinator_handoff(ctx, FrontendRequest::GetCoordinatorHandoff).await;
     assert!(matches!(
         next_event(&f.sink).await.1,
-        FrontendEvent::CoordinatorHandoffResult { handoff: None }
+        FrontendEvent::CoordinatorHandoffResult {
+            handoff: None,
+            authorization_delivery: Some(boss_protocol::CoordinatorHandoffAuthorizationDelivery {
+                requested: true,
+                ..
+            }),
+        }
     ));
-    wait_for_prompt(&f.runner).await;
+    wait_for_credential_prompt(&f.runner).await;
     let authorization = f
         .state
         .work_db
         .coordinator_handoff_authorization()
         .unwrap()
         .expect("show from coordinator ancestry must mint a missing credential");
+    wait_until("confirmed delivery must be recorded against the live session", || {
+        f.state
+            .work_db
+            .coordinator_handoff_authorization_delivered_to(TOKEN)
+            .unwrap()
+    })
+    .await;
     assert!(
         f.runner
             .calls()
@@ -752,4 +838,246 @@ async fn pending_reset_does_not_stall_the_connection_read_loop() {
 
     drop(writer);
     let _ = tokio::time::timeout(Duration::from_secs(2), conn).await;
+}
+
+/// A coordinator session that outlived the deploy introducing handoff
+/// authorization (or any engine restart) has no credential and was never
+/// briefed with one. Re-association at app registration must mint and deliver
+/// it, exactly once, and a later reset request must carry that same
+/// credential so the surviving session can write a fresh handoff.
+#[tokio::test]
+async fn adopted_coordinator_from_before_authorization_receives_its_credential_and_reset_requests() {
+    let Fixture {
+        state,
+        sink,
+        runner,
+        session_dir,
+        _dir,
+    } = fixture(Duration::from_secs(30)).await;
+    // The record predates authorization: no credential row, nothing briefed.
+    state.work_db.clear_coordinator_handoff_authorization().unwrap();
+    assert!(state.work_db.coordinator_handoff_authorization().unwrap().is_none());
+    assert!(
+        !state
+            .work_db
+            .coordinator_handoff_authorization_delivered_to(TOKEN)
+            .unwrap()
+    );
+
+    // The engine restarted and the app registered: the live session is adopted.
+    let attach = tokio::spawn(sessions::attach_coordinator_to_registered_app(state.clone()));
+    assert_eq!(
+        acknowledge_attach(&state, &sink).await,
+        TOKEN,
+        "adoption keeps the surviving session"
+    );
+    attach.await.unwrap();
+    wait_for_credential_prompt(&runner).await;
+    let authorization = state
+        .work_db
+        .coordinator_handoff_authorization()
+        .unwrap()
+        .expect("adoption must mint a credential for a pre-authorization session");
+    let credential_prompts = runner.inbox_prompts("[Boss handoff authorization]");
+    assert_eq!(credential_prompts.len(), 1, "{credential_prompts:?}");
+    assert!(credential_prompts[0].contains(&authorization));
+    assert!(
+        runner.position("send-keys").is_none(),
+        "the credential never goes through the composer"
+    );
+    wait_until("confirmed delivery must be recorded against the live session", || {
+        state
+            .work_db
+            .coordinator_handoff_authorization_delivered_to(TOKEN)
+            .unwrap()
+    })
+    .await;
+
+    // A second registration (app relaunch) re-adopts the same session and
+    // must not queue the credential again.
+    let attach = tokio::spawn(sessions::attach_coordinator_to_registered_app(state.clone()));
+    assert_eq!(acknowledge_attach(&state, &sink).await, TOKEN);
+    attach.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(runner.inbox_prompts("[Boss handoff authorization]").len(), 1);
+
+    // The operator resets: the request carries the credential the session already holds.
+    sessions::handle_recreate_coordinator(dispatch(&state, &sink, "reset-1"), reset_request()).await;
+    wait_for_prompt(&runner).await;
+    let reset_prompts = runner.inbox_prompts("[Boss reset request");
+    assert_eq!(reset_prompts.len(), 1, "{reset_prompts:?}");
+    assert!(
+        reset_prompts[0].contains(&format!("--authorization {authorization} -")),
+        "{reset_prompts:?}"
+    );
+    assert_eq!(
+        state.work_db.coordinator_handoff_authorization().unwrap().unwrap(),
+        authorization,
+        "the reset must not rotate the credential the session was briefed with"
+    );
+
+    // The surviving session writes with it and the reset proceeds on that write.
+    let write_sink = make_session_sink();
+    state.set_boss_pid(std::process::id() as libc::pid_t);
+    let mut write_dispatch = dispatch(&state, &write_sink, "write-1");
+    write_dispatch.peer_pid = Some(std::process::id() as libc::pid_t);
+    coordinator_handoff::handle_set_coordinator_handoff(
+        write_dispatch,
+        FrontendRequest::SetCoordinatorHandoff {
+            body: "- facts from the session that outlived the upgrade".to_owned(),
+            authorization,
+        },
+    )
+    .await;
+    assert!(matches!(
+        next_event(&write_sink).await.1,
+        FrontendEvent::CoordinatorHandoffSet { .. }
+    ));
+    let mut completion_seen = false;
+    let replacement = loop {
+        let (reply_id, event) = next_event(&sink).await;
+        match event {
+            FrontendEvent::CoordinatorRecreated => {
+                assert_eq!(reply_id, "reset-1");
+                completion_seen = true;
+            }
+            FrontendEvent::EngineRequest {
+                request_id,
+                request: EngineToAppRequest::AttachCoordinatorPane(attach),
+            } => {
+                state
+                    .deliver_app_response(
+                        "session-app",
+                        &request_id,
+                        EngineToAppResponse::AttachCoordinatorPane {
+                            result: Ok(boss_protocol::AttachCoordinatorPaneResult {}),
+                        },
+                    )
+                    .await;
+                break attach.spawn_token;
+            }
+            other => panic!("expected the replacement attach request, got {other:?}"),
+        }
+    };
+    assert_ne!(replacement, TOKEN);
+    let brief = std::fs::read_to_string(
+        session_dir
+            .join(".claude")
+            .join(crate::coordinator_handoff::START_BRIEF_FILENAME),
+    )
+    .unwrap();
+    assert!(
+        brief.contains("- facts from the session that outlived the upgrade"),
+        "{brief}"
+    );
+    // The replacement was briefed with its own credential, so adopting it
+    // later must not redeliver either.
+    assert!(
+        state
+            .work_db
+            .coordinator_handoff_authorization_delivered_to(&replacement)
+            .unwrap()
+    );
+    if !completion_seen {
+        let (reply_id, event) = next_event(&sink).await;
+        assert!(matches!(event, FrontendEvent::CoordinatorRecreated), "got {event:?}");
+        assert_eq!(reply_id, "reset-1");
+    }
+}
+
+/// When the request cannot be delivered, the app's error must say which step
+/// failed and why, verbatim from the engine, so the operator is not left with
+/// only "could not deliver" and a forced reset.
+#[tokio::test]
+async fn reset_delivery_failure_names_the_failing_step_and_reason() {
+    let Fixture {
+        state,
+        sink,
+        runner,
+        _dir,
+        ..
+    } = fixture(Duration::from_secs(30)).await;
+    *runner.fail_delivery.lock().unwrap() =
+        Some("no Claude inbox registration under coordinator pane process 4242".to_owned());
+    sessions::handle_recreate_coordinator(dispatch(&state, &sink, "reset-1"), reset_request()).await;
+    let (request_id, event) = next_event(&sink).await;
+    assert_eq!(request_id, "reset-1");
+    let FrontendEvent::Error { message } = event else {
+        panic!("expected Error, got {event:?}")
+    };
+    assert_eq!(
+        message,
+        "recreate_coordinator: coordinator did not receive the handoff request: inbox delivery failed: \
+         no Claude inbox registration under coordinator pane process 4242. The coordinator session is still running."
+    );
+    assert!(
+        runner.position("kill-session").is_none(),
+        "the session must be left running"
+    );
+    assert!(runner.position("new-session").is_none());
+    wait_until("a failed delivery must release the reset", || {
+        !state
+            .coordinator_reset_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+    })
+    .await;
+    // The step label distinguishes a transport failure from a credential one.
+    assert!(!message.contains("could not be minted"));
+}
+
+/// `boss handoff show` is the coordinator's on-demand credential path. Its
+/// response must say the redelivery failed and why, not silently log it, and
+/// a later attempt must be able to try again.
+#[tokio::test]
+async fn handoff_show_reports_a_failed_credential_redelivery() {
+    let f = fixture(Duration::from_secs(1)).await;
+    f.state.work_db.clear_coordinator_handoff_authorization().unwrap();
+    f.state.set_boss_pid(std::process::id() as libc::pid_t);
+    *f.runner.fail_delivery.lock().unwrap() = Some(
+        "coordinator prompt delivery deadline (15s) expired while connecting to the coordinator's inbox socket"
+            .to_owned(),
+    );
+    for attempt in 0..2 {
+        let mut ctx = dispatch(&f.state, &f.sink, "read-handoff");
+        ctx.peer_pid = Some(std::process::id() as libc::pid_t);
+        coordinator_handoff::handle_get_coordinator_handoff(ctx, FrontendRequest::GetCoordinatorHandoff).await;
+        let (_, response) = next_event(&f.sink).await;
+        let FrontendEvent::CoordinatorHandoffResult {
+            handoff: None,
+            authorization_delivery: Some(delivery),
+        } = &response
+        else {
+            panic!("attempt {attempt}: expected a delivery report, got {response:?}");
+        };
+        assert!(!delivery.requested, "attempt {attempt}: {delivery:?}");
+        assert!(
+            delivery
+                .detail
+                .contains("delivering the credential to the coordinator's inbox"),
+            "attempt {attempt}: {delivery:?}"
+        );
+        assert!(
+            delivery.detail.contains("expired while connecting"),
+            "attempt {attempt}: {delivery:?}"
+        );
+        let authorization = f.state.work_db.coordinator_handoff_authorization().unwrap().unwrap();
+        assert!(!format!("{response:?}").contains(&authorization));
+        assert!(
+            !f.state
+                .work_db
+                .coordinator_handoff_authorization_delivered_to(TOKEN)
+                .unwrap()
+        );
+    }
+    // A human terminal without coordinator ancestry gets no delivery report.
+    let mut ctx = dispatch(&f.state, &f.sink, "read-handoff-human");
+    ctx.peer_pid = None;
+    coordinator_handoff::handle_get_coordinator_handoff(ctx, FrontendRequest::GetCoordinatorHandoff).await;
+    assert!(matches!(
+        next_event(&f.sink).await.1,
+        FrontendEvent::CoordinatorHandoffResult {
+            handoff: None,
+            authorization_delivery: None,
+        }
+    ));
 }

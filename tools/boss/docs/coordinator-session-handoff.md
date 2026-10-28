@@ -27,6 +27,8 @@ The request is delivered through Claude Code's local inbox, never the composer, 
 
 Delivery has its own bound (`DELIVERY_TIMEOUT`, 15 s) that does not consume the grace period. A `held` receipt is pending, not failure: the wait ends on a correlated transcript record or `delivered` receipt, or fails on an explicit `denied`/`expired`/`refused`/`dropped` receipt or the deadline. Stray or malformed receipt-socket traffic is ignored. If delivery fails, the session is left running and the error begins `coordinator did not receive the handoff request`; the app keeps the reset UI open and offers "Reset anyway (no fresh handoff)".
 
+The text after that prefix names the step that failed and why, and the app shows it verbatim under the banner (`coordinatorResetDeliveryFailureReason` in `ChatViewModel+BossSession.swift`). The two steps are the credential (`the handoff credential for this session could not be minted (…)`) and inbox delivery (`inbox delivery failed: …`). A deadline expiry during inbox delivery names the furthest stage reached: before the Claude inbox registration could be read, while connecting to the inbox socket, while writing the request, or after the request was written but the coordinator did not accept it as input (it is mid-turn, or its inbound policy is holding cross-session messages). The audit event `coordinator_handoff_delivery_failed` carries the same `step` and `error`. A generic "could not deliver" with no reason is never shown for an engine-reported failure.
+
 After delivery, the 30 s grace period ends at the first of: a fresh handoff write, the end of the turn the request started (an assistant `end_turn` record descends from the injected request UUID; if no write landed, the missing-handoff warning is shown), or the deadline.
 
 Each persisted handoff has a unique `write_id`, so an earlier write cannot satisfy the wait even when its body and second-resolution timestamp match. A fresh write wakes reset immediately. If grace expires without one, Boss logs an error, displays the missing-context warning, replaces the session, and labels an older saved handoff STALE.
@@ -41,7 +43,17 @@ Writes require both socket-peer ancestry to the engine-registered coordinator PI
 
 The new `coordinator_handoff_rejected` event records the caller PID, bounded parent chain and best-effort argv (the real credential is redacted by substring; a caller-chosen `--authorization` value is redacted only in place). Missing identity or credentials fail closed. A reduction exceeding 80% emits `coordinator_handoff_shrink_warning` with old and new byte counts; a valid write still succeeds.
 
-Enforcement takes effect on engine deployment. A surviving coordinator launched before authorization existed has no credential row. `boss handoff show` from coordinator ancestry mints one under `coordinator_tmux_lock` and redelivers it to the main-session inbox; a reset request mints the same way so the outgoing session can write a fresh handoff. Writes still require ancestry. New sessions receive a credential automatically at spawn. This mechanism prevents ambient environment inheritance from granting write access; it is not an OS sandbox against a same-user process deliberately stealing the private brief or a credential explicitly delegated by the coordinator.
+Enforcement takes effect on engine deployment. A surviving coordinator launched before authorization existed has no credential row, and a session adopted after an engine restart was briefed by an earlier engine. The engine therefore tracks, per spawn token, whether the live session has received its credential (`coordinator.handoff_authorization_delivered_to`, set when a fresh session's brief carries it and when an inbox delivery of it is confirmed, including the credential inside a confirmed reset request). Three paths converge on that marker:
+
+- **Adoption.** When app registration re-associates a surviving session (`attach_coordinator_to_registered_app` → `brief_adopted_coordinator_with_authorization` in `tools/boss/engine/core/src/app/sessions.rs`), a session without the marker is minted a credential under `coordinator_tmux_lock` and sent a `[Boss handoff authorization]` message through its inbox, detached from the attach flow. A later re-adoption of the same session does not resend it.
+- **`boss handoff show`** from coordinator ancestry requests the same delivery on demand and reports the outcome in its response (`authorization_delivery` on `CoordinatorHandoffResult`; the credential itself is never in the response): `requested: true` once the main session's inbox accepted the message, or `requested: false` with the failing step and reason. The CLI prints this as its last line. Acceptance is reported as soon as the frame is written: a coordinator that runs `show` mid-turn only reads its inbox when that turn ends, so the engine confirms in the background under `AUTHORIZATION_CONFIRMATION_TIMEOUT` (15 min) and records the marker on confirmation. Every outcome is audited as `coordinator_handoff_authorization_delivery` with `trigger` (`adoption` or `handoff_show`) and `outcome` (`accepted`, `confirmed`, `failed`, `unconfirmed`). While a delivery awaits confirmation, a repeat request reports it as pending rather than queueing the credential twice.
+- **A reset request** mints the same way, carries the credential, and records the marker once the request is confirmed delivered, so the outgoing session can write a fresh handoff.
+
+Writes still require ancestry. New sessions receive a credential automatically at spawn. This mechanism prevents ambient environment inheritance from granting write access; it is not an OS sandbox against a same-user process deliberately stealing the private brief or a credential explicitly delegated by the coordinator.
+
+#### The 1.0.823 incident
+
+A reset of a coordinator that had outlived the authorization deploy failed with the generic banner. The engine's error was `coordinator did not receive the handoff request: coordinator handoff authorization is unavailable`: the surviving session had no credential row, so the reset failed before any inbox message was sent, and the app dropped the reason. `boss handoff show` printed the stored handoff while its asynchronous redelivery failed on the same missing row and was only logged, so the session never learned why no credential arrived and could not write at all. The minting above (first landed in 1.0.827), the adoption delivery, the reported `show` outcome and the step-naming reset error each close one part of that failure.
 
 #### Diagnosis
 
@@ -75,7 +87,7 @@ If the archive cannot be written, the relay delivers a recovery notice pointing 
 
 The brief also carries, after the handoff, a "Product coordinator guidance" section: every non-archived product's `BOSS_COORDINATOR.md`, read from GitHub at the default branch's HEAD and shown with the commit sha it was read at. That is a separate mechanism with its own states and audit event; see [coordinator-product-guidance.md](coordinator-product-guidance.md).
 
-An _adopted_ session — the engine restarted but the coordinator's tmux session and `claude` process survived — keeps its own context and receives no brief. That path is the existing prompt-change nudge (`maybe_nudge_prompt_change` in the same file), which re-reads the rendered `CLAUDE.md` when its content changed across the restart. The two mechanisms are complementary and share the coordinator lifecycle code; neither replaces the other.
+An _adopted_ session — the engine restarted but the coordinator's tmux session and `claude` process survived — keeps its own context and receives no brief. That path is the existing prompt-change nudge (`maybe_nudge_prompt_change` in the same file), which re-reads the rendered `CLAUDE.md` when its content changed across the restart, plus the handoff credential delivery described under "Write authorization" when the session has not yet received one. The mechanisms are complementary and share the coordinator lifecycle code; none replaces another.
 
 The brief also carries **why** the previous session ended (tmux session missing, `claude` process exited, operator reset, model change, forced reset without a fresh handoff, or first creation), rendered from `CoordinatorStartReason`.
 
@@ -114,7 +126,10 @@ boss handoff write --authorization '<credential from this session-start brief>' 
 - Do not file chores about greyarea disk exhaustion.
 HANDOFF
 
-# Coordinator: read it back (age, writer, body).
+# Coordinator: read it back (age, writer, body). From the coordinator's own
+# session this also requests redelivery of the write credential to the main
+# session inbox and reports, on its last line, whether that was accepted or
+# which step failed.
 boss handoff show
 boss handoff show --json
 ```
@@ -134,7 +149,7 @@ Reset timing is also recorded at each boundary. The app's IPC JSONL records `coo
 
 To locate where time went in a slow reset, compare the timestamps in order: `coordinator_reset_rpc_send` → `coordinator_reset_rpc_received` → `coordinator_handoff_lock_acquired` → `coordinator_handoff_requested` → `coordinator_handoff_grace_started`. A long gap before `rpc_send` is app or dialog time; `rpc_send` to `rpc_received` is the RPC path; `delivery_started` to `lock_acquired` is `coordinator_tmux` lock contention; `lock_acquired` to `requested` is inbox delivery; `grace_started` to `received`, `timeout` or `turn_ended_without_write` is time spent waiting on the coordinator itself. Both reset UI entry points share the same RPC path, and the grace timer starts only after delivery is confirmed.
 
-Inbox delivery also records `coordinator_inbox_delivery_stage` for registration read, connection, frame write, lifecycle lock release, and transcript or receipt confirmation. Each includes an elapsed duration and wall-clock timestamp. These measurements distinguish a slow transport from waiting for Claude to accept input.
+Inbox delivery also records `coordinator_inbox_delivery_stage` for registration read, connection, frame write, lifecycle lock release, and transcript or receipt confirmation. Each includes an elapsed duration and wall-clock timestamp. These measurements distinguish a slow transport from waiting for Claude to accept input, and the furthest stage reached is what a `coordinator_handoff_delivery_failed` deadline error names. Credential deliveries (adoption and `boss handoff show`) record `coordinator_handoff_authorization_delivery` with their trigger and outcome.
 
 ### Verification and evidence limits
 

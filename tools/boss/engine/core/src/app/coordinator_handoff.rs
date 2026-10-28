@@ -57,9 +57,14 @@ pub(super) async fn handle_get_coordinator_handoff(ctx: Dispatch, req: FrontendR
             "coordinator handoff is unavailable to agents".to_owned(),
         );
     }
-    if coordinator_peer(&server_state, peer_pid) {
-        redeliver_authorization(server_state.clone());
-    }
+    // A coordinator-ancestry read doubles as the on-demand credential path:
+    // the response says whether the main session's inbox accepted the
+    // redelivery (or which step failed), never the credential itself.
+    let authorization_delivery = if coordinator_peer(&server_state, peer_pid) {
+        Some(deliver_authorization(server_state.clone(), "handoff_show").await)
+    } else {
+        None
+    };
     let current = match current_spawn_token(&work_db) {
         Ok(current) => current,
         Err(message) => {
@@ -72,7 +77,10 @@ pub(super) async fn handle_get_coordinator_handoff(ctx: Dispatch, req: FrontendR
             send_response(
                 &sink,
                 &request_id,
-                FrontendEvent::CoordinatorHandoffResult { handoff: None },
+                FrontendEvent::CoordinatorHandoffResult {
+                    handoff: None,
+                    authorization_delivery,
+                },
             );
         }
         HandoffState::Present(handoff) => {
@@ -82,6 +90,7 @@ pub(super) async fn handle_get_coordinator_handoff(ctx: Dispatch, req: FrontendR
                 &request_id,
                 FrontendEvent::CoordinatorHandoffResult {
                     handoff: Some(handoff_view(&handoff, current.as_deref(), now)),
+                    authorization_delivery,
                 },
             );
         }
@@ -94,29 +103,135 @@ pub(super) async fn handle_get_coordinator_handoff(ctx: Dispatch, req: FrontendR
     }
 }
 
-/// Never return the credential to the requesting process: a child can request
-/// recovery, but only the main coordinator's inbox receives the secret.
-fn redeliver_authorization(state: Arc<ServerState>) {
-    boss_task_scope::spawn(async move {
-        let result: anyhow::Result<()> = async {
-            let program = match &*state.tmux_preflight.read().map_err(|_| anyhow::anyhow!("tmux preflight lock poisoned"))? {
-                crate::tmux_preflight::TmuxPreflight::Ready { program, .. } => program.clone(),
-                crate::tmux_preflight::TmuxPreflight::Unavailable { reason } => anyhow::bail!("{reason}"),
-            };
-            let tmux = state.tmux_from_program(program)?;
-            let legacy = boss_tmux::Tmux::for_legacy_label_server(tmux.program().to_path_buf()).ok();
-            let guard = state.coordinator_tmux_lock.lock().await;
-            let tmux = crate::coordinator_tmux::resolve_active_handle(&tmux, legacy.as_ref()).await;
-            let record = state.work_db.coordinator_tmux_record()?.ok_or_else(|| anyhow::anyhow!("no coordinator session"))?;
-            let authorization = state.work_db.ensure_coordinator_handoff_authorization(&record.spawn_token)?;
-            let prompt = format!("[Boss handoff authorization] Use `boss handoff write --authorization {authorization} -` for rolling handoff writes. Keep this credential in the main session only; never delegate or archive it.");
-            drop(state.coordinator_handoff_delivery.deliver_locked(tmux, &record, &prompt, guard).await?);
-            Ok(())
-        }.await;
-        if let Err(error) = result {
-            tracing::error!(%error, "could not redeliver coordinator handoff authorization");
+/// The `[Boss handoff authorization]` inbox message. Test sources parse the
+/// write command out of this text, so keep its shape stable.
+pub(crate) fn authorization_prompt(authorization: &str) -> String {
+    format!(
+        "[Boss handoff authorization] Use `boss handoff write --authorization {authorization} -` for rolling handoff writes. Keep this credential in the main session only; never delegate or archive it."
+    )
+}
+
+/// Deliver the live coordinator's handoff write credential to its main
+/// session inbox, minting one first when the session predates authorization
+/// (it outlived the deploy, or an engine restart adopted it). Never returns
+/// the credential: a child can request recovery, but only the main
+/// coordinator's inbox receives the secret.
+///
+/// Resolves as soon as the inbox has accepted the message, so a coordinator
+/// that asked mid-turn gets an answer now and the message at its next input
+/// boundary. Confirmation continues in the background, bounded by
+/// [`crate::coordinator_tmux::inbox::AUTHORIZATION_CONFIRMATION_TIMEOUT`],
+/// and records the delivery against the spawn token once confirmed. Every
+/// outcome is audited as `coordinator_handoff_authorization_delivery`.
+pub(super) async fn deliver_authorization(
+    state: Arc<ServerState>,
+    trigger: &'static str,
+) -> boss_protocol::CoordinatorHandoffAuthorizationDelivery {
+    use std::sync::atomic::Ordering;
+    if state
+        .coordinator_authorization_delivery_in_flight
+        .swap(true, Ordering::AcqRel)
+    {
+        return boss_protocol::CoordinatorHandoffAuthorizationDelivery {
+            requested: true,
+            detail: "a delivery of the handoff credential to the main session's inbox is already pending; it is read at that session's next input boundary".to_owned(),
+        };
+    }
+    let in_flight = state.coordinator_authorization_delivery_in_flight.clone();
+    let accepted: anyhow::Result<(String, crate::coordinator_tmux::inbox::PendingConfirmation)> = async {
+        let program = match &*state
+            .tmux_preflight
+            .read()
+            .map_err(|_| anyhow::anyhow!("tmux preflight lock poisoned"))?
+        {
+            crate::tmux_preflight::TmuxPreflight::Ready { program, .. } => program.clone(),
+            crate::tmux_preflight::TmuxPreflight::Unavailable { reason } => {
+                anyhow::bail!("tmux is unavailable: {reason}")
+            }
+        };
+        let tmux = state.tmux_from_program(program)?;
+        let legacy = boss_tmux::Tmux::for_legacy_label_server(tmux.program().to_path_buf()).ok();
+        let guard = state.coordinator_tmux_lock.lock().await;
+        let tmux = crate::coordinator_tmux::resolve_active_handle(&tmux, legacy.as_ref()).await;
+        let record = state
+            .work_db
+            .coordinator_tmux_record()?
+            .ok_or_else(|| anyhow::anyhow!("no coordinator session is on record"))?;
+        let authorization = state
+            .work_db
+            .ensure_coordinator_handoff_authorization(&record.spawn_token)
+            .context("minting the handoff credential")?;
+        let confirmation = state
+            .coordinator_handoff_delivery
+            .deliver_accepted(tmux, &record, &authorization_prompt(&authorization), guard)
+            .await
+            .context("delivering the credential to the coordinator's inbox")?;
+        Ok((record.spawn_token, confirmation))
+    }
+    .await;
+    match accepted {
+        Err(error) => {
+            in_flight.store(false, Ordering::Release);
+            let error = format!("{error:#}");
+            crate::audit::record_event(
+                "coordinator_handoff_authorization_delivery",
+                &serde_json::json!({ "trigger": trigger, "outcome": "failed", "error": error }),
+            );
+            tracing::error!(%error, trigger, "could not deliver the coordinator handoff credential");
+            boss_protocol::CoordinatorHandoffAuthorizationDelivery {
+                requested: false,
+                detail: format!("the handoff credential was not delivered: {error}"),
+            }
         }
-    });
+        Ok((spawn_token, confirmation)) => {
+            crate::audit::record_event(
+                "coordinator_handoff_authorization_delivery",
+                &serde_json::json!({ "trigger": trigger, "outcome": "accepted", "spawn_token": spawn_token }),
+            );
+            let work_db = state.work_db.clone();
+            boss_task_scope::spawn(async move {
+                let outcome = tokio::time::timeout(
+                    crate::coordinator_tmux::inbox::AUTHORIZATION_CONFIRMATION_TIMEOUT,
+                    confirmation,
+                )
+                .await;
+                in_flight.store(false, Ordering::Release);
+                let (outcome, error) = match outcome {
+                    Ok(Ok(())) => {
+                        match work_db.record_coordinator_handoff_authorization_delivered(&spawn_token) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                tracing::warn!("handoff credential confirmed for a replaced coordinator session")
+                            }
+                            Err(error) => {
+                                tracing::warn!(error = %format!("{error:#}"), "could not record handoff credential delivery")
+                            }
+                        }
+                        ("confirmed", None)
+                    }
+                    Ok(Err(error)) => ("failed", Some(format!("{error:#}"))),
+                    Err(_) => (
+                        "unconfirmed",
+                        Some(format!(
+                            "no confirmation within {}s",
+                            crate::coordinator_tmux::inbox::AUTHORIZATION_CONFIRMATION_TIMEOUT.as_secs()
+                        )),
+                    ),
+                };
+                crate::audit::record_event(
+                    "coordinator_handoff_authorization_delivery",
+                    &serde_json::json!({ "trigger": trigger, "outcome": outcome, "spawn_token": spawn_token, "error": error }),
+                );
+                if let Some(error) = error {
+                    tracing::error!(%error, trigger, "coordinator handoff credential delivery was not confirmed");
+                }
+            });
+            boss_protocol::CoordinatorHandoffAuthorizationDelivery {
+                requested: true,
+                detail: "the main session's inbox accepted the handoff credential; it is read as a [Boss handoff authorization] message at that session's next input boundary (the end of the current turn)".to_owned(),
+            }
+        }
+    }
 }
 
 pub(super) async fn handle_set_coordinator_handoff(ctx: Dispatch, req: FrontendRequest) {

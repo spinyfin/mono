@@ -68,6 +68,7 @@ extension ChatViewModel {
         guard canSubmitUserActions() else { return }
         coordinatorResetForced = true
         coordinatorResetDeliveryFailed = false
+        coordinatorResetDeliveryFailureReason = nil
         coordinatorResetWaiting = true
         engine.sendRecreateCoordinator(
             expectedSpawnToken: pending.token, reason: pending.reason, forceWithoutHandoff: true
@@ -78,19 +79,43 @@ extension ChatViewModel {
         coordinatorResetForced = false
         coordinatorResetWaiting = false
         coordinatorResetDeliveryFailed = false
+        coordinatorResetDeliveryFailureReason = nil
         pendingCoordinatorReset = nil
     }
+
+    /// Leads the engine's delivery-failure error; what follows it names the
+    /// failing step and its reason (see `DELIVERY_FAILED_PREFIX` in the
+    /// engine's `reset_handoff.rs`).
+    static let coordinatorHandoffDeliveryFailedPrefix = "coordinator did not receive the handoff request"
 
     /// Returns true only when the reset UI owns the delivery failure.
     func handleCoordinatorResetError(_ message: String) -> Bool {
         guard message.hasPrefix("recreate_coordinator:"), pendingCoordinatorReset != nil else { return false }
         coordinatorResetWaiting = false
-        if message.contains("coordinator did not receive the handoff request") {
+        if message.contains(Self.coordinatorHandoffDeliveryFailedPrefix) {
             coordinatorResetDeliveryFailed = true
+            coordinatorResetDeliveryFailureReason = Self.coordinatorHandoffDeliveryFailureReason(from: message)
             return true
         }
         clearCoordinatorReset()
         return false
+    }
+
+    /// The engine's reason for a delivery failure, stripped of the RPC label,
+    /// the shared prefix and the trailing "session is still running" note the
+    /// banner already states. `nil` when the message carries no reason.
+    static func coordinatorHandoffDeliveryFailureReason(from message: String) -> String? {
+        guard let range = message.range(of: coordinatorHandoffDeliveryFailedPrefix) else { return nil }
+        var reason = String(message[range.upperBound...])
+        if reason.hasPrefix(":") { reason.removeFirst() }
+        let trailer = "The coordinator session is still running."
+        if let trailerRange = reason.range(of: trailer, options: .backwards) {
+            reason = String(reason[..<trailerRange.lowerBound])
+        }
+        reason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        while reason.hasSuffix(".") { reason.removeLast() }
+        reason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        return reason.isEmpty ? nil : reason
     }
 
     private func refreshCoordinatorModelRecreateConfirmation() {

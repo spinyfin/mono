@@ -334,3 +334,21 @@ time.sleep(60)
     assert_eq!(registration_count, 2, "nested session must be registered too");
     assert_eq!(Some(resolved), registered);
 }
+
+#[test]
+fn a_deadline_expiry_names_the_furthest_stage_reached() {
+    assert!(expiry_location(None).contains("registration"));
+    assert!(expiry_location(Some("registration_read")).contains("connecting"));
+    let held = expiry_location(Some("frame_written"));
+    assert!(held.contains("written to the coordinator's inbox"), "{held}");
+    assert!(held.contains("mid-turn"), "{held}");
+    assert_eq!(expiry_location(Some("lifecycle_lock_released")), held);
+    let stages = Stages::new();
+    stages.reached("registration_read");
+    stages.reached("connected");
+    let error = format!("{:#}", stages.expiry_error());
+    assert!(
+        error.starts_with("coordinator prompt delivery deadline (15s) expired while writing"),
+        "{error}"
+    );
+}

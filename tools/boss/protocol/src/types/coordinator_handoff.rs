@@ -31,3 +31,21 @@ pub struct CoordinatorHandoffView {
     /// is the writer. See the type-level doc.
     pub written_by_current_session: bool,
 }
+
+/// How the engine's attempt to (re)deliver the handoff write credential to
+/// the main coordinator session's inbox went. Reported by `boss handoff show`
+/// only to a caller with coordinator ancestry — the credential itself is
+/// never in the response.
+///
+/// `requested` is `true` once the coordinator's inbox accepted the message;
+/// the session reads it at its next input boundary, which for a `show` the
+/// coordinator ran itself is the end of the current turn. `false` means the
+/// request failed before acceptance, and `detail` says which step failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct CoordinatorHandoffAuthorizationDelivery {
+    pub requested: bool,
+    /// Operator-facing explanation: where the credential now is, or which
+    /// step failed and why.
+    pub detail: String,
+}

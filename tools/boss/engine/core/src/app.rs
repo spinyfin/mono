@@ -737,6 +737,11 @@ struct ServerState {
     /// request is refused instead of stacking a second handoff wait.
     #[builder(default)]
     coordinator_reset_in_flight: Arc<AtomicBool>,
+    /// Set while a handoff credential delivery to the coordinator's main
+    /// inbox awaits confirmation, so adoption and `boss handoff show` do not
+    /// queue the same credential twice.
+    #[builder(default)]
+    coordinator_authorization_delivery_in_flight: Arc<AtomicBool>,
     /// Test seam for the coordinator lifecycle (app-registration attach, the
     /// child-exit supervisor, and UI-confirmed reset): when set,
     /// [`ServerState::tmux_from_program`] returns it instead of building a

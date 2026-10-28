@@ -8,7 +8,7 @@
 //! reads it back at any time (after context compaction, say). Design:
 //! `tools/boss/docs/coordinator-session-handoff.md`.
 
-use boss_protocol::{CoordinatorHandoffView, FrontendEvent, FrontendRequest};
+use boss_protocol::{CoordinatorHandoffAuthorizationDelivery, CoordinatorHandoffView, FrontendEvent, FrontendRequest};
 use clap::{Args, Subcommand};
 
 use crate::{CliError, RunContext, connect_for_work, print_entity, unexpected_event};
@@ -83,13 +83,47 @@ async fn run_write(ctx: &RunContext, args: HandoffWriteArgs) -> Result<(), CliEr
 
 async fn run_show(ctx: &RunContext) -> Result<(), CliError> {
     let mut client = connect_for_work(ctx).await?;
-    let handoff: Option<CoordinatorHandoffView> = rpc_call!(
+    let (handoff, authorization_delivery): (
+        Option<CoordinatorHandoffView>,
+        Option<CoordinatorHandoffAuthorizationDelivery>,
+    ) = rpc_call!(
         client,
         FrontendRequest::GetCoordinatorHandoff,
         "handoff show",
-        FrontendEvent::CoordinatorHandoffResult { handoff } => handoff,
+        FrontendEvent::CoordinatorHandoffResult { handoff, authorization_delivery } => (handoff, authorization_delivery),
     )?;
-    print_entity(ctx, &serde_json::json!({ "handoff": handoff }), || match &handoff {
+    print_entity(
+        ctx,
+        &serde_json::json!({ "handoff": handoff, "authorization_delivery": authorization_delivery }),
+        || {
+            print_handoff(&handoff);
+            if let Some(delivery) = &authorization_delivery {
+                println!("---");
+                println!("{}", describe_authorization_delivery(delivery));
+            }
+        },
+    )
+}
+
+/// The credential line a coordinator-ancestry `show` prints: where the
+/// credential now is, or which step failed. The credential itself is never
+/// in the response.
+fn describe_authorization_delivery(delivery: &CoordinatorHandoffAuthorizationDelivery) -> String {
+    if delivery.requested {
+        format!(
+            "Handoff write credential: redelivery requested — {}. Wait for it there; do not retry `boss handoff show` in a loop.",
+            delivery.detail
+        )
+    } else {
+        format!(
+            "Handoff write credential: redelivery FAILED — {}. Report this to the operator; a reset will also be unable to request a fresh handoff until it is fixed.",
+            delivery.detail
+        )
+    }
+}
+
+fn print_handoff(handoff: &Option<CoordinatorHandoffView>) {
+    match handoff {
         None => println!(
             "No coordinator handoff is stored: no coordinator session has ever written one. \
              Write one with `boss handoff write --authorization AUTHORIZATION -` (stdin) or `boss handoff write --authorization AUTHORIZATION <file>`."
@@ -116,13 +150,32 @@ async fn run_show(ctx: &RunContext) -> Result<(), CliError> {
             println!("---");
             println!("{}", handoff.body);
         }
-    })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::HandoffCommand;
     use clap::Parser;
+
+    #[test]
+    fn show_names_the_credential_outcome_without_the_credential() {
+        let requested = boss_protocol::CoordinatorHandoffAuthorizationDelivery::builder()
+            .requested(true)
+            .detail("the main session's inbox accepted the handoff credential")
+            .build();
+        let line = super::describe_authorization_delivery(&requested);
+        assert!(line.contains("redelivery requested"), "{line}");
+        assert!(line.contains("inbox accepted"), "{line}");
+        let failed = boss_protocol::CoordinatorHandoffAuthorizationDelivery::builder()
+            .requested(false)
+            .detail("no Claude inbox registration under coordinator pane process 42")
+            .build();
+        let line = super::describe_authorization_delivery(&failed);
+        assert!(line.contains("FAILED"), "{line}");
+        assert!(line.contains("pane process 42"), "{line}");
+        assert!(line.contains("Report this to the operator"), "{line}");
+    }
 
     #[test]
     fn absent_credential_reaches_engine_for_rejection_and_audit() {

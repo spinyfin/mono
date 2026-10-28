@@ -76,7 +76,7 @@ fn set_view(event: FrontendEvent) -> CoordinatorHandoffView {
 
 fn result_view(event: FrontendEvent) -> Option<CoordinatorHandoffView> {
     match event {
-        FrontendEvent::CoordinatorHandoffResult { handoff } => handoff,
+        FrontendEvent::CoordinatorHandoffResult { handoff, .. } => handoff,
         other => panic!("expected CoordinatorHandoffResult, got {other:?}"),
     }
 }
