@@ -62,6 +62,10 @@ enum BossRevealCapture {
             BossOperatorQuestionCapture.start(path: path)
             return
         }
+        if state == "attachment-viewer" {
+            BossAttachmentViewerCapture.start(path: path)
+            return
+        }
         if state == "attachment-sidebar" {
             BossAttachmentSidebarCapture.start(path: path)
             return
