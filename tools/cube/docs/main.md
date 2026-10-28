@@ -705,6 +705,78 @@ disk stays held. That is deliberate — cube does not adjudicate liveness — an
 the `lease.heartbeat` audit event carries `lease_age_secs` so the population is
 greppable.
 
+### Shared-store upkeep (`cube repo gc`)
+
+The two passes above never touch `repos/<repo>`, but that store has its own
+growth: every workspace of a repo is a secondary jj workspace on it, and
+every operation any of them records — a `jj new` on lease, a worker's
+snapshot, a bookmark set, a fetch — writes one view file listing every
+bookmark in the store. jj never removes operations on its own, so the log
+grows until old operations are abandoned and their files collected.
+
+`cube repo gc <repo>` is the generic jj recipe, run in the store's primary
+checkout and not aware of anything above jj:
+
+1. `jj op abandon ..<cut>`, where the cut is the newest operation that ended
+   before the keep window (`--keep-hours`, default 72). Descendant operations
+   are reparented; views are content-addressed and untouched. The rewrite
+   gives every kept operation a new id, so a jj command that loaded the old
+   head and commits afterwards would leave a second operation head that
+   shares only the root with the new one, and jj would merge the two views
+   against an empty base. The abandon therefore runs only at an instant with
+   no `jj` process on the host (the pass waits up to five minutes for one and
+   otherwise skips the abandon and the collection until the next daily
+   pass), and the pass stops before collecting if the store then holds
+   anything but exactly one operation head. Every `jj` command cube itself
+   starts holds a host-wide shared gate (`locks/jj-maintenance.lock`) for
+   its run, and the pass holds the gate exclusive from before the abandon
+   until the post-abandon head check, so no cube-started command can load the
+   pre-rewrite head (cube commands wait up to two minutes on it). A `jj`
+   command that does not go through cube cannot take the gate; only the
+   process probes and head checks cover those.
+2. `jj util gc`. By default jj deletes only unreferenced files older than
+   two weeks, and jj 0.26 accepts no other threshold than `--expire now`.
+   A command that loaded the store before the abandon still names the old
+   id of the head it started from, and deleting that file would leave its
+   operation with a missing parent. So the pass collects immediately
+   (`--expire now`) only after it has observed an instant with no `jj`
+   process on the host _after_ the abandon: every command that loaded the
+   store before the rewrite has then finished, and any later command loads
+   the rewritten head, whose files the collection keeps. If the host is
+   never quiet for five minutes, the pass falls back to the two-week
+   threshold.
+3. `refs/heads/pr/<n>` git refs whose `pr/<n>` bookmark is gone are deleted;
+   jj's next import drops them from the view.
+
+Each workspace's working copy records the id of the operation it last
+updated at, and the abandon rewrites that operation under a new id. Verified
+on jj 0.26.0 with a second workspace: after its recorded operation was
+abandoned and deleted by `--expire now`, and its `@` was rewritten from the
+first workspace, its next `jj status` ran normally and landed on the
+rewritten `@` without `jj workspace update-stale`.
+
+The periodic pool-GC pass starts this once a day per repo as a detached
+`cube repo gc` child, because the collection deletes one file per abandoned
+operation and view and cannot fit the lease call's twenty-second budget. The
+child comes from the injected command runner (`CommandRunner::cube_executable`
+and `spawn_detached`) and never from `std::env::current_exe()` in the pass
+itself: under `cube_lib_test` that executable is the test binary, and a test
+binary re-run with `repo gc mono` runs every test those words match as a
+name filter, each of which leases and spawns again — the fork bomb that
+took down the dev Mac on 2026-10-23. Test doubles record the request and
+start nothing, and a regression test proves the lease and gc paths create
+no child process of the test binary.
+
+Concurrency: the per-repo stamp (`last_store_gc_at:<repo>`) is written
+before the child starts, so repeated leases cannot pile up collections, and
+the child holds a dedicated `locks/<repo>.store-gc.lock` for its whole run
+(`try_acquire`; a second run is refused). It deliberately does not take the
+per-repo lease lock: a collection runs for minutes and every `cube workspace
+lease` waits on that lock, while jj itself tolerates the workspaces'
+concurrent commands. Each jj call is bounded at thirty minutes. The outcome
+is recorded as a `repo.store_gc` audit event with before/after operation,
+view and byte counts.
+
 ## PR Model
 
 Each change node owns exactly one exported branch and at most one open PR.

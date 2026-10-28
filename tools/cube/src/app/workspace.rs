@@ -249,7 +249,7 @@ pub(super) fn run_workspace(
 
             let leased_at_epoch_s = current_epoch_s()?;
             // Kick a background pool-wide gc pass at most once per 24h.
-            maybe_trigger_pool_gc(&mut store, database_path, leased_at_epoch_s)?;
+            maybe_trigger_pool_gc(runner, &mut store, database_path, leased_at_epoch_s)?;
 
             let _lock = RepoLock::acquire(&repo_lock_path(&repo, database_path)?)?;
             let mut candidates = discover_workspaces(&repo_record)?;
@@ -1880,9 +1880,18 @@ pub(super) fn run_workspace(
             let cleanup_marks = cleanup_marks_by_workspace(&store, repo.as_deref())?;
             let retention = retention_summary(&retention_source, &cleanup_marks, now, ttl_secs);
 
+            let in_scope: Vec<String> = match repo.as_deref() {
+                Some(repo) => vec![repo.to_owned()],
+                None => store.list_repos()?.into_iter().map(|r| r.repo).collect(),
+            };
+            let store_gc = crate::app::store_gc::store_gc_attention(&store, &in_scope);
+
             let mut message = format_workspace_list(&records, &cleanup_marks, now);
             if let Some(block) = format_retention_summary(&retention) {
                 message.push_str(&block);
+            }
+            for attention in &store_gc {
+                message.push_str(&format!("\n{}", attention.summary()));
             }
             RunResult::new(
                 message,
@@ -1890,6 +1899,7 @@ pub(super) fn run_workspace(
                     "workspaces": records,
                     "reconciled": reconciled,
                     "retention": retention,
+                    "store_gc_attention": store_gc,
                 }),
             )
         }

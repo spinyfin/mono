@@ -10,6 +10,66 @@ The `execution_bookmarks` row for the execution records the shared store path, t
 
 Recovery resumes a later execution from `boss-base..<head>` of its predecessor. The integrity check requires a single line of history: every head must descend from the baseline, and when both heads exist one must descend from the other. A pointer that fails the check is never resumed from as-is.
 
+## What each pointer is for, and how long it is needed
+
+Every bookmark in the shared store costs every later operation: jj writes a full view of all bookmarks per operation, in every workspace of the repo, and nothing in jj ever removes an operation. With one execution's three pointers kept forever, the dev Mac's mono store held 13,279 bookmarks (4,458 `boss-base/`, 4,456 `boss-recovery/`, 4,346 `boss/`, 7 `pr/`), its views were 2.7 MB each, and its op store reached 95 GiB over 137k operations. The pointers are only needed while the execution's work might still have to be recovered, so the question is what each one carries and who reads it.
+
+Every consumer, by pointer (paths are repo-relative):
+
+**`boss-base/<exec>`**
+
+- Written by: `create_from` (`tools/boss/engine/recovery/src/execution_bookmark.rs:581`); moved by reconciliation and mechanical-rebase checkpoints through `set_bookmarks` (`tools/boss/engine/recovery/src/execution_bookmark/reconcile.rs:398`, called at `:479`, `:507`, `:603`) and by `restore_pointers` (`tools/boss/engine/recovery/src/execution_bookmark/snapshot.rs:21`).
+- Read by: `resolve_base` (`execution_bookmark.rs:475`; callers `execution_bookmark.rs:496`, `reconcile.rs:430`, `prune.rs:197`), which is the floor of `diff` (`execution_bookmark.rs:700`) and `unpublished_diff` (`execution_bookmark.rs:781`) and of the lineage check; the redispatch unpublished revsets (`tools/boss/engine/recovery/src/execution_bookmark/redispatch.rs:116`, `:127`); the rearm migration's error parsing (`tools/boss/engine/core/src/work/execution_recovery_rearm.rs:25`); pointer snapshots (`snapshot.rs:8`); prune (`prune.rs:186`).
+- What is actually needed: a baseline **commit id** that follows rewrites. The bookmark gives that for free (jj moves bookmarks with rebases) and keeps the commit visible; the record's `base_commit` column plus jj's evolution log give the same answer, and `resolve_base` and `heal_baseline` (`execution_bookmark.rs:724`) fall back to them whenever the bookmark is gone. Needed only until the work is proven published.
+
+**`boss-recovery/<exec>`**
+
+- Written by: `create_from` on `@` (`execution_bookmark.rs:581`); the worker advances it, as the dispatch prompt instructs (`tools/boss/engine/core/src/runner/prompt.rs:1578`, `:1761`).
+- Read by: `resolve_heads` (`execution_bookmark.rs:441`), `restore` (`:745`), `restore_for_retry` (`:751`), `release_heads` (`:684`), `diff` (`:700`); the coordinator's blocked-workspace recovery (`tools/boss/engine/core/src/coordinator/blocked_workspace.rs:45`, diff at `:83`); the abandoned-bookmark sweep (`tools/boss/engine/core/src/abandoned_execution_bookmarks.rs:17`); prune (`prune.rs:188`).
+- What is actually needed: the tip of the worker's **local** work, including work that was never pushed. This is the one pointer nothing else can reconstruct. Needed until the work is proven published, then never.
+
+**`boss/<exec>`**
+
+- Written by: `create_from` on `@` (`execution_bookmark.rs:581`); the worker advances it and pushes it (`tools/boss/engine/core/src/runner/prompt.rs:465`, `cube pr create --branch boss/<exec>`); cube may move it to the remote head on a bound-PR checkout.
+- Read by: `resolve_heads` (`execution_bookmark.rs:441`, the second head); PR binding by head ref (`tools/boss/engine/core/src/pr_binding_repair_sweep.rs:285`, `:288`; `tools/boss/engine/core/src/design_detector.rs:40`); the worker branch prefix (`tools/boss/engine/core/src/completion.rs:453`, `:497`); cube's bookmark sweep, which forgets it once it is reachable from `main` (`tools/cube/src/app/gc.rs:112`, `:157`); its remote-tracking twin `boss/<exec>@origin` is a publication voucher for prune (`prune.rs:58`, `tools/boss/engine/core/src/execution_bookmark_prune.rs:121`).
+- What is actually needed: a **git branch name** to push, which jj can only push from a local bookmark, plus "what was pushed last". The branch must exist while the worker may push again; afterwards GitHub (`headRefName`), the merge poller's `tasks.pr_head_sha`, and the executions' `pr_head_before`/`pr_head_after` columns all record the pushed head without the bookmark.
+
+**`pr/<n>`**
+
+- Written by: cube's bound-PR checkout (`cube workspace goto`) when positioning on a PR (`blocked_workspace.rs:182`, `:284`).
+- Read by: reconciliation rung 1, the PR head (`reconcile.rs:469`), and the positioned workspace itself; forgotten by cube's sweep once no workspace is positioned on it.
+- What is actually needed: the PR head for the duration of one positioning. Already bounded (7 local bookmarks on the dev Mac); what lingered were 656 `refs/heads/pr/<n>` git refs that an older jj left behind after the bookmark was forgotten, which the store upkeep below removes.
+
+**The minimal set.** During an execution's life the three pointers encode three different things, and two of them legitimately diverge: the worker pushes `boss/` (which cube may then move to the remote head) while `boss-recovery/` keeps tracking local unpushed work, and the baseline is the one commit both must descend from. What is not needed is any of them **after** the PR that carried the work is merged or closed, and that is where all of the growth was: the count was 3 × executions ever run, and should be 3 × live executions plus the unproven records kept for a human. The lifecycle below makes it so, which removes the growth term; coalescing changes only the constant.
+
+Two coalescings are sound but are not implemented here, because each is its own reviewable change across the recovery and engine crates:
+
+- **`boss-base/` as a recorded commit, not a bookmark.** `resolve_base` already treats the bookmark as a convenience over `base_commit` and jj's evolution log, and `heal_baseline` already rebuilds it. Stopping `create_from` from creating it saves one of the two creation operations per execution and a third of the live bookmarks. The reconciliation note texts and the rearm migration parse the bookmark's name out of error strings, and the tests across both crates assume it exists, so this is a deliberate change, not a deletion.
+- **`boss/` owned by the worker's push, not by dispatch.** The engine creates `boss/<exec>` at dispatch only so the worker finds it; the worker's own `jj bookmark set boss/<exec> -r @` before `cube pr create` would create it just the same, cube's sweep already forgets it once merged, and `Heads.publication` is already optional in recovery. With that, the engine owns exactly one bookmark per execution (`boss-recovery/`), `boss/` exists only between first push and merge, and `pr/<n>` only during a positioning.
+
+## Lifecycle: how the pointers are retired
+
+Creation is two operations at dispatch (`boss-base/` on the durable baseline, then both heads on `@`). From then on no engine path moves a pointer that already points where it is being set: `set_bookmarks` and `restore_pointers` skip unchanged bookmarks, and an empty `bookmark forget` runs nothing, because an operation that changes no bookmark still writes a full view.
+
+**The prune sweep** (`engine/core/src/execution_bookmark_prune.rs`) runs in the abandoned-branch sweep loop, every five minutes, over at most 100 live local records of terminal executions per pass (`list_prune_candidates`). A record whose chain root is still open is stamped `pr_open` and looked at again in six hours. For the rest it asks the recovery crate to prove the work published (`recovery/src/execution_bookmark/prune.rs`), with these vouchers in order:
+
+1. `unpublished_diff` empty: every non-empty preserved change is already reachable from a remote bookmark.
+2. The PR head the merge poller last observed (`tasks.pr_head_sha`), which for a merged PR is the head that merged.
+3. The PR heads the chain's executions recorded around their own pushes (`pr_head_before` / `pr_head_after`), newest first.
+4. The pushed branch's remote-tracking bookmark `boss/<exec>@origin`, then the trunk's.
+5. Only when all of those fail and the PR has a URL: one `gh pr view` for `headRefOid` (which survives the branch's deletion), at most twenty per pass.
+
+A voucher proves the work the same way reconciliation does ([`containment`]): each head is the voucher or one of its ancestors, or every non-empty preserved change has a content-equivalent variant (same change id, empty bookkeeping-filtered interdiff) in the voucher's history. Nothing is ever inferred from a name, and a voucher the store cannot resolve is skipped, never trusted.
+
+Outcomes, recorded in `execution_bookmarks.prune_outcome` / `prune_checked_at` (schema 60):
+
+- `published`: all three bookmarks are forgotten in one operation and the record is retired with the voucher in `retired_reason`. The commits stay in the store; only the references go.
+- `already_gone`: both heads were already gone; a surviving baseline is forgotten and the record retired.
+- `unproven`: every head no voucher carries is **kept**, whichever head that is (the recovery and publication heads can diverge, so a voucher that carries one says nothing about the other; when no voucher resolved, both stay). The baseline is forgotten because the record's `base_commit` rebuilds it, and so is any head a voucher did carry. An `execution_bookmark_prune_unproven` attention item names the kept heads, the changes nothing vouches for and the exact `jj bookmark forget` that retires them once someone has looked; the record is re-examined daily. Because only proven heads are ever forgotten, the second pass after the GitHub head lookup sees every head that still needs proof.
+- `error`: logged, reported through the recovery-failure signal, re-examined daily. One unreadable store never stops the rest of the batch.
+
+**Store upkeep** is cube's, not the engine's: `cube repo gc <repo>` abandons operations older than three days and collects what nothing references, but only at an instant with no `jj` process on the host (a busy store skips the pass until the next day), run once a day per repo by cube's periodic pool-GC pass (see `tools/cube/docs/main.md`, "Shared-store upkeep"). It is generic jj maintenance and knows nothing about these namespaces.
+
 ## How the pointers get damaged
 
 | Failure                                 | Typed kind        | How it arises                                                                                                                                                                                                                                                                                                                                     |
