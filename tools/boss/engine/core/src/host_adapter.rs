@@ -594,10 +594,7 @@ impl HostAdapter for LocalHostAdapter {
             record.host_id == self.host_id(),
             "recovery store belongs to another host"
         );
-        let remotes = Jj::run(&LocalJj, workspace, &["git", "remote", "list"]).await?;
-        let remote = git_utils::repo_slug::parse_github_remote(&remotes)
-            .map(|(name, _)| name)
-            .unwrap_or_else(|| "origin".into());
+        let remote = boss_host_execution::workspace::recovery_remote(&LocalJj, workspace).await?;
         pr_anchor::restore_rebased(&LocalJj, record, workspace, pr_bookmark, base_branch, &remote).await
     }
     async fn checkpoint_execution_baseline(&self, record: &ExecutionBookmark) -> Result<String> {
@@ -621,8 +618,7 @@ impl HostAdapter for LocalHostAdapter {
         if !recovery_pr_is_open(self, repo_id, pr).await? {
             return Ok(false);
         }
-        boss_host_execution::workspace::preserve_recovery_pointers(record, self.goto_workspace(workspace, pr))
-            .await?;
+        boss_host_execution::workspace::preserve_recovery_pointers(record, self.goto_workspace(workspace, pr)).await?;
         pr_anchor::ensure(&LocalJj, record, pr).await?;
         Ok(true)
     }
@@ -1186,10 +1182,7 @@ impl HostAdapter for SshHostAdapter {
             record.host_id == self.host_id(),
             "recovery store belongs to another host"
         );
-        let remotes = Jj::run(self, workspace, &["git", "remote", "list"]).await?;
-        let remote = git_utils::repo_slug::parse_github_remote(&remotes)
-            .map(|(name, _)| name)
-            .unwrap_or_else(|| "origin".into());
+        let remote = boss_host_execution::workspace::recovery_remote(self, workspace).await?;
         pr_anchor::restore_rebased(self, record, workspace, pr_bookmark, base_branch, &remote).await
     }
     async fn checkpoint_execution_baseline(&self, record: &ExecutionBookmark) -> Result<String> {

@@ -1902,11 +1902,16 @@ pub mod workspace {
         pr_bookmark: Option<&str>,
         base_branch: &str,
     ) -> Result<recovery::RestoreReport> {
-        let remotes = jj.run(workspace, &["git", "remote", "list"]).await?;
-        let remote = git_utils::repo_slug::parse_github_remote(&remotes)
-            .map(|(name, _)| name)
-            .unwrap_or_else(|| "origin".into());
+        let remote = recovery_remote(jj, workspace).await?;
         recovery::restore_rebased(jj, record, workspace, pr_bookmark, base_branch, &remote).await
+    }
+
+    /// Discover the recovery remote for both host execution and hub PR repair.
+    pub async fn recovery_remote(jj: &dyn Jj, workspace: &Path) -> Result<String> {
+        let remotes = jj.run(workspace, &["git", "remote", "list"]).await?;
+        Ok(git_utils::repo_slug::parse_github_remote(&remotes)
+            .map(|(name, _)| name)
+            .unwrap_or_else(|| "origin".into()))
     }
 }
 
