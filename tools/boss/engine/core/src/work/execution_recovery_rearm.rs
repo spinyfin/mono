@@ -12,6 +12,8 @@
 //! descends from its baseline look unrelated). Schema 43 re-arms the three
 //! failures dispatch now reconciles against engine-recorded pointers: a
 //! stranded baseline, diverged heads, and a missing baseline bookmark.
+//! Schema 59 re-arms missing or conflicted disposable PR aliases, which
+//! dispatch now reconstructs from the authoritative GitHub head.
 
 use boss_engine_recovery::execution_bookmark::NOT_DESCENDED_MESSAGE;
 
@@ -27,10 +29,9 @@ pub(super) fn is_false_not_descended_blocker(detail: &str) -> bool {
 }
 
 /// Items whose recorded blocker `recognizes` as repairable are moved back to
-/// `todo` with autostart on. Any other recovery failure (missing or
-/// conflicted heads, a foreign host, a precise not-contained report) is a
-/// real pointer problem that re-running cannot repair, so it is left
-/// blocked. Rearmed items still run the integrity check, so a pointer that
+/// `todo` with autostart on. Failures outside this migration's recognizer
+/// stay blocked: this step makes no claim that dispatch can repair them.
+/// Rearmed items still run the integrity check, so a pointer that
 /// truly cannot be vouched for blocks again, loudly, with the new precise
 /// text that this recognizer does not match.
 pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool) -> Result<usize> {

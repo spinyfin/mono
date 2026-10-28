@@ -187,6 +187,21 @@ fn parse_conflicted_bookmarks_from_status(status: &str) -> Vec<String> {
 /// lease at most this much rather than the full retry ladder.
 const LEASE_PR_REPAIR_FETCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Bookmark namespaces that are shared, repo-global pointers owned by the PR
+/// flow or the Boss engine rather than by the workspace being repaired:
+/// `pr/<n>` aliases and the per-execution publication, recovery and base
+/// bookmarks. Bookmarks live in the shared jj store, so forgetting one here
+/// would also drop it for every other lease that depends on it. (`pr/<n>`
+/// aliases never reach the forget path: [`repair_conflicted_bookmarks`]
+/// repairs them in place instead.)
+const SHARED_POINTER_BOOKMARK_PREFIXES: [&str; 4] = ["pr/", "boss/", "boss-recovery/", "boss-base/"];
+
+fn is_shared_pointer_bookmark(bookmark: &str) -> bool {
+    SHARED_POINTER_BOOKMARK_PREFIXES
+        .iter()
+        .any(|prefix| bookmark.starts_with(prefix))
+}
+
 /// Result of [`repair_conflicted_bookmarks`]: the bookmarks it could not
 /// repair and deliberately left conflicted and untouched.
 #[derive(Debug, Default)]
@@ -195,11 +210,12 @@ pub(super) struct BookmarkRepair {
 }
 
 /// Repair each conflicted bookmark so the workspace no longer reports
-/// bookmark conflicts. Called at lease time when the health check finds
+/// bookmark conflicts. Shared pointer bookmarks (see
+/// [`is_shared_pointer_bookmark`]) are left alone and audited as skipped. Called at lease time when the health check finds
 /// `ConflictedBookmarks` and the workspace is otherwise clean (working
 /// copy empty).
 ///
-/// Non-PR bookmarks are forgotten; a failure to forget one fails the lease.
+/// Non-PR bookmarks are forgotten (except shared pointers, which are skipped); a failure to forget one fails the lease.
 ///
 /// `pr/<n>` bookmarks are repaired **best-effort, one at a time**: the PR's
 /// authoritative head is its `head.sha`, used directly when the store has it
@@ -224,6 +240,15 @@ pub(super) fn repair_conflicted_bookmarks(
     let (pr_bookmarks, others): (Vec<String>, Vec<String>) =
         bookmarks.iter().cloned().partition(|b| pr_bookmark::is_pr_bookmark(b));
     for bookmark in &others {
+        if is_shared_pointer_bookmark(bookmark) {
+            audit!(
+                database_path,
+                "workspace.bookmark_forget_skipped",
+                workspace_path = workspace_path.display().to_string(),
+                bookmark = bookmark,
+            );
+            continue;
+        }
         audit!(
             database_path,
             "workspace.bookmark_forgotten",
@@ -504,4 +529,19 @@ pub(super) fn probe_workspace_reuse(
         deadline,
     )?;
     read_head_status_within(runner, database_path, workspace_path, main_branch, deadline)
+}
+
+#[cfg(test)]
+mod shared_pointer_tests {
+    use super::is_shared_pointer_bookmark;
+
+    #[test]
+    fn only_shared_pointer_namespaces_are_protected() {
+        for shared in ["pr/42", "boss/exec_1", "boss-recovery/exec_1", "boss-base/exec_1"] {
+            assert!(is_shared_pointer_bookmark(shared), "{shared}");
+        }
+        for owned in ["fix-burst", "feature/pr/42", "boss-ish"] {
+            assert!(!is_shared_pointer_bookmark(owned), "{owned}");
+        }
+    }
 }

@@ -1548,29 +1548,8 @@ impl ExecutionCoordinator {
                 if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
                     tracing::error!(?release_err, "failed to release lease after bookmark recovery failure");
                 }
-                // Only a damaged or missing pointer blocks the item: retrying
-                // cannot repair it. Fetch, goto and SSH failures are transient
-                // and keep the ordinary pre-start retry backoff.
-                let pointer_damaged = boss_engine_recovery::execution_bookmark::is_pointer_integrity_error(&err);
-                if pointer_damaged
-                    && matches!(
-                        execution.kind,
-                        ExecutionKind::ChoreImplementation
-                            | ExecutionKind::TaskImplementation
-                            | ExecutionKind::RevisionImplementation
-                    )
-                {
-                    self.work_db.update_work_item_as_actor(
-                        &execution.work_item_id,
-                        boss_protocol::WorkItemPatch::builder()
-                            .status("blocked")
-                            .blocked_reason("execution_recovery_failed")
-                            .blocked_detail(format!("{err:#}"))
-                            .autostart(false)
-                            .build(),
-                        "engine",
-                    )?;
-                }
+                let pointer_damaged =
+                    crate::execution_bookmark_recovery::block_unrecoverable(&self.work_db, execution, &err)?;
                 let attention = if pointer_damaged {
                     (
                         crate::execution_bookmark_recovery::RECOVERY_FAILED,

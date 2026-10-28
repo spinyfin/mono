@@ -82,7 +82,7 @@ pub async fn restore_rebased(
     let pointer = head_bookmark(jj, record).await?;
     let head = revision(&pointer);
     let pr_head = match pr_bookmark {
-        Some(bookmark) => Some(one_commit(jj, workspace, &revision(bookmark)).await?),
+        Some(bookmark) => Some(super::reconcile::resolve_pr_head(jj, record, bookmark).await?),
         None => None,
     };
     let sources = match &pr_head {

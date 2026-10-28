@@ -579,6 +579,7 @@ mod review_batches_tests;
 mod review_guide_state_tests;
 mod review_verdict_apply_tests;
 mod review_verdicts_tests;
+mod revision_recovery;
 mod revision_sequencing;
 mod semantic_progress_tests;
 mod short_id_alloc_tests;
