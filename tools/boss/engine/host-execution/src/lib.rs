@@ -277,6 +277,27 @@ pub mod cube {
         })
     }
 
+    /// Point the shared `pr/<pr>` alias of the store at `store` at the PR's
+    /// current GitHub head through Cube's guarded writer. Cube bounds the command
+    /// itself; `budget` is the transport's allowance for it (see
+    /// [`crate::cube_op_budget::REPAIR_PR_BOOKMARK`]).
+    pub async fn repair_pr_bookmark<T: CubeJsonTransport + ?Sized>(
+        transport: &T,
+        store: &Path,
+        pr: u64,
+        budget: Duration,
+    ) -> Result<()> {
+        let store = store.display().to_string();
+        let pr = pr.to_string();
+        transport
+            .run_cube_json_within(
+                &["--json", "workspace", "repair-pr-bookmark", "--workspace", &store, "--pr", &pr],
+                budget,
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Lease a cube workspace.
     ///
     /// When `allow_dirty` is set this is a *recovery* lease: cube reclaims the
@@ -623,6 +644,19 @@ pub mod cube {
                 *self.budget.lock().unwrap() = Some(budget);
                 self.run_cube_json(args).await
             }
+        }
+
+        #[tokio::test]
+        async fn repair_pr_bookmark_builds_the_argv_and_requests_its_budget() {
+            let t = RecordingTransport::new(json!({ "pr": 7, "bookmark": "pr/7" }));
+            repair_pr_bookmark(&t, Path::new("/store"), 7, crate::cube_op_budget::REPAIR_PR_BOOKMARK)
+                .await
+                .unwrap();
+            assert_eq!(
+                t.argv(),
+                ["--json", "workspace", "repair-pr-bookmark", "--workspace", "/store", "--pr", "7"]
+            );
+            assert_eq!(t.budget(), Some(crate::cube_op_budget::REPAIR_PR_BOOKMARK));
         }
 
         // --- Per-operation budgets -------------------------------------------
@@ -1011,6 +1045,13 @@ pub mod cube_op_budget {
     /// given machine performs the initial `jj git clone`, and the same
     /// wedged-subprocess hang class as [`LEASE`] applies, so it is bounded too.
     pub const REPO_ENSURE: Duration = Duration::from_secs(60);
+
+    /// Transport budget for `cube workspace repair-pr-bookmark`. Cube bounds the
+    /// command itself (a 30s GitHub/fetch phase plus a 30s wait for the
+    /// PR-bookmark lock), so this only needs to exceed that and the local jj
+    /// work; it is deliberately well under the engine's outer backstop so the
+    /// Cube side terminates before the engine ever gives up on it.
+    pub const REPAIR_PR_BOOKMARK: Duration = Duration::from_secs(120);
 
     /// Positioning may fetch a large repository; stay within the executor's 300s bound.
     pub const GOTO: Duration = Duration::from_secs(290);

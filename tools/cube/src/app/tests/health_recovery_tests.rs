@@ -784,7 +784,7 @@ fn conflicted_shared_pointers_are_skipped_not_forgotten() {
     )
     .expect("skipping shared pointers cannot fail the lease");
 
-    assert!(repair.unrepaired.is_empty());
+    assert!(repair.failures.is_empty());
     runner.assert_exhausted();
     let events = audit_events(&tempdir);
     let skipped: Vec<_> = events

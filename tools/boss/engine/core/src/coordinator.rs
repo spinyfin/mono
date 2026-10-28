@@ -949,20 +949,7 @@ impl CubeClient for CommandCubeClient {
     }
 
     async fn repair_pr_bookmark(&self, store: &Path, pr: u64) -> Result<()> {
-        let store_arg = store.display().to_string();
-        let pr_str = pr.to_string();
-        let _ = self
-            .run_json(&[
-                "--json",
-                "workspace",
-                "repair-pr-bookmark",
-                "--workspace",
-                &store_arg,
-                "--pr",
-                &pr_str,
-            ])
-            .await?;
-        Ok(())
+        crate::cube_commands::repair_pr_bookmark(self, store, pr, crate::cube_op_budget::REPAIR_PR_BOOKMARK).await
     }
 
     async fn rebase_workspace(&self, workspace_path: &Path, pr: u64) -> Result<RebaseOutcome> {

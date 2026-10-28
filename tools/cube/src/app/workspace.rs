@@ -1218,7 +1218,7 @@ pub(super) fn run_workspace(
                 // for all of them at once, let the cache say so. A bookmark
                 // that was left conflicted is still conflicted everywhere, so
                 // the cache stays accurate and is not cleared.
-                let cache_result = if repair.unrepaired.is_empty() {
+                let cache_result = if repair.failures.is_empty() {
                     store.clear_cached_conflicted_health(&workspace.repo)
                 } else {
                     Ok(0)

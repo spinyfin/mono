@@ -587,9 +587,18 @@ pub(super) fn resolve_pr_head(
     info: &Value,
     deadline: Option<Instant>,
 ) -> Result<PrHead> {
-    let sha = gh_pr::head_sha(info)
-        .ok_or_else(|| CubeError::InvalidArgument(format!("PR {number} {NO_PR_HEAD_PHRASE}")))?
-        .to_string();
+    let sha =
+        gh_pr::head_sha(info).ok_or_else(|| CubeError::InvalidArgument(format!("PR {number} {NO_PR_HEAD_PHRASE}")))?;
+    // The value is interpolated into a revset, so only a full commit id may
+    // reach it; a short or otherwise odd string could resolve to something
+    // other than the PR's head. Shares the no-head phrase so callers classify
+    // it as the same deterministic refusal.
+    if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(CubeError::InvalidArgument(format!(
+            "PR {number} {NO_PR_HEAD_PHRASE}: {sha:?} is not a full 40-character commit id"
+        )));
+    }
+    let sha = sha.to_string();
     let head_repo = head_repo_full_name(info);
     let same_repo = head_repo.is_some_and(|name| name.eq_ignore_ascii_case(owner_repo));
     let head = PrHead {

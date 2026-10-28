@@ -130,7 +130,7 @@ async fn repaired(conflicted: bool, restore: bool) {
     let cube = FakeCube::new(&store, &head);
     if restore {
         let preserved = one(&store.repo.repo, &record.head());
-        let report = restore_with(
+        let report = restore_rebased(
             &store,
             &cube,
             &record,
@@ -138,7 +138,6 @@ async fn repaired(conflicted: bool, restore: bool) {
             Some("pr/7"),
             "main",
             "origin",
-            REPAIR_TIMEOUT,
         )
         .await
         .unwrap();
@@ -147,7 +146,7 @@ async fn repaired(conflicted: bool, restore: bool) {
         assert_eq!(one(&store.repo.repo, &record.head()), preserved);
         assert_eq!(one(&store.repo.repo, &record.publication()), preserved);
     } else {
-        let result = reconcile_with(&store, &cube, &record, Some("pr/7"), "main", REPAIR_TIMEOUT)
+        let result = reconcile(&store, &cube, &record, Some("pr/7"), "main")
             .await
             .unwrap()
             .unwrap();
@@ -229,13 +228,12 @@ impl PrAliasRepair for FailingCube {
 async fn lookup_failures_remain_retryable_but_cube_refusals_block() {
     let dir = tempfile::tempdir().unwrap();
     let (store, record, _) = scene(dir.path(), false, false).await;
-    let transient = reconcile_with(
+    let transient = reconcile(
         &store,
         &FailingCube("Cube command failed: HTTP 503 network unavailable"),
         &record,
         Some("pr/7"),
         "main",
-        REPAIR_TIMEOUT,
     )
     .await
     .unwrap_err();
@@ -246,26 +244,28 @@ async fn lookup_failures_remain_retryable_but_cube_refusals_block() {
     for refusal in [
         "Cube command failed: cannot repair `pr/7`: cube cannot move `pr/7`: cube will not pick a side with unique content",
         "Cube command failed: cannot repair `pr/7`: PR 7 returned no head.sha",
+        "Cube command failed: cannot repair `pr/7`: PR 7 returned no head.sha: \"\" is not a full 40-character commit id",
+        // The shape `cube --json` writes to stderr, as the local and SSH
+        // transports surface it.
+        r#"Cube command failed: {"error":"cannot repair `pr/7`: PR 7 returned no head.sha: \"abc123\" is not a full 40-character commit id"}"#,
     ] {
-        let blocked = reconcile_with(
-            &store,
-            &FailingCube(refusal),
-            &record,
-            Some("pr/7"),
-            "main",
-            REPAIR_TIMEOUT,
-        )
-        .await
-        .unwrap_err();
+        let blocked = reconcile(&store, &FailingCube(refusal), &record, Some("pr/7"), "main")
+            .await
+            .unwrap_err();
         assert!(execution_bookmark::is_pointer_integrity_error(&blocked), "{blocked:#}");
     }
 }
 
-struct PendingCube;
+/// Moves the execution's publication pointer (as Cube's fetch can) and then
+/// hangs, so the timeout path has something real to restore.
+struct MovesPointerThenHangs<'a>(&'a Store, String);
 
 #[async_trait]
-impl PrAliasRepair for PendingCube {
-    async fn repair(&self, _: &Path, _: u64) -> Result<()> {
+impl PrAliasRepair for MovesPointerThenHangs<'_> {
+    async fn repair(&self, store: &Path, _: u64) -> Result<()> {
+        self.0
+            .run(store, &["bookmark", "set", &self.1, "-r", "main", "--allow-backwards"])
+            .await?;
         std::future::pending().await
     }
 }
@@ -275,12 +275,20 @@ async fn repair_timeout_keeps_prestart_retry_classification_and_restores_pointer
     let dir = tempfile::tempdir().unwrap();
     let (store, record, _) = scene(dir.path(), false, false).await;
     let saved = one(&store.repo.repo, &record.head());
-    let err = repair_with(&store, &PendingCube, &record, 7, Duration::from_millis(50))
+    let published = one(&store.repo.repo, &record.publication());
+    assert_ne!(
+        one(&store.repo.repo, "main"),
+        saved,
+        "the stand-in must really move the pointer"
+    );
+    let stand_in = MovesPointerThenHangs(&store, record.publication().to_string());
+    let err = repair_with(&store, &stand_in, &record, 7, Duration::from_millis(50))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("timed out"));
     assert!(!execution_bookmark::is_pointer_integrity_error(&err));
     assert_eq!(one(&store.repo.repo, &record.head()), saved);
+    assert_eq!(one(&store.repo.repo, &record.publication()), published);
 }
 
 #[tokio::test]
@@ -289,9 +297,9 @@ async fn ensure_repairs_missing_and_conflicted_alias_once() {
         let dir = tempfile::tempdir().unwrap();
         let (store, record, sha) = scene(dir.path(), conflicted, false).await;
         let lookup = FakeCube::new(&store, &sha);
-        ensure_with(&store, &lookup, &record, 7, REPAIR_TIMEOUT).await.unwrap();
+        ensure(&store, &lookup, &record, 7).await.unwrap();
         assert_eq!(one(&store.repo.repo, "pr/7"), lookup.sha);
-        ensure_with(&store, &lookup, &record, 7, REPAIR_TIMEOUT).await.unwrap();
+        ensure(&store, &lookup, &record, 7).await.unwrap();
         assert_eq!(lookup.calls.load(Ordering::SeqCst), 1);
     }
 }
@@ -303,7 +311,7 @@ async fn lost_again_after_repair_is_loud_and_not_a_legacy_blocker() {
         let (store, record, sha) = scene(dir.path(), conflicted, false).await;
         store.damage_after_repair.store(true, Ordering::SeqCst);
         let lookup = FakeCube::new(&store, &sha);
-        let err = reconcile_with(&store, &lookup, &record, Some("pr/7"), "main", REPAIR_TIMEOUT)
+        let err = reconcile(&store, &lookup, &record, Some("pr/7"), "main")
             .await
             .unwrap_err();
         assert!(execution_bookmark::is_pointer_integrity_error(&err));
@@ -320,9 +328,7 @@ async fn transient_fetch_failure_retries_repair_and_preserves_pointers() {
     let saved = one(&store.repo.repo, &record.head());
     let lookup = FakeCube::new(&store, &sha);
     store.fail_fetch.store(true, Ordering::SeqCst);
-    let err = ensure_with(&store, &lookup, &record, 7, REPAIR_TIMEOUT)
-        .await
-        .unwrap_err();
+    let err = ensure(&store, &lookup, &record, 7).await.unwrap_err();
     assert!(!execution_bookmark::is_pointer_integrity_error(&err));
     assert!(format!("{err:#}").contains("SSH connection reset"));
     use crate::work::{CreateExecutionInput, ExecutionKind, WorkDb};
@@ -365,7 +371,7 @@ async fn transient_fetch_failure_retries_repair_and_preserves_pointers() {
     assert_eq!(alerts(&db), 1);
     assert_eq!(one(&store.repo.repo, &record.head()), saved);
     store.fail_fetch.store(false, Ordering::SeqCst);
-    ensure_with(&store, &lookup, &record, 7, REPAIR_TIMEOUT).await.unwrap();
+    ensure(&store, &lookup, &record, 7).await.unwrap();
     assert_eq!(lookup.calls.load(Ordering::SeqCst), 2);
     assert_eq!(one(&store.repo.repo, "pr/7"), lookup.sha);
 }

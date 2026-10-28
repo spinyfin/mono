@@ -463,7 +463,7 @@ fn lease_repairs_obsolete_conflict() {
         &f.runner,
         format!(r#"{{"state":"open","head":{{"ref":"feat","sha":"{head}"}}}}"#),
     );
-    assert!(repair(&f, &runner).unrepaired.is_empty());
+    assert!(repair(&f, &runner).failures.is_empty());
     assert_eq!(f.pr_commits(1), vec![head.clone()]);
     assert_eq!(f.git_ref(1), Some(head));
 }
@@ -477,7 +477,7 @@ fn lease_succeeds_and_leaves_a_conflict_with_unique_content_untouched() {
         format!(r#"{{"state":"open","head":{{"ref":"feat","sha":"{head}"}}}}"#),
     );
     let repair = repair(&f, &runner);
-    assert_eq!(repair.unrepaired, ["pr/1"]);
+    assert_eq!(repair.unrepaired(), ["pr/1"]);
     assert_eq!(f.pr_commits(1).len(), 2, "still conflicted, no side picked");
     assert_eq!(f.git_ref(1), Some(other));
 }
@@ -556,6 +556,26 @@ fn repair_command_reports_a_response_without_a_head_sha() {
 }
 
 #[test]
+fn repair_command_rejects_an_empty_or_malformed_head_sha() {
+    let f = Fixture::new();
+    let _ = conflicted_pr_bookmark(&f, false);
+    for sha in [
+        "",
+        "abc123",
+        "main",
+        "z".repeat(40).as_str(),
+        &format!("{}0", "a".repeat(40)),
+    ] {
+        let runner = LeaseRunner::with_pr_json(&f.runner, head_json(sha));
+        let err = repair_command(&f, &runner).expect_err("malformed head.sha");
+        assert!(
+            err.to_string().contains(git_utils::pr_bookmark::NO_PR_HEAD_PHRASE),
+            "{sha:?}: {err}"
+        );
+    }
+}
+
+#[test]
 fn lease_repairs_from_head_sha_when_the_source_branch_is_gone() {
     let f = Fixture::new();
     let (head, _) = conflicted_pr_bookmark(&f, false);
@@ -563,7 +583,7 @@ fn lease_repairs_from_head_sha_when_the_source_branch_is_gone() {
         &f.runner,
         format!(r#"{{"state":"closed","merged":true,"head":{{"ref":"deleted-branch","sha":"{head}"}}}}"#),
     );
-    assert!(repair(&f, &runner).unrepaired.is_empty());
+    assert!(repair(&f, &runner).failures.is_empty());
     assert_eq!(f.pr_commits(1), vec![head]);
 }
 
@@ -577,7 +597,7 @@ fn lease_repairs_a_fork_headed_pr_from_head_sha() {
         &f.runner,
         format!(r#"{{"state":"open","head":{{"ref":"main","sha":"{head}","repo":{{"full_name":"fork/repo"}}}}}}"#),
     );
-    assert!(repair(&f, &runner).unrepaired.is_empty());
+    assert!(repair(&f, &runner).failures.is_empty());
     assert_eq!(f.pr_commits(1), vec![head]);
 }
 
@@ -592,7 +612,7 @@ fn lease_leaves_a_conflict_untouched_when_the_head_is_not_in_the_store() {
         &f.runner,
         LeaseRunner::fork_json("0123456789abcdef0123456789abcdef01234567", "feat", &missing),
     );
-    assert_eq!(repair(&f, &runner).unrepaired, ["pr/1"]);
+    assert_eq!(repair(&f, &runner).unrepaired(), ["pr/1"]);
     assert_eq!(f.pr_commits(1).len(), 2);
     assert!(f.pr_commits(1).contains(&other));
     assert!(
@@ -648,7 +668,7 @@ fn lease_fetches_a_fork_head_missing_from_the_store_and_repairs_to_it() {
     let (forge, sha) = fork_with_new_head(&f);
     let runner = LeaseRunner::with_pr_json(&f.runner, LeaseRunner::fork_json(&sha, "feat", &forge));
 
-    assert!(repair(&f, &runner).unrepaired.is_empty());
+    assert!(repair(&f, &runner).failures.is_empty());
 
     assert_eq!(f.pr_commits(1), vec![sha.clone()]);
     assert_eq!(f.git_ref(1), Some(sha));
@@ -660,7 +680,7 @@ fn lease_leaves_a_conflict_untouched_when_github_cannot_be_reached() {
     let f = Fixture::new();
     conflicted_pr_bookmark(&f, false);
     let runner = LeaseRunner::with_pr_json(&f.runner, "not json".to_string());
-    assert_eq!(repair(&f, &runner).unrepaired, ["pr/1"]);
+    assert_eq!(repair(&f, &runner).unrepaired(), ["pr/1"]);
     assert_eq!(f.pr_commits(1).len(), 2);
 }
 

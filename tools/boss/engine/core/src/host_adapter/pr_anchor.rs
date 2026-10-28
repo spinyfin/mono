@@ -28,18 +28,6 @@ fn classify_repair_error(err: anyhow::Error) -> anyhow::Error {
     }
 }
 
-fn repair_args<'a>(store: &'a str, pr: &'a str) -> [&'a str; 7] {
-    [
-        "--json",
-        "workspace",
-        "repair-pr-bookmark",
-        "--workspace",
-        store,
-        "--pr",
-        pr,
-    ]
-}
-
 #[async_trait]
 impl PrAliasRepair for LocalHostAdapter {
     async fn repair(&self, store: &Path, pr: u64) -> Result<()> {
@@ -53,11 +41,8 @@ impl PrAliasRepair for LocalHostAdapter {
 #[async_trait]
 impl PrAliasRepair for SshHostAdapter {
     async fn repair(&self, store: &Path, pr: u64) -> Result<()> {
-        let store = store.display().to_string();
-        let pr = pr.to_string();
-        self.run_cube_json_within(&repair_args(&store, &pr), REPAIR_TIMEOUT)
+        crate::cube_commands::repair_pr_bookmark(self, store, pr, crate::cube_op_budget::REPAIR_PR_BOOKMARK)
             .await
-            .map(|_| ())
             .map_err(classify_repair_error)
     }
 }
@@ -69,17 +54,6 @@ pub(super) async fn reconcile(
     pr_bookmark: Option<&str>,
     trunk: &str,
 ) -> Result<Option<execution_bookmark::Reconciliation>> {
-    reconcile_with(jj, repair, record, pr_bookmark, trunk, REPAIR_TIMEOUT).await
-}
-
-async fn reconcile_with(
-    jj: &dyn Jj,
-    repair: &dyn PrAliasRepair,
-    record: &ExecutionBookmark,
-    pr_bookmark: Option<&str>,
-    trunk: &str,
-    timeout: Duration,
-) -> Result<Option<execution_bookmark::Reconciliation>> {
     use execution_bookmark::{PointerIntegrityKind, pointer_integrity_kind};
     let initial = execution_bookmark::reconcile(jj, record, pr_bookmark, trunk).await;
     if !initial
@@ -89,26 +63,16 @@ async fn reconcile_with(
         return initial;
     }
     let pr = bound_pr(pr_bookmark)?;
-    repair_with(jj, repair, record, pr, timeout).await?;
+    repair_with(jj, repair, record, pr, REPAIR_TIMEOUT).await?;
     after_repair(execution_bookmark::reconcile(jj, record, pr_bookmark, trunk).await, pr)
 }
 
 pub(super) async fn ensure(jj: &dyn Jj, repair: &dyn PrAliasRepair, record: &ExecutionBookmark, pr: u64) -> Result<()> {
-    ensure_with(jj, repair, record, pr, REPAIR_TIMEOUT).await
-}
-
-async fn ensure_with(
-    jj: &dyn Jj,
-    repair: &dyn PrAliasRepair,
-    record: &ExecutionBookmark,
-    pr: u64,
-    timeout: Duration,
-) -> Result<()> {
     match execution_bookmark::resolve_bookmark_commit(jj, record, &format!("pr/{pr}")).await {
         Ok(Some(_)) => Ok(()),
-        Ok(None) => repair_with(jj, repair, record, pr, timeout).await,
+        Ok(None) => repair_with(jj, repair, record, pr, REPAIR_TIMEOUT).await,
         Err(err) if execution_bookmark::is_pointer_integrity_error(&err) => {
-            repair_with(jj, repair, record, pr, timeout).await
+            repair_with(jj, repair, record, pr, REPAIR_TIMEOUT).await
         }
         Err(err) => Err(err),
     }
@@ -123,30 +87,6 @@ pub(super) async fn restore_rebased(
     base_branch: &str,
     upstream: &str,
 ) -> Result<execution_bookmark::RestoreReport> {
-    restore_with(
-        jj,
-        repair,
-        record,
-        workspace,
-        pr_bookmark,
-        base_branch,
-        upstream,
-        REPAIR_TIMEOUT,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn restore_with(
-    jj: &dyn Jj,
-    repair: &dyn PrAliasRepair,
-    record: &ExecutionBookmark,
-    workspace: &Path,
-    pr_bookmark: Option<&str>,
-    base_branch: &str,
-    upstream: &str,
-    timeout: Duration,
-) -> Result<execution_bookmark::RestoreReport> {
     let initial = execution_bookmark::restore_rebased(jj, record, workspace, pr_bookmark, base_branch, upstream).await;
     if !initial.as_ref().is_err_and(|err| {
         execution_bookmark::pointer_integrity_kind(err)
@@ -155,7 +95,7 @@ async fn restore_with(
         return initial;
     }
     let pr = bound_pr(pr_bookmark)?;
-    repair_with(jj, repair, record, pr, timeout).await?;
+    repair_with(jj, repair, record, pr, REPAIR_TIMEOUT).await?;
     after_repair(
         execution_bookmark::restore_rebased(jj, record, workspace, pr_bookmark, base_branch, upstream).await,
         pr,
@@ -186,7 +126,9 @@ fn after_repair<T>(result: Result<T>, pr: u64) -> Result<T> {
 
 /// One repair, never a retry loop. Cube may fetch while repairing, which can
 /// move the execution's publication pointers, so they are restored whether or
-/// not the repair succeeded or timed out.
+/// not the repair succeeded or timed out. Cube bounds its own repair well
+/// inside `timeout` (see [`crate::cube_op_budget::REPAIR_PR_BOOKMARK`]), so
+/// `timeout` is only a backstop and has normally stopped Cube before it fires.
 async fn repair_with(
     jj: &dyn Jj,
     repair: &dyn PrAliasRepair,

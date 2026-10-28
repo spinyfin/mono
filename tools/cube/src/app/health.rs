@@ -190,6 +190,11 @@ fn parse_conflicted_bookmarks_from_status(status: &str) -> Vec<String> {
 /// lease at most this much rather than the full retry ladder.
 const LEASE_PR_REPAIR_FETCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Longest the locked write phase of PR-bookmark repair waits for the
+/// store-wide PR-bookmark lock. With [`LEASE_PR_REPAIR_FETCH_BUDGET`] this
+/// bounds the whole repair, so a caller can rely on cube terminating itself.
+const PR_REPAIR_LOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Bookmark namespaces that are shared, repo-global pointers owned by the PR
 /// flow or the Boss engine rather than by the workspace being repaired:
 /// `pr/<n>` aliases and the per-execution publication, recovery and base
@@ -209,9 +214,16 @@ fn is_shared_pointer_bookmark(bookmark: &str) -> bool {
 /// repair and deliberately left conflicted and untouched.
 #[derive(Debug, Default)]
 pub(super) struct BookmarkRepair {
-    pub(super) unrepaired: Vec<String>,
     /// Each unrepaired bookmark with the reason it was left untouched.
     pub(super) failures: Vec<(String, String)>,
+}
+
+impl BookmarkRepair {
+    /// Names of the bookmarks left untouched.
+    #[cfg(test)]
+    pub(super) fn unrepaired(&self) -> Vec<&str> {
+        self.failures.iter().map(|(name, _)| name.as_str()).collect()
+    }
 }
 
 /// Repair each conflicted bookmark so the workspace no longer reports
@@ -302,7 +314,6 @@ pub(super) fn repair_pr_bookmarks(
             commits = sides,
             reason = why,
         );
-        outcome.unrepaired.push(bookmark.to_string());
         outcome.failures.push((bookmark.to_string(), why.to_string()));
     };
 
@@ -340,7 +351,7 @@ pub(super) fn repair_pr_bookmarks(
 
     // Phase 2, locked: local writes only.
     if !heads.is_empty() {
-        let _lock = runner.lock_pr_bookmarks(workspace_path)?;
+        let _lock = runner.lock_pr_bookmarks_within(workspace_path, PR_REPAIR_LOCK_BUDGET)?;
         for (bookmark, number, sha) in &heads {
             pr_bookmarks::record_published_head(workspace_path, *number, sha);
             if let Err(error) = pr_bookmarks::point_pr_bookmark(runner, database_path, workspace_path, *number, sha) {
@@ -351,9 +362,11 @@ pub(super) fn repair_pr_bookmarks(
     Ok(outcome)
 }
 
-/// The PR number and authoritative head commit of conflicted `bookmark`, from
-/// GitHub's `head.sha` through the resolver `goto --pr` uses. The source
-/// branch name is not consulted, so a deleted branch does not matter.
+/// The PR number and authoritative head commit of the missing, conflicted or
+/// stale `pr/<n>` alias `bookmark`, from GitHub's `head.sha` through the
+/// resolver `goto --pr` uses. The source branch name is not consulted, so a
+/// deleted branch does not matter. The GitHub lookup shares `deadline` with
+/// the head fetches.
 fn resolve_lease_pr_head(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
@@ -365,7 +378,9 @@ fn resolve_lease_pr_head(
     let number: u64 = bookmark[3..]
         .parse()
         .map_err(|_| CubeError::InvalidArgument(format!("invalid PR bookmark {bookmark}")))?;
-    let info = crate::app::gh_pr::fetch_pr_json(runner, workspace_path, repo, number)?;
+    let timeout = crate::app::jj::budgeted_timeout(Some(deadline), crate::app::jj::network_cmd_timeout())
+        .ok_or_else(|| CubeError::InvalidArgument(format!("no time left to look up PR {number} on GitHub")))?;
+    let info = crate::app::gh_pr::fetch_pr_json_with_timeout(runner, workspace_path, repo, number, timeout)?;
     let head = pr_bookmarks::resolve_pr_head(
         runner,
         database_path,
