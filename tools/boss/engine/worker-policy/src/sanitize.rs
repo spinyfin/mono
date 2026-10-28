@@ -311,6 +311,8 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::DispatchConcurrencyResult { .. }
         | FrontendEvent::DriverQuotaUsageResult { .. }
         | FrontendEvent::DriverTrafficSplitResult { .. }
+        | FrontendEvent::CodexSolPercentage { .. }
+        | FrontendEvent::SolComparisonReport { .. }
         | FrontendEvent::DispatchStateResult { .. }
         | FrontendEvent::AutomationStateResult { .. }
         | FrontendEvent::ExternalTrackerSyncStarted { .. }

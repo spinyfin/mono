@@ -828,6 +828,9 @@ pub enum FrontendRequest {
         attempt_id: String,
     },
 
+    /// Current share of eligible Codex executions assigned to Sol (default 50).
+    GetCodexSolPercentage,
+
     /// Read-only: aggregate `conflict_diagnosis` for one product into a
     /// hotspot report (`boss engine conflicts hotspots`, Layer 0 / T5):
     /// per-file frequency, per-file-pair co-conflict frequency, per-class
@@ -905,7 +908,6 @@ pub enum FrontendRequest {
     /// implementation work) without changing it. Replies with
     /// [`FrontendEvent::DriverTrafficSplitResult`].
     GetDriverTrafficSplit,
-
     /// One-shot snapshot of the engine's user-visible configuration
     /// health — currently a single ANTHROPIC_API_KEY presence bit plus
     /// any rendered [`EngineHealthIssue`]s the UI should surface as a
@@ -1067,6 +1069,9 @@ pub enum FrontendRequest {
     GetStuckReport {
         minimum_age_secs: i64,
     },
+
+    /// Compare eligible PR families by their original Sol/Astra arm.
+    GetSolComparisonReport,
 
     /// Per-work-item runtime snapshot — single-item flavour of the
     /// `task_runtimes` block carried in `WorkTree`. Used by
@@ -2386,6 +2391,11 @@ pub enum FrontendRequest {
         work_item_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         budget: Option<i64>,
+    },
+
+    /// Human engine setting, independent of the three-way driver allocation.
+    SetCodexSolPercentage {
+        percentage: u8,
     },
 
     /// Replace the coordinator session handoff with `body`. Written by the

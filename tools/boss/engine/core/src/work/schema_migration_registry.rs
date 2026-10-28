@@ -261,6 +261,11 @@ pub(super) fn all() -> Vec<Migration> {
             },
         },
         Migration {
+            id: "20261029_0420_sol_selection".into(),
+            legacy_version: None,
+            apply: driver_allocation::sol_selection::migrate,
+        },
+        Migration {
             id: task_status_audit::MIGRATION_ID.into(),
             legacy_version: None,
             apply: task_status_audit::migrate,

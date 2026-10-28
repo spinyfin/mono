@@ -775,6 +775,7 @@ mod floor_tests {
             super::super::board_projection_schema::migrate(&expected).unwrap();
             expected.execute_batch(EXECUTION_BOOKMARK_PRUNE_COLUMNS_60).unwrap();
             expected.execute_batch(migrations::CREATE_LEDGER).unwrap();
+            driver_allocation::sol_selection::migrate(&expected).unwrap();
             task_status_audit::migrate(&expected).unwrap();
             super::super::critical_requests::migrate(&expected).unwrap();
             expected

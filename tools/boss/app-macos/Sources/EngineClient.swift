@@ -1300,6 +1300,10 @@ final class EngineClient: @unchecked Sendable {
                 codex: (raw["codex"] as? NSNumber)?.intValue ?? 0
             )
             emit(.driverTrafficSplitResult(split: decoded.isValid ? decoded : .engineDefault))
+        case "codex_sol_percentage":
+            guard let percentage = (payload["percentage"] as? NSNumber)?.intValue,
+                  (0...100).contains(percentage) else { return }
+            emit(.codexSolPercentage(percentage: percentage))
         case "driver_quota_usage_result":
             let raw = payload["snapshot"] as? [String: Any] ?? [:]
             emit(.driverQuotaUsageResult(snapshot: DriverQuotaSnapshot.decode(raw)))

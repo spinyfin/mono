@@ -182,3 +182,29 @@ pub struct TopCostReport {
     pub truncated: bool,
     pub until_epoch_s: i64,
 }
+
+/// Eligible Codex outcomes grouped by the original PR-family assignment.
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct SolArmReport {
+    pub arm: String,
+    pub ci_observed_prs: u64,
+    pub first_attempt_ci_passes: u64,
+    pub merged_prs: u64,
+    pub prs: u64,
+    pub review_findings: u64,
+    pub revisions_before_merge: u64,
+    pub merged_pr_cost: super::CostMeasurement,
+    pub first_attempt_ci_pass_rate: Option<f64>,
+    pub findings_per_pr: Option<f64>,
+    pub revisions_per_merged_pr: Option<f64>,
+    /// NULL when any run in a merged family lacks token measurements.
+    pub tokens_per_merged_pr: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SolComparisonReport {
+    pub arms: Vec<SolArmReport>,
+    pub notes: Vec<String>,
+}

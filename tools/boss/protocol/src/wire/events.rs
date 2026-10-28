@@ -1021,6 +1021,12 @@ pub enum FrontendEvent {
     CostWindowReport {
         report: crate::WindowCostReport,
     },
+    CodexSolPercentage {
+        percentage: u8,
+    },
+    SolComparisonReport {
+        report: crate::SolComparisonReport,
+    },
     /// Response to [`FrontendRequest::GetTopCostConsumers`].
     TopCostConsumers {
         report: crate::TopCostReport,

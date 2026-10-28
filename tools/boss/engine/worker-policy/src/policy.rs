@@ -467,6 +467,7 @@ fn worker_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::ExecutionTranscript { .. }
         | FrontendRequest::FocusWorkerPane { .. }
         | FrontendRequest::GetDriverQuotaUsage { .. }
+        | FrontendRequest::GetCodexSolPercentage
         | FrontendRequest::GetDriverTrafficSplit
         | FrontendRequest::GetDispatchConcurrency
         | FrontendRequest::GetDispatchState
@@ -502,6 +503,7 @@ fn worker_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::RetirePane { .. }
         | FrontendRequest::RevealWorkItem { .. }
         | FrontendRequest::SendInputToWorker { .. }
+        | FrontendRequest::SetCodexSolPercentage { .. }
         | FrontendRequest::SetDriverTrafficSplit { .. }
         | FrontendRequest::SetDispatchConcurrency { .. }
         | FrontendRequest::SetDispatchPaused { .. }
@@ -602,6 +604,7 @@ fn worker_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         // Cost reporting (design: token-spend CLI surface). An operator/
         // coordinator diagnostic akin to `AuditProductEffort` above, not
         // something a task worker needs about its own or other work items.
+        | FrontendRequest::GetSolComparisonReport
         | FrontendRequest::GetCostWindowReport { .. }
         | FrontendRequest::GetTopCostConsumers { .. }
         | FrontendRequest::GetStuckReport { .. }

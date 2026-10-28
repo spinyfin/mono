@@ -1393,6 +1393,12 @@ impl WorkDb {
         if task.deleted_at.is_some() {
             return Ok(None);
         }
+        let root = chain_root(&tx, work_item_id)?;
+        tx.execute(
+            "INSERT INTO sol_pr_outcomes(work_item_id,merged_at) VALUES (?1,?2)
+            ON CONFLICT(work_item_id) DO UPDATE SET merged_at=COALESCE(merged_at,excluded.merged_at)",
+            params![root, now_string()],
+        )?;
         if task.status == TaskStatus::Done || task.status == TaskStatus::Archived {
             // Already terminal — no status transition, but a task that
             // reached done/archived via a path that predates (or missed)
@@ -1661,6 +1667,14 @@ impl WorkDb {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let before = read_pr_observation_columns(&tx, work_item_id)?;
+        if before.is_some() {
+            driver_allocation::sol_selection::observe_ci(
+                &tx,
+                work_item_id,
+                input.pr_head_sha,
+                input.ci_required_state,
+            )?;
+        }
         let prior_ci_state = before.as_ref().and_then(|row| row.ci_required_state.clone());
         let prior_mergeable = before.as_ref().and_then(|row| row.pr_mergeable_state.as_deref());
         let prior_merge_status = before.as_ref().and_then(|row| row.pr_merge_state_status.as_deref());

@@ -135,11 +135,13 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::GetConflictHotspots { .. }
         | FrontendRequest::GetConflictResolution { .. }
         | FrontendRequest::GetCoordinatorHandoff
+        | FrontendRequest::GetSolComparisonReport
         | FrontendRequest::GetCostWindowReport { .. }
         | FrontendRequest::GetDecision { .. }
         | FrontendRequest::GetDispatchConcurrency
         | FrontendRequest::GetDispatchState
         | FrontendRequest::GetDriverQuotaUsage { .. }
+        | FrontendRequest::GetCodexSolPercentage
         | FrontendRequest::GetDriverTrafficSplit
         | FrontendRequest::GetEngineHealth
         | FrontendRequest::GetEnginePoolConfig
@@ -219,6 +221,7 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::SetCoordinatorHandoff { .. }
         | FrontendRequest::SetDispatchConcurrency { .. }
         | FrontendRequest::SetDispatchPaused { .. }
+        | FrontendRequest::SetCodexSolPercentage { .. }
         | FrontendRequest::SetDriverTrafficSplit { .. }
         | FrontendRequest::SetFeatureFlag { .. }
         | FrontendRequest::SetOffsiteBackup { .. }

@@ -364,6 +364,8 @@ extension ChatViewModel {
             engineHealthIssues = issues
         case .driverTrafficSplitResult(let split):
             driverTrafficSplit = split
+        case .codexSolPercentage(let percentage):
+            codexSolPercentage = percentage
         case .driverQuotaUsageResult(let snapshot):
             driverQuota = snapshot
             // The engine lists the drivers still being probed. The in-flight

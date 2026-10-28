@@ -671,6 +671,22 @@ pub(super) async fn handle_get_driver_traffic_split(ctx: Dispatch, req: Frontend
     }
 }
 
+pub(super) async fn handle_codex_sol_percentage(ctx: Dispatch, req: FrontendRequest) {
+    let result = match req {
+        FrontendRequest::GetCodexSolPercentage => ctx.work_db.get_codex_sol_percentage(),
+        FrontendRequest::SetCodexSolPercentage { percentage } => ctx.work_db.set_codex_sol_percentage(percentage),
+        _ => unreachable!(),
+    };
+    match result {
+        Ok(percentage) => send_response(
+            &ctx.sink,
+            &ctx.request_id,
+            FrontendEvent::CodexSolPercentage { percentage },
+        ),
+        Err(err) => send_work_error(&ctx.sink, &ctx.request_id, &err),
+    }
+}
+
 pub(super) async fn handle_set_driver_traffic_split(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         work_db,

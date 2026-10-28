@@ -2223,6 +2223,21 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "driver_traffic_split_result",
         },
         TagCase {
+            label: "CodexSolPercentage",
+            event: FrontendEvent::CodexSolPercentage { percentage: 50 },
+            expected_tag: "codex_sol_percentage",
+        },
+        TagCase {
+            label: "SolComparisonReport",
+            event: FrontendEvent::SolComparisonReport {
+                report: crate::SolComparisonReport {
+                    arms: vec![],
+                    notes: vec![],
+                },
+            },
+            expected_tag: "sol_comparison_report",
+        },
+        TagCase {
             label: "DriverQuotaUsageResult",
             event: FrontendEvent::DriverQuotaUsageResult {
                 snapshot: DriverQuotaSnapshot::default(),
@@ -2390,6 +2405,8 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::PrReconcilersKicked { .. }
         | FrontendEvent::DispatchConcurrencyResult { .. }
         | FrontendEvent::DriverTrafficSplitResult { .. }
+        | FrontendEvent::CodexSolPercentage { .. }
+        | FrontendEvent::SolComparisonReport { .. }
         | FrontendEvent::DriverQuotaUsageResult { .. }
         | FrontendEvent::DispatchStateResult { .. }
         | FrontendEvent::ExternalTrackerSyncStarted { .. }
