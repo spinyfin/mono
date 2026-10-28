@@ -329,7 +329,7 @@ extension ChatViewModel {
         // RULE: no punting" boilerplate ahead of their findings
         // (`render_revision_instructions` in
         // `tools/boss/engine/pr-review/src/render.rs`) — collapse it by
-        // default so the findings are immediately visible. Detection keys
+        // default as a complete outline section. Detection keys
         // on that heading being present in the description, not on
         // `task.kind`: a pre-merge brief is a `revision`, but the post-merge
         // follow-up the engine mints after a PR has merged is a `followup`

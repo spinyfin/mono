@@ -16,28 +16,30 @@ enum MarkdownParsedDocument {
                 return heading
             })
             let ranges = MarkdownHeadingSections.sections(in: source, collapsibleHeadings: collapsed).map(\.range)
+            let lineStarts = MarkdownHeadingSections.lineStarts(in: source)
             var result = Array(repeating: AttributedString(), count: chunks.count)
             var index = 0
-            var destination: Int?
-            var previousIntent: PresentationIntent?
-            for run in document.runs {
-                if let position = run.markdownSourcePosition,
-                   let range = Range(position, in: source) {
-                    while index < ranges.count && range.lowerBound >= ranges[index].upperBound {
+            // A paragraph is indivisible, including all inline spans and breaks.
+            // Converting each inline source position to a String range can move
+            // continuations across sections (and even beyond the document).
+            // Sections start on structural heading lines, so the first source
+            // line of the complete block is sufficient to place it.
+            for (_, blockRange) in document.runs[\.presentationIntent] {
+                let block = document[blockRange]
+                var destination: Int? = index < ranges.count ? index : nil
+                if let position = block.runs.compactMap(\.markdownSourcePosition).first,
+                   position.startLine > 0, position.startLine <= lineStarts.count {
+                    let start = lineStarts[position.startLine - 1]
+                    while index < ranges.count && start >= ranges[index].upperBound {
                         index += 1
                     }
-                    destination = index < ranges.count && ranges[index].contains(range.lowerBound) ? index : nil
-                } else if run.presentationIntent != previousIntent {
-                    // Synthetic blocks such as thematic breaks have no source
-                    // position either. A new block belongs to the current
-                    // section even when its preceding heading was folded out.
-                    destination = index < ranges.count ? index : nil
+                    destination = index < ranges.count && ranges[index].contains(start) ? index : nil
                 }
-                previousIntent = run.presentationIntent
-                // Foundation's soft/hard breaks have no source position; they
-                // belong to the preceding inline run, including its section.
+                // Synthetic blocks (such as thematic breaks) have no source
+                // position and stay in the current section, even after its
+                // heading has been replaced by disclosure chrome.
                 guard let destination else { continue }
-                var content = AttributedString(document[run.range])
+                var content = AttributedString(block)
                 content.markdownSourcePosition = nil
                 result[destination].append(content)
             }

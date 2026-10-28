@@ -521,7 +521,7 @@ private struct MarkdownDocumentColumn: View {
                 highlightGeneration: highlightGeneration,
                 chunkIndex: entry.id
             )
-            .modifier(MarkdownChunkTopSpacing(isFirst: entry.id == 0))
+            .modifier(MarkdownChunkTopSpacing(isFirst: entry.id == 0, editorialTop: entry.editorialTopSpacing))
         case .collapsible(let heading, let body):
             CollapsibleMarkdownSection(
                 heading: heading,
@@ -565,6 +565,7 @@ private struct MarkdownDocumentColumn: View {
             RenderedMarkdownChunk(
                 id: index,
                 chunk: chunk,
+                editorialTopSpacing: MarkdownEditorialMetrics.chunkTopSpacing(for: parsed[index]),
                 parser: markdownParser(
                     forChunkAt: index,
                     content: parsed[index],
@@ -692,6 +693,7 @@ enum MarkdownDocumentChunk: Equatable {
 private struct RenderedMarkdownChunk: Identifiable {
     let id: Int
     let chunk: MarkdownDocumentChunk
+    let editorialTopSpacing: CGFloat
     let parser: any MarkupParser
 }
 
@@ -699,8 +701,7 @@ private struct RenderedMarkdownChunk: Identifiable {
 /// so each section can be its own `StructuredText` (bounding layout
 /// recursion and making `LazyVStack` effective). Headings whose exact text
 /// (level markers and surrounding whitespace stripped) appears in
-/// `collapsibleHeadings` become `.collapsible`. Outline folds include descendants,
-/// while revision boilerplate stops before findings at the next heading;
+/// `collapsibleHeadings` become `.collapsible`. Outline folds include descendants;
 /// other top-level headings start `.plain` chunks with their heading line.
 /// A pure function over `String` —
 /// no Textual/StructuredText involvement — because Textual's block rendering
@@ -715,8 +716,7 @@ private struct RenderedMarkdownChunk: Identifiable {
 /// reference definitions.
 enum MarkdownHeadingSections {
     /// Fold a complete outline section, including deeper headings, up to the
-    /// next heading of the same or higher level. Revision boilerplate folds only
-    /// its own content so findings and their summary remain visible.
+    /// next heading of the same or higher level, without text-specific exceptions.
     static func chunks(in source: String, collapsibleHeadings: Set<String>) -> [MarkdownDocumentChunk] {
         sections(in: source, collapsibleHeadings: collapsibleHeadings).map { section in
             let text = String(source[section.range])
@@ -740,7 +740,7 @@ enum MarkdownHeadingSections {
         while i < headings.count {
             let heading = headings[i]
             var next = i + 1
-            if collapsibleHeadings.contains(heading.text), heading.text != RevisionBriefCollapsibleHeadings.hardRule {
+            if collapsibleHeadings.contains(heading.text) {
                 while next < headings.count && headings[next].level > heading.level { next += 1 }
             }
             let end = next < headings.count ? headings[next].lineRange.lowerBound : source.endIndex
@@ -800,10 +800,7 @@ enum MarkdownHeadingSections {
         guard let document = try? AttributedString(
             markdown: source, options: .init(appliesSourcePositionAttributes: true)
         ) else { return [] }
-        var starts = [source.startIndex]
-        for index in source.indices where source[index] == "\n" || source[index] == "\r" || source[index] == "\r\n" {
-            starts.append(source.index(after: index))
-        }
+        let starts = lineStarts(in: source)
         var results: [HeadingLine] = []
         for (intent, range) in document.runs[\.presentationIntent] {
             guard let intent, intent.components.count == 1,
@@ -829,6 +826,15 @@ enum MarkdownHeadingSections {
             results.append(HeadingLine(text: String(content.characters), level: level, lineRange: start..<end))
         }
         return results
+    }
+
+    /// CommonMark source positions count CRLF as one line ending.
+    static func lineStarts(in source: String) -> [String.Index] {
+        var starts = [source.startIndex]
+        for index in source.indices where source[index] == "\n" || source[index] == "\r" || source[index] == "\r\n" {
+            starts.append(source.index(after: index))
+        }
+        return starts
     }
 }
 
@@ -862,6 +868,7 @@ private struct DocumentStructuredText: View {
 /// for `.plain` chunks after the first.
 private struct MarkdownChunkTopSpacing: ViewModifier {
     let isFirst: Bool
+    let editorialTop: CGFloat
     @Environment(\.markdownEditorialStyle) private var isEditorial
     @ScaledMetric(relativeTo: .body) private var bodySize: CGFloat = BossHeadingStyle.bodyPointSize
 
@@ -875,7 +882,7 @@ private struct MarkdownChunkTopSpacing: ViewModifier {
 
     private var topGap: CGFloat {
         if isEditorial {
-            return bodySize * MarkdownEditorialMetrics.editorialH2Spacing.top
+            return bodySize * editorialTop
         }
         return BossHeadingStyle.headingBlockSpacingTop
     }

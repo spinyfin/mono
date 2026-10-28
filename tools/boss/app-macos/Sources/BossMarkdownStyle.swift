@@ -177,6 +177,23 @@ enum MarkdownEditorialMetrics {
     /// Editorial H2 headings use this font-scaled rhythm.
     static let editorialH2Spacing = (top: CGFloat(3), bottom: CGFloat(0.75))
 
+    /// Share the same rhythm inside StructuredText and across lazy chunks.
+    static func headingSpacing(for level: Int) -> (top: CGFloat, bottom: CGFloat) {
+        switch level {
+        case 1: return (1.5, 1)
+        case 2: return editorialH2Spacing
+        case 3: return (2, 0.6)
+        default: return (1.5, 0.6)
+        }
+    }
+
+    static func chunkTopSpacing(for content: AttributedString) -> CGFloat {
+        guard case .header(let level)? = content.runs.first?.presentationIntent?.components.first?.kind else {
+            return 1
+        }
+        return headingSpacing(for: level).top
+    }
+
     /// Rhythm for `CollapsibleMarkdownSection`'s disclosure summary. Kept
     /// separate from `editorialH2Spacing` because the summary is a quiet
     /// control, not a heading — it must not inherit the generous spacing
@@ -293,19 +310,8 @@ struct BossHeadingStyle: StructuredText.HeadingStyle {
     }
 
     private func editorialHeadingSpacing(for level: Int) -> FontScaled<StructuredText.BlockSpacing> {
-        return switch level {
-        case 1:
-            FontScaled<StructuredText.BlockSpacing>.fontScaled(top: 1.5, bottom: 1)
-        case 2:
-            FontScaled<StructuredText.BlockSpacing>.fontScaled(
-                top: MarkdownEditorialMetrics.editorialH2Spacing.top,
-                bottom: MarkdownEditorialMetrics.editorialH2Spacing.bottom
-            )
-        case 3:
-            FontScaled<StructuredText.BlockSpacing>.fontScaled(top: 2, bottom: 0.6)
-        default:
-            FontScaled<StructuredText.BlockSpacing>.fontScaled(top: 1.5, bottom: 0.6)
-        }
+        let spacing = MarkdownEditorialMetrics.headingSpacing(for: level)
+        return .fontScaled(top: spacing.top, bottom: spacing.bottom)
     }
 }
 

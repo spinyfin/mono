@@ -354,23 +354,20 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         XCTAssertEqual(chunks, [.plain(source)])
     }
 
-    /// Revision boilerplate stops before findings, regardless of heading level.
-    func testHeadingSectionsKeepsFindingsOutsideBoilerplate() {
+    /// Every fold includes descendant headings through the next peer or ancestor.
+    func testHeadingSectionsIncludesFindingsInsideParentSection() {
         let chunks = MarkdownHeadingSections.chunks(
             in: Self.revisionBrief,
             collapsibleHeadings: [RevisionBriefCollapsibleHeadings.hardRule]
         )
-        XCTAssertEqual(chunks.count, 3)
+        XCTAssertEqual(chunks.count, 2)
         guard case .plain(let prefix) = chunks[0] else { return XCTFail("expected preamble") }
         XCTAssertTrue(prefix.contains("Automated PR review of PR #5"))
         guard case .collapsible(let heading, let body) = chunks[1] else { return XCTFail("expected fold") }
         XCTAssertEqual(heading, RevisionBriefCollapsibleHeadings.hardRule)
         XCTAssertTrue(body.contains("FORBIDDEN"))
-        XCTAssertFalse(body.contains("### [high]"))
-        XCTAssertFalse(body.contains("Review summary"))
-        guard case .plain(let findings) = chunks[2] else { return XCTFail("expected visible findings") }
-        XCTAssertTrue(findings.contains("### [high]"))
-        XCTAssertTrue(findings.contains("**Review summary:**"))
+        XCTAssertTrue(body.contains("### [high]"))
+        XCTAssertTrue(body.contains("**Review summary:**"))
     }
 
     /// Concatenating the chunks (re-adding back the `## ` marker and
@@ -506,6 +503,9 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         let heading = RevisionBriefCollapsibleHeadings.hardRule
         state.updateSource(Self.revisionBrief, baseURL: nil, collapsibleHeadings: [heading])
         state.query = "FORBIDDEN"
+        XCTAssertEqual(state.matches.count, 1)
+        XCTAssertEqual(state.currentCollapsibleHeadingToExpand, heading)
+        state.query = "Null pointer"
         XCTAssertEqual(state.matches.count, 1)
         XCTAssertEqual(state.currentCollapsibleHeadingToExpand, heading)
     }
