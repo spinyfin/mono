@@ -662,6 +662,10 @@ struct ServerState {
     /// so exercising the Direct routing decision never shells out to a real
     /// `gh` process.
     direct_merge_executor: Arc<dyn merge_when_ready::DirectMergeExecutor>,
+    /// Live PR open/merged/closed probe behind `create_revision`'s gate and the
+    /// board's "add a revision" offer, so both judge eligibility from the same
+    /// facts. Production uses `GhPrStateChecker`; tests inject a fake.
+    pr_state_checker: Arc<dyn crate::work::PrStateChecker>,
     /// Shared dispatch-event sink. The execution coordinator emits
     /// the per-stage events into this sink during dispatch; the
     /// `UpdateWorkItem` handler emits a `StatusTransition` event
@@ -1609,7 +1613,7 @@ impl ServerState {
         if let Some(branch_verifier) = branch_verifier_override {
             completion_handler_builder = completion_handler_builder.with_branch_verifier(branch_verifier);
         }
-        if let Some(checker) = pr_state_checker_override {
+        if let Some(checker) = pr_state_checker_override.clone() {
             completion_handler_builder = completion_handler_builder.with_pr_state_checker(checker);
         }
         if let Some(verifier) = workspace_diff_verifier_override {
@@ -1750,6 +1754,7 @@ impl ServerState {
                 .publisher(publisher_for_state)
                 .merge_probe(merge_probe_for_state)
                 .direct_merge_executor(direct_merge_executor_for_state)
+                .pr_state_checker(pr_state_checker_override.unwrap_or_else(|| Arc::new(GhPrStateChecker)))
                 .dispatch_events(dispatch_events_for_state)
                 .dispatch_event_root(dispatch_event_root_for_state)
                 .topic_broker(topic_broker)

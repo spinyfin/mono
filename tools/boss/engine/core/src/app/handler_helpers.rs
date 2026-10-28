@@ -572,6 +572,190 @@ pub(super) fn send_work_error(sink: &SessionSink, request_id: &str, err: impl st
     );
 }
 
+/// A board gesture the engine refused or reverted: what to tell the user
+/// next to the dragged card. Carried to the app as
+/// [`FrontendEvent::WorkItemRefused`].
+#[derive(Debug, Clone)]
+pub(super) struct BoardRefusal {
+    pub(super) code: boss_protocol::BoardRefusalCode,
+    /// Plain-language sentence for the board card.
+    pub(super) message: String,
+    /// The engine's own text, sent as the `WorkError` to callers that are not
+    /// board gestures (the CLI), whose users act on the exact wording (e.g.
+    /// the `boss chore update --repo` hint). `None` when `message` is already
+    /// the engine's text.
+    pub(super) raw: Option<String>,
+    pub(super) action: Option<boss_protocol::BoardRefusalAction>,
+}
+
+impl BoardRefusal {
+    pub(super) fn new(code: boss_protocol::BoardRefusalCode, message: impl std::fmt::Display) -> Self {
+        Self {
+            code,
+            message: message.to_string(),
+            raw: None,
+            action: None,
+        }
+    }
+
+    /// A refusal whose board sentence differs from the engine's own text.
+    fn phrased(code: boss_protocol::BoardRefusalCode, message: String, err: &anyhow::Error) -> Self {
+        Self {
+            code,
+            message,
+            raw: Some(format!("{err:#}")),
+            action: None,
+        }
+    }
+
+    /// A pause-override drag the engine will not force. `reason` is the
+    /// admission decision's own sentence; the item is named by its title
+    /// rather than its internal id.
+    pub(super) fn pause_override(work_db: &WorkDb, id: &str, reason: impl std::fmt::Display) -> Self {
+        let reason = reason.to_string();
+        Self {
+            code: boss_protocol::BoardRefusalCode::PauseOverrideRefused,
+            message: format!("Can't start {} right now: {reason}.", item_label(work_db, id)),
+            raw: Some(format!("cannot start {id}: {reason}")),
+            action: None,
+        }
+    }
+
+    /// Classify a failed status/field patch. A gated item names what it is
+    /// waiting on; anything else keeps the engine's own text.
+    pub(super) fn from_update_error(work_db: &WorkDb, id: &str, err: &anyhow::Error) -> Self {
+        if let Some(gated) = err.downcast_ref::<crate::work::GatedByPrerequisites>() {
+            return Self::phrased(
+                boss_protocol::BoardRefusalCode::UpdateRejected,
+                format!(
+                    "{} is waiting on {}, so it can't be moved yet. Finish those first, or remove the dependency.",
+                    item_label(work_db, id),
+                    gated
+                        .prerequisites
+                        .iter()
+                        .map(|prerequisite| item_name(work_db, prerequisite)
+                            .map_or_else(|| prerequisite.clone(), |name| format!("\"{name}\"")))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                err,
+            );
+        }
+        Self::new(boss_protocol::BoardRefusalCode::UpdateRejected, format!("{err:#}"))
+    }
+
+    /// Classify a dispatch failure. A bound-PR refusal names the PR and
+    /// points at revisions only when `create_revision` would accept one; a
+    /// missing repo says which item needs one; anything else keeps the
+    /// engine's own text under `fallback`. `prior_status` is the item's status
+    /// before the refused move, if known. `pr_checker` is the same live probe
+    /// `create_revision`'s gate uses.
+    pub(super) fn from_dispatch_error(
+        work_db: &WorkDb,
+        id: &str,
+        err: &anyhow::Error,
+        fallback: boss_protocol::BoardRefusalCode,
+        prior_status: Option<boss_protocol::TaskStatus>,
+        pr_checker: &dyn crate::work::PrStateChecker,
+    ) -> Self {
+        if err.downcast_ref::<crate::work::BoundPrRefusal>().is_some() {
+            let pr_url = match work_db.get_work_item(id) {
+                Ok(WorkItem::Task(task)) | Ok(WorkItem::Chore(task)) => task.pr_url,
+                _ => None,
+            };
+            let pr_number = pr_url
+                .as_deref()
+                .and_then(|url| url.trim_end_matches('/').rsplit('/').next())
+                .filter(|tail| !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()));
+            let pr_phrase = pr_number.map_or_else(|| "a PR".to_owned(), |number| format!("a PR (#{number})"));
+            // Mirror `assert_parent_revisable_and_insert`: a Done item's PR has
+            // merged (the move has already flipped the stored status, so the
+            // pre-move status is the signal); otherwise the live probe decides
+            // between Open, Merged and ClosedUnmerged.
+            let state = if prior_status == Some(boss_protocol::TaskStatus::Done) {
+                Some(crate::work::PrOpenState::Merged)
+            } else {
+                pr_url.as_deref().and_then(|url| pr_checker.check(url).ok())
+            };
+            let not_revisable = |what: &str| Self {
+                code: boss_protocol::BoardRefusalCode::BoundPrNotRevisable,
+                message: format!(
+                    "This item already has {pr_phrase}, and it {what}, so it can't be run again. Create a new item for follow-up work."
+                ),
+                raw: Some(format!("{err:#}")),
+                action: None,
+            };
+            return match state {
+                Some(crate::work::PrOpenState::Merged) => not_revisable("has been merged"),
+                Some(crate::work::PrOpenState::ClosedUnmerged) => not_revisable("was closed without merging"),
+                Some(crate::work::PrOpenState::Open) => Self {
+                    code: boss_protocol::BoardRefusalCode::BoundPr,
+                    message: format!("This item already has {pr_phrase}. To change it, add a revision."),
+                    raw: Some(format!("{err:#}")),
+                    action: Some(boss_protocol::BoardRefusalAction::AddRevision),
+                },
+                // The PR's state could not be read, so a revision can't be
+                // promised: say what is known and offer nothing that may fail.
+                None => Self {
+                    code: boss_protocol::BoardRefusalCode::BoundPr,
+                    message: format!("This item already has {pr_phrase}, so it can't be run again."),
+                    raw: Some(format!("{err:#}")),
+                    action: None,
+                },
+            };
+        }
+        if fallback == boss_protocol::BoardRefusalCode::MissingRepo {
+            return Self::phrased(
+                fallback,
+                format!(
+                    "{} has no repository to run in, so it can't be started. Give it a repo and try again.",
+                    item_label(work_db, id)
+                ),
+                err,
+            );
+        }
+        Self::phrased(
+            fallback,
+            format!("Couldn't start {}: {err:#}", item_label(work_db, id)),
+            err,
+        )
+    }
+}
+
+fn item_name(work_db: &WorkDb, id: &str) -> Option<String> {
+    match work_db.get_work_item(id) {
+        Ok(WorkItem::Task(task)) | Ok(WorkItem::Chore(task)) => Some(task.name),
+        _ => None,
+    }
+}
+
+/// How a refusal names an item: its title in quotes, or a generic phrase
+/// when the title cannot be read.
+fn item_label(work_db: &WorkDb, id: &str) -> String {
+    item_name(work_db, id).map_or_else(|| "This item".to_owned(), |name| format!("\"{name}\""))
+}
+
+/// Answer a request with a refusal: the structured
+/// [`FrontendEvent::WorkItemRefused`] for a board gesture (`board_gesture`),
+/// a plain [`FrontendEvent::WorkError`] for every other caller, whose
+/// clients match on that shape.
+pub(super) fn send_refusal(sink: &SessionSink, request_id: &str, board_gesture: bool, id: &str, refusal: BoardRefusal) {
+    if board_gesture {
+        send_response(
+            sink,
+            request_id,
+            FrontendEvent::WorkItemRefused {
+                id: id.to_owned(),
+                code: refusal.code,
+                message: refusal.message,
+                suggested_action: refusal.action,
+            },
+        );
+    } else {
+        send_work_error(sink, request_id, refusal.raw.unwrap_or(refusal.message));
+    }
+}
+
 pub(super) fn send_response_with_revision(sink: &SessionSink, request_id: &str, revision: u64, payload: FrontendEvent) {
     sink.enqueue(FrontendEventEnvelope::response_with_revision(
         request_id.to_owned(),

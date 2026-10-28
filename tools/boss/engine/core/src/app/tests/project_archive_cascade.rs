@@ -220,6 +220,7 @@ async fn archive_with_children(child_count: usize) -> Cost {
         project.id.clone(),
         WorkItemPatch::builder().status("archived").build(),
         None,
+        false,
     )
     .await;
 

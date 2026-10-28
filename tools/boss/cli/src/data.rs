@@ -2039,6 +2039,7 @@ pub(crate) async fn reorder_project_tasks(
         FrontendRequest::ReorderProjectTasks {
             project_id: project_id.to_owned(),
             task_ids: task_ids.to_vec(),
+            moved_task_id: None,
         },
         "task reorder",
         FrontendEvent::ProjectTasksReordered { .. } => (),

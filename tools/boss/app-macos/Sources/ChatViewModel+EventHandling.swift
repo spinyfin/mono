@@ -106,7 +106,10 @@ extension ChatViewModel {
             // `pendingDragAdmissionCheck` or the optimistic move it guards.
             // A check parked for Retry is still in the unsent queue and is
             // kept; only checks whose request was in flight are settled.
-            bounceUnparkedDrags(message: nil, includeMovesWithoutCheck: false)
+            bounceUnparkedDrags(
+                message: "Connection to the engine was lost before it could answer — try the move again.",
+                includeMovesWithoutCheck: false
+            )
             scheduleConnectionLostBannerCheck()
         case .workInvalidated(let topic, let productId, let itemIDs, let invalidationClass):
             if CommentEngineBridge.isCommentTopic(topic) {
@@ -178,7 +181,8 @@ extension ChatViewModel {
         case .workItemUpdated(let item, let revision):
             noteBoardRevision(revision, item: item)
             handleUpdatedWorkItem(item)
-        case .projectTasksReordered(let projectId, _):
+        case .projectTasksReordered(let projectId, _, let requestId):
+            settleReorderSuccess(requestId: requestId)
             if let productID = project(withID: projectId)?.productID {
                 scheduleWorkTreeRefetch(productID: productID, flow: .itemRefetch)
             }
@@ -194,6 +198,8 @@ extension ChatViewModel {
             handleOperatorQuestionError(message: message, requestId: requestId)
         case .boardReadFailed(let requestId):
             failBoardRead(requestID: requestId)
+        case .workItemRefused(let id, let code, let message, let suggestedAction, let requestId):
+            handleWorkItemRefused(id: id, code: code, message: message, suggestedAction: suggestedAction, requestId: requestId)
         case .workError(let message, let requestId):
             failBoardRead(requestID: requestId)
             if settleOffsiteBackupError(message, requestID: requestId) { return }
@@ -203,6 +209,9 @@ extension ChatViewModel {
             // Likewise a refused project archive: the row drops its pending
             // mark and the message surfaces, with no other state touched.
             if settleArchiveWorkError(message: message, requestId: requestId) { return }
+            // A refused Move Up/Down reorder carries its own request id:
+            // show the reason on the card that was moved.
+            if settleReorderWorkError(message: message, requestId: requestId) { return }
             abandonBackgroundWorkRequest(requestId: requestId)
             // Legacy list_executions/list_attachments guards do not retain
             // request IDs, so they cannot match the error's envelope ID.
@@ -311,6 +320,18 @@ extension ChatViewModel {
             // it is the only reply that request gets, so settle it here.
             if settleArchiveWorkError(message: message, requestId: requestId) { return }
             handle(.error(message: message))
+        case .revisionRefused(let message, let parentTaskID):
+            settleRevisionRefused(message: message, parentTaskID: parentTaskID)
+        case .dispatchAdmissionDecodeFailed(let message, let taskID):
+            // An undecodable `dispatch_admission_evaluated` reply would
+            // otherwise leave its card optimistically rendered in Doing
+            // forever. Bounce back exactly that card, as a hard-blocker
+            // refusal would. If the client could not say which card the reply
+            // answered, fall back to the cards with an admission check in
+            // flight — never to unrelated optimistic moves.
+            let affected = taskID.map { [$0] } ?? pendingDragAdmissionChecks.keys.sorted()
+            if affected.isEmpty { handle(.error(message: message)); return }
+            for id in affected { bounceBackAdmissionCheck(taskID: id, message: message) }
         case .error(let message, let requestId):
             if let requestId,
                let pending = pendingDragAdmissionChecks.values.first(where: { $0.requestID == requestId }),

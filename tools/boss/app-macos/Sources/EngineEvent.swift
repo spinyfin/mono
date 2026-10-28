@@ -59,14 +59,25 @@ enum EngineEvent {
     /// user's current selection/filters — it's a passive data refresh.
     case workItemsCreated(items: [WorkItemPayload])
     case workItemUpdated(item: WorkItemPayload, revision: UInt64? = nil)
-    case projectTasksReordered(projectId: String, taskIds: [String])
+    case projectTasksReordered(projectId: String, taskIds: [String], requestId: String? = nil)
     case workItemDeleted(id: String)
     case boardReadFailed(requestId: String?)
     case workError(message: String, requestId: String?)
+    /// The engine refused or reverted a board gesture. `code` is the
+    /// machine-readable reason (`bound_pr`, `update_rejected`, …), `message`
+    /// is final user-facing text, and `suggestedAction` (`add_revision`) is
+    /// an optional next step. The app displays this next to the dragged card.
+    case workItemRefused(id: String, code: String, message: String, suggestedAction: String?, requestId: String? = nil)
     /// A `work_item_updated` reply whose payload failed to decode. Carries
     /// the envelope request id so a pending request waiting on that reply
     /// (e.g. a project archive) can settle instead of waiting forever.
     case workItemUpdateDecodeFailed(message: String, requestId: String?)
+    /// A `create_revision` the engine refused, attributed by the client to the
+    /// parent card the revision was filed against.
+    case revisionRefused(message: String, parentTaskID: String)
+    /// A `dispatch_admission_evaluated` reply that failed to decode. `taskID`
+    /// is the card whose admission check it answered, when the client knows.
+    case dispatchAdmissionDecodeFailed(message: String, taskID: String?)
     /// Typed refusal of an `answer_operator_question` request (`not_found`,
     /// `conflict`, `validation_failed`). `message` is user-readable;
     /// `requestId` is the envelope id of the answer request it refuses.
