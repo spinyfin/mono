@@ -184,7 +184,7 @@ Bazel's CI-mode output root, disk cache, and repository cache are all pointed at
 - `build:ci-linux --disk_cache=/mnt/ssd/bazel/disk_cache` (`.ci.bazelrc`)
 - `build:ci-linux --repository_cache=/mnt/ssd/bazel/repo_cache` (`.ci.bazelrc`)
 
-This keeps Bazel's large, disk-hungry action cache and sandboxed build outputs off the smaller boot disk and on dedicated capacity sized for it. The disk cache's size-based GC cap is computed per host from that capacity (1800 GB on these 3.6 TB disks) rather than fixed in `.ci.bazelrc` — see "Disk-cache GC sizing" below. The age-based GC (60 days, `experimental_disk_cache_gc_max_age` in `.ci.bazelrc`) is fleet-wide.
+This keeps Bazel's large, disk-hungry action cache and sandboxed build outputs off the smaller boot disk and on dedicated capacity sized for it. The disk cache's size-based GC cap is computed per host from that capacity (2880 GB on these 3.6 TB disks) rather than fixed in `.ci.bazelrc` — see "Disk-cache GC sizing" below. The age-based GC (60 days, `experimental_disk_cache_gc_max_age` in `.ci.bazelrc`) is fleet-wide.
 
 ## Disk-cache GC sizing
 
