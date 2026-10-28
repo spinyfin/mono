@@ -96,7 +96,7 @@ impl Materializer {
         check_graph(output)?;
 
         let mut conn = db.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
 
         // Resolve the product from the project (also validates it exists).

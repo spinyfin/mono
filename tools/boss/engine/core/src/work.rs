@@ -624,7 +624,7 @@ struct InMemoryAnchor {
 
 /// A connection handle borrowed from [`WorkDb::connect`]'s pool. Derefs
 /// transparently to [`Connection`], so existing call sites (`conn.execute`,
-/// `conn.prepare`, `conn.transaction()` on a `mut` binding, …) are unaffected
+/// `conn.prepare`, `conn.transaction_with_behavior(..)` on a `mut` binding, …) are unaffected
 /// by the switch from "fresh connection per call" to "one shared, cached
 /// connection guarded by a mutex."
 pub(crate) type PooledConnection<'a> = connection_wait::ConnectionGuard<'a>;
