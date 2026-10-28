@@ -134,3 +134,78 @@ fn pr_redirect_approves_echo_with_jj_git_push_phrase() {
     let decision = run_pr_redirect_guard(r#"echo "jj git push is now blocked""#);
     assert_eq!(decision, "approve", "echo with jj git push phrase must not be blocked");
 }
+
+/// Run the PR redirect guard and return the block `reason`.
+fn run_pr_redirect_guard_reason(bash_command: &str, revision: bool) -> String {
+    use std::io::Write as _;
+    let stdin_payload = serde_json::json!({
+        "tool_input": {"command": bash_command}
+    })
+    .to_string();
+
+    let mut child = std::process::Command::new("sh");
+    child.arg("-c").arg(PR_REDIRECT_GUARD_COMMAND);
+    if revision {
+        child.env(PR_REDIRECT_REVISION_ENV, "1");
+    }
+    let mut child = child
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("sh must be available");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(stdin_payload.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "PR redirect guard produced invalid JSON for command {:?}: {e}\nstdout={stdout}\nstderr={}",
+            bash_command,
+            String::from_utf8_lossy(&out.stderr),
+        )
+    });
+    parsed["reason"].as_str().unwrap_or("").to_owned()
+}
+
+#[test]
+fn pr_redirect_ordinary_reason_recommends_cube_pr_create() {
+    let reason = run_pr_redirect_guard_reason("gh pr create --title x --body y", false);
+    assert!(
+        reason.contains("CUBE_BIN") && reason.contains("pr create --branch"),
+        "ordinary redirect must recommend cube pr create, got: {reason}",
+    );
+    assert!(
+        !reason.contains("propose followup-task"),
+        "ordinary redirect must not send a non-revision worker to followup-task, got: {reason}",
+    );
+}
+
+#[test]
+fn pr_redirect_revision_reason_names_followup_task_and_not_cube_pr_create() {
+    let reason = run_pr_redirect_guard_reason("gh pr create --title x --body y", true);
+    assert!(
+        reason.contains("BOSS_BIN")
+            && reason.contains("propose followup-task --name")
+            && reason.contains("--description")
+            && reason.contains("--rationale"),
+        "revision redirect must show the followup-task invocation, got: {reason}",
+    );
+    assert!(
+        reason.contains("pr update --branch"),
+        "revision redirect must point at cube pr update, got: {reason}",
+    );
+    assert!(
+        !reason.contains("pr create --branch"),
+        "revision redirect must not recommend cube pr create, got: {reason}",
+    );
+    assert!(
+        reason.contains("A revision never opens a new PR"),
+        "revision redirect must say a revision never opens a new PR, got: {reason}",
+    );
+}

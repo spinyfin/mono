@@ -33,6 +33,7 @@ fn write_workspace_files_does_not_pre_trust_claude_json_for_non_claude_driver() 
         worker_kind: WorkerKind::Standard,
         automation_outcome_proposals_seam_enabled: false,
         run_done_proposals_seam_enabled: false,
+        worker_signal_proposals_seam_enabled: false,
         is_review_supervisor: false,
         is_post_merge_reviewer: false,
         checkout_positioned_on_pr_head: false,

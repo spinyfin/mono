@@ -369,7 +369,7 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "        while j<len(rest) and rest[j].startswith('-'):\n",
     "            j += 2 if rest[j] in ('--socket-path','--engine-max-wait') else 1\n",
     "        if j<len(rest) and rest[j]=='handoff':\n",
-    "            _block('Blocked: boss handoff is coordinator-only; workers cannot read or mutate the coordinator handoff.')\n",
+    "            _block('Blocked: boss handoff is coordinator-only; workers cannot read or mutate the coordinator handoff. If this blocks your task, use '+chr(34)+chr(36)+'BOSS_BIN'+chr(34)+' propose blocked --reason '+chr(34)+'<specific question>'+chr(34)+'.')\n",
     "matched=None\n",
     "for g in groups:\n",
     "    rest=strip_prefixes(g)\n",
@@ -519,6 +519,12 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "_approve()\n",
 );
 
+/// Env var that switches [`PR_REDIRECT_GUARD_COMMAND`] onto the revision
+/// rejection. Set to `1` on revision sessions so a blocked `gh pr create`
+/// never recommends `cube pr create` (the next step the revision PR guard
+/// then refuses). Ordinary Standard workers leave it unset.
+pub const PR_REDIRECT_REVISION_ENV: &str = "BOSS_REVISION_WORKER";
+
 /// Inline Python decision hook that blocks all Standard workers from pushing
 /// branches or opening PRs via bare VCS commands (`gh pr create`, `jj git push`,
 /// `git push`). Uses `shlex.split()` so push/PR-creation phrases inside quoted
@@ -526,7 +532,9 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
 ///
 /// Applies to ALL `WorkerKind::Standard` workers (local and remote). The
 /// revision-specific guard ([`REVISION_PR_GUARD_COMMAND`]) stacks on top for
-/// revision workers and adds additional blocks.
+/// revision workers and adds additional blocks. When
+/// [`PR_REDIRECT_REVISION_ENV`] is `1`, the block names `cube pr update` and
+/// `"$BOSS_BIN" propose followup-task` instead of `cube pr create`.
 pub const PR_REDIRECT_GUARD_COMMAND: &str = python_command_guard!(
     "DELIMS={'&&','||',';','|','&'}\n",
     "try:\n",
@@ -563,15 +571,33 @@ pub const PR_REDIRECT_GUARD_COMMAND: &str = python_command_guard!(
     "if matched:\n",
     "    q=chr(34)\n",
     "    cub=q+chr(36)+'CUBE_BIN'+q\n",
-    "    msg='Workers must not push branches or open PRs with bare VCS commands (blocked: '+matched+'). Use cube instead: '+cub+' pr create --branch <branch> (new PR: pushes the branch and opens the PR in one step, jj-aware, no GIT_DIR) or '+cub+' pr update --branch <branch> (existing PR: pushes new commits to it). Never use jj git push, git push, or gh pr create directly.'\n",
+    "    if os.environ.get('BOSS_REVISION_WORKER')=='1':\n",
+    "        bos=q+chr(36)+'BOSS_BIN'+q\n",
+    "        follow=bos+' propose followup-task --name '+q+'<short title>'+q+' --description '+q+'<one paragraph of scope>'+q+' --rationale '+q+'<why a separate PR>'+q\n",
+    "        msg='Workers must not push branches or open PRs with bare VCS commands (blocked: '+matched+'). A revision never opens a new PR. Push in-scope commits to the existing parent PR with '+cub+' pr update --branch <branch>. For work that needs its own PR, run '+follow+' and finish the in-scope work. Never use jj git push, git push, or gh pr create directly. Do not declare you could not complete.'\n",
+    "    else:\n",
+    "        msg='Workers must not push branches or open PRs with bare VCS commands (blocked: '+matched+'). Use cube instead: '+cub+' pr create --branch <branch> (new PR: pushes the branch and opens the PR in one step, jj-aware, no GIT_DIR) or '+cub+' pr update --branch <branch> (existing PR: pushes new commits to it). Never use jj git push, git push, or gh pr create directly.'\n",
     "    _block(msg)\n",
     "_approve()\n",
 );
+
+/// Hook command for [`PR_REDIRECT_GUARD_COMMAND`]. Revision sessions prefix
+/// [`PR_REDIRECT_REVISION_ENV`] so the rejection never recommends
+/// `cube pr create`.
+pub fn pr_redirect_guard_command(is_revision: bool) -> String {
+    if is_revision {
+        format!("{PR_REDIRECT_REVISION_ENV}=1 {PR_REDIRECT_GUARD_COMMAND}")
+    } else {
+        PR_REDIRECT_GUARD_COMMAND.to_owned()
+    }
+}
 
 /// Inline Python decision hook that guards revision tasks from opening new PRs.
 /// Uses `shlex.split()` to tokenise the Bash command so PR-creation phrases
 /// inside quoted arguments do NOT trigger the block. Blocks `gh pr create`,
 /// `cube pr create`, and the deprecated `cube pr ensure`; allows `cube pr update`.
+/// A block names `cube pr update` for in-scope commits and
+/// `"$BOSS_BIN" propose followup-task` for work that needs its own PR.
 pub const REVISION_PR_GUARD_COMMAND: &str = python_command_guard!(
     "DELIMS={'&&','||',';','|','&'}\n",
     "try:\n",
@@ -616,8 +642,11 @@ pub const REVISION_PR_GUARD_COMMAND: &str = python_command_guard!(
     "        break\n",
     "if matched:\n",
     "    cub=chr(34)+chr(36)+'CUBE_BIN'+chr(34)\n",
+    "    bos=chr(34)+chr(36)+'BOSS_BIN'+chr(34)\n",
     "    sug=cub+' pr update --branch '+br if br else cub+' pr update --branch <your-pr-bookmark>'\n",
-    "    msg='Revision tasks push commits to the existing parent PR; they must not open a new PR (matched command: '+matched+'). Push your commits to the existing PR with: '+sug\n",
+    "    q=chr(34)\n",
+    "    follow=bos+' propose followup-task --name '+q+'<short title>'+q+' --description '+q+'<one paragraph of scope>'+q+' --rationale '+q+'<why a separate PR>'+q\n",
+    "    msg='Revision tasks push commits to the existing parent PR; they must not open a new PR (matched command: '+matched+'). Push in-scope commits to the existing PR with: '+sug+'. If this work needs its own PR, run '+follow+' and finish the in-scope work on this parent PR. Do not declare you could not complete.'\n",
     "    _block(msg)\n",
     "_approve()\n",
 );
@@ -1012,7 +1041,7 @@ impl AgentDriver for ClaudeDriver {
         if config.is_standard_worker {
             hooks.push(serde_json::json!({
                 "matcher": "Bash",
-                "hooks": [{"type": "command", "command": PR_REDIRECT_GUARD_COMMAND}],
+                "hooks": [{"type": "command", "command": pr_redirect_guard_command(config.is_revision)}],
             }));
         }
 
@@ -1728,6 +1757,10 @@ mod tests {
         assert!(
             cmds.iter().any(|c| c.contains("ensure")),
             "revision guard must block cube pr ensure: {cmds:?}",
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("BOSS_REVISION_WORKER=1")),
+            "revision PR-redirect must set BOSS_REVISION_WORKER: {cmds:?}",
         );
     }
 

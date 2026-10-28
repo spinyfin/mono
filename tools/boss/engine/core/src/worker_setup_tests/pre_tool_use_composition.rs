@@ -42,6 +42,10 @@ fn revision_implementation_adds_gh_pr_create_guard_to_pre_tool_use() {
         "revision guard block message must point workers at `$CUBE_BIN` pr update: {guard_cmd}",
     );
     assert!(
+        guard_cmd.contains("BOSS_BIN") && guard_cmd.contains("propose followup-task --name"),
+        "revision guard block message must point workers at `$BOSS_BIN` propose followup-task: {guard_cmd}",
+    );
+    assert!(
         guard_cmd.contains("block"),
         "revision guard must produce a block decision: {guard_cmd}",
     );
@@ -60,6 +64,80 @@ fn revision_implementation_adds_gh_pr_create_guard_to_pre_tool_use() {
     assert!(
         redirect_cmd.contains("CUBE_BIN") && redirect_cmd.contains("pr update"),
         "PR redirect guard block message must mention $CUBE_BIN pr update: {redirect_cmd}",
+    );
+    assert!(
+        redirect_cmd.contains("BOSS_REVISION_WORKER=1"),
+        "revision PreToolUse must set BOSS_REVISION_WORKER so the redirect rejection is revision-shaped: {redirect_cmd}",
+    );
+}
+
+/// A revision worker's `gh pr create` hits the generic PR-redirect guard
+/// first. The reason that guard emits (with `BOSS_REVISION_WORKER=1`) must
+/// name `propose followup-task`, not `cube pr create`.
+#[test]
+fn revision_worker_gh_pr_create_redirect_reason_names_followup_task() {
+    let mut input = sample_input();
+    input.execution_kind = "revision_implementation".into();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
+    let redirect_cmd = parsed["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("PreToolUse must be an array")
+        .iter()
+        .filter_map(|e| e["hooks"][0]["command"].as_str())
+        .find(|cmd| {
+            cmd.contains("jj git push")
+                && cmd.contains("CUBE_BIN")
+                && cmd.contains("pr create")
+                && !cmd.contains("ensure")
+        })
+        .expect("revision PreToolUse must include the PR redirect guard")
+        .to_owned();
+    assert!(
+        redirect_cmd.contains("BOSS_REVISION_WORKER=1"),
+        "installed redirect command must set the revision env: {redirect_cmd}",
+    );
+
+    use std::io::Write as _;
+    let stdin_payload = serde_json::json!({
+        "tool_input": {"command": "gh pr create --title x --body y"}
+    })
+    .to_string();
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&redirect_cmd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("sh must be available");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(stdin_payload.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "PR redirect guard produced invalid JSON: {e}\nstdout={stdout}\nstderr={}",
+            String::from_utf8_lossy(&out.stderr),
+        )
+    });
+    assert_eq!(
+        parsed["decision"].as_str().unwrap_or("missing"),
+        "block",
+        "gh pr create must still be blocked: {parsed}"
+    );
+    let reason = parsed["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("propose followup-task"),
+        "revision worker's gh pr create reason must name propose followup-task, got: {reason}",
+    );
+    assert!(
+        !reason.contains("pr create --branch"),
+        "revision worker's gh pr create reason must not recommend cube pr create, got: {reason}",
     );
 }
 

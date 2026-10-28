@@ -95,8 +95,8 @@ fn path_guard_script_has_the_load_bearing_logic() {
         "must be able to emit a block decision"
     );
     assert!(
-        s.contains("boss task restore") || s.contains("boss shake"),
-        "block message must point at the sanctioned recovery surface"
+        s.contains("propose blocked --reason"),
+        "block message must point at propose blocked when progress needs a human"
     );
 }
 
@@ -227,6 +227,10 @@ fn path_guard_blocks_a_relative_read_whose_cwd_is_the_data_dir() {
         "a Read of a relative path resolving into the data dir must be blocked: {reason}",
     );
     assert!(reason.contains("engine-owned"), "{reason}");
+    assert!(
+        reason.contains("propose blocked --reason"),
+        "data-directory rejection must name propose blocked: {reason}"
+    );
 
     // Same shape one level deeper, and via `..` — canonicalisation, not
     // string matching, is what makes the boundary hold.

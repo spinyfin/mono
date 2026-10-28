@@ -57,8 +57,8 @@ use crate::transcript_store::{
 use progress::{CodexRolloutProgressSession, CodexTranscriptSession, normalize_rollout, verified_sessions_root};
 
 use super::claude::{
-    BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND,
-    REVISION_PR_GUARD_COMMAND,
+    BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, PR_REDIRECT_REVISION_ENV,
+    REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND,
 };
 use super::{
     AgentDriver, AgentJsonlFileIngress, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, EnvDirective,
@@ -1227,11 +1227,16 @@ fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> 
 
     // 4. PR redirect — Standard workers only.
     if config.is_standard_worker {
+        let extra_env = if config.is_revision {
+            vec![(PR_REDIRECT_REVISION_ENV, "1".to_owned())]
+        } else {
+            Vec::new()
+        };
         planned.push(Planned {
             name: "pr_redirect_guard",
             source: GuardSource::Inline(python_c_to_script(PR_REDIRECT_GUARD_COMMAND)?),
             matcher: "Bash",
-            extra_env: Vec::new(),
+            extra_env,
         });
     }
 

@@ -51,6 +51,10 @@ from the PR URL or `jj git remote`).
 - Before pushing, run `jj diff -r @`. If the diff is empty,
 do NOT commit, push, or open a PR — stop and explain.
 
+## Revisions
+
+A revision never opens a new PR. Push in-scope commits to the existing parent PR with `"$CUBE_BIN" pr update`. Out-of-scope or separately-approved PR work goes through `"$BOSS_BIN" propose followup-task --name "<short title>" --description "<one paragraph of scope>" --rationale "<why a separate PR>"`; then finish the in-scope work on the parent PR. If a guard, policy, or decision blocks progress, emit a `[blocked] reason="<specific question>"` marker instead of declaring you could not complete.
+
 ## Checking your own PR's state
 
 The engine already stores most of what you'd otherwise ask GitHub for.

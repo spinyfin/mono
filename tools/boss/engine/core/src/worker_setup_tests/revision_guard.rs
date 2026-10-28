@@ -206,3 +206,26 @@ fn guard_block_message_reuses_head_branch_from_gh_pr_create() {
         "block reason must reuse the --head branch in the update suggestion, got: {reason}",
     );
 }
+
+#[test]
+fn guard_block_message_points_at_followup_task_for_a_separate_pr() {
+    // The rejection must name the propose verb with its invocation shape
+    // and tell the worker to finish in-scope work on the parent PR rather
+    // than exit as could-not-complete.
+    let reason = run_revision_guard_reason("cube pr create --branch boss/exec_abc123_01 --title 'x'");
+    assert!(
+        reason.contains("BOSS_BIN")
+            && reason.contains("propose followup-task --name")
+            && reason.contains("--description")
+            && reason.contains("--rationale"),
+        "block reason must show the followup-task invocation shape, got: {reason}",
+    );
+    assert!(
+        reason.contains("finish the in-scope work"),
+        "block reason must tell the worker to finish in-scope work, got: {reason}",
+    );
+    assert!(
+        reason.contains("could not complete"),
+        "block reason must steer away from a could-not-complete exit, got: {reason}",
+    );
+}

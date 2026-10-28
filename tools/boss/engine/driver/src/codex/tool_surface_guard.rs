@@ -86,7 +86,12 @@ MCP_BLOCK = (
     "GitHub app tool would push branches, open or merge PRs outside every one "
     "of those gates. Do the work through the shell instead, where the "
     "guardrails apply: `gh` for GitHub reads, `cube pr create` / "
-    "`cube pr update` for pull requests, `jj` for VCS."
+    "`cube pr update` for pull requests, `jj` for VCS. If you are a "
+    "revision: never open a new PR; push in-scope work with "
+    "`\"$CUBE_BIN\" pr update`. For work that needs its own PR, run "
+    "`\"$BOSS_BIN\" propose followup-task --name \"<short title>\" "
+    "--description \"<one paragraph of scope>\" --rationale "
+    "\"<why a separate PR>\"` and finish the in-scope work."
 )
 
 STDIN_CHANNEL_BLOCK = (
@@ -348,6 +353,10 @@ mod tests {
         assert!(
             reason.contains("cube pr create"),
             "reason must redirect to cube: {reason}"
+        );
+        assert!(
+            reason.contains("propose followup-task --name"),
+            "reason must name followup-task for work that needs its own PR: {reason}"
         );
     }
 

@@ -99,7 +99,10 @@ fn checkleft_push_guard_script_has_the_load_bearing_logic() {
         s.contains("\"decision\"") && s.contains("\"block\"") || s.contains("'block'"),
         "must be able to emit a block decision",
     );
-    assert!(s.contains("BYPASS_"), "block message must surface the bypass guidance");
+    assert!(
+        s.contains("propose blocked --reason"),
+        "block message must point at propose blocked for internal errors and false positives"
+    );
 }
 
 #[test]
@@ -474,8 +477,16 @@ fn push_guard_blocks_jj_git_push_when_checkleft_fails() {
         "block reason must echo the findings: {reason}"
     );
     assert!(
-        reason.contains("BYPASS_"),
-        "block reason must include bypass guidance: {reason}"
+        reason.contains("Fix the findings above and retry"),
+        "block reason must keep root-cause retry guidance: {reason}"
+    );
+    assert!(
+        reason.contains("propose blocked --reason"),
+        "false-positive branch must escalate via propose blocked, not a BYPASS_ directive: {reason}"
+    );
+    assert!(
+        reason.contains("Do not add a `BYPASS_"),
+        "workers must be told not to add a BYPASS_ directive: {reason}"
     );
 }
 
@@ -566,6 +577,10 @@ fn push_guard_reports_internal_error_when_only_stderr() {
     assert!(
         !reason.contains("BYPASS_"),
         "internal error message must NOT include bypass guidance: {reason}",
+    );
+    assert!(
+        reason.contains("propose blocked --reason"),
+        "internal error must name propose blocked when the retry still fails: {reason}",
     );
     assert!(
         reason.contains("unsupported jj diff summary line"),

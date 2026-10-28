@@ -90,7 +90,7 @@ pub use git_store_guard::{ensure_git_store_guard_script_in, git_store_guard_scri
 // Scoped to test builds: the constants are not needed at runtime in this module.
 #[cfg(test)]
 pub(crate) use crate::driver::claude::{
-    BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND,
+    BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, PR_REDIRECT_REVISION_ENV, REVISION_PR_GUARD_COMMAND,
 };
 // Only constructed directly by tests (`ProgressIngress::HookCallback(..)`
 // fixtures) — production code only destructures it via
@@ -266,6 +266,11 @@ pub struct WorkerSetupInput {
     /// Whether the terminal proposal channel can carry operator questions.
     #[builder(default)]
     pub run_done_proposals_seam_enabled: bool,
+    /// Mirrors `worker_signal_proposals_seam` (composed with `worker_proposals`).
+    /// Gates the Revisions-section `propose blocked` teaching so worker rules
+    /// and the revision prompt never disagree about the blocked channel.
+    #[builder(default)]
+    pub worker_signal_proposals_seam_enabled: bool,
     /// `true` when this [`WorkerKind::Reviewer`] execution is the batch's
     /// consolidating supervisor rather than a leaf reviewer — selects
     /// [`crate::pr_review::render_supervisor_claude_md`] over
@@ -371,6 +376,13 @@ fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir
     } else {
         String::new()
     };
+    let revision_blocked_sentence = if input.worker_signal_proposals_seam_enabled {
+        format!(
+            "If a guard, policy, or decision blocks progress, use `{boss} propose blocked --reason \"<specific question>\"` instead of declaring you could not complete."
+        )
+    } else {
+        "If a guard, policy, or decision blocks progress, emit a `[blocked] reason=\"<specific question>\"` marker instead of declaring you could not complete.".to_string()
+    };
     format!(
         "# Worker rules\n\
          \n\
@@ -419,6 +431,10 @@ fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir
            from the PR URL or `jj git remote`).\n\
          - Before pushing, run `jj diff -r @`. If the diff is empty,\n\
            do NOT commit, push, or open a PR — stop and explain.\n\
+         \n\
+         ## Revisions\n\
+         \n\
+         A revision never opens a new PR. Push in-scope commits to the existing parent PR with `{cube} pr update`. Out-of-scope or separately-approved PR work goes through `{boss} propose followup-task --name \"<short title>\" --description \"<one paragraph of scope>\" --rationale \"<why a separate PR>\"`; then finish the in-scope work on the parent PR. {revision_blocked_sentence}\n\
          \n\
          ## Checking your own PR's state\n\
          \n\
@@ -1309,11 +1325,9 @@ RECOVERY = (
     "-wal/-shm sidecars, the events socket, and engine pid/state files must "
     "never be read, copied, moved, edited, or opened by a session (no "
     "sqlite3, duckdb, litecli, sqlite-utils, cp/mv/rm, cat/head/tail/hexdump, "
-    "editors, lsof, etc.). To recover or inspect engine state use the "
-    "sanctioned surface instead: ask the repo owner, file a shake with "
-    "'boss shake' describing what you need, or use the dedicated boss/bossctl "
-    "verb once it exists (e.g. 'boss task restore'). Do not work around this "
-    "gate."
+    "editors, lsof, etc.). If progress needs a human to inspect or recover "
+    "engine state, use `\"$BOSS_BIN\" propose blocked --reason \"<specific question>\"`. "
+    "Do not work around this gate."
 )
 
 # -- Broad-traversal boundary ------------------------------------------------
@@ -1820,8 +1834,10 @@ not run git's pre-push hook, so an installed git hook is inert for the worker
 fleet. This hook restores the gate at the harness layer: it inspects every Bash
 command and, when the command is a push (`jj git push` or `git push`), runs the
 repository's checkleft against the outgoing changes before the push proceeds.
-If checkleft reports errors the push is blocked and the findings (plus bypass
-guidance) are echoed back so the worker can fix them or add a BYPASS_ directive.
+If checkleft reports errors the push is blocked and the findings are echoed
+back so the worker can fix them and retry. A genuine false positive that
+needs a human decision is escalated with propose blocked -- workers do not
+add BYPASS_ directives themselves.
 
 All policy lives in checkleft: this script shells out and trusts the exit code
 (0 = allow, non-zero = block). It is fail-open by construction -- a non-push
@@ -2049,7 +2065,10 @@ def main():
     if not findings:
         reason = (
             "Push blocked: checkleft internal error — this is "
-            "a bug, not a policy violation. Please report it.\n\n"
+            "a bug, not a policy violation. Retry after a clean "
+            "`checkleft run`. If it keeps failing, use "
+            "`\"$BOSS_BIN\" propose blocked --reason \"<specific question>\"` "
+            "naming the error.\n\n"
             + extra
         )
     else:
@@ -2057,10 +2076,11 @@ def main():
             "Push blocked: checkleft found errors that must be fixed before "
             "pushing to GitHub.\n\n"
             + findings
-            + "\n\nFix the findings above and retry the push. If a finding is a "
-            "genuine false positive, add a `BYPASS_<CHECK_NAME>=<reason>` line to "
-            "your commit message (jj describe) or the PR description, then retry. "
-            "Do not bypass without a real justification."
+            + "\n\nFix the findings above and retry the push. Do not add a "
+            "`BYPASS_<CHECK_NAME>` line yourself — workers do not bypass "
+            "checks. If a finding is a genuine false positive that needs a "
+            "human decision, use "
+            "`\"$BOSS_BIN\" propose blocked --reason \"<specific question>\"`."
         )
     emit("block", reason)
 

@@ -556,6 +556,10 @@ pub struct StartWorkerInput {
     /// Forwarded to worker rules to gate operator question guidance.
     #[builder(default)]
     pub run_done_proposals_seam_enabled: bool,
+    /// Forwarded to worker rules so the Revisions `propose blocked` sentence
+    /// matches the revision prompt's seam-gated blocked channel.
+    #[builder(default)]
+    pub worker_signal_proposals_seam_enabled: bool,
     /// Forwarded to `WorkerSetupInput` — see that field's doc. Ignored
     /// unless `worker_kind` is [`WorkerKind::Reviewer`].
     #[builder(default)]
@@ -817,6 +821,7 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
         .worker_kind(input.worker_kind.clone())
         .automation_outcome_proposals_seam_enabled(input.automation_outcome_proposals_seam_enabled)
         .run_done_proposals_seam_enabled(input.run_done_proposals_seam_enabled)
+        .worker_signal_proposals_seam_enabled(input.worker_signal_proposals_seam_enabled)
         .is_review_supervisor(input.is_review_supervisor)
         .is_post_merge_reviewer(input.is_post_merge_reviewer)
         .checkout_positioned_on_pr_head(input.checkout_positioned_on_pr_head)
@@ -1244,6 +1249,7 @@ mod tests {
             ),
             automation_outcome_proposals_seam_enabled: false,
             run_done_proposals_seam_enabled: false,
+            worker_signal_proposals_seam_enabled: false,
             is_review_supervisor: false,
             is_post_merge_reviewer: false,
             checkout_positioned_on_pr_head: false,

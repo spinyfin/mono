@@ -50,8 +50,8 @@ use serde_json::json;
 
 use super::home::hooks_file_path;
 use crate::claude::{
-    BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND,
-    REVISION_PR_GUARD_COMMAND,
+    BOSS_LAUNCH_GUARD_COMMAND, REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND,
+    pr_redirect_guard_command,
 };
 use crate::{ProgressObservationConfig, ToolUseInterceptionConfig};
 
@@ -183,7 +183,7 @@ fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
     // 3. PR-redirect guard. Standard workers only (local + remote).
     if config.is_standard_worker {
         out.push(Guard {
-            command: PR_REDIRECT_GUARD_COMMAND.to_owned(),
+            command: pr_redirect_guard_command(config.is_revision),
             matcher: "Bash",
         });
     }
@@ -512,6 +512,7 @@ if __name__ == "__main__":
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::claude::{PR_REDIRECT_GUARD_COMMAND, PR_REDIRECT_REVISION_ENV};
 
     fn interception_config(overrides: impl FnOnce(&mut ToolUseInterceptionConfig)) -> ToolUseInterceptionConfig {
         let mut config = ToolUseInterceptionConfig {
@@ -649,6 +650,11 @@ mod tests {
         let config = interception_config(|c| c.is_revision = true);
         let guards = guard_commands(&config);
         assert_eq!(guards.len(), 3, "launch + pr-redirect + revision: {config:?}");
+        assert!(
+            guards[1].command.starts_with(&format!("{PR_REDIRECT_REVISION_ENV}=1 ")),
+            "revision PR-redirect must set {PR_REDIRECT_REVISION_ENV}: {}",
+            guards[1].command
+        );
         assert_eq!(guards.last().unwrap().command, REVISION_PR_GUARD_COMMAND);
     }
 

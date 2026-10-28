@@ -2085,6 +2085,55 @@ fn guide_comment_revision_directive_injects_guide_instructions() {
 }
 
 #[test]
+fn revision_directive_steers_separate_pr_work_to_followup_task() {
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("A revision never opens a new PR"),
+        "revision prompt must state a revision never opens a new PR:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("\"$BOSS_BIN\" propose followup-task --name \"<short title>\""),
+        "revision prompt must show the followup-task invocation shape:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("[blocked] reason=\"<specific question>\""),
+        "revision prompt, seam off: must steer a blocked guard/policy/decision to a specific \
+             question marker rather than a could-not-complete exit:\n{prompt}",
+    );
+}
+
+#[test]
+fn revision_directive_steers_blocked_progress_to_propose_blocked_when_seam_is_on() {
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .worker_signal_proposals_seam_enabled(true)
+            .build(),
+    );
+    assert!(
+        prompt.contains("\"$BOSS_BIN\" propose blocked --reason \"<specific question>\""),
+        "revision prompt, seam on: must steer a blocked guard/policy/decision to propose \
+             blocked with a specific question:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("instead of declaring you could not complete"),
+        "revision prompt must name the could-not-complete exit it is replacing:\n{prompt}",
+    );
+}
+
+#[test]
 fn ordinary_revision_directive_omits_guide_instructions() {
     let work_item = revision_task_with_created_via(None, "operator");
     let prompt = compose_execution_prompt(

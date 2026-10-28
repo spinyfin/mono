@@ -1416,6 +1416,7 @@ impl HostAdapter for SshHostAdapter {
             // its reduced surface instead of silently becoming Standard.
             .worker_kind(crate::worker_setup::worker_kind_for_execution(&execution.kind))
             .run_done_proposals_seam_enabled(spawn_opts.run_done_proposals_seam_enabled)
+            .worker_signal_proposals_seam_enabled(spawn_opts.worker_signal_proposals_seam_enabled)
             .is_review_supervisor(is_review_supervisor)
             .is_post_merge_reviewer(is_post_merge_reviewer)
             // Mirrors `WorkerSpawnOpts` above: a remotely dispatched triage
