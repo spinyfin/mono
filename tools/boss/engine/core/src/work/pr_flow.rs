@@ -642,6 +642,17 @@ impl WorkDb {
         let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let mut pending = PendingEvents::new();
         stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
+        // A same-chain later revision may already be `blocked: dependency`
+        // on this row. Once the writer is a dead halt with no live
+        // execution, `gating_prereqs_for` no longer treats it as a gate;
+        // re-evaluate dependents in this transaction so they do not wait
+        // for the dep-unblock sweep.
+        if task
+            .as_ref()
+            .is_some_and(|t| t.status == TaskStatus::Blocked && t.blocked_reason.as_deref() == Some("worker_failed"))
+        {
+            cascade_dependents_after_prereq_status_change(&mut pending, &tx, &work_item_id, "blocked", &now)?;
+        }
         commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(WorkerFailureCompletion {
             execution: updated_execution,

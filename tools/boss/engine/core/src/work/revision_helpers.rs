@@ -50,6 +50,8 @@ impl WorkDb {
 /// terminal halt (`worker_failed`, `spawning_attempt_retired_unsuccessfully`)
 /// that still has a non-terminal execution. A halted revision with no live
 /// execution is skipped — gating a later revision on it queues forever.
+/// Parent PR CI is not part of the predicate; a dead halt holds no branch
+/// state whether the head is green, red, or unknown.
 /// `in_review` is **not** live: that worker already pushed and stopped, so
 /// gating a conflict- or CI-fix revision on it waits for the parent PR to
 /// merge, which a conflicting PR cannot do. `done` / `archived` are finished.

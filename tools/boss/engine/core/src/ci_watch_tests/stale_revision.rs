@@ -208,10 +208,9 @@ async fn human_filed_revision_is_untouched() {
     assert_eq!(task(&db, &review.id).status, TaskStatus::Blocked);
 }
 
-/// A queue-side attempt that has already ended (`abandoned`) leaves its
-/// CI-fix revision stranded. A green PR-head probe must close that
-/// revision; excluding `trunk_queue_eviction` / `merge_queue_rebounce`
-/// from the moot-close query used to pin the parent in Review ▸ Blocked.
+/// A queue-side attempt that has ended (`abandoned`) strands its CI-fix
+/// revision; a green PR-head probe closes it so the parent is not held in
+/// Review ▸ Blocked.
 #[tokio::test]
 async fn queue_side_abandoned_attempt_revision_is_closed_when_head_is_green() {
     for (label, failure_kind) in [

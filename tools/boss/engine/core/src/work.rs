@@ -26,8 +26,9 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const CHORE_LIKE_KINDS_SQL: &str =
     "'chore', 'project_task', 'design', 'investigation', 'followup', 'design_postmortem'";
 
-/// SQL boolean: `{alias}` is a live writer for the revision chain-tail gate
-/// and [`WorkDb::has_in_flight_ci_fix_revision`].
+/// SQL boolean: `{alias}` is a live writer for the revision chain-tail gate,
+/// [`WorkDb::has_in_flight_ci_fix_revision`], and same-chain revision
+/// gating in [`crate::work_dependencies::gating_prereqs_for`].
 ///
 /// Live = `todo` / `active`, or `blocked` for a reason other than a
 /// terminal halt (`worker_failed`, `spawning_attempt_retired_unsuccessfully`),
@@ -35,7 +36,15 @@ pub(crate) const CHORE_LIKE_KINDS_SQL: &str =
 /// A halted revision with no live execution is not a writer: gating a later
 /// revision on it queues forever, and the parent sits in Review ▸ Blocked.
 ///
-/// `alias` is a compile-time table alias from the two callers (`t`, `next`);
+/// Parent PR CI is not part of this predicate. A dead halt has already
+/// released the branch — there is no live worker to finish — whether the
+/// head is green, red, or unknown. Requiring `ci_required_state = 'success'`
+/// would leave later revisions queued behind a corpse while CI is red, which
+/// is the case that most needs a new writer. A red head still places the
+/// parent in Review ▸ Blocked via `classify_review_section`; that is the
+/// CI failure itself, not this gate.
+///
+/// `alias` is a compile-time table alias from callers (`t`, `next`);
 /// never user input.
 pub(crate) fn live_chain_writer_sql(alias: &str) -> String {
     debug_assert!(
@@ -61,6 +70,23 @@ pub(crate) fn live_chain_writer_sql(alias: &str) -> String {
               )
           ))"
     )
+}
+
+/// True when `task_id` is a live writer per [`live_chain_writer_sql`].
+pub(crate) fn is_live_chain_writer(conn: &Connection, task_id: &str) -> Result<bool> {
+    let live = live_chain_writer_sql("t");
+    Ok(conn.query_row(
+        &format!(
+            "SELECT EXISTS(
+                 SELECT 1 FROM tasks t
+                  WHERE t.id = ?1
+                    AND t.deleted_at IS NULL
+                    AND {live}
+             )"
+        ),
+        [task_id],
+        |row| row.get(0),
+    )?)
 }
 
 /// Error of the single most recent terminal, non-superseded review-guide

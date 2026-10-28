@@ -351,6 +351,26 @@ fn same_revision_chain(conn: &Connection, a: &str, b: &str) -> Result<bool> {
     Ok(crate::work::chain_root(conn, a)? == crate::work::chain_root(conn, b)?)
 }
 
+/// A same-chain revision that is not a live writer cannot complete, so it
+/// must not keep gating a later revision on the same PR.
+fn dead_same_chain_revision_writer(
+    conn: &Connection,
+    dependent_kind: Option<&str>,
+    dependent_id: &str,
+    prerequisite_id: &str,
+) -> Result<bool> {
+    if dependent_kind != Some("revision") {
+        return Ok(false);
+    }
+    if lookup_work_item_kind(conn, prerequisite_id)?.as_deref() != Some("revision") {
+        return Ok(false);
+    }
+    if !same_revision_chain(conn, dependent_id, prerequisite_id)? {
+        return Ok(false);
+    }
+    Ok(!crate::work::is_live_chain_writer(conn, prerequisite_id)?)
+}
+
 /// Return the prerequisite ids that currently *gate* `work_item_id`
 /// — `blocks` edges whose prereq has not reached a satisfied
 /// status. Used by both the dispatcher (to demote a gated dependent
@@ -362,6 +382,14 @@ fn same_revision_chain(conn: &Connection, a: &str, b: &str) -> Result<bool> {
 /// still gate until done/archived. This applies to every `blocks` edge,
 /// including explicit `--depends-on` edges, not just prerequisite questions.
 /// For all other dependents the standard `done`/`archived` rules apply.
+///
+/// A same-chain revision prerequisite that is not a live writer
+/// (`live_chain_writer_sql`) also does not gate: a `blocked: worker_failed`
+/// / `spawning_attempt_retired_unsuccessfully` sibling with no live
+/// execution never completes, so a persisted `blocks` edge onto it must
+/// not hold the later revision in `blocked: dependency` forever.
+/// `maybe_engine_unblock_dependent` and the dep-unblock sweep re-evaluate
+/// this predicate.
 pub fn gating_prereqs_for(conn: &Connection, work_item_id: &str) -> Result<Vec<String>> {
     let dependent_kind = lookup_work_item_kind(conn, work_item_id)?;
     let edges = prerequisites_of(conn, work_item_id, Some(RELATION_BLOCKS))?;
@@ -392,7 +420,17 @@ pub fn gating_prereqs_for(conn: &Connection, work_item_id: &str) -> Result<Vec<S
                     gating.push(edge.prerequisite_id);
                 }
             }
-            _ => gating.push(edge.prerequisite_id),
+            _ => {
+                if dead_same_chain_revision_writer(
+                    conn,
+                    dependent_kind.as_deref(),
+                    work_item_id,
+                    &edge.prerequisite_id,
+                )? {
+                    continue;
+                }
+                gating.push(edge.prerequisite_id);
+            }
         }
     }
     if dependent_kind.as_deref() == Some("revision") {

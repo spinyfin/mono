@@ -386,7 +386,9 @@ The seven questions this design originally raised have been resolved by the oper
 - `blocked` for a reason other than `worker_failed` / `spawning_attempt_retired_unsuccessfully`, or
 - those two halt reasons while a non-terminal execution is still attached.
 
-A `blocked: worker_failed` or `blocked: spawning_attempt_retired_unsuccessfully` revision with no live execution is skipped, so a later revision is not gated on a sibling that will never finish, and the parent does not sit in Review ▸ Blocked waiting on it. `in_review` / `done` / `archived` remain non-live, as before. The same live-writer predicate is what `has_in_flight_ci_fix_revision` uses so a dead CI-fix does not block a new one.
+A `blocked: worker_failed` or `blocked: spawning_attempt_retired_unsuccessfully` revision with no live execution is skipped, so a later revision is not gated on a sibling that will never finish, and the parent does not sit in Review ▸ Blocked waiting on it. `in_review` / `done` / `archived` remain non-live, as before. The same live-writer predicate is what `has_in_flight_ci_fix_revision` uses so a dead CI-fix does not block a new one, and what `gating_prereqs_for` uses for a same-chain revision prerequisite so a persisted `blocks` edge onto a dead sibling does not keep the later revision in `blocked: dependency`. `maybe_engine_unblock_dependent` and the dep-unblock sweep re-evaluate that predicate.
+
+Parent PR CI is not part of the live-writer predicate. A dead halt has already released the branch: there is no live worker to finish, whether the head is green, red, or unknown. Requiring a green head would leave later revisions queued behind a corpse while CI is red, which is the case that most needs a new writer. When CI is red the parent still sits in Review ▸ Blocked because of the CI failure itself (`classify_review_section`), not because of this gate.
 
 ### OQ3 — Permission scope / `gh pr create` guard
 
