@@ -82,6 +82,43 @@ async fn missing_authorization_is_minted_and_reset_can_wait_for_a_fresh_handoff(
 }
 
 #[tokio::test(start_paused = true)]
+async fn fresh_write_during_delivery_is_retained_before_the_wait_is_registered() {
+    struct WritesDuringDelivery<'a>(&'a WorkDb, &'a Notify);
+    #[async_trait::async_trait]
+    impl crate::coordinator_tmux::inbox::HandoffDelivery for WritesDuringDelivery<'_> {
+        async fn deliver(&self, _: &Tmux, _: &CoordinatorTmuxRecord, _: &str) -> Result<()> {
+            self.0.set_coordinator_handoff(
+                "written before delivery confirmation",
+                "token",
+                boss_engine_utils::epoch_time::now_epoch_secs(),
+            )?;
+            self.1.notify_waiters();
+            Ok(())
+        }
+    }
+    let (db, tmux, _server, _dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
+    record(&db);
+    let lock = tokio::sync::Mutex::new(());
+    let written = Notify::new();
+    assert!(
+        crate::coordinator_tmux::reset_handoff::request_and_wait(
+            HandoffRequest::builder()
+                .work_db(&db)
+                .tmux(&tmux)
+                .lifecycle_lock(&lock)
+                .written(&written)
+                .expected_token("token")
+                .force(false)
+                .timeout(Duration::from_millis(100))
+                .delivery(&WritesDuringDelivery(&db, &written))
+                .build(),
+        )
+        .await
+        .unwrap()
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn the_full_thirty_second_grace_period_starts_only_after_delivery() {
     struct DelayedDelivery(Notify);
     #[async_trait::async_trait]
@@ -173,6 +210,15 @@ async fn prompt_submitted(server: &FakeTmux) {
 
 #[tokio::test(start_paused = true)]
 async fn fresh_write_wakes_reset_and_replacement_receives_present_brief_for_both_reasons() {
+    assert_fresh_write_receives_present_brief(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn fresh_write_ready_with_deadline_receives_present_brief_for_both_reasons() {
+    assert_fresh_write_receives_present_brief(true).await;
+}
+
+async fn assert_fresh_write_receives_present_brief(deadline_ready: bool) {
     for reason in [
         CoordinatorRecreateReason::OperatorReset,
         CoordinatorRecreateReason::ModelMismatch,
@@ -181,26 +227,44 @@ async fn fresh_write_wakes_reset_and_replacement_receives_present_brief_for_both
         record(&db);
         let written = Notify::new();
         let spawn = spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe);
-        let (result, ()) = tokio::join!(reset(&spawn, &written, false, reason), async {
-            prompt_submitted(&server).await;
-            assert!(
-                send_keys_calls(&server.calls()).is_empty(),
-                "handoff delivery must not touch the composer"
-            );
-            assert!(
-                !server
-                    .calls()
-                    .iter()
-                    .any(|c| c.get(2).map(String::as_str) == Some("kill-session"))
-            );
-            db.set_coordinator_handoff(
-                "fresh operator facts",
-                "token",
-                boss_engine_utils::epoch_time::now_epoch_secs(),
-            )
-            .unwrap();
-            written.notify_waiters();
-        });
+        let reset = reset(&spawn, &written, false, reason);
+        tokio::pin!(reset);
+        // Synchronous fake delivery reaches the registered write wait in one
+        // poll. Keep the writer ordered explicitly, without a polling timer.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(reset.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(
+            server
+                .calls()
+                .iter()
+                .any(|call| call.iter().any(|arg| arg == "@test_handoff_delivered"))
+        );
+        assert!(
+            send_keys_calls(&server.calls()).is_empty(),
+            "handoff delivery must not touch the composer"
+        );
+        assert!(
+            !server
+                .calls()
+                .iter()
+                .any(|c| c.get(2).map(String::as_str) == Some("kill-session"))
+        );
+        db.set_coordinator_handoff(
+            "fresh operator facts",
+            "token",
+            boss_engine_utils::epoch_time::now_epoch_secs(),
+        )
+        .unwrap();
+        written.notify_waiters();
+        if deadline_ready {
+            // The write is persisted before expiry, but the reset task is not
+            // polled until both the notification and deadline are ready.
+            tokio::time::advance(Duration::from_millis(100)).await;
+        }
+        let result = reset.await;
         assert_ne!(result.unwrap().spawn_token, "token");
         let brief = start_brief(dir.path());
         assert!(brief.contains("HANDOFF PRESENT:"), "{brief}");
