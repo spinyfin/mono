@@ -256,10 +256,14 @@ struct AttachmentDetailView: View {
         VStack(alignment: .leading, spacing: 12) {
             imageArea
             if !attachment.caption.isEmpty {
-                Text(attachment.caption)
-                    .font(.body)
-                    .lineLimit(3)
-                    .help(attachment.caption)
+                ScrollView {
+                    Text(attachment.caption)
+                        .font(.body)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 96)
+                .fixedSize(horizontal: false, vertical: true)
             }
             metadataRow
         }
@@ -276,7 +280,7 @@ struct AttachmentDetailView: View {
             } description: {
                 Text(reclaimedDescription)
             }
-            .frame(maxWidth: .infinity, minHeight: 240)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let image = loadedImage {
             GeometryReader { geometry in
                 let size = AttachmentImageSizing.fit(native: image.size, available: geometry.size)
@@ -286,6 +290,7 @@ struct AttachmentDetailView: View {
                     .frame(width: size.width, height: size.height)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+            .frame(minHeight: 120)
             .background(Color.black.opacity(0.05))
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         } else {
@@ -294,7 +299,7 @@ struct AttachmentDetailView: View {
             } description: {
                 Text("The image bytes could not be found on disk.")
             }
-            .frame(maxWidth: .infinity, minHeight: 240)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
