@@ -47,7 +47,7 @@ impl WorkDb {
     /// Create a new automation and return the inserted row.
     pub fn create_automation(&self, input: CreateAutomationInput) -> Result<boss_protocol::Automation> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         ensure_product_exists(&tx, &input.product_id)?;
 
         let id = next_id("auto");
@@ -235,7 +235,7 @@ impl WorkDb {
     /// but continue through their lifecycle normally.
     pub fn delete_automation(&self, id: &str) -> Result<()> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let _existing = query_automation(&tx, id).require("automation", id)?;
         tx.execute("DELETE FROM automation_runs WHERE automation_id = ?1", [id])?;
         tx.execute("DELETE FROM automations WHERE id = ?1", [id])?;
@@ -653,7 +653,7 @@ impl WorkDb {
         detail_suffix: &str,
     ) -> Result<usize> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         let stranded: Vec<(String, Option<String>)> = {
             let mut stmt = tx.prepare(
@@ -712,7 +712,7 @@ impl WorkDb {
     /// occurrence for retry rather than skip past it.
     pub fn record_automation_run_and_advance(&self, record: AutomationFireRecord) -> Result<()> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         let scheduled_for = record.scheduled_for.to_string();
         let started_at = record.started_at.to_string();
@@ -922,7 +922,7 @@ impl WorkDb {
         detail: Option<&str>,
     ) -> Result<bool> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let row: Option<(String, String)> = tx
             .query_row(
                 "SELECT id, automation_id FROM automation_runs
@@ -988,7 +988,7 @@ impl WorkDb {
     /// still throttled is a no-op. Returns `true` when a row was updated.
     pub fn update_automation_run_for_pool_throttle(&self, triage_execution_id: &str, detail: &str) -> Result<bool> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let rows_changed = tx.execute(
             "UPDATE automation_runs
                 SET outcome = 'pool_throttled', detail = ?2
@@ -1029,7 +1029,7 @@ impl WorkDb {
         detail: &str,
     ) -> Result<bool> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let rows_changed = tx.execute(
             "UPDATE automation_runs
                 SET triage_execution_id = ?2,
@@ -1066,7 +1066,7 @@ impl WorkDb {
     /// dispatched immediately). Returns `true` when a row was updated.
     pub fn mark_automation_run_triage_started(&self, triage_execution_id: &str) -> Result<bool> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let rows_changed = tx.execute(
             "UPDATE automation_runs
                 SET outcome = 'triage_running'

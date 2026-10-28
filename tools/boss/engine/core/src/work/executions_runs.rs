@@ -69,7 +69,7 @@ impl WorkDb {
     /// `queued_only` gate used by `bossctl executions cancel`.
     pub fn cancel_execution_with(&self, execution_id: &str, opts: CancelExecutionOpts) -> Result<WorkExecution> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let reason = normalize_optional_text(opts.reason.clone()).unwrap_or_else(|| "explicit cancel".to_owned());
         let mut pending = PendingEvents::new();
@@ -121,7 +121,7 @@ impl WorkDb {
             bail!("historical local worker is quarantined; rollback/drain and restart required before orphan recovery");
         }
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;
         if existing.status.is_terminal() {
             bail!(
@@ -301,7 +301,7 @@ impl WorkDb {
             bail!("refusing to re-adopt {execution_id} with a non-positive observed shell pid");
         }
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;
         if !matches!(existing.status, ExecutionStatus::Orphaned) {
             bail!(
@@ -465,7 +465,7 @@ impl WorkDb {
         reason: &str,
     ) -> Result<WorkExecution> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let dead = query_execution(&tx, dead_execution_id).require("execution", dead_execution_id)?;
 
         let now = now_string();
@@ -577,7 +577,7 @@ impl WorkDb {
     ) -> Result<String> {
         warn_if_lifecycle_undeclared(kind);
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let _ = product_id_for_work_item(&tx, work_item_id)?;
         let id = match reraise_open_work_item_attention(&tx, work_item_id, kind)? {
             Some(id) => id,
@@ -990,7 +990,7 @@ impl WorkDb {
 
     pub fn reconcile_product_executions(&self, product_id: &str) -> Result<ExecutionReconcileResult> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let _product = query_product(&tx, product_id).require("product", product_id)?;
         let _projects = list_projects_for_product(&tx, product_id)?;
         let tasks = list_tasks_for_product(&tx, product_id)?;
@@ -1201,7 +1201,7 @@ impl WorkDb {
         tmux_hosted: bool,
     ) -> Result<(WorkExecution, WorkRun)> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         if !execution.status.can_begin_run() {
             bail!(
@@ -1703,7 +1703,7 @@ impl WorkDb {
         error_text: &str,
     ) -> Result<(WorkExecution, WorkRun)> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         if !execution.status.can_begin_run() {
             bail!(
@@ -1790,7 +1790,7 @@ impl WorkDb {
         retry_delays: &[Duration],
     ) -> Result<(WorkExecution, Option<WorkRun>, PreStartFailureOutcome)> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         if !execution.status.can_begin_run() {
             bail!(
@@ -1916,7 +1916,7 @@ impl WorkDb {
         let error_text = error_text.as_deref();
 
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         // `is_live()` (`Running` or `WaitingHuman`), not `== Running`: every
         // sibling terminalizer that can finish a run out from under a worker
@@ -2089,7 +2089,7 @@ impl WorkDb {
         result_summary: Option<&str>,
     ) -> Result<Option<WorkExecution>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         if execution.status.is_terminal() {
             return Ok(None);
@@ -2197,7 +2197,7 @@ impl WorkDb {
     /// [`Self::complete_pane_parked_execution`].
     pub fn fail_pane_parked_execution(&self, execution_id: &str, error_text: &str) -> Result<Option<WorkExecution>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;
         if existing.status.is_terminal() {
             return Ok(None);

@@ -69,7 +69,7 @@ impl WorkDb {
     /// the pane and workspace.
     pub fn cancel_running_execution(&self, execution_id: &str) -> Result<bool> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let now = now_string();
         let cancelled = if !execution.status.is_terminal() {
@@ -94,7 +94,7 @@ impl WorkDb {
 
     pub fn cancel_running_execution_and_demote_task(&self, execution_id: &str) -> Result<(bool, bool)> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let now = now_string();
         // Cancel the execution only if it is still non-terminal.
@@ -141,7 +141,7 @@ impl WorkDb {
 
     pub fn clear_execution_workspace(&self, execution_id: &str) -> Result<Option<ClearedExecutionWorkspace>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let prior = execution.cube_lease_id.clone();
         // Workspace handback follows verified worker cleanup, including runs
@@ -200,7 +200,7 @@ impl WorkDb {
         rule_id: Option<&str>,
     ) -> Result<boss_protocol::EffortEscalation> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let product_id = product_id_for_work_item(&tx, work_item_id)
             .with_context(|| format!("unknown work item: {work_item_id}"))?;
         let id = next_id("esc");
@@ -508,7 +508,7 @@ impl WorkDb {
     /// PR-merge-close (Behavior 5). Cascades the dep-unblock sweep after commit.
     pub fn reconciler_close_work_item(&self, work_item_id: &str, merged_pr_urls: &[&str]) -> Result<bool> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let Some(task) = query_task(&tx, work_item_id)? else {
             return Ok(false);
         };
@@ -633,7 +633,7 @@ impl WorkDb {
         let upstream_checksum = content_checksum(upstream_title, upstream_body);
         let boss_checksum = content_checksum(new_name, new_description);
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let Some(task) = query_task(&tx, work_item_id)?.filter(|task| task.deleted_at.is_none()) else {
             return Ok(false);
         };

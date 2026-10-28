@@ -126,7 +126,7 @@ impl WorkDb {
     /// duplicate-click no-op path — rather than a second row.
     pub fn insert_trunk_merge_intent(&self, input: TrunkMergeIntentInsertInput) -> Result<Option<TrunkMergeIntent>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let id = next_id("tmi");
         let now = now_string();
         let rows = tx.execute(

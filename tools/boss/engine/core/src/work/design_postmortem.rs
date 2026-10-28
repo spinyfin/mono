@@ -148,7 +148,7 @@ impl WorkDb {
         description: String,
     ) -> Result<Task> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let task = insert_design_postmortem_in_tx(&tx, product_id, project_id, project_name, description)?;
         tx.commit()?;
         Ok(task)

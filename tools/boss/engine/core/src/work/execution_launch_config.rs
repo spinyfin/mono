@@ -14,7 +14,7 @@ impl WorkDb {
         effort_level: Option<EffortLevel>,
     ) -> Result<WorkExecution> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;
         if existing.driver.is_some() || existing.model.is_some() {
             tx.commit()?;

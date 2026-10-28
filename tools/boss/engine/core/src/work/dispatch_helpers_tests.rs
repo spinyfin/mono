@@ -543,7 +543,9 @@ fn reconcile_revision_backfills_pr_url_on_existing_execution() {
     let mut result = ExecutionReconcileResult::default();
     {
         let mut conn2 = db.connect().unwrap();
-        let tx = conn2.transaction().unwrap();
+        let tx = conn2
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
         let mut pending = PendingEvents::new();
         reconcile_revision_execution(&mut pending, &tx, &mut result, &revision_task).unwrap();
         tx.commit().unwrap();
@@ -609,7 +611,9 @@ fn reconcile_revision_execution_archives_and_tombstones_moot_revision_at_dispatc
     let mut result = ExecutionReconcileResult::default();
     {
         let mut conn2 = db.connect().unwrap();
-        let tx = conn2.transaction().unwrap();
+        let tx = conn2
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
         let mut pending = PendingEvents::new();
         reconcile_revision_execution(&mut pending, &tx, &mut result, &revision_task).unwrap();
         tx.commit().unwrap();
@@ -693,7 +697,9 @@ fn reconcile_revision_execution_clears_merge_queue_state_on_moot_archive() {
     let mut result = ExecutionReconcileResult::default();
     {
         let mut conn2 = db.connect().unwrap();
-        let tx = conn2.transaction().unwrap();
+        let tx = conn2
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
         let mut pending = PendingEvents::new();
         reconcile_revision_execution(&mut pending, &tx, &mut result, &revision_task).unwrap();
         tx.commit().unwrap();
@@ -770,7 +776,9 @@ fn reconcile_revision_execution_converts_pr_review_revision_to_followup_at_dispa
     let mut result = ExecutionReconcileResult::default();
     {
         let mut conn2 = db.connect().unwrap();
-        let tx = conn2.transaction().unwrap();
+        let tx = conn2
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
         let mut pending = PendingEvents::new();
         reconcile_revision_execution(&mut pending, &tx, &mut result, &revision_task).unwrap();
         tx.commit().unwrap();

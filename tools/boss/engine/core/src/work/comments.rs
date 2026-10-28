@@ -163,7 +163,7 @@ impl WorkDb {
             bail!("comment artifact_id may not be empty");
         }
         let mut conn = self.connect()?;
-        let conn = conn.transaction()?;
+        let conn = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let guide_context = super::guide_comments::context_for_create(&conn, &input, guide_version_id)?;
         let id = next_id("cmt");
         let now = now_string();
@@ -853,7 +853,7 @@ impl WorkDb {
             bail!("guide anchor resolution requires an immutable guide version");
         }
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         // Resolve active + orphaned (orphans can recover); resolved/dismissed
         // are intentionally not re-resolved.
         let comments = query_comments(&tx, artifact_kind, artifact_id, false)?;
@@ -945,7 +945,7 @@ impl WorkDb {
         config: &CommentFuzzyConfig,
     ) -> Result<usize> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let originals: Vec<WorkComment> = query_comments(&tx, "work_item", task_id, false)?
             .into_iter()
             .filter(|c| c.status == COMMENT_STATUS_ACTIVE)

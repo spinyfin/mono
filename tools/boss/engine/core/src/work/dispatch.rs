@@ -51,7 +51,7 @@ impl WorkDb {
             input.work_item_id = resolved;
         }
         ensure_dispatch_repo_resolvable(&mut conn, &input.work_item_id)?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut pending = PendingEvents::new();
         let execution = request_execution_in_tx_with_live_check(&mut pending, &tx, input, is_live)?;
         commit_and_publish(tx, pending, &self.event_bus)?;
@@ -70,7 +70,7 @@ impl WorkDb {
     pub fn request_pr_review(&self, work_item_id: &str, pr_checker: &dyn PrStateChecker) -> Result<WorkExecution> {
         let mut conn = self.connect()?;
         let resolved = resolve_friendly_work_item_id(&conn, work_item_id)?.unwrap_or_else(|| work_item_id.to_owned());
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let execution = request_pr_review_in_tx(&tx, &resolved, pr_checker)?;
         tx.commit()?;
         Ok(execution)
@@ -167,7 +167,7 @@ impl WorkDb {
     /// `reconcile_active_dispatch` handles those via re-dispatch.
     pub fn heal_ghost_active_chores(&self) -> Result<Vec<HealedGhostActive>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let candidates: Vec<(String, String)> = {
             let mut stmt = tx.prepare(
                 "SELECT t.id, t.product_id FROM tasks t
@@ -260,7 +260,7 @@ impl WorkDb {
     /// across an engine restart.
     pub fn abandon_stranded_executions_on_closed_work_items(&self) -> Result<Vec<AbandonedStrandedExecution>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let candidates: Vec<(String, String)> = {
             let mut stmt = tx.prepare(
                 "SELECT we.id, we.work_item_id
@@ -533,7 +533,7 @@ impl WorkDb {
             input.work_item_id = resolved;
         }
         ensure_dispatch_repo_resolvable(&mut conn, &input.work_item_id)?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if !Self::reenable_autostart_after_dispatch_failure_in_tx(&tx, work_item_id)? {
             tx.commit()?;
             return Ok(None);
@@ -563,7 +563,7 @@ impl WorkDb {
     /// pre-live-check semantics.
     pub fn reconcile_active_dispatch<F: Fn(&str) -> bool>(&self, is_live: F) -> Result<Vec<String>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         // Active, non-deleted task/chore rows are the candidate set.
         let candidate_ids: Vec<String> = {
             let mut stmt = tx.prepare(
@@ -690,7 +690,7 @@ impl WorkDb {
     /// ids that were freshly redispatched so the caller can log them.
     pub fn rescan_active_dispatch(&self) -> Result<Vec<String>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         // FIFO by `updated_at` so the chore that has been waiting
         // longest gets the freed worker. `id` is the deterministic
         // tie-breaker for rows that share an updated_at second.
@@ -1741,7 +1741,7 @@ impl WorkDb {
     /// claim is retired with the unused spawn rather than left hanging).
     pub fn retire_stale_revision_before_dispatch(&self, execution_id: &str, task_id: &str) -> Result<bool> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let execution_rows = tx.execute(
             "UPDATE work_executions

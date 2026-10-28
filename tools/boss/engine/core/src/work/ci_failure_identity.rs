@@ -71,7 +71,9 @@ mod tests {
             INSERT INTO ci_remediations VALUES ('old', 'task', 'head', 'fix', '[]');",
         )
         .unwrap();
-        let tx = conn.transaction().unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
         migrate(&tx).unwrap();
         migrate(&tx).unwrap();
         let count: i64 = tx

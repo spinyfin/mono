@@ -4,6 +4,9 @@ use super::*;
 async fn newer_domain_failures_do_not_replace_successful_snapshots() {
     use boss_protocol::{DesignDocContent, DesignDocTreeState};
     let failures = [
+        FrontendEvent::OperatorQuestionError {
+            error: boss_protocol::OperatorQuestionError::NotFound,
+        },
         FrontendEvent::ProductDesignDocContent {
             repo_remote_url: "repo".into(),
             path: "doc.md".into(),

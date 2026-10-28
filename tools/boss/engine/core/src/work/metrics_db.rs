@@ -51,7 +51,7 @@ impl WorkDb {
             return Ok(());
         }
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         for c in counters {
             tx.execute(
                 "INSERT INTO metrics_counter (name, value, updated_at_ms, description)
@@ -100,7 +100,7 @@ impl WorkDb {
     /// `(counters_cleared, gauges_cleared)`.
     pub fn metrics_reset_all(&self, now_ms: i64) -> Result<(usize, usize)> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let counter_rows = tx.execute(
             "UPDATE metrics_counter SET value = 0, updated_at_ms = ?1",
             params![now_ms],

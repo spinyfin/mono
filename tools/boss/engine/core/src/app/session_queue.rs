@@ -492,21 +492,7 @@ impl SessionSink {
             .then(|| super::frontend_event_kind::kind(&env.payload));
         let mut reads = self.view_reads.lock().expect("view reads poisoned");
         if let Some(id) = env.request_id.clone() {
-            if matches!(
-                env.payload,
-                FrontendEvent::Error { .. }
-                    | FrontendEvent::WorkError { .. }
-                    | FrontendEvent::ExecutionTranscriptUnavailable { .. }
-                    | FrontendEvent::ProductDesignDocContent {
-                        content: boss_protocol::DesignDocContent::Failed { .. },
-                        ..
-                    }
-                    | FrontendEvent::ProductDesignDocsList {
-                        state: boss_protocol::DesignDocTreeState::Unreachable { .. }
-                            | boss_protocol::DesignDocTreeState::RateLimited { .. },
-                        ..
-                    }
-            ) {
+            if env.payload.is_failed_read_reply() {
                 reads.cancel(&id);
             } else {
                 env = reads.finish(&id, env);

@@ -6,7 +6,7 @@ impl WorkDb {
     /// neighbours. Re-adopting a pane must never widen its original authority.
     pub fn capture_progression_neighbourhood(&self, execution_id: &str) -> Result<()> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let (item, existing): (Option<String>, Option<String>) = tx.query_row(
             "SELECT work_item_id, progression_neighbourhood FROM work_executions WHERE id = ?1",
             [execution_id],

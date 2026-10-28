@@ -442,7 +442,7 @@ impl WorkDb {
     /// Clean head CI must still see an active queue-side attempt after the audit.
     pub(crate) fn rearm_audited_queue_failure(&self, attempt: &CiRemediation) -> Result<bool> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let newer: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM ci_remediations WHERE work_item_id = ?1 AND id != ?2 AND CAST(created_at AS INTEGER) >= CAST(?3 AS INTEGER))",
             params![attempt.work_item_id, attempt.id, attempt.created_at],

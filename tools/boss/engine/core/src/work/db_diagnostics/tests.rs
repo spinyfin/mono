@@ -70,7 +70,9 @@ async fn busy_names_actual_writer_and_counts_rate_limited_failures() {
             }
             .scope(async {
                 let mut conn = writer.connect_new().unwrap();
-                let tx = conn.transaction().unwrap();
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .unwrap();
                 assert!(holder_snapshot().iter().any(|line| line.contains("diagnostic_writer")));
                 release.wait();
                 release.wait();

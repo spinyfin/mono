@@ -186,7 +186,7 @@ pub(crate) fn ensure_dispatch_repo_resolvable(conn: &mut Connection, work_item_i
         return Ok(());
     }
     let label = repo_unresolved_kind_label(conn, work_item_id)?;
-    let attn_tx = conn.transaction()?;
+    let attn_tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     record_repo_unresolved_attention(&attn_tx, work_item_id, label)?;
     attn_tx.commit()?;
     bail!("{}", repo_unresolved_attention_body(work_item_id, label));

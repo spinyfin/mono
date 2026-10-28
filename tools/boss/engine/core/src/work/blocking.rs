@@ -197,7 +197,7 @@ impl WorkDb {
 
     fn recanonicalize_blocked_signal(&self, work_item_id: &str, pr_url: &str, reason: &str) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE tasks
@@ -248,7 +248,7 @@ impl WorkDb {
         pr_url: &str,
     ) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE tasks
@@ -293,7 +293,7 @@ impl WorkDb {
     /// or a PR that has been re-pointed at a different URL.
     pub fn mark_chore_blocked_merge_conflict(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE tasks
@@ -340,7 +340,7 @@ impl WorkDb {
     /// when the guard misses.
     pub fn mark_chore_blocked_deletion_signoff(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE tasks
@@ -384,7 +384,7 @@ impl WorkDb {
     /// changed underneath us).
     pub fn clear_chore_blocked_merge_conflict(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE tasks
@@ -436,7 +436,7 @@ impl WorkDb {
         attempt_id: &str,
     ) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE tasks
@@ -552,7 +552,7 @@ impl WorkDb {
     /// hasn't been deleted, and the PR url still matches.
     pub fn mark_chore_blocked_ci_failure_exhausted(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         // Match either `in_review` (first failure, budget already 0) or
         // an active `ci_failure` row whose budget has now exhausted.
@@ -591,7 +591,7 @@ impl WorkDb {
         reason: &str,
     ) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE tasks
@@ -625,7 +625,7 @@ impl WorkDb {
     /// Idempotent — returns `Ok(None)` on WHERE-guard miss.
     pub fn clear_chore_blocked_ci_failure(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE tasks
@@ -771,7 +771,7 @@ impl WorkDb {
     /// leave the row alone.
     pub fn rearm_blocked_merge_conflict_signal(&self, work_item_id: &str) -> Result<bool> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let is_blocked: bool = tx
             .query_row(
@@ -806,7 +806,7 @@ impl WorkDb {
     /// the re-arm scenario. A `false` return means leave the row alone.
     pub fn rearm_blocked_ci_failure_signal(&self, work_item_id: &str) -> Result<bool> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let reason: Option<String> = tx
             .query_row(
@@ -913,7 +913,7 @@ impl WorkDb {
         queue_base_sha: Option<&str>,
     ) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let id = next_id("cir");
         let now = now_string();
         let rows = tx.execute(
@@ -1116,7 +1116,7 @@ impl WorkDb {
     /// not exist (or has been soft-deleted).
     pub fn retry_ci_remediation_for_work_item(&self, work_item_id: &str) -> Result<Option<(CiBudgetSnapshot, bool)>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         // Confirm the parent exists (and capture its current
         // blocked_reason). A missing parent → Ok(None) so the CLI can
         // surface "unknown work item" without conflating with the
@@ -1619,7 +1619,7 @@ impl WorkDb {
     /// observation, never the most recent). Per design Phase 12 #39.
     pub fn observe_ci_in_flight(&self, work_item_id: &str, head_sha: &str) -> Result<CiInFlightObservation> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         tx.execute(
             "INSERT OR IGNORE INTO ci_inflight_observations
@@ -1724,7 +1724,7 @@ impl WorkDb {
         head_sha_after: Option<&str>,
     ) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE ci_remediations
@@ -1771,7 +1771,7 @@ impl WorkDb {
         head_sha: Option<&str>,
     ) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE ci_remediations
@@ -1847,7 +1847,7 @@ impl WorkDb {
         worker_id: &str,
     ) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE ci_remediations
@@ -1873,7 +1873,7 @@ impl WorkDb {
     /// Idempotent — a row already terminal returns `Ok(None)`.
     pub fn mark_ci_remediation_failed(&self, attempt_id: &str, reason: &str) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE ci_remediations
@@ -1927,7 +1927,7 @@ impl WorkDb {
         include_queue_side: bool,
     ) -> Result<Vec<CiRemediation>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let queue_side_filter = if include_queue_side {
             ""
@@ -1976,7 +1976,7 @@ impl WorkDb {
     /// engine declined to spawn, so the attempt row never ran.
     pub fn mark_ci_remediation_abandoned(&self, attempt_id: &str, reason: &str) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE ci_remediations
@@ -2008,7 +2008,7 @@ impl WorkDb {
         revision_task_id: &str,
     ) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         // Charge atomically with the first successful revision link. Re-linking
         // or redispatching the same attempt cannot spend another slot.
         tx.execute(
@@ -2034,7 +2034,7 @@ impl WorkDb {
     /// it yet. `Ok(None)` when the id is missing.
     pub fn set_ci_remediation_log_excerpt(&self, attempt_id: &str, log_excerpt: &str) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let rows = tx.execute(
             "UPDATE ci_remediations
                 SET log_excerpt = ?2
@@ -2054,7 +2054,7 @@ impl WorkDb {
         triage_class: &str,
     ) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let rows = tx.execute(
             "UPDATE ci_remediations
                 SET triage_class = ?2
@@ -2085,7 +2085,7 @@ impl WorkDb {
     /// nothing (so the signal is not re-armed on a duplicate marker).
     pub fn mark_ci_remediation_retriggered(&self, attempt_id: &str) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE ci_remediations
@@ -2176,7 +2176,7 @@ impl WorkDb {
         head_sha: Option<&str>,
     ) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         // Snapshot the row so we know whether to decrement the counter.
         // A second call for the same id finds `status = 'succeeded'` and

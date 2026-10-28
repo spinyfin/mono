@@ -307,7 +307,7 @@ impl WorkDb {
         new_pr_url: &str,
     ) -> Result<bool> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE tasks
@@ -355,7 +355,7 @@ impl WorkDb {
         detail: &str,
     ) -> Result<bool> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE tasks

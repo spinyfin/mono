@@ -61,7 +61,7 @@ impl WorkDb {
         }
 
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         ensure_product_exists(&tx, &input.product_id)?;
 
         if let Some(ref work_item_id) = input.related_work_item_id {
@@ -154,7 +154,7 @@ impl WorkDb {
     /// successor, or leave the chain alone).
     pub fn revoke_decision(&self, id: &str) -> Result<Decision> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let existing = query_decision(&tx, id)?.with_context(|| format!("unknown decision: {id}"))?;
         match existing.status {
             DecisionStatus::Revoked => {
@@ -186,7 +186,7 @@ impl WorkDb {
             bail!("a decision cannot supersede itself");
         }
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let existing = query_decision(&tx, id)?.with_context(|| format!("unknown decision: {id}"))?;
         if existing.status != DecisionStatus::Active {
             bail!(

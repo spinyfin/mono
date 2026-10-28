@@ -63,7 +63,7 @@ impl WorkDb {
         }
 
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         ensure_product_exists(&tx, &input.product_id)?;
 
         let id = next_id("idea");
@@ -181,7 +181,7 @@ impl WorkDb {
         }
 
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let idea = query_idea(&tx, id).require("idea", id)?;
         if idea.status != IdeaStatus::Draft {
             bail!(

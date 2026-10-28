@@ -128,7 +128,7 @@ impl WorkDb {
     pub fn recover_running_planner_runs_on_engine_restart(&self) -> Result<Vec<PlannerRun>> {
         let now = now_string();
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut recovered = {
             let mut stmt = tx.prepare(&format!("{SELECT_PLANNER_RUN} WHERE outcome = ?1"))?;
             collect_rows(stmt.query_map(params![PLANNER_OUTCOME_RUNNING], map_planner_run)?)?

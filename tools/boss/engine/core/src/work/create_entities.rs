@@ -157,7 +157,7 @@ impl WorkDb {
 
     pub fn create_product(&self, input: CreateProductInput) -> Result<Product> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         let id = next_id("prod");
         let now = now_string();
@@ -221,7 +221,7 @@ impl WorkDb {
 
     pub fn create_project(&self, input: CreateProjectInput) -> Result<Project> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let project = create_project_in_tx(&tx, input, "")?;
         tx.commit()?;
         Ok(project)
@@ -239,7 +239,7 @@ impl WorkDb {
     /// `'human'` may create the row at `critical`.
     pub fn create_task_as_actor(&self, input: CreateTaskInput, actor: &str) -> Result<Task> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let task = insert_task_in_tx_as_actor(&tx, input, actor)?;
         tx.commit()?;
         Ok(task)
@@ -254,7 +254,7 @@ impl WorkDb {
     /// `'human'` may create the row at `critical`.
     pub fn create_chore_as_actor(&self, input: CreateChoreInput, actor: &str) -> Result<Task> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let chore = insert_chore_in_tx_as_actor(&tx, input, actor)?;
         tx.commit()?;
         Ok(chore)
@@ -275,7 +275,7 @@ impl WorkDb {
         actor: &str,
     ) -> Result<Task> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let task = insert_investigation_in_tx_as_actor(&tx, input, actor)?;
         tx.commit()?;
         Ok(task)
@@ -325,7 +325,7 @@ impl WorkDb {
         upstream_body: &str,
     ) -> Result<Task> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let chore = insert_chore_in_tx(&tx, input)?;
         let upstream_checksum = content_checksum(upstream_title, upstream_body);
         let boss_checksum = content_checksum(&chore.name, &chore.description);
@@ -368,7 +368,7 @@ impl WorkDb {
     /// `'engine'` tier named); a human raises such a row afterwards.
     pub fn create_many_tasks(&self, input: CreateManyTasksInput) -> Result<Vec<Task>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut created = Vec::with_capacity(input.items.len());
         for (index, item) in input.items.into_iter().enumerate() {
             let task = insert_task_in_tx(&tx, item).with_context(|| format!("item {index}"))?;
@@ -382,7 +382,7 @@ impl WorkDb {
     /// atomicity contract.
     pub fn create_many_chores(&self, input: CreateManyChoresInput) -> Result<Vec<Task>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut created = Vec::with_capacity(input.items.len());
         for (index, item) in input.items.into_iter().enumerate() {
             let chore = insert_chore_in_tx(&tx, item).with_context(|| format!("item {index}"))?;
@@ -394,7 +394,7 @@ impl WorkDb {
 
     pub fn create_execution(&self, input: CreateExecutionInput) -> Result<WorkExecution> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let execution = insert_execution(&tx, input)?;
         tx.commit()?;
         Ok(execution)

@@ -299,7 +299,7 @@ impl WorkDb {
         }
         let mut conn = self.connect()?;
         let now = now_string();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut updated = 0usize;
         {
             let mut stmt =
