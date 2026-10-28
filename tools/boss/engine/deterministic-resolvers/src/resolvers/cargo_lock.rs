@@ -83,7 +83,7 @@ impl DeterministicResolver for CargoLockResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::FakeCommandRunner;
+    use crate::command::{CommandOutput, FakeCommandRunner};
 
     fn file(path: &str) -> ConflictedFile {
         ConflictedFile {
@@ -128,17 +128,46 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
         let pinned = "[[package]]\nname = \"serde\"\nversion = \"1.0.100\"\n";
-        let runner = Arc::new(FakeCommandRunner::success_writing_file("Cargo.lock", pinned));
-        let resolver = CargoLockResolver::with_runner(runner.clone());
+        let runner = Arc::new(
+            FakeCommandRunner::sequence(vec![
+                Ok(CommandOutput {
+                    success: true,
+                    code: Some(0),
+                    stdout: pinned.to_owned(),
+                    stderr: String::new(),
+                }),
+                Ok(CommandOutput {
+                    success: true,
+                    code: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }),
+            ])
+            .capture_file("Cargo.lock"),
+        );
+        let resolver = CargoLockResolver::with_runner(runner.clone()).with_base_revision("main@origin".into());
 
         let outcome = resolver.resolve(dir.path(), &file("Cargo.lock")).await;
 
         assert!(matches!(outcome, ResolveOutcome::Resolved { .. }));
         let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "base seed then lock-preserving update: {calls:?}");
         assert!(
-            !calls[0].1.iter().any(|arg| arg == "generate-lockfile"),
-            "must not rebuild the lockfile from scratch: {:?}",
+            calls[0].1.iter().any(|arg| arg == "file") && calls[0].1.iter().any(|arg| arg == "show"),
+            "first call must seed the lockfile from the PR base: {:?}",
             calls[0].1
+        );
+        assert_eq!(calls[1].0, "cargo");
+        assert_eq!(calls[1].1, vec!["update".to_owned(), "--workspace".to_owned()]);
+        assert!(
+            !calls[1].1.iter().any(|arg| arg == "generate-lockfile"),
+            "must not rebuild the lockfile from scratch: {:?}",
+            calls[1].1
+        );
+        assert_eq!(
+            runner.captured_file.lock().unwrap().as_deref(),
+            Some(pinned),
+            "cargo must see the seeded base lockfile, unchanged, when it runs"
         );
         assert_eq!(std::fs::read_to_string(dir.path().join("Cargo.lock")).unwrap(), pinned);
     }

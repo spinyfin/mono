@@ -144,8 +144,9 @@ impl WorkerCompletionHandler {
         };
         if self.is_merge_conflict_revision(execution) {
             let pr_url = self.resolve_bound_pr_url(execution);
-            if let Some(outcome) = self.conflict_delivery_failure(execution, pr_url.as_deref()).await {
-                return outcome;
+            match self.conflict_delivery_decision(execution, pr_url.as_deref()).await {
+                ConflictDeliveryDecision::Failed(outcome) => return outcome,
+                ConflictDeliveryDecision::Moot | ConflictDeliveryDecision::Proceed => {}
             }
         }
         // Captured before `record_worker_no_op_completion` below nulls

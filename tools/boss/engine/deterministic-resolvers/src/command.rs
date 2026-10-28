@@ -73,6 +73,10 @@ pub(crate) struct FakeCommandRunner {
     /// File to (re)write in `cwd` when a call succeeds, simulating a real
     /// `cargo`/`bazel` invocation actually regenerating the lockfile.
     writes_file: Option<(String, String)>,
+    /// When set, each successful call records `cwd.join(filename)` contents
+    /// as they were at invocation time.
+    capture_filename: Option<String>,
+    pub(crate) captured_file: std::sync::Mutex<Option<String>>,
     pub(crate) calls: std::sync::Mutex<Vec<(String, Vec<String>, std::path::PathBuf)>>,
 }
 
@@ -121,8 +125,15 @@ impl FakeCommandRunner {
         Self {
             outcomes: std::sync::Mutex::new(outcomes.into_iter().collect()),
             writes_file: None,
+            capture_filename: None,
+            captured_file: std::sync::Mutex::new(None),
             calls: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    pub(crate) fn capture_file(mut self, filename: &str) -> Self {
+        self.capture_filename = Some(filename.to_owned());
+        self
     }
 }
 
@@ -135,6 +146,11 @@ impl CommandRunner for FakeCommandRunner {
             args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect(),
             cwd.expect("resolvers always supply a working directory").to_path_buf(),
         ));
+        let cwd = cwd.expect("resolvers always supply a working directory");
+        if let Some(filename) = &self.capture_filename {
+            let path = cwd.join(filename);
+            *self.captured_file.lock().unwrap() = std::fs::read_to_string(path).ok();
+        }
         let outcome = self
             .outcomes
             .lock()
@@ -144,10 +160,7 @@ impl CommandRunner for FakeCommandRunner {
         if let (Ok(output), Some((filename, contents))) = (&outcome, &self.writes_file)
             && output.success
         {
-            std::fs::write(
-                cwd.expect("resolvers always supply a working directory").join(filename),
-                contents,
-            )?;
+            std::fs::write(cwd.join(filename), contents)?;
         }
         outcome
     }

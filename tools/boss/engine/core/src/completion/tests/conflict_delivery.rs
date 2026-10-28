@@ -1,3 +1,4 @@
+use super::super::ConflictDeliveryDecision;
 use super::*;
 use crate::merge_poller::OpenPrMergeability;
 use crate::work::{PendingMergeCheck, WorkItemPatch};
@@ -121,7 +122,10 @@ async fn conflict_delivery_gate_treats_a_merged_pr_as_moot_not_a_delivery_failur
         .handler
         .with_merge_probe(Arc::new(MergedProbe));
     let execution = db.get_execution(&execution_id).unwrap();
-    assert!(handler.conflict_delivery_failure(&execution, Some(pr)).await.is_none());
+    assert!(matches!(
+        handler.conflict_delivery_decision(&execution, Some(pr)).await,
+        ConflictDeliveryDecision::Moot
+    ));
     assert_ne!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
 }
 
@@ -132,12 +136,91 @@ async fn conflict_delivery_gate_reports_a_missing_bound_pr_url_specifically() {
     let (_dir, db, _, _, _, execution_id, _) = conflict_revision_fixture(workspace.path(), pr, "old-head");
     let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None)).handler;
     let execution = db.get_execution(&execution_id).unwrap();
-    let outcome = handler.conflict_delivery_failure(&execution, None).await;
+    let outcome = handler.conflict_delivery_decision(&execution, None).await;
     assert!(
-        matches!(outcome, Some(StopOutcome::RunDoneDeclaredWithoutDelivery { ref detail }) if detail.contains("no bound PR URL")),
+        matches!(
+            outcome,
+            ConflictDeliveryDecision::Failed(StopOutcome::RunDoneDeclaredWithoutDelivery { ref detail })
+                if detail.contains("no bound PR URL")
+        ),
         "{outcome:?}"
     );
     assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
+}
+
+struct ClosedUnmergedProbe;
+
+#[async_trait]
+impl MergeProbe for ClosedUnmergedProbe {
+    async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
+        Ok(PrLifecycleProbe::builder()
+            .url(url.to_owned())
+            .state(PrLifecycleState::ClosedUnmerged)
+            .labels(Vec::new())
+            .review(crate::merge_poller::PrReviewState::Unknown)
+            .build())
+    }
+}
+
+fn no_open_failure_attention(db: &WorkDb, work_item_id: &str) {
+    let items = db.list_attention_items_for_work_item(work_item_id).unwrap();
+    assert!(
+        items.iter().all(|i| i.status != "open"),
+        "closed-unmerged conflict delivery must not file a failure attention item, got {items:?}"
+    );
+}
+
+#[tokio::test]
+async fn conflict_declared_delivery_treats_a_closed_unmerged_pr_as_moot() {
+    let workspace = tempdir().unwrap();
+    let pr = "https://github.com/spinyfin/mono/pull/2070";
+    let (_dir, db, _, _, revision, execution_id, _) = conflict_revision_fixture(workspace.path(), pr, "old-head");
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_branch_verifier(StubBranchVerifier::ok("my-feature"))
+        .with_pr_state_checker(Arc::new(crate::work::FakePrStateChecker::always(
+            crate::work::PrOpenState::ClosedUnmerged,
+        )));
+    let outcome = handler
+        .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
+        .await;
+    assert!(matches!(outcome, StopOutcome::PrMerged { .. }), "{outcome:?}");
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Completed
+    );
+    let WorkItem::Task(task) = db.get_work_item(&revision).unwrap() else {
+        panic!("revision missing")
+    };
+    assert_eq!(task.status, TaskStatus::Done);
+    no_open_failure_attention(&db, &revision);
+}
+
+#[tokio::test]
+async fn conflict_declared_delivery_treats_a_lifecycle_close_between_probes_as_moot() {
+    let workspace = tempdir().unwrap();
+    let pr = "https://github.com/spinyfin/mono/pull/2070";
+    let (_dir, db, _, _, revision, execution_id, _) = conflict_revision_fixture(workspace.path(), pr, "old-head");
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_branch_verifier(StubBranchVerifier::ok("my-feature"))
+        .with_pr_state_checker(Arc::new(crate::work::FakePrStateChecker::always(
+            crate::work::PrOpenState::Open,
+        )))
+        .with_merge_probe(Arc::new(ClosedUnmergedProbe));
+    let outcome = handler
+        .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
+        .await;
+    assert!(matches!(outcome, StopOutcome::PrMerged { .. }), "{outcome:?}");
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Completed
+    );
+    let WorkItem::Task(task) = db.get_work_item(&revision).unwrap() else {
+        panic!("revision missing")
+    };
+    assert_eq!(task.status, TaskStatus::Done);
+    no_open_failure_attention(&db, &revision);
 }
 
 #[tokio::test]

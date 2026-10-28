@@ -597,6 +597,17 @@ pub(crate) async fn run_rung1_in_lease(
 /// regenerated mechanically.
 pub(crate) const LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND: &str = "conflict_lockfile_regeneration_failed";
 
+/// Lower the lockfile-regeneration attention once the condition no longer
+/// holds: a mechanical retry, a human (or engine) clearing the conflict, or
+/// a re-armed attempt. Best-effort; a miss is logged.
+pub(crate) fn clear_lockfile_regeneration_failed_attention(work_db: &WorkDb, work_item_id: &str) {
+    if let Err(err) =
+        work_db.resolve_external_tracker_attention(work_item_id, LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND)
+    {
+        tracing::warn!(work_item_id, ?err, "failed to clear lockfile-regeneration attention",);
+    }
+}
+
 /// Terminate a lockfile-only attempt whose regeneration failed operationally:
 /// stamp the attempt `failed` with the specific resolver reason (which also
 /// ends the per-tick retry, since the row owns the (base, head) key), and
@@ -886,6 +897,8 @@ async fn retire_attempt_at_rung(
         "deterministic",
         &format!("mechanical rung {rung} resolved every conflicted file; no worker spawned"),
     );
+
+    clear_lockfile_regeneration_failed_attention(work_db, &candidate.work_item_id);
 
     // The parent was flipped to `blocked: merge_conflict` upfront by
     // `on_conflict_detected`; clear it back to `in_review`. The WHERE guard

@@ -180,9 +180,10 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     // ── Cleared by work resuming ────────────────────────────────────────
     entry(
         crate::conflict_ladder::LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND,
-        ClearedBy::WorkResumed,
-        "Claims that mechanical lockfile regeneration could not run and no worker was started. A run \
-         starting for the item (a retried attempt dispatching a worker) contradicts that.",
+        ClearedBy::ProducerReconciles,
+        "Claims that mechanical lockfile regeneration could not run. The producer lowers it when a \
+         mechanical retry succeeds, when the conflict is cleared, or when a new attempt is re-armed \
+         — none of those start a run on the parent PR task.",
     ),
     entry(
         crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND,

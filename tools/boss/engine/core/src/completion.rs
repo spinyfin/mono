@@ -106,6 +106,7 @@ mod worker_signals;
 // Re-export contribution-gate types into this parent so sibling completion
 // submodules (which `use super::*`) can name them — same pattern as the
 // free helpers defined directly in this file.
+use conflict_delivery_gate::ConflictDeliveryDecision;
 use contribution_gate::{RevisionContributionReason, RevisionReviewGate};
 pub use pr_transition::ReviewBatchEnqueuer;
 pub(crate) use pr_transition::{

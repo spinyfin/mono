@@ -2,7 +2,8 @@ use super::helpers::*;
 
 #[tokio::test]
 async fn stale_head_sha_supersedes_pending_crz() {
-    // Regression test for T1795 / T1764.
+    // Regression test for a pending attempt whose revision is dead after
+    // the PR head moved.
     //
     // Scenario: a crz is spawned for head SHA A.  The revision pushes a
     // commit (head moves to B) but doesn't resolve the conflict; then
@@ -197,7 +198,8 @@ async fn terminal_revision_supersedes_pending_crz_even_without_head_move() {
 
 #[tokio::test]
 async fn stale_head_sha_and_base_advance_supersedes_pending_crz() {
-    // Regression test for the real incident path (T1764: crz pending ~11h).
+    // Regression test for a pending attempt with a dead revision after
+    // both head and base moved (crz pending for hours).
     //
     // Scenario: a crz is spawned for head SHA "head-A" / base SHA "base-1".
     // Over the next ~11 h main advances to "base-2" AND the PR author pushes
@@ -521,4 +523,131 @@ async fn live_revision_same_head_sha_remains_no_op() {
         "no second crz must be created when revision is still live"
     );
     assert_eq!(all[0].status, "pending");
+}
+
+fn seed_pending_attempt_with_revision(
+    db: &WorkDb,
+    product: &str,
+    chore: &str,
+    pr: &str,
+    head: &str,
+) -> (String, String) {
+    let attempt = db
+        .insert_conflict_resolution(crate::work::ConflictResolutionInsertInput {
+            product_id: product.to_owned(),
+            work_item_id: chore.to_owned(),
+            pr_url: pr.into(),
+            pr_number: 46,
+            head_branch: "feature".into(),
+            base_branch: "main".into(),
+            base_sha_at_trigger: Some("abc123".into()),
+            head_sha_before: Some(head.into()),
+        })
+        .unwrap()
+        .expect("pending attempt");
+    let revision = db
+        .create_revision(
+            boss_protocol::CreateRevisionInput::builder()
+                .parent_task_id(chore.to_owned())
+                .description("Resolve merge conflict against main")
+                .created_via(format!("merge-conflict:{}", attempt.id))
+                .build(),
+            &open_checker(),
+        )
+        .unwrap();
+    db.set_conflict_resolution_revision_task_id(&attempt.id, &revision.id)
+        .unwrap();
+    (attempt.id, revision.id)
+}
+
+#[tokio::test]
+async fn blocked_revision_with_completed_execution_does_not_wedge_pending_attempt() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("boss.db");
+    let db = WorkDb::open(db_path.clone()).unwrap();
+    let pr = "https://github.com/foo/bar/pull/46";
+    let (product, chore) = make_in_review(&db, "C-blocked-completed-rev", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let (original_id, revision_id) = seed_pending_attempt_with_revision(&db, &product, &chore, pr, "head-A");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'blocked', blocked_reason = 'worker_gave_up' WHERE id = ?1",
+            rusqlite::params![revision_id],
+        )
+        .unwrap();
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO work_executions
+             (id, work_item_id, kind, status, repo_remote_url, cube_lease_id,
+              cube_workspace_id, workspace_path, priority, prefer_is_soft,
+              created_at, started_at, finished_at)
+         VALUES (?1, ?2, 'revision_implementation', 'completed',
+                 'git@github.com:foo/bar.git', NULL, NULL, NULL, 0, 0,
+                 '1', '2', '3')",
+        rusqlite::params![crate::work::next_id("exec"), revision_id],
+    )
+    .unwrap();
+    drop(conn);
+
+    let recovered = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe_with_head(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()), "head-A"),
+    )
+    .await;
+    assert!(
+        recovered,
+        "a blocked revision whose execution already completed must not suppress a still-conflicting PR"
+    );
+    let all = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
+    assert_eq!(all.len(), 2, "stale attempt superseded, fresh attempt inserted");
+    let abandoned = all.iter().find(|r| r.id == original_id).expect("original kept");
+    assert_eq!(abandoned.status, "abandoned");
+    let fresh = all.iter().find(|r| r.id != original_id).expect("fresh attempt");
+    assert_eq!(fresh.status, "pending");
+    assert_ne!(fresh.revision_task_id.as_deref(), Some(revision_id.as_str()));
+}
+
+#[tokio::test]
+async fn stale_undispatched_revision_does_not_wedge_pending_attempt() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("boss.db");
+    let db = WorkDb::open(db_path.clone()).unwrap();
+    let pr = "https://github.com/foo/bar/pull/47";
+    let (product, chore) = make_in_review(&db, "C-stale-undispatched-rev", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let (original_id, revision_id) = seed_pending_attempt_with_revision(&db, &product, &chore, pr, "head-A");
+    db.connect()
+        .unwrap()
+        .execute(
+            "DELETE FROM work_executions WHERE work_item_id = ?1",
+            rusqlite::params![revision_id],
+        )
+        .unwrap();
+    rewind_task_created_at(&db_path, &revision_id, 31 * 60);
+
+    let recovered = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe_with_head(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()), "head-A"),
+    )
+    .await;
+    assert!(
+        recovered,
+        "an undispatched revision past the grace window must not suppress conflict handling"
+    );
+    let all = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
+    assert_eq!(all.len(), 2, "stale undispatched revision superseded");
+    let abandoned = all.iter().find(|r| r.id == original_id).expect("original kept");
+    assert_eq!(abandoned.status, "abandoned");
+    let fresh = all.iter().find(|r| r.id != original_id).expect("fresh attempt");
+    assert_eq!(fresh.status, "pending");
+    assert!(fresh.revision_task_id.is_some());
 }

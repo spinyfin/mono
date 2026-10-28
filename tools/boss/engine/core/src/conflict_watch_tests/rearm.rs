@@ -1,6 +1,6 @@
 use super::helpers::*;
 
-/// Regression test for T2396 / PR #1874: the stale-base re-arm path
+/// Regression test for PR #1874: the stale-base re-arm path
 /// must not permanently no-op when a succeeded crz's resolution has
 /// gone stale (PR still CONFLICTING) but the PR's `baseRefOid` — fixed
 /// at PR-open time — hasn't moved. GitHub never advances `baseRefOid`
@@ -246,7 +246,7 @@ async fn rearm_invalidates_stale_success_when_head_unchanged_and_breaks_wedge() 
     );
 }
 
-/// Reconciliation path (T791/T898 scenario): parent is in `blocked: merge_conflict`
+/// Reconciliation path: parent is in `blocked: merge_conflict`
 /// but an active revision is already in flight. The next CONFLICTING probe should
 /// flip the parent BACK to `in_review` without spawning a second revision.
 #[tokio::test]
@@ -258,7 +258,7 @@ async fn rearm_reconciles_blocked_parent_when_revision_is_in_flight() {
     let pub_ = Arc::new(RecordingPublisher::default());
 
     // Simulate the pre-model-change state: parent is blocked AND a revision
-    // exists (T898-style). Manually flip to blocked, insert a crz, create a
+    // exists (a live revision behind a blocked parent). Manually flip to blocked, insert a crz, create a
     // revision, stamp the crz's revision_task_id.
     db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
     let attempt = db
@@ -275,7 +275,7 @@ async fn rearm_reconciles_blocked_parent_when_revision_is_in_flight() {
         .unwrap()
         .expect("fresh insert");
     // Stamp a genuinely live (status='active') task as the revision to
-    // simulate T898 being active. It must be a real, live task — not a
+    // simulate that revision being active. It must be a real, live task — not a
     // dangling id — otherwise `supersede_if_stale`'s dead-revision check
     // (added for the engine-restart fix) correctly treats it as dead and
     // supersedes instead of reconciling, which is a different scenario
@@ -519,5 +519,87 @@ async fn rearm_supersedes_blocked_parent_when_revision_execution_died_in_restart
         TaskStatus::InReview,
         "parent recovers to in_review once the dead attempt is superseded"
     );
+    assert!(reason.is_none());
+}
+
+fn seed_lockfile_failure(db: &WorkDb, product: &str, chore: &str, pr: &str, head: &str, base: &str) -> String {
+    db.mark_chore_blocked_merge_conflict(chore, pr).unwrap();
+    let attempt = db
+        .insert_conflict_resolution(crate::work::ConflictResolutionInsertInput {
+            product_id: product.to_owned(),
+            work_item_id: chore.to_owned(),
+            pr_url: pr.into(),
+            pr_number: 81,
+            head_branch: "feature".into(),
+            base_branch: "main".into(),
+            base_sha_at_trigger: Some(base.into()),
+            head_sha_before: Some(head.into()),
+        })
+        .unwrap()
+        .expect("fresh lockfile-failure attempt");
+    db.mark_conflict_resolution_failed(&attempt.id, "lockfile_regeneration_failed: MODULE.bazel.lock")
+        .unwrap()
+        .expect("stamp lockfile failure");
+    attempt.id
+}
+
+#[tokio::test]
+async fn rearm_does_not_retry_lockfile_failure_for_the_same_base_head_pair() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/81";
+    let (product, chore) = make_in_review(&db, "C-lockfile-same-pair", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let failed_id = seed_lockfile_failure(&db, &product, &chore, pr, "head456", "abc123");
+
+    let retried = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+    )
+    .await;
+    assert!(!retried, "the same (base, head) pair must not mint a new attempt");
+    let all = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
+    assert_eq!(all.len(), 1, "failed row is kept and not duplicated: {all:?}");
+    assert_eq!(all[0].id, failed_id);
+    assert_eq!(all[0].status, "failed");
+    assert!(db.active_conflict_resolution_for_work_item(&chore).unwrap().is_none());
+    let (status, reason) = chore_status(&db, &chore);
+    assert_eq!(status, TaskStatus::Blocked);
+    assert_eq!(reason.as_deref(), Some("merge_conflict"));
+}
+
+#[tokio::test]
+async fn rearm_retries_lockfile_failure_when_head_or_base_moves() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/82";
+    let (product, chore) = make_in_review(&db, "C-lockfile-moved-pair", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let failed_id = seed_lockfile_failure(&db, &product, &chore, pr, "head-old", "abc123");
+
+    let retried = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe_with_head(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()), "head-new"),
+    )
+    .await;
+    assert!(retried, "a moved head must start a fresh attempt");
+    let all = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
+    assert_eq!(all.len(), 2, "old failure kept, fresh attempt inserted: {all:?}");
+    let failed = all.iter().find(|r| r.id == failed_id).expect("failed row kept");
+    assert_eq!(failed.status, "failed");
+    let fresh = all.iter().find(|r| r.id != failed_id).expect("fresh attempt");
+    assert_eq!(fresh.status, "pending");
+    assert_eq!(fresh.head_sha_before.as_deref(), Some("head-new"));
+    assert!(fresh.revision_task_id.is_some(), "fresh attempt must spawn a revision");
+    let (status, reason) = chore_status(&db, &chore);
+    assert_eq!(status, TaskStatus::InReview);
     assert!(reason.is_none());
 }

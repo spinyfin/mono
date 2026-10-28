@@ -175,7 +175,8 @@ impl WorkerCompletionHandler {
             }
         };
 
-        let merged = matches!(target, WorkerPrCompletionTarget::Done);
+        let mut target = target;
+        let mut merged = matches!(target, WorkerPrCompletionTarget::Done);
 
         // incident-004 AI-3: a revision may terminalize to PendingReview /
         // InReview only with an explicit associated change (head SHA moved
@@ -251,11 +252,15 @@ impl WorkerCompletionHandler {
             self.record_mid_turn_reap(execution, source).await;
         }
 
-        if !merged
-            && let Ok(execution) = execution_result.as_ref()
-            && let Some(outcome) = self.conflict_delivery_failure(execution, Some(&pr_url)).await
-        {
-            return outcome;
+        if !merged && let Ok(execution) = execution_result.as_ref() {
+            match self.conflict_delivery_decision(execution, Some(&pr_url)).await {
+                ConflictDeliveryDecision::Failed(outcome) => return outcome,
+                ConflictDeliveryDecision::Moot => {
+                    target = WorkerPrCompletionTarget::Done;
+                    merged = true;
+                }
+                ConflictDeliveryDecision::Proceed => {}
+            }
         }
 
         // Forensic teardown head — captured before any durable reviewer

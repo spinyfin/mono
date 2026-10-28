@@ -97,7 +97,7 @@ impl WorkDb {
     /// queued), or one created moments ago that has not been dispatched yet.
     /// Stricter than [`Self::is_conflict_resolution_revision_live`], which
     /// also treats `blocked` tasks and cleanly finished executions as live.
-    fn is_conflict_revision_running_or_queued(&self, revision_task_id: &str) -> Result<bool> {
+    pub(crate) fn is_conflict_revision_running_or_queued(&self, revision_task_id: &str) -> Result<bool> {
         let conn = self.connect()?;
         let row: Option<(String, String)> = conn
             .query_row(
@@ -143,7 +143,7 @@ impl WorkDb {
     /// GitHub's PR `baseRefOid`, which is fixed at PR-open time and does
     /// not track `main` moving under an in-review PR — keying on it alone
     /// would make every re-arm past a stale `succeeded` attempt collide
-    /// forever (T2396 / PR #1874).
+    /// forever (PR #1874).
     ///
     /// Phase 3 of the merge-conflict design (Q4). The caller is
     /// `conflict_watch::on_conflict_detected` after the parent
@@ -173,7 +173,7 @@ impl WorkDb {
         let cutoff_secs = now_secs - CHURN_GUARD_WINDOW_SECS;
         // Excludes `event_source = 'speculative_predicted'` rows: those are
         // telemetry-only observations from the Layer 4 speculative-rebase
-        // sweep (T10), never a live resolution attempt, and must not eat
+        // sweep, never a live resolution attempt, and must not eat
         // into the churn budget that gates *real* conflict-resolution
         // cycles. Without this exclusion a burst of speculative predictions
         // for one work item could pre-abandon its next genuine attempt.
@@ -250,8 +250,10 @@ impl WorkDb {
     /// regardless of status. Used by the stale-base re-arm path in
     /// `conflict_watch::on_conflict_detected` to check whether the
     /// previous attempt ended in `succeeded` (eligible for re-arm when
-    /// the PR is still CONFLICTING) vs `failed`/`abandoned` (not eligible
-    /// — the churn guard or human owns the retry decision in that case).
+    /// the PR is still CONFLICTING), `failed` with
+    /// `lockfile_regeneration_failed` (eligible once the (base, head)
+    /// pair moves), or another terminal status (the churn guard or a
+    /// human owns the retry).
     ///
     /// Returns `None` when no attempt has ever been recorded for this
     /// work item.
@@ -436,7 +438,7 @@ impl WorkDb {
     /// rungs 0–3). Identical to [`Self::mark_conflict_resolution_succeeded`]
     /// but records `resolved_by_rung = rung` for a resolution the engine
     /// produced without the full-worker path — the rung-1 engine-direct
-    /// mechanical rebase (T4) passes `1`, deterministic resolvers (rung 0)
+    /// mechanical rebase passes `1`, deterministic resolvers (rung 0)
     /// pass `0`. `resolved_by_rung` is `COALESCE`d so a rung already stamped
     /// on the row (e.g. by the harness before the poller's retire) wins over
     /// a later default.
@@ -816,7 +818,7 @@ impl WorkDb {
     }
 
     /// Aggregate `conflict_resolutions.conflict_diagnosis` for one
-    /// product into a hotspot report (Layer 0 telemetry, T5): per-file
+    /// product into a hotspot report (Layer 0 telemetry): per-file
     /// conflict frequency, per-file-_pair_ co-conflict frequency, and
     /// per-class counts. Backs `boss engine conflicts hotspots`.
     ///
@@ -969,13 +971,15 @@ impl WorkDb {
             params![reset.work_item_id, reset.id, now],
         )?;
         tx.commit()?;
+        drop(conn);
+        crate::conflict_ladder::clear_lockfile_regeneration_failed_attention(self, &reset.work_item_id);
         Ok(Some(reset))
     }
 
     /// Record a producer-side conflict event: a normal worker's own
     /// `cube workspace rebase` reported `REBASED_WITH_CONFLICTS`
     /// mid-task and it resolved the conflict inline, without ever
-    /// going through `conflict_watch` (Layer 0 / T1 of
+    /// going through `conflict_watch` (Layer 0 of
     /// `merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`
     /// — previously the largest source of telemetry undercount).
     /// `product_id`, `work_item_id`, and any already-open PR are
@@ -1061,7 +1065,7 @@ impl WorkDb {
     }
 
     /// Record a speculative-conflict-prediction event: the merge poller's
-    /// Layer 4 sweep (T10) ran a throwaway, no-push engine-direct rebase of
+    /// Layer 4 sweep ran a throwaway, no-push engine-direct rebase of
     /// an in-review PR against current `main` and it came back conflicted.
     /// This is purely a telemetry observation — it never touches the parent
     /// task's status, never gates the escalation ladder, and is inserted

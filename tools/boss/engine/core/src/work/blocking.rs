@@ -418,6 +418,8 @@ impl WorkDb {
         let updated = query_task(&tx, work_item_id)?
             .with_context(|| format!("unknown task after merge_conflict clear: {work_item_id}"))?;
         tx.commit()?;
+        drop(conn);
+        crate::conflict_ladder::clear_lockfile_regeneration_failed_attention(self, work_item_id);
         Ok(Some(updated))
     }
 
@@ -470,6 +472,8 @@ impl WorkDb {
         let updated = query_task(&tx, work_item_id)?
             .with_context(|| format!("unknown task after merge_conflict clear: {work_item_id}"))?;
         tx.commit()?;
+        drop(conn);
+        crate::conflict_ladder::clear_lockfile_regeneration_failed_attention(self, work_item_id);
         Ok(Some(updated))
     }
 
