@@ -106,10 +106,8 @@ pub(crate) async fn request_and_wait(request: HandoffRequest<'_>) -> Result<bool
         _ => String::new(),
     };
     let authorization = work_db
-        .coordinator_handoff_authorization()
-        .with_context(|| format!("{DELIVERY_FAILED_PREFIX}: reading handoff authorization"))?
-        .filter(|authorization| !authorization.is_empty())
-        .ok_or_else(|| anyhow!("{DELIVERY_FAILED_PREFIX}: coordinator handoff authorization is unavailable"))?;
+        .ensure_coordinator_handoff_authorization(&record.spawn_token)
+        .with_context(|| format!("{DELIVERY_FAILED_PREFIX}: coordinator handoff authorization is unavailable"))?;
     let turn_ended = delivery
         .deliver_locked(
             tmux,

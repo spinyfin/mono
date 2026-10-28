@@ -542,6 +542,85 @@ async fn run_scope_refusal_for_progression_peers_is_typed_to_their_tier() {
     }
 }
 
+#[test]
+fn worker_tier_gate_handoff_write_is_audited() {
+    let _audit = crate::audit::lock_audit_globals_for_tests();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let pid = runtime.block_on(async {
+        let (server_state, _dir) = enforcing_state("exec_handoff_worker");
+        server_state
+            .work_db
+            .record_coordinator_tmux_spawn_intent("boss-coordinator", "token", "opus", None)
+            .unwrap();
+        let credential = server_state
+            .work_db
+            .coordinator_handoff_authorization()
+            .unwrap()
+            .unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "sleep 30",
+                "boss",
+                "handoff",
+                "write",
+                "--authorization",
+                credential.as_str(),
+                "-",
+            ])
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        server_state.worker_registry.unregister(self_pid());
+        server_state
+            .worker_registry
+            .register(pid, "exec_handoff_worker".to_owned());
+        let request = serde_json::json!({
+            "request_id": "handoff-write",
+            "payload": {
+                "type": "set_coordinator_handoff",
+                "body": "should never land",
+                "authorization": credential,
+            },
+        })
+        .to_string();
+        let parsed = round_trip(server_state.clone(), Some(pid), &request).await;
+        child.kill().ok();
+        let _ = child.wait();
+        assert_eq!(parsed["payload"]["type"], "worker_tier_denied");
+        assert_eq!(parsed["payload"]["denial"]["verb"], "SetCoordinatorHandoff");
+        assert_eq!(parsed["payload"]["denial"]["reason"], "coordinator_only");
+        match server_state.work_db.coordinator_handoff_state() {
+            crate::coordinator_handoff::HandoffState::Missing => {}
+            other => panic!("a denied worker write must not persist: {other:?}"),
+        }
+        (pid, credential)
+    });
+    let (pid, credential) = pid;
+    let log = std::fs::read_to_string(crate::audit::default_audit_log_path().unwrap()).unwrap();
+    let events: Vec<serde_json::Value> = log.lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
+    let denial = events
+        .iter()
+        .rev()
+        .find(|event| event["event"] == "coordinator_handoff_rejected" && event["reason"] == "worker-tier denial")
+        .unwrap_or_else(|| panic!("missing worker-tier denial audit in {log}"));
+    assert_eq!(denial["pid"], pid as u32);
+    assert_eq!(denial["run_id"], "exec_handoff_worker");
+    assert_eq!(denial["caller"]["parent_chain"][0], pid as u32);
+    let argv = denial["caller"]["argv"].as_str().unwrap();
+    assert!(
+        !argv.contains(&credential),
+        "the real credential must be redacted from argv: {argv}"
+    );
+    assert!(
+        argv.contains("--authorization [redacted]"),
+        "the presented credential is redacted in place: {argv}"
+    );
+}
+
 #[tokio::test]
 async fn critical_update_handler_refuses_worker_and_accepts_human_peer() {
     let (state, _dir) = test_server_state();

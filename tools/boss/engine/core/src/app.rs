@@ -2584,7 +2584,8 @@ async fn handle_frontend_connection(
                 let expected = server_state.work_db.coordinator_handoff_authorization().ok().flatten();
                 let caller = coordinator_handoff::rejected_caller(
                     peer_pid,
-                    &[authorization, expected.as_deref().unwrap_or_default()],
+                    expected.as_deref().unwrap_or_default(),
+                    authorization,
                 );
                 crate::audit::record_event(
                     "coordinator_handoff_rejected",
