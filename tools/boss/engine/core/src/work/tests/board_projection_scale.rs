@@ -51,7 +51,9 @@ fn board_projection_scale_measurement() {
             let write_cpu = resources().0;
             let write_start = Instant::now();
             let mut conn = db.connect().unwrap();
-            let tx = conn.transaction().unwrap();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
             for i in 0..workers {
                 let id = format!("scale-task-{}", 7756 + i);
                 tx.execute(
