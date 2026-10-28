@@ -18,16 +18,16 @@ use crate::types::{
     CreateExecutionInput, CreateIdeaInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput,
     CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput, Decision,
     DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState, DispatchAdmission,
-    DriverQuotaSnapshot, DriverTrafficSplit, EditorialAction, EngineAttemptListEntry, FollowupMemberOverride,
-    GitHubAuthStateDto, GuideCommentDisposition, Idea, IdeaGraduationKind, IdeaPatch, LinkExternalRefInput,
-    ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation, ProbeDeliveryState,
-    ProbeInterruptOutcome, ProbeResumeEvidence, Product, Project, ProposalKind, ProposalState, ProposalSubmissionError,
-    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviewGuideAttempt,
-    ReviewGuideSummary, ReviewGuideVersion, ReviseDocInput, ReviseDocOutcome, SelectedProductState,
-    SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput,
-    Task, TaskRuntime, TranscriptSegment, WorkAttachment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem,
-    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle,
-    WorkerProposal, WorkerTierDenial,
+    DispatchPauseScope, DriverQuotaSnapshot, DriverTrafficSplit, EditorialAction, EngineAttemptListEntry,
+    FollowupMemberOverride, GitHubAuthStateDto, GuideCommentDisposition, Idea, IdeaGraduationKind, IdeaPatch,
+    LinkExternalRefInput, ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation,
+    ProbeDeliveryState, ProbeInterruptOutcome, ProbeResumeEvidence, Product, Project, ProposalKind, ProposalState,
+    ProposalSubmissionError, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
+    ResolvedComment, ReviewGuideAttempt, ReviewGuideSummary, ReviewGuideVersion, ReviseDocInput, ReviseDocOutcome,
+    SelectedProductState, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput,
+    SetTaskDocPointerInput, Task, TaskRuntime, TranscriptSegment, WorkAttachment, WorkAttentionItem, WorkComment,
+    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
+    WorkRun, WorkerContextBundle, WorkerProposal, WorkerTierDenial,
 };
 
 /// Outcome of the live `getQueue` smoke check `boss engine trunk status`
@@ -2436,10 +2436,19 @@ pub enum FrontendRequest {
     /// queueing and drain once dispatch resumes. Pausing dispatch never
     /// sets or implies the automation-pause flag, and vice versa. Replies
     /// with [`FrontendEvent::DispatchStateResult`].
+    ///
+    /// `scope` chooses what the pause holds (see [`DispatchPauseScope`]).
+    /// Absent means the default, [`DispatchPauseScope::NewWork`]: new work is
+    /// held and PR-review / review-guide executions stay exempt.
+    /// [`DispatchPauseScope::AllSpawns`] holds every pool, reviews included —
+    /// for when the spawn path itself is suspect. Ignored when
+    /// `paused = false`.
     SetDispatchPaused {
         paused: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<DispatchPauseScope>,
     },
 
     /// Set the driver traffic split: how eligible `standard`-reasoning

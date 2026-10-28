@@ -10,6 +10,7 @@ mod execution_bookmarks;
 mod helpers;
 mod local_worker_quarantine;
 mod pause_admission;
+mod pause_all_spawns;
 mod pause_bypass;
 mod pointer_reconciliation;
 mod pool;

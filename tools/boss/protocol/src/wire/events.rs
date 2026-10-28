@@ -1341,6 +1341,17 @@ pub enum FrontendEvent {
         /// cannot enter a paused state without one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        /// What the pause holds. `None` when `paused = false`. Always
+        /// consistent with `reviews_exempt` (`NewWork` iff exempt); carried
+        /// separately so a client names the scope instead of inferring it
+        /// from a boolean.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<DispatchPauseScope>,
+        /// Who paused: `"operator"` or `"breaker"`. `None` when
+        /// `paused = false`. Separate from `scope` so an operator all-spawns
+        /// hold is not mistaken for the circuit breaker's pause.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
     },
     /// Response to [`FrontendRequest::SetAutomationPaused`] and
     /// [`FrontendRequest::GetAutomationState`]. Carries the current

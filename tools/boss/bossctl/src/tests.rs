@@ -1,5 +1,5 @@
 use super::*;
-use boss_protocol::{CreateChoreInput, CreateProductInput, WorkItemPatch, WorkerActivity};
+use boss_protocol::{CreateChoreInput, CreateProductInput, DispatchPauseScope, WorkItemPatch, WorkerActivity};
 
 fn live(slot: u8, run: &str) -> LiveWorkerState {
     LiveWorkerState {
@@ -247,8 +247,9 @@ fn format_dispatch_set_line_matches_existing_dispatch_pause_text() {
     let paused = pause::DispatchPauseState {
         paused: true,
         paused_since_epoch_s: Some(123),
-        reviews_exempt: true,
         reason: Some("investigating a spike in failed dispatch attempts".to_string()),
+        scope: Some(DispatchPauseScope::NewWork),
+        origin: Some("operator".to_string()),
     };
     assert_eq!(
         pause::format_dispatch_set_line(&paused),
@@ -259,8 +260,9 @@ fn format_dispatch_set_line_matches_existing_dispatch_pause_text() {
     let resumed = pause::DispatchPauseState {
         paused: false,
         paused_since_epoch_s: None,
-        reviews_exempt: false,
         reason: None,
+        scope: None,
+        origin: None,
     };
     assert_eq!(pause::format_dispatch_set_line(&resumed), "dispatch resumed");
 }
@@ -270,8 +272,9 @@ fn format_dispatch_set_line_flags_non_exempt_breaker_pause() {
     let paused = pause::DispatchPauseState {
         paused: true,
         paused_since_epoch_s: None,
-        reviews_exempt: false,
         reason: Some("spawn-capability circuit breaker tripped".to_string()),
+        scope: Some(DispatchPauseScope::AllSpawns),
+        origin: Some("breaker".to_string()),
     };
     assert_eq!(
         pause::format_dispatch_set_line(&paused),
@@ -288,7 +291,7 @@ fn format_dispatch_set_line_flags_non_exempt_breaker_pause() {
 /// than left for an operator to discover from a dispatch tail.
 #[test]
 fn dispatch_scope_lines_declare_a_breaker_pause_scope_and_its_bypasses() {
-    let block = pause::dispatch_scope_lines(false).join("\n");
+    let block = pause::dispatch_scope_lines("breaker", DispatchPauseScope::AllSpawns).join("\n");
     assert!(block.contains("origin: breaker"), "{block}");
     assert!(block.contains("reviews: held"), "{block}");
     assert!(
@@ -305,7 +308,7 @@ fn dispatch_scope_lines_declare_a_breaker_pause_scope_and_its_bypasses() {
 /// *that* — the honesty requirement runs in both directions.
 #[test]
 fn dispatch_scope_lines_declare_an_operator_pause_review_exemption() {
-    let block = pause::dispatch_scope_lines(true).join("\n");
+    let block = pause::dispatch_scope_lines("operator", DispatchPauseScope::NewWork).join("\n");
     assert!(block.contains("origin: operator"), "{block}");
     assert!(block.contains("reviews: exempt"), "{block}");
     assert!(
@@ -316,6 +319,118 @@ fn dispatch_scope_lines_declare_an_operator_pause_review_exemption() {
         block.contains("bossctl agents launch"),
         "the explicit operator override applies to every pause mode: {block}"
     );
+}
+
+/// An operator all-spawns pause holds reviews too, but it is NOT the
+/// breaker's pause — the scope block must say both, and must not advertise
+/// the breaker's recovery canary (an operator pause is never auto-probed).
+#[test]
+fn dispatch_scope_lines_declare_an_operator_all_spawns_pause() {
+    let block = pause::dispatch_scope_lines("operator", DispatchPauseScope::AllSpawns).join("\n");
+    assert!(block.contains("origin: operator"), "{block}");
+    assert!(block.contains("scope: all_spawns"), "{block}");
+    assert!(block.contains("reviews: held"), "{block}");
+    assert!(
+        !block.contains("breaker"),
+        "an operator hold is not the breaker: {block}"
+    );
+    assert!(block.contains("no canary is admitted"), "{block}");
+    assert!(block.contains("bossctl agents launch"), "{block}");
+}
+
+#[test]
+fn dispatch_scope_lines_name_the_scope_for_every_pause() {
+    for (origin, scope) in [
+        ("operator", DispatchPauseScope::NewWork),
+        ("breaker", DispatchPauseScope::AllSpawns),
+        ("operator", DispatchPauseScope::AllSpawns),
+    ] {
+        let block = pause::dispatch_scope_lines(origin, scope).join("\n");
+        assert!(block.contains(&format!("scope: {}", scope.as_str())), "{block}");
+    }
+}
+
+#[test]
+fn format_dispatch_set_line_states_operator_all_spawns_scope() {
+    let paused = pause::DispatchPauseState {
+        paused: true,
+        paused_since_epoch_s: None,
+        reason: Some("spawn path suspect".to_string()),
+        scope: Some(DispatchPauseScope::AllSpawns),
+        origin: Some("operator".to_string()),
+    };
+    assert_eq!(
+        pause::format_dispatch_set_line(&paused),
+        "dispatch paused — scope all_spawns: every spawn is held except explicit `bossctl agents launch` overrides, PR reviews and review guides \
+         included — reason: spawn path suspect"
+    );
+}
+
+/// The JSON names scope and origin separately, and reports them as `null`
+/// while running rather than a stale value.
+#[test]
+fn dispatch_pause_state_json_reflects_the_chosen_scope() {
+    let all_spawns = pause::DispatchPauseState {
+        paused: true,
+        paused_since_epoch_s: Some(7),
+        reason: Some("r".to_string()),
+        scope: Some(DispatchPauseScope::AllSpawns),
+        origin: Some("operator".to_string()),
+    }
+    .to_json();
+    assert_eq!(all_spawns["scope"], "all_spawns");
+    assert_eq!(all_spawns["origin"], "operator");
+    assert_eq!(all_spawns["reviews_exempt"], false);
+
+    let default = pause::DispatchPauseState {
+        paused: true,
+        paused_since_epoch_s: Some(7),
+        reason: Some("r".to_string()),
+        scope: Some(DispatchPauseScope::NewWork),
+        origin: Some("operator".to_string()),
+    }
+    .to_json();
+    assert_eq!(default["scope"], "new_work");
+    assert_eq!(default["reviews_exempt"], true);
+
+    let running = pause::DispatchPauseState {
+        paused: false,
+        paused_since_epoch_s: None,
+        reason: None,
+        scope: None,
+        origin: None,
+    }
+    .to_json();
+    assert!(running["scope"].is_null() && running["origin"].is_null(), "{running}");
+}
+
+/// An engine that predates the scope/origin fields still gets a correct
+/// report, inferred from `reviews_exempt` exactly as before — and a running
+/// engine reports neither.
+#[test]
+fn dispatch_pause_state_infers_scope_from_a_legacy_engine_reply() {
+    let legacy = |paused, reviews_exempt| {
+        pause::DispatchPauseState::from_event(
+            FrontendEvent::DispatchStateResult {
+                paused,
+                paused_since_epoch_s: None,
+                reviews_exempt,
+                reason: None,
+                scope: None,
+                origin: None,
+            },
+            "test",
+        )
+        .unwrap()
+    };
+    let exempting = legacy(true, true);
+    assert_eq!(exempting.scope, Some(DispatchPauseScope::NewWork));
+    assert_eq!(exempting.origin.as_deref(), Some("operator"));
+    let holding = legacy(true, false);
+    assert_eq!(holding.scope, Some(DispatchPauseScope::AllSpawns));
+    assert_eq!(holding.origin.as_deref(), Some("breaker"));
+    let running = legacy(false, false);
+    assert_eq!((running.scope, running.origin), (None, None));
 }
 
 #[test]
@@ -421,10 +536,36 @@ fn dispatch_pause_parses_an_explicit_reason() {
     let cli = Cli::try_parse_from(["bossctl", "dispatch", "pause", "--reason", "disk full"]).unwrap();
     match cli.command {
         Command::Dispatch {
-            action: DispatchAction::Pause { reason },
-        } => assert_eq!(reason, "disk full"),
+            action: DispatchAction::Pause { reason, all_spawns },
+        } => {
+            assert_eq!(reason, "disk full");
+            assert!(!all_spawns, "the default pause must not hold reviews");
+        }
         other => panic!("expected DispatchAction::Pause, got {other:?}"),
     }
+}
+
+#[test]
+fn dispatch_pause_parses_all_spawns() {
+    let cli = Cli::try_parse_from([
+        "bossctl",
+        "dispatch",
+        "pause",
+        "--reason",
+        "spawn path suspect",
+        "--all-spawns",
+    ])
+    .unwrap();
+    match cli.command {
+        Command::Dispatch {
+            action: DispatchAction::Pause { all_spawns, .. },
+        } => {
+            assert!(all_spawns);
+            assert_eq!(pause::dispatch_pause_scope(all_spawns), DispatchPauseScope::AllSpawns);
+        }
+        other => panic!("expected DispatchAction::Pause, got {other:?}"),
+    }
+    assert_eq!(pause::dispatch_pause_scope(false), DispatchPauseScope::NewWork);
 }
 
 #[test]
@@ -810,4 +951,28 @@ fn drop_closed_work_items_drops_terminal_work_items_and_keeps_open_or_unknown() 
         vec!["exec-open", "exec-none", "exec-unknown"],
         "closed work items are dropped; missing ids and unbound executions stay: {kept:?}"
     );
+}
+
+#[test]
+fn all_spawns_mutation_requires_explicit_operator_acknowledgment() {
+    for reviews_exempt in [true, false] {
+        let reply = boss_protocol::FrontendEvent::DispatchStateResult {
+            paused: true,
+            paused_since_epoch_s: Some(7),
+            reviews_exempt,
+            reason: Some("hold".into()),
+            scope: None,
+            origin: None,
+        };
+        assert!(pause::validate_dispatch_pause_reply(reply, true).is_err());
+    }
+    let reply = boss_protocol::FrontendEvent::DispatchStateResult {
+        paused: true,
+        paused_since_epoch_s: Some(7),
+        reviews_exempt: false,
+        reason: Some("hold".into()),
+        scope: Some(DispatchPauseScope::AllSpawns),
+        origin: Some("operator".into()),
+    };
+    assert!(pause::validate_dispatch_pause_reply(reply, true).is_ok());
 }

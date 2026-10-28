@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use boss_engine::dispatch_events::DispatchEvent;
 use boss_engine::dispatch_reader;
-use boss_protocol::{FrontendEvent, FrontendRequest};
+use boss_protocol::{DispatchPauseScope, FrontendEvent, FrontendRequest};
 
 use super::{PauseArg, PauseSystem, connect, resolve_state_root};
 
@@ -25,13 +25,99 @@ pub(super) fn require_pause_reason(reason: Option<String>) -> Result<String> {
     reason.ok_or_else(|| anyhow::anyhow!("--reason is required to pause (why are these systems being paused?)"))
 }
 
+/// The scope `--all-spawns` selects: all spawns when set, otherwise the
+/// default (new work held, reviews exempt).
+pub(super) fn dispatch_pause_scope(all_spawns: bool) -> DispatchPauseScope {
+    if all_spawns {
+        DispatchPauseScope::AllSpawns
+    } else {
+        DispatchPauseScope::NewWork
+    }
+}
+
 /// Current dispatch-pause state as returned by
 /// [`FrontendRequest::SetDispatchPaused`] / [`FrontendRequest::GetDispatchState`].
 pub(super) struct DispatchPauseState {
     pub(super) paused: bool,
     pub(super) paused_since_epoch_s: Option<u64>,
-    pub(super) reviews_exempt: bool,
     pub(super) reason: Option<String>,
+    /// What the pause holds; `None` while running.
+    pub(super) scope: Option<DispatchPauseScope>,
+    /// Who paused (`"operator"` / `"breaker"`); `None` while running.
+    pub(super) origin: Option<String>,
+}
+
+impl DispatchPauseState {
+    /// Build from the engine's reply. An engine that predates the scope and
+    /// origin fields only had the two historical pauses, which
+    /// `reviews_exempt` tells apart: an exempting pause was the operator's
+    /// default, a reviews-holding one the breaker's.
+    pub(super) fn from_event(event: FrontendEvent, what: &str) -> Result<Self> {
+        match event {
+            FrontendEvent::DispatchStateResult {
+                paused,
+                paused_since_epoch_s,
+                reviews_exempt,
+                reason,
+                scope,
+                origin,
+            } => {
+                let (scope, origin) = if paused {
+                    (
+                        Some(scope.unwrap_or(if reviews_exempt {
+                            DispatchPauseScope::NewWork
+                        } else {
+                            DispatchPauseScope::AllSpawns
+                        })),
+                        Some(origin.unwrap_or_else(|| if reviews_exempt { "operator" } else { "breaker" }.to_owned())),
+                    )
+                } else {
+                    (None, None)
+                };
+                Ok(DispatchPauseState {
+                    paused,
+                    paused_since_epoch_s,
+                    reason,
+                    scope,
+                    origin,
+                })
+            }
+            FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+                bail!("engine rejected {what}: {message}")
+            }
+            other => bail!("engine returned unexpected response: {other:?}"),
+        }
+    }
+
+    /// The scope to report (the new-work default if none, which only a
+    /// running state has and nothing prints a scope for).
+    pub(super) fn resolved_scope(&self) -> DispatchPauseScope {
+        self.scope.unwrap_or_default()
+    }
+
+    pub(super) fn resolved_origin(&self) -> &str {
+        self.origin.as_deref().unwrap_or("operator")
+    }
+
+    /// Whether the pause exempts PR reviews; `false` while running (an
+    /// absent pause exempts nothing because it holds nothing).
+    pub(super) fn reviews_exempt(&self) -> bool {
+        self.paused && !self.resolved_scope().holds_reviews()
+    }
+
+    /// The JSON every `bossctl` dispatch-pause surface prints, so the scope
+    /// is reported identically by `dispatch pause`, `dispatch state`,
+    /// `pause` and `state`. `scope` and `origin` are `null` while running.
+    pub(super) fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "paused": self.paused,
+            "paused_since_epoch_s": self.paused_since_epoch_s,
+            "reviews_exempt": self.reviews_exempt(),
+            "scope": self.scope.map(DispatchPauseScope::as_str),
+            "origin": self.origin,
+            "reason": self.reason,
+        })
+    }
 }
 
 /// Current automation-pause state as returned by
@@ -44,30 +130,39 @@ pub(super) struct AutomationPauseState {
 
 /// `reason` is `Some` to pause (with that reason) and `None` to resume —
 /// mirrors the required-only-when-pausing contract on the wire request.
-async fn set_dispatch_paused_raw(socket_path: &Option<String>, reason: Option<String>) -> Result<DispatchPauseState> {
+/// `scope` is sent only when pausing; resuming has no scope.
+async fn set_dispatch_paused_raw(
+    socket_path: &Option<String>,
+    reason: Option<String>,
+    scope: DispatchPauseScope,
+) -> Result<DispatchPauseState> {
     let paused = reason.is_some();
     let mut client = connect(socket_path).await?;
     let response = client
-        .send_request(&FrontendRequest::SetDispatchPaused { paused, reason })
+        .send_request(&FrontendRequest::SetDispatchPaused {
+            paused,
+            reason,
+            scope: (paused && scope == DispatchPauseScope::AllSpawns).then_some(scope),
+        })
         .await
         .context("sending SetDispatchPaused")?;
-    match response {
-        FrontendEvent::DispatchStateResult {
-            paused,
-            paused_since_epoch_s,
-            reviews_exempt,
-            reason,
-        } => Ok(DispatchPauseState {
-            paused,
-            paused_since_epoch_s,
-            reviews_exempt,
-            reason,
-        }),
-        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
-            bail!("engine rejected SetDispatchPaused: {message}")
-        }
-        other => bail!("engine returned unexpected response: {other:?}"),
+    validate_dispatch_pause_reply(response, paused && scope == DispatchPauseScope::AllSpawns)
+}
+
+pub(super) fn validate_dispatch_pause_reply(
+    response: FrontendEvent,
+    require_all_spawns: bool,
+) -> Result<DispatchPauseState> {
+    if require_all_spawns
+        && !matches!(&response, FrontendEvent::DispatchStateResult {
+        paused: true, scope: Some(DispatchPauseScope::AllSpawns), origin: Some(origin), ..
+    } if origin == "operator")
+    {
+        bail!(
+            "engine did not confirm an operator all_spawns pause; update the running engine and retry --all-spawns, then verify with dispatch state"
+        );
     }
+    DispatchPauseState::from_event(response, "SetDispatchPaused")
 }
 
 async fn get_dispatch_state_raw(socket_path: &Option<String>) -> Result<DispatchPauseState> {
@@ -76,23 +171,7 @@ async fn get_dispatch_state_raw(socket_path: &Option<String>) -> Result<Dispatch
         .send_request(&FrontendRequest::GetDispatchState)
         .await
         .context("sending GetDispatchState")?;
-    match response {
-        FrontendEvent::DispatchStateResult {
-            paused,
-            paused_since_epoch_s,
-            reviews_exempt,
-            reason,
-        } => Ok(DispatchPauseState {
-            paused,
-            paused_since_epoch_s,
-            reviews_exempt,
-            reason,
-        }),
-        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
-            bail!("engine rejected GetDispatchState: {message}")
-        }
-        other => bail!("engine returned unexpected response: {other:?}"),
-    }
+    DispatchPauseState::from_event(response, "GetDispatchState")
 }
 
 /// `reason` is `Some` to pause (with that reason) and `None` to resume.
@@ -146,31 +225,48 @@ async fn get_automation_state_raw(socket_path: &Option<String>) -> Result<Automa
     }
 }
 
-/// The scope block `dispatch state` prints under a live pause: what the
-/// pause holds, and every route that can still reach a worker spawn while it
-/// holds.
+/// The scope block `dispatch state` prints under a live pause: who paused,
+/// what the pause holds, and every route that can still reach a worker spawn
+/// while it holds.
 ///
 /// Kept as one function returning the whole block so the scope claim and its
 /// exceptions can never be edited apart. The engine-side counterpart is
 /// `ExecutionCoordinator::dispatch_hold_for`, which is the single authority
 /// these lines describe — if a bypass is added there it belongs here too.
-pub(super) fn dispatch_scope_lines(reviews_exempt: bool) -> Vec<String> {
+pub(super) fn dispatch_scope_lines(origin: &str, scope: DispatchPauseScope) -> Vec<String> {
     let mut lines = Vec::new();
-    if reviews_exempt {
-        lines.push("  origin: operator".to_owned());
-        lines.push("  reviews: exempt — PR-review executions keep dispatching (a review is the".to_owned());
-        lines.push("           lifecycle of a change already in flight, not new work)".to_owned());
-    } else {
-        lines.push("  origin: breaker (spawn-capability circuit breaker)".to_owned());
-        lines.push("  reviews: held — every pool is held, PR reviews included; the breaker tripped".to_owned());
-        lines.push("           on the worker-spawn path itself, which reviews depend on too".to_owned());
-        lines.push("  bypass: one recovery canary may be admitted periodically to test whether the".to_owned());
-        lines.push("          spawn path recovered — never a PR review, one at a time, on a backoff.".to_owned());
-        lines.push("          Look for `breaker_recovery_probe_admitted` in `bossctl dispatch tail`.".to_owned());
+    match (origin, scope) {
+        (_, DispatchPauseScope::NewWork) => {
+            lines.push("  origin: operator".to_owned());
+            lines.push(format!("  scope: {} — new work is held", scope.as_str()));
+            lines.push("  reviews: exempt — PR-review and review-guide executions keep dispatching (a".to_owned());
+            lines.push("           review is the lifecycle of a change already in flight, not new work)".to_owned());
+        }
+        ("breaker", DispatchPauseScope::AllSpawns) => {
+            lines.push("  origin: breaker (spawn-capability circuit breaker)".to_owned());
+            lines.push(format!("  scope: {} — every pool is held", scope.as_str()));
+            lines.push("  reviews: held — every pool is held, PR reviews included; the breaker tripped".to_owned());
+            lines.push("           on the worker-spawn path itself, which reviews depend on too".to_owned());
+            lines.push("  bypass: one recovery canary may be admitted periodically to test whether the".to_owned());
+            lines.push("          spawn path recovered — never a PR review, one at a time, on a backoff.".to_owned());
+            lines.push("          Look for `breaker_recovery_probe_admitted` in `bossctl dispatch tail`.".to_owned());
+        }
+        (_, DispatchPauseScope::AllSpawns) => {
+            lines.push("  origin: operator".to_owned());
+            lines.push(format!(
+                "  scope: {} — every spawn is held except explicit agents launch overrides",
+                scope.as_str()
+            ));
+            lines.push("  reviews: held — every pool is held, PR reviews and review guides included;".to_owned());
+            lines.push("           the operator chose this scope because the spawn path itself is suspect".to_owned());
+            lines.push("  recovery: no canary is admitted and nothing auto-resumes — an operator pause is".to_owned());
+            lines.push("            manual-resume-only (`bossctl dispatch resume`).".to_owned());
+            lines.push("  bypass: `bossctl work start --force` is refused under this scope.".to_owned());
+        }
     }
     lines.push("  bypass: `bossctl agents launch <id>` force-dispatches one execution through".to_owned());
     lines.push("          the pause — an explicit operator override, by design.".to_owned());
-    if reviews_exempt {
+    if scope == DispatchPauseScope::NewWork {
         lines.push("  bypass: work items at priority `critical` (human-set only) keep dispatching".to_owned());
         lines.push("          through an operator pause, and past the interactive concurrency cap.".to_owned());
     }
@@ -185,10 +281,12 @@ pub(super) fn format_dispatch_set_line(state: &DispatchPauseState) -> String {
             .paused_since_epoch_s
             .map(|s| format!(" (since epoch {s})"))
             .unwrap_or_default();
-        let exempt_str = if state.reviews_exempt {
-            " — PR reviews are exempt and keep dispatching"
-        } else {
-            " — PR reviews are held too (spawn-capability breaker)"
+        let exempt_str = match (state.resolved_origin(), state.resolved_scope()) {
+            (_, DispatchPauseScope::NewWork) => " — PR reviews are exempt and keep dispatching",
+            ("breaker", DispatchPauseScope::AllSpawns) => " — PR reviews are held too (spawn-capability breaker)",
+            (_, DispatchPauseScope::AllSpawns) => {
+                " — scope all_spawns: every spawn is held except explicit `bossctl agents launch` overrides, PR reviews and review guides included"
+            }
         };
         // `bossctl agents launch` overrides any pause by design; see
         // `dispatch_state` below for the long-form scope report.
@@ -229,18 +327,11 @@ pub(super) async fn dispatch_set_paused(
     socket_path: &Option<String>,
     json: bool,
     reason: Option<String>,
+    scope: DispatchPauseScope,
 ) -> Result<()> {
-    let state = set_dispatch_paused_raw(socket_path, reason).await?;
+    let state = set_dispatch_paused_raw(socket_path, reason, scope).await?;
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "paused": state.paused,
-                "paused_since_epoch_s": state.paused_since_epoch_s,
-                "reviews_exempt": state.reviews_exempt,
-                "reason": state.reason,
-            })
-        );
+        println!("{}", state.to_json());
     } else {
         println!("{}", format_dispatch_set_line(&state));
     }
@@ -250,15 +341,7 @@ pub(super) async fn dispatch_set_paused(
 pub(super) async fn dispatch_state(socket_path: &Option<String>, json: bool) -> Result<()> {
     let state = get_dispatch_state_raw(socket_path).await?;
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "paused": state.paused,
-                "paused_since_epoch_s": state.paused_since_epoch_s,
-                "reviews_exempt": state.reviews_exempt,
-                "reason": state.reason,
-            })
-        );
+        println!("{}", state.to_json());
     } else if state.paused {
         let since_str = state
             .paused_since_epoch_s
@@ -277,7 +360,7 @@ pub(super) async fn dispatch_state(socket_path: &Option<String>, json: bool) -> 
         // `reviews: held` while the breaker's own recovery canary was
         // spending PR-review rows), so every route through a pause is named
         // here — including the ones that are deliberate.
-        for line in dispatch_scope_lines(state.reviews_exempt) {
+        for line in dispatch_scope_lines(state.resolved_origin(), state.resolved_scope()) {
             println!("{line}");
         }
     } else {
@@ -364,13 +447,14 @@ pub(super) async fn set_paused_for_systems(
     json: bool,
     targets: &[PauseSystem],
     reason: Option<String>,
+    scope: DispatchPauseScope,
 ) -> Result<()> {
     let mut dispatch_result = None;
     let mut automation_result = None;
     for system in targets {
         match system {
             PauseSystem::Dispatch => {
-                dispatch_result = Some(set_dispatch_paused_raw(socket_path, reason.clone()).await?)
+                dispatch_result = Some(set_dispatch_paused_raw(socket_path, reason.clone(), scope).await?)
             }
             PauseSystem::Automation => {
                 automation_result = Some(set_automation_paused_raw(socket_path, reason.clone()).await?)
@@ -381,15 +465,7 @@ pub(super) async fn set_paused_for_systems(
     if json {
         let mut systems = serde_json::Map::new();
         if let Some(d) = &dispatch_result {
-            systems.insert(
-                "dispatch".to_string(),
-                serde_json::json!({
-                    "paused": d.paused,
-                    "paused_since_epoch_s": d.paused_since_epoch_s,
-                    "reviews_exempt": d.reviews_exempt,
-                    "reason": d.reason,
-                }),
-            );
+            systems.insert("dispatch".to_string(), d.to_json());
         }
         if let Some(a) = &automation_result {
             systems.insert(
@@ -438,12 +514,7 @@ pub(super) async fn unified_state(socket_path: &Option<String>, json: bool) -> R
         println!(
             "{}",
             serde_json::json!({
-                "dispatch": {
-                    "paused": dispatch.paused,
-                    "paused_since_epoch_s": dispatch.paused_since_epoch_s,
-                    "reviews_exempt": dispatch.reviews_exempt,
-                    "reason": dispatch.reason,
-                },
+                "dispatch": dispatch.to_json(),
                 "automation": {
                     "paused": automation.paused,
                     "paused_since_epoch_s": automation.paused_since_epoch_s,
@@ -460,11 +531,17 @@ pub(super) async fn unified_state(socket_path: &Option<String>, json: bool) -> R
             if let Some(reason) = &dispatch.reason {
                 println!("            reason: {reason}");
             }
-            let reviews = if dispatch.reviews_exempt {
-                "reviews: exempt — PR-review executions keep dispatching"
-            } else {
-                "reviews: held — spawn-capability breaker pause"
+            let scope = dispatch.resolved_scope();
+            let reviews = match (dispatch.resolved_origin(), scope) {
+                (_, DispatchPauseScope::NewWork) => {
+                    "reviews: exempt — PR-review executions keep dispatching".to_owned()
+                }
+                ("breaker", DispatchPauseScope::AllSpawns) => {
+                    "reviews: held — spawn-capability breaker pause".to_owned()
+                }
+                (_, DispatchPauseScope::AllSpawns) => "reviews: held — operator all-spawns pause".to_owned(),
             };
+            println!("            scope: {}", scope.as_str());
             println!("            {reviews}");
         }
         println!(

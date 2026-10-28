@@ -364,7 +364,8 @@ mod tests {
         assert_eq!(
             replay_safety(&FrontendRequest::SetDispatchPaused {
                 paused: true,
-                reason: None
+                reason: None,
+                scope: None,
             }),
             ReplaySafety::Always
         );

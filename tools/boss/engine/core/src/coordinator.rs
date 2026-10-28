@@ -9,7 +9,8 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use boss_event_bus::{Event, EventBus, EventKind, TopicFilter};
 use boss_protocol::{
-    EngineToAppError, ExecutionKind, ExecutionStatus, FrontendEvent, LiveWorkerState, PauseReason, TaskKind, TaskStatus,
+    DispatchPauseScope, EngineToAppError, ExecutionKind, ExecutionStatus, FrontendEvent, LiveWorkerState, PauseReason,
+    TaskKind, TaskStatus,
 };
 use tokio::process::Command;
 use tokio::sync::{Mutex, Semaphore};
@@ -1840,14 +1841,17 @@ fn default_coordinator_metrics() -> Arc<Registry> {
     metrics
 }
 
-/// Why dispatch is currently paused. Determines the pause's **scope** —
-/// whether `pr_review` executions are held along with everything else. See
+/// Who paused dispatch. Governs how the pause ends (the breaker auto-recovers;
+/// an operator pause is manual-resume-only) and which overrides apply. What the
+/// pause *holds* is the separate [`DispatchPauseScope`] — see
 /// [`DispatchPause::reviews_held`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchPauseOrigin {
     /// An operator toggled `bossctl dispatch pause` / the app's pause
-    /// switch. A review is the lifecycle of a change already in flight, not
-    /// new work, so reviews keep dispatching through an operator pause.
+    /// switch. By default ([`DispatchPauseScope::NewWork`]) a review is the
+    /// lifecycle of a change already in flight, not new work, so reviews keep
+    /// dispatching through an operator pause; the operator may instead choose
+    /// [`DispatchPauseScope::AllSpawns`]. Manual-resume-only either way.
     Operator,
     /// The spawn-capability circuit breaker tripped (see
     /// [`crate::spawn_health`]) because the app's worker-pane spawn path
@@ -1864,6 +1868,16 @@ impl DispatchPauseOrigin {
         match self {
             DispatchPauseOrigin::Operator => "operator",
             DispatchPauseOrigin::Breaker => "breaker",
+        }
+    }
+
+    /// The scope an origin pauses with when nothing chose one: the long-standing
+    /// behaviour — an operator pause exempts reviews, a breaker pause holds
+    /// everything.
+    pub fn default_scope(self) -> DispatchPauseScope {
+        match self {
+            DispatchPauseOrigin::Operator => DispatchPauseScope::NewWork,
+            DispatchPauseOrigin::Breaker => DispatchPauseScope::AllSpawns,
         }
     }
 
@@ -1886,10 +1900,18 @@ impl DispatchPauseOrigin {
 /// unit, so "is dispatch paused" and "what does this pause hold" can never be
 /// answered from different instants. Resuming clears the episode whole, so no
 /// field can survive a resume and describe a pause that no longer exists.
+///
+/// *Who* paused ([`Self::origin`]) and *what is held* ([`Self::scope`]) are
+/// separate fields on purpose: an operator can hold every spawn without
+/// pretending to be the circuit breaker, and the breaker's pause stays
+/// distinguishable from an operator's in every audit surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchPause {
-    /// Who paused, which determines [`Self::reviews_held`].
+    /// Who paused. Governs auto-recovery and the per-request override, not
+    /// the scope: see [`DispatchPauseOrigin`].
     pub origin: DispatchPauseOrigin,
+    /// What is held, which determines [`Self::reviews_held`].
+    pub scope: DispatchPauseScope,
     /// Epoch seconds at which this pause episode began.
     pub since_epoch_s: u64,
     /// Why. Non-empty by construction ([`boss_protocol::PauseReason`]):
@@ -1899,28 +1921,46 @@ pub struct DispatchPause {
 }
 
 impl DispatchPause {
-    /// Whether this pause holds `pr_review` executions too.
+    /// Whether this pause holds review-pool executions (`pr_review` and
+    /// review guide) too.
     ///
-    /// An operator pause does not: a review is the lifecycle of a change
-    /// already in flight, not new work, so reviews keep draining while the
-    /// operator holds new work back. A breaker pause does: the thing the
-    /// breaker tripped on is the worker-spawn path, which reviews depend on
-    /// exactly as much as anything else, so dispatching one would just burn
-    /// another attempt against the same dead path.
+    /// The default operator pause does not: a review is the lifecycle of a
+    /// change already in flight, not new work, so reviews keep draining
+    /// while the operator holds new work back. An [`DispatchPauseScope::AllSpawns`]
+    /// pause does — whether the operator chose it or the breaker did, because
+    /// what both mean is that the worker-spawn path is suspect and dispatching
+    /// a review would just burn another attempt against it.
     pub fn reviews_held(&self) -> bool {
-        self.origin != DispatchPauseOrigin::Operator
+        self.scope.holds_reviews()
+    }
+
+    /// Whether the per-request pause override
+    /// ([`DispatchAdmission::PauseBypassOverride`], `bossctl work start
+    /// --force`) may admit a row through this pause: only an operator pause
+    /// that keeps the default scope. A breaker pause says the spawn path is
+    /// unhealthy; an operator [`DispatchPauseScope::AllSpawns`] pause says
+    /// the same in the operator's own words — neither is overridable per
+    /// request. (`bossctl agents launch`, [`DispatchAdmission::OperatorForced`],
+    /// remains the explicit manual escape hatch for both.)
+    pub fn accepts_pause_bypass(&self) -> bool {
+        self.origin == DispatchPauseOrigin::Operator && !self.reviews_held()
     }
 
     /// One-line scope description, phrased for an operator. Kept next to
     /// [`Self::reviews_held`] so the words and the behaviour cannot drift:
     /// anything that renders a pause's scope for a human renders this.
     pub fn scope_description(&self) -> &'static str {
-        match self.origin {
-            DispatchPauseOrigin::Operator => {
-                "new work is held; PR reviews are exempt and keep dispatching (a review is the \
-                 lifecycle of a change already in flight)"
+        match (self.origin, self.scope) {
+            (_, DispatchPauseScope::NewWork) => {
+                "new work is held; PR reviews and review guides are exempt and keep dispatching (a \
+                 review is the lifecycle of a change already in flight)"
             }
-            DispatchPauseOrigin::Breaker => {
+            (DispatchPauseOrigin::Operator, DispatchPauseScope::AllSpawns) => {
+                "every spawn is held except explicit `bossctl agents launch` overrides, PR reviews and review guides included — the operator chose \
+                 the all-spawns scope because the spawn path itself is suspect; no recovery probe \
+                 is admitted"
+            }
+            (DispatchPauseOrigin::Breaker, DispatchPauseScope::AllSpawns) => {
                 "every pool is held, PR reviews included — the breaker tripped on the worker-spawn \
                  path itself, which reviews depend on too"
             }

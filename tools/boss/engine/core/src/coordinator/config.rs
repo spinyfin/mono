@@ -498,23 +498,38 @@ impl ExecutionCoordinator {
         self.worker_pool.clone()
     }
 
+    /// Pause global dispatch with `origin`'s default scope — see
+    /// [`Self::pause_dispatch_scoped`], which this wraps.
+    pub fn pause_dispatch(&self, paused_since_epoch_s: u64, origin: DispatchPauseOrigin, reason: PauseReason) {
+        self.pause_dispatch_scoped(paused_since_epoch_s, origin, origin.default_scope(), reason);
+    }
+
     /// Pause global dispatch. No work item in the pause's scope reaches a
     /// worker spawn or a cube lease until it is resumed; already-running
     /// executions are untouched, because the pause is admission-only by
-    /// design. `origin` determines the scope — see
-    /// [`DispatchPause::reviews_held`]. `reason` is a required, validated
+    /// design. `scope` determines what is held — see
+    /// [`DispatchPause::reviews_held`]; `origin` records who paused.
+    /// `reason` is a required, validated
     /// non-empty [`PauseReason`] rather than a bare `String` — there is no
     /// overload that lets a caller pause dispatch without one, which is the
     /// point: dispatch must never be found paused with no record of who
     /// paused it or why. See [`Self::resume_dispatch`] to clear the pause.
     ///
     /// The caller is responsible for persisting the new state (including
-    /// `origin`, via [`DispatchPauseOrigin::as_metadata_str`], and `reason`)
-    /// to `state.db` so it survives an engine restart — see the
-    /// `handle_set_dispatch_paused` handler in `app/engine_meta.rs`.
-    pub fn pause_dispatch(&self, paused_since_epoch_s: u64, origin: DispatchPauseOrigin, reason: PauseReason) {
+    /// `origin` via [`DispatchPauseOrigin::as_metadata_str`], `scope` via
+    /// [`DispatchPauseScope::as_str`], and `reason`) to `state.db` so it
+    /// survives an engine restart — see the `handle_set_dispatch_paused`
+    /// handler in `app/engine_meta.rs`.
+    pub fn pause_dispatch_scoped(
+        &self,
+        paused_since_epoch_s: u64,
+        origin: DispatchPauseOrigin,
+        scope: DispatchPauseScope,
+        reason: PauseReason,
+    ) {
         let pause = DispatchPause {
             origin,
+            scope,
             since_epoch_s: paused_since_epoch_s,
             reason: reason.into(),
         };
@@ -532,7 +547,7 @@ impl ExecutionCoordinator {
     }
 
     /// Resume global dispatch, clearing the entire pause episode — flag,
-    /// origin, timestamp and reason together. A later pause therefore always
+    /// origin, scope, timestamp and reason together. A later pause therefore always
     /// starts from a clean slate rather than silently inheriting a field the
     /// previous episode left behind.
     ///
@@ -611,17 +626,19 @@ impl ExecutionCoordinator {
     ///   `reviews: held` true — a breaker pause that spent reviews as
     ///   canaries was not holding them.
     /// - [`DispatchAdmission::PauseBypassOverride`] — allowed **only** under
-    ///   an Operator-origin pause; a Breaker-origin pause holds it exactly
-    ///   like [`DispatchAdmission::Queued`]. [`Self::dispatch_with_pause_bypass`]
+    ///   an Operator-origin pause with the default scope
+    ///   ([`DispatchPause::accepts_pause_bypass`]); a Breaker-origin pause or
+    ///   an operator all-spawns pause holds it exactly like
+    ///   [`DispatchAdmission::Queued`]. [`Self::dispatch_with_pause_bypass`]
     ///   has already confirmed the pause was operator-originated and
     ///   overridable before consuming this execution's
     ///   `dispatch_pause_bypass_execution_ids` marker, so this arm exists to
     ///   keep that confirmation honest at the chokepoint rather than to
     ///   re-derive it.
     /// - [`DispatchAdmission::Critical`] — the human-only `critical`
-    ///   priority: admitted under an Operator-origin pause (that is the
+    ///   priority: admitted under a default-scope operator pause (that is the
     ///   pause the owner controls and the one the escape hatch exists to
-    ///   get past), held by a Breaker-origin pause exactly like
+    ///   get past), held by any all-spawns pause exactly like
     ///   [`DispatchAdmission::Queued`] — the spawn path is broken, so the
     ///   urgent row would only burn another attempt against it.
     pub fn dispatch_hold_for(&self, execution: &WorkExecution, admission: DispatchAdmission) -> Option<DispatchHold> {
@@ -640,8 +657,9 @@ impl ExecutionCoordinator {
             DispatchAdmission::BreakerRecoveryProbe => {
                 if pause.origin != DispatchPauseOrigin::Breaker {
                     return hold(format!(
-                        "dispatch is paused by the operator ({reason}) — an operator pause is \
-                         manual-resume-only and is never auto-probed",
+                        "dispatch is paused by the operator (scope {scope}: {reason}) — an operator \
+                         pause, all-spawns included, is manual-resume-only and is never auto-probed",
+                        scope = pause.scope.as_str(),
                         reason = pause.reason,
                     ));
                 }
@@ -660,8 +678,9 @@ impl ExecutionCoordinator {
                     return None;
                 }
                 hold(format!(
-                    "dispatch is paused ({origin}): {reason}",
+                    "dispatch is paused ({origin}, scope {scope}): {reason}",
                     origin = pause.origin.as_metadata_str(),
+                    scope = pause.scope.as_str(),
                     reason = pause.reason,
                 ))
             }
@@ -673,22 +692,26 @@ impl ExecutionCoordinator {
             // and the blast radius is one execution. This arm only re-checks
             // origin so a breaker pause still refuses a bypassed row.
             DispatchAdmission::PauseBypassOverride => {
-                if pause.origin == DispatchPauseOrigin::Operator {
+                if pause.accepts_pause_bypass() {
                     return None;
                 }
                 hold(format!(
-                    "dispatch is breaker-paused ({reason}) — the pause-only forced-dispatch override \
-                     applies only to an operator pause",
+                    "dispatch is paused ({origin}, scope {scope}: {reason}) — the pause-only \
+                     forced-dispatch override applies only to an operator pause with the default \
+                     new_work scope",
+                    origin = pause.origin.as_metadata_str(),
+                    scope = pause.scope.as_str(),
                     reason = pause.reason,
                 ))
             }
             DispatchAdmission::Critical => {
-                if pause.origin == DispatchPauseOrigin::Operator {
+                if pause.accepts_pause_bypass() {
                     return None;
                 }
                 hold(format!(
-                    "dispatch is breaker-paused ({reason}) — a `critical` priority bypasses only an \
-                     operator pause, not a broken spawn path",
+                    "dispatch is paused (scope {scope}: {reason}) — a `critical` priority bypasses only \
+                     the default operator pause, not an all-spawns hold",
+                    scope = pause.scope.as_str(),
                     reason = pause.reason,
                 ))
             }

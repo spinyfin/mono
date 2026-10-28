@@ -6,6 +6,9 @@
 use super::*;
 
 use boss_engine_utils::iso8601::{format_epoch_iso8601, format_paused_since_phrase};
+use boss_protocol::DispatchPauseScope;
+
+use crate::coordinator::DispatchPauseOrigin;
 use sha2::{Digest, Sha256};
 
 /// Build the per-product effort-audit report. Handles the product
@@ -58,6 +61,14 @@ pub(crate) const METADATA_KEY_DISPATCH_PAUSED_SINCE: &str = "dispatch_paused_sin
 /// non-exempt `breaker` origin — see
 /// [`crate::coordinator::DispatchPauseOrigin::from_metadata_str`].
 pub(crate) const METADATA_KEY_DISPATCH_PAUSE_ORIGIN: &str = "dispatch_paused_origin";
+/// Metadata key storing the scope of the current pause — one of
+/// [`boss_protocol::DispatchPauseScope::as_str`]'s values — so a restart
+/// restores what the pause *held*, not just who paused. Absent (a
+/// pause persisted before this key existed) restores as the origin's default
+/// scope; an unrecognised value restores as the stricter `all_spawns` — see
+/// [`load_dispatch_pause_scope`]. `pub(crate)` for the same reason as the
+/// origin key: the spawn-capability breaker persists its pause through it.
+pub(crate) const METADATA_KEY_DISPATCH_PAUSE_SCOPE: &str = "dispatch_paused_scope";
 /// Metadata key storing why dispatch is currently paused. Absent (or
 /// empty) while running; always set alongside [`METADATA_KEY_DISPATCH_PAUSED`]
 /// `"1"` and cleared alongside it going back to `"0"` — see
@@ -182,17 +193,35 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
     }
 
     if dispatch_paused {
-        let reviews_exempt = server_state.execution_coordinator.dispatch_pause_exempts_reviews();
-        let scope_body = if reviews_exempt {
-            "The engine is not dispatching new executions from the main or automation pools. \
-             PR-review executions are exempt and keep dispatching — a review is the lifecycle \
-             of a change already in flight, not new work. Currently-running workers continue to \
-             completion. Run `bossctl dispatch resume` to restore normal dispatch."
-        } else {
-            "The engine is not dispatching new executions from any source, including PR \
-             reviews — the spawn-capability circuit breaker tripped, so review dispatch is held \
-             too until the engine's tmux spawn path is confirmed healthy. Currently-running workers \
-             continue to completion. Run `bossctl dispatch resume` to restore normal dispatch."
+        // One snapshot so the banner's scope and origin describe the same
+        // pause episode.
+        let pause = server_state.execution_coordinator.dispatch_pause();
+        let scope_title = match pause.as_ref().map(|p| p.scope) {
+            Some(DispatchPauseScope::AllSpawns) => "all spawns held, PR reviews included",
+            Some(DispatchPauseScope::NewWork) | None => "new work held, PR reviews exempt",
+        };
+        let scope_body = match pause.as_ref().map(|p| (p.origin, p.scope)) {
+            Some((_, DispatchPauseScope::NewWork)) | None => {
+                "Scope: new work only. The engine is not dispatching new executions from the main \
+                 or automation pools. PR-review and review-guide executions are exempt and keep \
+                 dispatching — a review is the lifecycle of a change already in flight, not new \
+                 work. Currently-running workers continue to completion. Run `bossctl dispatch \
+                 resume` to restore normal dispatch."
+            }
+            Some((DispatchPauseOrigin::Operator, DispatchPauseScope::AllSpawns)) => {
+                "Scope: all spawns (operator). The engine is not dispatching any execution from \
+                 any source except explicit `bossctl agents launch` overrides, including PR reviews and review guides — the operator held every \
+                 spawn because the spawn path itself is suspect, and no recovery probe is \
+                 admitted. Currently-running workers continue to completion. Run `bossctl \
+                 dispatch resume` to restore normal dispatch."
+            }
+            Some((DispatchPauseOrigin::Breaker, DispatchPauseScope::AllSpawns)) => {
+                "Scope: all spawns (circuit breaker). The engine is not dispatching new \
+                 executions from any source, including PR reviews — the spawn-capability circuit \
+                 breaker tripped, so review dispatch is held too until the engine's tmux spawn path is \
+                 confirmed healthy. Currently-running workers continue to completion. Run \
+                 `bossctl dispatch resume` to restore normal dispatch."
+            }
         };
         let reason = server_state
             .execution_coordinator
@@ -212,7 +241,9 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
         issues.push(EngineHealthIssue {
             kind: "dispatch_paused".to_owned(),
             severity: "warning".to_owned(),
-            title: format!("Dispatch is globally paused{since_suffix}"),
+            // The banner shows only the title inline, so the title is what
+            // names the scope; the body spells it out.
+            title: format!("Dispatch is globally paused — {scope_title}{since_suffix}"),
             body,
         });
     }
@@ -460,6 +491,60 @@ pub(super) fn load_dispatch_paused_state(
     let origin = crate::coordinator::DispatchPauseOrigin::from_metadata_str(origin_raw.as_deref());
     let reason = load_persisted_pause_reason(work_db, METADATA_KEY_DISPATCH_PAUSE_REASON, paused);
     (paused, since_epoch_s, origin, reason)
+}
+
+/// Read the persisted scope of the dispatch pause. Absent — a pause
+/// persisted before the scope key existed, which then behaved as its origin's
+/// default — restores as `origin`'s default scope. Anything else that is not
+/// a recognised scope restores as the stricter
+/// [`boss_protocol::DispatchPauseScope::AllSpawns`]: restoring an unknown
+/// scope as the more permissive one could resume spawning into a path the
+/// operator had held.
+pub(super) fn load_dispatch_pause_scope(
+    work_db: &WorkDb,
+    origin: crate::coordinator::DispatchPauseOrigin,
+) -> boss_protocol::DispatchPauseScope {
+    match work_db.get_metadata(METADATA_KEY_DISPATCH_PAUSE_SCOPE).ok().flatten() {
+        Some(raw) => boss_protocol::DispatchPauseScope::from_persisted(&raw),
+        None => origin.default_scope(),
+    }
+}
+
+/// Re-apply a persisted dispatch pause to `coordinator` at boot. No-op when
+/// the persisted flag says dispatch was running. Returns whether a pause was
+/// restored.
+///
+/// Origin, scope and reason are restored together: a restart must not
+/// quietly turn an operator's all-spawns hold back into the review-exempt
+/// default. `load_dispatch_paused_state` already substitutes
+/// [`LEGACY_PAUSE_REASON_FALLBACK`] when the flag is set but no reason was
+/// persisted; a garbage persisted value (e.g. whitespace-only, from a future
+/// writer bug) still falls back here rather than aborting engine startup.
+pub(super) fn restore_persisted_dispatch_pause(
+    work_db: &WorkDb,
+    coordinator: &crate::coordinator::ExecutionCoordinator,
+) -> bool {
+    let (paused, paused_since, origin, reason) = load_dispatch_paused_state(work_db);
+    if !paused {
+        return false;
+    }
+    let reason = reason
+        .and_then(|r| boss_protocol::PauseReason::new(r).ok())
+        .unwrap_or_else(|| {
+            boss_protocol::PauseReason::new(LEGACY_PAUSE_REASON_FALLBACK)
+                .expect("LEGACY_PAUSE_REASON_FALLBACK is a non-empty literal")
+        });
+    let scope = load_dispatch_pause_scope(work_db, origin);
+    coordinator.pause_dispatch_scoped(paused_since, origin, scope, reason);
+    tracing::info!(
+        paused_since_epoch_s = paused_since,
+        origin = origin.as_metadata_str(),
+        scope = scope.as_str(),
+        reason = coordinator.dispatch_paused_reason().as_deref(),
+        "dispatch: restoring persisted pause state — dispatch remains \
+         globally paused until `bossctl dispatch resume` is called",
+    );
+    true
 }
 
 /// Read the persisted automation-pause state from the metadata KV. Returns
