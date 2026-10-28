@@ -292,6 +292,132 @@ async fn wait_for_prompt(runner: &LiveCoordinatorRunner) {
 }
 
 #[tokio::test]
+async fn surviving_coordinator_without_authorization_can_reset_with_fresh_handoff() {
+    let Fixture {
+        state,
+        sink,
+        runner,
+        session_dir,
+        _dir,
+    } = fixture(Duration::from_secs(30)).await;
+    state.work_db.clear_coordinator_handoff_authorization().unwrap();
+    assert!(state.work_db.coordinator_handoff_authorization().unwrap().is_none());
+
+    sessions::handle_recreate_coordinator(dispatch(&state, &sink, "reset-1"), reset_request()).await;
+    wait_for_prompt(&runner).await;
+    let authorization = state
+        .work_db
+        .coordinator_handoff_authorization()
+        .unwrap()
+        .expect("reset must mint a credential when the surviving record has none");
+    assert!(
+        runner
+            .calls()
+            .iter()
+            .any(|call| call.first().is_some_and(|v| v == "inbox") && call[1].contains(&authorization)),
+        "the reset request must carry the minted credential"
+    );
+
+    let write_sink = make_session_sink();
+    state.set_boss_pid(std::process::id() as libc::pid_t);
+    let mut write_dispatch = dispatch(&state, &write_sink, "write-1");
+    write_dispatch.peer_pid = Some(std::process::id() as libc::pid_t);
+    coordinator_handoff::handle_set_coordinator_handoff(
+        write_dispatch,
+        FrontendRequest::SetCoordinatorHandoff {
+            body: "- facts preserved across the upgrade".to_owned(),
+            authorization,
+        },
+    )
+    .await;
+    assert!(matches!(
+        next_event(&write_sink).await.1,
+        FrontendEvent::CoordinatorHandoffSet { .. }
+    ));
+
+    let mut completion_seen = false;
+    let (request_id, request) = loop {
+        let (reply_id, event) = next_event(&sink).await;
+        match event {
+            FrontendEvent::CoordinatorRecreated => {
+                assert_eq!(reply_id, "reset-1");
+                completion_seen = true;
+            }
+            FrontendEvent::EngineRequest { request_id, request } => break (request_id, request),
+            other => panic!("expected the coordinator attach request, got {other:?}"),
+        }
+    };
+    let EngineToAppRequest::AttachCoordinatorPane(attach) = request else {
+        panic!("expected AttachCoordinatorPane, got {request:?}")
+    };
+    assert_ne!(attach.spawn_token, TOKEN);
+    let brief = std::fs::read_to_string(
+        session_dir
+            .join(".claude")
+            .join(crate::coordinator_handoff::START_BRIEF_FILENAME),
+    )
+    .unwrap();
+    assert!(brief.contains("- facts preserved across the upgrade"), "{brief}");
+    state
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::AttachCoordinatorPane {
+                result: Ok(boss_protocol::AttachCoordinatorPaneResult {}),
+            },
+        )
+        .await;
+    if !completion_seen {
+        let (reply_id, event) = next_event(&sink).await;
+        assert!(matches!(event, FrontendEvent::CoordinatorRecreated), "got {event:?}");
+        assert_eq!(reply_id, "reset-1");
+    }
+}
+
+#[tokio::test]
+async fn handoff_show_mints_authorization_for_a_surviving_pre_auth_coordinator() {
+    let f = fixture(Duration::from_secs(1)).await;
+    f.state.work_db.clear_coordinator_handoff_authorization().unwrap();
+    f.state.set_boss_pid(std::process::id() as libc::pid_t);
+    let mut ctx = dispatch(&f.state, &f.sink, "read-handoff");
+    ctx.peer_pid = Some(std::process::id() as libc::pid_t);
+    coordinator_handoff::handle_get_coordinator_handoff(ctx, FrontendRequest::GetCoordinatorHandoff).await;
+    assert!(matches!(
+        next_event(&f.sink).await.1,
+        FrontendEvent::CoordinatorHandoffResult { handoff: None }
+    ));
+    wait_for_prompt(&f.runner).await;
+    let authorization = f
+        .state
+        .work_db
+        .coordinator_handoff_authorization()
+        .unwrap()
+        .expect("show from coordinator ancestry must mint a missing credential");
+    assert!(
+        f.runner
+            .calls()
+            .iter()
+            .any(|call| call.first().is_some_and(|v| v == "inbox") && call[1].contains(&authorization))
+    );
+
+    let write_sink = make_session_sink();
+    let mut write_dispatch = dispatch(&f.state, &write_sink, "write-after-show");
+    write_dispatch.peer_pid = Some(std::process::id() as libc::pid_t);
+    coordinator_handoff::handle_set_coordinator_handoff(
+        write_dispatch,
+        FrontendRequest::SetCoordinatorHandoff {
+            body: "- bootstrapped after show".to_owned(),
+            authorization,
+        },
+    )
+    .await;
+    assert!(matches!(
+        next_event(&write_sink).await.1,
+        FrontendEvent::CoordinatorHandoffSet { .. }
+    ));
+}
+
+#[tokio::test]
 async fn timeout_is_reported_on_the_original_request_without_blocking_the_handler() {
     let Fixture {
         state,

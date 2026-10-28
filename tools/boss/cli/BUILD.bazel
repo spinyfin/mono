@@ -37,8 +37,6 @@ rust_binary(
     name = "boss",
     srcs = glob(["src/**/*.rs"]),
     compile_data = [
-        "//tools/boss/app-macos:handoff_prompt_source",
-        "//tools/boss/engine/core:handoff_reset_prompt_source",
         # Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
         # Referenced via include!(env!("BOSS_BUILD_INFO_RS")) in build_info_stamp module.
         # rules_rust expands $(execpath ...) to an absolute path at compile time.
@@ -51,8 +49,6 @@ rust_binary(
     # actually sees the vars via option_env!(). Default values are empty
     # strings (see .bazelrc); the release pipeline overrides via --define.
     rustc_env = {
-        "HANDOFF_SYSTEM_PROMPT": "$(execpath //tools/boss/app-macos:handoff_prompt_source)",
-        "HANDOFF_RESET_PROMPT": "$(execpath //tools/boss/engine/core:handoff_reset_prompt_source)",
         # Absolute path to the generated build-info constants file.
         # rules_rust prefixes $(execpath) values with ${pwd} and resolves
         # them to absolute filesystem paths before invoking rustc.
@@ -80,11 +76,30 @@ rust_binary(
 rust_test(
     name = "boss_test",
     size = "small",
+    # Prompt sources are consumed only by `#[cfg(test)]` in src/handoff.rs.
+    # Keeping them off the production binary means an edit to
+    # BossPaneModel.swift does not rebuild `boss` or the installer/app
+    # bundles that embed it.
+    compile_data = [
+        "//tools/boss/app-macos:handoff_prompt_source",
+        "//tools/boss/engine/core:handoff_reset_prompt_source",
+    ],
     crate = ":boss",
+    # rustc_env $(execpath) expansion requires these as declared
+    # prerequisites of the test rule; compile_data alone is not enough
+    # when `crate =` wraps the production binary.
+    data = [
+        "//tools/boss/app-macos:handoff_prompt_source",
+        "//tools/boss/engine/core:handoff_reset_prompt_source",
+    ],
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),
+    rustc_env = {
+        "HANDOFF_SYSTEM_PROMPT": "$(execpath //tools/boss/app-macos:handoff_prompt_source)",
+        "HANDOFF_RESET_PROMPT": "$(execpath //tools/boss/engine/core:handoff_reset_prompt_source)",
+    },
     deps = [
         "//lib/rust/git_utils",
         "//tools/boss/build-info",

@@ -37,23 +37,46 @@ async fn request_and_wait(
 use tokio::sync::Notify;
 
 #[tokio::test]
-async fn missing_authorization_preserves_session_and_offers_forced_reset() {
-    let (db, tmux, _server, _dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
+async fn missing_authorization_is_minted_and_reset_can_wait_for_a_fresh_handoff() {
+    let (db, tmux, server, _dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
     record(&db);
-    db.set_metadata("coordinator.handoff_authorization", "").unwrap();
+    db.clear_coordinator_handoff_authorization().unwrap();
+    assert!(db.coordinator_handoff_authorization().unwrap().is_none());
     let lock = tokio::sync::Mutex::new(());
     let written = Notify::new();
-    let error = request_and_wait(&db, &tmux, &lock, &written, "token", false, Duration::from_secs(1))
-        .await
-        .unwrap_err();
+    let request = request_and_wait(&db, &tmux, &lock, &written, "token", false, Duration::from_secs(1));
+    tokio::pin!(request);
     assert!(
-        error
-            .to_string()
-            .starts_with(super::reset_handoff::DELIVERY_FAILED_PREFIX)
-    );
-    assert!(
-        !request_and_wait(&db, &tmux, &lock, &written, "token", true, Duration::from_secs(1))
+        tokio::time::timeout(Duration::from_millis(50), &mut request)
             .await
+            .is_err(),
+        "reset must wait for a fresh write after minting a credential"
+    );
+    let authorization = db
+        .coordinator_handoff_authorization()
+        .unwrap()
+        .expect("reset must mint a credential for a surviving pre-authorization session");
+    assert!(!authorization.is_empty());
+    let calls = server.calls();
+    let delivered = calls
+        .iter()
+        .find(|call| call.iter().any(|arg| arg == "@test_handoff_delivered"))
+        .expect("delivery must record the prompt");
+    assert!(
+        delivered.iter().any(|arg| arg.contains(&authorization)),
+        "the reset request must carry the minted credential: {delivered:?}"
+    );
+    db.set_coordinator_handoff(
+        "preserved after upgrade",
+        "token",
+        boss_engine_utils::epoch_time::now_epoch_secs(),
+    )
+    .unwrap();
+    written.notify_waiters();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), request)
+            .await
+            .unwrap()
             .unwrap()
     );
 }

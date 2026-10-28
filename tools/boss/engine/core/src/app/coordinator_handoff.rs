@@ -47,7 +47,7 @@ pub(super) async fn handle_get_coordinator_handoff(ctx: Dispatch, req: FrontendR
             "coordinator_handoff_rejected",
             &serde_json::json!({
                 "pid": peer_pid,
-                "caller": rejected_caller(peer_pid, &[expected.as_deref().unwrap_or_default()]),
+                "caller": rejected_caller(peer_pid, expected.as_deref().unwrap_or_default(), ""),
                 "reason": "handoff reads are unavailable to agents",
             }),
         );
@@ -108,7 +108,7 @@ fn redeliver_authorization(state: Arc<ServerState>) {
             let guard = state.coordinator_tmux_lock.lock().await;
             let tmux = crate::coordinator_tmux::resolve_active_handle(&tmux, legacy.as_ref()).await;
             let record = state.work_db.coordinator_tmux_record()?.ok_or_else(|| anyhow::anyhow!("no coordinator session"))?;
-            let authorization = state.work_db.coordinator_handoff_authorization()?.ok_or_else(|| anyhow::anyhow!("no handoff authorization"))?;
+            let authorization = state.work_db.ensure_coordinator_handoff_authorization(&record.spawn_token)?;
             let prompt = format!("[Boss handoff authorization] Use `boss handoff write --authorization {authorization} -` for rolling handoff writes. Keep this credential in the main session only; never delegate or archive it.");
             drop(state.coordinator_handoff_delivery.deliver_locked(tmux, &record, &prompt, guard).await?);
             Ok(())
@@ -147,7 +147,8 @@ pub(super) async fn handle_set_coordinator_handoff(ctx: Dispatch, req: FrontendR
         };
         let caller = rejected_caller(
             peer_pid,
-            &[authorization.as_str(), expected.as_deref().unwrap_or_default()],
+            expected.as_deref().unwrap_or_default(),
+            authorization.as_str(),
         );
         crate::audit::record_event(
             "coordinator_handoff_rejected",
@@ -233,9 +234,12 @@ pub(super) async fn handle_set_coordinator_handoff(ctx: Dispatch, req: FrontendR
 }
 
 /// Best-effort diagnostics only: authorization never trusts argv or environment.
-/// Bound the ancestry walk; redact the presented and real secrets
-/// even when they occur inside an ancestor shell's command string.
-pub(super) fn rejected_caller(peer: Option<libc::pid_t>, secrets: &[&str]) -> serde_json::Value {
+/// Bound the ancestry walk. The real expected credential is redacted by
+/// substring wherever it appears. The caller-chosen presented value is
+/// redacted only as the token after `--authorization` or inside
+/// `--authorization=`, so a rejected caller cannot erase the rest of argv
+/// by passing `/`, `-`, `boss`, or another short string.
+pub(super) fn rejected_caller(peer: Option<libc::pid_t>, expected: &str, presented: &str) -> serde_json::Value {
     let mut chain = Vec::new();
     let mut next = peer;
     while let Some(pid) = next {
@@ -245,7 +249,7 @@ pub(super) fn rejected_caller(peer: Option<libc::pid_t>, secrets: &[&str]) -> se
         chain.push(pid);
         next = crate::worker_registry::parent_pid(pid).ok().flatten();
     }
-    let mut argv = chain
+    let argv = chain
         .iter()
         .map(|pid| {
             let command = boss_engine_utils::process_args::command(*pid as u32)
@@ -254,8 +258,51 @@ pub(super) fn rejected_caller(peer: Option<libc::pid_t>, secrets: &[&str]) -> se
         })
         .collect::<Vec<_>>()
         .join("\n");
-    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
-        argv = argv.replace(secret, "[redacted]");
+    serde_json::json!({
+        "parent_chain": chain,
+        "argv": redact_rejected_caller_argv(&argv, expected, presented),
+    })
+}
+
+pub(super) fn redact_rejected_caller_argv(argv: &str, expected: &str, presented: &str) -> String {
+    let mut out = argv.to_owned();
+    if !expected.is_empty() {
+        out = out.replace(expected, "[redacted]");
     }
-    serde_json::json!({"parent_chain": chain, "argv": argv})
+    redact_presented_authorization_flag(&out, presented)
+}
+
+fn redact_presented_authorization_flag(argv: &str, presented: &str) -> String {
+    if presented.is_empty() {
+        return argv.to_owned();
+    }
+    argv.split('\n')
+        .map(|line| redact_presented_authorization_in_line(line, presented))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn redact_presented_authorization_in_line(line: &str, presented: &str) -> String {
+    let tokens: Vec<&str> = line.split(' ').collect();
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = tokens[i];
+        if let Some(value) = token.strip_prefix("--authorization=") {
+            if value == presented {
+                out.push("--authorization=[redacted]".to_owned());
+            } else {
+                out.push(token.to_owned());
+            }
+            i += 1;
+            continue;
+        }
+        out.push(token.to_owned());
+        i += 1;
+        if token == "--authorization" && i < tokens.len() && tokens[i] == presented {
+            out.push("[redacted]".to_owned());
+            i += 1;
+        }
+    }
+    out.join(" ")
 }

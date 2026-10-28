@@ -320,6 +320,42 @@ async fn an_unreadable_stored_handoff_is_an_error_not_an_empty_result() {
     assert!(message.contains("not valid JSON"), "got: {message}");
 }
 
+#[test]
+fn presented_authorization_is_redacted_only_at_the_flag() {
+    let expected = crate::engine_control::generate_token();
+    let argv = "123: /bin/sh -c sleep 30 boss handoff write --authorization / -\n456: boss handoff show";
+    let redacted = coordinator_handoff::redact_rejected_caller_argv(argv, &expected, "/");
+    assert!(
+        redacted.contains("/bin/sh"),
+        "a presented '/' must not erase paths: {redacted}"
+    );
+    assert!(
+        redacted.contains("boss handoff write --authorization [redacted] -"),
+        "{redacted}"
+    );
+    assert!(redacted.contains("boss handoff show"), "{redacted}");
+
+    let attached =
+        coordinator_handoff::redact_rejected_caller_argv("123: boss handoff write --authorization=/ -", &expected, "/");
+    assert_eq!(attached, "123: boss handoff write --authorization=[redacted] -");
+
+    let named = "123: /usr/bin/boss handoff write --authorization boss -";
+    let redacted = coordinator_handoff::redact_rejected_caller_argv(named, &expected, "boss");
+    assert!(
+        redacted.contains("/usr/bin/boss"),
+        "a presented 'boss' must not erase the binary: {redacted}"
+    );
+    assert!(redacted.contains("--authorization [redacted]"), "{redacted}");
+
+    let with_expected = format!("123: leftover {expected} then --authorization {expected} -");
+    let redacted = coordinator_handoff::redact_rejected_caller_argv(&with_expected, &expected, &expected);
+    assert!(
+        !redacted.contains(&expected),
+        "the real credential is always a substring secret: {redacted}"
+    );
+    assert!(redacted.contains("leftover [redacted]"), "{redacted}");
+}
+
 #[tokio::test]
 async fn human_terminal_can_read_without_a_coordinator_pid() {
     let (state, _dir) = server_state();

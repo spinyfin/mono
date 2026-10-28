@@ -56,6 +56,58 @@ impl WorkDb {
         self.get_metadata(HANDOFF_AUTHORIZATION_KEY)
     }
 
+    /// Return the live coordinator's handoff write credential, minting one
+    /// when a pre-authorization session is still running.
+    ///
+    /// The insert is a no-op when a non-empty credential already exists, and
+    /// is refused when `spawn_token` is not the live record — a replacement's
+    /// [`Self::record_coordinator_tmux_spawn_intent`] already minted its own.
+    /// Callers hold `coordinator_tmux_lock` so a concurrent spawn cannot
+    /// race this with a new generation; the token check is the belt that
+    /// still applies if that lock is dropped.
+    pub(crate) fn ensure_coordinator_handoff_authorization(&self, spawn_token: &str) -> Result<String> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let live_token: Option<String> = tx
+            .query_row("SELECT value FROM metadata WHERE key = ?1", [SPAWN_TOKEN_KEY], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        anyhow::ensure!(
+            live_token.as_deref() == Some(spawn_token),
+            "coordinator spawn token does not match the live record"
+        );
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                [HANDOFF_AUTHORIZATION_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing.filter(|value| !value.is_empty()) {
+            tx.commit()?;
+            return Ok(existing);
+        }
+        let authorization = crate::engine_control::generate_token();
+        tx.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![HANDOFF_AUTHORIZATION_KEY, authorization.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(authorization)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_coordinator_handoff_authorization(&self) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "DELETE FROM metadata WHERE key = ?1",
+            params![HANDOFF_AUTHORIZATION_KEY],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn coordinator_tmux_record(&self) -> Result<Option<CoordinatorTmuxRecord>> {
         let conn = self.connect()?;
         let value_for = |key: &str| {
@@ -232,6 +284,42 @@ impl WorkDb {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn ensure_handoff_authorization_mints_when_missing_and_is_spawn_token_scoped() {
+        let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+        db.record_coordinator_tmux_spawn_intent("boss-coordinator", "token-a", "opus", None)
+            .unwrap();
+        let original = db.coordinator_handoff_authorization().unwrap().unwrap();
+        assert_eq!(
+            db.ensure_coordinator_handoff_authorization("token-a").unwrap(),
+            original,
+            "an existing credential must not rotate"
+        );
+
+        db.clear_coordinator_handoff_authorization().unwrap();
+        assert!(db.coordinator_handoff_authorization().unwrap().is_none());
+        let minted = db.ensure_coordinator_handoff_authorization("token-a").unwrap();
+        assert_eq!(minted.len(), 64);
+        assert_eq!(
+            db.coordinator_handoff_authorization().unwrap().as_deref(),
+            Some(minted.as_str())
+        );
+        assert_eq!(db.ensure_coordinator_handoff_authorization("token-a").unwrap(), minted);
+
+        db.set_metadata("coordinator.handoff_authorization", "").unwrap();
+        let from_empty = db.ensure_coordinator_handoff_authorization("token-a").unwrap();
+        assert_ne!(from_empty, minted);
+        assert!(!from_empty.is_empty());
+
+        db.clear_coordinator_handoff_authorization().unwrap();
+        let err = db.ensure_coordinator_handoff_authorization("token-other").unwrap_err();
+        assert!(err.to_string().contains("does not match the live record"), "{err:#}");
+        assert!(
+            db.coordinator_handoff_authorization().unwrap().is_none(),
+            "a mismatched spawn token must not mint"
+        );
+    }
 
     #[test]
     fn coordinator_intent_is_atomic_and_confirmation_is_token_bound() {
