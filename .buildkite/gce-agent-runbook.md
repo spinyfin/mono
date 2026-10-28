@@ -62,13 +62,26 @@ gcloud compute ssh bk-bazel-any-gce-1 --zone=ZONE --project=PROJECT
 
 The dead hosts' CPU and RAM were never recorded. `n2-standard-16` (16 vCPU / 64 GB) is inferred from observed action parallelism (58 concurrent test actions at peak) and warm-build timings: Linux `bazel-build-test` p50 18s / p90 152s across 77 sampled jobs, roughly at parity with the M-series Macs. `n2-standard-8` works; expect the p90 cases to stretch. Do not go below 32 GB — the hosts set `--shutdown_on_low_sys_mem`, and `.bazelrc:1` sets `--jobs=200`.
 
-Disk: each mono output base measures ~10 GB, the shared disk cache ~40 GB. 500 GB is comfortable. Note `.ci.bazelrc:4` sets `--experimental_disk_cache_gc_max_size=3T`, so cache GC will never fire on a smaller disk. If disk climbs:
+Disk: each mono output base measures ~10 GB, the shared disk cache ~40 GB at steady state. 500 GB is comfortable. The disk cache's size-based GC cap is sized to the host, not fixed: `steps/ci-env.sh` computes it on every CI step as half of the total size of the filesystem holding `/mnt/ssd/bazel/disk_cache` (~244 GB on a 500 GB boot disk) and passes it as `--experimental_disk_cache_gc_max_size` after `--config=ci-linux`, overriding the fleet-wide `3T` in `.ci.bazelrc`, which on a disk this size would never fire. The age-based GC (60 days) is unchanged. Each CI step prints the computed cap at the top of its log:
 
-```sh
-sudo rm -rf /mnt/ssd/bazel/disk_cache
+```
+--- [ci-env] disk cache /mnt/ssd/bazel/disk_cache: filesystem is 489 GB, GC cap 244G (50%)
 ```
 
-**Do not edit `.ci.bazelrc`** — it is fleet-wide config sized for the real hosts.
+To verify on the host (from the agent's checkout, e.g. `/var/lib/buildkite-agent/builds/<agent>/flunge/mono`):
+
+```sh
+df -P -k /mnt/ssd/bazel/disk_cache        # the 1024-blocks total is the cap's input
+bash -c 'source .buildkite/steps/disk-cache-gc-cap.sh &&
+  ci_disk_cache_gc_cap_from_total_kb "$(ci_disk_cache_fs_total_kb /mnt/ssd/bazel/disk_cache)"'
+grep "Disk cache garbage collector" /mnt/ssd/bazel/output_base/*/java.log | tail
+```
+
+The last command shows the GC actually running (`Deleted N of M files, reclaimed ...`); it runs about five minutes after a build, once the Bazel server goes idle.
+
+**Disk-full symptom.** An agent whose disk has filled up does not go offline. It stays connected in Buildkite and keeps accepting `bazel-any` jobs, which then sit in "accepted" with empty logs and stall the merge queue. If jobs are stuck that way, run `df -h /mnt/ssd /` on the host first. The cache cap is computed from the disk size, so a full disk now points at something other than the disk cache — or at a host whose CI steps are not going through `steps/ci-env.sh`. If the disk cache itself is what filled the disk, a one-time `sudo rm -rf /mnt/ssd/bazel/disk_cache` frees it; the computed cap keeps it from recurring, so do not add a cron job for this.
+
+**Do not edit `.ci.bazelrc`'s GC lines for a host's disk size** — the cap is computed per host; `.ci.bazelrc` is fleet-wide config.
 
 Use persistent disk, not Local SSD. Local SSD is ephemeral, so every stop/start rebuilds the whole cache.
 

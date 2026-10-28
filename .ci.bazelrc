@@ -1,6 +1,16 @@
 # ==========================================
 # CI GARBAGE COLLECTION
 # ==========================================
+# The size cap below is only a fallback for bazel run by hand on a CI host.
+# Every CI step sources .buildkite/steps/ci-env.sh, which computes a cap from
+# the filesystem that actually holds the disk cache (half of its total size)
+# and passes it on the command line after --config=ci-<os>, where it overrides
+# this value. 3T only ever fitted the 3.6 TB office hosts: on a smaller disk
+# the size-based GC never fires and the cache fills the disk, and an agent on
+# a full disk stays connected and accepts jobs it never runs. 3T is kept rather
+# than lowered because a hand-run command that evicts nothing is harmless,
+# whereas a small fallback would evict most of a 3.6 TB host's cache. See
+# .buildkite/linux-agents-runbook.md, "Disk-cache GC sizing".
 build:ci --experimental_disk_cache_gc_max_size=3T
 build:ci --experimental_disk_cache_gc_max_age=60d
 build:ci --experimental_disk_cache_gc_idle_delay=5m

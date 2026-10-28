@@ -1,0 +1,12 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+# Script-level test for the per-host Bazel disk-cache GC cap that ci-env.sh
+# computes: known filesystem sizes map to the expected cap, and an
+# unresolvable cache directory, unusable df output or missing rc line fails
+# loudly instead of falling back to .ci.bazelrc's fleet-wide value.
+sh_test(
+    name = "disk_cache_gc_cap_test",
+    size = "small",
+    srcs = ["disk_cache_gc_cap_test.sh"],
+    data = ["//.buildkite/steps:disk-cache-gc-cap.sh"],
+)

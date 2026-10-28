@@ -184,7 +184,42 @@ Bazel's CI-mode output root, disk cache, and repository cache are all pointed at
 - `build:ci-linux --disk_cache=/mnt/ssd/bazel/disk_cache` (`.ci.bazelrc`)
 - `build:ci-linux --repository_cache=/mnt/ssd/bazel/repo_cache` (`.ci.bazelrc`)
 
-This keeps Bazel's large, disk-hungry action cache and sandboxed build outputs off the smaller boot disk and on dedicated capacity sized for it (disk cache GC is configured for up to 3 TB / 60 days via `experimental_disk_cache_gc_max_size`/`_max_age` in `.ci.bazelrc`, which would not fit on the boot disk alongside the OS and everything else on it).
+This keeps Bazel's large, disk-hungry action cache and sandboxed build outputs off the smaller boot disk and on dedicated capacity sized for it. The disk cache's size-based GC cap is computed per host from that capacity (1800 GB on these 3.6 TB disks) rather than fixed in `.ci.bazelrc` — see "Disk-cache GC sizing" below. The age-based GC (60 days, `experimental_disk_cache_gc_max_age` in `.ci.bazelrc`) is fleet-wide.
+
+## Disk-cache GC sizing
+
+`.ci.bazelrc` sets `build:ci --experimental_disk_cache_gc_max_size=3T` fleet-wide. That value only ever fitted these three hosts' 3.6 TB disks, and it is the reason a smaller agent fills up: on a disk below 3 TB the size-based GC never fires and the cache grows until the disk is full. Incident (2026-10-28): a 500 GB Linux agent did exactly that, accumulated ~450 GB of disk cache, and stalled the merge queue — see "Disk-full symptom" below.
+
+Since then `.buildkite/steps/ci-env.sh` sizes the cap to the host on every CI step:
+
+- It reads the `build:ci-linux --disk_cache=` path out of `.ci.bazelrc` (so the cache location is still defined in one place), creates the directory if needed, and asks `df -P -k` for the total size of the filesystem holding it.
+- The cap is **half of that total**, rounded down to whole gigabytes, passed as `--experimental_disk_cache_gc_max_size` after `--config=ci-linux` on every CI bazel command (the wrapper in `ci-env.sh` and, via `REPOBIN_BAZEL_FLAGS`, repobin's own calls). A flag on the command line after `--config` overrides the rc file's value. Half leaves room for what shares the filesystem — the output bases (~10 GB each, one per agent on the host), the repository cache — and for the cache overshooting the cap between GC passes, since GC only runs once the Bazel server has been idle for five minutes.
+- If the filesystem cannot be determined (the rc line is missing, the directory cannot be created, `df` fails or prints nothing usable), the step fails with a `[ci-env] error:` line. It never silently falls back to `3T`.
+- `.ci.bazelrc` keeps `3T` as the fallback for bazel run by hand on a host with `--config=ci-linux`, which does not go through `ci-env.sh`. A hand-run command therefore makes the GC pass that follows it evict nothing — harmless, and the next CI job restores the computed cap — whereas a small fallback would evict most of a 3.6 TB host's cache.
+
+The cap computation is covered by `//.buildkite/steps/tests:disk_cache_gc_cap_test`.
+
+To verify on a host (from the agent's checkout under `/var/lib/buildkite-agent/builds/<agent>/flunge/mono`):
+
+```sh
+df -P -k /mnt/ssd/bazel/disk_cache        # the 1024-blocks total is the cap's input
+bash -c 'source .buildkite/steps/disk-cache-gc-cap.sh &&
+  ci_disk_cache_gc_cap_from_total_kb "$(ci_disk_cache_fs_total_kb /mnt/ssd/bazel/disk_cache)"'
+grep "Disk cache garbage collector" /mnt/ssd/bazel/output_base/*/java.log | tail
+```
+
+Every CI step also prints the value it computed at the top of its log (`--- [ci-env] disk cache /mnt/ssd/bazel/disk_cache: filesystem is 3662 GB, GC cap 1800G (50%)`), and the `java.log` grep shows the GC actually running (`Deleted N of M files, reclaimed ...`).
+
+### Disk-full symptom: agent connected, jobs stuck in "accepted" with empty logs
+
+A Linux agent whose disk has filled up does **not** drop offline. It stays connected in Buildkite and keeps accepting `bazel-any` jobs, which then sit in "accepted" with empty logs instead of running; the merge queue stalls behind them. If you see that pattern, check the disks first:
+
+```sh
+df -h /mnt/ssd /
+du -sh /mnt/ssd/bazel/disk_cache /mnt/ssd/bazel/output_base /mnt/ssd/bazel/repo_cache
+```
+
+The cache cap is computed from the disk size, so if `/mnt/ssd` is full the disk cache should not be the reason any more — look at what else grew, or check whether the host's CI steps are actually going through `.buildkite/steps/ci-env.sh` (the `[ci-env] disk cache ...` line should be in every step log). If the disk cache itself is what filled the disk, a one-time `sudo rm -rf /mnt/ssd/bazel/disk_cache` frees it and the next build repopulates it; the computed cap keeps it from recurring, so do not add a cron job for this.
 
 ## Deploy-key posture
 

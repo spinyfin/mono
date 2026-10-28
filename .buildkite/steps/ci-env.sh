@@ -2,7 +2,38 @@
 
 OS_TYPE=$(uname -s | tr '[:upper:]' '[:lower:]')
 
-export REPOBIN_BAZEL_FLAGS="--config=ci-${OS_TYPE}"
+# Size the disk-cache GC cap to this host's disk. .ci.bazelrc sets
+# `build:ci --experimental_disk_cache_gc_max_size=3T` fleet-wide; on any host
+# whose cache filesystem is smaller than that, size-based GC never fires and
+# the cache fills the disk. A full disk does not take the agent offline -- it
+# stays connected and keeps accepting jobs it never runs -- so the cap must fit
+# the disk the cache actually lives on. ci_disk_cache_* live in
+# disk-cache-gc-cap.sh (tested by //.buildkite/steps/tests). The computed value
+# is passed on the command line after --config=ci-<os>, which is where bazel
+# lets it override the rc file's value. Nothing here falls back to the 3T
+# value: if the cache's filesystem cannot be determined, the step fails.
+# shellcheck source=disk-cache-gc-cap.sh
+source "$(dirname "${BASH_SOURCE[0]}")/disk-cache-gc-cap.sh"
+
+CI_BAZELRC=".ci.bazelrc"
+if ! CI_DISK_CACHE_DIR="$(ci_disk_cache_path "$OS_TYPE" "$CI_BAZELRC")" \
+  || ! mkdir -p "$CI_DISK_CACHE_DIR" \
+  || ! CI_DISK_CACHE_FS_TOTAL_KB="$(ci_disk_cache_fs_total_kb "$CI_DISK_CACHE_DIR")" \
+  || ! CI_DISK_CACHE_GC_MAX_SIZE="$(ci_disk_cache_gc_cap_from_total_kb "$CI_DISK_CACHE_FS_TOTAL_KB")"; then
+  echo "^^^ +++"
+  echo "[ci-env] error: could not size the Bazel disk-cache GC cap for this host (see above). Refusing to run bazel with .ci.bazelrc's fleet-wide 3T cap: on a smaller disk it never fires and the cache fills the disk." >&2
+  exit 1
+fi
+echo "--- [ci-env] disk cache ${CI_DISK_CACHE_DIR}: filesystem is $((CI_DISK_CACHE_FS_TOTAL_KB / 1048576)) GB, GC cap ${CI_DISK_CACHE_GC_MAX_SIZE} (${CI_DISK_CACHE_GC_PERCENT}%)"
+
+# CI_BAZEL_FLAGS is the single source of truth for the per-command bazel flags
+# every CI invocation passes: the OS's CI config plus the per-host disk-cache GC
+# cap computed above. The two must travel together -- any invocation that
+# selects --config=ci-<os> without the cap puts the fleet-wide 3T cap back in
+# force for the GC pass that follows it. The bazel() wrapper below and repobin
+# (via REPOBIN_BAZEL_FLAGS) both read from here.
+export CI_BAZEL_FLAGS="--config=ci-${OS_TYPE} --experimental_disk_cache_gc_max_size=${CI_DISK_CACHE_GC_MAX_SIZE}"
+export REPOBIN_BAZEL_FLAGS="$CI_BAZEL_FLAGS"
 
 # Bazel daemon idle TTL for every CI pipeline and OS: 30 minutes, so idle
 # servers on shared CI hosts (e.g. 16 GB Macs) release their memory. This is a
@@ -46,7 +77,7 @@ if [[ "$OS_TYPE" == "darwin" ]]; then
   echo "$CURRENT_XCODE_VERSION" > "$XCODE_VERSION_FILE"
 fi
 
-# Wrap bazel and pass in ci configuration.
+# Wrap bazel and pass in ci configuration (CI_BAZEL_FLAGS, above).
 # Automatically detects Xcode version mismatch errors (caused by a stale disk
 # cache after an Xcode upgrade) and recovers by running `bazel clean --expunge`
 # then retrying once.
@@ -60,7 +91,7 @@ bazel() {
   if command bazel \
     $BAZEL_STARTUP_FLAGS \
     "$subcommand" \
-    --config="ci-${OS_TYPE}" \
+    $CI_BAZEL_FLAGS \
     "$@" 2>&1 | tee "$tmplog"; then
     rm -f "$tmplog"
     return 0
@@ -74,7 +105,7 @@ bazel() {
     command bazel \
       $BAZEL_STARTUP_FLAGS \
       "$subcommand" \
-      --config="ci-${OS_TYPE}" \
+      $CI_BAZEL_FLAGS \
       "$@"
     return $?
   fi
