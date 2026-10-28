@@ -431,6 +431,9 @@ fn request_execution_requeues_stale_ci_remediation_drag_to_doing() {
 /// re-flip the task before the worker pushes a fix.
 #[test]
 fn request_execution_requeues_ci_remediation_from_blocked_bossctl_path() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t02::request_execution_requeues_ci_remediation_from_blocked_bossctl_path",
+    );
     let path = temp_db_path("req-ci-remediation-bossctl");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
@@ -856,6 +859,9 @@ fn mark_execution_orphaned_errors_on_already_terminal() {
 /// move) and report whether it demoted anything.
 #[test]
 fn demote_active_work_item_to_todo_resets_active_card() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t02::demote_active_work_item_to_todo_resets_active_card",
+    );
     let path = temp_db_path("demote-active-to-todo");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);

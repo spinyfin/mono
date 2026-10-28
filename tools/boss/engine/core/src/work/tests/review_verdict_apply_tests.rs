@@ -493,6 +493,9 @@ fn clean_verdict_does_not_advance_revision_when_only_an_older_execution_matches(
 /// to stranding R2 `active` in Doing.
 #[test]
 fn clean_verdict_advances_a_revision_nested_under_another_revision() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::review_verdict_apply_tests::clean_verdict_advances_a_revision_nested_under_another_revision",
+    );
     let db = WorkDb::open(temp_db_path("verdict-apply-advances-nested-revision")).unwrap();
     let product = create_test_product(&db);
     let product_id = product.id.clone();
@@ -1593,6 +1596,9 @@ fn tombstone_cancels_the_orphaned_revision_ready_execution() {
 
 #[test]
 fn clean_verdict_runs_the_merge_parent_deletion_tripwire() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::review_verdict_apply_tests::clean_verdict_runs_the_merge_parent_deletion_tripwire",
+    );
     let db = WorkDb::open(temp_db_path("verdict-apply-deletion-tripwire")).unwrap();
     let product = create_test_product(&db);
     let cycle_root = create_test_chore_manual(&db, product.id.clone(), "review target");
@@ -2294,6 +2300,9 @@ fn findings_verdict_for_a_superseded_head_is_recorded_stale_and_mints_nothing() 
 /// its hold — nothing else ever will — while the root stays held.
 #[test]
 fn verdict_for_a_head_the_live_pr_has_moved_past_is_stale_and_releases_the_held_revision() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::review_verdict_apply_tests::verdict_for_a_head_the_live_pr_has_moved_past_is_stale_and_releases_the_held_revision",
+    );
     let db = WorkDb::open(temp_db_path("verdict-apply-stale-live-head")).unwrap();
     let (root_id, batch, supervisor_id) = supervising_batch_on_held_root(&db, "head-a");
     let revision_id = make_held_revision(&db, &root_id, PR_URL, "head-a");
@@ -2386,6 +2395,9 @@ fn explicit_batch_verdict_for_a_moved_head_is_recorded_stale() {
 /// An explicit batch whose target is still the live head applies normally.
 #[test]
 fn explicit_batch_verdict_for_the_current_head_is_applied() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::review_verdict_apply_tests::explicit_batch_verdict_for_the_current_head_is_applied",
+    );
     let db = WorkDb::open(temp_db_path("verdict-apply-explicit-current")).unwrap();
     let (root_id, batch, supervisor_id) = supervising_batch_on_held_root(&db, "head-a");
     db.connect()

@@ -330,6 +330,9 @@ fn pr_review_active_revision_creates_autostart_followup() {
 /// row instead of materialising the original review findings again.
 #[test]
 fn pr_review_completed_implementation_is_not_rematerialised_during_re_review() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t09::pr_review_completed_implementation_is_not_rematerialised_during_re_review",
+    );
     let db = WorkDb::open(temp_db_path("followup-completed-revision")).unwrap();
     let product_id = make_revision_product(&db, "fu-completed");
     let pr_url = FOLLOWUP_PR_URL;
@@ -458,6 +461,9 @@ fn pr_review_redispatched_revision_with_pending_second_implementation_still_conv
 /// `list_chores_pending_merge_check` so the merge poller can flip it to `done`.
 #[test]
 fn followup_visible_to_merge_check_poller() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t09::followup_visible_to_merge_check_poller",
+    );
     let db = WorkDb::open(temp_db_path("followup-merge-check")).unwrap();
     let product_id = make_revision_product(&db, "fu-merge");
     let parent_pr = "https://github.com/spinyfin/mono/pull/1000";

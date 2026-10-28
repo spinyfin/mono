@@ -2817,6 +2817,9 @@ fn duplicate_or_work_error_maps_other_error_to_work_error() {
 /// ordinary slotless hook.
 #[tokio::test]
 async fn hook_for_terminal_execution_is_counted_not_silently_dropped() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "app::tests::t02::hook_for_terminal_execution_is_counted_not_silently_dropped",
+    );
     use crate::protocol::WorkerEvent;
     use boss_protocol::{CreateChoreInput, RequestExecutionInput};
 

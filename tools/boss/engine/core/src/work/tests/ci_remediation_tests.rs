@@ -517,6 +517,9 @@ fn ci_failure_block_mark_clear_rearm_lifecycle() {
 /// Idempotent on a terminal row.
 #[test]
 fn validated_green_noop_retires_attempt_and_unblocks_parent() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::ci_remediation_tests::validated_green_noop_retires_attempt_and_unblocks_parent",
+    );
     let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
     let product_id = make_revision_product(&db, "ci-validated-green");
     let pr = "https://github.com/spinyfin/mono/pull/950";

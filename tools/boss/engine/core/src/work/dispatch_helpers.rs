@@ -1395,7 +1395,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         let now = now_string();
         let rows_cleared = crate::work::task_status_audit::execute(
             conn,
-            "status_ineligibility",
+            "explicit_start_dependency_clear",
             "engine",
             "UPDATE tasks
              SET status            = 'todo',
@@ -1430,7 +1430,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         // will re-stamp the fields if it fails the same way.
         crate::work::task_status_audit::execute(
             conn,
-            "status_ineligibility",
+            "explicit_start_dispatch_failure_clear",
             "engine",
             "UPDATE tasks
              SET dispatch_failed_reason = NULL,
@@ -1464,7 +1464,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         super::pr_flow::withdraw_questions(conn, &work_item_id, "restarted_without_answer")?;
         crate::work::task_status_audit::execute(
             conn,
-            "status_ineligibility",
+            "explicit_start_failure_clear",
             "engine",
             "UPDATE tasks SET status = 'todo', blocked_reason = NULL, blocked_detail = NULL,
                  last_status_actor = 'engine', updated_at = ?2
@@ -1521,7 +1521,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
             let reopened = reopen_retired_spawning_attempt(conn, &task)?;
             let unblocked = crate::work::task_status_audit::execute(
                 conn,
-                "status_ineligibility",
+                "explicit_start_retired_attempt_clear",
                 "engine",
                 "UPDATE tasks SET status = 'todo', blocked_reason = NULL, blocked_detail = NULL,
                      last_status_actor = 'engine', updated_at = ?2
@@ -1699,7 +1699,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                 let now = now_string();
                 let rows_cleared = crate::work::task_status_audit::execute(
                     conn,
-                    "status_ineligibility",
+                    "explicit_start_ci_failure_clear",
                     "engine",
                     "UPDATE tasks
                      SET status             = 'todo',

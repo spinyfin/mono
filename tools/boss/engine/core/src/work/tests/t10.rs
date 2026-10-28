@@ -147,6 +147,9 @@ fn reconciler_close_work_item_sets_completed_at() {
 /// renumbered position (mono#58-shown-for-4).
 #[test]
 fn reconciler_close_work_item_clears_merge_queue_state() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t10::reconciler_close_work_item_clears_merge_queue_state",
+    );
     let db = WorkDb::open(temp_db_path("reconciler-close-clears-queue")).unwrap();
     let product_id = make_revision_product(&db, "rec-close-queue");
     let pr_url = "https://github.com/spinyfin/mono/pull/9006";
@@ -328,6 +331,9 @@ fn record_worker_no_op_completion_sets_completed_at() {
 /// return Ok(None) (idempotent) and leave completed_at unchanged.
 #[test]
 fn record_worker_no_op_completion_coalesce_stability() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t10::record_worker_no_op_completion_coalesce_stability",
+    );
     let db = WorkDb::open(temp_db_path("rwnoc-coalesce")).unwrap();
     let (_product_id, chore_id, exec_id) = make_waiting_human_chore(&db, "rwnoc-c");
 

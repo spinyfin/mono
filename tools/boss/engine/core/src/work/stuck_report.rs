@@ -9,7 +9,7 @@ impl WorkDb {
     /// A zero age threshold measures the whole backlog from the first day.
     pub fn stuck_daily_snapshot(&self, now: i64) -> Result<StuckReport> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = conn.transaction()?;
         let day = now.div_euclid(86400);
         let existing: Option<String> = tx
             .query_row(
@@ -31,12 +31,19 @@ impl WorkDb {
             )?,
         );
         report.questions_filed_by_stuck_kind = questions_by_kind(&tx, now - 86400, now)?;
-        tx.execute(
-            "INSERT INTO task_stuck_daily_snapshots(day, report_json) VALUES (?1, ?2)",
+        // Release the read snapshot before taking a write lock. A concurrent
+        // sampler may win the insert; every caller returns that stored sample.
+        tx.commit()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO task_stuck_daily_snapshots(day, report_json) VALUES (?1, ?2)",
             params![day, serde_json::to_string(&report)?],
         )?;
-        tx.commit()?;
-        Ok(report)
+        let json: String = conn.query_row(
+            "SELECT report_json FROM task_stuck_daily_snapshots WHERE day = ?1",
+            [day],
+            |r| r.get(0),
+        )?;
+        Ok(serde_json::from_str(&json)?)
     }
 
     pub fn stuck_report(&self, minimum_age_secs: i64, now: i64) -> Result<StuckReport> {
@@ -61,11 +68,14 @@ pub(super) fn build(conn: &Connection, minimum_age_secs: i64, now: i64) -> Resul
     for id in ids {
         let task = query_task(conn, &id)?.context("stuck item disappeared inside read transaction")?;
         let failure_basis = latest_basis(conn, &id, "blocked_reason")?;
-        let basis: String = conn.query_row(
-            "SELECT basis FROM task_status_audit WHERE work_item_id = ?1 ORDER BY id DESC LIMIT 1",
-            [&id],
-            |r| r.get(0),
-        )?;
+        let basis: String = conn
+            .query_row(
+                "SELECT basis FROM task_status_audit WHERE work_item_id = ?1 ORDER BY id DESC LIMIT 1",
+                [&id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| "unknown_legacy".into());
         // Age a failure from its own latest observation. An unrelated
         // autostart edit must not make a week-old blocker look new.
         let age_property = if task.dispatch_failed_reason.is_some() {
@@ -75,13 +85,16 @@ pub(super) fn build(conn: &Connection, minimum_age_secs: i64, now: i64) -> Resul
         } else {
             None
         };
-        let (changed_at, legacy): (i64, bool) = conn.query_row(
-            "SELECT CAST(changed_at AS INTEGER), age_is_lower_bound
+        let (changed_at, legacy): (i64, bool) = conn
+            .query_row(
+                "SELECT CAST(changed_at AS INTEGER), age_is_lower_bound
              FROM task_status_audit WHERE work_item_id = ?1 AND (?2 IS NULL OR property = ?2)
              ORDER BY id DESC LIMIT 1",
-            params![id, age_property],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
+                params![id, age_property],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or((task.updated_at.parse().unwrap_or(now), true));
         let declared = task.dispatch_failed_reason.as_deref() == Some("deliberate_park")
             || (task.blocked_reason.as_deref() == Some("worker_failed")
                 && matches!(failure_basis.as_deref(), Some("declared_blocked" | "nudge_breaker")));
@@ -188,6 +201,11 @@ fn human_hold(conn: &Connection, task: &Task, failure_basis: Option<&str>) -> Re
 
 fn progressing_prerequisite(conn: &Connection, id: &str) -> Result<bool> {
     for prereq in deps::gating_prereqs_for(conn, id)? {
+        if let Some(project) = query_project(conn, &prereq)?
+            && !matches!(project.status, ProjectStatus::Done | ProjectStatus::Archived)
+        {
+            return Ok(true);
+        }
         if let Some(task) = query_task(conn, &prereq)?
             && task.deleted_at.is_none()
             && !task.status.is_terminal()

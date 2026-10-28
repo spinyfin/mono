@@ -757,6 +757,9 @@ fn resolve_task_doc_pointer_none_when_unset() {
 
 #[test]
 fn resolve_task_doc_pointer_builds_same_product_urls() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::design_doc_audit_tests::resolve_task_doc_pointer_builds_same_product_urls",
+    );
     let db = WorkDb::open(temp_db_path("task-doc-resolve")).unwrap();
     let (_product, task) = seed_investigation_for_doc(&db);
     db.sync_task_doc_pointer_from_detector(&task.id, None, Some("boss/exec_abc_1"), "docs/investigations/foo.md")

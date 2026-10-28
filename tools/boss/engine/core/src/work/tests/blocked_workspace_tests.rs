@@ -12,6 +12,9 @@ fn stamp_outcome(db: &WorkDb, id: &str, outcome: Option<&str>) {
 
 #[test]
 fn abandonment_preserves_only_a_durable_blocked_declaration() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::blocked_workspace_tests::abandonment_preserves_only_a_durable_blocked_declaration",
+    );
     for outcome in [None, Some("delivered"), Some("no_changes_needed"), Some("blocked")] {
         let db = WorkDb::open(temp_db_path("blocked-preservation")).unwrap();
         let (_, task, id) = make_waiting_human_chore(&db, "park");

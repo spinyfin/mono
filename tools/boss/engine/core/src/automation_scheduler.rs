@@ -853,6 +853,19 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn automation_status_fixture_records_its_write() {
+        let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+            "automation_scheduler::tests::automation_status_fixture_records_its_write",
+        );
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_daily_automation(&db, &product);
+        let task = create_test_chore_manual(&db, &product, "produced");
+        db.stamp_task_source_automation_for_test(&task.id, &automation.id, "active")
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn first_evaluation_initializes_next_due_without_firing() {
         let (_d, db) = open_db();

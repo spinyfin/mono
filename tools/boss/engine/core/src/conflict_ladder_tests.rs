@@ -1141,6 +1141,9 @@ async fn reconcile_recovers_orphaned_mechanical_attempt_and_frees_its_slot() {
 
 #[tokio::test]
 async fn reconcile_recovers_bare_pending_attempt_with_no_mechanical_marker() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "conflict_ladder::tests::reconcile_recovers_bare_pending_attempt_with_no_mechanical_marker",
+    );
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
     // A bare pending, no-marker, no-revision attempt: no rung was ever

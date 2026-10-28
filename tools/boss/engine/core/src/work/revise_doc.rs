@@ -863,6 +863,9 @@ mod tests {
 
     #[test]
     fn resolves_comment_when_revision_lands_before_chain_root_merges() {
+        let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+            "work::revise_doc::tests::resolves_comment_when_revision_lands_before_chain_root_merges",
+        );
         let db = mem_db();
         let (design, artifact_id) = seed_design_owned_artifact(&db);
         let pr_url = "https://github.com/o/r/pull/1".to_owned();

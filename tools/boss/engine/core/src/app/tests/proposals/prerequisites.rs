@@ -349,6 +349,9 @@ async fn revision_prerequisite_answers_redispatch_only_after_completion() {
 
 #[tokio::test]
 async fn prerequisite_dedup_skips_manual_gates_and_restarts_terminal_executions() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "app::tests::proposals::prerequisites::prerequisite_dedup_skips_manual_gates_and_restarts_terminal_executions",
+    );
     for gated in [false, true] {
         let (state, _dir, _, task_id) = parked_task_with_question(prerequisite_question_payload()).await;
         let product_id = question_task(&state, &task_id).product_id;

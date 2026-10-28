@@ -502,6 +502,9 @@ mod tests {
 
     #[tokio::test]
     async fn rearm_restores_the_parent_signal_not_the_revisions() {
+        let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+            "completion::queue_ci_audit::tests::rearm_restores_the_parent_signal_not_the_revisions",
+        );
         let (_dir, db) = crate::test_support::open_db();
         let product = crate::test_support::create_test_product(&db);
         let parent = crate::test_support::create_test_chore(&db, product.id.clone(), "Parent");

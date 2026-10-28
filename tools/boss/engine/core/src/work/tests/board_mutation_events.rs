@@ -17,6 +17,9 @@ async fn assert_changed(sub: &mut boss_event_bus::Subscription, task: &Task) {
 
 #[tokio::test]
 async fn dependency_block_and_recovery_publish_committed_card_changes() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::board_mutation_events::dependency_block_and_recovery_publish_committed_card_changes",
+    );
     let db = WorkDb::open(temp_db_path("dependency-board-events")).unwrap();
     let product = create_test_product(&db);
     let prerequisite = create_test_chore(&db, product.id.clone(), "Prerequisite");

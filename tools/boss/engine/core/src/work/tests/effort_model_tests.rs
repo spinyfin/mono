@@ -255,6 +255,9 @@ fn investigation_kind_seeds_investigation_and_explicit_choice_wins() {
 
 #[test]
 fn coordinator_design_xhigh_roundtrips_only_for_design_rows() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::effort_model_tests::coordinator_design_xhigh_roundtrips_only_for_design_rows",
+    );
     let path = temp_db_path("design-reasoning-effort-xhigh");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));

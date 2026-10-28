@@ -26,6 +26,163 @@ fn waiver(db: &WorkDb, id: &str) -> Option<String> {
         .unwrap()
 }
 
+#[test]
+fn missing_ledger_uses_task_age_and_does_not_prevent_daily_snapshot() {
+    let db = WorkDb::open(temp_db_path("stuck-missing-ledger")).unwrap();
+    let product = create_test_product_named(&db, "Legacy");
+    let task = create_test_chore_manual(&db, &product.id, "Missing history");
+    let conn = db.connect().unwrap();
+    let timestamp = now();
+    conn.execute("DELETE FROM task_status_audit WHERE work_item_id = ?1", [&task.id])
+        .unwrap();
+    conn.execute(
+        "UPDATE tasks SET updated_at = ?2 WHERE id = ?1",
+        params![task.id, timestamp - 100],
+    )
+    .unwrap();
+    drop(conn);
+    let report = db.stuck_report(0, timestamp).unwrap();
+    let entry = report.rows.iter().find(|r| r.work_item_id == task.id).unwrap();
+    assert_eq!(entry.last_ledger_basis, "unknown_legacy");
+    assert_eq!(entry.age_in_state_secs, 100);
+    assert!(entry.age_is_lower_bound);
+    assert_eq!(db.stuck_daily_snapshot(timestamp).unwrap().rows.len(), 1);
+}
+
+#[test]
+fn run_start_clears_dispatch_failure_without_an_explicit_start_request() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::task_status_audit_tests::run_start_clears_dispatch_failure_without_an_explicit_start_request",
+    );
+    let db = WorkDb::open(temp_db_path("audit-run-start-clear")).unwrap();
+    let product = create_test_product_named(&db, "Run clear");
+    let task = create_test_chore_manual(&db, &product.id, "Retry");
+    db.bounce_dispatch_failed_to_backlog(&task.id, "lease_failed", "No lease")
+        .unwrap();
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&task.id)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.start_execution_run(&execution.id, "agent", "repo", "lease", "workspace", "/tmp/workspace")
+        .unwrap();
+    assert_eq!(
+        latest_basis(&db.connect().unwrap(), &task.id, "dispatch_failed_reason")
+            .unwrap()
+            .as_deref(),
+        Some("start_execution_run_on_host_with_tmux_hosting")
+    );
+}
+
+#[test]
+fn manual_revision_hold_preserves_caller_actor() {
+    for (actor, bucket) in [
+        ("human", StuckBucket::WaitingOnHuman),
+        ("engine", StuckBucket::EngineStuck),
+    ] {
+        let db = WorkDb::open(temp_db_path("stuck-revision-actor")).unwrap();
+        let product = make_revision_product(&db, actor);
+        let parent = make_in_review_chore(&db, &product, "https://github.com/spinyfin/mono/pull/77");
+        let revision = db
+            .create_revision_as_actor(
+                CreateRevisionInput::builder()
+                    .parent_task_id(parent)
+                    .description("Manual revision")
+                    .autostart(false)
+                    .build(),
+                &FakePrStateChecker::always(PrOpenState::Open),
+                actor,
+            )
+            .unwrap();
+        assert_eq!(row(&db, &revision.id).bucket, bucket);
+        let conn = db.connect().unwrap();
+        let recorded: String = conn.query_row("SELECT actor FROM task_status_audit WHERE work_item_id = ?1 AND property = 'autostart' ORDER BY id DESC LIMIT 1", [&revision.id], |r| r.get(0)).unwrap();
+        assert_eq!(recorded, actor);
+    }
+}
+
+#[test]
+fn project_prerequisite_is_progressing_until_terminal_or_missing() {
+    let db = WorkDb::open(temp_db_path("stuck-project-prerequisite")).unwrap();
+    let product = create_test_product_named(&db, "Projects");
+    let project = db
+        .create_project(CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "Live prerequisite".into(),
+            description: None,
+            goal: None,
+            autostart: true,
+            no_design_task: true,
+            design_reasoning_effort_xhigh: false,
+        })
+        .unwrap();
+    let task = create_test_chore_manual(&db, &product.id, "Waiting for project");
+    db.add_dependency(AddDependencyInput {
+        prerequisite: project.id.clone(),
+        dependent: task.id.clone(),
+        relation: None,
+    })
+    .unwrap();
+    assert_eq!(row(&db, &task.id).bucket, StuckBucket::WaitingOnDependency);
+    db.connect()
+        .unwrap()
+        .execute("UPDATE projects SET status = 'active' WHERE id = ?1", [&project.id])
+        .unwrap();
+    assert_eq!(row(&db, &task.id).bucket, StuckBucket::WaitingOnDependency);
+    for status in ["done", "archived"] {
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE projects SET status = ?2 WHERE id = ?1",
+                params![project.id, status],
+            )
+            .unwrap();
+        assert_eq!(row(&db, &task.id).bucket, StuckBucket::EngineStuck);
+    }
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_item_dependencies SET prerequisite_id = 'proj_missing' WHERE dependent_id = ?1",
+            [&task.id],
+        )
+        .unwrap();
+    assert_eq!(row(&db, &task.id).bucket, StuckBucket::EngineStuck);
+}
+
+#[test]
+fn concurrent_daily_snapshots_share_the_winner_and_roll_over_at_utc_midnight() {
+    let (_directory, path) = disk_db_path("stuck-concurrent-snapshot");
+    let db = WorkDb::open(path).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let day_start = now().div_euclid(86400) * 86400;
+    let handles: Vec<_> = (0..2)
+        .map(|offset| {
+            let db = WorkDb::open(db.path.clone()).unwrap();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.stuck_daily_snapshot(day_start + offset).unwrap()
+            })
+        })
+        .collect();
+    let reports: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(reports[0].generated_at_epoch_s, reports[1].generated_at_epoch_s);
+    assert_eq!(
+        db.stuck_daily_snapshot(day_start + 86400).unwrap().generated_at_epoch_s,
+        day_start + 86400
+    );
+    let count: i64 = db
+        .connect()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM task_stuck_daily_snapshots", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
 fn question() -> boss_protocol::OperatorQuestion {
     boss_protocol::OperatorQuestion {
         text: "Change the timeout?".into(),
@@ -36,6 +193,9 @@ fn question() -> boss_protocol::OperatorQuestion {
 
 #[test]
 fn every_failure_producer_records_provenance_and_only_refusal_is_human() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::task_status_audit_tests::every_failure_producer_records_provenance_and_only_refusal_is_human",
+    );
     for basis in [
         WorkerFailureBasis::DeclaredBlocked,
         WorkerFailureBasis::NudgeBreaker,
@@ -91,6 +251,9 @@ fn deliberate_park_waives_grace_and_counts_unconverted_even_before_age_threshold
 
 #[test]
 fn repeated_failure_and_clear_then_fail_do_not_reuse_old_provenance() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::task_status_audit_tests::repeated_failure_and_clear_then_fail_do_not_reuse_old_provenance",
+    );
     let db = WorkDb::open(temp_db_path("audit-repeated")).unwrap();
     let (_, id, first) = make_waiting_human_chore(&db, "Repeated");
     db.record_worker_failure_with_basis(&first, "first", WorkerFailureBasis::DeclaredBlocked)
@@ -153,11 +316,11 @@ fn repeated_failure_and_clear_then_fail_do_not_reuse_old_provenance() {
     let next = db
         .request_execution(RequestExecutionInput::builder().work_item_id(&id).build())
         .unwrap();
-    assert_ne!(
+    assert_eq!(
         latest_basis(&db.connect().unwrap(), &id, "blocked_reason")
             .unwrap()
             .as_deref(),
-        Some("nudge_breaker")
+        Some("explicit_start_failure_clear")
     );
     db.start_execution_run(&next.id, "agent-2", "repo", "lease", "workspace", "/tmp/workspace")
         .unwrap();
@@ -428,6 +591,9 @@ fn questions_keep_their_filed_classification_after_answer_and_state_changes() {
 
 #[test]
 fn legacy_backfill_does_not_reuse_an_older_execution_refusal() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::task_status_audit_tests::legacy_backfill_does_not_reuse_an_older_execution_refusal",
+    );
     let db = WorkDb::open(temp_db_path("audit-old-refusal")).unwrap();
     let (_, id, execution) = make_waiting_human_chore(&db, "Old refusal");
     let q = question();

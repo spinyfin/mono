@@ -451,6 +451,9 @@ fn action_question_with_open_pr_creates_revision() {
 
 #[test]
 fn action_question_with_merged_doc_creates_design_task() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t08::action_question_with_merged_doc_creates_design_task",
+    );
     let (db, _product, project_id, task_id) = fixture();
     set_task_pr(&db, &task_id, "https://github.com/spinyfin/mono/pull/7", "in_review");
     let (a, _g) = db

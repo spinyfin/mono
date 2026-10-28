@@ -204,6 +204,9 @@ fn retry_resets_abandoned_attempt() {
 /// reset row.
 #[test]
 fn retry_reblocks_parent_from_in_review() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t15::retry_reblocks_parent_from_in_review",
+    );
     let pr_url = "https://github.com/foo/bar/pull/4";
     let (db, chore_id, attempt) = seed_blocked_chore_with_attempt("retry-reblock", pr_url, 4, "sha-4");
     db.mark_conflict_resolution_running(&attempt.id, "lease-4", "ws-4", "worker-4")

@@ -43,7 +43,8 @@ pub fn register_metrics(registry: &Registry) {
 
 pub fn spawn(registry: Arc<Registry>, db: Arc<WorkDb>) -> tokio::task::JoinHandle<()> {
     boss_task_scope::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(86400));
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
             let now = boss_engine_utils::epoch_time::now_epoch_secs();

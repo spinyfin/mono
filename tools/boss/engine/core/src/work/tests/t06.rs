@@ -604,6 +604,9 @@ fn bind_pr_to_active_task_transitions_to_in_review() {
 
 #[test]
 fn bind_pr_to_active_task_is_idempotent_when_already_in_review() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t06::bind_pr_to_active_task_is_idempotent_when_already_in_review",
+    );
     let db = WorkDb::open(temp_db_path("bind-pr-idempotent")).unwrap();
     let (_, chore_id, _) = make_abandoned_chore_with_workspace(&db, "bind-pr-idempotent");
 
@@ -1734,6 +1737,9 @@ fn get_work_item_has_in_progress_revision() {
 
 #[test]
 fn get_work_tree_flag_cleared_when_revision_in_review() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t06::get_work_tree_flag_cleared_when_revision_in_review",
+    );
     // A revision that moves to in_review no longer triggers the flag.
     let db = WorkDb::open(temp_db_path("in-progress-rev-cleared")).unwrap();
     let product_id = make_revision_product(&db, "flag-cleared");

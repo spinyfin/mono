@@ -1055,6 +1055,9 @@ async fn pool_exhaustion_recovers_automatically_when_slot_frees_without_manual_i
 /// those.
 #[tokio::test]
 async fn heal_ghost_active_demotes_chores_without_run_history() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "coordinator::tests::pool::heal_ghost_active_demotes_chores_without_run_history",
+    );
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let product = create_test_product(&db);

@@ -2,6 +2,9 @@ use super::*;
 
 #[test]
 fn open_remediation_snapshot_is_compact_complete_and_recovers_exhaustion() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::remediation_state::open_remediation_snapshot_is_compact_complete_and_recovers_exhaustion",
+    );
     let (_dir, path) = disk_db_path("open-remediation");
     let db = WorkDb::open(path).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));

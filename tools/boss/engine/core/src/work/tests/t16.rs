@@ -492,6 +492,9 @@ fn recanonicalize_blocked_merge_conflict_pr_mismatch_is_none() {
 /// and a repeat call misses the guard (`None`).
 #[test]
 fn recanonicalize_blocked_ci_failure_some_then_none() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t16::recanonicalize_blocked_ci_failure_some_then_none",
+    );
     let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
     let product_id = make_revision_product(&db, "recanon-ci");
     let url = pr(1);
@@ -741,6 +744,9 @@ fn merge_conflict_signal_cleared_at(db: &WorkDb, work_item_id: &str) -> Option<S
 /// `task_blocked_signals` row `cleared_at`.
 #[test]
 fn clear_for_attempt_retires_when_all_three_match() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t16::clear_for_attempt_retires_when_all_three_match",
+    );
     let pr_url = "https://github.com/foo/bar/pull/1";
     let (db, chore_id, attempt) = seed_blocked_merge_conflict_with_attempt("clear-match", pr_url, 1, "sha-1");
 
@@ -1346,6 +1352,9 @@ fn retarget_flips_ci_failure_exhausted_to_merge_conflict() {
 /// `cleared_at`, and afterwards the only active signal is `merge_conflict`.
 #[test]
 fn retarget_clears_all_ci_signals_and_arms_merge_conflict() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t16::retarget_clears_all_ci_signals_and_arms_merge_conflict",
+    );
     let pr_url = pr(3);
     let (db, chore_id) = seed_blocked_ci("retarget-signals", &pr_url, true);
     // Plant the third CI-family signal the takeover must also clear.

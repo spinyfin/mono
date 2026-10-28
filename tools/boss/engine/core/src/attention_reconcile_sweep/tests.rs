@@ -598,6 +598,9 @@ async fn review_result_missing_survives_its_own_review_pass_completing() {
 /// would do it only on the sweep path.
 #[tokio::test]
 async fn clearing_a_banner_does_not_reset_the_orphan_active_age_clock() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "attention_reconcile_sweep::tests::clearing_a_banner_does_not_reset_the_orphan_active_age_clock",
+    );
     let (_dir, db) = open_db();
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, product.id, "Age clock");

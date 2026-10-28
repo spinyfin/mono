@@ -1734,6 +1734,9 @@ fn transcript_path_lands_on_active_run_after_prior_prestart_failure() {
 
 #[test]
 fn cancel_execution_marks_row_and_resets_active_chore_to_todo() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t01::cancel_execution_marks_row_and_resets_active_chore_to_todo",
+    );
     let path = temp_db_path("cancel-active");
     let db = WorkDb::open(path.clone()).unwrap();
 

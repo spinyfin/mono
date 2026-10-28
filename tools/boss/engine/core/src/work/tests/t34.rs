@@ -51,6 +51,9 @@ fn fixture_timeout_question() -> boss_protocol::OperatorQuestion {
 /// execution survives the next reconcile tick, and a worker can pick it up.
 #[test]
 fn ci_fix_revision_question_answered_yes_resumes_after_attempt_retired() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t34::ci_fix_revision_question_answered_yes_resumes_after_attempt_retired",
+    );
     let db = WorkDb::open(temp_db_path("ci-fix-question-yes-resume")).unwrap();
     let product_id = make_revision_product(&db, "ci-fix-q-yes");
     let pr_url = "https://github.com/spinyfin/mono/pull/3142";
@@ -212,6 +215,9 @@ fn manual_start_of_ci_fix_revision_with_retired_attempt_reopens_it() {
 /// still win: attempt re-opened, row unblocked, execution survives.
 #[test]
 fn kanban_drag_of_ci_fix_revision_with_retired_attempt_wins_the_reconcile_race() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t34::kanban_drag_of_ci_fix_revision_with_retired_attempt_wins_the_reconcile_race",
+    );
     let db = WorkDb::open(temp_db_path("ci-fix-drag-retired")).unwrap();
     let product_id = make_revision_product(&db, "ci-fix-drag");
     let pr_url = "https://github.com/spinyfin/mono/pull/3144";
@@ -525,6 +531,9 @@ fn rescan_active_dispatch_does_not_reopen_retired_attempt() {
 /// the block stays intact.
 #[test]
 fn automatic_request_execution_does_not_reopen_retired_attempt() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t34::automatic_request_execution_does_not_reopen_retired_attempt",
+    );
     for succeeded in [false, true] {
         let name = if succeeded { "succeeded" } else { "failed" };
         let db = WorkDb::open(temp_db_path(&format!("ci-fix-auto-no-reopen-{name}"))).unwrap();

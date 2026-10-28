@@ -101,6 +101,9 @@ async fn stale_conflict(
 
 #[tokio::test]
 async fn conflicting_pr_with_green_ci_closes_stale_ci_fix_revision() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "merge_poller::tests::stale_revision_sweep_tests::conflicting_pr_with_green_ci_closes_stale_ci_fix_revision",
+    );
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
     let pr = "https://github.com/foo/bar/pull/8001";

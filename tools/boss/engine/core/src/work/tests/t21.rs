@@ -223,6 +223,9 @@ fn mark_chore_pr_merged_noop_when_task_missing() {
 /// merging advances to `done` and returns `Some(Task)`.
 #[test]
 fn mark_chore_pr_closed_unmerged_advances_in_review_to_done() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t21::mark_chore_pr_closed_unmerged_advances_in_review_to_done",
+    );
     let db = WorkDb::open(temp_db_path("closed-advance-done")).unwrap();
     let product_id = make_revision_product(&db, "closed-advance");
     let pr_url = "https://github.com/spinyfin/mono/pull/4010";

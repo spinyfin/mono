@@ -111,6 +111,9 @@ fn seed_ready_revision(db: &WorkDb, label: &str) -> (String, String) {
 /// successful revision reaches. Reports `true` because the task transitioned.
 #[test]
 fn retire_stale_revision_before_dispatch_abandons_execution_and_advances_task() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t26::retire_stale_revision_before_dispatch_abandons_execution_and_advances_task",
+    );
     let db = WorkDb::open(temp_db_path("retire-happy")).unwrap();
     let (revision, exec_id) = seed_ready_revision(&db, "retire-happy");
 
@@ -754,6 +757,9 @@ fn mark_chore_blocked_deletion_signoff_flips_a_merge_conflict_chore() {
 /// keep the chore in the merge-conflict sweep's candidate set.
 #[test]
 fn mark_chore_blocked_deletion_signoff_clears_the_merge_conflict_signal() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t26::mark_chore_blocked_deletion_signoff_clears_the_merge_conflict_signal",
+    );
     let db = WorkDb::open(temp_db_path("signoff-signal")).unwrap();
     let pr_url = "https://github.com/spinyfin/mono/pull/802";
     let chore = seed_chore_blocked_on_merge_conflict(&db, "signoff-signal", pr_url);

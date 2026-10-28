@@ -883,7 +883,7 @@ fn action_question_group(
             // mode is real evidence about the shape of this work, so it
             // should inherit rather than pin `standard`.
             .build();
-        match assert_parent_revisable_and_insert(pending, conn, input, pr_checker) {
+        match assert_parent_revisable_and_insert(pending, conn, input, pr_checker, "engine") {
             Ok(revision) => {
                 let reference = serde_json::json!({
                     "task_id": revision.id,

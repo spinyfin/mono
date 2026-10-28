@@ -220,6 +220,9 @@ fn bind_pr_to_task_from_terminal_execution_transitions_todo_task_to_in_review() 
 
 #[test]
 fn bind_pr_to_task_from_terminal_execution_is_idempotent_when_pr_url_already_set() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t33::bind_pr_to_task_from_terminal_execution_is_idempotent_when_pr_url_already_set",
+    );
     let db = WorkDb::open(temp_db_path("bind-pr-idempotent")).unwrap();
     let (_, chore_id, _) = make_terminal_chore(&db, "bind-pr-idempotent", "todo", GRACE_SECS + 60);
 

@@ -958,6 +958,9 @@ mod tests {
 
     #[tokio::test]
     async fn engine_archived_followup_bound_to_its_origin_pr_is_rebound_and_loses_archive_metadata() {
+        let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+            "pr_binding_repair_sweep::tests::engine_archived_followup_bound_to_its_origin_pr_is_rebound_and_loses_archive_metadata",
+        );
         let (_dir, db) = open_db();
         let (_product, task_id, _exec_id) = mis_bound_followup(&db, ORIGIN);
         db.connect()
@@ -998,6 +1001,9 @@ mod tests {
 
     #[tokio::test]
     async fn engine_closed_rows_without_an_own_pr_are_parked_and_clear_provenance() {
+        let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+            "pr_binding_repair_sweep::tests::engine_closed_rows_without_an_own_pr_are_parked_and_clear_provenance",
+        );
         for status in ["done", "archived"] {
             let (_dir, db) = open_db();
             let (_, task_id, _) = mis_bound_followup(&db, ORIGIN);

@@ -87,7 +87,7 @@ impl WorkDb {
             .build();
 
         let mut pending = PendingEvents::new();
-        let task = match assert_parent_revisable_and_insert(&mut pending, &tx, revision_input, pr_checker) {
+        let task = match assert_parent_revisable_and_insert(&mut pending, &tx, revision_input, pr_checker, "engine") {
             Ok(task) => task,
             Err(err) if err.downcast_ref::<RevisionGateError>().is_some() => {
                 return Ok(ReviseDocOutcome::PrClosed {

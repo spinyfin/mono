@@ -1008,6 +1008,7 @@ mod floor_tests {
             55,
             56,
             58,
+            59,
             CURRENT_SCHEMA_VERSION,
             CURRENT_SCHEMA_VERSION + 1,
         ] {
@@ -1093,7 +1094,7 @@ mod floor_tests {
             if version >= 56 {
                 super::super::board_projection_schema::migrate(&conn).unwrap();
             }
-            if version >= 59 {
+            if version >= 60 {
                 task_status_audit::migrate(&conn).unwrap();
             }
             conn.execute(

@@ -249,6 +249,9 @@ fn list_dispatch_failed_recovery_candidates_breaks_dispatch_failed_at_ties_by_id
 /// Backlog) and mints the fresh `ready` execution that actually re-runs it.
 #[test]
 fn reenable_and_request_execution_reenables_autostart_and_creates_execution() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t27::reenable_and_request_execution_reenables_autostart_and_creates_execution",
+    );
     let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
     let product = create_test_product_named(&db, "reen-happy").id;
     let chore = create_test_chore_manual(&db, product, "retry me").id;

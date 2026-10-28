@@ -1284,6 +1284,9 @@ fn request_execution_refuses_gated_work_item() {
 /// execution so the dispatcher can proceed.
 #[test]
 fn request_execution_clears_stale_dependency_block_when_prereqs_done() {
+    let _audit = crate::work::task_status_audit::coverage::Fixture::new(
+        "work::tests::t03::request_execution_clears_stale_dependency_block_when_prereqs_done",
+    );
     let path = temp_db_path("deps-clear-stale-block");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));

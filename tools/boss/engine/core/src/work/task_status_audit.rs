@@ -2,6 +2,10 @@
 //! captures row values, including bulk updates, inside the writer's transaction.
 use super::*;
 
+#[cfg(test)]
+#[path = "tests/task_status_coverage.rs"]
+pub(crate) mod coverage;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerFailureBasis {
     NudgeBreaker,
@@ -26,6 +30,7 @@ impl WorkerFailureBasis {
 /// A savepoint also makes callers that otherwise use autocommit atomic.
 /// The context is transaction-local in effect: SQLite serializes writers and
 /// readers cannot see the context until the savepoint has removed it.
+#[cfg_attr(test, track_caller)]
 pub(crate) fn execute<P: rusqlite::Params>(
     conn: &Connection,
     basis: &str,
@@ -33,6 +38,8 @@ pub(crate) fn execute<P: rusqlite::Params>(
     sql: &str,
     params: P,
 ) -> rusqlite::Result<usize> {
+    #[cfg(test)]
+    let before = coverage::before(conn)?;
     conn.execute_batch("SAVEPOINT task_status_write")?;
     let result = (|| {
         conn.execute(
@@ -47,6 +54,12 @@ pub(crate) fn execute<P: rusqlite::Params>(
         conn.execute_batch("ROLLBACK TO task_status_write")?;
     }
     conn.execute_batch("RELEASE task_status_write")?;
+    #[cfg(test)]
+    if result.is_ok()
+        && let Some(before) = before
+    {
+        coverage::observe(conn, before, std::panic::Location::caller())?;
+    }
     result
 }
 
