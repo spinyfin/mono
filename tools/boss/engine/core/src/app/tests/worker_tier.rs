@@ -563,7 +563,9 @@ fn worker_tier_gate_handoff_write_is_audited() {
         let mut child = std::process::Command::new("/bin/sh")
             .args([
                 "-c",
-                "sleep 30",
+                // Trailing `:` stops the shell exec-ing `sleep` in place, which would
+                // rewrite the process argv and drop the credential under test.
+                "sleep 30; :",
                 "boss",
                 "handoff",
                 "write",
