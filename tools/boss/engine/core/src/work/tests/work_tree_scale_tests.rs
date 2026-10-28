@@ -3,7 +3,7 @@ use super::*;
 use crate::population_timing::{PopulationTrace, segment};
 use std::time::Instant;
 
-fn seed(conn: &Connection) {
+pub(super) fn seed(conn: &Connection) {
     conn.execute_batch("BEGIN").unwrap();
     for i in 0..5 {
         conn.execute(

@@ -41,7 +41,7 @@ pub(super) fn tasks_lane_query() -> String {
     format!(
         "SELECT {BOARD_TASK_COLUMNS} FROM tasks \
          WHERE product_id = ?1 AND {BOARD_TASKS_LANE} AND {BOARD_LIVE} \
-         ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC"
+         ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC, id ASC"
     )
 }
 
@@ -50,26 +50,29 @@ pub(super) fn chores_lane_query() -> String {
     format!(
         "SELECT {BOARD_TASK_COLUMNS} FROM tasks \
          WHERE product_id = ?1 AND {BOARD_CHORES_LANE} AND {BOARD_LIVE} \
-         ORDER BY created_at ASC"
+         ORDER BY created_at ASC, id ASC"
     )
 }
 
-/// Whether the tree puts `task` in its chores lane. Mirrors
-/// [`BOARD_CHORES_LANE`]; the patch uses it to keep each card in the lane
-/// (and so the `WorkItem` arm) the tree would have used.
-fn is_board_chore(task: &Task) -> bool {
-    matches!(task.kind, TaskKind::Chore | TaskKind::Followup) && task.project_id.is_none()
+#[derive(Clone, Copy)]
+pub(super) enum CardScope {
+    WholeProduct,
+    Subset,
 }
 
 /// Attach every derived per-card field the board carries, in the order the
 /// fields depend on each other, and return the tasks lane (the revision
 /// projection rebuilds it). `tasks` and `chores` must contain whole revision
-/// chains. `caller` labels per-card warnings.
+/// chains. `scope` selects bulk or per-card queries; `caller` only labels warnings.
+// The scope and the optional review cache are independent per-caller choices;
+// bundling them into a struct would only rename the two call sites.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn attach_board_derivations(
     conn: &Connection,
     tasks: Vec<Task>,
     chores: &mut [Task],
     product_id: &str,
+    scope: CardScope,
     caller: &str,
     trace: &mut PopulationTrace,
     review_cache: Option<&BoardReviewCache>,
@@ -130,7 +133,12 @@ pub(super) fn attach_board_derivations(
     // Errors are non-fatal — log and leave the field at its default
     // (affordance hidden). Single batched `IN (...)` query.
     let t = Instant::now();
-    if let Err(err) = attach_has_attachments_flag(conn, &mut tasks, chores) {
+    let attachments = if matches!(scope, CardScope::WholeProduct) {
+        attach_has_attachments_flag(conn, &mut tasks, chores)
+    } else {
+        revision_helpers::attach_has_attachments_flag_for_ids(conn, &mut tasks, chores)
+    };
+    if let Err(err) = attachments {
         tracing::warn!(?err, "{caller}: failed to attach has_attachments flag; ignoring");
     }
     trace.record_plain(segment::DB_HAS_ATTACHMENTS, elapsed_ms(t));
@@ -156,13 +164,22 @@ pub(super) fn attach_board_derivations(
     // task are non-fatal — log and leave the field None (affordance
     // hidden).
     //
-    // A single prefilter finds the rows with a pointer; each of those
-    // costs 1-3 resolution queries. `resolved` is the number of
-    // pointer-bearing items and `doc_pointer_queries` is the aggregate
-    // statement count, recorded alongside `db.task_runtimes`.
+    // Whole-product reads prefilter pointer-bearing rows; subset reads probe
+    // each requested card. `resolved` counts pointer-bearing items (including
+    // broken links), not all probed cards. `doc_pointer_queries` counts all
+    // statements, including probes without pointers.
     let t = Instant::now();
-    let (resolved, doc_pointer_queries) =
-        attach_task_doc_link_states_for_groups(conn, &mut [&mut tasks[..], &mut chores[..]], caller, product_id);
+    let (resolved, doc_pointer_queries) = if matches!(scope, CardScope::WholeProduct) {
+        attach_task_doc_link_states_for_groups(conn, &mut [&mut tasks[..], &mut chores[..]], caller, product_id)
+    } else {
+        let mut queries = 0;
+        let mut resolved = 0;
+        for task in tasks.iter_mut().chain(chores.iter_mut()) {
+            attach_task_doc_link_state(conn, task, caller, &mut queries);
+            resolved += usize::from(task.doc_link_state.is_some());
+        }
+        (resolved, queries)
+    };
     trace.record_nplus1(segment::DB_DOC_POINTERS, elapsed_ms(t), resolved, doc_pointer_queries);
     tasks
 }
@@ -177,6 +194,7 @@ pub struct WorkRuntimePatch {
     /// archived, moved to another product, or not tasks at all. A consumer
     /// holding any of them must treat that as a structural change.
     pub absent: Vec<String>,
+    pub(super) validity: HashMap<String, (bool, Option<i64>)>,
 }
 
 impl WorkDb {
@@ -204,72 +222,98 @@ impl WorkDb {
             closure.insert(id.clone());
         }
 
-        let select = format!(
-            "SELECT {BOARD_TASK_COLUMNS} FROM tasks \
+        read_cards(
+            &conn,
+            product_id,
+            &closure,
+            &requested,
+            boss_engine_utils::epoch_time::now_epoch_secs(),
+        )
+    }
+}
+
+pub(super) fn read_cards(
+    conn: &Connection,
+    product_id: &str,
+    closure: &BTreeSet<String>,
+    requested: &[&str],
+    now: i64,
+) -> Result<WorkRuntimePatch> {
+    let select = format!(
+        "SELECT {BOARD_TASK_COLUMNS} FROM tasks \
              WHERE product_id = ?1 AND id = ?2 AND ({BOARD_TASKS_LANE} OR {BOARD_CHORES_LANE}) AND {BOARD_LIVE}"
-        );
-        let mut tasks = Vec::new();
-        let mut chores = Vec::new();
-        {
-            let mut stmt = conn.prepare(&select)?;
-            for id in &closure {
-                let row = stmt
-                    .query_row(
-                        params![product_id, id],
-                        map_task_with_external_ref_parent_source_and_provenance,
-                    )
-                    .optional()?;
-                match row {
-                    Some(task) if is_board_chore(&task) => chores.push(task),
-                    Some(task) => tasks.push(task),
-                    None => {}
-                }
+    );
+    let mut tasks = Vec::new();
+    let mut chores = Vec::new();
+    {
+        let mut stmt = conn.prepare(&select)?;
+        for id in closure {
+            let row = stmt
+                .query_row(
+                    params![product_id, id],
+                    map_task_with_external_ref_parent_source_and_provenance,
+                )
+                .optional()?;
+            match row {
+                Some(task) if boss_board_projection::is_chore(&task) => chores.push(task),
+                Some(task) => tasks.push(task),
+                None => {}
             }
         }
-
-        let mut queries = 0u64;
-        let mut runtimes = HashMap::new();
-        for task in tasks.iter().chain(chores.iter()) {
-            runtimes.insert(task.id.clone(), query_task_runtime(&conn, &task.id, &mut queries)?);
-        }
-
-        let mut trace = PopulationTrace::disabled();
-        // A patch names a few chains; recomputing their owners is cheaper
-        // than a cache pass, and keeps the patch a pure function of the
-        // snapshot.
-        let tasks = attach_board_derivations(
-            &conn,
-            tasks,
-            &mut chores,
-            product_id,
-            "get_work_runtime_patch",
-            &mut trace,
-            None,
-        );
-
-        let present: HashSet<&str> = tasks.iter().chain(chores.iter()).map(|t| t.id.as_str()).collect();
-        let absent = requested
-            .iter()
-            .filter(|id| !present.contains(*id))
-            .map(|id| (*id).to_owned())
-            .collect();
-
-        let mut items = Vec::with_capacity(tasks.len() + chores.len());
-        for (task, chore) in tasks
-            .into_iter()
-            .map(|task| (task, false))
-            .chain(chores.into_iter().map(|task| (task, true)))
-        {
-            let runtime = runtimes
-                .remove(&task.id)
-                .expect("a runtime is read for every board row");
-            let item = if chore {
-                WorkItem::Chore(task)
-            } else {
-                WorkItem::Task(task)
-            };
-            items.push(WorkRuntimePatchItem { item, runtime });
-        }
-        Ok(WorkRuntimePatch { items, absent })
     }
+
+    tasks.sort_by(boss_board_projection::task_order);
+    chores.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+    let mut queries = 0u64;
+    let mut runtimes = HashMap::new();
+    let mut validity = HashMap::new();
+    for task in tasks.iter().chain(chores.iter()) {
+        let computed = dispatch_helpers::compute_task_runtime(conn, &task.id, &mut queries, now)?;
+        validity.insert(task.id.clone(), (computed.cacheable, computed.expires_at));
+        runtimes.insert(task.id.clone(), computed.runtime);
+    }
+
+    let mut trace = PopulationTrace::disabled();
+    // A patch names a few chains; recomputing their owners is cheaper
+    // than a cache pass, and keeps the patch a pure function of the
+    // snapshot.
+    let tasks = attach_board_derivations(
+        conn,
+        tasks,
+        &mut chores,
+        product_id,
+        CardScope::Subset,
+        "get_work_runtime_patch",
+        &mut trace,
+        None,
+    );
+
+    let present: HashSet<&str> = tasks.iter().chain(chores.iter()).map(|t| t.id.as_str()).collect();
+    let absent = requested
+        .iter()
+        .filter(|id| !present.contains(*id))
+        .map(|id| (*id).to_owned())
+        .collect();
+
+    let mut items = Vec::with_capacity(tasks.len() + chores.len());
+    for (task, chore) in tasks
+        .into_iter()
+        .map(|task| (task, false))
+        .chain(chores.into_iter().map(|task| (task, true)))
+    {
+        let runtime = runtimes
+            .remove(&task.id)
+            .expect("a runtime is read for every board row");
+        let item = if chore {
+            WorkItem::Chore(task)
+        } else {
+            WorkItem::Task(task)
+        };
+        items.push(WorkRuntimePatchItem { item, runtime });
+    }
+    Ok(WorkRuntimePatch {
+        items,
+        absent,
+        validity,
+    })
 }

@@ -15,6 +15,7 @@ pub(crate) fn collect_task_runtimes_cached(
     chores: &[Task],
     cache: &BoardRuntimeCache,
     now: i64,
+    mut validity: Option<&mut HashMap<String, (bool, Option<i64>)>>,
 ) -> Result<(Vec<TaskRuntime>, u64)> {
     let epochs = query_runtime_epochs(conn, product_id)?;
     let mut queries = 1u64;
@@ -26,12 +27,18 @@ pub(crate) fn collect_task_runtimes_cached(
     let lookup = cache.lookup(product_id, &items, now);
     let mut runtimes = Vec::with_capacity(items.len());
     let mut fresh = Vec::new();
-    for ((id, epoch), hit) in items.iter().zip(lookup.hits) {
+    for (((id, epoch), hit), expires_at) in items.iter().zip(lookup.hits).zip(lookup.expiries) {
         if let Some(runtime) = hit {
+            if let Some(validity) = validity.as_mut() {
+                validity.insert((*id).to_owned(), (true, expires_at));
+            }
             runtimes.push(runtime);
             continue;
         }
         let computed = compute_task_runtime(conn, id, &mut queries, now)?;
+        if let Some(validity) = validity.as_mut() {
+            validity.insert((*id).to_owned(), (computed.cacheable, computed.expires_at));
+        }
         if computed.cacheable {
             fresh.push((
                 (*id).to_owned(),

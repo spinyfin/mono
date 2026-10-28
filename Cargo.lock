@@ -398,6 +398,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-board-projection"
+version = "0.1.0"
+dependencies = [
+ "boss-protocol",
+]
+
+[[package]]
 name = "boss-build-info"
 version = "0.1.0"
 
@@ -567,6 +574,7 @@ dependencies = [
  "async-trait",
  "bon",
  "boss-backoff",
+ "boss-board-projection",
  "boss-build-info",
  "boss-build-provenance",
  "boss-ci-log-reader",

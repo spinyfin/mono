@@ -640,6 +640,8 @@ mod blocking;
 pub(crate) mod board_caches;
 mod board_notifications;
 mod board_patch;
+pub(crate) mod board_projection;
+pub(crate) mod board_projection_schema;
 pub(crate) mod board_review_cache;
 pub(crate) mod board_runtime_cache;
 mod boothby;

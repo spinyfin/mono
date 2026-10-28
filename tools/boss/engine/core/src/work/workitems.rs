@@ -1120,14 +1120,25 @@ impl WorkDb {
         caches: Option<&BoardCaches>,
         now: i64,
     ) -> Result<WorkTree> {
-        let runtime_cache = caches.map(|caches| &caches.runtimes);
-        let review_cache = caches.map(|caches| &caches.reviews);
         let mut connection = self.connect()?;
         // All projections must describe one consistent database snapshot.
         let conn = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
 
+        Self::assemble_work_tree_in(&conn, product_id, trace, caches, now, None)
+    }
+
+    pub(super) fn assemble_work_tree_in(
+        conn: &Connection,
+        product_id: &str,
+        trace: &mut PopulationTrace,
+        caches: Option<&BoardCaches>,
+        now: i64,
+        validity: Option<&mut HashMap<String, (bool, Option<i64>)>>,
+    ) -> Result<WorkTree> {
+        let runtime_cache = caches.map(|caches| &caches.runtimes);
+        let review_cache = caches.map(|caches| &caches.reviews);
         let t = Instant::now();
-        let product = query_product(&conn, product_id).require("product", product_id)?;
+        let product = query_product(conn, product_id).require("product", product_id)?;
         trace.record_query(segment::DB_PRODUCT, elapsed_ms(t), 1);
 
         let t = Instant::now();
@@ -1179,8 +1190,8 @@ impl WorkDb {
         // per-row fan-out visible in the log.
         let t = Instant::now();
         let (task_runtimes, runtime_queries) = match runtime_cache {
-            Some(cache) => collect_task_runtimes_cached(&conn, product_id, &tasks, &chores, cache, now)?,
-            None => collect_task_runtimes(&conn, &tasks, &chores, now)?,
+            Some(cache) => collect_task_runtimes_cached(conn, product_id, &tasks, &chores, cache, now, validity)?,
+            None => collect_task_runtimes(conn, &tasks, &chores, now)?,
         };
         trace.record_nplus1(
             segment::DB_TASK_RUNTIMES,
@@ -1190,28 +1201,29 @@ impl WorkDb {
         );
 
         let t = Instant::now();
-        let dependencies = collect_product_dependencies(&conn, product_id)?;
+        let dependencies = collect_product_dependencies(conn, product_id)?;
         trace.record_query(segment::DB_DEPENDENCIES, elapsed_ms(t), dependencies.len());
 
         // Derived per-card fields (revision projections, review/CI flags,
         // badges, doc links). Shared with the runtime patch so a patched
         // card is the card this tree would have produced.
         let tasks = super::board_patch::attach_board_derivations(
-            &conn,
+            conn,
             tasks,
             &mut chores,
             product_id,
+            board_patch::CardScope::WholeProduct,
             "get_work_tree",
             trace,
             review_cache,
         );
 
-        let ideas = list_ideas_in_tx(&conn, product_id, None)?;
-        let attention_items = super::attentions::reads::list_items(&conn, product_id)?;
+        let ideas = list_ideas_in_tx(conn, product_id, None)?;
+        let attention_items = super::attentions::reads::list_items(conn, product_id)?;
         let (attention_groups, attention_members) =
-            super::attentions::reads::list_groups_with_members(&conn, product_id, None, None, None, None)?;
+            super::attentions::reads::list_groups_with_members(conn, product_id, None, None, None, None)?;
 
-        let planner_runs = super::planner_runs::latest_settled_planner_run_summaries(&conn, product_id)?;
+        let planner_runs = super::planner_runs::latest_settled_planner_run_summaries(conn, product_id)?;
 
         Ok(WorkTree {
             product,

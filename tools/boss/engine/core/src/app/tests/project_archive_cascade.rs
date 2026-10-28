@@ -9,7 +9,8 @@
 //! - exactly one `WorkInvalidated` push on the product's work topic (the
 //!   subscription the macOS app holds), naming only the project;
 //! - a bounded number of row writes — the project row and its status
-//!   audit row — never one per child;
+//!   audit row, plus one board journal entry and bounded pruning — never
+//!   one per child;
 //! - a bounded number of transactions and SQL statements, identical at
 //!   50 and 500 children. Transactions are counted at the connection
 //!   (every `BEGIN` and every commit during the handler), so a per-child
@@ -56,8 +57,8 @@ fn count_statement(event: TraceEvent<'_>) {
     }
 }
 
-/// Rows the archive is allowed to write: the project row itself plus the
-/// `project_property_audit` row recording the status transition.
+/// Domain rows the archive is allowed to write: the project row itself plus
+/// its status audit row. Journal writes have their own exact assertions.
 const MAX_ROW_WRITES: u64 = 2;
 
 fn dispatch(state: &Arc<ServerState>, sink: &Arc<SessionSink>) -> Dispatch {
@@ -194,15 +195,22 @@ async fn archive_with_children(child_count: usize) -> Cost {
     let commits = Arc::new(AtomicUsize::new(0));
     BEGINS.store(0, Ordering::SeqCst);
     STATEMENTS.store(0, Ordering::SeqCst);
-    let writes_before = {
+    let (writes_before, journal_before, journal_rows_before) = {
         let conn = state.work_db.connect().expect("db");
+        let (revision, rows): (u64, u64) = conn
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0), COUNT(*) FROM board_changes",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         let commit_counter = commits.clone();
         conn.commit_hook(Some(move || {
             commit_counter.fetch_add(1, Ordering::SeqCst);
             false
         }));
         conn.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(count_statement));
-        conn.total_changes()
+        (conn.total_changes(), revision, rows)
     };
 
     let sink = make_session_sink();
@@ -215,11 +223,26 @@ async fn archive_with_children(child_count: usize) -> Cost {
     )
     .await;
 
-    let writes_after = {
+    let (writes_after, journal_after, journal_rows_after) = {
         let conn = state.work_db.connect().expect("db");
         conn.trace_v2(TraceEventCodes::empty(), None);
         conn.commit_hook(None::<fn() -> bool>);
-        conn.total_changes()
+        let (revision, rows): (u64, u64) = conn
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0), COUNT(*) FROM board_changes",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let change: (Option<String>, String) = conn
+            .query_row(
+                "SELECT item_id, source FROM board_changes WHERE sequence = ?1",
+                [revision],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(change, (None, "projects".to_owned()));
+        (conn.total_changes(), revision, rows)
     };
     let cost = Cost {
         transactions: BEGINS.load(Ordering::SeqCst),
@@ -276,8 +299,15 @@ async fn archive_with_children(child_count: usize) -> Cost {
         "archiving a project with {child_count} children must publish exactly one invalidation"
     );
 
-    // Bounded writes: the project row and its audit row, never per child.
-    let row_writes = writes_after - writes_before;
+    // One durable input regardless of child count, with at most one expired
+    // journal row pruned. Domain-row writes are bounded separately by MAX_ROW_WRITES.
+    assert_eq!(journal_after - journal_before, 1, "one project journal entry");
+    assert_eq!(
+        journal_rows_after,
+        (journal_rows_before + 1).min(crate::work::board_projection_schema::JOURNAL_LIMIT)
+    );
+    let journal_pruned = journal_rows_before + 1 - journal_rows_after;
+    let row_writes = writes_after - writes_before - 1 - journal_pruned;
     assert!(
         row_writes <= MAX_ROW_WRITES,
         "archiving a project with {child_count} children wrote {row_writes} rows; \

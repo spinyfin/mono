@@ -623,3 +623,6 @@ mod work_tree_scale_tests;
 mod board_patch_tests;
 
 mod design_doc_contention_tests;
+
+mod board_projection_scale;
+mod board_projection_tests;

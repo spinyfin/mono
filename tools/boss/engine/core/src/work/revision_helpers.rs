@@ -735,7 +735,7 @@ pub(crate) fn attach_has_attachments_flag(
 /// Like [`attach_has_attachments_flag`], but queries only the supplied
 /// candidate rows. This is for single-row projections, whose revision-chain
 /// slices are small enough that keyed lookups beat a board-wide index scan.
-fn attach_has_attachments_flag_for_ids(
+pub(crate) fn attach_has_attachments_flag_for_ids(
     conn: &Connection,
     tasks: &mut [Task],
     chores: &mut [Task],
