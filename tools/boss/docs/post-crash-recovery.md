@@ -33,12 +33,14 @@ Compared to the other terminal statuses:
 - `orphaned`: the row had a live worker once; the engine no longer
   has signal that it does.
 
-**Critical difference from `cancelled`:** the cube workspace lease on
-an orphaned row is intentionally **not** released. The workspace
-filesystem typically still holds in-flight commits the next worker
-should resume against. The engine clears `cube_lease_id` /
-`cube_workspace_id` / `workspace_path` only when the human explicitly
-cancels, or when cube's lease TTL elapses and cube force-releases it.
+**Lease handling:** resume reads preserved work from
+`boss-recovery/<execution>` bookmarks in the shared jj store, not from
+the originating workspace. After an orphan is recorded, the engine
+releases the cube lease once the recovery bookmark is confirmed and no
+process still has its cwd inside the workspace. If either gate fails,
+the lease stays held until cube's 24-hour TTL. The engine clears
+`cube_lease_id` / `cube_workspace_id` / `workspace_path` only after a
+successful cube release (or when the human explicitly cancels).
 
 ## How orphans get detected
 

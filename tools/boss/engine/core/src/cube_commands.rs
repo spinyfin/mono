@@ -312,6 +312,16 @@ pub async fn release_workspace<T: CubeJsonTransport + ?Sized>(transport: &T, lea
     Ok(())
 }
 
+/// End-of-run release: skip cube's dirty-preservation probe so the
+/// workspace returns to the pool. Safe only after the recovery bookmark
+/// is confirmed; the shared store keeps the commits.
+pub async fn release_workspace_with_reset<T: CubeJsonTransport + ?Sized>(transport: &T, lease_id: &str) -> Result<()> {
+    let _ = transport
+        .run_cube_json(&["--json", "workspace", "release", "--lease", lease_id, "--force-reset"])
+        .await?;
+    Ok(())
+}
+
 pub async fn workspace_status<T: CubeJsonTransport + ?Sized>(
     transport: &T,
     workspace_path: &Path,
@@ -741,6 +751,16 @@ mod tests {
         let t = RecordingTransport::new(json!({ "ok": true }));
         release_workspace(&t, "lease-7").await.unwrap();
         assert_eq!(t.argv(), ["--json", "workspace", "release", "--lease", "lease-7"]);
+    }
+
+    #[tokio::test]
+    async fn release_workspace_with_reset_builds_argv() {
+        let t = RecordingTransport::new(json!({ "ok": true }));
+        release_workspace_with_reset(&t, "lease-7").await.unwrap();
+        assert_eq!(
+            t.argv(),
+            ["--json", "workspace", "release", "--lease", "lease-7", "--force-reset"]
+        );
     }
 
     #[tokio::test]

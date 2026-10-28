@@ -48,17 +48,28 @@ impl WorkerCompletionHandler {
             );
             return ForceReleaseOutcome::HeldForRemoteWorker;
         }
-        if matches!(
-            self.pane_releaser.release_proven_dead_remote_pane(execution_id).await,
-            PaneReleaseOutcome::NoLiveWorker
-        ) {
-            tracing::info!(
-                execution_id,
-                "force_release: no live worker pane mapped (mid-spawn or already released); \
-                 leaving the cube lease held — the in-flight run releases it after reaping, \
-                 so an occupied workspace is never re-leased",
-            );
-            return ForceReleaseOutcome::HeldForInFlightSpawn;
+        let pane_outcome = self.pane_releaser.release_proven_dead_remote_pane(execution_id).await;
+        if matches!(pane_outcome, PaneReleaseOutcome::NoLiveWorker) {
+            let execution = match self.work_db.get_execution(execution_id) {
+                Ok(execution) => execution,
+                Err(_) => return ForceReleaseOutcome::WorkspaceColumnClearFailed,
+            };
+            if !execution.status.is_terminal() || execution.started_at.is_some() {
+                tracing::info!(
+                    execution_id,
+                    "force_release: no live worker pane mapped (mid-spawn or already released); \
+                     leaving the cube lease held — the in-flight run releases it after reaping, \
+                     so an occupied workspace is never re-leased",
+                );
+                return ForceReleaseOutcome::HeldForInFlightSpawn;
+            }
+            // Terminal, never started, never mapped a pane: pre-start leftover.
+            return self
+                .release_held_lease(
+                    &execution,
+                    crate::workspace_lease_release::TerminalCause::ProvenNeverStarted,
+                )
+                .await;
         }
 
         // Remote leases belong to the owning host. Keep the durable lease
@@ -89,43 +100,48 @@ impl WorkerCompletionHandler {
             }
         }
 
-        // Cube release: claim ownership of the lease id atomically by
-        // clearing it from the DB row before calling the cube CLI.
-        // A concurrent caller will see `None` and skip.
-        let cleared = match self.work_db.clear_execution_workspace(execution_id) {
-            Ok(Some(cleared)) => cleared,
-            Ok(None) => return ForceReleaseOutcome::NoLeaseHeld,
-            Err(err) => {
-                tracing::warn!(
-                    execution_id,
-                    ?err,
-                    "force_release: failed to clear execution workspace columns",
-                );
-                return ForceReleaseOutcome::WorkspaceColumnClearFailed;
-            }
+        let execution = match self.work_db.get_execution(execution_id) {
+            Ok(execution) => execution,
+            Err(_) => return ForceReleaseOutcome::WorkspaceColumnClearFailed,
         };
-        let lease_id = cleared.lease_id;
-        // Stop termination path (force_release backs `bossctl agents stop`,
-        // cascade cancel, and every other explicit teardown): tear down any
-        // driver-owned state outside the workspace, using the path captured
-        // before `clear_execution_workspace` nulled it.
         crate::driver_teardown::teardown_driver_workspace(
             &self.work_db,
             execution_id,
-            cleared.workspace_path.as_deref().map(std::path::Path::new),
+            execution.workspace_path.as_deref().map(std::path::Path::new),
             crate::driver_teardown::TeardownReason::ForceRelease,
         )
         .await;
-        if let Err(err) = self.cube_client.release_workspace(&lease_id).await {
-            tracing::warn!(
-                execution_id,
-                lease_id,
-                ?err,
-                "force_release: cube workspace release failed",
-            );
-            return ForceReleaseOutcome::LeaseReleaseFailed { lease_id };
+        self.release_held_lease(&execution, crate::workspace_lease_release::TerminalCause::ProvenStopped)
+            .await
+    }
+
+    async fn release_held_lease(
+        &self,
+        execution: &boss_protocol::WorkExecution,
+        cause: crate::workspace_lease_release::TerminalCause,
+    ) -> ForceReleaseOutcome {
+        let Some(lease_id) = execution.cube_lease_id.clone() else {
+            return ForceReleaseOutcome::NoLeaseHeld;
+        };
+        match crate::workspace_lease_release::apply_release(
+            &self.work_db,
+            execution,
+            &lease_id,
+            cause,
+            crate::workspace_lease_release::PaneStatus::Gone,
+            &crate::workspace_lease_release::EmptyOccupancy,
+            &crate::workspace_lease_release::DbBookmarkGate { db: &self.work_db },
+            self.cube_client.release_workspace_with_reset(&lease_id),
+        )
+        .await
+        {
+            crate::workspace_lease_release::LeaseReleaseOutcome::Released => ForceReleaseOutcome::Released { lease_id },
+            crate::workspace_lease_release::LeaseReleaseOutcome::NoLease => ForceReleaseOutcome::NoLeaseHeld,
+            crate::workspace_lease_release::LeaseReleaseOutcome::Kept { .. }
+            | crate::workspace_lease_release::LeaseReleaseOutcome::CubeFailed { .. } => {
+                ForceReleaseOutcome::LeaseReleaseFailed { lease_id }
+            }
         }
-        ForceReleaseOutcome::Released { lease_id }
     }
 
     /// Stop a worker whose task was dragged back to Backlog by the user.

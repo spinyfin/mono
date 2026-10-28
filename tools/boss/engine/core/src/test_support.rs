@@ -822,12 +822,21 @@ macro_rules! stub_cube_client {
 
     // ── release_workspace ───────────────────────────────────────────────────
     (@munch $ty:ty [$($acc:tt)*] @release_workspace async fn release_workspace $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn release_workspace $a -> $r $b] @workspace_status $($rest)*);
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn release_workspace $a -> $r $b] @release_workspace_with_reset $($rest)*);
     };
     (@munch $ty:ty [$($acc:tt)*] @release_workspace $($rest:tt)*) => {
         $crate::stub_cube_client!(@munch $ty [$($acc)*
             async fn release_workspace(&self, _lease_id: &str) -> ::anyhow::Result<()> { ::core::unimplemented!() }
-        ] @workspace_status $($rest)*);
+        ] @release_workspace_with_reset $($rest)*);
+    };
+
+    // ── release_workspace_with_reset ────────────────────────────────────────
+    // Has a trait default (delegates to release_workspace).
+    (@munch $ty:ty [$($acc:tt)*] @release_workspace_with_reset async fn release_workspace_with_reset $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn release_workspace_with_reset $a -> $r $b] @workspace_status $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @release_workspace_with_reset $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)*] @workspace_status $($rest)*);
     };
 
     // ── workspace_status ────────────────────────────────────────────────────
@@ -955,12 +964,20 @@ macro_rules! stub_host_adapter {
 
     // ── release_workspace ───────────────────────────────────────────────────
     (@munch $ty:ty [$($acc:tt)*] @release_workspace async fn release_workspace $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn release_workspace $a -> $r $b] @probe_initial_input_alive $($rest)*);
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn release_workspace $a -> $r $b] @release_workspace_with_reset $($rest)*);
     };
     (@munch $ty:ty [$($acc:tt)*] @release_workspace $($rest:tt)*) => {
         $crate::stub_host_adapter!(@munch $ty [$($acc)*
             async fn release_workspace(&self, _lease_id: &str) -> ::anyhow::Result<()> { ::core::unimplemented!() }
-        ] @probe_initial_input_alive $($rest)*);
+        ] @release_workspace_with_reset $($rest)*);
+    };
+
+    // ── release_workspace_with_reset (trait default unless overridden) ──
+    (@munch $ty:ty [$($acc:tt)*] @release_workspace_with_reset async fn release_workspace_with_reset $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn release_workspace_with_reset $a -> $r $b] @probe_initial_input_alive $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @release_workspace_with_reset $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*] @probe_initial_input_alive $($rest)*);
     };
 
     // ── probe_initial_input_alive (trait default unless overridden) ────────

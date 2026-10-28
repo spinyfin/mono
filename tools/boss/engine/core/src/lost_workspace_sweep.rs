@@ -334,7 +334,7 @@ async fn reconcile_if_execution_dead_at(
                 "lost-workspace reconcile: finalized execution whose workspace directory is gone",
             );
             release_reconciled_persona(work_db, execution);
-            maybe_force_release_reconciled_lease(execution, cube_client).await;
+            maybe_force_release_reconciled_lease(work_db, execution, cube_client).await;
         }
 
         return reconciled;
@@ -432,7 +432,7 @@ async fn reconcile_if_execution_dead_at(
             "execution-liveness reconcile: finalized execution whose worker pane never attached",
         );
         release_reconciled_persona(work_db, execution);
-        maybe_force_release_reconciled_lease(execution, cube_client).await;
+        maybe_force_release_reconciled_lease(work_db, execution, cube_client).await;
     }
 
     reconciled
@@ -457,20 +457,25 @@ fn release_reconciled_persona(work_db: &WorkDb, execution: &WorkExecution) {
     }
 }
 
-/// Best-effort cube lease release after a successful lost-workspace /
+/// Gated cube lease release after a successful lost-workspace /
 /// never-attached reconcile. The workspace is gone or the pane never came
-/// up, so there is no live writer to protect — unlike the pane-pid path,
-/// which gates on the live registry.
-async fn maybe_force_release_reconciled_lease(execution: &WorkExecution, cube_client: Option<&dyn CubeClient>) {
+/// up; occupancy and the recovery bookmark still have to pass before the
+/// lease is actually dropped.
+async fn maybe_force_release_reconciled_lease(
+    work_db: &WorkDb,
+    execution: &WorkExecution,
+    cube_client: Option<&dyn CubeClient>,
+) {
     let Some(cube) = cube_client else {
         return;
     };
     let Some(lease_id) = execution.cube_lease_id.as_deref() else {
         return;
     };
-    crate::execution_liveness::force_release_lease_best_effort(
-        &execution.id,
-        lease_id,
+    crate::workspace_lease_release::release_lease_after_inferred_death(
+        work_db,
+        execution,
+        crate::workspace_lease_release::PaneStatus::Gone,
         cube.force_release_lease(lease_id, Some("execution-liveness reconcile: worker pane gone")),
     )
     .await;

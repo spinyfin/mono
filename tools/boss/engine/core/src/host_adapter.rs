@@ -255,6 +255,12 @@ pub trait HostAdapter: Send + Sync {
 
     async fn release_workspace(&self, lease_id: &str) -> Result<()>;
 
+    /// End-of-run release that resets the working copy. Defaults to
+    /// [`Self::release_workspace`].
+    async fn release_workspace_with_reset(&self, lease_id: &str) -> Result<()> {
+        self.release_workspace(lease_id).await
+    }
+
     /// Missing attempt PID evidence is inconclusive, never proof of death.
     async fn probe_initial_input_alive(&self, _workspace: &str, _run_id: &str) -> Result<Option<bool>> {
         Ok(None)
@@ -640,6 +646,10 @@ impl HostAdapter for LocalHostAdapter {
 
     async fn release_workspace(&self, lease_id: &str) -> Result<()> {
         self.cube_client.release_workspace(lease_id).await
+    }
+
+    async fn release_workspace_with_reset(&self, lease_id: &str) -> Result<()> {
+        self.cube_client.release_workspace_with_reset(lease_id).await
     }
 
     async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()> {
@@ -1245,6 +1255,10 @@ impl HostAdapter for SshHostAdapter {
 
     async fn release_workspace(&self, lease_id: &str) -> Result<()> {
         crate::cube_commands::release_workspace(self, lease_id).await
+    }
+
+    async fn release_workspace_with_reset(&self, lease_id: &str) -> Result<()> {
+        crate::cube_commands::release_workspace_with_reset(self, lease_id).await
     }
 
     async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()> {
@@ -1963,6 +1977,10 @@ impl CubeClient for HostAdapterCubeClient {
 
     async fn release_workspace(&self, lease_id: &str) -> Result<()> {
         self.adapter.release_workspace(lease_id).await
+    }
+
+    async fn release_workspace_with_reset(&self, lease_id: &str) -> Result<()> {
+        self.adapter.release_workspace_with_reset(lease_id).await
     }
 
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus> {

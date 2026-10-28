@@ -170,6 +170,28 @@ impl WorkDb {
         }
     }
 
+    /// Put a lease back on a terminal row after a cube release failed.
+    /// Fills only currently-NULL columns so a row that still holds the
+    /// lease is left alone.
+    pub fn restore_execution_workspace(
+        &self,
+        execution_id: &str,
+        lease_id: &str,
+        workspace_id: Option<&str>,
+        workspace_path: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE work_executions
+             SET cube_lease_id = COALESCE(cube_lease_id, ?2),
+                 cube_workspace_id = COALESCE(cube_workspace_id, ?3),
+                 workspace_path = COALESCE(workspace_path, ?4)
+             WHERE id = ?1",
+            params![execution_id, lease_id, workspace_id, workspace_path],
+        )?;
+        Ok(())
+    }
+
     /// Preserve the workspace the engine assigned to an execution as its
     /// durable recovery preference before teardown clears the live lease
     /// columns. Used when a parent-PR merge converts a live review revision

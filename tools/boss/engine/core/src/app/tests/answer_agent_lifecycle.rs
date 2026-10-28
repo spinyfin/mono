@@ -139,7 +139,7 @@ async fn stop_hook_through_the_events_socket(
 /// with its slot back — with no human in the loop and no timeout involved.
 #[tokio::test]
 async fn a_delivered_answer_completes_the_execution_and_frees_its_slot_on_the_turn_boundary() {
-    let (server_state, _dir) = test_server_state();
+    let (server_state, _dir) = test_server_state_with_fakes();
     let slot_id = 8;
     let (comment_id, run_id, execution_id) = seed_parked_answer_agent(&server_state, slot_id);
     post_the_reply(&server_state, &comment_id, &run_id);
@@ -195,7 +195,7 @@ async fn a_delivered_answer_completes_the_execution_and_frees_its_slot_on_the_tu
 /// ends without ever answering must also reach a terminal execution, not park.
 #[tokio::test]
 async fn an_agent_that_never_replied_still_completes_on_the_turn_boundary() {
-    let (server_state, _dir) = test_server_state();
+    let (server_state, _dir) = test_server_state_with_fakes();
     let slot_id = 8;
     let (comment_id, run_id, execution_id) = seed_parked_answer_agent(&server_state, slot_id);
 

@@ -625,10 +625,13 @@ async fn reap_confirmed_candidates(
             // this sweep is the terminalizer for this candidate — nothing else
             // will free the lease once the row drops out of every
             // lease-reclaim path's non-terminal filter.
-            if let Some(lease_id) = candidate.cube_lease_id.as_deref() {
-                crate::execution_liveness::force_release_lease_best_effort(
-                    &candidate.run_id,
-                    lease_id,
+            if let Some(lease_id) = candidate.cube_lease_id.as_deref()
+                && let Ok(execution) = work_db.get_execution(&candidate.run_id)
+            {
+                crate::workspace_lease_release::release_lease_after_inferred_death(
+                    work_db,
+                    &execution,
+                    crate::workspace_lease_release::PaneStatus::Gone,
                     cube_client.force_release_lease(
                         lease_id,
                         Some("terminal-work sweep: bound work item row no longer exists"),
@@ -1316,6 +1319,15 @@ mod tests {
         let cube = RecordingCubeClient::default();
         let lease_id = "lease-25";
         force_cube_lease_id(&db, &execution_id, lease_id);
+        let workspace = tempfile::tempdir().unwrap();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET workspace_path = ?2 WHERE id = ?1",
+                rusqlite::params![execution_id, workspace.path().display().to_string()],
+            )
+            .unwrap();
+        }
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let teardown = TeardownRegistry::new();
         let mut seen = HashSet::new();

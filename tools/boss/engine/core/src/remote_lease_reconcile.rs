@@ -528,25 +528,20 @@ async fn release_terminal_remote_resources(
         tracing::warn!(?error, "remote input cleanup failed; retaining lease for retry");
         return;
     }
-    let Some(lease_id) = execution.cube_lease_id.as_deref() else {
+    let Some(lease_id) = execution.cube_lease_id.clone() else {
         return;
     };
-    match adapter
-        .force_release_lease(lease_id, Some("remote-lease reconcile: worker process gone"))
-        .await
-    {
-        Ok(()) => {
-            if let Err(err) = work_db.clear_execution_workspace(&execution.id) {
-                tracing::warn!(execution_id = %execution.id, ?err, "remote-lease reconcile: clearing lease columns failed");
-            }
-        }
-        Err(err) => tracing::warn!(
-            execution_id = %execution.id,
-            lease_id,
-            error = %format!("{err:#}"),
-            "remote-lease reconcile: terminal remote lease release failed; will retry",
-        ),
-    }
+    crate::workspace_lease_release::apply_release(
+        work_db,
+        &execution,
+        &lease_id,
+        crate::workspace_lease_release::TerminalCause::ProvenStopped,
+        crate::workspace_lease_release::PaneStatus::Gone,
+        &crate::workspace_lease_release::EmptyOccupancy,
+        &crate::workspace_lease_release::DbBookmarkGate { db: work_db },
+        adapter.force_release_lease(&lease_id, Some("remote-lease reconcile: worker process gone")),
+    )
+    .await;
 }
 
 async fn release_persona_only(

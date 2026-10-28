@@ -153,53 +153,28 @@ impl ExecutionCoordinator {
             // normal completion recording — the row is already
             // `cancelled`, so `finish_execution_run` would reject it.
             Ok(outcome) if outcome.wait_state == RunWaitState::CancelledDuringSpawn => {
-                // Claim ownership of the lease atomically before calling
-                // cube, mirroring `force_release`: whichever path clears
-                // the workspace columns first owns the release, so a
-                // concurrent `force_release` and this branch can't issue
-                // a duplicate cube release against the same lease.
-                let released = match self.work_db.clear_execution_workspace(&execution.id) {
-                    Ok(Some(cleared)) => {
-                        // Stop termination path (mid-spawn cancel): tear
-                        // down any driver-owned state outside the
-                        // workspace, using the path captured before
-                        // `clear_execution_workspace` nulled it. Called
-                        // unconditionally (not gated on a workspace path)
-                        // since a driver may key its out-of-workspace state
-                        // by run id alone.
-                        crate::driver_teardown::teardown_driver_workspace(
-                            &self.work_db,
-                            &execution.id,
-                            cleared.workspace_path.as_deref().map(std::path::Path::new),
-                            crate::driver_teardown::TeardownReason::CancelledDuringSpawn,
-                        )
-                        .await;
-                        match adapter.release_workspace(&cleared.lease_id).await {
-                            Ok(()) => true,
-                            Err(err) => {
-                                tracing::error!(
-                                    ?err,
-                                    execution_id = %execution.id,
-                                    run_id = %run.id,
-                                    lease_id = %cleared.lease_id,
-                                    "failed to release deferred lease after mid-spawn cancel",
-                                );
-                                false
-                            }
-                        }
-                    }
-                    // Already cleared by a racing force_release that saw
-                    // the slot mapped and reaped + released itself.
-                    Ok(None) => false,
-                    Err(err) => {
-                        tracing::error!(
-                            ?err,
-                            execution_id = %execution.id,
-                            "failed to clear workspace columns after mid-spawn cancel",
-                        );
-                        false
-                    }
-                };
+                crate::driver_teardown::teardown_driver_workspace(
+                    &self.work_db,
+                    &execution.id,
+                    execution.workspace_path.as_deref().map(std::path::Path::new),
+                    crate::driver_teardown::TeardownReason::CancelledDuringSpawn,
+                )
+                .await;
+                let released = matches!(
+                    crate::workspace_lease_release::apply_release(
+                        &self.work_db,
+                        &execution,
+                        &lease.lease_id,
+                        crate::workspace_lease_release::TerminalCause::ProvenStopped,
+                        crate::workspace_lease_release::PaneStatus::Gone,
+                        &crate::workspace_lease_release::EmptyOccupancy,
+                        &crate::workspace_lease_release::DbBookmarkGate { db: &self.work_db },
+                        adapter.release_workspace_with_reset(&lease.lease_id),
+                    )
+                    .await,
+                    crate::workspace_lease_release::LeaseReleaseOutcome::Released
+                        | crate::workspace_lease_release::LeaseReleaseOutcome::NoLease
+                );
                 tracing::warn!(
                     execution_id = %execution.id,
                     run_id = %run.id,
@@ -455,19 +430,21 @@ impl ExecutionCoordinator {
                         crate::driver_teardown::TeardownReason::SpawnFailed,
                     )
                     .await;
-                    match adapter.release_workspace(&lease.lease_id).await {
-                        Ok(()) => true,
-                        Err(release_err) => {
-                            tracing::error!(
-                                ?release_err,
-                                execution_id = %execution.id,
-                                run_id = %run.id,
-                                lease_id = %lease.lease_id,
-                                "failed to release workspace after run failure"
-                            );
-                            false
-                        }
-                    }
+                    matches!(
+                        crate::workspace_lease_release::apply_release(
+                            &self.work_db,
+                            &execution,
+                            &lease.lease_id,
+                            crate::workspace_lease_release::TerminalCause::ProvenStopped,
+                            crate::workspace_lease_release::PaneStatus::Gone,
+                            &crate::workspace_lease_release::EmptyOccupancy,
+                            &crate::workspace_lease_release::DbBookmarkGate { db: &self.work_db },
+                            adapter.release_workspace_with_reset(&lease.lease_id),
+                        )
+                        .await,
+                        crate::workspace_lease_release::LeaseReleaseOutcome::Released
+                            | crate::workspace_lease_release::LeaseReleaseOutcome::NoLease
+                    )
                 };
                 // Persist the same full cause chain the abort log and
                 // attention body already use (`{err:#}`). `Display` without
@@ -1095,19 +1072,21 @@ impl ExecutionCoordinator {
         }
 
         let released = if release_workspace {
-            match adapter.release_workspace(&lease.lease_id).await {
-                Ok(()) => true,
-                Err(err) => {
-                    tracing::error!(
-                        ?err,
-                        execution_id = %execution.id,
-                        run_id = %run.id,
-                        lease_id = %lease.lease_id,
-                        "failed to release workspace after successful run"
-                    );
-                    false
-                }
-            }
+            matches!(
+                crate::workspace_lease_release::apply_release(
+                    &self.work_db,
+                    execution,
+                    &lease.lease_id,
+                    crate::workspace_lease_release::TerminalCause::ProvenCompleted,
+                    crate::workspace_lease_release::PaneStatus::Gone,
+                    &crate::workspace_lease_release::EmptyOccupancy,
+                    &crate::workspace_lease_release::DbBookmarkGate { db: &self.work_db },
+                    adapter.release_workspace_with_reset(&lease.lease_id),
+                )
+                .await,
+                crate::workspace_lease_release::LeaseReleaseOutcome::Released
+                    | crate::workspace_lease_release::LeaseReleaseOutcome::NoLease
+            )
         } else {
             false
         };

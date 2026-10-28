@@ -103,11 +103,11 @@ impl WorkDb {
     ///
     /// The workspace lease columns (`cube_lease_id`,
     /// `cube_workspace_id`, `workspace_path`) are intentionally left
-    /// intact. The brief is explicit: do NOT release the cube
-    /// workspace lease here — the workspace may still have in-flight
-    /// commits from the dead worker that a fresh execution should
-    /// resume against. Lease cleanup is a separate concern (cube TTL
-    /// expiry or explicit `bossctl agents stop`).
+    /// intact. Resume reads preserved work from `boss-recovery/<execution>`
+    /// bookmarks, not this working copy; [`crate::workspace_lease_release`]
+    /// releases the lease once the bookmark is confirmed and no process
+    /// still has its cwd inside the workspace. If those gates fail the
+    /// columns stay so a later pass can retry; cube's TTL is the backstop.
     ///
     /// Any non-terminal `work_runs` rows attached to the execution are
     /// stamped `orphaned` with the same reason recorded as
@@ -839,6 +839,26 @@ impl WorkDb {
                     pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
              FROM work_executions
              WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+               AND cube_lease_id IS NOT NULL
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([], map_execution)?;
+        collect_rows(rows)
+    }
+
+    /// Terminal rows that still record a cube lease — leftover from a
+    /// completion path that nulled too early, an inferred-death path that
+    /// kept the columns for provenance, or a cube release that failed.
+    /// The ended-run lease sweep uses this as its candidate set.
+    pub fn list_terminal_executions_holding_lease(&self) -> Result<Vec<WorkExecution>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                    cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                    created_at, started_at, finished_at,
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+             FROM work_executions
+             WHERE status IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND cube_lease_id IS NOT NULL
              ORDER BY created_at ASC, id ASC",
         )?;
@@ -1803,6 +1823,11 @@ impl WorkDb {
     /// [`PreStartFailureOutcome::PermanentFail`] (the terminal failed
     /// bookkeeping row). On [`PreStartFailureOutcome::Retry`] it is
     /// `None` — no `work_runs` row was written.
+    ///
+    /// Lease columns are left as they stand. Dispatch persists the lease on
+    /// acquire and releases it through [`crate::workspace_lease_release`];
+    /// clearing here would hide a cube-release failure from the leftover
+    /// sweep.
     pub fn record_pre_start_failure(
         &self,
         execution_id: &str,
@@ -1826,6 +1851,9 @@ impl WorkDb {
         let new_count = execution.pre_start_failure_count + 1;
         let max_retries = retry_delays.len() as i64;
         let from_status = execution.status.clone();
+        // Lease columns stay. The pre-start path persists the lease on
+        // acquire and releases through `workspace_lease_release`; clearing
+        // here would hide a cube-release failure from the leftover-lease sweep.
 
         let (outcome, run_id) = if new_count <= max_retries {
             let delay = retry_delays[(new_count - 1) as usize];
@@ -1836,9 +1864,6 @@ impl WorkDb {
                  SET status = 'ready',
                      pre_start_failure_count = ?2,
                      cube_repo_id = COALESCE(?3, cube_repo_id),
-                     cube_lease_id = NULL,
-                     cube_workspace_id = NULL,
-                     workspace_path = NULL,
                      started_at = NULL,
                      finished_at = NULL,
                      dispatch_not_before = ?4,
@@ -1863,9 +1888,6 @@ impl WorkDb {
                  SET status = 'failed',
                      pre_start_failure_count = ?2,
                      cube_repo_id = COALESCE(?3, cube_repo_id),
-                     cube_lease_id = NULL,
-                     cube_workspace_id = NULL,
-                     workspace_path = NULL,
                      finished_at = ?4,
                      last_error = ?5
                  WHERE id = ?1

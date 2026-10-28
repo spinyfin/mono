@@ -51,7 +51,7 @@
 //! lease + workspace *columns* on the row for provenance). This sweep's
 //! redispatch path creates a fresh execution that never reclaims that lease
 //! in place, so a successful reconcile follows up with a best-effort
-//! [`crate::execution_liveness::force_release_lease_best_effort`] — gated on
+//! [`crate::workspace_lease_release::release_lease_after_inferred_death`] — gated on
 //! the absence of a non-terminal live-registry entry, because this reconcile
 //! is DB-only and does not tear the worker process down. Triage
 //! automation-run bookkeeping is finalized the same way
@@ -505,9 +505,10 @@ pub async fn reconcile_if_pane_dead(
                      still tracks this execution — worker may still be writing the workspace",
                 );
             } else {
-                crate::execution_liveness::force_release_lease_best_effort(
-                    &execution.id,
-                    lease_id,
+                crate::workspace_lease_release::release_lease_after_inferred_death(
+                    work_db,
+                    execution,
+                    crate::workspace_lease_release::PaneStatus::Gone,
                     cube.force_release_lease(lease_id, Some("pane-death reconcile: worker pane gone")),
                 )
                 .await;

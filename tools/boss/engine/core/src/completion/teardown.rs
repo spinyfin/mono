@@ -200,39 +200,58 @@ impl WorkerCompletionHandler {
         if let Some(lease_id) = lease_id {
             let release = async {
                 match owning_cube {
-                    Ok(resolved) if resolved.is_local() => self.cube_client.release_workspace(lease_id).await,
+                    Ok(resolved) if resolved.is_local() => {
+                        self.cube_client.release_workspace_with_reset(lease_id).await
+                    }
                     Ok(resolved) => resolved.cube.force_release_lease(lease_id, Some(path)).await,
                     Err(err) => Err(err),
                 }
             };
-            match tokio::time::timeout(CUBE_RELEASE_TIMEOUT, release).await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => tracing::error!(
+            let timed = async {
+                match tokio::time::timeout(CUBE_RELEASE_TIMEOUT, release).await {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        cube_timed_out = true;
+                        Err(anyhow::anyhow!(
+                            "cube workspace release timed out after {}s",
+                            CUBE_RELEASE_TIMEOUT.as_secs()
+                        ))
+                    }
+                }
+            };
+            match self.work_db.get_execution(execution_id) {
+                Ok(execution) => {
+                    let outcome = crate::workspace_lease_release::apply_release(
+                        &self.work_db,
+                        &execution,
+                        lease_id,
+                        crate::workspace_lease_release::TerminalCause::ProvenCompleted,
+                        crate::workspace_lease_release::PaneStatus::Gone,
+                        &crate::workspace_lease_release::EmptyOccupancy,
+                        &crate::workspace_lease_release::DbBookmarkGate { db: &self.work_db },
+                        timed,
+                    )
+                    .await;
+                    if !matches!(
+                        outcome,
+                        crate::workspace_lease_release::LeaseReleaseOutcome::Released
+                            | crate::workspace_lease_release::LeaseReleaseOutcome::NoLease
+                    ) {
+                        tracing::error!(
+                            execution_id,
+                            lease_id,
+                            outcome = ?outcome,
+                            "worker teardown: cube lease was not released",
+                        );
+                    }
+                }
+                Err(err) => tracing::error!(
                     execution_id,
                     path,
                     lease_id,
                     ?err,
-                    elapsed_ms = cube_started.elapsed().as_millis(),
-                    "worker teardown: cube workspace release failed",
+                    "worker teardown: execution lookup failed; cube release skipped",
                 ),
-                Err(_elapsed) => {
-                    cube_timed_out = true;
-                    // The lease columns were already cleared by the
-                    // terminalizing write, so nothing downstream will retry
-                    // this release. Cube's own lease TTL reclaims it once the
-                    // engine's heartbeat stops (it stops the moment the
-                    // execution goes terminal), so the workspace is not lost
-                    // — but the operator should see that it took the slow
-                    // path.
-                    tracing::error!(
-                        execution_id,
-                        path,
-                        lease_id,
-                        timeout_secs = CUBE_RELEASE_TIMEOUT.as_secs(),
-                        "worker teardown: cube workspace release timed out and was abandoned; \
-                         the lease is left to cube's TTL reclaim",
-                    );
-                }
             }
         }
         let cube_ms = cube_started.elapsed().as_millis();

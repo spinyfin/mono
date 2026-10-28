@@ -2339,12 +2339,12 @@ impl ExecutionCoordinator {
                 return;
             }
         };
-        if let Some(lease_id) = current.cube_lease_id.as_deref() {
-            crate::execution_liveness::force_release_lease_best_effort(
-                &current.id,
-                lease_id,
-                self.host_adapter()
-                    .force_release_lease(lease_id, Some("schedule_execution_error")),
+        if let Some(lease_id) = current.cube_lease_id.clone() {
+            crate::workspace_lease_release::release_lease_after_proven_never_started(
+                &self.work_db,
+                &current,
+                &lease_id,
+                self.host_adapter().release_workspace_with_reset(&lease_id),
             )
             .await;
         }
