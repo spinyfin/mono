@@ -1847,9 +1847,16 @@ mod compose_worker_spawn_tests {
         );
         assert_eq!(composed.embedded_output_path, None);
         assert!(
-            composed
+            !composed
                 .prompt_text
-                .contains("Follow the question-writing contract in the generated worker rules.")
+                .contains("Follow the question-writing contract in the generated worker rules."),
+            "pr_review fallback must not point at a Standard-only rules section:\n{}",
+            composed.prompt_text,
+        );
+        assert!(
+            !composed.prompt_text.contains("--question"),
+            "pr_review fallback must not teach question flags it cannot file:\n{}",
+            composed.prompt_text,
         );
         let input = crate::worker_setup::WorkerSetupInput::builder()
             .run_id("review-1")
@@ -1862,7 +1869,7 @@ mod compose_worker_spawn_tests {
             .run_done_proposals_seam_enabled(true)
             .build();
         let rules = crate::worker_setup::render_claude_md(&input, "", ".claude");
-        assert!(rules.contains("## Write questions for someone arriving cold"));
+        assert!(!rules.contains("## Write questions for someone arriving cold"));
     }
 
     /// A missing automation row degrades an automation-triage execution to
@@ -1888,7 +1895,10 @@ mod compose_worker_spawn_tests {
             &task_without_pr("task-triage-1"),
             workspace.path(),
             None,
-            WorkerSpawnOpts::default(),
+            WorkerSpawnOpts {
+                run_done_proposals_seam_enabled: true,
+                ..WorkerSpawnOpts::default()
+            },
         )
         .await
         .unwrap();
@@ -1898,6 +1908,25 @@ mod compose_worker_spawn_tests {
             crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::TriageDecision);
         assert_eq!(composed.embedded_output_path, None);
         assert!(!composed.prompt_text.contains(&triage_path));
+        assert!(
+            !composed
+                .prompt_text
+                .contains("Follow the question-writing contract in the generated worker rules."),
+            "triage fallback must not point at a Standard-only rules section:\n{}",
+            composed.prompt_text,
+        );
+        let input = crate::worker_setup::WorkerSetupInput::builder()
+            .run_id("worker-1")
+            .execution_kind(execution.kind.as_str())
+            .lease_id("lease-1")
+            .workspace_path(workspace.path().to_path_buf())
+            .events_socket_path(workspace.path().join("events.sock"))
+            .boss_event_path(workspace.path().join("boss-event"))
+            .worker_kind(crate::worker_setup::worker_kind_for_execution(&execution.kind))
+            .run_done_proposals_seam_enabled(true)
+            .build();
+        let rules = crate::worker_setup::render_claude_md(&input, "", ".claude");
+        assert!(!rules.contains("## Write questions for someone arriving cold"));
     }
 
     /// When a `pr_review` execution has a `pr_url`, `compose_worker_spawn`

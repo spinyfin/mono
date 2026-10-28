@@ -819,8 +819,8 @@ fn render_merged_parent_deletion_block(deletions: &[String]) -> String {
         "This PR resolves a merge / forward-port. The engine diffed the \
          resolution against **both merge parents** (not just `main`) and found \
          that it **removes surfaces a MERGED parent added** — functionality that \
-         already landed and that this resolution drops. This is the exact \
-         incident-002 failure class: a forward-port deleting a just-merged \
+         already landed and that this resolution drops. This is the \
+         Forward-port failure class: a forward-port deleting a just-merged \
          feature and calling it \"superseded\".\n\n\
          This finding is **rationale-independent** — it is anchored on the fact \
          that a merged parent lost functionality, NOT on the worker's stated \
@@ -1222,6 +1222,8 @@ mod tests {
         assert!(prompt.contains("Merged-parent deletion tripwire (engine-computed)"));
         assert!(prompt.contains("RecommendationBadge.tsx"));
         assert!(prompt.contains("rationale-independent"));
+        assert!(prompt.contains("Forward-port failure class"));
+        assert!(!prompt.contains("incident-002"));
         // Authoritative supersession-language block.
         assert!(prompt.contains("Supersession-claim citation check (engine-flagged)"));
         assert!(prompt.contains("supersedes"));

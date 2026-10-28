@@ -511,7 +511,7 @@ fn static_question_contract_lives_in_generated_rules() {
 }
 
 #[test]
-fn question_contract_requires_enabled_channel_for_every_worker_kind() {
+fn question_contract_requires_standard_worker_and_enabled_channel() {
     for kind in [
         WorkerKind::Standard,
         WorkerKind::Reviewer,
@@ -526,7 +526,7 @@ fn question_contract_requires_enabled_channel_for_every_worker_kind() {
             let rendered = claude_md_for(&input);
             assert_eq!(
                 rendered.contains("## Write questions for someone arriving cold"),
-                enabled
+                kind == WorkerKind::Standard && enabled
             );
             assert!(!rendered.contains("### Write questions"));
         }
