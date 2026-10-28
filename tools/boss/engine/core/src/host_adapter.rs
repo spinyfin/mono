@@ -2183,7 +2183,7 @@ pub(crate) async fn resolve_host_adapter(
     Ok(adapter)
 }
 
-/// Stage the real launch artifacts through the same injectable transport as spawn.
+/// Render generated rules and ship them to the remote agent-rules destination.
 pub(crate) async fn stage_remote_agent_rules(
     transport: &dyn crate::ssh_spawn::SshExec,
     input: &WorkerSetupInput,
@@ -2204,6 +2204,7 @@ pub(crate) async fn stage_remote_agent_rules(
     .await
 }
 
+/// Stage the real launch artifacts through the same injectable transport as spawn.
 pub(crate) async fn stage_remote_initial_input(
     transport: &dyn crate::ssh_spawn::SshExec,
     run_id: &str,

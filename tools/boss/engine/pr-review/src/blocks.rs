@@ -28,8 +28,8 @@ pub fn render_supersession_flag_block(flag_lines: &[String]) -> String {
         "For EACH flagged replacement or obsolescence claim below, require design authorization: \
          verify a specific design doc citation (path + section), read it, and raise a `regression` \
          finding if it is absent or does not support replacement. A clean build, apparent dead \
-         code, or this PR removing the only caller is not authorization. Restore the removal \
-         or escalate; do not accept the narrative at face value.\n\nFlagged phrases:\n\n",
+         code, or this PR removing the only caller is not authorization. The finding should require restoring the removed surface \
+         or escalating; do not accept the narrative at face value.\n\nFlagged phrases:\n\n",
     );
     for line in flag_lines {
         out.push_str(&format!("- {line}\n"));

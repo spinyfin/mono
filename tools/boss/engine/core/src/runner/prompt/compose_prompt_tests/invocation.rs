@@ -256,6 +256,40 @@ fn run_done_seam_on_worker_signal_seam_off_teaches_summary_not_blocked_verb() {
 }
 
 #[test]
+fn run_done_directive_omits_question_contract_for_non_standard_kinds() {
+    for kind in [
+        ExecutionKind::PrReview,
+        ExecutionKind::AutomationTriage,
+        ExecutionKind::AnswerAgent,
+        ExecutionKind::PrReviewGuide,
+    ] {
+        let mut execution = base_execution();
+        execution.kind = kind.clone();
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&execution)
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .run_done_proposals_seam_enabled(true)
+                .build(),
+        );
+        assert!(
+            prompt.contains("## Declaring your run finished"),
+            "{kind:?} fallback still teaches propose done:\n{prompt}",
+        );
+        assert!(
+            !prompt.contains("Follow the question-writing contract in the generated worker rules."),
+            "{kind:?} fallback must not point at a Standard-only rules section:\n{prompt}",
+        );
+        assert!(
+            !prompt.contains("--question"),
+            "{kind:?} fallback must not teach question flags it cannot file:\n{prompt}",
+        );
+    }
+}
+
+#[test]
 fn run_done_seam_on_worker_signal_seam_on_teaches_propose_blocked() {
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
@@ -532,5 +566,42 @@ fn every_block_boundary_kind_emits_check_prohibition_once() {
             assert_eq!(prompt.matches("**Hard constraint").count(), 1, "{kind:?}");
             assert!(prompt.contains("exclusions/allowlists"));
         }
+    }
+}
+
+#[test]
+fn revision_attempts_emit_check_prohibition_once() {
+    let conflict = sample_conflict_attempt();
+    let fix = super::sample_ci_attempt();
+    let mut queue = fix.clone();
+    queue.failure_kind = Some("trunk_queue_eviction".into());
+    for enabled in [false, true] {
+        for (conflict, ci) in [(Some(&conflict), None), (None, Some(&fix)), (None, Some(&queue))] {
+            let execution = revision_execution("https://github.com/org/repo/pull/77");
+            let prompt = compose_execution_prompt(
+                ExecutionPromptParams::builder()
+                    .execution(&execution)
+                    .work_item(&chore_without_pr())
+                    .workspace_path(std::path::Path::new("/tmp/workspace"))
+                    .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                    .maybe_conflict_attempt(conflict)
+                    .maybe_ci_attempt(ci)
+                    .run_done_proposals_seam_enabled(enabled)
+                    .build(),
+            );
+            assert_eq!(prompt.matches("**Hard constraint").count(), 1);
+        }
+        let execution = super::ci_remediation_execution("https://github.com/org/repo/pull/77");
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&execution)
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .ci_attempt(&queue)
+                .run_done_proposals_seam_enabled(enabled)
+                .build(),
+        );
+        assert_eq!(prompt.matches("**Hard constraint").count(), 1);
     }
 }

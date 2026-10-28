@@ -24,8 +24,8 @@ use boss_protocol::{
 
 use super::answer_agent_prompt::compose_answer_agent_prompt;
 use super::prompt::{
-    ExecutionPromptParams, compose_execution_prompt, designated_output_kind, render_merge_order_preservation_lines,
-    with_bazel_caching_rule,
+    ExecutionPromptParams, append_bazel_caching_rule, compose_execution_prompt, designated_output_kind,
+    render_merge_order_preservation_lines, with_bazel_caching_rule,
 };
 use super::review_guide_prompt::compose_review_guide_prompt;
 use super::work_item::{
@@ -1086,7 +1086,7 @@ pub(crate) async fn compose_worker_spawn(
         // (exact versioned template + embedded source packet) instead of
         // the ordinary implementer prompt. Its `work_item_id` is the
         // comparison id (see `WorkDb::create_pr_review_guide_execution`).
-        with_bazel_caching_rule(compose_review_guide_prompt(work_db, execution, workspace_path)?)
+        append_bazel_caching_rule(compose_review_guide_prompt(work_db, execution, workspace_path)?)
     } else {
         compose_execution_prompt(
             ExecutionPromptParams::builder()
@@ -1826,7 +1826,10 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            WorkerSpawnOpts::default(),
+            WorkerSpawnOpts {
+                run_done_proposals_seam_enabled: true,
+                ..WorkerSpawnOpts::default()
+            },
         )
         .await
         .unwrap();
@@ -1843,6 +1846,30 @@ mod compose_worker_spawn_tests {
             composed.prompt_text,
         );
         assert_eq!(composed.embedded_output_path, None);
+        assert!(
+            !composed
+                .prompt_text
+                .contains("Follow the question-writing contract in the generated worker rules."),
+            "pr_review fallback must not point at a Standard-only rules section:\n{}",
+            composed.prompt_text,
+        );
+        assert!(
+            !composed.prompt_text.contains("--question"),
+            "pr_review fallback must not teach question flags it cannot file:\n{}",
+            composed.prompt_text,
+        );
+        let input = crate::worker_setup::WorkerSetupInput::builder()
+            .run_id("review-1")
+            .execution_kind(execution.kind.as_str())
+            .lease_id("lease-1")
+            .workspace_path(workspace.path().to_path_buf())
+            .events_socket_path(workspace.path().join("events.sock"))
+            .boss_event_path(workspace.path().join("boss-event"))
+            .worker_kind(crate::worker_setup::worker_kind_for_execution(&execution.kind))
+            .run_done_proposals_seam_enabled(true)
+            .build();
+        let rules = crate::worker_setup::render_claude_md(&input, "", ".claude");
+        assert!(!rules.contains("## Write questions for someone arriving cold"));
     }
 
     /// A missing automation row degrades an automation-triage execution to
@@ -1868,7 +1895,10 @@ mod compose_worker_spawn_tests {
             &task_without_pr("task-triage-1"),
             workspace.path(),
             None,
-            WorkerSpawnOpts::default(),
+            WorkerSpawnOpts {
+                run_done_proposals_seam_enabled: true,
+                ..WorkerSpawnOpts::default()
+            },
         )
         .await
         .unwrap();
@@ -1878,6 +1908,25 @@ mod compose_worker_spawn_tests {
             crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::TriageDecision);
         assert_eq!(composed.embedded_output_path, None);
         assert!(!composed.prompt_text.contains(&triage_path));
+        assert!(
+            !composed
+                .prompt_text
+                .contains("Follow the question-writing contract in the generated worker rules."),
+            "triage fallback must not point at a Standard-only rules section:\n{}",
+            composed.prompt_text,
+        );
+        let input = crate::worker_setup::WorkerSetupInput::builder()
+            .run_id("worker-1")
+            .execution_kind(execution.kind.as_str())
+            .lease_id("lease-1")
+            .workspace_path(workspace.path().to_path_buf())
+            .events_socket_path(workspace.path().join("events.sock"))
+            .boss_event_path(workspace.path().join("boss-event"))
+            .worker_kind(crate::worker_setup::worker_kind_for_execution(&execution.kind))
+            .run_done_proposals_seam_enabled(true)
+            .build();
+        let rules = crate::worker_setup::render_claude_md(&input, "", ".claude");
+        assert!(!rules.contains("## Write questions for someone arriving cold"));
     }
 
     /// When a `pr_review` execution has a `pr_url`, `compose_worker_spawn`
@@ -2716,10 +2765,43 @@ mod compose_worker_spawn_tests {
     #[tokio::test]
     async fn review_guide_prompt_omits_jj_recovery_bookmark_instructions() {
         let workspace = TempDir::new().unwrap();
-        let db = open_memory_db();
+        let (_db_dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_product(&db);
+        let root = crate::test_support::create_active_chore(&db, &product, "Review changes");
+        let packet = boss_pr_review_sources::SourcePacket {
+            schema_version: 3,
+            canonical_pr_url: "https://github.com/org/repo/pull/42".into(),
+            pr_number: 42,
+            title: "Review changes".into(),
+            body: None,
+            base_repository: "org/repo".into(),
+            head_repository: "org/repo".into(),
+            observed_base_sha: "base".into(),
+            probe_base_sha: None,
+            merge_base_sha: "merge-base".into(),
+            head_sha: "head".into(),
+            files: vec![],
+            omissions: vec![],
+        };
+        let crate::work::PrSourceCapturePersistOutcome::Stored(capture) = db
+            .persist_pr_review_guide_source_capture(&root, 1, crate::work::PrSourceCaptureTrigger::Creation, &packet)
+            .unwrap()
+        else {
+            panic!("capture must persist")
+        };
+        let git_dir = workspace.path().join(".git").display().to_string();
+        let metadata = boss_review_guide::PromptMetadata::builder()
+            .pr_url(&packet.canonical_pr_url)
+            .repository(&packet.base_repository)
+            .pr_title(&packet.title)
+            .base_sha(&packet.merge_base_sha)
+            .head_sha(&packet.head_sha)
+            .git_dir(&git_dir)
+            .build();
+        let template = boss_review_guide::render_prompt(&metadata);
         let execution = WorkExecution::builder()
             .id("exec_guide_01")
-            .work_item_id("cmp_missing")
+            .work_item_id(&capture.comparison_id)
             .kind(ExecutionKind::PrReviewGuide)
             .status(ExecutionStatus::Running)
             .repo_remote_url("git@github.com:org/repo.git")
@@ -2739,6 +2821,7 @@ mod compose_worker_spawn_tests {
         .await
         .expect("review-guide spawn must compose");
         assert_bazel_caching_rule(&composed.prompt_text);
+        assert!(composed.prompt_text.starts_with(&template));
         assert!(
             !composed.prompt_text.contains("jj bookmark set"),
             "review-guide workers cannot run jj bookmark commands: {}",

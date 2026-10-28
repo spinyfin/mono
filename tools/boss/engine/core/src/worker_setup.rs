@@ -312,6 +312,11 @@ pub struct WorkerSetupInput {
 /// For [`WorkerKind::Reviewer`] workers, returns a reviewer-specific file
 /// that prominently states the read-only mandate and omits PR-creation
 /// instructions (reviewers never open or update PRs).
+///
+/// [`operator_question::GUIDANCE`] is Standard-only: Reviewer, Triage,
+/// AnswerAgent, and ReviewGuide workers cannot file `--question` /
+/// `--explanation` flags, and the generic composer's pointer to this
+/// section is gated on the same predicate.
 pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &str) -> String {
     let mut rules = render_worker_rules_body(input, preamble, config_dir);
     if input.worker_kind == WorkerKind::Standard {

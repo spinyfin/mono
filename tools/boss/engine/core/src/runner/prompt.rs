@@ -9,6 +9,7 @@ use crate::ci_log_reader::{parse_buildkite_build_id, parse_buildkite_pipeline_sl
 use crate::conflict_diagnosis::ConflictDiagnosis;
 use crate::structured_output::StructuredOutputKind;
 use crate::work::{CiRemediation, ConflictResolution, Project, WorkExecution, WorkItem};
+use crate::worker_setup::{WorkerKind, worker_kind_for_execution};
 use boss_protocol::{EditorialRules, ExecutionKind, TaskKind, TemplatePolicy};
 
 use super::work_item::{project_details, work_item_details, work_item_name, work_item_pr_url};
@@ -529,6 +530,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         run_done_proposals_seam_enabled,
         worker_signal_proposals_seam_enabled,
         conflict_attempt.is_some(),
+        worker_kind_for_execution(&execution.kind) == WorkerKind::Standard,
     ));
     prompt.push_str("\nRespond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
@@ -608,7 +610,7 @@ pub(crate) fn bazel_prepush_gate_text(worker_signal_seam_enabled: bool, run_done
         "Emit a `[blocked] reason=\"...\"` marker in your final response naming the failing/timed-out command and its output, and stop (see \"If you are blocked or the work is bigger than estimated\" below for the exact syntax)"
     };
     let clean_bullet = if run_done_seam_enabled {
-        "- Both `bazel build` and `bazel test` must finish clean — exit 0, no build errors, no failing tests — before you push, unless a still-red target is evidence-backed as pre-existing or environmental (see the exception in the next paragraph and in \"Declaring your run finished\"). Clippy/lint is not reported by bazel; it runs at push time via the checkleft guard (and in CI).\n"
+        "- Both `bazel build` and `bazel test` must finish clean — exit 0, no build errors, no failing tests — before you push, unless a still-red target is evidence-backed as pre-existing or environmental (see the validation-failure exception in \"Declaring your run finished\"). Clippy/lint is not reported by bazel; it runs at push time via the checkleft guard (and in CI).\n"
     } else {
         "- Both `bazel build` and `bazel test` must finish clean — exit 0, no build errors, no failing tests — before you push. Clippy/lint is not reported by bazel; it runs at push time via the checkleft guard (and in CI).\n"
     };
@@ -705,6 +707,11 @@ pub(super) fn with_bazel_caching_rule(prompt: String) -> String {
         Some((opening, rest)) => format!("{opening}\n{}{rest}", bazel_caching_rule_text()),
         None => format!("{prompt}{}", bazel_caching_rule_text()),
     }
+}
+
+/// Append cache policy without splitting a pinned template.
+pub(super) fn append_bazel_caching_rule(prompt: String) -> String {
+    format!("{prompt}{}", bazel_caching_rule_text())
 }
 
 fn bazel_caching_rule_text() -> &'static str {
@@ -1047,20 +1054,35 @@ fn worker_wait_protocol_directive() -> String {
 /// `finalize_declared_run_done`, so a marker emitted immediately before
 /// this terminal call is lost. The mixed-flag path therefore stores the
 /// blocker in `--summary` instead.
+///
+/// `standard_worker` is true when
+/// [`crate::worker_setup::worker_kind_for_execution`] maps this execution to
+/// [`crate::worker_setup::WorkerKind::Standard`]. Question flags
+/// (`--question` / `--explanation`) and the pointer to the generated-rules
+/// writing contract are Standard-only: that contract lives in Standard
+/// workers' rules, and Reviewer / Triage / AnswerAgent / ReviewGuide
+/// workers cannot file those questions. Non-standard fallbacks of this
+/// generic composer (a PrReview without a PR URL, an AutomationTriage
+/// without an automation row) still get `propose done`.
 pub(crate) fn run_done_directive(
     seam_enabled: bool,
     worker_signal_seam_enabled: bool,
     conflict_resolution: bool,
+    standard_worker: bool,
 ) -> String {
     if !seam_enabled {
         return String::new();
     }
     let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
     let (blocked_file, blocked_while_continuing) = if worker_signal_seam_enabled {
+        let question_carve_out = if standard_worker {
+            ", unless the declaration carries a question as described below"
+        } else {
+            ""
+        };
         (
             format!(
-                "File `{boss} propose blocked --reason \"...\"` alongside it (before this call), \
-                 unless the declaration carries a question as described below"
+                "File `{boss} propose blocked --reason \"...\"` alongside it (before this call){question_carve_out}"
             ),
             format!("`{boss} propose blocked --reason \"...\"` alone records"),
         )
@@ -1073,14 +1095,6 @@ pub(crate) fn run_done_directive(
              ends without a terminal `propose done`) and records"
                 .to_string(),
         )
-    };
-    let question_companion = if worker_signal_seam_enabled {
-        format!(
-            " A declaration that carries a question is its own blocker record: do NOT also file \
-             `{boss} propose blocked`, because that raises a separate attention item the answer never clears."
-        )
-    } else {
-        String::new()
     };
     let gate_exception = if conflict_resolution {
         "The merge-correctness pre-push gate is not covered by any unattributable-failure exception. \
@@ -1108,7 +1122,37 @@ pub(crate) fn run_done_directive(
          credentials or authorization, genuine instruction conflicts or contradictory requirements."
             .to_string()
     };
-    let question_guidance = "Follow the question-writing contract in the generated worker rules.";
+    let operator_question_block = if standard_worker {
+        let question_companion = if worker_signal_seam_enabled {
+            format!(
+                " A declaration that carries a question is its own blocker record: do NOT also file \
+                 `{boss} propose blocked`, because that raises a separate attention item the answer never clears."
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "When delivery requires a human decision, attach one specific Yes/No question to that blocked declaration:\n\n\
+     ```\n\
+     {boss} propose done --outcome blocked --summary \"<blocker>\" --question \"Approve including the remaining files needed for this fix?\" --answer-type yes-no --explanation \"<Context, Yes, No, Recommendation, and optional Details; see below>\"\n\
+     ```\n\n\
+     Say in plain words what is blocked and what Yes will let you do; put check names and numbers in Details. \"Can I proceed?\" is not specific enough. Put the justification in --explanation, not the question.{question_companion} One question per run: ask the most blocking decision and disclose any further decisions in the explanation. The run waits durably for the answer; Yes appends authorization and restarts in the preserved workspace, No leaves the task blocked.\n\n\
+     Follow the question-writing contract in the generated worker rules.\n\n\
+     **When the decision is a choice among several options rather than approve/decline, use `--answer-type multiple-choice`.** Pass two to six short, distinct, single-line labels with `--choices`; the card shows one button per label. Use `--question` for the decision itself and an `--explanation` with only `Context:` (say what each option leads to), `Recommendation:` and optional `Details:` — no `Yes:` or `No:` sections, which are rejected for this type. Example:\n\n\
+     ```\n\
+     {boss} propose done --outcome blocked --summary \"<blocker>\" --question \"Which rollout should the migration use?\" --answer-type multiple-choice --choices \"Gradual\" \"All at once\" --explanation \"<Context, Recommendation, and optional Details>\"\n\
+     ```\n\n\
+     The same one-question-per-run rule applies. The chosen label is recorded verbatim and the task restarts in the preserved workspace; your next run's task description ends with a `## Recorded answer` section naming the question and the chosen option. Act on that choice; it grants no authorization beyond the decision itself.\n\n\
+     **When your task cannot proceed until some other, unrelated piece of work lands first, ask to create a prerequisite task instead of a plain Yes/No.** Example: a CI-fix revision finds that a pre-existing test fixture races retention cleanup; that needs its own fix on main before the PR's CI can go green, and it is out of scope for you. Propose that work as its own task:\n\n\
+     ```\n\
+     {boss} propose done --outcome blocked --summary \"<blocker>\" --answer-type create-prerequisite-task --prerequisite-name \"<short task name>\" --prerequisite-brief \"<self-contained description>\" --explanation \"<Context, Yes, No, Recommendation, and optional Details; see above>\"\n\
+     ```\n\n\
+     The description must stand alone: the prerequisite becomes a separate task that a different worker picks up cold, seeing only that description. Name the files, the failure and its evidence, and what done looks like; never refer to \"this task\", \"above\", or your own session. Do not pass `--question` — the engine words it for the repo owner (\"Create prerequisite task '<name>'? This task will wait for it.\"). The repo owner still answers Yes or No. Yes creates the task in this product (or, if an equivalent open task already exists, links to it instead), makes your task depend on it, appends a dated note to your task description, and redispatches your task once the prerequisite is done; No leaves the task blocked like any declined question. Use this only for work that blocks your task: `{boss} propose followup-task` remains the non-blocking path for nice-to-have work later. The one-question-per-run rule applies here too.\n\n\
+     Before asking, check the task description for recorded approval of the requested action or an `## Recorded answer` section. If it already grants the authorization or makes the decision needed, proceed and cite it in the PR body. Do not ask for decisions you are allowed to make, or use questions to hand back work that is merely hard. The answer authorizes exactly the question; it does not disable or bypass repository checks.\n\n"
+        )
+    } else {
+        String::new()
+    };
     format!(
         "\n## Declaring your run finished\n\n\
      When your run is over, say so — as the ABSOLUTE LAST thing you do:\n\n\
@@ -1129,23 +1173,7 @@ pub(crate) fn run_done_directive(
      Never relax a repository check without approval. Include the exact failed command, missing \
      credential, or decision needed in the summary. {blocked_file} so the blocker itself is \
      recorded, not just the fact that you stopped.\n\n\
-     When delivery requires a human decision, attach one specific Yes/No question to that blocked declaration:\n\n\
-     ```\n\
-     {boss} propose done --outcome blocked --summary \"<blocker>\" --question \"Approve including the remaining files needed for this fix?\" --answer-type yes-no --explanation \"<Context, Yes, No, Recommendation, and optional Details; see below>\"\n\
-     ```\n\n\
-     Say in plain words what is blocked and what Yes will let you do; put check names and numbers in Details. \"Can I proceed?\" is not specific enough. Put the justification in --explanation, not the question.{question_companion} One question per run: ask the most blocking decision and disclose any further decisions in the explanation. The run waits durably for the answer; Yes appends authorization and restarts in the preserved workspace, No leaves the task blocked.\n\n\
-     {question_guidance}\n\n\
-     **When the decision is a choice among several options rather than approve/decline, use `--answer-type multiple-choice`.** Pass two to six short, distinct, single-line labels with `--choices`; the card shows one button per label. Use `--question` for the decision itself and an `--explanation` with only `Context:` (say what each option leads to), `Recommendation:` and optional `Details:` — no `Yes:` or `No:` sections, which are rejected for this type. Example:\n\n\
-     ```\n\
-     {boss} propose done --outcome blocked --summary \"<blocker>\" --question \"Which rollout should the migration use?\" --answer-type multiple-choice --choices \"Gradual\" \"All at once\" --explanation \"<Context, Recommendation, and optional Details>\"\n\
-     ```\n\n\
-     The same one-question-per-run rule applies. The chosen label is recorded verbatim and the task restarts in the preserved workspace; your next run's task description ends with a `## Recorded answer` section naming the question and the chosen option. Act on that choice; it grants no authorization beyond the decision itself.\n\n\
-     **When your task cannot proceed until some other, unrelated piece of work lands first, ask to create a prerequisite task instead of a plain Yes/No.** Example: a CI-fix revision finds that a pre-existing test fixture races retention cleanup; that needs its own fix on main before the PR's CI can go green, and it is out of scope for you. Propose that work as its own task:\n\n\
-     ```\n\
-     {boss} propose done --outcome blocked --summary \"<blocker>\" --answer-type create-prerequisite-task --prerequisite-name \"<short task name>\" --prerequisite-brief \"<self-contained description>\" --explanation \"<Context, Yes, No, Recommendation, and optional Details; see above>\"\n\
-     ```\n\n\
-     The description must stand alone: the prerequisite becomes a separate task that a different worker picks up cold, seeing only that description. Name the files, the failure and its evidence, and what done looks like; never refer to \"this task\", \"above\", or your own session. Do not pass `--question` — the engine words it for the repo owner (\"Create prerequisite task '<name>'? This task will wait for it.\"). The repo owner still answers Yes or No. Yes creates the task in this product (or, if an equivalent open task already exists, links to it instead), makes your task depend on it, appends a dated note to your task description, and redispatches your task once the prerequisite is done; No leaves the task blocked like any declined question. Use this only for work that blocks your task: `{boss} propose followup-task` remains the non-blocking path for nice-to-have work later. The one-question-per-run rule applies here too.\n\n\
-     Before asking, check the task description for recorded approval of the requested action or an `## Recorded answer` section. If it already grants the authorization or makes the decision needed, proceed and cite it in the PR body. Do not ask for decisions you are allowed to make, or use questions to hand back work that is merely hard. The answer authorizes exactly the question; it does not disable or bypass repository checks.\n\n\
+     {operator_question_block}\
      {gate_exception}\n\n\
      To flag a concern while continuing, {blocked_while_continuing} the blocker and pauses the \
      nudge loop; it does NOT end the run. Only `{boss} propose done --outcome blocked` ends the \
@@ -1912,7 +1940,6 @@ If already queued, read its existing entry ID with `gh api graphql -f query='que
         out.push_str("\n### Re-enter the Trunk queue\n\nDeclare the verified revision delivered. The engine's existing poller resubmits once the revision is in review and head CI is green; it does not require a changed head SHA. Do not submit a competing queue request.\n");
     }
     out.push_str("\nFinish with `\"$BOSS_BIN\" propose done --outcome delivered --summary <main-SHA-and-target-results> --queue-ci-evidence-file /tmp/queue-ci-evidence.json`. Verified requeue is a delivery even when no code changed. This queue-specific completion path replaces any generic requirement to produce a diff or new head SHA.\n");
-    out.push_str(check_bypass_prohibition_text());
     out
 }
 
@@ -2068,7 +2095,6 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
             was extending. Reason: `architectural_mismatch`.\n\n\
          Do NOT close the PR yourself. Closing is the human's call.\n\n",
     );
-    out.push_str(check_bypass_prohibition_text());
     out.push('\n');
     out.push_str("### Post-resolution PR comment\n\n");
     out.push_str(
@@ -2457,7 +2483,6 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
          - **Always pass `-m \"…\"` to `jj describe` / `jj squash`.** The worker \
          environment has no usable `$EDITOR`.\n\n",
     );
-    out.push_str(check_bypass_prohibition_text());
     out.push('\n');
     out
 }
@@ -2501,6 +2526,7 @@ fn compose_ci_remediation_prompt(
 
     if crate::work::queue_ci_evidence::queue_ci_verification_required(attempt) {
         prompt.push_str(&compose_queue_ci_fragment(attempt));
+        prompt.push_str(check_bypass_prohibition_text());
         return prompt;
     }
 
