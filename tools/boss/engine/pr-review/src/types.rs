@@ -41,14 +41,14 @@ pub struct PrReviewContext {
     /// module tree spread across a diff's unchanged and changed hunks).
     pub last_reviewed_sha: Option<String>,
     /// Deterministic supersession-language hits found in the PR body, commit
-    /// messages, or comments (incident-002 P3). Each entry is a rendered
+    /// messages, or comments. Each entry is a rendered
     /// `term — snippet` line. When non-empty the reviewer prompt carries an
     /// authoritative block requiring a verified design-doc citation for each
     /// flagged claim. Populated by the caller (the spawn path scans the PR
     /// narrative); empty here by default.
     #[builder(default)]
     pub supersession_flags: Vec<String>,
-    /// Deterministic both-parents deletion-tripwire result (incident-002 P2):
+    /// Deterministic both-parents deletion-tripwire result:
     /// files a merged parent added and this forward-port/merge resolution
     /// removed, rename/move-aware. Each entry is a rendered description line.
     /// When non-empty the reviewer prompt carries an authoritative,
