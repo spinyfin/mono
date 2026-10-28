@@ -1038,6 +1038,7 @@ pub(crate) fn reconcile_revision_execution(
                          settled revision to blocked (halting re-dispatch without false in_review; \
                          incident-004 AI-3)",
                     );
+                    cascade_dependents_after_prereq_status_change(pending, conn, &task.id, "blocked", &now)?;
                 }
             }
         }

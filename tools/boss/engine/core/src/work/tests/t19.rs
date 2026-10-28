@@ -3,12 +3,12 @@ use super::*;
 // Behaviour coverage for `WorkDb::has_in_flight_ci_fix_revision` in
 // `work/blocking.rs` — the secondary pre-flight gate `ci_watch` uses to keep a
 // new CI-fix revision from spawning while a prior revision's worker is still in
-// flight. The predicate returns true when the chore has a live child that is a
-// `kind='revision'`, `created_via LIKE 'ci-fix:%'`, `status IN
-// (todo,active,blocked)`, `deleted_at IS NULL` row. Each test plants children
-// in a specific shape (via the `insert_ci_fix_revision_row` /
-// `insert_revision_row` helpers and raw SQL where a shape the helpers won't
-// produce is needed) and asserts the observable boolean — never SQL internals.
+// flight. The predicate returns true when the chore has a `kind='revision'`,
+// `created_via LIKE 'ci-fix:%'`, non-deleted child that is a live writer
+// (see `live_chain_writer_sql`). Each test plants children in a specific
+// shape (via the `insert_ci_fix_revision_row` / `insert_revision_row`
+// helpers and raw SQL where a shape the helpers won't produce is needed)
+// and asserts the observable boolean — never SQL internals.
 
 /// Flip a task's `status` directly so the `status IN (todo,active,blocked)`
 /// predicate can be exercised with any value, including terminal ones no
@@ -164,5 +164,43 @@ fn has_in_flight_ci_fix_revision_false_for_non_revision_kind() {
     assert!(
         !db.has_in_flight_ci_fix_revision(&chore).unwrap(),
         "a non-revision child does not count even with a live ci-fix provenance",
+    );
+}
+
+/// A `blocked: worker_failed` or `blocked: spawning_attempt_retired_unsuccessfully`
+/// CI-fix with no live execution is not in flight. A matching halt that still
+/// holds a non-terminal execution remains in flight.
+#[test]
+fn has_in_flight_ci_fix_revision_false_for_dead_halt_without_live_execution() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "cifix-dead-halt");
+    let chore = make_chore_root(&db, &product_id, "dead-halt-rev");
+    let revision = insert_ci_fix_revision_row(&db, &product_id, &chore, "rem_dead");
+
+    for reason in ["worker_failed", "spawning_attempt_retired_unsuccessfully"] {
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'blocked', blocked_reason = ?2 WHERE id = ?1",
+                rusqlite::params![revision, reason],
+            )
+            .unwrap();
+        assert!(
+            !db.has_in_flight_ci_fix_revision(&chore).unwrap(),
+            "a {reason} CI-fix with no execution is not in flight",
+        );
+    }
+
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(revision.clone())
+            .kind(ExecutionKind::RevisionImplementation)
+            .status(ExecutionStatus::Ready)
+            .build(),
+    )
+    .unwrap();
+    assert!(
+        db.has_in_flight_ci_fix_revision(&chore).unwrap(),
+        "the same halt still counts as in flight while a non-terminal execution is attached",
     );
 }

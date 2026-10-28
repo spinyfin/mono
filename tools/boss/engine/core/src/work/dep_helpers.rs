@@ -782,12 +782,18 @@ pub(crate) fn cascade_dependents_after_prereq_status_change(
     //   - `done` / `archived` satisfy all dependents (standard rule).
     //   - `in_review` satisfies revision dependents specifically
     //     (the PR is open; the revision can push to it).
+    //   - `blocked` does not satisfy by status, but a same-chain
+    //     revision that has dead-halted is no longer a live writer
+    //     (`gating_prereqs_for` / `live_chain_writer_sql`). Re-evaluate
+    //     so a persisted `blocked: dependency` edge unblocks when its
+    //     writer dies. Still-live blocked writers keep gating.
     //
     // `maybe_engine_unblock_dependent` re-evaluates each dependent's
     // full gating list via `gating_prereqs_for`, which is revision-
     // aware, so non-revision dependents are not inadvertently unblocked
-    // by an `in_review` transition.
-    let might_satisfy = deps::status_satisfies(new_prereq_status) || new_prereq_status == "in_review";
+    // by an `in_review` or `blocked` transition.
+    let might_satisfy =
+        deps::status_satisfies(new_prereq_status) || new_prereq_status == "in_review" || new_prereq_status == "blocked";
     if !might_satisfy {
         return Ok(());
     }

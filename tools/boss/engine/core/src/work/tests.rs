@@ -565,6 +565,7 @@ mod blocked_workspace_tests;
 mod board_mutation_events;
 mod ci_remediation_tests;
 mod current_head_review_badge_tests;
+mod dead_chain_tail_tests;
 mod decision_tests;
 mod design_doc_audit_tests;
 mod effort_model_tests;

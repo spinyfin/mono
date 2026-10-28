@@ -206,34 +206,51 @@ async fn blocked_worker_failed_revision_dropped_on_doing_dispatches() {
 }
 
 /// The refusal half of the contract: a revision whose prerequisite is
-/// genuinely unsatisfied (here, a sibling still `blocked`) must be refused
-/// by the engine with a `work_error` that names the gate — so the app can
-/// surface the refusal reason — and must not move or dispatch.
-/// Same handler, same rule, same message family as an explicit start.
+/// genuinely unsatisfied (here, a sibling still `todo` — a live writer)
+/// must be refused by the engine with a `work_error` that names the gate
+/// — so the app can surface the refusal reason — and must not move or
+/// dispatch. Same handler, same rule, same message family as an explicit
+/// start. A `worker_failed` sibling is not a live writer and is covered
+/// by the chain-tail skip, not this refusal.
 #[tokio::test]
 async fn gated_revision_dropped_on_doing_is_refused_with_the_gate_named() {
     let (server_state, _dir) = test_server_state_with_fakes();
-    let (root, _review_findings, ci_fix) = seed_ci_fix_behind_in_review_revision(&server_state);
+    let product = create_test_product_with_repo(
+        &server_state.work_db,
+        "BoardDragGatedLiveWriter",
+        Some("git@example.com:board/drag-gated-live-writer.git"),
+    );
+    let root = create_test_chore_manual(&server_state.work_db, product.id.clone(), "Chain root chore");
+    server_state
+        .work_db
+        .update_work_item(
+            &root.id,
+            WorkItemPatch {
+                status: Some("in_review".to_owned()),
+                pr_url: Some("https://github.com/example/repo/pull/2".to_owned()),
+                ..Default::default()
+            },
+        )
+        .expect("move chain root to in_review with a PR");
 
-    // A third revision created while the CI fix is still blocked: the CI
-    // fix is the chain tail, so this one is gated on it. `blocked` does not
-    // satisfy anything, so this row is genuinely stuck until the CI fix
-    // reaches `in_review` (or is archived).
-    let second_findings = create_manual_revision(&server_state, &root.id, "Second review-findings pass");
-    assert_eq!(second_findings.status, TaskStatus::Blocked);
-    assert_eq!(second_findings.blocked_reason.as_deref(), Some("dependency"));
+    let first = create_manual_revision(&server_state, &root.id, "First review-findings pass");
+    assert_eq!(first.status, TaskStatus::Todo);
+
+    let second = create_manual_revision(&server_state, &root.id, "Second review-findings pass");
+    assert_eq!(second.status, TaskStatus::Blocked);
+    assert_eq!(second.blocked_reason.as_deref(), Some("dependency"));
     assert_eq!(
         server_state
             .work_db
-            .gating_prereqs_for(&second_findings.id)
+            .gating_prereqs_for(&second.id)
             .expect("gating prereqs"),
-        vec![ci_fix.id.clone()],
-        "the third revision must be gated on the blocked CI fix"
+        vec![first.id.clone()],
+        "the second revision must be gated on the still-open first writer"
     );
 
     let sink = make_session_sink();
     let ctx = dispatch(&server_state, &sink, "req-drop-gated-revision");
-    handle_move_work_item_on_board(ctx, drop_on_doing(&second_findings.id)).await;
+    handle_move_work_item_on_board(ctx, drop_on_doing(&second.id)).await;
 
     match sole_response(&sink).await {
         FrontendEvent::WorkError { message } => {
@@ -242,14 +259,14 @@ async fn gated_revision_dropped_on_doing_is_refused_with_the_gate_named() {
                 "the refusal must say the row is gated, got: {message}"
             );
             assert!(
-                message.contains(&ci_fix.id),
+                message.contains(&first.id),
                 "the refusal must name the prerequisite holding the row, got: {message}"
             );
         }
         other => panic!("expected a WorkError naming the gate, got: {other:?}"),
     }
 
-    let after = task_row(&server_state, &second_findings.id);
+    let after = task_row(&server_state, &second.id);
     assert_eq!(
         after.status,
         TaskStatus::Blocked,
@@ -258,7 +275,7 @@ async fn gated_revision_dropped_on_doing_is_refused_with_the_gate_named() {
     assert_eq!(after.blocked_reason.as_deref(), Some("dependency"));
     let executions = server_state
         .work_db
-        .list_executions(Some(&second_findings.id))
+        .list_executions(Some(&second.id))
         .expect("list executions");
     assert!(
         executions.iter().all(|e| e.status.is_terminal()),
