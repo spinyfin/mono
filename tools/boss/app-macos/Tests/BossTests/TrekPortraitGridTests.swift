@@ -225,7 +225,8 @@ final class TrekPortraitGridTests: XCTestCase {
     /// `TrekIconAssets.keepLargestComponent`, so the two cross-check each
     /// other. Bookkeeping lives in raw buffers and plain `while` loops
     /// because the test bundle is compiled without optimisation, where
-    /// each Swift array access costs on the order of a microsecond.
+    /// each Swift array access costs on the order of a microsecond, so an
+    /// array-based fill over 56 full-size portraits takes tens of seconds.
     private func opaqueComponentCount(of image: CGImage) throws -> Int {
         let width = image.width, height = image.height
         let pixelCount = width * height
