@@ -68,7 +68,7 @@ async fn drain_legacy_label_server_adopts_a_surviving_run_against_l_boss_argv() 
 
     assert!(outcome.adopted_execution_ids.contains(&execution_id));
     assert!(
-        spawner.registry.lookup(4321).as_deref() == Some(execution_id.as_str()),
+        spawner.registry.lookup_unverified(4321).as_deref() == Some(execution_id.as_str()),
         "the adopted worker's freshly-read pane pid must be registered",
     );
 

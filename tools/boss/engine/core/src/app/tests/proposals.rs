@@ -1100,19 +1100,25 @@ async fn accepted_review_verdict_immediately_terminalizes_its_live_supervisor() 
 /// calls it a second time.
 #[tokio::test]
 async fn a_replayed_review_report_acceptance_still_reaches_the_finalizer() {
-    let (server_state, _dir, _work_item_id, batch_id, execution_id) = live_batch_leaf();
+    let (server_state, _dir, work_item_id, batch_id, execution_id) = live_batch_leaf();
     let peer_pid = std::process::id() as libc::pid_t;
     let payload = review_report_payload(&batch_id, "head-sha");
 
-    let (first, already_submitted) = submitted(
-        call_with_peer(
-            &server_state,
-            Some(peer_pid),
-            submit_request_keyed(&execution_id, ProposalKind::ReviewReport, payload.clone(), "replay-key"),
-        )
-        .await,
-    );
-    assert!(!already_submitted);
+    // Simulate the crash after persistence and before the RPC handler calls
+    // the finalizer. This retry must still finish the live execution.
+    let persisted = server_state
+        .work_db
+        .submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+            execution_id: &execution_id,
+            work_item_id: &work_item_id,
+            kind: ProposalKind::ReviewReport,
+            payload_json: &payload.to_string(),
+            idempotency_key: "replay-key",
+        })
+        .unwrap()
+        .unwrap();
+    assert!(!persisted.already_submitted);
+    let first = persisted.proposal;
     assert_eq!(first.state, ProposalState::Applied);
     assert!(
         server_state
@@ -1120,14 +1126,13 @@ async fn a_replayed_review_report_acceptance_still_reaches_the_finalizer() {
             .get_execution(&execution_id)
             .unwrap()
             .status
-            .is_terminal(),
-        "the first acceptance must already have torn the leaf down"
+            .is_live(),
+        "persistence alone must leave the crash window before finalization"
     );
 
     // Replay: same idempotency key, same execution — the shape a crashed
-    // worker's retry takes. This must not error, and the (already-terminal)
-    // finalizer call it triggers must be a harmless no-op rather than a
-    // panic or a spurious error log path.
+    // worker's retry takes. It must return the original row and complete the
+    // finalizer that the first handler never reached.
     let (replay, replay_already_submitted) = submitted(
         call_with_peer(
             &server_state,
@@ -1147,6 +1152,21 @@ async fn a_replayed_review_report_acceptance_still_reaches_the_finalizer() {
             .status
             .is_terminal()
     );
+    let (late, already) = submitted(
+        call_with_peer(
+            &server_state,
+            Some(peer_pid),
+            submit_request_keyed(
+                &execution_id,
+                ProposalKind::ReviewReport,
+                review_report_payload(&batch_id, "head-sha"),
+                "replay-key",
+            ),
+        )
+        .await,
+    );
+    assert!(already);
+    assert_eq!(late.id, first.id);
 }
 
 /// A leaf with a real durable `shell_pid` must be genuinely reaped by the
@@ -2205,6 +2225,30 @@ async fn a_peer_resolving_to_a_pruned_execution_is_refused() {
 // ── Rate caps ────────────────────────────────────────────────────────────────
 
 #[tokio::test]
+async fn terminal_execution_is_refused_and_its_peer_stays_confined() {
+    let fx = WorkerFixture::new();
+    fx.server_state
+        .work_db
+        .cancel_running_execution(&fx.execution_id)
+        .unwrap();
+    assert!(
+        fx.server_state
+            .work_db
+            .get_execution(&fx.execution_id)
+            .unwrap()
+            .status
+            .is_terminal()
+    );
+    let error = rejected(submit(&fx, ProposalKind::Blocked, json!({"reason": "late call"})).await);
+    assert!(fx.server_state.classify_peer(Some(fx.peer_pid)).is_worker());
+    assert_eq!(error.code, ProposalErrorCode::AttributionUnresolved);
+    assert_eq!(
+        fx.server_state.worker_registry.lookup_with_ancestor_walk(fx.peer_pid),
+        Some(fx.execution_id.clone())
+    );
+}
+
+#[tokio::test]
 async fn the_per_kind_cap_is_enforced_with_a_typed_error() {
     let fx = WorkerFixture::new();
     for i in 0..PROPOSAL_CAP_PER_KIND_PER_EXECUTION {
@@ -2667,6 +2711,28 @@ async fn review_guide_submission_publishes_for_its_attributed_codex_execution() 
             json!({"body_markdown": guide}),
         )
     };
+    // Persist the guide but stop before the handler's finalization step.
+    // A live caller must be able to replay this acknowledgement safely.
+    let validated =
+        boss_engine_proposal_validation::validate_payload(ProposalKind::ReviewGuide, &json!({"body_markdown": guide}))
+            .unwrap();
+    let key = boss_engine_proposal_validation::derive_idempotency_key(
+        &execution.id,
+        ProposalKind::ReviewGuide,
+        &validated.canonical_json,
+    );
+    let persisted = db
+        .submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+            execution_id: &execution.id,
+            work_item_id: &execution.work_item_id,
+            kind: ProposalKind::ReviewGuide,
+            payload_json: &validated.canonical_json,
+            idempotency_key: &key,
+        })
+        .unwrap()
+        .unwrap();
+    assert!(!persisted.already_submitted);
+    assert!(db.get_execution(&execution.id).unwrap().status.is_live());
     let response = call_with_peer(&state, Some(pid), request()).await;
     let FrontendEvent::ProposalSubmitted {
         proposal,
@@ -2675,7 +2741,8 @@ async fn review_guide_submission_publishes_for_its_attributed_codex_execution() 
     else {
         panic!("{response:?}")
     };
-    assert!(!already_submitted);
+    assert!(already_submitted);
+    assert_eq!(proposal.id, persisted.proposal.id);
     assert_eq!(proposal.state, ProposalState::Applied);
     assert_eq!(proposal.applied_ref.as_deref(), Some(attempt.id.as_str()));
     let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
@@ -2686,16 +2753,13 @@ async fn review_guide_submission_publishes_for_its_attributed_codex_execution() 
         .unwrap();
     assert_eq!(version.markdown, guide);
     assert!(db.get_execution(&execution.id).unwrap().status.is_terminal());
-    // The same command replays its durable proposal even after finalization.
+    // The same key recovers its acknowledgement after finalization.
     state.worker_registry.register(pid, execution.id.clone());
     let replay = call_with_peer(&state, Some(pid), request()).await;
-    assert!(matches!(
-        replay,
-        FrontendEvent::ProposalSubmitted {
-            already_submitted: true,
-            ..
-        }
-    ));
+    let (replayed, already) = submitted(replay);
+    assert!(already);
+    assert_eq!(replayed.id, proposal.id);
+    assert_eq!(state.worker_registry.lookup_with_ancestor_walk(pid), Some(execution.id));
 }
 
 #[tokio::test]

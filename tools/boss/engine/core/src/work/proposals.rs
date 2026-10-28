@@ -25,8 +25,7 @@
 use super::*;
 use boss_engine_proposal_validation::{ProposalCounts, check_rate_caps};
 use boss_protocol::{
-    Attention, AttentionGroup, ProposalDecider, ProposalFieldError, ProposalKind, ProposalState,
-    ProposalSubmissionError, WorkerProposal,
+    Attention, AttentionGroup, ProposalDecider, ProposalKind, ProposalState, ProposalSubmissionError, WorkerProposal,
 };
 
 // ---- input types ----
@@ -212,14 +211,10 @@ impl WorkDb {
                 // caller that submitted `pr_created` must not silently get back
                 // an unrelated `blocked` row with `already_submitted: true`.
                 if existing.kind != input.kind {
-                    return Ok(Err(ProposalSubmissionError::validation(vec![ProposalFieldError::new(
-                        "idempotency_key",
-                        format!(
-                            "idempotency_key `{}` was already used for a `{}` proposal (id {}); reuse it \
-                             only for a genuine retry of the same submission, or choose a different key",
-                            input.idempotency_key, existing.kind, existing.id
-                        ),
-                    )])));
+                    return Ok(Err(ProposalSubmissionError::idempotency_key_kind_mismatch(
+                        input.idempotency_key,
+                        &existing,
+                    )));
                 }
                 return Ok(Ok(SubmitWorkerProposalOutcome {
                     proposal: existing,

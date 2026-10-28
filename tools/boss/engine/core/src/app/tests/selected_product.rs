@@ -560,12 +560,24 @@ async fn reading_the_state_does_not_consume_or_change_it() {
 /// A worker pane is the sibling-process adversary `RpcTier::AppOrBoss`
 /// excludes, so it is what this uses for a peer outside the subtree: a
 /// registered worker pid, with a different pid installed as the Boss trust
-/// root so the permissive no-trust-roots path does not apply.
+/// root so the permissive no-trust-roots path does not apply. Both are real
+/// sibling processes: the registry only honours a worker whose live process
+/// still matches the start time recorded at registration.
 #[tokio::test]
 async fn get_from_outside_the_app_or_boss_subtree_is_refused() {
+    struct Sleeper(std::process::Child);
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let sleeper = || Sleeper(std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap());
+    let (boss, worker) = (sleeper(), sleeper());
+
     let (server_state, _dir) = test_server_state();
-    server_state.set_boss_pid(std::process::id() as libc::pid_t);
-    let worker_pid: libc::pid_t = i32::MAX;
+    server_state.set_boss_pid(boss.0.id() as libc::pid_t);
+    let worker_pid = worker.0.id() as libc::pid_t;
     server_state.worker_registry.register(worker_pid, "exec-worker-test");
 
     let sink = make_session_sink();

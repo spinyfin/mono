@@ -517,6 +517,7 @@ mod worker_pane_reattach;
 mod worker_probe_dispatch;
 mod worker_process_reaping;
 mod worker_readoption;
+mod worker_readoption_confinement;
 mod worker_tier;
 
 use std::sync::atomic::{AtomicUsize, Ordering};

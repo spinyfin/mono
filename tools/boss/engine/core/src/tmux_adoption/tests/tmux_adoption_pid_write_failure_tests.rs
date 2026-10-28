@@ -52,7 +52,10 @@ async fn write_failed_pid_snapshot_does_not_block_in_memory_adoption() {
         "a failed durable write must not stop in-memory adoption from completing",
     );
 
-    assert_eq!(spawner.registry.lookup(4321).as_deref(), Some(execution_id.as_str()));
+    assert_eq!(
+        spawner.registry.lookup_unverified(4321).as_deref(),
+        Some(execution_id.as_str())
+    );
     assert_eq!(
         spawner.registry.pane_for_run(&execution_id),
         Some(crate::worker_registry::RegisteredWorkerPane {

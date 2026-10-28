@@ -47,6 +47,8 @@ async fn no_such_session_releases_the_pool_slot_after_a_refused_reap() {
     let pool = state.execution_coordinator.worker_pool();
     assert_eq!(pool.claim_worker(&exec, None).await.unwrap(), "worker-1");
     state.worker_registry.register_run_slot(&exec, 1);
+    let peer_pid = std::process::id() as libc::pid_t;
+    state.worker_registry.register(peer_pid, &exec);
     state.live_worker_states.register_spawn(1, &exec, "test", 0, None);
     let (tmux, runner) = fake_tmux([
         failure("error connecting to /state/boss/tmux.sock (Permission denied)"),
@@ -58,18 +60,42 @@ async fn no_such_session_releases_the_pool_slot_after_a_refused_reap() {
     assert_eq!(db.tmux_identity_for_execution(&exec).unwrap(), Some(identity));
     assert_eq!(pool.idle_count().await, 0);
     assert_eq!(state.worker_registry.slot_for_run(&exec), Some(1));
+    assert_eq!(
+        state.worker_registry.lookup_with_ancestor_walk(peer_pid).as_deref(),
+        Some(exec.as_str())
+    );
     assert!(state.live_worker_states.get(1).is_some());
 
     assert_eq!(state.release_worker_pane(&exec).await, PaneReleaseOutcome::Reaped);
     assert!(db.tmux_identity_for_execution(&exec).unwrap().is_none());
     assert_eq!(pool.idle_count().await, 1);
     assert!(state.worker_registry.slot_for_run(&exec).is_none());
+    assert_eq!(state.worker_registry.lookup_with_ancestor_walk(peer_pid), None);
     assert!(state.live_worker_states.get(1).is_none());
     let observation = db.tmux_pane_observation_for_execution(&exec).unwrap().unwrap();
     assert_eq!(observation.kind, crate::work::TmuxPaneObservationKind::SessionMissing);
     assert_eq!(pool.claim_worker("next-execution", None).await.unwrap(), "worker-1");
     assert_eq!(runner.calls().len(), 2, "neither probe should signal or kill a session");
     assert!(runner.calls().iter().all(|args| args[2] == "show-environment"));
+}
+
+#[tokio::test]
+async fn terminal_run_retains_confinement_when_teardown_is_refused() {
+    let (state, _dir) = test_server_state();
+    let product = create_product(&state.work_db);
+    let item = create_active_chore(&state.work_db, &product, "finished worker");
+    let exec = seed_tmux_run(&state.work_db, &item, "boss-finished", "tok-finished", 999_999);
+    let peer_pid = std::process::id() as libc::pid_t;
+    state.worker_registry.register(peer_pid, &exec);
+    state.worker_registry.register_run_slot(&exec, 1);
+    state.work_db.cancel_running_execution(&exec).unwrap();
+    let (tmux, _) = fake_tmux([failure("permission denied")]);
+    state.set_tmux_override_for_test(tmux);
+
+    assert_eq!(state.release_worker_pane(&exec).await, PaneReleaseOutcome::NoLiveWorker);
+    assert_eq!(state.worker_registry.slot_for_run(&exec), Some(1));
+    assert_eq!(state.worker_registry.lookup_with_ancestor_walk(peer_pid), Some(exec));
+    assert!(state.classify_peer(Some(peer_pid)).is_worker());
 }
 
 /// The cardinal case: live token matches, so the pane pid's process group

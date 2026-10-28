@@ -11,20 +11,24 @@
 //! peer pid, walk up the process tree until we hit a registered
 //! ancestor. That's the run the hook event belongs to.
 //!
-//! Pids are recycled by the OS, so a registered pid alone is not process
-//! identity: each entry also records the process's start time at
-//! registration, and an entry whose pid now belongs to a process with a
-//! different start time is treated as absent. Entries are additionally
-//! dropped when the run's pane is torn down
-//! ([`WorkerRegistry::take_worker_pane_for_run`]), so a finished run's shell
-//! pid does not linger to be matched by an unrelated process that later
-//! reuses it.
+//! # Identity, not just a pid
+//!
+//! A bare pid is not an identity: the kernel recycles pids, and a busy
+//! host can wrap its pid counter within minutes under load. Every entry is
+//! therefore keyed by the pid *and* the process start time captured at
+//! registration. An ancestor-walk hit only counts when the live process at
+//! that pid still has the registered start time; a mismatch means the
+//! registered process is gone and the pid now belongs to something else, so
+//! the entry is dropped and the walk keeps climbing. Entries are also removed
+//! when their run is released ([`WorkerRegistry::take_worker_pane_for_run`] /
+//! [`WorkerRegistry::forget_run_pids`]), so a finished run never resolves.
 //!
 //! Platform-specific process-tree walks: macOS uses `proc_pidinfo`; Linux
 //! reads `/proc/<pid>/stat`. `getppid()` is per-process and would require
 //! IPC for either implementation.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io;
 use std::sync::{Arc, Mutex};
 
@@ -60,6 +64,36 @@ pub struct WorkerRegistry {
     /// [`crate::sleep_assertion::SleepAssertionController`] for why remote
     /// workers — which run on a different machine — must never count here.
     sleep_assertion: Arc<crate::sleep_assertion::SleepAssertionController>,
+    /// Source of live process identity (parent pid, start time, command).
+    /// Production reads the OS; tests inject a fake process tree.
+    processes: Arc<dyn ProcessTable>,
+}
+
+/// One live process as the OS reports it right now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessSnapshot {
+    /// Parent pid; `None` at the root of the tree (parent 0 / launchd).
+    pub ppid: Option<libc::pid_t>,
+    /// Opaque, platform-specific process start time. Equal values for the
+    /// same pid mean the same process incarnation; a recycled pid differs.
+    pub start: u64,
+    /// Short process name, for diagnostics only.
+    pub command: String,
+}
+
+/// Reads live process identity. A seam so the ancestor walk is testable
+/// against a fabricated process tree, including pid reuse.
+pub trait ProcessTable: Send + Sync {
+    fn snapshot(&self, pid: libc::pid_t) -> io::Result<ProcessSnapshot>;
+}
+
+/// The real process table, backed by [`process_snapshot`].
+struct SystemProcessTable;
+
+impl ProcessTable for SystemProcessTable {
+    fn snapshot(&self, pid: libc::pid_t) -> io::Result<ProcessSnapshot> {
+        process_snapshot(pid)
+    }
 }
 
 impl Default for WorkerRegistry {
@@ -70,40 +104,101 @@ impl Default for WorkerRegistry {
 
 #[derive(Default)]
 struct RegistryInner {
-    // Identity and progression classification are captured together.
-    pid_to_run: HashMap<libc::pid_t, RegisteredPid>,
+    pid_to_run: HashMap<libc::pid_t, PidEntry>,
     run_to_slot: HashMap<String, RegisteredWorkerPane>,
 }
 
-/// When a process started, in a platform-specific but equality-comparable
-/// form. Two readings for the same pid are the same process iff they are
-/// equal; the OS never hands a recycled pid the previous holder's start time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ProcessStart {
-    major: u64,
-    minor: u64,
-}
-
-/// A registered worker shell pid and the process identity it was registered
-/// with. `start` is `None` when the process could not be read at registration
-/// (it had already exited, or the platform has no reader); such an entry is
-/// matched by pid alone.
-#[derive(Clone, Debug)]
-struct RegisteredPid {
+/// A registered worker shell: the run it belongs to and the start time of
+/// the process that was at this pid when it was registered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PidEntry {
     run_id: String,
-    start: Option<ProcessStart>,
+    /// `None` when the process could not be read at registration (it had
+    /// already exited). Such an entry can never be verified, so it never
+    /// matches.
+    start: Option<u64>,
     progression: bool,
 }
 
-impl RegisteredPid {
-    /// Whether `pid` still belongs to the process that was registered. A pid
-    /// that cannot be read now is not treated as reused: it cannot be an
-    /// ancestor of any live caller, and the walk fails closed on its own.
-    fn is_current(&self, pid: libc::pid_t) -> bool {
-        match (self.start, process_start(pid)) {
-            (Some(recorded), Ok(live)) => recorded == live,
-            _ => true,
+/// How one pid on an ancestor walk related to the registry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkVerdict {
+    /// No registry entry for this pid.
+    Unregistered,
+    /// A registry entry whose recorded start time equals the live process's:
+    /// the walk resolved here.
+    Matched,
+    /// A registry entry exists but the live process at this pid started at a
+    /// different time: the pid was recycled. The entry is dropped.
+    PidReused { registered_start: u64, live_start: u64 },
+    /// A registry entry exists but its identity cannot be verified (it was
+    /// registered without a start time, or the live process cannot be read).
+    Unverifiable,
+}
+
+/// One level of an ancestor walk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AncestorLink {
+    pub pid: libc::pid_t,
+    /// `None` when the process could not be read.
+    pub command: Option<String>,
+    /// The run the registry holds for this pid, matched or not.
+    pub registered_run: Option<String>,
+    pub verdict: LinkVerdict,
+}
+
+/// Outcome of [`WorkerRegistry::resolve_ancestry`]: the full walked chain and,
+/// when an identity-verified entry was found, which pid it was and its run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AncestorResolution {
+    pub chain: Vec<AncestorLink>,
+    pub matched: Option<(libc::pid_t, String)>,
+    progression: bool,
+}
+
+impl AncestorResolution {
+    /// The resolved run id, if any.
+    pub fn run_id(&self) -> Option<&str> {
+        self.matched.as_ref().map(|(_, run_id)| run_id.as_str())
+    }
+
+    /// Single-line rendering of the walked chain for logs, innermost first,
+    /// e.g. `pid 7133 (codex) > pid 6228 (zsh) [matched run exec_1]`.
+    pub fn describe_chain(&self) -> String {
+        let mut out = String::new();
+        for (index, link) in self.chain.iter().enumerate() {
+            if index > 0 {
+                out.push_str(" > ");
+            }
+            let command = link.command.as_deref().unwrap_or("?");
+            let _ = write!(out, "pid {} ({command})", link.pid);
+            match (&link.verdict, link.registered_run.as_deref()) {
+                (LinkVerdict::Unregistered, _) => {}
+                (LinkVerdict::Matched, run) => {
+                    let _ = write!(out, " [matched run {}]", run.unwrap_or("?"));
+                }
+                (
+                    LinkVerdict::PidReused {
+                        registered_start,
+                        live_start,
+                    },
+                    run,
+                ) => {
+                    let _ = write!(
+                        out,
+                        " [stale entry for run {}: pid reused, registered start {registered_start} != live start {live_start}; dropped]",
+                        run.unwrap_or("?"),
+                    );
+                }
+                (LinkVerdict::Unverifiable, run) => {
+                    let _ = write!(out, " [unverifiable entry for run {}; dropped]", run.unwrap_or("?"));
+                }
+            }
         }
+        if out.is_empty() {
+            out.push_str("(empty)");
+        }
+        out
     }
 }
 
@@ -128,47 +223,82 @@ impl WorkerRegistry {
         Self {
             inner: Arc::default(),
             sleep_assertion,
+            processes: Arc::new(SystemProcessTable),
         }
+    }
+
+    /// Replace the process table. Tests use this to fabricate a process tree
+    /// and simulate pid reuse.
+    #[cfg(test)]
+    pub(crate) fn with_process_table(mut self, processes: Arc<dyn ProcessTable>) -> Self {
+        self.processes = processes;
+        self
     }
 
     /// Record that pid is the worker process for run `run_id`. Called by
     /// the spawn flow once it has both the run id and the spawned pid.
     ///
-    /// An existing progression registration for `pid` keeps its progression
-    /// bit: re-registering must never downgrade a confined peer to worker tier.
+    /// The process's start time is captured now, so a later hit on this pid
+    /// only counts while the same process incarnation is still there. A run
+    /// owns one shell pid: registering a different pid for a run that already
+    /// has one (restart re-adoption, a respawn) replaces the earlier entry.
     pub fn register(&self, pid: libc::pid_t, run_id: impl Into<String>) {
-        self.register_with_start(pid, run_id, process_start(pid).ok());
-    }
-
-    fn register_with_start(&self, pid: libc::pid_t, run_id: impl Into<String>, start: Option<ProcessStart>) {
-        let mut inner = self.inner.lock().expect("registry poisoned");
-        let progression = inner.pid_to_run.get(&pid).is_some_and(|entry| {
-            entry.progression && !matches!((entry.start, start), (Some(old), Some(new)) if old != new)
-        });
-        inner.pid_to_run.insert(
-            pid,
-            RegisteredPid {
-                run_id: run_id.into(),
-                start,
-                progression,
-            },
-        );
+        self.register_identity(pid, run_id.into(), false);
     }
 
     /// Capture durable authority before exposing the progression identity.
     pub fn register_progression(&self, pid: libc::pid_t, run_id: &str, db: &crate::work::WorkDb) -> anyhow::Result<()> {
         db.capture_progression_neighbourhood(run_id)?;
-        let start = process_start(pid).ok();
+        self.register_identity(pid, run_id.to_owned(), true);
+        Ok(())
+    }
+
+    fn register_identity(&self, pid: libc::pid_t, run_id: String, progression: bool) {
+        let start = match self.processes.snapshot(pid) {
+            Ok(snapshot) => Some(snapshot.start),
+            Err(error) => {
+                tracing::warn!(
+                    pid,
+                    run_id = %run_id,
+                    %error,
+                    "worker registry: could not read the process start time; this entry cannot \
+                     be identity-verified and will never match an ancestor walk",
+                );
+                None
+            }
+        };
+        self.register_with_start(pid, run_id, start, progression);
+    }
+
+    fn register_with_start(&self, pid: libc::pid_t, run_id: impl Into<String>, start: Option<u64>, progression: bool) {
+        let run_id = run_id.into();
         let mut inner = self.inner.lock().expect("registry poisoned");
+        // Re-registration must not downgrade a confined process. Preserve
+        // its tier unless a different process incarnation is proven.
+        let progression = progression
+            || inner.pid_to_run.get(&pid).is_some_and(|entry| {
+                entry.progression && !matches!((entry.start, start), (Some(old), Some(new)) if old != new)
+            });
+        inner.pid_to_run.retain(|existing_pid, entry| {
+            let superseded = entry.run_id == run_id && *existing_pid != pid;
+            if superseded {
+                tracing::info!(
+                    pid = *existing_pid,
+                    run_id = %run_id,
+                    replaced_by = pid,
+                    "worker registry: replacing the run's earlier pid entry",
+                );
+            }
+            !superseded
+        });
         inner.pid_to_run.insert(
             pid,
-            RegisteredPid {
-                run_id: run_id.to_owned(),
+            PidEntry {
+                run_id,
                 start,
-                progression: true,
+                progression,
             },
         );
-        Ok(())
     }
 
     /// Record the viewer slot id for `run_id` without a tmux session identity.
@@ -292,18 +422,26 @@ impl WorkerRegistry {
     /// Cleanup detaches the app viewer; the worker itself is torn down by
     /// token-verified tmux teardown.
     ///
-    /// Also drops every shell pid registered for the run, whether or not a
-    /// pane was still mapped: a finished run's pid must not stay resolvable,
-    /// because the OS will hand it to some unrelated process.
+    /// Every release path funnels through here, so it also drops the run's pid
+    /// entries — even when no pane was registered — and a finished run's shell
+    /// pid can never resolve to it again.
     pub fn take_worker_pane_for_run(&self, run_id: &str) -> Option<RegisteredWorkerPane> {
         {
             let mut inner = self.inner.lock().expect("registry poisoned");
-            inner.pid_to_run.retain(|_, entry| entry.run_id != run_id);
+            drop_run_pids(&mut inner, run_id);
             let pane = inner.run_to_slot.remove(run_id);
             self.sleep_assertion
                 .set_live_worker_panes(local_live_pane_count(&inner));
             pane
         }
+    }
+
+    /// Drop every pid entry for `run_id` without touching its slot mapping.
+    /// For teardown that reaps the worker process but does not go through
+    /// pane release (an aborted spawn). Returns how many entries were removed.
+    pub fn forget_run_pids(&self, run_id: &str) -> usize {
+        let mut inner = self.inner.lock().expect("registry poisoned");
+        drop_run_pids(&mut inner, run_id)
     }
 
     /// Drop the entry for `pid`. Called when a run terminates and the
@@ -321,87 +459,145 @@ impl WorkerRegistry {
         }
     }
 
-    /// Direct pid lookup — no ancestor walk. Returns `None` if the pid
-    /// is not a registered worker, or if it was registered but now belongs
-    /// to a different process (the OS recycled the pid).
-    pub fn lookup(&self, pid: libc::pid_t) -> Option<String> {
-        let entry = self
-            .inner
+    /// Raw pid lookup: no ancestor walk and **no identity check**, so a
+    /// recycled pid still answers. Never use this to attribute a caller; it
+    /// exists to inspect registrations. Attribution goes through
+    /// [`Self::resolve_ancestry`] / [`Self::lookup_with_ancestor_walk`].
+    #[cfg(test)]
+    pub(crate) fn lookup_unverified(&self, pid: libc::pid_t) -> Option<String> {
+        self.inner
             .lock()
             .expect("registry poisoned")
             .pid_to_run
             .get(&pid)
-            .cloned()?;
-        entry.is_current(pid).then_some(entry.run_id)
+            .map(|entry| entry.run_id.clone())
     }
 
-    /// Walk up the process tree from `pid` until we find a registered
-    /// ancestor or hit the depth limit. The shim runs as a descendant
-    /// of the worker (claude → shell? → boss-event), so this is how
-    /// hook events are correlated to runs.
+    /// Walk up the process tree from `pid` until we find an identity-verified
+    /// registered ancestor or hit the depth limit. The shim runs as a
+    /// descendant of the worker (claude → shell? → boss-event), so this is
+    /// how hook events are correlated to runs. See [`Self::resolve_ancestry`]
+    /// for the semantics and the walked chain.
     pub fn lookup_with_ancestor_walk(&self, pid: libc::pid_t) -> Option<String> {
-        self.resolve_with_ancestor_walk(pid).map(|(_, run_id)| run_id)
+        self.resolve_ancestry(pid).matched.map(|(_, run_id)| run_id)
     }
 
-    /// Also return the registered pid that supplied the identity.
-    pub fn resolve_with_ancestor_walk(&self, pid: libc::pid_t) -> Option<(libc::pid_t, String)> {
-        self.resolve_classified_with_ancestor_walk(pid)
-            .map(|(pid, entry)| (pid, entry.run_id))
-    }
-
-    /// Resolve identity and classification from the same registry entry.
+    /// Resolve identity and confinement tier from the same verified entry.
     pub(crate) fn lookup_classified_with_ancestor_walk(&self, pid: libc::pid_t) -> Option<(String, bool)> {
-        self.resolve_classified_with_ancestor_walk(pid)
-            .map(|(_, entry)| (entry.run_id, entry.progression))
+        let resolution = self.resolve_ancestry(pid);
+        resolution.matched.map(|(_, run)| (run, resolution.progression))
     }
 
-    fn resolve_classified_with_ancestor_walk(&self, mut pid: libc::pid_t) -> Option<(libc::pid_t, RegisteredPid)> {
+    /// Walk up from `pid`, returning every level visited and the first
+    /// registered ancestor that is *the same process* that was registered.
+    ///
+    /// A registry entry whose pid is now held by a process with a different
+    /// start time is not a match: it is dropped from the registry and the
+    /// walk continues to the next ancestor, so a stale entry can neither
+    /// attribute the caller to the wrong run nor mask the caller's real
+    /// worker further up. An entry that cannot be verified is skipped too.
+    pub fn resolve_ancestry(&self, mut pid: libc::pid_t) -> AncestorResolution {
+        let mut chain = Vec::new();
+        let mut matched = None;
+        let mut progression = false;
         for _ in 0..ANCESTOR_WALK_DEPTH {
-            let entry = self
-                .inner
-                .lock()
-                .expect("registry poisoned")
-                .pid_to_run
-                .get(&pid)
-                .cloned();
-            if let Some(entry) = entry.filter(|entry| entry.is_current(pid)) {
-                return Some((pid, entry));
+            let mut inner = self.inner.lock().expect("registry poisoned");
+            let snapshot = self.processes.snapshot(pid);
+            let entry = inner.pid_to_run.get(&pid).cloned();
+
+            let verdict = match (&entry, &snapshot) {
+                (None, _) => LinkVerdict::Unregistered,
+                (
+                    Some(PidEntry {
+                        start: Some(registered),
+                        ..
+                    }),
+                    Ok(live),
+                ) if *registered == live.start => LinkVerdict::Matched,
+                (
+                    Some(PidEntry {
+                        start: Some(registered),
+                        ..
+                    }),
+                    Ok(live),
+                ) => LinkVerdict::PidReused {
+                    registered_start: *registered,
+                    live_start: live.start,
+                },
+                (Some(_), _) => LinkVerdict::Unverifiable,
+            };
+            chain.push(AncestorLink {
+                pid,
+                command: snapshot.as_ref().ok().map(|live| live.command.clone()),
+                registered_run: entry.as_ref().map(|entry| entry.run_id.clone()),
+                verdict: verdict.clone(),
+            });
+
+            match verdict {
+                LinkVerdict::Matched => {
+                    progression = entry.as_ref().is_some_and(|entry| entry.progression);
+                    matched = entry.map(|entry| (pid, entry.run_id));
+                    break;
+                }
+                LinkVerdict::PidReused { .. } | LinkVerdict::Unverifiable => {
+                    inner.pid_to_run.remove(&pid);
+                }
+                LinkVerdict::Unregistered => {}
             }
-            pid = match parent_pid(pid) {
-                Ok(Some(parent)) => parent,
-                Ok(None) | Err(_) => return None,
+
+            pid = match snapshot {
+                Ok(ProcessSnapshot { ppid: Some(parent), .. }) => parent,
+                Ok(_) | Err(_) => break,
             };
         }
-        None
+        AncestorResolution {
+            chain,
+            matched,
+            progression,
+        }
     }
 
     pub fn len(&self) -> usize {
         self.inner.lock().expect("registry poisoned").pid_to_run.len()
     }
 
-    /// Snapshot of every registered worker shell pid. Used by the
-    /// engine's RPC auth to decide "is this peer a worker?" — peers
-    /// whose process tree descends from one of these pids are workers,
-    /// not the Boss session.
+    /// Snapshot of every registered worker shell pid whose process is still
+    /// the one that was registered. Used by the engine's RPC auth to decide
+    /// "is this peer a worker?" — peers whose process tree descends from one
+    /// of these pids are workers, not the Boss session. Entries whose pid has
+    /// been recycled are dropped (and so excluded) rather than letting an
+    /// unrelated process's descendants be treated as a worker's.
     pub fn registered_pids(&self) -> Vec<libc::pid_t> {
-        let entries: Vec<(libc::pid_t, RegisteredPid)> = self
-            .inner
-            .lock()
-            .expect("registry poisoned")
-            .pid_to_run
-            .iter()
-            .map(|(pid, entry)| (*pid, entry.clone()))
-            .collect();
-        entries
-            .into_iter()
-            .filter(|(pid, entry)| entry.is_current(*pid))
-            .map(|(pid, _)| pid)
-            .collect()
+        let mut inner = self.inner.lock().expect("registry poisoned");
+        inner.pid_to_run.retain(|pid, entry| {
+            let current = matches!((entry.start, self.processes.snapshot(*pid)),
+                (Some(start), Ok(snapshot)) if start == snapshot.start);
+            if !current {
+                tracing::info!(pid, run_id = %entry.run_id, "worker registry: dropped an unverifiable or reused pid entry");
+            }
+            current
+        });
+        inner.pid_to_run.keys().copied().collect()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// Remove every pid entry belonging to `run_id`, returning how many there were.
+fn drop_run_pids(inner: &mut RegistryInner, run_id: &str) -> usize {
+    let before = inner.pid_to_run.len();
+    inner.pid_to_run.retain(|_, entry| entry.run_id != run_id);
+    let removed = before - inner.pid_to_run.len();
+    if removed > 0 {
+        tracing::debug!(
+            run_id,
+            removed,
+            "worker registry: dropped the released run's pid entries"
+        );
+    }
+    removed
 }
 
 /// Count of registered panes hosted on *this* machine — every slot below
@@ -418,438 +614,69 @@ fn local_live_pane_count(inner: &RegistryInner) -> u32 {
         .count() as u32
 }
 
-/// Read when `pid` started via macOS `proc_pidinfo`.
+/// Read `pid`'s parent pid, start time and command via macOS `proc_pidinfo`.
+/// `ppid` is `None` when `pid` is the root of the process tree (parent 0 /
+/// launchd).
 #[cfg(target_os = "macos")]
-pub(crate) fn process_start(pid: libc::pid_t) -> io::Result<ProcessStart> {
+pub fn process_snapshot(pid: libc::pid_t) -> io::Result<ProcessSnapshot> {
     let info = crate::libproc::proc_bsd_info(pid)?;
-    Ok(ProcessStart {
-        major: info.start_seconds,
-        minor: info.start_microseconds,
+    Ok(ProcessSnapshot {
+        ppid: if info.ppid == 0 { None } else { Some(info.ppid) },
+        start: info.start_micros,
+        command: info.command,
     })
 }
 
-/// Read when `pid` started from field 22 (`starttime`, clock ticks since
-/// boot) of Linux's `/proc/<pid>/stat`.
-#[cfg(target_os = "linux")]
-pub(crate) fn process_start(pid: libc::pid_t) -> io::Result<ProcessStart> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    let (_, fields) = stat.rsplit_once(')').ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("/proc/{pid}/stat is missing its process-name terminator"),
-        )
-    })?;
-    // `fields` starts at field 3 (state), so field 22 is index 19.
-    let ticks = fields
-        .split_whitespace()
-        .nth(19)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("/proc/{pid}/stat is missing starttime"),
-            )
-        })?
-        .parse::<u64>()
-        .map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid starttime in /proc/{pid}/stat: {err}"),
-            )
-        })?;
-    Ok(ProcessStart { major: ticks, minor: 0 })
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub(crate) fn process_start(_pid: libc::pid_t) -> io::Result<ProcessStart> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "process_start is only implemented on macOS and Linux",
-    ))
-}
-
-/// Look up the parent pid of `pid` via macOS `proc_pidinfo`. Returns
-/// `Ok(None)` when `pid` is the root of the process tree (parent is
-/// 0 / launchd).
-#[cfg(target_os = "macos")]
-pub fn parent_pid(pid: libc::pid_t) -> io::Result<Option<libc::pid_t>> {
-    let ppid = crate::libproc::proc_bsd_info(pid)?.ppid;
-    if ppid == 0 { Ok(None) } else { Ok(Some(ppid)) }
-}
-
-/// Look up the parent pid of `pid` from Linux's `/proc/<pid>/stat`.
+/// Read `pid`'s parent pid, start time and command from Linux's
+/// `/proc/<pid>/stat`.
 ///
 /// The process name field is parenthesized and may itself contain spaces or
 /// closing parentheses, so split after its final closing parenthesis before
-/// reading the state and parent-pid fields that follow it.
+/// reading the fields that follow it. After the name, field 0 is the state,
+/// field 1 the parent pid and field 19 the start time (clock ticks since boot).
 #[cfg(target_os = "linux")]
-pub fn parent_pid(pid: libc::pid_t) -> io::Result<Option<libc::pid_t>> {
+pub fn process_snapshot(pid: libc::pid_t) -> io::Result<ProcessSnapshot> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    let (_, fields) = stat.rsplit_once(')').ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("/proc/{pid}/stat is missing its process-name terminator"),
-        )
-    })?;
+    let invalid = |what: String| io::Error::new(io::ErrorKind::InvalidData, what);
+    let (head, fields) = stat
+        .rsplit_once(')')
+        .ok_or_else(|| invalid(format!("/proc/{pid}/stat is missing its process-name terminator")))?;
+    let command = head
+        .split_once('(')
+        .map(|(_, name)| name)
+        .unwrap_or_default()
+        .to_owned();
+    let mut fields = fields.split_whitespace();
     let parent = fields
-        .split_whitespace()
         .nth(1)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("/proc/{pid}/stat is missing ppid")))?
+        .ok_or_else(|| invalid(format!("/proc/{pid}/stat is missing ppid")))?
         .parse::<libc::pid_t>()
-        .map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid ppid in /proc/{pid}/stat: {err}"),
-            )
-        })?;
-    if parent <= 0 { Ok(None) } else { Ok(Some(parent)) }
+        .map_err(|err| invalid(format!("invalid ppid in /proc/{pid}/stat: {err}")))?;
+    let start = fields
+        .nth(17)
+        .ok_or_else(|| invalid(format!("/proc/{pid}/stat is missing starttime")))?
+        .parse::<u64>()
+        .map_err(|err| invalid(format!("invalid starttime in /proc/{pid}/stat: {err}")))?;
+    Ok(ProcessSnapshot {
+        ppid: if parent <= 0 { None } else { Some(parent) },
+        start,
+        command,
+    })
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn parent_pid(_pid: libc::pid_t) -> io::Result<Option<libc::pid_t>> {
+pub fn process_snapshot(_pid: libc::pid_t) -> io::Result<ProcessSnapshot> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "parent_pid is only implemented on macOS and Linux",
+        "process_snapshot is only implemented on macOS and Linux",
     ))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn register_after_register_progression_keeps_progression_tier() {
-        let reg = WorkerRegistry::new();
-        reg.inner.lock().unwrap().pid_to_run.insert(
-            77,
-            RegisteredPid {
-                run_id: "run-p".to_owned(),
-                start: process_start(77).ok(),
-                progression: true,
-            },
-        );
-        reg.register(77, "run-p");
-        assert_eq!(
-            reg.lookup_classified_with_ancestor_walk(77),
-            Some(("run-p".to_owned(), true))
-        );
-        reg.register_with_start(77, "run-p", None);
-        assert_eq!(
-            reg.lookup_classified_with_ancestor_walk(77),
-            Some(("run-p".to_owned(), true))
-        );
-        reg.register(78, "run-w");
-        assert_eq!(
-            reg.lookup_classified_with_ancestor_walk(78),
-            Some(("run-w".to_owned(), false))
-        );
-    }
-
-    #[test]
-    fn register_and_lookup() {
-        let reg = WorkerRegistry::new();
-        reg.register(1234, "run-abc");
-        assert_eq!(reg.lookup(1234).as_deref(), Some("run-abc"));
-        assert_eq!(reg.lookup(9999), None);
-    }
-
-    #[test]
-    fn unregister_removes_and_returns_old_value() {
-        let reg = WorkerRegistry::new();
-        reg.register(42, "run-1");
-        assert_eq!(reg.unregister(42).as_deref(), Some("run-1"));
-        assert_eq!(reg.lookup(42), None);
-    }
-
-    #[test]
-    fn unregister_unknown_pid_returns_none() {
-        let reg = WorkerRegistry::new();
-        assert_eq!(reg.unregister(123), None);
-    }
-
-    #[test]
-    fn len_and_is_empty_track_state() {
-        let reg = WorkerRegistry::new();
-        assert!(reg.is_empty());
-        reg.register(1, "a");
-        reg.register(2, "b");
-        assert_eq!(reg.len(), 2);
-        reg.unregister(1);
-        assert_eq!(reg.len(), 1);
-    }
-
-    #[test]
-    fn run_for_slot_is_the_inverse_of_slot_for_run() {
-        let reg = WorkerRegistry::new();
-        reg.register_run_slot("run-x", 4);
-        assert_eq!(reg.run_for_slot(4).as_deref(), Some("run-x"));
-        assert_eq!(reg.run_for_slot(5), None);
-        assert_eq!(reg.take_slot_for_run("run-x"), Some(4));
-        assert_eq!(reg.run_for_slot(4), None);
-    }
-
-    #[test]
-    fn take_slot_for_run_is_idempotent() {
-        let reg = WorkerRegistry::new();
-        reg.register_run_slot("run-x", 4);
-        assert_eq!(reg.take_slot_for_run("run-x"), Some(4));
-        // Second call returns None — that's the idempotency guard the
-        // release path leans on.
-        assert_eq!(reg.take_slot_for_run("run-x"), None);
-        // Unregistered run is also None.
-        assert_eq!(reg.take_slot_for_run("never-registered"), None);
-    }
-
-    #[test]
-    fn tmux_registration_preserves_session_identity_until_cleanup() {
-        let reg = WorkerRegistry::new();
-        reg.register_tmux_run_slot("run-tmux", 4, "boss-4-worker");
-
-        assert_eq!(reg.slot_for_run("run-tmux"), Some(4));
-        assert_eq!(
-            reg.take_worker_pane_for_run("run-tmux"),
-            Some(RegisteredWorkerPane {
-                slot_id: 4,
-                tmux_session_name: Some("boss-4-worker".to_owned()),
-            })
-        );
-        assert_eq!(reg.slot_for_run("run-tmux"), None);
-    }
-
-    #[test]
-    fn registry_clones_share_state() {
-        let reg = WorkerRegistry::new();
-        let clone = reg.clone();
-        reg.register(7, "shared");
-        assert_eq!(clone.lookup(7).as_deref(), Some("shared"));
-        clone.unregister(7);
-        assert!(reg.is_empty());
-    }
-
-    #[test]
-    fn remote_slot_allocation_is_idempotent_per_run() {
-        let reg = WorkerRegistry::new();
-        let (slot_a, fresh_a) = reg.get_or_allocate_remote_slot("exec-a").unwrap();
-        assert!(fresh_a, "first allocation must report freshly_allocated");
-        assert!(
-            slot_a >= REMOTE_SLOT_BASE,
-            "remote slot must come from the reserved range"
-        );
-        // Second call for the same run returns the same slot, not fresh.
-        let (slot_again, fresh_again) = reg.get_or_allocate_remote_slot("exec-a").unwrap();
-        assert_eq!(slot_again, slot_a);
-        assert!(!fresh_again);
-        // slot_for_run now resolves it like any other registered run.
-        assert_eq!(reg.slot_for_run("exec-a"), Some(slot_a));
-    }
-
-    #[test]
-    fn remote_slots_are_distinct_and_avoid_local_pool_range() {
-        let reg = WorkerRegistry::new();
-        // Occupy a couple of local-pool slots first.
-        reg.register_run_slot("local-1", 1);
-        reg.register_run_slot("local-9", 9);
-        let (a, _) = reg.get_or_allocate_remote_slot("exec-a").unwrap();
-        let (b, _) = reg.get_or_allocate_remote_slot("exec-b").unwrap();
-        assert_ne!(a, b, "concurrent remote runs must get distinct slots");
-        for s in [a, b] {
-            assert!(s >= REMOTE_SLOT_BASE, "remote slot {s} collided with the pool range");
-        }
-    }
-
-    #[test]
-    fn sleep_assertion_counts_only_local_panes_and_releases_them() {
-        let reg = WorkerRegistry::new();
-        assert!(!reg.sleep_assertion.is_asserted());
-
-        reg.get_or_allocate_remote_slot("remote").unwrap();
-        assert!(
-            !reg.sleep_assertion.is_asserted(),
-            "remote panes must not take the local machine assertion"
-        );
-
-        reg.register_run_slot("local", 1);
-        assert!(reg.sleep_assertion.is_asserted());
-        reg.take_slot_for_run("local");
-        assert!(!reg.sleep_assertion.is_asserted());
-    }
-
-    #[test]
-    fn remote_slot_reuses_lowest_free_after_release() {
-        let reg = WorkerRegistry::new();
-        let (a, _) = reg.get_or_allocate_remote_slot("exec-a").unwrap();
-        assert_eq!(a, REMOTE_SLOT_BASE);
-        let (b, _) = reg.get_or_allocate_remote_slot("exec-b").unwrap();
-        assert_eq!(b, REMOTE_SLOT_BASE + 1);
-        // Release the first run's slot; the next allocation reuses it.
-        assert_eq!(reg.take_slot_for_run("exec-a"), Some(REMOTE_SLOT_BASE));
-        let (c, fresh) = reg.get_or_allocate_remote_slot("exec-c").unwrap();
-        assert_eq!(c, REMOTE_SLOT_BASE);
-        assert!(fresh);
-    }
-
-    #[test]
-    fn take_worker_pane_for_run_drops_the_runs_pids() {
-        let reg = WorkerRegistry::new();
-        reg.register_with_start(5001, "run-done", None);
-        reg.register_with_start(5002, "run-live", None);
-        reg.register_run_slot("run-done", 3);
-        reg.register_run_slot("run-live", 4);
-
-        assert_eq!(reg.lookup(5001).as_deref(), Some("run-done"));
-        assert!(reg.take_worker_pane_for_run("run-done").is_some());
-
-        assert_eq!(reg.lookup(5001), None, "a torn-down run's pid must no longer resolve");
-        assert!(!reg.registered_pids().contains(&5001));
-        assert_eq!(
-            reg.lookup(5002).as_deref(),
-            Some("run-live"),
-            "other runs are untouched"
-        );
-    }
-
-    #[test]
-    fn take_worker_pane_for_run_drops_pids_even_without_a_mapped_pane() {
-        let reg = WorkerRegistry::new();
-        reg.register_with_start(5003, "run-no-slot", None);
-        assert!(reg.take_worker_pane_for_run("run-no-slot").is_none());
-        assert_eq!(reg.lookup(5003), None);
-        assert!(reg.is_empty());
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn registered_pid_reused_by_a_process_with_a_different_start_time_misses() {
-        let reg = WorkerRegistry::new();
-        let self_pid = std::process::id() as libc::pid_t;
-        let live = process_start(self_pid).unwrap();
-        // Simulate the pid having been registered by an earlier process that
-        // has since exited and whose pid this test process now holds.
-        let earlier = ProcessStart {
-            major: live.major.wrapping_sub(1),
-            minor: live.minor,
-        };
-        reg.register_with_start(self_pid, "finished-run", Some(earlier));
-        reg.inner
-            .lock()
-            .unwrap()
-            .pid_to_run
-            .get_mut(&self_pid)
-            .unwrap()
-            .progression = true;
-
-        assert_eq!(reg.lookup(self_pid), None);
-        assert_eq!(reg.lookup_with_ancestor_walk(self_pid), None);
-        assert_eq!(reg.resolve_with_ancestor_walk(self_pid), None);
-        assert_eq!(reg.lookup_classified_with_ancestor_walk(self_pid), None);
-        assert!(!reg.registered_pids().contains(&self_pid));
-        reg.register(self_pid, "new-run");
-        assert_eq!(
-            reg.lookup_classified_with_ancestor_walk(self_pid),
-            Some(("new-run".to_owned(), false))
-        );
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn ancestor_walk_skips_a_reused_pid_and_finds_the_live_registered_ancestor() {
-        let reg = WorkerRegistry::new();
-        let self_pid = std::process::id() as libc::pid_t;
-        let Some(parent) = parent_pid(self_pid).unwrap() else {
-            return;
-        };
-        let live = process_start(self_pid).unwrap();
-        let earlier = ProcessStart {
-            major: live.major.wrapping_sub(1),
-            minor: live.minor,
-        };
-        reg.register_with_start(self_pid, "stale-run", Some(earlier));
-        reg.register(parent, "live-run");
-
-        assert_eq!(
-            reg.resolve_with_ancestor_walk(self_pid),
-            Some((parent, "live-run".to_owned()))
-        );
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn register_records_start_time_so_the_live_process_still_matches() {
-        let reg = WorkerRegistry::new();
-        let self_pid = std::process::id() as libc::pid_t;
-        reg.register(self_pid, "self-run");
-        assert_eq!(reg.lookup(self_pid).as_deref(), Some("self-run"));
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn parent_pid_of_self_is_some() {
-        let self_pid = std::process::id() as libc::pid_t;
-        let parent = parent_pid(self_pid).unwrap();
-        assert!(parent.is_some(), "expected a parent pid for the test process");
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn ancestor_walk_finds_self_pid_when_registered() {
-        let reg = WorkerRegistry::new();
-        let self_pid = std::process::id() as libc::pid_t;
-        reg.register(self_pid, "self-run");
-        // Walking up from self should hit self immediately.
-        assert_eq!(reg.lookup_with_ancestor_walk(self_pid).as_deref(), Some("self-run"));
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn ancestor_walk_finds_parent_when_only_parent_registered() {
-        let reg = WorkerRegistry::new();
-        let self_pid = std::process::id() as libc::pid_t;
-        let Some(parent) = parent_pid(self_pid).unwrap() else {
-            // No parent? Skip.
-            return;
-        };
-        reg.register(parent, "parent-run");
-        // Walking up from self should reach parent.
-        assert_eq!(reg.lookup_with_ancestor_walk(self_pid).as_deref(), Some("parent-run"));
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn ancestor_walk_returns_none_when_no_ancestor_registered() {
-        let reg = WorkerRegistry::new();
-        let self_pid = std::process::id() as libc::pid_t;
-        assert_eq!(reg.lookup_with_ancestor_walk(self_pid), None);
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn ancestor_walk_reaches_registered_shell_through_deep_launcher_chain() {
-        use std::process::Command;
-        let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("nest.sh");
-        let marker = dir.path().join("deepest.pid");
-        std::fs::write(
-            &script,
-            "if [ \"$1\" -gt 0 ]; then sh \"$0\" $(($1 - 1)) \"$2\"; true; else echo $$ > \"$2\"; sleep 5; fi\n",
-        )
-        .unwrap();
-        // The registered shell sits 11 processes above the deepest caller.
-        let mut outer = Command::new("sh").arg(&script).arg("11").arg(&marker).spawn().unwrap();
-        let mut deepest = None;
-        for _ in 0..200 {
-            if let Ok(raw) = std::fs::read_to_string(&marker)
-                && let Ok(pid) = raw.trim().parse::<libc::pid_t>()
-            {
-                deepest = Some(pid);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-        let deepest = deepest.expect("deepest process published its pid");
-        let reg = WorkerRegistry::new();
-        reg.register(outer.id() as libc::pid_t, "chain-run");
-        let found = reg.lookup_with_ancestor_walk(deepest);
-        let _ = outer.kill();
-        let _ = outer.wait();
-        assert_eq!(found.as_deref(), Some("chain-run"));
-    }
+/// Look up the parent pid of `pid`. Returns `Ok(None)` when `pid` is the root
+/// of the process tree (parent is 0 / launchd).
+pub fn parent_pid(pid: libc::pid_t) -> io::Result<Option<libc::pid_t>> {
+    process_snapshot(pid).map(|snapshot| snapshot.ppid)
 }
+
+#[cfg(test)]
+mod tests;
