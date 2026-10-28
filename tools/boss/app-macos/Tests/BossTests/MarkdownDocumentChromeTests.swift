@@ -354,20 +354,23 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         XCTAssertEqual(chunks, [.plain(source)])
     }
 
-    /// Every fold includes descendant headings through the next peer or ancestor.
-    func testHeadingSectionsIncludesFindingsInsideParentSection() {
+    /// Default-collapsed boilerplate stops at the next heading of any level,
+    /// so findings stay visible outside the fold.
+    func testHeadingSectionsKeepsFindingsOutsideBoilerplate() {
         let chunks = MarkdownHeadingSections.chunks(
             in: Self.revisionBrief,
             collapsibleHeadings: [RevisionBriefCollapsibleHeadings.hardRule]
         )
-        XCTAssertEqual(chunks.count, 2)
+        XCTAssertEqual(chunks.count, 3)
         guard case .plain(let prefix) = chunks[0] else { return XCTFail("expected preamble") }
         XCTAssertTrue(prefix.contains("Automated PR review of PR #5"))
         guard case .collapsible(let heading, let body) = chunks[1] else { return XCTFail("expected fold") }
         XCTAssertEqual(heading, RevisionBriefCollapsibleHeadings.hardRule)
         XCTAssertTrue(body.contains("FORBIDDEN"))
-        XCTAssertTrue(body.contains("### [high]"))
-        XCTAssertTrue(body.contains("**Review summary:**"))
+        XCTAssertFalse(body.contains("### [high]"))
+        guard case .plain(let finding) = chunks[2] else { return XCTFail("expected finding") }
+        XCTAssertTrue(finding.contains("### [high]"))
+        XCTAssertTrue(finding.contains("**Review summary:**"))
     }
 
     /// Concatenating the chunks (re-adding back the `## ` marker and
@@ -445,10 +448,19 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         ### Next
         """
         let chunks = MarkdownHeadingSections.chunks(in: doc, collapsibleHeadings: ["Indented heading"])
-        XCTAssertEqual(chunks.count, 2, "expected prefix and complete folded outline: \(chunks)")
+        XCTAssertEqual(chunks.count, 3, "expected prefix, fold, and next heading: \(chunks)")
         guard case .collapsible(let heading, let body) = chunks[1] else { return XCTFail("expected a .collapsible chunk") }
         XCTAssertEqual(heading, "Indented heading")
-        XCTAssertTrue(body.hasSuffix("### Next"))
+        XCTAssertFalse(body.contains("### Next"))
+        XCTAssertTrue(chunks[2].renderedText.contains("### Next"))
+        let outline = MarkdownHeadingSections.chunks(
+            in: doc,
+            collapsibleHeadings: ["Indented heading"],
+            foldDescendants: true
+        )
+        XCTAssertEqual(outline.count, 2, "outline fold includes the descendant heading: \(outline)")
+        guard case .collapsible(_, let outlineBody) = outline[1] else { return XCTFail("expected a .collapsible chunk") }
+        XCTAssertTrue(outlineBody.hasSuffix("### Next"))
     }
 
     // MARK: - Find-in-document over a chunked document
@@ -505,9 +517,9 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         state.query = "FORBIDDEN"
         XCTAssertEqual(state.matches.count, 1)
         XCTAssertEqual(state.currentCollapsibleHeadingToExpand, heading)
-        state.query = "Null pointer"
+        state.query = "null check"
         XCTAssertEqual(state.matches.count, 1)
-        XCTAssertEqual(state.currentCollapsibleHeadingToExpand, heading)
+        XCTAssertNil(state.currentCollapsibleHeadingToExpand)
     }
 
     /// A match outside any collapsible chunk must not report a heading to

@@ -5,7 +5,12 @@ import Textual
 /// lazy heading sections. Definitions may live before or after their uses.
 @MainActor
 enum MarkdownParsedDocument {
-    static func parse(source: String, chunks: [MarkdownDocumentChunk], baseURL: URL?) -> [AttributedString] {
+    static func parse(
+        source: String,
+        chunks: [MarkdownDocumentChunk],
+        baseURL: URL?,
+        foldDescendants: Bool = false
+    ) -> [AttributedString] {
         do {
             let document = try AttributedStringMarkdownParser(
                 baseURL: baseURL,
@@ -15,7 +20,11 @@ enum MarkdownParsedDocument {
                 guard case .collapsible(let heading, _) = chunk else { return nil }
                 return heading
             })
-            let ranges = MarkdownHeadingSections.sections(in: source, collapsibleHeadings: collapsed).map(\.range)
+            let ranges = MarkdownHeadingSections.sections(
+                in: source,
+                collapsibleHeadings: collapsed,
+                foldDescendants: foldDescendants
+            ).map(\.range)
             let lineStarts = MarkdownHeadingSections.lineStarts(in: source)
             var result = Array(repeating: AttributedString(), count: chunks.count)
             var index = 0
@@ -55,14 +64,30 @@ enum MarkdownParsedDocument {
         private var source: String?
         private var chunks: [MarkdownDocumentChunk]?
         private var baseURL: URL?
+        private var foldDescendants = false
         private var value: [AttributedString] = []
 
-        func parse(source: String, chunks: [MarkdownDocumentChunk], baseURL: URL?) -> [AttributedString] {
-            if self.source != source || self.chunks != chunks || self.baseURL != baseURL {
-                value = MarkdownParsedDocument.parse(source: source, chunks: chunks, baseURL: baseURL)
+        func parse(
+            source: String,
+            chunks: [MarkdownDocumentChunk],
+            baseURL: URL?,
+            foldDescendants: Bool = false
+        ) -> [AttributedString] {
+            if self.source != source
+                || self.chunks != chunks
+                || self.baseURL != baseURL
+                || self.foldDescendants != foldDescendants
+            {
+                value = MarkdownParsedDocument.parse(
+                    source: source,
+                    chunks: chunks,
+                    baseURL: baseURL,
+                    foldDescendants: foldDescendants
+                )
                 self.source = source
                 self.chunks = chunks
                 self.baseURL = baseURL
+                self.foldDescendants = foldDescendants
             }
             return value
         }

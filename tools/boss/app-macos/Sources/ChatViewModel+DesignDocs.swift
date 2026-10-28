@@ -328,17 +328,18 @@ extension ChatViewModel {
         // Engine-minted review-findings briefs carry the standing "HARD
         // RULE: no punting" boilerplate ahead of their findings
         // (`render_revision_instructions` in
-        // `tools/boss/engine/pr-review/src/render.rs`) — collapse it by
-        // default as a complete outline section. Detection keys
-        // on that heading being present in the description, not on
-        // `task.kind`: a pre-merge brief is a `revision`, but the post-merge
-        // follow-up the engine mints after a PR has merged is a `followup`
-        // carrying the same rendering behind a provenance preamble, and it
-        // must collapse identically. This is purely presentational: the
-        // heading text matched here never changes what `task.description`
-        // itself contains, which is what the worker actually reads (see
-        // that Rust function's doc comment for the cross-language contract
-        // this string must stay in sync with).
+        // `tools/boss/engine/pr-review/src/render.rs`). Collapse that
+        // boilerplate by default so the findings that follow stay on
+        // screen. Detection keys on that heading being present in the
+        // description, not on `task.kind`: a pre-merge brief is a
+        // `revision`, but the post-merge follow-up the engine mints after
+        // a PR has merged is a `followup` carrying the same rendering
+        // behind a provenance preamble, and it must collapse identically.
+        // This is purely presentational: the heading text matched here
+        // never changes what `task.description` itself contains, which is
+        // what the worker actually reads (see that Rust function's doc
+        // comment for the cross-language contract this string must stay
+        // in sync with).
         asyncMarkdownViewerVM.collapsedByDefaultHeadings =
             RevisionBriefCollapsibleHeadings.collapsedByDefault(in: markdown)
         asyncMarkdownViewerVM.state = .loaded(

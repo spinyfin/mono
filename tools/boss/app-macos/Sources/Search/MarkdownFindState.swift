@@ -109,9 +109,23 @@ final class MarkdownFindState: ObservableObject {
     /// projection comments anchor against (`CommentProjection.plainText`) so
     /// search hits and comment highlights never disagree about where text
     /// lives in the rendered document.
-    func updateSource(_ source: String, baseURL: URL?, collapsibleHeadings: Set<String> = []) {
-        let chunks = MarkdownHeadingSections.chunks(in: source, collapsibleHeadings: collapsibleHeadings)
-        let parsed = MarkdownParsedDocument.parse(source: source, chunks: chunks, baseURL: baseURL)
+    func updateSource(
+        _ source: String,
+        baseURL: URL?,
+        collapsibleHeadings: Set<String> = [],
+        foldDescendants: Bool = false
+    ) {
+        let chunks = MarkdownHeadingSections.chunks(
+            in: source,
+            collapsibleHeadings: collapsibleHeadings,
+            foldDescendants: foldDescendants
+        )
+        let parsed = MarkdownParsedDocument.parse(
+            source: source,
+            chunks: chunks,
+            baseURL: baseURL,
+            foldDescendants: foldDescendants
+        )
         chunkCorpora = zip(chunks, parsed).map { chunk, content in
             ChunkCorpus(chunk: chunk, plainText: String(content.characters))
         }

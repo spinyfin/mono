@@ -171,7 +171,10 @@ sh_test(
 # NSPrincipalClass, which XCTest instantiates before the first test runs, and
 # it installs the missing-review-section assertion before XCTest starts. See
 # BossTestsPrincipal.swift and Tests/BossTests/Info.plist.
-_BOSS_TESTS_PRINCIPAL_SRCS = ["Tests/BossTests/BossTestsPrincipal.swift"]
+_BOSS_TESTS_PRINCIPAL_SRCS = [
+    "Tests/BossTests/BossTestsPrincipal.swift",
+    "Tests/BossTests/RevisionBriefCaptureFixture.swift",
+]
 
 _BOSS_TESTS_INFOPLISTS = ["Tests/BossTests/Info.plist"]
 

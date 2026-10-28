@@ -102,9 +102,13 @@ final class RevisionBriefCollapsedHeadingsTests: XCTestCase {
             return XCTFail("expected the provenance preamble as a leading .plain chunk; got \(chunks)")
         }
         XCTAssertTrue(preamble.hasPrefix("**Provenance:**"), "the preamble stays visible ahead of the fold")
-        XCTAssertTrue(
+        XCTAssertFalse(
             chunks.contains { if case .collapsible(_, let text) = $0 { return text.contains("### [medium]") } else { return false } },
-            "descendant findings belong to the complete parent section: \(chunks)"
+            "findings stay outside the default-collapsed boilerplate: \(chunks)"
+        )
+        XCTAssertTrue(
+            chunks.contains { if case .plain(let text) = $0 { return text.contains("### [medium]") } else { return false } },
+            "findings remain visible as their own section: \(chunks)"
         )
     }
 

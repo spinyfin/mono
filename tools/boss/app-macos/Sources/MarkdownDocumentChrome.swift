@@ -701,8 +701,11 @@ private struct RenderedMarkdownChunk: Identifiable {
 /// so each section can be its own `StructuredText` (bounding layout
 /// recursion and making `LazyVStack` effective). Headings whose exact text
 /// (level markers and surrounding whitespace stripped) appears in
-/// `collapsibleHeadings` become `.collapsible`. Outline folds include descendants;
-/// other top-level headings start `.plain` chunks with their heading line.
+/// `collapsibleHeadings` become `.collapsible`. By default a collapsible
+/// body runs until the next heading of any level, so nested headings stay
+/// visible as their own sections. Pass `foldDescendants: true` to fold
+/// through deeper headings up to the next peer or ancestor. Other
+/// top-level headings start `.plain` chunks with their heading line.
 /// A pure function over `String` —
 /// no Textual/StructuredText involvement — because Textual's block rendering
 /// has no supported hook for grouping or hiding a run of blocks (see the
@@ -715,10 +718,21 @@ private struct RenderedMarkdownChunk: Identifiable {
 /// attributed content by these same source ranges, preserving document-wide
 /// reference definitions.
 enum MarkdownHeadingSections {
-    /// Fold a complete outline section, including deeper headings, up to the
-    /// next heading of the same or higher level, without text-specific exceptions.
-    static func chunks(in source: String, collapsibleHeadings: Set<String>) -> [MarkdownDocumentChunk] {
-        sections(in: source, collapsibleHeadings: collapsibleHeadings).map { section in
+    /// Fold a heading through the next heading of any level. Nested headings
+    /// stay outside the fold as their own sections, so a default-collapsed
+    /// boilerplate heading does not hide the findings that follow it. Pass
+    /// `foldDescendants: true` to include deeper headings through the next
+    /// peer or ancestor.
+    static func chunks(
+        in source: String,
+        collapsibleHeadings: Set<String>,
+        foldDescendants: Bool = false
+    ) -> [MarkdownDocumentChunk] {
+        sections(
+            in: source,
+            collapsibleHeadings: collapsibleHeadings,
+            foldDescendants: foldDescendants
+        ).map { section in
             let text = String(source[section.range])
             if let heading = section.heading {
                 return .collapsible(heading: heading, body: text)
@@ -728,7 +742,9 @@ enum MarkdownHeadingSections {
     }
 
     static func sections(
-        in source: String, collapsibleHeadings: Set<String>
+        in source: String,
+        collapsibleHeadings: Set<String>,
+        foldDescendants: Bool = false
     ) -> [(heading: String?, range: Range<String.Index>)] {
         let headings = headingLines(in: source)
         guard !headings.isEmpty else { return [(nil, source.startIndex..<source.endIndex)] }
@@ -740,7 +756,7 @@ enum MarkdownHeadingSections {
         while i < headings.count {
             let heading = headings[i]
             var next = i + 1
-            if collapsibleHeadings.contains(heading.text) {
+            if foldDescendants && collapsibleHeadings.contains(heading.text) {
                 while next < headings.count && headings[next].level > heading.level { next += 1 }
             }
             let end = next < headings.count ? headings[next].lineRange.lowerBound : source.endIndex
