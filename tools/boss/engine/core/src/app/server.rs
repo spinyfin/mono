@@ -1919,6 +1919,7 @@ async fn serve_scoped(
             // agents stop` so a reconcile-cancel kills the worker's
             // process tree before its slot/lease is freed.
             reaper: server_state.clone() as Arc<dyn crate::stale_worker_sweep::StaleWorkerReaper>,
+            broadcaster: server_state.clone(),
             hold_registry: server_state.hold_registry.clone(),
             cube_client: server_state.cube_client.clone(),
         },

@@ -467,7 +467,11 @@ struct WorkerSlotView: View, @MainActor Equatable {
     /// `slotTaskLine` and intentionally not duplicated here.
     @ViewBuilder
     private var slotSubtitle: some View {
-        if let recovering = snapshot.live?.recoveryStatus,
+        if snapshot.live?.activity == .terminated {
+            Text("Exited")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        } else if let recovering = snapshot.live?.recoveryStatus,
            !recovering.isEmpty
         {
             // Transient-recovery banner wins outright: it means the

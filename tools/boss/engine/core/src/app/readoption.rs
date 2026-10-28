@@ -440,7 +440,7 @@ impl ServerState {
                 .as_ref()
                 .map(|driver| driver.descriptor().label.to_owned())
                 .unwrap_or_else(|| "Unknown driver".to_owned());
-            let awaiting_input_capable = driver.is_some_and(|driver| {
+            let awaiting_input_capable = driver.as_ref().is_some_and(|driver| {
                 driver
                     .capabilities()
                     .provides(crate::driver::Capability::AwaitingInputSignal)

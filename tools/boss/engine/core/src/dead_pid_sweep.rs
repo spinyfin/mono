@@ -236,8 +236,11 @@ pub async fn run_one_pass(
             continue;
         }
 
-        // Skip terminal slots — the completion path handles these.
-        if state.activity.is_terminal() {
+        // Skip terminal slots the completion path already owns. Confirmed
+        // death that only froze display (`observed_dead`) still needs this
+        // pass: the live-status refresh guard marks Terminated without
+        // releasing the registry entry or pool claim.
+        if state.activity.is_terminal() && !live_states.is_observed_dead(&state.run_id) {
             continue;
         }
 
@@ -253,8 +256,14 @@ pub async fn run_one_pass(
         };
 
         // Skip executions already in a terminal DB state (completion
-        // path may have raced the sweep).
+        // path may have raced the sweep), except observed-dead slots
+        // whose process is also gone: drop the retained registry entry
+        // so pool_claim_sweep can release the claim.
         if execution.status.is_terminal() {
+            if live_states.is_observed_dead(execution_id) && matches!(probe_pid(state.shell_pid), PidStatus::Dead) {
+                release_reaped_execution(live_states, &coordinator, &state).await;
+                outcome.reaped += 1;
+            }
             continue;
         }
 
@@ -435,7 +444,7 @@ async fn reap_live_nonterminal_worker(
         return false;
     };
 
-    if state.activity.is_terminal() {
+    if state.activity.is_terminal() && !matches!(evidence, DeathEvidence::TmuxObservation) {
         // Already finalized via the normal completion path; nothing to do.
         return false;
     }
@@ -644,6 +653,9 @@ async fn reap_dead_execution(
         return false;
     }
 
+    // Freeze status before slow teardown/backup work yields to the summarizer.
+    live_states.mark_terminated(execution_id);
+
     // Every dead-worker reap removes this slot from the live-state registry.
     // Resolve the work item's stale-worker attention before that happens so
     // the periodic sweep, the pane-input path, and tmux-observed death path
@@ -794,7 +806,7 @@ pub(crate) fn probe_pid(pid: i32) -> PidStatus {
 mod tests {
     use std::sync::Arc;
 
-    use boss_protocol::WorkItemBinding;
+    use boss_protocol::{WorkItemBinding, WorkerActivity};
 
     use super::*;
     use crate::dispatch_events::RecordingDispatchEventSink;
@@ -1892,6 +1904,157 @@ mod tests {
         assert_eq!(
             db.get_execution(&execution_id).unwrap().status,
             ExecutionStatus::Orphaned
+        );
+    }
+
+    /// Refresh-guard PID death marks the slot Terminated without releasing
+    /// it; the death sweep and pool-claim sweep must still clean up.
+    #[tokio::test]
+    async fn refresh_guard_pid_death_is_released_by_subsequent_sweeps() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "refresh-first");
+        let pid = dead_pid();
+        let execution_id = create_spawned_execution(&db, &work_item_id, i64::from(pid));
+        let db = Arc::new(db);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_binding(&live_states, 1, &execution_id, pid, &work_item_id);
+        drive_working_idle(&live_states, 1);
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        live_states.set_last_event_at_for_test(1, iso8601_utc(now - 200));
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+        assert!(live_states.get(1).is_some());
+        assert!(
+            coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&execution_id)
+        );
+
+        let outcome = crate::worker_refresh_liveness::evaluate(&db, &live_states, None, &execution_id, now).await;
+        assert_eq!(
+            outcome.permit,
+            crate::worker_refresh_liveness::WorkerRefreshPermit::Stop
+        );
+        assert_eq!(live_states.get(1).unwrap().activity, WorkerActivity::Terminated);
+        assert!(live_states.is_observed_dead(&execution_id));
+        assert!(
+            coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&execution_id),
+            "the refresh guard must not release the pool claim"
+        );
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let death = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            &AlwaysSucceedsCube,
+        )
+        .await;
+        assert_eq!(death.reaped, 1);
+
+        struct AllowTeardown;
+        #[async_trait::async_trait]
+        impl crate::pool_claim_sweep::WorkerViewerDetach for AllowTeardown {
+            async fn confirm_process_torn_down(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            async fn confirm_viewers_detached(&self, run_ids: &[String]) -> Vec<Result<(), String>> {
+                run_ids.iter().map(|_| Ok(())).collect()
+            }
+        }
+        let _pool = crate::pool_claim_sweep::run_one_pass(
+            db.as_ref(),
+            live_states.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &AllowTeardown,
+            &mut crate::pool_claim_sweep::TeardownRetries::default(),
+        )
+        .await;
+
+        assert!(live_states.get(1).is_none(), "registry entry must be released");
+        assert!(
+            !coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&execution_id),
+            "pool claim must be released"
+        );
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Orphaned
+        );
+    }
+
+    /// The durable reap can win the race: the execution row is already
+    /// terminal while the fenced slot and pool claim are still held. The
+    /// death sweep must still drop the retained entry so the pool-claim
+    /// sweep can release the claim.
+    #[tokio::test]
+    async fn terminal_row_with_fenced_dead_pid_slot_is_released_by_subsequent_sweeps() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "terminal-row");
+        let pid = dead_pid();
+        let execution_id = create_spawned_execution(&db, &work_item_id, i64::from(pid));
+        let db = Arc::new(db);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_binding(&live_states, 1, &execution_id, pid, &work_item_id);
+        drive_working_idle(&live_states, 1);
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+        assert!(live_states.mark_terminated(&execution_id));
+        db.force_execution_status_for_test(&work_item_id, ExecutionStatus::Completed)
+            .unwrap();
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let death = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            &AlwaysSucceedsCube,
+        )
+        .await;
+        assert_eq!(death.reaped, 1);
+
+        struct AllowTeardown;
+        #[async_trait::async_trait]
+        impl crate::pool_claim_sweep::WorkerViewerDetach for AllowTeardown {
+            async fn confirm_process_torn_down(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            async fn confirm_viewers_detached(&self, run_ids: &[String]) -> Vec<Result<(), String>> {
+                run_ids.iter().map(|_| Ok(())).collect()
+            }
+        }
+        let _pool = crate::pool_claim_sweep::run_one_pass(
+            db.as_ref(),
+            live_states.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &AllowTeardown,
+            &mut crate::pool_claim_sweep::TeardownRetries::default(),
+        )
+        .await;
+
+        assert!(live_states.get(1).is_none(), "registry entry must be released");
+        assert!(
+            !coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&execution_id),
+            "pool claim must be released"
         );
     }
 }

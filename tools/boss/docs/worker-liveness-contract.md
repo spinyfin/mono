@@ -146,6 +146,35 @@ being handled here.
 
 ### Retained worker exits
 
+Confirmed session loss is reconciled independently of the last transcript
+event and the activity it left behind: idle and waiting workers can die too.
+The engine marks the pane terminated before asynchronous teardown, preserving
+the final driver timestamp and summary. A surviving recorded PID still blocks
+destructive cleanup for an absent session or mismatched token; it does not
+make that missing pane display as working.
+
+The `observed_dead` fence drops buffered hooks until same-run re-adoption or
+a later `Alive` inspection restores the activity saved before termination,
+falling back to semantic evidence only when no activity was saved. Without
+either, activity is unchanged.
+Ordinary buffered hooks never clear it. Inferred death that still has a live
+PID skips the live-status refresh without fencing hooks or stopping the
+status loop; the stale-worker sweep still uses a reversible terminated
+display. Confirmed death (an observed pane exit, or inferred absence
+whose PID is gone) sets the fence, parks the live-status loop, and stays
+eligible for the ordinary death and pool-claim sweeps so the registry entry
+and pool claim are released even when the refresh guard noticed first. A
+later Alive inspection or same-run re-adoption un-parks the loop on its next wake.
+Only engine-inferred or observed-dead terminations can be revived this way;
+a driver SessionEnd remains under the authority of the hook stream.
+
+The live-status timer and the stale-worker sweep share one confirmed-death
+predicate. The timer checks process/session liveness before using a cached
+transcript and again before publishing a model response. Confirmed death
+stops the loop, and the registry rejects summary writes after termination.
+The app renders that activity in the header and the exited body; it does not
+infer death from summary age or viewer attachment.
+
 Before Boss creates its first private-server window, it starts the server and
 sets the global `history-limit=2000` and `remain-on-exit=on` defaults. The
 former makes scrollback a bounded diagnostic convenience; driver JSONL remains

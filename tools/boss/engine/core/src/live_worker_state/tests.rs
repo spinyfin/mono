@@ -1,6 +1,9 @@
 use super::*;
 use boss_protocol::StopReason;
 
+#[path = "tests/revival_tests.rs"]
+mod revival_tests;
+
 fn pre_tool(tool: &str) -> WorkerEvent {
     WorkerEvent::PreToolUse {
         session_id: "s".into(),

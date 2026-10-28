@@ -163,7 +163,7 @@ pub enum DeadPaneEvidence {
 }
 
 impl DeadPaneEvidence {
-    fn requires_pid_corroboration(&self) -> bool {
+    pub(crate) fn requires_pid_corroboration(&self) -> bool {
         !matches!(self, Self::PaneExited { .. })
     }
 
@@ -327,6 +327,28 @@ pub trait WorkerTerminalInspector: Send + Sync {
             boss_tmux::quote_for_shell(session_name)
         )
     }
+}
+
+/// Confirmed death for inferred tmux evidence: an observed pane exit, or
+/// session-absent / token-mismatch whose durable PID is not alive.
+/// Shared with the live-status refresh guard so both paths apply one
+/// standard for "dead".
+pub(crate) fn inferred_death_is_confirmed(
+    work_db: &WorkDb,
+    evidence: &DeadPaneEvidence,
+    run_id: &str,
+    now_epoch_secs: i64,
+) -> bool {
+    if !evidence.requires_pid_corroboration() {
+        return true;
+    }
+    !crate::durable_liveness::probe_execution_worker_within(
+        work_db,
+        run_id,
+        crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
+        now_epoch_secs,
+    )
+    .is_alive()
 }
 
 /// Production tmux inspector. A run without tmux identity (a remote detached
@@ -638,6 +660,7 @@ pub struct StaleWorkerSweepDeps {
     /// Forwarded to [`crate::dead_pid_sweep::reap_observed_worker_death`] so a
     /// tmux-confirmed dead pane can force-release its cube lease.
     pub cube_client: Arc<dyn CubeClient>,
+    pub broadcaster: Arc<dyn crate::live_status_loop::LiveStatusBroadcaster>,
 }
 
 /// Borrowed control collaborators for a single pass. Keeping teardown
@@ -690,6 +713,7 @@ pub fn spawn_loop(
         reaper,
         hold_registry,
         cube_client,
+        broadcaster,
     } = deps;
     crate::sweep_loop::spawn_sweep_loop(interval, move || {
         let work_db = Arc::clone(&work_db);
@@ -700,8 +724,10 @@ pub fn spawn_loop(
         let reaper = Arc::clone(&reaper);
         let hold_registry = Arc::clone(&hold_registry);
         let cube_client = Arc::clone(&cube_client);
+        let broadcaster = Arc::clone(&broadcaster);
         async move {
-            run_one_pass_with_terminal(
+            let before = live_states.snapshot();
+            let outcome = run_one_pass_with_terminal(
                 work_db.as_ref(),
                 live_states.as_ref(),
                 terminal_inspector.as_deref(),
@@ -717,7 +743,11 @@ pub fn spawn_loop(
                     auto_reap_threshold_secs,
                 },
             )
-            .await
+            .await;
+            if live_states.snapshot() != before {
+                broadcaster.broadcast_live_worker_states().await;
+            }
+            outcome
         }
     })
 }
@@ -831,11 +861,8 @@ pub async fn run_one_pass_with_terminal_and_grace(
             continue;
         }
 
-        // Only `working` slots are candidates. `Spawning` is still
-        // coming up (no event history expected); `Idle` and
-        // `WaitingForInput` are handled by the completion and
-        // transient-recovery paths; terminal states are done.
-        if state.activity != WorkerActivity::Working {
+        // A spawn may have persisted its session identity before creating it.
+        if state.activity == WorkerActivity::Spawning {
             outcome.not_working_skipped += 1;
             continue;
         }
@@ -853,6 +880,7 @@ pub async fn run_one_pass_with_terminal_and_grace(
             continue;
         };
         if execution.status.is_terminal() {
+            live_states.mark_terminated(&state.run_id);
             resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
             continue;
         }
@@ -863,26 +891,22 @@ pub async fn run_one_pass_with_terminal_and_grace(
             Some(inspector) => match inspector.inspect(&state.run_id).await {
                 Ok(Some(TerminalLiveness::Dead { session_name, evidence })) => {
                     // Tmux's death signal is authoritative on its own terms;
-                    // it needs no cadence/semantic evidence.
-                    if evidence.requires_pid_corroboration() {
-                        let process = crate::durable_liveness::probe_execution_worker_within(
-                            work_db,
-                            &state.run_id,
-                            crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
-                            now_epoch_secs,
+                    // it needs no cadence/semantic evidence. Inferred absence
+                    // still requires a dead PID before the permanent fence.
+                    if !inferred_death_is_confirmed(work_db, &evidence, &state.run_id, now_epoch_secs) {
+                        // Surviving PID: reversible exited display, no hook fence.
+                        live_states.mark_terminated_display(&state.run_id);
+                        tracing::warn!(
+                            execution_id = %state.run_id,
+                            session_name,
+                            ?evidence,
+                            "stale-worker sweep: tmux inferred death without an observed exit, \
+                             but durable_liveness still reports the worker pid alive; not reaping"
                         );
-                        if process.is_alive() {
-                            tracing::warn!(
-                                execution_id = %state.run_id,
-                                session_name,
-                                ?evidence,
-                                "stale-worker sweep: tmux inferred death without an observed exit, \
-                                 but durable_liveness still reports the worker pid alive; not reaping"
-                            );
-                            outcome.dead_uncorroborated += 1;
-                            continue;
-                        }
+                        outcome.dead_uncorroborated += 1;
+                        continue;
                     }
+                    live_states.mark_terminated(&state.run_id);
                     outcome.dead += 1;
                     let reason = evidence.reap_reason(&session_name);
                     tracing::info!(
@@ -907,7 +931,10 @@ pub async fn run_one_pass_with_terminal_and_grace(
                     }
                     continue;
                 }
-                Ok(Some(TerminalLiveness::Alive { session_name, .. })) => Some(TmuxIdentity::Live { session_name }),
+                Ok(Some(TerminalLiveness::Alive { session_name, .. })) => {
+                    let _ = live_states.revive_from_liveness_inference(&state.run_id);
+                    Some(TmuxIdentity::Live { session_name })
+                }
                 Ok(None) => None,
                 Err(err) => {
                     // A failed probe is never proof of health or death — it
@@ -927,6 +954,12 @@ pub async fn run_one_pass_with_terminal_and_grace(
             },
             None => None,
         };
+
+        // Death is independent of activity; semantic staleness requires Working.
+        if state.activity != WorkerActivity::Working {
+            outcome.not_working_skipped += 1;
+            continue;
+        }
 
         let Some(identity) = identity else {
             // No tmux identity for this run at all (no terminal inspector
