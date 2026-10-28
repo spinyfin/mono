@@ -8,7 +8,6 @@
 //! naming what was missing, so the guide run fails visibly instead of
 //! producing a guide with no orientation.
 
-use boss_protocol::{CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_MERGE_CONFLICT_PREFIX, CREATED_VIA_PR_REVIEW_PREFIX};
 use boss_review_guide::{GuideContext, RelatedWork, Relation, Revision, RevisionOrigin, RootTask};
 
 use super::*;
@@ -17,19 +16,17 @@ use super::*;
 /// keeps the declared dependencies first and truncates the unrelated rest.
 const MAX_RELATED_WORK: usize = 40;
 
-/// Classify a revision by the provenance stamped on it at creation. Anything
+/// Classify a revision by the provenance stamped on it at creation, using
+/// the same classifier the dispatcher uses so the two cannot drift. Anything
 /// the engine did not mint for review findings, a CI failure, or a merge
 /// conflict was asked for by a person (a guide comment, a PR comment, the
 /// CLI, the app).
 fn revision_origin(created_via: &str) -> RevisionOrigin {
-    if created_via.starts_with(CREATED_VIA_PR_REVIEW_PREFIX) {
-        RevisionOrigin::ReviewFindings
-    } else if created_via.starts_with(CREATED_VIA_CI_FIX_PREFIX) {
-        RevisionOrigin::CiFix
-    } else if created_via.starts_with(CREATED_VIA_MERGE_CONFLICT_PREFIX) {
-        RevisionOrigin::MergeConflict
-    } else {
-        RevisionOrigin::HumanRequested
+    match DispatchClass::classify(Some(TaskKind::Revision.as_str()), Some(created_via)) {
+        DispatchClass::PrReviewRevision => RevisionOrigin::ReviewFindings,
+        DispatchClass::CiFixRevision => RevisionOrigin::CiFix,
+        DispatchClass::MergeConflictRevision => RevisionOrigin::MergeConflict,
+        DispatchClass::OtherRevision | DispatchClass::OtherWork => RevisionOrigin::HumanRequested,
     }
 }
 
@@ -65,6 +62,22 @@ impl WorkDb {
             .optional()
             .with_context(|| format!("loading the revision that produced head {head_sha}"))?;
 
+        // Revisions that pushed commits for this PR, whatever their status
+        // now: their commits are in the pinned head even if the revision was
+        // later parked or archived.
+        let pushed_revisions: HashSet<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT revision_task_id FROM pr_review_guide_revision_heads
+                     WHERE root_task_id = ?1 AND pr_url = ?2",
+                )
+                .context("preparing the pushed-revision lookup")?;
+            stmt.query_map(params![root_task_id, pr_url], |row| row.get(0))
+                .context("loading the revisions that pushed to this PR")?
+                .collect::<rusqlite::Result<_>>()
+                .context("reading the revisions that pushed to this PR")?
+        };
+
         let mut revisions = Vec::new();
         for id in collect_chain_revision_ids(&conn, root_task_id)? {
             let task = query_task(&conn, &id)
@@ -73,12 +86,14 @@ impl WorkDb {
                     format!("revision {id} of task {root_task_id} disappeared while loading its guide context")
                 })?;
             // A revision that has not started, is parked, or was archived has
-            // not changed the PR; listing it would invite the guide to credit
-            // it with changes it never made.
-            if matches!(
-                task.status,
-                TaskStatus::Todo | TaskStatus::Blocked | TaskStatus::Archived
-            ) {
+            // not changed the PR unless it recorded a head; listing it would
+            // invite the guide to credit it with changes it never made.
+            if !pushed_revisions.contains(&id)
+                && matches!(
+                    task.status,
+                    TaskStatus::Todo | TaskStatus::Blocked | TaskStatus::Archived
+                )
+            {
                 continue;
             }
             revisions.push((

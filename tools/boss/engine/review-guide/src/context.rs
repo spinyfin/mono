@@ -220,7 +220,7 @@ fn quote_description(description: Option<&str>) -> String {
     let mut shown = 0usize;
     let mut truncated = false;
     for line in text.lines() {
-        let remaining = MAX_DESCRIPTION_CHARS - shown;
+        let remaining = MAX_DESCRIPTION_CHARS.saturating_sub(shown);
         if remaining == 0 {
             truncated = true;
             break;
@@ -281,6 +281,28 @@ mod tests {
         let quoted = quote_description(Some(&long));
         assert!(quoted.contains("[description truncated at 8000 characters]"));
         assert!(quoted.matches('x').count() == MAX_DESCRIPTION_CHARS);
+    }
+
+    #[test]
+    fn a_line_ending_exactly_at_the_cap_does_not_underflow() {
+        let exact = format!("{}\ny", "x".repeat(MAX_DESCRIPTION_CHARS));
+        let quoted = quote_description(Some(&exact));
+        assert!(quoted.contains("[description truncated at 8000 characters]"));
+        assert_eq!(quoted.matches('x').count(), MAX_DESCRIPTION_CHARS);
+        assert!(!quoted.contains("> y"));
+    }
+
+    #[test]
+    fn reaching_the_cap_after_earlier_lines_truncates_with_a_marker() {
+        // 10 lines of 99 chars consume 1000; the next line fills the rest of
+        // the budget exactly (it is one char short once its newline counts).
+        let early = vec!["a".repeat(99); 10].join("\n");
+        let fill = "b".repeat(MAX_DESCRIPTION_CHARS - 1000);
+        let text = format!("{early}\n{fill}\nafter");
+        let quoted = quote_description(Some(&text));
+        assert!(quoted.contains("[description truncated at 8000 characters]"));
+        assert!(!quoted.contains("> after"));
+        assert!(quoted.matches('b').count() <= MAX_DESCRIPTION_CHARS - 1000);
     }
 
     #[test]

@@ -766,6 +766,22 @@ async fn revision_guide_prompt_carries_parent_inputs_revisions_and_project() {
             &[&f.root, &status, &via, &description],
         );
     }
+    let pushed_then_blocked = create_active_chore(db, &product, "Pushed then blocked");
+    set_task_columns(
+        &f,
+        &pushed_then_blocked,
+        "kind = 'revision', parent_task_id = ?1, status = 'blocked', created_via = 'human'",
+        &[&f.root],
+    );
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO pr_review_guide_revision_heads
+             (root_task_id, pr_url, head_sha, revision_task_id, observation_sequence)
+             VALUES (?1, ?2, 'blocked-head', ?3, 1)",
+            rusqlite::params![&f.root, PR_URL, &pushed_then_blocked],
+        )
+        .unwrap();
     let parked = create_active_chore(db, &product, "Not started revision");
     set_task_columns(
         &f,
@@ -780,7 +796,8 @@ async fn revision_guide_prompt_carries_parent_inputs_revisions_and_project() {
     // task description and revisions from the task context.
     assert!(prompt.contains("### PR description"));
     assert!(prompt.contains("> People saw the layout jump whenever the window was resized."));
-    assert!(prompt.contains("2 revision(s), oldest first"));
+    assert!(prompt.contains("3 revision(s), oldest first"));
+    assert!(prompt.contains("3. human-requested revision (status: blocked)"));
     assert!(prompt.contains("1. review-findings revision (status: done)"));
     assert!(prompt.contains("> The reviewer found the minimum width was ignored."));
     assert!(prompt.contains("2. CI-fix revision (status: in_review)"));
