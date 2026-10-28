@@ -1434,8 +1434,7 @@ fn fresh_init_includes_project_design_doc_columns() {
 }
 
 /// Fresh init lands the new `tasks.repo_remote_url` column, the
-/// partial `tasks_repo_idx` index, and bumps the recorded
-/// `schema_version` to the current value.
+/// partial `tasks_repo_idx` index, and records all named migrations.
 #[test]
 fn fresh_init_includes_tasks_repo_remote_url() {
     let path = temp_db_path("tasks-repo-fresh");
@@ -1454,12 +1453,7 @@ fn fresh_init_includes_tasks_repo_remote_url() {
         .unwrap();
     assert_eq!(index_exists, 1);
 
-    let version: String = conn
-        .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(version, crate::work::schema_init::CURRENT_SCHEMA_VERSION.to_string());
+    crate::work::schema_init::assert_all_migrations_applied(&conn);
 
     let _ = std::fs::remove_file(path);
 }

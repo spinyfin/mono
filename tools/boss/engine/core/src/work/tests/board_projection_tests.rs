@@ -604,7 +604,8 @@ fn board_projection_upgrade_replaces_broad_triggers_and_preserves_watermark() {
             INSERT INTO board_changes(source) VALUES ('tasks');
         END;
         DROP TRIGGER board_changes_pr_review_guide_revision_heads_INSERT;
-        UPDATE metadata SET value = '57' WHERE key = 'schema_version';",
+        DROP TABLE schema_migrations;
+        INSERT OR REPLACE INTO metadata VALUES ('schema_version', '57');",
     )
     .unwrap();
     let before: u64 = conn

@@ -375,12 +375,7 @@ fn fresh_init_includes_external_tracker_schema() {
             .unwrap();
         assert_eq!(exists, 1, "index {idx} should exist after fresh init");
     }
-    let version: String = conn
-        .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(version, crate::work::schema_init::CURRENT_SCHEMA_VERSION.to_string());
+    crate::work::schema_init::assert_all_migrations_applied(&conn);
     let _ = std::fs::remove_file(path);
 }
 
