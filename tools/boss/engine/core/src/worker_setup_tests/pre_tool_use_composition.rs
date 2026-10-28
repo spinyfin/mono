@@ -42,6 +42,10 @@ fn revision_implementation_adds_gh_pr_create_guard_to_pre_tool_use() {
         "revision guard block message must point workers at `$CUBE_BIN` pr update: {guard_cmd}",
     );
     assert!(
+        guard_cmd.contains("BOSS_BIN") && guard_cmd.contains("propose followup-task --name"),
+        "revision guard block message must point workers at `$BOSS_BIN` propose followup-task: {guard_cmd}",
+    );
+    assert!(
         guard_cmd.contains("block"),
         "revision guard must produce a block decision: {guard_cmd}",
     );

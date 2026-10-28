@@ -79,6 +79,16 @@ fn launch_guard_blocks_all_handoff_subcommands() {
     }
 }
 
+#[test]
+fn launch_guard_handoff_block_points_at_propose_blocked() {
+    let (decision, reason) = run_launch_guard("boss handoff show");
+    assert_eq!(decision, "block");
+    assert!(
+        reason.contains("BOSS_BIN") && reason.contains("propose blocked --reason"),
+        "handoff denial must name the sanctioned propose path, got: {reason}",
+    );
+}
+
 // --- the observed launches that must be blocked ---
 
 /// The first incident, verbatim. `./bazel-bin/...` carries no bundle

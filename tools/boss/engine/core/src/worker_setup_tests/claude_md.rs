@@ -431,6 +431,28 @@ fn every_worker_kind_claude_md_carries_the_absolute_paths_instruction() {
 /// teach the engine's internal vocabulary any more than the prompt does (see
 /// `crate::prose_vocabulary`).
 #[test]
+fn claude_md_steers_revision_workers_to_followup_task() {
+    let input = sample_input();
+    let rendered = claude_md_for(&input);
+    assert!(
+        rendered.contains("## Revisions"),
+        "worker rules must carry a Revisions section; got:\n{rendered}",
+    );
+    assert!(
+        rendered.contains("A revision never opens a new PR"),
+        "worker rules must state a revision never opens a new PR; got:\n{rendered}",
+    );
+    assert!(
+        rendered.contains("propose followup-task --name"),
+        "worker rules must show the followup-task invocation shape; got:\n{rendered}",
+    );
+    assert!(
+        rendered.contains("propose blocked --reason"),
+        "worker rules must steer a blocked guard/policy/decision to propose blocked; got:\n{rendered}",
+    );
+}
+
+#[test]
 fn claude_md_avoids_internal_vocabulary() {
     for draft_pr_mode in [false, true] {
         let mut input = sample_input();

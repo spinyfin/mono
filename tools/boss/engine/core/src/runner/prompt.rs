@@ -1563,7 +1563,7 @@ fn compose_revision_directive(
     let is_conflict_resolution = conflict_attempt.is_some();
     let mut out = String::new();
     out.push_str("Expected outcome for this run:\n");
-    out.push_str("- This is a **REVISION** task. Your deliverable is an update to an EXISTING pull request — typically a new commit on the PR branch, or a rebase if that is all that is needed. Do NOT open a new PR. The engine owns your `boss-recovery/exec_*` recovery bookmark; keep it advanced locally.\n");
+    out.push_str("- This is a **REVISION** task. Your deliverable is an update to an EXISTING pull request — typically a new commit on the PR branch, or a rebase if that is all that is needed. A revision never opens a new PR. The engine owns your `boss-recovery/exec_*` recovery bookmark; keep it advanced locally.\n");
     out.push_str(&format!("- The parent PR is #{pr_number} at {parent_pr_url}.\n"));
     out.push_str("- Implement the requested changes in the Task description at the end of this prompt.\n");
     if let WorkItem::Task(task) | WorkItem::Chore(task) = work_item
@@ -1742,7 +1742,26 @@ fn compose_revision_directive(
     out.push_str(rebase_gate_clause);
     out.push('\n');
     out.push_str("Constraints:\n");
-    out.push_str("- Do NOT run `gh pr create` — this revision has no PR of its own.\n");
+    out.push_str(&format!(
+        "- A revision never opens a new PR. Do NOT run `gh pr create` or `{cube} pr create`. Push in-scope commits to the existing parent PR with `{cube} pr update --branch <parent-branch-name>`.\n"
+    ));
+    // Named even when `followup_proposals_seam` is off: the revision PR
+    // guard always prints this invocation, SubmitProposal accepts the
+    // kind regardless of the scrape-vs-proposal read-path flag, and a
+    // revision that needs a separate PR must not be left with only "do
+    // not open a PR".
+    out.push_str(
+        "- Out-of-scope or separately-approved PR work goes through `\"$BOSS_BIN\" propose followup-task --name \"<short title>\" --description \"<one paragraph of scope>\" --rationale \"<why a separate PR>\"`. Then finish the in-scope work on this parent PR. Do not declare you could not complete.\n",
+    );
+    if worker_signal_proposals_seam_enabled {
+        out.push_str(
+            "- If a guard, policy, or decision blocks progress, use `\"$BOSS_BIN\" propose blocked --reason \"<specific question>\"` instead of declaring you could not complete.\n",
+        );
+    } else {
+        out.push_str(
+            "- If a guard, policy, or decision blocks progress, emit a `[blocked] reason=\"<specific question>\"` marker instead of declaring you could not complete.\n",
+        );
+    }
     out.push_str("- The engine owns your `boss-recovery/exec_*` recovery bookmark; keep it advanced locally — push to the existing parent branch.\n");
     out.push_str("- Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty and this is NOT a rebase-only revision, stop and explain.\n");
     out.push('\n');

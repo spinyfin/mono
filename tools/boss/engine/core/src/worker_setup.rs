@@ -420,6 +420,10 @@ fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir
          - Before pushing, run `jj diff -r @`. If the diff is empty,\n\
            do NOT commit, push, or open a PR — stop and explain.\n\
          \n\
+         ## Revisions\n\
+         \n\
+         A revision never opens a new PR. Push in-scope commits to the existing parent PR with `{cube} pr update`. Out-of-scope or separately-approved PR work goes through `{boss} propose followup-task --name \"<short title>\" --description \"<one paragraph of scope>\" --rationale \"<why a separate PR>\"`; then finish the in-scope work on the parent PR. If a guard, policy, or decision blocks progress, use `{boss} propose blocked --reason \"<specific question>\"` instead of declaring you could not complete.\n\
+         \n\
          ## Checking your own PR's state\n\
          \n\
          The engine already stores most of what you'd otherwise ask GitHub for.\n\
