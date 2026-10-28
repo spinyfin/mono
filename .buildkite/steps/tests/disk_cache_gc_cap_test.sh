@@ -72,22 +72,22 @@ write_lines() {
 # ---------------------------------------------------------------------------
 
 # The host from the incident: a 500 GB VM whose df reported 489 GiB total.
-expect_output "244G" "489 GiB disk" ci_disk_cache_gc_cap_from_total_kb 512753664
+expect_output "391G" "489 GiB disk" ci_disk_cache_gc_cap_from_total_kb 512753664
 # An exact 500 GiB filesystem.
-expect_output "250G" "500 GiB disk" ci_disk_cache_gc_cap_from_total_kb 524288000
+expect_output "400G" "500 GiB disk" ci_disk_cache_gc_cap_from_total_kb 524288000
 # The 3.6 TiB secondary disks on the office Linux hosts.
-expect_output "1800G" "3.6 TiB disk" ci_disk_cache_gc_cap_from_total_kb 3774873600
-# 2 GiB is the smallest filesystem that yields a whole gigabyte; anything
+expect_output "2880G" "3.6 TiB disk" ci_disk_cache_gc_cap_from_total_kb 3774873600
+# 1.25 GiB is the smallest filesystem that yields a whole gigabyte; anything
 # less rounds down to zero and must be refused.
-expect_output "1G" "2 GiB disk" ci_disk_cache_gc_cap_from_total_kb 2097152
-expect_error "too small" "just under 2 GiB" ci_disk_cache_gc_cap_from_total_kb 2097151
+expect_output "1G" "1.25 GiB disk" ci_disk_cache_gc_cap_from_total_kb 1310720
+expect_error "too small" "just under 1.25 GiB" ci_disk_cache_gc_cap_from_total_kb 1310719
 expect_error "too small" "1 GiB disk" ci_disk_cache_gc_cap_from_total_kb 1048576
 expect_error "too small" "zero-size filesystem" ci_disk_cache_gc_cap_from_total_kb 0
 expect_error "not a whole number" "non-numeric size" ci_disk_cache_gc_cap_from_total_kb 12abc
 expect_error "not a whole number" "empty size" ci_disk_cache_gc_cap_from_total_kb ""
 expect_error "not a whole number" "negative size" ci_disk_cache_gc_cap_from_total_kb -5
 # Bazel size flags take whole units, so the cap is never fractional.
-expect_output "4G" "rounds down, never up" ci_disk_cache_gc_cap_from_total_kb 10485759
+expect_output "7G" "rounds down, never up" ci_disk_cache_gc_cap_from_total_kb 10485759
 if [[ "$CI_DISK_CACHE_GC_PERCENT" -le 0 || "$CI_DISK_CACHE_GC_PERCENT" -ge 100 ]]; then
   fail "CI_DISK_CACHE_GC_PERCENT must leave headroom on the disk, is ${CI_DISK_CACHE_GC_PERCENT}"
 fi
@@ -216,7 +216,7 @@ end_to_end() {
   total="$(ci_disk_cache_fs_total_kb "$cache_dir")" || return 1
   ci_disk_cache_gc_cap_from_total_kb "$total"
 }
-expect_output "244G" "end to end" end_to_end
+expect_output "391G" "end to end" end_to_end
 PATH="$original_path"
 
 if [[ "$failures" -ne 0 ]]; then

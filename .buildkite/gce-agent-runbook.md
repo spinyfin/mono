@@ -62,10 +62,10 @@ gcloud compute ssh bk-bazel-any-gce-1 --zone=ZONE --project=PROJECT
 
 The dead hosts' CPU and RAM were never recorded. `n2-standard-16` (16 vCPU / 64 GB) is inferred from observed action parallelism (58 concurrent test actions at peak) and warm-build timings: Linux `bazel-build-test` p50 18s / p90 152s across 77 sampled jobs, roughly at parity with the M-series Macs. `n2-standard-8` works; expect the p90 cases to stretch. Do not go below 32 GB — the hosts set `--shutdown_on_low_sys_mem`, and `.bazelrc:1` sets `--jobs=200`.
 
-Disk: each mono output base measures ~10 GB, the shared disk cache ~40 GB at steady state. 500 GB is comfortable. The disk cache's size-based GC cap is sized to the host, not fixed: `steps/ci-env.sh` computes it on every CI step as half of the total size of the filesystem holding `/mnt/ssd/bazel/disk_cache` (~244 GB on a 500 GB boot disk) and passes it as `--experimental_disk_cache_gc_max_size` after `--config=ci-linux`, overriding the fleet-wide `3T` in `.ci.bazelrc`, which on a disk this size would never fire. The age-based GC (60 days) is unchanged. Each CI step prints the computed cap at the top of its log:
+Disk: each mono output base measures ~10 GB, the shared disk cache ~40 GB at steady state. 500 GB is comfortable. The disk cache's size-based GC cap is sized to the host, not fixed: `steps/ci-env.sh` computes it on every CI step as 80% of the total size of the filesystem holding `/mnt/ssd/bazel/disk_cache` (~391 GB on a 500 GB boot disk) and passes it as `--experimental_disk_cache_gc_max_size` after `--config=ci-linux`, overriding the fleet-wide `3T` in `.ci.bazelrc`, which on a disk this size would never fire. The age-based GC (60 days) is unchanged. Each CI step prints the computed cap at the top of its log:
 
 ```
---- [ci-env] disk cache /mnt/ssd/bazel/disk_cache: filesystem is 489 GB, GC cap 244G (50%)
+--- [ci-env] disk cache /mnt/ssd/bazel/disk_cache: filesystem is 489 GB, GC cap 391G (80%)
 ```
 
 To verify on the host (from the agent's checkout, e.g. `/var/lib/buildkite-agent/builds/<agent>/flunge/mono`):

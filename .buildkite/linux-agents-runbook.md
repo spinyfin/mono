@@ -193,7 +193,7 @@ This keeps Bazel's large, disk-hungry action cache and sandboxed build outputs o
 Since then `.buildkite/steps/ci-env.sh` sizes the cap to the host on every CI step:
 
 - It reads the `build:ci-linux --disk_cache=` path out of `.ci.bazelrc` (so the cache location is still defined in one place), creates the directory if needed, and asks `df -P -k` for the total size of the filesystem holding it.
-- The cap is **half of that total**, rounded down to whole gigabytes, passed as `--experimental_disk_cache_gc_max_size` after `--config=ci-linux` on every CI bazel command (the wrapper in `ci-env.sh` and, via `REPOBIN_BAZEL_FLAGS`, repobin's own calls). A flag on the command line after `--config` overrides the rc file's value. Half leaves room for what shares the filesystem — the output bases (~10 GB each, one per agent on the host), the repository cache — and for the cache overshooting the cap between GC passes, since GC only runs once the Bazel server has been idle for five minutes.
+- The cap is **80% of that total**, rounded down to whole gigabytes, passed as `--experimental_disk_cache_gc_max_size` after `--config=ci-linux` on every CI bazel command (the wrapper in `ci-env.sh` and, via `REPOBIN_BAZEL_FLAGS`, repobin's own calls). A flag on the command line after `--config` overrides the rc file's value. The remaining 20% leaves room for what shares the filesystem — the output bases (~10 GB each, one per agent on the host), the repository cache — and for the cache overshooting the cap between GC passes, since GC only runs once the Bazel server has been idle for five minutes.
 - If the filesystem cannot be determined (the rc line is missing, the directory cannot be created, `df` fails or prints nothing usable), the step fails with a `[ci-env] error:` line. It never silently falls back to `3T`.
 - `.ci.bazelrc` keeps `3T` as the fallback for bazel run by hand on a host with `--config=ci-linux`, which does not go through `ci-env.sh`. A hand-run command therefore makes the GC pass that follows it evict nothing — harmless, and the next CI job restores the computed cap — whereas a small fallback would evict most of a 3.6 TB host's cache.
 
@@ -208,7 +208,7 @@ bash -c 'source .buildkite/steps/disk-cache-gc-cap.sh &&
 grep "Disk cache garbage collector" /mnt/ssd/bazel/output_base/*/java.log | tail
 ```
 
-Every CI step also prints the value it computed at the top of its log (`--- [ci-env] disk cache /mnt/ssd/bazel/disk_cache: filesystem is 3662 GB, GC cap 1800G (50%)`), and the `java.log` grep shows the GC actually running (`Deleted N of M files, reclaimed ...`).
+Every CI step also prints the value it computed at the top of its log (`--- [ci-env] disk cache /mnt/ssd/bazel/disk_cache: filesystem is 3600 GB, GC cap 2880G (80%)`), and the `java.log` grep shows the GC actually running (`Deleted N of M files, reclaimed ...`).
 
 ### Disk-full symptom: agent connected, jobs stuck in "accepted" with empty logs
 

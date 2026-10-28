@@ -18,11 +18,12 @@
 # bases (~10 GB each, one per agent on the host) and the repository cache share
 # it, and the GC only runs once the server has been idle for
 # --experimental_disk_cache_gc_idle_delay, so the cache can overshoot the cap by
-# whatever the builds in between wrote. Half the disk leaves room for all of
-# that. A disk is "too small" only when half of it rounds down to 0 GB; that is
+# whatever the builds in between wrote. Reserving 20% leaves headroom while
+# letting large dedicated cache disks retain more build outputs. A disk is
+# "too small" only when 80% of it rounds down to 0 GB; that is
 # a configuration error, not a host to size the cache for.
 
-CI_DISK_CACHE_GC_PERCENT=50
+CI_DISK_CACHE_GC_PERCENT=80
 
 _ci_disk_cache_err() {
   echo "[ci-env] error: $*" >&2
