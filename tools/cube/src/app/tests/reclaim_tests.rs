@@ -917,9 +917,9 @@ fn a_surplus_the_last_trim_could_not_act_on_does_not_pin_the_gc_at_five_minutes(
 
 #[test]
 fn no_disk_pressure_relief_when_the_volume_is_above_its_floor() {
-    // A floor of one byte is below the injected test volume, so this
+    // Floors of one byte are below the injected test volume, so this
     // exercises the ordinary path: no reclamation, no audit noise, no cost.
-    let _config = ConfigGuard::new("[pool]\nmin-free-bytes = 1\nmin-free-percent = 0\n");
+    let _config = ConfigGuard::new("[pool]\nmin-free-bytes = 1\nmin-free-percent = 0\nmint-min-free-bytes = 1\n");
     let (tempdir, database_path) = with_database_path();
     let (store, workspace_root) = seed_pool(&tempdir, &database_path, 1, None);
     write_artifact_tree(&workspace_root.join("mono-agent-001"), "target");
@@ -946,12 +946,13 @@ fn no_disk_pressure_relief_when_the_volume_is_above_its_floor() {
 
 #[test]
 fn disk_pressure_compacts_before_the_lease_continues() {
-    // A floor of u64::MAX is above the injected test volume, so the pressure
+    // Floors of u64::MAX are above the injected test volume, so the pressure
     // path always fires and no re-measure can ever clear it — the cheapest way
     // to exercise "below the floor, and still below it afterwards".
     let _config = ConfigGuard::new(
         "[pool]\n\
          min-free-bytes = 18446744073709551615\n\
+         mint-min-free-bytes = 18446744073709551615\n\
          build-artifact-dirs = [\"target\"]\n",
     );
     let (tempdir, database_path) = with_database_path();
@@ -997,7 +998,7 @@ fn disk_pressure_that_recovers_lets_the_mint_through() {
     // volume below its floor compacts, the re-measure clears the floor, and
     // the mint that would have been refused goes ahead instead. Scripting the
     // probe is the only way to express "space changed" — the first reading is
-    // 1 GiB against the default `max(20 GiB, 2% of total)` floor, every
+    // 1 GiB against the default cleanup and mint floors, every
     // reading after it is the ample volume, which is what compaction is
     // standing in for.
     let _config = ConfigGuard::new("[pool]\nbuild-artifact-dirs = [\"target\"]\n");
@@ -1037,9 +1038,8 @@ fn disk_pressure_that_recovers_lets_the_mint_through() {
 #[test]
 fn a_mint_is_allowed_on_a_volume_above_its_floor() {
     // The ordinary case, and the one that must not depend on the host: the
-    // default floor is `max(20 GiB, 2% of total)`, which the injected volume
-    // clears with room to spare no matter how full the machine running the
-    // suite happens to be.
+    // injected volume clears the default mint floor with room to spare no
+    // matter how full the machine running the suite happens to be.
     let _config = ConfigGuard::new("[pool]\n");
     let _disk = with_reading(AMPLE_TEST_VOLUME);
     let (tempdir, _database_path) = with_database_path();
@@ -1049,7 +1049,7 @@ fn a_mint_is_allowed_on_a_volume_above_its_floor() {
 
 #[test]
 fn a_mint_is_refused_on_a_volume_below_its_floor() {
-    // 7.4 GiB free against the default floor — the reading taken from a CI
+    // 7.4 GiB free against the default mint floor — the reading taken from a CI
     // agent that had filled up. Injected rather than provoked, because the
     // refusal is the behaviour under test and "run the suite on a full disk"
     // is not a test.
@@ -1071,8 +1071,80 @@ fn a_mint_is_refused_on_a_volume_below_its_floor() {
     assert_eq!(repo, "mono");
     assert_eq!(available, "7.4 GiB");
     assert_eq!(
-        floor, "20.5 GiB",
-        "the floor is max(20 GiB, 2% of total), and 2% of 1 TiB just edges it out",
+        floor, "58.0 GiB",
+        "the mint floor is 2 × a 24 GiB workspace + a 10 GiB OS reserve, whatever the volume's size",
     );
-    assert_eq!(shortfall, "13.1 GiB");
+    assert_eq!(shortfall, "50.6 GiB");
+}
+
+#[test]
+fn a_high_cleanup_trigger_does_not_refuse_a_mint_that_fits() {
+    // The regression this split exists for: a host raised `min-free-percent`
+    // to 10 so cleanup would start earlier, and on a large volume that turned
+    // into "refuse every new workspace with 120 GiB free". The cleanup trigger
+    // still fires (the lease compacts), but the mint is judged against what a
+    // workspace needs, so it goes ahead.
+    let _config = ConfigGuard::new("[pool]\nmin-free-percent = 10\nbuild-artifact-dirs = [\"target\"]\n");
+    let free = 90 * 1024 * 1024 * 1024; // below 10% of 1 TiB, above the mint floor
+    let _disk = with_reading(volume_with_free(free));
+    let (tempdir, database_path) = with_database_path();
+    let (store, workspace_root) = seed_pool(&tempdir, &database_path, 0, None);
+
+    let runner = FakeRunner::new(vec![]);
+    let relief = relieve_disk_pressure(
+        &runner,
+        &store,
+        Some(&database_path),
+        "mono",
+        &workspace_root,
+        NOW,
+        None,
+    )
+    .expect("below the cleanup trigger, so reclamation runs");
+    assert!(
+        relief.recovered,
+        "the volume clears the mint floor even though it is under the trigger"
+    );
+    assert_mint_headroom("mono", &workspace_root).expect("a workspace fits; the mint must not be refused");
+}
+
+#[test]
+fn an_explicit_mint_floor_overrides_the_default() {
+    let _config = ConfigGuard::new("[pool]\nmint-min-free-bytes = 107374182400\n"); // 100 GiB
+    let _disk = with_reading(volume_with_free(90 * 1024 * 1024 * 1024));
+    let (tempdir, _database_path) = with_database_path();
+
+    let err = assert_mint_headroom("mono", tempdir.path()).expect_err("90 GiB is below a 100 GiB mint floor");
+    let CubeError::InsufficientDiskSpace { floor, shortfall, .. } = err else {
+        panic!("expected InsufficientDiskSpace, got {err:?}");
+    };
+    assert_eq!(floor, "100.0 GiB");
+    assert_eq!(shortfall, "10.0 GiB");
+}
+
+#[test]
+fn a_mint_floor_below_the_cleanup_trigger_still_reclaims_first() {
+    // The reverse ordering: a mint floor above the cleanup trigger (a small
+    // disk with the default 20 GiB trigger) must still give the lease a chance
+    // to reclaim before the mint is refused, rather than refusing a volume
+    // nothing has tried to clean.
+    let _config =
+        ConfigGuard::new("[pool]\nmin-free-bytes = 1\nmin-free-percent = 0\nmint-min-free-bytes = 107374182400\n");
+    let _disk = with_reading(volume_with_free(90 * 1024 * 1024 * 1024));
+    let (tempdir, database_path) = with_database_path();
+    let (store, workspace_root) = seed_pool(&tempdir, &database_path, 0, None);
+
+    let runner = FakeRunner::new(vec![]);
+    let relief = relieve_disk_pressure(
+        &runner,
+        &store,
+        Some(&database_path),
+        "mono",
+        &workspace_root,
+        NOW,
+        None,
+    )
+    .expect("below the mint floor, so reclamation runs even above the cleanup trigger");
+    assert!(!relief.recovered);
+    assert!(assert_mint_headroom("mono", &workspace_root).is_err());
 }
