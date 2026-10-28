@@ -21,7 +21,9 @@ rust_library(
 
 rust_test(
     name = "recovery_test",
-    size = "small",
+    # Real-jj fixtures: every test spawns a throwaway colocated repo, so the
+    # suite exceeds the 60s `small` budget on a loaded CI host.
+    size = "medium",
     crate = ":recovery",
     data = ["@jj_test_tools//:jj"],
     edition = "2024",
