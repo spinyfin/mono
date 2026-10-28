@@ -196,7 +196,7 @@ async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedbac
     );
     let pid = std::process::id() as libc::pid_t;
     state.worker_registry.register(pid, guide_execution.to_owned());
-    let guide = "# Revised retry guide\n## Changed since the previous version\nPermission errors now stop immediately.\n## Problem\nPermission errors used to retry.\n## Implementation\nStop immediately.\n## Example\nA permission error returns once.\n## Review\nCheck the regression test.\n## Evidence\nThe revision added a permission-error regression test.";
+    let guide = "# Revised retry guide\n## Orientation\nPermission errors used to retry; they now stop immediately.\n## Changed since the previous version\nPermission errors now stop immediately.\n## Problem\nPermission errors used to retry.\n## Implementation\nStop immediately.\n## Example\nA permission error returns once.\n## Review\nCheck the regression test.\n## Evidence\nThe revision added a permission-error regression test.";
     let (proposal, _) = submitted(
         call_with_peer(
             &state,
