@@ -271,6 +271,8 @@ fn attempting_survives_restart_and_result_commits_once() {
     assert!(journal.begin_pending().unwrap().is_none());
     assert_eq!(journal.applied_commands().unwrap(), 1);
     assert_eq!(journal.record_bounds().unwrap().1, 1);
+    let retained = journal.next_record(0).unwrap().unwrap();
+    assert_eq!(journal.bytes().unwrap(), retained.bytes.len() as u64 + 256);
 }
 
 #[test]
