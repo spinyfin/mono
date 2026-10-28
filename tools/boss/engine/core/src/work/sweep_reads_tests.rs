@@ -202,12 +202,13 @@ fn clone_row(conn: &Connection, table: &str, template_id: &str, overrides: &[(&s
     .unwrap();
 }
 
-/// Not a correctness test: the before/after cost evidence for the sweep
-/// reads, on a synthetic DB shaped like a busy engine (review cycles with
-/// revisions and verdicts, which is what makes the full projection's
-/// badge query expensive). It asserts only that the narrow reads agree
-/// with the full projection; the timings are printed for the PR body and
-/// never asserted, so the test cannot flake on a slow host.
+/// Not a correctness test: compares the per-id full `get_work_item`
+/// projection against the narrow sweep reads on a synthetic DB shaped like
+/// a busy engine (review cycles with revisions and verdicts, which is what
+/// makes the projection's badge query expensive). It asserts only that the
+/// narrow reads agree with the full projection; timings are printed (run
+/// with `--nocapture`) and never asserted, so the test cannot flake on a
+/// slow host.
 #[test]
 fn sweep_cost_baseline_full_projection_vs_narrow_reads() {
     const ROOTS: usize = 1500;
@@ -409,7 +410,7 @@ fn sweep_cost_baseline_full_projection_vs_narrow_reads() {
         );
     }
 
-    // Full projection, one read per id: what every sweep did per slot.
+    // Full projection: one `get_work_item` per id, for comparison with the narrow batched and single-row reads below.
     let full_started = Instant::now();
     let mut full_efforts = HashMap::new();
     let mut full_closed = HashMap::new();

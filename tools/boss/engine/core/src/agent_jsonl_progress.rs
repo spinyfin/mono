@@ -1366,7 +1366,6 @@ where
         // only on the iterations that are about to publish bytes or a
         // delimiter, where it is what keeps a rename after validation from
         // substituting a second file's bytes.
-        before_descriptor_read(&path)?;
         let opened_metadata = file
             .metadata()
             .map_err(|err| format!("metadata {}: {err}", path.display()))?;
@@ -1390,6 +1389,9 @@ where
             // rename after validation cannot substitute bytes from a second
             // file: this runs before the read, and again after it below.
             validate_descriptor_before_publish(&prepared, &path, &file, opened_identity)?;
+            // Test seam: fires between the pre-read check and the read, the
+            // window only the post-read check below can close.
+            before_descriptor_read(&path)?;
             file.seek(SeekFrom::Start(offset))
                 .map_err(|err| format!("seek {}: {err}", path.display()))?;
             let read_len = usize::try_from((size - offset).min(FILE_CHUNK_BYTES as u64))
