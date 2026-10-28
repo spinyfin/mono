@@ -35,6 +35,7 @@ mod proposals;
 mod review;
 mod selected_product;
 mod stream_integrity;
+mod stuck_report;
 use boss_engine::dispatch_events::DispatchEvent;
 use boss_engine::dispatch_reader;
 use boss_protocol::{
@@ -1373,16 +1374,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         } => doctor::run_tmux_preflight(cli.json).await,
         Command::Dispatch {
             action: DispatchAction::Stuck { since },
-        } => {
-            let mut client = connect(&cli.socket_path).await?;
-            let report = boss_client::stuck_report::fetch(&mut client, &since).await?;
-            if cli.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                print!("{}", boss_client::stuck_report::render(&report));
-            }
-            Ok(())
-        }
+        } => stuck_report::run(&cli.socket_path, cli.json, &since).await,
         Command::Dispatch {
             action:
                 DispatchAction::Tail {
