@@ -427,9 +427,6 @@ fn every_worker_kind_claude_md_carries_the_absolute_paths_instruction() {
     }
 }
 
-/// The generated rules file is read by every standard worker, so it must not
-/// teach the engine's internal vocabulary any more than the prompt does (see
-/// `crate::prose_vocabulary`).
 #[test]
 fn claude_md_steers_revision_workers_to_followup_task() {
     let input = sample_input();
@@ -447,11 +444,33 @@ fn claude_md_steers_revision_workers_to_followup_task() {
         "worker rules must show the followup-task invocation shape; got:\n{rendered}",
     );
     assert!(
-        rendered.contains("propose blocked --reason"),
-        "worker rules must steer a blocked guard/policy/decision to propose blocked; got:\n{rendered}",
+        rendered.contains("[blocked] reason=\"<specific question>\""),
+        "worker rules, seam off: must steer a blocked guard/policy/decision to the marker; got:\n{rendered}",
+    );
+    assert!(
+        !rendered.contains("propose blocked --reason"),
+        "worker rules, seam off: must not teach propose blocked; got:\n{rendered}",
     );
 }
 
+#[test]
+fn claude_md_steers_blocked_progress_to_propose_blocked_when_seam_is_on() {
+    let mut input = sample_input();
+    input.worker_signal_proposals_seam_enabled = true;
+    let rendered = claude_md_for(&input);
+    assert!(
+        rendered.contains("propose blocked --reason"),
+        "worker rules, seam on: must steer a blocked guard/policy/decision to propose blocked; got:\n{rendered}",
+    );
+    assert!(
+        !rendered.contains("[blocked] reason=\"<specific question>\""),
+        "worker rules, seam on: must not teach the marker as the primary channel; got:\n{rendered}",
+    );
+}
+
+/// The generated rules file is read by every standard worker, so it must not
+/// teach the engine's internal vocabulary any more than the prompt does (see
+/// `crate::prose_vocabulary`).
 #[test]
 fn claude_md_avoids_internal_vocabulary() {
     for draft_pr_mode in [false, true] {

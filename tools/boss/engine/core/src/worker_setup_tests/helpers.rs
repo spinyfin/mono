@@ -74,6 +74,7 @@ pub(crate) fn sample_input() -> WorkerSetupInput {
         worker_kind: WorkerKind::Standard,
         automation_outcome_proposals_seam_enabled: false,
         run_done_proposals_seam_enabled: false,
+        worker_signal_proposals_seam_enabled: false,
         is_review_supervisor: false,
         is_post_merge_reviewer: false,
         checkout_positioned_on_pr_head: false,

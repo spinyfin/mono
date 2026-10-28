@@ -209,10 +209,9 @@ fn guard_block_message_reuses_head_branch_from_gh_pr_create() {
 
 #[test]
 fn guard_block_message_points_at_followup_task_for_a_separate_pr() {
-    // A revision told to split work into a dependent PR used to hit this
-    // guard, then declare it could not complete. The rejection must name
-    // the sanctioned propose verb with the invocation shape, and tell the
-    // worker to finish in-scope work on the parent PR.
+    // The rejection must name the propose verb with its invocation shape
+    // and tell the worker to finish in-scope work on the parent PR rather
+    // than exit as could-not-complete.
     let reason = run_revision_guard_reason("cube pr create --branch boss/exec_abc123_01 --title 'x'");
     assert!(
         reason.contains("BOSS_BIN")
