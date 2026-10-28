@@ -12,7 +12,8 @@ use crate::work::{WorkDb, WorkExecution};
 /// Compose the full review-guide prompt for a `pr_review_guide` execution:
 /// the exact versioned template (`boss_review_guide::render_prompt`) plus
 /// the embedded, revision-pinned source context
-/// (`boss_review_guide::render_source_context`). `execution.work_item_id` is
+/// (`boss_review_guide::render_source_context`) and the orientation inputs
+/// (`boss_review_guide::render_guide_context`). `execution.work_item_id` is
 /// the comparison id (see `WorkDb::create_pr_review_guide_execution`) — not
 /// a task — so this loads the immutable packet directly rather than going
 /// through the generic work-item path. No async work: the packet is already
@@ -81,6 +82,20 @@ pub(super) fn compose_review_guide_prompt(
     };
     prompt.push_str("\n\n");
     prompt.push_str(&boss_review_guide::render_source_context(&packet));
+    // Every guide opens with an orientation built from the originating task,
+    // its revisions and its project. A guide without those inputs cannot
+    // orient anyone, so a missing one aborts the run with the reason instead
+    // of letting the model write around the gap.
+    let context = work_db
+        .review_guide_task_context(&capture.root_task_id, &packet.canonical_pr_url, &packet.head_sha)
+        .with_context(|| {
+            format!(
+                "review-guide execution {} cannot be started: the orientation context for {} is unavailable",
+                execution.id, packet.canonical_pr_url
+            )
+        })?;
+    prompt.push('\n');
+    prompt.push_str(&boss_review_guide::render_guide_context(&context));
     // Guide executions point to a comparison, not a task. The captured
     // series already carries the canonical root resolved at source capture.
     // Reuse the gallery's chain-wide query so revisions contribute evidence.

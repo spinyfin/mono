@@ -156,7 +156,7 @@ The engine passes the store as
 spells the two permitted reads out as
 `git --git-dir {{GIT_DIR}} show {{BASE_SHA}}:<path>` and
 `git --git-dir {{GIT_DIR}} diff --no-ext-diff --no-textconv {{BASE_SHA}} {{HEAD_SHA}} -- <path>`
-(prompt contract `review-guide-v10`, update contract `review-guide-update-v4`;
+(prompt contract `review-guide-v11`, update contract `review-guide-update-v5`;
 see `tools/boss/docs/designs/automatic-pr-review-guides.md`). The shared
 review-guide command guard accepts `--git-dir <path>` only when `<path>` is
 the engine-supplied store, and still pins the revisions; the shared-source-

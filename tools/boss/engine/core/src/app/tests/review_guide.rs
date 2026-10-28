@@ -190,7 +190,7 @@ impl Fixture {
         // Deterministic driver response: tests the contract/publication seam,
         // not whether a live model follows the prose instructions.
         let markdown = format!(
-            "# Layout review\n\n## Problem\nThe layout needs verification.\n\n\
+            "# Layout review\n\n## Orientation\nThe app lays out content on screen; this checks one layout adjustment.\n\n## Problem\nThe layout needs verification.\n\n\
              ## Core fix\nThe author reports a layout adjustment.\n\n\
              ## Walkthrough\nThis fixture supplies no source files.\n\n\
              ## Tests\nThe PR describes a layout test run.\n\n\
@@ -662,4 +662,169 @@ async fn regeneration_refreshes_a_changed_head() {
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
     assert_ne!(Some(attempt.comparison_id), old.selected_comparison_id);
     assert_eq!(attempt.series_id, old.series_id);
+}
+
+fn set_task_columns(f: &Fixture, id: &str, assignments: &str, params: &[&dyn rusqlite::ToSql]) {
+    f.state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            &format!("UPDATE tasks SET {assignments} WHERE id = ?{}", params.len() + 1),
+            {
+                let mut all = params.to_vec();
+                all.push(&id);
+                rusqlite::params_from_iter(all)
+            },
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn primary_guide_prompt_requires_orientation_and_carries_the_originating_task() {
+    let f = Fixture::new(false);
+    set_task_columns(
+        &f,
+        &f.root,
+        "description = ?1",
+        &[&"People saw the layout jump whenever the window was resized."],
+    );
+    let attempt = f.generate("primary-orientation", false).await;
+    let prompt = f.prompt(&attempt.id).await;
+    assert!(prompt.contains("a section headed exactly `## Orientation`, placed first, directly after the title"));
+    assert!(prompt.contains("Lead with the goal in the reader's terms"));
+    assert!(prompt.contains("### Task context"));
+    assert!(prompt.contains("- Title: Existing PR"));
+    assert!(prompt.contains("> People saw the layout jump whenever the window was resized."));
+    assert!(prompt.contains("None. This guide covers a primary change"));
+    assert!(prompt.contains("None. This change is not part of a larger project; do not describe one."));
+}
+
+#[tokio::test]
+async fn revision_guide_prompt_carries_parent_inputs_revisions_and_project() {
+    let f = Fixture::new(false);
+    let db = &f.state.work_db;
+    let product = create_product(db);
+    let project = db
+        .create_project(boss_protocol::CreateProjectInput {
+            product_id: product.clone(),
+            name: "Resizable layout".to_owned(),
+            description: Some("Make every screen reflow smoothly when the window changes size.".to_owned()),
+            goal: Some("Windows resize without jumping".to_owned()),
+            autostart: true,
+            no_design_task: true,
+            design_reasoning_effort_xhigh: false,
+        })
+        .unwrap();
+    set_task_columns(
+        &f,
+        &f.root,
+        "description = ?1, project_id = ?2",
+        &[
+            &"People saw the layout jump whenever the window was resized.",
+            &project.id,
+        ],
+    );
+    f.state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE projects SET design_doc_path = 'docs/designs/resizable-layout.md' WHERE id = ?1",
+            [&project.id],
+        )
+        .unwrap();
+    let later = create_active_chore(db, &product, "Animate the reflow");
+    set_task_columns(&f, &later, "project_id = ?1", &[&project.id]);
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at)
+             VALUES (?1, ?2, 'blocks', '2026-10-28T00:00:00Z')",
+            [&later, &f.root],
+        )
+        .unwrap();
+    for (name, via, status, description) in [
+        (
+            "Address review findings",
+            "pr_review:exec_review",
+            "done",
+            "The reviewer found the minimum width was ignored.",
+        ),
+        (
+            "Fix the failing check",
+            "ci-fix:cir_1",
+            "in_review",
+            "The lint check failed.",
+        ),
+    ] {
+        let revision = create_active_chore(db, &product, name);
+        set_task_columns(
+            &f,
+            &revision,
+            "kind = 'revision', parent_task_id = ?1, status = ?2, created_via = ?3, description = ?4",
+            &[&f.root, &status, &via, &description],
+        );
+    }
+    let parked = create_active_chore(db, &product, "Not started revision");
+    set_task_columns(
+        &f,
+        &parked,
+        "kind = 'revision', parent_task_id = ?1, status = 'todo'",
+        &[&f.root],
+    );
+
+    let attempt = f.generate("revision-orientation", false).await;
+    let prompt = f.prompt(&attempt.id).await;
+    // Parent PR title/body come from the source context; the originating
+    // task description and revisions from the task context.
+    assert!(prompt.contains("### PR description"));
+    assert!(prompt.contains("> People saw the layout jump whenever the window was resized."));
+    assert!(prompt.contains("2 revision(s), oldest first"));
+    assert!(prompt.contains("1. review-findings revision (status: done)"));
+    assert!(prompt.contains("> The reviewer found the minimum width was ignored."));
+    assert!(prompt.contains("2. CI-fix revision (status: in_review)"));
+    assert!(!prompt.contains("Not started revision"));
+    assert!(prompt.contains(
+        "first summarize the PR as a whole (what the original change does and why, as above) and only then say what the revisions change relative to it and why"
+    ));
+    assert!(prompt.contains("- Project: Resizable layout"));
+    assert!(prompt.contains("- Goal: Windows resize without jumping"));
+    assert!(prompt.contains("> Make every screen reflow smoothly when the window changes size."));
+    assert!(prompt.contains("`docs/designs/resizable-layout.md` on branch `main`"));
+    assert!(prompt.contains("Animate the reflow (active) — enabled by this change (later piece)"));
+    println!(
+        "Rendered revision-guide inputs:\n{}",
+        prompt.split("### Task context").nth(1).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn guide_context_fails_loudly_when_the_project_or_root_is_missing() {
+    let f = Fixture::new(false);
+    let db = &f.state.work_db;
+    // The schema normally forbids a dangling project reference; simulate the
+    // corruption the guide must refuse to paper over.
+    let conn = db.connect().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+    conn.execute(
+        "UPDATE tasks SET project_id = 'project_missing' WHERE id = ?1",
+        [&f.root],
+    )
+    .unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+    drop(conn);
+    let error = format!(
+        "{:#}",
+        db.review_guide_task_context(&f.root, PR_URL, "head").unwrap_err()
+    );
+    assert!(error.contains("project project_missing"), "{error}");
+    assert!(error.contains("does not exist"), "{error}");
+
+    let error = format!(
+        "{:#}",
+        db.review_guide_task_context("task_missing", PR_URL, "head")
+            .unwrap_err()
+    );
+    assert!(error.contains("originating task"), "{error}");
 }
