@@ -4,8 +4,8 @@
 //! check.
 //!
 //! Draws the boundary between a genuine missing-decision stop and work the
-//! worker is expected to do itself — resolving conflicts in its own branch,
-//! and classifying a CI failure by cause.
+//! worker is expected to do itself, including resolving conflicts in its own branch.
+//! CI failure classification lives in `worker_setup/ci_failure.rs`.
 
 /// Opening block-boundary text injected at the top of
 /// [`super::compose_execution_prompt`].

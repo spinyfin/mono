@@ -317,7 +317,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
     if input.worker_kind == WorkerKind::Standard {
         rules.push_str(ci_failure::GUIDANCE);
     }
-    if input.worker_kind == WorkerKind::Standard && input.run_done_proposals_seam_enabled {
+    if input.run_done_proposals_seam_enabled {
         rules.push_str(operator_question::GUIDANCE);
     }
     rules.push('\n');

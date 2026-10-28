@@ -549,7 +549,7 @@ pub fn render_reviewer_initial_prompt(
         _ => String::new(),
     };
 
-    // incident-002 P2: rationale-independent both-parents deletion tripwire.
+    // Both-parents deletion tripwire, independent of any stated rationale.
     // When the engine deterministically found merged-parent surfaces this
     // resolution removed, the reviewer receives them as authoritative,
     // must-address context — independent of any "supersedes" narrative.
@@ -557,7 +557,7 @@ pub fn render_reviewer_initial_prompt(
         .map(|c| render_merged_parent_deletion_block(&c.merged_parent_deletions))
         .unwrap_or_default();
 
-    // incident-002 P3: deterministic supersession-language scan of the PR
+    // Supersession-language check: deterministic supersession-language scan of the PR
     // narrative. When present, the reviewer must verify a design-doc citation
     // for each flagged claim.
     let supersession_flag_block = ctx
@@ -799,8 +799,8 @@ pub fn render_batch_reviewer_initial_prompt(
     )
 }
 
-/// Render the authoritative merged-parent deletion-tripwire block (incident-002
-/// P2). `deletions` are engine-computed, rename/move-aware descriptions of
+/// Render the authoritative merged-parent deletion-tripwire block.
+/// `deletions` are engine-computed, rename/move-aware descriptions of
 /// surfaces a merged parent added and this resolution removed. Returns an empty
 /// string when there are none, so the caller can unconditionally interpolate it.
 ///
@@ -1149,14 +1149,14 @@ mod tests {
         assert!(prompt.contains("gh pr diff"));
         assert!(prompt.contains("--repo org/repo"), "prompt must include --repo flag");
         assert!(prompt.contains("org/repo"), "prompt must state the repo slug");
-        // incident-002 P2: the regression rubric must instruct diffing against
+        // Both-parents deletion tripwire: the regression rubric must instruct diffing against
         // BOTH merge parents for forward-ports and anchoring on the fact of the
         // deletion rather than the worker's narrative.
         assert!(
             prompt.contains("both merge parents"),
             "regression rubric must require diffing against both merge parents",
         );
-        // incident-002 P3: the reviewer must verify a design-doc citation for
+        // Supersession-language check: the reviewer must verify a design-doc citation for
         // supersession claims.
         assert!(
             prompt.contains("Supersession / obsolescence claims"),
@@ -1218,11 +1218,11 @@ mod tests {
             Some(&ctx),
             "org/repo",
         );
-        // P2 authoritative deletion-tripwire block.
+        // Authoritative deletion-tripwire block.
         assert!(prompt.contains("Merged-parent deletion tripwire (engine-computed)"));
         assert!(prompt.contains("RecommendationBadge.tsx"));
         assert!(prompt.contains("rationale-independent"));
-        // P3 authoritative supersession block.
+        // Authoritative supersession-language block.
         assert!(prompt.contains("Supersession-claim citation check (engine-flagged)"));
         assert!(prompt.contains("supersedes"));
         let docs_prompt = render_reviewer_initial_prompt(
@@ -1427,7 +1427,7 @@ mod tests {
         assert!(prompt.contains("tests"));
     }
 
-    /// The reuse/duplication rubric dimension (P1690 incident: a sixth
+    /// The reuse/duplication rubric dimension (a sixth
     /// hand-rolled Anthropic Messages API client landed unflagged) must be
     /// present with the search-then-compare behaviour and the
     /// revision-forcing note — a vague one-liner would not satisfy the
@@ -1789,7 +1789,7 @@ mod tests {
     /// When `last_reviewed_sha` is set (a revision pushed after a prior
     /// review pass), the prompt must tell the reviewer to prioritise the
     /// delta AND explicitly override diff-only scoping for whole-PR-state
-    /// defects — the motivating T192/rec_engine duplication incident.
+    /// defects — the motivating rec_engine duplication incident.
     #[test]
     fn revision_triggered_prompt_includes_delta_and_whole_pr_guidance() {
         let ctx = PrReviewContext {

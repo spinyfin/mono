@@ -608,7 +608,7 @@ pub(crate) fn bazel_prepush_gate_text(worker_signal_seam_enabled: bool, run_done
         "Emit a `[blocked] reason=\"...\"` marker in your final response naming the failing/timed-out command and its output, and stop (see \"If you are blocked or the work is bigger than estimated\" below for the exact syntax)"
     };
     let clean_bullet = if run_done_seam_enabled {
-        "- Both `bazel build` and `bazel test` must finish clean — exit 0, no build errors, no failing tests — before you push, unless a still-red target is evidence-backed as pre-existing or environmental (see the exception in the next paragraph and in \"Declaring your run finished\"). Clippy/lint is not reported by bazel; it runs at push time via the checkleft guard (and in CI).\n"
+        "- Both `bazel build` and `bazel test` must finish clean — exit 0, no build errors, no failing tests — before you push, unless a still-red target is evidence-backed as pre-existing or environmental (see the validation-failure exception in \"Declaring your run finished\"). Clippy/lint is not reported by bazel; it runs at push time via the checkleft guard (and in CI).\n"
     } else {
         "- Both `bazel build` and `bazel test` must finish clean — exit 0, no build errors, no failing tests — before you push. Clippy/lint is not reported by bazel; it runs at push time via the checkleft guard (and in CI).\n"
     };
@@ -705,6 +705,11 @@ pub(super) fn with_bazel_caching_rule(prompt: String) -> String {
         Some((opening, rest)) => format!("{opening}\n{}{rest}", bazel_caching_rule_text()),
         None => format!("{prompt}{}", bazel_caching_rule_text()),
     }
+}
+
+/// Append cache policy without splitting a pinned template.
+pub(super) fn append_bazel_caching_rule(prompt: String) -> String {
+    format!("{prompt}{}", bazel_caching_rule_text())
 }
 
 fn bazel_caching_rule_text() -> &'static str {
@@ -1912,7 +1917,6 @@ If already queued, read its existing entry ID with `gh api graphql -f query='que
         out.push_str("\n### Re-enter the Trunk queue\n\nDeclare the verified revision delivered. The engine's existing poller resubmits once the revision is in review and head CI is green; it does not require a changed head SHA. Do not submit a competing queue request.\n");
     }
     out.push_str("\nFinish with `\"$BOSS_BIN\" propose done --outcome delivered --summary <main-SHA-and-target-results> --queue-ci-evidence-file /tmp/queue-ci-evidence.json`. Verified requeue is a delivery even when no code changed. This queue-specific completion path replaces any generic requirement to produce a diff or new head SHA.\n");
-    out.push_str(check_bypass_prohibition_text());
     out
 }
 
@@ -2068,7 +2072,6 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
             was extending. Reason: `architectural_mismatch`.\n\n\
          Do NOT close the PR yourself. Closing is the human's call.\n\n",
     );
-    out.push_str(check_bypass_prohibition_text());
     out.push('\n');
     out.push_str("### Post-resolution PR comment\n\n");
     out.push_str(
@@ -2457,7 +2460,6 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
          - **Always pass `-m \"…\"` to `jj describe` / `jj squash`.** The worker \
          environment has no usable `$EDITOR`.\n\n",
     );
-    out.push_str(check_bypass_prohibition_text());
     out.push('\n');
     out
 }
@@ -2501,6 +2503,7 @@ fn compose_ci_remediation_prompt(
 
     if crate::work::queue_ci_evidence::queue_ci_verification_required(attempt) {
         prompt.push_str(&compose_queue_ci_fragment(attempt));
+        prompt.push_str(check_bypass_prohibition_text());
         return prompt;
     }
 

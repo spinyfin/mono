@@ -534,3 +534,40 @@ fn every_block_boundary_kind_emits_check_prohibition_once() {
         }
     }
 }
+
+#[test]
+fn revision_attempts_emit_check_prohibition_once() {
+    let conflict = sample_conflict_attempt();
+    let fix = super::sample_ci_attempt();
+    let mut queue = fix.clone();
+    queue.failure_kind = Some("trunk_queue_eviction".into());
+    for enabled in [false, true] {
+        for (conflict, ci) in [(Some(&conflict), None), (None, Some(&fix)), (None, Some(&queue))] {
+            let execution = revision_execution("https://github.com/org/repo/pull/77");
+            let prompt = compose_execution_prompt(
+                ExecutionPromptParams::builder()
+                    .execution(&execution)
+                    .work_item(&chore_without_pr())
+                    .workspace_path(std::path::Path::new("/tmp/workspace"))
+                    .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                    .maybe_conflict_attempt(conflict)
+                    .maybe_ci_attempt(ci)
+                    .run_done_proposals_seam_enabled(enabled)
+                    .build(),
+            );
+            assert_eq!(prompt.matches("**Hard constraint").count(), 1);
+        }
+        let execution = super::ci_remediation_execution("https://github.com/org/repo/pull/77");
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&execution)
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .ci_attempt(&queue)
+                .run_done_proposals_seam_enabled(enabled)
+                .build(),
+        );
+        assert_eq!(prompt.matches("**Hard constraint").count(), 1);
+    }
+}
