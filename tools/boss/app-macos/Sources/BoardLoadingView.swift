@@ -90,3 +90,71 @@ struct BoardRefreshBanner: View {
         .accessibilityIdentifier("board-refreshing")
     }
 }
+
+/// How long a refresh must be in flight before the refresh banner appears.
+let boardRefreshBannerDelay: Duration = .seconds(2)
+
+/// Decides when the refresh banner is visible: only once a refresh has been
+/// in flight for `boardRefreshBannerDelay`, and until it completes. The
+/// delay is a cancellable task started with the refresh and cancelled when
+/// the refresh ends, so a fast refresh never shows the banner.
+@MainActor
+final class RefreshBannerGate: ObservableObject {
+    @Published private(set) var isVisible = false
+    private var pending: Task<Void, Never>?
+    private let delay: Duration
+    private let sleep: @Sendable (Duration) async throws -> Void
+
+    init(
+        delay: Duration = boardRefreshBannerDelay,
+        sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+    ) {
+        self.delay = delay
+        self.sleep = sleep
+    }
+
+    func refreshStarted() {
+        guard pending == nil, !isVisible else { return }
+        pending = Task { [delay, sleep] in
+            do { try await sleep(delay) } catch { return }
+            guard !Task.isCancelled else { return }
+            self.isVisible = true
+            self.pending = nil
+        }
+    }
+
+    func refreshEnded() {
+        pending?.cancel()
+        pending = nil
+        isVisible = false
+    }
+}
+
+/// Wraps `BoardRefreshBanner` so a refresh shows it only after the delay.
+/// A failure is shown immediately.
+struct DelayedBoardRefreshBanner: View {
+    let isRefreshing: Bool
+    let since: Date?
+    let progress: BoardLoadProgress?
+    let failed: Bool
+    let isConnected: Bool
+    let retry: () -> Void
+
+    @StateObject private var gate = RefreshBannerGate()
+
+    var body: some View {
+        Group {
+            if failed || gate.isVisible {
+                BoardRefreshBanner(
+                    since: since, progress: progress, failed: failed,
+                    isConnected: isConnected, retry: retry)
+            }
+        }
+        .onAppear { sync() }
+        .onChange(of: isRefreshing) { _ in sync() }
+    }
+
+    private func sync() {
+        if isRefreshing { gate.refreshStarted() } else { gate.refreshEnded() }
+    }
+}

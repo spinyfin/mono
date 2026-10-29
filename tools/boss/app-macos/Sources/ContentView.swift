@@ -908,7 +908,8 @@ struct ContentView: View {
                     }
                     if model.isBoardLoaded(product.id) {
                         if model.boardLoad.isRefreshing(product.id) || model.boardLoad.hasFailed(product.id) {
-                            BoardRefreshBanner(
+                            DelayedBoardRefreshBanner(
+                                isRefreshing: model.boardLoad.isRefreshing(product.id),
                                 since: model.boardLoad.waitingSince(product.id),
                                 progress: model.boardLoad.progress(for: product.id),
                                 failed: model.boardLoad.hasFailed(product.id),
