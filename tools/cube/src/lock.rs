@@ -120,6 +120,21 @@ mod tests {
     }
 
     #[test]
+    fn for_workspace_within_times_out_while_held_then_succeeds_once_released() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".jj/repo")).unwrap();
+        let held = RepoLock::for_workspace(dir.path()).unwrap();
+        let started = Instant::now();
+        let err = RepoLock::for_workspace_within(dir.path(), Duration::from_millis(200))
+            .err()
+            .expect("held lock must time out");
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert!(err.to_string().contains("timed out"), "{err}");
+        drop(held);
+        RepoLock::for_workspace_within(dir.path(), Duration::from_millis(200)).expect("free lock");
+    }
+
+    #[test]
     fn drop_releases_so_reacquire_succeeds() {
         let dir = tempdir().unwrap();
         let lock_path = dir.path().join("repo.lock");

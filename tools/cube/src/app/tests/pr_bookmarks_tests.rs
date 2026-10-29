@@ -1096,3 +1096,70 @@ fn gc_waits_until_positioning_has_made_the_bookmark_reachable() {
     assert!(!gc.join().unwrap().unwrap().contains(&"pr/1".to_string()));
     assert_eq!(f.pr_commits(1), vec![f.commit("feat")]);
 }
+
+/// Delegates to a [`LeaseRunner`] but fails every bounded PR-bookmark lock
+/// wait, as a stalled holder would.
+struct ContendedLock<'a>(LeaseRunner<'a>);
+
+impl CommandRunner for ContendedLock<'_> {
+    fn run(&self, invocation: &CommandInvocation) -> Result<String> {
+        self.0.run(invocation)
+    }
+
+    fn lock_pr_bookmarks_within(&self, _cwd: &Path, _timeout: std::time::Duration) -> Result<crate::lock::RepoLock> {
+        Err(CubeError::InvalidArgument(
+            "timed out waiting for the PR-bookmark lock".into(),
+        ))
+    }
+}
+
+#[test]
+fn lease_survives_a_contended_pr_bookmark_lock() {
+    let f = Fixture::new();
+    let (head, _) = conflicted_pr_bookmark(&f, false);
+    let runner = ContendedLock(LeaseRunner::with_pr_json(&f.runner, head_json(&head)));
+    let repair = crate::app::health::repair_conflicted_bookmarks(&runner, None, &f.ws, &["pr/1".to_string()])
+        .expect("lock contention must not fail the lease");
+    assert_eq!(repair.unrepaired(), ["pr/1"]);
+    assert_eq!(f.pr_commits(1).len(), 2, "left conflicted and untouched");
+}
+
+/// A recording runner for the ambient deadline: it never runs anything, only
+/// reports the timeout each call was given.
+struct TimeoutProbe(std::cell::RefCell<Vec<std::time::Duration>>);
+
+impl CommandRunner for TimeoutProbe {
+    fn run(&self, _invocation: &CommandInvocation) -> Result<String> {
+        unreachable!("run_jj goes through run_with_timeout")
+    }
+
+    fn run_with_timeout(&self, _invocation: &CommandInvocation, timeout: std::time::Duration) -> Result<String> {
+        self.0.borrow_mut().push(timeout);
+        Ok(String::new())
+    }
+}
+
+#[test]
+fn scoped_deadline_bounds_every_jj_call_even_without_an_explicit_one() {
+    let probe = TimeoutProbe(Default::default());
+    let call = || {
+        crate::app::jj::run_jj(
+            &probe,
+            None,
+            &RealCommandRunner::invocation(Path::new("/"), "jj", &["git", "import"]),
+        )
+    };
+    {
+        let _scope = crate::app::jj::scope_deadline(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        call().unwrap();
+        assert!(probe.0.borrow()[0] <= std::time::Duration::from_secs(5));
+    }
+    call().unwrap();
+    assert!(
+        probe.0.borrow()[1] > std::time::Duration::from_secs(5),
+        "scope restored"
+    );
+    let _expired = crate::app::jj::scope_deadline(std::time::Instant::now());
+    assert!(matches!(call(), Err(CubeError::DeadlineExceeded { .. })));
+    assert_eq!(probe.0.borrow().len(), 2, "nothing spawned past the deadline");
+}
