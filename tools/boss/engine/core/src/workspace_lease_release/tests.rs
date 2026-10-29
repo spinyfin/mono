@@ -375,9 +375,10 @@ async fn sweep_keeps_orphaned_row_when_occupancy_is_occupied() {
         .current_dir(dir.path())
         .spawn()
         .unwrap();
-    // HostOccupancy is what the sweep uses; give the child a moment to
-    // exist so the cwd probe can see it.
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    // HostOccupancy is what the sweep uses. Poll until the child cwd is
+    // visible: a single short sleep misses on a loaded host, and the
+    // occupancy scan itself can take tens of milliseconds.
+    assert_eq!(wait_until_occupied(dir.path()), Occupancy::Occupied);
     let outcome = run_one_pass(&db, &SweepCube, &LiveWorkerStateRegistry::new()).await;
     let _ = child.kill();
     let _ = child.wait();
@@ -441,11 +442,21 @@ fn host_occupancy_sees_a_child_with_cwd_in_the_workspace() {
         .current_dir(dir.path())
         .spawn()
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    let seen = HostOccupancy.occupancy(dir.path());
+    let seen = wait_until_occupied(dir.path());
     let _ = child.kill();
     let _ = child.wait();
     assert_eq!(seen, Occupancy::Occupied);
+}
+
+fn wait_until_occupied(path: &Path) -> Occupancy {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let seen = HostOccupancy.occupancy(path);
+        if seen == Occupancy::Occupied || std::time::Instant::now() >= deadline {
+            return seen;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 #[test]
