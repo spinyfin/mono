@@ -726,6 +726,7 @@ mod floor_tests {
             super::super::board_projection_schema::migrate(&expected).unwrap();
             expected.execute_batch(EXECUTION_BOOKMARK_PRUNE_COLUMNS_60).unwrap();
             expected.execute_batch(migrations::CREATE_LEDGER).unwrap();
+            task_status_audit::migrate(&expected).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {
