@@ -132,7 +132,7 @@ Both are env-overridable (`BUILDKITE_ANY_QUEUE` / `BUILDKITE_MACOS_QUEUE`) so ne
 The design's two-tier plan (v1 disk cache, remote cache as fast-follow) shipped its v1 half; **there is still no remote cache**, and nothing so far has hit the triggers that would justify one. The as-built disk story is more developed than the design sketch:
 
 - Per-OS cache roots on dedicated SSDs, set in `.ci.bazelrc`: `--disk_cache` + `--repository_cache` under `/mnt/ssd/bazel/` (linux) and `/Volumes/ssd/bazel/` (darwin), selected via `--config=ci-linux` / `--config=ci-darwin` from `.buildkite/steps/ci-env.sh`.
-- Cache GC tuned for CI (`3T` / `60d` / 5-minute idle delay) vs the conservative local defaults in `.bazelrc`.
+- Cache GC tuned for CI: `.buildkite/steps/ci-env.sh` computes the size cap per host as 80% of the cache filesystem; `3T` in `.ci.bazelrc` remains the manual-invocation fallback. The age limit is `60d` and the idle delay is 5 minutes, vs the conservative local defaults in `.bazelrc`.
 - Bazel daemon idle TTL (`ci-env.sh`): every CI bazel invocation on every pipeline and OS runs with `--max_idle_secs=1800`, set only in `ci-env.sh` via `CI_BAZEL_STARTUP_FLAGS` and never in an rc file read by local bazel, so idle servers on shared hosts free memory after 30 minutes. All CI bazel entry points read startup flags from one `CI_BAZEL_STARTUP_FLAGS` source of truth, because divergent startup flags spawn duplicate daemons.
 - Darwin agents pin the Xcode toolchain (`--xcode_version` + `--repo_env=DEVELOPER_DIR`) after two incidents of in-place Xcode updates corrupting cached toolchain state; `ci-env.sh` also detects Xcode-version drift and auto-expunges the stale output base.
 

@@ -1,0 +1,7 @@
+# The disk-cache GC sizing library is exported only to its own test; the step
+# scripts themselves are run by Buildkite straight from the checkout, not by
+# bazel.
+exports_files(
+    ["disk-cache-gc-cap.sh"],
+    visibility = ["//.buildkite/steps/tests:__pkg__"],
+)
