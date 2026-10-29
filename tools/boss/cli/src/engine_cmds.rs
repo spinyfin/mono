@@ -780,8 +780,12 @@ pub(crate) async fn run_engine_conflicts_command(
                 .args(["resolve", "--list"])
                 .output()
                 .map_err(|err| CliError::application(format!("failed to run `jj resolve --list`: {err}")))?;
-            let conflicted =
-                boss_engine::conflict_lockfiles::parse_jj_resolve_list(&String::from_utf8_lossy(&listed.stdout));
+            let conflicted = boss_engine::conflict_lockfiles::checked_jj_resolve_list(
+                listed.status.code(),
+                &String::from_utf8_lossy(&listed.stdout),
+                &String::from_utf8_lossy(&listed.stderr),
+            )
+            .map_err(CliError::application)?;
             let base_ref = args
                 .base_ref
                 .clone()

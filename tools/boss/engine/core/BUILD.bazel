@@ -223,23 +223,16 @@ rust_binary(
 )
 
 # engine_lib_test is ONE rust_test with native Bazel sharding
-# (shard_count = 22), enabled by the rules_rust#3774 backport patch in
+# (shard_count = 11), enabled by the rules_rust#3774 backport patch in
 # //third_party/patches (see MODULE.bazel single_version_override). One
-# cfg(test) compile of the crate + 22 parallel shard executions, vs the
+# cfg(test) compile of the crate + 11 parallel shard executions, vs the
 # previous layout's 4 filter-partitioned rust_test targets = 4 full compiles.
 # See docs/investigations/rust-test-sharding-engine-lib-test.md for
 # the correctness gate and before/after measurements this adoption is based on.
-# shard_count tracks suite size: the investigation sized 11 shards for ~3,200
-# tests (slowest shard ~39 s). The suite is now ~6,900 tests, and the
-# production-cardinality scale measurements take ~270 s locally on their own,
-# so 11 × 300 s shards time out when those tests share a shard with anything
-# else. 22 shards restore the original tests-per-shard budget.
 #
-# size = "small" / timeout = "long" (900 s):
+# size = "small" / timeout = "moderate" (300 s):
 #   linux-amd64 CI runners run ~6-7x slower than macOS dev boxes, so the
-#   60 s default for size="small" is too tight. timeout is independent of
-#   size (scheduling/resource class stays small); 300 s (moderate) is below
-#   one scale measurement plus co-located tests.
+#   60 s default for size="small" is too tight.
 # env:
 #   HOME=/tmp — Bazel's sandbox does not inherit HOME; tests that call
 #     cube_default_workspace_root_for_test need a stable sentinel value.
@@ -259,7 +252,7 @@ rust_binary(
 rust_test(
     name = "engine_lib_test",
     size = "small",
-    timeout = "long",
+    timeout = "moderate",
     crate = ":engine_lib",
     data = [
         # The checksum-pinned Codex release (codex_test_archives.bzl) that the
@@ -282,7 +275,48 @@ rust_test(
         proc_macro = True,
         proc_macro_dev = True,
     ),
-    shard_count = 22,
+    shard_count = 11,
+    deps = [
+        "//tools/boss/engine/task-scope",
+        "//tools/boss/engine/test-git",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# Production-cardinality measurements run separately from unit shards.
+# Observed locally at roughly 270 seconds; long gives this target 900 seconds.
+rust_test(
+    name = "work_tree_scale_test",
+    size = "large",
+    timeout = "long",
+    args = [
+        "_measurement",
+        "--nocapture",
+    ],
+    crate = ":engine_lib",
+    crate_features = ["scale_measurements"],
+    data = [
+        # The checksum-pinned Codex release (codex_test_archives.bzl) that the
+        # conformance live pins (version_pin, guard_conformance) exercise; the
+        # hermetic wrapper strips PATH, so without it they could only skip.
+        "//tools/boss/engine/driver:codex_test_binary",
+        "//tools/repobin",
+        "@jj_test_tools//:jj",
+    ],
+    edition = "2024",
+    env = {
+        "BOSS_EVENT_BIN": "/opt/boss/bin/boss-event",
+        "BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)",
+        "BOSS_TEST_CODEX": "$(rootpath //tools/boss/engine/driver:codex_test_binary)",
+        "BOSS_TEST_REPOBIN": "$(rootpath //tools/repobin)",
+        "HOME": "/tmp",
+    },
+    proc_macro_deps = ["//tools/boss/engine/work-db-boundary:work_db_boundary"] + all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
     deps = [
         "//tools/boss/engine/task-scope",
         "//tools/boss/engine/test-git",
