@@ -20,8 +20,9 @@
 //!    against an empty base (conflicting bookmarks, undoing deletions,
 //!    moving a workspace's `@`). The abandon therefore runs only at an
 //!    instant with no `jj` process on the host (polling outside the gate,
-//!    then one bounded probe under exclusivity); when busy, the pass abandons and
-//!    collects nothing and the next daily pass tries again. After the
+//!    then a bounded probe under exclusivity, retrying within the budget);
+//!    when busy, the pass abandons and collects nothing and the next daily
+//!    pass tries again. After the
 //!    abandon the store must hold exactly one operation head; otherwise the
 //!    pass stops before collecting and reports the extra heads. The heads
 //!    are counted once more after the post-abandon quiet wait and before
@@ -46,9 +47,15 @@
 //! (lease, goto, push, fetch; see `command_runner`) holds the gate shared for
 //! its run, so none of those can load the pre-rewrite head; cube commands
 //! wait at most two seconds, then return a retryable maintenance error.
-//! Abandon and index warm-up share a two-minute safety deadline; interrupted
-//! rewrites are checked before releasing exclusivity. An unverified rewrite
-//! leaves a persistent marker that rejects cube readers until repaired.
+//! Abandon has a two-minute deadline and index warm-up has a separate 20s
+//! deadline: at most 140s of subprocess work excludes readers. Warm-up failure
+//! is non-fatal; the next reader builds the index. Interrupted rewrites are
+//! checked before releasing exclusivity. A durable, atomically published
+//! marker rejects readers until recovery observes no jj processes and one
+//! head under the exclusive gate. Readers attempt this recovery immediately,
+//! even for unregistered stores; busy or unverifiable stores return exit 75.
+//! Multiple heads require repair, and an invalid owner requires explicit
+//! operator verification before marker removal. GC refuses foreign markers.
 //! Post-abandon polling and collection hold only a shared gate.
 //! A `jj` command that does not go through cube (a worker's own shell, the
 //! engine) cannot take part, so for
@@ -106,6 +113,9 @@ const QUIESCENCE_POLL: Duration = Duration::from_millis(250);
 /// Timeout kills and reaps the child; heads are checked even on failure.
 /// The scale regression exercises 16,800 retained operations.
 const EXCLUSIVE_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+/// Best-effort warm-up keeps combined exclusive subprocess work to 140s.
+/// Leave the rewrite bound large enough for the measured retained DAG.
+const INDEX_WARMUP_TIMEOUT: Duration = Duration::from_secs(20);
 /// Template the cut-point selection reads: one `<operation id> <end epoch>`
 /// line per operation, newest first.
 pub(super) const OP_LOG_TEMPLATE: &str = r#"id ++ " " ++ time.end().format("%s") ++ "\n""#;
@@ -326,7 +336,7 @@ pub(super) fn jj_processes(ps_output: &str) -> Vec<String> {
 
 /// Number of operation heads in the store at `source`. One means every
 /// workspace's operations descend from a single head.
-pub(super) fn count_op_heads(source: &Path) -> Result<usize> {
+pub(crate) fn count_op_heads(source: &Path) -> Result<usize> {
     let heads = source.join(".jj/repo/op_heads/heads");
     let mut entries = std::fs::read_dir(&heads).map_err(CubeError::Io)?;
     entries.try_fold(0, |count, entry| entry.map(|_| count + 1).map_err(CubeError::Io))
@@ -371,23 +381,25 @@ fn jj_maintenance_gate(database_path: Option<&Path>, wait: Duration) -> Result<O
 }
 
 /// Settle a leftover host-wide marker while holding the exclusive gate. A
-/// marker naming this store whose heads are now a single one is a rewrite
-/// that was verified or never started (a killed pass), so it is lifted. More
+/// marker naming this store is lifted only after no jj process remains and
+/// its heads are a single one, including recovery after a killed pass. More
 /// heads, or a marker naming another store, stop the pass: that store's own
 /// pass owns the repair, and clearing or replacing its marker would let
 /// readers merge abandoned ancestry.
-fn reconcile_quarantine(gate: &JjGate, record: &RepoRecord, source: &Path) -> Result<()> {
+fn reconcile_quarantine(runner: &dyn CommandRunner, gate: &JjGate, record: &RepoRecord, source: &Path) -> Result<()> {
     let Some(owner) = gate.quarantine_owner()? else {
         return Ok(());
     };
+    if owner.trim().is_empty() || !Path::new(&owner).is_absolute() {
+        return gate.recover_quarantine(runner);
+    }
     if owner != source.display().to_string() {
         return Err(CubeError::InvalidArgument(format!(
-            "repo `{}`: another store ({owner}) has an unverified jj operation-head rewrite;              repair it and run `cube repo gc` for that repo before maintaining this one",
+            "repo `{}`: another store ({owner}) has an unverified jj operation-head rewrite; repair it and run `cube repo gc` for that repo before maintaining this one",
             record.repo
         )));
     }
-    require_single_op_head(record, source, "under a leftover maintenance marker")?;
-    gate.clear_quarantine(source)
+    gate.recover_quarantine(runner)
 }
 
 /// A maintenance `jj` command. It is marked as made by the pass that holds
@@ -400,7 +412,7 @@ fn gated_jj_invocation(source: &Path, args: &[&str]) -> CommandInvocation {
 
 /// Wait up to `timeout` for an instant with no `jj` process on the host,
 /// polling the process table every `poll`. `Ok(true)` when one was seen.
-pub(super) fn wait_for_jj_quiescence(
+pub(crate) fn wait_for_jj_quiescence(
     runner: &dyn CommandRunner,
     cwd: &Path,
     timeout: Duration,
@@ -548,7 +560,7 @@ pub(super) fn gc_repo_store_with_deadline(
     let before = measure_op_store(&source);
 
     // A marker left by a killed pass would reject the listing below, and
-    // nothing else lifts it. Settle it first, under the exclusive gate.
+    // readers would attempt recovery too. Settle it first under exclusivity.
     if !dry_run
         && JjGate::quarantine_path(&JjGate::path(&gate_data_dir(database_path)?))
             .try_exists()
@@ -560,7 +572,7 @@ pub(super) fn gc_repo_store_with_deadline(
                 record.repo
             ))
         })?;
-        reconcile_quarantine(&gate, record, &source)?;
+        reconcile_quarantine(runner, &gate, record, &source)?;
     }
 
     // Listing a neglected log is itself slow (35s for 137k operations on
@@ -611,7 +623,7 @@ pub(super) fn gc_repo_store_with_deadline(
                 let Some(candidate) = jj_maintenance_gate(database_path, remaining)? else {
                     continue;
                 };
-                reconcile_quarantine(&candidate, record, &source)?;
+                reconcile_quarantine(runner, &candidate, record, &source)?;
                 if wait_for_jj_quiescence(runner, &source, Duration::ZERO, QUIESCENCE_POLL)? {
                     exclusive_started = Some(Instant::now());
                     gate = Some(candidate);
@@ -646,7 +658,7 @@ pub(super) fn gc_repo_store_with_deadline(
                             "commit_id",
                         ],
                     ),
-                    exclusive_timeout,
+                    INDEX_WARMUP_TIMEOUT.min(exclusive_timeout),
                 ) {
                     eprintln!(
                         "cube: store gc: {}: commit-index warm-up failed after a verified abandon: {error}",

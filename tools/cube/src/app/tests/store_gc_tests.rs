@@ -872,10 +872,12 @@ fn timed_out_abandon_with_two_heads_quarantines_readers() {
         "{error}"
     );
     assert_eq!(*probe.observed.borrow(), vec![("abandon".into(), true)]);
-    let error = crate::command_runner::JjGate::shared_for_database(Some(&database))
+    let recovery = FakeRunner::new(vec![ps_command(&source, "")]);
+    let error = crate::command_runner::JjGate::shared_for_database_with_runner(Some(&database), &recovery)
         .err()
         .expect("unsafe heads must keep readers blocked after the gate is dropped");
-    assert!(error.to_string().contains("unverified jj operation-head rewrite"));
+    assert!(error.to_string().contains("2 operation heads"));
+    recovery.assert_exhausted();
     fake.assert_exhausted();
 }
 

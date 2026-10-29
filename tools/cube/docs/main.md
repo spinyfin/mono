@@ -725,18 +725,26 @@ checkout and not aware of anything above jj:
    shares only the root with the new one, and jj would merge the two views
    against an empty base. The abandon therefore runs only at an instant with
    no `jj` process on the host (poll for up to five minutes outside the
-   exclusive gate, then re-probe once under it; a persistently busy host
+   exclusive gate, then re-probe under it, retrying that sequence within the budget; a persistently busy host
    skips the abandon and collection until the next daily pass), and the pass stops before collecting if the store then holds
    anything but exactly one operation head. Every `jj` command cube itself
    starts holds a host-wide shared gate (`locks/jj-maintenance.lock`) for
    its run, and the pass holds the gate exclusive from before the abandon
    through the immediate head check and commit-index warm-up, so no cube-started command
-   can load the pre-rewrite head. The rewrite and read-only index warm-up share a two-minute safety deadline
-   to accommodate large kept-operation DAGs. A timed-out child is killed and
+   can load the pre-rewrite head. The rewrite has a two-minute safety deadline
+   to accommodate large kept-operation DAGs; read-only index warm-up has its own
+   20-second deadline, bounding their combined exclusive subprocess work at
+   140 seconds. Warm-up failure is non-fatal: the next reader builds the index. A timed-out child is killed and
    reaped, and heads are checked before releasing the gate even on failure.
-   A persistent `locks/jj-maintenance.blocked` marker prevents cube readers
-   from resuming after an unverified rewrite; an operator must repair the
-   store and verify a single head before removing it. Collection does not
+   A durable, atomically published `locks/jj-maintenance.blocked` marker prevents cube readers
+   from resuming after an unverified rewrite. Readers immediately attempt recovery
+   under a nonblocking exclusive gate: only a quiet host with exactly one head
+   in the named store permits removal, including when that store is no longer
+   registered. Busy or unverifiable stores return retryable exit 75 with the
+   owning store and guidance to run `cube repo gc <repo>`. Multiple heads require
+   repair; an empty or unreadable owner requires explicit operator verification
+   before removing the marker. GC also reconciles its own marker at startup and
+   under each exclusive acquisition, but refuses another store's marker. Collection does not
    follow a failed rewrite. Post-abandon quiet polling uses a shared gate,
    and heads are checked again before collection. Cube commands wait at most two seconds
    for the gate and return exit 75 with a message to retry if it stays busy.

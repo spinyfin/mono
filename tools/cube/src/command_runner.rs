@@ -125,14 +125,15 @@ impl JjGate {
     /// update. Refuses to replace a marker that is already present, so one
     /// pass can never take over another store's unverified rewrite.
     pub fn quarantine(&self, source: &Path) -> Result<(), CubeError> {
-        let mut marker = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&self.quarantine)
-            .map_err(CubeError::Io)?;
+        let parent = self.quarantine.parent().expect("gate has a parent");
+        let mut marker = tempfile::NamedTempFile::new_in(parent).map_err(CubeError::Io)?;
         marker
             .write_all(source.display().to_string().as_bytes())
-            .map_err(CubeError::Io)
+            .map_err(CubeError::Io)?;
+        marker.as_file().sync_all().map_err(CubeError::Io)?;
+        // Publish a complete owner without replacing another pass's marker.
+        fs::hard_link(marker.path(), &self.quarantine).map_err(CubeError::Io)?;
+        File::open(parent).and_then(|dir| dir.sync_all()).map_err(CubeError::Io)
     }
 
     /// Lift the marker, but only when it names `source`, the store whose
@@ -156,7 +157,9 @@ impl JjGate {
         match fs::read_to_string(&self.quarantine) {
             Ok(owner) => Ok(Some(owner)),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(CubeError::Io(err)),
+            Err(_) => Err(CubeError::MaintenanceQuarantined(
+                "unknown owner (unreadable marker)".into(),
+            )),
         }
     }
 
@@ -169,11 +172,18 @@ impl JjGate {
     /// the lease registry lock. Maintenance contention must not leave a
     /// partially prepared lease or a convoy behind the registry lock.
     pub fn shared_for_database(database_path: Option<&Path>) -> Result<Self, CubeError> {
+        Self::shared_for_database_with_runner(database_path, &RealCommandRunner)
+    }
+
+    pub(crate) fn shared_for_database_with_runner(
+        database_path: Option<&Path>,
+        runner: &dyn CommandRunner,
+    ) -> Result<Self, CubeError> {
         let data_dir = match database_path.and_then(Path::parent) {
             Some(parent) => parent.to_path_buf(),
             None => crate::paths::data_dir()?,
         };
-        Self::shared(&Self::path(&data_dir), JJ_GATE_WAIT)
+        Self::shared_with_runner(&Self::path(&data_dir), JJ_GATE_WAIT, runner)
     }
 
     pub fn path(data_dir: &Path) -> std::path::PathBuf {
@@ -181,7 +191,56 @@ impl JjGate {
     }
 
     pub fn shared(lock_path: &Path, wait: Duration) -> Result<Self, CubeError> {
-        Self::acquire_within(lock_path, wait, false)
+        Self::shared_with_runner(lock_path, wait, &RealCommandRunner)
+    }
+
+    pub(crate) fn shared_with_runner(
+        lock_path: &Path,
+        wait: Duration,
+        runner: &dyn CommandRunner,
+    ) -> Result<Self, CubeError> {
+        match Self::acquire_within(lock_path, wait, false) {
+            Err(CubeError::MaintenanceQuarantined(owner)) => {
+                // The shared handle has dropped. Never upgrade a shared flock:
+                // another reader may be attempting recovery at the same time.
+                let gate =
+                    Self::exclusive(lock_path, Duration::ZERO).map_err(|_| CubeError::MaintenanceQuarantined(owner))?;
+                gate.recover_quarantine(runner)?;
+                drop(gate);
+                Self::acquire_within(lock_path, wait, false)
+            }
+            result => result,
+        }
+    }
+
+    /// Under exclusivity, wait for any orphaned abandon child before trusting
+    /// even a single old head. No registration is needed for owner recovery.
+    pub(crate) fn recover_quarantine(&self, runner: &dyn CommandRunner) -> Result<(), CubeError> {
+        let Some(owner) = self.quarantine_owner()? else {
+            return Ok(());
+        };
+        let source = Path::new(&owner);
+        if owner.trim().is_empty() || !source.is_absolute() {
+            return Err(CubeError::MaintenanceQuarantined(
+                "unknown owner (invalid marker)".into(),
+            ));
+        }
+        if !crate::app::store_gc::wait_for_jj_quiescence(runner, source, Duration::ZERO, Duration::ZERO)
+            .map_err(|_| CubeError::MaintenanceQuarantined(owner.clone()))?
+        {
+            return Err(CubeError::MaintenanceQuarantined(owner));
+        }
+        let heads = crate::app::store_gc::count_op_heads(source)
+            .map_err(|_| CubeError::MaintenanceQuarantined(owner.clone()))?;
+        if heads == 0 {
+            return Err(CubeError::MaintenanceQuarantined(owner));
+        }
+        if heads > 1 {
+            return Err(CubeError::InvalidArgument(format!(
+                "store {owner} holds {heads} operation heads; repair the store before running `cube repo gc <repo>`"
+            )));
+        }
+        self.clear_quarantine(source)
     }
 
     pub fn exclusive(lock_path: &Path, wait: Duration) -> Result<Self, CubeError> {
@@ -217,11 +276,9 @@ impl JjGate {
             if got {
                 let quarantine = Self::quarantine_path(lock_path);
                 if !exclusive && quarantine.try_exists().map_err(CubeError::Io)? {
-                    return Err(CubeError::InvalidArgument(format!(
-                        "unverified jj operation-head rewrite in {}; repair the store and verify a single operation head before removing {}",
-                        fs::read_to_string(&quarantine).map_err(CubeError::Io)?,
-                        quarantine.display()
-                    )));
+                    return Err(CubeError::MaintenanceQuarantined(
+                        fs::read_to_string(&quarantine).unwrap_or_else(|_| "unknown owner (unreadable marker)".into()),
+                    ));
                 }
                 return Ok(Self {
                     _file: file,
