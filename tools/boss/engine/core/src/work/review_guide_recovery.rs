@@ -13,7 +13,8 @@
 //!
 //! This startup pass finds those rows and publishes them as their PR's guide,
 //! under exactly the fences a live submission would face: the attempt is
-//! reopened (or, when startup re-adoption already reopened it, confirmed running) only when its comparison is still the series' selected one and
+//! reopened (or, when startup re-adoption already reopened it, confirmed
+//! running) only when its comparison is still the series' selected one and
 //! nothing else has been published or started for the series
 //! ([`super::review_guide_jobs::reopen_review_guide_attempt_for_readoption`]),
 //! and the body is validated against the recorded comparison at the

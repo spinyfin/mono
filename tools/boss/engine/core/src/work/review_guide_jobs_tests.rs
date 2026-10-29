@@ -1188,3 +1188,166 @@ fn startup_recovery_publishes_a_refused_guide_for_an_attempt_readoption_already_
     assert_eq!(summary.lifecycle, "ready");
     assert!(db.recover_orphaned_review_guide_submissions().unwrap().is_empty());
 }
+
+fn review_guide_version_count(db: &WorkDb) -> i64 {
+    db.connect()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM pr_review_guide_versions", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn attempt_recovery_snapshot(
+    db: &WorkDb,
+    attempt_id: &str,
+) -> (String, Option<String>, Option<String>, Option<String>) {
+    db.connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, error, finished_at, failed_by_build FROM pr_review_guide_attempts WHERE id = ?1",
+            [attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap()
+}
+
+/// A refused insert of the version row after adopt must roll the whole
+/// recovery transaction back: the proposal stays `rejected` with no
+/// `applied_ref`, the attempt and series stay as the orphan reap left them,
+/// and no version exists. Dropping the trigger and running again publishes
+/// exactly once; a third pass is a no-op.
+#[test]
+fn startup_recovery_rolls_back_when_publish_insert_fails() {
+    let (_dir, db) = open_db();
+    let (root, series_id, comparison_id) = seeded_series(&db);
+    let (attempt_id, execution_id) = spawned_guide_run(&db, &series_id, &comparison_id, "tok-35");
+    db.mark_execution_orphaned(
+        &execution_id,
+        "engine startup: recovery probe proved worker dead across restart",
+    )
+    .unwrap();
+    let proposal_id = store_refused_guide_submission(&db, &execution_id, &comparison_id, RESTART_GUIDE);
+    let attempt_before = attempt_recovery_snapshot(&db, &attempt_id);
+    let summary_before = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert_eq!(attempt_before.0, "failed");
+    assert_eq!(summary_before.lifecycle, "failed");
+    assert_eq!(summary_before.readable_version_id, None);
+
+    db.connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_version BEFORE INSERT ON pr_review_guide_versions BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .unwrap();
+    let report = db.recover_orphaned_review_guide_submissions().unwrap();
+    assert!(report.published.is_empty(), "{report:?}");
+    assert_eq!(report.skipped.len(), 1);
+    assert_eq!(report.skipped[0].0, proposal_id);
+    assert!(
+        report.skipped[0].1.contains("injected"),
+        "expected the injected abort in {:?}",
+        report.skipped[0].1
+    );
+    assert_eq!(proposal_state(&db, &proposal_id), ("rejected".to_owned(), None));
+    assert_eq!(attempt_recovery_snapshot(&db, &attempt_id), attempt_before);
+    let summary_after_fail = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert_eq!(summary_after_fail.lifecycle, summary_before.lifecycle);
+    assert_eq!(summary_after_fail.readable_version_id, None);
+    assert_eq!(review_guide_version_count(&db), 0);
+
+    db.connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_version")
+        .unwrap();
+    let report = db.recover_orphaned_review_guide_submissions().unwrap();
+    assert_eq!(report.skipped, Vec::<(String, String)>::new());
+    assert_eq!(report.published.len(), 1);
+    assert_eq!(
+        proposal_state(&db, &proposal_id),
+        ("applied".to_owned(), Some(attempt_id.clone()))
+    );
+    assert_eq!(attempt_status(&db, &attempt_id), "succeeded");
+    assert_eq!(review_guide_version_count(&db), 1);
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert_eq!(summary.lifecycle, "ready");
+    assert_eq!(
+        summary.readable_version_id.as_deref(),
+        Some(report.published[0].2.as_str())
+    );
+
+    assert!(db.recover_orphaned_review_guide_submissions().unwrap().is_empty());
+    assert_eq!(review_guide_version_count(&db), 1);
+}
+
+/// When publish fences with a non-`Published` outcome after adopt (here:
+/// the series epoch moves mid-transaction so the insert never happens),
+/// dropping the transaction rolls back the reopen and the proposal update.
+/// A later unfenced pass still publishes exactly once.
+#[test]
+fn startup_recovery_rolls_back_when_publish_is_fenced_as_superseded() {
+    let (_dir, db) = open_db();
+    let (root, series_id, comparison_id) = seeded_series(&db);
+    let (attempt_id, execution_id) = spawned_guide_run(&db, &series_id, &comparison_id, "tok-36");
+    db.mark_execution_orphaned(
+        &execution_id,
+        "engine startup: recovery probe proved worker dead across restart",
+    )
+    .unwrap();
+    let proposal_id = store_refused_guide_submission(&db, &execution_id, &comparison_id, RESTART_GUIDE);
+    let attempt_before = attempt_recovery_snapshot(&db, &attempt_id);
+    let epoch_before: i64 = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT request_epoch FROM pr_review_guide_source_series WHERE id = ?1",
+            [&series_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    db.connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER bump_epoch AFTER UPDATE OF status ON pr_review_guide_attempts
+             WHEN NEW.status = 'running'
+             BEGIN
+               UPDATE pr_review_guide_source_series SET request_epoch = request_epoch + 1 WHERE id = NEW.series_id;
+             END;",
+        )
+        .unwrap();
+    let report = db.recover_orphaned_review_guide_submissions().unwrap();
+    assert!(report.published.is_empty(), "{report:?}");
+    assert_eq!(report.skipped.len(), 1);
+    assert_eq!(report.skipped[0].0, proposal_id);
+    assert!(
+        report.skipped[0].1.contains("fenced"),
+        "expected the publish-fence skip in {:?}",
+        report.skipped[0].1
+    );
+    assert_eq!(proposal_state(&db, &proposal_id), ("rejected".to_owned(), None));
+    assert_eq!(attempt_recovery_snapshot(&db, &attempt_id), attempt_before);
+    let epoch_after: i64 = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT request_epoch FROM pr_review_guide_source_series WHERE id = ?1",
+            [&series_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(epoch_after, epoch_before);
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert_eq!(summary.lifecycle, "failed");
+    assert_eq!(summary.readable_version_id, None);
+    assert_eq!(review_guide_version_count(&db), 0);
+
+    db.connect().unwrap().execute_batch("DROP TRIGGER bump_epoch").unwrap();
+    let report = db.recover_orphaned_review_guide_submissions().unwrap();
+    assert_eq!(report.skipped, Vec::<(String, String)>::new());
+    assert_eq!(report.published.len(), 1);
+    assert_eq!(
+        proposal_state(&db, &proposal_id),
+        ("applied".to_owned(), Some(attempt_id.clone()))
+    );
+    assert_eq!(review_guide_version_count(&db), 1);
+    assert!(db.recover_orphaned_review_guide_submissions().unwrap().is_empty());
+}

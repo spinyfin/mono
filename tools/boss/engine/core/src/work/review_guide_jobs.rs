@@ -1334,13 +1334,13 @@ pub(super) fn publish_pr_review_guide_version_in_tx(
 /// same reversal lets a guide submitted while the attempt was wrongly closed
 /// be recovered (`WorkDb::recover_orphaned_review_guide_submissions`).
 ///
-/// Only an attempt that is `failed` **after a worker ran** (or, with
-/// `accept_running`, already `running` again because re-adoption got there
-/// first — the checks below still apply and the write is then a no-op) (`failed_pre_start
-/// = 0`), whose comparison is still the series' selected one at the same
-/// request epoch, with no guide published for it and no other live attempt in
-/// the series, is reopened. A pre-start failure, a superseded attempt, a
-/// published one, or one whose series has moved on stands as recorded.
+/// Only an attempt that failed after a worker ran (`failed_pre_start = 0`),
+/// whose comparison is still the series' selected one at the same request
+/// epoch, with no guide published for it and no other live attempt in the
+/// series, is reopened. With `accept_running`, an already-running attempt
+/// (re-adoption got there first) passes the same checks and is re-stamped.
+/// A pre-start failure, a superseded attempt, a published one, or one whose
+/// series has moved on stands as recorded.
 ///
 /// Returns the reopened attempt id.
 pub(super) fn reopen_review_guide_attempt_for_readoption(
