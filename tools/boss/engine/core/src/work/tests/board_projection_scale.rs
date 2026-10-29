@@ -4,6 +4,7 @@ use super::*;
 use crate::population_timing::PopulationTrace;
 use crate::work::{board_caches::BoardCaches, board_projection::Refresh};
 use std::time::Instant;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 fn resources() -> (f64, i64) {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
@@ -184,4 +185,122 @@ fn attention_reconcile_scale_measurement() {
         println!("{line}");
     }
     assert!(result.unwrap().is_empty());
+}
+
+/// Socket-inclusive cold first-snapshot measurement on the production-cardinality
+/// fixture: request line in, final snapshot frame out, through request
+/// admission, the shared read connection, the session queue and the writer.
+/// Prints per-mode latency, frame sizes and the engine's own population stages.
+struct Measured {
+    elapsed_ms: f64,
+    frames: usize,
+    total_bytes: usize,
+    max_frame_bytes: usize,
+}
+
+async fn first_board(engine: &crate::app::MeasurementEngine, request_id: &str, payload: serde_json::Value) -> Measured {
+    let (client, handler) = engine.serve();
+    let (read, mut write) = client.into_split();
+    let mut lines = tokio::io::BufReader::new(read).lines();
+    let request = serde_json::json!({ "request_id": request_id, "payload": payload });
+    let start = std::time::Instant::now();
+    write.write_all(format!("{request}\n").as_bytes()).await.unwrap();
+    let mut measured = Measured {
+        elapsed_ms: 0.0,
+        frames: 0,
+        total_bytes: 0,
+        max_frame_bytes: 0,
+    };
+    loop {
+        let line = lines.next_line().await.unwrap().unwrap();
+        let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if frame["request_id"] != request_id {
+            continue;
+        }
+        measured.frames += 1;
+        measured.total_bytes += line.len();
+        measured.max_frame_bytes = measured.max_frame_bytes.max(line.len());
+        let page = &frame["payload"]["update"]["changes"]["snapshot_page"];
+        let paged_mid = page["index"]
+            .as_u64()
+            .zip(page["count"].as_u64())
+            .is_some_and(|(i, n)| i + 1 < n);
+        if !paged_mid {
+            measured.elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            break;
+        }
+    }
+    drop(lines);
+    drop(write);
+    handler.await.unwrap().unwrap();
+    measured
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cold_snapshot_end_to_end_measurement() {
+    let diagnostics = tempfile::tempdir().unwrap();
+    crate::population_timing::install_global(Some(diagnostics.path().to_path_buf()));
+    let modes = [
+        (
+            "single_frame",
+            serde_json::json!({"delta": false, "snapshot_pages": false}),
+        ),
+        ("paged", serde_json::json!({"delta": true, "snapshot_pages": true})),
+    ];
+    for (mode, flags) in modes {
+        // A fresh engine state per mode, so sample 0 is a genuinely cold first
+        // snapshot (no shared board cache, no session cache); later samples are warm.
+        let engine = crate::app::MeasurementEngine::new();
+        super::work_tree_scale_tests::seed(&engine.db().connect().unwrap());
+        for sample in 0..3 {
+            let mut payload = serde_json::json!({"type": "get_work_tree", "product_id": "scale-product-0"});
+            payload
+                .as_object_mut()
+                .unwrap()
+                .extend(flags.as_object().unwrap().clone());
+            let request_id = format!("{mode}-{sample}");
+            let m = first_board(&engine, &request_id, payload).await;
+            println!(
+                "e2e_cold mode={mode} sample={sample} {} elapsed_ms={:.1} frames={} total_bytes={} max_frame_bytes={}",
+                if sample == 0 { "cold" } else { "warm" },
+                m.elapsed_ms,
+                m.frames,
+                m.total_bytes,
+                m.max_frame_bytes
+            );
+            assert!(m.frames >= 1 && m.total_bytes > 0);
+            if mode == "paged" {
+                assert!(m.max_frame_bytes < 513 * 1024 + 4096, "frame bound");
+            }
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    // One line per (request, stage): per-page stages are summed over the pages.
+    let mut stages: Vec<(String, String, f64, i64, usize)> = Vec::new();
+    for entry in std::fs::read_dir(diagnostics.path()).unwrap() {
+        for line in std::fs::read_to_string(entry.unwrap().path()).unwrap().lines() {
+            let rec: serde_json::Value = serde_json::from_str(line).unwrap();
+            let (Some(request), Some(segment)) = (rec["request_id"].as_str(), rec["segment"].as_str()) else {
+                continue;
+            };
+            if !request.ends_with("-0") {
+                continue;
+            }
+            let ms = rec["duration_ms"].as_f64().unwrap_or(0.0);
+            let bytes = rec["payload_bytes"].as_i64().unwrap_or(0);
+            match stages.iter_mut().find(|s| s.0 == request && s.1 == segment) {
+                Some(stage) => {
+                    stage.2 += ms;
+                    stage.3 += bytes;
+                    stage.4 += 1;
+                }
+                None => stages.push((request.to_owned(), segment.to_owned(), ms, bytes, 1)),
+            }
+        }
+    }
+    for (request, segment, ms, bytes, count) in stages {
+        println!(
+            "e2e_stage request={request} segment={segment} duration_ms={ms:.1} payload_bytes={bytes} count={count}"
+        );
+    }
 }

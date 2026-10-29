@@ -2437,27 +2437,21 @@ async fn handle_frontend_connection(
                 tracing::info!(request_id = ?event.request_id, elapsed_ms = write_start.elapsed().as_secs_f64() * 1000.0, write_failed, "merge acknowledgement socket write completed");
             }
 
-            if let Some(mut t) = trace {
-                if !write_failed && last_board_page {
-                    first_board_served.notify_one();
-                }
-                t.record_plain(
-                    crate::population_timing::segment::SOCKET_WRITE,
-                    crate::population_timing::elapsed_ms(write_start),
-                );
-                if !last_board_page && !write_failed {
-                    writer_sink.stash_population_trace(event.request_id.as_deref().expect("board response id"), t);
-                    continue;
-                }
-                let total_ms = t.elapsed_ms();
-                t.record_plain(crate::population_timing::segment::TOTAL, total_ms);
-                t.log_slow();
-                if let Some(log) = crate::population_timing::global() {
-                    t.flush(log);
-                }
-            }
-
-            writer_sink.complete_response_delivery(event.request_id.as_deref(), !write_failed);
+            writer_sink.finish_written_frame(
+                work_tree_loads::WrittenFrame {
+                    request_id: event.request_id.as_deref(),
+                    last_board_page,
+                    write_failed,
+                    write_start,
+                },
+                trace,
+                &first_board_served,
+                |t| {
+                    if let Some(log) = crate::population_timing::global() {
+                        t.flush(log);
+                    }
+                },
+            );
             if write_failed {
                 break;
             }
@@ -2696,4 +2690,33 @@ fn read_error_is_peer_disconnect(error: &std::io::Error) -> bool {
         error.kind(),
         std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
     )
+}
+
+/// An engine over an empty database and a way to serve connections to it, for
+/// socket-inclusive measurements that live beside the work fixtures they seed.
+#[cfg(test)]
+pub(crate) struct MeasurementEngine {
+    state: Arc<ServerState>,
+    _dir: tempfile::TempDir,
+}
+
+#[cfg(test)]
+impl MeasurementEngine {
+    pub(crate) fn new() -> Self {
+        let (state, _dir) = tests::test_server_state();
+        Self { state, _dir }
+    }
+
+    pub(crate) fn db(&self) -> &crate::work::WorkDb {
+        &self.state.work_db
+    }
+
+    /// The client end of a new connection, and the task serving its other end.
+    pub(crate) fn serve(&self) -> (UnixStream, tokio::task::JoinHandle<Result<()>>) {
+        let (client, server) = UnixStream::pair().unwrap();
+        (
+            client,
+            tokio::spawn(handle_frontend_connection(server, self.state.clone(), None)),
+        )
+    }
 }

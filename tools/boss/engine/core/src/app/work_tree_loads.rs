@@ -136,3 +136,56 @@ impl WorkTreeLoads {
 #[cfg(test)]
 #[path = "work_tree_loads_tests.rs"]
 mod tests;
+
+/// What happened when the writer put one frame on the socket.
+pub(super) struct WrittenFrame<'a> {
+    pub(super) request_id: Option<&'a str>,
+    /// False only for a non-final page of a paged board snapshot.
+    pub(super) last_board_page: bool,
+    pub(super) write_failed: bool,
+    pub(super) write_start: Instant,
+}
+
+impl SessionSink {
+    /// Finish one written frame: advance or complete the board population
+    /// trace and acknowledge delivery. A non-final page of a paged board
+    /// snapshot re-stashes its trace and acknowledges nothing, whether or not
+    /// a trace was stashed, so the trace is flushed and delivery completed
+    /// exactly once, after the final frame. `flush` receives the finished
+    /// trace.
+    pub(super) fn finish_written_frame(
+        &self,
+        frame: WrittenFrame<'_>,
+        trace: Option<crate::population_timing::PopulationTrace>,
+        first_board_served: &tokio::sync::Notify,
+        flush: impl FnOnce(&crate::population_timing::PopulationTrace),
+    ) {
+        let WrittenFrame {
+            request_id,
+            last_board_page,
+            write_failed,
+            write_start,
+        } = frame;
+        let mid_snapshot = !last_board_page && !write_failed;
+        if let Some(mut t) = trace {
+            if !write_failed && last_board_page {
+                first_board_served.notify_one();
+            }
+            t.record_plain(
+                crate::population_timing::segment::SOCKET_WRITE,
+                crate::population_timing::elapsed_ms(write_start),
+            );
+            if mid_snapshot {
+                self.stash_population_trace(request_id.expect("board response id"), t);
+            } else {
+                let total_ms = t.elapsed_ms();
+                t.record_plain(crate::population_timing::segment::TOTAL, total_ms);
+                t.log_slow();
+                flush(&t);
+            }
+        }
+        if !mid_snapshot {
+            self.complete_response_delivery(request_id, !write_failed);
+        }
+    }
+}

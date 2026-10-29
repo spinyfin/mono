@@ -377,6 +377,12 @@ impl PopulationTrace {
         );
     }
 
+    /// Serialized bytes recorded so far, summed across every page of a paged
+    /// snapshot (one `serialize` segment per frame).
+    pub(crate) fn payload_bytes(&self) -> i64 {
+        self.segments.iter().filter_map(|s| s.payload_bytes).sum()
+    }
+
     /// Slow populations remain visible even if the diagnostics file is disabled.
     pub fn log_slow(&self) {
         if !self
@@ -386,7 +392,7 @@ impl PopulationTrace {
         {
             return;
         }
-        let payload_bytes: i64 = self.segments.iter().filter_map(|s| s.payload_bytes).sum();
+        let payload_bytes = self.payload_bytes();
         for seg in &self.segments {
             tracing::info!(product_id = %self.ctx.product_id, request_id = %self.ctx.request_id,
                 items = ?self.ctx.items, payload_bytes, segment = seg.segment,
@@ -439,6 +445,10 @@ impl PopulationTrace {
             .iter()
             .find(|s| s.segment == name)
             .map(|s| (s.cache_hits, s.cache_misses, s.owners))
+    }
+
+    pub(crate) fn segment_count(&self, name: &str) -> usize {
+        self.segments.iter().filter(|s| s.segment == name).count()
     }
 
     pub(crate) fn request_id(&self) -> &str {

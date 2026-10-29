@@ -188,7 +188,7 @@ fn is_interrupted(err: &anyhow::Error) -> bool {
 
 /// A per-row deadline interruption skips that row; the next pass retries it.
 /// Any other error stays fatal.
-fn skip_interrupted(id: &str, result: Result<usize>) -> Result<usize> {
+pub(super) fn skip_interrupted(id: &str, result: Result<usize>) -> Result<usize> {
     match result {
         Err(err) if is_interrupted(&err) => {
             tracing::warn!(id, "attention reconcile: row interrupted by deadline; skipping");
@@ -200,7 +200,7 @@ fn skip_interrupted(id: &str, result: Result<usize>) -> Result<usize> {
 
 /// An interrupted selection cannot advance the keyset cursor, so it ends that
 /// scan (`None`) rather than failing the whole pass.
-fn skip_interrupted_selection(what: &str, result: Result<Vec<String>>) -> Result<Option<Vec<String>>> {
+pub(super) fn skip_interrupted_selection(what: &str, result: Result<Vec<String>>) -> Result<Option<Vec<String>>> {
     match result {
         Err(err) if is_interrupted(&err) => {
             tracing::warn!(
@@ -212,22 +212,6 @@ fn skip_interrupted_selection(what: &str, result: Result<Vec<String>>) -> Result
         Ok(ids) => Ok(Some(ids)),
         Err(err) => Err(err),
     }
-}
-
-/// Test seam: simulate the deadline interrupting the per-row statement for one id.
-#[cfg(test)]
-fn inject_interrupt(id: &str) -> Option<anyhow::Error> {
-    super::db_diagnostics::INTERRUPT_ID.with_borrow(|target| (target.as_deref() == Some(id)).then(interrupted_error))
-}
-
-#[cfg(test)]
-fn interrupted_error() -> anyhow::Error {
-    rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT), None).into()
-}
-
-#[cfg(not(test))]
-fn inject_interrupt(_id: &str) -> Option<anyhow::Error> {
-    None
 }
 
 #[work_db_boundary::instrument]
@@ -282,10 +266,7 @@ impl WorkDb {
                 }
                 for id in &ids {
                     let deadline = super::db_diagnostics::QueryDeadline::after(std::time::Duration::from_millis(100));
-                    resolved += skip_interrupted(
-                        id,
-                        inject_interrupt(id).map_or_else(|| resolve_one_kind(&conn, &now, lifecycle, id), Err),
-                    )?;
+                    resolved += skip_interrupted(id, resolve_one_kind(&conn, &now, lifecycle, id))?;
                     drop(deadline);
                     after.clone_from(id);
                     if held.elapsed() >= std::time::Duration::from_millis(10) {
@@ -326,10 +307,7 @@ impl WorkDb {
             }
             for id in &ids {
                 let deadline = super::db_diagnostics::QueryDeadline::after(std::time::Duration::from_millis(100));
-                outcome.dispatch_banners_cleared += skip_interrupted(
-                    id,
-                    inject_interrupt(id).map_or_else(|| clear_stale_dispatch_failures(&conn, id), Err),
-                )?;
+                outcome.dispatch_banners_cleared += skip_interrupted(id, clear_stale_dispatch_failures(&conn, id))?;
                 drop(deadline);
                 after.clone_from(id);
                 if held.elapsed() >= std::time::Duration::from_millis(10) {

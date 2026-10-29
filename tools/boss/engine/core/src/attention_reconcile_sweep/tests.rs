@@ -77,29 +77,6 @@ fn reconcile_advances_past_unresolved_batches() {
     assert_eq!(attention_status(&db, &cleared).0, "resolved");
 }
 
-#[test]
-fn an_interrupted_row_does_not_abort_later_rows_or_the_banner_loop() {
-    let (_dir, db) = open_db();
-    let product = create_test_product(&db);
-    let chore = create_test_chore(&db, product.id, "Interrupted row");
-    let first = open_attention_for_work_item(&db, &chore.id, crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND, 1000);
-    let second = open_attention_for_work_item(&db, &chore.id, crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND, 1001);
-    start_run_at(&db, &chore.id, 2000);
-    force_dispatch_failure(&db, &chore.id, "cube_workspace_lease_failed", "lease refused", 1000);
-    crate::work::db_diagnostics::INTERRUPT_ID.with_borrow_mut(|id| *id = Some(first.clone()));
-    let result = db.reconcile_stale_attention_signals();
-    crate::work::db_diagnostics::INTERRUPT_ID.with_borrow_mut(|id| *id = None);
-    let outcome = result.unwrap();
-    assert_eq!(
-        attention_status(&db, &first).0,
-        "open",
-        "the interrupted row is retried next pass"
-    );
-    assert_eq!(attention_status(&db, &second).0, "resolved");
-    assert_eq!(outcome.attentions_resolved, 1);
-    assert_eq!(outcome.dispatch_banners_cleared, 1);
-}
-
 /// Insert an `open` attention row directly, with an explicit `created_at`.
 ///
 /// Tests must be able to place a signal before or after its evidence, which

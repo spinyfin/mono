@@ -635,46 +635,143 @@ fn get_work_tree(product_id: &str, delta: bool, snapshot_pages: bool) -> Fronten
     }
 }
 
+async fn settle() {
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The bulk lane starts one slot short of the headroom a page needs, so the
+/// paged reply must suspend before every page until the test drains a frame.
+/// That makes the second request's chance to slip a delta between pages
+/// deterministic: without the per-session ordering lock, both handlers wait
+/// on the same headroom signal and the second is woken between pages.
 #[tokio::test]
 async fn concurrent_same_session_fetches_do_not_interleave_with_paged_snapshot() {
     let (state, _dir) = test_server_state();
     let product_id = seed_big_board(&state, "ordered");
     let sink = make_session_sink();
-    tokio::join!(
-        work_items::handle_get_work_tree(
-            paged_ctx(&state, &sink, "first"),
-            get_work_tree(&product_id, true, true)
-        ),
-        work_items::handle_get_work_tree(
-            paged_ctx(&state, &sink, "second"),
-            get_work_tree(&product_id, true, false)
-        ),
-    );
-    let mut frames: Vec<(String, bool)> = Vec::new();
-    while frames.last().is_none_or(|(_, last)| !*last)
-        || frames
-            .iter()
-            .map(|(id, _)| id)
-            .collect::<std::collections::HashSet<_>>()
-            .len()
-            < 2
-    {
+    for i in 0..MAX_SESSION_QUEUE - 1 {
+        sink.enqueue(FrontendEventEnvelope::response(
+            format!("filler-{i}"),
+            FrontendEvent::Error { message: "busy".into() },
+        ));
+    }
+    let first = tokio::spawn(work_items::handle_get_work_tree(
+        paged_ctx(&state, &sink, "first"),
+        get_work_tree(&product_id, true, true),
+    ));
+    settle().await;
+    assert!(!first.is_finished(), "the paged reply must be suspended on headroom");
+    let second = tokio::spawn(work_items::handle_get_work_tree(
+        paged_ctx(&state, &sink, "second"),
+        get_work_tree(&product_id, true, false),
+    ));
+    settle().await;
+
+    let mut frames = Vec::new();
+    while !(first.is_finished() && second.is_finished() && sink.queue_stats().depth == 0) {
         let envelope = sink.next().await.unwrap();
         let id = envelope.request_id.clone().unwrap();
-        frames.push((id, update(envelope.payload).is_last_page()));
+        if !id.starts_with("filler-") {
+            frames.push((id, update(envelope.payload)));
+        }
+        settle().await;
     }
-    // Each request's frames are contiguous and its sequence is monotonic.
-    let mut seen_done = Vec::new();
-    for (id, _) in &frames {
-        if seen_done.last() != Some(id) {
+    first.await.unwrap();
+    second.await.unwrap();
+
+    let pages: Vec<_> = frames.iter().filter(|(id, _)| id == "first").collect();
+    let deltas: Vec<_> = frames.iter().filter(|(id, _)| id == "second").collect();
+    assert!(pages.len() > 1, "the snapshot must span several pages");
+    assert_eq!(deltas.len(), 1);
+    let snapshot_sequence = pages[0].1.sequence;
+    for (index, (_, page)) in pages.iter().enumerate() {
+        assert_eq!(page.base_sequence, None);
+        assert_eq!(page.sequence, snapshot_sequence);
+        assert_eq!(page.changes["snapshot_page"]["index"], index);
+    }
+    let delta_position = frames.iter().position(|(id, _)| id == "second").unwrap();
+    assert_eq!(
+        delta_position,
+        frames.len() - 1,
+        "the delta must follow every snapshot page: {:?}",
+        frames.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>()
+    );
+    assert_eq!(deltas[0].1.base_sequence, Some(snapshot_sequence));
+}
+
+fn board_page_reply() -> FrontendEventEnvelope {
+    FrontendEventEnvelope::response("paged", FrontendEvent::Error { message: "page".into() })
+}
+
+async fn gate_is_open(gate: &tokio::sync::Notify) -> bool {
+    tokio::time::timeout(Duration::ZERO, gate.notified()).await.is_ok()
+}
+
+#[tokio::test]
+async fn paged_snapshot_flushes_one_trace_and_acknowledges_delivery_once_after_the_last_frame() {
+    use crate::app::work_tree_loads::WrittenFrame;
+    let sink = make_session_sink();
+    let mut delivery = sink.enqueue_response_awaiting_delivery(board_page_reply());
+    sink.stash_population_trace(
+        "paged",
+        crate::population_timing::PopulationTrace::new("product", "paged", None, Instant::now()),
+    );
+    let gate = tokio::sync::Notify::new();
+    let page_bytes = [4_000usize, 2_500, 700];
+    let mut flushed = Vec::new();
+    for (index, bytes) in page_bytes.iter().enumerate() {
+        let mut trace = sink
+            .take_population_trace("paged")
+            .expect("every page finds the trace stashed for the request");
+        trace.record_serialize(0.1, *bytes);
+        let last = index + 1 == page_bytes.len();
+        sink.finish_written_frame(
+            WrittenFrame {
+                request_id: Some("paged"),
+                last_board_page: last,
+                write_failed: false,
+                write_start: Instant::now(),
+            },
+            Some(trace),
+            &gate,
+            |trace| flushed.push((trace.payload_bytes(), trace.segment_count("serialize"))),
+        );
+        if !last {
+            assert!(flushed.is_empty(), "trace flushed before the final page");
             assert!(
-                !seen_done.contains(id),
-                "frames for {id} interleaved with another reply"
+                matches!(delivery.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+                "delivery acknowledged before the final page"
             );
-            seen_done.push(id.clone());
+            assert!(!gate_is_open(&gate).await, "gate opened before the final page");
         }
     }
-    assert_eq!(seen_done.len(), 2);
+    assert_eq!(
+        flushed,
+        vec![(page_bytes.iter().sum::<usize>() as i64, page_bytes.len())]
+    );
+    assert_eq!(delivery.try_recv(), Ok(true));
+    assert!(gate_is_open(&gate).await);
+    assert!(sink.take_population_trace("paged").is_none(), "nothing left stashed");
+}
+
+#[tokio::test]
+async fn non_final_page_without_a_trace_does_not_acknowledge_delivery() {
+    use crate::app::work_tree_loads::WrittenFrame;
+    let sink = make_session_sink();
+    let mut delivery = sink.enqueue_response_awaiting_delivery(board_page_reply());
+    let gate = tokio::sync::Notify::new();
+    let frame = |last_board_page| WrittenFrame {
+        request_id: Some("paged"),
+        last_board_page,
+        write_failed: false,
+        write_start: Instant::now(),
+    };
+    sink.finish_written_frame(frame(false), None, &gate, |_| panic!("no trace to flush"));
+    assert!(matches!(delivery.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+    sink.finish_written_frame(frame(true), None, &gate, |_| panic!("no trace to flush"));
+    assert_eq!(delivery.try_recv(), Ok(true));
 }
 
 #[tokio::test]

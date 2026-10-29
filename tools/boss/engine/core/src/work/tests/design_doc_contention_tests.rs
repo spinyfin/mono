@@ -1,5 +1,6 @@
 use super::*;
 use std::sync::{Arc, Barrier};
+use std::time::Duration;
 
 #[test]
 fn attention_reconcile_releases_connection_between_kinds() {
@@ -266,5 +267,54 @@ fn open_kind_probe_uses_partial_index_over_large_resolved_history() {
     assert!(
         !plan.iter().any(|line| line.contains("SCAN work_attention_items")),
         "{plan:?}"
+    );
+}
+
+// The attention reconcile skips a row or selection that the per-statement
+// deadline really interrupted, and only that.
+use crate::work::attention_reconcile::{skip_interrupted, skip_interrupted_selection};
+use crate::work::db_diagnostics::QueryDeadline;
+
+/// Run a statement long enough for SQLite's progress handler to see an
+/// already-expired deadline, and return the error it actually produced.
+fn genuinely_interrupted(db: &WorkDb) -> anyhow::Error {
+    let conn = db.connect().unwrap();
+    let _deadline = QueryDeadline::after(Duration::ZERO);
+    conn.prepare(
+        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 100000000) SELECT count(*) FROM n",
+    )
+    .unwrap()
+    .query_row([], |row| row.get::<_, i64>(0))
+    .map_err(anyhow::Error::from)
+    .expect_err("an expired deadline interrupts a long statement")
+}
+
+#[test]
+fn a_deadline_interrupted_statement_is_skipped_not_fatal() {
+    let db = WorkDb::open(temp_db_path("attention-real-interrupt")).unwrap();
+    assert_eq!(skip_interrupted("row", Err(genuinely_interrupted(&db))).unwrap(), 0);
+    assert!(
+        skip_interrupted_selection("kind", Err(genuinely_interrupted(&db)))
+            .unwrap()
+            .is_none(),
+        "an interrupted selection ends that scan"
+    );
+    // The interruption ended with the deadline; the connection is still usable.
+    let one: i64 = db
+        .connect()
+        .unwrap()
+        .query_row("SELECT 1", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(one, 1);
+}
+
+#[test]
+fn other_errors_and_successes_pass_through() {
+    assert!(skip_interrupted("row", Err(anyhow::anyhow!("disk I/O error"))).is_err());
+    assert!(skip_interrupted_selection("kind", Err(anyhow::anyhow!("disk I/O error"))).is_err());
+    assert_eq!(skip_interrupted("row", Ok(3)).unwrap(), 3);
+    assert_eq!(
+        skip_interrupted_selection("kind", Ok(vec!["a".to_owned()])).unwrap(),
+        Some(vec!["a".to_owned()])
     );
 }
