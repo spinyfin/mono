@@ -1435,6 +1435,16 @@ pub enum FrontendEvent {
         #[serde(default)]
         background_work: Vec<BackgroundWorkItem>,
     },
+    /// Complete current global background-work snapshot, pushed on
+    /// [`crate::TOPIC_ENGINE_BACKGROUND_WORK`] whenever it changes and
+    /// replayed to a session when it subscribes. A full snapshot, not a
+    /// delta: the newest push supersedes every earlier one, and `items`
+    /// has the same engine-decided membership and order as
+    /// [`FrontendEvent::EngineAttemptsList::background_work`], so its
+    /// length is the toolbar badge count.
+    BackgroundWorkSnapshot {
+        items: Vec<BackgroundWorkItem>,
+    },
     /// Engine acknowledges a reveal request — the macOS app has
     /// switched to the kanban, scrolled the target card into view, and
     /// started its transient highlight. Carries the resolved canonical

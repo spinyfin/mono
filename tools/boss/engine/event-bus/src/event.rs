@@ -49,6 +49,13 @@ pub enum Event {
     /// today (the automation scheduler) reacts by recomputing its
     /// min-next-fire sleep from the DB rather than trusting event contents.
     AutomationMutation,
+    /// An input of the global background-work snapshot changed: a planner
+    /// run was claimed, updated or deleted, or a conflict-resolution
+    /// mechanical rung started, concluded or reached a terminal state. No
+    /// payload: the subscriber (the background-work publisher) recomputes
+    /// the snapshot from the database and registry rather than trusting
+    /// event contents, and a burst coalesces into one recompute.
+    BackgroundWorkChanged,
 }
 
 /// The discriminant of an [`Event`], with no payload — what
@@ -70,6 +77,7 @@ pub enum EventKind {
     DispatchReady,
     Timer,
     AutomationMutation,
+    BackgroundWorkChanged,
 }
 
 impl EventKind {
@@ -94,6 +102,7 @@ impl EventKind {
             EventKind::DispatchReady => "dispatch_ready",
             EventKind::Timer => "timer",
             EventKind::AutomationMutation => "automation_mutation",
+            EventKind::BackgroundWorkChanged => "background_work_changed",
         }
     }
 }
@@ -116,6 +125,7 @@ impl Event {
             Event::DispatchReady => EventKind::DispatchReady,
             Event::Timer { .. } => EventKind::Timer,
             Event::AutomationMutation => EventKind::AutomationMutation,
+            Event::BackgroundWorkChanged => EventKind::BackgroundWorkChanged,
         }
     }
 
@@ -144,6 +154,7 @@ impl Event {
             Event::DispatchReady => String::new(),
             Event::Timer { deadline_id } => deadline_id.clone(),
             Event::AutomationMutation => String::new(),
+            Event::BackgroundWorkChanged => String::new(),
         }
     }
 }

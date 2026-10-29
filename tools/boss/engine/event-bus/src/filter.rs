@@ -39,6 +39,7 @@ impl TopicFilter {
             EventKind::DispatchReady,
             EventKind::Timer,
             EventKind::AutomationMutation,
+            EventKind::BackgroundWorkChanged,
         ])
     }
 

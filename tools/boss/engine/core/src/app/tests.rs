@@ -496,6 +496,7 @@ mod answer_agent_lifecycle;
 mod app_channel;
 mod attachments;
 mod awaiting_input_status;
+mod background_work_topic;
 mod board_drag_gated_revision;
 mod context;
 mod coordinator_guidance;

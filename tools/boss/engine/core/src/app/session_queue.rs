@@ -430,6 +430,8 @@ fn snapshot_event_kind(payload: &FrontendEvent) -> Option<&'static str> {
         FrontendEvent::WorkerLiveStatesList { .. } => Some("worker_live_states_list"),
         // Complete health report, including all current issues and pause flags.
         FrontendEvent::EngineHealthResult { .. } => Some("engine_health_result"),
+        // The whole background-work set behind the toolbar badge, not a changed item.
+        FrontendEvent::BackgroundWorkSnapshot { .. } => Some("background_work_snapshot"),
         // All pool capacities and the coordinator model for this engine.
         FrontendEvent::EnginePoolConfig { .. } => Some("engine_pool_config"),
         // Entire feature registry with effective values; current RPC replies stay separate.
@@ -676,6 +678,9 @@ impl SessionSink {
 #[derive(Default)]
 pub(super) struct TopicBroker {
     pub(super) decision_snapshot: Mutex<Option<Vec<boss_protocol::OperatorDecisionNotification>>>,
+    /// Last background-work snapshot computed, so a change is computed once
+    /// and fanned out, and a subscribing session is served from memory.
+    pub(super) background_work_snapshot: Mutex<Option<Vec<boss_protocol::BackgroundWorkItem>>>,
     pub(super) inner: Mutex<TopicBrokerInner>,
 }
 

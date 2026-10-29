@@ -2396,6 +2396,9 @@ async fn serve_scoped(
     // See `ServerState::spawn_pause_state_health_broadcaster` for why this
     // must not live in the individual pausers.
     let _pause_state_health_handle = server_state.spawn_pause_state_health_broadcaster();
+    // Background-work snapshot → `engine.background_work` push, so the app's
+    // toolbar badge needs no `list_engine_attempts` poll.
+    let _background_work_publisher_handle = server_state.spawn_background_work_publisher();
     if _dispatch_ready_subscriber_handle.is_some() {
         // Boot-time sanity check that the bus injected via `set_event_bus`
         // in `app.rs` is the same one the subscriber just attached to —

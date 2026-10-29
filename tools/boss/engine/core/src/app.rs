@@ -123,6 +123,7 @@ pub(crate) mod proposals;
 // `pub(crate)` so `crate::attention_lifecycle` can name
 // `PROGRESS_INGRESS_UNRECOVERABLE_ATTENTION_KIND` in the lifecycle registry
 // (crate-internal only — nothing outside the engine sees this module).
+mod background_work_topic;
 mod decision_notifications;
 mod panic_hook;
 pub(crate) mod readoption;

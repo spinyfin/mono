@@ -309,6 +309,9 @@ pub(crate) async fn try_mechanical_rungs(
     // 2026-07-18 leaked-lease incident), then run the rung and release
     // unconditionally.
     crate::ladder_lease_registry::register(&lease);
+    // The background-work snapshot admits this rung only once its lease is
+    // registered (the stamp above ran before it did), so announce it now.
+    work_db.notify_background_work_changed();
     let outcome = run_rung1_in_lease(work_db, publisher, cube_client, candidate, attempt, pr_number, &lease).await;
 
     // The rung has concluded (retired, halted, or fell through) — clear the
@@ -333,6 +336,9 @@ pub(crate) async fn try_mechanical_rungs(
         );
     }
     crate::ladder_lease_registry::unregister(&lease.lease_id);
+    // The registry is the snapshot's stale-marker veto: a failed clear write
+    // above would otherwise leave the item published after its lease is gone.
+    work_db.notify_background_work_changed();
     outcome
 }
 

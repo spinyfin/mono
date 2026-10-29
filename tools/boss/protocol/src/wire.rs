@@ -54,6 +54,14 @@ pub const TOPIC_GITHUB_AUTH: &str = "github.auth";
 /// out on this topic so subscribed frontends update without polling.
 pub const TOPIC_ENGINE_HEALTH: &str = "engine.health";
 
+/// Global topic carrying the background-work snapshot
+/// ([`FrontendEvent::BackgroundWorkSnapshot`]) behind the toolbar badge.
+/// The engine publishes a fresh full snapshot whenever one of its inputs
+/// changes (a planner run or a mechanical conflict rung starting, changing
+/// or ending) and replays the current one to each session that subscribes,
+/// so a frontend never has to poll `list_engine_attempts` for it.
+pub const TOPIC_ENGINE_BACKGROUND_WORK: &str = "engine.background_work";
+
 pub fn work_product_topic(product_id: &str) -> String {
     format!("work.product.{product_id}")
 }

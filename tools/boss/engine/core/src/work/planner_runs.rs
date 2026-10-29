@@ -145,6 +145,9 @@ impl WorkDb {
             ],
         )?;
         tx.commit()?;
+        if !recovered.is_empty() {
+            self.notify_background_work_changed();
+        }
         for run in &mut recovered {
             run.outcome = PLANNER_OUTCOME_PLANNER_FAILED.to_owned();
             run.result_summary = Some(PLANNER_RUN_ENGINE_RESTART_SUMMARY.to_owned());
@@ -202,6 +205,25 @@ impl WorkDb {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
+    /// Earliest `created_at` (epoch seconds) among `running` rows that
+    /// [`Self::list_running_planner_runs_older_than_at`] would still omit at
+    /// `now_secs` because they are younger than `min_age_secs`; `None` when
+    /// no such row exists. Tells the background-work publisher when the next
+    /// run crosses the anti-flicker gate, which no write announces.
+    pub fn earliest_planner_run_hidden_by_age_gate_at(&self, min_age_secs: i64, now_secs: i64) -> Result<Option<i64>> {
+        let conn = self.connect()?;
+        let cutoff = now_secs - min_age_secs;
+        let earliest: Option<i64> = conn.query_row(
+            "SELECT MIN(CAST(created_at AS INTEGER))
+             FROM planner_runs
+             WHERE outcome = ?1
+               AND CAST(created_at AS INTEGER) > ?2",
+            params![PLANNER_OUTCOME_RUNNING, cutoff],
+            |row| row.get(0),
+        )?;
+        Ok(earliest)
+    }
+
     /// Attempt to claim a planner run for `project_id` by inserting a row
     /// with `outcome = 'running'`.
     ///
@@ -237,6 +259,7 @@ impl WorkDb {
         if rows == 0 {
             return Ok(None);
         }
+        self.notify_background_work_changed();
         Ok(Some(PlannerRun {
             id,
             project_id: input.project_id.to_owned(),
@@ -301,6 +324,7 @@ impl WorkDb {
         if changed == 0 {
             return Ok(None);
         }
+        self.notify_background_work_changed();
         self.get_planner_run(id)
     }
 
@@ -369,6 +393,9 @@ impl WorkDb {
     pub fn delete_planner_run(&self, id: &str) -> Result<bool> {
         let conn = self.connect()?;
         let changed = conn.execute("DELETE FROM planner_runs WHERE id = ?1", params![id])?;
+        if changed > 0 {
+            self.notify_background_work_changed();
+        }
         Ok(changed > 0)
     }
 

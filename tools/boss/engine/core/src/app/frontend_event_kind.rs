@@ -167,6 +167,7 @@ pub(super) fn kind(event: &FrontendEvent) -> &'static str {
         FrontendEvent::CiBudget { .. } => "CiBudget",
         FrontendEvent::CiBudgetUpdated { .. } => "CiBudgetUpdated",
         FrontendEvent::EngineAttemptsList { .. } => "EngineAttemptsList",
+        FrontendEvent::BackgroundWorkSnapshot { .. } => "BackgroundWorkSnapshot",
         FrontendEvent::WorkItemRevealed { .. } => "WorkItemRevealed",
         FrontendEvent::DocumentOpened { .. } => "DocumentOpened",
         FrontendEvent::ShutdownAccepted => "ShutdownAccepted",

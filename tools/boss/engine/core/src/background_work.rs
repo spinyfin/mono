@@ -71,6 +71,25 @@ pub fn snapshot_with_leases(
     Ok(items)
 }
 
+/// How long until the oldest planner run still hidden by
+/// [`PLANNER_BACKGROUND_MIN_AGE_SECS`] becomes eligible, or `None` when none
+/// is hidden. A run entering the snapshot by growing old is the one input
+/// that changes with no write, so the publisher sleeps until then instead of
+/// polling for it.
+pub fn next_planner_eligibility(work_db: &WorkDb) -> anyhow::Result<Option<std::time::Duration>> {
+    let now_secs: i64 = crate::work::now_string().parse().unwrap_or(0);
+    Ok(work_db
+        .earliest_planner_run_hidden_by_age_gate_at(PLANNER_BACKGROUND_MIN_AGE_SECS, now_secs)?
+        .map(|created| planner_eligibility_delay(created, now_secs)))
+}
+
+/// Eligibility is `created <= now - MIN_AGE` on whole epoch seconds, so waking
+/// `created + MIN_AGE - now` seconds from a point inside second `now` lands at
+/// or after the first second that qualifies; a sleep never fires early.
+fn planner_eligibility_delay(created_secs: i64, now_secs: i64) -> std::time::Duration {
+    std::time::Duration::from_secs((created_secs + PLANNER_BACKGROUND_MIN_AGE_SECS - now_secs).max(0) as u64)
+}
+
 fn planner_items(work_db: &WorkDb) -> anyhow::Result<Vec<BackgroundWorkItem>> {
     Ok(work_db
         .list_running_planner_runs_older_than(PLANNER_BACKGROUND_MIN_AGE_SECS)?

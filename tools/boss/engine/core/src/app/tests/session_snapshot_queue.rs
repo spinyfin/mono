@@ -158,6 +158,7 @@ fn allowlisted_kinds_are_independent_and_correlated_replies_are_never_coalesced(
             coordinator_model: "test-model".into(),
         },
         FrontendEvent::FeatureFlagsList { flags: vec![] },
+        FrontendEvent::BackgroundWorkSnapshot { items: vec![] },
         FrontendEvent::DriverQuotaUsageResult {
             snapshot: boss_protocol::DriverQuotaSnapshot::default(),
         },
@@ -305,4 +306,31 @@ fn row_events_and_control_requests_retain_each_envelope() {
         }
         assert!(q.pop_front().is_none());
     }
+}
+
+#[test]
+fn background_work_snapshots_coalesce_to_the_newest_full_set() {
+    let item = |id: &str| {
+        boss_protocol::BackgroundWorkItem::builder()
+            .id(format!("project_planner:{id}"))
+            .kind(boss_protocol::BackgroundWorkKind::ProjectPlanner)
+            .phase("Planning")
+            .product_id("product")
+            .source_id(id)
+            .title("Project planner")
+            .build()
+    };
+    let snapshot = |ids: &[&str]| {
+        FrontendEventEnvelope::push(FrontendEvent::BackgroundWorkSnapshot {
+            items: ids.iter().map(|id| item(id)).collect(),
+        })
+    };
+    let mut q = SessionQueue::new();
+    assert_eq!(q.enqueue(snapshot(&["a"])), EnqueueOutcome::Enqueued);
+    assert_eq!(q.enqueue(snapshot(&["a", "b"])), EnqueueOutcome::Coalesced);
+    // An emptied set is a snapshot too, not a delta to merge into the pending one.
+    assert_eq!(q.enqueue(snapshot(&[])), EnqueueOutcome::Coalesced);
+    assert_eq!(q.stats().depth, 1);
+    assert_payload(q.pop_front().unwrap(), snapshot(&[]));
+    assert!(q.pop_front().is_none());
 }

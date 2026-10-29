@@ -316,6 +316,7 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::CiBudget { .. }
         | FrontendEvent::CiBudgetUpdated { .. }
         | FrontendEvent::EngineAttemptsList { .. }
+        | FrontendEvent::BackgroundWorkSnapshot { .. }
         | FrontendEvent::WorkItemRevealed { .. }
         | FrontendEvent::DocumentOpened { .. }
         | FrontendEvent::ShutdownAccepted

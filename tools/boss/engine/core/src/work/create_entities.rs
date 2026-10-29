@@ -127,6 +127,25 @@ impl WorkDb {
         &self.event_bus
     }
 
+    /// Tell the background-work publisher that an input of the global
+    /// snapshot (`crate::background_work`) may have changed. Publishes
+    /// [`Event::BackgroundWorkChanged`] and nothing else: the subscriber
+    /// recomputes from current state and only pushes when the result
+    /// differs, so over-notifying costs one recompute, never a wrong push.
+    /// Call it after the write has committed.
+    pub fn notify_background_work_changed(&self) {
+        self.event_bus.publish(Event::BackgroundWorkChanged);
+    }
+
+    /// Pass a committed attempt-row update through, notifying the
+    /// background-work publisher when it actually changed a row.
+    pub(crate) fn background_work_notified<T>(&self, updated: Result<Option<T>>) -> Result<Option<T>> {
+        if matches!(updated, Ok(Some(_))) {
+            self.notify_background_work_changed();
+        }
+        updated
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

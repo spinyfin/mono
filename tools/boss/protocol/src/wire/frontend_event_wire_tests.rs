@@ -1784,6 +1784,11 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "engine_attempts_list",
         },
+        TagCase {
+            label: "BackgroundWorkSnapshot",
+            event: FrontendEvent::BackgroundWorkSnapshot { items: vec![] },
+            expected_tag: "background_work_snapshot",
+        },
         // --- Reveal / shutdown / auth ---
         TagCase {
             label: "WorkItemRevealed",
@@ -2354,6 +2359,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::CiBudget { .. }
         | FrontendEvent::CiBudgetUpdated { .. }
         | FrontendEvent::EngineAttemptsList { .. }
+        | FrontendEvent::BackgroundWorkSnapshot { .. }
         | FrontendEvent::WorkItemRevealed { .. }
         | FrontendEvent::DocumentOpened { .. }
         | FrontendEvent::ShutdownAccepted

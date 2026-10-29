@@ -348,7 +348,7 @@ impl WorkDb {
                 AND status IN ('pending', 'running')",
             params![attempt_id, reason, now],
         )?;
-        finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
+        self.background_work_notified(finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution))
     }
 
     /// Auto-retire transition: flip an attempt from `pending` or `running`
@@ -394,7 +394,7 @@ impl WorkDb {
                 AND status IN ('pending', 'running')",
             params![attempt_id, head_sha_after, now, rung],
         )?;
-        finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
+        self.background_work_notified(finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution))
     }
 
     /// Close the revision task a conflict-resolution or CI-fix attempt
@@ -580,7 +580,7 @@ impl WorkDb {
                 AND status IN ('pending', 'running')",
             params![attempt_id, rung, cube_lease_id, cube_workspace_id],
         )?;
-        finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
+        self.background_work_notified(finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution))
     }
 
     /// Clear the mechanical-rung-in-flight marker (and the mechanical
@@ -607,7 +607,7 @@ impl WorkDb {
               WHERE id = ?1",
             params![attempt_id],
         )?;
-        finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
+        self.background_work_notified(finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution))
     }
 
     /// Engine-side abandon: flip a non-terminal attempt to `abandoned`
@@ -637,7 +637,7 @@ impl WorkDb {
                 AND status IN ('pending', 'running')",
             params![attempt_id, reason, now],
         )?;
-        finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
+        self.background_work_notified(finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution))
     }
 
     /// Abandon a stale `conflict_resolutions` row for supersede when the base
@@ -681,7 +681,7 @@ impl WorkDb {
                 AND status IN ('pending', 'running', 'abandoned')",
             params![attempt_id, reason, now],
         )?;
-        finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
+        self.background_work_notified(finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution))
     }
 
     /// Invalidate a **terminal `succeeded`** attempt whose resolution did not
