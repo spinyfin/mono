@@ -31,8 +31,19 @@ impl WorkDb {
     /// `pr_checker` is threaded straight through to [`WorkDb::create_revision`]
     /// (production: [`GhPrStateChecker`]; tests: a fake).
     pub fn revise_doc(&self, input: ReviseDocInput, pr_checker: &dyn PrStateChecker) -> Result<ReviseDocOutcome> {
+        self.revise_doc_as_actor(input, pr_checker, boss_protocol::LAST_STATUS_ACTOR_ENGINE)
+    }
+
+    /// Like [`Self::revise_doc`], but records `actor` on the created
+    /// revision's ledger insert row instead of `engine`.
+    pub fn revise_doc_as_actor(
+        &self,
+        input: ReviseDocInput,
+        pr_checker: &dyn PrStateChecker,
+        actor: &str,
+    ) -> Result<ReviseDocOutcome> {
         if input.artifact_kind == "pr_review_guide" {
-            return self.revise_guide_pr(input, pr_checker);
+            return self.revise_guide_pr(input, pr_checker, actor);
         }
         let Some(owner) = self.resolve_doc_owner(&input.artifact_kind, &input.artifact_id)? else {
             return Ok(ReviseDocOutcome::NotApplicable {
@@ -68,7 +79,7 @@ impl WorkDb {
 
         let (task_id, task_kind, pr_url) = match owner.pr_lifecycle {
             DocOwnerPrLifecycle::Open => {
-                match self.create_revision(
+                match self.create_revision_as_actor(
                     CreateRevisionInput::builder()
                         .parent_task_id(owner.chain_root_id.clone())
                         .description(directive.clone())
@@ -92,6 +103,7 @@ impl WorkDb {
                         // it should inherit rather than pin `standard`.
                         .build(),
                     pr_checker,
+                    actor,
                 ) {
                     Ok(task) => (task.id, "revision".to_owned(), owner.pr_url.clone()),
                     Err(err) if err.downcast_ref::<RevisionGateError>().is_some() => {

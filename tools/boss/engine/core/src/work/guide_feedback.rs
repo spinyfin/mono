@@ -4,7 +4,7 @@
 
 use super::feedback_target::FeedbackTarget;
 use super::revise_doc::{ClaimOutcome, claim_revisable_comments_in_tx, push_comment_directive_block};
-use super::revision_helpers::assert_parent_revisable_and_insert;
+use super::revision_helpers::assert_parent_revisable_and_insert_as_actor;
 use super::*;
 use boss_protocol::{GuideCommentOutcome, THREAD_ENTRY_AUTHOR_ENGINE};
 
@@ -36,6 +36,7 @@ impl WorkDb {
         &self,
         input: ReviseDocInput,
         pr_checker: &dyn PrStateChecker,
+        actor: &str,
     ) -> Result<ReviseDocOutcome> {
         let Some(FeedbackTarget::PullRequestImplementation {
             series_id,
@@ -87,15 +88,16 @@ impl WorkDb {
             .build();
 
         let mut pending = PendingEvents::new();
-        let task = match assert_parent_revisable_and_insert(&mut pending, &tx, revision_input, pr_checker) {
-            Ok(task) => task,
-            Err(err) if err.downcast_ref::<RevisionGateError>().is_some() => {
-                return Ok(ReviseDocOutcome::PrClosed {
-                    reason: "This PR can no longer be revised.".to_owned(),
-                });
-            }
-            Err(err) => return Err(err),
-        };
+        let task =
+            match assert_parent_revisable_and_insert_as_actor(&mut pending, &tx, revision_input, pr_checker, actor) {
+                Ok(task) => task,
+                Err(err) if err.downcast_ref::<RevisionGateError>().is_some() => {
+                    return Ok(ReviseDocOutcome::PrClosed {
+                        reason: "This PR can no longer be revised.".to_owned(),
+                    });
+                }
+                Err(err) => return Err(err),
+            };
 
         match claim_revisable_comments_in_tx(&tx, &candidates, &task.id)? {
             ClaimOutcome::Claimed(addressed_comment_ids) => {

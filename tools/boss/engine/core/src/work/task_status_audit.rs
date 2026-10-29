@@ -59,13 +59,20 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         // displayed reason is unchanged. Ordinary unchanged updates do not
         // restart the age clock.
         let repeated = if property == "blocked_reason" {
-            "OR (NEW.blocked_reason = 'worker_failed' AND EXISTS (
-                SELECT 1 FROM task_status_audit_context WHERE basis IN
-                ('nudge_breaker','declared_blocked','delivered_without_pr','foreign_pr_binding','operator_no')))"
+            let bases = super::pr_flow::WorkerFailureBasis::ALL
+                .iter()
+                .map(|basis| format!("'{}'", basis.as_str()))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "OR (NEW.blocked_reason = 'worker_failed' AND EXISTS (
+                SELECT 1 FROM task_status_audit_context WHERE basis IN ({bases})))"
+            )
         } else if property == "dispatch_failed_reason" {
             "OR (NEW.dispatch_failed_reason IS NOT NULL AND NEW.dispatch_failed_at IS NOT OLD.dispatch_failed_at)"
+                .to_owned()
         } else {
-            ""
+            String::new()
         };
         conn.execute_batch(&format!(
             "CREATE TRIGGER IF NOT EXISTS task_status_audit_update_{property}

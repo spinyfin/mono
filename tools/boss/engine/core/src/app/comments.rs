@@ -1114,7 +1114,8 @@ pub(super) async fn handle_comments_revise_doc(ctx: Dispatch, req: FrontendReque
 
         let artifact_kind = input.artifact_kind.clone();
         let artifact_id = input.artifact_id.clone();
-        match work_db.revise_doc(input, server_state.pr_state_checker.as_ref()) {
+        let actor = super::process_signals::resolve_status_actor(&server_state, peer_pid);
+        match work_db.revise_doc_as_actor(input, server_state.pr_state_checker.as_ref(), actor) {
             Ok(outcome) => {
                 let revision = if let ReviseDocOutcome::Created { ref task_id, .. } = outcome {
                     let product_id = work_db
