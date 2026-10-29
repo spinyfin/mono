@@ -1869,24 +1869,23 @@ import sys
 
 # The probe (`repobin exec checkleft --version`) is what pays a cold
 # dispatch-cache miss: a full `bazel build //tools/checkleft:checkleft`, which
-# can run into the tens of seconds to a few minutes depending on host
-# contention. Budget generously for it since it runs at most once per push
-# (repobin's dispatch cache is content-hash keyed, so a warm cache after the
-# probe means the subsequent `run` invocation below hits it too). On timeout
-# the probe is treated as failed and resolution falls through to the legacy
-# bin/checkleft / PATH lookup -- it does NOT fail open, since a fallback
-# checkleft may still exist and would otherwise be skipped for no reason.
-CHECKLEFT_PROBE_TIMEOUT_SECONDS = 240
+# can run into tens of minutes on a host already running several Bazel
+# compiles. Budget at least two hours: a short wall-clock kill cancels the
+# Bazel client, throws away the partly finished compile, and falls through
+# to a stale PATH checkleft. On timeout the probe is treated as failed and
+# resolution falls through to the legacy bin/checkleft / PATH lookup -- it
+# does NOT fail open, since a fallback checkleft may still exist and would
+# otherwise be skipped for no reason.
+CHECKLEFT_PROBE_TIMEOUT_SECONDS = 7200
 
-# Once the probe above has (if needed) warmed the dispatch cache, the actual
-# `checkleft run` is a fast, already-built invocation -- measured at 85-95s on
-# this repo -- but this budget is kept well above that measurement (roughly
-# 3x headroom) rather than trimmed close to it, because a run timeout takes
-# the fail-open path below and silently approves an unchecked push, which is
-# exactly the outcome this gate exists to prevent. On timeout we fail open
-# (approve) rather than strand the session -- the cube verb gates are the
-# belt for that rare case.
-CHECKLEFT_TIMEOUT_SECONDS = 300
+# Once the probe above has (if needed) warmed the dispatch cache, `checkleft
+# run` can still wait on Bazel (content-hash cache miss, lock contention,
+# a slow compile sharing the machine). Two hours is the floor so a still-
+# compiling build is not fail-opened into an unchecked push. On timeout we
+# fail open (approve) rather than strand the session -- the cube verb gates
+# are the belt for that rare case. A timeout must never be treated as a
+# reason to rerun the same command under the same cap.
+CHECKLEFT_TIMEOUT_SECONDS = 7200
 
 ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 DELIMS = {"&&", "||", ";", "|", "&"}

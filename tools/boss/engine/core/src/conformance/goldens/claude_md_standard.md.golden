@@ -6,6 +6,8 @@ via claude hooks.
 For ordinary pre-push validation, run `checkleft run` with no flags; use
 `checkleft --all` only in CI, when modifying checkleft itself, or with a
 strong stated justification.
+Do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run`
+in a shell `timeout`.
 
 ## Pull requests are the deliverable
 

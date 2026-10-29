@@ -253,6 +253,7 @@ fn generated_config_toml_loads_under_strict_config_on_pinned_codex() {
     let guards = vec![crate::driver::codex::MaterializedGuard {
         command_path: PathBuf::from("/bin/true"),
         matcher: Some(".*"),
+        timeout_sec: None,
     }];
     let full = crate::driver::codex::append_hooks_toml(&base, &guards);
     std::fs::write(codex_home.join("config.toml"), &full).expect("write config.toml");

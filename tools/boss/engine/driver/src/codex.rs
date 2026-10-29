@@ -327,6 +327,8 @@ const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a managed worke
      For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
      `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
      strong stated justification.\n\
+     Do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run`\n\
+     in a shell `timeout`.\n\
      \n\
      Two tool routes are blocked in this session, because the command\n\
      guardrails cannot see them:\n\
@@ -364,10 +366,14 @@ const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a managed worke
      \n\
      Empty `write_stdin(session_id, chars: \"\")` polling is allowed for a\n\
      session started by an ordinary command; writing commands through stdin\n\
-     is not. Do not claim a gate result without the real `exit_code`. Give a\n\
-     command that might hang its own foreground timeout so expiry returns a\n\
-     nonzero status. A job you deliberately leave running rather than polling\n\
-     it to completion must be declared with\n\
+     is not. Do not claim a gate result without the real `exit_code`. Do not\n\
+     wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run` in a\n\
+     shell `timeout`; poll those commands until they return a real\n\
+     `exit_code`. A build that is still compiling is making progress. If a\n\
+     hard cap is ever unavoidable for some other hanging command, it must be\n\
+     at least two hours, and a timeout must never be treated as a reason to\n\
+     rerun the same command under the same cap. A job you deliberately leave\n\
+     running rather than polling it to completion must be declared with\n\
      `\"$BOSS_BIN\" propose wait --reason \"<what you are waiting on>\" --duration <bound>`\n\
      before you end the turn.\n\
      \n\
@@ -1131,6 +1137,11 @@ pub struct MaterializedGuard {
     /// Matcher for PreToolUse (`".*"` covers all tools; Bash-only where the
     /// Claude path used a Bash matcher).
     pub matcher: Option<&'static str>,
+    /// Codex command-hook timeout in seconds. `None` uses Codex's 600s default.
+    /// The checkleft push guard sets this above its own 7200s subprocess
+    /// budget so the inner fail-open wins rather than Codex cutting the gate
+    /// short at 600s.
+    pub timeout_sec: Option<u64>,
 }
 
 /// Materialise Boss guard scripts under `codex_home/guards/` and return the
@@ -1248,7 +1259,13 @@ fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> 
             name: "checkleft_push_guard",
             source: GuardSource::Existing(checkleft_script.clone()),
             matcher: "Bash",
-            extra_env: Vec::new(),
+            // Covers the guard script's sequential probe + run budgets so a
+            // contended Bazel compile is not fail-closed by the shim
+            // (default 420s) or Codex's 600s command-hook default.
+            extra_env: vec![(
+                "BOSS_GUARD_TIMEOUT_SECONDS",
+                crate::CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS.to_string(),
+            )],
         });
     }
 
@@ -1327,6 +1344,8 @@ fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> 
         out.push(MaterializedGuard {
             command_path: fs::canonicalize(&wrapper).unwrap_or(wrapper),
             matcher: Some(guard.matcher),
+            timeout_sec: (guard.name == "checkleft_push_guard")
+                .then_some(crate::CHECKLEFT_GUARD_CODEX_RUNNER_TIMEOUT_SECS),
         });
     }
 
@@ -1390,6 +1409,9 @@ pub fn append_hooks_toml(base: &str, guards: &[MaterializedGuard]) -> String {
         }
         out.push_str("[[hooks.PreToolUse.hooks]]\n");
         out.push_str("type = \"command\"\n");
+        if let Some(timeout) = guard.timeout_sec {
+            out.push_str(&format!("timeout = {timeout}\n"));
+        }
         out.push_str(&format!(
             "command = {}\n\n",
             toml_basic_string(&guard.command_path.display().to_string())
@@ -1433,6 +1455,7 @@ pub fn write_hooks_and_attest(
                 .event(HookEvent::PreToolUse)
                 .maybe_matcher(guard.matcher.map(str::to_owned))
                 .command(guard.command_path.clone())
+                .maybe_timeout_sec(guard.timeout_sec)
                 .group_index(group_index)
                 .handler_index(0usize)
                 .require_guard_executable(true)

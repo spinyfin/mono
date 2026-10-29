@@ -128,7 +128,8 @@ fn agent_rules_require_session_polling_until_a_real_exit_status() {
         "let r = await tools.exec_command",
         "session_id: r.session_id",
         "yield_time_ms: 300000",
-        "own foreground timeout",
+        "Do not wrap `bazel build`",
+        "at least two hours",
     ] {
         assert!(
             preamble.contains(required),
@@ -811,11 +812,32 @@ fn append_hooks_toml_emits_pre_tool_use_groups() {
     let guards = vec![MaterializedGuard {
         command_path: PathBuf::from("/tmp/guard.sh"),
         matcher: Some(".*"),
+        timeout_sec: None,
     }];
     let full = append_hooks_toml(&base, &guards);
     assert!(full.contains("[[hooks.PreToolUse]]"));
     assert!(full.contains("matcher = \".*\""));
     assert!(full.contains("command = \"/tmp/guard.sh\""));
+    assert!(
+        !full.contains("timeout ="),
+        "omitted timeout_sec must leave Codex's default in place: {full}"
+    );
+}
+
+#[test]
+fn append_hooks_toml_emits_explicit_timeout_when_set() {
+    let full = append_hooks_toml(
+        "",
+        &[MaterializedGuard {
+            command_path: PathBuf::from("/tmp/checkleft.sh"),
+            matcher: Some("Bash"),
+            timeout_sec: Some(7500),
+        }],
+    );
+    assert!(
+        full.contains("timeout = 7500"),
+        "checkleft hook must outlive a contended Bazel compile: {full}"
+    );
 }
 
 #[test]
@@ -1145,6 +1167,49 @@ fn path_guard_keeps_its_data_dir_env_through_the_wrapper() {
         .expect("path guard must be armed for a local worker");
     let body = fs::read_to_string(&path_guard.command_path).unwrap();
     assert!(body.contains("export BOSS_DATA_DIR="), "{body}");
+}
+
+#[test]
+fn checkleft_push_guard_gets_a_two_hour_hook_timeout() {
+    let tmp = TempDir::new().unwrap();
+    let (home, config) = full_interception(tmp.path());
+    let guards = materialize_guards(&home, &config).unwrap();
+    let checkleft = guards
+        .iter()
+        .find(|guard| {
+            guard
+                .command_path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().contains("checkleft_push_guard"))
+        })
+        .expect("standard worker must arm the checkleft push guard");
+    assert_eq!(
+        checkleft.timeout_sec,
+        Some(crate::CHECKLEFT_GUARD_CODEX_RUNNER_TIMEOUT_SECS),
+        "Codex must not cut the checkleft gate at the 600s hook default"
+    );
+    let body = fs::read_to_string(&checkleft.command_path).unwrap();
+    assert!(
+        body.contains(&format!(
+            "export BOSS_GUARD_TIMEOUT_SECONDS='{}'",
+            crate::CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS
+        )),
+        "shim budget must cover the guard's probe + run budgets: {body}"
+    );
+    for guard in &guards {
+        if guard
+            .command_path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().contains("checkleft_push_guard"))
+        {
+            continue;
+        }
+        assert_eq!(
+            guard.timeout_sec, None,
+            "ordinary guards keep Codex's default timeout: {:?}",
+            guard.command_path
+        );
+    }
 }
 
 #[test]

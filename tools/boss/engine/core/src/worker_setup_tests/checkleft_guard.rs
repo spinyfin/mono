@@ -94,6 +94,16 @@ fn checkleft_push_guard_script_has_the_load_bearing_logic() {
         s.contains("bin") && s.contains("checkleft"),
         "must fall back to the repobin-installed checkleft path",
     );
+    assert!(
+        s.contains(&format!(
+            "CHECKLEFT_TIMEOUT_SECONDS = {}",
+            crate::driver::CHECKLEFT_GUARD_STEP_TIMEOUT_SECS
+        )) && s.contains(&format!(
+            "CHECKLEFT_PROBE_TIMEOUT_SECONDS = {}",
+            crate::driver::CHECKLEFT_GUARD_STEP_TIMEOUT_SECS
+        )),
+        "checkleft Bazel-driving invocations must get a two-hour wall-clock cap, not a short kill"
+    );
     assert!(s.contains("returncode"), "must gate on checkleft's exit code");
     assert!(
         s.contains("\"decision\"") && s.contains("\"block\"") || s.contains("'block'"),

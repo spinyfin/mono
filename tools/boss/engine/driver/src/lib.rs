@@ -24,6 +24,27 @@ pub mod git_store_guard;
 pub mod initial_prompt;
 pub mod transcript_store;
 
+/// Wall-clock cap, in seconds, on each of the two sequential subprocesses the
+/// checkleft push guard script runs (the repobin probe, then `checkleft run`).
+/// Must match `CHECKLEFT_PROBE_TIMEOUT_SECONDS` / `CHECKLEFT_TIMEOUT_SECONDS`
+/// in the generated guard script (pinned by a worker_setup test).
+pub const CHECKLEFT_GUARD_STEP_TIMEOUT_SECS: u64 = 7200;
+
+/// Slack above the guard's own total budget so the script can emit its own
+/// decision before the outer runner kills it.
+const CHECKLEFT_GUARD_MARGIN_SECS: u64 = 300;
+
+/// Outer hook budget for the checkleft push guard in every driver: it covers
+/// the probe and the run back to back, plus margin, so a slow probe cannot
+/// eat into the run's own two-hour budget.
+pub const CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS: u64 = 2 * CHECKLEFT_GUARD_STEP_TIMEOUT_SECS + CHECKLEFT_GUARD_MARGIN_SECS;
+
+/// Codex's hook runner sits above the shim's own deadline
+/// (`BOSS_GUARD_TIMEOUT_SECONDS`, [`CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS`]) so the
+/// shim can emit its decision before the runner kills it.
+pub const CHECKLEFT_GUARD_CODEX_RUNNER_TIMEOUT_SECS: u64 =
+    CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS + CHECKLEFT_GUARD_MARGIN_SECS;
+
 /// `large`/`max`-effort worker-prompt addendum, shared verbatim across every
 /// driver's `*_prompt_addendum_for_level` table so the wording cannot drift
 /// between drivers. `tests::large_effort_addendum_is_shared_across_drivers`
@@ -2357,5 +2378,13 @@ pub mod test_support;
 
 #[cfg(test)]
 mod tests;
+
+// The outer hook budget must cover the guard's sequential probe + run budgets
+// with margin, and Codex's runner must outlive the shim's own deadline.
+const _: () = {
+    assert!(CHECKLEFT_GUARD_STEP_TIMEOUT_SECS >= 7200);
+    assert!(CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS > 2 * CHECKLEFT_GUARD_STEP_TIMEOUT_SECS);
+    assert!(CHECKLEFT_GUARD_CODEX_RUNNER_TIMEOUT_SECS > CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS);
+};
 
 mod guard_python;
