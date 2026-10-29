@@ -8,13 +8,20 @@ use super::*;
 /// or no turn-start evidence). The pane may have come up and then been reaped.
 /// See [`crate::attention_lifecycle::ATTENTION_LIFECYCLES`] for its clearing
 /// rule: `ClearedBy::WorkResumed`, since a later run starting for the item
-/// is direct evidence the pane-spawn problem is no longer blocking it.
+/// is direct evidence the pane-spawn problem is no longer blocking it —
+/// provided that run did not itself fail to spawn, which the evidence clause
+/// in [`crate::work::attention_reconcile`] enforces.
+///
+/// Filed execution-scoped (`finish_execution_run` rejects a work-item id);
+/// `WorkDb::list_attention_items_for_work_item` is what makes it reachable
+/// from the work item's own surfaces.
 pub const PANE_SPAWN_FAILED_ATTENTION_KIND: &str = "pane_spawn_failed";
 
 fn pane_spawn_failed_attention_body(
     exec_id: &str,
     workspace_id: &str,
     err: &anyhow::Error,
+    precondition_line: &str,
     released: bool,
     abort_unconfirmed: bool,
 ) -> String {
@@ -47,8 +54,9 @@ fn pane_spawn_failed_attention_body(
         }
     };
     format!(
-        "{lead}\n\n**Error:** {err_detail}\n\nThe lease was {release_state}. Inspect \
-         `dispatch-events/executions/{exec_id}/dispatch.jsonl` for the full stage timeline."
+        "{lead}\n\n**Error:** {err_detail}\n\n{precondition_line}The lease was {release_state}. Inspect \
+         `dispatch-events/executions/{exec_id}/dispatch.jsonl` for the full stage timeline, \
+         or run `bossctl dispatch diagnose {exec_id}`."
     )
 }
 
@@ -346,6 +354,13 @@ impl ExecutionCoordinator {
                 // Reconciliation already retried stale occupants. A remaining
                 // rejection must be recorded as a spawn failure.
                 let slot_busy = slot_busy_occupant(&err).is_some();
+                // Which spawn step refused, and what it refused — the
+                // machine-readable half of `err_detail`. Rides on both
+                // dispatch events below and on the attention item, so
+                // `bossctl dispatch diagnose` can match a signature on the
+                // step instead of regexing the prose message. `None` for a
+                // failure that never reached the spawn flow.
+                let spawn_failure = spawn_failure_classification(&err);
                 tracing::error!(
                     execution_id = %execution.id,
                     work_item_id = %execution.work_item_id,
@@ -371,6 +386,7 @@ impl ExecutionCoordinator {
                                 "run_id": run.id,
                                 "slot_id": slot_id,
                                 "page": slot_id.and_then(worker_page_label),
+                                "spawn_failure": spawn_failure,
                             })),
                     )
                     .await;
@@ -417,12 +433,17 @@ impl ExecutionCoordinator {
                         }
                     }
                 };
-                // Persist the same full cause chain the abort log and
-                // attention body already use (`{err:#}`). `Display` without
-                // `#` would keep only the outermost context (e.g. pane_spawn's
-                // "writing permission/hook config…" wrapper) and drop the
-                // underlying refusal reason that last_error, the card and the
-                // JSON must show.
+                // The FLATTENED chain, not `err.to_string()`. anyhow's
+                // `Display` renders only the outermost context, so the run
+                // row used to store bare
+                // `spawning worker pane for run <exec>` while the whole
+                // actionable half of the message — `: preparing progress
+                // ingress: <path> is not a real directory` — lived only in
+                // the dispatch event. `boss task show --json` is the first
+                // surface an operator reaches for, and it was showing a
+                // sentence with no cause in it. Same persistence as the
+                // abort log / attention body (`{err:#}`): `Display` without
+                // `#` drops the underlying refusal reason.
                 let error_text = err_detail.clone();
 
                 // A `SlotBusy` app rejection means the engine and the app
@@ -451,6 +472,25 @@ impl ExecutionCoordinator {
                 // turns up in the kanban "Attention" lane and via
                 // `ListAttentionItems`. The structured event below
                 // gives tooling a parallel signal.
+                //
+                // The item is execution-scoped (`work_item_id: None`) —
+                // `finish_execution_run` rejects anything else. That is why
+                // `list_attention_items_for_work_item`, which backs both
+                // `boss task show` and the app's Attention lane, has to
+                // resolve an item's work item through its execution: fifteen
+                // consecutive spawn failures filed fifteen of these rows and
+                // not one of them reached a work-item surface.
+                //
+                // The body must carry the underlying cause, never just
+                // "spawn failed" — `err_detail` is the flattened chain, and
+                // the rejected precondition is called out separately when the
+                // failure was classified, since that is the line an operator
+                // acts on.
+                let precondition_line = spawn_failure
+                    .as_ref()
+                    .and_then(|failure| Some((failure.get("class")?.as_str()?, failure.get("cause")?.as_str()?)))
+                    .map(|(class, cause)| format!("**Rejected precondition** (`{class}`): {cause}\n\n"))
+                    .unwrap_or_default();
                 let attention = Some(CreateAttentionItemInput {
                     execution_id: Some(execution.id.clone()),
                     work_item_id: None,
@@ -461,6 +501,7 @@ impl ExecutionCoordinator {
                         &execution.id,
                         &lease.workspace_id,
                         &err,
+                        &precondition_line,
                         released,
                         abort_unconfirmed,
                     ),
@@ -506,6 +547,7 @@ impl ExecutionCoordinator {
                             "page": slot_id.and_then(worker_page_label),
                             "pre_start_failure_count": execution.pre_start_failure_count,
                             "transient_failure_count": execution.transient_failure_count,
+                            "spawn_failure": spawn_failure,
                         });
                         // A `SlotBusy` spawn rejection means the engine and
                         // the app disagree about slot occupancy — the
@@ -1231,7 +1273,7 @@ mod pane_spawn_failed_attention_body_tests {
     #[test]
     fn composer_timeout_uses_neutral_wording() {
         let err = composer_not_ready_error("claude", "exec-1", Duration::from_secs(20));
-        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true, false);
+        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, "", true, false);
         assert!(
             body.contains("spawn confirmation failed and the pane was reaped"),
             "{body}"
@@ -1244,7 +1286,7 @@ mod pane_spawn_failed_attention_body_tests {
     #[test]
     fn turn_start_timeout_says_the_driver_started() {
         let err = turn_did_not_start_error("claude", "exec-1", Duration::from_secs(45));
-        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true, false);
+        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, "", true, false);
         assert!(body.contains("the driver started"), "{body}");
         assert!(body.contains("the pane was reaped"), "{body}");
         assert!(!body.contains("never came up"), "{body}");
@@ -1254,7 +1296,7 @@ mod pane_spawn_failed_attention_body_tests {
     #[test]
     fn other_spawn_failure_says_the_pane_never_came_up() {
         let err = anyhow::anyhow!("worker prompt failed");
-        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true, false);
+        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, "", true, false);
         assert!(body.contains("worker pane never came up"), "{body}");
         assert!(!body.contains("the driver started"), "{body}");
     }

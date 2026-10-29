@@ -94,6 +94,27 @@ const ATTENTION_RAISED_AT: &str = "COALESCE(work_attention_items.last_raised_at,
 /// it just as squarely as one a minute later. Requiring strict inequality
 /// would leave a same-second signal stuck open forever, since `started_at`
 /// never advances — reproducing the exact defect this pass exists to fix.
+///
+/// ## A run that hit the same failure is not evidence
+///
+/// `work_runs.started_at` is stamped when the row is *inserted*
+/// (`start_execution_run`), which is before the worker pane is asked for —
+/// so "a run started" is a much weaker fact than it reads as. For
+/// `pane_spawn_failed` in particular it is not evidence at all: the
+/// redispatch inserts its run row, fails to spawn identically, and files its
+/// own attention row — and on the old clause that row's `started_at` was
+/// accepted as proof the *previous* occurrence was over. A repeating
+/// failure therefore resolved itself on every retry, which is the precise
+/// inverse of this module's stated invariant that a genuinely-broken item
+/// stays loud. Observed on the 2026-08-06/07 codex-driver spawn outage:
+/// fifteen consecutive failures, each one silently clearing its
+/// predecessor.
+///
+/// The extra clause is stated generically rather than special-cased to one
+/// kind, because the reasoning is: an evidence run whose own execution
+/// raised *this same signal* demonstrates the condition recurring, not
+/// ending. It is a no-op for work-item-scoped kinds, whose rows have a NULL
+/// `execution_id` and so never match a run's execution.
 fn work_resumed_evidence() -> String {
     format!(
         "EXISTS (
@@ -104,6 +125,12 @@ fn work_resumed_evidence() -> String {
                AND r.started_at IS NOT NULL
                AND CAST(r.started_at AS INTEGER) >= CAST({ATTENTION_RAISED_AT} AS INTEGER)
                AND r.execution_id IS NOT work_attention_items.execution_id
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM work_attention_items recurrence
+                   WHERE recurrence.execution_id = r.execution_id
+                     AND recurrence.kind = work_attention_items.kind
+               )
          )"
     )
 }
