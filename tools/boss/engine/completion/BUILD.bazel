@@ -9,6 +9,7 @@ exports_files(["Cargo.toml"])
 # caller injects.
 COMPLETION_DEPS = [
     "//lib/rust/git_utils",
+    "//lib/rust/workspace_procs",
     "//tools/boss/backoff",
     "//tools/boss/engine/dispatch-events",
     "//tools/boss/engine/driver",
