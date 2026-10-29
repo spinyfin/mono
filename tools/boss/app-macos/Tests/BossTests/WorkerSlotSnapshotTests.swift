@@ -553,14 +553,21 @@ final class WorkerSlotSnapshotTests: XCTestCase {
 
     // MARK: - WorkerSlotView Equatable
 
+    /// Distinct reveal-work-item handlers must not affect slot equality.
     func testSlotViewEquatableIgnoresClosures() {
         let snap = WorkerSlotSnapshot.build(
             slot: WorkerSlot(slotId: 1),
             liveState: nil
         )
         let runtime = GhosttyRuntime.shared
-        let a = WorkerSlotView(runtime: runtime, snapshot: snap)
-        let b = WorkerSlotView(runtime: runtime, snapshot: snap)
+        let a = WorkerSlotView(
+            runtime: runtime, snapshot: snap,
+            onRevealWorkItem: { _, _ in XCTFail("First reveal handler must not run during equality") }
+        )
+        let b = WorkerSlotView(
+            runtime: runtime, snapshot: snap,
+            onRevealWorkItem: { _, _ in XCTFail("Second reveal handler must not run during equality") }
+        )
         XCTAssertEqual(a, b)
     }
 
@@ -960,8 +967,8 @@ final class WorkerSlotSnapshotTests: XCTestCase {
 
     // MARK: - WorkersDetailView Equatable
 
-    /// Closures must not participate in `==` — otherwise every ContentView
-    /// re-render that rebuilds a handler would defeat `.equatable()`
+    /// Reveal-work-item handlers must not participate in `==` — otherwise
+    /// every ContentView re-render would defeat `.equatable()`
     /// and re-lay-out all 40 slots.
     func testDetailViewEquatableIgnoresClosures() {
         let workspace = WorkersWorkspaceModel()
@@ -969,12 +976,14 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         let a = WorkersDetailView(
             workspace: workspace,
             liveStates: liveStates,
-            isVisible: true
+            isVisible: true,
+            onRevealWorkItem: { _, _ in XCTFail("First reveal handler must not run during equality") }
         )
         let b = WorkersDetailView(
             workspace: workspace,
             liveStates: liveStates,
-            isVisible: true
+            isVisible: true,
+            onRevealWorkItem: { _, _ in XCTFail("Second reveal handler must not run during equality") }
         )
         XCTAssertEqual(a, b)
     }

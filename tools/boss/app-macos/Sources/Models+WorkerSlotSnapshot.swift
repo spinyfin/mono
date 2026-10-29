@@ -95,10 +95,10 @@ struct WorkerSlotLiveSlice: Equatable {
     }
 }
 
-/// Per-slot view input. Closures stay off this type so a parent rebuild
-/// cannot defeat `.equatable()`. `session` is
-/// compared by identity: the terminal `NSViewRepresentable` is keyed on
-/// the same object, and pointer equality is the cheap "same pane"
+/// Per-slot view input. Closures such as the reveal-work-item handler stay
+/// off this type so a parent rebuild cannot defeat `.equatable()`.
+/// `session` is compared by identity: the terminal `NSViewRepresentable`
+/// is keyed on the same object, and pointer equality is the cheap "same pane"
 /// signal. Equatable is isolated to the main actor (same shape as
 /// `WorkBoardCardView`) because `session` is a `@MainActor` class.
 struct WorkerSlotSnapshot: @MainActor Equatable {
