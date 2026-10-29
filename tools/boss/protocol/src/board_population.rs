@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 pub enum BoardPopulationPhase {
     /// The engine began a full read of the product's board.
     Started,
-    /// One stage of the read finished; the event's `stage` names it.
+    /// The read entered a stage; the event's `stage` names the stage now running.
     Stage,
     /// The snapshot was serialized and written to the requesting session.
     /// `items` and `bytes` describe it.

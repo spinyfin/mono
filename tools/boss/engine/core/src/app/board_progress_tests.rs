@@ -208,3 +208,90 @@ async fn writer_stage_frames_precede_the_snapshot() {
         .unwrap();
     assert!(lines.next_line().await.unwrap().unwrap().contains("work_tree"));
 }
+
+/// `GetWorkTree` must enqueue every build progress push before its reply, or
+/// a late `started` reaches the app after the snapshot and leaves the loaded
+/// board refreshing.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_work_tree_enqueues_all_progress_before_the_reply() {
+    for delta in [false, true] {
+        let (state, _dir) = crate::app::tests::test_server_state();
+        let product = state
+            .work_db
+            .create_product(boss_protocol::CreateProductInput::builder().name("Ordered").build())
+            .unwrap();
+        let sink = session_sink();
+        state.topic_broker.register_session("board", sink.clone()).await;
+        state
+            .topic_broker
+            .subscribe("board", &[work_product_topic(&product.id)])
+            .await;
+        let ctx = Dispatch::builder()
+            .server_state(state.clone())
+            .work_db(state.work_db.clone())
+            .sink(sink.clone())
+            .session_id("board")
+            .request_id("ordered-read")
+            .recv_instant(std::time::Instant::now())
+            .decode_ms(0.0)
+            .build();
+        work_items::handle_get_work_tree(
+            ctx,
+            FrontendRequest::GetWorkTree {
+                product_id: product.id.clone(),
+                fetch_seq: None,
+                delta,
+            },
+        )
+        .await;
+
+        let mut progress = 0;
+        let mut replies = 0;
+        while let Ok(Some(envelope)) = tokio::time::timeout(std::time::Duration::from_millis(500), sink.next()).await {
+            match envelope.payload {
+                FrontendEvent::BoardPopulationProgress { phase, .. } => {
+                    assert_eq!(
+                        replies, 0,
+                        "progress ({phase:?}) arrived after the reply (delta={delta})"
+                    );
+                    progress += 1;
+                }
+                FrontendEvent::WorkTree { .. } | FrontendEvent::WorkTreeUpdate { .. } => replies += 1,
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert_eq!(replies, 1, "delta={delta}");
+        assert!(progress >= 2, "a cold build reports Started and stages (delta={delta})");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn broad_input_rebuild_publishes_no_progress() {
+    let (state, _dir) = crate::app::tests::test_server_state();
+    let product = state
+        .work_db
+        .create_product(boss_protocol::CreateProductInput::builder().name("Loaded").build())
+        .unwrap();
+    drop(load_with_topic_progress(&state, &product.id).await);
+    // Any product write journals a broad (item-less) change, which forces the
+    // next refresh down the full-rebuild path even though a board is retained.
+    state
+        .work_db
+        .create_product(boss_protocol::CreateProductInput::builder().name("Other").build())
+        .unwrap();
+    let watcher = session_sink();
+    state.topic_broker.register_session("watcher", watcher.clone()).await;
+    state
+        .topic_broker
+        .subscribe("watcher", &[work_product_topic(&product.id)])
+        .await;
+
+    let trace = load_with_topic_progress(&state, &product.id).await;
+    drop(trace);
+
+    let quiet = tokio::time::timeout(std::time::Duration::from_millis(500), next_progress(&watcher)).await;
+    assert!(
+        quiet.is_err(),
+        "a rebuild of a retained board must not report a cold build"
+    );
+}
