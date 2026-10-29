@@ -1581,7 +1581,6 @@ pub(super) async fn handle_create_revision(ctx: Dispatch, req: FrontendRequest) 
         sink,
         session_id,
         request_id,
-        peer_pid,
         ..
     } = ctx;
     let FrontendRequest::CreateRevision { input } = req else {
@@ -1592,9 +1591,7 @@ pub(super) async fn handle_create_revision(ctx: Dispatch, req: FrontendRequest) 
         &sink,
         &session_id,
         &request_id,
-        resolve_write_actor(&server_state, peer_pid, None, None)
-            .and_then(|actor| work_db.create_revision_as_actor(input, &GhPrStateChecker, actor))
-            .map(WorkItem::Task),
+        work_db.create_revision(input, &GhPrStateChecker).map(WorkItem::Task),
         "revision_created",
         |err| FrontendEvent::WorkError {
             message: err.to_string(),

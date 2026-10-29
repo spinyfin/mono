@@ -2,16 +2,28 @@ use super::*;
 use crate::merge_poller::OpenPrMergeability;
 use crate::work::{
     AddDependencyInput, CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_PR_REVIEW_PREFIX, CiRemediationInsertInput,
-    ConflictResolutionInsertInput, CreateExecutionInput, CreateProjectInput, CreateRevisionInput, CreateTaskInput,
-    ExecutionKind, ExecutionStatus, FakePrStateChecker, LAST_STATUS_ACTOR_HUMAN, PrOpenState, RequestExecutionInput,
-    ReviewBatchCreateInput, ReviewBatchMemberCreateInput, ReviewBatchMemberRole, ReviewBatchMemberStatus,
-    ReviewBatchPhase, ReviewClassification, SubmitWorkerProposalInput, WorkItemPatch, WorkerFailureBasis,
+    ConflictResolutionInsertInput, CreateAttentionInput, CreateExecutionInput, CreateProjectInput, CreateRevisionInput,
+    CreateTaskInput, ExecutionKind, ExecutionStatus, FakePrStateChecker, LAST_STATUS_ACTOR_HUMAN, PrOpenState,
+    PrStateChecker, REVIEW_GATE_OUTCOME_COMPLETED_CLEAN, RequestExecutionInput, ReviewBatchCreateInput,
+    ReviewBatchMemberCreateInput, ReviewBatchMemberRole, ReviewBatchMemberStatus, ReviewBatchPhase,
+    ReviewClassification, ReviewVerdictInput, SubmitWorkerProposalInput, WorkItemPatch, WorkerFailureBasis,
     WorkerPrCompletionTarget,
 };
 use boss_protocol::{
     CreateInvestigationInput, OperatorAnswer, OperatorAnswerType, OperatorQuestion, ProposalKind, ReviewLanguageBucket,
     ReviewProfile,
 };
+
+fn records_repeat_worker_failed_observation(basis: WorkerFailureBasis) -> bool {
+    match basis {
+        WorkerFailureBasis::NudgeBreaker
+        | WorkerFailureBasis::DeclaredBlocked
+        | WorkerFailureBasis::DeliveredWithoutPr
+        | WorkerFailureBasis::ForeignPrBinding
+        | WorkerFailureBasis::OperatorNo => true,
+        WorkerFailureBasis::ConflictDeliveryUnverified => false,
+    }
+}
 
 fn latest_ledger(db: &WorkDb, work_item_id: &str, property: &str) -> (String, String) {
     db.connect()
@@ -332,30 +344,13 @@ fn merge_conflict_and_dependency_producers_record_their_basis() {
     let (basis, actor) = latest_ledger(&db, &dependent.id, "blocked_reason");
     assert_eq!(basis, "maybe_engine_block_dependent");
     assert_eq!(actor, "engine");
+    assert_latest(&db, &dependent.id, "status", "maybe_engine_block_dependent", "engine");
 }
 
 #[test]
 fn worker_failure_bases_each_record_a_repeat_observation() {
     let (db, product) = memory_db();
-    assert_eq!(
-        WorkerFailureBasis::all(),
-        &[
-            WorkerFailureBasis::NudgeBreaker,
-            WorkerFailureBasis::DeclaredBlocked,
-            WorkerFailureBasis::DeliveredWithoutPr,
-            WorkerFailureBasis::ForeignPrBinding,
-            WorkerFailureBasis::OperatorNo,
-            WorkerFailureBasis::ConflictDeliveryUnverified,
-        ]
-    );
-    let repeat_on_same_reason = [
-        WorkerFailureBasis::NudgeBreaker,
-        WorkerFailureBasis::DeclaredBlocked,
-        WorkerFailureBasis::DeliveredWithoutPr,
-        WorkerFailureBasis::ForeignPrBinding,
-        WorkerFailureBasis::OperatorNo,
-    ];
-    for producer in repeat_on_same_reason {
+    for producer in WorkerFailureBasis::all() {
         let chore = create_test_chore(&db, product.clone(), producer.as_str());
         let exec = start_waiting_human(&db, &chore.id);
         db.record_worker_failure_with_basis(&exec.id, "first failure", WorkerFailureBasis::NudgeBreaker)
@@ -371,9 +366,8 @@ fn worker_failure_bases_each_record_a_repeat_observation() {
             )
             .unwrap();
         let second_exec = start_waiting_human(&db, &chore.id);
-        db.record_worker_failure_with_basis(&second_exec.id, "repeat", producer)
+        db.record_worker_failure_with_basis(&second_exec.id, "repeat", *producer)
             .unwrap();
-        assert_latest(&db, &chore.id, "blocked_reason", producer.as_str(), "engine");
         let second_id: i64 = db
             .connect()
             .unwrap()
@@ -384,42 +378,14 @@ fn worker_failure_bases_each_record_a_repeat_observation() {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(second_id > first_id, "{}", producer.as_str());
+        if records_repeat_worker_failed_observation(*producer) {
+            assert_latest(&db, &chore.id, "blocked_reason", producer.as_str(), "engine");
+            assert!(second_id > first_id, "{}", producer.as_str());
+        } else {
+            assert_latest(&db, &chore.id, "blocked_reason", "nudge_breaker", "engine");
+            assert_eq!(second_id, first_id, "{}", producer.as_str());
+        }
     }
-
-    let unverified = create_test_chore(&db, product, WorkerFailureBasis::ConflictDeliveryUnverified.as_str());
-    let exec = start_waiting_human(&db, &unverified.id);
-    db.record_worker_failure_with_basis(&exec.id, "first failure", WorkerFailureBasis::NudgeBreaker)
-        .unwrap();
-    let first_id: i64 = db
-        .connect()
-        .unwrap()
-        .query_row(
-            "SELECT id FROM task_status_audit WHERE work_item_id = ?1 AND property = 'blocked_reason'
-             ORDER BY id DESC LIMIT 1",
-            [&unverified.id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let second_exec = start_waiting_human(&db, &unverified.id);
-    db.record_worker_failure_with_basis(
-        &second_exec.id,
-        "repeat",
-        WorkerFailureBasis::ConflictDeliveryUnverified,
-    )
-    .unwrap();
-    assert_latest(&db, &unverified.id, "blocked_reason", "nudge_breaker", "engine");
-    let second_id: i64 = db
-        .connect()
-        .unwrap()
-        .query_row(
-            "SELECT id FROM task_status_audit WHERE work_item_id = ?1 AND property = 'blocked_reason'
-             ORDER BY id DESC LIMIT 1",
-            [&unverified.id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(second_id, first_id);
 }
 
 #[test]
@@ -1052,9 +1018,53 @@ fn pr_flow_and_binding_producers_record_exact_bases() {
         "mark_task_pr_binding_unresolved"
     );
 
-    let close = create_test_chore(&db, product, "Reconciler close");
+    let close = create_test_chore(&db, product.clone(), "Reconciler close");
     db.reconciler_close_work_item(&close.id, &[]).unwrap();
     assert_latest(&db, &close.id, "status", "reconciler_close_work_item", "engine");
+
+    let root = create_test_chore(&db, product.clone(), "Verdict source");
+    let revision = create_test_chore(&db, product, "Held revision");
+    db.update_work_item(
+        &revision.id,
+        WorkItemPatch {
+            status: Some("active".into()),
+            pr_url: Some(pr.into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let review_exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&root.id)
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    WorkDb::insert_review_verdict_in_tx(
+        &db.connect().unwrap(),
+        &review_exec.id,
+        &root.id,
+        &ReviewVerdictInput {
+            head_sha: Some("reviewed-head".to_owned()),
+            findings_count: 0,
+            revision_warranted: false,
+            gate_outcome: REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+        },
+    )
+    .unwrap();
+    assert!(
+        db.advance_pending_review_task_to_in_review_with_verdict_source(&revision.id, &root.id)
+            .unwrap()
+    );
+    assert_latest(
+        &db,
+        &revision.id,
+        "status",
+        "advance_pending_review_task_to_in_review_with_verdict_source",
+        "engine",
+    );
 }
 
 #[test]
@@ -1126,6 +1136,42 @@ fn insert_and_update_producers_record_exact_bases() {
     )
     .unwrap();
     assert_latest(&db, &chore.id, "status", "update_task", "human");
+
+    let postmortem = db
+        .create_design_postmortem(&product, &project.id, &project.name, "review merged PRs".to_owned())
+        .unwrap();
+    assert_eq!(
+        insert_ledger(&db, &postmortem.id, "status"),
+        ("insert_design_postmortem_in_tx".into(), "engine".into())
+    );
+
+    let (attention, group) = db
+        .create_attention(
+            CreateAttentionInput::builder()
+                .kind("question")
+                .association_project_id(&project.id)
+                .source_kind("design_doc")
+                .source_doc_path("docs/ledger.md")
+                .question_type("prompt")
+                .prompt_text("keep the table?")
+                .build(),
+        )
+        .unwrap();
+    db.answer_attention(&attention.id, Some("yes".to_owned()), false, false)
+        .unwrap();
+    let actioned = db
+        .action_attention_group(
+            &group.id,
+            false,
+            &Default::default(),
+            &FakePrStateChecker::always(PrOpenState::Open),
+        )
+        .unwrap();
+    assert_eq!(actioned.produced_work_item_ids.len(), 1);
+    assert_eq!(
+        insert_ledger(&db, &actioned.produced_work_item_ids[0], "status"),
+        ("insert_seeded_design_task_in_tx".into(), "engine".into())
+    );
 }
 
 #[test]
@@ -1161,23 +1207,6 @@ fn chain_conflict_and_queue_producers_record_exact_bases() {
             &checker,
         )
         .unwrap();
-    let findings = db
-        .create_revision(
-            CreateRevisionInput::builder()
-                .parent_task_id(&parent.id)
-                .description("Review findings")
-                .created_via(format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_findings"))
-                .build(),
-            &checker,
-        )
-        .unwrap();
-    db.connect()
-        .unwrap()
-        .execute(
-            "UPDATE tasks SET status = 'blocked' WHERE id = ?1",
-            rusqlite::params![findings.id],
-        )
-        .unwrap();
     db.mark_chore_pr_merged(&parent.id, pr).unwrap();
     assert_latest(
         &db,
@@ -1187,24 +1216,82 @@ fn chain_conflict_and_queue_producers_record_exact_bases() {
         "engine",
     );
     assert_latest(&db, &moot.id, "status", "archive_revision_task", "engine");
-    let findings_rows: Vec<(String, String, String)> = {
-        let conn = db.connect().unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT property, basis, actor FROM task_status_audit
-                 WHERE work_item_id = ?1 ORDER BY id",
-            )
-            .unwrap();
-        stmt.query_map([&findings.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap()
-    };
-    assert!(
-        findings_rows.iter().any(|(property, basis, actor)| {
-            property.as_str() != "" && basis == "convert_revision_to_review_findings_followup" && actor == "engine"
-        }),
-        "expected convert_revision_to_review_findings_followup on findings ledger, got {findings_rows:?}"
+
+    // Convert must be the writer that changes status. A findings revision on
+    // the same parent as the moot CI-fix is auto-gated on that sibling; the
+    // archive cascade unblocks it to todo before convert runs, so convert's
+    // `status = todo` assignment is a no-op and writes no status row.
+    let findings_parent = create_test_chore(&db, product.clone(), "Findings parent");
+    let findings_pr = "https://github.com/spinyfin/mono/pull/1051";
+    bind_pr(&db, &findings_parent.id, findings_pr);
+    let findings = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(&findings_parent.id)
+                .description("Review findings")
+                .created_via(format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_findings"))
+                .build(),
+            &checker,
+        )
+        .unwrap();
+    db.update_work_item(
+        &findings.id,
+        WorkItemPatch {
+            status: Some("active".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.mark_chore_pr_merged(&findings_parent.id, findings_pr).unwrap();
+    assert_latest(
+        &db,
+        &findings.id,
+        "status",
+        "convert_revision_to_review_findings_followup",
+        "engine",
+    );
+
+    let delivered_parent = create_test_chore(&db, product.clone(), "Delivered parent");
+    let delivered_pr = "https://github.com/spinyfin/mono/pull/1052";
+    bind_pr(&db, &delivered_parent.id, delivered_pr);
+    let delivered = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(&delivered_parent.id)
+                .description("Already delivered findings")
+                .created_via(format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_delivered"))
+                .build(),
+            &checker,
+        )
+        .unwrap();
+    let implementation = db
+        .list_executions(Some(&delivered.id))
+        .unwrap()
+        .into_iter()
+        .find(|execution| execution.kind == ExecutionKind::RevisionImplementation)
+        .expect("revision creation must enqueue its implementation");
+    db.update_work_item(
+        &delivered.id,
+        WorkItemPatch {
+            status: Some("active".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed', finished_at = '1' WHERE id = ?1",
+            rusqlite::params![implementation.id],
+        )
+        .unwrap();
+    db.mark_chore_pr_merged(&delivered_parent.id, delivered_pr).unwrap();
+    assert_latest(
+        &db,
+        &delivered.id,
+        "status",
+        "resolve_revision_on_parent_close",
+        "engine",
     );
 
     let conflict_parent = create_test_chore(&db, product.clone(), "Conflict retry");
@@ -1311,6 +1398,7 @@ fn chain_conflict_and_queue_producers_record_exact_bases() {
         "maybe_engine_unblock_dependent",
         "engine",
     );
+    assert_latest(&db, &dependent.id, "status", "maybe_engine_unblock_dependent", "engine");
 }
 
 #[test]
@@ -1330,7 +1418,7 @@ fn operator_yes_and_prerequisite_approval_record_exact_bases() {
         .unwrap();
     assert_latest(&db, &yes.id, "status", "restart_after_answer", "human");
 
-    let gated = create_test_chore(&db, product, "Needs prereq");
+    let gated = create_test_chore(&db, product.clone(), "Needs prereq");
     let gated_exec = start_waiting_human(&db, &gated.id);
     let prereq_q = OperatorQuestion {
         text: "Create the missing work?".into(),
@@ -1346,6 +1434,24 @@ fn operator_yes_and_prerequisite_approval_record_exact_bases() {
     db.answer_operator_question(&gated.id, OperatorAnswer::YesNo { value: true })
         .unwrap();
     assert_has(&db, &gated.id, "status", "approve_in_tx", "human");
+
+    let parked = create_test_chore_manual(&db, product.clone(), "Parked prerequisite");
+    let waiting = create_test_chore(&db, product, "Waiting on parked");
+    let waiting_exec = start_waiting_human(&db, &waiting.id);
+    let parked_q = OperatorQuestion {
+        text: "Create the missing work?".into(),
+        explanation: "This cannot proceed without it.".into(),
+        answer_type: OperatorAnswerType::CreatePrerequisiteTask {
+            name: "Parked prerequisite".into(),
+            brief: "Do the other thing first.".into(),
+        },
+    };
+    crate::work::insert_question(&db.connect().unwrap(), &waiting_exec.id, "proposal", &parked_q).unwrap();
+    db.record_worker_awaiting_operator_answer(&waiting_exec.id, "needs a prereq", &parked_q)
+        .unwrap();
+    db.answer_operator_question(&waiting.id, OperatorAnswer::YesNo { value: true })
+        .unwrap();
+    assert_has(&db, &parked.id, "autostart", "approve_in_tx", "engine");
 }
 
 #[test]
@@ -1443,6 +1549,185 @@ fn review_verdict_apply_records_cycle_root_advance() {
         "advance_cycle_root_to_in_review_in_tx",
         "engine",
     );
+}
+
+#[test]
+fn review_verdict_apply_records_deletion_signoff_hold() {
+    let (db, product) = memory_db();
+    let root = create_test_chore_manual(&db, product.clone(), "Deletion signoff target");
+    let pr = "https://github.com/example/repo/pull/42";
+    set_pr_url(&db, &root.id, pr);
+    db.mark_chore_blocked_merge_conflict(&root.id, pr).unwrap();
+    let attempt = db
+        .insert_conflict_resolution(ConflictResolutionInsertInput {
+            product_id: product,
+            work_item_id: root.id.clone(),
+            pr_url: pr.into(),
+            pr_number: 42,
+            head_branch: "feature".into(),
+            base_branch: "main".into(),
+            base_sha_at_trigger: Some("base-sha".into()),
+            head_sha_before: Some("head-before".into()),
+        })
+        .unwrap()
+        .unwrap();
+    db.mark_conflict_resolution_succeeded(&attempt.id, Some("head-sha"))
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'in_review', blocked_reason = NULL, pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![root.id, pr],
+        )
+        .unwrap();
+    let supervisor = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&root.id)
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let classification = ReviewClassification::builder()
+        .changed_files(vec!["src/lib.rs".to_owned()])
+        .complexity_flags(vec![])
+        .has_production_code(true)
+        .metadata_missing(vec![])
+        .production_languages(vec![ReviewLanguageBucket::Rust])
+        .profile(ReviewProfile::Light)
+        .subsystem_buckets(vec!["engine".to_owned()])
+        .additions(1)
+        .deletions(0)
+        .build();
+    let (batch, _) = db
+        .create_review_batch(
+            ReviewBatchCreateInput::builder()
+                .cycle_root_id(&root.id)
+                .base_sha("base-sha")
+                .classification(classification)
+                .phase(ReviewBatchPhase::PreMerge)
+                .pr_number(42)
+                .pr_url(pr)
+                .target_sha("head-sha")
+                .build(),
+            &[ReviewBatchMemberCreateInput::builder()
+                .attempt(1)
+                .provider_effort("medium")
+                .requested_driver("claude")
+                .resolved_model("test-model")
+                .role(ReviewBatchMemberRole::Supervisor)
+                .status(ReviewBatchMemberStatus::Pending)
+                .maybe_execution_id(Some(supervisor.id.clone()))
+                .build()],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_batches SET status = 'supervising' WHERE id = ?1",
+            rusqlite::params![batch.id],
+        )
+        .unwrap();
+    let payload = format!(
+        r#"{{"batch_id":"{}","verdict":{{"batch_id":"{}","pr_url":"{pr}","target_sha":"head-sha","phase":"pre_merge","summary":"Clean.","revision_warranted":false,"findings":[],"contradictions":[]}}}}"#,
+        batch.id, batch.id
+    );
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &supervisor.id,
+            work_item_id: &root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &payload,
+            idempotency_key: "verdict-signoff",
+        })
+        .unwrap()
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            [&supervisor.id],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_head_sha = 'head-sha', ci_required_state = 'success', pr_mergeable_state = 'mergeable' WHERE id = ?1",
+            [&root.id],
+        )
+        .unwrap();
+    struct DeletingPrChecker {
+        inner: FakePrStateChecker,
+        deletions: Vec<String>,
+    }
+    impl PrStateChecker for DeletingPrChecker {
+        fn check(&self, pr_url: &str) -> anyhow::Result<PrOpenState> {
+            self.inner.check(pr_url)
+        }
+        fn inspect(&self, pr_url: &str) -> anyhow::Result<crate::work::PrInspect> {
+            self.inner.inspect(pr_url)
+        }
+        fn merged_parent_deletions(
+            &self,
+            _repo_slug: &str,
+            _head_before: &str,
+            _base_sha: &str,
+            _head_after: &str,
+        ) -> Vec<String> {
+            self.deletions.clone()
+        }
+    }
+    db.apply_review_verdict_proposal(
+        &outcome.proposal.id,
+        &DeletingPrChecker {
+            inner: FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+            deletions: vec!["`src/lib.rs` — added by a merged parent, removed by this resolution".to_owned()],
+        },
+    )
+    .unwrap();
+    assert_latest(
+        &db,
+        &root.id,
+        "status",
+        "hold_cycle_root_for_deletion_signoff",
+        "engine",
+    );
+    assert_latest(
+        &db,
+        &root.id,
+        "blocked_reason",
+        "hold_cycle_root_for_deletion_signoff",
+        "engine",
+    );
+}
+
+#[test]
+fn execution_recovery_rearm_records_its_basis() {
+    let (db, product) = memory_db();
+    let chore = create_test_chore_manual(&db, product, "Wedged recovery");
+    let detail = format!(
+        "{} boss-base/exec_ledger_rearm",
+        boss_engine_recovery::execution_bookmark::NOT_DESCENDED_MESSAGE
+    );
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'blocked', blocked_reason = 'execution_recovery_failed',
+             blocked_detail = ?2, autostart = 0 WHERE id = ?1",
+            rusqlite::params![chore.id, detail],
+        )
+        .unwrap();
+    assert_eq!(db.rearm_repairable_execution_recovery_failures().unwrap(), 1);
+    assert_latest(&db, &chore.id, "status", "rearm_execution_recovery_failed", "engine");
+    assert_latest(
+        &db,
+        &chore.id,
+        "blocked_reason",
+        "rearm_execution_recovery_failed",
+        "engine",
+    );
+    assert_latest(&db, &chore.id, "autostart", "rearm_execution_recovery_failed", "engine");
 }
 
 #[test]

@@ -35,6 +35,22 @@ impl WorkDb {
         let conn = self.connect().ok()?;
         get_chain_root_task(&conn, task_id).ok().flatten().map(|t| t.id)
     }
+
+    /// Like [`Self::create_revision`], but records `actor` on the revision's
+    /// ledger insert row instead of `engine`.
+    pub fn create_revision_as_actor(
+        &self,
+        input: CreateRevisionInput,
+        pr_checker: &dyn PrStateChecker,
+        actor: &str,
+    ) -> Result<Task> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut pending = PendingEvents::new();
+        let task = assert_parent_revisable_and_insert_as_actor(&mut pending, &tx, input, pr_checker, actor)?;
+        commit_and_publish(tx, pending, self.event_bus())?;
+        Ok(task)
+    }
 }
 
 /// Return the id of the last unfinished revision in dependency order that is a

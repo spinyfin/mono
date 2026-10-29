@@ -34,6 +34,16 @@ pub enum WorkerFailureBasis {
 
 impl WorkerFailureBasis {
     pub const fn all() -> &'static [Self] {
+        // Exhaustive so a new variant cannot compile until it is also in the
+        // slice. Ledger tests iterate this inventory and match on each value.
+        match Self::NudgeBreaker {
+            Self::NudgeBreaker
+            | Self::DeclaredBlocked
+            | Self::DeliveredWithoutPr
+            | Self::ForeignPrBinding
+            | Self::OperatorNo
+            | Self::ConflictDeliveryUnverified => {}
+        }
         &[
             Self::NudgeBreaker,
             Self::DeclaredBlocked,

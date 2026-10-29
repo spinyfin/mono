@@ -477,7 +477,13 @@ pub(crate) fn maybe_engine_block_dependent(
     if dependent_id.starts_with("proj_") {
         write_engine_project_status(conn, dependent_id, ProjectStatus::Blocked, now_epoch)?;
     } else if dependent_id.starts_with("task_") {
-        write_engine_task_status(conn, dependent_id, TaskStatus::Blocked, now_epoch)?;
+        write_engine_task_status(
+            conn,
+            dependent_id,
+            TaskStatus::Blocked,
+            now_epoch,
+            "maybe_engine_block_dependent",
+        )?;
     }
     // Stamp blocked_reason so the user-override path in
     // request_execution_in_tx_with_live_check can identify and clear
@@ -699,7 +705,13 @@ pub(crate) fn maybe_engine_unblock_dependent(
     if dependent_id.starts_with("proj_") {
         write_engine_project_status(conn, dependent_id, ProjectStatus::Planned, now_epoch)?;
     } else if dependent_id.starts_with("task_") {
-        write_engine_task_status(conn, dependent_id, TaskStatus::Todo, now_epoch)?;
+        write_engine_task_status(
+            conn,
+            dependent_id,
+            TaskStatus::Todo,
+            now_epoch,
+            "maybe_engine_unblock_dependent",
+        )?;
     }
     // Clear blocked_reason so it doesn't linger on a todo row.
     if dependent_id.starts_with("task_") {
@@ -904,10 +916,11 @@ pub(crate) fn write_engine_task_status(
     task_id: &str,
     new_status: TaskStatus,
     now_epoch: &str,
+    basis: &str,
 ) -> Result<()> {
     crate::work::task_status_audit::execute(
         conn,
-        "write_engine_task_status",
+        basis,
         "engine",
         "UPDATE tasks
          SET status = ?2, last_status_actor = 'engine', updated_at = ?3

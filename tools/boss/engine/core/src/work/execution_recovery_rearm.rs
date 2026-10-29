@@ -53,7 +53,10 @@ pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool) -> Result
         .map(|(id, _)| id)
         .collect();
     for id in &ids {
-        conn.execute(
+        crate::work::task_status_audit::execute(
+            conn,
+            "rearm_execution_recovery_failed",
+            "engine",
             "UPDATE tasks
              SET status = 'todo', blocked_reason = NULL, blocked_detail = NULL, autostart = 1,
                  last_status_actor = 'engine', updated_at = ?2
@@ -115,6 +118,14 @@ pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool) -> Result
         );
     }
     Ok(rearmed)
+}
+
+#[cfg(test)]
+impl WorkDb {
+    pub(crate) fn rearm_repairable_execution_recovery_failures(&self) -> Result<usize> {
+        let conn = self.connect()?;
+        migrate(&conn, is_false_not_descended_blocker)
+    }
 }
 
 #[cfg(test)]
