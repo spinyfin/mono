@@ -18,8 +18,18 @@ pub(crate) fn create_in_tx(
     let (question_type, choices) = match &question.answer_type {
         OperatorAnswerType::YesNo => ("yes_no", None),
         OperatorAnswerType::MultipleChoice { choices } => ("multiple_choice", Some(serde_json::to_string(choices)?)),
-        OperatorAnswerType::CreatePrerequisiteTask { name, brief } => {
+        OperatorAnswerType::CreatePrerequisiteTask {
+            name,
+            brief,
+            file_count_bypass,
+        } => {
             prompt.push_str(&format!("\n\nPrerequisite: {name}\n\n{brief}\n\nYes creates or links this prerequisite for the work that handles this answer."));
+            if let Some(spec) = file_count_bypass {
+                prompt.push_str(&format!(
+                    " No authorizes a change/file-count exception for this PR only, up to {} files (limit {}), and the work continues in one PR.",
+                    spec.files, spec.limit
+                ));
+            }
             ("yes_no", None)
         }
     };
@@ -111,7 +121,7 @@ pub(super) fn apply_prerequisite_in_tx(
     let Some(record) = record else {
         return Ok(());
     };
-    let OperatorAnswerType::CreatePrerequisiteTask { name, brief } = &record.question.answer_type else {
+    let OperatorAnswerType::CreatePrerequisiteTask { name, brief, .. } = &record.question.answer_type else {
         return Ok(());
     };
     let now = now_string();

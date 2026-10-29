@@ -2428,7 +2428,7 @@ impl WorkDb {
         let mut minted_execution = false;
         let mut prerequisite_work_item_id = None;
         match (answer, &question.question.answer_type) {
-            (OperatorAnswer::YesNo { value: true }, OperatorAnswerType::CreatePrerequisiteTask { name, brief }) => {
+            (OperatorAnswer::YesNo { value: true }, OperatorAnswerType::CreatePrerequisiteTask { name, brief, .. }) => {
                 let linked = super::prerequisite_question::approve_in_tx(
                     &mut pending,
                     &tx,
@@ -2449,6 +2449,18 @@ impl WorkDb {
             (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. }) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
                 let block = choice_block(&question.question, &value, &timestamp);
+                restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
+                minted_execution = true;
+            }
+            (
+                OperatorAnswer::YesNo { value: false },
+                OperatorAnswerType::CreatePrerequisiteTask {
+                    file_count_bypass: Some(spec),
+                    ..
+                },
+            ) => {
+                let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
+                let block = file_count_bypass_authorization_block(&question.question, *spec, &timestamp);
                 restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
                 minted_execution = true;
             }
@@ -2578,6 +2590,25 @@ The repo owner recorded this answer. It is explicit, human-granted approval for 
     )
 }
 
+/// No on a split-vs-file-count-bypass question: keep this change in one PR,
+/// bound to the approved file count, and no other check.
+fn file_count_bypass_authorization_block(
+    question: &OperatorQuestionView,
+    spec: boss_protocol::FileCountBypassSpec,
+    timestamp: &str,
+) -> String {
+    format!(
+        "\n\n---\n\n## Repo owner approval ({timestamp})\n\n\
+- **Question the previous worker asked:** {}\n\
+- **Answer:** No — keep this change in one PR\n\
+- **Authorized exception:** change/file-count for this PR only, up to {} files (repository limit {})\n\
+- **The worker's explanation:** {}\n\
+- **Asked by run:** `{}`\n\n\
+The repo owner recorded this answer. It is explicit, human-granted approval to finish this change as a single PR by declaring `BYPASS_CHANGE_FILE_COUNT={}:approved by the repo owner` in the commit description. It does not authorize bypassing any other check, raising any other limit, or using the exception on a different PR. State in the PR body that this file-count exception was approved by the repo owner on the date above.\n",
+        question.text, spec.files, spec.limit, question.explanation, question.execution_id, spec.files
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use crate::test_support::*;
@@ -2596,6 +2627,32 @@ mod tests {
         let text = super::authorization_block(&question, "2026-10-23");
         crate::prose_vocabulary::assert_no_forbidden_prose("recorded approval", &text);
         assert!(text.contains("## Repo owner approval (2026-10-23)"));
+    }
+
+    #[test]
+    fn file_count_bypass_approval_text_is_scoped_and_avoids_internal_vocabulary() {
+        let question = boss_protocol::OperatorQuestionView::builder()
+            .id("question-1")
+            .text("Split this 48-file change (limit 30) by landing 'Extract the first PR' first, or keep it in one PR?")
+            .answer_type(boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
+                name: "Extract the first PR".into(),
+                brief: "Land the first capability as its own PR.".into(),
+                file_count_bypass: Some(boss_protocol::FileCountBypassSpec { files: 48, limit: 30 }),
+            })
+            .explanation("The change is 48 files against a limit of 30.")
+            .asked_at("2026-10-23")
+            .execution_id("exec_example")
+            .build();
+        let text = super::file_count_bypass_authorization_block(
+            &question,
+            boss_protocol::FileCountBypassSpec { files: 48, limit: 30 },
+            "2026-10-23",
+        );
+        crate::prose_vocabulary::assert_no_forbidden_prose("file-count bypass approval", &text);
+        assert!(text.contains("## Repo owner approval (2026-10-23)"));
+        assert!(text.contains("change/file-count for this PR only, up to 48 files"));
+        assert!(text.contains("BYPASS_CHANGE_FILE_COUNT=48:approved by the repo owner"));
+        assert!(text.contains("It does not authorize bypassing any other check"));
     }
 
     /// A task whose `review_cycle` is a known non-zero value must serialise

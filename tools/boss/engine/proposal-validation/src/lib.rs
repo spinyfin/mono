@@ -600,7 +600,12 @@ impl<'a> PayloadReader<'a> {
                 return None;
             }
         };
-        if let boss_protocol::OperatorAnswerType::CreatePrerequisiteTask { name, brief } = question.answer_type {
+        if let boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
+            name,
+            brief,
+            file_count_bypass,
+        } = question.answer_type
+        {
             let name = self.text_from(
                 "question.answer_type.name",
                 &Value::String(name),
@@ -615,10 +620,22 @@ impl<'a> PayloadReader<'a> {
             if name.contains(['\n', '\r']) {
                 self.error("question.answer_type.name", "must be a single line");
             }
+            if let Some(spec) = file_count_bypass
+                && let Err(message) = spec.validate()
+            {
+                self.error("question.answer_type.file_count_bypass", message);
+            }
             // The engine owns the wording so the card always reads the same;
             // whatever the worker sent as `text` is replaced.
-            question.text = boss_protocol::OperatorAnswerType::prerequisite_question_text(&name);
-            question.answer_type = boss_protocol::OperatorAnswerType::CreatePrerequisiteTask { name, brief };
+            question.text = match file_count_bypass {
+                Some(spec) => boss_protocol::OperatorAnswerType::file_count_split_question_text(&name, spec),
+                None => boss_protocol::OperatorAnswerType::prerequisite_question_text(&name),
+            };
+            question.answer_type = boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
+                name,
+                brief,
+                file_count_bypass,
+            };
         } else {
             if let boss_protocol::OperatorAnswerType::MultipleChoice { choices } = &question.answer_type
                 && let Err(message) = boss_protocol::OperatorAnswerType::validate_choices(choices)
@@ -916,6 +933,7 @@ mod operator_question_tests {
             boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
                 name: "Fix the retention-cleanup fixture race".into(),
                 brief: "A stand-alone brief.".into(),
+                file_count_bypass: None,
             }
         );
         assert_eq!(
@@ -958,5 +976,42 @@ mod operator_question_tests {
         let mut no_explanation = prerequisite_payload();
         no_explanation["question"]["explanation"] = json!("");
         assert!(validate_payload(ProposalKind::RunDone, &no_explanation).is_err());
+    }
+
+    #[test]
+    fn file_count_split_question_is_canonicalized_and_rejects_a_non_over_limit_count() {
+        let payload = json!({"outcome":"blocked", "summary":"Over the file-count limit", "question":{
+            "text":"Worker wording should be replaced",
+            "answer_type":{"kind":"create_prerequisite_task",
+                "name":"  Extract the first capability  ",
+                "brief":"  Land the first PR.  ",
+                "file_count_bypass":{"files":48,"limit":30}},
+            "explanation":"  48 files, limit 30.  "
+        }});
+        let canonical = validate_payload(ProposalKind::RunDone, &payload).unwrap();
+        let parsed: RunDoneProposalPayload = serde_json::from_str(&canonical.canonical_json).unwrap();
+        let question = parsed.question.unwrap();
+        assert_eq!(
+            question.text,
+            "Split this 48-file change (limit 30) by landing 'Extract the first capability' first, or keep it in one PR?"
+        );
+        assert_eq!(
+            question.answer_type,
+            boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
+                name: "Extract the first capability".into(),
+                brief: "Land the first PR.".into(),
+                file_count_bypass: Some(boss_protocol::FileCountBypassSpec { files: 48, limit: 30 }),
+            }
+        );
+        for spec in [
+            json!({"files":30,"limit":30}),
+            json!({"files":0,"limit":30}),
+            json!({"files":48,"limit":0}),
+            json!({"files":29,"limit":30}),
+        ] {
+            let mut invalid = payload.clone();
+            invalid["question"]["answer_type"]["file_count_bypass"] = spec.clone();
+            assert!(validate_payload(ProposalKind::RunDone, &invalid).is_err(), "{spec}");
+        }
     }
 }
