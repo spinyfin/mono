@@ -519,7 +519,6 @@ fn aspect_query_args(startup_flags: &[String], query: String) -> Vec<String> {
     args
 }
 
-/// Args for the aspect `bazel build`; always led by `startup_flags`.
 /// Flags shared by the aspect build and cquery: CI's per-command flags first,
 /// then the aspect and its output groups.
 fn aspect_invocation_flags(ci_flags: Vec<String>, aspect: &BazelAspectInvocation) -> Vec<String> {
@@ -531,6 +530,7 @@ fn aspect_invocation_flags(ci_flags: Vec<String>, aspect: &BazelAspectInvocation
     flags
 }
 
+/// Args for the aspect `bazel build`; always led by `startup_flags`.
 fn aspect_build_args(
     startup_flags: &[String],
     aspect_flags: &[String],

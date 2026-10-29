@@ -246,10 +246,11 @@ caller's exact environment, the startup flags from `CI_BAZEL_STARTUP_FLAGS`
 and, on `build`/`cquery`, the per-command flags from `CI_BAZEL_FLAGS` (CI's
 `--config` and disk-cache GC cap), so server and cache keys match ordinary
 builds. The one addition is `USE_BAZEL_VERSION`, set from workspace
-`.bazeliskrc` first, then `.bazelversion`, so the user version pin cannot override the repository pin. A conflicting inherited
-`USE_BAZEL_VERSION` is an error: unset it or match the repository pin. Other user
-`~/.bazeliskrc` keys, including `BAZELISK_BASE_URL` and `BAZELISK_HOME`, still apply;
-checkleft does not relocate Bazelisk caches or replace its download configuration.
+`.bazeliskrc` first, then `.bazelversion`, so the user version pin cannot
+override the repository pin. A conflicting inherited `USE_BAZEL_VERSION` is an
+error: unset it or match the repository pin. Other user `~/.bazeliskrc` keys,
+including `BAZELISK_BASE_URL` and `BAZELISK_HOME`, still apply; checkleft does
+not relocate Bazelisk caches or replace its download configuration.
 Hermeticity of Bazel actions belongs in the repository's `.bazelrc`.
 Repositories remain responsible for pinning their Bazel toolchains
 and explicit path bindings. `format/rust` requires its rules_rust wrapper:

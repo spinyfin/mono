@@ -97,6 +97,21 @@ fn ci_flags_follow_the_subcommand_and_precede_other_flags() {
     let flags = aspect_invocation_flags(ci.clone(), &aspect);
     assert_eq!(&flags[..2], ci.as_slice());
     assert_eq!(flags[2], "--aspects=@x//:y.bzl%z");
+
+    let startup = vec!["--output_base=/tmp/ob".to_owned()];
+    let build_flags = vec!["--keep_going".to_owned(), "--nobuild".to_owned()];
+    let targets = vec!["//a:b".to_owned()];
+    for (sub, args) in [
+        ("build", aspect_build_args(&startup, &flags, &build_flags, &targets)),
+        ("cquery", aspect_cquery_args(&startup, &flags, &build_flags, &targets)),
+    ] {
+        assert_eq!(args[0], startup[0]);
+        assert_eq!(args[1], sub);
+        assert_eq!(&args[2..4], ci.as_slice());
+        assert_eq!(args[4], "--aspects=@x//:y.bzl%z");
+        assert_eq!(args[5], "--output_groups=g");
+        assert_eq!(&args[6..8], build_flags.as_slice());
+    }
 }
 
 #[test]
