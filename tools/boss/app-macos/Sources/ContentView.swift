@@ -906,18 +906,19 @@ struct ContentView: View {
                             isSearchExpanded = false
                         }
                     }
-                    if model.isBoardLoaded(product.id) {
-                        if model.boardLoad.isRefreshing(product.id) || model.boardLoad.hasFailed(product.id) {
-                            DelayedBoardRefreshBanner(
-                                isRefreshing: model.boardLoad.isRefreshing(product.id),
-                                since: model.boardLoad.waitingSince(product.id),
-                                progress: model.boardLoad.progress(for: product.id),
-                                failed: model.boardLoad.hasFailed(product.id),
-                                isConnected: model.isConnected,
-                                retry: { model.refetchBoard(productID: product.id) })
-                        }
+                    switch boardMainPresentation(isBoardLoaded: model.isBoardLoaded(product.id)) {
+                    case .loaded:
+                        DelayedBoardRefreshBanner(
+                            isRefreshing: model.boardLoad.isRefreshing(product.id),
+                            since: model.boardLoad.waitingSince(product.id),
+                            progress: model.boardLoad.progress(for: product.id),
+                            failed: model.boardLoad.hasFailed(product.id),
+                            isConnected: model.isConnected,
+                            retry: { model.refetchBoard(productID: product.id) }
+                        )
+                        .id(product.id)
                         workBoard()
-                    } else {
+                    case .loading:
                         BoardLoadingView(
                             isConnected: model.isConnected,
                             since: model.boardLoad.waitingSince(product.id),
