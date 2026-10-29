@@ -33,10 +33,10 @@ final class BackgroundWorkSnapshotTests: XCTestCase {
         defer { model.applyEventForTest(.disconnected) }
         recorder.value.removeAll()
 
-        // The old poll fired every five seconds; nothing may be scheduled at
-        // any cadence now, so a short wait is enough to catch a regression
-        // that reintroduces a timer with a test-shortened interval.
-        try await Task.sleep(for: .milliseconds(400))
+        // The app schedules no recurring snapshot requests. Waiting past the
+        // previous five-second poll interval is what would catch that timer
+        // if it were reintroduced.
+        try await Task.sleep(for: .seconds(6))
 
         XCTAssertTrue(listEngineAttempts(in: recorder).isEmpty)
     }
