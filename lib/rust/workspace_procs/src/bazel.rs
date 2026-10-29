@@ -84,7 +84,7 @@ pub fn output_base_from_symlink(workspace: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process_table::fake_process;
+    use crate::testing::fake_process;
 
     fn with_argv(argv: &[&str]) -> LiveProcess {
         let mut p = fake_process(5, 1, "java", Some("/ws"));

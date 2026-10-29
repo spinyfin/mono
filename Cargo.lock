@@ -1279,6 +1279,7 @@ dependencies = [
  "chrono-tz",
  "libc",
  "tempfile",
+ "workspace-procs",
 ]
 
 [[package]]

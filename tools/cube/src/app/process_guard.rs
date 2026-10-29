@@ -1,36 +1,11 @@
-//! Nothing may still be running inside a workspace when cube releases its
-//! lease or removes its directory.
-//!
-//! The leak this closes: a worker run's tool shell was cut short before the
-//! `kill` at the end of its command, leaving four `( while :; do …; done ) &`
-//! fork loops behind. They re-parented to launchd, the run's lease was
-//! released, the pool trim staged the directory to `.removing-<id>` and
-//! unlinked it, and the loops kept running — for four days — with their
-//! working directory in a directory that no longer existed. Nothing in cube
-//! looked, so nothing in cube could say so.
-//!
-//! cube owns workspace usability, so cube checks. Every lease release and
-//! every directory removal first sweeps the process table for processes
-//! whose working directory is inside the workspace (under whatever name it
-//! currently has — a staged `.removing-` directory counts) or inside its
-//! Bazel output base, kills them (`SIGTERM`, a short grace, `SIGKILL`), and
-//! logs every one it killed with pid, command and age. The workspace's Bazel
-//! server is the one deliberate exception: it is meant to stay warm and exits
-//! on its own idle timeout, and it is recognised by the `bazel(<workspace>)`
-//! name the client gives it (see [`workspace_procs::bazel`]). An interactive
-//! shell a human has `cd`'d into the workspace is reported, not killed.
-//!
-//! A release proceeds after the sweep whatever happened — the lease must not
-//! stay held because a process refused to die — but the survivors are logged
-//! and audited. A removal does not: unlinking a directory with live
-//! occupants is exactly the silent failure above, so it fails loudly with
-//! their pids and leaves the directory for a later pass.
+//! Sweep occupants before release and removal; refuse removal when verification fails.
+//! Working-directory ownership catches detached tools after re-parenting.
 
 use std::path::Path;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use workspace_procs::{ProcessTable, ReapReport, Scope, SystemProcessTable, reap};
+use workspace_procs::{ReapReport, Scope, SystemWorkspaceProcessTable, WorkspaceProcessTable, reap};
 
 use crate::app::errors::{CubeError, Result};
 
@@ -44,6 +19,7 @@ pub(super) const TEARDOWN_GRACE: Duration = Duration::from_secs(2);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SweepPhase {
     Release,
+    Expire,
     Remove,
 }
 
@@ -51,16 +27,16 @@ impl SweepPhase {
     fn as_str(self) -> &'static str {
         match self {
             Self::Release => "release",
+            Self::Expire => "expire",
             Self::Remove => "remove",
         }
     }
 }
 
 /// Kill every process a run left inside `workspace_path` and report what
-/// happened. Never fails: an unreadable process table is logged and treated
-/// as an empty sweep, since a release cannot be held hostage to it.
+/// happened, retaining verification failures and partial signal reports.
 pub(super) fn sweep_workspace_processes(
-    table: &dyn ProcessTable,
+    table: &dyn WorkspaceProcessTable,
     workspace_id: &str,
     workspace_path: &Path,
     phase: SweepPhase,
@@ -73,7 +49,10 @@ pub(super) fn sweep_workspace_processes(
                 phase.as_str(),
                 workspace_path.display(),
             );
-            return ReapReport::default();
+            ReapReport {
+                error: Some(err.to_string()),
+                ..ReapReport::default()
+            }
         }
     };
     for sent in &report.signalled {
@@ -110,13 +89,13 @@ pub(super) fn sweep_live_workspace_processes(
     workspace_path: &Path,
     phase: SweepPhase,
 ) -> ReapReport {
-    sweep_workspace_processes(&SystemProcessTable, workspace_id, workspace_path, phase)
+    sweep_workspace_processes(&SystemWorkspaceProcessTable, workspace_id, workspace_path, phase)
 }
 
 /// Sweep before a directory removal, and refuse the removal when anything
 /// owned is still alive afterwards.
 pub(super) fn ensure_no_live_processes(
-    table: &dyn ProcessTable,
+    table: &dyn WorkspaceProcessTable,
     workspace_id: &str,
     workspace_path: &Path,
 ) -> Result<ReapReport> {
@@ -126,23 +105,24 @@ pub(super) fn ensure_no_live_processes(
     }
     Err(CubeError::WorkspaceBusy {
         path: workspace_path.to_path_buf(),
-        processes: report.survivor_summary(),
+        processes: report.error.clone().unwrap_or_else(|| report.survivor_summary()),
     })
 }
 
 /// [`ensure_no_live_processes`] against the real process table.
 pub(super) fn ensure_no_live_processes_in(workspace_id: &str, workspace_path: &Path) -> Result<ReapReport> {
-    ensure_no_live_processes(&SystemProcessTable, workspace_id, workspace_path)
+    ensure_no_live_processes(&SystemWorkspaceProcessTable, workspace_id, workspace_path)
 }
 
 /// Whether the sweep did anything worth an audit line.
 pub(super) fn sweep_is_noteworthy(report: &ReapReport) -> bool {
-    !report.signalled.is_empty() || !report.survivors.is_empty()
+    !report.signalled.is_empty() || !report.survivors.is_empty() || !report.spared.is_empty() || report.error.is_some()
 }
 
 /// The sweep as audit-log / `--json` fields.
 pub(super) fn sweep_json(report: &ReapReport) -> Value {
     json!({
+        "error": report.error,
         "killed": report
             .signalled
             .iter()
@@ -181,7 +161,8 @@ pub(super) fn sweep_json(report: &ReapReport) -> Value {
 mod tests {
     use std::path::PathBuf;
 
-    use workspace_procs::{Signal, StaticProcessTable, fake_process};
+    use workspace_procs::Signal;
+    use workspace_procs_testing::{StaticProcessTable, fake_process};
 
     use super::*;
 
@@ -261,7 +242,7 @@ mod tests {
         };
         let err = CubeError::WorkspaceBusy {
             path: PathBuf::from(WS),
-            processes: report.survivor_summary(),
+            processes: report.error.clone().unwrap_or_else(|| report.survivor_summary()),
         };
         let text = err.to_string();
         assert!(text.contains("40 (zsh)"), "{text}");
@@ -280,5 +261,69 @@ mod tests {
         assert!(!sweep_is_noteworthy(&report));
         assert!(table.signals().is_empty());
         ensure_no_live_processes(&table, "mono-agent-008", Path::new("/pool/mono-agent-008")).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod verification_tests {
+    use super::*;
+    use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use workspace_procs::{LiveProcess, Signal};
+    use workspace_procs_testing::{StaticProcessTable, fake_process};
+
+    struct FailingTable {
+        inner: StaticProcessTable,
+        calls: AtomicUsize,
+        fail_at: usize,
+    }
+    impl WorkspaceProcessTable for FailingTable {
+        fn list(&self) -> io::Result<Vec<LiveProcess>> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) >= self.fail_at {
+                Err(io::Error::other("process list unavailable"))
+            } else {
+                self.inner.list()
+            }
+        }
+        fn snapshot(&self, pid: i32) -> io::Result<LiveProcess> {
+            self.inner.snapshot(pid)
+        }
+        fn signal(&self, pid: i32, signal: Signal) -> io::Result<()> {
+            self.inner.signal(pid, signal)
+        }
+        fn own_pid(&self) -> i32 {
+            900
+        }
+    }
+    fn failing(fail_at: usize) -> FailingTable {
+        FailingTable {
+            inner: StaticProcessTable::new(vec![fake_process(40, 1, "tool", Some("/pool/test"))], 900),
+            calls: AtomicUsize::new(0),
+            fail_at,
+        }
+    }
+    #[test]
+    fn removal_refuses_initial_and_post_term_scan_failures() {
+        for fail_at in [0, 1, 2] {
+            let error = ensure_no_live_processes(&failing(fail_at), "test", Path::new("/pool/test")).unwrap_err();
+            assert!(error.to_string().contains("process list unavailable"), "{error}");
+        }
+    }
+    #[test]
+    fn post_term_failure_retains_signal_audit() {
+        let report = sweep_workspace_processes(&failing(1), "test", Path::new("/pool/test"), SweepPhase::Remove);
+        assert_eq!(report.killed_pids(), vec![40]);
+        assert!(report.error.is_some());
+        assert!(sweep_is_noteworthy(&report));
+        assert_eq!(sweep_json(&report)["error"], "process list unavailable");
+    }
+    #[test]
+    fn spared_server_is_noteworthy_on_removal() {
+        let mut server = fake_process(60, 1, "java", Some("/pool/test"));
+        server.argv = vec!["bazel(test)".into()];
+        let table = StaticProcessTable::new(vec![server], 900);
+        let report = ensure_no_live_processes(&table, "test", Path::new("/pool/test")).unwrap();
+        assert!(sweep_is_noteworthy(&report));
+        assert_eq!(sweep_json(&report)["spared"][0]["pid"], 60);
     }
 }
