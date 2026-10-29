@@ -1,45 +1,71 @@
 import Foundation
 
-/// Badge category for an agent. `unknown` stands for any missing or
-/// unrecognised wire value; it is filterable and never dropped.
+/// The single definition of a worker kind: each case is one verb a pane
+/// badge can show, and the Agents view Type filter lists exactly
+/// [`allCases`] under the same [`badgeLabel`]. `unknown` stands for any
+/// missing or unrecognised wire value; it is filterable and never dropped.
+///
+/// `guide` and `consolidation` are never wire `agent_type` values: they are
+/// refinements of `review` resolved by [`resolve`] from the execution kind
+/// and review stage, so a filter selects exactly the panes showing the verb.
 public enum AgentType: String, CaseIterable, Hashable, Sendable {
     case coding
     case design
     case review
+    case guide
+    case consolidation
     case automation
     case answer
     case unknown
 
-    /// Map a wire `agent_type` to a badge. Missing and unrecognised values
-    /// become `unknown` so they stay visible and filterable.
+    /// Map a wire `agent_type` to a base kind. Missing and unrecognised
+    /// values become `unknown` so they stay visible and filterable.
     public static func fromWire(_ value: String?) -> AgentType {
         guard let value, !value.isEmpty else { return .unknown }
-        return AgentType(rawValue: value) ?? .unknown
+        switch value {
+        case "coding": return .coding
+        case "design": return .design
+        case "review": return .review
+        case "automation": return .automation
+        case "answer": return .answer
+        default: return .unknown
+        }
     }
 
-    /// Title-case badge label. `unknown` stays "Unknown" even when the
-    /// raw wire value is shown beside it.
+    /// The kind a pane displays: the wire `agent_type` refined by the
+    /// engine-reported execution kind and review stage. Review-guide
+    /// generation is `guide`; the consolidating agent of an AI review is
+    /// `consolidation` rather than one more reviewer.
+    public static func resolve(wire: String?, reviewStage: String? = nil, executionKind: String? = nil) -> AgentType {
+        let base = fromWire(wire)
+        guard base == .review else { return base }
+        if executionKind == AgentExecutionKind.prReviewGuide { return .guide }
+        if reviewStage == AgentReviewStage.consolidation { return .consolidation }
+        return base
+    }
+
+    /// Title-case badge verb, also the Type filter label. `unknown` stays
+    /// "Unknown" even when the raw wire value is shown beside it.
     public var badgeLabel: String {
         switch self {
         case .coding: "Coding"
         case .design: "Design"
         case .review: "Reviewing"
+        case .guide: "Guiding"
+        case .consolidation: "Consolidating"
         case .automation: "Automation"
         case .answer: "Answer"
         case .unknown: "Unknown"
         }
     }
 
-    /// Badge label from the engine-reported execution kind and review stage.
-    /// Review-guide generation reads "Guiding". The
-    /// consolidating agent of an AI review reads "Consolidating" rather than
-    /// as one more reviewer; every other type, and every other stage, keeps
-    /// [`badgeLabel`].
-    public func badgeLabel(reviewStage: String?, executionKind: String? = nil) -> String {
-        if self == .review, executionKind == "pr_review_guide" { return "Guiding" }
-        if self == .review, reviewStage == AgentReviewStage.consolidation { return "Consolidating" }
-        return badgeLabel
-    }
+    /// Type filter menu labels, in menu order.
+    public static var filterLabels: [String] { allCases.map(\.badgeLabel) }
+}
+
+/// Wire values of the engine's execution `kind` that refine a badge.
+public enum AgentExecutionKind {
+    public static let prReviewGuide = "pr_review_guide"
 }
 
 /// Wire values of the engine's `review_stage`. The engine owns the state; the

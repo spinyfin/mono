@@ -91,8 +91,9 @@ final class AgentsGridModel: ObservableObject {
         }
     }
 
-    /// Every badge type is offered, including Unknown, so a worker with a
-    /// missing or unrecognised wire type can always be filtered to.
+    /// Every badge kind is offered, including Unknown, so a worker with a
+    /// missing or unrecognised wire type can always be filtered to. The
+    /// menu labels are each kind's `badgeLabel`, the verb the pane shows.
     var typeOptions: [AgentType] { AgentType.allCases }
 
     func projectLabel(_ project: AgentProject) -> String {

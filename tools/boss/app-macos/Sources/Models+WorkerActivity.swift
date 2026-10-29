@@ -94,8 +94,8 @@ struct WorkerLiveState {
     /// with `boss_protocol::LOCAL_HOST_ID`.
     static let localHostId = "local"
 
-    var badgeType: AgentType { AgentType.fromWire(agentType) }
-    var badgeLabel: String { badgeType.badgeLabel(reviewStage: reviewStage, executionKind: executionKind) }
+    var badgeType: AgentType { AgentType.resolve(wire: agentType, reviewStage: reviewStage, executionKind: executionKind) }
+    var badgeLabel: String { badgeType.badgeLabel }
 
     var agentProject: AgentProject {
         if let projectId, !projectId.isEmpty { return .project(id: projectId) }

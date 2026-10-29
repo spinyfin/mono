@@ -318,6 +318,21 @@ final class AgentsGridModelTests: XCTestCase {
         XCTAssertEqual(grid.personaName(for: "run-b"), "Data")
     }
 
+    func testTypeFilterOptionsMatchBadgeVerbs() {
+        let grid = AgentsGridModel()
+        XCTAssertEqual(grid.typeOptions.map(\.badgeLabel), AgentType.filterLabels)
+        // Every verb a pane can display is a filter option, worded identically.
+        let shown: [(String?, String?, String?)] = [
+            ("coding", nil, nil), ("design", nil, nil), ("review", nil, nil),
+            ("review", "consolidation", nil), ("review", nil, "pr_review_guide"),
+            ("automation", nil, nil), ("answer", nil, nil), (nil, nil, nil),
+        ]
+        let verbs = Set(shown.map { AgentType.resolve(wire: $0.0, reviewStage: $0.1, executionKind: $0.2).badgeLabel })
+        XCTAssertEqual(verbs, Set(grid.typeOptions.map(\.badgeLabel)))
+        XCTAssertEqual(Set(grid.typeOptions.map(\.badgeLabel)).count, AgentType.allCases.count)
+        XCTAssertTrue(verbs.contains("Guiding"))
+    }
+
     func testAgentTypeFromWire() {
         XCTAssertEqual(AgentType.fromWire("coding"), .coding)
         XCTAssertEqual(AgentType.fromWire("review"), .review)

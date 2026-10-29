@@ -56,8 +56,8 @@ struct WorkerSlotLiveSlice: Equatable {
         self.viewerAttachError = live.viewerAttachError
     }
 
-    var badgeType: AgentType { AgentType.fromWire(agentType) }
-    var badgeLabel: String { badgeType.badgeLabel(reviewStage: reviewStage, executionKind: executionKind) }
+    var badgeType: AgentType { AgentType.resolve(wire: agentType, reviewStage: reviewStage, executionKind: executionKind) }
+    var badgeLabel: String { badgeType.badgeLabel }
     var isExited: Bool { activity == .terminated }
     var isEngineTerminal: Bool { activity == .terminated || activity == .errored }
 
