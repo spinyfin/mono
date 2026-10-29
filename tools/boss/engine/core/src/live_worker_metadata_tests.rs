@@ -1,10 +1,11 @@
 use super::*;
 
-use boss_protocol::{CreateProjectInput, CreateTaskInput, ExecutionKind, RequestExecutionInput};
+use boss_protocol::{CreateProjectInput, CreateRevisionInput, CreateTaskInput, ExecutionKind, RequestExecutionInput};
 
 use crate::test_support::{
     create_test_chore_manual, create_test_product, insert_host_capability, open_db, seed_daily_automation,
 };
+use crate::work::{FakePrStateChecker, PrOpenState};
 
 /// Request and start an execution of `work_item_id` on `host_id`, so it
 /// carries a `started_at`.
@@ -134,6 +135,51 @@ fn chore_with_pr_url_stamps_header_fields() {
         metadata.pr_url.as_deref(),
         Some("https://github.com/spinyfin/mono/pull/3356")
     );
+}
+
+/// Revision task rows are inserted with `pr_url` NULL; the bound PR is on
+/// the execution. The Agents pane header still has to show that PR.
+#[test]
+fn revision_falls_back_to_execution_pr_url_when_task_row_has_none() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let parent = create_test_chore_manual(&db, product.id.clone(), "Parent chore");
+    const PARENT_PR: &str = "https://github.com/spinyfin/mono/pull/3356";
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'in_review', pr_url = ?1 WHERE id = ?2",
+            rusqlite::params![PARENT_PR, parent.id],
+        )
+        .unwrap();
+    let revision = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(parent.id.clone())
+                .description("Address review findings")
+                .build(),
+            &FakePrStateChecker::always(PrOpenState::Open),
+        )
+        .unwrap();
+    assert!(revision.pr_url.is_none());
+
+    let started = started_execution(&db, &revision.id, "local");
+    let with_pr = WorkExecution {
+        kind: ExecutionKind::RevisionImplementation,
+        pr_url: Some(PARENT_PR.to_owned()),
+        ..started.clone()
+    };
+    let metadata = resolve(&db, &with_pr, "local");
+    assert_eq!(metadata.product_id.as_deref(), Some(product.id.as_str()));
+    assert_eq!(metadata.work_item_short_id, revision.short_id);
+    assert_eq!(metadata.pr_url.as_deref(), Some(PARENT_PR));
+
+    let without_pr = WorkExecution {
+        kind: ExecutionKind::RevisionImplementation,
+        pr_url: None,
+        ..started
+    };
+    assert_eq!(resolve(&db, &without_pr, "local").pr_url, None);
 }
 
 #[test]

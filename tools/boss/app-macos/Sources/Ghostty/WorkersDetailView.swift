@@ -354,7 +354,6 @@ struct WorkerSlotView: View, @MainActor Equatable {
                     .aspectRatio(contentMode: .fit)
                     .frame(width: 28, height: 28)
                     .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
-                    .help(slotTooltip)
             }
 
             VStack(alignment: .leading, spacing: 1) {
@@ -394,6 +393,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, snapshot.headerWorkLinks == nil ? 6 : 4)
+        .help(slotTooltip)
     }
 
     /// Compact third header line: `T<n>` · `repo#n`. Truncates as a
