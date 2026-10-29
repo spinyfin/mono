@@ -630,3 +630,5 @@ mod board_projection_scale;
 mod board_projection_tests;
 
 mod task_status_audit_tests;
+
+mod stuck_report_tests;

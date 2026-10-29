@@ -1063,6 +1063,11 @@ pub enum FrontendRequest {
     /// [`FrontendEvent::SettingsList`]. Read-only; no side effects.
     GetSettings,
 
+    /// Read-only age and provenance report for inactive work items.
+    GetStuckReport {
+        minimum_age_secs: i64,
+    },
+
     /// Per-work-item runtime snapshot — single-item flavour of the
     /// `task_runtimes` block carried in `WorkTree`. Used by
     /// `boss chore show` / `boss task show` to enrich the rendered work

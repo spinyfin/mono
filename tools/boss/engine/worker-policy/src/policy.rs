@@ -604,6 +604,7 @@ fn worker_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         // something a task worker needs about its own or other work items.
         | FrontendRequest::GetCostWindowReport { .. }
         | FrontendRequest::GetTopCostConsumers { .. }
+        | FrontendRequest::GetStuckReport { .. }
         | FrontendRequest::GetWorkItemCostReport { .. }
         | FrontendRequest::GitHubAuthCancel
         | FrontendRequest::GitHubAuthDisconnect

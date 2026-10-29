@@ -108,6 +108,7 @@ mod idea_args;
 mod idea_commands;
 mod output;
 mod project_create_args;
+mod report;
 mod status_args;
 mod time_fmt;
 mod work_cmds;
@@ -341,6 +342,10 @@ pub(crate) async fn run_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Editorial { command } => {
             let ctx = RunContext::from_flags(&cli.global)?;
             run_editorial_command(command, &ctx).await
+        }
+        Commands::Report { command } => {
+            let ctx = RunContext::from_flags(&cli.global)?;
+            report::run(command, &ctx).await
         }
         Commands::Cost { command } => {
             let ctx = RunContext::from_flags(&cli.global)?;

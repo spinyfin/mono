@@ -2138,6 +2138,21 @@ impl WorkDb {
     }
 }
 
+pub(super) const OPERATOR_QUESTION_STUCK_CLASSIFICATION_MIGRATION_ID: &str =
+    "20261029_1807_operator_question_stuck_classification";
+
+/// Records which stuck state a question was filed in, so the stuck report can
+/// count questions by kind long after the item has moved on. Rows filed before
+/// this column existed read as `unknown_legacy`.
+pub(super) fn migrate_operator_question_stuck_classification(conn: &Connection) -> Result<()> {
+    if !super::schema_init::table_has_column(conn, "operator_questions", "stuck_classification")? {
+        conn.execute_batch(
+            "ALTER TABLE operator_questions ADD COLUMN stuck_classification TEXT NOT NULL DEFAULT 'unknown_legacy'",
+        )?;
+    }
+    Ok(())
+}
+
 // Durable questions attached to blocked completion declarations.
 pub(super) fn migrate_operator_questions(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -2211,10 +2226,15 @@ pub(crate) fn insert_question(
         return Ok(());
     };
     let parkable = task.deleted_at.is_none() && matches!(task.status, TaskStatus::Active | TaskStatus::Todo);
+    let stuck_classification = if task.blocked_reason.is_some() || task.dispatch_failed_reason.is_some() {
+        super::stuck_report::classification(conn, &task, None, boss_engine_utils::epoch_time::now_epoch_secs())?
+    } else {
+        "S8_operator_question".to_owned()
+    };
     conn.execute(
         "INSERT INTO operator_questions
-         (id, work_item_id, execution_id, proposal_id, question_json, status, withdrawn_reason, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         (id, work_item_id, execution_id, proposal_id, question_json, status, withdrawn_reason, created_at, stuck_classification)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             next_id("oq"),
             task.id,
@@ -2223,7 +2243,8 @@ pub(crate) fn insert_question(
             serde_json::to_string(question)?,
             if parkable { "open" } else { "withdrawn" },
             if parkable { None } else { Some("task_not_parkable") },
-            now_string()
+            now_string(),
+            stuck_classification
         ],
     )?;
     Ok(())

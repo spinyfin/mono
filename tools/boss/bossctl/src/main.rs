@@ -35,6 +35,7 @@ mod proposals;
 mod review;
 mod selected_product;
 mod stream_integrity;
+mod stuck_report;
 use boss_engine::dispatch_events::DispatchEvent;
 use boss_engine::dispatch_reader;
 use boss_protocol::{
@@ -445,6 +446,11 @@ enum LiveStatusAction {
 
 #[derive(Subcommand, Debug)]
 enum DispatchAction {
+    /// Items without live work, grouped by the reason they are waiting.
+    Stuck {
+        #[arg(long, default_value = "7d")]
+        since: String,
+    },
     /// Print recent dispatch events from `current.jsonl`. Filterable
     /// by stage / outcome. Defaults to the last 50 events.
     Tail {
@@ -1368,6 +1374,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Doctor {
             action: DoctorAction::Tmux,
         } => doctor::run_tmux_preflight(cli.json).await,
+        Command::Dispatch {
+            action: DispatchAction::Stuck { since },
+        } => stuck_report::run(&cli.socket_path, cli.json, &since).await,
         Command::Dispatch {
             action:
                 DispatchAction::Tail {

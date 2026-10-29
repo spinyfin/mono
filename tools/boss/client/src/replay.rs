@@ -161,6 +161,7 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::GetWorkerContext { .. }
         | FrontendRequest::GetWorkItem { .. }
         | FrontendRequest::GetWorkItemByShortId { .. }
+        | FrontendRequest::GetStuckReport { .. }
         | FrontendRequest::GetWorkItemCostReport { .. }
         | FrontendRequest::GetWorkRuntimePatch { .. }
         | FrontendRequest::GetWorkTree { .. }

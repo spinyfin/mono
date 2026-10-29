@@ -302,6 +302,11 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: EditorialCommand,
     },
+    /// Report task progression and the reasons work is waiting.
+    Report {
+        #[command(subcommand)]
+        command: crate::report::ReportCommand,
+    },
     /// Read-only reporting over recorded per-run token spend
     /// (`work_runs.input_tokens` / `output_tokens` / `cache_creation_tokens`
     /// / `cache_read_tokens`). Token counts are the measured figures the
