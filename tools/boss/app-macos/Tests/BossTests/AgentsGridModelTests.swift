@@ -15,8 +15,7 @@ final class AgentsGridModelTests: XCTestCase {
             viewers: [:],
             interactivePoolSize: 16,
             automationPoolSize: 8,
-            reviewPoolSize: 16,
-            feedUnavailable: false
+            reviewPoolSize: 16
         )
         XCTAssertEqual(grid.layout.visibleCount, 1)
         XCTAssertEqual(grid.layout.logicalCellIndex(ofRun: "local-1"), 0)
@@ -53,8 +52,7 @@ final class AgentsGridModelTests: XCTestCase {
             viewers: [:],
             interactivePoolSize: 16,
             automationPoolSize: 8,
-            reviewPoolSize: 16,
-            feedUnavailable: false
+            reviewPoolSize: 16
         )
         XCTAssertTrue(grid.layout.isEmpty)
     }
@@ -68,11 +66,10 @@ final class AgentsGridModelTests: XCTestCase {
             viewers: workspace.viewersByRunId,
             interactivePoolSize: 16,
             automationPoolSize: 8,
-            reviewPoolSize: 16,
-            feedUnavailable: false
+            reviewPoolSize: 16
         )
         XCTAssertTrue(grid.layout.isEmpty)
-        XCTAssertEqual(grid.unplacedViewers.map(\.runId), ["early"])
+        XCTAssertEqual(grid.renderRunIds(attached: workspace.viewersByRunId.keys), ["early"])
         XCTAssertNotNil(workspace.viewersByRunId["early"]?.session)
     }
 
@@ -85,11 +82,10 @@ final class AgentsGridModelTests: XCTestCase {
             viewers: [:],
             interactivePoolSize: 16,
             automationPoolSize: 8,
-            reviewPoolSize: 16,
-            feedUnavailable: false
+            reviewPoolSize: 16
         )
         XCTAssertEqual(grid.layout.visibleCount, 1)
-        XCTAssertTrue(grid.unplacedViewers.isEmpty)
+        XCTAssertEqual(grid.renderRunIds(attached: workspace.viewersByRunId.keys), ["run-a"])
 
         _ = workspace.attachWorkerPane(makeAttach(runId: "run-a", slot: 1))
         grid.apply(
@@ -97,8 +93,7 @@ final class AgentsGridModelTests: XCTestCase {
             viewers: workspace.viewersByRunId,
             interactivePoolSize: 16,
             automationPoolSize: 8,
-            reviewPoolSize: 16,
-            feedUnavailable: false
+            reviewPoolSize: 16
         )
         XCTAssertEqual(grid.layout.logicalCellIndex(ofRun: "run-a"), 0)
         let page = try XCTUnwrap(grid.layout.currentPage)
@@ -107,7 +102,8 @@ final class AgentsGridModelTests: XCTestCase {
             return
         }
         XCTAssertTrue(member.hasViewer)
-        XCTAssertTrue(grid.unplacedViewers.isEmpty)
+        XCTAssertEqual(grid.renderRunIds(attached: workspace.viewersByRunId.keys), ["run-a"])
+        XCTAssertTrue(grid.placement(for: "run-a", area: CGSize(width: 800, height: 600)).visible)
     }
 
     func testEngineReleaseThenDelayedDetachDoesNotResurrectMembership() {
@@ -119,8 +115,7 @@ final class AgentsGridModelTests: XCTestCase {
             viewers: workspace.viewersByRunId,
             interactivePoolSize: 16,
             automationPoolSize: 8,
-            reviewPoolSize: 16,
-            feedUnavailable: false
+            reviewPoolSize: 16
         )
         XCTAssertEqual(grid.layout.visibleCount, 1)
 
@@ -129,11 +124,11 @@ final class AgentsGridModelTests: XCTestCase {
             viewers: workspace.viewersByRunId,
             interactivePoolSize: 16,
             automationPoolSize: 8,
-            reviewPoolSize: 16,
-            feedUnavailable: false
+            reviewPoolSize: 16
         )
         XCTAssertTrue(grid.layout.isEmpty)
-        XCTAssertEqual(grid.unplacedViewers.map(\.runId), ["run-a"])
+        XCTAssertEqual(grid.renderRunIds(attached: workspace.viewersByRunId.keys), ["run-a"])
+        XCTAssertFalse(grid.placement(for: "run-a", area: CGSize(width: 800, height: 600)).visible)
 
         _ = workspace.detachWorkerPane(runId: "run-a")
         grid.apply(
@@ -141,11 +136,10 @@ final class AgentsGridModelTests: XCTestCase {
             viewers: workspace.viewersByRunId,
             interactivePoolSize: 16,
             automationPoolSize: 8,
-            reviewPoolSize: 16,
-            feedUnavailable: false
+            reviewPoolSize: 16
         )
         XCTAssertTrue(grid.layout.isEmpty)
-        XCTAssertTrue(grid.unplacedViewers.isEmpty)
+        XCTAssertTrue(grid.renderRunIds(attached: workspace.viewersByRunId.keys).isEmpty)
         XCTAssertTrue(workspace.viewersByRunId.isEmpty)
     }
 
@@ -158,8 +152,7 @@ final class AgentsGridModelTests: XCTestCase {
             viewers: [:],
             interactivePoolSize: 16,
             automationPoolSize: 8,
-            reviewPoolSize: 16,
-            feedUnavailable: false
+            reviewPoolSize: 16
         )
         store.update(states: [
             makeState(runId: "run-a", slotId: 1),
@@ -170,8 +163,7 @@ final class AgentsGridModelTests: XCTestCase {
             viewers: [:],
             interactivePoolSize: 16,
             automationPoolSize: 8,
-            reviewPoolSize: 16,
-            feedUnavailable: store.feedUnavailable
+            reviewPoolSize: 16
         )
         XCTAssertEqual(store.byRunID.count, 1)
         XCTAssertEqual(grid.layout.visibleCount, 1)
@@ -188,10 +180,9 @@ final class AgentsGridModelTests: XCTestCase {
             viewers: [:],
             interactivePoolSize: 16,
             automationPoolSize: 8,
-            reviewPoolSize: 16,
-            feedUnavailable: store.feedUnavailable
+            reviewPoolSize: 16
         )
-        XCTAssertTrue(grid.feedUnavailable)
+        XCTAssertTrue(store.feedUnavailable)
         XCTAssertEqual(grid.layout.visibleCount, 1)
 
         store.update(states: [makeState(runId: "run-a", activity: .idle)])
@@ -200,10 +191,9 @@ final class AgentsGridModelTests: XCTestCase {
             viewers: [:],
             interactivePoolSize: 16,
             automationPoolSize: 8,
-            reviewPoolSize: 16,
-            feedUnavailable: store.feedUnavailable
+            reviewPoolSize: 16
         )
-        XCTAssertFalse(grid.feedUnavailable)
+        XCTAssertFalse(store.feedUnavailable)
         XCTAssertEqual(store.byRunID["run-a"]?.activity, .idle)
     }
 
@@ -214,8 +204,7 @@ final class AgentsGridModelTests: XCTestCase {
             viewers: [:],
             interactivePoolSize: 16,
             automationPoolSize: 8,
-            reviewPoolSize: 16,
-            feedUnavailable: false
+            reviewPoolSize: 16
         )
         XCTAssertEqual(grid.layout.visibleCount, 1)
         let live = makeState(runId: "run-a", activity: .terminated)
@@ -241,8 +230,7 @@ final class AgentsGridModelTests: XCTestCase {
             viewers: [:],
             interactivePoolSize: 16,
             automationPoolSize: 8,
-            reviewPoolSize: 16,
-            feedUnavailable: false
+            reviewPoolSize: 16
         )
         XCTAssertEqual(grid.layout.visibleCount, 1)
         let page = try XCTUnwrap(grid.layout.currentPage)
@@ -281,41 +269,73 @@ final class AgentsGridModelTests: XCTestCase {
         XCTAssertNotEqual(grid.layout.geometry.area.width, 800)
     }
 
-    func testPersonaSurvivesPlaceholderAfterRelease() {
-        let grid = AgentsGridModel()
-        grid.apply(
-            states: [makeState(runId: "run-a", name: "Riker")],
-            viewers: [:],
-            interactivePoolSize: 16,
-            automationPoolSize: 8,
-            reviewPoolSize: 16,
-            feedUnavailable: false
-        )
+    func testPersonaSurvivesPlaceholderAfterRelease() throws {
+        let grid = roomyGrid()
+        let runA = makeState(runId: "run-a", name: "Riker")
+        let runB = makeState(runId: "run-b", slotId: 2, name: "Data", startedAt: "2026-10-09T00:00:01Z")
+        grid.apply(states: [runA, runB], viewers: [:], interactivePoolSize: 16, automationPoolSize: 8, reviewPoolSize: 16)
         XCTAssertEqual(grid.personaName(for: "run-a"), "Riker")
-        // A second member keeps the page count from collapsing to empty
-        // so a release can leave a placeholder instead of compacting away.
-        grid.apply(
-            states: [
-                makeState(runId: "run-a", name: "Riker"),
-                makeState(runId: "run-b", slotId: 2, name: "Data", startedAt: "2026-10-09T00:00:01Z"),
-            ],
-            viewers: [:],
-            interactivePoolSize: 16,
-            automationPoolSize: 8,
-            reviewPoolSize: 16,
-            feedUnavailable: false
-        )
-        grid.apply(
-            states: [makeState(runId: "run-b", slotId: 2, name: "Data", startedAt: "2026-10-09T00:00:01Z")],
-            viewers: [:],
-            interactivePoolSize: 16,
-            automationPoolSize: 8,
-            reviewPoolSize: 16,
-            feedUnavailable: false
-        )
-        // Forced collapse when fewer pages suffice removes placeholders.
-        // Persona for the surviving run remains.
+        // Capacity is 8, so releasing run-a while visible leaves a placeholder
+        // rather than compacting its cell away.
+        grid.apply(states: [runB], viewers: [:], interactivePoolSize: 16, automationPoolSize: 8, reviewPoolSize: 16)
+        let page = try XCTUnwrap(grid.layout.currentPage)
+        XCTAssertTrue(page.cells.contains { cell in
+            if case .placeholder(let run) = cell.content { return run == "run-a" }
+            return false
+        })
+        XCTAssertEqual(grid.personaName(for: "run-a"), "Riker")
         XCTAssertEqual(grid.personaName(for: "run-b"), "Data")
+    }
+
+    func testReturningToAgentsRepacksCurrentMembership() throws {
+        let grid = roomyGrid()
+        let states = (0..<3).map {
+            makeState(runId: "run-\($0)", slotId: $0 + 1, startedAt: "2026-10-09T00:00:0\($0)Z")
+        }
+        func sync(_ visible: Bool, _ current: [WorkerLiveState]) {
+            grid.apply(isVisible: visible, states: current, viewers: [:],
+                       interactivePoolSize: 16, automationPoolSize: 8, reviewPoolSize: 16)
+        }
+        sync(true, states)
+        sync(false, states)
+        // While hidden: run-1 ends and run-3 arrives.
+        let arrival = makeState(runId: "run-3", slotId: 4, startedAt: "2026-10-09T00:00:03Z")
+        sync(false, [states[0], states[2], arrival])
+        sync(true, [states[0], states[2], arrival])
+        let page = try XCTUnwrap(grid.layout.currentPage)
+        var order: [String] = []
+        for cell in page.cells {
+            switch cell.content {
+            case .occupied(let member): order.append(member.runId)
+            case .placeholder(let run): XCTFail("unexpected placeholder for \(run)")
+            case .empty: break
+            }
+        }
+        XCTAssertEqual(order, ["run-0", "run-2", "run-3"])
+        XCTAssertFalse(grid.layout.isTidyHighlighted)
+    }
+
+    func testPlacementUsesPolicyGap() {
+        let grid = AgentsGridModel(
+            policy: PaneCapacityPolicy(minColumns: 1, minRows: 1, headerHeight: 0, maxPanesPerPage: 8, gap: 10, deadBand: 0),
+            geometry: PaneGeometry(area: PaneSize(width: 410, height: 100), cell: PaneSize(width: 100, height: 100))
+        )
+        grid.apply(
+            states: [makeState(runId: "a"), makeState(runId: "b", slotId: 2, startedAt: "2026-10-09T00:00:01Z")],
+            viewers: [:], interactivePoolSize: 16, automationPoolSize: 8, reviewPoolSize: 16
+        )
+        let area = CGSize(width: 410, height: 100)
+        let first = grid.placement(for: "a", area: area).frame
+        let second = grid.placement(for: "b", area: area).frame
+        XCTAssertEqual(second.minX - first.maxX, 10, accuracy: 0.001)
+    }
+
+    func testFallbackCellKeepsCapacityAboveOneBeforeMeasurement() {
+        let grid = AgentsGridModel(
+            policy: PaneCapacityPolicy(minColumns: 10, minRows: 10, headerHeight: 0, maxPanesPerPage: 8, gap: 0, deadBand: 0),
+            geometry: PaneGeometry(area: PaneSize(width: 800, height: 600), cell: AgentsGridModel.fallbackCell)
+        )
+        XCTAssertGreaterThan(grid.layout.capacity, 1)
     }
 
     func testTypeFilterOptionsMatchBadgeVerbs() {
@@ -331,6 +351,30 @@ final class AgentsGridModelTests: XCTestCase {
         XCTAssertEqual(verbs, Set(grid.typeOptions.map(\.badgeLabel)))
         XCTAssertEqual(Set(grid.typeOptions.map(\.badgeLabel)).count, AgentType.allCases.count)
         XCTAssertTrue(verbs.contains("Guiding"))
+    }
+
+    func testDefaultInitializerSeedsFallbackAndMeasurementReplacesIt() {
+        let grid = AgentsGridModel()
+        XCTAssertEqual(grid.layout.geometry.cell, AgentsGridModel.fallbackCell)
+        grid.noteArea(width: 1600, height: 1000, inLiveResize: true)
+        grid.liveResizeDidEnd()
+        XCTAssertEqual(grid.layout.geometry.area.width, 1600)
+        XCTAssertGreaterThan(grid.layout.capacity, 1)
+        grid.noteCellSize(width: 9, height: 20)
+        XCTAssertEqual(grid.layout.geometry.cell, PaneSize(width: 9, height: 20))
+    }
+
+    func testPlaceholderSnapshotsDoNotOfferLiveStatusToggle() {
+        func snapshot(placeholder: Bool) -> WorkerSlotSnapshot {
+            WorkerSlotSnapshot(
+                slotId: 1, runId: "run-a", summary: nil, taskTitle: nil, session: nil,
+                liveStatusEnabled: true, live: nil, isPlaceholder: placeholder, cachedPersona: nil, viewerAttachFailure: nil
+            )
+        }
+        XCTAssertTrue(snapshot(placeholder: false).offersLiveStatusToggle)
+        XCTAssertFalse(snapshot(placeholder: true).offersLiveStatusToggle)
+        XCTAssertEqual(snapshot(placeholder: false).showsLiveStatusToggle, snapshot(placeholder: false).offersLiveStatusToggle)
+        XCTAssertEqual(snapshot(placeholder: true).showsLiveStatusToggle, snapshot(placeholder: true).offersLiveStatusToggle)
     }
 
     func testAgentTypeFromWire() {
@@ -363,7 +407,7 @@ final class AgentsGridModelTests: XCTestCase {
             geometry: PaneGeometry(area: PaneSize(width: 400, height: 200), cell: PaneSize(width: 100, height: 100))
         )
         grid.apply(states: (0..<8).map { makeState(runId: "run-\($0)", slotId: $0) },
-                   viewers: [:], interactivePoolSize: 16, automationPoolSize: 8, reviewPoolSize: 16, feedUnavailable: false)
+                   viewers: [:], interactivePoolSize: 16, automationPoolSize: 8, reviewPoolSize: 16)
         grid.setFocusedRun("run-6")
         grid.noteArea(width: 200, height: 200, inLiveResize: true)
         grid.liveResizeDidEnd()
@@ -378,14 +422,13 @@ final class AgentsGridModelTests: XCTestCase {
         for (index, run) in ["a", "b", "c"].enumerated() {
             _ = workspace.attachWorkerPane(makeAttach(runId: run, slot: index + 1))
         }
-        let sessions = workspace.viewersByRunId.mapValues { $0.session }
         let states = [
             makeState(runId: "a", slotId: 1, agentType: "coding", projectId: "p1", projectName: "Alpha"),
             makeState(runId: "b", slotId: 2, activity: .waitingForInput, agentType: "review", projectId: "p2", projectName: "Beta"),
             makeState(runId: "c", slotId: 3, agentType: "mystery"),
         ]
         grid.apply(states: states, viewers: workspace.viewersByRunId, interactivePoolSize: 16,
-                   automationPoolSize: 8, reviewPoolSize: 16, feedUnavailable: false)
+                   automationPoolSize: 8, reviewPoolSize: 16)
         XCTAssertFalse(grid.layout.filter.isActive)
         XCTAssertEqual(grid.projectOptions, [.project(id: "p1"), .project(id: "p2"), .unfiled])
         XCTAssertEqual(grid.projectLabel(.project(id: "p2")), "Beta")
@@ -397,8 +440,12 @@ final class AgentsGridModelTests: XCTestCase {
         XCTAssertEqual(grid.layout.waitingCount, 0)
         XCTAssertEqual(grid.layout.hiddenWaitingCount, 1)
         // Hidden runs keep their mounted viewers; they are just unplaced.
-        for (run, session) in sessions { XCTAssertTrue(workspace.viewersByRunId[run]?.session === session) }
-        XCTAssertEqual(Set(grid.unplacedViewers.compactMap(\.runId)), ["b", "c"])
+        let mounted = grid.renderRunIds(attached: workspace.viewersByRunId.keys)
+        XCTAssertEqual(mounted, ["a", "b", "c"])
+        XCTAssertEqual(Set(mounted.filter { grid.layout.logicalCellIndex(ofRun: $0) == nil }), ["b", "c"])
+        for run in ["b", "c"] {
+            XCTAssertFalse(grid.placement(for: run, area: CGSize(width: 800, height: 600)).visible)
+        }
 
         grid.clearFilter()
         grid.toggleProject(.unfiled)
@@ -411,7 +458,10 @@ final class AgentsGridModelTests: XCTestCase {
 
         grid.clearFilter()
         XCTAssertEqual(grid.layout.visibleCount, 3)
-        XCTAssertTrue(grid.unplacedViewers.isEmpty)
+        XCTAssertEqual(grid.renderRunIds(attached: workspace.viewersByRunId.keys), ["a", "b", "c"])
+        for run in ["a", "b", "c"] {
+            XCTAssertNotNil(grid.layout.logicalCellIndex(ofRun: run))
+        }
     }
 
     func testFilterStartsAtAllOnEveryNewModel() {
@@ -431,11 +481,13 @@ final class AgentsGridModelTests: XCTestCase {
         let sessions = workspace.viewersByRunId.mapValues { $0.session }
         func apply(_ count: Int) {
             grid.apply(states: (0..<count).map { makeState(runId: "run-\($0)", slotId: $0 + 1) },
-                       viewers: workspace.viewersByRunId, interactivePoolSize: 16, automationPoolSize: 8, reviewPoolSize: 16, feedUnavailable: false)
-            for (run, session) in sessions { XCTAssertTrue(workspace.viewersByRunId[run]?.session === session) }
+                       viewers: workspace.viewersByRunId, interactivePoolSize: 16, automationPoolSize: 8, reviewPoolSize: 16)
+            // Every attached surface stays mounted whatever the layout does.
+            XCTAssertEqual(Set(grid.renderRunIds(attached: workspace.viewersByRunId.keys)), Set(sessions.keys))
         }
         apply(0) // Attached before membership.
-        XCTAssertEqual(grid.unplacedViewers.count, 9)
+        XCTAssertEqual(grid.renderRunIds(attached: workspace.viewersByRunId.keys).count, 9)
+        XCTAssertFalse(grid.placement(for: "run-3", area: CGSize(width: 400, height: 200)).visible)
         apply(4)
         apply(6) // Shape growth.
         grid.tidy()
@@ -449,7 +501,11 @@ final class AgentsGridModelTests: XCTestCase {
         grid.selectPage(0)
         grid.noteArea(width: 200, height: 200, inLiveResize: true)
         grid.liveResizeDidEnd()
-        XCTAssertEqual(Set(grid.unplacedViewers.compactMap(\.runId)), Set((1..<9).map { "run-\($0)" }))
+        // Released runs keep their surfaces mounted, hidden, until detach.
+        XCTAssertEqual(Set(grid.renderRunIds(attached: workspace.viewersByRunId.keys)), Set((0..<9).map { "run-\($0)" }))
+        for index in 1..<9 {
+            XCTAssertFalse(grid.placement(for: "run-\(index)", area: CGSize(width: 200, height: 200)).visible)
+        }
     }
 
     // MARK: - Released runs never linger
