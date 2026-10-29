@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use boss_protocol::{CreateAttentionItemInput, ExecutionStatus, WorkExecution};
+use boss_protocol::{CreateAttentionItemInput, WorkExecution};
 
 use crate::coordinator::CubeClient;
 use crate::live_worker_state::LiveWorkerStateRegistry;
@@ -94,6 +94,26 @@ pub enum LeaseReleaseOutcome {
 /// Workspace occupancy probe. Production walks process cwds; tests inject.
 pub trait WorkspaceOccupancy: Send + Sync {
     fn occupancy(&self, workspace_path: &Path) -> Occupancy;
+
+    /// True when the verdict was established on the host that owns a
+    /// non-local row's workspace. A probe that only sees the engine host
+    /// must not vouch for a remote workspace.
+    fn probes_owning_host(&self) -> bool {
+        false
+    }
+}
+
+/// A verdict already established on a remote row's owning host.
+pub struct OwningHostOccupancy(pub Occupancy);
+
+impl WorkspaceOccupancy for OwningHostOccupancy {
+    fn occupancy(&self, _: &Path) -> Occupancy {
+        self.0
+    }
+
+    fn probes_owning_host(&self) -> bool {
+        true
+    }
 }
 
 /// Recovery-bookmark confirmation on the execution's owning host.
@@ -153,6 +173,19 @@ impl BookmarkGate for DbBookmarkGate<'_> {
                 .workspace_path
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("workspace path unavailable for recovery confirmation"))?;
+            // A lost workspace has no working copy to cover: only the
+            // shared-store pointers can be confirmed.
+            if self.adapter.is_none() && workspace_provably_absent(Path::new(workspace)) {
+                anyhow::ensure!(
+                    record.host_id == "local",
+                    "recovery confirmation requires the owning host"
+                );
+                return boss_engine_recovery::execution_bookmark::confirm_pointers(
+                    &boss_engine_recovery::execution_bookmark::LocalJj,
+                    &record,
+                )
+                .await;
+            }
             if let Some(adapter) = self.adapter {
                 adapter.confirm_workspace_recovery(&record, Path::new(workspace)).await
             } else {
@@ -174,6 +207,11 @@ impl BookmarkGate for DbBookmarkGate<'_> {
             Err(err) => BookmarkStatus::Unconfirmed(format!("{err:#}")),
         }
     }
+}
+
+/// The directory is positively known not to exist (not merely unreadable).
+fn workspace_provably_absent(path: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(path), Err(err) if err.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Evidence supplied by the caller, separately from lease identity.
@@ -232,7 +270,7 @@ pub async fn apply_release(
     let local = matches!(db.execution_host_id(&execution.id), Ok(None))
         || matches!(db.execution_host_id(&execution.id), Ok(Some(host)) if host == "local");
     let occupancy_status = match cause {
-        TerminalCause::Inferred if !local => Occupancy::Unknown,
+        TerminalCause::Inferred if !local && !occupancy.probes_owning_host() => Occupancy::Unknown,
         TerminalCause::Inferred => match execution.workspace_path.as_deref() {
             Some(path) => occupancy.occupancy(Path::new(path)),
             None => Occupancy::Unknown,
@@ -366,13 +404,6 @@ pub async fn release_refused_workspace(
     lease_id: &str,
     adapter: &dyn crate::host_adapter::HostAdapter,
 ) -> LeaseReleaseOutcome {
-    struct Unpositioned;
-    #[async_trait::async_trait]
-    impl BookmarkGate for Unpositioned {
-        async fn status(&self, _: &WorkExecution) -> BookmarkStatus {
-            BookmarkStatus::NotRequired
-        }
-    }
     apply_release(
         db,
         execution,
@@ -381,11 +412,31 @@ pub async fn release_refused_workspace(
             cause: TerminalCause::ProvenNeverStarted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &Unpositioned,
+            bookmark: &NeverPositioned,
         },
         adapter.force_release_lease(lease_id, Some("refused occupied workspace; preserve checkout")),
     )
     .await
+}
+
+/// How far dispatch got before a pre-start failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreStartStage {
+    /// The execution's recovery bookmark has not been written. The workspace
+    /// holds only what cube placed there, so there is no worker work to lose.
+    BeforeRecoveryBookmark,
+    /// Bookmark creation was attempted or has run; its pointers must be
+    /// confirmed before the workspace is returned.
+    AtOrAfterRecoveryBookmark,
+}
+
+struct NeverPositioned;
+
+#[async_trait::async_trait]
+impl BookmarkGate for NeverPositioned {
+    async fn status(&self, _: &WorkExecution) -> BookmarkStatus {
+        BookmarkStatus::NotRequired
+    }
 }
 
 /// Pre-start helper: the worker never started, so occupancy is not scanned.
@@ -394,6 +445,7 @@ pub async fn release_lease_after_proven_never_started(
     execution: &WorkExecution,
     lease_id: &str,
     adapter: &dyn crate::host_adapter::HostAdapter,
+    stage: PreStartStage,
 ) -> LeaseReleaseOutcome {
     let current = match work_db.get_execution(&execution.id) {
         Ok(row) if row.cube_lease_id.as_deref() == Some(lease_id) => row,
@@ -412,7 +464,14 @@ pub async fn release_lease_after_proven_never_started(
     {
         return match work_db.claim_execution_workspace_release(&execution.id, lease_id) {
             Ok(true) => {
-                let _ = work_db.finish_execution_workspace_release(execution);
+                if let Err(err) = work_db.finish_execution_workspace_release(execution) {
+                    tracing::error!(
+                        execution_id = %execution.id,
+                        lease_id,
+                        error = %format!("{err:#}"),
+                        "failed to clear released workspace metadata",
+                    );
+                }
                 LeaseReleaseOutcome::Released
             }
             Ok(false) => LeaseReleaseOutcome::NoLease,
@@ -421,6 +480,15 @@ pub async fn release_lease_after_proven_never_started(
             },
         };
     }
+    let db_gate = DbBookmarkGate {
+        db: work_db,
+        adapter: Some(adapter),
+    };
+    // Only a failure that precedes any bookmark row may skip confirmation: a
+    // row means pointers exist that the release must not strand.
+    let never_positioned = stage == PreStartStage::BeforeRecoveryBookmark
+        && matches!(work_db.execution_bookmark_optional(&execution.id), Ok(None));
+    let bookmark: &dyn BookmarkGate = if never_positioned { &NeverPositioned } else { &db_gate };
     apply_release(
         work_db,
         execution,
@@ -429,10 +497,7 @@ pub async fn release_lease_after_proven_never_started(
             cause: TerminalCause::ProvenNeverStarted,
             pane: PaneStatus::Gone,
             occupancy: &EmptyOccupancy,
-            bookmark: &DbBookmarkGate {
-                db: work_db,
-                adapter: Some(adapter),
-            },
+            bookmark,
         },
         adapter.release_workspace(lease_id),
     )
@@ -515,7 +580,23 @@ struct ProcessSnapshot {
 }
 
 impl ProcessSnapshot {
+    /// A process caught mid-fork/exec briefly refuses its cwd even to its
+    /// own user, so an incomplete scan is retried a few times before it is
+    /// reported as inconclusive.
     fn capture() -> Self {
+        const ATTEMPTS: u32 = 5;
+        let mut snapshot = Self::capture_once();
+        for _ in 1..ATTEMPTS {
+            if snapshot.complete {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            snapshot = Self::capture_once();
+        }
+        snapshot
+    }
+
+    fn capture_once() -> Self {
         let mut snapshot = Self {
             cwds: Vec::new(),
             complete: true,
@@ -527,17 +608,36 @@ impl ProcessSnapshot {
         snapshot
     }
 
-    fn record(&mut self, pid: u32, cwd: std::io::Result<PathBuf>) {
-        match cwd.and_then(|path| path.canonicalize()) {
-            Ok(path) => self.cwds.push((pid, path)),
+    /// Record one process's cwd lookup. `owner_uid` is consulted only after
+    /// a failed lookup: a process owned by another user is unreadable to a
+    /// non-root engine and cannot be a workspace occupant, while a failure
+    /// for a same-uid process (or one whose owner is unknown) is inconclusive.
+    fn record(&mut self, pid: u32, cwd: std::io::Result<PathBuf>, owner_uid: impl FnOnce() -> Option<u32>) {
+        match cwd {
+            Ok(path) => match path.canonicalize() {
+                Ok(path) => self.cwds.push((pid, path)),
+                // A deleted cwd lies inside no existing workspace.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => self.complete = false,
+            },
             Err(err) if err.raw_os_error() == Some(libc::ESRCH) => {}
-            Err(_) => self.complete = false,
+            Err(_) => {
+                // SAFETY: geteuid has no preconditions.
+                let own_uid = unsafe { libc::geteuid() };
+                if !owner_uid().is_some_and(|uid| uid != own_uid) {
+                    self.complete = false;
+                }
+            }
         }
     }
 }
 
 impl WorkspaceOccupancy for ProcessSnapshot {
     fn occupancy(&self, workspace_path: &Path) -> Occupancy {
+        // No process can have its cwd in a directory that does not exist.
+        if workspace_provably_absent(workspace_path) {
+            return Occupancy::Empty;
+        }
         let root = match workspace_path.canonicalize() {
             Ok(root) => root,
             Err(_) => return Occupancy::Unknown,
@@ -563,8 +663,13 @@ fn path_is_inside(cwd: &Path, workspace: &Path) -> bool {
 fn process_cwds(snapshot: &mut ProcessSnapshot) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        for pid in crate::libproc::list_pids()? {
-            snapshot.record(pid as u32, crate::libproc::proc_cwd(pid));
+        // Only the engine user's processes: the kernel refuses another
+        // user's cwd to a non-root engine, and such a process cannot be a
+        // workspace occupant. A failure for one of these is inconclusive.
+        // SAFETY: geteuid has no preconditions.
+        let own_uid = unsafe { libc::geteuid() };
+        for pid in crate::libproc::list_pids_for_uid(own_uid)? {
+            snapshot.record(pid as u32, crate::libproc::proc_cwd(pid), || Some(own_uid));
         }
         Ok(())
     }
@@ -588,7 +693,7 @@ fn process_cwds(snapshot: &mut ProcessSnapshot) -> std::io::Result<()> {
             {
                 continue;
             }
-            snapshot.record(pid, cwd);
+            snapshot.record(pid, cwd, || proc_uid(&entry.path()));
         }
         Ok(())
     }
@@ -599,15 +704,23 @@ fn process_cwds(snapshot: &mut ProcessSnapshot) -> std::io::Result<()> {
     }
 }
 
+/// Effective uid from the `Uid:` line of `/proc/<pid>/status`.
+#[cfg(target_os = "linux")]
+fn proc_uid(proc_dir: &Path) -> Option<u32> {
+    let status = std::fs::read_to_string(proc_dir.join("status")).ok()?;
+    let line = status.lines().find_map(|line| line.strip_prefix("Uid:"))?;
+    line.split_whitespace().nth(1)?.parse().ok()
+}
+
 fn sweep_pane_status(db: &WorkDb, live: &LiveWorkerStateRegistry, execution: &WorkExecution) -> PaneStatus {
     if live.snapshot().iter().any(|state| state.run_id == execution.id) {
         return PaneStatus::Present;
     }
-    // Cancel and failed-start teardown owns these leases. In particular, a
-    // cancelled in-flight spawn and a failed viewer abort have no death proof.
-    if matches!(execution.status, ExecutionStatus::Cancelled | ExecutionStatus::Failed) {
-        return PaneStatus::Present;
-    }
+    // Cancelled and failed rows go through the same durable death proof as
+    // any other: a recorded worker pid that is dead. A cancelled in-flight
+    // spawn (no pid recorded yet) and a failed viewer abort (pid still alive)
+    // therefore stay held, while a row whose confirmed teardown hit a
+    // transient cube failure is retried here once the error clears.
     match db.latest_local_shell_pid_for_execution(&execution.id) {
         Ok(Some(pid))
             if i32::try_from(pid).ok().is_some_and(|pid| {
@@ -627,18 +740,23 @@ fn sweep_pane_status(db: &WorkDb, live: &LiveWorkerStateRegistry, execution: &Wo
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct EndedRunLeaseSweepOutcome {
     pub released: usize,
+    /// Rows without durable death evidence (no dead worker pid, or a live
+    /// pane). Expected to persist across passes, so not activity.
+    pub held: usize,
+    /// Rows with death evidence whose release gates or cube call kept the lease.
     pub kept: usize,
 }
 
 impl crate::sweep_loop::SweepOutcome for EndedRunLeaseSweepOutcome {
     fn has_activity(&self) -> bool {
-        self.released > 0 || self.kept > 0
+        self.released > 0
     }
 
     fn log(&self) {
         tracing::info!(
             released = self.released,
             kept = self.kept,
+            held = self.held,
             "ended-run lease sweep: pass complete",
         );
     }
@@ -693,7 +811,7 @@ async fn run_one_pass_with_occupancy<O: WorkspaceOccupancy>(
         // registry is not proof after a restart. Require durable pid death.
         let pane = sweep_pane_status(work_db, live_states, &execution);
         if pane == PaneStatus::Present {
-            outcome.kept += 1;
+            outcome.held += 1;
             continue;
         }
         let occupancy = occupancy.get_or_insert_with(|| capture.take().expect("one scan per pass")());

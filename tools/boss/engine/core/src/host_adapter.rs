@@ -60,6 +60,37 @@ const REMOTE_SETTINGS_DIR: &str = ".boss-remote/settings";
 /// resolves it by name rather than an engine-local absolute path.
 const REMOTE_BOSS_EVENT_BIN: &str = "boss-event";
 
+/// Prints `EMPTY`, `OCCUPIED` or `UNKNOWN` for "does any process owned by the
+/// current user have its cwd in `$1`". Only the user's own processes are
+/// scanned (another user's cwd is unreadable and cannot be a workspace
+/// occupant); an unreadable same-user process, or an unavailable probe tool,
+/// is `UNKNOWN`. A workspace directory that does not exist is `EMPTY`.
+const REMOTE_OCCUPANCY_SCRIPT: &str = r#"
+ws="$1"
+if [ ! -e "$ws" ] && [ ! -L "$ws" ]; then echo EMPTY; exit 0; fi
+ws=$(cd "$ws" 2>/dev/null && pwd -P) || { echo UNKNOWN; exit 0; }
+inside() { case "$1" in "$ws"|"$ws"/*) return 0;; esac; return 1; }
+if [ -d /proc/self ]; then
+  for p in /proc/[0-9]*; do
+    [ -O "$p" ] || continue
+    if c=$(readlink "$p/cwd" 2>/dev/null); then
+      if inside "$c"; then echo OCCUPIED; exit 0; fi
+    elif [ -e "$p" ] && ! grep -q '^State:[[:space:]]*[ZX]' "$p/status" 2>/dev/null; then
+      echo UNKNOWN; exit 0
+    fi
+  done
+  echo EMPTY
+else
+  out=$(lsof -a -u "$(id -u)" -d cwd -Fn 2>/dev/null) || { echo UNKNOWN; exit 0; }
+  if printf '%s
+' "$out" | awk -v ws="$ws" 'index($0, "n" ws) == 1 { r = substr($0, length(ws) + 2, 1); if (r == "" || r == "/") f = 1 } END { exit !f }'; then
+    echo OCCUPIED
+  else
+    echo EMPTY
+  fi
+fi
+"#;
+
 #[async_trait]
 impl Jj for SshHostAdapter {
     async fn run(&self, repo: &Path, args: &[&str]) -> Result<String> {
@@ -384,6 +415,14 @@ pub trait HostAdapter: Send + Sync {
     /// `ControlMaster`.
     async fn probe_remote_worker_alive(&self, _remote_pid: i64) -> Result<Option<bool>> {
         Ok(None)
+    }
+
+    /// Whether any process on this host has its cwd inside `workspace`.
+    /// Anything but a definite verdict is [`Occupancy::Unknown`], which keeps
+    /// the lease: the default (no probe on this adapter) and
+    /// [`SshHostAdapter`]'s transport failures both land there.
+    async fn probe_workspace_occupancy(&self, _workspace: &Path) -> Result<crate::workspace_lease_release::Occupancy> {
+        Ok(crate::workspace_lease_release::Occupancy::Unknown)
     }
 
     /// Read the tail of the worker's own stdout/stderr log for the run in
@@ -1767,6 +1806,26 @@ impl HostAdapter for SshHostAdapter {
         let path = remote_worker_log_path(workspace_path);
         let content = crate::remote_transcript::pull_remote_transcript_tail(&self.transport, &path, max_bytes).await?;
         Ok(Some(content))
+    }
+
+    async fn probe_workspace_occupancy(&self, workspace: &Path) -> Result<crate::workspace_lease_release::Occupancy> {
+        use crate::workspace_lease_release::Occupancy;
+        let workspace = workspace.to_str().context("workspace path is not UTF-8")?;
+        let output = self
+            .transport
+            .run(&["sh", "-c", REMOTE_OCCUPANCY_SCRIPT, "sh", workspace])
+            .await?;
+        anyhow::ensure!(
+            output.success(),
+            "remote occupancy probe failed on {}: {}",
+            self.transport.host_id,
+            output.stderr
+        );
+        Ok(match output.stdout.trim() {
+            "EMPTY" => Occupancy::Empty,
+            "OCCUPIED" => Occupancy::Occupied,
+            _ => Occupancy::Unknown,
+        })
     }
 
     async fn probe_remote_worker_alive(&self, remote_pid: i64) -> Result<Option<bool>> {

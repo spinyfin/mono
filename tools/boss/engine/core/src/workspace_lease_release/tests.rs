@@ -1,7 +1,7 @@
 use super::*;
 use crate::test_support::*;
 use boss_engine_recovery::execution_bookmark::ExecutionBookmark;
-use boss_protocol::{CreateExecutionInput, ExecutionKind};
+use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus};
 use std::sync::Mutex;
 
 struct SweepCube;
@@ -478,22 +478,46 @@ fn inconclusive_cwd_and_path_probes_keep_the_lease() {
         cwds: vec![],
         complete: true,
     };
-    snapshot.record(123, Err(std::io::Error::from_raw_os_error(libc::EPERM)));
-    for occupancy in [
-        snapshot.occupancy(dir.path()),
-        snapshot.occupancy(&dir.path().join("missing")),
-    ] {
-        assert_eq!(occupancy, Occupancy::Unknown);
-        assert_eq!(
-            decide(
-                TerminalCause::Inferred,
-                &BookmarkStatus::Confirmed,
-                PaneStatus::Gone,
-                occupancy
-            ),
-            LeaseReleaseDecision::Keep(KeepReason::OccupancyUnconfirmed)
-        );
-    }
+    snapshot.record(123, Err(std::io::Error::from_raw_os_error(libc::EPERM)), || {
+        Some(unsafe { libc::geteuid() })
+    });
+    // A directory that provably does not exist cannot hold a process.
+    assert_eq!(snapshot.occupancy(&dir.path().join("missing")), Occupancy::Empty);
+    let occupancy = snapshot.occupancy(dir.path());
+    assert_eq!(occupancy, Occupancy::Unknown);
+    assert_eq!(
+        decide(
+            TerminalCause::Inferred,
+            &BookmarkStatus::Confirmed,
+            PaneStatus::Gone,
+            occupancy
+        ),
+        LeaseReleaseDecision::Keep(KeepReason::OccupancyUnconfirmed)
+    );
+}
+
+#[test]
+fn other_users_unreadable_processes_and_deleted_cwds_do_not_block_empty() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut snapshot = ProcessSnapshot {
+        cwds: vec![],
+        complete: true,
+    };
+    let other_uid = unsafe { libc::geteuid() }.wrapping_add(1);
+    snapshot.record(1, Err(std::io::Error::from_raw_os_error(libc::EPERM)), || {
+        Some(other_uid)
+    });
+    snapshot.record(2, Ok(dir.path().join("deleted-cwd")), || None);
+    assert_eq!(snapshot.occupancy(dir.path()), Occupancy::Empty);
+    // An unknown owner for a failed lookup stays inconclusive.
+    snapshot.record(3, Err(std::io::Error::from_raw_os_error(libc::EACCES)), || None);
+    assert_eq!(snapshot.occupancy(dir.path()), Occupancy::Unknown);
+}
+
+#[test]
+fn real_host_snapshot_of_a_fresh_dir_is_empty() {
+    let dir = tempfile::TempDir::new().unwrap();
+    assert_eq!(ProcessSnapshot::capture().occupancy(dir.path()), Occupancy::Empty);
 }
 
 #[tokio::test]

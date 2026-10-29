@@ -609,6 +609,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_gone_reconcile_releases_the_lease_without_attention() {
+        struct RecordingCube(std::sync::Mutex<Vec<String>>);
+        crate::stub_cube_client! { RecordingCube {
+            async fn force_release_lease(&self, lease_id: &str, _: Option<&str>) -> anyhow::Result<()> {
+                self.0.lock().unwrap().push(lease_id.to_owned());
+                Ok(())
+            }
+        } }
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let exec = parked_triage_execution(&db, &automation, "/nonexistent/old-root/mono-agent-030", "local");
+        seed_dispatch_run(&db, &automation, &exec.id, 1_700_000_000);
+        // The recovery pointers live in the shared store, which outlives the workspace.
+        let store = TempDir::new().unwrap();
+        let repo = boss_engine_test_git::jj::JjRepo::new(store.path());
+        let record = boss_engine_recovery::execution_bookmark::create(
+            &boss_engine_recovery::execution_bookmark::LocalJj,
+            &repo.worker,
+            &exec.id,
+            "local",
+        )
+        .await
+        .unwrap();
+        db.record_execution_bookmark(&record).unwrap();
+        let cube = RecordingCube(Default::default());
+
+        assert!(reconcile_if_execution_dead(&db, &NoopDispatchEventSink, &exec, Some(&cube)).await);
+
+        assert_eq!(*cube.0.lock().unwrap(), vec!["lease-1".to_owned()]);
+        assert_eq!(db.get_execution(&exec.id).unwrap().cube_lease_id, None);
+        assert!(
+            db.list_attention_items(&exec.id)
+                .unwrap()
+                .iter()
+                .all(|item| item.kind != crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND)
+        );
+    }
+
+    #[tokio::test]
     async fn workspace_gone_reconcile_releases_the_persona_lease() {
         let (_d, db) = open_db();
         let product = create_product(&db);

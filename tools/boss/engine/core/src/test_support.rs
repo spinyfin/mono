@@ -1186,9 +1186,17 @@ macro_rules! stub_host_adapter {
 
     // ── collect_structured_output (trait default unless overridden) ──────────
     (@munch $ty:ty [$($acc:tt)*] @collect_structured_output async fn collect_structured_output $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn collect_structured_output $a -> $r $b] @done $($rest)*);
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn collect_structured_output $a -> $r $b] @probe_workspace_occupancy $($rest)*);
     };
     (@munch $ty:ty [$($acc:tt)*] @collect_structured_output $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*] @probe_workspace_occupancy $($rest)*);
+    };
+
+    // ── probe_workspace_occupancy (trait default unless overridden) ──────────
+    (@munch $ty:ty [$($acc:tt)*] @probe_workspace_occupancy async fn probe_workspace_occupancy $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn probe_workspace_occupancy $a -> $r $b] @done $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @probe_workspace_occupancy $($rest:tt)*) => {
         $crate::stub_host_adapter!(@munch $ty [$($acc)*] @done $($rest)*);
     };
 

@@ -87,7 +87,7 @@ pub(crate) struct ProcBsdInfo {
 }
 
 const PROC_PIDVNODEPATHINFO: libc::c_int = 9;
-const PROC_ALL_PIDS: u32 = 1;
+const PROC_UID_ONLY: u32 = 4;
 const MAXPATHLEN: usize = 1024;
 
 unsafe extern "C" {
@@ -156,17 +156,21 @@ pub(crate) fn proc_cwd(pid: libc::pid_t) -> std::io::Result<std::path::PathBuf> 
     Ok(std::path::PathBuf::from(path))
 }
 
-/// Every pid the kernel currently knows about.
-pub(crate) fn list_pids() -> std::io::Result<Vec<libc::pid_t>> {
+/// Every pid owned by `uid` (effective uid), via `PROC_UID_ONLY`.
+pub(crate) fn list_pids_for_uid(uid: u32) -> std::io::Result<Vec<libc::pid_t>> {
+    list_pids_of(PROC_UID_ONLY, uid)
+}
+
+fn list_pids_of(kind: u32, info: u32) -> std::io::Result<Vec<libc::pid_t>> {
     // SAFETY: null buffer is the documented size-query form of `proc_listpids`.
-    let bytes = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
+    let bytes = unsafe { libc::proc_listpids(kind, info, std::ptr::null_mut(), 0) };
     if bytes <= 0 {
         return Err(std::io::Error::last_os_error());
     }
     let mut buf = vec![0i32; (bytes as usize / std::mem::size_of::<i32>()) + 32];
     let capacity = (buf.len() * std::mem::size_of::<i32>()) as libc::c_int;
     // SAFETY: `buf` is a valid integer buffer of `capacity` bytes.
-    let written = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, buf.as_mut_ptr() as *mut c_void, capacity) };
+    let written = unsafe { libc::proc_listpids(kind, info, buf.as_mut_ptr() as *mut c_void, capacity) };
     if written <= 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -255,8 +259,13 @@ mod tests {
     }
 
     #[test]
-    fn list_pids_includes_self() {
+    fn uid_scoped_listing_includes_self() {
         let self_pid = std::process::id() as libc::pid_t;
-        assert!(list_pids().unwrap().contains(&self_pid));
+        // SAFETY: geteuid has no preconditions.
+        assert!(
+            list_pids_for_uid(unsafe { libc::geteuid() })
+                .unwrap()
+                .contains(&self_pid)
+        );
     }
 }

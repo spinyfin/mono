@@ -728,7 +728,7 @@ async fn lease_fallback_failure_transitions_execution_to_failed() {
 }
 
 #[tokio::test]
-async fn change_creation_failure_keeps_workspace_without_recovery_proof() {
+async fn change_creation_failure_releases_workspace_before_any_recovery_bookmark() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let product = create_test_product(&db);
@@ -762,10 +762,10 @@ async fn change_creation_failure_keeps_workspace_without_recovery_proof() {
     let run = db.list_runs(&execution.id).unwrap().pop().unwrap();
     assert_eq!(run.status, "failed");
     assert_eq!(run.error_text.as_deref(), Some("cube change create failed"));
-    assert!(cube.release_calls.lock().await.is_empty());
-    assert_eq!(execution.cube_lease_id.as_deref(), Some("lease-1"));
+    assert!(!cube.release_calls.lock().await.is_empty());
+    assert_eq!(execution.cube_lease_id.as_deref(), None);
     assert!(
-        db.list_attention_items(&execution.id)
+        !db.list_attention_items(&execution.id)
             .unwrap()
             .iter()
             .any(|item| item.kind == crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND)

@@ -2345,6 +2345,7 @@ impl ExecutionCoordinator {
                 &current,
                 &lease_id,
                 self.host_adapter().as_ref(),
+                crate::workspace_lease_release::PreStartStage::AtOrAfterRecoveryBookmark,
             )
             .await;
         }
