@@ -243,7 +243,7 @@ enum AttachmentDateFormatting {
 
 // MARK: - AttachmentDetailView
 
-/// Right-pane detail: the full-size image (or an explanatory placeholder
+/// Right-pane detail: the fitted image (or an explanatory placeholder
 /// when the bytes are gone) plus caption and metadata.
 struct AttachmentDetailView: View {
     let attachment: AttachmentVM
@@ -253,18 +253,22 @@ struct AttachmentDetailView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                imageArea
-                if !attachment.caption.isEmpty {
+        VStack(alignment: .leading, spacing: 12) {
+            imageArea
+            if !attachment.caption.isEmpty {
+                ScrollView {
                     Text(attachment.caption)
                         .font(.body)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                metadataRow
+                .frame(maxHeight: 96)
+                .fixedSize(horizontal: false, vertical: true)
             }
-            .padding()
-            .frame(maxWidth: .infinity, alignment: .leading)
+            metadataRow
         }
+        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         .navigationTitle(attachment.displayTitle)
     }
 
@@ -276,21 +280,26 @@ struct AttachmentDetailView: View {
             } description: {
                 Text(reclaimedDescription)
             }
-            .frame(maxWidth: .infinity, minHeight: 240)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let image = loadedImage {
-            Image(nsImage: image)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(maxWidth: .infinity)
-                .background(Color.black.opacity(0.05))
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            GeometryReader { geometry in
+                let size = AttachmentImageSizing.fit(native: image.size, available: geometry.size)
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: size.width, height: size.height)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .frame(minHeight: 120)
+            .background(Color.black.opacity(0.05))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         } else {
             ContentUnavailableView {
                 Label("Screenshot Unavailable", systemImage: "photo.badge.exclamationmark")
             } description: {
                 Text("The image bytes could not be found on disk.")
             }
-            .frame(maxWidth: .infinity, minHeight: 240)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
