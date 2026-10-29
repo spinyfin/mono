@@ -519,10 +519,7 @@ impl WorkerCompletionHandler {
              The task/chore's status records a worker failure with this diagnostic.",
             execution.id
         );
-        if !self
-            .finalize_worker_failure(execution, &detail, crate::work::WorkerFailureBasis::DeliveredWithoutPr)
-            .await
-        {
+        if !self.finalize_worker_failure(execution, &detail).await {
             return StopOutcome::DbError;
         }
         if let Err(err) = self
@@ -564,12 +561,7 @@ impl WorkerCompletionHandler {
             execution.id
         );
         if !self
-            .finalize_worker_failure_or_question(
-                execution,
-                &detail,
-                question.as_ref(),
-                crate::work::WorkerFailureBasis::DeclaredBlocked,
-            )
+            .finalize_worker_failure_or_question(execution, &detail, question.as_ref())
             .await
         {
             return StopOutcome::DbError;

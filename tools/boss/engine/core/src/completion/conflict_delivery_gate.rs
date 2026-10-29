@@ -27,14 +27,7 @@ impl WorkerCompletionHandler {
             let detail =
                 "Conflict resolution cannot be verified: this execution has no bound PR URL to check against GitHub."
                     .to_owned();
-            if !self
-                .finalize_worker_failure(
-                    execution,
-                    &detail,
-                    crate::work::WorkerFailureBasis::ConflictDeliveryUnverified,
-                )
-                .await
-            {
+            if !self.finalize_worker_failure(execution, &detail).await {
                 return ConflictDeliveryDecision::Failed(StopOutcome::DbError);
             }
             return ConflictDeliveryDecision::Failed(StopOutcome::RunDoneDeclaredWithoutDelivery { detail });
@@ -62,14 +55,7 @@ impl WorkerCompletionHandler {
         let detail = format!(
             "Conflict resolution was not delivered to {pr_url}: {reason}. A changed local or remote head alone does not prove the conflict is resolved."
         );
-        if !self
-            .finalize_worker_failure(
-                execution,
-                &detail,
-                crate::work::WorkerFailureBasis::ConflictDeliveryUnverified,
-            )
-            .await
-        {
+        if !self.finalize_worker_failure(execution, &detail).await {
             return ConflictDeliveryDecision::Failed(StopOutcome::DbError);
         }
         ConflictDeliveryDecision::Failed(StopOutcome::RunDoneDeclaredWithoutDelivery { detail })

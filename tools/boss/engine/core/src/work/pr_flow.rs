@@ -20,8 +20,10 @@ pub(crate) const DELETION_SIGNOFF_BLOCKED_REASON: &str = "deletion_signoff";
 /// [`Self::OperatorNo`] even when the displayed reason is unchanged.
 /// [`Self::ConflictDeliveryUnverified`] records on the first transition to
 /// `worker_failed`; a same-reason repeat does not, because that variant is
-/// not in the trigger IN-list. [`Self::all`] is the enum inventory the
-/// ledger tests pin against that list so a new variant cannot land untested.
+/// not in the trigger IN-list. [`Self::index`] is exhaustive; [`Self::all`]
+/// is a `[Self; COUNT]` array whose `index` values must be `0..COUNT` in
+/// order, so a new variant must be added to `index`, `all`, `COUNT`, and
+/// `as_str` together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerFailureBasis {
     NudgeBreaker,
@@ -33,25 +35,31 @@ pub enum WorkerFailureBasis {
 }
 
 impl WorkerFailureBasis {
-    pub const fn all() -> &'static [Self] {
-        // Exhaustive so a new variant cannot compile until it is also in the
-        // slice. Ledger tests iterate this inventory and match on each value.
-        match Self::NudgeBreaker {
-            Self::NudgeBreaker
-            | Self::DeclaredBlocked
-            | Self::DeliveredWithoutPr
-            | Self::ForeignPrBinding
-            | Self::OperatorNo
-            | Self::ConflictDeliveryUnverified => {}
+    /// Declaration order. A new variant must be added at the end, given the
+    /// next index, appended to [`Self::all`], and included in `as_str`.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::NudgeBreaker => 0,
+            Self::DeclaredBlocked => 1,
+            Self::DeliveredWithoutPr => 2,
+            Self::ForeignPrBinding => 3,
+            Self::OperatorNo => 4,
+            Self::ConflictDeliveryUnverified => 5,
         }
-        &[
-            Self::NudgeBreaker,
-            Self::DeclaredBlocked,
-            Self::DeliveredWithoutPr,
-            Self::ForeignPrBinding,
-            Self::OperatorNo,
-            Self::ConflictDeliveryUnverified,
-        ]
+    }
+
+    pub const COUNT: usize = 6;
+
+    pub const fn all() -> &'static [Self] {
+        const ALL: [WorkerFailureBasis; WorkerFailureBasis::COUNT] = [
+            WorkerFailureBasis::NudgeBreaker,
+            WorkerFailureBasis::DeclaredBlocked,
+            WorkerFailureBasis::DeliveredWithoutPr,
+            WorkerFailureBasis::ForeignPrBinding,
+            WorkerFailureBasis::OperatorNo,
+            WorkerFailureBasis::ConflictDeliveryUnverified,
+        ];
+        &ALL
     }
 
     pub fn as_str(self) -> &'static str {
@@ -65,6 +73,15 @@ impl WorkerFailureBasis {
         }
     }
 }
+
+const _: () = {
+    assert!(WorkerFailureBasis::all().len() == WorkerFailureBasis::COUNT);
+    let mut i = 0;
+    while i < WorkerFailureBasis::COUNT {
+        assert!(WorkerFailureBasis::all()[i].index() == i);
+        i += 1;
+    }
+};
 
 /// A task held in PendingReview with no live pre-merge batch, waiting for
 /// weighted admission to retry.
