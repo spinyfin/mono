@@ -265,6 +265,21 @@ impl PopulationTrace {
         self.started.is_some()
     }
 
+    /// Announce a stage before beginning its work, separately from duration logging.
+    pub fn enter_stage(&self, name: &'static str) {
+        self.progress.stage(name, self.elapsed_ms(), self.ctx.items);
+    }
+
+    /// Writer stages go directly to the socket ahead of the snapshot.
+    pub(crate) fn writer_stage(
+        &self,
+        name: &'static str,
+    ) -> Option<(&str, crate::population_progress::PopulationProgress)> {
+        self.progress
+            .stage_report(name, self.elapsed_ms(), self.ctx.items)
+            .map(|report| (self.ctx.product_id.as_str(), report))
+    }
+
     /// Record a plain timed segment (duration only).
     pub fn record_plain(&mut self, segment: &'static str, duration_ms: f64) {
         self.push(segment, duration_ms, None, None, None);
@@ -404,7 +419,6 @@ impl PopulationTrace {
                 .maybe_payload_bytes(payload_bytes)
                 .build(),
         );
-        self.progress.stage(segment, self.elapsed_ms(), self.ctx.items);
     }
 
     /// Emit every recorded segment to `log`. No-op for a disabled trace.
@@ -567,9 +581,12 @@ mod tests {
         trace.set_progress_sink(sink);
         trace.record_plain(segment::DECODE, 0.5);
         trace.begin_cold_build();
+        trace.enter_stage(segment::DB_TASKS);
         trace.record_query(segment::DB_TASKS, 12.0, 1949);
         trace.set_items(1949);
+        trace.enter_stage(segment::DB_TASK_RUNTIMES);
         trace.record_nplus1(segment::DB_TASK_RUNTIMES, 6000.0, 1949, 4200);
+        trace.enter_stage(segment::ASSEMBLE);
         trace.record_plain(segment::ASSEMBLE, 3.0);
         trace.record_plain(segment::SHARED_LOAD_WAIT, 6015.0);
         trace.record_serialize(80.0, 31_500_000);
@@ -588,7 +605,7 @@ mod tests {
                 (Stage, Some(segment::ASSEMBLE)),
                 (Done, None),
             ],
-            "decode, the shared-load wait and the writer-side tail are not live stages"
+            "only explicit stage entries publish progress; writer stages use direct frames"
         );
         assert_eq!(
             seen[2].items,

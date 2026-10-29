@@ -51,7 +51,7 @@ enum EngineEvent {
     case workTree(product: WorkProduct, projects: [WorkProject], tasks: [WorkTask], chores: [WorkTask], taskRuntimes: [WorkTaskRuntime], dependencies: [WorkItemDependency], ideas: [WorkIdea], attentionItems: [WorkAttentionItem] = [], attentionGroups: [AttentionGroup] = [], attentionMembers: [Attention] = [], plannerRuns: [PlannerRunSummary] = [], requestId: String? = nil, revision: UInt64? = nil)
     /// The engine is still building `productId`'s first board snapshot
     /// (`board_population_progress`). `phase` is `started`, `stage` or
-    /// `done`; `stage` names the finished stage on `stage` events. Never a
+    /// `done`; `stage` names the current stage on `stage` events. Never a
     /// reply and never board state: it only describes the wait.
     case boardPopulationProgress(productId: String, phase: String, stage: String?, elapsedMs: Int, items: Int?, bytes: Int?)
     case workItemCreated(item: WorkItemPayload)

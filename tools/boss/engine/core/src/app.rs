@@ -2413,6 +2413,20 @@ async fn handle_frontend_connection(
                 t.record_queue_wait();
             }
 
+            if board_progress::write_stage(
+                &writer_sink,
+                &mut write_half,
+                &writer_session_id,
+                trace.as_ref(),
+                crate::population_timing::segment::SERIALIZE,
+            )
+            .await
+            .is_err()
+            {
+                writer_sink.complete_response_delivery(event.request_id.as_deref(), false);
+                break;
+            }
+
             let serialize_start = Instant::now();
             let line = match serde_json::to_string(&event) {
                 Ok(line) => line,
@@ -2424,6 +2438,20 @@ async fn handle_frontend_connection(
             };
             if let Some(t) = trace.as_mut() {
                 t.record_serialize(crate::population_timing::elapsed_ms(serialize_start), line.len());
+            }
+
+            if board_progress::write_stage(
+                &writer_sink,
+                &mut write_half,
+                &writer_session_id,
+                trace.as_ref(),
+                crate::population_timing::segment::SOCKET_WRITE,
+            )
+            .await
+            .is_err()
+            {
+                writer_sink.complete_response_delivery(event.request_id.as_deref(), false);
+                break;
             }
 
             let write_start = Instant::now();

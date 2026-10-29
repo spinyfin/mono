@@ -904,12 +904,22 @@ struct ContentView: View {
                         }
                     }
                     if model.isBoardLoaded(product.id) {
+                        if model.boardLoad.isRefreshing(product.id) || model.boardLoad.hasFailed(product.id) {
+                            BoardRefreshBanner(
+                                since: model.boardLoad.waitingSince(product.id),
+                                progress: model.boardLoad.progress(for: product.id),
+                                failed: model.boardLoad.hasFailed(product.id),
+                                isConnected: model.isConnected,
+                                retry: { model.refetchBoard(productID: product.id) })
+                        }
                         workBoard()
                     } else {
                         BoardLoadingView(
                             isConnected: model.isConnected,
                             since: model.boardLoad.waitingSince(product.id),
-                            progress: model.boardLoad.progress(for: product.id)
+                            progress: model.boardLoad.progress(for: product.id),
+                            failed: model.boardLoad.hasFailed(product.id),
+                            retry: { model.refetchBoard(productID: product.id) }
                         )
                     }
                 }

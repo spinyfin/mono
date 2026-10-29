@@ -5,15 +5,11 @@
 //! projection was dropped) can take minutes on a large database, and the
 //! `GetWorkTree` reply carries nothing until the whole snapshot is assembled.
 //! A [`PopulationTrace`](crate::population_timing::PopulationTrace) that has a
-//! [`ProgressSink`] reports each finished stage to it as the build runs, so a
+//! [`ProgressSink`] reports each stage on entry to it as the build runs, so a
 //! client can show what the engine is doing instead of an empty board.
 //!
-//! The stage source is the existing per-segment timing: every segment the
-//! trace records while a cold build is in flight becomes one
-//! [`BoardPopulationPhase::Stage`] event. The `serialize` / `socket_write`
-//! segments run after the snapshot frame is already on its way, so they are
-//! not reported live; the closing [`BoardPopulationPhase::Done`] event
-//! carries the item and byte counts instead.
+//! Stage entries use the existing timing names, separately from duration logging.
+//! The writer sends serialize/socket_write entries directly before the snapshot.
 //!
 //! [`SlowPopulation`] is the other half: whenever a population's `total`
 //! exceeds [`SLOW_POPULATION_MS`] the stages are logged at INFO with the
@@ -34,7 +30,7 @@ pub const SLOW_POPULATION_MS: f64 = 5_000.0;
 #[derive(Debug, Clone, PartialEq)]
 pub struct PopulationProgress {
     pub phase: BoardPopulationPhase,
-    /// The finished stage on [`BoardPopulationPhase::Stage`] events.
+    /// The current stage on [`BoardPopulationPhase::Stage`] events.
     pub stage: Option<&'static str>,
     pub elapsed_ms: f64,
     pub items: Option<i64>,
@@ -84,21 +80,26 @@ impl ProgressReporter {
         }
     }
 
-    /// Report a just-recorded segment as a finished stage, if a cold build
-    /// is in flight and the segment is one a client can act on.
+    /// Report entry to a stage while a cold build is in flight.
     pub(crate) fn stage(&self, name: &'static str, elapsed_ms: f64, items: Option<i64>) {
-        if !self.started || !is_live_stage(name) {
-            return;
+        if let (Some(sink), Some(report)) = (&self.sink, self.stage_report(name, elapsed_ms, items)) {
+            sink(report);
         }
-        if let Some(sink) = &self.sink {
-            sink(PopulationProgress {
-                phase: BoardPopulationPhase::Stage,
-                stage: Some(name),
-                elapsed_ms,
-                items,
-                bytes: None,
-            });
-        }
+    }
+
+    pub(crate) fn stage_report(
+        &self,
+        name: &'static str,
+        elapsed_ms: f64,
+        items: Option<i64>,
+    ) -> Option<PopulationProgress> {
+        (self.started && is_live_stage(name)).then_some(PopulationProgress {
+            phase: BoardPopulationPhase::Stage,
+            stage: Some(name),
+            elapsed_ms,
+            items,
+            bytes: None,
+        })
     }
 
     /// Close a cold build's progress with the snapshot's size. No-op when no
@@ -122,21 +123,16 @@ impl ProgressReporter {
 
 /// Whether a segment is a build stage worth reporting live. Excludes the
 /// segments outside the build window: request decode, the wait on another
-/// request's shared load, and the writer-side tail.
+/// request's shared load, and the total duration.
 fn is_live_stage(name: &str) -> bool {
     !matches!(
         name,
-        segment::DECODE
-            | segment::SHARED_LOAD_WAIT
-            | segment::QUEUE_WAIT
-            | segment::SERIALIZE
-            | segment::SOCKET_WRITE
-            | segment::TOTAL
+        segment::DECODE | segment::SHARED_LOAD_WAIT | segment::QUEUE_WAIT | segment::TOTAL
     )
 }
 
 /// A population that ran longer than [`SLOW_POPULATION_MS`], with the
-/// numbers an operator needs to see where the time went.
+/// per-stage durations and snapshot size needed to see where the time went.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SlowPopulation {
     pub total_ms: f64,

@@ -178,7 +178,7 @@ extension ChatViewModel {
             // `done` follows the snapshot frame, so only the stages describe a wait.
             guard phase != "done" else { break }
             updateBoardLoad {
-                $0.noteProgress(productId, BoardLoadProgress(stage: stage, engineElapsedMs: elapsedMs, items: items))
+                $0.noteProgress(productId, BoardLoadProgress(stage: stage, engineElapsedMs: elapsedMs, items: items), started: phase == "started")
             }
         case .workItemCreated(let item):
             handleCreatedWorkItem(item)

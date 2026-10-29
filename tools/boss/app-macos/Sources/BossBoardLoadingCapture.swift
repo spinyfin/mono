@@ -9,9 +9,11 @@ import UpdateCore
 /// its first snapshot, with the engine's cold-build progress seeded the way
 /// `board_population_progress` pushes would. Tunables, all optional:
 /// - `--capture-board-loading-elapsed=<seconds>` how long the wait has run (47).
-/// - `--capture-board-loading-stage=<segment>` last finished stage (`db.task_runtimes`).
+/// - `--capture-board-loading-stage=<segment>` current stage (`db.task_runtimes`).
 /// - `--capture-board-loading-items=<n>` cards counted so far (1949).
 /// - `--capture-board-loading-disconnected` shows the offline wording.
+/// - `--capture-board-loading-refreshing` preserves a previously loaded board.
+/// - `--capture-board-loading-failed` shows the inline retry state.
 @MainActor
 enum BossBoardLoadingCapture {
     private static var window: NSWindow?
@@ -49,12 +51,19 @@ enum BossBoardLoadingCapture {
             let elapsed = option("elapsed").flatMap(TimeInterval.init) ?? 47
             model.isConnected = !CommandLine.arguments.contains("--capture-board-loading-disconnected")
             model.updateBoardLoad {
+                if CommandLine.arguments.contains("--capture-board-loading-refreshing") {
+                    $0.noteSnapshot(product.id)
+                    $0.noteDisconnected()
+                }
                 $0.noteRequested(product.id, at: Date().addingTimeInterval(-elapsed))
                 $0.noteProgress(product.id, BoardLoadProgress(
                     stage: option("stage") ?? "db.task_runtimes",
                     engineElapsedMs: Int(elapsed * 1000),
                     items: option("items").flatMap(Int.init) ?? 1949
                 ))
+                if CommandLine.arguments.contains("--capture-board-loading-failed") {
+                    $0.noteReadFailed(product.id)
+                }
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 captureWindow.contentView?.layoutSubtreeIfNeeded()

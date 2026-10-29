@@ -10,18 +10,27 @@ struct BoardLoadingView: View {
     let since: Date?
     let progress: BoardLoadProgress?
 
+    var failed = false
+    var retry: () -> Void = {}
+
     var body: some View {
         VStack(spacing: 12) {
-            ProgressView()
-                .controlSize(.large)
-            Text(isConnected ? "Loading board…" : "Waiting for the engine…")
-                .font(.title3.weight(.semibold))
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                Text(Self.detailText(elapsed: since.map { context.date.timeIntervalSince($0) }, progress: progress))
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-                    .multilineTextAlignment(.center)
+            if failed {
+                Text("Couldn’t load the board")
+                Button("Retry", action: retry)
+                    .disabled(!isConnected)
+            } else {
+                ProgressView()
+                    .controlSize(.large)
+                Text(isConnected ? "Loading board…" : "Waiting for the engine…")
+                    .font(.title3.weight(.semibold))
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    Text(Self.detailText(elapsed: since.map { context.date.timeIntervalSince($0) }, progress: progress))
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                        .multilineTextAlignment(.center)
+                }
             }
         }
         .padding(24)
@@ -30,7 +39,7 @@ struct BoardLoadingView: View {
         .accessibilityIdentifier("board-loading")
     }
 
-    /// `"47s elapsed · last step: read task runtimes · 1,949 cards"`, with
+    /// `"47s elapsed · current activity: reading task runtimes · 1,949 cards"`, with
     /// each part left out until it is known.
     static func detailText(elapsed: TimeInterval?, progress: BoardLoadProgress?) -> String {
         var parts: [String] = []
@@ -38,7 +47,7 @@ struct BoardLoadingView: View {
             parts.append("\(elapsedText(seconds: Int(max(0, elapsed)))) elapsed")
         }
         if let step = progress?.stageDescription {
-            parts.append("last step: \(step)")
+            parts.append("current activity: \(step)")
         }
         if let items = progress?.items {
             parts.append("\(items.formatted()) \(items == 1 ? "card" : "cards")")
@@ -49,5 +58,35 @@ struct BoardLoadingView: View {
     static func elapsedText(seconds: Int) -> String {
         guard seconds >= 60 else { return "\(seconds)s" }
         return String(format: "%dm %02ds", seconds / 60, seconds % 60)
+    }
+}
+
+/// A refresh keeps the previous snapshot visible while exposing its stale state.
+struct BoardRefreshBanner: View {
+    let since: Date?
+    let progress: BoardLoadProgress?
+    let failed: Bool
+    let isConnected: Bool
+    let retry: () -> Void
+
+    var body: some View {
+        HStack {
+            if failed {
+                Text("Couldn’t refresh the board")
+                Button("Retry", action: retry).disabled(!isConnected)
+            } else {
+                ProgressView().controlSize(.small)
+                Text(isConnected ? "Refreshing board…" : "Waiting to reconnect…")
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    Text(BoardLoadingView.detailText(
+                        elapsed: since.map { context.date.timeIntervalSince($0) }, progress: progress))
+                        .monospacedDigit()
+                }
+            }
+            Spacer()
+        }
+        .font(.callout)
+        .padding(10)
+        .accessibilityIdentifier("board-refreshing")
     }
 }

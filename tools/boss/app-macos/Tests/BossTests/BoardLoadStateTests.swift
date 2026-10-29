@@ -73,6 +73,55 @@ final class BoardLoadStateTests: XCTestCase {
         XCTAssertEqual(tracker.waitingSince("waiting"), Date(timeIntervalSince1970: 500))
     }
 
+    func testLoadedBoardRefreshesOnReconnectAndStartedUntilSnapshot() {
+        var tracker = BoardLoadTracker()
+        tracker.noteSnapshot("prod_1")
+        tracker.noteDisconnected()
+        XCTAssertTrue(tracker.isLoaded("prod_1"))
+        XCTAssertTrue(tracker.isRefreshing("prod_1"))
+        tracker.noteRequested("prod_1", at: Date(timeIntervalSince1970: 100))
+        tracker.noteProgress("prod_1", BoardLoadProgress(stage: "db.tasks", engineElapsedMs: 90, items: 2))
+        XCTAssertEqual(tracker.progress(for: "prod_1")?.stage, "db.tasks")
+        tracker.noteSnapshot("prod_1")
+        XCTAssertFalse(tracker.isRefreshing("prod_1"))
+        tracker.noteProgress("prod_1", BoardLoadProgress(stage: nil, engineElapsedMs: 1, items: nil), started: true)
+        XCTAssertTrue(tracker.isRefreshing("prod_1"))
+        XCTAssertNotNil(tracker.waitingSince("prod_1"))
+        tracker.noteSnapshot("prod_1")
+        XCTAssertFalse(tracker.isRefreshing("prod_1"))
+    }
+
+    func testStartedResetsElapsedOrderingForAnotherBuild() {
+        var tracker = BoardLoadTracker()
+        tracker.noteProgress("prod_1", BoardLoadProgress(stage: "assemble", engineElapsedMs: 40_000, items: 100))
+        tracker.noteProgress("prod_1", BoardLoadProgress(stage: nil, engineElapsedMs: 1, items: nil), started: true)
+        tracker.noteProgress("prod_1", BoardLoadProgress(stage: "db.tasks", engineElapsedMs: 10, items: 2))
+        XCTAssertEqual(tracker.progress(for: "prod_1")?.stage, "db.tasks")
+        XCTAssertEqual(tracker.progress(for: "prod_1")?.items, 2)
+    }
+
+    func testLastFailedTreeReadStopsWaitingAndRetryResetsProgress() {
+        let model = makeModel()
+        model.noteWorkTreeRequested(productID: product.id, requestID: "first")
+        model.noteWorkTreeRequested(productID: product.id, requestID: "second")
+        model.applyEventForTest(.boardPopulationProgress(
+            productId: product.id, phase: "stage", stage: "assemble", elapsedMs: 40_000, items: 100, bytes: nil))
+        model.failBoardRead(requestID: "first")
+        XCTAssertFalse(model.boardLoad.hasFailed(product.id), "another tree read is still outstanding")
+        model.failBoardRead(requestID: "second")
+        XCTAssertTrue(model.boardLoad.hasFailed(product.id))
+        XCTAssertNil(model.boardLoad.waitingSince(product.id))
+        XCTAssertNil(model.boardLoad.progress(for: product.id))
+        model.noteWorkTreeRequested(productID: product.id, requestID: "retry")
+        XCTAssertFalse(model.boardLoad.hasFailed(product.id))
+        XCTAssertNotNil(model.boardLoad.waitingSince(product.id))
+        model.applyEventForTest(.boardPopulationProgress(
+            productId: product.id, phase: "stage", stage: "db.tasks", elapsedMs: 10, items: 2, bytes: nil))
+        XCTAssertEqual(model.boardLoad.progress(for: product.id)?.stage, "db.tasks")
+        model.applyEventForTest(snapshot(product))
+        XCTAssertTrue(model.isBoardLoaded(product.id))
+    }
+
     // MARK: loading text
 
     func testDetailTextNamesElapsedStageAndCardsAsTheyBecomeKnown() {
@@ -81,10 +130,10 @@ final class BoardLoadStateTests: XCTestCase {
         let progress = BoardLoadProgress(stage: "db.task_runtimes", engineElapsedMs: 40_000, items: 1949)
         XCTAssertEqual(
             BoardLoadingView.detailText(elapsed: 47, progress: progress),
-            "47s elapsed · last step: read task runtimes · 1,949 cards")
+            "47s elapsed · current activity: reading task runtimes · 1,949 cards")
         XCTAssertEqual(
             BoardLoadingView.detailText(elapsed: 113, progress: BoardLoadProgress(stage: "serialize", engineElapsedMs: 1, items: 1)),
-            "1m 53s elapsed · last step: serialize · 1 card",
+            "1m 53s elapsed · current activity: serializing board · 1 card",
             "an unknown stage is shown as the engine named it")
     }
 

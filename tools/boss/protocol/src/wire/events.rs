@@ -61,7 +61,7 @@ pub enum FrontendEvent {
     /// informational: it never carries board state and is never a reply, so
     /// a consumer must not treat it as the snapshot arriving.
     ///
-    /// `stage` names the finished stage on [`BoardPopulationPhase::Stage`]
+    /// `stage` names the current stage on [`BoardPopulationPhase::Stage`]
     /// events (a `population_timing` segment such as `db.tasks`); `items`
     /// and `bytes` are set once known (items from the task/chore query on,
     /// bytes on [`BoardPopulationPhase::Done`]).

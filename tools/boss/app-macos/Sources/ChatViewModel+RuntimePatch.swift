@@ -127,6 +127,9 @@ extension ChatViewModel {
         for (productID, var fence) in boardReadFences {
             if fence.trees.removeValue(forKey: requestID) != nil {
                 fence.needsTreeSince = .now
+                if fence.trees.isEmpty {
+                    updateBoardLoad { $0.noteReadFailed(productID) }
+                }
             }
             let patchFailed = fence.patchRequestID == requestID
             if patchFailed {

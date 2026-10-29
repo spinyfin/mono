@@ -1154,10 +1154,12 @@ impl WorkDb {
     ) -> Result<WorkTree> {
         let runtime_cache = caches.map(|caches| &caches.runtimes);
         let review_cache = caches.map(|caches| &caches.reviews);
+        trace.enter_stage(segment::DB_PRODUCT);
         let t = Instant::now();
         let product = query_product(conn, product_id).require("product", product_id)?;
         trace.record_query(segment::DB_PRODUCT, elapsed_ms(t), 1);
 
+        trace.enter_stage(segment::DB_PROJECTS);
         let t = Instant::now();
         let projects = {
             let mut stmt = conn.prepare(
@@ -1172,6 +1174,7 @@ impl WorkDb {
         };
         trace.record_query(segment::DB_PROJECTS, elapsed_ms(t), projects.len());
 
+        trace.enter_stage(segment::DB_TASKS);
         let t = Instant::now();
         let tasks = {
             // The tasks lane holds every project-member kind plus chores and
@@ -1184,6 +1187,7 @@ impl WorkDb {
         };
         trace.record_query(segment::DB_TASKS, elapsed_ms(t), tasks.len());
 
+        trace.enter_stage(segment::DB_CHORES);
         let t = Instant::now();
         let mut chores = {
             // `project_id IS NULL` keeps project members out of the backlog.
@@ -1205,6 +1209,7 @@ impl WorkDb {
         // 1-4 point queries (on the cached path, only for misses).
         // `runtime_queries` is the aggregate statement count, which makes the
         // per-row fan-out visible in the log.
+        trace.enter_stage(segment::DB_TASK_RUNTIMES);
         let t = Instant::now();
         let (task_runtimes, runtime_queries) = match runtime_cache {
             Some(cache) => collect_task_runtimes_cached(conn, product_id, &tasks, &chores, cache, now, validity)?,
@@ -1217,6 +1222,7 @@ impl WorkDb {
             runtime_queries,
         );
 
+        trace.enter_stage(segment::DB_DEPENDENCIES);
         let t = Instant::now();
         let dependencies = collect_product_dependencies(conn, product_id)?;
         trace.record_query(segment::DB_DEPENDENCIES, elapsed_ms(t), dependencies.len());

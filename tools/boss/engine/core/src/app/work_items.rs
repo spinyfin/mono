@@ -1405,7 +1405,8 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
     trace.record_plain(crate::population_timing::segment::DECODE, decode_ms);
     // A cold build reports its stages on the product's work topic as it runs;
     // a warm refresh never starts one, so the sink then sees nothing.
-    trace.set_progress_sink(super::board_progress::topic_progress_sink(&server_state, &product_id));
+    let (progress_sink, flush_progress) = super::board_progress::topic_progress_sink(&server_state, &product_id);
+    trace.set_progress_sink(progress_sink);
 
     sink.board_reads
         .lock()
@@ -1423,6 +1424,7 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
         crate::population_timing::segment::SHARED_LOAD_WAIT,
         crate::population_timing::elapsed_ms(started),
     );
+    flush_progress.await;
     let result = loaded.and_then(|loaded| {
         loaded
             .value
