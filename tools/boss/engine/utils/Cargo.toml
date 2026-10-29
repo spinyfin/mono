@@ -6,6 +6,7 @@ workspace = "../../../.."
 
 [dependencies]
 fastrand = { workspace = true }
+workspace-procs = { path = "../../../../lib/rust/workspace_procs" }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
 libc = { workspace = true }

@@ -5,17 +5,15 @@
 //! recycled pid is never mistaken for the process that was recorded), the
 //! working directory (the ownership signal that survives re-parenting to
 //! launchd), the argument vector (to recognise a Bazel server) and whether
-//! the process has a controlling terminal (to tell an interactive human
-//! shell from a detached tool subprocess).
+//! the process has a controlling terminal. Terminal attachment does not exempt
+//! workspace occupants from cleanup.
 //!
-//! The [`ProcessTable`] trait is the seam between the scan and the OS:
-//! production uses [`SystemProcessTable`]; consumers' unit tests use
-//! [`StaticProcessTable`] to fabricate a tree and record the signals the
-//! reap would have sent.
+//! The [`WorkspaceProcessTable`] trait is the seam between the scan and the OS:
+//! production uses [`SystemWorkspaceProcessTable`]; consumers' unit tests use
+//! a fabricated tree to record the signals the reap would have sent.
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One live process.
@@ -85,7 +83,7 @@ impl Signal {
 
 /// Source of live process state. A seam so the scan and the reap ladder are
 /// testable against a fabricated process tree without signalling anything.
-pub trait ProcessTable: Send + Sync {
+pub trait WorkspaceProcessTable: Send + Sync {
     /// Every process the caller may inspect.
     fn list(&self) -> io::Result<Vec<LiveProcess>>;
 
@@ -110,9 +108,9 @@ pub trait ProcessTable: Send + Sync {
 
 /// The real process table.
 #[derive(Default)]
-pub struct SystemProcessTable;
+pub struct SystemWorkspaceProcessTable;
 
-impl ProcessTable for SystemProcessTable {
+impl WorkspaceProcessTable for SystemWorkspaceProcessTable {
     fn list(&self) -> io::Result<Vec<LiveProcess>> {
         sys::list()
     }
@@ -143,327 +141,29 @@ impl ProcessTable for SystemProcessTable {
     }
 }
 
-/// An in-memory process table for tests: a fixed set of processes, plus a
-/// log of every signal sent. A `Kill` removes the process from the table so
-/// a following scan sees it gone; a `Term` does too unless the pid is in
-/// `ignores_term`, which models a process that shrugs off SIGTERM. An
-/// `immortal` pid survives both, modelling one the caller cannot kill.
-pub struct StaticProcessTable {
-    inner: Mutex<StaticInner>,
-    own_pid: i32,
-    now_micros: u64,
-}
-
-struct StaticInner {
-    processes: Vec<LiveProcess>,
-    ignores_term: Vec<i32>,
-    immortal: Vec<i32>,
-    signals: Vec<(i32, Signal)>,
-}
-
-impl StaticProcessTable {
-    pub fn new(processes: Vec<LiveProcess>, own_pid: i32) -> Self {
-        Self {
-            inner: Mutex::new(StaticInner {
-                processes,
-                ignores_term: Vec::new(),
-                immortal: Vec::new(),
-                signals: Vec::new(),
-            }),
-            own_pid,
-            now_micros: 1_000_000_000_000_000,
-        }
-    }
-
-    /// Make `pid` survive SIGTERM (it only disappears on SIGKILL).
-    pub fn ignore_term(&self, pid: i32) {
-        self.inner.lock().unwrap().ignores_term.push(pid);
-    }
-
-    /// Make `pid` survive every signal: the signal is recorded as delivered
-    /// but the process stays.
-    pub fn immortal(&self, pid: i32) {
-        self.inner.lock().unwrap().immortal.push(pid);
-    }
-
-    /// Every `(pid, signal)` delivered so far, in order.
-    pub fn signals(&self) -> Vec<(i32, Signal)> {
-        self.inner.lock().unwrap().signals.clone()
-    }
-
-    pub fn is_alive(&self, pid: i32) -> bool {
-        self.inner.lock().unwrap().processes.iter().any(|p| p.pid == pid)
-    }
-}
-
-impl ProcessTable for StaticProcessTable {
-    fn list(&self) -> io::Result<Vec<LiveProcess>> {
-        Ok(self.inner.lock().unwrap().processes.clone())
-    }
-
-    fn snapshot(&self, pid: i32) -> io::Result<LiveProcess> {
-        self.inner
-            .lock()
-            .unwrap()
-            .processes
-            .iter()
-            .find(|p| p.pid == pid)
-            .cloned()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no process {pid}")))
-    }
-
-    fn signal(&self, pid: i32, signal: Signal) -> io::Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-        if !inner.processes.iter().any(|p| p.pid == pid) {
-            return Err(io::Error::new(io::ErrorKind::NotFound, format!("no process {pid}")));
-        }
-        inner.signals.push((pid, signal));
-        let dies = !inner.immortal.contains(&pid)
-            && match signal {
-                Signal::Kill => true,
-                Signal::Term => !inner.ignores_term.contains(&pid),
-            };
-        if dies {
-            inner.processes.retain(|p| p.pid != pid);
-        }
-        Ok(())
-    }
-
-    fn own_pid(&self) -> i32 {
-        self.own_pid
-    }
-
-    fn now_micros(&self) -> u64 {
-        self.now_micros
-    }
-}
-
-/// A convenient fabricated process for tests.
-pub fn fake_process(pid: i32, ppid: i32, command: &str, cwd: Option<&str>) -> LiveProcess {
-    LiveProcess {
-        pid,
-        ppid,
-        pgid: pid,
-        start_micros: 999_000_000_000_000,
-        command: command.to_owned(),
-        argv: vec![command.to_owned()],
-        cwd: cwd.map(PathBuf::from),
-        has_controlling_terminal: false,
-    }
-}
-
 #[cfg(target_os = "macos")]
 mod sys {
-    //! Darwin: `libproc` for the pid list, `proc_bsdinfo` and the vnode
-    //! path info (working directory); `sysctl(KERN_PROCARGS2)` for argv.
-
-    use std::io;
-    use std::os::raw::c_void;
-    use std::path::PathBuf;
-
     use super::LiveProcess;
-
-    const PROC_ALL_PIDS: u32 = 1;
-    const PROC_PIDTBSDINFO: libc::c_int = 3;
-    const PROC_PIDVNODEPATHINFO: libc::c_int = 9;
-    /// `NODEV`: the value `proc_bsdinfo.e_tdev` carries for a process
-    /// without a controlling terminal.
-    const NODEV: u32 = u32::MAX;
-
-    /// `sizeof(struct proc_bsdinfo)`.
-    const BSDINFO_SIZE: usize = 136;
-    const BSDINFO_PPID: usize = 16;
-    const BSDINFO_NAME: usize = 64;
-    const BSDINFO_NAME_LEN: usize = 32;
-    const BSDINFO_COMM: usize = 48;
-    const BSDINFO_COMM_LEN: usize = 16;
-    const BSDINFO_PGID: usize = 100;
-    const BSDINFO_TDEV: usize = 108;
-    const BSDINFO_START_SEC: usize = 120;
-    const BSDINFO_START_USEC: usize = 128;
-
-    /// `sizeof(struct proc_vnodepathinfo)`: two `vnode_info_path`, each a
-    /// 152-byte `vnode_info` followed by a `MAXPATHLEN` (1024) path. The
-    /// current directory is the first; its path starts after its
-    /// `vnode_info`.
-    const VNODEPATHINFO_SIZE: usize = 2 * (152 + 1024);
-    const VNODEPATHINFO_CDIR_PATH: usize = 152;
-    const MAXPATHLEN: usize = 1024;
-
-    unsafe extern "C" {
-        fn proc_listpids(kind: u32, typeinfo: u32, buffer: *mut c_void, buffersize: libc::c_int) -> libc::c_int;
-        fn proc_pidinfo(
-            pid: libc::c_int,
-            flavor: libc::c_int,
-            arg: u64,
-            buffer: *mut c_void,
-            buffersize: libc::c_int,
-        ) -> libc::c_int;
-    }
-
+    use std::io;
     pub(super) fn list() -> io::Result<Vec<LiveProcess>> {
-        // SAFETY: a null buffer asks for the byte count needed.
-        let needed = unsafe { proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
-        if needed <= 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // Headroom for processes created between the two calls.
-        let capacity = (needed as usize / std::mem::size_of::<libc::pid_t>()) + 64;
-        let mut pids = vec![0 as libc::pid_t; capacity];
-        let bytes = (capacity * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
-        // SAFETY: `pids` holds exactly `bytes` bytes.
-        let filled = unsafe { proc_listpids(PROC_ALL_PIDS, 0, pids.as_mut_ptr() as *mut c_void, bytes) };
-        if filled <= 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let count = filled as usize / std::mem::size_of::<libc::pid_t>();
-        let mut out = Vec::with_capacity(count);
-        for &pid in pids.iter().take(count) {
-            if pid <= 0 {
-                continue;
-            }
-            // A process that exited between listing and inspection, or one
-            // we may not inspect, is simply absent from the result.
-            if let Ok(process) = snapshot(pid) {
-                out.push(process);
-            }
-        }
-        Ok(out)
+        // SAFETY: geteuid has no preconditions.
+        Ok(crate::darwin::list_pids_for_uid(unsafe { libc::geteuid() })?
+            .into_iter()
+            .filter_map(|pid| snapshot(pid).ok())
+            .collect())
     }
-
     pub(super) fn snapshot(pid: i32) -> io::Result<LiveProcess> {
-        let mut info = [0u8; BSDINFO_SIZE];
-        // SAFETY: `info` is exactly `BSDINFO_SIZE` bytes.
-        let n = unsafe {
-            proc_pidinfo(
-                pid,
-                PROC_PIDTBSDINFO,
-                0,
-                info.as_mut_ptr() as *mut c_void,
-                BSDINFO_SIZE as libc::c_int,
-            )
-        };
-        if n <= 0 {
-            let err = io::Error::last_os_error();
-            return Err(if err.raw_os_error() == Some(libc::ESRCH) {
-                io::Error::new(io::ErrorKind::NotFound, format!("no process {pid}"))
-            } else {
-                err
-            });
-        }
-        if n as usize != BSDINFO_SIZE {
-            return Err(io::Error::other(format!(
-                "proc_pidinfo returned {n} bytes for pid {pid}; expected {BSDINFO_SIZE}"
-            )));
-        }
-        let u32_at = |off: usize| u32::from_ne_bytes(info[off..off + 4].try_into().unwrap());
-        let u64_at = |off: usize| u64::from_ne_bytes(info[off..off + 8].try_into().unwrap());
-        let name = c_name(&info[BSDINFO_NAME..BSDINFO_NAME + BSDINFO_NAME_LEN])
-            .filter(|n| !n.is_empty())
-            .or_else(|| c_name(&info[BSDINFO_COMM..BSDINFO_COMM + BSDINFO_COMM_LEN]))
-            .unwrap_or_default();
-        let start_micros = u64_at(BSDINFO_START_SEC)
-            .saturating_mul(1_000_000)
-            .saturating_add(u64_at(BSDINFO_START_USEC));
+        let info = crate::darwin::proc_bsd_info(pid)?;
         Ok(LiveProcess {
             pid,
-            ppid: u32_at(BSDINFO_PPID) as i32,
-            pgid: u32_at(BSDINFO_PGID) as i32,
-            start_micros,
-            command: name,
-            argv: argv(pid).unwrap_or_default(),
-            cwd: cwd(pid),
-            has_controlling_terminal: u32_at(BSDINFO_TDEV) != NODEV,
+            ppid: info.ppid,
+            pgid: info.pgid,
+            start_micros: info.start_micros,
+            command: info.command,
+            argv: crate::process_args::arguments(pid as u32).unwrap_or_default(),
+            cwd: crate::darwin::proc_cwd(pid).ok(),
+            has_controlling_terminal: info.terminal_device != u32::MAX,
         })
-    }
-
-    fn cwd(pid: i32) -> Option<PathBuf> {
-        let mut buf = vec![0u8; VNODEPATHINFO_SIZE];
-        // SAFETY: `buf` is exactly `VNODEPATHINFO_SIZE` bytes.
-        let n = unsafe {
-            proc_pidinfo(
-                pid,
-                PROC_PIDVNODEPATHINFO,
-                0,
-                buf.as_mut_ptr() as *mut c_void,
-                VNODEPATHINFO_SIZE as libc::c_int,
-            )
-        };
-        if n <= 0 {
-            return None;
-        }
-        let path = c_name(&buf[VNODEPATHINFO_CDIR_PATH..VNODEPATHINFO_CDIR_PATH + MAXPATHLEN])?;
-        if path.is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(path))
-        }
-    }
-
-    /// `sysctl(KERN_PROCARGS2)`: a 32-bit argc, the executable path, NUL
-    /// padding, then `argc` NUL-terminated strings.
-    fn argv(pid: i32) -> Option<Vec<String>> {
-        let mut argmax: libc::c_int = 0;
-        let mut argmax_len = std::mem::size_of::<libc::c_int>();
-        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
-        // SAFETY: `argmax` is a valid out-parameter of the declared length.
-        let rc = unsafe {
-            libc::sysctl(
-                mib.as_mut_ptr(),
-                mib.len() as u32,
-                &mut argmax as *mut _ as *mut c_void,
-                &mut argmax_len,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if rc != 0 || argmax <= 0 {
-            return None;
-        }
-        let mut buf = vec![0u8; argmax as usize];
-        let mut len = buf.len();
-        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
-        // SAFETY: `buf` has `len` bytes available.
-        let rc = unsafe {
-            libc::sysctl(
-                mib.as_mut_ptr(),
-                mib.len() as u32,
-                buf.as_mut_ptr() as *mut c_void,
-                &mut len,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if rc != 0 || len < 4 {
-            return None;
-        }
-        buf.truncate(len);
-        let argc = i32::from_ne_bytes(buf[0..4].try_into().ok()?).max(0) as usize;
-        let mut cursor = 4;
-        // Skip the executable path.
-        while cursor < buf.len() && buf[cursor] != 0 {
-            cursor += 1;
-        }
-        // Skip the NUL padding between the path and argv[0].
-        while cursor < buf.len() && buf[cursor] == 0 {
-            cursor += 1;
-        }
-        let mut args = Vec::with_capacity(argc);
-        while args.len() < argc && cursor < buf.len() {
-            let end = buf[cursor..]
-                .iter()
-                .position(|b| *b == 0)
-                .map(|p| cursor + p)
-                .unwrap_or(buf.len());
-            args.push(String::from_utf8_lossy(&buf[cursor..end]).into_owned());
-            cursor = end + 1;
-        }
-        Some(args)
-    }
-
-    fn c_name(raw: &[u8]) -> Option<String> {
-        let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
-        std::str::from_utf8(&raw[..end]).ok().map(str::to_owned)
     }
 }
 
@@ -473,7 +173,7 @@ mod sys {
 
     use std::io;
 
-    use super::LiveProcess;
+    use super::{LinuxIdentity, LiveProcess};
 
     pub(super) fn list() -> io::Result<Vec<LiveProcess>> {
         let mut out = Vec::new();
@@ -490,6 +190,27 @@ mod sys {
     }
 
     pub(super) fn snapshot(pid: i32) -> io::Result<LiveProcess> {
+        let LinuxIdentity {
+            ppid,
+            pgid,
+            tty_nr,
+            start_ticks,
+            command,
+        } = linux_identity(pid)?;
+        let argv = crate::process_args::arguments(pid as u32).unwrap_or_default();
+        Ok(LiveProcess {
+            pid,
+            ppid,
+            pgid,
+            start_micros: boot_micros().saturating_add(start_ticks.saturating_mul(1_000_000) / clock_ticks()),
+            command,
+            argv,
+            cwd: std::fs::read_link(format!("/proc/{pid}/cwd")).ok(),
+            has_controlling_terminal: tty_nr != 0,
+        })
+    }
+
+    pub fn linux_identity(pid: i32) -> io::Result<LinuxIdentity> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
         let invalid = |what: &str| io::Error::new(io::ErrorKind::InvalidData, format!("/proc/{pid}/stat: {what}"));
         let (head, tail) = stat
@@ -508,24 +229,12 @@ mod sys {
         let pgid = field(2)?.parse::<i32>().map_err(|_| invalid("pgrp"))?;
         let tty_nr = field(4)?.parse::<i64>().map_err(|_| invalid("tty_nr"))?;
         let start_ticks = field(19)?.parse::<u64>().map_err(|_| invalid("starttime"))?;
-        let argv = std::fs::read(format!("/proc/{pid}/cmdline"))
-            .map(|bytes| {
-                bytes
-                    .split(|b| *b == 0)
-                    .filter(|part| !part.is_empty())
-                    .map(|part| String::from_utf8_lossy(part).into_owned())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        Ok(LiveProcess {
-            pid,
+        Ok(LinuxIdentity {
             ppid,
             pgid,
-            start_micros: boot_micros().saturating_add(start_ticks.saturating_mul(1_000_000) / clock_ticks()),
+            tty_nr,
+            start_ticks,
             command,
-            argv,
-            cwd: std::fs::read_link(format!("/proc/{pid}/cwd")).ok(),
-            has_controlling_terminal: tty_nr != 0,
         })
     }
 
@@ -552,7 +261,7 @@ mod sys {
 mod sys {
     use std::io;
 
-    use super::LiveProcess;
+    use super::{LinuxIdentity, LiveProcess};
 
     pub(super) fn list() -> io::Result<Vec<LiveProcess>> {
         Err(io::Error::new(
@@ -572,10 +281,11 @@ mod sys {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{StaticProcessTable, fake_process};
 
     #[test]
     fn self_snapshot_reports_identity_and_working_directory() {
-        let table = SystemProcessTable;
+        let table = SystemWorkspaceProcessTable;
         let me = table.snapshot(table.own_pid()).unwrap();
         assert_eq!(me.pid, std::process::id() as i32);
         assert!(me.ppid > 0);
@@ -591,7 +301,7 @@ mod tests {
 
     #[test]
     fn self_start_time_is_in_the_past_on_the_table_clock() {
-        let table = SystemProcessTable;
+        let table = SystemWorkspaceProcessTable;
         let me = table.snapshot(table.own_pid()).unwrap();
         let now = table.now_micros();
         assert!(me.start_micros <= now, "start {} after now {now}", me.start_micros);
@@ -601,7 +311,7 @@ mod tests {
 
     #[test]
     fn list_includes_self() {
-        let table = SystemProcessTable;
+        let table = SystemWorkspaceProcessTable;
         let all = table.list().unwrap();
         assert!(all.iter().any(|p| p.pid == table.own_pid()));
     }
@@ -609,7 +319,7 @@ mod tests {
     #[test]
     fn missing_pid_is_not_found() {
         // Far past any plausible pid on either platform.
-        let err = SystemProcessTable.snapshot(99_999_999 - 1).unwrap_err();
+        let err = SystemWorkspaceProcessTable.snapshot(99_999_999 - 1).unwrap_err();
         assert!(
             matches!(err.kind(), io::ErrorKind::NotFound | io::ErrorKind::InvalidInput),
             "{err:?}"
@@ -654,3 +364,15 @@ mod tests {
         assert_eq!(table.signals(), vec![(12, Signal::Term), (12, Signal::Kill)]);
     }
 }
+
+/// Linux stat identity, with start time in kernel clock ticks.
+#[cfg(target_os = "linux")]
+pub struct LinuxIdentity {
+    pub ppid: i32,
+    pub pgid: i32,
+    pub tty_nr: i64,
+    pub start_ticks: u64,
+    pub command: String,
+}
+#[cfg(target_os = "linux")]
+pub use sys::linux_identity;

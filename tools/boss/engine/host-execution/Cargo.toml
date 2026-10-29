@@ -17,6 +17,7 @@ boss-protocol-spoke = { path = "../../protocol-spoke" }
 boss-tmux = { path = "../../tmux" }
 libc = { workspace = true }
 git-utils = { path = "../../../../lib/rust/git_utils" }
+workspace-procs = { path = "../../../../lib/rust/workspace_procs" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "time"] }
