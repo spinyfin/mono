@@ -179,6 +179,13 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     ),
     // ── Cleared by work resuming ────────────────────────────────────────
     entry(
+        crate::conflict_ladder::LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "Claims that mechanical lockfile regeneration could not run. The producer lowers it when a \
+         mechanical retry succeeds, when the conflict is cleared, or when a new attempt is re-armed \
+         — none of those start a run on the parent PR task.",
+    ),
+    entry(
         crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND,
         ClearedBy::WorkResumed,
         "The guard's whole claim is 'we stopped auto-redispatching this item'. A run starting is \
@@ -695,6 +702,7 @@ mod tests {
         let declared: &[&str] = &[
             crate::pool_claim_sweep::TEARDOWN_ATTENTION_KIND,
             crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND,
+            crate::conflict_ladder::LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND,
             crate::work::DISPATCH_STAGE_STALLED_ATTENTION_KIND,
             crate::work::ATTENTION_KIND_RECOVERY_PERMANENT,
             crate::work::ATTENTION_KIND_RECOVERY_EXHAUSTED,

@@ -4,7 +4,7 @@ use super::*;
 /// mechanical rebase) and rung 0 (deterministic resolvers,
 /// `crate::conflict_ladder::attempt_rung0`, live by default as of
 /// `RUNG0_APPLY_LIVE`) are both live on the `conflict_watch` path when the
-/// `conflict_ladder_mechanical_rebase` feature flag is enabled; rung 2 (the
+/// `conflict_ladder_mechanical_rebase` feature flag is enabled (its default); rung 2 (the
 /// small pre-staged agent) is also live, bounded to a single residual file
 /// (the single-residual-file bound for rung 2 is specified in
 /// `merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`).
@@ -12,6 +12,10 @@ use super::*;
 /// ladder itself is disabled — still falls through to a full worker doing
 /// the whole job by hand.
 const RUNG_FULL_WORKER: i64 = 3;
+
+/// How long a conflict revision that has no execution yet still counts as
+/// queued for its first dispatch.
+const UNDISPATCHED_REVISION_GRACE_SECS: i64 = 30 * 60;
 
 /// One candidate row read by
 /// [`WorkDb::reconcile_orphaned_conflict_ladder_attempts`]:
@@ -67,6 +71,86 @@ impl WorkDb {
         Ok(count > 0)
     }
 
+    /// A revision that is genuinely running or queued owns resolution for its
+    /// PR even if its attempt ended, whatever its task status (a `blocked`
+    /// task can still own a running execution). A revision whose executions
+    /// have all finished does not: counting it would suppress conflict
+    /// handling for the PR indefinitely.
+    pub fn has_live_conflict_revision_for_pr(&self, pr_url: &str) -> Result<bool> {
+        let revisions: Vec<String> = {
+            let conn = self.connect()?;
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT revision_task_id FROM conflict_resolutions
+                 WHERE pr_url = ?1 AND revision_task_id IS NOT NULL",
+            )?;
+            stmt.query_map(params![pr_url], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for revision in revisions {
+            if self.is_conflict_revision_running_or_queued(&revision)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Is this conflict-resolution revision genuinely being, or about to be,
+    /// worked? Checked in order:
+    ///   1. The task row must exist and not be soft-deleted.
+    ///   2. An execution a worker has started (claimed, running, waiting on
+    ///      a human, review or merge) means a worker may be writing to the PR
+    ///      branch, so the revision is live whatever the task `status` says
+    ///      (a `blocked` task can still own a running execution).
+    ///   3. For a `todo`/`active` task, a still-queued execution (queued,
+    ///      ready, waiting on a dependency) is live too, as is a task that has
+    ///      never been dispatched and was created within a short grace
+    ///      window. A queued execution behind a `blocked` task is not: no
+    ///      worker will be dispatched for it. A task whose executions are all
+    ///      terminal is dead: the task `status` survives a worker death or
+    ///      engine restart, so it is not trusted on its own.
+    pub(crate) fn is_conflict_revision_running_or_queued(&self, revision_task_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT status, created_at FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+                params![revision_task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((status, created_at)) = row else {
+            return Ok(false);
+        };
+        let (started, queued, any): (bool, bool, bool) = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_executions
+                            WHERE work_item_id = ?1
+                              AND status NOT IN ('queued', 'ready', 'waiting_dependency',
+                                                 'completed', 'failed', 'abandoned', 'cancelled', 'orphaned')),
+                    EXISTS(SELECT 1 FROM work_executions
+                            WHERE work_item_id = ?1
+                              AND status IN ('queued', 'ready', 'waiting_dependency')),
+                    EXISTS(SELECT 1 FROM work_executions WHERE work_item_id = ?1)",
+            params![revision_task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if started {
+            return Ok(true);
+        }
+        if !matches!(status.as_str(), "todo" | "active") {
+            return Ok(false);
+        }
+        if queued {
+            return Ok(true);
+        }
+        if any {
+            return Ok(false);
+        }
+        // Never dispatched: queued for its first dispatch, but only for a
+        // grace window so an undispatchable revision cannot wedge the PR.
+        let created: i64 = created_at.parse().unwrap_or(0);
+        let now: i64 = now_string().parse().unwrap_or(0);
+        Ok(now - created <= UNDISPATCHED_REVISION_GRACE_SECS)
+    }
+
     /// Insert a `conflict_resolutions` row with `status='pending'`
     /// alongside a `tasks.blocked_attempt_id` pointer to the new
     /// attempt id. `(work_item_id, base_sha_at_trigger, head_sha_before)`
@@ -77,7 +161,7 @@ impl WorkDb {
     /// GitHub's PR `baseRefOid`, which is fixed at PR-open time and does
     /// not track `main` moving under an in-review PR — keying on it alone
     /// would make every re-arm past a stale `succeeded` attempt collide
-    /// forever (T2396 / PR #1874).
+    /// forever (PR #1874).
     ///
     /// Phase 3 of the merge-conflict design (Q4). The caller is
     /// `conflict_watch::on_conflict_detected` after the parent
@@ -107,7 +191,7 @@ impl WorkDb {
         let cutoff_secs = now_secs - CHURN_GUARD_WINDOW_SECS;
         // Excludes `event_source = 'speculative_predicted'` rows: those are
         // telemetry-only observations from the Layer 4 speculative-rebase
-        // sweep (T10), never a live resolution attempt, and must not eat
+        // sweep, never a live resolution attempt, and must not eat
         // into the churn budget that gates *real* conflict-resolution
         // cycles. Without this exclusion a burst of speculative predictions
         // for one work item could pre-abandon its next genuine attempt.
@@ -184,8 +268,10 @@ impl WorkDb {
     /// regardless of status. Used by the stale-base re-arm path in
     /// `conflict_watch::on_conflict_detected` to check whether the
     /// previous attempt ended in `succeeded` (eligible for re-arm when
-    /// the PR is still CONFLICTING) vs `failed`/`abandoned` (not eligible
-    /// — the churn guard or human owns the retry decision in that case).
+    /// the PR is still CONFLICTING), `failed` with
+    /// `lockfile_regeneration_failed` (eligible once the PR head
+    /// moves), or another terminal status (the churn guard or a
+    /// human owns the retry).
     ///
     /// Returns `None` when no attempt has ever been recorded for this
     /// work item.
@@ -370,7 +456,7 @@ impl WorkDb {
     /// rungs 0–3). Identical to [`Self::mark_conflict_resolution_succeeded`]
     /// but records `resolved_by_rung = rung` for a resolution the engine
     /// produced without the full-worker path — the rung-1 engine-direct
-    /// mechanical rebase (T4) passes `1`, deterministic resolvers (rung 0)
+    /// mechanical rebase passes `1`, deterministic resolvers (rung 0)
     /// pass `0`. `resolved_by_rung` is `COALESCE`d so a rung already stamped
     /// on the row (e.g. by the harness before the poller's retire) wins over
     /// a later default.
@@ -750,7 +836,7 @@ impl WorkDb {
     }
 
     /// Aggregate `conflict_resolutions.conflict_diagnosis` for one
-    /// product into a hotspot report (Layer 0 telemetry, T5): per-file
+    /// product into a hotspot report (Layer 0 telemetry): per-file
     /// conflict frequency, per-file-_pair_ co-conflict frequency, and
     /// per-class counts. Backs `boss engine conflicts hotspots`.
     ///
@@ -902,6 +988,11 @@ impl WorkDb {
                 AND deleted_at IS NULL",
             params![reset.work_item_id, reset.id, now],
         )?;
+        super::dispatch_helpers::resolve_attention_kind_in_tx(
+            &tx,
+            &reset.work_item_id,
+            crate::work::LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND,
+        )?;
         tx.commit()?;
         Ok(Some(reset))
     }
@@ -909,7 +1000,7 @@ impl WorkDb {
     /// Record a producer-side conflict event: a normal worker's own
     /// `cube workspace rebase` reported `REBASED_WITH_CONFLICTS`
     /// mid-task and it resolved the conflict inline, without ever
-    /// going through `conflict_watch` (Layer 0 / T1 of
+    /// going through `conflict_watch` (Layer 0 of
     /// `merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`
     /// — previously the largest source of telemetry undercount).
     /// `product_id`, `work_item_id`, and any already-open PR are
@@ -995,7 +1086,7 @@ impl WorkDb {
     }
 
     /// Record a speculative-conflict-prediction event: the merge poller's
-    /// Layer 4 sweep (T10) ran a throwaway, no-push engine-direct rebase of
+    /// Layer 4 sweep ran a throwaway, no-push engine-direct rebase of
     /// an in-review PR against current `main` and it came back conflicted.
     /// This is purely a telemetry observation — it never touches the parent
     /// task's status, never gates the escalation ladder, and is inserted

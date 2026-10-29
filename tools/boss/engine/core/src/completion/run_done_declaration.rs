@@ -115,6 +115,10 @@ pub(super) enum DeclaredPrResolution {
     /// branch. `detail` names the branch, what the detector saw and which
     /// staged URLs were rejected; it becomes the row's visible failure.
     NoneFound { detail: String },
+    /// The bound PR is closed without merging. A conflict-resolution
+    /// revision treats this as moot (same as merged); other executions
+    /// fail as if no PR could be bound.
+    ClosedUnmerged { pr_url: String },
     /// GitHub could not be consulted (error or budget exhausted). Nothing is
     /// bound; the Stop boundary / merge-poller recheck retry with the
     /// declaration still stamped.
@@ -347,9 +351,7 @@ impl WorkerCompletionHandler {
         match tokio::time::timeout(DECLARED_DELIVERY_NETWORK_BUDGET, check).await {
             Ok(Ok(Ok(crate::work::PrOpenState::Open))) => DeclaredPrResolution::Bound { pr_url, merged: false },
             Ok(Ok(Ok(crate::work::PrOpenState::Merged))) => DeclaredPrResolution::Bound { pr_url, merged: true },
-            Ok(Ok(Ok(crate::work::PrOpenState::ClosedUnmerged))) => DeclaredPrResolution::NoneFound {
-                detail: format!("PR {pr_url} is closed without merging"),
-            },
+            Ok(Ok(Ok(crate::work::PrOpenState::ClosedUnmerged))) => DeclaredPrResolution::ClosedUnmerged { pr_url },
             result => DeclaredPrResolution::Transient {
                 detail: format!("could not determine state of PR {pr_url}: {result:?}"),
             },
@@ -362,7 +364,8 @@ impl WorkerCompletionHandler {
     ///
     /// Mirrors [`Self::finalize_pr_transition`]'s termination write and
     /// teardown exactly. The only inline network calls are the bounded
-    /// branch check and branch-keyed detection the resolver performs — see
+    /// branch check, branch-keyed detection, and conflict-resolution mergeability
+    /// verification — see
     /// the module doc. Every other network-touching step that function
     /// layers on top (reviewer-batch enqueue, doc-link detection) runs in
     /// [`Self::spawn_declared_delivery_post_effects`], the same best-effort,
@@ -373,6 +376,18 @@ impl WorkerCompletionHandler {
     pub(super) async fn finalize_declared_delivery(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
         let (pr_url, merged) = match self.resolve_declared_pr_url(execution).await {
             DeclaredPrResolution::Bound { pr_url, merged } => (pr_url, merged),
+            DeclaredPrResolution::ClosedUnmerged { pr_url } => {
+                if self.is_merge_conflict_revision(execution) {
+                    (pr_url, true)
+                } else {
+                    return self
+                        .finalize_declared_delivery_without_pr(
+                            execution,
+                            &format!("PR {pr_url} is closed without merging"),
+                        )
+                        .await;
+                }
+            }
             DeclaredPrResolution::NoneFound { detail } => {
                 return self.finalize_declared_delivery_without_pr(execution, &detail).await;
             }
@@ -393,6 +408,15 @@ impl WorkerCompletionHandler {
             return self
                 .refuse_foreign_pr_binding(execution, &pr_url, &conflict, "run_done")
                 .await;
+        }
+
+        let mut merged = merged;
+        if !merged {
+            match self.conflict_delivery_decision(execution, Some(&pr_url)).await {
+                ConflictDeliveryDecision::Failed(outcome) => return outcome,
+                ConflictDeliveryDecision::Moot => merged = true,
+                ConflictDeliveryDecision::Proceed => {}
+            }
         }
 
         // Captured before `record_worker_pr_completion` nulls

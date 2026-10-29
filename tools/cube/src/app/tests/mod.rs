@@ -18,6 +18,7 @@ mod pr_bookmarks_tests;
 mod pr_push_tests;
 mod pr_rebase_tests;
 mod pr_tests;
+mod push_collapse_tests;
 mod push_tests;
 mod quarantine_tests;
 mod rebase_tests;

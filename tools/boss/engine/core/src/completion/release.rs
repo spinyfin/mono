@@ -450,7 +450,7 @@ impl WorkerCompletionHandler {
                     format!("conflict_mergeable_unknown:{bound_pr_url}"),
                 ))
             }
-            ConflictClearance::Cleared | ConflictClearance::Unavailable => None,
+            ConflictClearance::Cleared | ConflictClearance::NotOpen | ConflictClearance::Unavailable => None,
         }
     }
 }

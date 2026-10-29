@@ -142,6 +142,13 @@ impl WorkerCompletionHandler {
                 return StopOutcome::DbError;
             }
         };
+        if self.is_merge_conflict_revision(execution) {
+            let pr_url = self.resolve_bound_pr_url(execution);
+            match self.conflict_delivery_decision(execution, pr_url.as_deref()).await {
+                ConflictDeliveryDecision::Failed(outcome) => return outcome,
+                ConflictDeliveryDecision::Moot | ConflictDeliveryDecision::Proceed => {}
+            }
+        }
         // Captured before `record_worker_no_op_completion` below nulls
         // `workspace_path` in the same transaction that terminalizes the
         // execution — this path terminalizes a parked-live execution, so it

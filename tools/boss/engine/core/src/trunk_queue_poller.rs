@@ -1932,7 +1932,9 @@ async fn handle_trunk_queue_eviction(
                             );
                             TrunkEvictionCause::TestFailure
                         }
-                        ConflictClearance::Indeterminate | ConflictClearance::Unavailable => {
+                        ConflictClearance::Indeterminate
+                        | ConflictClearance::NotOpen
+                        | ConflictClearance::Unavailable => {
                             // A read that never resolves is not evidence of
                             // anything — least of all "safe to mint a CI
                             // revision". Leave the intent active and

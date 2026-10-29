@@ -45,6 +45,19 @@ fn workspace_push_happy_path_advances_and_pushes() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
+            &[
+                "log",
+                "-r",
+                "remote_bookmarks()..@",
+                "--no-graph",
+                "-T",
+                CONFLICT_COMMITS_TMPL,
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
             &["bookmark", "set", branch, "-r", "@", "--allow-backwards"],
             "",
         ),
@@ -123,6 +136,19 @@ fn workspace_push_pr_arg_resolves_head_branch_from_github() {
                 "@",
                 "-m",
                 "Resolve merge conflict on PR #9 (boss/exec_pr9)",
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                "remote_bookmarks()..@",
+                "--no-graph",
+                "-T",
+                CONFLICT_COMMITS_TMPL,
             ],
             "",
         ),
@@ -269,6 +295,19 @@ fn workspace_push_describes_an_undescribed_working_copy_before_pushing() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
+            &[
+                "log",
+                "-r",
+                "remote_bookmarks()..@",
+                "--no-graph",
+                "-T",
+                CONFLICT_COMMITS_TMPL,
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
             &["bookmark", "set", branch, "-r", "@", "--allow-backwards"],
             "",
         ),
@@ -331,6 +370,19 @@ fn workspace_push_leaves_an_existing_description_untouched() {
             "jj",
             &["log", "-r", "@", "--no-graph", "-T", "description"],
             "an existing commit message\n",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                "remote_bookmarks()..@",
+                "--no-graph",
+                "-T",
+                CONFLICT_COMMITS_TMPL,
+            ],
+            "",
         ),
         // No `describe` call expected here.
         ExpectedCommand::ok(
@@ -423,6 +475,19 @@ fn workspace_push_failure_surfaces_clear_error() {
             cwd.clone(),
             "jj",
             &["describe", "-r", "@", "-m", "Resolve merge conflict on boss/exec_pf2"],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                "remote_bookmarks()..@",
+                "--no-graph",
+                "-T",
+                CONFLICT_COMMITS_TMPL,
+            ],
             "",
         ),
         ExpectedCommand::ok(

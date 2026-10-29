@@ -1427,10 +1427,10 @@ pub(crate) async fn sweep_one(
                     // known-open; feed that observation to the gate via a
                     // static checker rather than a redundant `gh pr view`.
                     //
-                    // Escalation ladder: enabled only when the
-                    // `conflict_ladder_mechanical_rebase` flag is on. Off (or
-                    // no completion handler) → `Disabled` preserves the
-                    // worker-only path exactly.
+                    // Escalation ladder: enabled while the
+                    // `conflict_ladder_mechanical_rebase` flag is on (its
+                    // default). Set to false (or no completion handler) →
+                    // `Disabled` takes the worker-only path.
                     //
                     // When it IS on, the ladder must never be awaited here.
                     // This function is the detection path: `run_one_pass`

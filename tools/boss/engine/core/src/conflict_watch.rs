@@ -114,9 +114,9 @@ fn auto_pr_maintenance_disabled(work_db: &WorkDb, candidate: &PendingMergeCheck,
 /// first attempts the engine-direct mechanical rebase (rung 1) before spawning
 /// a worker — see [`crate::conflict_ladder`]. A clean rebase resolves and
 /// pushes the PR with no agent; the harness retires the attempt and this
-/// returns early. `None` (the default at call sites, and whenever the
-/// `conflict_ladder_mechanical_rebase` flag is off) preserves the pre-ladder
-/// worker-only path exactly.
+/// returns early. `None` (passed whenever the
+/// `conflict_ladder_mechanical_rebase` flag, enabled by default, has been set
+/// to `false`) takes the worker-only path.
 pub async fn on_conflict_detected(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -609,6 +609,36 @@ pub async fn on_conflict_detected_with(
                                             );
                                         }
                                     }
+                                } else if other == "failed"
+                                    && latest
+                                        .as_ref()
+                                        .and_then(|c| c.failure_reason.as_deref())
+                                        .is_some_and(|reason| reason.starts_with("lockfile_regeneration_failed"))
+                                {
+                                    // Terminal only for this PR head. The probe's
+                                    // base oid mirrors GitHub's `baseRefOid`, which
+                                    // does not track `main` moving, so only a head
+                                    // push (or a manual retry) re-arms the attempt.
+                                    // The failed row is kept.
+                                    let same_head = latest.as_ref().is_some_and(|failed| {
+                                        probe.head_ref_oid.is_some()
+                                            && probe.head_ref_oid.as_deref() == failed.head_sha_before.as_deref()
+                                    });
+                                    if same_head {
+                                        tracing::debug!(
+                                            work_item_id = %candidate.work_item_id,
+                                            attempt_id = ?latest.as_ref().map(|c| c.id.as_str()),
+                                            "conflict_watch: lockfile regeneration still failed for this PR head; not retrying",
+                                        );
+                                        return false;
+                                    }
+                                    tracing::info!(
+                                        work_item_id = %candidate.work_item_id,
+                                        pr_url = %candidate.pr_url,
+                                        attempt_id = ?latest.as_ref().map(|c| c.id.as_str()),
+                                        head_ref_oid = ?probe.head_ref_oid,
+                                        "conflict_watch: lockfile regeneration failed on a previous PR head; inserting a fresh attempt",
+                                    );
                                 } else {
                                     tracing::debug!(
                                         work_item_id = %candidate.work_item_id,
@@ -643,6 +673,33 @@ pub async fn on_conflict_detected_with(
             }
         }
     };
+
+    // Another row in the revision family can observe this same PR, and an
+    // ended attempt can still have a live worker. Do not mint a competitor.
+    if work_db
+        .has_live_conflict_revision_for_pr(&candidate.pr_url)
+        .unwrap_or(true)
+    {
+        if task_flipped_to_blocked {
+            tracing::info!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                "conflict_watch: a conflict revision for this PR is still running or queued; \
+                 not minting another",
+            );
+            publisher
+                .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "blocked_merge_conflict")
+                .await;
+        } else {
+            tracing::debug!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                "conflict_watch: a conflict revision for this PR is still running or queued; \
+                 not minting another",
+            );
+        }
+        return false;
+    }
 
     // Trunk merge-queue coordination (design §"Coordination with
     // conflict_watch / ci_watch"): a conflict detected while a Trunk merge
@@ -870,6 +927,21 @@ pub async fn on_conflict_detected_with(
                         );
                         return true;
                     }
+                    conflict_ladder::LadderOutcome::LockfileRegenerationFailed => {
+                        // Lockfile regeneration failed in the environment.
+                        // The attempt is terminal for this PR head
+                        // (`failed`, reason recorded, attention item
+                        // filed). A later probe whose head has moved
+                        // starts a fresh attempt; a worker would not do
+                        // better on the same head.
+                        tracing::warn!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            attempt_id = %a.id,
+                            "conflict_watch: lockfile regeneration failed; attempt failed, no worker spawned",
+                        );
+                        return true;
+                    }
                     conflict_ladder::LadderOutcome::FellThrough {
                         residual_conflict_files,
                         ..
@@ -898,7 +970,7 @@ pub async fn on_conflict_detected_with(
                     }
                 }
             } else {
-                // No cube client → the mechanical-rebase flag is off, so the
+                // No cube client → the mechanical-rebase flag was set to false, so the
                 // escalation ladder (rungs 0/1, including the deterministic
                 // lockfile resolver) is not attempted this dispatch at all.
                 // This used to be a debug-only line, invisible in the
@@ -999,18 +1071,22 @@ pub async fn on_conflict_detected_with(
 }
 
 /// Is `active_crz` (an in-flight attempt with a linked revision) stale?
-/// A crz is stale when either:
+/// A linked revision that is still running or queued (see
+/// [`WorkDb::is_conflict_revision_running_or_queued`]) is never superseded,
+/// even when the PR head has moved: a push can land while the worker is
+/// still resolving, and head movement must not replace a live fix vehicle.
+/// Otherwise the crz is stale when either:
 ///   (a) the probe head SHA has moved since the crz was created — the
 ///       revision pushed a commit but didn't resolve the conflict, then its
 ///       exec was abandoned by the orphan sweep (not NudgeBreakerParked, so
 ///       finalize_conflict_resolution_attempt never ran), leaving the crz
 ///       `pending` with `revision_task_id` set against an old head; or
-///   (b) the linked revision task is dead — either it reached a terminal
-///       status (in_review/done/archived) without the crz ever being
-///       finalised (same orphan-sweep abandonment scenario, head SHA
-///       unchanged), or its execution died outright (e.g. an engine
-///       restart) while the task itself never progressed past a live
-///       status.
+///   (b) a revision is linked (and, having passed the liveness check above,
+///       is dead) — it reached a terminal status (in_review/done/archived)
+///       without the crz ever being finalised (same orphan-sweep
+///       abandonment scenario, head SHA unchanged), or its execution died
+///       outright (e.g. an engine restart) while the task itself never
+///       progressed past a live status.
 /// Mirrors ci_watch's stale-head supersede logic.
 ///
 /// When stale, abandons the row (nullifying `base_sha_at_trigger` when the
@@ -1033,6 +1109,13 @@ fn supersede_if_stale(
     active_crz: &crate::work::ConflictResolution,
 ) -> bool {
     let current_head_sha = probe.head_ref_oid.as_deref();
+    // A push can change the head while the existing worker is still
+    // resolving it. Head movement must not replace a live fix vehicle.
+    if let Some(revision) = active_crz.revision_task_id.as_deref()
+        && work_db.is_conflict_revision_running_or_queued(revision).unwrap_or(true)
+    {
+        return false;
+    }
     let head_sha_stale = match current_head_sha {
         Some(current) => active_crz
             .head_sha_before
@@ -1041,11 +1124,9 @@ fn supersede_if_stale(
             .unwrap_or(false),
         None => false, // can't compare — conservative: don't supersede
     };
-    let revision_dead = active_crz
-        .revision_task_id
-        .as_deref()
-        .map(|rid| !work_db.is_conflict_resolution_revision_live(rid).unwrap_or(true))
-        .unwrap_or(false);
+    // The liveness check above already returned for a live revision, so any
+    // linked revision that reaches here is dead.
+    let revision_dead = active_crz.revision_task_id.is_some();
     if !(head_sha_stale || revision_dead) {
         return false;
     }
@@ -1389,6 +1470,19 @@ async fn maybe_spawn_conflict_revision(
     attempt: &crate::work::ConflictResolution,
     use_small_agent_profile: bool,
 ) -> bool {
+    if work_db
+        .has_live_conflict_revision_for_pr(&candidate.pr_url)
+        .unwrap_or(true)
+    {
+        tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            attempt_id = %attempt.id,
+            "conflict_watch: a conflict revision for this PR is still running or queued; \
+             not spawning another",
+        );
+        return false;
+    }
     let base_branch = probe
         .base_ref_name
         .as_deref()
@@ -1526,6 +1620,7 @@ pub async fn on_resolved(
     if auto_pr_maintenance_disabled(work_db, candidate, labels) {
         return false;
     }
+    crate::conflict_ladder::clear_lockfile_regeneration_failed_attention(work_db, &candidate.work_item_id);
     // Look up the engine-owned attempt row first. If one exists, drive
     // the strict (attempt-id-guarded) retire path; otherwise fall back
     // to the relaxed pr_url-only WHERE clause so this module still

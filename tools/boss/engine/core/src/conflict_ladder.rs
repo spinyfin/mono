@@ -29,6 +29,22 @@ use crate::coordinator::{CubeClient, CubeWorkspaceLease, ExecutionPublisher};
 use crate::merge_poller::stored_pr_number;
 use crate::work::{ConflictResolution, PendingMergeCheck, WorkDb};
 
+/// Builds the rung-0 resolver registry for a base revision (e.g.
+/// `main@origin`). Production uses [`builtin_resolvers`]; tests inject a
+/// registry whose resolvers do not need a host toolchain.
+pub(crate) type ResolverFactory<'a> = &'a (dyn Fn(&str) -> ResolverRegistry + Send + Sync);
+
+/// The shipped lockfile/append-union resolvers, seeded from `base_revision`.
+pub(crate) fn builtin_resolvers(base_revision: &str) -> ResolverRegistry {
+    ResolverRegistry::with_builtins_from_base(base_revision)
+}
+
+/// A leased workspace plus the resolver registry rung 0 uses against it.
+pub(crate) struct RungWorkspace<'a> {
+    pub(crate) lease: &'a CubeWorkspaceLease,
+    pub(crate) resolvers: ResolverFactory<'a>,
+}
+
 /// The escalation-ladder rung a resolution was produced at, recorded in
 /// `conflict_resolutions.resolved_by_rung` for telemetry. Rung 0
 /// (deterministic resolvers) and rung 1 (engine-direct rebase) are produced
@@ -122,7 +138,22 @@ pub(crate) enum LadderOutcome {
     /// rung on a pure infra failure is exactly the bug this variant exists
     /// to close. The attempt stays `pending` with no `revision_task_id`, so
     /// the ladder is retried in full on the next `conflict_watch` tick.
+    ///
+    /// Only the lease failure produces this; a resolver that ran and failed
+    /// is deterministic for the PR head and is reported through
+    /// [`Self::LockfileRegenerationFailed`] instead, so it cannot retry
+    /// silently forever.
     MechanicalRungsUnavailable,
+    /// Every residual conflicted file was a generated lockfile, but its
+    /// regeneration failed operationally (tool missing from `PATH`, no
+    /// network, the tool itself erroring, the lockfile absent on the base).
+    /// The attempt has been marked `failed` with the specific resolver
+    /// reason, an attention item names it, and the parent stays
+    /// `blocked: merge_conflict`. The caller must NOT spawn a worker (the
+    /// failure is environmental, not a semantic conflict) and must not
+    /// retry: the terminal attempt row is keyed on the PR head, so a new
+    /// attempt only starts once a new head is pushed (or a human retries).
+    LockfileRegenerationFailed,
 }
 
 /// Emits the single canonical decision line for a conflicted-PR
@@ -138,7 +169,7 @@ pub(crate) enum LadderOutcome {
 /// - `"generic"` — no mechanical rung applied; a full (or small-agent,
 ///   rung 2) worker revision will be spawned.
 /// - `"skip"` — the ladder was never attempted at all (e.g. the
-///   `conflict_ladder_mechanical_rebase` feature flag is off).
+///   `conflict_ladder_mechanical_rebase` feature flag was set to `false`).
 pub(crate) fn log_routing_verdict(
     work_item_id: &str,
     pr: Option<u64>,
@@ -180,6 +211,18 @@ pub(crate) async fn try_mechanical_rungs(
     cube_client: &dyn CubeClient,
     candidate: &PendingMergeCheck,
     attempt: &ConflictResolution,
+) -> LadderOutcome {
+    try_mechanical_rungs_with(work_db, publisher, cube_client, candidate, attempt, &builtin_resolvers).await
+}
+
+/// [`try_mechanical_rungs`] with an injectable rung-0 resolver registry.
+pub(crate) async fn try_mechanical_rungs_with(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    cube_client: &dyn CubeClient,
+    candidate: &PendingMergeCheck,
+    attempt: &ConflictResolution,
+    resolvers: ResolverFactory<'_>,
 ) -> LadderOutcome {
     let Some(pr_number) = stored_pr_number(&candidate.pr_url).filter(|n| *n > 0) else {
         tracing::debug!(
@@ -309,7 +352,20 @@ pub(crate) async fn try_mechanical_rungs(
     // 2026-07-18 leaked-lease incident), then run the rung and release
     // unconditionally.
     crate::ladder_lease_registry::register(&lease);
-    let outcome = run_rung1_in_lease(work_db, publisher, cube_client, candidate, attempt, pr_number, &lease).await;
+    let workspace = RungWorkspace {
+        lease: &lease,
+        resolvers,
+    };
+    let outcome = run_rung1_in_lease_with(
+        work_db,
+        publisher,
+        cube_client,
+        candidate,
+        attempt,
+        pr_number,
+        &workspace,
+    )
+    .await;
 
     // The rung has concluded (retired, halted, or fell through) — clear the
     // in-flight marker (and the mechanical lease/workspace it stamped) now,
@@ -378,6 +434,7 @@ async fn lease_rung1_workspace(
 /// Position the leased workspace on the PR head, run the engine-direct
 /// rebase, and act on the outcome. Split out so the caller can release the
 /// lease unconditionally regardless of which branch this returns from.
+#[cfg(test)]
 pub(crate) async fn run_rung1_in_lease(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -387,6 +444,33 @@ pub(crate) async fn run_rung1_in_lease(
     pr_number: u64,
     lease: &crate::coordinator::CubeWorkspaceLease,
 ) -> LadderOutcome {
+    let workspace = RungWorkspace {
+        lease,
+        resolvers: &builtin_resolvers,
+    };
+    run_rung1_in_lease_with(
+        work_db,
+        publisher,
+        cube_client,
+        candidate,
+        attempt,
+        pr_number,
+        &workspace,
+    )
+    .await
+}
+
+/// [`run_rung1_in_lease`] with an injectable rung-0 resolver registry.
+pub(crate) async fn run_rung1_in_lease_with(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    cube_client: &dyn CubeClient,
+    candidate: &PendingMergeCheck,
+    attempt: &ConflictResolution,
+    pr_number: u64,
+    workspace: &RungWorkspace<'_>,
+) -> LadderOutcome {
+    let lease = workspace.lease;
     let saved = work_db.snapshot_rebase_pointers(&candidate.work_item_id).await;
     if let Err(err) = cube_client.goto_workspace(&lease.workspace_path, pr_number).await {
         work_db.restore_rebase_pointers(&saved).await;
@@ -510,13 +594,13 @@ pub(crate) async fn run_rung1_in_lease(
                 "conflict_ladder: failed to update in-flight marker to rung 0; restart recovery weakened",
             );
         }
-        let rung0_outcome = attempt_rung0(
+        let rung0_outcome = attempt_rung0_with(
             work_db,
             publisher,
             cube_client,
             candidate,
             attempt,
-            lease,
+            workspace,
             &rebase.conflicted_files,
         )
         .await;
@@ -527,8 +611,8 @@ pub(crate) async fn run_rung1_in_lease(
         // "did not resolve every residual file" message previously
         // misdiagnosed a resolved-but-push-rejected result as an unresolved
         // one.
-        // Any non-fall-through outcome means rung 0 pushed its resolution.
-        let pushed = !matches!(rung0_outcome, LadderOutcome::FellThrough { .. });
+        // Only a retired or signoff-held resolution was pushed.
+        let pushed = matches!(rung0_outcome, LadderOutcome::Retired | LadderOutcome::HaltedForSignoff);
         finish_rebase_pointers(work_db, &saved, attempt, candidate, pushed).await;
         match rung0_outcome {
             LadderOutcome::FellThrough { reason, .. } => reason,
@@ -578,6 +662,81 @@ pub(crate) async fn run_rung1_in_lease(
     }
 }
 
+/// Attention kind filed when a lockfile-only conflict could not be
+/// regenerated mechanically.
+pub(crate) use crate::work::LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND;
+
+/// Lower the lockfile-regeneration attention once the condition no longer
+/// holds: a mechanical retry, a human (or engine) clearing the conflict, or
+/// a re-armed attempt. Best-effort; a miss is logged.
+pub(crate) fn clear_lockfile_regeneration_failed_attention(work_db: &WorkDb, work_item_id: &str) {
+    if let Err(err) =
+        work_db.resolve_external_tracker_attention(work_item_id, LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND)
+    {
+        tracing::warn!(work_item_id, ?err, "failed to clear lockfile-regeneration attention",);
+    }
+}
+
+/// Terminate a lockfile-only attempt whose regeneration failed operationally:
+/// stamp the attempt `failed` with the specific resolver reason (which also
+/// ends the per-tick retry, since the row owns the head key), and
+/// file an attention item. The parent stays `blocked: merge_conflict`.
+pub(crate) async fn halt_attempt_for_lockfile_failure(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    attempt: &ConflictResolution,
+    conflicted_files: &[String],
+    reason: &str,
+) {
+    tracing::warn!(
+        work_item_id = %candidate.work_item_id,
+        attempt_id = %attempt.id,
+        %reason,
+        "conflict_ladder: generated lockfile regeneration failed; attempt marked failed, no worker spawned",
+    );
+    log_routing_verdict(
+        &candidate.work_item_id,
+        stored_pr_number(&candidate.pr_url).map(|n| n as u64),
+        conflicted_files,
+        "deterministic",
+        "lockfile-only conflict: regeneration failed operationally; attempt failed, no worker spawned",
+    );
+    if let Err(err) =
+        work_db.mark_conflict_resolution_failed(&attempt.id, &format!("lockfile_regeneration_failed: {reason}"))
+    {
+        tracing::warn!(attempt_id = %attempt.id, ?err, "conflict_ladder: failed to stamp lockfile-regeneration failure");
+    }
+    let files = conflicted_files
+        .iter()
+        .map(|f| format!("- `{f}`"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Idempotent: a re-armed attempt that fails again refreshes the one open
+    // item instead of piling up another with a stale reason.
+    if let Err(err) = work_db.upsert_external_tracker_attention(
+        &candidate.work_item_id,
+        LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND,
+        "Lockfile conflict could not be regenerated automatically",
+        &format!(
+            "PR {} conflicts only in generated lockfiles, but regenerating them failed:\n\n{files}\n\n\
+             Reason: {reason}\n\nThe attempt is marked failed and will not retry until a new commit \
+             is pushed to the PR head or the attempt is retried manually. Fix the resolver environment and \
+             retry the attempt, or resolve the lockfile by hand.",
+            candidate.pr_url
+        ),
+    ) {
+        tracing::warn!(attempt_id = %attempt.id, ?err, "conflict_ladder: failed to file lockfile-regeneration attention");
+    }
+    publisher
+        .publish_work_item_changed(
+            &candidate.product_id,
+            &candidate.work_item_id,
+            "conflict_lockfile_regeneration_failed",
+        )
+        .await;
+}
+
 /// Close the pointer-protection window opened before cube's goto/rebase:
 /// restore the saved recovery pointers and, when the operation pushed a PR
 /// head, adopt it for every record whose work it already carries.
@@ -618,6 +777,7 @@ async fn finish_rebase_pointers(
 /// as a parameter (`try_mechanical_rungs` already validated it parses
 /// before leasing a workspace) — one fewer argument keeps this under
 /// clippy's `too_many_arguments` limit.
+#[cfg(test)]
 pub(crate) async fn attempt_rung0(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -627,6 +787,33 @@ pub(crate) async fn attempt_rung0(
     lease: &CubeWorkspaceLease,
     residual_paths: &[String],
 ) -> LadderOutcome {
+    let workspace = RungWorkspace {
+        lease,
+        resolvers: &builtin_resolvers,
+    };
+    attempt_rung0_with(
+        work_db,
+        publisher,
+        cube_client,
+        candidate,
+        attempt,
+        &workspace,
+        residual_paths,
+    )
+    .await
+}
+
+/// [`attempt_rung0`] with an injectable rung-0 resolver registry.
+pub(crate) async fn attempt_rung0_with(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    cube_client: &dyn CubeClient,
+    candidate: &PendingMergeCheck,
+    attempt: &ConflictResolution,
+    workspace: &RungWorkspace<'_>,
+    residual_paths: &[String],
+) -> LadderOutcome {
+    let lease = workspace.lease;
     let Some(pr_number) = stored_pr_number(&candidate.pr_url).filter(|n| *n > 0) else {
         // Unreachable via the live call site (try_mechanical_rungs already
         // parsed this successfully before leasing), but attempt_rung0 is
@@ -659,7 +846,7 @@ pub(crate) async fn attempt_rung0(
         })
         .collect();
 
-    let registry = ResolverRegistry::with_builtins();
+    let registry = (workspace.resolvers)(&format!("{}@origin", attempt.base_branch));
     let resolved: Vec<ResolvedFile> = match registry.resolve_all(&lease.workspace_path, &files).await {
         RegistryResolution::AllResolved(resolved) => resolved,
         RegistryResolution::Declined {
@@ -718,6 +905,19 @@ pub(crate) async fn attempt_rung0(
                 "rung 0 attempted but a resolver failed operationally (environment/tooling issue, \
                  not a decline)"
             };
+            if files
+                .iter()
+                .all(|file| boss_deterministic_resolvers::is_generated_lockfile(&file.path))
+            {
+                let specific = failed
+                    .first()
+                    .map(|f| format!("{}: {}", f.path, f.reason))
+                    .or_else(|| declined.first().map(|d| format!("{}: {}", d.path, d.reason)))
+                    .unwrap_or_else(|| reason.to_owned());
+                halt_attempt_for_lockfile_failure(work_db, publisher, candidate, attempt, residual_paths, &specific)
+                    .await;
+                return LadderOutcome::LockfileRegenerationFailed;
+            }
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,
                 reason,
@@ -796,6 +996,8 @@ async fn retire_attempt_at_rung(
         "deterministic",
         &format!("mechanical rung {rung} resolved every conflicted file; no worker spawned"),
     );
+
+    clear_lockfile_regeneration_failed_attention(work_db, &candidate.work_item_id);
 
     // The parent was flipped to `blocked: merge_conflict` upfront by
     // `on_conflict_detected`; clear it back to `in_review`. The WHERE guard

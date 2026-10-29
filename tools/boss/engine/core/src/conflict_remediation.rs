@@ -311,6 +311,16 @@ impl ConflictRemediationJob for LadderRemediationJob {
                 );
                 RemediationDisposition::Settled
             }
+            LadderOutcome::LockfileRegenerationFailed => {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    attempt_id = %attempt.id,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "conflict_remediation: lockfile regeneration failed; attempt marked failed, no worker spawned",
+                );
+                RemediationDisposition::Settled
+            }
             LadderOutcome::MechanicalRungsUnavailable => {
                 // Same contract as the inline path: spawn nothing, leave the
                 // attempt `pending` with no `revision_task_id` so a later
