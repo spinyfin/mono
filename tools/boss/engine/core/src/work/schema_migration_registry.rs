@@ -255,6 +255,11 @@ pub(super) fn all() -> Vec<Migration> {
                 Ok(())
             },
         },
+        Migration {
+            id: task_status_audit::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: task_status_audit::migrate,
+        },
     ]);
     migrations
 }
