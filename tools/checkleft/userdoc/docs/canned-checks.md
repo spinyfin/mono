@@ -584,7 +584,7 @@ Notes:
 - Uses the same changed-file universe checkleft already builds for change detection — not a separate `git`/`gh` integration.
 - Emits a single locationless finding with the actual count, configured max, a recommendation to break the work into smaller tasks/PRs, and a pointer to the legitimate bypass when the large surface is intentional.
 - Findings default to `error`. Override per instance with `[checks.policy].severity`.
-- Enable bypass per instance with `[checks.policy].allow_bypass`. Directive name: `BYPASS_CHANGE_FILE_COUNT`. Format: `BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>`. The numeric maximum is the approved ceiling; the check passes only while the in-scope non-deleted file count is ≤ that maximum (the same include/exclude set the check counted). Growth past it fails again (approved maximum and current count are named) until a new approval or a split. A bypass without a numeric maximum is rejected, not treated as unlimited. When several directives exist, the most recent one wins, including an empty latest line, which revokes earlier approvals.
+- Enable bypass per instance with `[checks.policy].allow_bypass`. Directive name: `BYPASS_CHANGE_FILE_COUNT`.
 - Bypass is for rare, intentional large surfaces (coordinated renames, unsplittable generated trees). Do not raise the silent default or use bypass for convenience dumps.
 - **No-op under `checkleft run --all`.** Whole-repo mode lists every tracked file as modified (no real PR-sized change), so a file-count ceiling would always fire on any real tree. Like `policy.changed_lines_only` under `--all`, this check skips when the changeset is a full-repo scan (`ChangeSet.whole_repo`). PR-scoped / base-ref runs still enforce `max_files`.
 

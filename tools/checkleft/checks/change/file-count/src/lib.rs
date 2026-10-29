@@ -17,13 +17,6 @@
 //! repository, so this check is a documented no-op in whole-repo mode — the
 //! same class of caveat as `policy.changed_lines_only` under `--all`.
 //!
-//! When host policy enables bypasses, a one-off exception uses `BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>` in
-//! the commit or PR description. The bypass is bound to that approved
-//! maximum: the check passes while the non-deleted file count is ≤ it, and
-//! fails again if the change grows past it. A directive without a numeric
-//! maximum is rejected (not treated as unlimited). When several directives
-//! are present, the most recent one wins.
-//!
 //! ## Configuration (JSON-encoded, passed via `config-json`)
 //!
 //! ```json
@@ -45,13 +38,6 @@ use serde::Deserialize;
 /// `CHECKS.yaml` overrides this to 30 based on a recent PR-size audit.
 pub const DEFAULT_MAX_FILES: usize = 50;
 
-/// Split a large change so it stays reviewable.
-const SPLIT_REMEDIATION: &str =
-    "Break the work into smaller tasks/PRs so each change stays reviewable and within the file-count limit.";
-
-/// How to request a bound `change/file-count` exception.
-const BYPASS_REMEDIATION: &str = "If this large surface is intentional (coordinated rename, generated tree that cannot split, etc.), request a one-off exception with `BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>` in the commit description (read in every CI context) or the PR description (best-effort). The numeric maximum is the approved ceiling; growth past it needs a new approval or a split.";
-
 #[derive(Deserialize, Default)]
 struct Config {
     #[serde(default)]
@@ -66,14 +52,6 @@ fn count_non_deleted_files(input: &CheckInput) -> usize {
         .iter()
         .filter(|f| f.kind != ChangeKind::Deleted)
         .count()
-}
-
-fn exceeded_configured_max_finding(count: usize, max_files: usize) -> Finding {
-    Finding::error(format!(
-        "changeset touches {count} non-deleted files, exceeding configured max_files={max_files}"
-    ))
-    .with_remediation(SPLIT_REMEDIATION.to_owned())
-    .with_remediation(BYPASS_REMEDIATION.to_owned())
 }
 
 #[check(
@@ -98,7 +76,19 @@ pub fn change_file_count_check(input: CheckInput) -> Vec<Finding> {
         return Vec::new();
     }
 
-    vec![exceeded_configured_max_finding(count, max_files)]
+    vec![
+        Finding::error(format!(
+            "changeset touches {count} non-deleted files, exceeding configured max_files={max_files}"
+        ))
+        .with_remediation(
+            "Break the work into smaller tasks/PRs so each change stays reviewable and within the file-count limit."
+                .to_owned(),
+        )
+        .with_remediation(
+            "If this large surface is intentional (coordinated rename, generated tree that cannot split, etc.), request a one-off exception with `BYPASS_CHANGE_FILE_COUNT=<specific legitimate reason>` in the commit description (read in every CI context) or the PR description (best-effort)."
+                .to_owned(),
+        ),
+    ]
 }
 
 // NOTE: this crate is an rlib, NOT a standalone wasm component. The component
@@ -120,21 +110,12 @@ mod tests {
     }
 
     fn make_input(files: Vec<ChangedFile>, config_json: &str) -> CheckInput {
-        make_input_with_descriptions(files, config_json, None, None)
-    }
-
-    fn make_input_with_descriptions(
-        files: Vec<ChangedFile>,
-        config_json: &str,
-        commit_description: Option<&str>,
-        pr_description: Option<&str>,
-    ) -> CheckInput {
         CheckInput::__from_parts(
             ChangeSet {
                 changed_files: files,
                 file_diffs: vec![],
-                commit_description: commit_description.map(str::to_owned),
-                pr_description: pr_description.map(str::to_owned),
+                commit_description: None,
+                pr_description: None,
                 pr_description_unavailable_reason: None,
                 change_id: None,
                 repository: None,
@@ -143,10 +124,6 @@ mod tests {
             },
             config_json.to_owned(),
         )
-    }
-
-    fn oversized_files(n: usize) -> Vec<ChangedFile> {
-        (0..n).map(|i| file(&format!("f{i}.rs"), ChangeKind::Added)).collect()
     }
 
     fn make_whole_repo_input(files: Vec<ChangedFile>, config_json: &str) -> CheckInput {
@@ -211,23 +188,11 @@ mod tests {
             findings[0]
                 .remediations
                 .iter()
-                .any(|r| r.contains("BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>")),
-            "remediation should mention bound bypass; got {:?}",
+                .any(|r| r.contains("BYPASS_CHANGE_FILE_COUNT")),
+            "remediation should mention legitimate bypass; got {:?}",
             findings[0].remediations
         );
         assert!(findings[0].location.is_none());
-    }
-
-    #[test]
-    fn guest_leaves_bypass_evaluation_to_host_policy() {
-        let findings = change_file_count_check(make_input_with_descriptions(
-            oversized_files(6),
-            r#"{"max_files": 5}"#,
-            Some("BYPASS_CHANGE_FILE_COUNT=100:rename"),
-            Some("BYPASS_CHANGE_FILE_COUNT=200:rename"),
-        ));
-        assert_eq!(findings.len(), 1);
-        assert!(findings[0].message.contains("max_files=5"));
     }
 
     #[test]

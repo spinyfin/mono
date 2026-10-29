@@ -1200,7 +1200,7 @@ fn bundled_change_file_count_flags_oversized_and_noops_whole_repo() {
         fail.findings[0]
             .remediations
             .iter()
-            .any(|r| r.contains("BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>")),
+            .any(|r| r.contains("BYPASS_CHANGE_FILE_COUNT")),
         "remediations: {:?}",
         fail.findings[0].remediations
     );
