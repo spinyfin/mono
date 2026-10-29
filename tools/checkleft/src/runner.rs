@@ -10,8 +10,8 @@ use tokio::task::JoinSet;
 use crate::progress::{NoopProgressReporter, ProgressReporter, files_failed_count};
 
 use crate::bypass::{
-    bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id,
-    bypass_unreachable_pr_description_guidance,
+    CHANGE_FILE_COUNT_BYPASS_NAME, bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id,
+    bypass_unreachable_pr_description_guidance, change_file_count_bypass_findings,
 };
 use crate::check::{CheckRegistry, ConfiguredCheck};
 use crate::config::{CheckConfig, CheckConfigOrigin, CheckScope, ConfigDiagnostic, ConfigResolver};
@@ -1637,22 +1637,34 @@ fn apply_policy_to_result(
     if policy.allow_bypass {
         if let Some(reason) = changeset.bypass_reason(&policy.bypass_name) {
             let location = result.findings.iter().find_map(|finding| finding.location.clone());
-            result.findings = vec![bypass_applied_finding(&policy.bypass_name, &reason, location)];
-            return result;
-        }
-
-        // Distinguish "no bypass declared" from "a bypass may exist but this
-        // run could not resolve a PR description to check" — otherwise a
-        // directive declared only in the PR body (e.g. on a GitHub
-        // merge-queue build, which cannot fetch it) looks identical to no
-        // directive existing at all.
-        let guidance = if changeset.pr_description.is_none() {
-            bypass_unreachable_pr_description_guidance(&policy.bypass_name)
+            if policy.bypass_name == CHANGE_FILE_COUNT_BYPASS_NAME {
+                // Bound to the approved maximum. Do not treat a bare reason as
+                // unlimited, and fail again if the change has grown past the
+                // ceiling that was approved. A still-valid bound is a pass
+                // (empty findings). Remaining errors fall through so the
+                // instance severity override applies, same as an unbound fail.
+                result.findings = change_file_count_bypass_findings(changeset, &reason, location);
+                if result.findings.is_empty() {
+                    return result;
+                }
+            } else {
+                result.findings = vec![bypass_applied_finding(&policy.bypass_name, &reason, location)];
+                return result;
+            }
         } else {
-            bypass_failure_guidance(&policy.bypass_name)
-        };
-        for finding in &mut result.findings {
-            finding.remediations.push(guidance.clone());
+            // Distinguish "no bypass declared" from "a bypass may exist but this
+            // run could not resolve a PR description to check" — otherwise a
+            // directive declared only in the PR body (e.g. on a GitHub
+            // merge-queue build, which cannot fetch it) looks identical to no
+            // directive existing at all.
+            let guidance = if changeset.pr_description.is_none() {
+                bypass_unreachable_pr_description_guidance(&policy.bypass_name)
+            } else {
+                bypass_failure_guidance(&policy.bypass_name)
+            };
+            for finding in &mut result.findings {
+                finding.remediations.push(guidance.clone());
+            }
         }
     }
 

@@ -73,11 +73,17 @@ For `file/size`:
 BYPASS_FILE_SIZE=Generated file mirrors upstream source and cannot be split safely.
 ```
 
-For `change/file-count`:
+For `change/file-count` the value is an approved maximum, then a reason:
 
 ```text
-BYPASS_CHANGE_FILE_COUNT=Coordinated rename of the protocol surface; splitting would leave the tree unbuildable mid-stack.
+BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>
 ```
+
+```text
+BYPASS_CHANGE_FILE_COUNT=64:Coordinated rename of the protocol surface; splitting would leave the tree unbuildable mid-stack.
+```
+
+The check passes only while the change's non-deleted file count is at or below that maximum. If later rebases or conflict resolution grow the change past it, the check fails again and names both the approved maximum and the current count — request a new approval or split the work. A directive with no numeric maximum is rejected (it is not treated as unlimited). When several directives exist, the most recent one wins.
 
 For `no-usfa-typo`:
 
@@ -102,6 +108,8 @@ When a check has `[checks.policy] allow_bypass = true` and a matching directive 
 - the check emits a `warning` finding recording bypass use and reason
 
 This keeps bypass use visible in output and CI logs.
+
+`change/file-count` is bound rather than all-or-nothing: a matching `BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>` passes (no finding) only while the non-deleted file count is ≤ `max_files`. Above that ceiling, or when the value has no numeric maximum, the check fails with an error instead of a warning.
 
 ## Behavior when bypass is enabled but not used
 

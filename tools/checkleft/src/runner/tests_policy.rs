@@ -503,8 +503,8 @@ allow_bypass = true
 
     let bypass_results = runner
         .run_changeset(
-            &oversized.with_commit_description(Some(
-                "BYPASS_CHANGE_FILE_COUNT=Coordinated rename of the protocol surface; splitting would leave the tree unbuildable mid-stack.".to_owned(),
+            &oversized.clone().with_commit_description(Some(
+                "BYPASS_CHANGE_FILE_COUNT=4:Coordinated rename of the protocol surface; splitting would leave the tree unbuildable mid-stack.".to_owned(),
             )),
         )
         .await
@@ -513,20 +513,90 @@ allow_bypass = true
         .iter()
         .find(|r| r.check_id == "change/file-count")
         .expect("change/file-count ran with bypass");
-    assert_eq!(bypassed.findings.len(), 1);
-    assert_eq!(bypassed.findings[0].severity, Severity::Warning);
     assert!(
-        bypassed.findings[0].message.contains("BYPASS_CHANGE_FILE_COUNT"),
-        "message was: {}",
-        bypassed.findings[0].message
+        bypassed.findings.is_empty(),
+        "count 4 is within approved max 4; findings: {:?}",
+        bypassed.findings
     );
+
+    let grew_results = runner
+        .run_changeset(&oversized.clone().with_commit_description(Some(
+            "BYPASS_CHANGE_FILE_COUNT=3:Approved when the change still had 3 files.".to_owned(),
+        )))
+        .await
+        .expect("run with outgrown bypass");
+    let grew = grew_results
+        .iter()
+        .find(|r| r.check_id == "change/file-count")
+        .expect("change/file-count ran with outgrown bypass");
+    assert_eq!(grew.findings.len(), 1);
+    assert_eq!(grew.findings[0].severity, Severity::Error);
     assert!(
-        bypassed.findings[0]
-            .remediations
-            .iter()
-            .any(|r| r.contains("Coordinated rename")),
-        "bypass reason should be recorded; got {:?}",
-        bypassed.findings[0].remediations
+        grew.findings[0].message.contains("4 non-deleted files")
+            && grew.findings[0].message.contains("approved")
+            && grew.findings[0].message.contains('3'),
+        "message was: {}",
+        grew.findings[0].message
+    );
+
+    let malformed_results = runner
+        .run_changeset(
+            &oversized.clone().with_commit_description(Some(
+                "BYPASS_CHANGE_FILE_COUNT=Coordinated rename of the protocol surface; splitting would leave the tree unbuildable mid-stack.".to_owned(),
+            )),
+        )
+        .await
+        .expect("run with malformed bypass");
+    let malformed = malformed_results
+        .iter()
+        .find(|r| r.check_id == "change/file-count")
+        .expect("change/file-count ran with malformed bypass");
+    assert_eq!(malformed.findings.len(), 1);
+    assert_eq!(malformed.findings[0].severity, Severity::Error);
+    assert!(
+        malformed.findings[0].message.contains("approved maximum")
+            && malformed.findings[0].message.contains("not treated as unlimited"),
+        "message was: {}",
+        malformed.findings[0].message
+    );
+
+    let latest_results = runner
+        .run_changeset(&oversized.clone().with_commit_description(Some(
+            "BYPASS_CHANGE_FILE_COUNT=3:first approval.\nBYPASS_CHANGE_FILE_COUNT=4:later approval.\n".to_owned(),
+        )))
+        .await
+        .expect("run with two bypass directives");
+    let latest = latest_results
+        .iter()
+        .find(|r| r.check_id == "change/file-count")
+        .expect("change/file-count ran with two bypass directives");
+    assert!(
+        latest.findings.is_empty(),
+        "latest directive approves 4; findings: {:?}",
+        latest.findings
+    );
+
+    // Historical content-commit directive is host-only (`bypass_commit_descriptions`);
+    // the guest check sees an empty tip. The bound still applies.
+    let historical_results = runner
+        .run_changeset(
+            &oversized
+                .clone()
+                .with_commit_description(Some("wip: empty working-copy tip".to_owned()))
+                .with_bypass_commit_descriptions(Some(
+                    "feat: large rename\n\nBYPASS_CHANGE_FILE_COUNT=4:Approved on the content commit.\n\nwip: empty working-copy tip".to_owned(),
+                )),
+        )
+        .await
+        .expect("run with historical bypass");
+    let historical = historical_results
+        .iter()
+        .find(|r| r.check_id == "change/file-count")
+        .expect("change/file-count ran with historical bypass");
+    assert!(
+        historical.findings.is_empty(),
+        "historical bound of 4 must still cover 4 files; findings: {:?}",
+        historical.findings
     );
 }
 
