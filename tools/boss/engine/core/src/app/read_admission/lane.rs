@@ -256,6 +256,9 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::Unsubscribe { .. }
         | R::UpdateAutomation { .. }
         | R::UpdateIdea { .. }
+        | R::RequestCriticalPriority { .. }
+        | R::ListCriticalPriorityRequests
+        | R::ResolveCriticalPriorityRequest { .. }
         | R::UpdateWorkItem { .. }
         | R::GetPrStatus { refresh: true, .. } => ReadLane::Ordered,
     }

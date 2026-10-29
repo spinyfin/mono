@@ -428,7 +428,10 @@ fn worker_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         // a worker has no board to drag on. A worker that wants a status
         // change asks for it explicitly via the `UpdateWorkItem` route
         // below, where the redirect can name the right `boss propose …`.
-        FrontendRequest::ActionAttentionGroup { .. }
+        FrontendRequest::RequestCriticalPriority { .. }
+        | FrontendRequest::ListCriticalPriorityRequests
+        | FrontendRequest::ResolveCriticalPriorityRequest { .. }
+        | FrontendRequest::ActionAttentionGroup { .. }
         | FrontendRequest::AddDependency { .. }
         | FrontendRequest::AnswerAttention { .. }
         | FrontendRequest::CreateProduct { .. }

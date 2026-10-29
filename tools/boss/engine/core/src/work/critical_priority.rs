@@ -52,7 +52,9 @@ pub fn critical_refusal(caller_tier: &str) -> anyhow::Error {
         "priority `critical` is reserved for the human owner: refused for caller tier `{caller_tier}`. \
          Only a human running `boss task update <id> --priority critical` (or `boss chore update`, \
          or the Boss app's priority picker) from their own session may set it; `high` is the \
-         highest level an automated caller may request, and lowering from `critical` is always allowed."
+         highest level an automated caller may set directly, and lowering from `critical` is always allowed. \
+         The coordinator can use `boss task request-critical <ids...> --ask <verbatim-human-ask>` \
+         for a single confirmation in the Boss app; submitting it does not change priority."
     )
 }
 

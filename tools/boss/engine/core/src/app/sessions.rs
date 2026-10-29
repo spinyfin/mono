@@ -1,9 +1,7 @@
 //! `FrontendRequest` handlers — app/boss session registration, engine responses, shutdown.
 //!
-//! Split out of `app.rs`; each handler is dispatched from the
-//! `handle_frontend_connection` match. Pure structural move — no
-//! behavioural change. See [`super::Dispatch`] for the per-request
-//! context every handler receives.
+//! App registration excludes automated callers before considering restart
+//! recovery. See [`super::Dispatch`] for the per-request context.
 
 use super::*;
 use crate::coordinator_tmux::ClaudeVersionProbe;
@@ -52,7 +50,11 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
         //       real one.
         let engine_pid = std::process::id() as libc::pid_t;
         let current_app_pid = server_state.current_app_pid();
-        let trust_ok = register_app_session_trust_ok(current_app_pid, peer_pid, engine_pid);
+        // Autonomous callers cannot acquire the app identity during a restart,
+        // even when the ordinary worker verb gate is disabled.
+        let autonomous = server_state.classify_peer(peer_pid).is_agent()
+            || resolve_status_actor(&server_state, peer_pid) == boss_protocol::LAST_STATUS_ACTOR_BOSS;
+        let trust_ok = !autonomous && register_app_session_trust_ok(current_app_pid, peer_pid, engine_pid);
         if !trust_ok {
             tracing::warn!(
                 peer_pid = ?peer_pid,

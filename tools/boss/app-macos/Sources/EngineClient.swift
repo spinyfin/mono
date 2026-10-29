@@ -909,6 +909,11 @@ final class EngineClient: @unchecked Sendable {
             if !items.isEmpty {
                 emit(.workItemsCreated(items: items))
             }
+        case "critical_priority_requests":
+            let requests = (payload["requests"] as? [[String: Any]] ?? []).compactMap(CriticalPriorityRequest.init)
+            emit(.criticalPriorityRequests(requests))
+        case "critical_priority_resolved":
+            if let id = payload["id"] as? String { emit(.criticalPriorityResolved(id)) }
         case "work_item_updated":
             guard let itemPayload = payload["item"] as? [String: Any],
                   let item = parseWorkItem(itemPayload)

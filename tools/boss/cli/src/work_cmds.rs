@@ -670,6 +670,7 @@ pub(crate) async fn run_project_command(command: ProjectCommand, ctx: &RunContex
 pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), CliError> {
     let mut client = connect_for_work(ctx).await?;
     match command {
+        TaskCommand::RequestCritical { ids, ask } => request_critical(&mut client, ctx, ids, ask).await,
         TaskCommand::Create(args) => {
             // `--automation`: the triage agent's create path. The produced
             // task is product-level (no project) and routed to the automations
@@ -886,6 +887,7 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
 pub(crate) async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<(), CliError> {
     let mut client = connect_for_work(ctx).await?;
     match command {
+        ChoreCommand::RequestCritical { ids, ask } => request_critical(&mut client, ctx, ids, ask).await,
         ChoreCommand::Create(args) => {
             let product = resolve_product(&mut client, args.product, ctx).await?;
             let name = required_text(args.name, "Chore name", ctx)?;
@@ -2105,4 +2107,25 @@ pub(crate) fn print_org_state_human(org_state: &OrgAuthState) {
         }
         OrgAuthState::Unknown => println!("Org access: unknown (probe failed)"),
     }
+}
+
+async fn request_critical(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    ids: Vec<String>,
+    ask: String,
+) -> Result<(), CliError> {
+    let id = rpc_call!(
+        client,
+        FrontendRequest::RequestCriticalPriority { ids, ask },
+        "critical priority request",
+        FrontendEvent::CriticalPriorityRequested { id } => id,
+    )?;
+    print_entity(
+        ctx,
+        &serde_json::json!({"id": id, "status": "pending_confirmation", "expires_in_seconds": 300}),
+        || {
+            println!("Pending app confirmation: {id} (expires in five minutes)");
+        },
+    )
 }

@@ -4,6 +4,9 @@ use boss_protocol::FrontendEvent;
 /// Exhaustive so new protocol variants cannot silently share an unknown label.
 pub(super) fn kind(event: &FrontendEvent) -> &'static str {
     match event {
+        FrontendEvent::CriticalPriorityRequests { .. } => "CriticalPriorityRequests",
+        FrontendEvent::CriticalPriorityRequested { .. } => "CriticalPriorityRequested",
+        FrontendEvent::CriticalPriorityResolved { .. } => "CriticalPriorityResolved",
         FrontendEvent::Hello { .. } => "Hello",
         FrontendEvent::Subscribed { .. } => "Subscribed",
         FrontendEvent::Unsubscribed { .. } => "Unsubscribed",

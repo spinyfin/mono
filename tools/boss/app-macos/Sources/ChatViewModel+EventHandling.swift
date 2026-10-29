@@ -40,6 +40,10 @@ extension ChatViewModel {
         switch event {
         case .operatorDecisionSnapshot(let questions):
             reviewNotifier.applyDecisionSnapshot(questions)
+        case .criticalPriorityRequests(let requests):
+            criticalPriorityRequests = requests
+        case .criticalPriorityResolved(let id):
+            criticalPriorityRequests.removeAll { $0.id == id }
         case .connected:
             handleConnected()
         case .resyncRequired:

@@ -123,6 +123,14 @@ struct ContentView: View {
         // kanban top edge are no longer painted under the bar — without
         // demoting the NavigationSplitView out of the window root, which is
         // what made the sidebar render as a floating inset panel (#2459).
+        .task(id: model.isConnected) {
+            guard model.isConnected else { return }
+            while !Task.isCancelled {
+                model.criticalPriorityRequests.removeAll { $0.expiresAt <= Date() }
+                model.engine.sendLine(["type": "list_critical_priority_requests"], reportIfDisconnected: false)
+                do { try await Task.sleep(for: .seconds(5)) } catch { return }
+            }
+        }
         .windowTitlebarAccessory(isPresented: hasChromeBanners) {
             chromeBanners
         }
@@ -492,7 +500,7 @@ struct ContentView: View {
     /// healthy window's titlebar is untouched. The coordinator-update
     /// banner is not chrome: it lives in the coordinator pane column.
     private var hasChromeBanners: Bool {
-        chromeBannersPresent(
+        (model.isConnected && !model.criticalPriorityRequests.isEmpty) || chromeBannersPresent(
             isConnected: model.isConnected,
             showConnectionLostBanner: model.showConnectionLostBanner,
             supervisionState: model.engineSupervisionState,
@@ -520,6 +528,9 @@ struct ContentView: View {
     @ViewBuilder
     private var chromeBanners: some View {
         VStack(spacing: 0) {
+            if model.isConnected {
+                CriticalPriorityBanner(model: model)
+            }
             // A self-update whose first launch failed and was rolled back by the
             // relaunch watchdog. Persistent until dismissed or retried so a silent
             // "came back on the old version" can never happen again.

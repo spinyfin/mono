@@ -11,6 +11,7 @@ private let workNoticeLog = Logger(subsystem: "dev.spinyfin.bossmacapp", categor
 
 @MainActor
 final class ChatViewModel: ObservableObject {
+    @Published var criticalPriorityRequests: [CriticalPriorityRequest] = []
     @Published var navigationMode: NavigationMode = .agents
     @Published var isConnected: Bool = false
     /// Full product list as reported by the engine, including archived

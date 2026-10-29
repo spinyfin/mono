@@ -26,6 +26,8 @@ struct WorkRuntimePatchCard {
 }
 
 enum EngineEvent {
+    case criticalPriorityRequests([CriticalPriorityRequest])
+    case criticalPriorityResolved(String)
     case operatorDecisionSnapshot(questions: [DecisionNotification])
     case connected
     case disconnected

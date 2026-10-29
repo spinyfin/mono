@@ -80,6 +80,7 @@ mod context;
 mod coordinator_guidance;
 mod coordinator_handoff;
 mod cost;
+mod critical_requests;
 mod decisions;
 mod dependencies;
 mod design_docs;

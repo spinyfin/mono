@@ -33,6 +33,14 @@ Derived rows never inherit it: a follow-up chore minted from a deferred-scope at
 
 Provenance of the raise is recorded on the row as `critical_set_by` (the tier, `human`) and `critical_set_at`, both visible in `boss task show --json`, and both cleared when the row is lowered.
 
+## Coordinator requests with human confirmation
+
+The coordinator can submit one batch with `boss task request-critical <ids...> --ask '<verbatim human ask>'` (also available under `boss chore`). This does not change priority. The app shows the quoted ask, item names and canonical IDs, and Confirm critical / Deny buttons in the chrome above the coordinator pane. Requests expire after five minutes; at most five batches of fifty items may be pending. Changing an item's priority after submission invalidates confirmation of the entire batch.
+
+Only the coordinator can submit; only the exact pinned app process can list or resolve requests. Workers and progression sessions are denied independently of the worker-tier feature flag. Coordinator and worker callers cannot register themselves as the app during an app restart. No CLI flag or quoted prompt grants authority. A confirmation atomically records the human actor, confirmation time, verbatim ask, and each affected item with its previous priority in `critical_requests` / `critical_request_changes`. This history survives lowering priority. Replays, expired requests, and forged IDs are refused.
+
+Hook prompts were rejected as an authorization source: `UserPromptSubmit` has session and prompt data but no verified human-origin field, and engine-injected pane input also produces that event. App confirmation supplies the human gesture instead. Pending requests are polled every five seconds, including after reconnect; no attention item is created.
+
 ## Surfaces
 
 - `boss task create|update --priority critical`, `boss chore create|update --priority critical`, `boss investigation create --priority critical`.

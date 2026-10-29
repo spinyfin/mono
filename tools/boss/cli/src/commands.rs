@@ -488,6 +488,14 @@ pub(crate) struct TaskAnswerArgs {
 /// meaningful for project tasks).
 #[derive(Debug, Subcommand)]
 pub(crate) enum TaskCommand {
+    /// Ask for one app confirmation to raise these items to critical (coordinator only).
+    RequestCritical {
+        #[arg(required = true, num_args = 1..)]
+        ids: Vec<String>,
+        /// The human's verbatim request, shown for confirmation.
+        #[arg(long)]
+        ask: String,
+    },
     /// Answer the open question on a task, or a specific question id.
     Answer(TaskAnswerArgs),
     Create(TaskCreateArgs),
@@ -630,6 +638,14 @@ pub(crate) enum TaskCommand {
 /// and for callers who prefer to name the kind explicitly.
 #[derive(Debug, Subcommand)]
 pub(crate) enum ChoreCommand {
+    /// Ask for one app confirmation to raise these items to critical (coordinator only).
+    RequestCritical {
+        #[arg(required = true, num_args = 1..)]
+        ids: Vec<String>,
+        /// The human's verbatim request, shown for confirmation.
+        #[arg(long)]
+        ask: String,
+    },
     Create(ChoreCreateArgs),
     /// Bulk-create N chores from a JSON array. See `boss task
     /// create-many --help` for the schema; chores omit `project_id`.

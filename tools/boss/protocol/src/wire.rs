@@ -1419,6 +1419,9 @@ pub enum FrontendRequest {
         product_id: Option<String>,
     },
 
+    /// Pending critical-priority confirmations, visible only to the app.
+    ListCriticalPriorityRequests,
+
     /// List product-scoped decision records, newest first. By default
     /// only `active` rows are returned; set `include_inactive` to also
     /// include `superseded` / `revoked`. Replies with
@@ -2183,6 +2186,12 @@ pub enum FrontendRequest {
         product_id: Option<String>,
     },
 
+    /// Coordinator proposal only; confirmation requires the pinned app process.
+    RequestCriticalPriority {
+        ids: Vec<String>,
+        ask: String,
+    },
+
     RequestExecution {
         #[serde(flatten)]
         input: RequestExecutionInput,
@@ -2199,6 +2208,12 @@ pub enum FrontendRequest {
     /// `LiveWorkerState::viewer_attach_error` on the live-state topic).
     RequestWorkerPaneAttach {
         run_id: String,
+    },
+
+    /// Consume an unexpired request after an app confirmation or denial.
+    ResolveCriticalPriorityRequest {
+        id: String,
+        confirm: bool,
     },
 
     /// Read-only: resolve a project's design-doc pointer into the
