@@ -82,6 +82,7 @@ use crate::app::disk::{DiskSpace, human_bytes};
 use crate::app::errors::Result;
 use crate::app::health::probe_workspace_reuse;
 use crate::app::jj::{self, budgeted_timeout, cleanup_workspace_logs, workspace_path_exists};
+use crate::app::process_guard::{ensure_no_live_processes_in, sweep_is_noteworthy, sweep_json};
 use crate::app::util::repo_lock_path;
 
 /// Wall-clock bound for the purely local jj subprocesses this module spawns:
@@ -573,7 +574,7 @@ fn trim_one_repo(
                 );
                 continue;
             }
-            stage_workspace_for_removal(runner, repo_record, record, deadline)
+            stage_workspace_for_removal(runner, database_path, repo_record, record, deadline)
         };
         let staged_path = match staged {
             Ok(path) => path,
@@ -686,6 +687,7 @@ pub(super) fn removal_staging_name(workspace_id: &str) -> String {
 /// a failure leaves cosmetic cruft in the shared store, not a broken pool.
 pub(super) fn stage_workspace_for_removal(
     runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
     repo_record: &RepoRecord,
     record: &WorkspaceRecord,
     deadline: Option<Instant>,
@@ -696,12 +698,21 @@ pub(super) fn stage_workspace_for_removal(
     if staged_path.exists() {
         // A leftover from a pass that died between staging and unlinking.
         // Clearing it is what lets the rename below succeed — `fs::rename`
-        // onto a non-empty directory fails.
+        // onto a non-empty directory fails. It may still have occupants
+        // (that is one way a pass dies here), so the same guard applies.
+        let sweep = ensure_no_live_processes_in(&record.workspace_id, &staged_path)?;
+        audit_processes_reaped(database_path, record, "remove-leftover", &sweep);
         fs::remove_dir_all(&staged_path).map_err(|source| crate::app::errors::CubeError::WorkspaceDirRemove {
             path: staged_path.clone(),
             source,
         })?;
     }
+    // A workspace is not taken out of circulation while anything is still
+    // running inside it. Kill what a finished run left behind; if something
+    // survives, refuse (loudly, with its pid) and leave the directory where a
+    // later pass — or an operator — can find it. See `process_guard`.
+    let sweep = ensure_no_live_processes_in(&record.workspace_id, &record.workspace_path)?;
+    audit_processes_reaped(database_path, record, "remove", &sweep);
     fs::rename(&record.workspace_path, &staged_path).map_err(|source| {
         crate::app::errors::CubeError::WorkspaceDirRemove {
             path: record.workspace_path.clone(),
@@ -742,6 +753,27 @@ pub(super) fn stage_workspace_for_removal(
     Ok(staged_path)
 }
 
+/// Audit a removal-time process sweep that killed something or left a
+/// survivor; a quiet sweep is the normal case and not worth a line.
+fn audit_processes_reaped(
+    database_path: Option<&Path>,
+    record: &WorkspaceRecord,
+    phase: &str,
+    sweep: &workspace_procs::ReapReport,
+) {
+    if !sweep_is_noteworthy(sweep) {
+        return;
+    }
+    audit!(
+        database_path,
+        "workspace.processes_reaped",
+        repo = record.repo,
+        workspace_id = record.workspace_id,
+        phase = phase,
+        processes = sweep_json(sweep),
+    );
+}
+
 /// Unlink a workspace already staged out of circulation by
 /// [`stage_workspace_for_removal`], and clear up everything else it left
 /// behind.
@@ -760,6 +792,13 @@ fn remove_workspace_from_disk(
     context: TrimContext,
     bazel_root_cache: &BazelUserRootCache<'_>,
 ) -> Result<u64> {
+    // Re-check under the staged name: the kernel reports a process's working
+    // directory by its current path, so an occupant that appeared or
+    // re-parented since the pre-stage sweep is found here as living inside
+    // `.removing-<id>`. A survivor fails the removal rather than being
+    // unlinked out from under.
+    let sweep = ensure_no_live_processes_in(&record.workspace_id, staged_path)?;
+    audit_processes_reaped(database_path, record, "remove-staged", &sweep);
     let before = DiskSpace::probe(&repo_record.workspace_root).ok();
     fs::remove_dir_all(staged_path).map_err(|source| crate::app::errors::CubeError::WorkspaceDirRemove {
         path: staged_path.to_path_buf(),

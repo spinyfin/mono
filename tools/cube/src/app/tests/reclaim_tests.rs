@@ -544,7 +544,7 @@ fn a_staged_workspace_cannot_be_rediscovered_and_re_registered() {
 
     let runner = FakeRunner::new(vec![forget_registration(&workspace_root, &source, "mono-agent-001")]);
     store.forget_workspace("mono", "mono-agent-001").expect("forget row");
-    let staged = stage_workspace_for_removal(&runner, &repo_record, &record, None).expect("stage");
+    let staged = stage_workspace_for_removal(&runner, None, &repo_record, &record, None).expect("stage");
     runner.assert_exhausted();
 
     assert!(!record.workspace_path.exists(), "the prefixed name is gone");
@@ -589,7 +589,7 @@ fn staging_clears_a_leftover_from_a_pass_that_died_mid_removal() {
 
     let runner = FakeRunner::new(vec![]);
     store.forget_workspace("mono", "mono-agent-001").expect("forget row");
-    let staged = stage_workspace_for_removal(&runner, &repo_record, &record, None).expect("stage");
+    let staged = stage_workspace_for_removal(&runner, None, &repo_record, &record, None).expect("stage");
     runner.assert_exhausted();
 
     assert_eq!(staged, leftover);

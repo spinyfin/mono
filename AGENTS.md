@@ -106,6 +106,10 @@ root-cause rule as the section below.
   dispatch to chosen projects/products; scope rules, precedence against the
   pause and force-launch, the `focus_mode` hold reason):
   [`tools/boss/docs/dispatch-focus-mode.md`](tools/boss/docs/dispatch-focus-mode.md)
+- Run process teardown (how the engine and cube find and kill what a run
+  left running in its workspace, why working directory rather than process
+  group, and how a workspace's Bazel server is told apart and spared):
+  [`tools/boss/docs/run-process-teardown.md`](tools/boss/docs/run-process-teardown.md)
 - Operator runbooks:
   [`tools/boss/docs/runbooks/`](tools/boss/docs/runbooks/)
 
