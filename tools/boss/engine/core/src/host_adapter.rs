@@ -36,14 +36,14 @@ use crate::coordinator::{
 use crate::host_registry::Host;
 use crate::remote_wrapper::remote_wrapper_path;
 use crate::runner::{
-    ComposedWorkerSpawn, ExecutionRunner, RunOutcome, RunWaitState, WorkerSpawnOpts, bazel_prepush_gate_text,
-    compose_worker_spawn, work_item_name, work_item_task_kind,
+    ComposedWorkerSpawn, ExecutionRunner, RunOutcome, RunWaitState, WorkerSpawnOpts, compose_worker_spawn,
+    work_item_name, work_item_task_kind,
 };
 use crate::ssh_spawn::{
-    REASON_WORKER_LAUNCH_FAILED, RemoteSpawnPlan, perform_remote_launch, reap_failed_remote_turn,
+    REASON_WORKER_LAUNCH_FAILED, RemoteSpawnPlan, SshExec, perform_remote_launch, reap_failed_remote_turn,
     remote_events_socket_path,
 };
-use crate::ssh_transport::SshTransport;
+use crate::ssh_transport::{SshOutput, SshTransport};
 use crate::work::{WorkDb, WorkExecution, WorkItem};
 use crate::worker_setup::{WorkerSetupInput, render_remote_settings_json};
 use crate::wrapper_distribution::{WrapperPushLocks, WrapperPushOutcome, ensure_wrapper_current};
@@ -904,55 +904,12 @@ impl SshHostAdapter {
         }
     }
 
-    /// Append the Bazel pre-push build gate to the worker prompt when the
-    /// remote workspace is a Bazel workspace.
-    ///
-    /// The shared `compose_execution_prompt` injects this gate only when
-    /// `is_bazel_workspace` matches — but that probes the *local*
-    /// filesystem, and the workspace lives on the remote, so it never
-    /// fires for a remote worker. Probe the remote for the marker files
-    /// over the master and append the gate for the same execution kinds
-    /// the local runner gates (`task_implementation` / `chore_implementation`).
-    /// A probe failure logs and leaves the prompt unchanged rather than
-    /// blocking the spawn.
-    async fn append_remote_bazel_gate(
-        &self,
-        execution: &WorkExecution,
-        workspace: &str,
-        prompt_text: String,
-    ) -> String {
-        if !matches!(execution.kind.as_str(), "task_implementation" | "chore_implementation") {
-            return prompt_text;
-        }
-        // Single-string command so the remote shell evaluates the whole
-        // `test … -o …` expression (a multi-token argv would be
-        // space-joined by ssh and mis-parsed). Workspace paths come from
-        // cube and contain no shell metacharacters.
-        let probe = format!(
-            "test -f '{ws}/MODULE.bazel' -o -f '{ws}/WORKSPACE' -o -f '{ws}/WORKSPACE.bazel'",
-            ws = workspace
-        );
-        match self.transport.run_shell(probe.as_str()).await {
-            Ok(out) if out.success() => {
-                let mut prompt_text = prompt_text;
-                // Both flags false: the remote path doesn't yet read
-                // `worker_signal_proposals_seam` or `run_done_proposals_seam`
-                // (see the comment on the `compose_worker_spawn` call above)
-                // — legacy marker text and the absolute do-not-push-red-code
-                // stop match each flag's registry default.
-                prompt_text.push_str(&bazel_prepush_gate_text(false, false));
-                prompt_text
-            }
-            Ok(_) => prompt_text,
-            Err(err) => {
-                tracing::warn!(
-                    host_id = %self.transport.host_id,
-                    error = %format!("{err:#}"),
-                    "remote bazel-marker probe failed; worker prompt omits the pre-push gate",
-                );
-                prompt_text
-            }
-        }
+    /// Probe the remote workspace for Bazel markers *before* composing
+    /// the worker prompt. `Some(true)` / `Some(false)` are confirmed;
+    /// `None` means the probe failed and the composer must not treat a
+    /// missing local path as a non-Bazel repo.
+    async fn probe_remote_bazel_workspace(&self, workspace: &str) -> Option<bool> {
+        probe_remote_bazel_workspace_on(&self.transport, workspace).await
     }
 
     /// `mkdir -p` the parent dir on the remote, stage `contents` to a
@@ -968,6 +925,46 @@ impl SshHostAdapter {
     ) -> Result<()> {
         ship_file(&self.transport, run_id, remote_dir, remote_path, contents, label).await
     }
+}
+
+/// Map a remote Bazel-marker `test -f A -o -f B -o -f C` result onto the
+/// composer's tri-state. `test` exits 0 (found) or 1 (not found); any
+/// other status means the markers were never evaluated (ssh 255, shell
+/// 126/127, signal termination).
+pub(crate) fn map_remote_bazel_probe_output(result: Result<SshOutput>, host_id: &str) -> Option<bool> {
+    match result {
+        Ok(out) if out.status == 0 => Some(true),
+        Ok(out) if out.status == 1 => Some(false),
+        Ok(out) => {
+            tracing::warn!(
+                host_id,
+                status = out.status,
+                stderr = %out.stderr,
+                "remote bazel-marker probe returned inconclusive exit; composer will not assume a non-Bazel repo",
+            );
+            None
+        }
+        Err(err) => {
+            tracing::warn!(
+                host_id,
+                error = %format!("{err:#}"),
+                "remote bazel-marker probe failed; composer will not assume a non-Bazel repo",
+            );
+            None
+        }
+    }
+}
+
+/// A single-string command so the remote shell evaluates the whole
+/// `test … -o …` expression (a multi-token argv would be space-joined
+/// by ssh and mis-parsed). Workspace paths come from cube and contain
+/// no shell metacharacters.
+pub(crate) async fn probe_remote_bazel_workspace_on(exec: &dyn SshExec, workspace: &str) -> Option<bool> {
+    let probe = format!(
+        "test -f '{ws}/MODULE.bazel' -o -f '{ws}/WORKSPACE' -o -f '{ws}/WORKSPACE.bazel'",
+        ws = workspace
+    );
+    map_remote_bazel_probe_output(exec.run_shell(probe.as_str()).await, exec.host_id())
 }
 
 pub(crate) async fn ship_file(
@@ -1358,8 +1355,10 @@ impl HostAdapter for SshHostAdapter {
         //    local one (same task framing, branch name, acceptance
         //    criterion, effort addendum, product preamble).
         // Keep prompt and generated-rules feature gates on the same values.
+        let bazel_workspace = self.probe_remote_bazel_workspace(&workspace).await;
         let spawn_opts = WorkerSpawnOpts::builder()
             .max_embed_diff_lines(self.cfg.work.max_review_embed_diff_lines)
+            .maybe_bazel_workspace(bazel_workspace)
             .build();
         let ComposedWorkerSpawn {
             mut prompt_text,
@@ -1431,11 +1430,6 @@ impl HostAdapter for SshHostAdapter {
             }
             prompt_text = prompt_text.replace(local_path, "$BOSS_STRUCTURED_OUTPUT");
         }
-        // `compose_execution_prompt` decides the Bazel pre-push gate by
-        // probing the LOCAL filesystem, which never matches a remote
-        // workspace path — so probe the remote and append it ourselves.
-        let prompt_text = self.append_remote_bazel_gate(execution, &workspace, prompt_text).await;
-
         // 4. Render the remote worker settings: the same boss-event hooks
         //    as a local worker, but pointed at the FORWARDED events
         //    socket and the remote shim, and without the engine-data-dir
@@ -2329,6 +2323,9 @@ pub(crate) async fn stage_remote_initial_input(
 mod tests {
     use super::*;
     use crate::driver::AgentDriver;
+    use crate::ssh_spawn::SshExec;
+    use crate::ssh_transport::SshOutput;
+    use async_trait::async_trait;
 
     fn run_occupancy_script(workspace: &Path) -> String {
         let output = std::process::Command::new("sh")
@@ -2716,6 +2713,72 @@ mod tests {
         assert_eq!(
             validate_remote_output_path("/tmp/a.review-result.json\n", ReviewResult).unwrap(),
             "/tmp/a.review-result.json"
+        );
+    }
+
+    struct ProbeExec {
+        /// `Some(status)` is a completed ssh command; `None` is a transport error.
+        status: Option<i32>,
+    }
+
+    #[async_trait]
+    impl SshExec for ProbeExec {
+        fn host_id(&self) -> &str {
+            "probe-host"
+        }
+        async fn run(&self, _: &[&str]) -> Result<SshOutput> {
+            unreachable!("bazel-marker probe uses run_shell")
+        }
+        async fn run_shell(&self, script: &str) -> Result<SshOutput> {
+            assert!(
+                script.contains("MODULE.bazel") && script.contains("WORKSPACE"),
+                "{script}"
+            );
+            match self.status {
+                Some(status) => Ok(SshOutput {
+                    status,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }),
+                None => Err(anyhow::anyhow!("ssh: connection refused")),
+            }
+        }
+        async fn add_reverse_unix_forward(&self, _: &str, _: &str) -> Result<SshOutput> {
+            unreachable!("probe never forwards")
+        }
+        async fn cancel_reverse_unix_forward(&self, _: &str, _: &str) -> Result<SshOutput> {
+            unreachable!("probe never cancels")
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_bazel_probe_maps_exit_0_1_255_and_transport_err() {
+        assert_eq!(
+            probe_remote_bazel_workspace_on(&ProbeExec { status: Some(0) }, "/ws").await,
+            Some(true)
+        );
+        assert_eq!(
+            probe_remote_bazel_workspace_on(&ProbeExec { status: Some(1) }, "/ws").await,
+            Some(false)
+        );
+        assert_eq!(
+            probe_remote_bazel_workspace_on(&ProbeExec { status: Some(255) }, "/ws").await,
+            None
+        );
+        assert_eq!(
+            probe_remote_bazel_workspace_on(&ProbeExec { status: None }, "/ws").await,
+            None
+        );
+        assert_eq!(
+            map_remote_bazel_probe_output(
+                Ok(SshOutput {
+                    status: 126,
+                    stdout: String::new(),
+                    stderr: "permission denied".into(),
+                }),
+                "probe-host",
+            ),
+            None
         );
     }
 }

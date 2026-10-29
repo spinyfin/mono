@@ -9,6 +9,7 @@ use crate::work::Task;
 
 mod blocked_recovery;
 mod invocation;
+mod non_bazel_gate;
 mod vocabulary_leakage;
 
 #[test]
@@ -883,7 +884,7 @@ fn bazel_gate_absent_on_non_bazel_workspace() {
             .build(),
     );
     assert!(
-        !prompt.contains("Pre-push build gate"),
+        !prompt.contains("Pre-push build gate (Bazel workspace)"),
         "bazel gate must NOT fire on a non-Bazel repo:\n{prompt}",
     );
 }
@@ -1711,7 +1712,7 @@ fn merge_queue_brief_names_failure_source_and_requires_rebased_bazel_evidence() 
     attempt.before_commit_sha = Some("queue-commit".into());
     attempt.failed_checks = r#"[{"name":"bazel-build-test","conclusion":"FAILURE","target_url":"https://buildkite.com/flunge/mono/builds/20619","provider":"buildkite"}]"#.into();
     attempt.queue_base_sha = Some("historical-base".into());
-    let prompt = compose_ci_remediation_fragment(&attempt);
+    let prompt = compose_ci_remediation_fragment(&attempt, Some(true));
     for required in [
         "Failure source: the failing merge-queue build",
         "builds/20619",
@@ -1729,10 +1730,10 @@ fn merge_queue_brief_names_failure_source_and_requires_rebased_bazel_evidence() 
     }
     attempt.failed_checks = "[]".into();
     attempt.queue_base_sha = Some("empty-capture-base".into());
-    assert!(compose_ci_remediation_fragment(&attempt).contains("empty-capture-base"));
+    assert!(compose_ci_remediation_fragment(&attempt, Some(true)).contains("empty-capture-base"));
     attempt.failure_kind = Some("trunk_queue_eviction".into());
     attempt.failed_checks = "{malformed".into();
-    assert!(compose_ci_remediation_fragment(&attempt).contains("Merge-queue CI verification"));
+    assert!(compose_ci_remediation_fragment(&attempt, Some(true)).contains("Merge-queue CI verification"));
     let legacy = compose_ci_remediation_prompt(
         &ci_remediation_execution(&attempt.pr_url),
         &chore_without_pr(),
@@ -1740,6 +1741,7 @@ fn merge_queue_brief_names_failure_source_and_requires_rebased_bazel_evidence() 
         None,
         &attempt,
         None,
+        Some(true),
     );
     assert!(legacy.contains("Merge-queue CI verification"));
     assert!(!prompt.contains("rely on CI to verify the push"));

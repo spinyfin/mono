@@ -4,7 +4,7 @@
 use super::*;
 use boss_protocol::{QueueCiEvidence, RunDoneOutcome, RunDoneProposalPayload};
 
-pub(crate) const REQUIRED: &str = "Merge-queue CI verification required: fetch origin, rebase the PR onto current origin/main, and run every command in each failed job's captured verification contract (BOSS_CI_VERIFICATION.json). For jobs without a declaration, run every failed target with Bazel (the full job invocation for whole-job failures; `checkleft run` for a lint job; the job's own npm/pnpm/yarn invocation for a non-Bazel job). Supply --queue-ci-evidence-file with main_sha, verified_head_sha, queue_sha, queue_base_sha and successful runs (check_name, source_url, command, exit_code, output, coverage). A requeue of an unchanged head also needs queue_entry_id and queue_entry_enqueued_at from the enqueuePullRequest receipt (mergeQueueEntry { id enqueuedAt }). PR-head checks or isolated un-rebased reruns are not evidence. This gate does not expire; continue verification before declaring failure.";
+pub(crate) const REQUIRED: &str = "Merge-queue CI verification required: fetch origin, rebase the PR onto current origin/main, and run every command in each failed job's captured verification contract (BOSS_CI_VERIFICATION.json). For jobs without a declaration, the engine accepts as evidence: a Bazel build/test of the job's targets (the full job invocation for whole-job failures), `checkleft run` for a lint job, or the job's own npm/pnpm/yarn invocation. Cargo, go, make, and other undocumented invocations are not evidence; stop as blocked if the job is none of those and has no declaration. Supply --queue-ci-evidence-file with main_sha, verified_head_sha, queue_sha, queue_base_sha and successful runs (check_name, source_url, command, exit_code, output, coverage). A requeue of an unchanged head also needs queue_entry_id and queue_entry_enqueued_at from the enqueuePullRequest receipt (mergeQueueEntry { id enqueuedAt }). PR-head checks or isolated un-rebased reruns are not evidence. This gate does not expire; continue verification before declaring failure.";
 
 pub(crate) fn queue_ci_verification_required(attempt: &CiRemediation) -> bool {
     // A Trunk construction rejection with no failing build is a conflict or
@@ -243,7 +243,7 @@ fn validate_evidence(attempt: &CiRemediation, evidence: &QueueCiEvidence) -> Res
                 && !run.output.trim().is_empty()
                 && !run.coverage.trim().is_empty()
                 && run.source_url.starts_with("https://"),
-            "{REQUIRED} Every run must report a successful complete invocation declared for its job, or for undeclared jobs (a Bazel build/test of the job's targets, `checkleft run` for a lint job, or the job's own npm/pnpm/yarn build/test script for a non-Bazel job; no test filters), its output and coverage."
+            "{REQUIRED} Every run must report a successful complete invocation declared for its job, or for undeclared jobs (a Bazel build/test of the job's targets, `checkleft run` for a lint job, or the job's own npm/pnpm/yarn build/test script; cargo, go, make, and other undocumented invocations are not evidence; no test filters), its output and coverage."
         );
     }
     if let Some(base) = &attempt.queue_base_sha {
