@@ -95,7 +95,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 '$TMPDIR/boss-worker-settings/checkleft-push-guard-<sha256>/boss-checkleft-push-guard.py'"
+            "command": "python3 '$TMPDIR/boss-worker-settings/checkleft-push-guard-<sha256>/boss-checkleft-push-guard.py'",
+            "timeout": 14700
           }
         ]
       }

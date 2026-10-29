@@ -1259,10 +1259,13 @@ fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> 
             name: "checkleft_push_guard",
             source: GuardSource::Existing(checkleft_script.clone()),
             matcher: "Bash",
-            // 7500s sits above the guard script's 7200s subprocess timeout
-            // so a contended Bazel compile is not fail-closed by the shim
+            // Covers the guard script's sequential probe + run budgets so a
+            // contended Bazel compile is not fail-closed by the shim
             // (default 420s) or Codex's 600s command-hook default.
-            extra_env: vec![("BOSS_GUARD_TIMEOUT_SECONDS", "7500".to_owned())],
+            extra_env: vec![(
+                "BOSS_GUARD_TIMEOUT_SECONDS",
+                crate::CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS.to_string(),
+            )],
         });
     }
 
@@ -1341,7 +1344,8 @@ fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> 
         out.push(MaterializedGuard {
             command_path: fs::canonicalize(&wrapper).unwrap_or(wrapper),
             matcher: Some(guard.matcher),
-            timeout_sec: (guard.name == "checkleft_push_guard").then_some(7500),
+            timeout_sec: (guard.name == "checkleft_push_guard")
+                .then_some(crate::CHECKLEFT_GUARD_CODEX_RUNNER_TIMEOUT_SECS),
         });
     }
 

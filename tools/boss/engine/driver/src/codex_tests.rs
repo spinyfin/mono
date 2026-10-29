@@ -1185,13 +1185,16 @@ fn checkleft_push_guard_gets_a_two_hour_hook_timeout() {
         .expect("standard worker must arm the checkleft push guard");
     assert_eq!(
         checkleft.timeout_sec,
-        Some(7500),
+        Some(crate::CHECKLEFT_GUARD_CODEX_RUNNER_TIMEOUT_SECS),
         "Codex must not cut the checkleft gate at the 600s hook default"
     );
     let body = fs::read_to_string(&checkleft.command_path).unwrap();
     assert!(
-        body.contains("export BOSS_GUARD_TIMEOUT_SECONDS='7500'"),
-        "shim budget must exceed the guard's 7200s subprocess timeout: {body}"
+        body.contains(&format!(
+            "export BOSS_GUARD_TIMEOUT_SECONDS='{}'",
+            crate::CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS
+        )),
+        "shim budget must cover the guard's probe + run budgets: {body}"
     );
     for guard in &guards {
         if guard

@@ -1059,9 +1059,9 @@ impl AgentDriver for ClaudeDriver {
             );
             hooks.push(serde_json::json!({
                 "matcher": "Bash",
-                // 7500s sits above the guard script's 7200s subprocess timeout
-                // so Claude's default 60s hook timeout does not cut the gate short.
-                "hooks": [{"type": "command", "command": guard_command, "timeout": 7500}],
+                // Covers the guard's sequential probe + run budgets so Claude's
+                // default 60s hook timeout does not cut the gate short.
+                "hooks": [{"type": "command", "command": guard_command, "timeout": crate::CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS}],
             }));
         }
 
@@ -1755,7 +1755,7 @@ mod tests {
             .expect("local standard worker must arm the checkleft push guard");
         assert_eq!(
             checkleft["hooks"][0]["timeout"].as_u64(),
-            Some(7500),
+            Some(crate::CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS),
             "Claude must not cut the checkleft gate at the 60s hook default: {checkleft}"
         );
     }

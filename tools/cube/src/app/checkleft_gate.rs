@@ -237,3 +237,15 @@ fn probe_repobin_checkleft(repobin: &Path, cwd: &Path) -> bool {
         Ok(None) | Err(_) => false,
     }
 }
+
+#[cfg(test)]
+mod timeout_floor_tests {
+    use super::*;
+
+    #[test]
+    fn checkleft_timeouts_keep_a_two_hour_floor() {
+        let floor = Duration::from_secs(7200);
+        assert!(CHECKLEFT_PROBE_TIMEOUT >= floor);
+        assert!(CHECKLEFT_RUN_TIMEOUT >= floor);
+    }
+}

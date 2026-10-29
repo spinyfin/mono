@@ -149,8 +149,8 @@ BLOCK_DECISIONS = ("block", "deny")
 # Wall-clock budget for one ordinary guard. High enough that a legitimately
 # slow guard finishes and reports, low enough that Boss -- not Codex's
 # fail-open -- is what decides what a hung guard means. The checkleft push
-# guard overrides this via BOSS_GUARD_TIMEOUT_SECONDS (7500s, above its own
-# 7200s subprocess timeout) so a contended Bazel compile is not fail-closed
+# guard overrides this via BOSS_GUARD_TIMEOUT_SECONDS (above the sum of its own
+# probe and run subprocess timeouts) so a contended Bazel compile is not fail-closed
 # at this default.
 DEFAULT_TIMEOUT_SECONDS = 420.0
 

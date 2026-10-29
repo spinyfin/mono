@@ -1118,10 +1118,10 @@ pub(crate) fn run_done_directive(
         "For validation failures, this is a narrow exception to the earlier gate/stop rules, including \
          the pre-push Bazel gate: a failing gate warrants stopping without delivery only when it is \
          reproducible AND attributable to your change — fix it; if attribution remains unresolved, \
-         the failure still stands. A full-suite failure that passes in isolation, or a \
-         failure in untouched code is not by itself a reason to stop or to refuse the push: retry the \
+         the failure still stands. A Bazel test TIMEOUT result, a full-suite failure that passes in \
+         isolation, or a failure in untouched code is not by itself a reason to stop or to refuse the push: retry the \
          specific Bazel target (two or three attempts maximum), and if it keeps failing, check whether \
-         it reproduces on an unmodified base revision. A shell-timeout of `bazel` or `checkleft run` is \
+         it reproduces on an unmodified base revision. Separately, a shell-timeout of `bazel` or `checkleft run` is \
          not a reason to rerun the same command under the same cap — keep polling a still-running \
          command instead, and do not wrap those commands in `timeout`. You MAY push despite a still-red target, and \
          declare `delivered`, only with evidence that the failure is pre-existing or environmental (a \

@@ -140,8 +140,8 @@ struct Guard {
     command: String,
     matcher: &'static str,
     /// Outer Grok hook-runner timeout in seconds. `None` omits the field
-    /// (Grok's default). The checkleft push guard sets this above its own
-    /// 7200s subprocess timeout so the inner fail-open wins.
+    /// (Grok's default). The checkleft push guard sets this above the sum of its
+    /// own probe and run subprocess timeouts so the inner fail-open wins.
     timeout_sec: Option<u64>,
 }
 
@@ -206,7 +206,7 @@ fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
                 script = shell_quote(&checkleft_script.display().to_string())
             ),
             matcher: "Bash",
-            timeout_sec: Some(7500),
+            timeout_sec: Some(crate::CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS),
         });
     }
 
@@ -576,7 +576,7 @@ mod tests {
         assert!(guards[3].command.contains("boss-checkleft-push-guard.py"));
         assert_eq!(
             guards[3].timeout_sec,
-            Some(7500),
+            Some(crate::CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS),
             "checkleft hook must outlive a contended Bazel compile"
         );
         assert!(
@@ -853,7 +853,7 @@ mod tests {
             .expect("standard worker must arm the checkleft push guard");
         assert_eq!(
             checkleft["hooks"][0]["timeout"].as_u64(),
-            Some(7500),
+            Some(crate::CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS),
             "Grok must not cut the checkleft gate at a short default: {checkleft}"
         );
     }
