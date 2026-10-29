@@ -1156,3 +1156,35 @@ fn startup_recovery_leaves_a_refused_guide_alone_when_the_series_has_a_live_atte
     assert_eq!(proposal_state(&db, &proposal_id).0, "rejected");
     assert_eq!(attempt_status(&db, &attempt_id), "failed");
 }
+
+/// Startup runs tmux re-adoption before recovery. When the worker's pane is
+/// still live, re-adoption has already reopened the attempt to `running` by
+/// the time recovery looks, and the stored legacy rejection must still be
+/// published against that running attempt.
+#[test]
+fn startup_recovery_publishes_a_refused_guide_for_an_attempt_readoption_already_reopened() {
+    let (_dir, db) = open_db();
+    let (root, series_id, comparison_id) = seeded_series(&db);
+    let (attempt_id, execution_id) = spawned_guide_run(&db, &series_id, &comparison_id, "tok-34");
+    db.mark_execution_orphaned(
+        &execution_id,
+        "engine startup: recovery probe proved worker dead across restart",
+    )
+    .unwrap();
+    let proposal_id = store_refused_guide_submission(&db, &execution_id, &comparison_id, RESTART_GUIDE);
+    db.readopt_inferred_terminal_execution(&execution_id, "hook_after_terminal", None)
+        .unwrap();
+    assert_eq!(attempt_status(&db, &attempt_id), "running");
+
+    let report = db.recover_orphaned_review_guide_submissions().unwrap();
+    assert_eq!(report.skipped, Vec::<(String, String)>::new());
+    assert_eq!(report.published.len(), 1);
+    assert_eq!(
+        proposal_state(&db, &proposal_id),
+        ("applied".to_owned(), Some(attempt_id.clone()))
+    );
+    assert_eq!(attempt_status(&db, &attempt_id), "succeeded");
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert_eq!(summary.lifecycle, "ready");
+    assert!(db.recover_orphaned_review_guide_submissions().unwrap().is_empty());
+}

@@ -13,13 +13,13 @@
 //!
 //! This startup pass finds those rows and publishes them as their PR's guide,
 //! under exactly the fences a live submission would face: the attempt is
-//! reopened only when its comparison is still the series' selected one and
+//! reopened (or, when startup re-adoption already reopened it, confirmed running) only when its comparison is still the series' selected one and
 //! nothing else has been published or started for the series
 //! ([`super::review_guide_jobs::reopen_review_guide_attempt_for_readoption`]),
 //! and the body is validated against the recorded comparison at the
 //! execution's workspace before anything is written. A body that no longer
-//! validates (or whose workspace is gone) is logged and left untouched; the
-//! operator can regenerate that PR's guide by hand.
+//! validates (or whose workspace is gone) is logged and left untouched; that
+//! PR's guide must be regenerated manually.
 
 use super::*;
 use boss_protocol::ProposalDecider;
@@ -72,7 +72,7 @@ impl WorkDb {
                AND p.state = 'rejected'
                AND p.decision_reason = ?1
                AND e.kind = 'pr_review_guide'
-               AND a.status = 'failed'
+               AND a.status IN ('failed', 'running')
                AND a.failed_pre_start = 0
                AND s.selected_comparison_id = a.comparison_id
                AND s.request_epoch = a.request_epoch
@@ -112,23 +112,37 @@ impl WorkDb {
         Ok(candidates)
     }
 
-    /// Reopen the attempt and mark the stored proposal `applied` against it,
-    /// atomically. Returns `false` when the attempt could not be reopened
-    /// (the series moved on, or something else was published or started
-    /// in the meantime) — nothing is written then.
-    fn adopt_orphaned_review_guide_submission(&self, submission: &OrphanedGuideSubmission) -> Result<bool> {
+    /// Reopen the attempt, mark the stored proposal `applied` against it and
+    /// publish the guide, all in one transaction. Returns the version id, or
+    /// `None` when a fence refused it (the series moved on, or something else
+    /// was published or started in the meantime) — nothing is written then,
+    /// so a refused or failed publish never strands an `applied` proposal.
+    fn adopt_and_publish_orphaned_review_guide_submission(
+        &self,
+        submission: &OrphanedGuideSubmission,
+        markdown: &str,
+        raw_output: &str,
+    ) -> Result<Option<String>> {
         let now = now_string();
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let reopened =
-            super::review_guide_jobs::reopen_review_guide_attempt_for_readoption(&tx, &submission.execution_id, &now)?;
+        let reopened = super::review_guide_jobs::reopen_review_guide_attempt_for_readoption(
+            &tx,
+            &submission.execution_id,
+            &now,
+            true,
+        )?;
         if reopened.as_deref() != Some(submission.attempt_id.as_str()) {
-            return Ok(false);
+            return Ok(None);
         }
         let adopted = tx.execute(
             "UPDATE worker_proposals
              SET state = 'applied', applied_ref = ?2, decided_by = ?3, decision_reason = ?4, decided_at = ?5
-             WHERE id = ?1 AND state = 'rejected'",
+             WHERE id = ?1 AND state = 'rejected'
+               AND NOT EXISTS (
+                   SELECT 1 FROM worker_proposals q
+                   WHERE q.execution_id = worker_proposals.execution_id AND q.kind = 'review_guide' AND q.state = 'applied'
+               )",
             params![
                 submission.proposal_id,
                 submission.attempt_id,
@@ -138,10 +152,31 @@ impl WorkDb {
             ],
         )?;
         if adopted != 1 {
-            return Ok(false);
+            return Ok(None);
         }
-        tx.commit()?;
-        Ok(true)
+        match super::review_guide_jobs::publish_pr_review_guide_version_in_tx(
+            &tx,
+            &submission.attempt_id,
+            markdown,
+            raw_output,
+            &now,
+        )? {
+            PublishReviewGuideOutcome::Published(version) => {
+                tx.commit()?;
+                Ok(Some(version.id))
+            }
+            other => {
+                // Dropping the transaction rolls back the reopen and the
+                // proposal update with it.
+                tracing::info!(
+                    proposal_id = %submission.proposal_id,
+                    attempt_id = %submission.attempt_id,
+                    ?other,
+                    "review-guide recovery: the publish fence declined the guide; nothing was written",
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// Startup pass: publish every guide that was submitted while its attempt
@@ -188,7 +223,7 @@ impl WorkDb {
     }
 
     /// Validate, adopt and publish one stored submission. `Ok(None)` means
-    /// the adopt or publish fence refused it; `Err` means it could not be
+    /// a fence refused it and nothing was written; `Err` means it could not be
     /// validated (body, comparison or workspace), and nothing was written.
     fn recover_one_orphaned_review_guide_submission(
         &self,
@@ -202,24 +237,6 @@ impl WorkDb {
         let validated = self
             .validate_review_guide_at_workspace(&submission.execution_id, &payload.body_markdown, &capture.packet)
             .map_err(|err| anyhow::anyhow!("stored guide body failed validation: {err:#}"))?;
-        if !self.adopt_orphaned_review_guide_submission(submission)? {
-            return Ok(None);
-        }
-        match self.publish_pr_review_guide_version(
-            &submission.attempt_id,
-            &validated.markdown,
-            &payload.body_markdown,
-        )? {
-            PublishReviewGuideOutcome::Published(version) => Ok(Some(version.id)),
-            other => {
-                tracing::info!(
-                    proposal_id = %submission.proposal_id,
-                    attempt_id = %submission.attempt_id,
-                    ?other,
-                    "review-guide recovery: attempt reopened but the publish fence declined it",
-                );
-                Ok(None)
-            }
-        }
+        self.adopt_and_publish_orphaned_review_guide_submission(submission, &validated.markdown, &payload.body_markdown)
     }
 }

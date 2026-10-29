@@ -452,64 +452,9 @@ impl WorkDb {
         let now = now_string();
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let attempt = query_pr_review_guide_attempt(&tx, attempt_id).require("pr_review_guide_attempt", attempt_id)?;
-        if PrReviewGuideAttemptStatus::from_str(&attempt.status)?.is_terminal() {
-            tx.commit()?;
-            return Ok(PublishReviewGuideOutcome::AlreadyTerminal);
-        }
-        let (selected, epoch): (Option<String>, i64) = tx.query_row(
-            "SELECT selected_comparison_id, request_epoch FROM pr_review_guide_source_series WHERE id = ?1",
-            [&attempt.series_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        if selected.as_deref() != Some(attempt.comparison_id.as_str()) || epoch != attempt.request_epoch {
-            tx.execute(
-                "UPDATE pr_review_guide_attempts SET status = ?2, finished_at = ?3 WHERE id = ?1",
-                params![attempt_id, PrReviewGuideAttemptStatus::Superseded.as_str(), now],
-            )?;
-            tx.commit()?;
-            return Ok(PublishReviewGuideOutcome::Superseded);
-        }
-        let content_hash = format!("{:x}", Sha256::digest(markdown.as_bytes()));
-        let version_id = next_id("prgv");
-        tx.execute(
-            "INSERT INTO pr_review_guide_versions (
-                id, series_id, comparison_id, attempt_id, markdown, raw_output, content_hash, prompt_version, generated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                version_id,
-                attempt.series_id,
-                attempt.comparison_id,
-                attempt_id,
-                markdown,
-                raw_output,
-                content_hash,
-                attempt.prompt_version,
-                now,
-            ],
-        )?;
-        tx.execute(
-            "UPDATE pr_review_guide_attempts SET status = ?2, finished_at = ?3 WHERE id = ?1",
-            params![attempt_id, PrReviewGuideAttemptStatus::Succeeded.as_str(), now],
-        )?;
-        tx.execute(
-            "UPDATE pr_review_guide_source_series
-             SET guide_lifecycle = 'ready', readable_version_id = ?2, updated_at = ?3
-             WHERE id = ?1",
-            params![attempt.series_id, version_id, now],
-        )?;
+        let outcome = publish_pr_review_guide_version_in_tx(&tx, attempt_id, markdown, raw_output, &now)?;
         tx.commit()?;
-        Ok(PublishReviewGuideOutcome::Published(Box::new(PrReviewGuideVersion {
-            id: version_id,
-            series_id: attempt.series_id,
-            comparison_id: attempt.comparison_id,
-            attempt_id: attempt_id.to_owned(),
-            markdown: markdown.to_owned(),
-            raw_output: raw_output.to_owned(),
-            content_hash,
-            prompt_version: attempt.prompt_version,
-            generated_at: now,
-        })))
+        Ok(outcome)
     }
 
     /// Record a classified generation failure. Never touches the series'
@@ -711,9 +656,8 @@ impl WorkDb {
     ///   row with a live process is exactly the contradiction re-adoption
     ///   resolves by putting the execution back to `running`, and an attempt
     ///   closed in the meantime would leave that re-adopted run with nothing
-    ///   to submit its guide to (the restart-during-spawn incident, where the
-    ///   worker finished a guide six minutes after the engine restarted and
-    ///   `propose review-guide` found no running attempt). "Live" is the
+    ///   to submit its guide to (a guide run still working after an engine
+    ///   restart would otherwise have no running attempt to submit to). "Live" is the
     ///   durable pid probe ([`crate::durable_liveness`]) or the caller's own
     ///   evidence in `known_live_execution_ids` — startup passes the
     ///   executions the tmux adoption pass just observed alive. A genuinely
@@ -796,7 +740,14 @@ impl WorkDb {
                 let liveness = if known_live_execution_ids.contains(&execution_id) {
                     Some("observed_live_by_caller")
                 } else {
-                    let process = crate::durable_liveness::probe_execution_worker(self, &execution_id);
+                    // Bounded by the pid-reuse trust window: a recycled pid
+                    // must not keep a truly dead run's attempt open forever.
+                    let process = crate::durable_liveness::probe_execution_worker_within(
+                        self,
+                        &execution_id,
+                        crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
+                        boss_engine_utils::epoch_time::now_epoch_secs(),
+                    );
                     process.alive_pid().is_some().then(|| process.reason())
                 };
                 if let Some(evidence) = liveness {
@@ -1304,6 +1255,74 @@ fn bind_review_guide_execution(tx: &Connection, attempt_id: &str, execution_id: 
     Ok(())
 }
 
+/// [`WorkDb::publish_pr_review_guide_version`] inside the caller's
+/// transaction. Commits nothing: a caller that must publish atomically with
+/// other writes commits only on [`PublishReviewGuideOutcome::Published`] and
+/// drops the transaction otherwise.
+pub(super) fn publish_pr_review_guide_version_in_tx(
+    tx: &Connection,
+    attempt_id: &str,
+    markdown: &str,
+    raw_output: &str,
+    now: &str,
+) -> Result<PublishReviewGuideOutcome> {
+    let attempt = query_pr_review_guide_attempt(tx, attempt_id).require("pr_review_guide_attempt", attempt_id)?;
+    if PrReviewGuideAttemptStatus::from_str(&attempt.status)?.is_terminal() {
+        return Ok(PublishReviewGuideOutcome::AlreadyTerminal);
+    }
+    let (selected, epoch): (Option<String>, i64) = tx.query_row(
+        "SELECT selected_comparison_id, request_epoch FROM pr_review_guide_source_series WHERE id = ?1",
+        [&attempt.series_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if selected.as_deref() != Some(attempt.comparison_id.as_str()) || epoch != attempt.request_epoch {
+        tx.execute(
+            "UPDATE pr_review_guide_attempts SET status = ?2, finished_at = ?3 WHERE id = ?1",
+            params![attempt_id, PrReviewGuideAttemptStatus::Superseded.as_str(), now],
+        )?;
+        return Ok(PublishReviewGuideOutcome::Superseded);
+    }
+    let content_hash = format!("{:x}", Sha256::digest(markdown.as_bytes()));
+    let version_id = next_id("prgv");
+    tx.execute(
+            "INSERT INTO pr_review_guide_versions (
+                id, series_id, comparison_id, attempt_id, markdown, raw_output, content_hash, prompt_version, generated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                version_id,
+                attempt.series_id,
+                attempt.comparison_id,
+                attempt_id,
+                markdown,
+                raw_output,
+                content_hash,
+                attempt.prompt_version,
+                now,
+            ],
+        )?;
+    tx.execute(
+        "UPDATE pr_review_guide_attempts SET status = ?2, finished_at = ?3 WHERE id = ?1",
+        params![attempt_id, PrReviewGuideAttemptStatus::Succeeded.as_str(), now],
+    )?;
+    tx.execute(
+        "UPDATE pr_review_guide_source_series
+             SET guide_lifecycle = 'ready', readable_version_id = ?2, updated_at = ?3
+             WHERE id = ?1",
+        params![attempt.series_id, version_id, now],
+    )?;
+    Ok(PublishReviewGuideOutcome::Published(Box::new(PrReviewGuideVersion {
+        id: version_id,
+        series_id: attempt.series_id,
+        comparison_id: attempt.comparison_id,
+        attempt_id: attempt_id.to_owned(),
+        markdown: markdown.to_owned(),
+        raw_output: raw_output.to_owned(),
+        content_hash,
+        prompt_version: attempt.prompt_version,
+        generated_at: now.to_owned(),
+    })))
+}
+
 /// Reverse the inferred-death closure of the attempt bound to a
 /// `pr_review_guide` execution, inside the caller's transaction.
 ///
@@ -1315,7 +1334,9 @@ fn bind_review_guide_execution(tx: &Connection, attempt_id: &str, execution_id: 
 /// same reversal lets a guide submitted while the attempt was wrongly closed
 /// be recovered (`WorkDb::recover_orphaned_review_guide_submissions`).
 ///
-/// Only an attempt that is `failed` **after a worker ran** (`failed_pre_start
+/// Only an attempt that is `failed` **after a worker ran** (or, with
+/// `accept_running`, already `running` again because re-adoption got there
+/// first — the checks below still apply and the write is then a no-op) (`failed_pre_start
 /// = 0`), whose comparison is still the series' selected one at the same
 /// request epoch, with no guide published for it and no other live attempt in
 /// the series, is reopened. A pre-start failure, a superseded attempt, a
@@ -1326,13 +1347,19 @@ pub(super) fn reopen_review_guide_attempt_for_readoption(
     tx: &Connection,
     execution_id: &str,
     now: &str,
+    accept_running: bool,
 ) -> Result<Option<String>> {
     let attempt: Option<(String, String, String, i64, i64)> = tx
         .query_row(
             "SELECT id, series_id, comparison_id, request_epoch, failed_pre_start
              FROM pr_review_guide_attempts
-             WHERE execution_id = ?1 AND status = ?2",
-            params![execution_id, PrReviewGuideAttemptStatus::Failed.as_str()],
+             WHERE execution_id = ?1 AND (status = ?2 OR (?3 AND status = ?4))",
+            params![
+                execution_id,
+                PrReviewGuideAttemptStatus::Failed.as_str(),
+                accept_running,
+                PrReviewGuideAttemptStatus::Running.as_str()
+            ],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .optional()?;

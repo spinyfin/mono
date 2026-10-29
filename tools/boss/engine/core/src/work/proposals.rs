@@ -182,6 +182,12 @@ impl WorkDb {
     /// moved, body invalid — [`ProposalErrorCode::NotAccepted`]) — each a
     /// normal, typed outcome the worker is meant to see, not an engine
     /// fault, and none of them stores a row.
+    ///
+    /// Because a refused review guide stores no row, it is not counted by the
+    /// per-execution rate caps: those count stored rows. That exemption is
+    /// deliberate — the refusal is a state judgement about a single running
+    /// attempt (one per execution), and persisting refusals to count them is
+    /// the very replay behaviour the refusal avoids.
     pub fn submit_worker_proposal(
         &self,
         input: SubmitWorkerProposalInput<'_>,

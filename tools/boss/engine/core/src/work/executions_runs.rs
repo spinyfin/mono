@@ -400,7 +400,7 @@ impl WorkDb {
         // the attempt back with the execution, or the live worker has no
         // running attempt to submit its guide to.
         let reopened_review_guide_attempt = if existing.kind == ExecutionKind::PrReviewGuide {
-            super::review_guide_jobs::reopen_review_guide_attempt_for_readoption(&tx, execution_id, &now)?
+            super::review_guide_jobs::reopen_review_guide_attempt_for_readoption(&tx, execution_id, &now, false)?
         } else {
             None
         };
