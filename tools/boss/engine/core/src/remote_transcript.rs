@@ -24,7 +24,7 @@ use crate::ssh_transport::shell_quote;
 ///
 /// A single shell string (not a multi-token argv) so the remote shell
 /// evaluates one well-formed command — the same convention
-/// `SshHostAdapter::append_remote_bazel_gate` uses. `tail -c` reads a
+/// `SshHostAdapter::probe_remote_bazel_workspace` uses. `tail -c` reads a
 /// byte suffix; `--` ends option parsing so a path that begins with `-`
 /// is treated as a filename; and the path is quoted via the shared
 /// [`shell_quote`] (also used by `SshTransport::run`) so spaces or

@@ -33,8 +33,10 @@ fn detected_manifests(workspace_path: &Path) -> Vec<&'static str> {
 }
 
 /// The pre-push gate for a non-Bazel repository. `conflict_resolution`
-/// selects the merge-correctness variant (compile/type-check before push,
-/// tests left to the PR's CI) over the full build-and-test variant.
+/// selects the merge-correctness variant, which still requires the repo's
+/// documented compile, type-check AND test commands with exit codes
+/// reported. Bazel conflict policy (compile only, tests in CI) lives in
+/// the parent module and is unchanged.
 pub(super) fn non_bazel_gate_text(
     workspace_path: &Path,
     conflict_resolution: bool,
@@ -57,8 +59,8 @@ pub(super) fn non_bazel_gate_text(
     let (heading, scope, tests) = if conflict_resolution {
         (
             "Pre-push gate for conflict resolution (non-Bazel repository) — merge correctness first, then push",
-            "For a conflict-resolution revision the gate you MUST clear before pushing is **merge correctness**: the merged code must compile and type-check. The full test suite is not a precondition for the push; it runs in the PR's CI.",
-            "Run the repo's documented compile and type-check commands (for example `npm run typecheck` / `npm run build`, `cargo check`, `go build ./...`) over the code your resolution touched and the code the rebased-in upstream change touched. Regenerate any lockfile or generated artifact the rebase invalidated using the repo's own package manager (for example `npm install` to refresh `package-lock.json`, `cargo update -w` / `cargo check` for `Cargo.lock`) and include it in your commit.",
+            "For a conflict-resolution revision the gate you MUST clear before pushing is **merge correctness**: the merged code must compile, type-check, and pass the repo's documented test commands. Run every command with its real exit code reported.",
+            "Run the repo's documented compile, type-check and test commands (for example `npm run typecheck` / `npm run build` / `npm test`, `cargo test`, `go test ./...`) over the code your resolution touched and the code the rebased-in upstream change touched. A repo whose only documented check is a test command still requires that test. Regenerate any lockfile or generated artifact the rebase invalidated using the repo's own package manager (for example `npm install` to refresh `package-lock.json`, `cargo update -w` / `cargo check` for `Cargo.lock`) and include it in your commit.",
         )
     } else {
         (
@@ -86,7 +88,7 @@ pub(super) fn non_bazel_gate_text(
 /// Rebase-only exception wording for a non-Bazel repository.
 pub(super) fn non_bazel_rebase_clause(conflict_resolution: bool) -> &'static str {
     if conflict_resolution {
-        "Rebase-only exception (VCS only — not a build-gate skip): if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces NO diff whatsoever (zero changed files), it is valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change. IMPORTANT: this exception covers VCS mechanics only — whether to add a new commit. It does NOT exempt you from the merge-correctness gate. Any rebase, merge, or conflict resolution MUST run the repo's own documented compile and type-check commands (and regenerate invalidated lockfiles with the repo's package manager) before pushing, even when the rebase appeared clean — a rebase merges upstream changes in and the resulting code is new and must compile. The full test suite is NOT a precondition for this push; it runs in the PR's CI after you push (see the conflict-resolution gate above).\n"
+        "Rebase-only exception (VCS only — not a build-gate skip): if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces NO diff whatsoever (zero changed files), it is valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change. IMPORTANT: this exception covers VCS mechanics only — whether to add a new commit. It does NOT exempt you from the merge-correctness gate. Any rebase, merge, or conflict resolution MUST run the repo's own documented compile, type-check and test commands (and regenerate invalidated lockfiles with the repo's package manager) before pushing, even when the rebase appeared clean — a rebase merges upstream changes in and the resulting code is new and must compile, type-check, and pass those tests. Report each command and its real exit code.\n"
     } else {
         "Rebase-only exception (VCS only — not a build-gate skip): if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces NO diff whatsoever (zero changed files), it is valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change. IMPORTANT: this exception covers VCS mechanics only — whether to add a new commit. It does NOT exempt you from the pre-push build gate. Any revision that involves a rebase, merge, or conflict resolution MUST run the repo's own documented compile, type-check and test commands before pushing, even when the rebase appeared clean. A rebase merges upstream changes into your branch — the resulting code is new and must be compiled and tested. This is exactly where compile errors get reintroduced.\n"
     }
