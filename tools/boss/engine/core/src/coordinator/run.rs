@@ -165,11 +165,16 @@ impl ExecutionCoordinator {
                         &self.work_db,
                         &execution,
                         &lease.lease_id,
-                        crate::workspace_lease_release::TerminalCause::ProvenStopped,
-                        crate::workspace_lease_release::PaneStatus::Gone,
-                        &crate::workspace_lease_release::EmptyOccupancy,
-                        &crate::workspace_lease_release::DbBookmarkGate { db: &self.work_db },
-                        adapter.release_workspace_with_reset(&lease.lease_id),
+                        crate::workspace_lease_release::ReleaseEvidence {
+                            cause: crate::workspace_lease_release::TerminalCause::ProvenStopped,
+                            pane: crate::workspace_lease_release::PaneStatus::Gone,
+                            occupancy: &crate::workspace_lease_release::EmptyOccupancy,
+                            bookmark: &crate::workspace_lease_release::DbBookmarkGate {
+                                db: &self.work_db,
+                                adapter: Some(adapter.as_ref())
+                            }
+                        },
+                        adapter.release_workspace_with_reset(&lease.lease_id)
                     )
                     .await,
                     crate::workspace_lease_release::LeaseReleaseOutcome::Released
@@ -435,11 +440,16 @@ impl ExecutionCoordinator {
                             &self.work_db,
                             &execution,
                             &lease.lease_id,
-                            crate::workspace_lease_release::TerminalCause::ProvenStopped,
-                            crate::workspace_lease_release::PaneStatus::Gone,
-                            &crate::workspace_lease_release::EmptyOccupancy,
-                            &crate::workspace_lease_release::DbBookmarkGate { db: &self.work_db },
-                            adapter.release_workspace_with_reset(&lease.lease_id),
+                            crate::workspace_lease_release::ReleaseEvidence {
+                                cause: crate::workspace_lease_release::TerminalCause::ProvenStopped,
+                                pane: crate::workspace_lease_release::PaneStatus::Gone,
+                                occupancy: &crate::workspace_lease_release::EmptyOccupancy,
+                                bookmark: &crate::workspace_lease_release::DbBookmarkGate {
+                                    db: &self.work_db,
+                                    adapter: Some(adapter.as_ref())
+                                }
+                            },
+                            adapter.release_workspace_with_reset(&lease.lease_id)
                         )
                         .await,
                         crate::workspace_lease_release::LeaseReleaseOutcome::Released
@@ -503,7 +513,6 @@ impl ExecutionCoordinator {
                         .execution_status(ExecutionStatus::Failed)
                         .run_status("failed")
                         .error_text(error_text.as_str())
-                        .clear_workspace_lease(released)
                         .increment_pre_start_failure_count(!is_slot_busy)
                         .record_last_error(true)
                         .maybe_attention(attention)
@@ -1077,11 +1086,16 @@ impl ExecutionCoordinator {
                     &self.work_db,
                     execution,
                     &lease.lease_id,
-                    crate::workspace_lease_release::TerminalCause::ProvenCompleted,
-                    crate::workspace_lease_release::PaneStatus::Gone,
-                    &crate::workspace_lease_release::EmptyOccupancy,
-                    &crate::workspace_lease_release::DbBookmarkGate { db: &self.work_db },
-                    adapter.release_workspace_with_reset(&lease.lease_id),
+                    crate::workspace_lease_release::ReleaseEvidence {
+                        cause: crate::workspace_lease_release::TerminalCause::ProvenCompleted,
+                        pane: crate::workspace_lease_release::PaneStatus::Gone,
+                        occupancy: &crate::workspace_lease_release::EmptyOccupancy,
+                        bookmark: &crate::workspace_lease_release::DbBookmarkGate {
+                            db: &self.work_db,
+                            adapter: Some(adapter.as_ref())
+                        }
+                    },
+                    adapter.release_workspace_with_reset(&lease.lease_id)
                 )
                 .await,
                 crate::workspace_lease_release::LeaseReleaseOutcome::Released
@@ -1108,7 +1122,6 @@ impl ExecutionCoordinator {
                 .execution_status(outcome.wait_state.execution_status())
                 .run_status("completed")
                 .maybe_result_summary(outcome.result_summary.as_deref())
-                .clear_workspace_lease(released)
                 .maybe_attention(attention)
                 .build(),
         )?;

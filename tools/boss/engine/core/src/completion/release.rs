@@ -11,8 +11,8 @@ impl WorkerCompletionHandler {
     /// duplicate calls (e.g. completion-detection followed by a manual
     /// stop, or two clients racing to mark a chore done) become no-ops
     /// on the second pass via the registry's `take_slot_for_run`
-    /// invariant and cleared lease columns. Concurrent remote releases are
-    /// idempotent at the owning host; its lease stays recorded until success.
+    /// invariant and an atomic claim of the expected lease. A genuine
+    /// release failure restores that claim for a later retry.
     ///
     /// Does NOT change the execution's status field. Callers that need
     /// the execution marked `completed` / `failed` should drive that
@@ -72,8 +72,8 @@ impl WorkerCompletionHandler {
                 .await;
         }
 
-        // Remote leases belong to the owning host. Keep the durable lease
-        // columns until its adapter confirms release so a failed call can retry.
+        // Remote leases belong to the owning host. The release claim prevents
+        // duplicate calls and is restored if that host reports a failure.
         match self.owning_cube(execution_id).await {
             Ok(resolved) if !resolved.is_local() => {
                 let adapter = resolved.cube;
@@ -81,16 +81,32 @@ impl WorkerCompletionHandler {
                     Ok(execution) => execution,
                     Err(_) => return ForceReleaseOutcome::WorkspaceColumnClearFailed,
                 };
-                let Some(lease_id) = execution.cube_lease_id else {
+                let Some(lease_id) = execution.cube_lease_id.clone() else {
                     return ForceReleaseOutcome::NoLeaseHeld;
                 };
-                if let Err(err) = adapter.force_release_lease(&lease_id, Some("force release")).await {
-                    tracing::warn!(execution_id, ?err, "force_release: remote cube release failed");
-                    return ForceReleaseOutcome::LeaseReleaseFailed { lease_id };
-                }
-                return match self.work_db.clear_execution_workspace(execution_id) {
-                    Ok(_) => ForceReleaseOutcome::Released { lease_id },
-                    Err(_) => ForceReleaseOutcome::WorkspaceColumnClearFailed,
+                let recovery_adapter = self.recovery_adapter(execution_id).await;
+                let outcome = crate::workspace_lease_release::apply_release(
+                    &self.work_db,
+                    &execution,
+                    &lease_id,
+                    crate::workspace_lease_release::ReleaseEvidence {
+                        cause: crate::workspace_lease_release::TerminalCause::ProvenStopped,
+                        pane: crate::workspace_lease_release::PaneStatus::Gone,
+                        occupancy: &crate::workspace_lease_release::EmptyOccupancy,
+                        bookmark: &crate::workspace_lease_release::DbBookmarkGate {
+                            db: &self.work_db,
+                            adapter: recovery_adapter.as_deref(),
+                        },
+                    },
+                    adapter.force_release_lease(&lease_id, Some("force release")),
+                )
+                .await;
+                return match outcome {
+                    crate::workspace_lease_release::LeaseReleaseOutcome::Released => {
+                        ForceReleaseOutcome::Released { lease_id }
+                    }
+                    crate::workspace_lease_release::LeaseReleaseOutcome::NoLease => ForceReleaseOutcome::NoLeaseHeld,
+                    _ => ForceReleaseOutcome::LeaseReleaseFailed { lease_id },
                 };
             }
             Ok(_) => {}
@@ -127,10 +143,15 @@ impl WorkerCompletionHandler {
             &self.work_db,
             execution,
             &lease_id,
-            cause,
-            crate::workspace_lease_release::PaneStatus::Gone,
-            &crate::workspace_lease_release::EmptyOccupancy,
-            &crate::workspace_lease_release::DbBookmarkGate { db: &self.work_db },
+            crate::workspace_lease_release::ReleaseEvidence {
+                cause,
+                pane: crate::workspace_lease_release::PaneStatus::Gone,
+                occupancy: &crate::workspace_lease_release::EmptyOccupancy,
+                bookmark: &crate::workspace_lease_release::DbBookmarkGate {
+                    db: &self.work_db,
+                    adapter: None,
+                },
+            },
             self.cube_client.release_workspace_with_reset(&lease_id),
         )
         .await

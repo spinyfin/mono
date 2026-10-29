@@ -234,9 +234,6 @@ impl WorkDb {
         tx.execute(
             "UPDATE work_executions
              SET status = 'completed',
-                 cube_lease_id = NULL,
-                 cube_workspace_id = NULL,
-                 workspace_path = NULL,
                  finished_at = ?2,
                  pr_url = ?3,
                  pr_head_after = ?4
@@ -456,9 +453,6 @@ impl WorkDb {
         tx.execute(
             "UPDATE work_executions
              SET status = 'completed',
-                 cube_lease_id = NULL,
-                 cube_workspace_id = NULL,
-                 workspace_path = NULL,
                  finished_at = ?2
              WHERE id = ?1",
             params![execution_id, now],
@@ -613,9 +607,6 @@ impl WorkDb {
         tx.execute(
             "UPDATE work_executions
              SET status = 'failed',
-                 cube_lease_id = NULL,
-                 cube_workspace_id = NULL,
-                 workspace_path = NULL,
                  finished_at = ?2
              WHERE id = ?1",
             params![execution_id, now],

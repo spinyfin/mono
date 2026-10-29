@@ -1370,8 +1370,15 @@ impl ExecutionCoordinator {
                     .or_default()
                     .push(lease.workspace_id.clone());
 
-                // Hand the workspace straight back so it isn't stranded.
-                self.release_pre_start_workspace(execution, &lease, &adapter).await;
+                // Drop only the refused registry lease, never reset the live
+                // occupant's checkout. This execution has not positioned it.
+                crate::workspace_lease_release::release_refused_workspace(
+                    &self.work_db,
+                    execution,
+                    &lease.lease_id,
+                    adapter.as_ref(),
+                )
+                .await;
                 let err = anyhow!(
                     "leased workspace {} is occupied by live worker {}",
                     lease.workspace_id,
@@ -1819,6 +1826,7 @@ impl ExecutionCoordinator {
         }
         .await;
         if let Err(err) = bookmark_result {
+            crate::execution_bookmark_recovery::report_failure(&self.work_db, execution, &format!("{err:#}"));
             self.release_pre_start_workspace(execution, &lease, &adapter).await;
             self.record_start_failure(
                 Arc::clone(self),
@@ -2079,7 +2087,7 @@ impl ExecutionCoordinator {
                 &self.work_db,
                 execution,
                 existing_lease,
-                adapter.release_workspace_with_reset(existing_lease),
+                adapter.as_ref(),
             )
             .await;
             if !matches!(
@@ -2364,7 +2372,7 @@ impl ExecutionCoordinator {
             &self.work_db,
             execution,
             &lease.lease_id,
-            adapter.release_workspace_with_reset(&lease.lease_id),
+            adapter.as_ref(),
         )
         .await;
     }

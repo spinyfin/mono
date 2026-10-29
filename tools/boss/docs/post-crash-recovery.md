@@ -36,11 +36,14 @@ Compared to the other terminal statuses:
 **Lease handling:** resume reads preserved work from
 `boss-recovery/<execution>` bookmarks in the shared jj store, not from
 the originating workspace. After an orphan is recorded, the engine
-releases the cube lease once the recovery bookmark is confirmed and no
-process still has its cwd inside the workspace. If either gate fails,
-the lease stays held until cube's 24-hour TTL. The engine clears
-`cube_lease_id` / `cube_workspace_id` / `workspace_path` only after a
-successful cube release (or when the human explicitly cancels).
+releases the cube lease once the recovery bookmark preserves the current
+workspace commit, the pane is confirmed gone, and no process has its cwd
+inside the workspace. Inconclusive probes keep the lease held, with cube's
+24-hour TTL as the backstop. A release attempt atomically claims
+`cube_lease_id` before calling cube; a genuine failure restores the claim.
+Successful release, including an already-absent lease, clears the remaining
+workspace metadata. The leftover sweep checks at most 100 recent local
+executions per pass and does not infer teardown from terminal status alone.
 
 ## How orphans get detected
 

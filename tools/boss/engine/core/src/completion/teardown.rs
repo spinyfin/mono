@@ -84,6 +84,24 @@ impl WorkerCompletionHandler {
         }
     }
 
+    pub(super) async fn recovery_adapter(
+        &self,
+        execution_id: &str,
+    ) -> Option<Arc<dyn crate::host_adapter::HostAdapter>> {
+        let host = self.work_db.execution_host_id(execution_id).ok().flatten()?;
+        if host == "local" {
+            return None;
+        }
+        let provider = self
+            .host_adapter_provider
+            .read()
+            .expect("host adapter provider lock poisoned")
+            .clone()?;
+        crate::host_adapter::resolve_host_adapter(&self.work_db, provider.as_ref(), &host)
+            .await
+            .ok()
+    }
+
     /// True when `execution_id` is not a remote run, or its remote worker
     /// process is provably gone (`kill -0` on the owning host reports no such
     /// process). A terminal status is NOT that proof: a cancelled remote
@@ -197,6 +215,7 @@ impl WorkerCompletionHandler {
 
         let cube_started = Instant::now();
         let mut cube_timed_out = false;
+        let mut lease_released = false;
         if let Some(lease_id) = lease_id {
             let release = async {
                 match owning_cube {
@@ -221,17 +240,27 @@ impl WorkerCompletionHandler {
             };
             match self.work_db.get_execution(execution_id) {
                 Ok(execution) => {
+                    let recovery_adapter = self.recovery_adapter(execution_id).await;
                     let outcome = crate::workspace_lease_release::apply_release(
                         &self.work_db,
                         &execution,
                         lease_id,
-                        crate::workspace_lease_release::TerminalCause::ProvenCompleted,
-                        crate::workspace_lease_release::PaneStatus::Gone,
-                        &crate::workspace_lease_release::EmptyOccupancy,
-                        &crate::workspace_lease_release::DbBookmarkGate { db: &self.work_db },
+                        crate::workspace_lease_release::ReleaseEvidence {
+                            cause: crate::workspace_lease_release::TerminalCause::ProvenCompleted,
+                            pane: match pane_outcome {
+                                PaneReleaseOutcome::Reaped => crate::workspace_lease_release::PaneStatus::Gone,
+                                PaneReleaseOutcome::NoLiveWorker => crate::workspace_lease_release::PaneStatus::Present,
+                            },
+                            occupancy: &crate::workspace_lease_release::EmptyOccupancy,
+                            bookmark: &crate::workspace_lease_release::DbBookmarkGate {
+                                db: &self.work_db,
+                                adapter: recovery_adapter.as_deref(),
+                            },
+                        },
                         timed,
                     )
                     .await;
+                    lease_released = outcome == crate::workspace_lease_release::LeaseReleaseOutcome::Released;
                     if !matches!(
                         outcome,
                         crate::workspace_lease_release::LeaseReleaseOutcome::Released
@@ -282,7 +311,7 @@ impl WorkerCompletionHandler {
                     .with_details(serde_json::json!({
                         "path": path,
                         "pane_outcome": format!("{pane_outcome:?}"),
-                        "released_lease": lease_id.is_some(),
+                        "released_lease": lease_released,
                         "cube_timed_out": cube_timed_out,
                         "release_pane_ms": pane_ms,
                         "driver_teardown_ms": driver_ms,

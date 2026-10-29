@@ -81,7 +81,11 @@ impl CubeCliError {
 
 impl fmt::Display for CubeCliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ssh cube command failed on host {}: {}", self.host, self.detail())
+        if self.host == "local" {
+            write!(f, "Cube command failed: {}", self.detail())
+        } else {
+            write!(f, "ssh cube command failed on host {}: {}", self.host, self.detail())
+        }
     }
 }
 

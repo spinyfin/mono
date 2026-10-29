@@ -349,6 +349,7 @@ async fn session_end_for_a_failed_execution_does_not_readopt() {
     let product_id = create_product(db);
     let work_item_id = create_active_chore(db, &product_id, "test chore");
     let execution_id = create_spawned_execution(db, &work_item_id, dead_pid());
+    let workspace = db.get_execution(&execution_id).unwrap().workspace_path;
     db.record_worker_failure(&execution_id, "breaker tripped")
         .unwrap()
         .expect("live execution is failed");
@@ -366,9 +367,9 @@ async fn session_end_for_a_failed_execution_does_not_readopt() {
         ExecutionStatus::Failed,
         "session_end is the worker announcing exit, not proof of life",
     );
-    assert!(
-        after.workspace_path.is_none() || after.workspace_path.as_deref() == Some(""),
-        "worker failure cleared the workspace; readopt must not restore a running row on top of that",
+    assert_eq!(
+        after.workspace_path, workspace,
+        "failure retains the workspace for guarded release; session_end must not readopt it",
     );
 }
 

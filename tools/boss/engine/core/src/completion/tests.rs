@@ -584,6 +584,18 @@ fn auto_advancing_clock() -> Arc<dyn Fn() -> std::time::Instant + Send + Sync> {
 /// a cube lease attached — this is the state the engine is in once
 /// `PaneSpawnRunner::run_execution` has returned and
 /// `record_run_completion` has run.
+fn finish_run_worker_pane_alive(db: &WorkDb, execution_id: &str, run_id: &str, result_summary: Option<&str>) {
+    let execution = db.get_execution(execution_id).unwrap();
+    if execution
+        .workspace_path
+        .as_deref()
+        .is_some_and(|path| Path::new(path).is_dir())
+    {
+        crate::test_support::preserve_test_workspace(db, execution_id);
+    }
+    crate::test_support::finish_run_worker_pane_alive(db, execution_id, run_id, result_summary);
+}
+
 fn fixture(workspace_path: &Path) -> (TempDir, Arc<WorkDb>, String, String, String) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("boss.db");
@@ -607,6 +619,31 @@ fn fixture(workspace_path: &Path) -> (TempDir, Arc<WorkDb>, String, String, Stri
     finish_run_worker_pane_alive(&db, &execution.id, &run.id, Some("spawned worker pane"));
 
     (dir, db, product.id, chore.id, execution.id)
+}
+
+#[tokio::test]
+async fn completion_without_teardown_proof_retains_workspace() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, chore, execution) = fixture(workspace.path());
+    let pane = Arc::new(RecordingPaneReleaser::with_outcome(PaneReleaseOutcome::NoLiveWorker));
+    let TestHarness { handler, cube, .. } = TestHarness::with_pane(db.clone(), StubPrDetector::ok(None), pane);
+    db.complete_pane_parked_execution(&execution, "completed", None)
+        .unwrap();
+    handler
+        .finish_worker_teardown(
+            &execution,
+            &chore,
+            Some("lease-1"),
+            Some(workspace.path()),
+            "test",
+            handler.begin_teardown(&execution),
+        )
+        .await;
+    assert!(cube.release_calls.lock().await.is_empty());
+    assert_eq!(
+        db.get_execution(&execution).unwrap().cube_lease_id.as_deref(),
+        Some("lease-1")
+    );
 }
 
 /// Stand up a `question`-classified comment already `answering`, with its
@@ -666,6 +703,7 @@ fn answer_agent_fixture(workspace_path: &Path) -> (TempDir, Arc<WorkDb>, String,
             workspace_path.to_str().unwrap(),
         )
         .unwrap();
+    crate::test_support::preserve_test_workspace(&db, &execution.id);
     (dir, db, comment.id, run.id, execution.id)
 }
 
@@ -855,6 +893,7 @@ fn fixture_running(workspace_path: &Path) -> (TempDir, Arc<WorkDb>, String, Stri
         )
         .unwrap();
     assert_eq!(execution.status, ExecutionStatus::Running);
+    crate::test_support::preserve_test_workspace(&db, &execution.id);
     (dir, db, product.id, chore.id, execution.id)
 }
 
@@ -1730,6 +1769,7 @@ fn pr_review_exec_fixture_with_jsonl(
         )
         .unwrap();
 
+    crate::test_support::preserve_test_workspace(&db, &pr_review_exec.id);
     // Optionally write a pre-built JSONL transcript and register its path.
     if let Some(jsonl) = transcript_jsonl {
         let transcript_path = workspace_path.join(format!("transcript-{}.jsonl", pr_review_exec.id));

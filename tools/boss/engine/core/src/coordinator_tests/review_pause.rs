@@ -352,11 +352,11 @@ async fn pr_review_goto_failure_records_positioning_failed() {
         .await;
     assert!(result.is_err(), "schedule_execution must fail when goto fails");
 
-    // The workspace was leased and must be released after goto failure.
+    // A failed positioning attempt has no recovery proof; retain its lease.
+    assert!(cube.release_calls.lock().await.is_empty());
     assert_eq!(
-        cube.release_calls.lock().await.len(),
-        1,
-        "workspace must be released after goto failure"
+        db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(),
+        Some("lease-1")
     );
 
     // A cube_workspace_positioning_failed attention item must exist.

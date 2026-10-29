@@ -2344,7 +2344,7 @@ impl ExecutionCoordinator {
                 &self.work_db,
                 &current,
                 &lease_id,
-                self.host_adapter().release_workspace_with_reset(&lease_id),
+                self.host_adapter().as_ref(),
             )
             .await;
         }

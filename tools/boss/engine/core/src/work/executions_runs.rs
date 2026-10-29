@@ -846,10 +846,8 @@ impl WorkDb {
         collect_rows(rows)
     }
 
-    /// Terminal rows that still record a cube lease — leftover from a
-    /// completion path that nulled too early, an inferred-death path that
-    /// kept the columns for provenance, or a cube release that failed.
-    /// The ended-run lease sweep uses this as its candidate set.
+    /// Bounded recent local leftovers. Older leases have reached cube's TTL;
+    /// remote leases belong to the owning host's reconciler.
     pub fn list_terminal_executions_holding_lease(&self) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
@@ -860,9 +858,17 @@ impl WorkDb {
              FROM work_executions
              WHERE status IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND cube_lease_id IS NOT NULL
-             ORDER BY created_at ASC, id ASC",
+               AND COALESCE(host_id, 'local') = 'local'
+               AND COALESCE((SELECT r.host_id FROM work_runs r
+                             WHERE r.execution_id = work_executions.id
+                             ORDER BY r.created_at DESC, r.id DESC LIMIT 1), 'local') = 'local'
+               AND CAST(COALESCE(finished_at, created_at) AS INTEGER) >= ?1
+             ORDER BY created_at DESC, id DESC LIMIT 100",
         )?;
-        let rows = stmt.query_map([], map_execution)?;
+        let rows = stmt.query_map(
+            [boss_engine_utils::epoch_time::now_epoch_secs() - 86_400],
+            map_execution,
+        )?;
         collect_rows(rows)
     }
 
@@ -1760,9 +1766,6 @@ impl WorkDb {
             "UPDATE work_executions
              SET status = 'failed',
                  cube_repo_id = COALESCE(?2, cube_repo_id),
-                 cube_lease_id = NULL,
-                 cube_workspace_id = NULL,
-                 workspace_path = NULL,
                  finished_at = ?3
              WHERE id = ?1",
             params![execution_id, cube_repo_id, now],
@@ -2153,9 +2156,6 @@ impl WorkDb {
         tx.execute(
             "UPDATE work_executions
              SET status = 'completed',
-                 cube_lease_id = NULL,
-                 cube_workspace_id = NULL,
-                 workspace_path = NULL,
                  finished_at = ?2
              WHERE id = ?1",
             params![execution_id, now],
@@ -2262,9 +2262,6 @@ impl WorkDb {
         tx.execute(
             "UPDATE work_executions
              SET status = 'failed',
-                 cube_lease_id = NULL,
-                 cube_workspace_id = NULL,
-                 workspace_path = NULL,
                  finished_at = ?2
              WHERE id = ?1",
             params![execution_id, now],

@@ -78,6 +78,9 @@ crate::stub_host_adapter! { StubAdapter {
         }
         Ok(self.worker_log.lock().unwrap().clone())
     }
+    async fn confirm_workspace_recovery(&self, record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark, workspace: &std::path::Path) -> anyhow::Result<()> {
+        crate::test_support::confirm_remote_test_recovery(record, workspace, &self.host_id)
+    }
 } }
 
 struct StubProvider {
@@ -124,6 +127,7 @@ fn start_remote_run(db: &WorkDb, work_item_id: &str, host_id: &str, lease_id: &s
             host_id,
         )
         .unwrap();
+    crate::test_support::record_remote_test_recovery(db, &execution.id, host_id);
     if let Some(pid) = remote_pid {
         db.set_run_remote_pid_for_execution(&execution.id, pid).unwrap();
     }

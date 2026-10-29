@@ -877,14 +877,13 @@ impl CommandCubeClient {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            let detail = if !stderr.is_empty() {
-                stderr
-            } else if !stdout.is_empty() {
-                stdout
-            } else {
-                format!("exit status {}", output.status)
-            };
-            return Err(anyhow!("Cube command failed: {detail}"));
+            return Err(crate::cube_commands::CubeCliError {
+                host: "local".to_owned(),
+                exit_code: output.status.code(),
+                stderr,
+                stdout,
+            }
+            .into());
         }
 
         serde_json::from_slice(&output.stdout).context("failed to decode Cube JSON output")

@@ -27,8 +27,17 @@ async fn bookmark_creation_failure_is_recorded_before_a_worker_can_start() {
         "a missing recovery ref must prevent spawn"
     );
     assert_eq!(cube.bookmark_calls.lock().await.as_slice(), [id.as_str()]);
-    assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+    assert!(
+        cube.release_calls.lock().await.is_empty(),
+        "failed recovery creation must retain the lease"
+    );
+    assert_eq!(db.get_execution(&id).unwrap().cube_lease_id.as_deref(), Some("lease-1"));
     let attention = db.list_attention_items(&id).unwrap();
+    assert!(
+        attention
+            .iter()
+            .any(|a| a.kind == crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND)
+    );
     assert!(
         attention
             .iter()

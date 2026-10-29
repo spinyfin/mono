@@ -19,7 +19,10 @@ use crate::protocol::WorkerEvent;
 /// pane-parked (`waiting_human`) `answer_agent` execution occupying `slot_id`
 /// — the exact state the observed strand was found in. Returns
 /// `(comment_id, run_id, execution_id)`.
-fn seed_parked_answer_agent(server_state: &Arc<ServerState>, slot_id: u8) -> (String, String, String) {
+fn seed_parked_answer_agent(
+    server_state: &Arc<ServerState>,
+    slot_id: u8,
+) -> (String, String, String, tempfile::TempDir) {
     let work_db = &server_state.work_db;
     let product = crate::test_support::create_test_product_with_repo(
         work_db,
@@ -57,7 +60,7 @@ fn seed_parked_answer_agent(server_state: &Arc<ServerState>, slot_id: u8) -> (St
     let execution = work_db
         .create_answer_agent_execution(&comment.id, &product.repo_remote_url.clone().unwrap())
         .unwrap();
-    let workspace = std::env::temp_dir();
+    let workspace = tempfile::tempdir().unwrap();
     let (execution, spawn_run) = work_db
         .start_execution_run(
             &execution.id,
@@ -65,13 +68,14 @@ fn seed_parked_answer_agent(server_state: &Arc<ServerState>, slot_id: u8) -> (St
             "mono",
             "lease-1",
             "mono-agent-038",
-            workspace.to_str().unwrap(),
+            workspace.path().to_str().unwrap(),
         )
         .unwrap();
     crate::test_support::finish_run_worker_pane_alive(work_db, &execution.id, &spawn_run.id, Some("spawned"));
+    crate::test_support::preserve_test_workspace(work_db, &execution.id);
     register_working_worker(server_state, &execution.id, slot_id);
     super::tmux_stub::install_teardown(server_state, &execution.id, 4_194_303);
-    (comment.id, run.id, execution.id)
+    (comment.id, run.id, execution.id, workspace)
 }
 
 /// The reply the agent posts with `boss comment reply`, as
@@ -141,7 +145,7 @@ async fn stop_hook_through_the_events_socket(
 async fn a_delivered_answer_completes_the_execution_and_frees_its_slot_on_the_turn_boundary() {
     let (server_state, _dir) = test_server_state_with_fakes();
     let slot_id = 8;
-    let (comment_id, run_id, execution_id) = seed_parked_answer_agent(&server_state, slot_id);
+    let (comment_id, run_id, execution_id, _workspace) = seed_parked_answer_agent(&server_state, slot_id);
     post_the_reply(&server_state, &comment_id, &run_id);
 
     // Before: the row says live and the pool says claimed — they agree.
@@ -197,7 +201,7 @@ async fn a_delivered_answer_completes_the_execution_and_frees_its_slot_on_the_tu
 async fn an_agent_that_never_replied_still_completes_on_the_turn_boundary() {
     let (server_state, _dir) = test_server_state_with_fakes();
     let slot_id = 8;
-    let (comment_id, run_id, execution_id) = seed_parked_answer_agent(&server_state, slot_id);
+    let (comment_id, run_id, execution_id, _workspace) = seed_parked_answer_agent(&server_state, slot_id);
 
     let stop = crate::events_socket::IncomingHookEvent::for_test(
         WorkerEvent::Stop {

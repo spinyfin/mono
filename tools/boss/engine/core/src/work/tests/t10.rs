@@ -352,7 +352,7 @@ fn record_worker_no_op_completion_coalesce_stability() {
     );
 }
 
-/// Failure releases resources and records a task failure atomically.
+/// Failure retains the lease for teardown and records a task failure atomically.
 #[test]
 fn record_worker_failure_finalizes_execution_and_records_task_failure() {
     let db = WorkDb::open(temp_db_path("rwia-finalize")).unwrap();
@@ -364,8 +364,8 @@ fn record_worker_failure_finalizes_execution_and_records_task_failure() {
         .expect("a live execution must be finalized");
 
     assert_eq!(completion.execution.status, ExecutionStatus::Failed);
-    assert!(completion.execution.cube_lease_id.is_none());
-    assert!(completion.execution.cube_workspace_id.is_none());
+    assert_eq!(completion.execution.cube_lease_id.as_deref(), Some("lease-1"));
+    assert_eq!(completion.execution.cube_workspace_id.as_deref(), Some("ws-1"));
     assert!(completion.execution.finished_at.is_some());
     assert_eq!(completion.released_lease_id.as_deref(), Some("lease-1"));
 
@@ -406,8 +406,7 @@ fn record_worker_failure_finalizes_execution_and_records_task_failure() {
 }
 
 /// If the task/chore row is gone by the time the breaker fails the attempt (e.g. hard
-/// deleted while the execution was still live), the lease/pane must still
-/// be freed — that is the entire point of this method. It must not bail
+/// deleted while the execution was still live), return its lease for teardown. It must not bail
 /// out just because a best-effort work-item lookup came up empty.
 #[test]
 fn record_worker_failure_frees_execution_even_if_task_row_missing() {
@@ -426,8 +425,8 @@ fn record_worker_failure_frees_execution_even_if_task_row_missing() {
         .expect("a live execution must still be finalized when its task row is missing");
 
     assert_eq!(completion.execution.status, ExecutionStatus::Failed);
-    assert!(completion.execution.cube_lease_id.is_none());
-    assert!(completion.execution.cube_workspace_id.is_none());
+    assert_eq!(completion.execution.cube_lease_id.as_deref(), Some("lease-1"));
+    assert_eq!(completion.execution.cube_workspace_id.as_deref(), Some("ws-1"));
     assert_eq!(completion.released_lease_id.as_deref(), Some("lease-1"));
     assert!(
         completion.work_item.is_none(),

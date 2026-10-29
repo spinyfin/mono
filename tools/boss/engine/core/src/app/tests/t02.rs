@@ -753,6 +753,9 @@ crate::stub_host_adapter! { ProbeAdapter {
             RemoteProbe::Inconclusive => anyhow::bail!("host unreachable"),
         }
     }
+    async fn confirm_workspace_recovery(&self, record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark, workspace: &std::path::Path) -> anyhow::Result<()> {
+        crate::test_support::confirm_remote_test_recovery(record, workspace, "zakalwe")
+    }
 } }
 
 struct ProbeProvider(Arc<ProbeAdapter>);
@@ -807,6 +810,7 @@ async fn retained_remote_worker_release(completed: bool) {
             "zakalwe",
         )
         .unwrap();
+    crate::test_support::record_remote_test_recovery(db, &execution.id, "zakalwe");
     db.set_run_remote_pid_for_execution(&execution.id, 4242).unwrap();
     let event = crate::events_socket::IncomingHookEvent::for_test(
         WorkerEvent::PostToolUse {

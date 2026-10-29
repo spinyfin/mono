@@ -36,7 +36,7 @@ pub enum TerminalCause {
     ProvenCompleted,
     /// Pre-start failure: lease was acquired, no worker ever started.
     ProvenNeverStarted,
-    /// Operator/engine stop; the pane has been (or is being) reaped.
+    /// Explicit stop; the pane and worker process have been confirmed torn down.
     ProvenStopped,
     /// Abandoned, orphaned, idle reap, or liveness timeout — death inferred.
     Inferred,
@@ -96,9 +96,10 @@ pub trait WorkspaceOccupancy: Send + Sync {
     fn occupancy(&self, workspace_path: &Path) -> Occupancy;
 }
 
-/// Recovery-bookmark confirmation. Production reads the engine record.
+/// Recovery-bookmark confirmation on the execution's owning host.
+#[async_trait::async_trait]
 pub trait BookmarkGate: Send + Sync {
-    fn status(&self, execution: &WorkExecution) -> BookmarkStatus;
+    async fn status(&self, execution: &WorkExecution) -> BookmarkStatus;
 }
 
 /// Pure policy. Callers still have to perform the cube release and DB clear.
@@ -126,32 +127,61 @@ pub fn decide(
     }
 }
 
-/// Map a terminal execution's status onto a [`TerminalCause`].
-pub fn cause_for(execution: &WorkExecution) -> TerminalCause {
-    match execution.status {
-        ExecutionStatus::Completed => TerminalCause::ProvenCompleted,
-        ExecutionStatus::Failed if execution.started_at.is_none() => TerminalCause::ProvenNeverStarted,
-        ExecutionStatus::Failed | ExecutionStatus::Cancelled => TerminalCause::ProvenStopped,
-        ExecutionStatus::Abandoned | ExecutionStatus::Orphaned => TerminalCause::Inferred,
-        _ => TerminalCause::Inferred,
-    }
-}
-
-/// Confirm the engine-created recovery bookmark was recorded. A missing
-/// record means this run never preserved work (pre-start, or a fixture);
-/// resume does not read the originating workspace either way.
+/// Confirm preserved work through jj on the owning host. A missing record
+/// is never evidence of an empty workspace.
 pub struct DbBookmarkGate<'a> {
     pub db: &'a WorkDb,
+    pub adapter: Option<&'a dyn crate::host_adapter::HostAdapter>,
 }
 
+#[async_trait::async_trait]
 impl BookmarkGate for DbBookmarkGate<'_> {
-    fn status(&self, execution: &WorkExecution) -> BookmarkStatus {
-        match self.db.execution_bookmark_optional(&execution.id) {
-            Ok(Some(_)) => BookmarkStatus::Confirmed,
-            Ok(None) => BookmarkStatus::NotRequired,
+    async fn status(&self, execution: &WorkExecution) -> BookmarkStatus {
+        let result: Result<()> = async {
+            let failures = self.db.list_attention_items(&execution.id)?;
+            anyhow::ensure!(
+                !failures.iter().any(|item| item.status == "open"
+                    && matches!(
+                        item.kind.as_str(),
+                        crate::execution_bookmark_recovery::RECOVERY_FAILED
+                            | crate::execution_bookmark_recovery::CREATE_FAILED
+                    )),
+                "recovery creation or backup failed"
+            );
+            let record = self.db.execution_bookmark(&execution.id)?;
+            let workspace = execution
+                .workspace_path
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("workspace path unavailable for recovery confirmation"))?;
+            if let Some(adapter) = self.adapter {
+                adapter.confirm_workspace_recovery(&record, Path::new(workspace)).await
+            } else {
+                anyhow::ensure!(
+                    record.host_id == "local",
+                    "recovery confirmation requires the owning host"
+                );
+                boss_engine_recovery::execution_bookmark::confirm_workspace(
+                    &boss_engine_recovery::execution_bookmark::LocalJj,
+                    &record,
+                    Path::new(workspace),
+                )
+                .await
+            }
+        }
+        .await;
+        match result {
+            Ok(()) => BookmarkStatus::Confirmed,
             Err(err) => BookmarkStatus::Unconfirmed(format!("{err:#}")),
         }
     }
+}
+
+/// Evidence supplied by the caller, separately from lease identity.
+pub struct ReleaseEvidence<'a> {
+    pub cause: TerminalCause,
+    pub pane: PaneStatus,
+    pub occupancy: &'a dyn WorkspaceOccupancy,
+    pub bookmark: &'a dyn BookmarkGate,
 }
 
 /// Scan local processes for a cwd inside the workspace.
@@ -173,22 +203,36 @@ impl WorkspaceOccupancy for EmptyOccupancy {
 }
 
 /// Release `lease_id` for `execution` when [`decide`] says so. Cube is
-/// called before the DB columns are cleared; a cube error keeps the
-/// columns (restoring them if a caller already nulled them) and files
-/// attention. Errors are never swallowed.
-#[allow(clippy::too_many_arguments)] // policy tuple: row, lease, cause, pane, occupancy, bookmark, cube future
+/// claimed with a compare-and-clear before cube is called. Only the claim
+/// owner may restore the lease after a genuine release failure.
 pub async fn apply_release(
     db: &WorkDb,
     execution: &WorkExecution,
     lease_id: &str,
-    cause: TerminalCause,
-    pane: PaneStatus,
-    occupancy: &dyn WorkspaceOccupancy,
-    bookmark: &dyn BookmarkGate,
+    evidence: ReleaseEvidence<'_>,
     do_release: impl Future<Output = Result<()>>,
 ) -> LeaseReleaseOutcome {
-    let bookmark_status = bookmark.status(execution);
+    let current = match db.get_execution(&execution.id) {
+        Ok(row) if row.cube_lease_id.as_deref() == Some(lease_id) => row,
+        Ok(_) => return LeaseReleaseOutcome::NoLease,
+        Err(err) => {
+            return LeaseReleaseOutcome::CubeFailed {
+                error: format!("{err:#}"),
+            };
+        }
+    };
+    let execution = &current;
+    let ReleaseEvidence {
+        cause,
+        pane,
+        occupancy,
+        bookmark,
+    } = evidence;
+    let bookmark_status = bookmark.status(execution).await;
+    let local = matches!(db.execution_host_id(&execution.id), Ok(None))
+        || matches!(db.execution_host_id(&execution.id), Ok(Some(host)) if host == "local");
     let occupancy_status = match cause {
+        TerminalCause::Inferred if !local => Occupancy::Unknown,
         TerminalCause::Inferred => match execution.workspace_path.as_deref() {
             Some(path) => occupancy.occupancy(Path::new(path)),
             None => Occupancy::Unknown,
@@ -197,22 +241,6 @@ pub async fn apply_release(
     };
     match decide(cause, &bookmark_status, pane, occupancy_status) {
         LeaseReleaseDecision::Keep(reason) => {
-            // A completion path may already have nulled the columns. Put them
-            // back so the leftover-lease sweep can retry rather than waiting
-            // on cube's TTL with no recorded lease.
-            if let Err(restore_err) = db.restore_execution_workspace(
-                &execution.id,
-                lease_id,
-                execution.cube_workspace_id.as_deref(),
-                execution.workspace_path.as_deref(),
-            ) {
-                tracing::error!(
-                    execution_id = %execution.id,
-                    lease_id,
-                    error = %format!("{restore_err:#}"),
-                    "failed to restore lease columns after keeping the lease",
-                );
-            }
             if matches!(reason, KeepReason::BookmarkUnconfirmed) {
                 let detail = match &bookmark_status {
                     BookmarkStatus::Unconfirmed(msg) => msg.clone(),
@@ -236,57 +264,75 @@ pub async fn apply_release(
             );
             LeaseReleaseOutcome::Kept { reason }
         }
-        LeaseReleaseDecision::Release => match do_release.await {
-            Ok(()) => {
-                if let Err(err) = db.clear_execution_workspace(&execution.id) {
-                    tracing::error!(
-                        execution_id = %execution.id,
-                        lease_id,
-                        error = %format!("{err:#}"),
-                        "cube released the workspace but clearing lease columns failed",
-                    );
+        LeaseReleaseDecision::Release => {
+            match db.claim_execution_workspace_release(&execution.id, lease_id) {
+                Ok(true) => {}
+                Ok(false) => return LeaseReleaseOutcome::NoLease,
+                Err(err) => {
+                    return LeaseReleaseOutcome::CubeFailed {
+                        error: format!("{err:#}"),
+                    };
                 }
-                tracing::info!(
-                    execution_id = %execution.id,
-                    lease_id,
-                    cause = cause.label(),
-                    "workspace lease released",
-                );
-                LeaseReleaseOutcome::Released
             }
-            Err(err) => {
-                let error = format!("{err:#}");
-                if let Err(restore_err) = db.restore_execution_workspace(
-                    &execution.id,
-                    lease_id,
-                    execution.cube_workspace_id.as_deref(),
-                    execution.workspace_path.as_deref(),
-                ) {
-                    tracing::error!(
+            let result = match do_release.await {
+                Ok(()) => {
+                    tracing::info!(
                         execution_id = %execution.id,
                         lease_id,
-                        error = %format!("{restore_err:#}"),
-                        "failed to restore lease columns after cube release failure",
+                        cause = cause.label(),
+                        "workspace lease released",
                     );
+                    LeaseReleaseOutcome::Released
                 }
-                raise_unreleased_attention(
-                    db,
-                    execution,
-                    "Workspace lease held: cube release failed",
-                    &format!(
-                        "The cube workspace lease `{lease_id}` was not released: {error}. \
+                Err(err)
+                    if err.chain().any(|source| {
+                        source
+                            .downcast_ref::<crate::cube_commands::CubeCliError>()
+                            .is_some_and(|error| error.exit_code == Some(5))
+                    }) =>
+                {
+                    LeaseReleaseOutcome::Released
+                }
+                Err(err) => {
+                    let error = format!("{err:#}");
+                    if let Err(restore_err) = db.restore_claimed_execution_workspace(
+                        &execution.id,
+                        lease_id,
+                        execution.cube_workspace_id.as_deref(),
+                        execution.workspace_path.as_deref(),
+                    ) {
+                        tracing::error!(
+                            execution_id = %execution.id,
+                            lease_id,
+                            error = %format!("{restore_err:#}"),
+                            "failed to restore lease columns after cube release failure",
+                        );
+                    }
+                    raise_unreleased_attention(
+                        db,
+                        execution,
+                        "Workspace lease held: cube release failed",
+                        &format!(
+                            "The cube workspace lease `{lease_id}` was not released: {error}. \
                          The lease stays recorded so a later pass can retry; cube's TTL remains the backstop."
-                    ),
-                );
-                tracing::error!(
-                    execution_id = %execution.id,
-                    lease_id,
-                    error = %error,
-                    "workspace lease release failed; keeping the lease",
-                );
-                LeaseReleaseOutcome::CubeFailed { error }
+                        ),
+                    );
+                    tracing::error!(
+                        execution_id = %execution.id,
+                        lease_id,
+                        error = %error,
+                        "workspace lease release failed; keeping the lease",
+                    );
+                    LeaseReleaseOutcome::CubeFailed { error }
+                }
+            };
+            if result == LeaseReleaseOutcome::Released
+                && let Err(err) = db.finish_execution_workspace_release(execution)
+            {
+                tracing::error!(error = %err, "failed to clear released workspace metadata");
             }
-        },
+            result
+        }
     }
 }
 
@@ -312,22 +358,83 @@ impl TerminalCause {
     }
 }
 
+/// The refused lease has not been positioned by this execution. Registry-only
+/// release preserves all of the occupant's files and recovery pointers.
+pub async fn release_refused_workspace(
+    db: &WorkDb,
+    execution: &WorkExecution,
+    lease_id: &str,
+    adapter: &dyn crate::host_adapter::HostAdapter,
+) -> LeaseReleaseOutcome {
+    struct Unpositioned;
+    #[async_trait::async_trait]
+    impl BookmarkGate for Unpositioned {
+        async fn status(&self, _: &WorkExecution) -> BookmarkStatus {
+            BookmarkStatus::NotRequired
+        }
+    }
+    apply_release(
+        db,
+        execution,
+        lease_id,
+        ReleaseEvidence {
+            cause: TerminalCause::ProvenNeverStarted,
+            pane: PaneStatus::Gone,
+            occupancy: &EmptyOccupancy,
+            bookmark: &Unpositioned,
+        },
+        adapter.force_release_lease(lease_id, Some("refused occupied workspace; preserve checkout")),
+    )
+    .await
+}
+
 /// Pre-start helper: the worker never started, so occupancy is not scanned.
 pub async fn release_lease_after_proven_never_started(
     work_db: &WorkDb,
     execution: &WorkExecution,
     lease_id: &str,
-    do_release: impl Future<Output = Result<()>>,
+    adapter: &dyn crate::host_adapter::HostAdapter,
 ) -> LeaseReleaseOutcome {
+    let current = match work_db.get_execution(&execution.id) {
+        Ok(row) if row.cube_lease_id.as_deref() == Some(lease_id) => row,
+        Ok(_) => return LeaseReleaseOutcome::NoLease,
+        Err(err) => {
+            return LeaseReleaseOutcome::CubeFailed {
+                error: format!("{err:#}"),
+            };
+        }
+    };
+    let execution = &current;
+    // A previous attempt's lease may have expired or completed release after
+    // a timeout. Registry absence requires no destructive workspace operation.
+    if let Ok(workspaces) = adapter.list_workspaces().await
+        && !workspaces.iter().any(|ws| ws.lease_id.as_deref() == Some(lease_id))
+    {
+        return match work_db.claim_execution_workspace_release(&execution.id, lease_id) {
+            Ok(true) => {
+                let _ = work_db.finish_execution_workspace_release(execution);
+                LeaseReleaseOutcome::Released
+            }
+            Ok(false) => LeaseReleaseOutcome::NoLease,
+            Err(err) => LeaseReleaseOutcome::CubeFailed {
+                error: format!("{err:#}"),
+            },
+        };
+    }
     apply_release(
         work_db,
         execution,
         lease_id,
-        TerminalCause::ProvenNeverStarted,
-        PaneStatus::Gone,
-        &EmptyOccupancy,
-        &DbBookmarkGate { db: work_db },
-        do_release,
+        ReleaseEvidence {
+            cause: TerminalCause::ProvenNeverStarted,
+            pane: PaneStatus::Gone,
+            occupancy: &EmptyOccupancy,
+            bookmark: &DbBookmarkGate {
+                db: work_db,
+                adapter: Some(adapter),
+            },
+        },
+        adapter.release_workspace(lease_id),
     )
     .await
 }
@@ -348,10 +455,15 @@ pub async fn release_lease_after_inferred_death(
         work_db,
         execution,
         lease_id,
-        TerminalCause::Inferred,
-        pane,
-        &HostOccupancy,
-        &DbBookmarkGate { db: work_db },
+        ReleaseEvidence {
+            cause: TerminalCause::Inferred,
+            pane,
+            occupancy: &HostOccupancy,
+            bookmark: &DbBookmarkGate {
+                db: work_db,
+                adapter: None,
+            },
+        },
         do_release,
     )
     .await
@@ -394,28 +506,51 @@ fn raise_unreleased_attention(db: &WorkDb, execution: &WorkExecution, title: &st
 }
 
 fn occupancy_of(workspace_path: &Path) -> Occupancy {
-    let root = match workspace_path.canonicalize() {
-        Ok(root) => root,
-        Err(_) => return Occupancy::Empty,
-    };
-    match process_cwds() {
-        Ok(cwds) => {
-            let self_pid = std::process::id();
-            if cwds
-                .iter()
-                .any(|(pid, cwd)| *pid != self_pid && path_is_inside(cwd, &root))
-            {
-                Occupancy::Occupied
-            } else {
-                Occupancy::Empty
-            }
+    ProcessSnapshot::capture().occupancy(workspace_path)
+}
+
+struct ProcessSnapshot {
+    cwds: Vec<(u32, PathBuf)>,
+    complete: bool,
+}
+
+impl ProcessSnapshot {
+    fn capture() -> Self {
+        let mut snapshot = Self {
+            cwds: Vec::new(),
+            complete: true,
+        };
+        if let Err(err) = process_cwds(&mut snapshot) {
+            tracing::warn!(error = %err, "workspace occupancy enumeration failed");
+            snapshot.complete = false;
         }
-        Err(err) => {
-            tracing::warn!(
-                workspace = %workspace_path.display(),
-                error = %format!("{err:#}"),
-                "workspace occupancy probe failed; treating occupancy as unknown",
-            );
+        snapshot
+    }
+
+    fn record(&mut self, pid: u32, cwd: std::io::Result<PathBuf>) {
+        match cwd.and_then(|path| path.canonicalize()) {
+            Ok(path) => self.cwds.push((pid, path)),
+            Err(err) if err.raw_os_error() == Some(libc::ESRCH) => {}
+            Err(_) => self.complete = false,
+        }
+    }
+}
+
+impl WorkspaceOccupancy for ProcessSnapshot {
+    fn occupancy(&self, workspace_path: &Path) -> Occupancy {
+        let root = match workspace_path.canonicalize() {
+            Ok(root) => root,
+            Err(_) => return Occupancy::Unknown,
+        };
+        if self
+            .cwds
+            .iter()
+            .any(|(pid, cwd)| *pid != std::process::id() && path_is_inside(cwd, &root))
+        {
+            Occupancy::Occupied
+        } else if self.complete {
+            Occupancy::Empty
+        } else {
             Occupancy::Unknown
         }
     }
@@ -425,51 +560,66 @@ fn path_is_inside(cwd: &Path, workspace: &Path) -> bool {
     cwd == workspace || cwd.starts_with(workspace)
 }
 
-fn process_cwds() -> std::io::Result<Vec<(u32, PathBuf)>> {
+fn process_cwds(snapshot: &mut ProcessSnapshot) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        let mut out = Vec::new();
         for pid in crate::libproc::list_pids()? {
-            match crate::libproc::proc_cwd(pid) {
-                Ok(cwd) => {
-                    if let Ok(canonical) = cwd.canonicalize() {
-                        out.push((pid as u32, canonical));
-                    }
-                }
-                Err(_) => {
-                    // ESRCH, EPERM on another user's process, zombies: skip.
-                    // Workers in this workspace run as the engine's user.
-                }
-            }
+            snapshot.record(pid as u32, crate::libproc::proc_cwd(pid));
         }
-        Ok(out)
+        Ok(())
     }
     #[cfg(target_os = "linux")]
     {
-        let mut out = Vec::new();
-        let proc = std::fs::read_dir("/proc")?;
-        for entry in proc {
+        for entry in std::fs::read_dir("/proc")? {
             let entry = entry?;
-            let pid = match entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) {
-                Some(pid) => pid,
-                None => continue,
+            let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else {
+                continue;
             };
-            match std::fs::read_link(entry.path().join("cwd")) {
-                Ok(cwd) => {
-                    if let Ok(canonical) = cwd.canonicalize() {
-                        out.push((pid, canonical));
-                    }
-                }
-                Err(_) => {}
+            let cwd = std::fs::read_link(entry.path().join("cwd"));
+            // ENOENT is inconclusive (e.g. a zombie or an inaccessible cwd),
+            // unless kill(0) independently confirms that the process is gone.
+            if cwd.is_err()
+                && i32::try_from(pid).ok().is_some_and(|pid| {
+                    matches!(
+                        crate::dead_pid_sweep::probe_pid(pid),
+                        crate::dead_pid_sweep::PidStatus::Dead
+                    )
+                })
+            {
+                continue;
             }
+            snapshot.record(pid, cwd);
         }
-        Ok(out)
+        Ok(())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        Err(std::io::Error::other(
-            "workspace occupancy probe is not supported on this OS",
-        ))
+        let _ = snapshot;
+        Err(std::io::Error::other("unsupported occupancy probe"))
+    }
+}
+
+fn sweep_pane_status(db: &WorkDb, live: &LiveWorkerStateRegistry, execution: &WorkExecution) -> PaneStatus {
+    if live.snapshot().iter().any(|state| state.run_id == execution.id) {
+        return PaneStatus::Present;
+    }
+    // Cancel and failed-start teardown owns these leases. In particular, a
+    // cancelled in-flight spawn and a failed viewer abort have no death proof.
+    if matches!(execution.status, ExecutionStatus::Cancelled | ExecutionStatus::Failed) {
+        return PaneStatus::Present;
+    }
+    match db.latest_local_shell_pid_for_execution(&execution.id) {
+        Ok(Some(pid))
+            if i32::try_from(pid).ok().is_some_and(|pid| {
+                matches!(
+                    crate::dead_pid_sweep::probe_pid(pid),
+                    crate::dead_pid_sweep::PidStatus::Dead
+                )
+            }) =>
+        {
+            PaneStatus::Gone
+        }
+        _ => PaneStatus::Present,
     }
 }
 
@@ -516,6 +666,15 @@ pub async fn run_one_pass(
     cube_client: &dyn CubeClient,
     live_states: &LiveWorkerStateRegistry,
 ) -> EndedRunLeaseSweepOutcome {
+    run_one_pass_with_occupancy(work_db, cube_client, live_states, ProcessSnapshot::capture).await
+}
+
+async fn run_one_pass_with_occupancy<O: WorkspaceOccupancy>(
+    work_db: &WorkDb,
+    cube_client: &dyn CubeClient,
+    live_states: &LiveWorkerStateRegistry,
+    capture: impl FnOnce() -> O,
+) -> EndedRunLeaseSweepOutcome {
     let mut outcome = EndedRunLeaseSweepOutcome::default();
     let candidates = match work_db.list_terminal_executions_holding_lease() {
         Ok(rows) => rows,
@@ -524,24 +683,34 @@ pub async fn run_one_pass(
             return outcome;
         }
     };
+    let mut occupancy = None;
+    let mut capture = Some(capture);
     for execution in candidates {
         let Some(lease_id) = execution.cube_lease_id.clone() else {
             continue;
         };
-        let pane = if live_states.is_run_live(&execution.id) {
-            PaneStatus::Present
-        } else {
-            PaneStatus::Gone
-        };
+        // A terminal registry entry may still own a pane; absence from the
+        // registry is not proof after a restart. Require durable pid death.
+        let pane = sweep_pane_status(work_db, live_states, &execution);
+        if pane == PaneStatus::Present {
+            outcome.kept += 1;
+            continue;
+        }
+        let occupancy = occupancy.get_or_insert_with(|| capture.take().expect("one scan per pass")());
         let result = apply_release(
             work_db,
             &execution,
             &lease_id,
-            cause_for(&execution),
-            pane,
-            &HostOccupancy,
-            &DbBookmarkGate { db: work_db },
-            cube_client.release_workspace_with_reset(&lease_id),
+            ReleaseEvidence {
+                cause: TerminalCause::Inferred,
+                pane,
+                occupancy,
+                bookmark: &DbBookmarkGate {
+                    db: work_db,
+                    adapter: None,
+                },
+            },
+            cube_client.release_workspace(&lease_id),
         )
         .await;
         match result {
@@ -554,463 +723,6 @@ pub async fn run_one_pass(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::*;
-    use boss_engine_recovery::execution_bookmark::ExecutionBookmark;
-    use boss_protocol::{CreateExecutionInput, ExecutionKind};
-    use std::sync::Mutex;
-
-    struct SweepCube;
-    crate::stub_cube_client! { SweepCube {
-        async fn release_workspace(&self, _: &str) -> Result<()> { Ok(()) }
-        async fn release_workspace_with_reset(&self, _: &str) -> Result<()> { Ok(()) }
-    } }
-
-    struct FixedOccupancy(Occupancy);
-    impl WorkspaceOccupancy for FixedOccupancy {
-        fn occupancy(&self, _: &Path) -> Occupancy {
-            self.0
-        }
-    }
-
-    struct FixedBookmark(BookmarkStatus);
-    impl BookmarkGate for FixedBookmark {
-        fn status(&self, _: &WorkExecution) -> BookmarkStatus {
-            self.0.clone()
-        }
-    }
-
-    fn decide_release(cause: TerminalCause) -> LeaseReleaseDecision {
-        decide(cause, &BookmarkStatus::NotRequired, PaneStatus::Gone, Occupancy::Empty)
-    }
-
-    #[test]
-    fn proven_completed_releases() {
-        assert_eq!(
-            decide_release(TerminalCause::ProvenCompleted),
-            LeaseReleaseDecision::Release
-        );
-    }
-
-    #[test]
-    fn proven_never_started_releases() {
-        assert_eq!(
-            decide_release(TerminalCause::ProvenNeverStarted),
-            LeaseReleaseDecision::Release
-        );
-    }
-
-    #[test]
-    fn proven_stopped_releases_when_pane_gone() {
-        assert_eq!(
-            decide_release(TerminalCause::ProvenStopped),
-            LeaseReleaseDecision::Release
-        );
-    }
-
-    #[test]
-    fn proven_stopped_keeps_when_pane_present() {
-        assert_eq!(
-            decide(
-                TerminalCause::ProvenStopped,
-                &BookmarkStatus::NotRequired,
-                PaneStatus::Present,
-                Occupancy::Empty,
-            ),
-            LeaseReleaseDecision::Keep(KeepReason::PaneStillPresent)
-        );
-    }
-
-    #[test]
-    fn inferred_releases_when_pane_gone_and_empty() {
-        assert_eq!(decide_release(TerminalCause::Inferred), LeaseReleaseDecision::Release);
-    }
-
-    #[test]
-    fn inferred_keeps_when_a_process_is_in_the_workspace() {
-        assert_eq!(
-            decide(
-                TerminalCause::Inferred,
-                &BookmarkStatus::NotRequired,
-                PaneStatus::Gone,
-                Occupancy::Occupied,
-            ),
-            LeaseReleaseDecision::Keep(KeepReason::ProcessInWorkspace)
-        );
-    }
-
-    #[test]
-    fn inferred_keeps_when_occupancy_is_unknown() {
-        assert_eq!(
-            decide(
-                TerminalCause::Inferred,
-                &BookmarkStatus::NotRequired,
-                PaneStatus::Gone,
-                Occupancy::Unknown,
-            ),
-            LeaseReleaseDecision::Keep(KeepReason::OccupancyUnconfirmed)
-        );
-    }
-
-    #[test]
-    fn bookmark_unconfirmed_keeps_even_for_proven_completion() {
-        assert_eq!(
-            decide(
-                TerminalCause::ProvenCompleted,
-                &BookmarkStatus::Unconfirmed("jj bookmark missing".into()),
-                PaneStatus::Gone,
-                Occupancy::Empty,
-            ),
-            LeaseReleaseDecision::Keep(KeepReason::BookmarkUnconfirmed)
-        );
-    }
-
-    fn seed_terminal(db: &WorkDb, status: ExecutionStatus, lease: &str) -> WorkExecution {
-        let product = create_test_product(db);
-        let chore = create_test_chore(db, product.id.clone(), "lease-release");
-        db.create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(chore.id)
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(status)
-                .cube_lease_id(lease)
-                .cube_workspace_id("ws-1")
-                .workspace_path("/tmp/ws-lease-release")
-                .build(),
-        )
-        .unwrap()
-    }
-
-    async fn apply_with(
-        db: &WorkDb,
-        execution: &WorkExecution,
-        cause: TerminalCause,
-        occupancy: Occupancy,
-        bookmark: BookmarkStatus,
-        release: Result<()>,
-    ) -> LeaseReleaseOutcome {
-        let lease = execution.cube_lease_id.clone().unwrap();
-        apply_release(
-            db,
-            execution,
-            &lease,
-            cause,
-            PaneStatus::Gone,
-            &FixedOccupancy(occupancy),
-            &FixedBookmark(bookmark),
-            async { release },
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn apply_releases_completed_and_clears_columns() {
-        let (_dir, db) = open_db();
-        let execution = seed_terminal(&db, ExecutionStatus::Completed, "lease-done");
-        let outcome = apply_with(
-            &db,
-            &execution,
-            TerminalCause::ProvenCompleted,
-            Occupancy::Empty,
-            BookmarkStatus::Confirmed,
-            Ok(()),
-        )
-        .await;
-        assert_eq!(outcome, LeaseReleaseOutcome::Released);
-        let after = db.get_execution(&execution.id).unwrap();
-        assert!(after.cube_lease_id.is_none());
-        assert!(after.workspace_path.is_none());
-    }
-
-    #[tokio::test]
-    async fn apply_releases_never_started_failure() {
-        let (_dir, db) = open_db();
-        let execution = seed_terminal(&db, ExecutionStatus::Failed, "lease-prestart");
-        let outcome = apply_with(
-            &db,
-            &execution,
-            TerminalCause::ProvenNeverStarted,
-            Occupancy::Occupied,
-            BookmarkStatus::NotRequired,
-            Ok(()),
-        )
-        .await;
-        assert_eq!(outcome, LeaseReleaseOutcome::Released);
-        assert!(db.get_execution(&execution.id).unwrap().cube_lease_id.is_none());
-    }
-
-    #[tokio::test]
-    async fn apply_releases_cancelled_when_pane_gone() {
-        let (_dir, db) = open_db();
-        let execution = seed_terminal(&db, ExecutionStatus::Cancelled, "lease-stop");
-        let outcome = apply_with(
-            &db,
-            &execution,
-            TerminalCause::ProvenStopped,
-            Occupancy::Empty,
-            BookmarkStatus::NotRequired,
-            Ok(()),
-        )
-        .await;
-        assert_eq!(outcome, LeaseReleaseOutcome::Released);
-    }
-
-    #[tokio::test]
-    async fn apply_keeps_inferred_when_a_process_is_in_the_workspace() {
-        let (_dir, db) = open_db();
-        let execution = seed_terminal(&db, ExecutionStatus::Orphaned, "lease-orphan");
-        let outcome = apply_with(
-            &db,
-            &execution,
-            TerminalCause::Inferred,
-            Occupancy::Occupied,
-            BookmarkStatus::NotRequired,
-            Ok(()),
-        )
-        .await;
-        assert_eq!(
-            outcome,
-            LeaseReleaseOutcome::Kept {
-                reason: KeepReason::ProcessInWorkspace
-            }
-        );
-        assert_eq!(
-            db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(),
-            Some("lease-orphan")
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_keeps_and_files_attention_when_bookmark_is_unconfirmed() {
-        let (_dir, db) = open_db();
-        let execution = seed_terminal(&db, ExecutionStatus::Completed, "lease-bm");
-        let released = Arc::new(Mutex::new(false));
-        let flag = Arc::clone(&released);
-        let outcome = apply_release(
-            &db,
-            &execution,
-            "lease-bm",
-            TerminalCause::ProvenCompleted,
-            PaneStatus::Gone,
-            &FixedOccupancy(Occupancy::Empty),
-            &FixedBookmark(BookmarkStatus::Unconfirmed("bookmark write failed".into())),
-            async move {
-                *flag.lock().unwrap() = true;
-                Ok(())
-            },
-        )
-        .await;
-        assert_eq!(
-            outcome,
-            LeaseReleaseOutcome::Kept {
-                reason: KeepReason::BookmarkUnconfirmed
-            }
-        );
-        assert!(
-            !*released.lock().unwrap(),
-            "cube must not be called when the bookmark is unconfirmed"
-        );
-        assert_eq!(
-            db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(),
-            Some("lease-bm")
-        );
-        let items = db.list_attention_items(&execution.id).unwrap();
-        assert!(
-            items
-                .iter()
-                .any(|item| item.kind == LEASE_UNRELEASED_ATTENTION_KIND && item.status == "open")
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_keeps_lease_and_files_attention_when_cube_release_fails() {
-        let (_dir, db) = open_db();
-        let execution = seed_terminal(&db, ExecutionStatus::Completed, "lease-fail");
-        let outcome = apply_with(
-            &db,
-            &execution,
-            TerminalCause::ProvenCompleted,
-            Occupancy::Empty,
-            BookmarkStatus::NotRequired,
-            Err(anyhow::anyhow!("cube unavailable")),
-        )
-        .await;
-        assert!(matches!(outcome, LeaseReleaseOutcome::CubeFailed { .. }));
-        assert_eq!(
-            db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(),
-            Some("lease-fail")
-        );
-        let items = db.list_attention_items(&execution.id).unwrap();
-        assert!(items.iter().any(|item| item.kind == LEASE_UNRELEASED_ATTENTION_KIND));
-    }
-
-    #[tokio::test]
-    async fn apply_keep_restores_columns_when_bookmark_is_unconfirmed_after_clear() {
-        let (_dir, db) = open_db();
-        let execution = seed_terminal(&db, ExecutionStatus::Completed, "lease-keep-restore");
-        db.clear_execution_workspace(&execution.id).unwrap();
-        let cleared = db.get_execution(&execution.id).unwrap();
-        let outcome = apply_release(
-            &db,
-            &cleared,
-            "lease-keep-restore",
-            TerminalCause::ProvenCompleted,
-            PaneStatus::Gone,
-            &FixedOccupancy(Occupancy::Empty),
-            &FixedBookmark(BookmarkStatus::Unconfirmed("bookmark write failed".into())),
-            async { Ok(()) },
-        )
-        .await;
-        assert_eq!(
-            outcome,
-            LeaseReleaseOutcome::Kept {
-                reason: KeepReason::BookmarkUnconfirmed
-            }
-        );
-        assert_eq!(
-            db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(),
-            Some("lease-keep-restore")
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_restores_columns_when_caller_had_already_cleared_them() {
-        let (_dir, db) = open_db();
-        let execution = seed_terminal(&db, ExecutionStatus::Completed, "lease-restore");
-        db.clear_execution_workspace(&execution.id).unwrap();
-        let cleared = db.get_execution(&execution.id).unwrap();
-        assert!(cleared.cube_lease_id.is_none());
-        let outcome = apply_release(
-            &db,
-            &cleared,
-            "lease-restore",
-            TerminalCause::ProvenCompleted,
-            PaneStatus::Gone,
-            &FixedOccupancy(Occupancy::Empty),
-            &FixedBookmark(BookmarkStatus::NotRequired),
-            async { Err(anyhow::anyhow!("cube timeout")) },
-        )
-        .await;
-        assert!(matches!(outcome, LeaseReleaseOutcome::CubeFailed { .. }));
-        assert_eq!(
-            db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(),
-            Some("lease-restore")
-        );
-    }
-
-    #[tokio::test]
-    async fn sweep_releases_a_completed_row_still_holding_a_lease() {
-        let (_dir, db) = open_db();
-        let execution = seed_terminal(&db, ExecutionStatus::Completed, "lease-sweep");
-        let live = LiveWorkerStateRegistry::new();
-        let outcome = run_one_pass(&db, &SweepCube, &live).await;
-        assert_eq!(outcome.released, 1);
-        assert!(db.get_execution(&execution.id).unwrap().cube_lease_id.is_none());
-    }
-
-    #[tokio::test]
-    async fn sweep_keeps_orphaned_row_when_occupancy_is_occupied() {
-        let (_dir, db) = open_db();
-        let dir = tempfile::TempDir::new().unwrap();
-        let product = create_test_product(&db);
-        let chore = create_test_chore(&db, product.id.clone(), "occupied-orphan");
-        let execution = db
-            .create_execution(
-                CreateExecutionInput::builder()
-                    .work_item_id(chore.id)
-                    .kind(ExecutionKind::ChoreImplementation)
-                    .status(ExecutionStatus::Orphaned)
-                    .cube_lease_id("lease-occ")
-                    .workspace_path(dir.path().display().to_string())
-                    .build(),
-            )
-            .unwrap();
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .current_dir(dir.path())
-            .spawn()
-            .unwrap();
-        // HostOccupancy is what the sweep uses; give the child a moment to
-        // exist so the cwd probe can see it.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let outcome = run_one_pass(&db, &SweepCube, &LiveWorkerStateRegistry::new()).await;
-        let _ = child.kill();
-        let _ = child.wait();
-        assert_eq!(outcome.released, 0);
-        assert_eq!(
-            db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(),
-            Some("lease-occ")
-        );
-    }
-
-    #[test]
-    fn db_bookmark_gate_treats_a_recorded_bookmark_as_confirmed() {
-        let (_dir, db) = open_db();
-        let execution = seed_terminal(&db, ExecutionStatus::Completed, "lease-rec");
-        db.record_execution_bookmark(&ExecutionBookmark {
-            execution_id: execution.id.clone(),
-            repo_path: PathBuf::from("/tmp/repo"),
-            host_id: "local".to_owned(),
-            base_commit: None,
-        })
-        .unwrap();
-        assert_eq!(DbBookmarkGate { db: &db }.status(&execution), BookmarkStatus::Confirmed);
-    }
-
-    #[test]
-    fn db_bookmark_gate_treats_a_missing_record_as_not_required() {
-        let (_dir, db) = open_db();
-        let execution = seed_terminal(&db, ExecutionStatus::Failed, "lease-none");
-        assert_eq!(
-            DbBookmarkGate { db: &db }.status(&execution),
-            BookmarkStatus::NotRequired
-        );
-    }
-
-    #[test]
-    fn cause_for_maps_terminal_statuses() {
-        let (_dir, db) = open_db();
-        assert_eq!(
-            cause_for(&seed_terminal(&db, ExecutionStatus::Completed, "a")),
-            TerminalCause::ProvenCompleted
-        );
-        assert_eq!(
-            cause_for(&seed_terminal(&db, ExecutionStatus::Failed, "b")),
-            TerminalCause::ProvenNeverStarted
-        );
-        assert_eq!(
-            cause_for(&seed_terminal(&db, ExecutionStatus::Cancelled, "c")),
-            TerminalCause::ProvenStopped
-        );
-        assert_eq!(
-            cause_for(&seed_terminal(&db, ExecutionStatus::Orphaned, "d")),
-            TerminalCause::Inferred
-        );
-        assert_eq!(
-            cause_for(&seed_terminal(&db, ExecutionStatus::Abandoned, "e")),
-            TerminalCause::Inferred
-        );
-    }
-
-    #[test]
-    fn host_occupancy_sees_a_child_with_cwd_in_the_workspace() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .current_dir(dir.path())
-            .spawn()
-            .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let seen = HostOccupancy.occupancy(dir.path());
-        let _ = child.kill();
-        let _ = child.wait();
-        assert_eq!(seen, Occupancy::Occupied);
-    }
-
-    #[test]
-    fn host_occupancy_of_an_empty_unique_dir_is_empty() {
-        let dir = tempfile::TempDir::new().unwrap();
-        assert_eq!(HostOccupancy.occupancy(dir.path()), Occupancy::Empty);
-    }
-}
+mod recovery_tests;
+#[cfg(test)]
+mod tests;

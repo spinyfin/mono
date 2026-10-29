@@ -57,6 +57,7 @@ pub(super) struct FakeCubeClient {
     pub(super) goto_revision_calls: Mutex<Vec<(String, String)>>,
     pub(super) create_calls: Mutex<Vec<(String, String)>>,
     pub(super) release_calls: Mutex<Vec<String>>,
+    pub(super) active_leases: Mutex<Vec<CubeWorkspaceStatus>>,
     pub(super) status_calls: Mutex<Vec<PathBuf>>,
     pub(super) heartbeat_calls: Mutex<Vec<(String, Option<u64>)>>,
     pub(super) force_release_calls: Mutex<Vec<(String, Option<String>)>>,
@@ -142,6 +143,13 @@ pub(super) struct FakeCubeClient {
 }
 
 impl FakeCubeClient {
+    pub(super) fn with_real_workspace(mut self, root: &std::path::Path) -> Self {
+        boss_engine_test_git::jj::JjRepo::new(root);
+        self.workspace_root = Some(root.to_path_buf());
+        self.real_bookmarks = true;
+        self.with_next_workspace_id("worker")
+    }
+
     pub(super) fn with_next_workspace_id(self, id: impl Into<String>) -> Self {
         *self.next_workspace_id.try_lock().expect("uncontended") = Some(id.into());
         self
@@ -252,6 +260,10 @@ crate::stub_cube_client! { FakeCubeClient {
             .or_else(|| self.next_workspace_id.try_lock().ok().and_then(|g| g.clone()))
             .or_else(|| prefer_workspace_id.map(str::to_owned))
             .unwrap_or_else(|| "mono-agent-001".to_owned());
+        self.active_leases.lock().await.push(CubeWorkspaceStatus::builder()
+            .workspace_id(workspace_id.clone())
+            .workspace_path(self.workspace_root.clone().unwrap_or_else(|| PathBuf::from("/tmp")).join(&workspace_id))
+            .state("leased").lease_id("lease-1").build());
         Ok(CubeWorkspaceLease {
             lease_id: "lease-1".to_owned(),
             workspace_id: workspace_id.clone(),
@@ -305,6 +317,7 @@ crate::stub_cube_client! { FakeCubeClient {
         // Record BEFORE parking on the gate, so a test can observe that the
         // release was entered and still hold it open.
         self.release_calls.lock().await.push(lease_id.to_owned());
+        self.active_leases.lock().await.retain(|ws| ws.lease_id.as_deref() != Some(lease_id));
         if let Some(gate) = self.release_gate.as_ref() {
             gate.notified().await;
         }
@@ -337,6 +350,7 @@ crate::stub_cube_client! { FakeCubeClient {
     }
 
     async fn force_release_lease(&self, lease_id: &str, reason: Option<&str>) -> Result<()> {
+        self.active_leases.lock().await.retain(|ws| ws.lease_id.as_deref() != Some(lease_id));
         self.force_release_calls
             .lock()
             .await
@@ -345,7 +359,9 @@ crate::stub_cube_client! { FakeCubeClient {
     }
 
     async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
-        Ok(self.list_workspaces_response.lock().await.clone())
+        let mut rows = self.list_workspaces_response.lock().await.clone();
+        rows.extend(self.active_leases.lock().await.clone());
+        Ok(rows)
     }
 
     async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
@@ -568,7 +584,9 @@ impl ExecutionRunner for FakeExecutionRunner {
 }
 
 pub(super) async fn wait_for_execution_status(db: &WorkDb, execution_id: &str, expected: ExecutionStatus) {
-    for _ in 0..100 {
+    // Dispatch fixtures with real recovery pointers execute several jj
+    // subprocesses before the terminal transition can be observed.
+    for _ in 0..3000 {
         let execution = db.get_execution(execution_id).unwrap();
         if execution.status == expected {
             return;

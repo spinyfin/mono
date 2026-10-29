@@ -535,10 +535,15 @@ async fn release_terminal_remote_resources(
         work_db,
         &execution,
         &lease_id,
-        crate::workspace_lease_release::TerminalCause::ProvenStopped,
-        crate::workspace_lease_release::PaneStatus::Gone,
-        &crate::workspace_lease_release::EmptyOccupancy,
-        &crate::workspace_lease_release::DbBookmarkGate { db: work_db },
+        crate::workspace_lease_release::ReleaseEvidence {
+            cause: crate::workspace_lease_release::TerminalCause::ProvenStopped,
+            pane: crate::workspace_lease_release::PaneStatus::Gone,
+            occupancy: &crate::workspace_lease_release::EmptyOccupancy,
+            bookmark: &crate::workspace_lease_release::DbBookmarkGate {
+                db: work_db,
+                adapter: Some(adapter.as_ref()),
+            },
+        },
         adapter.force_release_lease(&lease_id, Some("remote-lease reconcile: worker process gone")),
     )
     .await;

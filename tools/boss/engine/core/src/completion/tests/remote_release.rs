@@ -17,6 +17,9 @@ crate::stub_host_adapter! { RemoteReleaseAdapter {
     async fn probe_remote_worker_alive(&self, _remote_pid: i64) -> Result<Option<bool>> {
         Ok(Some(self.alive))
     }
+    async fn confirm_workspace_recovery(&self, record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark, workspace: &std::path::Path) -> anyhow::Result<()> {
+        crate::test_support::confirm_remote_test_recovery(record, workspace, "remote")
+    }
 } }
 
 struct Provider(Arc<RemoteReleaseAdapter>);
@@ -45,6 +48,7 @@ fn remote_fixture() -> (TempDir, Arc<WorkDb>, String) {
         "remote",
     )
     .unwrap();
+    crate::test_support::record_remote_test_recovery(&db, &execution.id, "remote");
     db.set_run_remote_pid_for_execution(&execution.id, 4242).unwrap();
     db.cancel_running_execution(&execution.id).unwrap();
     (dir, db, execution.id)
@@ -106,12 +110,12 @@ async fn completion_teardown_releases_on_remote_host() {
         alive: false,
     });
     handler.set_host_adapter_provider(Arc::new(Provider(adapter.clone())));
-    let cleared = db.clear_execution_workspace(&id).unwrap().unwrap();
+    let lease = db.get_execution(&id).unwrap().cube_lease_id.unwrap();
     handler
         .finish_worker_teardown(
             &id,
             "work",
-            Some(&cleared.lease_id),
+            Some(&lease),
             Some(Path::new("/remote/workspace")),
             "test",
             handler.begin_teardown(&id),

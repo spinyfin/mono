@@ -161,6 +161,11 @@ pub trait HostAdapter: Send + Sync {
         bail!("execution bookmarks are not supported by this host adapter")
     }
 
+    async fn confirm_workspace_recovery(&self, record: &ExecutionBookmark, workspace: &Path) -> Result<()> {
+        let _ = (record, workspace);
+        bail!("workspace recovery confirmation is not supported by this host adapter")
+    }
+
     async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {
         let _ = record;
         bail!("execution bookmark inspection is not supported by this host adapter")
@@ -499,6 +504,11 @@ impl HostAdapter for LocalHostAdapter {
         self.cube_client
             .create_execution_bookmark(workspace, execution_id, predecessor, inherited_base)
             .await
+    }
+
+    async fn confirm_workspace_recovery(&self, record: &ExecutionBookmark, workspace: &Path) -> Result<()> {
+        anyhow::ensure!(record.host_id == self.host_id(), "recovery host mismatch");
+        execution_bookmark::confirm_workspace(&LocalJj, record, workspace).await
     }
 
     async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {
@@ -1088,6 +1098,11 @@ impl HostAdapter for SshHostAdapter {
             inherited_base,
         )
         .await
+    }
+
+    async fn confirm_workspace_recovery(&self, record: &ExecutionBookmark, workspace: &Path) -> Result<()> {
+        anyhow::ensure!(record.host_id == self.host_id(), "recovery host mismatch");
+        execution_bookmark::confirm_workspace(self, record, workspace).await
     }
 
     async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {

@@ -786,5 +786,27 @@ pub async fn unpublished_diff(jj: &dyn Jj, record: &ExecutionBookmark) -> Result
     })
 }
 
+/// Verify that the recovery head preserves the current workspace commit,
+/// after snapshotting pending file edits on the owning host.
+pub async fn confirm_workspace(jj: &dyn Jj, record: &ExecutionBookmark, workspace: &Path) -> Result<()> {
+    anyhow::ensure!(
+        jj.shared_repo(workspace).await? == record.repo_path,
+        "workspace recovery store changed"
+    );
+    let current = jj
+        .run(workspace, &["log", "--no-graph", "-r", "@", "-T", "commit_id"])
+        .await?;
+    // Resume also needs a usable baseline, not merely a retained head.
+    resolve_pointers(jj, record).await?;
+    let head = resolve_optional(jj, &record.repo_path, &record.head())
+        .await?
+        .ok_or_else(|| pointer_integrity_error("recovery head is missing"))?;
+    anyhow::ensure!(
+        descends(jj, &record.repo_path, current.trim(), &head).await?,
+        "recovery head does not preserve the workspace commit"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;
