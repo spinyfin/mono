@@ -411,3 +411,147 @@ async fn direct_mutation_invalidation_refreshes_the_queued_order() {
         state.published_queued_dispatch.lock().unwrap()
     );
 }
+
+/// An execution of `kind` in `status` on `task_id`, created through the same
+/// path the dispatcher's own rows take.
+fn execution_in(db: &WorkDb, task_id: &str, kind: ExecutionKind, status: ExecutionStatus, created_at: &str) -> String {
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(task_id)
+                .kind(kind)
+                .status(status)
+                .build(),
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET created_at = ?1 WHERE id = ?2",
+            params![created_at, execution.id],
+        )
+        .unwrap();
+    execution.id
+}
+
+/// A chain root with a live execution of `writer_kind`, a ready revision on
+/// that chain, and an unrelated ready chore queued behind the revision.
+fn chain_fixture(db: &WorkDb, live_kind: ExecutionKind) {
+    let product = create_test_product(db).id;
+    insert_task(db, &product, "task_parent", "chore", "cli", "medium");
+    insert_task(db, &product, "task_revision", "revision", "bossctl", "medium");
+    insert_task(db, &product, "task_runnable", "chore", "cli", "medium");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET parent_task_id = 'task_parent' WHERE id = 'task_revision'",
+            [],
+        )
+        .unwrap();
+    execution_in(db, "task_parent", live_kind, ExecutionStatus::Running, "900");
+    ready_execution(db, "task_revision", "1000");
+    ready_execution(db, "task_runnable", "1001");
+}
+
+/// Runs the production chain projection through the real coordinator.
+#[tokio::test]
+async fn a_revision_behind_a_live_chain_writer_is_held_by_the_real_projection() {
+    let (state, _temp) = crate::app::tests::test_server_state();
+    chain_fixture(&state.work_db, ExecutionKind::ChoreImplementation);
+
+    let entries = state.queued_dispatch_snapshot();
+
+    assert_eq!(entries["task_revision"].position, None);
+    assert!(!entries["task_revision"].next_up);
+    assert_eq!(entries["task_runnable"].position, Some(0));
+    assert!(entries["task_runnable"].next_up);
+}
+
+/// A read-only review never holds a revision, so it stays ranked.
+#[tokio::test]
+async fn a_live_read_only_review_does_not_hold_a_revision_in_the_real_projection() {
+    let (state, _temp) = crate::app::tests::test_server_state();
+    chain_fixture(&state.work_db, ExecutionKind::PrReview);
+
+    let entries = state.queued_dispatch_snapshot();
+
+    assert_eq!(entries["task_revision"].position, Some(0));
+    assert!(entries["task_revision"].next_up);
+    assert_eq!(entries["task_runnable"].position, Some(1));
+}
+
+/// A refresh blocked behind another must compute after it, so the order it
+/// stores reflects writes made while it waited.
+#[tokio::test]
+async fn a_refresh_waiting_on_another_computes_after_it() {
+    let (state, _temp) = crate::app::tests::test_server_state();
+    let product = create_test_product(&state.work_db).id;
+    insert_task(&state.work_db, &product, "task_first", "chore", "cli", "medium");
+    insert_task(&state.work_db, &product, "task_second", "chore", "cli", "medium");
+    ready_execution(&state.work_db, "task_first", "1000");
+    state.refresh_queued_dispatch();
+
+    let in_progress = state.queued_dispatch_refresh.lock().unwrap();
+    let racer = {
+        let state = state.clone();
+        std::thread::spawn(move || state.refresh_queued_dispatch())
+    };
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    ready_execution(&state.work_db, "task_second", "1001");
+    drop(in_progress);
+
+    assert!(racer.join().unwrap(), "the waiting refresh saw the later write");
+    assert_eq!(
+        state.published_queued_dispatch.lock().unwrap()["task_second"].position,
+        Some(1)
+    );
+}
+
+/// A refresh that runs while the drain holds a row `claimed` would omit it, so
+/// it keeps the stored order instead; releasing the claim announces nothing, so
+/// a retry armed behind the claim must bring the order up to date.
+#[tokio::test]
+async fn the_order_is_not_replaced_mid_claim_and_recovers_after_release() {
+    let (state, _temp) = crate::app::tests::test_server_state();
+    let product = create_test_product(&state.work_db).id;
+    for id in ["task_first", "task_second", "task_third"] {
+        insert_task(&state.work_db, &product, id, "chore", "cli", "medium");
+    }
+    let first = ready_execution(&state.work_db, "task_first", "1000");
+    ready_execution(&state.work_db, "task_second", "1001");
+    state.refresh_queued_dispatch();
+
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute("UPDATE work_executions SET status = 'claimed' WHERE id = ?1", [&first])
+        .unwrap();
+    ready_execution(&state.work_db, "task_third", "1002");
+    assert!(!state.refresh_queued_dispatch(), "mid-claim computation is discarded");
+    {
+        let published = state.published_queued_dispatch.lock().unwrap();
+        assert_eq!(published["task_first"].position, Some(0), "claimed row keeps its place");
+        assert!(!published.contains_key("task_third"));
+    }
+    // Arms the retry that follows the claim.
+    state.republish_queued_dispatch_if_changed().await;
+
+    state.work_db.release_dispatch_claim(&first).unwrap();
+
+    for _ in 0..150 {
+        if state
+            .published_queued_dispatch
+            .lock()
+            .unwrap()
+            .contains_key("task_third")
+        {
+            let published = state.published_queued_dispatch.lock().unwrap();
+            assert_eq!(published["task_first"].position, Some(0));
+            assert_eq!(published["task_third"].position, Some(2));
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("order never caught up after the claim was released");
+}

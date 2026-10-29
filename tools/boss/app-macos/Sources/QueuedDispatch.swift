@@ -14,7 +14,9 @@ enum DispatchPool: String, Equatable {
 struct QueuedDispatch: Equatable {
     let pool: DispatchPool
     /// Rank among the executions the dispatcher would take right now. `nil`
-    /// when it will not currently take the card (a pause holds it).
+    /// when the dispatcher will not currently take the card: a pause or a live
+    /// writer on its PR chain holds it, it waits on a dependency, or it is
+    /// inside a retry backoff.
     let position: Int?
     /// The first runnable main-pool card.
     let nextUp: Bool

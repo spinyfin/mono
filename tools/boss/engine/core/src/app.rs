@@ -734,6 +734,15 @@ struct ServerState {
     /// so a ready-queue change re-pushes the board only when the order moved.
     #[builder(default)]
     published_queued_dispatch: StdMutex<std::collections::BTreeMap<String, boss_protocol::QueuedDispatch>>,
+    /// Held across a whole recompute-and-store of the queued order, so a
+    /// computation that read the queue earlier can never store after one that
+    /// read it later.
+    #[builder(default)]
+    queued_dispatch_refresh: StdMutex<()>,
+    /// Set while a retry of the queued-order refresh is scheduled behind an
+    /// outstanding dispatch claim, so a burst of invalidations arms one.
+    #[builder(default)]
+    queued_dispatch_retry_pending: std::sync::atomic::AtomicBool,
     /// Epoch second of the pending timer that re-evaluates the queued order
     /// when a backed-off row's `dispatch_not_before` passes.
     #[builder(default)]
