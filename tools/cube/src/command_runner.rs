@@ -117,9 +117,19 @@ pub const JJ_GATE_HELD_ENV: &str = "CUBE_JJ_GATE_HELD";
 /// checks.
 pub struct JjGate {
     _file: File,
+    quarantine: PathBuf,
 }
 
 impl JjGate {
+    /// Fail closed across a killed maintenance process or a partial head update.
+    pub fn quarantine(&self, source: &Path) -> Result<(), CubeError> {
+        fs::write(&self.quarantine, source.display().to_string()).map_err(CubeError::Io)
+    }
+
+    pub fn clear_quarantine(&self) -> Result<(), CubeError> {
+        fs::remove_file(&self.quarantine).map_err(CubeError::Io)
+    }
+
     /// Take a reader reservation before claiming a workspace or waiting on
     /// the lease registry lock. Maintenance contention must not leave a
     /// partially prepared lease or a convoy behind the registry lock.
@@ -170,7 +180,18 @@ impl JjGate {
             }
             .map_err(io_error)?;
             if got {
-                return Ok(Self { _file: file });
+                let quarantine = lock_path.with_extension("blocked");
+                if !exclusive && quarantine.try_exists().map_err(CubeError::Io)? {
+                    return Err(CubeError::InvalidArgument(format!(
+                        "unverified jj operation-head rewrite in {}; repair the store and verify a single operation head before removing {}",
+                        fs::read_to_string(&quarantine).map_err(CubeError::Io)?,
+                        quarantine.display()
+                    )));
+                }
+                return Ok(Self {
+                    _file: file,
+                    quarantine,
+                });
             }
             if started.elapsed() >= wait {
                 if !exclusive {

@@ -36,7 +36,8 @@ rust_binary(
 
 rust_test(
     name = "cube_lib_test",
-    size = "medium",
+    # Includes a real 16,800-operation GC rewrite and concurrent leases.
+    size = "large",
     crate = ":cube_lib",
     # Real-jj fixtures (a throwaway colocated repo) for the `pr/<n>` bookmark
     # lifecycle tests; the binary is declared, never taken from PATH.

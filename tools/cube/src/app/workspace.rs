@@ -31,7 +31,7 @@ use crate::app::gc::{
     gc_aged_unhealthy_workspaces, gc_workspace_bookmarks, maybe_trigger_pool_gc, reclaim_quarantined_workspace,
 };
 use crate::app::health::{
-    WorkspaceHealthOutcome, check_workspace_health, read_head_status, repair_conflicted_bookmarks,
+    WorkspaceHealthOutcome, check_workspace_health_within, read_head_status, repair_conflicted_bookmarks,
 };
 use crate::app::jj::{cleanup_workspace_logs, current_workspace_commit, workspace_path_exists};
 use crate::app::lease_reclaim::{
@@ -140,6 +140,10 @@ const STALE_HEALTH_REVALIDATE_PER_LEASE: usize = 3;
 /// one point and 182s at another), so the scan also stops at a deadline and
 /// provisions instead.
 const LEASE_HEALTH_SCAN_BUDGET: Duration = Duration::from_secs(5);
+
+/// Leave room to try another candidate when an op-log rewrite makes one
+/// working copy expensive to inspect. A timed-out probe never authorizes reuse.
+const LEASE_HEALTH_PROBE_BUDGET: Duration = Duration::from_secs(2);
 
 /// Wall-clock budget for the quarantine-reclaim scan that runs after the
 /// health scan when nothing usable was found. Its probes each include a
@@ -685,7 +689,13 @@ pub(super) fn run_workspace(
                 // Any error from check_workspace_health skips this workspace
                 // rather than hard-failing the lease. The pool is not fixed —
                 // cube provisions a fresh workspace when none are usable.
-                let outcome = match check_workspace_health(runner, database_path, &ws.workspace_path) {
+                let probe_deadline = scan_deadline.min(Instant::now() + LEASE_HEALTH_PROBE_BUDGET);
+                let outcome = match check_workspace_health_within(
+                    runner,
+                    database_path,
+                    &ws.workspace_path,
+                    Some(probe_deadline),
+                ) {
                     Ok(o) => o,
                     Err(e) => {
                         let err_str = e.to_string();
@@ -747,7 +757,13 @@ pub(super) fn run_workspace(
                             args: vec!["workspace".to_string(), "update-stale".to_string()],
                             env: vec![],
                         };
-                        match runner.run(&update_stale_inv) {
+                        match crate::app::jj::budgeted_timeout(Some(probe_deadline), LEASE_HEALTH_PROBE_BUDGET)
+                            .ok_or_else(|| CubeError::DeadlineExceeded {
+                                program: update_stale_inv.program.clone(),
+                                args: update_stale_inv.args.clone(),
+                            })
+                            .and_then(|timeout| runner.run_with_timeout(&update_stale_inv, timeout))
+                        {
                             Ok(_) => {
                                 audit!(
                                     database_path,
@@ -756,7 +772,12 @@ pub(super) fn run_workspace(
                                     repo = repo,
                                     workspace_id = ws_id,
                                 );
-                                match check_workspace_health(runner, database_path, &ws.workspace_path) {
+                                match check_workspace_health_within(
+                                    runner,
+                                    database_path,
+                                    &ws.workspace_path,
+                                    Some(probe_deadline),
+                                ) {
                                     Ok(WorkspaceHealthOutcome::Clean) => {
                                         let was_stale_dirty = matches!(
                                             ws.health_status,

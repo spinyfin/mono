@@ -109,7 +109,10 @@ pub(super) fn check_workspace_health_within(
             // the original error so the lease loop can skip this workspace.
             if jj_needs_colocate_init(&err, workspace_path) {
                 let init = RealCommandRunner::invocation(workspace_path, "jj", &["git", "init", "--colocate"]);
-                if runner.run(&init).is_err() {
+                let Some(init_timeout) = budgeted_timeout(deadline, network_cmd_timeout()) else {
+                    return Err(err);
+                };
+                if runner.run_with_timeout(&init, init_timeout).is_err() {
                     return Err(err);
                 }
                 audit!(

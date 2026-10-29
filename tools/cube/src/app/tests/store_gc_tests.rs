@@ -182,12 +182,14 @@ fn repo_gc_abandons_old_operations_collects_and_drops_stale_pr_refs() {
         op_log_command(&source, &op_log(now)),
         // The host is quiet before the abandon...
         ps_command(&source, "/bin/sh\n"),
+        ps_command(&source, ""),
         ExpectedCommand::ok(
             source.clone(),
             "jj",
             &["--ignore-working-copy", "op", "abandon", &format!("..{cut}")],
             "Abandoned 2 operations and reparented 3 descendant operations.\n",
         ),
+        index_command(&source),
         // ...and right after it: collect immediately.
         ps_command(&source, "/bin/sh\n/usr/bin/git\n"),
         ExpectedCommand::ok(
@@ -317,6 +319,7 @@ fn collection_is_deferred_to_the_two_week_threshold_when_jj_goes_busy_after_the_
     let mut expected = vec![
         op_log_command(&source, &op_log(now)),
         ps_command(&source, ""),
+        ps_command(&source, ""),
         ExpectedCommand::ok(
             source.clone(),
             "jj",
@@ -328,7 +331,8 @@ fn collection_is_deferred_to_the_two_week_threshold_when_jj_goes_busy_after_the_
             ],
             "",
         ),
-        // A busy probe defers immediately rather than holding up leases.
+        index_command(&source),
+        // A busy probe defers after its polling budget outside exclusivity.
         ps_command(&source, "/opt/homebrew/bin/jj\n/bin/sh\n"),
         // So the collection keeps jj's two-week threshold: no `--expire now`.
         ExpectedCommand::ok(source.clone(), "jj", &["--ignore-working-copy", "util", "gc"], ""),
@@ -341,7 +345,7 @@ fn collection_is_deferred_to_the_two_week_threshold_when_jj_goes_busy_after_the_
         Some(&database_path),
         &record,
         DEFAULT_KEEP,
-        Duration::from_millis(400),
+        Duration::from_millis(200),
         false,
     )
     .expect("repo gc");
@@ -710,7 +714,7 @@ fn a_busy_store_is_neither_abandoned_nor_collected() {
         Some(&database_path),
         &record,
         DEFAULT_KEEP,
-        Duration::from_millis(400),
+        Duration::from_millis(200),
         false,
     )
     .expect("repo gc");
@@ -736,6 +740,7 @@ fn a_second_operation_head_after_the_abandon_stops_the_pass_before_collecting() 
     let runner = FakeRunner::new(vec![
         op_log_command(&source, &op_log(now)),
         ps_command(&source, ""),
+        ps_command(&source, ""),
         ExpectedCommand::ok(
             source.clone(),
             "jj",
@@ -753,12 +758,29 @@ fn a_second_operation_head_after_the_abandon_stops_the_pass_before_collecting() 
         Some(&database_path),
         &record,
         DEFAULT_KEEP,
-        Duration::from_millis(400),
+        Duration::from_millis(200),
         false,
     )
     .expect_err("two heads");
     runner.assert_exhausted();
     assert!(err.to_string().contains("2 operation heads"), "{err}");
+}
+
+fn index_command(source: &std::path::Path) -> ExpectedCommand {
+    ExpectedCommand::ok(
+        source.to_path_buf(),
+        "jj",
+        &[
+            "--ignore-working-copy",
+            "log",
+            "-r",
+            "root()",
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ],
+        "",
+    )
 }
 
 fn abandon_command(source: &std::path::Path) -> ExpectedCommand {
@@ -793,7 +815,8 @@ fn slow_abandon_is_bounded_and_releases_the_gate_without_collecting() {
     let runner = FakeRunner::new(vec![
         op_log_command(&source, &op_log(now)),
         ps_command(&source, ""),
-        abandon_command(&source).taking(Duration::from_secs(30)),
+        ps_command(&source, ""),
+        abandon_command(&source).taking(Duration::from_secs(130)),
     ]);
     let started = std::time::Instant::now();
     let error = gc_repo_store(
@@ -806,12 +829,123 @@ fn slow_abandon_is_bounded_and_releases_the_gate_without_collecting() {
     )
     .expect_err("slow rewrite must yield to leases");
     assert!(
-        matches!(error, CubeError::CommandTimedOut { timeout_secs: 2, .. }),
+        matches!(error, CubeError::CommandTimedOut { timeout_secs: 120, .. }),
         "{error}"
     );
-    assert!(started.elapsed() < Duration::from_secs(4));
+    assert!(started.elapsed() < Duration::from_secs(122));
     runner.assert_exhausted();
     crate::command_runner::JjGate::shared_for_database(Some(&database_path)).unwrap();
+}
+
+#[test]
+fn timed_out_abandon_with_two_heads_quarantines_readers() {
+    let (tempdir, database) = with_database_path();
+    seed_mono_repo(&tempdir.path().join("workspaces"), &database);
+    let source = seed_store_files(&source_of(&database));
+    let mut abandon = abandon_command(&source).creating_dir(source.join(".jj/repo/op_heads/heads/interrupted"));
+    abandon.result = Err(CubeError::CommandTimedOut {
+        program: "jj".into(),
+        args: abandon.args.clone(),
+        timeout_secs: 120,
+    });
+    let fake = FakeRunner::new(vec![
+        op_log_command(&source, &op_log(crate::app::util::current_epoch_s().unwrap())),
+        ps_command(&source, ""),
+        ps_command(&source, ""),
+        abandon,
+    ]);
+    let probe = GateProbe {
+        inner: &fake,
+        gate_path: crate::command_runner::JjGate::path(tempdir.path()),
+        observed: Default::default(),
+    };
+    let error = gc_repo_store(
+        &probe,
+        Some(&database),
+        &mono_record(&database),
+        DEFAULT_KEEP,
+        Duration::ZERO,
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("2 operation heads after the abandon"),
+        "{error}"
+    );
+    assert_eq!(*probe.observed.borrow(), vec![("abandon".into(), true)]);
+    let error = crate::command_runner::JjGate::shared_for_database(Some(&database))
+        .err()
+        .expect("unsafe heads must keep readers blocked after the gate is dropped");
+    assert!(error.to_string().contains("unverified jj operation-head rewrite"));
+    fake.assert_exhausted();
+}
+
+#[test]
+fn busy_host_becomes_quiet_without_excluding_readers() {
+    let (tempdir, database) = with_database_path();
+    seed_mono_repo(&tempdir.path().join("workspaces"), &database);
+    let source = seed_store_files(&source_of(&database));
+    let mut expected = vec![
+        op_log_command(&source, &op_log(crate::app::util::current_epoch_s().unwrap())),
+        ps_command(&source, "jj"),
+        ps_command(&source, "jj"),
+        ps_command(&source, ""),
+        ps_command(&source, ""),
+        abandon_command(&source),
+        index_command(&source),
+        ps_command(&source, "jj"),
+        ps_command(&source, "jj"),
+        ps_command(&source, ""),
+        ExpectedCommand::ok(
+            source.clone(),
+            "jj",
+            &["--ignore-working-copy", "util", "gc", "--expire", "now"],
+            "",
+        ),
+    ];
+    expected.extend(pr_ref_commands(&source, "", ""));
+    let fake = FakeRunner::new(expected);
+    struct PollProbe<'a> {
+        fake: &'a FakeRunner,
+        database: &'a std::path::Path,
+        polls: std::cell::Cell<usize>,
+    }
+    impl crate::command_runner::CommandRunner for PollProbe<'_> {
+        fn run(&self, i: &crate::command_runner::CommandInvocation) -> crate::app::errors::Result<String> {
+            self.fake.run(i)
+        }
+        fn run_with_timeout(
+            &self,
+            i: &crate::command_runner::CommandInvocation,
+            t: Duration,
+        ) -> crate::app::errors::Result<String> {
+            if i.program == "ps" {
+                let n = self.polls.get();
+                self.polls.set(n + 1);
+                if n != 3 {
+                    crate::command_runner::JjGate::shared_for_database(Some(self.database))
+                        .expect("polling must not exclude readers");
+                }
+            }
+            self.fake.run_with_timeout(i, t)
+        }
+    }
+    let probe = PollProbe {
+        fake: &fake,
+        database: &database,
+        polls: std::cell::Cell::new(0),
+    };
+    let report = gc_repo_store(
+        &probe,
+        Some(&database),
+        &mono_record(&database),
+        DEFAULT_KEEP,
+        Duration::from_secs(3),
+        false,
+    )
+    .unwrap();
+    assert_eq!(report.collection, Collection::Immediate);
+    fake.assert_exhausted();
 }
 
 #[test]
@@ -827,7 +961,9 @@ fn a_head_that_appears_after_the_abandon_returns_stops_the_pass_before_collectin
     let runner = FakeRunner::new(vec![
         op_log_command(&source, &op_log(now)),
         ps_command(&source, ""),
+        ps_command(&source, ""),
         abandon_command(&source),
+        index_command(&source),
         ps_command(&source, "").creating_dir(source.join(".jj/repo/op_heads/heads/raced")),
     ]);
     let err = gc_repo_store(
@@ -835,7 +971,7 @@ fn a_head_that_appears_after_the_abandon_returns_stops_the_pass_before_collectin
         Some(&database_path),
         &record,
         DEFAULT_KEEP,
-        Duration::from_millis(400),
+        Duration::from_millis(200),
         false,
     )
     .expect_err("racing head");
@@ -856,7 +992,9 @@ fn a_head_that_appears_while_the_post_abandon_wait_fails_stops_the_deferred_coll
     let runner = FakeRunner::new(vec![
         op_log_command(&source, &op_log(now)),
         ps_command(&source, ""),
+        ps_command(&source, ""),
         abandon_command(&source),
+        index_command(&source),
         // A busy probe also reveals a racing head. Even the two-week
         // collection must not run in that case.
         ps_command(&source, "/opt/homebrew/bin/jj\n").creating_dir(source.join(".jj/repo/op_heads/heads/raced")),
@@ -866,7 +1004,7 @@ fn a_head_that_appears_while_the_post_abandon_wait_fails_stops_the_deferred_coll
         Some(&database_path),
         &record,
         DEFAULT_KEEP,
-        Duration::from_millis(400),
+        Duration::from_millis(200),
         false,
     )
     .expect_err("racing head");
@@ -886,6 +1024,7 @@ fn a_failed_pass_and_a_skipped_pass_are_each_recorded_and_surfaced_by_workspace_
     let now = crate::app::util::current_epoch_s().unwrap();
     let runner = FakeRunner::new(vec![
         op_log_command(&source, &op_log(now)),
+        ps_command(&source, ""),
         ps_command(&source, ""),
         abandon_command(&source),
     ]);
@@ -927,7 +1066,7 @@ fn a_failed_pass_and_a_skipped_pass_are_each_recorded_and_surfaced_by_workspace_
     assert!(store_gc_attention(&store, &repos).is_empty());
 }
 
-/// Delegates to a [`FakeRunner`] and, on each destructive jj call, records
+/// Delegates to a [`FakeRunner`] and, on each maintenance jj call, records
 /// whether a cube-started jj command (a shared gate holder) would have to
 /// wait: `(subcommand, blocked)`.
 struct GateProbe<'a> {
@@ -946,10 +1085,17 @@ impl crate::command_runner::CommandRunner for GateProbe<'_> {
         invocation: &crate::command_runner::CommandInvocation,
         timeout: Duration,
     ) -> crate::app::errors::Result<String> {
-        if invocation.program == "jj" && invocation.args.iter().any(|a| a == "abandon" || a == "gc") {
+        if invocation.program == "jj"
+            && invocation
+                .args
+                .iter()
+                .any(|a| a == "abandon" || a == "gc" || a == "root()")
+        {
             let blocked = crate::command_runner::JjGate::shared(&self.gate_path, Duration::from_millis(30)).is_err();
             let kind = if invocation.args.iter().any(|a| a == "abandon") {
                 "abandon"
+            } else if invocation.args.iter().any(|a| a == "root()") {
+                "index"
             } else {
                 "gc"
             };
@@ -976,7 +1122,9 @@ fn cube_started_jj_commands_are_held_off_for_the_abandon_but_not_the_collection(
     let mut expected = vec![
         op_log_command(&source, &op_log(now)),
         ps_command(&source, ""),
+        ps_command(&source, ""),
         abandon_command(&source),
+        index_command(&source),
         ps_command(&source, ""),
         ExpectedCommand::ok(
             source.clone(),
@@ -997,20 +1145,24 @@ fn cube_started_jj_commands_are_held_off_for_the_abandon_but_not_the_collection(
         Some(&database_path),
         &record,
         DEFAULT_KEEP,
-        Duration::from_millis(400),
+        Duration::from_millis(200),
         false,
     )
     .expect("repo gc");
     fake.assert_exhausted();
     assert_eq!(
         *probe.observed.borrow(),
-        vec![("abandon".to_owned(), true), ("gc".to_owned(), false)],
+        vec![
+            ("abandon".to_owned(), true),
+            ("index".to_owned(), true),
+            ("gc".to_owned(), false)
+        ],
         "a jj command that starts mid-abandon waits on the gate; the collection runs after it is released"
     );
 }
 
 #[test]
-fn the_gate_stays_held_until_the_post_abandon_head_check_fails_the_pass() {
+fn post_abandon_head_check_fails_the_pass_after_releasing_exclusivity() {
     let (tempdir, database_path) = with_database_path();
     seed_mono_repo(&tempdir.path().join("workspaces"), &database_path);
     let source = seed_store_files(&source_of(&database_path));
@@ -1022,7 +1174,9 @@ fn the_gate_stays_held_until_the_post_abandon_head_check_fails_the_pass() {
     let fake = FakeRunner::new(vec![
         op_log_command(&source, &op_log(now)),
         ps_command(&source, ""),
+        ps_command(&source, ""),
         abandon_command(&source),
+        index_command(&source),
         ps_command(&source, "").creating_dir(source.join(".jj/repo/op_heads/heads/raced")),
     ]);
     let probe = GateProbe {
@@ -1035,12 +1189,15 @@ fn the_gate_stays_held_until_the_post_abandon_head_check_fails_the_pass() {
         Some(&database_path),
         &record,
         DEFAULT_KEEP,
-        Duration::from_millis(400),
+        Duration::from_millis(200),
         false,
     )
     .expect_err("racing head");
     fake.assert_exhausted();
-    assert_eq!(*probe.observed.borrow(), vec![("abandon".to_owned(), true)]);
+    assert_eq!(
+        *probe.observed.borrow(),
+        vec![("abandon".to_owned(), true), ("index".to_owned(), true)]
+    );
     crate::command_runner::JjGate::shared(
         &crate::command_runner::JjGate::path(tempdir.path()),
         Duration::from_millis(100),
@@ -1061,7 +1218,7 @@ fn cube_jj_commands_still_running_skip_the_abandon() {
         Duration::from_millis(100),
     )
     .unwrap();
-    let mut expected = vec![op_log_command(&source, &op_log(now))];
+    let mut expected = vec![op_log_command(&source, &op_log(now)), ps_command(&source, "")];
     expected.extend(pr_ref_commands(&source, "", ""));
     let runner = FakeRunner::new(expected);
     let report = gc_repo_store(
