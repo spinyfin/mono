@@ -125,9 +125,8 @@ pub mod cube {
 
     impl CubeCliError {
         /// The single-line human detail: trimmed stderr, else trimmed stdout,
-        /// else a synthetic exit-status clause. Matches the message the SSH
-        /// adapter historically built so `error_message` and logs are byte
-        /// identical after this change.
+        /// else a synthetic exit-status clause. The SSH adapter uses the same
+        /// detail in error messages and structured logs.
         pub fn detail(&self) -> String {
             let stderr = self.stderr.trim();
             if !stderr.is_empty() {
