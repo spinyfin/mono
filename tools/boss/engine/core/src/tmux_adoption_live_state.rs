@@ -27,23 +27,18 @@ pub(crate) async fn register_adopted_live_state<S>(
     let Some(live_states) = spawner.live_worker_state_registry() else {
         return;
     };
-    let binding = work_db
-        .get_work_item(&execution.work_item_id)
-        .ok()
-        .map(|item| boss_protocol::WorkItemBinding {
-            work_item_id: execution.work_item_id.clone(),
-            work_item_name: crate::runner::work_item_name(&item).to_owned(),
-            execution_id: execution_id.to_owned(),
-        });
+    let binding = Some(crate::live_worker_metadata::execution_binding(work_db, execution));
     let has_source_automation = matches!(
         work_db.source_automation_id_for_work_item(&execution.work_item_id),
         Ok(Some(_))
     );
     let pool = attributed_pool_label(execution.kind.clone(), has_source_automation);
-    let model_label = driver
-        .as_ref()
-        .map(|driver| driver.descriptor().label.to_owned())
-        .unwrap_or_else(|| "Unknown driver".to_owned());
+    let model_label = execution.model.clone().unwrap_or_else(|| {
+        driver
+            .as_ref()
+            .map(|driver| driver.descriptor().label.to_owned())
+            .unwrap_or_else(|| "Unknown driver".to_owned())
+    });
     let awaiting_input_capable = driver.as_ref().is_some_and(|driver| {
         driver
             .capabilities()
@@ -147,6 +142,54 @@ mod tests {
             )
             .unwrap();
         execution
+    }
+
+    #[tokio::test]
+    async fn restart_preserves_codex_launch_identity_and_non_task_binding() {
+        let (_dir, db) = open_db();
+        let execution = seed_running(&db, true);
+        // Review-guide comparisons are execution owners, but get_work_item
+        // cannot resolve them as a task, chore, product, or project.
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET work_item_id = 'prgc_restart', kind = 'pr_review_guide' WHERE id = ?1",
+                [&execution.id],
+            )
+            .unwrap();
+        let execution = db
+            .record_execution_launch_config(&execution.id, "codex", "gpt-6-astra", None)
+            .unwrap();
+        let spawned = LiveWorkerStateRegistry::default();
+        spawned.register_spawn_with_capabilities(
+            1,
+            execution.id.clone(),
+            "gpt-6-astra",
+            4321,
+            Some(boss_protocol::WorkItemBinding {
+                work_item_id: execution.work_item_id.clone(),
+                work_item_name: execution.work_item_id.clone(),
+                execution_id: execution.id.clone(),
+            }),
+            false,
+            LiveSpawnRouting::new_with_hosting(Some("main".to_owned()), execution.kind.as_str(), true)
+                .with_metadata(crate::live_worker_metadata::resolve(&db, &execution, "local")),
+        );
+        let spawner = LiveStateSpawner::default();
+        let driver = crate::driver_transcript::driver_for_spawned_execution(&db, &execution.id).unwrap();
+        assert_eq!(driver.descriptor().name, "codex");
+        register_adopted_live_state(&db, &spawner, &execution, &execution.id, 1, 4321, Some(driver)).await;
+        let before = spawned.get(1).unwrap();
+        let after = spawner.live_states.get(1).unwrap();
+        assert_eq!(after.model, before.model);
+        assert_eq!(after.work_item_id, before.work_item_id);
+        assert_eq!(after.work_item_name, before.work_item_name);
+        assert_eq!(after.agent_type, before.agent_type);
+        assert_eq!(after.run_id, before.run_id);
+        assert_eq!(
+            spawner.live_states.awaiting_input_capable(1),
+            spawned.awaiting_input_capable(1)
+        );
     }
 
     #[tokio::test]

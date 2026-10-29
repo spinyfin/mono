@@ -486,7 +486,7 @@ async fn readoption_derives_the_awaiting_input_capability_from_the_runs_driver()
 
 #[tokio::test]
 async fn readoption_does_not_substitute_an_unregistered_launch_driver() {
-    assert_readoption_driver(Some("removed-driver"), "Unknown driver").await;
+    assert_readoption_driver(Some("removed-driver"), "test-model").await;
 }
 
 async fn assert_readoption_driver(launch_driver: Option<&str>, expected_label: &str) {

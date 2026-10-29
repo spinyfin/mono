@@ -11,6 +11,20 @@ use boss_protocol::{AgentType, ExecutionKind, LiveWorkerMetadata, WorkItem};
 
 use crate::work::{WorkDb, WorkExecution};
 
+/// Keep the durable binding even for execution owners (such as review-guide
+/// comparisons and comments) that are not ordinary work-item variants.
+pub(crate) fn execution_binding(work_db: &WorkDb, execution: &WorkExecution) -> boss_protocol::WorkItemBinding {
+    let work_item_name = work_db
+        .get_work_item(&execution.work_item_id)
+        .map(|item| crate::runner::work_item_name(&item).to_owned())
+        .unwrap_or_else(|_| execution.work_item_id.clone());
+    boss_protocol::WorkItemBinding {
+        work_item_id: execution.work_item_id.clone(),
+        work_item_name,
+        execution_id: execution.id.clone(),
+    }
+}
+
 /// Project attribution for a dispatched work item, in precedence order:
 ///
 /// 1. The work item *is* a project (project-level work): that project.

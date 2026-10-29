@@ -161,12 +161,12 @@ async fn orphaned_execution_with_dead_pane_is_not_readopted() {
 /// even when live resolution from worker id / pool policy would pick Claude.
 #[tokio::test]
 async fn codex_launch_config_survives_tmux_adoption() {
-    assert_adopted_driver("codex", "OpenAI Codex").await;
+    assert_adopted_driver("codex", "test-model").await;
 }
 
 #[tokio::test]
 async fn unregistered_launch_config_is_not_relabelled_by_tmux_adoption() {
-    assert_adopted_driver("removed-driver", "Unknown driver").await;
+    assert_adopted_driver("removed-driver", "test-model").await;
 }
 
 async fn assert_adopted_driver(driver: &str, expected_label: &str) {
