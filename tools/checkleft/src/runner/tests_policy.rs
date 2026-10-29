@@ -769,7 +769,7 @@ allow_bypass = true
         failed.findings[0]
             .remediations
             .iter()
-            .any(|r| r.contains("splitting it into smaller stacked PRs")),
+            .any(|r| r.contains("Break the work into smaller tasks/PRs")),
         "exceeded-bound remediations must keep the guest split guidance; got {:?}",
         failed.findings[0].remediations
     );
