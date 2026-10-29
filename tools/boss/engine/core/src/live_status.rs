@@ -91,6 +91,11 @@ pub const MAX_TRANSCRIPT_ENTRIES: usize = 30;
 /// kanban card subtitle to a single line at default card width (~60 chars).
 pub const MAX_LIVE_STATUS_LEN: usize = 60;
 
+/// Byte cap on the logged `insufficient_input` reason, ellipsis included.
+/// The reason is redacted first, then clipped so a secret straddling
+/// this cut cannot leak a prefix into the log.
+pub const INSUFFICIENT_INPUT_REASON_MAX_BYTES: usize = 200;
+
 /// Literal string used by the trigger fan-in when `activity` flips
 /// to `WaitingForInput` and no prior summary is available. Written
 /// directly to `live_status` without a model call.
@@ -543,7 +548,8 @@ pub enum ClaudeReply {
     Success(String),
     PostFilterDropped,
     /// The forced tool call set `insufficient_input`. The reason has
-    /// been through the secret-pattern redactor and clipped.
+    /// been through the secret-pattern redactor and clipped to at most
+    /// [`INSUFFICIENT_INPUT_REASON_MAX_BYTES`] (ellipsis included).
     InsufficientInput {
         reason: String,
     },
@@ -585,6 +591,16 @@ pub async fn claude_one_sentence(call: &UtilityCall, transcript: &str) -> Result
     Ok(parse_status_reply(input))
 }
 
+/// Redact-then-clip bound for [`ClaudeReply::InsufficientInput`]: the
+/// returned string is at most [`INSUFFICIENT_INPUT_REASON_MAX_BYTES`]
+/// including the ellipsis `clip_to_bytes` appends on truncation.
+fn clip_insufficient_input_reason(redacted: &str) -> String {
+    if redacted.len() <= INSUFFICIENT_INPUT_REASON_MAX_BYTES {
+        return redacted.to_owned();
+    }
+    boss_engine_utils::string_clip::clip_to_bytes(redacted, INSUFFICIENT_INPUT_REASON_MAX_BYTES - '…'.len_utf8())
+}
+
 /// Interpret the forced tool call's input. The `insufficient_input`
 /// flag wins over any `status` text, so an explanation the model also
 /// typed into `status` can never be mistaken for a label.
@@ -599,8 +615,7 @@ pub fn parse_status_reply(input: &Value) -> ClaudeReply {
                 .and_then(Value::as_str)
                 .unwrap_or("(no reason given)");
             let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-            let reason =
-                boss_engine_utils::string_clip::clip_to_bytes(&live_status_redact::redact_text(&one_line), 200);
+            let reason = clip_insufficient_input_reason(&live_status_redact::redact_text(&one_line));
             return ClaudeReply::InsufficientInput { reason };
         }
         Some(Value::Bool(false)) | None => {}
@@ -924,16 +939,34 @@ mod tests {
 
     #[test]
     fn parse_status_reply_redacts_and_clips_the_reason() {
+        // Spaced ordinary words survive the generic 32+ base64 redaction
+        // pattern, so the clip path actually runs. A GitHub token starts
+        // before byte 200 and ends after it: clip-then-redact would keep
+        // a `ghp_` prefix too short to match the token pattern; redact-
+        // then-clip removes the whole token first.
+        let head = "word ".repeat(37);
+        let token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+        let tail = "more ".repeat(80);
+        let raw = format!("{head}{token} {tail}");
+        let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        let token_at = one_line.find(token).expect("fixture must contain the token");
+        assert!(
+            token_at < INSUFFICIENT_INPUT_REASON_MAX_BYTES
+                && token_at + token.len() > INSUFFICIENT_INPUT_REASON_MAX_BYTES,
+            "token must straddle the {INSUFFICIENT_INPUT_REASON_MAX_BYTES}-byte cut; starts at {token_at}"
+        );
+
         let reply = parse_status_reply(&json!({
             "insufficient_input": true,
-            "reason": format!("saw token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345 and {}", "x".repeat(400)),
+            "reason": raw,
         }));
         let ClaudeReply::InsufficientInput { reason } = reply else {
             panic!("expected insufficient input, got {reply:?}");
         };
         assert!(!reason.contains("ghp_"), "{reason}");
-        // The clip adds a 3-byte ellipsis past the 200-byte budget.
-        assert!(reason.len() <= 200 + '…'.len_utf8(), "{}", reason.len());
+        assert!(reason.contains("<redacted>"), "{reason}");
+        assert!(reason.ends_with('…'), "{reason}");
+        assert!(reason.len() <= INSUFFICIENT_INPUT_REASON_MAX_BYTES, "{}", reason.len());
     }
 
     #[test]
