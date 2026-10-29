@@ -9,342 +9,18 @@ use super::*;
 mod baseline;
 
 /// Databases older than the schema shipped by this release are unsupported.
-/// Raise this pair together when squashing the next migration generation.
+/// This integer floor is frozen with the legacy migration history.
 /// The historical version marker was coarse; 32 is the value stamped by
 /// boss-v1.0.707 (cc72dac8), including its final last_error migration.
 const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 
-/// Schema version stamped once every post-floor migration has run. Bump it
-/// together with the migration that earns it; the guard and the stamp in
-/// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 60;
-
-/// Schema 43: the baseline commit a recovery record was created at, the
-/// pointer-reconciliation note for the worker prompt, and the retirement
-/// marker that stops a record being a recovery source.
-pub(in crate::work) const EXECUTION_BOOKMARK_COLUMNS_43: &str =
-    "ALTER TABLE execution_bookmarks ADD COLUMN base_commit TEXT;
-     ALTER TABLE execution_bookmarks ADD COLUMN reconciliation_note TEXT;
-     ALTER TABLE execution_bookmarks ADD COLUMN retired_at TEXT;
-     ALTER TABLE execution_bookmarks ADD COLUMN retired_reason TEXT";
-
-/// Schema 60: when the bookmark prune sweep last examined a recovery record
-/// (Unix epoch seconds) and what it concluded (`published`, `already_gone`,
-/// `unproven`, `pr_open`, `error`), so a record that could not be proven
-/// published is re-examined on a schedule instead of on every pass.
-pub(in crate::work) const EXECUTION_BOOKMARK_PRUNE_COLUMNS_60: &str =
-    "ALTER TABLE execution_bookmarks ADD COLUMN prune_checked_at INTEGER;
-     ALTER TABLE execution_bookmarks ADD COLUMN prune_outcome TEXT";
-
-/// Schema 45: GitHub's `updatedAt` for the task's PR, written by the merge
-/// poller. The Review column orders its Pending section by it.
-const TASKS_PR_UPDATED_AT_45: &str = "ALTER TABLE tasks ADD COLUMN pr_updated_at TEXT";
-
-/// Schema 46: provenance of a raise to the human-only `critical`
-/// priority — the resolved caller tier and the timestamp. Both NULL
-/// unless `priority = 'critical'`; see `work/critical_priority.rs`.
-const TASKS_CRITICAL_PROVENANCE_46: &str = "ALTER TABLE tasks ADD COLUMN critical_set_by TEXT;
-     ALTER TABLE tasks ADD COLUMN critical_set_at TEXT";
-
-/// Schema 50: the durable turn condition of a run's worker
-/// (`in_turn` / `ended` / `unknown`), written beside `semantic_tool_condition`
-/// by the same driver events. Re-adoption after an engine restart seeds the
-/// slot's activity from it, so a worker that was mid-turn — including one
-/// waiting on its own background command, whose tool condition reads `idle`
-/// — comes back `Working` rather than `Idle`. NULL on every pre-existing row,
-/// which parses as `unknown`; see `semantic_progress::SemanticTurnCondition`.
-const WORK_RUNS_SEMANTIC_TURN_CONDITION_50: &str = "ALTER TABLE work_runs ADD COLUMN semantic_turn_condition TEXT";
-
-/// Serves the shared-PR probes (`o.pr_url = t.pr_url`, `pr_url = ?`) so they
-/// are index lookups instead of full `tasks` scans.
-const TASKS_PR_URL_INDEX_SQL: &str =
-    "CREATE INDEX IF NOT EXISTS tasks_pr_url_idx ON tasks(pr_url) WHERE pr_url IS NOT NULL";
-
-const IN_FLIGHT_WORKSPACES_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS work_executions_in_flight_idx
-     ON work_executions(created_at, id, repo_remote_url, workspace_path)
-     WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
-       AND cube_lease_id IS NOT NULL";
-
-/// Lets attention reconcile prove a kind has no open rows without scanning
-/// the resolved history.
-const ATTENTION_OPEN_KIND_INDEX_SQL: &str =
-    "CREATE INDEX IF NOT EXISTS work_attention_items_open_kind_idx ON work_attention_items(kind) WHERE status = 'open'";
-
-/// Schema 49: per-item version counters for the board runtime cache.
-///
-/// `board_runtime_epoch.epoch` increases whenever an input of that item's
-/// `TaskRuntime` is written (see `dispatch_helpers::compute_task_runtime` for
-/// the input list), so a cached runtime is reusable exactly while its epoch is
-/// unchanged. The bump happens in the writer's own transaction, which makes it
-/// visible to a reader in the same snapshot as the data, and it fires for any
-/// connection or process that writes the database.
-///
-/// Rows are never deleted: epochs only grow, so a recreated id can never alias
-/// an older cached value, and the table holds at most one small row per item
-/// that ever had an execution. `work_executions` bumps on any column update
-/// (over-invalidating is harmless and survives new runtime fields); `work_runs`
-/// bumps on the columns `query_latest_run` reads.
-const BOARD_RUNTIME_EPOCH_49: &str = "CREATE TABLE IF NOT EXISTS board_runtime_epoch (
-         work_item_id TEXT PRIMARY KEY NOT NULL,
-         epoch INTEGER NOT NULL
-     ) WITHOUT ROWID;
-     CREATE TRIGGER IF NOT EXISTS board_runtime_epoch_execution_insert
-     AFTER INSERT ON work_executions
-     BEGIN
-         INSERT INTO board_runtime_epoch(work_item_id, epoch) VALUES (NEW.work_item_id, 1)
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-     END;
-     CREATE TRIGGER IF NOT EXISTS board_runtime_epoch_execution_update
-     AFTER UPDATE ON work_executions
-     BEGIN
-         INSERT INTO board_runtime_epoch(work_item_id, epoch) VALUES (NEW.work_item_id, 1)
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-     END;
-     CREATE TRIGGER IF NOT EXISTS board_runtime_epoch_execution_reassigned
-     AFTER UPDATE OF work_item_id ON work_executions
-     WHEN OLD.work_item_id IS NOT NEW.work_item_id
-     BEGIN
-         INSERT INTO board_runtime_epoch(work_item_id, epoch) VALUES (OLD.work_item_id, 1)
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-     END;
-     CREATE TRIGGER IF NOT EXISTS board_runtime_epoch_execution_delete
-     AFTER DELETE ON work_executions
-     BEGIN
-         INSERT INTO board_runtime_epoch(work_item_id, epoch) VALUES (OLD.work_item_id, 1)
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-     END;
-     CREATE TRIGGER IF NOT EXISTS board_runtime_epoch_run_insert
-     AFTER INSERT ON work_runs
-     BEGIN
-         INSERT INTO board_runtime_epoch(work_item_id, epoch)
-         SELECT work_item_id, 1 FROM work_executions WHERE id = NEW.execution_id
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-     END;
-     CREATE TRIGGER IF NOT EXISTS board_runtime_epoch_run_update
-     AFTER UPDATE OF status, execution_id, created_at ON work_runs
-     BEGIN
-         INSERT INTO board_runtime_epoch(work_item_id, epoch)
-         SELECT work_item_id, 1 FROM work_executions WHERE id = NEW.execution_id
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_runtime_epoch(work_item_id, epoch)
-         SELECT work_item_id, 1 FROM work_executions
-         WHERE id = OLD.execution_id AND OLD.execution_id IS NOT NEW.execution_id
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-     END;
-     CREATE TRIGGER IF NOT EXISTS board_runtime_epoch_run_delete
-     AFTER DELETE ON work_runs
-     BEGIN
-         INSERT INTO board_runtime_epoch(work_item_id, epoch)
-         SELECT work_item_id, 1 FROM work_executions WHERE id = OLD.execution_id
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-     END";
-
-/// Schema 53: per-item version counters for the board review-state cache.
-///
-/// `board_review_epoch.epoch` increases whenever an input of a card's
-/// AI-review projection (`ai_review_state`, `ai_review_findings_revision_id`,
-/// `ai_review_badge`; see `review_badge::fetch_current_heads` and
-/// `review_badge::fetch_badge_histories` for the exact column list) is written.
-/// Those projections are derived per PR owner (chain root) from the
-/// root's row, every revision row under it, the family's
-/// `pr_review_verdicts`, the findings revision's `work_executions`,
-/// and the applied `worker_proposals` payload. Each trigger therefore
-/// bumps the written row's work item *and* that item's `parent_task_id`
-/// (a revision's chain root, since `insert_revision_in_tx` always
-/// parents a revision directly to the root). A root epoch alone does
-/// not cover descendants of off-board revisions in legacy chains. The
-/// reader therefore keys each family by member IDs and epochs from
-/// the full SQL family, including off-board ancestors in nested
-/// legacy chains.
-///
-/// Same discipline as `board_runtime_epoch`: the bump is in the writer's own
-/// transaction, rows are never deleted, and `UPDATE OF` lists only the columns
-/// the projection reads, so unrelated writes (poll timestamps, runtime
-/// bookkeeping) leave the cache warm.
-const BOARD_REVIEW_EPOCH_53: &str = "CREATE TABLE IF NOT EXISTS board_review_epoch (
-         work_item_id TEXT PRIMARY KEY NOT NULL,
-         epoch INTEGER NOT NULL
-     ) WITHOUT ROWID;
-     CREATE TRIGGER IF NOT EXISTS board_review_epoch_task_insert
-     AFTER INSERT ON tasks
-     BEGIN
-         INSERT INTO board_review_epoch(work_item_id, epoch) VALUES (NEW.id, 1)
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT NEW.parent_task_id, 1 WHERE NEW.parent_task_id IS NOT NULL
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-     END;
-     CREATE TRIGGER IF NOT EXISTS board_review_epoch_task_update
-     AFTER UPDATE OF kind, status, deleted_at, parent_task_id, pr_url, pr_head_sha,
-                     ci_required_state, pr_mergeable_state, last_reviewed_sha, name, description
-     ON tasks
-     BEGIN
-         INSERT INTO board_review_epoch(work_item_id, epoch) VALUES (NEW.id, 1)
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT NEW.parent_task_id, 1 WHERE NEW.parent_task_id IS NOT NULL
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT OLD.parent_task_id, 1
-         WHERE OLD.parent_task_id IS NOT NULL AND OLD.parent_task_id IS NOT NEW.parent_task_id
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-     END;
-     CREATE TRIGGER IF NOT EXISTS board_review_epoch_task_delete
-     AFTER DELETE ON tasks
-     BEGIN
-         INSERT INTO board_review_epoch(work_item_id, epoch) VALUES (OLD.id, 1)
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT OLD.parent_task_id, 1 WHERE OLD.parent_task_id IS NOT NULL
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-     END;
-     CREATE TRIGGER IF NOT EXISTS board_review_epoch_verdict_insert
-     AFTER INSERT ON pr_review_verdicts
-     BEGIN
-         INSERT INTO board_review_epoch(work_item_id, epoch) VALUES (NEW.work_item_id, 1)
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT parent_task_id, 1 FROM tasks WHERE id = NEW.work_item_id AND parent_task_id IS NOT NULL
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-     END;
-     CREATE TRIGGER IF NOT EXISTS board_review_epoch_verdict_update
-     AFTER UPDATE ON pr_review_verdicts
-     BEGIN
-         INSERT INTO board_review_epoch(work_item_id, epoch) VALUES (NEW.work_item_id, 1)
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT parent_task_id, 1 FROM tasks WHERE id = NEW.work_item_id AND parent_task_id IS NOT NULL
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT OLD.work_item_id, 1 WHERE OLD.work_item_id IS NOT NEW.work_item_id
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT parent_task_id, 1 FROM tasks
-         WHERE id = OLD.work_item_id AND parent_task_id IS NOT NULL AND OLD.work_item_id IS NOT NEW.work_item_id
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-     END;
-     CREATE TRIGGER IF NOT EXISTS board_review_epoch_verdict_delete
-     AFTER DELETE ON pr_review_verdicts
-     BEGIN
-         INSERT INTO board_review_epoch(work_item_id, epoch) VALUES (OLD.work_item_id, 1)
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT parent_task_id, 1 FROM tasks WHERE id = OLD.work_item_id AND parent_task_id IS NOT NULL
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-     END;
-     CREATE TRIGGER IF NOT EXISTS board_review_epoch_execution_insert
-     AFTER INSERT ON work_executions
-     BEGIN
-         INSERT INTO board_review_epoch(work_item_id, epoch) VALUES (NEW.work_item_id, 1)
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT parent_task_id, 1 FROM tasks WHERE id = NEW.work_item_id AND parent_task_id IS NOT NULL
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-     END;
-     CREATE TRIGGER IF NOT EXISTS board_review_epoch_execution_update
-     AFTER UPDATE OF work_item_id, kind, status, finished_at, pr_head_after ON work_executions
-     BEGIN
-         INSERT INTO board_review_epoch(work_item_id, epoch) VALUES (NEW.work_item_id, 1)
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT parent_task_id, 1 FROM tasks WHERE id = NEW.work_item_id AND parent_task_id IS NOT NULL
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT OLD.work_item_id, 1 WHERE OLD.work_item_id IS NOT NEW.work_item_id
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT parent_task_id, 1 FROM tasks
-         WHERE id = OLD.work_item_id AND parent_task_id IS NOT NULL AND OLD.work_item_id IS NOT NEW.work_item_id
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-     END;
-     CREATE TRIGGER IF NOT EXISTS board_review_epoch_execution_delete
-     AFTER DELETE ON work_executions
-     BEGIN
-         INSERT INTO board_review_epoch(work_item_id, epoch) VALUES (OLD.work_item_id, 1)
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT parent_task_id, 1 FROM tasks WHERE id = OLD.work_item_id AND parent_task_id IS NOT NULL
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-     END;
-     CREATE TRIGGER IF NOT EXISTS board_review_epoch_proposal_insert
-     AFTER INSERT ON worker_proposals
-     BEGIN
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT NEW.work_item_id, 1 WHERE NEW.work_item_id IS NOT NULL
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT parent_task_id, 1 FROM tasks WHERE id = NEW.work_item_id AND parent_task_id IS NOT NULL
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-     END;
-     CREATE TRIGGER IF NOT EXISTS board_review_epoch_proposal_update
-     AFTER UPDATE OF work_item_id, kind, state, payload_json ON worker_proposals
-     BEGIN
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT NEW.work_item_id, 1 WHERE NEW.work_item_id IS NOT NULL
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT parent_task_id, 1 FROM tasks WHERE id = NEW.work_item_id AND parent_task_id IS NOT NULL
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT OLD.work_item_id, 1
-         WHERE OLD.work_item_id IS NOT NULL AND OLD.work_item_id IS NOT NEW.work_item_id
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT v.work_item_id, 1 FROM pr_review_verdicts v WHERE v.proposal_id = NEW.id
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT t.parent_task_id, 1 FROM pr_review_verdicts v JOIN tasks t ON t.id = v.work_item_id
-         WHERE v.proposal_id = NEW.id AND t.parent_task_id IS NOT NULL
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-     END;
-     CREATE TRIGGER IF NOT EXISTS board_review_epoch_proposal_delete
-     AFTER DELETE ON worker_proposals
-     BEGIN
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT OLD.work_item_id, 1 WHERE OLD.work_item_id IS NOT NULL
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT parent_task_id, 1 FROM tasks WHERE id = OLD.work_item_id AND parent_task_id IS NOT NULL
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT v.work_item_id, 1 FROM pr_review_verdicts v WHERE v.proposal_id = OLD.id
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-         INSERT INTO board_review_epoch(work_item_id, epoch)
-         SELECT t.parent_task_id, 1 FROM pr_review_verdicts v JOIN tasks t ON t.id = v.work_item_id
-         WHERE v.proposal_id = OLD.id AND t.parent_task_id IS NOT NULL
-         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
-     END";
-
-/// Schema 54: covering index for the board-review family-key read.
-///
-/// The warm cache pass walks each on-board owner's revision children
-/// to assemble `(member_id, epoch)` keys. `idx_tasks_parent_task_id`
-/// covers only `parent_task_id`, so that walk fetched every member
-/// `tasks` row to test `kind`. This index covers
-/// `(parent_task_id, kind, id)`, so the recursive step answers from
-/// the index without touching `tasks` pages.
-const TASKS_PARENT_KIND_INDEX_54: &str =
-    "CREATE INDEX IF NOT EXISTS idx_tasks_parent_kind_id ON tasks(parent_task_id, kind, id)";
-
-/// Schema 55: partial covering index for the verdict arm of the
-/// board-review family-key read, and removal of the now-redundant
-/// `idx_tasks_parent_task_id`.
-///
-/// The key read folds in each family member's verdict-named findings
-/// revision. `pr_review_verdicts_work_item_idx (work_item_id, created_at)`
-/// does not hold `revision_task_id`, so every warm pass fetched every
-/// historical verdict row of every on-board family member. This index holds
-/// only the rows that name a revision, keyed by `(work_item_id,
-/// revision_task_id)`, so the arm is index-only and its cost follows the
-/// number of findings revisions rather than review history. The predicate
-/// matches the key read's `WHERE` verbatim, which SQLite needs to use it.
-/// `idx_tasks_parent_kind_id` (schema 54) starts with `parent_task_id`, so
-/// the single-column parent index served nothing it did not and only added
-/// write cost to every `tasks` update.
-const VERDICT_REVISION_INDEX_55: &str = "CREATE INDEX IF NOT EXISTS pr_review_verdicts_revision_idx
-         ON pr_review_verdicts(work_item_id, revision_task_id)
-         WHERE revision_task_id IS NOT NULL AND revision_task_id != '';
-     DROP INDEX IF EXISTS idx_tasks_parent_task_id;";
+#[path = "schema_legacy_sql.rs"]
+mod legacy_sql;
+use legacy_sql::*;
+#[path = "schema_migrations.rs"]
+mod migrations;
+#[path = "schema_migration_registry.rs"]
+mod registry;
 
 // Derive requirements once from the fresh-database SQL, but check every DB.
 static BASELINE_OBJECTS: std::sync::LazyLock<Result<std::collections::BTreeSet<String>>> =
@@ -372,8 +48,8 @@ fn schema_objects(conn: &Connection) -> Result<std::collections::BTreeSet<String
 impl WorkDb {
     /// Install the floor directly on empty databases. Existing databases
     /// must meet the floor before any data or schema changes are attempted.
-    /// Future migrations must use increasing versions above the floor and
-    /// run here for both paths, advancing the marker only after success.
+    /// Bootstrap integer history once, then apply missing named migrations.
+    /// Schema changes and their ledger entries commit atomically.
     pub(crate) fn init(&self) -> Result<()> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -382,8 +58,10 @@ impl WorkDb {
             [],
             |row| row.get(0),
         )?;
-        let version = if has_schema {
-            Self::check_schema_floor(&tx)?
+        let version = if table_exists(&tx, "schema_migrations")? {
+            None
+        } else if has_schema {
+            Some(Self::check_schema_floor(&tx)?)
         } else {
             tx.execute_batch(baseline::SQL)?;
             tx.execute(
@@ -394,110 +72,10 @@ impl WorkDb {
                 "INSERT INTO metadata (key, value) VALUES (?1, CAST(strftime('%s','now') AS INTEGER))",
                 [review_verdicts::PR_REVIEW_VERDICTS_SINCE_METADATA_KEY],
             )?;
-            SCHEMA_COMPATIBILITY_FLOOR.1
+            Some(SCHEMA_COMPATIBILITY_FLOOR.1)
         };
-        if version < 33 {
-            project_postmortem::migrate_project_postmortem_signals(&tx)?;
-        }
-        if version < 34 {
-            pr_flow::migrate_operator_questions(&tx)?;
-        }
-        if version < 35 {
-            tx.execute_batch("CREATE TABLE execution_restore_reports (execution_id TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE, report TEXT NOT NULL)")?;
-        }
-        if version < 36 {
-            // Schema 36 refreshes existing question views with the declaring run's summary.
-            pr_flow::migrate_operator_questions(&tx)?;
-        }
-        if version < 37 {
-            personas::migrate(&tx)?;
-        }
-        if version < 38 {
-            tx.execute_batch("ALTER TABLE work_executions ADD COLUMN dispatch_wait_blocker_id TEXT")?;
-        }
-        if version < 39 {
-            // Data only: restart items blocked by the false ancestry failure.
-            execution_recovery_rearm::migrate(&tx, execution_recovery_rearm::is_false_not_descended_blocker)?;
-        }
-        if version < 40 {
-            tx.execute_batch("ALTER TABLE ci_remediations ADD COLUMN queue_base_sha TEXT")?;
-        }
-        if version < 41 {
-            tx.execute_batch("ALTER TABLE ci_remediations ADD COLUMN requeue_enqueued_at INTEGER")?;
-        }
-        if version < 42 {
-            review_guide_jobs::guide_updates::migrate(&tx)?;
-        }
-        if version < 43 {
-            tx.execute_batch(EXECUTION_BOOKMARK_COLUMNS_43)?;
-            // Restart items wedged by baseline loss or diverged pointers.
-            execution_recovery_rearm::migrate(
-                &tx,
-                boss_engine_recovery::execution_bookmark::is_legacy_reconcilable_blocker,
-            )?;
-        }
-        if version < 44 {
-            tx.execute_batch(TASKS_PR_URL_INDEX_SQL)?;
-        }
-        if version < 45 {
-            tx.execute_batch(TASKS_PR_UPDATED_AT_45)?;
-        }
-        // Guarded so a replay against a database that already carries the
-        // columns (the downgrade-and-reopen test fixtures reset only
-        // `schema_version`) is a no-op rather than a duplicate-column error.
-        if version < 46 && !table_has_column(&tx, "tasks", "critical_set_by")? {
-            tx.execute_batch(TASKS_CRITICAL_PROVENANCE_46)?;
-        }
-        if version < 47 {
-            tx.execute_batch(IN_FLIGHT_WORKSPACES_INDEX_SQL)?;
-        }
-        if version < 48 {
-            tx.execute_batch(ATTENTION_OPEN_KIND_INDEX_SQL)?;
-        }
-        if version < 49 {
-            tx.execute_batch(BOARD_RUNTIME_EPOCH_49)?;
-        }
-        // Guarded for the same reason as schema 46: a replay against a
-        // database that already carries the column must be a no-op.
-        if version < 50 && !table_has_column(&tx, "work_runs", "semantic_turn_condition")? {
-            tx.execute_batch(WORK_RUNS_SEMANTIC_TURN_CONDITION_50)?;
-        }
-        if version < 51 {
-            ci_failure_identity::migrate(&tx)?;
-        }
-        if version < 52 && !table_has_column(&tx, "work_executions", "progression_neighbourhood")? {
-            tx.execute_batch("ALTER TABLE work_executions ADD COLUMN progression_neighbourhood TEXT")?;
-        }
-        if version < 53 {
-            tx.execute_batch(BOARD_REVIEW_EPOCH_53)?;
-        }
-        if version < 54 {
-            tx.execute_batch(TASKS_PARENT_KIND_INDEX_54)?;
-        }
-        if version < 55 {
-            tx.execute_batch(VERDICT_REVISION_INDEX_55)?;
-        }
-        if version < 56 {
-            super::board_projection_schema::migrate(&tx)?;
-        }
-        if version < 58 {
-            super::board_projection_schema::refine_triggers(&tx)?;
-        }
-        if version < 59 {
-            execution_recovery_rearm::migrate(
-                &tx,
-                boss_engine_recovery::execution_bookmark::is_legacy_pr_anchor_blocker,
-            )?;
-        }
-        if version < 60 && !table_has_column(&tx, "execution_bookmarks", "prune_checked_at")? {
-            tx.execute_batch(EXECUTION_BOOKMARK_PRUNE_COLUMNS_60)?;
-        }
-        if version < CURRENT_SCHEMA_VERSION {
-            tx.execute(
-                "UPDATE metadata SET value = ?1 WHERE key = 'schema_version'",
-                [CURRENT_SCHEMA_VERSION.to_string()],
-            )?;
-        }
+        let known = registry::all();
+        migrations::apply(&tx, &known, version)?;
         // Required runtime data, not a historical migration. Capability
         // discovery remains outside DB startup (no processes or network).
         crate::host_registry::ensure_local_host(&tx)?;
@@ -682,12 +260,7 @@ mod tests {
         let db = WorkDb::open_in_memory().unwrap();
         let conn = db.connect().unwrap();
 
-        let schema_version: String = conn
-            .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(schema_version, CURRENT_SCHEMA_VERSION.to_string());
+        assert_all_migrations_applied(&conn);
 
         let boothby_passes_exists: bool = conn
             .query_row(
@@ -921,6 +494,28 @@ pub(crate) fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
 }
 
 #[cfg(test)]
+pub(in crate::work) fn assert_all_migrations_applied(conn: &Connection) {
+    let expected = registry::all().into_iter().map(|m| m.id).collect();
+    assert_eq!(migrations::applied(conn).unwrap(), expected);
+    let legacy: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM metadata WHERE key = 'schema_version')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!legacy, "the integer marker must be retired after bootstrap");
+    let missing_stamps: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM schema_migrations WHERE applied_at = ''",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(missing_stamps, 0);
+}
+
+#[cfg(test)]
 mod floor_tests {
     use super::*;
 
@@ -998,27 +593,7 @@ mod floor_tests {
 
     #[test]
     fn supported_databases_apply_post_floor_migrations_without_losing_data() {
-        for version in [
-            32,
-            33,
-            34,
-            35,
-            36,
-            38,
-            40,
-            41,
-            42,
-            43,
-            44,
-            45,
-            51,
-            54,
-            55,
-            56,
-            59,
-            CURRENT_SCHEMA_VERSION,
-            CURRENT_SCHEMA_VERSION + 1,
-        ] {
+        for version in 32..=60 {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("supported.db");
             let conn = Connection::open(&path).unwrap();
@@ -1150,6 +725,7 @@ mod floor_tests {
             expected.execute_batch(VERDICT_REVISION_INDEX_55).unwrap();
             super::super::board_projection_schema::migrate(&expected).unwrap();
             expected.execute_batch(EXECUTION_BOOKMARK_PRUNE_COLUMNS_60).unwrap();
+            expected.execute_batch(migrations::CREATE_LEDGER).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {
@@ -1166,12 +742,7 @@ mod floor_tests {
                         .unwrap();
                     assert_eq!(report, "retained report");
                 }
-                let observed: String = conn
-                    .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
-                        row.get(0)
-                    })
-                    .unwrap();
-                assert_eq!(observed, version.max(CURRENT_SCHEMA_VERSION).to_string());
+                assert_all_migrations_applied(&conn);
                 let stamp: String = conn
                     .query_row(
                         "SELECT value FROM metadata WHERE key = ?1",

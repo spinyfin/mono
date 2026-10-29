@@ -133,7 +133,8 @@ mod tests {
         ALTER TABLE execution_bookmarks DROP COLUMN retired_at;
         ALTER TABLE execution_bookmarks DROP COLUMN retired_reason;
         ALTER TABLE tasks DROP COLUMN pr_updated_at;
-        UPDATE metadata SET value = '38' WHERE key = 'schema_version';";
+        DROP TABLE schema_migrations;
+        INSERT OR REPLACE INTO metadata VALUES ('schema_version', '38');";
 
     /// Undo later schema steps so reopening replays the schema 43 re-arm.
     const RESET_TO_42: &str = "DROP INDEX work_executions_in_flight_idx;
@@ -142,7 +143,8 @@ mod tests {
         ALTER TABLE execution_bookmarks DROP COLUMN retired_at;
         ALTER TABLE execution_bookmarks DROP COLUMN retired_reason;
         ALTER TABLE tasks DROP COLUMN pr_updated_at;
-        UPDATE metadata SET value = '42' WHERE key = 'schema_version';";
+        DROP TABLE schema_migrations;
+        INSERT OR REPLACE INTO metadata VALUES ('schema_version', '42');";
 
     /// Create a chore under a fresh product and park it the way the
     /// coordinator does after a pointer-integrity failure.
