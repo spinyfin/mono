@@ -17,6 +17,7 @@ use super::work_item::{project_details, work_item_details, work_item_name, work_
 mod block_boundary;
 mod ci_monitoring;
 mod design;
+mod repo_gate;
 use block_boundary::block_boundary_fragment;
 use ci_monitoring::ci_monitoring_directive;
 use design::{compose_design_directive, compose_design_postmortem_directive};
@@ -406,11 +407,13 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
     if matches!(
         execution.kind,
         ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation
-    ) && let Some(gate) = bazel_prepush_gate_block(
-        workspace_path,
-        worker_signal_proposals_seam_enabled,
-        run_done_proposals_seam_enabled,
     ) {
+        let gate = bazel_prepush_gate_block(
+            workspace_path,
+            worker_signal_proposals_seam_enabled,
+            run_done_proposals_seam_enabled,
+        )
+        .unwrap_or_else(|| repo_gate::non_bazel_gate_text(workspace_path, false, worker_signal_proposals_seam_enabled));
         prompt.push_str(&gate);
     }
     if matches!(
@@ -531,6 +534,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         worker_signal_proposals_seam_enabled,
         conflict_attempt.is_some(),
         worker_kind_for_execution(&execution.kind) == WorkerKind::Standard,
+        is_bazel_workspace(workspace_path),
     ));
     prompt.push_str("\nRespond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
@@ -1077,6 +1081,7 @@ pub(crate) fn run_done_directive(
     worker_signal_seam_enabled: bool,
     conflict_resolution: bool,
     standard_worker: bool,
+    bazel_workspace: bool,
 ) -> String {
     if !seam_enabled {
         return String::new();
@@ -1131,6 +1136,21 @@ pub(crate) fn run_done_directive(
          bypass or weaken checks, and still stop for required approval to relax a check, missing \
          credentials or authorization, genuine instruction conflicts or contradictory requirements."
             .to_string()
+    };
+    // Non-Bazel repos are gated by the repo's own commands, not `bazel`.
+    let gate_exception = if bazel_workspace {
+        gate_exception
+    } else {
+        gate_exception
+            .replace("`bazel build`", "the repo's compile/type-check command")
+            .replace("pre-push Bazel gate", "pre-push build gate")
+            .replace("A Bazel test TIMEOUT", "A test TIMEOUT")
+            .replace("specific Bazel target", "specific failing command")
+            .replace(
+                "a shell-timeout of `bazel` or `checkleft run`",
+                "a shell-timeout of a build, test or `checkleft run` command",
+            )
+            .replace("Bazel remains", "The repo's own checks remain")
     };
     let operator_question_block = if standard_worker {
         let question_companion = if worker_signal_seam_enabled {
@@ -1642,9 +1662,13 @@ fn compose_revision_directive(
             run_done_proposals_seam_enabled,
         )
     };
-    if let Some(gate) = prepush_gate {
-        out.push_str(&gate);
-    }
+    out.push_str(&prepush_gate.unwrap_or_else(|| {
+        repo_gate::non_bazel_gate_text(
+            workspace_path,
+            is_conflict_resolution,
+            worker_signal_proposals_seam_enabled,
+        )
+    }));
     out.push('\n');
     out.push_str("## Workspace state\n");
     // `pr_number != "?"` is equivalent to `execution.pr_url` being a parseable
@@ -1772,7 +1796,9 @@ fn compose_revision_directive(
     out.push('\n');
     out.push_str("Preserve revision history — each revision is a new commit on the PR branch; never amend, squash, or rename existing commits on the branch.\n");
     out.push('\n');
-    let rebase_gate_clause = if is_conflict_resolution {
+    let rebase_gate_clause = if !is_bazel_workspace(workspace_path) {
+        repo_gate::non_bazel_rebase_clause(is_conflict_resolution)
+    } else if is_conflict_resolution {
         "Rebase-only exception (VCS only — not a build-gate skip): if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces NO diff whatsoever (zero changed files), it is valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change. IMPORTANT: this exception covers VCS mechanics only — whether to add a new commit. It does NOT exempt you from the merge-correctness build gate. Any rebase, merge, or conflict resolution MUST run the `bazel build` merge-correctness gate (compile the touched/upstream targets, regenerate invalidated lockfiles) before pushing, even when the rebase appeared clean — a rebase merges upstream changes in and the resulting code is new and must compile. The full `bazel test` suite is NOT a precondition for this push; it runs in the PR's CI after you push (see the conflict-resolution gate above).\n"
     } else {
         "Rebase-only exception (VCS only — not a build-gate skip): if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces NO diff whatsoever (zero changed files), it is valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change. IMPORTANT: this exception covers VCS mechanics only — whether to add a new commit. It does NOT exempt you from the pre-push build gate. Any revision that involves a rebase, merge, or conflict resolution MUST run the full `bazel build` + `bazel test` gate before pushing, even when the rebase appeared clean. A rebase merges upstream changes into your branch — the resulting code is new and must be compiled and tested. This is exactly where compile errors get reintroduced.\n"
@@ -1821,7 +1847,7 @@ fn compose_revision_directive(
     ));
     out.push_str("The revision's post-push steps remain your responsibility: finish them before your final response; a push or staged PR URL alone does not mean the revision is done. The driver-resolved boundary after that response is the completion handshake.\n");
     if let Some(attempt) = conflict_attempt {
-        out.push_str(&compose_conflict_resolution_fragment(attempt));
+        out.push_str(&compose_conflict_resolution_fragment(attempt, workspace_path));
         out.push_str(&compose_merge_order_preservation_fragment(merge_order_preservation));
     }
     if let Some(attempt) = ci_attempt {
@@ -1962,7 +1988,7 @@ If already queued, read its existing entry ID with `gh api graphql -f query='que
 /// is already covered by the shared revision directive, so this fragment
 /// covers only the signal-specific parts: the diagnosis block, rebase
 /// instructions, stop conditions, and post-resolution PR comment template.
-fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String {
+fn compose_conflict_resolution_fragment(attempt: &ConflictResolution, workspace_path: &Path) -> String {
     let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     let mut out = String::new();
     out.push_str("\n---\n\n");
@@ -1988,17 +2014,25 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
          resolve the conflicts — **you are not adding new work to this PR.**\n\n",
     );
     out.push_str(&compose_conflict_ground_truth_fragment(attempt));
-    out.push_str(
+    let lockfile_tools = if is_bazel_workspace(workspace_path) {
+        "For `MODULE.bazel.lock`, run `bazel mod deps --lockfile_mode=update`; for `Cargo.lock`, \
+         use Cargo's lockfile generator through the repository's supported tooling."
+    } else {
+        "Use the package manager that owns the lockfile, as the repository documents it: for \
+         `package-lock.json`, run `npm install` (or `npm install --package-lock-only`); for \
+         `yarn.lock` or `pnpm-lock.yaml`, run `yarn install` or `pnpm install`; for `Cargo.lock`, \
+         use Cargo's lockfile generator through the repository's supported tooling."
+    };
+    out.push_str(&format!(
         "### Generated lockfiles\n\n\
          Never hand-merge generated lockfiles or ask a model to choose their entries. \
          First reconcile the source manifests, then restore only the lockfile from the PR's \
          base branch and regenerate it with its owning tool against those merged inputs. \
-         For `MODULE.bazel.lock`, run `bazel mod deps --lockfile_mode=update`; for `Cargo.lock`, \
-         use Cargo's lockfile generator through the repository's supported tooling. Apply the same \
+         {lockfile_tools} Apply the same \
          base-and-regenerate rule to other package-manager lockfiles. A tool failure is a tooling \
          blocker, never permission to hand-edit the generated result. Verify GitHub reports the \
-         bound PR `MERGEABLE` after pushing; a local clean tree or a moved head is insufficient.\n\n",
-    );
+         bound PR `MERGEABLE` after pushing; a local clean tree or a moved head is insufficient.\n\n"
+    ));
     out.push_str(
         "### Preservation rule (HARD CONSTRAINT — read before resolving)\n\n\
          A merge/forward-port resolution is a **reconciliation**, not an authoring surface. \

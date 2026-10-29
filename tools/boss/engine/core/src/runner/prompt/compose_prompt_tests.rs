@@ -9,6 +9,7 @@ use crate::work::Task;
 
 mod blocked_recovery;
 mod invocation;
+mod non_bazel_gate;
 mod vocabulary_leakage;
 
 #[test]
@@ -883,7 +884,7 @@ fn bazel_gate_absent_on_non_bazel_workspace() {
             .build(),
     );
     assert!(
-        !prompt.contains("Pre-push build gate"),
+        !prompt.contains("Pre-push build gate (Bazel workspace)"),
         "bazel gate must NOT fire on a non-Bazel repo:\n{prompt}",
     );
 }
