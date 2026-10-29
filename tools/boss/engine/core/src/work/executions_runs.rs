@@ -27,6 +27,9 @@ pub struct CancelExecutionOpts {
     pub record_failure_reason: bool,
 }
 
+/// Column list `map_execution` reads, qualified with the `we` alias.
+const EXECUTION_COLUMNS: &str = "we.id, we.work_item_id, we.kind, we.status, we.repo_remote_url, we.cube_repo_id, we.cube_lease_id, we.cube_workspace_id, we.workspace_path, we.priority, we.preferred_workspace_id, we.created_at, we.started_at, we.finished_at, we.pre_start_failure_count, we.dispatch_not_before, we.pr_url, we.pr_head_before, we.prefer_is_soft, we.worker_branch_prefix, we.transient_failure_count, we.allow_dirty, we.branch_naming, we.dispatch_wait_reason, we.dispatch_wait_since, we.driver_runtime_state, we.driver, we.model, we.effort_level, we.pr_head_after, we.last_error";
+
 #[work_db_boundary::instrument]
 impl WorkDb {
     /// Mark an execution `cancelled` and stamp `finished_at`. Errors
@@ -702,12 +705,7 @@ impl WorkDb {
             pr_review = CREATED_VIA_PR_REVIEW_PREFIX,
         );
         let sql = format!(
-            "SELECT we.id, we.work_item_id, we.kind, we.status, we.repo_remote_url, we.cube_repo_id, we.cube_lease_id, \
-                    we.cube_workspace_id, we.workspace_path, we.priority, we.preferred_workspace_id, \
-                    we.created_at, we.started_at, we.finished_at, \
-                    we.pre_start_failure_count, we.dispatch_not_before, we.pr_url, we.pr_head_before, \
-                    we.prefer_is_soft, we.worker_branch_prefix, we.transient_failure_count, we.allow_dirty, we.branch_naming, \
-                    we.dispatch_wait_reason, we.dispatch_wait_since, we.driver_runtime_state, we.driver, we.model, we.effort_level, we.pr_head_after, we.last_error \
+            "SELECT {EXECUTION_COLUMNS} \
              FROM work_executions we \
              LEFT JOIN tasks t ON t.id = we.work_item_id \
              WHERE we.status = 'ready' \
@@ -717,10 +715,46 @@ impl WorkDb {
                       CASE WHEN t.priority = '{critical}' THEN we.created_at END ASC, \
                       {class_case} ASC, we.priority DESC, we.created_at ASC, we.id ASC",
             critical = super::critical_priority::PRIORITY_CRITICAL,
+            EXECUTION_COLUMNS = EXECUTION_COLUMNS,
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], map_execution)?;
         collect_rows(rows)
+    }
+
+    /// Pre-dispatch executions the dispatcher is not walking right now: rows
+    /// parked in `queued` / `waiting_dependency`, and `ready` rows still inside
+    /// their `dispatch_not_before` backoff window. The board shows these
+    /// cards as queued without a dispatch position.
+    pub fn list_unranked_pending_executions(&self) -> Result<Vec<WorkExecution>> {
+        let conn = self.connect()?;
+        let sql = format!(
+            "SELECT {EXECUTION_COLUMNS} \
+             FROM work_executions we \
+             WHERE we.status IN ('queued', 'waiting_dependency') \
+                OR (we.status = 'ready' \
+                    AND we.dispatch_not_before IS NOT NULL \
+                    AND CAST(we.dispatch_not_before AS INTEGER) > CAST(strftime('%s', 'now') AS INTEGER)) \
+             ORDER BY we.created_at ASC, we.id ASC",
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], map_execution)?;
+        collect_rows(rows)
+    }
+
+    /// The soonest future `dispatch_not_before` among `ready` rows, as epoch
+    /// seconds: the next moment a backed-off row joins the dispatcher's order
+    /// without any write happening.
+    pub fn next_ready_dispatch_deadline(&self) -> Result<Option<i64>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT MIN(CAST(dispatch_not_before AS INTEGER)) FROM work_executions \
+             WHERE status = 'ready' AND dispatch_not_before IS NOT NULL \
+               AND CAST(dispatch_not_before AS INTEGER) > CAST(strftime('%s', 'now') AS INTEGER)",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .map_err(Into::into)
     }
 
     /// Ids of the `ready` executions whose work item is at `critical`

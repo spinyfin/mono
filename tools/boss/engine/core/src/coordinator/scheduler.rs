@@ -693,8 +693,16 @@ impl ExecutionCoordinator {
     /// the row in a defer loop instead of actually dispatching it.
     pub(super) async fn resolve_chain_hold(&self, execution: &WorkExecution) -> Result<ChainHold> {
         let siblings = self.live_chain_siblings(execution).await?;
+        Ok(self.chain_hold_from_siblings(execution, siblings))
+    }
+
+    /// The hold policy of [`Self::resolve_chain_hold`], applied to an
+    /// already-gathered set of live chain siblings. Kept separate so the
+    /// read-only [`Self::is_chain_blocked`] projection cannot drift from the
+    /// decision the drain makes.
+    fn chain_hold_from_siblings(&self, execution: &WorkExecution, siblings: Vec<WorkExecution>) -> ChainHold {
         let Some(first_sibling) = siblings.first().cloned() else {
-            return Ok(ChainHold::Clear);
+            return ChainHold::Clear;
         };
         let is_revision = !matches!(
             self.work_db.classify_work_item_for_dispatch(&execution.work_item_id),
@@ -710,14 +718,14 @@ impl ExecutionCoordinator {
                 .filter(|s| !s.kind.is_read_only_review())
                 .cloned()
                 .collect();
-            return Ok(match writers.first().cloned() {
+            return match writers.first().cloned() {
                 None => ChainHold::ReviewBypassed(first_sibling),
                 Some(sibling) => ChainHold::Blocked {
                     sibling,
                     review_held: false,
                     queue_len: writers.len(),
                 },
-            });
+            };
         }
         // Non-revision work keeps serializing behind a review. Prefer
         // surfacing a non-review (writer) sibling in the `Blocked` outcome
@@ -730,11 +738,33 @@ impl ExecutionCoordinator {
             .find(|s| !s.kind.is_read_only_review())
             .cloned()
             .unwrap_or(first_sibling);
-        Ok(ChainHold::Blocked {
+        ChainHold::Blocked {
             sibling,
             review_held: all_review_siblings,
             queue_len,
-        })
+        }
+    }
+
+    /// `true` when [`Self::resolve_chain_hold`] would currently defer
+    /// `execution` behind a live chain sibling. Read-only: unlike the drain it
+    /// does not reconcile zombie siblings or write a wait reason, so a board
+    /// projection can ask it on every refresh. A query error reads as "not
+    /// blocked", the same fail-open policy the drain applies.
+    pub fn is_chain_blocked(&self, execution: &WorkExecution) -> bool {
+        let Ok(mut siblings) = self.work_db.live_executions_elsewhere_in_chain(&execution.work_item_id) else {
+            return false;
+        };
+        if let Ok(inflight) = self.inflight_chain_siblings(execution) {
+            let extra: Vec<WorkExecution> = inflight
+                .into_iter()
+                .filter(|i| !siblings.iter().any(|d| d.id == i.id))
+                .collect();
+            siblings.extend(extra);
+        }
+        matches!(
+            self.chain_hold_from_siblings(execution, siblings),
+            ChainHold::Blocked { .. }
+        )
     }
 
     /// Build the operator-facing string persisted into

@@ -9,19 +9,24 @@ use boss_protocol::{DispatchPool, QueuedDispatch, WorkExecution};
 use crate::coordinator::DispatchPause;
 use crate::work::WorkDb;
 
-/// The pause state the scheduler consults before it walks the ready queue.
+/// What the scheduler consults before it walks the ready queue: the pause
+/// state, and the per-row chain-serialization hold.
 pub(super) struct DispatchGate<'a> {
     pub pause: Option<&'a DispatchPause>,
     pub automation_paused: bool,
     pub pool_of: &'a dyn Fn(&WorkExecution) -> DispatchPool,
+    /// `true` when the scheduler would defer the row behind a live writer on
+    /// its PR chain (the row stays `ready` with a wait reason).
+    pub chain_blocked: &'a dyn Fn(&WorkExecution) -> bool,
 }
 
-/// One entry per work item that has a `ready` execution the dispatcher would
-/// consider, ranked in the order `WorkDb::list_ready_executions` returns them
-/// (the order `drain_ready_queue` walks). Items whose ready rows are all held
-/// by a pause get an entry without a position. Items with no ready row
-/// (waiting on a dependency, a future `dispatch_not_before`, or no execution)
-/// get no entry and sort below every ranked card.
+/// One entry per work item with a pending execution. Items with a `ready`
+/// execution the dispatcher would take are ranked in the order
+/// `WorkDb::list_ready_executions` returns them (the order `drain_ready_queue`
+/// walks). Items whose ready rows are all held (a pause, or a live writer on
+/// the PR chain) and items that are not on the ready walk at all (waiting on
+/// a dependency, or inside a `dispatch_not_before` backoff) still carry their
+/// pool but have no position, and sort below every ranked card.
 pub(super) fn classify_queued_dispatch(db: &WorkDb, gate: &DispatchGate<'_>) -> BTreeMap<String, QueuedDispatch> {
     let ready = match db.list_ready_executions() {
         Ok(ready) => ready,
@@ -40,7 +45,7 @@ pub(super) fn classify_queued_dispatch(db: &WorkDb, gate: &DispatchGate<'_>) -> 
     let mut next_position = 0u32;
     for execution in &ready {
         let pool = (gate.pool_of)(execution);
-        let held = is_held(gate, pool, critical.contains(&execution.id));
+        let held = is_held(gate, pool, critical.contains(&execution.id)) || (gate.chain_blocked)(execution);
         let position = (!held).then(|| {
             let position = next_position;
             next_position += 1;
@@ -58,6 +63,25 @@ pub(super) fn classify_queued_dispatch(db: &WorkDb, gate: &DispatchGate<'_>) -> 
                     position,
                     next_up: false,
                 },
+            );
+        }
+    }
+    match db.list_unranked_pending_executions() {
+        Ok(pending) => {
+            for execution in &pending {
+                entries
+                    .entry(db.owning_work_item_id(&execution.work_item_id))
+                    .or_insert_with(|| QueuedDispatch {
+                        pool: (gate.pool_of)(execution),
+                        position: None,
+                        next_up: false,
+                    });
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "queued dispatch pools unavailable for unranked pending executions"
             );
         }
     }

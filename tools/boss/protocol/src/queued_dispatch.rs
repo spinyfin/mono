@@ -10,6 +10,17 @@ pub enum DispatchPool {
     Automation,
 }
 
+impl DispatchPool {
+    /// The label diagnostic surfaces use for the pool.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Review => "review",
+            Self::Automation => "automation",
+        }
+    }
+}
+
 /// Where a queued Doing card sits in the dispatcher's order, computed by the
 /// engine from the same ready-queue ordering the scheduler walks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

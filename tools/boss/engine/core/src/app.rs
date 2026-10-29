@@ -734,6 +734,14 @@ struct ServerState {
     /// so a ready-queue change re-pushes the board only when the order moved.
     #[builder(default)]
     published_queued_dispatch: StdMutex<std::collections::BTreeMap<String, boss_protocol::QueuedDispatch>>,
+    /// Epoch second of the pending timer that re-evaluates the queued order
+    /// when a backed-off row's `dispatch_not_before` passes.
+    #[builder(default)]
+    queued_dispatch_wakeup_at: StdMutex<Option<i64>>,
+    /// Late-bound hook that re-publishes the queued order on a spawned task,
+    /// for mutation paths that hold only a `&ServerState`.
+    #[builder(default)]
+    queued_dispatch_changed: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
     /// How long a UI-confirmed coordinator reset waits for the fresh handoff.
     /// Tests inject a short value.
     #[builder(default = crate::coordinator_tmux::reset_handoff::HANDOFF_TIMEOUT)]
@@ -1853,7 +1861,7 @@ impl ServerState {
         let coord_for_kick = server_state.execution_coordinator.clone();
         publisher_impl.set_kick(move || coord_for_kick.kick());
         let weak_for_queue = Arc::downgrade(&server_state);
-        publisher_impl.set_queue_changed(move || {
+        let queue_changed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             let weak = weak_for_queue.clone();
             tokio::spawn(async move {
                 if let Some(state) = weak.upgrade() {
@@ -1861,6 +1869,11 @@ impl ServerState {
                 }
             });
         });
+        let _ = server_state.queued_dispatch_changed.set(queue_changed.clone());
+        publisher_impl.set_queue_changed(move || queue_changed());
+        // Seed the stored order once; from here it changes only through
+        // `refresh_queued_dispatch`.
+        server_state.refresh_queued_dispatch();
 
         // Seed the live-status manager's disabled-slot set from the
         // engine metadata KV — survives restarts of the engine

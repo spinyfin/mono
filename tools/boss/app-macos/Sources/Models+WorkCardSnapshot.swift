@@ -518,8 +518,9 @@ enum WorkCardLiveStatus {
 
         if runtime?.executionStatus == "claimed" { return "Starting worker" }
         if isQueued(task: task, runtime: runtime) {
-            let label = queuedLabel(runtime: runtime, now: now)
-            return isNextUp ? nextUpLabel(queued: label) : label
+            return isNextUp
+                ? nextUpLabel(runtime: runtime, now: now)
+                : queuedLabel(runtime: runtime, now: now)
         }
         // A declared job wait names what the worker is waiting on, so it
         // is shown even for conflict / CI-remediation runs.

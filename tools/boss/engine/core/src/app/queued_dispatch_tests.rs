@@ -52,6 +52,16 @@ fn classify(
     automation_paused: bool,
     pool_by_task: &HashMap<String, DispatchPool>,
 ) -> BTreeMap<String, QueuedDispatch> {
+    classify_with_chain_blocked(db, pause, automation_paused, pool_by_task, &[])
+}
+
+fn classify_with_chain_blocked(
+    db: &WorkDb,
+    pause: Option<&DispatchPause>,
+    automation_paused: bool,
+    pool_by_task: &HashMap<String, DispatchPool>,
+    chain_blocked_tasks: &[&str],
+) -> BTreeMap<String, QueuedDispatch> {
     let pool_of = |execution: &WorkExecution| {
         pool_by_task
             .get(&execution.work_item_id)
@@ -64,6 +74,7 @@ fn classify(
             pause,
             automation_paused,
             pool_of: &pool_of,
+            chain_blocked: &|execution| chain_blocked_tasks.contains(&execution.work_item_id.as_str()),
         },
     )
 }
@@ -195,10 +206,41 @@ fn rows_the_dispatcher_will_not_take_have_no_position() {
         )
         .unwrap();
 
-    let entries = classify(&db, None, false, &HashMap::new());
+    let pools = pools(&[
+        ("task_backoff", DispatchPool::Automation),
+        ("task_dependent", DispatchPool::Review),
+    ]);
+    let entries = classify(&db, None, false, &pools);
 
-    assert_eq!(entries.keys().collect::<Vec<_>>(), ["task_runnable"]);
+    assert_eq!(
+        entries.keys().collect::<Vec<_>>(),
+        ["task_backoff", "task_dependent", "task_runnable"]
+    );
     assert_eq!(entries["task_runnable"].position, Some(0));
+    assert_eq!(entries["task_backoff"].pool, DispatchPool::Automation);
+    assert_eq!(entries["task_dependent"].pool, DispatchPool::Review);
+    for id in ["task_backoff", "task_dependent"] {
+        assert_eq!(entries[id].position, None, "{id} is not on the ready walk");
+        assert!(!entries[id].next_up);
+    }
+}
+
+#[test]
+fn a_ready_revision_behind_a_live_chain_writer_is_not_ranked_or_next_up() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db).id;
+    // The revision sorts ahead of the plain chore in the dispatcher's order.
+    insert_task(&db, &product, "task_revision", "revision", "bossctl", "medium");
+    insert_task(&db, &product, "task_runnable", "chore", "cli", "medium");
+    ready_execution(&db, "task_revision", "1000");
+    ready_execution(&db, "task_runnable", "1001");
+
+    let entries = classify_with_chain_blocked(&db, None, false, &HashMap::new(), &["task_revision"]);
+
+    assert_eq!(entries["task_revision"].position, None);
+    assert!(!entries["task_revision"].next_up);
+    assert_eq!(entries["task_runnable"].position, Some(0));
+    assert!(entries["task_runnable"].next_up);
 }
 
 #[test]
@@ -286,4 +328,86 @@ fn automation_pause_holds_only_automation_rows() {
     assert_eq!(entries["task_auto"].position, None);
     assert_eq!(entries["task_main"].position, Some(0));
     assert!(entries["task_main"].next_up);
+}
+
+/// Backing off the first queued card through a direct mutation reorders the
+/// dispatcher's queue without any other wait reason changing; the stored order
+/// must follow without a worker-slot event.
+#[tokio::test]
+async fn direct_mutation_invalidation_refreshes_the_queued_order() {
+    let (state, _temp) = crate::app::tests::test_server_state();
+    let product = create_test_product(&state.work_db);
+    let ready = |name: &str, created_at: &str| {
+        let task = crate::test_support::create_test_chore(&state.work_db, &product.id, name);
+        let execution = state
+            .work_db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(&task.id)
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        state
+            .work_db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![created_at, execution.id],
+            )
+            .unwrap();
+        (task.id, execution.id)
+    };
+    let (first_task, first_execution) = ready("first", "1000");
+    let (second_task, _) = ready("second", "1001");
+    assert!(state.refresh_queued_dispatch());
+    assert_eq!(
+        state.published_queued_dispatch.lock().unwrap()[&first_task].position,
+        Some(0)
+    );
+    assert_eq!(
+        state.published_queued_dispatch.lock().unwrap()[&second_task].position,
+        Some(1)
+    );
+
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET dispatch_not_before = '99999999999' WHERE id = ?1",
+            [&first_execution],
+        )
+        .unwrap();
+    crate::app::handler_helpers::publish_work_invalidation(
+        &state,
+        "session",
+        "request",
+        vec![],
+        "test_mutation",
+        Some(product.id.clone()),
+        vec![first_task.clone()],
+    )
+    .await;
+
+    // The kick the mutation issues may also dispatch the second card, so
+    // assert on the card that left the queue's front.
+    for _ in 0..100 {
+        let position = state
+            .published_queued_dispatch
+            .lock()
+            .unwrap()
+            .get(&first_task)
+            .map(|entry| entry.position);
+        if position == Some(None) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!(
+        "queued order was not republished after the direct mutation: {:?}",
+        state.published_queued_dispatch.lock().unwrap()
+    );
 }

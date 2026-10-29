@@ -50,7 +50,8 @@ enum BossQueuedOrderCapture {
             )
         }
 
-        // Task age (the old board order) runs opposite to dispatch order.
+        // Task creation order runs opposite to dispatch order, so the capture shows
+        // Queued following the engine's positions rather than task age.
         let rows = [
             card("coding", "Implement the new scheduler", age: 1, shortID: 101),
             decision("ask1", "Expand the migration scope", age: 2, shortID: 102,

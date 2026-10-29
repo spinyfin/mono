@@ -2,6 +2,7 @@
 //! and slot release all update the board without a second database refresh.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use boss_protocol::{DoingSection, ExecutionKind, FrontendEvent, LiveWorkerState, QueuedDispatch, WorkExecution};
 
@@ -10,11 +11,12 @@ use super::queued_dispatch::{DispatchGate, classify_queued_dispatch};
 use crate::work::WorkDb;
 
 impl ServerState {
+    /// Reads the stored queued-card order; it is recomputed only where it can
+    /// change ([`Self::refresh_queued_dispatch`]), not on every live-worker push.
     pub(super) fn live_worker_board_snapshot(&self) -> FrontendEvent {
         let states = self.live_worker_states_snapshot();
         let doing_sections = classify_doing_sections(&self.work_db, &states);
-        let queued_dispatch = self.queued_dispatch_snapshot();
-        *self.published_queued_dispatch.lock().unwrap() = queued_dispatch.clone();
+        let queued_dispatch = self.published_queued_dispatch.lock().unwrap().clone();
         FrontendEvent::WorkerLiveStatesList {
             states,
             doing_sections,
@@ -22,14 +24,59 @@ impl ServerState {
         }
     }
 
-    /// Re-push the board snapshot when the dispatcher's order for queued
-    /// cards differs from the last one pushed. Invalidations and pause
-    /// transitions reorder the ready queue without touching any worker slot,
-    /// which is the only other thing that re-pushes the snapshot.
-    pub(super) async fn republish_queued_dispatch_if_changed(&self) {
-        if *self.published_queued_dispatch.lock().unwrap() != self.queued_dispatch_snapshot() {
+    /// Recompute the dispatcher's order for queued cards and store it as the
+    /// order the board snapshot serves. Returns whether it moved.
+    pub(super) fn refresh_queued_dispatch(&self) -> bool {
+        let fresh = self.queued_dispatch_snapshot();
+        let mut published = self.published_queued_dispatch.lock().unwrap();
+        if *published == fresh {
+            return false;
+        }
+        *published = fresh;
+        true
+    }
+
+    /// Refresh the stored order and re-push the board snapshot when it moved.
+    /// Invalidations, direct mutations and pause transitions reorder the ready
+    /// queue without touching any worker slot, which is the only other thing
+    /// that re-pushes the snapshot. Also arms a wakeup for the next backoff
+    /// deadline, since a row joins the order when its time passes with no
+    /// write to announce it.
+    pub(super) async fn republish_queued_dispatch_if_changed(self: &Arc<Self>) {
+        if self.refresh_queued_dispatch() {
             self.broadcast_live_worker_states().await;
         }
+        self.schedule_queued_dispatch_wakeup();
+    }
+
+    /// Ask for [`Self::republish_queued_dispatch_if_changed`] on a spawned
+    /// task. For mutation paths that only hold a `&ServerState`.
+    pub(super) fn notify_queued_dispatch_may_have_changed(&self) {
+        if let Some(notify) = self.queued_dispatch_changed.get() {
+            notify();
+        }
+    }
+
+    fn schedule_queued_dispatch_wakeup(self: &Arc<Self>) {
+        let Ok(Some(deadline)) = self.work_db.next_ready_dispatch_deadline() else {
+            return;
+        };
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        {
+            let mut scheduled = self.queued_dispatch_wakeup_at.lock().unwrap();
+            if scheduled.is_some_and(|at| at > now && at <= deadline) {
+                return;
+            }
+            *scheduled = Some(deadline);
+        }
+        let weak = Arc::downgrade(self);
+        let delay = std::time::Duration::from_secs((deadline - now).max(0) as u64 + 1);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if let Some(state) = weak.upgrade() {
+                state.republish_queued_dispatch_if_changed().await;
+            }
+        });
     }
 
     /// The dispatcher's current order for queued cards, under the pause state
@@ -38,10 +85,12 @@ impl ServerState {
         let coordinator = &self.execution_coordinator;
         let pause = coordinator.dispatch_pause();
         let pool_of = |execution: &WorkExecution| coordinator.dispatch_pool_for(execution);
+        let chain_blocked = |execution: &WorkExecution| coordinator.is_chain_blocked(execution);
         let gate = DispatchGate {
             pause: pause.as_ref(),
             automation_paused: coordinator.is_automation_paused(),
             pool_of: &pool_of,
+            chain_blocked: &chain_blocked,
         };
         classify_queued_dispatch(&self.work_db, &gate)
     }
