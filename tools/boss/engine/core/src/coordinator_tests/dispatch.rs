@@ -655,7 +655,7 @@ async fn interactive_concurrency_cap_holds_ready_rows() {
     for i in 0..MAX_CONCURRENT_INTERACTIVE_WORKERS {
         coordinator
             .worker_pool()
-            .claim_worker(&format!("exec-busy-{i}"), None)
+            .claim_working(&format!("exec-busy-{i}"), None)
             .await
             .expect("idle slot below the cap");
     }
@@ -817,7 +817,7 @@ async fn raising_interactive_concurrency_cap_live_unblocks_held_rows() {
     for i in 0..MAX_CONCURRENT_INTERACTIVE_WORKERS {
         coordinator
             .worker_pool()
-            .claim_worker(&format!("exec-busy-{i}"), None)
+            .claim_working(&format!("exec-busy-{i}"), None)
             .await
             .expect("idle slot below the cap");
     }
@@ -1521,7 +1521,7 @@ async fn critical_item_dispatches_past_a_full_interactive_cap() {
     for i in 0..MAX_CONCURRENT_INTERACTIVE_WORKERS {
         coordinator
             .worker_pool()
-            .claim_worker(&format!("exec-busy-{i}"), None)
+            .claim_working(&format!("exec-busy-{i}"), None)
             .await
             .expect("idle slot below the cap");
     }

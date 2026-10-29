@@ -182,12 +182,23 @@ impl ExecutionCoordinator {
         // The interactive concurrency cap only governs main-pool work, and
         // only means anything once the row is otherwise eligible.
         if facts.ineligible_reason.is_none() && facts.targets_main_pool && !facts.is_critical {
-            let live = self.worker_pool.busy_count().await;
+            let occupancy = self.worker_pool.occupancy().await;
             let cap = self.max_concurrent_interactive_workers();
-            if live >= cap {
+            if occupancy.working >= cap {
+                let message = if occupancy.lease_pending == 0 {
+                    format!(
+                        "interactive concurrency cap reached ({}/{cap} workers live)",
+                        occupancy.working
+                    )
+                } else {
+                    format!(
+                        "interactive concurrency cap reached ({}/{cap} workers live, {} waiting for a workspace)",
+                        occupancy.working, occupancy.lease_pending
+                    )
+                };
                 blockers.push(DispatchAdmissionBlocker {
                     code: ADMISSION_BLOCKER_INTERACTIVE_CONCURRENCY_CAP.to_string(),
-                    message: format!("interactive concurrency cap reached ({live}/{cap} workers live)"),
+                    message,
                 });
             }
         }

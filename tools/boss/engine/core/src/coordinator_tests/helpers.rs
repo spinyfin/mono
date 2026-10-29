@@ -149,6 +149,16 @@ pub(super) struct FakeCubeClient {
     /// long enough for a cancel to land in the middle of it. A gate rather
     /// than a sleep so the window is deterministic instead of timing-tuned.
     pub(super) release_gate: Option<Arc<tokio::sync::Notify>>,
+    /// When true, `lease_workspace` records the call then waits forever.
+    /// Models a cube lease hung behind `repo gc`.
+    pub(super) hang_lease: bool,
+    /// In-flight hung (or slow) lease calls. Tests for the per-repo bound
+    /// read this to observe concurrency.
+    pub(super) in_flight_leases: std::sync::atomic::AtomicUsize,
+    /// High-water mark of [`Self::in_flight_leases`].
+    pub(super) peak_in_flight_leases: std::sync::atomic::AtomicUsize,
+    /// Signalled each time a hung lease call is entered.
+    pub(super) lease_entered: Arc<tokio::sync::Notify>,
 }
 
 impl FakeCubeClient {
@@ -224,6 +234,19 @@ crate::stub_cube_client! { FakeCubeClient {
             exclude_workspace_ids.iter().map(|s| s.to_string()).collect(),
         ));
         drop(calls);
+        if self.hang_lease {
+            struct InflightGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+            impl Drop for InflightGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            let n = self.in_flight_leases.fetch_add(1, Ordering::SeqCst) + 1;
+            let _guard = InflightGuard(&self.in_flight_leases);
+            self.peak_in_flight_leases.fetch_max(n, Ordering::SeqCst);
+            self.lease_entered.notify_waiters();
+            pending::<()>().await;
+        }
         if self.panic_on_next_lease.swap(false, Ordering::SeqCst) {
             panic!("fake cube lease panicked (claimed-dispatch RAII test)");
         }

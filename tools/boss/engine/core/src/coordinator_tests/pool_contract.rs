@@ -57,7 +57,7 @@ async fn interactive_cap_only_holds_new_main_pool_admission() {
     for i in 0..8 {
         coordinator
             .worker_pool()
-            .claim_worker(&format!("busy-{i}"), None)
+            .claim_working(&format!("busy-{i}"), None)
             .await
             .unwrap();
     }

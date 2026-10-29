@@ -11,6 +11,10 @@ final class QueuedWaitTests: XCTestCase {
             "automation_paused": "Queued — automation paused",
             "Waiting for an available worker (3 working)":
                 "Queued — Waiting for an available worker (3 working)",
+            "Waiting for an available worker (2 working, 9 waiting for a workspace)":
+                "Queued — Waiting for an available worker (2 working, 9 waiting for a workspace)",
+            "Waiting for a workspace":
+                "Queued — Waiting for a workspace",
             "pool_exhausted": "Queued — worker pool full",
             "blocked by an earlier review": "Queued — blocked by an earlier review"
         ]

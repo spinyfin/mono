@@ -114,6 +114,8 @@ impl ExecutionCoordinator {
             max_concurrent_interactive_workers: AtomicUsize::new(MAX_CONCURRENT_INTERACTIVE_WORKERS),
             pause_state_changed: tokio::sync::watch::channel(0).0,
             pre_start_streaks: Arc::default(),
+            repo_lease_limiter: super::lease_limiter::RepoLeaseLimiter::new(MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO),
+            cube_lease_timeout: CUBE_LEASE_TIMEOUT,
         }
     }
 
@@ -435,6 +437,22 @@ impl ExecutionCoordinator {
     /// before they reach the spillover/preemption path under test.
     pub fn with_max_concurrent_interactive_workers(self, max: usize) -> Self {
         self.max_concurrent_interactive_workers.store(max, Ordering::Release);
+        self
+    }
+
+    /// Override the per-repo concurrent cube-lease bound (default
+    /// [`MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO`]). Tests that need a
+    /// tighter storm check pass 1.
+    pub fn with_max_concurrent_leases_per_repo(mut self, max: usize) -> Self {
+        self.repo_lease_limiter = super::lease_limiter::RepoLeaseLimiter::new(max);
+        self
+    }
+
+    /// Override the outer `cube workspace lease` timeout. Tests that
+    /// model a hung lease pass a short duration so the timeout path
+    /// fires without waiting [`CUBE_LEASE_TIMEOUT`].
+    pub fn with_cube_lease_timeout(mut self, timeout: Duration) -> Self {
+        self.cube_lease_timeout = timeout;
         self
     }
 

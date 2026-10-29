@@ -1253,7 +1253,10 @@ impl ExecutionCoordinator {
             .lease_workspace_with_fallback(execution, worker_id, &repo, &task, &adapter)
             .await
         {
-            Ok(lease) => lease,
+            Ok(lease) => {
+                self.pool_for_worker_id(worker_id).mark_working(worker_id).await;
+                lease
+            }
             Err(err) => {
                 if had_requested_host {
                     self.cancel_requested_host_pre_start_failure(execution, "cube workspace lease", &err)
@@ -2234,7 +2237,7 @@ impl ExecutionCoordinator {
                         "prefer_workspace_id": prefer,
                         "fallback_policy": fallback_policy,
                         "allow_dirty": allow_dirty,
-                        "timeout_ms": CUBE_LEASE_TIMEOUT.as_millis() as u64,
+                        "timeout_ms": self.cube_lease_timeout.as_millis() as u64,
                         "excluded_workspace_ids": refused,
                     })),
             )
@@ -2246,7 +2249,7 @@ impl ExecutionCoordinator {
                 repo,
                 task,
                 (prefer, allow_dirty),
-                CUBE_LEASE_TIMEOUT,
+                self.cube_lease_timeout,
                 adapter,
                 &refused_refs,
             )
@@ -2288,6 +2291,14 @@ impl ExecutionCoordinator {
                             .with_details(details),
                     )
                     .await;
+                if reason == "timeout" {
+                    // A timed-out lease must not immediately re-attempt
+                    // inside this dispatch (the fallback is for a refused
+                    // `--prefer`, not for a hang). Backoff lives on
+                    // `record_start_failure` / `dispatch_not_before`.
+                    CUBE_WORKSPACE_LEASE_FAILURE.inc(&self.metrics);
+                    return Err(err);
+                }
             }
         };
 
@@ -2316,7 +2327,7 @@ impl ExecutionCoordinator {
                         "attempt": 2,
                         "prefer_workspace_id": serde_json::Value::Null,
                         "fallback_policy": "none",
-                        "timeout_ms": CUBE_LEASE_TIMEOUT.as_millis() as u64,
+                        "timeout_ms": self.cube_lease_timeout.as_millis() as u64,
                         "fallback_from_prefer": prefer,
                         "excluded_workspace_ids": refused,
                     })),
@@ -2325,7 +2336,14 @@ impl ExecutionCoordinator {
 
         CUBE_WORKSPACE_LEASE_ATTEMPTS.inc(&self.metrics);
         match self
-            .invoke_lease(repo, task, (None, false), CUBE_LEASE_TIMEOUT, adapter, &refused_refs)
+            .invoke_lease(
+                repo,
+                task,
+                (None, false),
+                self.cube_lease_timeout,
+                adapter,
+                &refused_refs,
+            )
             .await
         {
             Ok(lease) => {
