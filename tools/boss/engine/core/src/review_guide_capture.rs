@@ -11,7 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use boss_event_bus::{Event, EventBus, EventKind, TopicFilter};
 use boss_github::pr_files::PrComparisonMetadata;
 use boss_pr_review_sources::{
@@ -139,7 +139,32 @@ pub(crate) fn github_source_packet_collector() -> SourcePacketCollector {
                 Ok(metadata)
             })
         }),
-        live_head: Arc::new(|url| Box::pin(async move { boss_github::pr_files::fetch_pr_head_ref_oid(&url).await })),
+        live_head: Arc::new(|url| {
+            Box::pin(async move {
+                let (owner, repo, number) = boss_github::pr_url::parse_pr_url_parts(&url)
+                    .with_context(|| format!("source capture requires a canonical PR URL: {url}"))?;
+                let slug = format!("{owner}/{repo}");
+                let timer = boss_gh_telemetry::GhCallTimer::start_args(&[
+                    "pr",
+                    "view",
+                    &number.to_string(),
+                    "-R",
+                    &slug,
+                    "--json",
+                    "headRefOid",
+                ]);
+                let result = git_utils::gh_cli::fetch_pr_head_oid(&slug, number).await;
+                let outcome = match &result {
+                    Ok(_) => boss_gh_telemetry::GhOutcome::Ok,
+                    Err(error) if boss_gh_telemetry::classify::is_rate_limited(&error.to_string()) => {
+                        boss_gh_telemetry::GhOutcome::RateLimited
+                    }
+                    Err(_) => boss_gh_telemetry::GhOutcome::Error,
+                };
+                timer.finish(outcome, None);
+                result
+            })
+        }),
     }
 }
 

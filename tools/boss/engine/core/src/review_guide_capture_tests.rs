@@ -1186,3 +1186,66 @@ async fn head_change_while_generating_supersedes_the_old_attempt_and_stops_its_w
     .await
     .expect("cancelled review-guide worker must be stopped");
 }
+
+async fn completion_metadata_failure(has_revision_head: bool) {
+    let (dir, db) = open_db();
+    let db = Arc::new(db);
+    let product = create_product(&db);
+    let root = create_active_chore(&db, &product, "completion metadata failure");
+    let url = "https://github.com/acme/widget/pull/106";
+    let revision = if has_revision_head {
+        let task = create_active_chore(&db, &product, "revision metadata failure");
+        Some(RevisionCapture {
+            task_id: task,
+            head_before: Some("old-head".into()),
+            head_after: Some("new-head".into()),
+        })
+    } else {
+        None
+    };
+    let packet = source_capture_packet(url, "base", "new-head");
+    let collect: PacketCollectFn = Arc::new(|_, _, _, _| panic!("metadata failure must stop collection"));
+    let mut collector = SourcePacketCollector::fixture(collect, packet);
+    let metadata_calls = Arc::new(AtomicUsize::new(0));
+    let counted = metadata_calls.clone();
+    collector.metadata = Arc::new(move |_, _| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { anyhow::bail!("comparison metadata unavailable") })
+    });
+    reconcile_review_guide_source_with_collector(
+        db.clone(),
+        enable_guide_flags(&dir),
+        SourceCaptureRequest::builder()
+            .root_task_id(&root)
+            .pr_url(url)
+            .trigger(PrSourceCaptureTrigger::Completion)
+            .maybe_revision(revision)
+            .build(),
+        collector,
+    )
+    .unwrap()
+    .await
+    .unwrap();
+    assert_eq!(metadata_calls.load(Ordering::SeqCst), 1);
+    assert!(db.get_latest_pr_review_guide_source_capture(&root).unwrap().is_none());
+    let error = db.pr_review_guide_capture_error_for_root(&root).unwrap();
+    if has_revision_head {
+        assert!(
+            error
+                .expect("delivered revision must retain a durable error")
+                .contains("comparison metadata unavailable")
+        );
+    } else {
+        assert!(error.is_none(), "primary completion defers to the poller");
+    }
+}
+
+#[tokio::test]
+async fn primary_completion_metadata_error_defers_without_capture_or_durable_error() {
+    completion_metadata_failure(false).await;
+}
+
+#[tokio::test]
+async fn revision_completion_metadata_error_records_durable_error() {
+    completion_metadata_failure(true).await;
+}
