@@ -2493,6 +2493,48 @@ impl ExecutionCoordinator {
         .await;
     }
 
+    /// File (or refresh) the work-item-scoped blocker for a review-phase
+    /// execution that could not start because its predecessor's preserved
+    /// work could not be reconciled with the PR head. Best-effort: the
+    /// failure is already recorded on the execution and in the event stream.
+    fn file_pre_start_blocked_on_card(&self, execution: &WorkExecution, error_text: &str) {
+        let subject = match execution.kind {
+            ExecutionKind::PrReview => "The automated review of this PR",
+            _ => "This execution",
+        };
+        let title = match execution.kind {
+            ExecutionKind::PrReview => "Automated review blocked before start",
+            _ => "Execution blocked before start",
+        };
+        let body = format!(
+            "{subject} (execution `{id}`, `{kind}`) could not start after {attempts} attempt(s): the \
+             preserved work recorded for an earlier execution of this item could not be reconciled \
+             with the PR head. A damaged recovery pointer does not repair itself and the PR head does \
+             not move on its own, so the engine will not retry this execution or re-fire a \
+             replacement automatically.\n\n\
+             **Error:** {error_text}\n\n\
+             To unblock it: if the error confirms which commits are missing and their content is in \
+             the PR head, adopt the head with the `jj bookmark set` command the error names and \
+             request the review again; otherwise recover the commits first, or push a new PR head.",
+            id = execution.id,
+            kind = execution.kind.as_str(),
+            attempts = execution.pre_start_failure_count,
+        );
+        if let Err(err) = self.work_db.upsert_refreshing_work_item_attention(
+            &execution.work_item_id,
+            crate::execution_bookmark_recovery::BLOCKED_BEFORE_START,
+            title,
+            &body,
+        ) {
+            tracing::error!(
+                ?err,
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                "failed to file the blocked-before-start attention item on the work item",
+            );
+        }
+    }
+
     /// Record a pre-start failure and either schedule an automatic retry
     /// or surface a permanent failure to the operator.
     ///
@@ -2515,24 +2557,30 @@ impl ExecutionCoordinator {
     ) -> Result<()> {
         let (attention_kind, attention_title) = attention;
         let error_text = format!("{error:#}");
-        let transition = self.work_db.record_pre_start_failure(
-            &execution.id,
-            worker_id,
-            cube_repo_id,
-            &error_text,
-            if attention_kind == crate::execution_bookmark_recovery::RECOVERY_FAILED
-                && matches!(
-                    execution.kind,
-                    ExecutionKind::ChoreImplementation
-                        | ExecutionKind::TaskImplementation
-                        | ExecutionKind::RevisionImplementation
-                )
-            {
-                &[]
-            } else {
-                &self.pre_start_retry_delays
-            },
+        let is_implementation = matches!(
+            execution.kind,
+            ExecutionKind::ChoreImplementation
+                | ExecutionKind::TaskImplementation
+                | ExecutionKind::RevisionImplementation
         );
+        // A damaged recovery pointer fails the same way on every attempt:
+        // its inputs are the preserved pointers and the PR head they were
+        // checked against, and neither moves until a human or a push moves
+        // it. Retrying only multiplies the same error, so it is recorded
+        // once. Implementation kinds already blocked their item on any
+        // pointer failure; every other kind skips the retries only for the
+        // pointer-shape kinds, since a missing `pr/<n>` alias or a record on
+        // another host may come out differently on the next attempt.
+        let deterministic = attention_kind == crate::execution_bookmark_recovery::RECOVERY_FAILED
+            && (is_implementation || boss_engine_recovery::execution_bookmark::is_deterministic_pointer_error(error));
+        let retry_delays: &[Duration] = if deterministic {
+            &[]
+        } else {
+            &self.pre_start_retry_delays
+        };
+        let transition =
+            self.work_db
+                .record_pre_start_failure(&execution.id, worker_id, cube_repo_id, &error_text, retry_delays);
         let (execution, run, outcome) = match transition {
             Ok(recorded) => recorded,
             Err(bookkeeping_error) => {
@@ -2667,6 +2715,18 @@ impl ExecutionCoordinator {
                 }
 
                 self.notify_review_guide_pre_start_failure(&execution);
+
+                // A review-phase kind whose dispatch failed on a damaged
+                // recovery pointer has no other surface on its card: the
+                // item is not blocked (the PR and its implementation are
+                // fine) and the execution-scoped item above is not listed
+                // under the work item. Name the blocker on the card itself,
+                // and say that nothing re-fires it automatically: the
+                // dead-review sweep skips an execution that carries an open
+                // recovery-failed item (see `pr_review_recovery`).
+                if attention_kind == crate::execution_bookmark_recovery::RECOVERY_FAILED && !is_implementation {
+                    self.file_pre_start_blocked_on_card(&execution, &error_text);
+                }
 
                 // Stop the silent claim → fail → release → re-queue loop
                 // (the "waiting for a slot" vs. "failing to start"

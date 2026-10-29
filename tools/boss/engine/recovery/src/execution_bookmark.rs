@@ -37,8 +37,8 @@ mod redispatch_tests;
 
 mod reconcile;
 pub use reconcile::{
-    Anchor, Containment, MissingChange, Reconciliation, RewrittenChange, SupersededPointer, adopt_pushed_head,
-    reconcile, resolve_bookmark_commit,
+    Anchor, Containment, MissingChange, Reconciliation, RewriteEvidence, RewrittenChange, SupersededPointer,
+    adopt_pushed_head, reconcile, resolve_bookmark_commit,
 };
 
 #[cfg(test)]
@@ -122,6 +122,30 @@ pub fn pointer_integrity_kind(error: &anyhow::Error) -> Option<PointerIntegrityK
         .chain()
         .find_map(|cause| cause.downcast_ref::<PointerIntegrityError>())
         .map(|cause| cause.kind)
+}
+
+/// True when `error` is a pointer-shape failure that running the same
+/// dispatch again cannot change: the preserved pointers do not descend from
+/// their baseline, have diverged, have lost their baseline, or (after
+/// reconciliation was attempted) carry work nothing recorded vouches for.
+/// Those depend only on the pointers in the store and the PR head they were
+/// checked against, and both stay where they are until a human moves them or
+/// a push lands. [`PointerIntegrityKind::PrHeadUnavailable`] is not one of
+/// them: cube rewrites the `pr/<n>` alias on every attempt, so a retry
+/// repeats the GitHub lookup that may repair it. Neither is
+/// [`PointerIntegrityKind::Other`], whose causes include a record that lives
+/// on a different host than the one dispatch selected, which another attempt
+/// may select differently.
+pub fn is_deterministic_pointer_error(error: &anyhow::Error) -> bool {
+    matches!(
+        pointer_integrity_kind(error),
+        Some(
+            PointerIntegrityKind::NotDescended
+                | PointerIntegrityKind::Diverged
+                | PointerIntegrityKind::MissingBaseline
+                | PointerIntegrityKind::NotContained
+        )
+    )
 }
 
 /// True when `error` is one of the failures [`reconcile`] can repair from an

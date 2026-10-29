@@ -9,6 +9,12 @@ use boss_engine_recovery::recovery_backup::{backup_execution_patch, default_reco
 use crate::work::{CreateAttentionItemInput, WorkDb, WorkExecution};
 
 pub(crate) const RECOVERY_FAILED: &str = "execution_bookmark_recovery_failed";
+/// Work-item-scoped blocker for a review-phase execution that could not
+/// start because its predecessor's pointers failed [`RECOVERY_FAILED`]
+/// deterministically. The item is not blocked (its PR is fine), so this is
+/// what the card shows; the dead-review sweep stops re-firing while the
+/// execution-scoped [`RECOVERY_FAILED`] item stays open.
+pub(crate) const BLOCKED_BEFORE_START: &str = "execution_blocked_before_start";
 pub(crate) const CHAIN_BLOCKED: &str = "revision_chain_recovery_blocked";
 pub(crate) const CREATE_FAILED: &str = "execution_bookmark_create_failed";
 /// The engine retired a recovery record whose baseline was gone and whose

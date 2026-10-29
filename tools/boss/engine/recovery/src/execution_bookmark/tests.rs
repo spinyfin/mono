@@ -331,3 +331,29 @@ async fn conflicted_pointer_bookmark_is_a_pointer_integrity_error() {
     assert!(is_pointer_integrity_error(&error), "{error:#}");
     assert!(error.to_string().contains("exactly one"), "{error:#}");
 }
+
+#[test]
+fn deterministic_pointer_errors_are_the_pointer_shape_kinds() {
+    for kind in [
+        PointerIntegrityKind::NotDescended,
+        PointerIntegrityKind::Diverged,
+        PointerIntegrityKind::MissingBaseline,
+        PointerIntegrityKind::NotContained,
+    ] {
+        let error = pointer_integrity_error_of(kind, "damaged").context("while recovering");
+        assert!(is_deterministic_pointer_error(&error), "{kind:?}");
+    }
+    for (kind, message) in [
+        (PointerIntegrityKind::PrHeadUnavailable, "pr/9 is conflicted"),
+        (
+            PointerIntegrityKind::Other,
+            "recovery store is on host remote; dispatch selected local",
+        ),
+    ] {
+        let error = pointer_integrity_error_of(kind, message);
+        assert!(!is_deterministic_pointer_error(&error), "{kind:?}");
+    }
+    assert!(!is_deterministic_pointer_error(&anyhow::anyhow!(
+        "ssh: connection reset"
+    )));
+}

@@ -31,7 +31,14 @@
 //!    `anaplian`) must not spin a fresh doomed review forever.
 //! 3. Re-fires the review via `WorkDb::request_pr_review`, which itself
 //!    refuses when the PR has since merged or closed — this sweep just
-//!    logs and skips those.
+//!    logs and skips those. A review that never started because dispatch
+//!    found its predecessor's recovery pointers damaged
+//!    (`execution_bookmark_recovery_failed` still open on the dead
+//!    execution) is not re-fired either: that failure is deterministic for
+//!    the current PR head, the coordinator already put the blocker on the
+//!    card, and a fresh pass would only fail the same way and raise the
+//!    same item again. Resolving the attention, or a new head, lets the
+//!    next review through.
 //! 4. Files an open attention item on the work item (kind
 //!    `pr_review_died_without_findings`) so the gap between "review died,
 //!    auto-refired" and "reviewed, clean" is visible on the kanban card
@@ -56,12 +63,17 @@ use crate::work::{
 pub const PR_REVIEW_DIED_ATTENTION_KIND: &str = "pr_review_died_without_findings";
 
 /// Counts from one pass of the sweep; logged at `info` when non-zero.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, bon::Builder)]
+#[builder(on(String, into))]
 pub struct PrReviewRecoveryOutcome {
     pub refired: usize,
     pub churn_skipped: usize,
     pub pr_closed_skipped: usize,
     pub error_skipped: usize,
+    /// Dead reviews left alone because their dispatch failed on a damaged
+    /// recovery pointer that is still unrepaired (an open
+    /// `execution_bookmark_recovery_failed` item on the dead execution).
+    pub blocked_skipped: usize,
     /// Batches this pass terminal-failed (exhausted supervisor retry, or
     /// supervisor died after the PR head moved). Distinct from `refired`:
     /// nothing new is spawned, but the batch is no longer wedged in
@@ -71,7 +83,11 @@ pub struct PrReviewRecoveryOutcome {
 
 impl crate::sweep_loop::SweepOutcome for PrReviewRecoveryOutcome {
     fn has_activity(&self) -> bool {
-        self.refired > 0 || self.churn_skipped > 0 || self.pr_closed_skipped > 0 || self.terminal_failed > 0
+        self.refired > 0
+            || self.churn_skipped > 0
+            || self.pr_closed_skipped > 0
+            || self.terminal_failed > 0
+            || self.blocked_skipped > 0
     }
 
     fn log(&self) {
@@ -81,6 +97,7 @@ impl crate::sweep_loop::SweepOutcome for PrReviewRecoveryOutcome {
             pr_closed_skipped = self.pr_closed_skipped,
             error_skipped = self.error_skipped,
             terminal_failed = self.terminal_failed,
+            blocked_skipped = self.blocked_skipped,
             "pr_review recovery: pass complete",
         );
     }
@@ -477,6 +494,38 @@ fn recover_reviews(work_db: &WorkDb, pr_checker: &dyn PrStateChecker) -> (PrRevi
                     dead_execution_id = %dead_execution_id,
                     ?error,
                     "pr_review recovery: failed to identify batch membership; skipping legacy recovery",
+                );
+                outcome.error_skipped += 1;
+                continue;
+            }
+        }
+
+        // A review that never started because its predecessor's recovery
+        // pointers could not be reconciled with the PR head fails the same
+        // way for the same head every time. The coordinator recorded that
+        // failure once, without retries, and put the blocker on the card;
+        // re-firing would only add another dead execution and another
+        // identical item. Leave it until the attention is resolved (a
+        // repaired pointer, or a run that got past the check).
+        match work_db
+            .has_open_execution_attention(&dead_execution_id, crate::execution_bookmark_recovery::RECOVERY_FAILED)
+        {
+            Ok(true) => {
+                tracing::info!(
+                    work_item_id = %work_item_id,
+                    dead_execution_id = %dead_execution_id,
+                    "pr_review recovery: review failed before start on a damaged recovery pointer; not auto-refiring while that attention is open",
+                );
+                outcome.blocked_skipped += 1;
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(
+                    work_item_id = %work_item_id,
+                    dead_execution_id = %dead_execution_id,
+                    ?error,
+                    "pr_review recovery: failed to check for an open recovery-failed attention; skipping item",
                 );
                 outcome.error_skipped += 1;
                 continue;
@@ -1433,6 +1482,112 @@ mod tests {
             db.review_batch(&batch_id).unwrap().unwrap().status,
             ReviewBatchStatus::Failed,
             "a merged PR must settle a dead supervisor batch rather than leaving it supervising"
+        );
+    }
+    /// A dead review whose dispatch failed on a damaged recovery pointer
+    /// (an open `execution_bookmark_recovery_failed` item on the dead
+    /// execution) is deterministic for the current PR head: the sweep must
+    /// not re-fire it, file nothing new, and resume once the item is resolved.
+    #[tokio::test]
+    async fn does_not_refire_a_review_that_failed_before_start_on_a_damaged_pointer() {
+        let (_dir, db) = open_db();
+        let product_id = create_test_product_with_repo(&db, "test-product", Some("https://github.com/test/repo")).id;
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product_id)
+                    .name("blocked review chore")
+                    .build(),
+            )
+            .unwrap();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".to_owned()),
+                pr_url: Some("https://github.com/test/repo/pull/9".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let dead = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Failed)
+                    .build(),
+            )
+            .unwrap();
+        db.create_attention_item(CreateAttentionItemInput {
+            execution_id: Some(dead.id.clone()),
+            work_item_id: None,
+            kind: crate::execution_bookmark_recovery::RECOVERY_FAILED.to_owned(),
+            status: None,
+            title: "Execution bookmark recovery failed".to_owned(),
+            body_markdown: "preserved work of execution exec_prior is not contained in PR head pr/9".to_owned(),
+            resolved_at: None,
+        })
+        .unwrap();
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+
+        for pass in 0..2 {
+            let outcome = run_one_pass(
+                db.as_ref(),
+                coordinator.clone(),
+                sink.as_ref(),
+                Arc::new(checker.clone()),
+            )
+            .await;
+            assert_eq!(
+                outcome.refired, 0,
+                "pass {pass}: a deterministic pre-start failure is not re-fired"
+            );
+            assert_eq!(outcome.blocked_skipped, 1, "pass {pass}");
+            assert_eq!(outcome.churn_skipped, 0, "pass {pass}");
+            assert_eq!(outcome.error_skipped, 0, "pass {pass}");
+        }
+        let executions = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(
+            executions.iter().filter(|e| e.kind == ExecutionKind::PrReview).count(),
+            1,
+            "no fresh pr_review execution: {executions:?}"
+        );
+        let attentions = db.list_attention_items_for_work_item(&chore.id).unwrap();
+        assert!(
+            !attentions.iter().any(|a| a.kind == PR_REVIEW_DIED_ATTENTION_KIND),
+            "a review that never started did not die without findings: {attentions:?}"
+        );
+        assert!(
+            sink.events().await.is_empty(),
+            "nothing was re-fired, so no recovery event"
+        );
+
+        // Resolving the pointer failure (a human repaired the pointers, or a
+        // later run got past the check) lets the ordinary recovery through.
+        assert_eq!(
+            db.resolve_attention_kind_for_execution(&dead.id, crate::execution_bookmark_recovery::RECOVERY_FAILED)
+                .unwrap(),
+            1
+        );
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            Arc::new(checker.clone()),
+        )
+        .await;
+        assert_eq!(outcome.refired, 1);
+        assert_eq!(outcome.blocked_skipped, 0);
+        let executions = db.list_executions(Some(&chore.id)).unwrap();
+        assert!(
+            executions
+                .iter()
+                .any(|e| e.kind == ExecutionKind::PrReview && e.status == ExecutionStatus::Ready && e.id != dead.id),
+            "{executions:?}"
         );
     }
 }

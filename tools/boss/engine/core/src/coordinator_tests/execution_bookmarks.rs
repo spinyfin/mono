@@ -924,3 +924,159 @@ mod prune_sweep {
         );
     }
 }
+
+/// Scene for a review-phase execution whose dispatch fails before start:
+/// a chore in review with an open PR and a `ready` `pr_review` execution.
+fn review_ready_to_dispatch(db: &WorkDb) -> (String, WorkExecution) {
+    let product = create_test_product(db);
+    let chore = create_test_chore(db, product.id.clone(), "Reviewed chore");
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("in_review".to_owned()),
+            pr_url: Some("https://github.com/test/repo/pull/9".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    (chore.id, execution)
+}
+
+/// Preserved work the PR head does not carry is the same answer on every
+/// attempt for that head. A review that hits it fails once, with no backoff
+/// retries, and the blocker lands on the work item's card: the item is not
+/// blocked (its PR is fine) and execution-scoped items are not listed under
+/// it, so without this the review's death was invisible on the board.
+#[tokio::test]
+async fn deterministic_pointer_failure_on_a_review_fails_once_and_puts_the_blocker_on_the_card() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let (chore_id, execution) = review_ready_to_dispatch(&db);
+    // Production backoff schedule: three retries would otherwise follow.
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeExecutionRunner::default()),
+    ));
+    let detail = "preserved work of execution exec_prior is not contained in PR head pr/9 (afe46bed): boss-recovery/exec_prior at 81de7f24 has 1 change(s) with no variant in it";
+    let error = boss_engine_recovery::execution_bookmark::pointer_integrity_error_of(
+        boss_engine_recovery::execution_bookmark::PointerIntegrityKind::NotContained,
+        detail,
+    );
+
+    coordinator
+        .record_start_failure(
+            Arc::clone(&coordinator),
+            &execution,
+            "worker",
+            Some("mono"),
+            (
+                crate::execution_bookmark_recovery::RECOVERY_FAILED,
+                "Execution bookmark recovery failed",
+            ),
+            &error,
+        )
+        .await
+        .unwrap();
+
+    let failed = db.get_execution(&execution.id).unwrap();
+    assert_eq!(failed.status, ExecutionStatus::Failed, "{failed:?}");
+    assert_eq!(
+        failed.pre_start_failure_count, 1,
+        "no retry for a deterministic failure"
+    );
+    assert!(failed.dispatch_not_before.is_none());
+    assert!(failed.last_error.as_deref().is_some_and(|e| e.contains(detail)));
+
+    let execution_items = db.list_attention_items(&execution.id).unwrap();
+    assert!(
+        execution_items
+            .iter()
+            .any(|a| a.kind == crate::execution_bookmark_recovery::RECOVERY_FAILED && a.status == "open"),
+        "{execution_items:?}"
+    );
+    let card_items = db.list_attention_items_for_work_item(&chore_id).unwrap();
+    let blocker = card_items
+        .iter()
+        .find(|a| a.kind == crate::execution_bookmark_recovery::BLOCKED_BEFORE_START)
+        .unwrap_or_else(|| panic!("the card must name the blocker: {card_items:?}"));
+    assert_eq!(blocker.status, "open");
+    assert_eq!(blocker.title, "Automated review blocked before start");
+    assert!(blocker.body_markdown.contains(detail), "{}", blocker.body_markdown);
+    assert!(
+        blocker
+            .body_markdown
+            .contains("will not retry this execution or re-fire"),
+        "{}",
+        blocker.body_markdown
+    );
+    assert!(blocker.body_markdown.contains(&execution.id));
+
+    // The item itself is untouched: the PR and its implementation are fine,
+    // so it stays in review rather than being blocked or bounced to backlog.
+    let WorkItem::Chore(chore) = db.get_work_item(&chore_id).unwrap() else {
+        panic!("chore");
+    };
+    assert_eq!(chore.status, TaskStatus::InReview);
+    assert!(chore.blocked_reason.is_none(), "{chore:?}");
+}
+
+/// A missing or conflicted `pr/<n>` alias is a pointer failure a
+/// retry can repair (cube rewrites it from GitHub on every attempt), so a
+/// review keeps the ordinary backoff and gets no card blocker yet.
+#[tokio::test]
+async fn pr_alias_failure_on_a_review_keeps_the_backoff_retry() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let (chore_id, execution) = review_ready_to_dispatch(&db);
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            Arc::new(FakeCubeClient::default()),
+            Arc::new(FakeExecutionRunner::default()),
+        )
+        .with_pre_start_retry_delays(vec![Duration::from_secs(3600)]),
+    );
+    let error = boss_engine_recovery::execution_bookmark::pointer_integrity_error_of(
+        boss_engine_recovery::execution_bookmark::PointerIntegrityKind::PrHeadUnavailable,
+        "PR head bookmark pr/9 must resolve to exactly one change; it is conflicted",
+    );
+
+    coordinator
+        .record_start_failure(
+            Arc::clone(&coordinator),
+            &execution,
+            "worker",
+            Some("mono"),
+            (
+                crate::execution_bookmark_recovery::RECOVERY_FAILED,
+                "Execution bookmark recovery failed",
+            ),
+            &error,
+        )
+        .await
+        .unwrap();
+
+    let retried = db.get_execution(&execution.id).unwrap();
+    assert_eq!(retried.status, ExecutionStatus::Ready, "{retried:?}");
+    assert_eq!(retried.pre_start_failure_count, 1);
+    assert!(retried.dispatch_not_before.is_some(), "backoff is scheduled");
+    let card_items = db.list_attention_items_for_work_item(&chore_id).unwrap();
+    assert!(
+        !card_items
+            .iter()
+            .any(|a| a.kind == crate::execution_bookmark_recovery::BLOCKED_BEFORE_START),
+        "{card_items:?}"
+    );
+}

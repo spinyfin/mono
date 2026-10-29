@@ -24,15 +24,53 @@
 //! that none of these carries is a hard failure naming each missing change,
 //! and nothing moves. Superseded commits stay in the store; only the
 //! references move.
+//!
+//! "Already in it" is decided by [`containment`], which accepts a preserved
+//! commit on three kinds of evidence and never on a name or description:
+//! ancestry; a commit with the same change id and an equivalent patch (an
+//! empty bookkeeping-filtered interdiff, which survives a rebase); or jj's
+//! recorded predecessor chain, when a commit in the vouching history was
+//! rewritten *from* the preserved commit itself. The last one is what the
+//! engine's own restaging leaves behind: `restore_rebased` copies PR history
+//! with `jj duplicate`, which gives every copy a new change id, and a worker
+//! then squashes a conflict resolution into the copy, which changes its
+//! patch. Neither a change-id match nor patch equivalence can see through
+//! that, but `jj evolog` of the copy still names the original commit, so the
+//! work was carried forward, not dropped. The chain is read from the
+//! vouching commit back to the preserved commit, never the other way round:
+//! an amendment made after the push is a *successor* of the published commit
+//! and stays uncontained.
 use super::*;
 
+/// How a commit in the vouching history was tied to the preserved commit it
+/// stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum RewriteEvidence {
+    /// Same change id and an empty bookkeeping-filtered interdiff: the same
+    /// patch, re-parented.
+    #[default]
+    EquivalentPatch,
+    /// jj's recorded predecessor chain (`jj evolog`) of the vouching commit
+    /// reaches the preserved commit itself: the vouching commit is a later
+    /// rewrite of it, under the same or a new change id, and its patch may
+    /// differ (a `jj duplicate` copy made by recovery restaging, a conflict
+    /// resolution squashed into it). The preserved commit was an input to the
+    /// rewrite, so nothing was dropped that the rewrite did not deliberately
+    /// change.
+    RecordedLineage,
+}
+
 /// One rewritten change: the preserved commit and the vouching history's
-/// commit that carries the same change id.
+/// commit that carries it, with the evidence that tied them together.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RewrittenChange {
     pub change_id: String,
     pub preserved: String,
     pub published: String,
+    /// Records persisted before lineage evidence existed were all matched by
+    /// patch equivalence.
+    #[serde(default)]
+    pub evidence: RewriteEvidence,
 }
 
 /// A non-empty preserved change with no variant anywhere in the vouching
@@ -50,7 +88,9 @@ pub enum Containment {
     /// The head is that commit or one of its ancestors.
     Ancestor,
     /// Every non-empty change in `base..head` that is not itself in the
-    /// vouching history has a content-equivalent variant with the same change id there.
+    /// vouching history has a variant there: a content-equivalent commit with
+    /// the same change id, or a commit whose recorded predecessors include
+    /// the preserved commit (see [`RewriteEvidence`]).
     Rewritten { matched: Vec<RewrittenChange> },
     /// Changes the vouching history does not carry in any form.
     Missing { missing: Vec<MissingChange> },
@@ -140,10 +180,14 @@ impl Reconciliation {
                     matched
                         .iter()
                         .map(|m| format!(
-                            "{} ({} -> {})",
+                            "{} ({} -> {}{})",
                             short(&m.change_id),
                             short(&m.preserved),
-                            short(&m.published)
+                            short(&m.published),
+                            match m.evidence {
+                                RewriteEvidence::EquivalentPatch => "",
+                                RewriteEvidence::RecordedLineage => ", by recorded lineage",
+                            }
                         ))
                         .collect::<Vec<_>>()
                         .join(", ")
@@ -222,10 +266,14 @@ fn vouching_range(base: &str, vouching: &str, trunk: &str) -> String {
 
 /// Is the preserved work of `head` already carried by `vouching`? Ancestry
 /// first; otherwise every non-empty preserved commit that is not an
-/// ancestor of `vouching` must have a visible commit with the same change
-/// id and an equivalent patch in the vouching history. An empty interdiff
+/// ancestor of `vouching` must have a visible commit in the vouching
+/// history that either has the same change id and an equivalent patch, or
+/// records the preserved commit among its predecessors. An empty interdiff
 /// proves equivalence across rebases; identity alone cannot vouch for an
-/// unpublished amendment. Without a base only ancestry counts.
+/// unpublished amendment. Recorded lineage is read from the vouching commit
+/// backwards, so an amendment made after the push (a successor of the
+/// published commit, not a predecessor) is never vouched for by it. Without a
+/// base only ancestry counts.
 pub(crate) async fn containment(
     jj: &dyn Jj,
     repo: &Path,
@@ -274,48 +322,124 @@ pub(crate) async fn containment(
         }
         None => Default::default(),
     };
+    // Predecessor commit -> vouching commit rewritten from it. Read lazily:
+    // one `jj evolog` per non-empty vouching commit, and only once a change
+    // has no equivalent-patch variant.
+    let mut lineage: Option<std::collections::HashMap<String, String>> = None;
     let mut matched = Vec::new();
     let mut missing = Vec::new();
     for (change, commit, description) in change_commit_lines(&outside) {
-        match published.get(change) {
-            Some(variant)
-                if crate::recovery_apply::filter_bookkeeping(
-                    &jj.run(
-                        repo,
-                        &[
-                            "--ignore-working-copy",
-                            "interdiff",
-                            "--from",
-                            commit,
-                            "--to",
-                            variant,
-                            "--git",
-                        ],
-                    )
-                    .await?,
-                )
-                .text
-                .trim()
-                .is_empty() =>
-            {
+        if let Some(variant) = published.get(change)
+            && equivalent_patch(jj, repo, commit, variant).await?
+        {
+            matched.push(RewrittenChange {
+                change_id: change.to_owned(),
+                preserved: commit.to_owned(),
+                published: variant.clone(),
+                evidence: RewriteEvidence::EquivalentPatch,
+            });
+            continue;
+        }
+        if let Some(base) = base {
+            if lineage.is_none() {
+                lineage = Some(recorded_lineage(jj, repo, base, vouching, trunk).await?);
+            }
+            if let Some(successor) = lineage.as_ref().and_then(|lineage| lineage.get(commit)) {
                 matched.push(RewrittenChange {
                     change_id: change.to_owned(),
                     preserved: commit.to_owned(),
-                    published: variant.clone(),
-                })
+                    published: successor.clone(),
+                    evidence: RewriteEvidence::RecordedLineage,
+                });
+                continue;
             }
-            _ => missing.push(MissingChange {
-                change_id: change.to_owned(),
-                commit: commit.to_owned(),
-                description: description.to_owned(),
-            }),
         }
+        missing.push(MissingChange {
+            change_id: change.to_owned(),
+            commit: commit.to_owned(),
+            description: description.to_owned(),
+        });
     }
     Ok(if missing.is_empty() {
         Containment::Rewritten { matched }
     } else {
         Containment::Missing { missing }
     })
+}
+
+/// True when `variant` carries the same patch as `preserved` once the
+/// bookkeeping sections are filtered out: an empty interdiff.
+async fn equivalent_patch(jj: &dyn Jj, repo: &Path, preserved: &str, variant: &str) -> Result<bool> {
+    let interdiff = jj
+        .run(
+            repo,
+            &[
+                "--ignore-working-copy",
+                "interdiff",
+                "--from",
+                preserved,
+                "--to",
+                variant,
+                "--git",
+            ],
+        )
+        .await?;
+    Ok(crate::recovery_apply::filter_bookkeeping(&interdiff)
+        .text
+        .trim()
+        .is_empty())
+}
+
+/// Every commit jj records as a predecessor (transitively) of a non-empty
+/// commit in the vouching history, mapped to that commit. jj writes these
+/// records for the operations that rewrite a commit into another one:
+/// rebase, amend, squash, split and duplicate. A commit is never its own
+/// predecessor here, so the map only ever vouches for a commit that is *not*
+/// already in the vouching history.
+async fn recorded_lineage(
+    jj: &dyn Jj,
+    repo: &Path,
+    base: &str,
+    vouching: &str,
+    trunk: &str,
+) -> Result<std::collections::HashMap<String, String>> {
+    let commits = jj
+        .run(
+            repo,
+            &[
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                &format!("({}) ~ empty()", vouching_range(base, vouching, trunk)),
+                "-T",
+                "commit_id ++ \"\\n\"",
+            ],
+        )
+        .await?;
+    let mut lineage = std::collections::HashMap::new();
+    for commit in commits.lines().filter(|line| !line.is_empty()) {
+        let evolution = jj
+            .run(
+                repo,
+                &[
+                    "--ignore-working-copy",
+                    "evolog",
+                    "-r",
+                    commit,
+                    "--no-graph",
+                    "-T",
+                    "commit_id ++ \"\\n\"",
+                ],
+            )
+            .await?;
+        for predecessor in evolution.lines().filter(|line| !line.is_empty() && *line != commit) {
+            lineage
+                .entry(predecessor.to_owned())
+                .or_insert_with(|| commit.to_owned());
+        }
+    }
+    Ok(lineage)
 }
 
 async fn superseded_pointers(

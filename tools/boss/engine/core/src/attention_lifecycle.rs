@@ -168,6 +168,14 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         "A successful recovery/start clears dispatch failures. The bookmark sweep also resolves this signal after inspecting the recorded reference successfully.",
     ),
     entry(
+        crate::execution_bookmark_recovery::BLOCKED_BEFORE_START,
+        ClearedBy::WorkResumed,
+        "Asserts a review-phase execution could not start because its predecessor's recovery pointers \
+         could not be reconciled with the PR head, and that nothing re-fires it automatically. A run \
+         for the item starting afterwards is exactly the contradiction: dispatch got past the pointer \
+         check, either because a human repaired the pointers or because a new head was pushed.",
+    ),
+    entry(
         crate::abandoned_execution_bookmarks::RECOVERABLE_WORK,
         ClearedBy::ProducerReconciles,
         "The bookmark sweep resolves this signal when the execution has no remaining unpublished work.",
@@ -756,6 +764,7 @@ mod tests {
             crate::execution_bookmark_recovery::CREATE_FAILED,
             crate::execution_bookmark_recovery::CHAIN_BLOCKED,
             crate::execution_bookmark_recovery::RECOVERY_FAILED,
+            crate::execution_bookmark_recovery::BLOCKED_BEFORE_START,
             crate::execution_bookmark_recovery::RECOVERY_RETIRED,
             crate::abandoned_execution_bookmarks::RECOVERABLE_WORK,
             crate::execution_bookmark_prune::UNPROVEN,

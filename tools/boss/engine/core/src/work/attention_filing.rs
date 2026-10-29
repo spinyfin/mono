@@ -146,4 +146,21 @@ impl WorkDb {
         let conn = self.connect()?;
         reraise_open_execution_attention(&conn, execution_id, kind)
     }
+
+    /// Whether `execution_id` carries a non-resolved item of `kind`. A pure
+    /// read: unlike [`Self::reraise_open_execution_attention`] it does not
+    /// stamp a re-raise, so a sweep that consults it on every pass does not
+    /// keep pushing the item's clearing reference point forward.
+    pub(crate) fn has_open_execution_attention(&self, execution_id: &str, kind: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let open: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM work_attention_items
+                 WHERE execution_id = ?1 AND kind = ?2 AND status != 'resolved'
+             )",
+            params![execution_id, kind],
+            |row| row.get(0),
+        )?;
+        Ok(open)
+    }
 }
