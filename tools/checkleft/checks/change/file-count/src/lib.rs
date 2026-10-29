@@ -17,7 +17,7 @@
 //! repository, so this check is a documented no-op in whole-repo mode — the
 //! same class of caveat as `policy.changed_lines_only` under `--all`.
 //!
-//! A one-off exception uses `BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>` in
+//! When host policy enables bypasses, a one-off exception uses `BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>` in
 //! the commit or PR description. The bypass is bound to that approved
 //! maximum: the check passes while the non-deleted file count is ≤ it, and
 //! fails again if the change grows past it. A directive without a numeric
@@ -70,95 +70,12 @@ fn count_non_deleted_files(input: &CheckInput) -> usize {
         .count()
 }
 
-/// Latest `BYPASS_CHANGE_FILE_COUNT` value in commit then PR description.
-///
-/// Later lines win; a PR directive wins over commit directives. Empty values
-/// are skipped the same way the host's generic bypass parser skips them.
-fn latest_file_count_bypass_raw(commit_description: Option<&str>, pr_description: Option<&str>) -> Option<String> {
-    let mut last = None;
-    for text in [commit_description, pr_description].into_iter().flatten() {
-        for line in text.lines() {
-            if let Some(raw) = file_count_bypass_raw_from_line(line) {
-                last = Some(raw);
-            }
-        }
-    }
-    last
-}
-
-fn file_count_bypass_raw_from_line(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    if !trimmed.starts_with("BYPASS_") {
-        return None;
-    }
-    let (raw_name, raw_value) = trimmed.split_once('=')?;
-    if raw_name.trim().eq_ignore_ascii_case(BYPASS_DIRECTIVE_NAME) {
-        let value = raw_value.trim();
-        if value.is_empty() {
-            return None;
-        }
-        return Some(value.to_owned());
-    }
-    None
-}
-
-/// Parse `BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>`.
-///
-/// `max_files` must be a decimal `usize`. The reason is the rest of the value
-/// after the first colon, trimmed; it must be non-empty. A value with no
-/// colon, a non-numeric maximum, or an empty reason is invalid.
-fn parse_approved_file_count_bypass(raw: &str) -> Option<(usize, String)> {
-    let (max_part, reason_part) = raw.split_once(':')?;
-    let max_files = max_part.trim().parse().ok()?;
-    let reason = reason_part.trim();
-    if reason.is_empty() {
-        return None;
-    }
-    Some((max_files, reason.to_owned()))
-}
-
 fn exceeded_configured_max_finding(count: usize, max_files: usize) -> Finding {
     Finding::error(format!(
         "changeset touches {count} non-deleted files, exceeding configured max_files={max_files}"
     ))
     .with_remediation(SPLIT_REMEDIATION.to_owned())
     .with_remediation(BYPASS_REMEDIATION.to_owned())
-}
-
-fn exceeded_approved_max_finding(count: usize, approved_max: usize) -> Finding {
-    Finding::error(format!(
-        "changeset touches {count} non-deleted files, exceeding the approved BYPASS_CHANGE_FILE_COUNT maximum of {approved_max}"
-    ))
-    .with_remediation(SPLIT_REMEDIATION.to_owned())
-    .with_remediation(format!(
-        "The previous exception was bound to {approved_max} files (current count {count}). Request a new approval with `BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>` or split the change."
-    ))
-}
-
-fn malformed_file_count_bypass_finding(raw: &str) -> Finding {
-    Finding::error(format!(
-        "BYPASS_CHANGE_FILE_COUNT requires an approved maximum: `BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>` (got `{raw}`). A bypass without a numeric maximum is not treated as unlimited."
-    ))
-    .with_remediation(
-        "Replace the directive with `BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>`, where max_files is the approved ceiling for this change.".to_owned(),
-    )
-}
-
-/// Findings once the configured `max_files` ceiling has already been exceeded.
-fn findings_for_oversized_change(
-    count: usize,
-    max_files: usize,
-    commit_description: Option<&str>,
-    pr_description: Option<&str>,
-) -> Vec<Finding> {
-    match latest_file_count_bypass_raw(commit_description, pr_description) {
-        None => vec![exceeded_configured_max_finding(count, max_files)],
-        Some(raw) => match parse_approved_file_count_bypass(&raw) {
-            Some((approved_max, _)) if count <= approved_max => Vec::new(),
-            Some((approved_max, _)) => vec![exceeded_approved_max_finding(count, approved_max)],
-            None => vec![malformed_file_count_bypass_finding(&raw)],
-        },
-    }
 }
 
 #[check(
@@ -183,12 +100,7 @@ pub fn change_file_count_check(input: CheckInput) -> Vec<Finding> {
         return Vec::new();
     }
 
-    findings_for_oversized_change(
-        count,
-        max_files,
-        input.changeset.commit_description.as_deref(),
-        input.changeset.pr_description.as_deref(),
-    )
+    vec![exceeded_configured_max_finding(count, max_files)]
 }
 
 // NOTE: this crate is an rlib, NOT a standalone wasm component. The component
@@ -309,135 +221,15 @@ mod tests {
     }
 
     #[test]
-    fn bypass_within_approved_max_passes() {
+    fn guest_leaves_bypass_evaluation_to_host_policy() {
         let findings = change_file_count_check(make_input_with_descriptions(
             oversized_files(6),
             r#"{"max_files": 5}"#,
-            Some("BYPASS_CHANGE_FILE_COUNT=8:Coordinated rename of the protocol surface."),
-            None,
-        ));
-        assert!(
-            findings.is_empty(),
-            "count 6 is within approved max 8; findings: {:?}",
-            findings
-        );
-    }
-
-    #[test]
-    fn bypass_above_approved_max_fails_with_counts() {
-        let findings = change_file_count_check(make_input_with_descriptions(
-            oversized_files(10),
-            r#"{"max_files": 5}"#,
-            Some("BYPASS_CHANGE_FILE_COUNT=8:Coordinated rename of the protocol surface."),
-            None,
-        ));
-
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].severity, checkleft_check_sdk::Severity::Error);
-        assert!(
-            findings[0].message.contains("10 non-deleted files")
-                && findings[0].message.contains("approved")
-                && findings[0].message.contains('8'),
-            "message was: {}",
-            findings[0].message
-        );
-        assert!(
-            findings[0]
-                .remediations
-                .iter()
-                .any(|r| r.contains("new approval") || r.contains("split")),
-            "remediation should require a new approval or a split; got {:?}",
-            findings[0].remediations
-        );
-    }
-
-    #[test]
-    fn bypass_missing_numeric_max_is_rejected() {
-        let findings = change_file_count_check(make_input_with_descriptions(
-            oversized_files(6),
-            r#"{"max_files": 5}"#,
-            Some("BYPASS_CHANGE_FILE_COUNT=Coordinated rename of the protocol surface."),
-            None,
-        ));
-
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].severity, checkleft_check_sdk::Severity::Error);
-        assert!(
-            findings[0].message.contains("approved maximum")
-                && findings[0].message.contains("<max_files>:<reason>")
-                && findings[0].message.contains("not treated as unlimited"),
-            "message was: {}",
-            findings[0].message
-        );
-    }
-
-    #[test]
-    fn bypass_non_numeric_max_is_rejected() {
-        let findings = change_file_count_check(make_input_with_descriptions(
-            oversized_files(6),
-            r#"{"max_files": 5}"#,
-            Some("BYPASS_CHANGE_FILE_COUNT=many:Coordinated rename of the protocol surface."),
-            None,
-        ));
-
-        assert_eq!(findings.len(), 1);
-        assert!(
-            findings[0].message.contains("approved maximum") && findings[0].message.contains("many:"),
-            "message was: {}",
-            findings[0].message
-        );
-    }
-
-    #[test]
-    fn latest_bypass_directive_wins() {
-        let commit = "\
-BYPASS_CHANGE_FILE_COUNT=6:first approval, too small once the change grew.
-BYPASS_CHANGE_FILE_COUNT=12:later approval after the surface was re-counted.
-";
-        let findings = change_file_count_check(make_input_with_descriptions(
-            oversized_files(10),
-            r#"{"max_files": 5}"#,
-            Some(commit),
-            None,
-        ));
-        assert!(
-            findings.is_empty(),
-            "latest directive approves 12; findings: {:?}",
-            findings
-        );
-
-        let older_last = "\
-BYPASS_CHANGE_FILE_COUNT=12:earlier larger approval.
-BYPASS_CHANGE_FILE_COUNT=6:later tighter approval.
-";
-        let findings = change_file_count_check(make_input_with_descriptions(
-            oversized_files(10),
-            r#"{"max_files": 5}"#,
-            Some(older_last),
-            None,
+            Some("BYPASS_CHANGE_FILE_COUNT=100:rename"),
+            Some("BYPASS_CHANGE_FILE_COUNT=200:rename"),
         ));
         assert_eq!(findings.len(), 1);
-        assert!(
-            findings[0].message.contains("10 non-deleted files") && findings[0].message.contains('6'),
-            "latest directive of 6 must bind; message was: {}",
-            findings[0].message
-        );
-    }
-
-    #[test]
-    fn latest_bypass_directive_prefers_pr_description() {
-        let findings = change_file_count_check(make_input_with_descriptions(
-            oversized_files(10),
-            r#"{"max_files": 5}"#,
-            Some("BYPASS_CHANGE_FILE_COUNT=12:from commit."),
-            Some("BYPASS_CHANGE_FILE_COUNT=6:from PR."),
-        ));
-        assert_eq!(findings.len(), 1);
-        assert!(
-            findings[0].message.contains('6'),
-            "PR description is the later surface; message was: {}",
-            findings[0].message
-        );
+        assert!(findings[0].message.contains("max_files=5"));
     }
 
     #[test]

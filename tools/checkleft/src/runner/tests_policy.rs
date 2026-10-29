@@ -935,3 +935,147 @@ check = "configurable-findings"
         "changed_lines_only defaults to false; both findings on the changed file must survive"
     );
 }
+
+#[tokio::test]
+async fn runner_file_count_bypass_policy_and_latest_value() {
+    use crate::external::BundledExternalCheckPackageProvider;
+    use crate::external::test_support::executor_with_precompiled_cache;
+
+    for (policy, name, commit, pr, expected) in [
+        (
+            "allow_bypass = false",
+            "BYPASS_CHANGE_FILE_COUNT",
+            "100:rename",
+            None,
+            "max_files=3",
+        ),
+        ("", "BYPASS_CHANGE_FILE_COUNT", "100:rename", None, "max_files=3"),
+        (
+            "allow_bypass = true",
+            "BYPASS_CHANGE_FILE_COUNT",
+            "",
+            None,
+            "requires an approved maximum",
+        ),
+        (
+            "allow_bypass = true",
+            "BYPASS_CHANGE_FILE_COUNT",
+            "100:rename\nBYPASS_CHANGE_FILE_COUNT=",
+            None,
+            "requires an approved maximum",
+        ),
+        (
+            "allow_bypass = true",
+            "BYPASS_CHANGE_FILE_COUNT",
+            "100:rename",
+            Some(""),
+            "requires an approved maximum",
+        ),
+        (
+            "allow_bypass = true",
+            "BYPASS_CUSTOM",
+            "3:rename",
+            None,
+            "approved BYPASS_CUSTOM maximum of 3",
+        ),
+        ("allow_bypass = true", "BYPASS_CUSTOM", "4:rename", None, ""),
+        (
+            "allow_bypass = true",
+            "BYPASS_CUSTOM",
+            "rename",
+            None,
+            "BYPASS_CUSTOM requires an approved maximum",
+        ),
+        (
+            "allow_bypass = true",
+            "BYPASS_CHANGE_FILE_COUNT",
+            "100:old\nBYPASS_CHANGE_FILE_COUNT=3:new",
+            None,
+            "maximum of 3",
+        ),
+        (
+            "allow_bypass = true",
+            "BYPASS_CHANGE_FILE_COUNT",
+            "3:old\nBYPASS_CHANGE_FILE_COUNT=100:new",
+            None,
+            "",
+        ),
+    ] {
+        let temp = tempdir().expect("temp dir");
+        fs::write(temp.path().join("CHECKS.toml"), format!(
+            "[[checks]]\nid = \"count-instance\"\ncheck = \"change/file-count\"\n[checks.config]\nmax_files = 3\n[checks.policy]\n{policy}\nbypass_name = \"{name}\"\n"
+        )).expect("config");
+        let files = (0..4)
+            .map(|i| {
+                let path = Path::new(&format!("f{i}.txt")).to_path_buf();
+                fs::write(temp.path().join(&path), "content").expect("file");
+                ChangedFile {
+                    path,
+                    kind: ChangeKind::Added,
+                    old_path: None,
+                }
+            })
+            .collect();
+        let changeset = ChangeSet::new(files)
+            .with_commit_description(Some(format!("{name}={commit}")))
+            .with_pr_description(pr.map(|value| format!("{name}={value}")));
+        let mut registry = CheckRegistry::new();
+        register_builtin_checks(&mut registry).expect("builtins");
+        let runner = Runner::with_external(
+            Arc::new(registry),
+            Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+            Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+            Arc::new(BundledExternalCheckPackageProvider),
+            Arc::new(executor_with_precompiled_cache(temp.path())),
+        );
+        let results = runner.run_changeset(&changeset).await.expect("run");
+        let result = results
+            .iter()
+            .find(|r| r.check_id == "count-instance")
+            .expect("count ran");
+        if expected.is_empty() {
+            assert!(result.findings.is_empty(), "{policy} {commit}: {:?}", result.findings);
+        } else {
+            assert_eq!(result.findings.len(), 1);
+            assert_eq!(result.findings[0].severity, Severity::Error);
+            assert!(
+                result.findings[0].message.contains(expected),
+                "{policy} {commit}: {:?}",
+                result.findings
+            );
+        }
+    }
+}
+
+#[test]
+fn other_check_with_file_count_bypass_name_keeps_generic_semantics() {
+    let changeset =
+        ChangeSet::new(vec![]).with_commit_description(Some("BYPASS_CHANGE_FILE_COUNT=ordinary reason".to_owned()));
+    let result = super::apply_policy_to_result(
+        CheckResult {
+            check_id: "other-check".to_owned(),
+            findings: vec![Finding {
+                fixable: false,
+                severity: Severity::Error,
+                message: "failure".to_owned(),
+                location: None,
+                surface: None,
+                remediations: vec![],
+                suggested_fix: None,
+            }],
+        },
+        &super::EffectiveCheckPolicy {
+            check_id: "other-check".to_owned(),
+            severity_override: None,
+            allow_bypass: true,
+            bypass_name: "BYPASS_CHANGE_FILE_COUNT".to_owned(),
+            preserve_finding_severity: false,
+            changed_lines_only: false,
+        },
+        &changeset,
+        &super::PathScope::new(&[], &[]).expect("scope"),
+    );
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(result.findings[0].severity, Severity::Warning);
+    assert!(result.findings[0].message.contains("check was bypassed"));
+}

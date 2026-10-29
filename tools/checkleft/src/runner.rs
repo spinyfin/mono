@@ -10,7 +10,7 @@ use tokio::task::JoinSet;
 use crate::progress::{NoopProgressReporter, ProgressReporter, files_failed_count};
 
 use crate::bypass::{
-    CHANGE_FILE_COUNT_BYPASS_NAME, bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id,
+    bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id,
     bypass_unreachable_pr_description_guidance, change_file_count_bypass_findings,
 };
 use crate::check::{CheckRegistry, ConfiguredCheck};
@@ -57,6 +57,7 @@ enum ScheduledExecution {
 
 #[derive(Debug, Clone)]
 struct EffectiveCheckPolicy {
+    check_id: String,
     severity_override: Option<Severity>,
     allow_bypass: bool,
     bypass_name: String,
@@ -1352,6 +1353,7 @@ impl Runner {
             .unwrap_or_else(|| bypass_name_for_check_id(&check.id));
 
         EffectiveCheckPolicy {
+            check_id: check.check.clone(),
             severity_override,
             allow_bypass,
             bypass_name,
@@ -1635,15 +1637,18 @@ fn apply_policy_to_result(
     }
 
     if policy.allow_bypass {
-        if let Some(reason) = changeset.bypass_reason(&policy.bypass_name) {
+        if let Some(reason) = changeset
+            .bypass_reason(&policy.bypass_name)
+            .filter(|value| policy.check_id == "change/file-count" || !value.is_empty())
+        {
             let location = result.findings.iter().find_map(|finding| finding.location.clone());
-            if policy.bypass_name == CHANGE_FILE_COUNT_BYPASS_NAME {
+            if policy.check_id == "change/file-count" {
                 // Bound to the approved maximum. Do not treat a bare reason as
                 // unlimited, and fail again if the change has grown past the
                 // ceiling that was approved. A still-valid bound is a pass
                 // (empty findings). Remaining errors fall through so the
                 // instance severity override applies, same as an unbound fail.
-                result.findings = change_file_count_bypass_findings(changeset, &reason, location);
+                result.findings = change_file_count_bypass_findings(changeset, &reason, &policy.bypass_name, location);
                 if result.findings.is_empty() {
                     return result;
                 }
@@ -1658,9 +1663,9 @@ fn apply_policy_to_result(
             // merge-queue build, which cannot fetch it) looks identical to no
             // directive existing at all.
             let guidance = if changeset.pr_description.is_none() {
-                bypass_unreachable_pr_description_guidance(&policy.bypass_name)
+                bypass_unreachable_pr_description_guidance(&policy.check_id, &policy.bypass_name)
             } else {
-                bypass_failure_guidance(&policy.bypass_name)
+                bypass_failure_guidance(&policy.check_id, &policy.bypass_name)
             };
             for finding in &mut result.findings {
                 finding.remediations.push(guidance.clone());
