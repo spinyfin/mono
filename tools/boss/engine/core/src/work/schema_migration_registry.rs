@@ -261,6 +261,16 @@ pub(super) fn all() -> Vec<Migration> {
             apply: task_status_audit::migrate,
         },
         Migration {
+            id: "20261028_1900_pr_head_after_capture".into(),
+            legacy_version: None,
+            apply: |conn| {
+                if !table_has_column(conn, "work_executions", "pr_head_after_capture")? {
+                    conn.execute_batch("ALTER TABLE work_executions ADD COLUMN pr_head_after_capture TEXT")?;
+                }
+                Ok(())
+            },
+        },
+        Migration {
             id: "20261029_0735_work_executions_item_kind_status_finished_idx".into(),
             legacy_version: None,
             apply: |conn| {

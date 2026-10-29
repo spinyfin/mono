@@ -777,6 +777,9 @@ mod floor_tests {
             expected.execute_batch(migrations::CREATE_LEDGER).unwrap();
             task_status_audit::migrate(&expected).unwrap();
             expected
+                .execute_batch("ALTER TABLE work_executions ADD COLUMN pr_head_after_capture TEXT")
+                .unwrap();
+            expected
                 .execute_batch(WORK_EXECUTIONS_ITEM_KIND_STATUS_FINISHED_INDEX)
                 .unwrap();
             let before = capture(&expected);

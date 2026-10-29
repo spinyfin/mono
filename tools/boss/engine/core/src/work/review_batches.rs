@@ -71,7 +71,7 @@ pub enum ReviewBatchDispatch {
         batch: ReviewBatch,
         executions: Vec<WorkExecution>,
     },
-    LegacyExecution(WorkExecution),
+    LegacyExecution(Box<WorkExecution>),
     /// The review pool's weighted reservation accounting (see
     /// [`can_admit_review_batch_in_tx`]) has no room for a new batch of this
     /// target's phase right now. No batch and no member executions were
@@ -1239,6 +1239,7 @@ impl WorkDb {
         if input.phase != ReviewBatchPhase::PreMerge {
             bail!("leaf reviewer dispatch only supports pre_merge batches");
         }
+        let task_id = input.legacy_task_id.as_ref().unwrap_or(&input.cycle_root_id).clone();
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if explicit {
@@ -1261,6 +1262,7 @@ impl WorkDb {
             };
             if !remint {
                 let executions = batch_executions_in_tx(&tx, &batch.id)?;
+                super::completion_evidence::record_review_admission_wait_in(&tx, &task_id, false)?;
                 tx.commit()?;
                 return Ok(ReviewBatchDispatch::ExistingBatch { batch, executions });
             }
@@ -1288,6 +1290,7 @@ impl WorkDb {
                 // Automatic path: not an error, just not yet. The caller
                 // sees the failed batch and the deferred-admission sweep
                 // retries on its next pass once the straggler settles.
+                super::completion_evidence::record_review_admission_wait_in(&tx, &task_id, false)?;
                 tx.commit()?;
                 return Ok(ReviewBatchDispatch::ExistingBatch { batch, executions });
             }
@@ -1323,8 +1326,9 @@ impl WorkDb {
                         execution.id
                     );
                 }
+                super::completion_evidence::record_review_admission_wait_in(&tx, &task_id, false)?;
                 tx.commit()?;
-                return Ok(ReviewBatchDispatch::LegacyExecution(execution));
+                return Ok(ReviewBatchDispatch::LegacyExecution(Box::new(execution)));
             }
         }
         // Checked here — after ExistingBatch/LegacyExecution, before the
@@ -1343,6 +1347,7 @@ impl WorkDb {
                     None => false,
                 });
         if already_reviewed {
+            super::completion_evidence::record_review_admission_wait_in(&tx, &task_id, true)?;
             tx.commit()?;
             return Ok(ReviewBatchDispatch::AlreadyReviewed);
         }
@@ -1353,10 +1358,9 @@ impl WorkDb {
                      (requires {PRE_MERGE_BATCH_RESERVATION_UNITS} units)"
                 );
             }
-            // Read-only so far — nothing to roll back. The caller must hold
-            // the producing task pending review rather than treat this as a
-            // legacy fallback; the deferred-admission sweep retries once an
-            // existing batch completes and frees its reservation.
+            // Persist the wait with the admission decision; an attention
+            // item is explanatory, never the source of truth for this hold.
+            super::completion_evidence::record_review_admission_wait_in(&tx, &task_id, true)?;
             tx.commit()?;
             return Ok(ReviewBatchDispatch::AdmissionDeferred);
         }
@@ -1387,6 +1391,7 @@ impl WorkDb {
         if explicit {
             super::resolve_attention_kind_in_tx(&tx, &batch.cycle_root_id, super::CHURN_GUARD_PARKED_ATTENTION_KIND)?;
         }
+        super::completion_evidence::record_review_admission_wait_in(&tx, &task_id, false)?;
         tx.commit()?;
         Ok(ReviewBatchDispatch::Created { batch, executions })
     }
