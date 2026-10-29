@@ -1060,7 +1060,10 @@ pub(crate) fn render_proposal_rejection(kind: Option<ProposalKind>, error: Propo
     }
     match error.code {
         ProposalErrorCode::ValidationFailed => CliError::usage(error.message),
-        ProposalErrorCode::RateLimited => CliError::application(error.message),
+        // Nothing was stored, so the worker's next attempt is a fresh
+        // submission. Same exit as a stored `rejected` review-guide /
+        // run-done row, so a worker that keyed off exit 6 sees no change.
+        ProposalErrorCode::RateLimited | ProposalErrorCode::NotAccepted => CliError::application(error.message),
         ProposalErrorCode::NoLocalPeer
         | ProposalErrorCode::AttributionUnresolved
         | ProposalErrorCode::AttributionMismatch

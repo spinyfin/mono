@@ -25,7 +25,8 @@
 use super::*;
 use boss_engine_proposal_validation::{ProposalCounts, check_rate_caps};
 use boss_protocol::{
-    Attention, AttentionGroup, ProposalDecider, ProposalKind, ProposalState, ProposalSubmissionError, WorkerProposal,
+    Attention, AttentionGroup, ProposalDecider, ProposalErrorCode, ProposalKind, ProposalState,
+    ProposalSubmissionError, WorkerProposal,
 };
 
 // ---- input types ----
@@ -176,9 +177,11 @@ impl WorkDb {
     /// reading a pre-insert count and both landing over the cap.
     ///
     /// Returns `Err` for a genuine storage failure and
-    /// `Ok(Err(ProposalSubmissionError))` for a rate-cap refusal — the
-    /// refusal is a normal, typed outcome the worker is meant to see, not an
-    /// engine fault.
+    /// `Ok(Err(ProposalSubmissionError))` for a rate-cap refusal, or for a
+    /// review guide the engine declined (no running attempt, comparison
+    /// moved, body invalid — [`ProposalErrorCode::NotAccepted`]) — each a
+    /// normal, typed outcome the worker is meant to see, not an engine
+    /// fault, and none of them stores a row.
     pub fn submit_worker_proposal(
         &self,
         input: SubmitWorkerProposalInput<'_>,
@@ -268,6 +271,24 @@ impl WorkDb {
                 )?),
                 ProposalApplyPolicy::Gated => None,
             };
+            // A review guide is accepted atomically or not at all. Its
+            // refusals are state judgements (the attempt is not running, the
+            // comparison moved, the body failed validation) that are only
+            // true at this instant; storing them as a `rejected` row would
+            // make every later retry with the same body a replay of this
+            // refusal (`already_submitted: true`), orphaning a finished guide
+            // behind an error the worker already acted on. Return the refusal
+            // before the insert so nothing is stored and the transaction rolls
+            // back; the worker's retry is then judged on the engine's state at
+            // that moment.
+            if input.kind == ProposalKind::ReviewGuide
+                && let Some(ApplyDecision::Rejected(reason)) = &apply_decision
+            {
+                return Ok(Err(ProposalSubmissionError::new(
+                    ProposalErrorCode::NotAccepted,
+                    reason.clone(),
+                )));
+            }
             let (
                 state,
                 applied_ref,

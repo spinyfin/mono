@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use super::*;
 use crate::test_support::{
     create_active_chore, create_product, open_db, review_guide_source_packet, seed_review_guide_series,
@@ -821,4 +823,336 @@ fn retry_dispatch_resolves_product_repository_and_task_override() {
         assert_eq!(execution.kind, ExecutionKind::PrReviewGuide);
         assert_eq!(execution.status, ExecutionStatus::Ready);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Attempts across an engine restart
+// ---------------------------------------------------------------------------
+
+const RESTART_GUIDE: &str = "# Guide\n## Orientation\nA change.\n## Problem\n## Implementation\n## Example\n## Review\n## Evidence\nNo validation results reported; no screenshots registered.";
+
+/// A bound attempt whose execution has started a run with a live tmux shell
+/// (`shell_pid` is this test process). Returns `(attempt_id, execution_id)`.
+fn spawned_guide_run(db: &WorkDb, series_id: &str, comparison_id: &str, token: &str) -> (String, String) {
+    let attempt = db
+        .create_pr_review_guide_attempt(series_id, comparison_id, boss_review_guide::PROMPT_VERSION)
+        .unwrap();
+    let execution = db
+        .create_pr_review_guide_execution(comparison_id, "https://github.com/acme/widget.git")
+        .unwrap();
+    db.bind_pr_review_guide_attempt_execution(&attempt.id, &execution.id)
+        .unwrap();
+    db.start_execution_run(&execution.id, "review-28", "mono", "lease-28", "ws-28", "/tmp/ws-28")
+        .unwrap();
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(&execution.id, "boss", "boss-review-28", token)
+            .unwrap()
+    );
+    assert!(
+        db.record_tmux_session_created_for_execution(&execution.id, token, i64::from(std::process::id()))
+            .unwrap()
+    );
+    (attempt.id, execution.id)
+}
+
+/// A pid that is guaranteed dead: spawn `true` and reap it.
+fn released_pid() -> i64 {
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    child.wait().unwrap();
+    i64::from(child.id())
+}
+
+fn submit_guide(
+    db: &WorkDb,
+    execution_id: &str,
+    comparison_id: &str,
+) -> std::result::Result<crate::work::SubmitWorkerProposalOutcome, boss_protocol::ProposalSubmissionError> {
+    let payload = serde_json::json!({ "body_markdown": RESTART_GUIDE }).to_string();
+    db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+        execution_id,
+        work_item_id: comparison_id,
+        kind: boss_protocol::ProposalKind::ReviewGuide,
+        payload_json: &payload,
+        idempotency_key: "guide",
+    })
+    .unwrap()
+}
+
+/// The restart-during-spawn ordering. A guide run is spawned seconds before
+/// the engine restarts; the restarted engine's recovery probe wrongly infers
+/// the worker dead and orphans the execution, which closes the attempt with
+/// it; the worker's next hook then re-adopts the execution. The attempt must
+/// come back with the execution, and the guide the worker finishes minutes
+/// later must bind to it and publish — instead of `propose review-guide`
+/// failing with "no running review-guide attempt".
+#[test]
+fn restart_during_spawn_reopens_the_attempt_with_the_readopted_execution_and_publishes_the_guide() {
+    let (_dir, db) = open_db();
+    let (root, series_id, comparison_id) = seeded_series(&db);
+    let (attempt_id, execution_id) = spawned_guide_run(&db, &series_id, &comparison_id, "tok-28");
+
+    // Restart. The startup reconcile sees a running execution: nothing to do.
+    assert_eq!(db.reconcile_pr_review_guide_attempts().unwrap(), 0);
+    assert_eq!(attempt_status(&db, &attempt_id), "running");
+
+    // The startup recovery probe wrongly proves the worker dead; the reap
+    // orphans the execution and closes the attempt on the strength of it.
+    db.reap_startup_dead_execution(&execution_id, &crate::run_reconcile::RunReconcileVerdict::Dead)
+        .unwrap()
+        .expect("the reap orphans the execution");
+    assert_eq!(attempt_status(&db, &attempt_id), "failed");
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert_eq!(summary.lifecycle, "failed");
+    // A guide submitted in this window is refused without storing anything.
+    let refusal = submit_guide(&db, &execution_id, &comparison_id).expect_err("no running attempt");
+    assert_eq!(refusal.code, boss_protocol::ProposalErrorCode::NotAccepted);
+
+    // The worker's next hook disproves the death: re-adoption restores the
+    // execution, and the attempt with it.
+    let (restored, _) = db
+        .readopt_inferred_terminal_execution(&execution_id, "hook_after_terminal", None)
+        .unwrap();
+    assert_eq!(restored.status, ExecutionStatus::Running);
+    let reopened = db
+        .pr_review_guide_attempt_for_execution(&execution_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reopened.id, attempt_id);
+    assert_eq!(reopened.status, "running");
+    assert!(reopened.error.is_none() && reopened.finished_at.is_none());
+    assert!(reopened.failed_by_build.is_none());
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert_eq!(summary.lifecycle, "generating");
+
+    // The guide the worker finished after the restart binds and publishes.
+    let accepted = submit_guide(&db, &execution_id, &comparison_id).expect("the live attempt accepts the guide");
+    assert!(!accepted.already_submitted);
+    assert_eq!(accepted.proposal.state, boss_protocol::ProposalState::Applied);
+    assert_eq!(accepted.proposal.applied_ref.as_deref(), Some(attempt_id.as_str()));
+    let body = db
+        .submitted_review_guide(&execution_id, &attempt_id)
+        .unwrap()
+        .expect("the applied proposal is the attempt's submission");
+    let PublishReviewGuideOutcome::Published(version) =
+        db.publish_pr_review_guide_version(&attempt_id, &body, &body).unwrap()
+    else {
+        panic!("must publish")
+    };
+    assert_eq!(version.markdown, RESTART_GUIDE);
+    assert_eq!(attempt_status(&db, &attempt_id), "succeeded");
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert_eq!(summary.lifecycle, "ready");
+}
+
+/// The reconcile judges an `orphaned` execution by whether its worker is
+/// live, not by the status alone: an attempt that is still `running` against
+/// an orphaned row with a live shell (or one the caller observed alive) is
+/// kept open for re-adoption, and is finished only once nothing is alive.
+#[test]
+fn reconcile_keeps_the_attempt_of_an_orphaned_execution_whose_worker_is_live() {
+    let (_dir, db) = open_db();
+    let (root, series_id, comparison_id) = seeded_series(&db);
+    let (attempt_id, execution_id) = spawned_guide_run(&db, &series_id, &comparison_id, "tok-29");
+    // Orphan the row without closing the attempt — the shape left behind by
+    // a resume that orphans its predecessor, or a reap interrupted between
+    // its two writes.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'orphaned', finished_at = datetime('now') WHERE id = ?1",
+            [&execution_id],
+        )
+        .unwrap();
+
+    // The durable pid (this process) is alive: keep the attempt open.
+    assert_eq!(db.reconcile_pr_review_guide_attempts().unwrap(), 0);
+    assert_eq!(attempt_status(&db, &attempt_id), "running");
+
+    // No live pid, but the caller (the tmux adoption pass) observed the
+    // worker alive: still kept open.
+    assert!(
+        db.set_run_shell_pid_for_execution(&execution_id, released_pid())
+            .unwrap()
+    );
+    let known_live = HashSet::from([execution_id.clone()]);
+    assert_eq!(
+        db.reconcile_pr_review_guide_attempts_with_live_runs(&known_live)
+            .unwrap(),
+        0
+    );
+    assert_eq!(attempt_status(&db, &attempt_id), "running");
+
+    // Nothing alive anywhere: the attempt really is stranded and is finished
+    // with the classified reason.
+    assert_eq!(db.reconcile_pr_review_guide_attempts().unwrap(), 1);
+    assert_eq!(attempt_status(&db, &attempt_id), "failed");
+    assert_eq!(attempt_error(&db, &attempt_id), "execution orphaned");
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert_eq!(summary.lifecycle, "failed");
+}
+
+/// A deliberate terminal status is never a candidate for keeping the
+/// attempt open, however alive the process behind it is.
+#[test]
+fn reconcile_finishes_the_attempt_of_a_deliberately_terminal_execution_even_with_a_live_pid() {
+    let (_dir, db) = open_db();
+    let (_root, series_id, comparison_id) = seeded_series(&db);
+    let (attempt_id, execution_id) = spawned_guide_run(&db, &series_id, &comparison_id, "tok-30");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'abandoned', finished_at = datetime('now') WHERE id = ?1",
+            [&execution_id],
+        )
+        .unwrap();
+    let known_live = HashSet::from([execution_id.clone()]);
+    assert_eq!(
+        db.reconcile_pr_review_guide_attempts_with_live_runs(&known_live)
+            .unwrap(),
+        1
+    );
+    assert_eq!(attempt_status(&db, &attempt_id), "failed");
+    assert_eq!(attempt_error(&db, &attempt_id), "execution abandoned");
+}
+
+/// Re-adoption reverses only the closure the inferred death caused: an
+/// attempt that failed before any worker ran stays failed (it is the
+/// re-enqueue pass's business), and a published attempt is never reopened.
+#[test]
+fn readoption_does_not_reopen_a_pre_start_failure() {
+    let (_dir, db) = open_db();
+    let (_root, series_id, comparison_id) = seeded_series(&db);
+    let (attempt_id, execution_id) = spawned_guide_run(&db, &series_id, &comparison_id, "tok-31");
+    db.fail_pr_review_guide_attempt_pre_start(&attempt_id, "pane never came up")
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'orphaned', finished_at = datetime('now') WHERE id = ?1",
+            [&execution_id],
+        )
+        .unwrap();
+    db.readopt_inferred_terminal_execution(&execution_id, "hook_after_terminal", None)
+        .unwrap();
+    assert_eq!(attempt_status(&db, &attempt_id), "failed");
+    assert_eq!(attempt_error(&db, &attempt_id), "pane never came up");
+}
+
+/// Insert the `rejected` row an older engine stored when a guide was
+/// submitted against a closed attempt.
+fn store_refused_guide_submission(db: &WorkDb, execution_id: &str, comparison_id: &str, body: &str) -> String {
+    let id = next_id("prp");
+    let payload = serde_json::json!({ "body_markdown": body }).to_string();
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO worker_proposals
+                 (id, execution_id, work_item_id, kind, payload_json, idempotency_key,
+                  state, applied_ref, decided_by, decision_reason, decided_at, created_at)
+             VALUES (?1, ?2, ?3, 'review_guide', ?4, ?5, 'rejected', NULL, 'policy', ?6, ?7, ?7)",
+            params![
+                id,
+                execution_id,
+                comparison_id,
+                payload,
+                format!("key-{id}"),
+                "this execution has no running review-guide attempt",
+                now_string(),
+            ],
+        )
+        .unwrap();
+    id
+}
+
+fn proposal_state(db: &WorkDb, proposal_id: &str) -> (String, Option<String>) {
+    db.connect()
+        .unwrap()
+        .query_row(
+            "SELECT state, applied_ref FROM worker_proposals WHERE id = ?1",
+            [proposal_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+}
+
+/// A guide an older engine stored as a refused submission — its attempt
+/// closed by an inferred death, the worker long gone — is published as the
+/// PR's guide on startup: the attempt is reopened, the proposal is applied
+/// against it, and the series' readable pointer advances. The pass is
+/// idempotent.
+#[test]
+fn startup_recovery_publishes_a_guide_whose_submission_was_refused_for_a_closed_attempt() {
+    let (_dir, db) = open_db();
+    let (root, series_id, comparison_id) = seeded_series(&db);
+    let (attempt_id, execution_id) = spawned_guide_run(&db, &series_id, &comparison_id, "tok-32");
+    db.mark_execution_orphaned(
+        &execution_id,
+        "engine startup: recovery probe proved worker dead across restart",
+    )
+    .unwrap();
+    assert_eq!(attempt_status(&db, &attempt_id), "failed");
+    let superseded_body = store_refused_guide_submission(
+        &db,
+        &execution_id,
+        &comparison_id,
+        "# Guide\n## Orientation\nOlder draft.\n## Problem\n## Implementation\n## Example\n## Review\n## Evidence\nNo validation results reported; no screenshots registered.",
+    );
+    let proposal_id = store_refused_guide_submission(&db, &execution_id, &comparison_id, RESTART_GUIDE);
+
+    let report = db.recover_orphaned_review_guide_submissions().unwrap();
+    assert_eq!(report.skipped, Vec::<(String, String)>::new());
+    assert_eq!(report.published.len(), 1);
+    let (published_proposal, published_attempt, version_id) = &report.published[0];
+    assert_eq!(
+        (published_proposal.as_str(), published_attempt.as_str()),
+        (proposal_id.as_str(), attempt_id.as_str())
+    );
+    assert_eq!(
+        proposal_state(&db, &proposal_id),
+        ("applied".to_owned(), Some(attempt_id.clone()))
+    );
+    assert_eq!(
+        proposal_state(&db, &superseded_body).0,
+        "rejected",
+        "only the newest body is adopted"
+    );
+    assert_eq!(attempt_status(&db, &attempt_id), "succeeded");
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert_eq!(summary.lifecycle, "ready");
+    assert_eq!(summary.readable_version_id.as_deref(), Some(version_id.as_str()));
+    assert_eq!(
+        db.get_pr_review_guide_version(version_id).unwrap().unwrap().markdown,
+        RESTART_GUIDE
+    );
+    // The execution itself is left as recorded: recovery publishes the
+    // guide, it does not resurrect the run.
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Orphaned
+    );
+
+    assert!(db.recover_orphaned_review_guide_submissions().unwrap().is_empty());
+}
+
+/// Recovery never publishes over a series that has moved on: once another
+/// attempt is live for the series the stored body is left as history.
+#[test]
+fn startup_recovery_leaves_a_refused_guide_alone_when_the_series_has_a_live_attempt() {
+    let (_dir, db) = open_db();
+    let (_root, series_id, comparison_id) = seeded_series(&db);
+    let (attempt_id, execution_id) = spawned_guide_run(&db, &series_id, &comparison_id, "tok-33");
+    db.mark_execution_orphaned(
+        &execution_id,
+        "engine startup: recovery probe proved worker dead across restart",
+    )
+    .unwrap();
+    let proposal_id = store_refused_guide_submission(&db, &execution_id, &comparison_id, RESTART_GUIDE);
+    let replacement = db
+        .create_pr_review_guide_attempt(&series_id, &comparison_id, boss_review_guide::PROMPT_VERSION)
+        .unwrap();
+    assert_ne!(replacement.id, attempt_id);
+
+    assert!(db.recover_orphaned_review_guide_submissions().unwrap().is_empty());
+    assert_eq!(proposal_state(&db, &proposal_id).0, "rejected");
+    assert_eq!(attempt_status(&db, &attempt_id), "failed");
 }

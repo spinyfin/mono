@@ -784,6 +784,7 @@ mod review_findings_followup;
 mod review_guide_context;
 mod review_guide_findings;
 mod review_guide_jobs;
+mod review_guide_recovery;
 mod review_guide_sources;
 mod review_guide_submission;
 mod review_section;

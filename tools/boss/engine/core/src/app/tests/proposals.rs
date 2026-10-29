@@ -1861,7 +1861,21 @@ async fn every_kind_can_be_submitted() {
             ProposalKind::RunDone => json!({"outcome": "delivered", "summary": "S"}),
             ProposalKind::Wait => json!({"reason": "bazel test", "duration_secs": 60}),
         };
-        let (proposal, _) = submitted(submit(&fx, kind, payload).await);
+        let response = submit(&fx, kind, payload).await;
+        if kind == ProposalKind::ReviewGuide {
+            // The fixture is a plain chore run with no review-guide attempt,
+            // and a guide is accepted atomically or refused without a row:
+            // the kind reaches the engine and is judged, nothing is stored.
+            let error = rejected(response);
+            assert_eq!(error.code, ProposalErrorCode::NotAccepted);
+            assert!(
+                error.message.contains("no running review-guide attempt"),
+                "{}",
+                error.message
+            );
+            continue;
+        }
+        let (proposal, _) = submitted(response);
         assert_eq!(proposal.kind, kind);
     }
 }
@@ -2795,23 +2809,24 @@ async fn review_guide_invented_link_is_rejected_and_a_corrected_resubmission_pub
         ),
     )
     .await;
-    let FrontendEvent::ProposalSubmitted {
-        proposal,
-        already_submitted,
-    } = rejected
-    else {
+    // Refused before anything is stored: the worker sees the reason, and
+    // the corrected resubmission below is a fresh submission, not a replay.
+    let FrontendEvent::ProposalRejected { error } = rejected else {
         panic!("{rejected:?}")
     };
-    assert!(!already_submitted);
-    assert_eq!(proposal.state, ProposalState::Rejected);
+    assert_eq!(error.code, ProposalErrorCode::NotAccepted);
     assert!(
-        proposal
-            .decision_reason
-            .as_deref()
-            .unwrap_or_default()
+        error
+            .message
             .contains("does not resolve to source at the recorded head or merge-base revision"),
         "{:?}",
-        proposal.decision_reason
+        error.message
+    );
+    assert!(
+        db.list_worker_proposals_for_execution(&execution.id, ProposalKind::ReviewGuide)
+            .unwrap()
+            .is_empty(),
+        "a refused guide must not leave a stored proposal row behind",
     );
     let still_running = db
         .pr_review_guide_attempt_for_execution(&execution.id)
@@ -2867,15 +2882,22 @@ async fn review_guide_submission_cannot_bind_to_another_execution_or_a_chore() {
         ),
     )
     .await;
-    let FrontendEvent::ProposalSubmitted { proposal, .. } = response else {
+    let FrontendEvent::ProposalRejected { error } = response else {
         panic!("{response:?}")
     };
-    assert_eq!(proposal.state, ProposalState::Rejected);
+    assert_eq!(error.code, ProposalErrorCode::NotAccepted);
     assert!(
-        proposal
-            .decision_reason
+        error.message.contains("no running review-guide attempt"),
+        "{}",
+        error.message
+    );
+    assert!(
+        fx.server_state
+            .work_db
+            .list_worker_proposals_for_execution(&fx.execution_id, ProposalKind::ReviewGuide)
             .unwrap()
-            .contains("no running review-guide attempt")
+            .is_empty(),
+        "a refused guide must not leave a stored proposal row behind",
     );
 }
 

@@ -692,11 +692,43 @@ impl WorkDb {
         }
     }
 
-    /// Startup / sweep pass: every non-terminal attempt whose bound
-    /// execution is already terminal is finished with a classified reason;
-    /// every queued attempt with no execution is dispatched. Returns the
-    /// number of attempts that were finished or dispatched.
+    /// Sweep pass over every non-terminal attempt; see
+    /// [`Self::reconcile_pr_review_guide_attempts_with_live_runs`]. Callers
+    /// with no liveness evidence of their own (the periodic terminal-work
+    /// sweep) still get the durable process probe applied to every
+    /// `orphaned` execution.
     pub(crate) fn reconcile_pr_review_guide_attempts(&self) -> Result<usize> {
+        self.reconcile_pr_review_guide_attempts_with_live_runs(&HashSet::new())
+    }
+
+    /// Startup / sweep pass over every non-terminal attempt.
+    ///
+    /// - An attempt bound to an execution that has reached a terminal status
+    ///   is finished with a classified reason — **unless** that status is
+    ///   `orphaned` and the worker is still live. `orphaned` is a death the
+    ///   engine *inferred* from missing signal, never a decision (see
+    ///   [`crate::worker_readoption::classify_contradiction`]); an orphaned
+    ///   row with a live process is exactly the contradiction re-adoption
+    ///   resolves by putting the execution back to `running`, and an attempt
+    ///   closed in the meantime would leave that re-adopted run with nothing
+    ///   to submit its guide to (the restart-during-spawn incident, where the
+    ///   worker finished a guide six minutes after the engine restarted and
+    ///   `propose review-guide` found no running attempt). "Live" is the
+    ///   durable pid probe ([`crate::durable_liveness`]) or the caller's own
+    ///   evidence in `known_live_execution_ids` — startup passes the
+    ///   executions the tmux adoption pass just observed alive. A genuinely
+    ///   stranded attempt (no live process) is still finished.
+    /// - An attempt whose bound execution row no longer exists is failed. A
+    ///   *read error* is not that: the attempt is left for the next pass
+    ///   rather than failed on a transient fault.
+    /// - A queued attempt with no execution is dispatched.
+    ///
+    /// Every action is logged with the attempt id, execution id and reason.
+    /// Returns the number of attempts finished or dispatched.
+    pub(crate) fn reconcile_pr_review_guide_attempts_with_live_runs(
+        &self,
+        known_live_execution_ids: &HashSet<String>,
+    ) -> Result<usize> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {PR_REVIEW_GUIDE_ATTEMPT_COLUMNS} FROM pr_review_guide_attempts
@@ -710,75 +742,154 @@ impl WorkDb {
 
         let mut acted = 0usize;
         for attempt in attempts {
-            if let Some(execution_id) = &attempt.execution_id {
-                match self.get_execution(execution_id) {
-                    Ok(execution) if execution.status.is_terminal() => {
-                        let reason = execution
-                            .last_error
-                            .clone()
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or_else(|| classified_review_guide_terminal_reason(&execution.status));
-                        if let Err(err) = self.finish_pr_review_guide_attempt_for_terminal_execution(
-                            execution_id,
-                            execution.status,
-                            &reason,
-                            false,
-                        ) {
+            let Some(execution_id) = attempt.execution_id.clone() else {
+                if attempt.status == PrReviewGuideAttemptStatus::Queued.as_str() {
+                    acted += usize::from(self.reconcile_dispatch_unbound_attempt(&attempt)?);
+                }
+                continue;
+            };
+            let execution = {
+                let conn = self.connect()?;
+                query_execution(&conn, &execution_id)
+            };
+            let execution = match execution {
+                Ok(Some(execution)) => execution,
+                Ok(None) => {
+                    let reason = "bound execution is gone";
+                    match self.fail_pr_review_guide_attempt(&attempt.id, reason) {
+                        Ok(()) => {
                             tracing::warn!(
                                 attempt_id = %attempt.id,
-                                execution_id,
-                                ?err,
-                                "review-guide reconcile: failed to finish a stranded attempt",
+                                execution_id = %execution_id,
+                                reason,
+                                action = "failed",
+                                "review-guide reconcile: bound execution row no longer exists; failed the attempt",
                             );
-                        } else {
                             acted += 1;
                         }
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        tracing::warn!(
+                        Err(fail_err) => tracing::warn!(
                             attempt_id = %attempt.id,
-                            execution_id,
-                            ?err,
-                            "review-guide reconcile: bound execution is gone; failing the attempt",
-                        );
-                        if let Err(fail_err) = self.fail_pr_review_guide_attempt(&attempt.id, "bound execution is gone")
-                        {
-                            tracing::warn!(
-                                attempt_id = %attempt.id,
-                                ?fail_err,
-                                "review-guide reconcile: failed to record a vanished-execution failure",
-                            );
-                        } else {
-                            acted += 1;
-                        }
+                            execution_id = %execution_id,
+                            ?fail_err,
+                            "review-guide reconcile: failed to record a vanished-execution failure",
+                        ),
                     }
+                    continue;
                 }
-            } else if attempt.status == PrReviewGuideAttemptStatus::Queued.as_str() {
-                let result = self.root_task_id_for_series(&attempt.series_id).and_then(|root| {
-                    let root = root.context("series has no root task")?;
-                    self.dispatch_pr_review_guide_attempt(&attempt.id, &root)
-                });
-                match result {
-                    Ok(_) => acted += 1,
-                    Err(err) => {
-                        let reason = format!("{err:#}");
-                        let permanent = reason.contains("has no repository") || reason.contains("has no root task");
-                        let retries: i64 = self.connect()?.query_row(
-                            "UPDATE pr_review_guide_attempts SET retries = retries + 1, error = ?2 WHERE id = ?1 RETURNING retries",
-                            params![attempt.id, reason], |row| row.get(0),
-                        )?;
-                        if permanent || retries >= 3 {
-                            self.fail_pr_review_guide_attempt(&attempt.id, &reason)?;
-                            acted += 1;
-                        } else {
-                            tracing::warn!(attempt_id = %attempt.id, retries, ?err, "review-guide reconcile: dispatch failed; will retry");
-                        }
-                    }
+                Err(err) => {
+                    // A failed read says nothing about the execution; failing
+                    // the attempt on it would be the same fault as closing a
+                    // live run. Leave it for the next pass.
+                    tracing::warn!(
+                        attempt_id = %attempt.id,
+                        execution_id = %execution_id,
+                        ?err,
+                        "review-guide reconcile: could not read the bound execution; leaving the attempt untouched",
+                    );
+                    continue;
                 }
+            };
+            if !execution.status.is_terminal() {
+                continue;
+            }
+            if execution.status == ExecutionStatus::Orphaned {
+                let liveness = if known_live_execution_ids.contains(&execution_id) {
+                    Some("observed_live_by_caller")
+                } else {
+                    let process = crate::durable_liveness::probe_execution_worker(self, &execution_id);
+                    process.alive_pid().is_some().then(|| process.reason())
+                };
+                if let Some(evidence) = liveness {
+                    tracing::info!(
+                        attempt_id = %attempt.id,
+                        execution_id = %execution_id,
+                        evidence,
+                        action = "kept_open",
+                        "review-guide reconcile: execution is orphaned but its worker is live; keeping the \
+                         attempt running for re-adoption",
+                    );
+                    continue;
+                }
+            }
+            let reason = execution
+                .last_error
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| classified_review_guide_terminal_reason(&execution.status));
+            match self.finish_pr_review_guide_attempt_for_terminal_execution(
+                &execution_id,
+                execution.status.clone(),
+                &reason,
+                false,
+            ) {
+                Ok(()) => {
+                    tracing::warn!(
+                        attempt_id = %attempt.id,
+                        execution_id = %execution_id,
+                        execution_status = %execution.status,
+                        reason = %reason,
+                        action = "finished",
+                        "review-guide reconcile: bound execution is terminal with no live worker; finished the attempt",
+                    );
+                    acted += 1;
+                }
+                Err(err) => tracing::warn!(
+                    attempt_id = %attempt.id,
+                    execution_id = %execution_id,
+                    ?err,
+                    "review-guide reconcile: failed to finish a stranded attempt",
+                ),
             }
         }
         Ok(acted)
+    }
+
+    /// Dispatch a queued attempt that has no execution. Returns whether the
+    /// pass acted on it (dispatched, or failed after exhausting retries).
+    fn reconcile_dispatch_unbound_attempt(&self, attempt: &PrReviewGuideAttempt) -> Result<bool> {
+        let result = self.root_task_id_for_series(&attempt.series_id).and_then(|root| {
+            let root = root.context("series has no root task")?;
+            self.dispatch_pr_review_guide_attempt(&attempt.id, &root)
+        });
+        match result {
+            Ok(bound) => {
+                tracing::info!(
+                    attempt_id = %attempt.id,
+                    execution_id = ?bound.execution_id,
+                    action = "dispatched",
+                    "review-guide reconcile: dispatched a queued attempt with no execution",
+                );
+                Ok(true)
+            }
+            Err(err) => {
+                let reason = format!("{err:#}");
+                let permanent = reason.contains("has no repository") || reason.contains("has no root task");
+                let retries: i64 = self.connect()?.query_row(
+                    "UPDATE pr_review_guide_attempts SET retries = retries + 1, error = ?2 WHERE id = ?1 RETURNING retries",
+                    params![attempt.id, reason],
+                    |row| row.get(0),
+                )?;
+                if permanent || retries >= 3 {
+                    self.fail_pr_review_guide_attempt(&attempt.id, &reason)?;
+                    tracing::warn!(
+                        attempt_id = %attempt.id,
+                        retries,
+                        reason = %reason,
+                        action = "failed",
+                        "review-guide reconcile: dispatch failed permanently; failed the attempt",
+                    );
+                    Ok(true)
+                } else {
+                    tracing::warn!(
+                        attempt_id = %attempt.id,
+                        retries,
+                        ?err,
+                        "review-guide reconcile: dispatch failed; will retry"
+                    );
+                    Ok(false)
+                }
+            }
+        }
     }
 
     /// Startup pass: give every review guide that failed *before a worker
@@ -1191,6 +1302,80 @@ fn bind_review_guide_execution(tx: &Connection, attempt_id: &str, execution_id: 
         params![attempt_id, now],
     )?;
     Ok(())
+}
+
+/// Reverse the inferred-death closure of the attempt bound to a
+/// `pr_review_guide` execution, inside the caller's transaction.
+///
+/// The orphan reap (`WorkDb::mark_execution_orphaned`) and the reconcile
+/// pass fail an attempt purely on the strength of its execution's status.
+/// When re-adoption later disproves that status
+/// (`WorkDb::readopt_inferred_terminal_execution`), the attempt has to come
+/// back with it, or the live worker has nothing to submit its guide to. The
+/// same reversal lets a guide submitted while the attempt was wrongly closed
+/// be recovered (`WorkDb::recover_orphaned_review_guide_submissions`).
+///
+/// Only an attempt that is `failed` **after a worker ran** (`failed_pre_start
+/// = 0`), whose comparison is still the series' selected one at the same
+/// request epoch, with no guide published for it and no other live attempt in
+/// the series, is reopened. A pre-start failure, a superseded attempt, a
+/// published one, or one whose series has moved on stands as recorded.
+///
+/// Returns the reopened attempt id.
+pub(super) fn reopen_review_guide_attempt_for_readoption(
+    tx: &Connection,
+    execution_id: &str,
+    now: &str,
+) -> Result<Option<String>> {
+    let attempt: Option<(String, String, String, i64, i64)> = tx
+        .query_row(
+            "SELECT id, series_id, comparison_id, request_epoch, failed_pre_start
+             FROM pr_review_guide_attempts
+             WHERE execution_id = ?1 AND status = ?2",
+            params![execution_id, PrReviewGuideAttemptStatus::Failed.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()?;
+    let Some((attempt_id, series_id, comparison_id, request_epoch, failed_pre_start)) = attempt else {
+        return Ok(None);
+    };
+    if failed_pre_start != 0 {
+        return Ok(None);
+    }
+    let (selected, epoch): (Option<String>, i64) = tx.query_row(
+        "SELECT selected_comparison_id, request_epoch FROM pr_review_guide_source_series WHERE id = ?1",
+        [&series_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if selected.as_deref() != Some(comparison_id.as_str()) || epoch != request_epoch {
+        return Ok(None);
+    }
+    let blocked: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pr_review_guide_versions WHERE attempt_id = ?1)
+             OR EXISTS(
+                 SELECT 1 FROM pr_review_guide_attempts
+                 WHERE series_id = ?2 AND id != ?1
+                   AND status NOT IN ('succeeded', 'failed', 'cancelled', 'superseded')
+             )",
+        params![attempt_id, series_id],
+        |row| row.get(0),
+    )?;
+    if blocked {
+        return Ok(None);
+    }
+    tx.execute(
+        "UPDATE pr_review_guide_attempts
+         SET status = ?2, error = NULL, finished_at = NULL, failed_by_build = NULL
+         WHERE id = ?1",
+        params![attempt_id, PrReviewGuideAttemptStatus::Running.as_str()],
+    )?;
+    tx.execute(
+        "UPDATE pr_review_guide_source_series
+         SET guide_lifecycle = 'generating', updated_at = ?2
+         WHERE id = ?1 AND guide_lifecycle = 'failed'",
+        params![series_id, now],
+    )?;
+    Ok(Some(attempt_id))
 }
 
 /// The query body behind [`WorkDb::get_pr_review_guide_summary_for_root`],
