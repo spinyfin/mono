@@ -429,6 +429,7 @@ pub(super) fn bazel_resolve_command(repo_root: &Path, launcher: &Path, target: &
     command
         .args(super::ci_bazel_startup_flags())
         .arg(if build { "build" } else { "cquery" })
+        .args(super::ci_bazel_flags())
         .args(["--color=no", "--curses=no", "--noshow_progress"]);
     if build {
         command

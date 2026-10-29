@@ -242,8 +242,9 @@ A check can explicitly declare string values in its CHECKS configuration under
 and cannot be overridden.
 
 Bazel and Bazelisk launchers are exempt from clearing: they run with the
-caller's exact environment and the startup flags from `CI_BAZEL_STARTUP_FLAGS`
-only, so server and cache keys match ordinary builds. The one addition is
+caller's exact environment, the startup flags from `CI_BAZEL_STARTUP_FLAGS`
+and, on `build`/`cquery`, the per-command flags from `CI_BAZEL_FLAGS` (CI's
+`--config` and disk-cache GC cap), so server and cache keys match ordinary builds. The one addition is
 `USE_BAZEL_VERSION`, set from workspace `.bazeliskrc` first, then `.bazelversion`,
 so the user version pin cannot override the repository pin. A conflicting inherited
 `USE_BAZEL_VERSION` is an error: unset it or match the repository pin. Other user

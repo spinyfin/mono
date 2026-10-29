@@ -54,6 +54,13 @@ ci_disk_cache_path() {
     _ci_disk_cache_err "expected exactly one 'build:ci-${os_type} --disk_cache=<path>' line in ${rcfile}, found ${matches}"
     return 1
   fi
+  # Bazel expands `~` and `%workspace%` in --disk_cache; this library does not,
+  # so a non-absolute value would be created and measured somewhere other than
+  # where bazel puts the cache, and the cap would be sized from the wrong disk.
+  if [[ "$path" != /* ]]; then
+    _ci_disk_cache_err "--disk_cache for ci-${os_type} in ${rcfile} must be an absolute path, got '${path}'"
+    return 1
+  fi
   printf '%s\n' "$path"
 }
 

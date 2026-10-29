@@ -680,10 +680,14 @@ fn run_bazel_aspect_invocation(
 
     // 2. Build the targets with the aspect. Exit semantics from the manifest
     //    classify the build's exit code (typically `0 → findings, default → error`).
-    let aspect_flags = [
+    // CI's per-command flags (`--config=ci-<os>` and the host-sized disk-cache
+    // GC cap) lead the build and cquery so this build writes to the same capped
+    // cache as every other CI bazel invocation. See `ci_bazel_flags`.
+    let mut aspect_flags = super::ci_bazel_flags();
+    aspect_flags.extend([
         format!("--aspects={}", aspect.aspect),
         format!("--output_groups={}", aspect.output_groups.join(",")),
-    ];
+    ]);
     let expanded_build_flags: Vec<String> = aspect
         .build_flags
         .iter()

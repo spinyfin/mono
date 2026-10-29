@@ -10,8 +10,9 @@ build --jobs=200
 build --disk_cache=~/.cache/bazelcache
 # Off-CI GC limits (coordinator laptop, cube worker workspaces). CI overrides
 # these via .ci.bazelrc (60d) and .buildkite/steps/ci-env.sh (a size cap
-# computed from each host's cache disk) and keeps its cache on a dedicated
-# volume. 250G must match flunge exactly: both repos share
+# computed from each host's cache disk, passed via CI_BAZEL_FLAGS), and keeps
+# its cache on a dedicated volume. Only CI bazel invocations that carry
+# CI_BAZEL_FLAGS get that; a manual bazel call on a CI host uses these. 250G must match flunge exactly: both repos share
 # ~/.cache/bazelcache, and bazel GC applies the invoking build's own
 # max-size to that shared directory, so a smaller value here would evict
 # flunge's entries (and vice versa).

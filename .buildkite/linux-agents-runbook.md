@@ -205,7 +205,7 @@ To verify on a host (from the agent's checkout under `/var/lib/buildkite-agent/b
 df -P -k /mnt/ssd/bazel/disk_cache        # the 1024-blocks total is the cap's input
 bash -c 'source .buildkite/steps/disk-cache-gc-cap.sh &&
   ci_disk_cache_gc_cap_from_total_kb "$(ci_disk_cache_fs_total_kb /mnt/ssd/bazel/disk_cache)"'
-grep "Disk cache garbage collector" /mnt/ssd/bazel/output_base/*/java.log | tail
+grep -E "Disk cache garbage collector|Deleted [0-9]+ of [0-9]+ files" /mnt/ssd/bazel/output_base/*/java.log | tail
 ```
 
 Every CI step also prints the value it computed at the top of its log (`--- [ci-env] disk cache /mnt/ssd/bazel/disk_cache: filesystem is 3600 GB, GC cap 2880G (80%)`), and the `java.log` grep shows the GC actually running (`Deleted N of M files, reclaimed ...`).
@@ -216,10 +216,11 @@ A Linux agent whose disk has filled up does **not** drop offline. It stays conne
 
 ```sh
 df -h /mnt/ssd /
-du -sh /mnt/ssd/bazel/disk_cache /mnt/ssd/bazel/output_base /mnt/ssd/bazel/repo_cache
+du -sh /mnt/ssd/bazel/disk_cache /mnt/ssd/bazel/output_base /mnt/ssd/bazel/repo_cache \
+  /var/lib/buildkite-agent/.cache/bazelcache /var/lib/buildkite-agent/.cache/bazel
 ```
 
-The cache cap is computed from the disk size, so if `/mnt/ssd` is full the disk cache should not be the reason any more — look at what else grew, or check whether the host's CI steps are actually going through `.buildkite/steps/ci-env.sh` (the `[ci-env] disk cache ...` line should be in every step log). If the disk cache itself is what filled the disk, a one-time `sudo rm -rf /mnt/ssd/bazel/disk_cache` frees it and the next build repopulates it; the computed cap keeps it from recurring, so do not add a cron job for this.
+The cache cap is computed from the disk size, so if `/mnt/ssd` is full the CI disk cache should not be the reason any more — look at what else grew (`/var/lib/buildkite-agent/.cache/bazelcache` is the off-CI disk cache, 250G-capped, and `.cache/bazel` the default output base; both fill when a bazel call bypasses the CI flags), or check whether the host's CI steps are actually going through `.buildkite/steps/ci-env.sh` (the `[ci-env] disk cache ...` line should be in every step log). If the disk cache itself is what filled the disk, a one-time `sudo rm -rf /mnt/ssd/bazel/disk_cache` frees it and the next build repopulates it; the computed cap keeps it from recurring, so do not add a cron job for this.
 
 ## Deploy-key posture
 

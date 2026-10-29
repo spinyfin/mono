@@ -973,3 +973,15 @@ pub(super) fn ci_bazel_startup_flags() -> Vec<String> {
         .map(|val| val.split_whitespace().map(str::to_owned).collect())
         .unwrap_or_default()
 }
+
+/// Per-command bazel flags (`--config=ci-<os>` plus the host-sized disk-cache GC
+/// cap) that CI sets via `CI_BAZEL_FLAGS` (see `.buildkite/steps/ci-env.sh`).
+/// `build` and `cquery` invocations must carry them, or they fall back to the
+/// root `.bazelrc`'s off-CI disk cache and its separate GC cap, so a second
+/// cache fills the same CI filesystem. Unset outside CI.
+pub(super) fn ci_bazel_flags() -> Vec<String> {
+    std::env::var("CI_BAZEL_FLAGS")
+        .ok()
+        .map(|val| val.split_whitespace().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
