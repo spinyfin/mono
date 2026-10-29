@@ -12,10 +12,12 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Result;
+use boss_event_bus::{Event, EventBus, EventKind, TopicFilter};
 use boss_github::pr_files::PrComparisonMetadata;
 use boss_pr_review_sources::{
     PinnedComparison, SourcePacket, collect_pinned_source_packet, collect_pinned_source_packet_with_metadata,
 };
+use boss_protocol::{ExecutionKind, ExecutionStatus};
 
 use crate::feature_flags::FeatureFlagsStore;
 use crate::work::{PrReviewGuideSourceCapture, PrSourceCapturePersistOutcome, PrSourceCaptureTrigger, WorkDb};
@@ -37,10 +39,14 @@ pub(crate) type PacketCollectFn = Arc<
 >;
 
 type MetadataFuture = Pin<Box<dyn Future<Output = Result<PrComparisonMetadata>> + Send>>;
+type LiveHeadFuture = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
+/// Stops a cancelled `pr_review_guide` worker after admission supersedes it.
+pub(crate) type CancelledGuideStopFn = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 #[derive(Clone)]
 pub struct SourcePacketCollector {
     collect: PacketCollectFn,
-    metadata: Arc<dyn Fn(String, Option<String>) -> MetadataFuture + Send + Sync>,
+    pub(crate) metadata: Arc<dyn Fn(String, Option<String>) -> MetadataFuture + Send + Sync>,
+    pub(crate) live_head: Arc<dyn Fn(String) -> LiveHeadFuture + Send + Sync>,
 }
 
 impl SourcePacketCollector {
@@ -56,6 +62,7 @@ impl SourcePacketCollector {
         packet: SourcePacket,
         metadata_base: String,
     ) -> Self {
+        let live_head_sha = packet.head_sha.clone();
         Self {
             collect,
             metadata: Arc::new(move |_, _| {
@@ -74,6 +81,10 @@ impl SourcePacketCollector {
                         changed_files: packet.files.len() as u64,
                     })
                 })
+            }),
+            live_head: Arc::new(move |_| {
+                let live_head_sha = live_head_sha.clone();
+                Box::pin(async move { Ok(live_head_sha) })
             }),
         }
     }
@@ -128,6 +139,7 @@ pub(crate) fn github_source_packet_collector() -> SourcePacketCollector {
                 Ok(metadata)
             })
         }),
+        live_head: Arc::new(|url| Box::pin(async move { boss_github::pr_files::fetch_pr_head_ref_oid(&url).await })),
     }
 }
 
@@ -327,13 +339,65 @@ pub(crate) fn reconcile_review_guide_source_with_collector(
                 record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
                 return;
             }
+            let confirmed_head = if trigger == PrSourceCaptureTrigger::Completion {
+                match revision.as_ref().and_then(|revision| revision.head_after.as_ref()) {
+                    Some(head) if !head.is_empty() => Some(head.clone()),
+                    _ => match (collector.live_head)(pr_url.clone()).await {
+                        Ok(head) if !head.is_empty() => Some(head),
+                        _ => {
+                            defer_unconfirmed_completion(
+                                &root_task_id,
+                                &pr_url,
+                                observation_sequence,
+                                "live PR head could not be read",
+                            );
+                            return;
+                        }
+                    },
+                }
+            } else {
+                None
+            };
             let metadata = match (collector.metadata)(pr_url.clone(), expected_head_branch.clone()).await {
                 Ok(metadata) => metadata,
                 Err(error) => {
+                    // A revision that already recorded the delivered head still
+                    // surfaces a durable failure. Any other completion without a
+                    // confirmed REST identity defers to the poller.
+                    if trigger == PrSourceCaptureTrigger::Completion
+                        && revision.as_ref().and_then(|revision| revision.head_after.as_ref()).is_none()
+                    {
+                        defer_unconfirmed_completion(
+                            &root_task_id,
+                            &pr_url,
+                            observation_sequence,
+                            format!("comparison metadata unavailable: {error}"),
+                        );
+                        return;
+                    }
                     record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
                     return;
                 }
             };
+            let mut observed = observed;
+            if let Some(confirmed) = &confirmed_head {
+                if metadata.head_sha != *confirmed {
+                    defer_unconfirmed_completion(
+                        &root_task_id,
+                        &pr_url,
+                        observation_sequence,
+                        format!(
+                            "REST head {} does not match confirmed live head {confirmed}",
+                            metadata.head_sha
+                        ),
+                    );
+                    return;
+                }
+                observed = Some(PinnedComparison {
+                    base_sha: metadata.base_sha.clone(),
+                    head_sha: metadata.head_sha.clone(),
+                });
+            }
             if let Some(observed) = &observed
                 && observed.head_sha != metadata.head_sha
             {
@@ -618,6 +682,53 @@ impl Drop for InFlightGuard {
 
 fn source_capture_enabled(feature_flags: &FeatureFlagsStore) -> bool {
     feature_flags.is_enabled(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG)
+}
+
+fn defer_unconfirmed_completion(
+    root_task_id: &str,
+    pr_url: &str,
+    observation_sequence: i64,
+    reason: impl std::fmt::Display,
+) {
+    tracing::info!(
+        root_task_id,
+        pr_url,
+        observation_sequence,
+        reason = %reason,
+        "review-guide source capture: completion head is unconfirmed; deferring to the poller",
+    );
+}
+
+/// Stops a cancelled `pr_review_guide` worker as soon as admission
+/// terminalizes its execution. Admission already records the attempt as
+/// `superseded` and the execution as `cancelled`; this subscriber is the
+/// pane/lease teardown that `cancel_execution_in_tx` does not perform.
+/// [`crate::terminal_work_sweep`] remains the periodic backstop.
+pub(crate) fn spawn_cancelled_review_guide_worker_stopper(
+    work_db: Arc<WorkDb>,
+    event_bus: Arc<EventBus>,
+    stop: CancelledGuideStopFn,
+) -> tokio::task::JoinHandle<()> {
+    boss_event_bus::spawn_supervised("cancelled_review_guide_stop", move || {
+        let work_db = Arc::clone(&work_db);
+        let event_bus = Arc::clone(&event_bus);
+        let stop = Arc::clone(&stop);
+        async move {
+            let mut subscription = event_bus.subscribe(TopicFilter::kind(EventKind::ExecutionTerminal));
+            while let Some(event) = subscription.recv().await {
+                let Event::ExecutionTerminal { execution_id, .. } = event else {
+                    continue;
+                };
+                let Ok(execution) = work_db.get_execution(&execution_id) else {
+                    continue;
+                };
+                if execution.kind != ExecutionKind::PrReviewGuide || execution.status != ExecutionStatus::Cancelled {
+                    continue;
+                }
+                stop(execution_id).await;
+            }
+        }
+    })
 }
 
 fn record_capture_failure(

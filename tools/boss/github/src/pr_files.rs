@@ -84,11 +84,16 @@ pub async fn fetch_pr_changed_files(pr_url: &str) -> Result<Vec<String>> {
 /// transport used elsewhere in Boss. A missing fork head repository or any
 /// missing SHA is an error: source collection must not fall back to the
 /// mutable base repository or branch tip.
+///
+/// Sends `Cache-Control: no-cache` so a stale merge-poller snapshot cannot
+/// be reused as the comparison identity. Completion capture keys the packet
+/// on this REST head; a cached `head.sha` from before a force-push would
+/// pin the guide to a head GitHub has already replaced.
 pub async fn fetch_pr_comparison_metadata(pr_url: &str) -> Result<PrComparisonMetadata> {
     let (owner, repo, number) = parse_pr_url_parts(pr_url)
         .with_context(|| format!("PR source capture requires a canonical GitHub PR URL, got `{pr_url}`"))?;
     let endpoint = format!("repos/{owner}/{repo}/pulls/{number}");
-    let output = gh_output(&["api", &endpoint]).await?;
+    let output = gh_output(&["api", "-H", "Cache-Control: no-cache", &endpoint]).await?;
     if !output.status.success() {
         bail!(
             "`gh api {endpoint}` failed (exit {:?}): {}",
@@ -99,6 +104,24 @@ pub async fn fetch_pr_comparison_metadata(pr_url: &str) -> Result<PrComparisonMe
     let value: Value =
         serde_json::from_slice(&output.stdout).with_context(|| format!("failed to parse `gh api {endpoint}` JSON"))?;
     parse_pr_comparison_metadata(&value)
+}
+
+/// Fetch the live PR head SHA through GraphQL (`gh pr view --json headRefOid`).
+/// Independent of the REST `pulls/{n}` resource that source capture keys on,
+/// so a cached REST `head.sha` cannot be mistaken for the current head.
+pub async fn fetch_pr_head_ref_oid(pr_url: &str) -> Result<String> {
+    let value = fetch_pr_view_json(pr_url, "headRefOid").await?;
+    parse_pr_head_ref_oid(&value).with_context(|| format!("PR view for `{pr_url}` is missing a live head SHA"))
+}
+
+/// Strict extractor for `gh pr view --json headRefOid`.
+pub fn parse_pr_head_ref_oid(value: &Value) -> Result<String> {
+    value
+        .get("headRefOid")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .context("PR view is missing required `headRefOid`")
 }
 
 /// Fetch every changed-file entry and reject partial coverage. GitHub's REST
@@ -237,6 +260,16 @@ mod tests {
     fn parse_changed_file_paths_skips_entries_without_path() {
         let root = serde_json::json!({"files": [{"changeType": "MODIFIED"}, {"path": "src/c.rs"}]});
         assert_eq!(parse_changed_file_paths(&root), vec!["src/c.rs"]);
+    }
+
+    #[test]
+    fn parse_pr_head_ref_oid_requires_a_nonempty_sha() {
+        assert_eq!(
+            parse_pr_head_ref_oid(&serde_json::json!({"headRefOid": "abc123"})).unwrap(),
+            "abc123"
+        );
+        assert!(parse_pr_head_ref_oid(&serde_json::json!({"headRefOid": ""})).is_err());
+        assert!(parse_pr_head_ref_oid(&serde_json::json!({})).is_err());
     }
 
     #[test]

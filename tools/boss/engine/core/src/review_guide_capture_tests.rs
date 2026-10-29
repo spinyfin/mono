@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 async fn divergent_probe(existing: bool) {
@@ -82,7 +83,8 @@ async fn divergent_probe_collects_and_persists_rest_identity() {
 }
 use crate::feature_flags::FeatureFlagsStore;
 use crate::test_support::{create_active_chore, create_product, open_db, source_capture_packet};
-use crate::work::{FakePrStateChecker, PrOpenState, PublishReviewGuideOutcome};
+use crate::work::{FakePrStateChecker, PrOpenState, PublishReviewGuideOutcome, WorkDb};
+use boss_github::pr_files::PrComparisonMetadata;
 use boss_protocol::{CreateExecutionInput, CreateRevisionInput, ExecutionKind, ExecutionStatus, WorkItemPatch};
 
 #[test]
@@ -889,4 +891,298 @@ async fn retry_after_a_failed_source_capture_recaptures_and_resumes_the_update()
         )
         .unwrap();
     assert_eq!(previous, version.id);
+}
+
+fn attach_repo(db: &WorkDb, root: &str) {
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET repo_remote_url = ?1 WHERE id = ?2",
+            ["https://github.com/acme/widget.git", root],
+        )
+        .unwrap();
+}
+
+fn enable_guide_flags(dir: &tempfile::TempDir) -> Arc<FeatureFlagsStore> {
+    let flags = Arc::new(FeatureFlagsStore::new(dir.path().join("flags.toml")));
+    flags.set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, true).unwrap();
+    flags.set(REVIEW_GUIDE_GENERATION_FLAG, true).unwrap();
+    flags
+}
+
+fn metadata_for(packet: &SourcePacket, head_sha: &str) -> PrComparisonMetadata {
+    PrComparisonMetadata {
+        number: packet.pr_number,
+        title: packet.title.clone(),
+        body: packet.body.clone(),
+        base_repository: packet.base_repository.clone(),
+        head_repository: packet.head_repository.clone(),
+        head_ref_name: "fixture".to_owned(),
+        base_sha: packet.observed_base_sha.clone(),
+        head_sha: head_sha.to_owned(),
+        changed_files: packet.files.len() as u64,
+    }
+}
+
+fn attempt_count(db: &WorkDb, series_id: &str) -> i64 {
+    db.connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM pr_review_guide_attempts WHERE series_id = ?1",
+            [series_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+async fn run_completion(
+    db: Arc<WorkDb>,
+    flags: Arc<FeatureFlagsStore>,
+    root: &str,
+    url: &str,
+    collector: SourcePacketCollector,
+) {
+    reconcile_review_guide_source_with_collector(
+        db,
+        flags,
+        SourceCaptureRequest::builder()
+            .root_task_id(root)
+            .pr_url(url)
+            .trigger(PrSourceCaptureTrigger::Completion)
+            .build(),
+        collector,
+    )
+    .unwrap()
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn completion_capture_at_a_confirmed_new_head_starts_exactly_one_attempt() {
+    let (dir, db) = open_db();
+    let db = Arc::new(db);
+    let product = create_product(&db);
+    let root = create_active_chore(&db, &product, "live head completion");
+    attach_repo(&db, &root);
+    let url = "https://github.com/acme/widget/pull/101";
+    let packet = source_capture_packet(url, "base", "new-head");
+    let output = packet.clone();
+    let collect: PacketCollectFn = Arc::new(move |_, observed, _, _| {
+        let observed = observed.expect("completion must pin the confirmed head");
+        assert_eq!(observed.head_sha, "new-head");
+        let packet = output.clone();
+        Box::pin(async move { Ok(packet) })
+    });
+    let collector = SourcePacketCollector::fixture(collect, packet);
+    let flags = enable_guide_flags(&dir);
+    run_completion(db.clone(), flags, &root, url, collector).await;
+    let capture = db
+        .get_latest_pr_review_guide_source_capture(&root)
+        .unwrap()
+        .expect("confirmed live head must persist");
+    assert_eq!(capture.packet.head_sha, "new-head");
+    assert_eq!(capture.trigger, "completion");
+    let live = db.live_pr_review_guide_attempts_for_series(&capture.series_id).unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].comparison_id, capture.comparison_id);
+    assert_eq!(attempt_count(&db, &capture.series_id), 1);
+}
+
+#[tokio::test]
+async fn force_push_before_completion_defers_stale_rest_and_poller_starts_one_attempt_at_the_new_head() {
+    let (dir, db) = open_db();
+    let db = Arc::new(db);
+    let product = create_product(&db);
+    let root = create_active_chore(&db, &product, "stale rest completion");
+    attach_repo(&db, &root);
+    let url = "https://github.com/acme/widget/pull/102";
+    let packet = source_capture_packet(url, "base", "new-head");
+    let collect_calls = Arc::new(AtomicUsize::new(0));
+    let counted = collect_calls.clone();
+    let output = packet.clone();
+    let collect: PacketCollectFn = Arc::new(move |_, observed, _, metadata| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        let head = metadata.as_ref().map(|m| m.head_sha.as_str());
+        assert_eq!(head, Some("new-head"), "must not collect a stale head");
+        assert_eq!(observed.as_ref().map(|o| o.head_sha.as_str()), Some("new-head"));
+        let packet = output.clone();
+        Box::pin(async move { Ok(packet) })
+    });
+    let mut collector = SourcePacketCollector::fixture(collect, packet.clone());
+    let metadata_calls = Arc::new(AtomicUsize::new(0));
+    let counted = metadata_calls.clone();
+    let stale = metadata_for(&packet, "old-head");
+    let fresh = metadata_for(&packet, "new-head");
+    collector.metadata = Arc::new(move |_, _| {
+        let n = counted.fetch_add(1, Ordering::SeqCst);
+        let metadata = if n == 0 { stale.clone() } else { fresh.clone() };
+        Box::pin(async move { Ok(metadata) })
+    });
+    collector.live_head = Arc::new(|_| Box::pin(async { Ok("new-head".to_owned()) }));
+    let flags = enable_guide_flags(&dir);
+    run_completion(db.clone(), flags.clone(), &root, url, collector.clone()).await;
+    assert!(
+        db.get_latest_pr_review_guide_source_capture(&root).unwrap().is_none(),
+        "unconfirmed completion must not persist a packet"
+    );
+    assert!(db.pr_review_guide_capture_error_for_root(&root).unwrap().is_none());
+    assert_eq!(collect_calls.load(Ordering::SeqCst), 0);
+
+    reconcile_review_guide_source_with_collector(
+        db.clone(),
+        flags,
+        SourceCaptureRequest::builder()
+            .root_task_id(&root)
+            .pr_url(url)
+            .trigger(PrSourceCaptureTrigger::Poller)
+            .observed(PinnedComparison {
+                base_sha: "base".to_owned(),
+                head_sha: "new-head".to_owned(),
+            })
+            .build(),
+        collector,
+    )
+    .unwrap()
+    .await
+    .unwrap();
+    let capture = db
+        .get_latest_pr_review_guide_source_capture(&root)
+        .unwrap()
+        .expect("poller must capture the confirmed new head");
+    assert_eq!(capture.packet.head_sha, "new-head");
+    assert_eq!(capture.trigger, "poller");
+    let live = db.live_pr_review_guide_attempts_for_series(&capture.series_id).unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].comparison_id, capture.comparison_id);
+    assert_eq!(attempt_count(&db, &capture.series_id), 1);
+    assert_eq!(collect_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn unconfirmed_live_head_defers_completion_capture_without_recording_failure() {
+    let (dir, db) = open_db();
+    let db = Arc::new(db);
+    let product = create_product(&db);
+    let root = create_active_chore(&db, &product, "unconfirmed live head");
+    attach_repo(&db, &root);
+    let url = "https://github.com/acme/widget/pull/103";
+    let packet = source_capture_packet(url, "base", "new-head");
+    let collect: PacketCollectFn = Arc::new(|_, _, _, _| panic!("unconfirmed completion must not collect a packet"));
+    let mut collector = SourcePacketCollector::fixture(collect, packet);
+    collector.live_head = Arc::new(|_| Box::pin(async { anyhow::bail!("graphql unavailable") }));
+    let flags = enable_guide_flags(&dir);
+    run_completion(db.clone(), flags, &root, url, collector).await;
+    assert!(db.get_latest_pr_review_guide_source_capture(&root).unwrap().is_none());
+    assert!(db.pr_review_guide_capture_error_for_root(&root).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn unchanged_head_never_starts_a_second_attempt() {
+    let (dir, db) = open_db();
+    let db = Arc::new(db);
+    let product = create_product(&db);
+    let root = create_active_chore(&db, &product, "unchanged head");
+    attach_repo(&db, &root);
+    let url = "https://github.com/acme/widget/pull/104";
+    let packet = source_capture_packet(url, "base", "head");
+    let output = packet.clone();
+    let collect: PacketCollectFn = Arc::new(move |_, _, _, _| {
+        let packet = output.clone();
+        Box::pin(async move { Ok(packet) })
+    });
+    let collector = SourcePacketCollector::fixture(collect, packet);
+    let flags = enable_guide_flags(&dir);
+    run_completion(db.clone(), flags.clone(), &root, url, collector.clone()).await;
+    run_completion(db.clone(), flags, &root, url, collector).await;
+    let capture = db.get_latest_pr_review_guide_source_capture(&root).unwrap().unwrap();
+    assert_eq!(capture.packet.head_sha, "head");
+    let live = db.live_pr_review_guide_attempts_for_series(&capture.series_id).unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(attempt_count(&db, &capture.series_id), 1);
+}
+
+#[tokio::test]
+async fn head_change_while_generating_supersedes_the_old_attempt_and_stops_its_worker() {
+    let (dir, db) = open_db();
+    let bus = db.event_bus().clone();
+    let db = Arc::new(db);
+    let product = create_product(&db);
+    let root = create_active_chore(&db, &product, "supersede in flight");
+    attach_repo(&db, &root);
+    let flags = enable_guide_flags(&dir);
+    let url = "https://github.com/acme/widget/pull/105";
+    let packet = source_capture_packet(url, "base", "old-head");
+    let stored = db
+        .persist_pr_review_guide_source_capture(&root, 1, PrSourceCaptureTrigger::Creation, &packet)
+        .unwrap();
+    let crate::work::PrSourceCapturePersistOutcome::Stored(capture) = stored else {
+        panic!("capture must persist")
+    };
+    enqueue_review_guide_generation(&db, &flags, &capture);
+    let live = db.live_pr_review_guide_attempts_for_series(&capture.series_id).unwrap();
+    assert_eq!(live.len(), 1);
+    let first_id = live[0].id.clone();
+    let first_exec = live[0].execution_id.clone().expect("enqueue must bind an execution");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'running' WHERE id = ?1",
+            [&first_exec],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_guide_attempts SET status = 'running' WHERE id = ?1",
+            [&first_id],
+        )
+        .unwrap();
+
+    let stopped = Arc::new(Mutex::new(Vec::new()));
+    let recorded = stopped.clone();
+    let stop: CancelledGuideStopFn = Arc::new(move |id| {
+        let recorded = recorded.clone();
+        Box::pin(async move {
+            recorded.lock().unwrap().push(id);
+        })
+    });
+    let _handle = spawn_cancelled_review_guide_worker_stopper(db.clone(), bus, stop);
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+
+    let packet2 = source_capture_packet(url, "base", "new-head");
+    let stored2 = db
+        .persist_pr_review_guide_source_capture(&root, 2, PrSourceCaptureTrigger::Poller, &packet2)
+        .unwrap();
+    let crate::work::PrSourceCapturePersistOutcome::Stored(capture2) = stored2 else {
+        panic!("second capture must persist")
+    };
+    enqueue_review_guide_generation(&db, &flags, &capture2);
+    let live = db.live_pr_review_guide_attempts_for_series(&capture.series_id).unwrap();
+    assert_eq!(live.len(), 1);
+    assert_ne!(live[0].id, first_id);
+    assert_eq!(live[0].comparison_id, capture2.comparison_id);
+    let old_status: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status FROM pr_review_guide_attempts WHERE id = ?1",
+            [&first_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_status, "superseded");
+    let exec = db.get_execution(&first_exec).unwrap();
+    assert_eq!(exec.status, ExecutionStatus::Cancelled);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if stopped.lock().unwrap().as_slice() == [first_exec.clone()].as_slice() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled review-guide worker must be stopped");
 }
