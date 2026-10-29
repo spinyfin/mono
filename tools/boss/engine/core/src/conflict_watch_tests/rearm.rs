@@ -603,3 +603,41 @@ async fn rearm_retries_lockfile_failure_when_head_or_base_moves() {
     assert_eq!(status, TaskStatus::InReview);
     assert!(reason.is_none());
 }
+
+#[tokio::test]
+async fn rearm_retries_lockfile_failure_when_base_moves() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/85";
+    let (product, chore) = make_in_review(&db, "C-lockfile-moved-base", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let failed_id = seed_lockfile_failure(&db, &product, &chore, pr, "head456", "abc123");
+
+    let retried = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe_with_head_and_base(
+            pr,
+            PrLifecycleState::Open(OpenPrStatus::conflict_only()),
+            "head456",
+            "base-new",
+        ),
+    )
+    .await;
+    assert!(retried, "a moved base must start a fresh attempt");
+    let all = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
+    assert_eq!(all.len(), 2, "old failure kept, fresh attempt inserted: {all:?}");
+    let failed = all.iter().find(|r| r.id == failed_id).expect("failed row kept");
+    assert_eq!(failed.status, "failed");
+    let fresh = all.iter().find(|r| r.id != failed_id).expect("fresh attempt");
+    assert_eq!(fresh.status, "pending");
+    assert_eq!(fresh.base_sha_at_trigger.as_deref(), Some("base-new"));
+    assert_eq!(fresh.head_sha_before.as_deref(), Some("head456"));
+    assert!(fresh.revision_task_id.is_some(), "fresh attempt must spawn a revision");
+    let (status, reason) = chore_status(&db, &chore);
+    assert_eq!(status, TaskStatus::InReview);
+    assert!(reason.is_none());
+}
