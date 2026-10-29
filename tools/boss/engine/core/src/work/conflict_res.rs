@@ -72,9 +72,10 @@ impl WorkDb {
     }
 
     /// A revision that is genuinely running or queued owns resolution for its
-    /// PR even if its attempt ended. A revision parked in `blocked`, or whose
-    /// executions have all finished, does not: counting those would suppress
-    /// conflict handling for the PR indefinitely.
+    /// PR even if its attempt ended, whatever its task status (a `blocked`
+    /// task can still own a running execution). A revision whose executions
+    /// have all finished does not: counting it would suppress conflict
+    /// handling for the PR indefinitely.
     pub fn has_live_conflict_revision_for_pr(&self, pr_url: &str) -> Result<bool> {
         let revisions: Vec<String> = {
             let conn = self.connect()?;
@@ -93,10 +94,20 @@ impl WorkDb {
         Ok(false)
     }
 
-    /// `todo`/`active` revision with a non-terminal execution (running or
-    /// queued), or one created moments ago that has not been dispatched yet.
-    /// Stricter than [`Self::is_conflict_resolution_revision_live`], which
-    /// also treats `blocked` tasks and cleanly finished executions as live.
+    /// Is this conflict-resolution revision genuinely being, or about to be,
+    /// worked? Checked in order:
+    ///   1. The task row must exist and not be soft-deleted.
+    ///   2. An execution a worker has started (claimed, running, waiting on
+    ///      a human, review or merge) means a worker may be writing to the PR
+    ///      branch, so the revision is live whatever the task `status` says
+    ///      (a `blocked` task can still own a running execution).
+    ///   3. For a `todo`/`active` task, a still-queued execution (queued,
+    ///      ready, waiting on a dependency) is live too, as is a task that has
+    ///      never been dispatched and was created within a short grace
+    ///      window. A queued execution behind a `blocked` task is not: no
+    ///      worker will be dispatched for it. A task whose executions are all
+    ///      terminal is dead: the task `status` survives a worker death or
+    ///      engine restart, so it is not trusted on its own.
     pub(crate) fn is_conflict_revision_running_or_queued(&self, revision_task_id: &str) -> Result<bool> {
         let conn = self.connect()?;
         let row: Option<(String, String)> = conn
@@ -109,18 +120,25 @@ impl WorkDb {
         let Some((status, created_at)) = row else {
             return Ok(false);
         };
+        let (started, queued, any): (bool, bool, bool) = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_executions
+                            WHERE work_item_id = ?1
+                              AND status NOT IN ('queued', 'ready', 'waiting_dependency',
+                                                 'completed', 'failed', 'abandoned', 'cancelled', 'orphaned')),
+                    EXISTS(SELECT 1 FROM work_executions
+                            WHERE work_item_id = ?1
+                              AND status IN ('queued', 'ready', 'waiting_dependency')),
+                    EXISTS(SELECT 1 FROM work_executions WHERE work_item_id = ?1)",
+            params![revision_task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if started {
+            return Ok(true);
+        }
         if !matches!(status.as_str(), "todo" | "active") {
             return Ok(false);
         }
-        let (non_terminal, any): (bool, bool) = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM work_executions
-                            WHERE work_item_id = ?1
-                              AND status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')),
-                    EXISTS(SELECT 1 FROM work_executions WHERE work_item_id = ?1)",
-            params![revision_task_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        if non_terminal {
+        if queued {
             return Ok(true);
         }
         if any {
@@ -251,8 +269,8 @@ impl WorkDb {
     /// `conflict_watch::on_conflict_detected` to check whether the
     /// previous attempt ended in `succeeded` (eligible for re-arm when
     /// the PR is still CONFLICTING), `failed` with
-    /// `lockfile_regeneration_failed` (eligible once the (base, head)
-    /// pair moves), or another terminal status (the churn guard or a
+    /// `lockfile_regeneration_failed` (eligible once the PR head
+    /// moves), or another terminal status (the churn guard or a
     /// human owns the retry).
     ///
     /// Returns `None` when no attempt has ever been recorded for this
@@ -970,9 +988,12 @@ impl WorkDb {
                 AND deleted_at IS NULL",
             params![reset.work_item_id, reset.id, now],
         )?;
+        super::dispatch_helpers::resolve_attention_kind_in_tx(
+            &tx,
+            &reset.work_item_id,
+            crate::work::LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND,
+        )?;
         tx.commit()?;
-        drop(conn);
-        crate::conflict_ladder::clear_lockfile_regeneration_failed_attention(self, &reset.work_item_id);
         Ok(Some(reset))
     }
 

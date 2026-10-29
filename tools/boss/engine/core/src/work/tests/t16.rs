@@ -139,7 +139,7 @@ fn insert_ci_remediation_execution(db: &WorkDb, work_item_id: &str, status: &str
 
 /// Insert a `work_executions` row of `kind='revision_implementation'` with
 /// the given status for `work_item_id`, so the execution-liveness half of
-/// `is_conflict_resolution_revision_live` can be exercised. `created_at` is
+/// `is_conflict_revision_running_or_queued` can be exercised. `created_at` is
 /// stamped explicitly so a test can control which row is "latest".
 fn insert_revision_execution(db: &WorkDb, work_item_id: &str, status: &str, created_at: &str) {
     let conn = db.connect().unwrap();
@@ -513,114 +513,71 @@ fn recanonicalize_blocked_ci_failure_some_then_none() {
     );
 }
 
-/// `is_conflict_resolution_revision_live` is true only while the revision
-/// task's status is one of `todo`/`active`/`blocked` and it is not
-/// soft-deleted; a terminal status, a soft-delete, or an unknown id yield
-/// false.
+/// A conflict revision is running-or-queued only while a worker is attached
+/// or it is queued for its first dispatch; a dead execution behind a paper-live
+/// task, a terminal task status, a soft-delete, or an unknown id are not live.
 #[test]
-fn is_conflict_resolution_revision_live_true_and_false() {
+fn is_conflict_revision_running_or_queued_reflects_execution_liveness() {
     let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
-    let product_id = make_revision_product(&db, "revision-live");
+    let product_id = make_revision_product(&db, "revision-exec-live");
     let parent = make_chore_root(&db, &product_id, "parent");
-    let revision = insert_revision_row(&db, &product_id, &parent);
+    let live = |id: &str| db.is_conflict_revision_running_or_queued(id).unwrap();
 
-    // Fresh revision rows are `todo` → live.
-    assert!(db.is_conflict_resolution_revision_live(&revision).unwrap());
+    // Fresh, never-dispatched `todo` row, inside the grace window → live.
+    let fresh = insert_revision_row(&db, &product_id, &parent);
+    assert!(live(&fresh));
 
-    // A terminal status (in_review) is not live.
-    db.connect()
-        .unwrap()
-        .execute("UPDATE tasks SET status = 'in_review' WHERE id = ?1", params![revision])
-        .unwrap();
-    assert!(!db.is_conflict_resolution_revision_live(&revision).unwrap());
-
-    // A live-status row that is soft-deleted is not live.
+    // Terminal task status, soft-delete and unknown ids are not live.
+    set_task_status(&db, &fresh, "in_review");
+    assert!(!live(&fresh));
     db.connect()
         .unwrap()
         .execute(
             "UPDATE tasks SET status = 'active', deleted_at = ?2 WHERE id = ?1",
-            params![revision, now_string()],
+            params![fresh, now_string()],
         )
         .unwrap();
-    assert!(!db.is_conflict_resolution_revision_live(&revision).unwrap());
+    assert!(!live(&fresh));
+    assert!(!live("task_does_not_exist"));
 
-    // Unknown id → false.
-    assert!(!db.is_conflict_resolution_revision_live("task_does_not_exist").unwrap());
-}
-
-/// A live-status revision *task* is only a live fix vehicle when it is
-/// genuinely being (or about to be) worked. The task `status` column is a
-/// paper signal that survives an engine restart, so a revision whose worker
-/// died — its execution reaped to a terminal `orphaned`/`failed` while the
-/// task row stayed `active`/`blocked` — must report NOT live so the conflict
-/// watcher supersedes the dead attempt and re-fires. This is the direct
-/// regression for "conflict_watch emits zero scan activity after restart".
-#[test]
-fn is_conflict_resolution_revision_live_reflects_execution_liveness() {
-    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
-    let product_id = make_revision_product(&db, "revision-exec-live");
-    let parent = make_chore_root(&db, &product_id, "parent");
-
-    // active task + a RUNNING execution → a worker is attached → live.
+    // active + RUNNING execution → live.
     let running = insert_revision_row(&db, &product_id, &parent);
     set_task_status(&db, &running, "active");
     insert_revision_execution(&db, &running, "running", &now_string());
-    assert!(
-        db.is_conflict_resolution_revision_live(&running).unwrap(),
-        "a running execution is a live fix vehicle"
-    );
+    assert!(live(&running));
 
-    // active task whose only execution is ORPHANED (the engine-restart
-    // shape: the task status survived the restart but the worker is gone) →
-    // NOT live.
-    let orphaned = insert_revision_row(&db, &product_id, &parent);
-    set_task_status(&db, &orphaned, "active");
-    insert_revision_execution(&db, &orphaned, "orphaned", &now_string());
-    assert!(
-        !db.is_conflict_resolution_revision_live(&orphaned).unwrap(),
-        "an orphaned execution behind a still-active task is a dead fix vehicle"
-    );
+    // blocked task that still owns a RUNNING / waiting_human execution is a
+    // live writer and must stay live.
+    for status in ["running", "waiting_human"] {
+        let blocked_live = insert_revision_row(&db, &product_id, &parent);
+        set_task_status(&db, &blocked_live, "blocked");
+        insert_revision_execution(&db, &blocked_live, status, &now_string());
+        assert!(live(&blocked_live), "blocked task with {status} execution is live");
+    }
 
-    // blocked task whose only execution is FAILED → NOT live.
-    let failed = insert_revision_row(&db, &product_id, &parent);
-    set_task_status(&db, &failed, "blocked");
-    insert_revision_execution(&db, &failed, "failed", &now_string());
-    assert!(
-        !db.is_conflict_resolution_revision_live(&failed).unwrap(),
-        "a failed execution behind a still-blocked task is a dead fix vehicle"
-    );
+    // Only a terminal execution (engine-restart shape) → dead, for any status.
+    for (task_status, exec_status) in [("active", "orphaned"), ("blocked", "failed"), ("active", "completed")] {
+        let dead = insert_revision_row(&db, &product_id, &parent);
+        set_task_status(&db, &dead, task_status);
+        insert_revision_execution(&db, &dead, exec_status, &now_string());
+        assert!(
+            !live(&dead),
+            "{task_status} task with only a {exec_status} execution is dead"
+        );
+    }
 
-    // active task + a READY (queued for dispatch) execution → live: it is
-    // about to be worked, so the watcher must not supersede it.
+    // active + READY (queued) execution → live.
     let ready = insert_revision_row(&db, &product_id, &parent);
     set_task_status(&db, &ready, "active");
     insert_revision_execution(&db, &ready, "ready", &now_string());
-    assert!(
-        db.is_conflict_resolution_revision_live(&ready).unwrap(),
-        "a queued (ready) execution is still a live fix vehicle"
-    );
+    assert!(live(&ready));
 
-    // active task whose latest execution COMPLETED (on-Stop finalize race:
-    // the worker finished but the task has not advanced yet) → still live;
-    // the crz-finalize path owns that transition, not the watcher.
-    let completed = insert_revision_row(&db, &product_id, &parent);
-    set_task_status(&db, &completed, "active");
-    insert_revision_execution(&db, &completed, "completed", &now_string());
-    assert!(
-        db.is_conflict_resolution_revision_live(&completed).unwrap(),
-        "a cleanly-completed execution is not the watcher's death signal"
-    );
-
-    // A dead execution shadowed by a newer live one (re-dispatch after the
-    // reaper reaped the first) → live: the newer worker is attached.
+    // Dead execution shadowed by a newer live one → live.
     let redispatched = insert_revision_row(&db, &product_id, &parent);
     set_task_status(&db, &redispatched, "active");
     insert_revision_execution(&db, &redispatched, "orphaned", "100");
     insert_revision_execution(&db, &redispatched, "running", "200");
-    assert!(
-        db.is_conflict_resolution_revision_live(&redispatched).unwrap(),
-        "a live re-dispatch shadowing an older orphaned execution is live"
-    );
+    assert!(live(&redispatched));
 }
 
 /// `task_blocked_reason` returns the scalar reason only for a live,

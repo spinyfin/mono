@@ -615,20 +615,20 @@ pub async fn on_conflict_detected_with(
                                         .and_then(|c| c.failure_reason.as_deref())
                                         .is_some_and(|reason| reason.starts_with("lockfile_regeneration_failed"))
                                 {
-                                    // Terminal only for this (base, head) pair. A
-                                    // later probe with a moved head or base starts
-                                    // a fresh attempt; the failed row is kept.
-                                    let same_pair = latest.as_ref().is_some_and(|failed| {
-                                        probe.base_ref_oid.is_some()
-                                            && probe.head_ref_oid.is_some()
-                                            && probe.base_ref_oid.as_deref() == failed.base_sha_at_trigger.as_deref()
+                                    // Terminal only for this PR head. The probe's
+                                    // base oid mirrors GitHub's `baseRefOid`, which
+                                    // does not track `main` moving, so only a head
+                                    // push (or a manual retry) re-arms the attempt.
+                                    // The failed row is kept.
+                                    let same_head = latest.as_ref().is_some_and(|failed| {
+                                        probe.head_ref_oid.is_some()
                                             && probe.head_ref_oid.as_deref() == failed.head_sha_before.as_deref()
                                     });
-                                    if same_pair {
+                                    if same_head {
                                         tracing::debug!(
                                             work_item_id = %candidate.work_item_id,
                                             attempt_id = ?latest.as_ref().map(|c| c.id.as_str()),
-                                            "conflict_watch: lockfile regeneration still failed for this (base, head) pair; not retrying",
+                                            "conflict_watch: lockfile regeneration still failed for this PR head; not retrying",
                                         );
                                         return false;
                                     }
@@ -636,9 +636,8 @@ pub async fn on_conflict_detected_with(
                                         work_item_id = %candidate.work_item_id,
                                         pr_url = %candidate.pr_url,
                                         attempt_id = ?latest.as_ref().map(|c| c.id.as_str()),
-                                        base_ref_oid = ?probe.base_ref_oid,
                                         head_ref_oid = ?probe.head_ref_oid,
-                                        "conflict_watch: lockfile regeneration failed on a previous (base, head) pair; inserting a fresh attempt",
+                                        "conflict_watch: lockfile regeneration failed on a previous PR head; inserting a fresh attempt",
                                     );
                                 } else {
                                     tracing::debug!(
@@ -930,11 +929,11 @@ pub async fn on_conflict_detected_with(
                     }
                     conflict_ladder::LadderOutcome::LockfileRegenerationFailed => {
                         // Lockfile regeneration failed in the environment.
-                        // The attempt is terminal for this (base, head)
-                        // pair (`failed`, reason recorded, attention item
-                        // filed). A later probe whose head or base has
-                        // moved starts a fresh attempt; a worker would not
-                        // do better on the same pair.
+                        // The attempt is terminal for this PR head
+                        // (`failed`, reason recorded, attention item
+                        // filed). A later probe whose head has moved
+                        // starts a fresh attempt; a worker would not do
+                        // better on the same head.
                         tracing::warn!(
                             work_item_id = %candidate.work_item_id,
                             pr_url = %candidate.pr_url,

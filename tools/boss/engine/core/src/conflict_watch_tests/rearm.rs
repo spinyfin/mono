@@ -355,7 +355,7 @@ async fn rearm_supersedes_blocked_parent_when_revision_is_dead() {
         .expect("fresh insert");
     let original_id = attempt.id.clone();
     // Dangling revision_task_id: no task exists at this id, so
-    // `is_conflict_resolution_revision_live` reports it dead — standing in
+    // `is_conflict_revision_running_or_queued` reports it dead — standing in
     // for a revision whose execution died across an engine restart.
     db.set_conflict_resolution_revision_task_id(&attempt.id, "task_dead_revision")
         .unwrap();
@@ -415,7 +415,7 @@ async fn rearm_supersedes_blocked_parent_when_revision_is_dead() {
 /// engine restart". The revision task the crz points at still EXISTS in a
 /// live status (`active`) — its status column survived the restart — but its
 /// backing execution died and was reaped to `orphaned`. Before the fix,
-/// `is_conflict_resolution_revision_live` looked only at the paper-live task
+/// `is_conflict_revision_running_or_queued` looked only at the paper-live task
 /// status, so `supersede_if_stale` treated this dead fix vehicle as in flight
 /// and every post-boot probe was an idempotent no-op: the blocked row could
 /// never recover. The watcher must now recognise the fix vehicle is dead,
@@ -573,7 +573,7 @@ async fn rearm_does_not_retry_lockfile_failure_for_the_same_base_head_pair() {
 }
 
 #[tokio::test]
-async fn rearm_retries_lockfile_failure_when_head_or_base_moves() {
+async fn rearm_retries_lockfile_failure_when_head_moves() {
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
     let pr = "https://github.com/foo/bar/pull/82";
@@ -604,14 +604,17 @@ async fn rearm_retries_lockfile_failure_when_head_or_base_moves() {
     assert!(reason.is_none());
 }
 
+/// The probe's base oid mirrors GitHub's `baseRefOid`, which does not track
+/// `main` moving; only a head push (or a manual retry) re-arms the attempt, so
+/// a base-only difference must not mint a new attempt.
 #[tokio::test]
-async fn rearm_retries_lockfile_failure_when_base_moves() {
+async fn rearm_does_not_retry_lockfile_failure_when_only_base_differs() {
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
     let pr = "https://github.com/foo/bar/pull/85";
     let (product, chore) = make_in_review(&db, "C-lockfile-moved-base", pr);
     let pub_ = Arc::new(RecordingPublisher::default());
-    let failed_id = seed_lockfile_failure(&db, &product, &chore, pr, "head456", "abc123");
+    seed_lockfile_failure(&db, &product, &chore, pr, "head456", "abc123");
 
     let retried = on_conflict_detected(
         &db,
@@ -627,17 +630,127 @@ async fn rearm_retries_lockfile_failure_when_base_moves() {
         ),
     )
     .await;
-    assert!(retried, "a moved base must start a fresh attempt");
+    assert!(!retried, "a base-only difference must not start a fresh attempt");
     let all = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
-    assert_eq!(all.len(), 2, "old failure kept, fresh attempt inserted: {all:?}");
-    let failed = all.iter().find(|r| r.id == failed_id).expect("failed row kept");
-    assert_eq!(failed.status, "failed");
-    let fresh = all.iter().find(|r| r.id != failed_id).expect("fresh attempt");
-    assert_eq!(fresh.status, "pending");
-    assert_eq!(fresh.base_sha_at_trigger.as_deref(), Some("base-new"));
-    assert_eq!(fresh.head_sha_before.as_deref(), Some("head456"));
-    assert!(fresh.revision_task_id.is_some(), "fresh attempt must spawn a revision");
-    let (status, reason) = chore_status(&db, &chore);
-    assert_eq!(status, TaskStatus::InReview);
-    assert!(reason.is_none());
+    assert_eq!(all.len(), 1, "failed row kept, nothing inserted: {all:?}");
+}
+
+/// Failure on head A, re-arm on head B, failure again: exactly one open
+/// attention item remains, carrying the latest reason.
+#[tokio::test]
+async fn repeated_lockfile_failures_keep_one_open_attention_item() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/86";
+    let (product, chore) = make_in_review(&db, "C-lockfile-dup-attention", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    seed_lockfile_failure(&db, &product, &chore, pr, "head-a", "abc123");
+    let kind = crate::conflict_ladder::LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND;
+    let candidate_row = candidate(&product, &chore, pr);
+    let file = vec!["MODULE.bazel.lock".to_owned()];
+    let file_ref = &file;
+
+    for (round, reason) in [(1, "first failure"), (2, "second failure")] {
+        let attempt = if round == 1 {
+            db.latest_conflict_resolution_for_work_item(&chore).unwrap().unwrap()
+        } else {
+            // Re-arm on a moved head, then fail that fresh attempt too.
+            let retried = on_conflict_detected(
+                &db,
+                pub_.as_ref(),
+                None,
+                &open_checker(),
+                &candidate_row,
+                &probe_with_head(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()), "head-b"),
+            )
+            .await;
+            assert!(retried);
+            db.active_conflict_resolution_for_work_item(&chore)
+                .unwrap()
+                .expect("fresh attempt")
+        };
+        crate::conflict_ladder::halt_attempt_for_lockfile_failure(
+            &db,
+            pub_.as_ref(),
+            &candidate_row,
+            &attempt,
+            file_ref,
+            reason,
+        )
+        .await;
+    }
+
+    let open: Vec<_> = db
+        .list_attention_items_for_work_item(&chore)
+        .unwrap()
+        .into_iter()
+        .filter(|i| i.kind == kind && i.status == "open")
+        .collect();
+    assert_eq!(open.len(), 1, "one open item, not a pile: {open:?}");
+    assert!(
+        open[0].body_markdown.contains("second failure"),
+        "{:?}",
+        open[0].body_markdown
+    );
+}
+
+/// A `blocked` conflict revision that still owns a running execution is a
+/// live writer: its attempt must not be superseded and no competing
+/// remediation may start.
+#[tokio::test]
+async fn rearm_keeps_blocked_revision_with_running_execution() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/87";
+    let (product, chore) = make_in_review(&db, "C-blocked-live-revision", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
+    let attempt = db
+        .insert_conflict_resolution(crate::work::ConflictResolutionInsertInput {
+            product_id: product.clone(),
+            work_item_id: chore.clone(),
+            pr_url: pr.into(),
+            pr_number: 87,
+            head_branch: "feature".into(),
+            base_branch: "main".into(),
+            base_sha_at_trigger: Some("abc123".into()),
+            head_sha_before: Some("head456".into()),
+        })
+        .unwrap()
+        .expect("fresh insert");
+    let revision = create_active_chore(&db, &product, "blocked revision, worker still running");
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(revision.clone())
+            .kind(ExecutionKind::RevisionImplementation)
+            .status(ExecutionStatus::Running)
+            .build(),
+    )
+    .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'blocked' WHERE id = ?1",
+            rusqlite::params![revision],
+        )
+        .unwrap();
+    db.set_conflict_resolution_revision_task_id(&attempt.id, &revision)
+        .unwrap();
+
+    on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+    )
+    .await;
+
+    let all = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
+    assert_eq!(all.len(), 1, "no competing attempt may start: {all:?}");
+    assert_eq!(all[0].id, attempt.id);
+    assert_eq!(all[0].status, "pending", "the live attempt must not be superseded");
+    assert!(db.has_live_conflict_revision_for_pr(pr).unwrap());
 }

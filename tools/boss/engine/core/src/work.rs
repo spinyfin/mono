@@ -180,6 +180,11 @@ pub enum ChurnTrip {
 /// ([`crate::attention_lifecycle::ClearedBy::WorkResumed`]).
 pub const CHURN_GUARD_PARKED_ATTENTION_KIND: &str = "churn_guard_parked";
 
+/// Attention kind filed when a lockfile-only conflict could not be
+/// regenerated mechanically. Lowered by the work layer whenever the
+/// `merge_conflict` blocked signal is cleared or the attempt is retried.
+pub(crate) const LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND: &str = "conflict_lockfile_regeneration_failed";
+
 /// `tasks.dispatch_failed_reason` value stamped by
 /// [`crate::work::WorkDb::bounce_churn_guard_parked_to_backlog`] when
 /// [`crate::orphan_sweep`] trips the churn guard on an `active` work item.
