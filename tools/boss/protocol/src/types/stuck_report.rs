@@ -30,7 +30,8 @@ pub struct StuckRow {
     pub classification: String,
     pub last_ledger_basis: String,
     pub name: String,
-    /// Historical rows without recoverable timing start at migration time.
+    /// Timing is a lower bound: historical rows start at migration time, or a
+    /// missing ledger row falls back to tasks.updated_at, which any mutation can reset.
     pub age_is_lower_bound: bool,
     pub failure_basis: Option<String>,
 }

@@ -780,6 +780,7 @@ mod floor_tests {
                 .execute_batch(WORK_EXECUTIONS_ITEM_KIND_STATUS_FINISHED_INDEX)
                 .unwrap();
             pr_flow::migrate_operator_question_stuck_classification(&expected).unwrap();
+            stuck_report::migrate_wait_history(&expected).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

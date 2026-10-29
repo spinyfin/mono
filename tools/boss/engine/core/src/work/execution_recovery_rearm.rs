@@ -568,6 +568,7 @@ mod tests {
             ))
             .unwrap();
         }
+        conn.execute_batch("DROP TRIGGER execution_waiting_human_insert; DROP TRIGGER execution_waiting_human_update; DELETE FROM schema_migrations WHERE id = '20261029_1900_execution_waiting_human_history';").unwrap();
         conn.execute_batch("DROP TABLE IF EXISTS task_status_audit; DROP TABLE IF EXISTS task_status_audit_context;")
             .unwrap();
     }

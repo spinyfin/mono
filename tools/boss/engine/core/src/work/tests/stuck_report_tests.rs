@@ -114,7 +114,16 @@ fn report_fixtures_cover_human_capacity_dependency_and_engine_stuck() {
         .unwrap();
     assert_eq!(row(&db, &manual.id).bucket, StuckBucket::WaitingOnHuman);
     assert_eq!(row(&db, &manual.id).classification, "S21_manual_start");
-    let capacity = create_test_chore_manual(&db, &product, "Capacity");
+    let capacity = db
+        .create_chore_as_actor(
+            CreateChoreInput::builder()
+                .product_id(&product)
+                .name("Capacity")
+                .autostart(false)
+                .build(),
+            "human",
+        )
+        .unwrap();
     let queued = db
         .request_execution(RequestExecutionInput::builder().work_item_id(&capacity.id).build())
         .unwrap();
@@ -125,6 +134,8 @@ fn report_fixtures_cover_human_capacity_dependency_and_engine_stuck() {
         row(&db, &capacity.id).classification,
         "S20_dispatch_wait:Waiting for an available worker (8 working)"
     );
+    crate::work::pr_flow::insert_question(&db.connect().unwrap(), &queued.id, "proposal", &question()).unwrap();
+    assert_eq!(row(&db, &capacity.id).bucket, StuckBucket::WaitingOnHuman);
     let dependent = create_test_chore_manual(&db, &product, "Dependent");
     db.add_dependency(AddDependencyInput {
         prerequisite: failed.clone(),
@@ -155,14 +166,7 @@ fn report_fixtures_cover_human_capacity_dependency_and_engine_stuck() {
         .unwrap();
     assert_eq!(row(&db, &review.id).bucket, StuckBucket::EngineStuck);
     assert_eq!(row(&db, &review.id).classification, "S18_pr_behind");
-    let (_, live, _) = make_waiting_human_chore(&db, "Live");
-    assert!(
-        !db.stuck_report(0, now())
-            .unwrap()
-            .rows
-            .iter()
-            .any(|r| r.work_item_id == live)
-    );
+    assert_eq!(db.stuck_report(0, now()).unwrap().unconverted_declared_blockers, 1);
 }
 
 #[test]
@@ -202,4 +206,344 @@ fn questions_keep_their_filed_classification_after_answer_and_state_changes() {
     assert_eq!(report.questions_filed, 1);
     assert_eq!(report.questions_filed_by_stuck_kind["S8_operator_question"], 1);
     assert_eq!(report.unconverted_declared_blockers, 0);
+}
+
+#[test]
+fn waiting_human_age_tracks_execution_transition_and_live_work_is_excluded() {
+    let db = WorkDb::open(temp_db_path("stuck-human-transition")).unwrap();
+    let (_, id, execution) = make_waiting_human_chore(&db, "Human transition");
+    let timestamp = now();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE task_status_audit SET changed_at = ?1 WHERE property = 'execution_waiting_human'",
+            [timestamp - 100],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET updated_at = ?1 WHERE id = ?2", params![timestamp, id])
+        .unwrap();
+    let report = db.stuck_report(50, timestamp).unwrap();
+    let entry = report.rows.iter().find(|r| r.work_item_id == id).unwrap();
+    assert_eq!(entry.classification, "S19_waiting_human");
+    assert_eq!(entry.bucket, StuckBucket::WaitingOnHuman);
+    assert_eq!(entry.age_in_state_secs, 100);
+    assert!(!entry.age_is_lower_bound);
+    let abandoned = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&id)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Abandoned)
+                .build(),
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET created_at = ?1 WHERE id = ?2",
+            params![timestamp + 1, abandoned.id],
+        )
+        .unwrap();
+    assert_eq!(row(&db, &id).classification, "S19_waiting_human");
+    assert_eq!(row(&db, &id).bucket, StuckBucket::WaitingOnHuman);
+    for status in ["claimed", "running"] {
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET status = ?1 WHERE id = ?2",
+                params![status, execution],
+            )
+            .unwrap();
+        assert!(
+            !db.stuck_report(0, timestamp)
+                .unwrap()
+                .rows
+                .iter()
+                .any(|r| r.work_item_id == id)
+        );
+    }
+    db.set_execution_awaiting_human(&execution, true).unwrap();
+    assert!(row(&db, &id).age_in_state_secs < 50);
+    assert_eq!(
+        db.connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM task_status_audit WHERE property = 'execution_waiting_human'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn waiting_human_migration_backfills_lower_bound_and_survives_reopen() {
+    let (_dir, path) = disk_db_path("stuck-wait-upgrade");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let (_, id, _) = make_waiting_human_chore(&db, "Historical wait");
+    let conn = db.connect().unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER execution_waiting_human_insert;
+        DROP TRIGGER execution_waiting_human_update;
+        DELETE FROM task_status_audit WHERE property = 'execution_waiting_human';
+        DELETE FROM schema_migrations WHERE id = '20261029_1900_execution_waiting_human_history';",
+    )
+    .unwrap();
+    drop(conn);
+    drop(db);
+    for _ in 0..2 {
+        let db = WorkDb::open(path.clone()).unwrap();
+        let entry = row(&db, &id);
+        assert_eq!(entry.classification, "S19_waiting_human");
+        assert!(entry.age_is_lower_bound);
+        assert_eq!(
+            db.connect()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM task_status_audit WHERE property = 'execution_waiting_human'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+}
+
+#[test]
+fn orphan_with_durable_live_pid_is_distinguished_from_missing_pid() {
+    let db = WorkDb::open(temp_db_path("stuck-orphan-pid")).unwrap();
+    let (_, id, execution) = make_waiting_human_chore(&db, "Orphan pid");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'orphaned' WHERE id = ?1",
+            [&execution],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET status = 'active' WHERE id = ?1", [&id])
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET shell_pid = ?1, host_id = 'local' WHERE execution_id = ?2",
+            params![std::process::id(), execution],
+        )
+        .unwrap();
+    assert_eq!(row(&db, &id).classification, "S15_orphan_live_pid");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET shell_pid = NULL WHERE execution_id = ?1",
+            [&execution],
+        )
+        .unwrap();
+    assert_eq!(row(&db, &id).classification, "orphan_active");
+}
+
+#[test]
+fn human_only_gates_do_not_count_as_progressing_prerequisites() {
+    let db = WorkDb::open(temp_db_path("stuck-human-gates")).unwrap();
+    let product = create_test_product_named(&db, "Human gates");
+    for (status, reason, human_driven, actor, expected) in [
+        (
+            "blocked",
+            Some("deletion_signoff"),
+            false,
+            "engine",
+            StuckBucket::WaitingOnHuman,
+        ),
+        ("blocked", None, false, "human", StuckBucket::WaitingOnHuman),
+        ("todo", None, true, "engine", StuckBucket::WaitingOnHuman),
+        ("blocked", None, false, "engine", StuckBucket::EngineStuck),
+    ] {
+        let task = create_test_chore_manual(&db, &product.id, format!("Gate {status} {reason:?} {actor}"));
+        db.connect().unwrap().execute("UPDATE tasks SET status = ?1, blocked_reason = ?2, human_driven = ?3, last_status_actor = ?4 WHERE id = ?5", params![status, reason, human_driven, actor, task.id]).unwrap();
+        assert_eq!(row(&db, &task.id).bucket, expected);
+        let dependent = create_test_chore_manual(&db, &product.id, format!("Dependent on {}", task.name));
+        db.add_dependency(AddDependencyInput {
+            prerequisite: task.id,
+            dependent: dependent.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+        assert_eq!(
+            row(&db, &dependent.id).bucket,
+            if expected == StuckBucket::WaitingOnHuman {
+                StuckBucket::EngineStuck
+            } else {
+                StuckBucket::WaitingOnDependency
+            }
+        );
+    }
+}
+
+#[test]
+fn declared_blocker_count_includes_park_and_nudge_but_excludes_operator_no() {
+    let db = WorkDb::open(temp_db_path("stuck-declared-count")).unwrap();
+    for (basis, expected) in [
+        (WorkerFailureBasis::DeclaredBlocked, 1),
+        (WorkerFailureBasis::NudgeBreaker, 2),
+        (WorkerFailureBasis::OperatorNo, 2),
+    ] {
+        let (_, _, execution) = make_waiting_human_chore(&db, basis.as_str());
+        db.record_worker_failure_with_basis(&execution, "blocked", basis)
+            .unwrap();
+        assert_eq!(
+            db.stuck_report(604800, now()).unwrap().unconverted_declared_blockers,
+            expected
+        );
+    }
+    let product = create_test_product_named(&db, "Park");
+    let task = create_test_chore_manual(&db, &product.id, "Park");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET dispatch_failed_reason = 'deliberate_park' WHERE id = ?1",
+            [&task.id],
+        )
+        .unwrap();
+    assert_eq!(db.stuck_report(604800, now()).unwrap().unconverted_declared_blockers, 3);
+}
+
+#[test]
+fn classification_table_covers_failure_attention_and_global_hold_precedence() {
+    let db = WorkDb::open(temp_db_path("stuck-classifications")).unwrap();
+    let product = create_test_product_named(&db, "Classifications");
+    let root = create_test_chore_manual(&db, &product.id, "Green parent");
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET ci_required_state = 'pass' WHERE id = ?1", [&root.id])
+        .unwrap();
+    for (dispatch, blocked, status, attention, ci, revision, wait, expected) in [
+        (
+            Some("spawn_failed"),
+            None,
+            "todo",
+            None,
+            None,
+            false,
+            None,
+            "S1_dispatch_failure:spawn_failed",
+        ),
+        (
+            Some("churn_guard"),
+            None,
+            "todo",
+            None,
+            None,
+            false,
+            None,
+            "S2_churn_guard",
+        ),
+        (
+            Some("deliberate_park"),
+            None,
+            "todo",
+            None,
+            None,
+            false,
+            None,
+            "S3_deliberate_park",
+        ),
+        (
+            None,
+            None,
+            "in_review",
+            None,
+            Some("fail"),
+            false,
+            None,
+            "S6_ci_failure",
+        ),
+        (
+            None,
+            Some("worker_failed"),
+            "blocked",
+            None,
+            None,
+            true,
+            None,
+            "S13_revision_chain:worker_failed",
+        ),
+        (
+            None,
+            None,
+            "active",
+            Some("worker_recovery_exhausted"),
+            None,
+            false,
+            None,
+            "S14_worker_recovery",
+        ),
+        (
+            None,
+            None,
+            "in_review",
+            Some("churn_guard_parked"),
+            None,
+            false,
+            None,
+            "S16_review_churn",
+        ),
+        (
+            None,
+            None,
+            "in_review",
+            Some("trunk_queue_failed"),
+            Some("fail"),
+            false,
+            None,
+            "S17_merge_queue",
+        ),
+        (
+            None,
+            None,
+            "active",
+            Some("abandoned_branch_no_pr"),
+            None,
+            false,
+            None,
+            "S22_abandoned_branch",
+        ),
+        (
+            None,
+            None,
+            "todo",
+            None,
+            None,
+            false,
+            Some("dispatch_paused"),
+            "S23_global_hold:dispatch_paused",
+        ),
+        (
+            None,
+            None,
+            "todo",
+            None,
+            None,
+            false,
+            Some("automation_paused"),
+            "S23_global_hold:automation_paused",
+        ),
+    ] {
+        let task = create_test_chore_manual(&db, &product.id, expected);
+        db.connect().unwrap().execute("UPDATE tasks SET dispatch_failed_reason = ?1, blocked_reason = ?2, status = ?3, ci_required_state = ?4, kind = ?5, parent_task_id = ?6 WHERE id = ?7", params![dispatch, blocked, status, ci, if revision { "revision" } else { "chore" }, if revision { Some(&root.id) } else { None }, task.id]).unwrap();
+        if let Some(kind) = attention {
+            db.connect().unwrap().execute("INSERT INTO work_attention_items (id, work_item_id, kind, status, title, body_markdown, created_at) VALUES (?1, ?1, ?2, 'open', 'Attention', '', '0')", params![task.id, kind]).unwrap();
+        }
+        if let Some(wait) = wait {
+            let execution = db
+                .request_execution(RequestExecutionInput::builder().work_item_id(&task.id).build())
+                .unwrap();
+            db.set_dispatch_wait_reason(&execution.id, wait).unwrap();
+            assert_eq!(row(&db, &task.id).bucket, StuckBucket::WaitingOnCapacity);
+        }
+        assert_eq!(row(&db, &task.id).classification, expected);
+    }
 }

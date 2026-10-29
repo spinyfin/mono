@@ -269,6 +269,11 @@ pub(super) fn all() -> Vec<Migration> {
             },
         },
         Migration {
+            id: "20261029_1900_execution_waiting_human_history".into(),
+            legacy_version: None,
+            apply: stuck_report::migrate_wait_history,
+        },
+        Migration {
             id: pr_flow::OPERATOR_QUESTION_STUCK_CLASSIFICATION_MIGRATION_ID.into(),
             legacy_version: None,
             apply: pr_flow::migrate_operator_question_stuck_classification,
