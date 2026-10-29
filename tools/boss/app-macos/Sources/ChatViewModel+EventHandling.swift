@@ -320,6 +320,7 @@ extension ChatViewModel {
             if settleArchiveWorkError(message: message, requestId: requestId) { return }
             handle(.error(message: message))
         case .error(let message, let requestId):
+            failBoardRead(requestID: requestId)
             if let requestId,
                let pending = pendingDragAdmissionChecks.values.first(where: { $0.requestID == requestId }),
                !engine.unsentDragTaskIDs().contains(pending.taskID) {

@@ -59,8 +59,13 @@ impl WorkDb {
             },
         };
         // Exactly one complete read, with no retry loop or partial publication.
-        // It can run for minutes on a large board, so report its progress.
-        trace.begin_cold_build();
+        // It can run for minutes on a large board, so report its progress, but
+        // only when no board was retained: rebuilds forced by broad input
+        // changes, journal gaps or affected limits are routine and quick, and
+        // would flash a refresh indicator on an already-loaded board.
+        if matches!(reason, "cold" | "product") {
+            trace.begin_cold_build();
+        }
         let mut validity = HashMap::new();
         let tree = Self::assemble_work_tree_in(&conn, product, trace, Some(caches), now, Some(&mut validity))?;
         // Bound retained state by both cardinality and encoded size. Oversized
