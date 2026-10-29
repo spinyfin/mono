@@ -2105,6 +2105,7 @@ async fn serve_scoped(
         server_state.work_db.clone(),
         crate::attention_reconcile_sweep::DEFAULT_INTERVAL,
         server_state.work_tree_loads.first_served.clone(),
+        crate::attention_reconcile_sweep::FIRST_PASS_GRACE,
     );
 
     // Periodic syspolicyd CPU monitor: detects when macOS's `syspolicyd`

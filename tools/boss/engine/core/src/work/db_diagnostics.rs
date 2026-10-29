@@ -83,6 +83,13 @@ thread_local! {
     static ACTIVE: RefCell<HashMap<usize, Rc<Observation>>> = RefCell::default();
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: the attention reconcile treats this id's per-row statement as
+    /// interrupted by its deadline.
+    pub(crate) static INTERRUPT_ID: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Cooperatively interrupt maintenance SQL without replacing the connection's
 /// observation hook. Drop before releasing the connection, including on error.
 pub(super) struct QueryDeadline(Option<Instant>);

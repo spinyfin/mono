@@ -689,6 +689,30 @@ fn work_tree_updates_strip_ideas_for_workers() {
 }
 
 #[test]
+fn paged_snapshots_strip_ideas_from_every_page_for_workers() {
+    let body = "private draft ".repeat(30_000);
+    let snapshot = boss_protocol::work_tree_delta::WorkTreeUpdate {
+        product_id: "prod_1".into(),
+        sequence: 1,
+        base_sequence: None,
+        changes: serde_json::json!({
+            "ideas": [{"body": body}, {"body": body}, {"body": body}],
+            "tasks": [{"id": "task_1"}],
+        }),
+    };
+    let pages = snapshot.into_pages(512 * 1024).unwrap();
+    assert!(pages.len() > 1);
+    for update in pages {
+        let FrontendEvent::WorkTreeUpdate { update } =
+            sanitize_event_for_worker(FrontendEvent::WorkTreeUpdate { update })
+        else {
+            panic!("update")
+        };
+        assert!(!serde_json::to_string(&update).unwrap().contains("private draft"));
+    }
+}
+
+#[test]
 fn idea_verbs_stay_closed_and_get_work_tree_stays_allowed() {
     for request in [
         FrontendRequest::CreateIdea {

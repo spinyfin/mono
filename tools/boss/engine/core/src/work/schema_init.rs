@@ -779,6 +779,7 @@ mod floor_tests {
             expected
                 .execute_batch(WORK_EXECUTIONS_ITEM_KIND_STATUS_FINISHED_INDEX)
                 .unwrap();
+            expected.execute_batch(registry::ATTENTION_OPEN_KIND_ID_INDEX).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

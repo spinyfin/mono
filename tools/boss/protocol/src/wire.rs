@@ -1146,7 +1146,8 @@ pub enum FrontendRequest {
 
     GetWorkTree {
         product_id: String,
-        /// Accept bounded multipart cold snapshots (requires delta).
+        /// Accept bounded multipart cold snapshots. With `delta: false` the cache
+        /// is reset first, so the reply is a fresh paged snapshot.
         #[serde(default)]
         snapshot_pages: bool,
         /// Opt in to session-local snapshot/delta replies.

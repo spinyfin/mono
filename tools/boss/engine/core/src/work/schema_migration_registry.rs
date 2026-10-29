@@ -3,6 +3,9 @@
 use super::*;
 use migrations::Migration;
 
+/// Keyset index for the attention reconcile's `kind = ? AND id > ?` batches.
+pub(super) const ATTENTION_OPEN_KIND_ID_INDEX: &str = "CREATE INDEX IF NOT EXISTS work_attention_items_open_kind_id_idx ON work_attention_items(kind, id) WHERE status = 'open'";
+
 pub(super) fn all() -> Vec<Migration> {
     // Versions 1..32 were squashed into the compatibility baseline.
     let mut migrations: Vec<_> = (1..=32)
@@ -265,6 +268,17 @@ pub(super) fn all() -> Vec<Migration> {
             legacy_version: None,
             apply: |conn| {
                 conn.execute_batch(WORK_EXECUTIONS_ITEM_KIND_STATUS_FINISHED_INDEX)?;
+                Ok(())
+            },
+        },
+        Migration {
+            id: "20261029_1200_attention_open_kind_id_index".into(),
+            legacy_version: None,
+            apply: |conn| {
+                // Keyset batches in the attention reconcile select
+                // `kind = ? AND id > ? ORDER BY id`; (kind, id) serves that
+                // without re-sorting the open backlog.
+                conn.execute_batch(ATTENTION_OPEN_KIND_ID_INDEX)?;
                 Ok(())
             },
         },

@@ -596,3 +596,152 @@ async fn work_tree_delta_handler_moves_deletes_and_recovers_full_snapshots() {
             .is_none()
     );
 }
+
+fn seed_big_board(state: &Arc<ServerState>, name: &str) -> String {
+    let product = crate::test_support::create_test_product_named(&state.work_db, name);
+    for i in 0..4 {
+        let task = crate::test_support::create_test_chore(&state.work_db, &product.id, format!("big {i}"));
+        state
+            .work_db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET description = ?2 WHERE id = ?1",
+                rusqlite::params![task.id, "detail".repeat(40_000)],
+            )
+            .unwrap();
+    }
+    product.id
+}
+
+fn paged_ctx(state: &Arc<ServerState>, sink: &Arc<SessionSink>, request_id: &str) -> Dispatch {
+    Dispatch::builder()
+        .server_state(state.clone())
+        .work_db(state.work_db.clone())
+        .sink(sink.clone())
+        .session_id("board")
+        .request_id(request_id)
+        .recv_instant(Instant::now())
+        .decode_ms(0.0)
+        .build()
+}
+
+fn get_work_tree(product_id: &str, delta: bool, snapshot_pages: bool) -> FrontendRequest {
+    FrontendRequest::GetWorkTree {
+        product_id: product_id.into(),
+        fetch_seq: None,
+        delta,
+        snapshot_pages,
+    }
+}
+
+#[tokio::test]
+async fn concurrent_same_session_fetches_do_not_interleave_with_paged_snapshot() {
+    let (state, _dir) = test_server_state();
+    let product_id = seed_big_board(&state, "ordered");
+    let sink = make_session_sink();
+    tokio::join!(
+        work_items::handle_get_work_tree(
+            paged_ctx(&state, &sink, "first"),
+            get_work_tree(&product_id, true, true)
+        ),
+        work_items::handle_get_work_tree(
+            paged_ctx(&state, &sink, "second"),
+            get_work_tree(&product_id, true, false)
+        ),
+    );
+    let mut frames: Vec<(String, bool)> = Vec::new();
+    while frames.last().is_none_or(|(_, last)| !*last)
+        || frames
+            .iter()
+            .map(|(id, _)| id)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            < 2
+    {
+        let envelope = sink.next().await.unwrap();
+        let id = envelope.request_id.clone().unwrap();
+        frames.push((id, update(envelope.payload).is_last_page()));
+    }
+    // Each request's frames are contiguous and its sequence is monotonic.
+    let mut seen_done = Vec::new();
+    for (id, _) in &frames {
+        if seen_done.last() != Some(id) {
+            assert!(
+                !seen_done.contains(id),
+                "frames for {id} interleaved with another reply"
+            );
+            seen_done.push(id.clone());
+        }
+    }
+    assert_eq!(seen_done.len(), 2);
+}
+
+#[tokio::test]
+async fn forced_snapshot_recovery_is_still_paged() {
+    let (state, _dir) = test_server_state();
+    let product_id = seed_big_board(&state, "recovery");
+    let sink = make_session_sink();
+    work_items::handle_get_work_tree(paged_ctx(&state, &sink, "cold"), get_work_tree(&product_id, true, true)).await;
+    while !update(sink.next().await.unwrap().payload).is_last_page() {}
+    work_items::handle_get_work_tree(
+        paged_ctx(&state, &sink, "recover"),
+        get_work_tree(&product_id, false, true),
+    )
+    .await;
+    let mut pages = 0;
+    loop {
+        let page = update(sink.next().await.unwrap().payload);
+        assert_eq!(page.base_sequence, None, "recovery must be a snapshot, not a delta");
+        pages += 1;
+        if page.is_last_page() {
+            break;
+        }
+    }
+    assert!(pages > 1, "recovery snapshot must be paged, not one legacy frame");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writer_opens_first_board_gate_only_after_the_last_page() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let (state, _dir) = test_server_state();
+    let product_id = seed_big_board(&state, "writer-gate");
+    let gate = state.work_tree_loads.first_served.clone();
+    let (client, server) = tokio::net::UnixStream::pair().unwrap();
+    let handler = tokio::spawn(handle_frontend_connection(server, state, None));
+    let (read, mut write) = client.into_split();
+    let mut lines = tokio::io::BufReader::new(read).lines();
+    let request = FrontendRequestEnvelope {
+        request_id: "gate".into(),
+        payload: get_work_tree(&product_id, true, true),
+    };
+    write
+        .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+        .await
+        .unwrap();
+    let mut pages = 0;
+    loop {
+        let envelope: FrontendEventEnvelope = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        if envelope.request_id.as_deref() != Some("gate") {
+            continue;
+        }
+        let last = update(envelope.payload).is_last_page();
+        pages += 1;
+        if last {
+            break;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), gate.notified())
+                .await
+                .is_err(),
+            "gate opened before the final page was written",
+        );
+    }
+    assert!(pages > 1);
+    tokio::time::timeout(Duration::from_secs(5), gate.notified())
+        .await
+        .expect("gate opens after the final page");
+    drop(lines);
+    drop(write);
+    handler.await.unwrap().unwrap();
+}

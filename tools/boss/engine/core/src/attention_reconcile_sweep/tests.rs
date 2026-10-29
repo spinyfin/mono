@@ -44,7 +44,12 @@ async fn sweep_waits_for_delivered_board_before_clearing_signals() {
     start_run_at(&db, &chore.id, 2000);
     let gate = Arc::new(tokio::sync::Notify::new());
     let db = Arc::new(db);
-    let handle = spawn_loop(db.clone(), Duration::from_secs(300), gate.clone());
+    let handle = spawn_loop(
+        db.clone(),
+        Duration::from_secs(300),
+        gate.clone(),
+        Duration::from_secs(60),
+    );
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(attention_status(&db, &attention).0, "open");
     gate.notify_one();
@@ -70,6 +75,29 @@ fn reconcile_advances_past_unresolved_batches() {
     let cleared = open_attention_for_work_item(&db, &chore.id, crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND, 999);
     assert_eq!(db.reconcile_stale_attention_signals().unwrap().attentions_resolved, 1);
     assert_eq!(attention_status(&db, &cleared).0, "resolved");
+}
+
+#[test]
+fn an_interrupted_row_does_not_abort_later_rows_or_the_banner_loop() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id, "Interrupted row");
+    let first = open_attention_for_work_item(&db, &chore.id, crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND, 1000);
+    let second = open_attention_for_work_item(&db, &chore.id, crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND, 1001);
+    start_run_at(&db, &chore.id, 2000);
+    force_dispatch_failure(&db, &chore.id, "cube_workspace_lease_failed", "lease refused", 1000);
+    crate::work::db_diagnostics::INTERRUPT_ID.with_borrow_mut(|id| *id = Some(first.clone()));
+    let result = db.reconcile_stale_attention_signals();
+    crate::work::db_diagnostics::INTERRUPT_ID.with_borrow_mut(|id| *id = None);
+    let outcome = result.unwrap();
+    assert_eq!(
+        attention_status(&db, &first).0,
+        "open",
+        "the interrupted row is retried next pass"
+    );
+    assert_eq!(attention_status(&db, &second).0, "resolved");
+    assert_eq!(outcome.attentions_resolved, 1);
+    assert_eq!(outcome.dispatch_banners_cleared, 1);
 }
 
 /// Insert an `open` attention row directly, with an explicit `created_at`.
@@ -282,7 +310,7 @@ async fn clears_a_dispatch_failure_banner_once_a_run_has_started_since() {
         1000,
     );
 
-    let outcome = run_one_pass(&db).await;
+    let outcome = run_one_pass(Arc::new(db.clone())).await;
     assert_eq!(outcome.dispatch_banners_cleared, 1);
     assert_eq!(dispatch_failure_columns(&db, &chore.id), (None, None, None));
 }
@@ -306,7 +334,7 @@ async fn keeps_a_dispatch_failure_banner_when_nothing_has_started_since() {
     );
     force_dispatch_failure(&db, &chore.id, "cube_workspace_lease_failed", "lease refused", 5000);
 
-    let outcome = run_one_pass(&db).await;
+    let outcome = run_one_pass(Arc::new(db.clone())).await;
     assert_eq!(outcome.dispatch_banners_cleared, 0);
     let (reason, error, at) = dispatch_failure_columns(&db, &chore.id);
     assert_eq!(reason.as_deref(), Some("cube_workspace_lease_failed"));
@@ -350,7 +378,7 @@ async fn work_resumed_kinds_resolve_once_a_later_run_starts() {
     let attention = open_attention_for_work_item(&db, &chore.id, crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND, 1000);
     start_run_at(&db, &chore.id, 1500);
 
-    let outcome = run_one_pass(&db).await;
+    let outcome = run_one_pass(Arc::new(db.clone())).await;
     assert_eq!(outcome.attentions_resolved, 1);
     let (status, resolved_at) = attention_status(&db, &attention);
     assert_eq!(status, "resolved");
@@ -378,7 +406,7 @@ async fn legacy_pane_death_reconcile_rows_still_resolve_once_a_later_run_starts(
     );
     start_run_at(&db, &chore.id, 1500);
 
-    let outcome = run_one_pass(&db).await;
+    let outcome = run_one_pass(Arc::new(db.clone())).await;
     assert_eq!(outcome.attentions_resolved, 1);
     let (status, resolved_at) = attention_status(&db, &attention);
     assert_eq!(status, "resolved");
@@ -397,7 +425,7 @@ async fn work_resumed_kinds_stay_open_when_the_only_run_predates_the_signal() {
     start_run_at(&db, &chore.id, 1000);
     let attention = open_attention_for_work_item(&db, &chore.id, crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND, 5000);
 
-    let outcome = run_one_pass(&db).await;
+    let outcome = run_one_pass(Arc::new(db.clone())).await;
     assert_eq!(outcome.attentions_resolved, 0);
     assert_eq!(attention_status(&db, &attention).0, "open");
 }
@@ -415,7 +443,7 @@ async fn execution_scoped_attentions_resolve_through_their_execution_s_work_item
     let attention = open_attention_for_execution(&db, &dead.id, crate::completion::NUDGE_BREAKER_ATTENTION_KIND, 1000);
     start_run_at(&db, &chore.id, 1500);
 
-    let outcome = run_one_pass(&db).await;
+    let outcome = run_one_pass(Arc::new(db.clone())).await;
     assert_eq!(outcome.attentions_resolved, 1);
     assert_eq!(attention_status(&db, &attention).0, "resolved");
 }
@@ -436,13 +464,13 @@ async fn execution_kind_completed_resolves_only_for_the_declared_kind() {
     // A completed implementation pass is NOT evidence about the review — a
     // churned retry must never mask a still-dead reviewer.
     completed_execution_at(&db, &chore.id, ExecutionKind::ChoreImplementation, 2000);
-    let outcome = run_one_pass(&db).await;
+    let outcome = run_one_pass(Arc::new(db.clone())).await;
     assert_eq!(outcome.attentions_resolved, 0);
     assert_eq!(attention_status(&db, &attention).0, "open");
 
     // A completed review of the right kind is.
     completed_execution_at(&db, &chore.id, ExecutionKind::PrReview, 3000);
-    let outcome = run_one_pass(&db).await;
+    let outcome = run_one_pass(Arc::new(db.clone())).await;
     assert_eq!(outcome.attentions_resolved, 1);
     assert_eq!(attention_status(&db, &attention).0, "resolved");
 }
@@ -463,7 +491,7 @@ async fn human_decision_kinds_are_never_auto_resolved() {
     start_run_at(&db, &chore.id, 9000);
     completed_execution_at(&db, &chore.id, ExecutionKind::PrReview, 9500);
 
-    let outcome = run_one_pass(&db).await;
+    let outcome = run_one_pass(Arc::new(db.clone())).await;
     assert_eq!(outcome.attentions_resolved, 0);
     assert_eq!(attention_status(&db, &attention).0, "open");
 }
@@ -484,7 +512,7 @@ async fn producer_owned_kinds_are_left_to_their_producer() {
     );
     start_run_at(&db, &chore.id, 9000);
 
-    let outcome = run_one_pass(&db).await;
+    let outcome = run_one_pass(Arc::new(db.clone())).await;
     assert_eq!(outcome.attentions_resolved, 0);
     assert_eq!(attention_status(&db, &attention).0, "open");
     assert_eq!(
@@ -506,12 +534,12 @@ async fn a_condition_that_re_trips_after_resolution_shows_again() {
 
     let first = open_attention_for_work_item(&db, &chore.id, crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND, 1000);
     start_run_at(&db, &chore.id, 1500);
-    assert_eq!(run_one_pass(&db).await.attentions_resolved, 1);
+    assert_eq!(run_one_pass(Arc::new(db.clone())).await.attentions_resolved, 1);
     assert_eq!(attention_status(&db, &first).0, "resolved");
 
     // The guard trips again, after the run that cleared the first one.
     let second = open_attention_for_work_item(&db, &chore.id, crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND, 9000);
-    assert_eq!(run_one_pass(&db).await.attentions_resolved, 0);
+    assert_eq!(run_one_pass(Arc::new(db.clone())).await.attentions_resolved, 0);
     assert_eq!(attention_status(&db, &second).0, "open");
 }
 
@@ -560,7 +588,7 @@ async fn a_condition_that_re_trips_onto_its_still_open_row_is_not_cleared_by_the
         "the stamp must postdate the run start it must not be cleared by"
     );
 
-    let outcome = run_one_pass(&db).await;
+    let outcome = run_one_pass(Arc::new(db.clone())).await;
     assert_eq!(outcome.attentions_resolved, 0);
     assert_eq!(
         attention_status(&db, &attention).0,
@@ -592,7 +620,7 @@ async fn an_execution_scoped_signal_is_not_cleared_by_its_own_execution_completi
     );
 
     force_execution_completed_at(&db, &reviewer, 2000);
-    let outcome = run_one_pass(&db).await;
+    let outcome = run_one_pass(Arc::new(db.clone())).await;
     assert_eq!(outcome.attentions_resolved, 0);
     assert_eq!(
         attention_status(&db, &attention).0,
@@ -602,7 +630,7 @@ async fn an_execution_scoped_signal_is_not_cleared_by_its_own_execution_completi
 
     // A different, later pr_review pass is.
     completed_execution_at(&db, &chore.id, ExecutionKind::PrReview, 3000);
-    let outcome = run_one_pass(&db).await;
+    let outcome = run_one_pass(Arc::new(db.clone())).await;
     assert_eq!(outcome.attentions_resolved, 1);
     assert_eq!(attention_status(&db, &attention).0, "resolved");
 }
@@ -640,13 +668,13 @@ async fn review_result_missing_survives_its_own_review_pass_completing() {
 
     // The producer ordering: the same execution completes right after filing.
     force_execution_completed_at(&db, &reviewer, 1000);
-    assert_eq!(run_one_pass(&db).await.attentions_resolved, 0);
+    assert_eq!(run_one_pass(Arc::new(db.clone())).await.attentions_resolved, 0);
     assert_eq!(attention_status(&db, &attention).0, "open");
 
     // Nor does any amount of later successful activity lower it.
     completed_execution_at(&db, &chore.id, ExecutionKind::PrReview, 9000);
     start_run_at(&db, &chore.id, 9500);
-    assert_eq!(run_one_pass(&db).await.attentions_resolved, 0);
+    assert_eq!(run_one_pass(Arc::new(db.clone())).await.attentions_resolved, 0);
     assert_eq!(attention_status(&db, &attention).0, "open");
 }
 
@@ -665,7 +693,7 @@ async fn clearing_a_banner_does_not_reset_the_orphan_active_age_clock() {
     force_dispatch_failure(&db, &chore.id, "cube_workspace_lease_failed", "lease refused", 1000);
     force_task_updated_at(&db, &chore.id, 1000);
 
-    assert_eq!(run_one_pass(&db).await.dispatch_banners_cleared, 1);
+    assert_eq!(run_one_pass(Arc::new(db.clone())).await.dispatch_banners_cleared, 1);
 
     assert_eq!(
         task_updated_at(&db, &chore.id),
@@ -680,7 +708,7 @@ async fn a_pass_with_nothing_to_do_reports_no_activity() {
     let product = create_test_product(&db);
     create_test_chore(&db, product.id, "Quiet");
 
-    let outcome = run_one_pass(&db).await;
+    let outcome = run_one_pass(Arc::new(db.clone())).await;
     assert!(outcome.is_empty());
     assert_eq!(outcome, AttentionReconcileOutcome::default());
 }
@@ -696,6 +724,26 @@ async fn the_pass_is_idempotent() {
     open_attention_for_work_item(&db, &chore.id, crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND, 1000);
     start_run_at(&db, &chore.id, 1500);
 
-    assert_eq!(run_one_pass(&db).await.attentions_resolved, 1);
-    assert!(run_one_pass(&db).await.is_empty());
+    assert_eq!(run_one_pass(Arc::new(db.clone())).await.attentions_resolved, 1);
+    assert!(run_one_pass(Arc::new(db.clone())).await.is_empty());
+}
+
+#[tokio::test]
+async fn sweep_runs_after_grace_period_without_a_served_board() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id, "No frontend");
+    let attention = open_attention_for_work_item(&db, &chore.id, crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND, 1000);
+    start_run_at(&db, &chore.id, 2000);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let db = Arc::new(db);
+    let handle = spawn_loop(db.clone(), Duration::from_secs(300), gate, Duration::from_millis(100));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while attention_status(&db, &attention).0 != "resolved" {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    handle.abort();
 }

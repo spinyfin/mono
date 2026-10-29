@@ -180,6 +180,56 @@ fn resolve_one_kind(conn: &Connection, now: &str, lifecycle: &AttentionLifecycle
     Ok(rows)
 }
 
+fn is_interrupted(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<rusqlite::Error>()
+        .and_then(rusqlite::Error::sqlite_error_code)
+        == Some(rusqlite::ErrorCode::OperationInterrupted)
+}
+
+/// A per-row deadline interruption skips that row; the next pass retries it.
+/// Any other error stays fatal.
+fn skip_interrupted(id: &str, result: Result<usize>) -> Result<usize> {
+    match result {
+        Err(err) if is_interrupted(&err) => {
+            tracing::warn!(id, "attention reconcile: row interrupted by deadline; skipping");
+            Ok(0)
+        }
+        other => other,
+    }
+}
+
+/// An interrupted selection cannot advance the keyset cursor, so it ends that
+/// scan (`None`) rather than failing the whole pass.
+fn skip_interrupted_selection(what: &str, result: Result<Vec<String>>) -> Result<Option<Vec<String>>> {
+    match result {
+        Err(err) if is_interrupted(&err) => {
+            tracing::warn!(
+                what,
+                "attention reconcile: selection interrupted by deadline; ending scan"
+            );
+            Ok(None)
+        }
+        Ok(ids) => Ok(Some(ids)),
+        Err(err) => Err(err),
+    }
+}
+
+/// Test seam: simulate the deadline interrupting the per-row statement for one id.
+#[cfg(test)]
+fn inject_interrupt(id: &str) -> Option<anyhow::Error> {
+    super::db_diagnostics::INTERRUPT_ID.with_borrow(|target| (target.as_deref() == Some(id)).then(interrupted_error))
+}
+
+#[cfg(test)]
+fn interrupted_error() -> anyhow::Error {
+    rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT), None).into()
+}
+
+#[cfg(not(test))]
+fn inject_interrupt(_id: &str) -> Option<anyhow::Error> {
+    None
+}
+
 #[work_db_boundary::instrument]
 impl WorkDb {
     /// Resolve every open attention item whose declared clearing evidence has
@@ -219,17 +269,23 @@ impl WorkDb {
                 let held = std::time::Instant::now();
                 let selection_deadline =
                     super::db_diagnostics::QueryDeadline::after(std::time::Duration::from_millis(100));
-                let ids = {
+                let ids = (|| -> Result<Vec<String>> {
                     let mut stmt = conn.prepare_cached("SELECT id FROM work_attention_items WHERE status = 'open' AND kind = ?1 AND id > ?2 ORDER BY id LIMIT 32")?;
-                    super::collect_rows(stmt.query_map(params![lifecycle.kind, after], |row| row.get::<_, String>(0))?)?
-                };
+                    super::collect_rows(stmt.query_map(params![lifecycle.kind, after], |row| row.get::<_, String>(0))?)
+                })();
                 drop(selection_deadline);
+                let Some(ids) = skip_interrupted_selection(lifecycle.kind, ids)? else {
+                    break;
+                };
                 if ids.is_empty() {
                     break;
                 }
                 for id in &ids {
                     let deadline = super::db_diagnostics::QueryDeadline::after(std::time::Duration::from_millis(100));
-                    resolved += resolve_one_kind(&conn, &now, lifecycle, id)?;
+                    resolved += skip_interrupted(
+                        id,
+                        inject_interrupt(id).map_or_else(|| resolve_one_kind(&conn, &now, lifecycle, id), Err),
+                    )?;
                     drop(deadline);
                     after.clone_from(id);
                     if held.elapsed() >= std::time::Duration::from_millis(10) {
@@ -257,17 +313,23 @@ impl WorkDb {
             let conn = db.connect()?;
             let held = std::time::Instant::now();
             let selection_deadline = super::db_diagnostics::QueryDeadline::after(std::time::Duration::from_millis(100));
-            let ids = {
+            let ids = (|| -> Result<Vec<String>> {
                 let mut stmt = conn.prepare_cached("SELECT id FROM tasks WHERE dispatch_failed_reason IS NOT NULL AND dispatch_failed_at IS NOT NULL AND id > ?1 ORDER BY id LIMIT 32")?;
-                super::collect_rows(stmt.query_map([&after], |row| row.get::<_, String>(0))?)?
-            };
+                super::collect_rows(stmt.query_map([&after], |row| row.get::<_, String>(0))?)
+            })();
             drop(selection_deadline);
+            let Some(ids) = skip_interrupted_selection("dispatch_banners", ids)? else {
+                break;
+            };
             if ids.is_empty() {
                 break;
             }
             for id in &ids {
                 let deadline = super::db_diagnostics::QueryDeadline::after(std::time::Duration::from_millis(100));
-                outcome.dispatch_banners_cleared += clear_stale_dispatch_failures(&conn, id)?;
+                outcome.dispatch_banners_cleared += skip_interrupted(
+                    id,
+                    inject_interrupt(id).map_or_else(|| clear_stale_dispatch_failures(&conn, id), Err),
+                )?;
                 drop(deadline);
                 after.clone_from(id);
                 if held.elapsed() >= std::time::Duration::from_millis(10) {

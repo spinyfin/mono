@@ -42,43 +42,48 @@ impl crate::sweep_loop::SweepOutcome for AttentionReconcileOutcome {
     }
 }
 
+/// How long the first pass waits for the first board to be served before
+/// running anyway. The wait keeps the pass from contending with the cold
+/// board load, but reconciliation must not depend on a frontend ever
+/// connecting.
+pub const FIRST_PASS_GRACE: Duration = Duration::from_secs(45);
+
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`.
+/// Only the first pass is gated: it waits for `first_board_served` or
+/// `first_pass_grace`, whichever comes first.
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     interval: Duration,
     first_board_served: Arc<tokio::sync::Notify>,
+    first_pass_grace: Duration,
 ) -> tokio::task::JoinHandle<()> {
+    let mut first = true;
     crate::sweep_loop::spawn_sweep_loop(interval, move || {
         let work_db = Arc::clone(&work_db);
-        let first_board_served = first_board_served.clone();
+        let gate = std::mem::take(&mut first).then(|| Arc::clone(&first_board_served));
         async move {
-            // A Notify permit survives a snapshot delivered before this task
-            // starts. Keep the gate open for all subsequent passes.
-            first_board_served.notified().await;
-            first_board_served.notify_one();
-            crate::work::db_diagnostics::spawn_blocking(move || work_db.reconcile_stale_attention_signals())
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|result| result)
-                .unwrap_or_else(|err| {
-                    tracing::warn!(?err, "attention-reconcile sweep: pass failed; skipping");
-                    AttentionReconcileOutcome::default()
-                })
+            if let Some(gate) = gate {
+                // A Notify permit survives a snapshot delivered before this
+                // task starts.
+                let _ = tokio::time::timeout(first_pass_grace, gate.notified()).await;
+            }
+            run_one_pass(work_db).await
         }
     })
 }
 
-/// Run a single reconciliation pass. Returns the tally; callers may log it.
-/// A DB error is logged and swallowed — this sweep is best-effort cleanup and
-/// must never take the engine down.
-pub async fn run_one_pass(work_db: &WorkDb) -> AttentionReconcileOutcome {
-    match work_db.reconcile_stale_attention_signals() {
-        Ok(outcome) => outcome,
-        Err(err) => {
+/// Run a single reconciliation pass off the async runtime. Returns the
+/// tally; callers may log it. A DB error is logged and swallowed — this
+/// sweep is best-effort cleanup and must never take the engine down.
+pub async fn run_one_pass(work_db: Arc<WorkDb>) -> AttentionReconcileOutcome {
+    crate::work::db_diagnostics::spawn_blocking(move || work_db.reconcile_stale_attention_signals())
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result)
+        .unwrap_or_else(|err| {
             tracing::warn!(?err, "attention-reconcile sweep: pass failed; skipping");
             AttentionReconcileOutcome::default()
-        }
-    }
+        })
 }
 
 #[cfg(test)]

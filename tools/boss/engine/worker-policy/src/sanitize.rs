@@ -81,7 +81,16 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
     match event {
         FrontendEvent::WorkTreeUpdate { mut update } => {
             if let Some(changes) = update.changes.as_object_mut() {
-                if update.base_sequence.is_none() {
+                if let Some(page) = changes.get_mut("snapshot_page").and_then(|page| page.as_object_mut()) {
+                    // Paged snapshots nest every collection under
+                    // `snapshot_page.fields`; blank the idea bodies there.
+                    let first = page.get("index").and_then(serde_json::Value::as_u64) == Some(0);
+                    if let Some(fields) = page.get_mut("fields").and_then(|fields| fields.as_object_mut())
+                        && (first || fields.contains_key("ideas"))
+                    {
+                        fields.insert("ideas".into(), serde_json::json!([]));
+                    }
+                } else if update.base_sequence.is_none() {
                     changes.insert("ideas".into(), serde_json::json!([]));
                 } else {
                     changes.remove("ideas");

@@ -1382,6 +1382,7 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
         server_state,
         work_db,
         sink,
+        session_id,
         request_id,
         recv_instant,
         decode_ms,
@@ -1427,13 +1428,25 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
     });
     match result {
         Ok((sequence, tree)) => {
+            // Cache sequencing and enqueueing must be atomic per session:
+            // reads run concurrently, and a second request advancing the
+            // cache must not enqueue its delta between this update's pages
+            // (or ahead of this reply). Held through the final frame.
+            let order = server_state.work_tree_loads.session_order(&session_id);
+            let _ordered = order.lock().await;
             let encoding_start = std::time::Instant::now();
             let (snapshot_revision, tree, pages) = {
                 let mut reads = sink.board_reads.lock().expect("board reads poisoned");
                 let (snapshot_revision, tree) = reads.finish_at(&request_id, sequence, tree);
                 trace.set_items(tree.tasks.len() + tree.chores.len());
                 let mut cache = sink.work_tree_cache.lock().expect("work tree cache poisoned");
-                let pages = if delta {
+                // `delta: false` forces a fresh snapshot (client recovery).
+                // With `snapshot_pages` it is still paged, so recovery never
+                // brings back the single oversized legacy frame.
+                let pages = if delta || snapshot_pages {
+                    if !delta {
+                        cache.clear();
+                    }
                     Some(cache.update(&tree).and_then(|update| {
                         if snapshot_pages {
                             update.into_pages(512 * 1024)

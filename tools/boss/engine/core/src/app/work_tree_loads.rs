@@ -5,22 +5,43 @@ use super::*;
 type BoardSlot = Arc<StdMutex<Option<crate::work::board_projection::CachedProjection>>>;
 
 #[derive(Default)]
-pub(super) struct WorkTreeLoads {
-    pub(super) first_served: Arc<tokio::sync::Notify>,
-    flights: boss_single_flight::SingleFlight<String, (u64, i64), (u64, boss_protocol::WorkTree)>,
+struct Sources {
     // data_version is comparable only on the SAME connection. This dedicated
     // reader holds no transaction and never acquires the writer connection.
     probe: StdMutex<Option<WorkDb>>,
-    // Per-item runtimes and per-owner review projections shared by every
-    // product's assembly, validated against per-item epochs in each load's
-    // own snapshot (see `board_runtime_cache` and `board_review_cache`).
-    caches: crate::work::board_caches::BoardCaches,
     // At most four retained products, each capped by the database adapter.
     // Individual locks preserve parallel reads for different products.
     projections: StdMutex<HashMap<String, (std::time::Instant, BoardSlot)>>,
 }
 
+#[derive(Default)]
+pub(super) struct WorkTreeLoads {
+    pub(super) first_served: Arc<tokio::sync::Notify>,
+    flights: boss_single_flight::SingleFlight<String, (u64, i64), (u64, boss_protocol::WorkTree)>,
+    // Per-item runtimes and per-owner review projections shared by every
+    // product's assembly, validated against per-item epochs in each load's
+    // own snapshot (see `board_runtime_cache` and `board_review_cache`).
+    caches: crate::work::board_caches::BoardCaches,
+    sources: Sources,
+    // Per-session reply ordering; entries die with the last holder.
+    session_order: StdMutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+}
+
 impl WorkTreeLoads {
+    /// The lock that serializes one session's `GetWorkTree` replies: held from
+    /// the cache update through the enqueue of every page, so response order
+    /// matches cache sequence order even though admitted reads run concurrently.
+    pub(super) fn session_order(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut orders = self.session_order.lock().expect("session order poisoned");
+        orders.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = orders.get(session_id).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        orders.insert(session_id.to_owned(), Arc::downgrade(&lock));
+        lock
+    }
+
     pub(super) fn load(
         &self,
         db: &WorkDb,
@@ -76,7 +97,7 @@ impl WorkTreeLoads {
     }
 
     fn projection(&self, product: &str) -> BoardSlot {
-        let mut projections = self.projections.lock().expect("board projections poisoned");
+        let mut projections = self.sources.projections.lock().expect("board projections poisoned");
         if let Some((accessed, slot)) = projections.get_mut(product) {
             *accessed = std::time::Instant::now();
             return slot.clone();
@@ -99,7 +120,7 @@ impl WorkTreeLoads {
     // require a follow-up, but never serialize scans for different products.
     fn freshness(&self, db: &WorkDb, revision: &AtomicU64) -> Result<(u64, i64), String> {
         let revision = revision.load(Ordering::SeqCst);
-        let mut probe = self.probe.lock().expect("tree freshness probe poisoned");
+        let mut probe = self.sources.probe.lock().expect("tree freshness probe poisoned");
         if probe.is_none() {
             *probe = Some(db.reader().map_err(|err| err.to_string())?);
         }
