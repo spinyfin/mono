@@ -563,9 +563,12 @@ fn worker_tier_gate_handoff_write_is_audited() {
         let mut child = std::process::Command::new("/bin/sh")
             .args([
                 "-c",
-                // Trailing `:` stops the shell exec-ing `sleep` in place, which would
-                // rewrite the process argv and drop the credential under test.
-                "sleep 30; :",
+                // `read` is a shell builtin. Piped stdin without a writer close
+                // keeps this process as `/bin/sh` with the original argv, so the
+                // credential stays visible for redaction. `sleep` is an external
+                // binary: a missing PATH entry or a shell exec of it would exit
+                // or rewrite argv before the audit ran.
+                "read x; :",
                 "boss",
                 "handoff",
                 "write",
@@ -573,9 +576,25 @@ fn worker_tier_gate_handoff_write_is_audited() {
                 credential.as_str(),
                 "-",
             ])
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let pid = child.id() as libc::pid_t;
+        let started = std::time::Instant::now();
+        loop {
+            if boss_engine_utils::process_args::command(pid as u32).is_some() {
+                break;
+            }
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "handoff argv fixture exited before its command line was readable"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "handoff argv fixture command line never became readable"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         server_state.worker_registry.unregister(self_pid());
         server_state
             .worker_registry
