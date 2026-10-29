@@ -349,8 +349,6 @@ enum EngineEvent {
     case automationUpdated(automation: AppAutomation, openTaskCount: Int? = nil, lastRun: AppAutomationRun? = nil)
     /// Response to `delete_automation` — the id of the deleted row.
     case automationDeleted(automationID: String)
-    /// Response to `get_automation_open_task_count`.
-    case automationOpenTaskCount(automationID: String, count: Int)
     /// Response to `list_automation_runs` — the run history for one automation.
     case automationRunsList(automationID: String, runs: [AppAutomationRun])
     // MARK: Idea events

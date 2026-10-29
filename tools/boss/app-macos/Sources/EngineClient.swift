@@ -1592,12 +1592,6 @@ final class EngineClient: @unchecked Sendable {
             if !automationID.isEmpty {
                 emit(.automationDeleted(automationID: automationID))
             }
-        case "automation_open_task_count":
-            let automationID = payload["automation_id"] as? String ?? ""
-            let count = (payload["count"] as? NSNumber)?.intValue ?? 0
-            if !automationID.isEmpty {
-                emit(.automationOpenTaskCount(automationID: automationID, count: count))
-            }
         case "automation_runs_list":
             let automationID = payload["automation_id"] as? String ?? ""
             let rawRuns = payload["runs"] as? [[String: Any]] ?? []

@@ -698,8 +698,6 @@ extension ChatViewModel {
             automationRunsByID.removeValue(forKey: automationID)
             latestRunByAutomationID.removeValue(forKey: automationID)
             if visibleAutomationHistoryID == automationID { visibleAutomationHistoryID = nil }
-        case .automationOpenTaskCount(let automationID, let count):
-            openTaskCountByAutomationID[automationID] = count
         case .automationRunsList(let automationID, let runs):
             automationRunsByID[automationID] = runs
         // MARK: Idea events
