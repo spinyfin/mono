@@ -7,6 +7,7 @@
 
 use super::*;
 use crate::driver::{ClaudeDriver, CodexDriver, GrokDriver};
+use crate::live_status::test_support::status_reply;
 use boss_protocol::WorkerEvent;
 use serde_json::json;
 use std::io::Write;
@@ -112,9 +113,7 @@ async fn dead_session_stops_timer_refresh_of_cached_transcript() {
     append_action(&transcript, "claude", "inspecting");
     let server = MockServer::start().await;
     Mock::given(wiremock::matchers::method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "content": [{"type": "text", "text": "inspecting the module"}]
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(status_reply("inspecting the module")))
         .expect(1)
         .mount(&server)
         .await;
@@ -244,9 +243,7 @@ async fn replay(driver: Arc<dyn AgentDriver>, transcript: PathBuf) {
                 assert!(prompt.contains("inspecting"), "native action missing: {prompt}");
                 "inspecting the module"
             };
-            ResponseTemplate::new(200).set_body_json(json!({
-                "content":[{"type":"text","text":summary}]
-            }))
+            ResponseTemplate::new(200).set_body_json(status_reply(summary))
         })
         .mount(&server)
         .await;

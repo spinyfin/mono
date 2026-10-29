@@ -1231,11 +1231,17 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             // next eligible event or from the Working timer floor
             // measured from last_refresh_attempt. The outcome is
             // already in the debug store + tracing above.
+            // `InsufficientInput` and `MalformedReply` belong here too: the
+            // model's own "I can't tell" is an engine error (already
+            // logged at `error` with its cause by the summarizer), never a
+            // sentence for the card.
             SummarizerOutcome::NoApiKey(_)
             | SummarizerOutcome::EmptyAfterRedaction
             | SummarizerOutcome::ApiError { .. }
             | SummarizerOutcome::Transport(_)
-            | SummarizerOutcome::PostFilterDropped => {}
+            | SummarizerOutcome::PostFilterDropped
+            | SummarizerOutcome::InsufficientInput { .. }
+            | SummarizerOutcome::MalformedReply(_) => {}
         }
     }
 }
@@ -1580,9 +1586,11 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content":[{"type":"text","text":"reading the Codex rollout"}]
-            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(crate::live_status::test_support::status_reply(
+                    "reading the Codex rollout",
+                )),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -1627,6 +1635,78 @@ mod tests {
             Some("reading the Codex rollout")
         );
         manager.stop_slot(9);
+    }
+
+    /// Run one summarizer attempt against `reply` with a prior label already
+    /// on the slot, and return the registry plus the debug snapshot once the
+    /// attempt's outcome has been recorded.
+    async fn run_attempt_with_prior_status(
+        reply: serde_json::Value,
+    ) -> (Option<String>, Option<String>, SlotDebugSnapshot) {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("t.jsonl");
+        let line = serde_json::json!({"type":"user","message":{"role":"user","content":"keep going on the refactor"}});
+        std::fs::write(&transcript, format!("{line}\n")).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply))
+            .mount(&server)
+            .await;
+        let utility: Arc<dyn UtilityModel> = Arc::new(
+            crate::utility_model::AnthropicUtilityModel::from_lookup(Some("test-key".to_owned()), |_| None)
+                .with_endpoint(format!("{}/v1/messages", server.uri())),
+        );
+        let registry = Arc::new(LiveWorkerStateRegistry::new());
+        registry.register_spawn(9, "run-keep-prior", "claude-opus-4-7", 0, None);
+        registry.set_live_status(9, Some("prior label".to_owned()));
+        let prior_at = registry.get(9).unwrap().live_status_at;
+        let manager = LiveStatusManager::new();
+        let broadcaster: Arc<dyn LiveStatusBroadcaster> = Arc::new(CountingBroadcaster::default());
+        let resolver: Arc<dyn TranscriptPathResolver> = Arc::new(CannedResolver::new(Some(transcript)));
+        manager.start_slot(
+            9,
+            live_run("run-keep-prior"),
+            utility,
+            registry.clone(),
+            broadcaster,
+            resolver,
+        );
+        manager.notify(9, Trigger::ActivityChanged(WorkerActivity::Working));
+        let debug_store = manager.debug_store();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while debug_store.snapshot_for(9).last_outcome_tag.is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("summarizer outcome was never recorded");
+        let snapshot = debug_store.snapshot_for(9);
+        let state = registry.get(9).unwrap();
+        assert_eq!(state.live_status_at, prior_at, "last_status_at must not advance");
+        manager.stop_slot(9);
+        (state.live_status, prior_at, snapshot)
+    }
+
+    #[tokio::test]
+    async fn insufficient_input_reply_keeps_the_prior_status() {
+        let (status, _, snapshot) = run_attempt_with_prior_status(
+            crate::live_status::test_support::insufficient_input_reply("only a turn-start marker is present"),
+        )
+        .await;
+        assert_eq!(status.as_deref(), Some("prior label"));
+        assert_eq!(snapshot.last_outcome_tag.as_deref(), Some("insufficient_input"));
+    }
+
+    #[tokio::test]
+    async fn free_text_reply_keeps_the_prior_status() {
+        let (status, _, snapshot) = run_attempt_with_prior_status(serde_json::json!({
+            "content": [{"type": "text", "text": "I cannot tell what the worker is doing."}],
+            "stop_reason": "end_turn",
+        }))
+        .await;
+        assert_eq!(status.as_deref(), Some("prior label"));
+        assert_eq!(snapshot.last_outcome_tag.as_deref(), Some("malformed_reply"));
     }
 
     #[test]

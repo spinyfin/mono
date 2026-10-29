@@ -857,6 +857,7 @@ dependencies = [
 name = "boss-engine-live-status-redact"
 version = "0.1.0"
 dependencies = [
+ "boss-engine-utils",
  "regex",
  "serde_json",
 ]

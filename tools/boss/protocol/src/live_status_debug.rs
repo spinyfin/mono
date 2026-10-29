@@ -206,7 +206,11 @@ pub struct LiveStatusSlotDebug {
     pub last_synthetic_trigger_at: Option<String>,
     /// Last summarizer outcome tag. One of:
     /// `success` / `no_api_key` / `empty_after_redaction` /
-    /// `api_error` / `transport_error` / `post_filter_dropped`.
+    /// `api_error` / `transport_error` / `post_filter_dropped` /
+    /// `insufficient_input` (the model's forced status tool reported
+    /// the tail held nothing to describe; logged as an engine error,
+    /// prior status kept) / `malformed_reply` (no status tool call in
+    /// the reply, or one outside its schema).
     /// `None` if the loop has never called the summarizer for this
     /// slot.
     pub last_outcome_tag: Option<String>,
