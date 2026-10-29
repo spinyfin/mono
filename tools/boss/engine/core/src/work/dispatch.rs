@@ -1879,7 +1879,7 @@ fn review_guide_executions_for_task(conn: &Connection, task_id: &str) -> Result<
         "SELECT we.id, we.work_item_id, we.kind, we.status, we.repo_remote_url, we.cube_repo_id, we.cube_lease_id,
                 we.cube_workspace_id, we.workspace_path, we.priority, we.preferred_workspace_id,
                 we.created_at, we.started_at, we.finished_at,
-                we.pre_start_failure_count, we.dispatch_not_before, we.pr_url, we.pr_head_before, we.prefer_is_soft, we.worker_branch_prefix, we.transient_failure_count, we.allow_dirty, we.branch_naming, we.dispatch_wait_reason, we.dispatch_wait_since, we.driver_runtime_state, we.driver, we.model, we.effort_level, we.pr_head_after, we.last_error
+                we.pre_start_failure_count, we.dispatch_not_before, we.pr_url, we.pr_head_before, we.prefer_is_soft, we.worker_branch_prefix, we.transient_failure_count, we.allow_dirty, we.branch_naming, we.dispatch_wait_reason, we.dispatch_wait_since, we.driver_runtime_state, we.driver, we.model, we.effort_level, we.pr_head_after, we.last_error, we.pr_head_after_capture
          {REVIEW_GUIDE_EXECUTIONS_FOR_TASK_FROM}",
     ))?;
     let rows = stmt.query_map([task_id], map_execution)?;
