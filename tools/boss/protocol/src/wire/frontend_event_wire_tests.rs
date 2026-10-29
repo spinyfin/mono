@@ -2336,6 +2336,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::CiNeverStartsAlert { .. }
         | FrontendEvent::EffortAuditReport { .. }
         | FrontendEvent::EffortEscalationRecorded { .. }
+        | FrontendEvent::StuckReport { .. }
         | FrontendEvent::WorkItemCostReport { .. }
         | FrontendEvent::CostWindowReport { .. }
         | FrontendEvent::TopCostConsumers { .. }

@@ -798,6 +798,7 @@ pub(crate) use schema_init::table_exists;
 #[cfg(test)]
 use schema_init::table_has_column;
 mod semantic_progress;
+mod stuck_report;
 mod sweep_reads;
 mod task_status_audit;
 mod task_status_backfill;

@@ -19,6 +19,7 @@ rust_binary(
         "src/review.rs",
         "src/selected_product.rs",
         "src/stream_integrity.rs",
+        "src/stuck_report.rs",
         "src/tests.rs",
     ],
     compile_data = [

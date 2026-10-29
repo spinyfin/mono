@@ -8,6 +8,19 @@
 
 use super::*;
 
+pub(super) async fn handle_stuck_report(ctx: Dispatch, req: FrontendRequest) {
+    let FrontendRequest::GetStuckReport { minimum_age_secs } = req else {
+        unreachable!()
+    };
+    match ctx
+        .work_db
+        .stuck_report(minimum_age_secs, boss_engine_utils::epoch_time::now_epoch_secs())
+    {
+        Ok(report) => send_response(&ctx.sink, &ctx.request_id, FrontendEvent::StuckReport { report }),
+        Err(error) => send_work_error(&ctx.sink, &ctx.request_id, error),
+    }
+}
+
 pub(super) async fn handle_get_work_item_cost_report(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,

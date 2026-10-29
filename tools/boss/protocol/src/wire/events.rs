@@ -999,6 +999,11 @@ pub enum FrontendEvent {
     EffortEscalationRecorded {
         event: crate::EffortEscalation,
     },
+    /// Response to [`FrontendRequest::GetStuckReport`].
+    StuckReport {
+        report: crate::StuckReport,
+    },
+
     /// Response to [`FrontendRequest::GetWorkItemCostReport`].
     WorkItemCostReport {
         report: crate::TaskCostReport,

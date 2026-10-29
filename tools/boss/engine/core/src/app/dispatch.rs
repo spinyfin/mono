@@ -177,6 +177,7 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
         r @ FrontendRequest::GetWorkItemByShortId { .. } => {
             Box::pin(work_items::handle_get_work_item_by_short_id(ctx, r))
         }
+        r @ FrontendRequest::GetStuckReport { .. } => Box::pin(cost::handle_stuck_report(ctx, r)),
         r @ FrontendRequest::GetWorkItemCostReport { .. } => Box::pin(cost::handle_get_work_item_cost_report(ctx, r)),
         r @ FrontendRequest::GetWorkRuntimePatch { .. } => Box::pin(work_items::handle_get_work_runtime_patch(ctx, r)),
         r @ FrontendRequest::GetWorkTree { .. } => Box::pin(work_items::handle_get_work_tree(ctx, r)),
