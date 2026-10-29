@@ -135,14 +135,15 @@ extension ChatViewModel {
     ///
     /// - `work_invalidated` on `work.product.*`: the product's coalesced
     ///   burst, which also covers the tree's attention items, groups and
-    ///   planner-run summaries, the deferred-scope list, the background-work
-    ///   poll and every open execution history.
+    ///   planner-run summaries, the deferred-scope list, and every open
+    ///   execution history.
     /// - `work_invalidated` on `work.products`: `list_products`. Its reply
     ///   fetches a tree only when no product is selected, so it adds no
     ///   second tree.
     /// - `worker_live_states_list`: pushed when a state changes, never on a
     ///   timer, so a dropped one stays stale until asked for.
     /// - `engine_health_result` and `git_hub_auth_state`.
+    /// - `background_work_snapshot`: replayed by re-subscribing to its topic.
     /// - `ci_remediation_*`, `ci_failure_cleared`, and `conflict_resolution_*`
     ///   pushes: attempt lists and Activity; the tree recovers active CI chips.
     /// - comment invalidations: each open comment layer reloads once.
@@ -161,7 +162,9 @@ extension ChatViewModel {
     func fireResyncRefetch() {
         pendingResyncRefetchTask = nil
         guard resyncRefetchGate.isDirty else { return }
-        engine.sendSubscribe(topics: ["work.decisions"])
+        // Re-subscribing replays state: the decision feed and the background
+        // work snapshot are full-state pushes a resync may have evicted.
+        engine.sendSubscribe(topics: ["work.decisions", "engine.background_work"])
         let productJoined = resyncRefetchGate.productBurstJoined
         resyncRefetchGate.noteFire(at: .now)
         refreshRemediationState()

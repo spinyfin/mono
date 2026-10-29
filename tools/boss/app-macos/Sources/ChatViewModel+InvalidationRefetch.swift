@@ -13,8 +13,6 @@ struct RefetchScope: OptionSet, Sendable {
     static let deferredScope = RefetchScope(rawValue: 1 << 1)
     /// `list_executions` for each invalidated item that has an open consumer.
     static let executions = RefetchScope(rawValue: 1 << 2)
-    /// The event-triggered `list_engine_attempts` background-work poll.
-    static let backgroundWork = RefetchScope(rawValue: 1 << 3)
     /// `get_work_runtime_patch` for the invalidated cards, in place of the
     /// tree. Only a burst with no `.tree` in it sends one; see
     /// `ChatViewModel+RuntimePatch.swift`.
@@ -24,16 +22,16 @@ struct RefetchScope: OptionSet, Sendable {
     static let treeOnly: RefetchScope = [.tree]
     /// A `work_invalidated` push for the product on screen: anything it
     /// could have covered.
-    static let invalidation: RefetchScope = [.tree, .deferredScope, .executions, .backgroundWork]
+    static let invalidation: RefetchScope = [.tree, .deferredScope, .executions]
     /// A runtime-class `work_invalidated` push for the product on screen: the
     /// named cards' runtime changed and nothing about the board's shape, so
     /// the board is not re-read. The side lists a structural push also fetches
     /// are left out because no runtime-class writer touches them: the
     /// deferred-scope list changes only when a run ends, which is structural.
-    static let runtimeInvalidation: RefetchScope = [.runtimePatch, .executions, .backgroundWork]
+    static let runtimeInvalidation: RefetchScope = [.runtimePatch, .executions]
     /// A `work_invalidated` push for a product that is not on screen: only
     /// the lazily loaded data that is not tied to the board.
-    static let offBoard: RefetchScope = [.executions, .backgroundWork]
+    static let offBoard: RefetchScope = [.executions]
 }
 
 /// Timing of the coalesced refetch. See [[ChatViewModel.scheduleRefetch]].
@@ -156,9 +154,6 @@ extension ChatViewModel {
             for taskID in candidates.sorted() where hasOpenExecutionsConsumer(taskID: taskID) {
                 engine.sendListExecutions(taskId: taskID)
             }
-        }
-        if burst.scope.contains(.backgroundWork) {
-            requestBackgroundWorkRefresh()
         }
     }
 

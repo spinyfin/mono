@@ -620,29 +620,16 @@ final class ChatViewModel: ObservableObject {
     @Published var engineAttempts: [EngineAttemptListEntry] = []
 
     /// Engine-owned snapshot for the background-work toolbar affordance.
-    /// Replaced atomically from `ListEngineAttempts` responses; the app
+    /// Replaced atomically by each `engine.background_work` push; the app
     /// must not filter or re-count by kind. Cleared on disconnect.
     @Published var backgroundWork: [BackgroundWorkItem] = []
 
-    /// Canonical five-second cadence for the connection-scoped background
-    /// snapshot poll. Tests shorten the instance property.
-    nonisolated static let backgroundWorkPollInterval: TimeInterval = 5
-
-    /// Polling interval used by `startBackgroundWorkPolling()`. Defaults
-    /// to ``ChatViewModel.backgroundWorkPollInterval``; tests assign a shorter value.
-    var backgroundWorkPollInterval: TimeInterval = ChatViewModel.backgroundWorkPollInterval
-
-    /// Cancellable connection-scoped poller. Non-nil while connected.
-    var backgroundWorkPollTask: Task<Void, Never>?
-
-    /// Monotonic generation for in-flight snapshot requests so a late
-    /// `limit = 0` poll cannot overwrite a newer event-triggered refresh.
-    var backgroundWorkSendGeneration: UInt64 = 0
-    var backgroundWorkAppliedGeneration: UInt64 = 0
-    /// Independent of `backgroundWorkAppliedGeneration` so a history
-    /// refresh that loses the snapshot race can still replace Activity.
-    var attemptsAppliedGeneration: UInt64 = 0
-    var backgroundWorkPending: [String: BackgroundWorkPendingRequest] = [:]
+    /// In-flight Activity history reads, keyed by request id, valued by the
+    /// send generation they were issued at so a late reply cannot overwrite
+    /// a newer one.
+    var engineAttemptsSendGeneration: UInt64 = 0
+    var engineAttemptsAppliedGeneration: UInt64 = 0
+    var engineAttemptsPending: [String: UInt64] = [:]
 
     /// Source-specific records requested by selected Activity rows, keyed by
     /// their shared-list attempt id.

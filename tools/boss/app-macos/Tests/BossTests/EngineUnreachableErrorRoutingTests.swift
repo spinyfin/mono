@@ -210,9 +210,7 @@ final class EngineUnreachableErrorRoutingTests: XCTestCase {
         XCTAssertNotNil(client.sendLine(["type": "get_work_tree"], queueIfDisconnected: true))
         XCTAssertNotNil(client.sendLine(["type": "get_work_tree"], queueIfDisconnected: true))
         XCTAssertEqual(client.queuedReadCountForTesting, 1, "identical reads coalesce")
-        XCTAssertNil(client.sendListEngineAttempts(limit: 0, includeBackgroundWork: true))
-        XCTAssertEqual(client.queuedReadCountForTesting, 1, "background polls retry on reconnect without holding a pending reply")
-        XCTAssertNotNil(client.sendListEngineAttempts(limit: 20, includeBackgroundWork: true))
+        XCTAssertNotNil(client.sendListEngineAttempts(limit: 20))
         XCTAssertEqual(client.queuedReadCountForTesting, 2, "on-demand history reads must survive backoff")
         XCTAssertNil(client.sendLine(["type": "create_chore"]))
 

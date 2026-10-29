@@ -87,21 +87,38 @@ final class ActivityLogDecoderTests: XCTestCase {
         XCTAssertEqual(backgroundWork?.kind, .unknown("future_worker"))
     }
 
-    func testDecodesEngineAttemptsListEnvelopeWithoutBackgroundWork() {
+    func testDecodesEngineAttemptsListEnvelope() {
         let client = makeClient()
         let received = expectation(description: "engine attempts list")
         client.onEvent = { event in
-            guard case .engineAttemptsList(let attempts, let backgroundWork, let requestId) = event else {
+            guard case .engineAttemptsList(let attempts, let requestId) = event else {
                 XCTFail("expected engine attempts list event")
                 return
             }
             XCTAssertEqual(attempts.map(\.id), ["cir_123"])
-            XCTAssertTrue(backgroundWork.isEmpty)
             XCTAssertEqual(requestId, "test")
             received.fulfill()
         }
 
         client.consumeLineForTesting(#"{"request_id":"test","payload":{"type":"engine_attempts_list","attempts":[{"id":"cir_123","product_id":"prod_123","created_at":"2026-08-19T12:00:00Z","extra":{},"kind":"ci","pr_url":"https://github.com/example/repo/pull/42","status":"running"}]}}"#)
+
+        wait(for: [received], timeout: 1)
+    }
+
+    func testDecodesBackgroundWorkSnapshotPush() {
+        let client = makeClient()
+        let received = expectation(description: "background work snapshot")
+        client.onEvent = { event in
+            guard case .backgroundWorkSnapshot(let items) = event else {
+                XCTFail("expected background work snapshot event, got \(event)")
+                return
+            }
+            XCTAssertEqual(items.map(\.id), ["project_planner:run_1"])
+            XCTAssertEqual(items.first?.kind, .projectPlanner)
+            received.fulfill()
+        }
+
+        client.consumeLineForTesting(#"{"payload":{"type":"background_work_snapshot","items":[{"id":"project_planner:run_1","kind":"project_planner","phase":"Planning Alpha","product_id":"prod_1","source_id":"run_1","title":"Project planner","project_id":"proj_1","started_at":"100"}]}}"#)
 
         wait(for: [received], timeout: 1)
     }
@@ -133,8 +150,8 @@ final class ActivityAttemptDetailTests: XCTestCase {
 
         model.applyEventForTest(.connected)
         defer { model.applyEventForTest(.disconnected) }
-        model.registerBackgroundWorkRequest(requestId: "list", replacesAttempts: true)
-        model.applyEventForTest(.engineAttemptsList(attempts: [conflict, ci], backgroundWork: [], requestId: "list"))
+        model.registerEngineAttemptsRequest(requestId: "list")
+        model.applyEventForTest(.engineAttemptsList(attempts: [conflict, ci], requestId: "list"))
         model.applyEventForTest(.conflictResolution(attempt: makeConflictResolution(id: conflict.id)))
         model.applyEventForTest(.ciRemediation(attempt: makeCiRemediation(id: ci.id)))
 

@@ -209,15 +209,15 @@ extension ChatViewModel {
         openProjectDesignDoc(project)
     }
 
-    /// Refresh Activity's one authoritative engine-attempt list. The
-    /// background-work snapshot shares this response so the app need not
-    /// reconstruct either view from the source-specific attempt tables.
+    /// Refresh Activity's one authoritative engine-attempt list. It does not
+    /// ask for the background-work snapshot: that arrives only as an
+    /// `engine.background_work` push, so it has a single writer.
     func refreshEngineAttempts() {
         guard activityIsVisible else { return }
-        guard let requestId = engine.sendListEngineAttempts(limit: 200, includeBackgroundWork: true) else {
+        guard let requestId = engine.sendListEngineAttempts(limit: 200) else {
             return
         }
-        registerBackgroundWorkRequest(requestId: requestId, replacesAttempts: true)
+        registerEngineAttemptsRequest(requestId: requestId)
     }
 
     /// Load source-specific fields only after an Activity row is selected.

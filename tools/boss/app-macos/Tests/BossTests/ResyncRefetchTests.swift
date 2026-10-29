@@ -141,15 +141,22 @@ final class ResyncRefetchTests: XCTestCase {
                 "get_engine_pool_config": 1,
                 "get_work_tree": 1,
                 "list_deferred_scope_attentions": 1,
-                "list_engine_attempts": 2,
+                "list_engine_attempts": 1,
             ],
             "25 resyncs must cost exactly one set, none of it per project"
         )
         let attempts = recorder.sent.filter { $0["type"] as? String == "list_engine_attempts" }
         let subscriptions = recorder.sent.filter { $0["type"] as? String == "subscribe" }
-        XCTAssertEqual(subscriptions.first?["topics"] as? [String], ["work.decisions"])
+        XCTAssertEqual(
+            subscriptions.first?["topics"] as? [String],
+            ["work.decisions", "engine.background_work"],
+            "re-subscribing replays the decision feed and the background-work snapshot"
+        )
         XCTAssertEqual(attempts.filter { $0["open_prs_only"] as? Bool == true }.count, 1)
-        XCTAssertEqual(attempts.filter { $0["limit"] as? Int == 0 }.count, 1)
+        XCTAssertTrue(
+            attempts.allSatisfy { $0["include_background_work"] == nil },
+            "the snapshot is replayed by subscribing, not requested"
+        )
         XCTAssertFalse(attempts.contains { $0["limit"] as? Int == 200 }, "hidden Activity must not fetch history")
     }
 

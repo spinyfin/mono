@@ -225,7 +225,12 @@ extension ChatViewModel {
         // re-renders live (OAuth device-flow design §4, TOPIC_GITHUB_AUTH).
         // `engine.health` carries health-state changes (dispatch pause/resume,
         // etc.) so the banner updates live without polling or restarting.
-        var topics: Set<String> = ["work.products", "work.decisions", "worker.live_states", "github.auth", "engine.health"]
+        // `engine.background_work` carries the toolbar badge's snapshot: the
+        // engine replays the current one on subscribe and pushes each change.
+        var topics: Set<String> = [
+            "work.products", "work.decisions", "worker.live_states", "github.auth", "engine.health",
+            "engine.background_work",
+        ]
         if let productID = currentSelectedProductID {
             topics.insert(workTopic(forProductID: productID))
         }

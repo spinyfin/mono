@@ -48,10 +48,9 @@ extension ChatViewModel {
             engine.sendGetWorkTree(productId: productID, flow: flow)
         }
         refreshRemediationState()
-        if activityIsVisible, !backgroundWorkPending.values.contains(where: { $0.replacesAttempts }) {
+        if activityIsVisible, engineAttemptsPending.isEmpty {
             refreshEngineAttempts()
         }
-        startBackgroundWorkPolling()
         if resyncOnlyReadsOwed {
             resyncOnlyReadsOwed = false
             sendResyncOnlyReads()

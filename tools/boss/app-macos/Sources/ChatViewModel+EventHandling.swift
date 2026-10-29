@@ -74,7 +74,9 @@ extension ChatViewModel {
             isConnected = false
             if refreshUnsentActions() { showDisconnectedActionNotice() }
             liveWorkerStates.markFeedUnavailable()
-            stopBackgroundWorkPolling(clearSnapshot: true)
+            dropSentEngineAttemptsReads()
+            // The next connect's subscription replays the current snapshot.
+            backgroundWork = []
             isAppSessionRegistered = false
             subscribedWorkTopics.removeAll()
             for (productID, state) in automationsFetchStateByProductID {
@@ -204,7 +206,7 @@ extension ChatViewModel {
             // Likewise a refused project archive: the row drops its pending
             // mark and the message surfaces, with no other state touched.
             if settleArchiveWorkError(message: message, requestId: requestId) { return }
-            abandonBackgroundWorkRequest(requestId: requestId)
+            abandonEngineAttemptsRequest(requestId: requestId)
             // Legacy list_executions/list_attachments guards do not retain
             // request IDs, so they cannot match the error's envelope ID.
             // `hasOtherTrackedAppRequestInFlight` checks every
@@ -513,12 +515,11 @@ extension ChatViewModel {
                     break
                 }
             }
-        case .engineAttemptsList(let attempts, let backgroundWork, let requestId):
-            applyEngineAttemptsList(
-                attempts: attempts,
-                backgroundWork: backgroundWork,
-                requestId: requestId
-            )
+        case .engineAttemptsList(let attempts, let requestId):
+            applyEngineAttemptsList(attempts: attempts, requestId: requestId)
+        case .backgroundWorkSnapshot(let items):
+            // A full snapshot: the newest push replaces whatever is shown.
+            backgroundWork = items
         case .conflictResolution(let attempt):
             engineAttemptDetails[attempt.id] = .conflictResolution(attempt)
             engineAttemptDetailErrors.removeValue(forKey: attempt.id)

@@ -1156,12 +1156,13 @@ final class EngineClient: @unchecked Sendable {
             emit(.ciRemediationsList(attempts: attempts))
         case "engine_attempts_list":
             let rawAttempts = payload["attempts"] as? [[String: Any]] ?? []
-            let rawBackgroundWork = payload["background_work"] as? [[String: Any]] ?? []
             emit(.engineAttemptsList(
                 attempts: rawAttempts.compactMap(parseEngineAttemptListEntry),
-                backgroundWork: rawBackgroundWork.compactMap(parseBackgroundWorkItem),
                 requestId: envelopeRequestId
             ))
+        case "background_work_snapshot":
+            let rawItems = payload["items"] as? [[String: Any]] ?? []
+            emit(.backgroundWorkSnapshot(items: rawItems.compactMap(parseBackgroundWorkItem)))
         case "conflict_resolution":
             guard let raw = payload["attempt"] as? [String: Any],
                   let attempt = parseConflictResolution(raw)

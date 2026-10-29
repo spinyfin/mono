@@ -84,7 +84,7 @@ final class RuntimePatchTests: XCTestCase {
 
         XCTAssertEqual(
             recorder.counts,
-            ["get_work_runtime_patch": 1, "list_engine_attempts": 1],
+            ["get_work_runtime_patch": 1],
             "ten runtime pushes cost one patch: no tree and no deferred-scope list"
         )
         XCTAssertEqual(recorder.patchItemIDs, (1...10).map { "task_\($0)" }.sorted())
@@ -132,10 +132,10 @@ final class RuntimePatchTests: XCTestCase {
             topic: model.workTopic(forProductID: "prod_b"), productId: "prod_b", itemIds: ["task_b"],
             invalidationClass: .runtime
         ))
-        await waitFor(recorder, "list_engine_attempts")
+        let settled = await model.waitForRefetchBurstsForTest()
 
-        XCTAssertNil(recorder.counts["get_work_runtime_patch"])
-        XCTAssertNil(recorder.counts["get_work_tree"])
+        XCTAssertTrue(settled)
+        XCTAssertTrue(recorder.sent.isEmpty, "an off-screen runtime push needs no read; got \(recorder.counts)")
     }
 
     func testBurstNamingMoreCardsThanAPatchIsWorthIsATreeRead() async {
