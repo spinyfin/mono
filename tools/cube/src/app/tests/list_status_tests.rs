@@ -292,7 +292,7 @@ fn workspace_status_includes_jj_status_output() {
     let status_runner = FakeRunner::new(vec![ExpectedCommand::ok(
         workspace_path.clone(),
         "jj",
-        &["status"],
+        &["status", "--no-pager"],
         "The working copy is clean",
     )]);
     let status = Cli::parse_from([
@@ -668,4 +668,53 @@ fn workspace_salvage_lists_recovered_work_with_apply_instructions() {
     .expect("salvage");
     assert_eq!(empty.payload["salvage"].as_array().unwrap().len(), 0);
     assert_eq!(empty.message, "No salvaged work.");
+}
+
+#[test]
+fn cli_status_reports_held_maintenance_gate_without_starting_jj() {
+    use super::support::ENV_MUTEX;
+    use crate::command_runner::JjGate;
+    use crate::metadata::WorkspaceCandidate;
+    use crate::store::Store;
+    use std::time::{Duration, Instant};
+
+    let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("state.db");
+    let root = dir.path().join("workspaces");
+    let workspace = root.join("mono-agent-001");
+    std::fs::create_dir_all(workspace.join(".jj")).unwrap();
+    seed_mono_repo(&root, &database);
+    Store::open_at(&database)
+        .unwrap()
+        .sync_workspaces(
+            "mono",
+            &[WorkspaceCandidate {
+                workspace_id: "mono-agent-001".into(),
+                workspace_path: workspace.clone(),
+            }],
+        )
+        .unwrap();
+    let gate_path = JjGate::path(dir.path());
+    let _gate = JjGate::exclusive(&gate_path, Duration::ZERO).unwrap();
+    let mut command = std::process::Command::new(std::env::var_os("CUBE_TEST_BIN").unwrap());
+    command
+        .args(["--json", "workspace", "status", "--workspace"])
+        .arg(&workspace)
+        .env("CUBE_DATA_DIR", dir.path())
+        // No jj executable: an attempted spawn would produce a different error.
+        .env("PATH", dir.path());
+    let started = Instant::now();
+    let output = process_runner::output_bounded(&mut command, Duration::from_secs(5), false, |_| {}, |_| {})
+        .expect("status must not wait for the held maintenance gate");
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty(), "no success JSON when jj cannot run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("jj maintenance gate busy"), "{stderr}");
+    assert!(stderr.contains(&gate_path.display().to_string()), "{stderr}");
+    assert!(stderr.contains("phase=registry_open finished"), "{stderr}");
+    assert!(stderr.contains("phase=registry_lookup finished"), "{stderr}");
+    assert!(stderr.contains("phase=maintenance_gate finished"), "{stderr}");
+    assert!(!stderr.contains("phase=jj_process started"), "{stderr}");
+    eprintln!("held-gate CLI status returned failure in {:?}", started.elapsed());
 }

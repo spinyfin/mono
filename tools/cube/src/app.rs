@@ -35,6 +35,7 @@ mod store_gc;
 mod util;
 mod workspace;
 mod workspace_ops;
+pub(crate) mod workspace_status;
 
 #[cfg(test)]
 mod tests;
