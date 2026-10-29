@@ -2565,6 +2565,10 @@ fn design_directive_requires_the_scope_tag() {
 #[test]
 fn design_directive_calibrates_breakdown_size_to_problem_size() {
     let directive = compose_design_directive(None, None);
+    assert!(directive.contains("Major deliverables:"));
+    assert!(directive.contains("Likely changed files:"));
+    assert!(directive.contains("Estimated size: ~N files / ~M changed lines"));
+    assert!(directive.contains("materialization rejects these entries and never auto-splits them"));
     // The split rules this calibration must not displace — tempered so a
     // thin multi-layer change may stay one entry, and so the planner is not
     // claimed to re-expand oversize entries.

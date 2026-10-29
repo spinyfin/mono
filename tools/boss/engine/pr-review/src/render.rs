@@ -1015,6 +1015,14 @@ pub(crate) fn render_rubric_section(scope: &ReviewScope) -> String {
                expected headings are present: Problem / Goal, Goals, Chosen \
                approach (or equivalent). Flag any that are absent or \
                substantively empty.\n\
+             - **Task footprint plausibility** — for every design breakdown entry, \
+               require numbered Major deliverables, Likely changed files (explicit \
+               paths or globs with approximate counts), and Estimated size: ~N files / \
+               ~M changed lines. Inspect the referenced code and callers: are the file \
+               list and line estimate plausible, including tests, build wiring, and \
+               mechanical edits? Flag missing or implausibly low estimates. Entries \
+               over 3 major deliverables, 25 files, or 1,500 changed lines must be \
+               split by the design author along capability boundaries before approval.\n\
              \n\
              Do NOT apply the code rubric (correctness, regressions, \
              architecture, tests, edge cases) to this docs-only PR.\n\
@@ -1882,6 +1890,9 @@ mod tests {
         assert!(prompt.contains("light rubric"));
         assert!(prompt.contains("Internal consistency"));
         assert!(prompt.contains("Required-sections check"));
+        assert!(prompt.contains("Task footprint plausibility"));
+        assert!(prompt.contains("Inspect the referenced code and callers"));
+        assert!(prompt.contains("1,500 changed lines"));
         // Code rubric must NOT appear in docs-only prompt.
         assert!(!prompt.contains("code PR"));
         assert!(!prompt.contains("T793"));

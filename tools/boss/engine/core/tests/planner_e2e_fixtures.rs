@@ -434,10 +434,30 @@ impl PopulatorSteps for FakeSteps {
     }
 }
 
-/// Steps that serve the given doc content and plan the given fixture graph.
+/// Historical docs predate mandatory footprint fields. Keep their content as
+/// quoted context and give the canned graph an explicit, estimated breakdown.
+/// Parsing the historical layouts is tested separately below; these tests
+/// exercise graph validation and materialization with a current-format doc.
+fn estimated_fixture_doc(doc: &str, output: &PlannerOutput) -> String {
+    if !output.breakdown_found {
+        return doc.to_owned();
+    }
+    let mut result = doc.lines().map(|line| format!("> {line}\n")).collect::<String>();
+    result.push_str("\n## Proposed implementation task breakdown\n");
+    for task in &output.tasks {
+        result.push_str(&format!(
+            "### {}\n{}\nMajor deliverables:\n1. Implement this capability and its tests.\n\
+             Likely changed files:\n- `src/{}.rs`\nEstimated size: ~1 files / ~100 changed lines\n",
+            task.name, task.description, task.handle
+        ));
+    }
+    result
+}
+
+/// Steps that serve an estimated doc and plan the given fixture graph.
 fn steps_for(doc: &str, output: PlannerOutput) -> FakeSteps {
     FakeSteps {
-        fetch: FakeFetch::Content(doc.to_owned()),
+        fetch: FakeFetch::Content(estimated_fixture_doc(doc, &output)),
         plan: FakePlan::Success(output),
     }
 }
@@ -982,7 +1002,10 @@ async fn planner_no_api_key_is_recorded_no_op() {
     let db = open();
     let (product_id, project_id, design_id) = seed(&db);
     let steps = FakeSteps {
-        fetch: FakeFetch::Content(DOC_AUTO_POPULATE.to_owned()),
+        fetch: FakeFetch::Content(estimated_fixture_doc(
+            DOC_AUTO_POPULATE,
+            &fixture_auto_populate().output(),
+        )),
         plan: FakePlan::NoApiKey,
     };
     let outcome = Populator::run(
@@ -1087,4 +1110,24 @@ fn every_fixture_graph_validates() {
             fixture.label,
         );
     }
+}
+#[tokio::test]
+async fn historical_unestimated_breakdown_is_sent_back_before_planning() {
+    let db = open();
+    let (product_id, project_id, design_id) = seed(&db);
+    let steps = FakeSteps {
+        fetch: FakeFetch::Content(DOC_AUTO_POPULATE.to_owned()),
+        plan: FakePlan::NoApiKey,
+    };
+    let outcome = Populator::run(
+        &db,
+        &steps,
+        &ctx(&product_id, &project_id, &design_id),
+        DEFAULT_MAX_TASKS,
+        &NoopExecutionPublisher,
+    )
+    .await;
+    assert_eq!(outcome, PopulateOutcome::RejectedBadGraph);
+    assert!(materialized_tasks(&db, &product_id, &project_id).is_empty());
+    assert_eq!(open_attention_count(&db, &product_id, &design_id), 1);
 }
