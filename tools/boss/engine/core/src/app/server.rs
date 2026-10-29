@@ -2238,6 +2238,21 @@ async fn serve_scoped(
         server_state.event_bus.clone(),
     );
 
+    // Fast path for a review-guide attempt that admission just superseded:
+    // cancel_execution_in_tx records Cancelled but does not reap the pane.
+    // Stop the cancelled worker immediately; terminal_work_sweep is the backstop.
+    let cancelled_guide_completion = server_state.completion_handler.clone();
+    let _cancelled_guide_stop_handle = crate::review_guide_capture::spawn_cancelled_review_guide_worker_stopper(
+        server_state.work_db.clone(),
+        server_state.event_bus.clone(),
+        Arc::new(move |execution_id| {
+            let handler = cancelled_guide_completion.clone();
+            Box::pin(async move {
+                handler.force_release(&execution_id).await;
+            })
+        }),
+    );
+
     // Periodic dispatch-failure recovery reconciler: the pre-spawn
     // sibling of the orphan-active sweep above. Re-enqueues work items
     // the engine bounced to Backlog after a pre-spawn dispatch failure
