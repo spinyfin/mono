@@ -223,7 +223,7 @@ fn run_done_seam_on_worker_signal_seam_off_teaches_summary_not_blocked_verb() {
         "worker_signal seam off: blocked outcome must preserve the reason on propose done --summary:\n{prompt}",
     );
     assert!(prompt.contains(
-        "--question \"Approve including the remaining files needed for this fix?\" --answer-type yes-no --explanation"
+        "--question \"Approve switching the retry to exponential backoff?\" --answer-type yes-no --explanation"
     ));
     assert!(
         prompt.contains(
@@ -245,6 +245,10 @@ fn run_done_seam_on_worker_signal_seam_off_teaches_summary_not_blocked_verb() {
     assert!(
         prompt.contains("ask the split-vs-bypass question — both answers act"),
         "file-count guidance must be a two-path question:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("projected upper-bound file count of the single-PR change"),
+        "file-count guidance must treat --file-count as a projected upper bound:\n{prompt}",
     );
     assert!(
         prompt.contains("exceed the `change/file-count` limit"),

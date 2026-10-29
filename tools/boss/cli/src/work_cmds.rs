@@ -1553,18 +1553,13 @@ pub(crate) async fn run_show_leaf(
                 q.asked_at, q.execution_id
             );
             println!("  Explanation: {}", q.explanation);
-            if let boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
-                name,
-                brief,
-                file_count_bypass,
-            } = &q.answer_type
-            {
+            if let boss_protocol::OperatorAnswerType::CreatePrerequisiteTask { name, brief, .. } = &q.answer_type {
                 println!("  Proposed prerequisite task: {name}");
                 println!("  Proposed brief:");
                 for line in brief.lines() {
                     println!("    {line}");
                 }
-                if let Some(spec) = file_count_bypass {
+                if let Some(spec) = q.answer_type.file_count_bypass() {
                     println!(
                         "  File-count split: {} files, limit {}. No authorizes a file-count exception for this PR only.",
                         spec.files, spec.limit

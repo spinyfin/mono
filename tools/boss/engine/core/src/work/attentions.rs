@@ -777,7 +777,7 @@ fn question_artifact_name(group: &AttentionGroup) -> String {
 /// to the revision / design worker. Skipped and dismissed members contribute
 /// nothing (the design: "produces one downstream artifact from the answered
 /// set").
-fn build_qa_brief(group: &AttentionGroup, answered: &[&Attention]) -> String {
+fn build_qa_brief(group: &AttentionGroup, answered: &[&Attention], file_count_bypass_no: bool) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     match group.source_doc_path.as_deref().filter(|s| !s.is_empty()) {
@@ -789,9 +789,14 @@ fn build_qa_brief(group: &AttentionGroup, answered: &[&Attention]) -> String {
             );
         }
         None if group.grouping_key.starts_with("worker_question|") => {
+            let disclaimer = if file_count_bypass_no {
+                ""
+            } else {
+                " A No answer does not authorize the proposed action."
+            };
             let _ = writeln!(
                 out,
-                "The operator answered a worker's questions. Apply the recorded decisions to the work below. A No answer does not authorize the proposed action."
+                "The operator answered a worker's questions. Apply the recorded decisions to the work below.{disclaimer}"
             );
         }
         None => {
@@ -878,7 +883,8 @@ fn action_question_group(
             group.id
         );
     }
-    let mut brief = build_qa_brief(group, &answered);
+    let file_count_bypass_no = worker_questions::file_count_bypass_no_spec(conn, group, members)?.is_some();
+    let mut brief = build_qa_brief(group, &answered, file_count_bypass_no);
     let source = group
         .source_task_id
         .as_deref()
@@ -1815,7 +1821,7 @@ mod tests {
     #[test]
     fn build_qa_brief_with_no_answered_has_header_but_no_entries() {
         let g = question_group(Some("docs/plan.md"));
-        let brief = build_qa_brief(&g, &[]);
+        let brief = build_qa_brief(&g, &[], false);
         assert!(brief.contains("docs/plan.md"));
         assert!(brief.contains("## Answered questions"));
         // No per-question entries.
@@ -1829,7 +1835,7 @@ mod tests {
         let m1 = answered_member("Ship on Friday?", "Yes", Some("Rollout"));
         let m2 = answered_member("Use feature flags?", "No", None);
         let answered = [&m1, &m2];
-        let brief = build_qa_brief(&g, &answered);
+        let brief = build_qa_brief(&g, &answered, false);
 
         assert!(brief.contains("### Ship on Friday?"));
         assert!(brief.contains("**Answer:** Yes"));
@@ -1840,10 +1846,10 @@ mod tests {
 
     #[test]
     fn build_qa_brief_intro_differs_when_doc_path_absent() {
-        let with_path = build_qa_brief(&question_group(Some("docs/plan.md")), &[]);
+        let with_path = build_qa_brief(&question_group(Some("docs/plan.md")), &[], false);
         assert!(with_path.contains("`docs/plan.md`"));
 
-        let without_path = build_qa_brief(&question_group(None), &[]);
+        let without_path = build_qa_brief(&question_group(None), &[], false);
         assert!(without_path.contains("about this design"));
         assert!(!without_path.contains('`'));
     }
