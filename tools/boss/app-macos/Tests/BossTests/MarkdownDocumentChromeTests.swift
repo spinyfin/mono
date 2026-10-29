@@ -453,14 +453,6 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         XCTAssertEqual(heading, "Indented heading")
         XCTAssertFalse(body.contains("### Next"))
         XCTAssertTrue(chunks[2].renderedText.contains("### Next"))
-        let outline = MarkdownHeadingSections.chunks(
-            in: doc,
-            collapsibleHeadings: ["Indented heading"],
-            foldDescendants: true
-        )
-        XCTAssertEqual(outline.count, 2, "outline fold includes the descendant heading: \(outline)")
-        guard case .collapsible(_, let outlineBody) = outline[1] else { return XCTFail("expected a .collapsible chunk") }
-        XCTAssertTrue(outlineBody.hasSuffix("### Next"))
     }
 
     // MARK: - Find-in-document over a chunked document

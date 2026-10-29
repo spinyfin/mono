@@ -8,8 +8,7 @@ enum MarkdownParsedDocument {
     static func parse(
         source: String,
         chunks: [MarkdownDocumentChunk],
-        baseURL: URL?,
-        foldDescendants: Bool = false
+        baseURL: URL?
     ) -> [AttributedString] {
         do {
             let document = try AttributedStringMarkdownParser(
@@ -22,8 +21,7 @@ enum MarkdownParsedDocument {
             })
             let ranges = MarkdownHeadingSections.sections(
                 in: source,
-                collapsibleHeadings: collapsed,
-                foldDescendants: foldDescendants
+                collapsibleHeadings: collapsed
             ).map(\.range)
             let lineStarts = MarkdownHeadingSections.lineStarts(in: source)
             var result = Array(repeating: AttributedString(), count: chunks.count)
@@ -64,30 +62,25 @@ enum MarkdownParsedDocument {
         private var source: String?
         private var chunks: [MarkdownDocumentChunk]?
         private var baseURL: URL?
-        private var foldDescendants = false
         private var value: [AttributedString] = []
 
         func parse(
             source: String,
             chunks: [MarkdownDocumentChunk],
-            baseURL: URL?,
-            foldDescendants: Bool = false
+            baseURL: URL?
         ) -> [AttributedString] {
             if self.source != source
                 || self.chunks != chunks
                 || self.baseURL != baseURL
-                || self.foldDescendants != foldDescendants
             {
                 value = MarkdownParsedDocument.parse(
                     source: source,
                     chunks: chunks,
-                    baseURL: baseURL,
-                    foldDescendants: foldDescendants
+                    baseURL: baseURL
                 )
                 self.source = source
                 self.chunks = chunks
                 self.baseURL = baseURL
-                self.foldDescendants = foldDescendants
             }
             return value
         }

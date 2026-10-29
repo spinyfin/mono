@@ -28,6 +28,18 @@ final class MarkdownRevisionBriefTests: XCTestCase {
     **Review summary:** All findings require a fix.
     """
 
+    func testCaptureBriefMarkdownLoadsEngineShapedFixture() throws {
+        let dir = ProcessInfo.processInfo.environment["TEST_TMPDIR"]
+            .map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? FileManager.default.temporaryDirectory
+        let temp = dir.appendingPathComponent("revision-brief-\(UUID().uuidString).md")
+        try RevisionBriefCaptureFixture.engineShaped.write(to: temp, atomically: true, encoding: .utf8)
+        XCTAssertEqual(
+            try BossRevisionBriefCapture.loadMarkdown(from: temp.path),
+            RevisionBriefCaptureFixture.engineShaped
+        )
+    }
+
     func testExactGeneratedBrief() throws {
         try assertExactBriefPreservesBlocks(RevisionBriefCaptureFixture.adjacentFindingHeading)
         try assertExactBriefPreservesBlocks(RevisionBriefCaptureFixture.engineShaped)
@@ -101,26 +113,23 @@ final class MarkdownRevisionBriefTests: XCTestCase {
         XCTAssertTrue(paragraphs.contains { $0.hasPrefix("File:") && $0.contains("\nCategory: deferred_scope") })
     }
 
-    func testExactBriefUsesOutlineBoundariesWithAnyHeadingAndLineEnding() throws {
+    func testExactBriefUsesDefaultFoldWithHardRuleHeadingAndLineEnding() throws {
+        let headings: Set<String> = [RevisionBriefCollapsibleHeadings.hardRule]
         for newline in ["\n", "\r\n", "\r"] {
-            let source = (RevisionBriefCaptureFixture.adjacentFindingHeading.replacingOccurrences(
-                of: RevisionBriefCollapsibleHeadings.hardRule, with: "Review instructions"
-            ) + "\n## Next section\nVisible.").replacingOccurrences(of: "\n", with: newline)
-            let chunks = MarkdownHeadingSections.chunks(
-                in: source,
-                collapsibleHeadings: ["Review instructions"],
-                foldDescendants: true
-            )
-            XCTAssertEqual(chunks.count, 3)
-            let parsed = MarkdownParsedDocument.parse(
-                source: source,
-                chunks: chunks,
-                baseURL: nil,
-                foldDescendants: true
-            )
-            XCTAssertTrue(String(parsed[1].characters).contains("The default is to do the work."))
-            XCTAssertTrue(String(parsed[1].characters).hasSuffix("Verified: dispatch only ensures ..."))
-            XCTAssertEqual(String(parsed[2].characters), "Next sectionVisible.")
+            for fixture in [RevisionBriefCaptureFixture.engineShaped, RevisionBriefCaptureFixture.adjacentFindingHeading] {
+                let source = fixture.replacingOccurrences(of: "\n", with: newline)
+                let chunks = MarkdownHeadingSections.chunks(
+                    in: source,
+                    collapsibleHeadings: headings
+                )
+                XCTAssertGreaterThanOrEqual(chunks.count, 3, "\(newline.debugDescription): \(chunks)")
+                XCTAssertFalse(chunks[1].renderedText.contains("### ["), "\(newline.debugDescription)")
+                XCTAssertTrue(chunks[2].renderedText.contains("### [high]"), "\(newline.debugDescription)")
+                let parsed = MarkdownParsedDocument.parse(source: source, chunks: chunks, baseURL: nil)
+                XCTAssertTrue(String(parsed[1].characters).contains("The default is to do the work."))
+                XCTAssertFalse(String(parsed[1].characters).contains("[high]"))
+                XCTAssertTrue(String(parsed[2].characters).contains("[high]"))
+            }
         }
     }
 
@@ -152,19 +161,15 @@ final class MarkdownRevisionBriefTests: XCTestCase {
         let unfolded = MarkdownHeadingSections.chunks(in: source, collapsibleHeadings: [])
         XCTAssertEqual(unfolded.count, 3)
         XCTAssertEqual(unfolded.map(\.renderedText).joined(), source)
-        let outline = MarkdownHeadingSections.chunks(
-            in: source,
-            collapsibleHeadings: ["Fold"],
-            foldDescendants: true
-        )
-        XCTAssertEqual(outline.count, 2)
-        XCTAssertTrue(outline[0].renderedText.contains("## Child\nbody"))
-        let higher = MarkdownHeadingSections.chunks(
+        let nested = MarkdownHeadingSections.chunks(
             in: "## Fold\nbody\n### Child\nchild\n# End\nend",
-            collapsibleHeadings: ["Fold"],
-            foldDescendants: true
+            collapsibleHeadings: ["Fold"]
         )
-        XCTAssertEqual(higher, [.collapsible(heading: "Fold", body: "body\n### Child\nchild\n"), .plain("# End\nend")])
+        XCTAssertEqual(nested, [
+            .collapsible(heading: "Fold", body: "body\n"),
+            .plain("### Child\nchild\n"),
+            .plain("# End\nend"),
+        ])
         let windows = Self.brief.replacingOccurrences(of: "\n", with: "\r\n")
         let windowsChunks = MarkdownHeadingSections.chunks(
             in: windows,

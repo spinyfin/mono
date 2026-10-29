@@ -1,4 +1,6 @@
-/// Review-brief markdown used by revision-brief regression tests.
+/// Review-brief markdown used by revision-brief regression tests and by
+/// quiet viewer capture (`--capture-brief-markdown` pointing at a file of
+/// these bytes).
 ///
 /// `engineShaped` snapshots the layout `render_revision_instructions`
 /// emits in `tools/boss/engine/pr-review/src/render.rs`: a blank line

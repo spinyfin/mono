@@ -112,19 +112,16 @@ final class MarkdownFindState: ObservableObject {
     func updateSource(
         _ source: String,
         baseURL: URL?,
-        collapsibleHeadings: Set<String> = [],
-        foldDescendants: Bool = false
+        collapsibleHeadings: Set<String> = []
     ) {
         let chunks = MarkdownHeadingSections.chunks(
             in: source,
-            collapsibleHeadings: collapsibleHeadings,
-            foldDescendants: foldDescendants
+            collapsibleHeadings: collapsibleHeadings
         )
         let parsed = MarkdownParsedDocument.parse(
             source: source,
             chunks: chunks,
-            baseURL: baseURL,
-            foldDescendants: foldDescendants
+            baseURL: baseURL
         )
         chunkCorpora = zip(chunks, parsed).map { chunk, content in
             ChunkCorpus(chunk: chunk, plainText: String(content.characters))
