@@ -202,6 +202,19 @@ final class DriverQuotaSectionTests: XCTestCase {
         )
     }
 
+    func testForcedRefreshIgnoresCachedReplyAndEndsOnNewerCycle() {
+        var cached = DriverQuotaSnapshot.empty
+        cached.generatedAtEpochS = 1_787_000_000
+        XCTAssertFalse(ChatViewModel.driverQuotaReplyEndsRefresh(cached, awaitingForced: true, baselineEpochS: 1_787_000_000))
+        var fresh = cached
+        fresh.generatedAtEpochS = 1_787_000_030
+        XCTAssertTrue(ChatViewModel.driverQuotaReplyEndsRefresh(fresh, awaitingForced: true, baselineEpochS: 1_787_000_000))
+        var declined = cached
+        declined.refreshThrottled = true
+        XCTAssertTrue(ChatViewModel.driverQuotaReplyEndsRefresh(declined, awaitingForced: true, baselineEpochS: 1_787_000_000))
+        XCTAssertTrue(ChatViewModel.driverQuotaReplyEndsRefresh(cached, awaitingForced: false, baselineEpochS: nil))
+    }
+
     func testEveryFailureKindHasADistinguishableLabel() {
         let kinds: [DriverQuotaFailureKind] = [
             .notInstalled, .notAuthenticated, .probeFailed, .unparseable, .timeout,

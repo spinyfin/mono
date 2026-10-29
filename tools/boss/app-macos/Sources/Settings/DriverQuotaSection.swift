@@ -337,7 +337,9 @@ struct DriverQuotaSection: View {
                 )
             }
             HStack(spacing: 8) {
-                Text(chatModel.driverQuota.checkedText(now: now))
+                Text(chatModel.isRefreshingDriverQuota
+                     ? "Checking…"
+                     : chatModel.driverQuota.checkedText(now: now))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if chatModel.driverQuota.refreshThrottled {
@@ -346,6 +348,9 @@ struct DriverQuotaSection: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                if chatModel.isRefreshingDriverQuota {
+                    ProgressView().controlSize(.small)
+                }
                 Button("Refresh") {
                     chatModel.refreshDriverQuota(force: true)
                 }
@@ -427,6 +432,9 @@ struct DriverQuotaRow: View {
                     .font(.body.weight(.medium))
                     .frame(minWidth: 64, alignment: .leading)
                 Spacer()
+                if checking {
+                    ProgressView().controlSize(.small)
+                }
                 switch entry.outcome {
                 case .reading(let reading):
                     Text(entry.outcome.headline(checking: checking))
