@@ -156,6 +156,7 @@ pub use boss_pr_template as pr_template;
 pub mod board_notification_bridge;
 pub mod pr_review_recovery;
 pub mod pr_url_capture;
+pub mod pre_start_streak;
 pub mod project_postmortem_sweep;
 pub(crate) mod prompt_fragments;
 pub mod proposal_channel_error;

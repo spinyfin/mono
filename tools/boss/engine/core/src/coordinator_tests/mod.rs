@@ -16,6 +16,7 @@ mod pointer_reconciliation;
 mod pool;
 mod pool_contract;
 mod post_merge_review_dispatch;
+mod pre_start_streak;
 mod recovery;
 mod review_batch_dispatch;
 mod review_pause;
