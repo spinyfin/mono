@@ -10,7 +10,7 @@ use tokio::task::JoinSet;
 use crate::progress::{NoopProgressReporter, ProgressReporter, files_failed_count};
 
 use crate::bypass::{
-    bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id,
+    bypass_applied_finding, bypass_empty_directive_guidance, bypass_failure_guidance, bypass_name_for_check_id,
     bypass_unreachable_pr_description_guidance, change_file_count_bypass_findings,
 };
 use crate::check::{CheckRegistry, ConfiguredCheck};
@@ -1637,38 +1637,57 @@ fn apply_policy_to_result(
     }
 
     if policy.allow_bypass {
-        if let Some(reason) = changeset
-            .bypass_reason(&policy.bypass_name)
-            .filter(|value| policy.check_id == "change/file-count" || !value.is_empty())
-        {
-            let location = result.findings.iter().find_map(|finding| finding.location.clone());
-            if policy.check_id == "change/file-count" {
-                // Bound to the approved maximum. Do not treat a bare reason as
-                // unlimited, and fail again if the change has grown past the
-                // ceiling that was approved. A still-valid bound is a pass
-                // (empty findings). Remaining errors fall through so the
-                // instance severity override applies, same as an unbound fail.
-                result.findings = change_file_count_bypass_findings(changeset, &reason, &policy.bypass_name, location);
+        match changeset.bypass_reason(&policy.bypass_name) {
+            Some(reason) if policy.check_id == "change/file-count" => {
+                // Bound to the approved maximum, counted against the same
+                // path-scope-filtered changeset the guest saw. Do not treat a
+                // bare reason as unlimited, and fail again if the in-scope
+                // change has grown past the ceiling that was approved. A
+                // still-valid bound is a pass (empty findings). Remaining
+                // errors fall through so the instance severity override
+                // applies, same as an unbound fail.
+                let location = result.findings.iter().find_map(|finding| finding.location.clone());
+                let guest_remediations = result
+                    .findings
+                    .first()
+                    .map(|finding| finding.remediations.clone())
+                    .unwrap_or_default();
+                result.findings = change_file_count_bypass_findings(
+                    &path_scope.filter_changeset(changeset),
+                    &reason,
+                    &policy.bypass_name,
+                    location,
+                    &guest_remediations,
+                );
                 if result.findings.is_empty() {
                     return result;
                 }
-            } else {
+            }
+            Some(reason) if reason.is_empty() => {
+                let guidance = bypass_empty_directive_guidance(&policy.check_id, &policy.bypass_name);
+                for finding in &mut result.findings {
+                    finding.remediations.push(guidance.clone());
+                }
+            }
+            Some(reason) => {
+                let location = result.findings.iter().find_map(|finding| finding.location.clone());
                 result.findings = vec![bypass_applied_finding(&policy.bypass_name, &reason, location)];
                 return result;
             }
-        } else {
-            // Distinguish "no bypass declared" from "a bypass may exist but this
-            // run could not resolve a PR description to check" — otherwise a
-            // directive declared only in the PR body (e.g. on a GitHub
-            // merge-queue build, which cannot fetch it) looks identical to no
-            // directive existing at all.
-            let guidance = if changeset.pr_description.is_none() {
-                bypass_unreachable_pr_description_guidance(&policy.check_id, &policy.bypass_name)
-            } else {
-                bypass_failure_guidance(&policy.check_id, &policy.bypass_name)
-            };
-            for finding in &mut result.findings {
-                finding.remediations.push(guidance.clone());
+            None => {
+                // Distinguish "no bypass declared" from "a bypass may exist but this
+                // run could not resolve a PR description to check" — otherwise a
+                // directive declared only in the PR body (e.g. on a GitHub
+                // merge-queue build, which cannot fetch it) looks identical to no
+                // directive existing at all.
+                let guidance = if changeset.pr_description.is_none() {
+                    bypass_unreachable_pr_description_guidance(&policy.check_id, &policy.bypass_name)
+                } else {
+                    bypass_failure_guidance(&policy.check_id, &policy.bypass_name)
+                };
+                for finding in &mut result.findings {
+                    finding.remediations.push(guidance.clone());
+                }
             }
         }
     }

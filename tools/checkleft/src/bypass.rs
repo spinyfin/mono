@@ -9,8 +9,10 @@ use crate::output::{Finding, Location, Severity};
 /// Accepted format per line:
 ///   BYPASS_NAME=Reason text
 ///
-/// Preserve explicit empty values: the latest declaration must supersede older
-/// approvals even when it is malformed. Consumers decide whether it is valid.
+/// Preserve explicit empty values: the latest declaration for a name supersedes
+/// older ones even when it is empty or otherwise malformed. An empty latest
+/// value revokes any earlier non-empty reason for that name; consumers decide
+/// whether the retained value is valid.
 pub fn parse_bypass_directives(text: &str) -> BTreeMap<String, String> {
     let mut directives = BTreeMap::new();
 
@@ -114,6 +116,19 @@ pub fn bypass_unreachable_pr_description_guidance(check_id: &str, bypass_name: &
     )
 }
 
+/// Guidance when a matching directive is present but its latest value is empty.
+///
+/// An empty `BYPASS_NAME=` line is still a declaration: it wins over earlier
+/// non-empty reasons for the same name and does not apply a bypass.
+pub fn bypass_empty_directive_guidance(check_id: &str, bypass_name: &str) -> String {
+    let value_shape = bypass_value_shape(check_id);
+    format!(
+        "The latest `{bypass_name}` directive is empty, so it revoked any earlier non-empty reason for this check. \
+         Replace it with `{bypass_name}={value_shape}` or remove the empty line so a previous reason still applies. \
+         Only for a real exception or emergency - never use bypasses for convenience."
+    )
+}
+
 /// Parse `BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>`.
 ///
 /// The numeric maximum is required; a bare reason is not treated as unlimited.
@@ -138,32 +153,41 @@ fn count_non_deleted_files(changeset: &ChangeSet) -> usize {
 /// Apply the bound `change/file-count` bypass to an already-failing result.
 ///
 /// Only the host evaluates directives, after enforcing the instance bypass policy.
+/// `changeset` must already be the path-scope-filtered view the guest counted.
+/// Exceeded-bound remediations keep the guest's split guidance and append the
+/// bound-specific follow-up; generic "how to request a bypass" lines from the
+/// guest are dropped because they are superseded once a bound exists.
 pub fn change_file_count_bypass_findings(
     changeset: &ChangeSet,
     raw: &str,
     bypass_name: &str,
     location: Option<Location>,
+    guest_remediations: &[String],
 ) -> Vec<Finding> {
     let count = count_non_deleted_files(changeset);
     match parse_change_file_count_bypass_value(raw) {
         Some((approved_max, _)) if count <= approved_max => Vec::new(),
-        Some((approved_max, _)) => vec![Finding {
-            fixable: false,
-            severity: Severity::Error,
-            message: format!(
-                "changeset touches {count} non-deleted files, exceeding the approved {bypass_name} maximum of {approved_max}"
-            ),
-            location,
-            surface: None,
-            remediations: vec![
-                "Feature work is resolved by splitting it into smaller stacked PRs along capability boundaries (each coherent and independently reviewable), not by requesting an exception."
-                    .to_owned(),
-                format!(
-                    "The previous exception was bound to {approved_max} files (current count {count}). Request a new approval with `{bypass_name}=<max_files>:<reason>` or split the change."
+        Some((approved_max, _)) => {
+            let mut remediations: Vec<String> = guest_remediations
+                .iter()
+                .filter(|remediation| !remediation.contains("BYPASS_"))
+                .cloned()
+                .collect();
+            remediations.push(format!(
+                "The previous exception was bound to {approved_max} files (current count {count}). Request a new approval with `{bypass_name}=<max_files>:<reason>` or split the change."
+            ));
+            vec![Finding {
+                fixable: false,
+                severity: Severity::Error,
+                message: format!(
+                    "changeset touches {count} non-deleted files, exceeding the approved {bypass_name} maximum of {approved_max}"
                 ),
-            ],
-            suggested_fix: None,
-        }],
+                location,
+                surface: None,
+                remediations,
+                suggested_fix: None,
+            }]
+        }
         None => vec![Finding {
             fixable: false,
             severity: Severity::Error,
@@ -172,9 +196,9 @@ pub fn change_file_count_bypass_findings(
             ),
             location,
             surface: None,
-            remediations: vec![
-                format!("Replace the directive with `{bypass_name}=<max_files>:<reason>`, where max_files is the approved ceiling for this change."),
-            ],
+            remediations: vec![format!(
+                "Replace the directive with `{bypass_name}=<max_files>:<reason>`, where max_files is the approved ceiling for this change."
+            )],
             suggested_fix: None,
         }],
     }
@@ -229,7 +253,7 @@ fn is_valid_bypass_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id,
+        bypass_applied_finding, bypass_empty_directive_guidance, bypass_failure_guidance, bypass_name_for_check_id,
         bypass_unreachable_pr_description_guidance, change_file_count_bypass_findings, maybe_bypass_findings,
         parse_bypass_directives, parse_bypass_directives_from_descriptions, parse_change_file_count_bypass_value,
     };
@@ -308,6 +332,16 @@ mod tests {
     }
 
     #[test]
+    fn empty_latest_directive_revokes_earlier_reason() {
+        let parsed = parse_bypass_directives_from_descriptions(
+            Some("BYPASS_FILE_SIZE=Generated fixture cannot be split."),
+            Some("BYPASS_FILE_SIZE="),
+        );
+
+        assert_eq!(parsed.get("BYPASS_FILE_SIZE"), Some(&"".to_owned()));
+    }
+
+    #[test]
     fn bypass_failure_guidance_includes_strict_wording() {
         let guidance = bypass_failure_guidance("api/breaking-surface", "BYPASS_API_BREAKING_SURFACE");
         assert!(guidance.contains("BYPASS_API_BREAKING_SURFACE=<specific legitimate reason>"));
@@ -333,6 +367,15 @@ mod tests {
         assert!(guidance.contains("Could not resolve a PR description"));
         assert!(guidance.contains("BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>"));
         assert!(guidance.contains("commit description"));
+        assert!(guidance.contains("never use bypasses for convenience"));
+    }
+
+    #[test]
+    fn bypass_empty_directive_guidance_names_revocation_and_shape() {
+        let guidance = bypass_empty_directive_guidance("file/size", "BYPASS_FILE_SIZE");
+        assert!(guidance.contains("The latest `BYPASS_FILE_SIZE` directive is empty"));
+        assert!(guidance.contains("revoked any earlier non-empty reason"));
+        assert!(guidance.contains("BYPASS_FILE_SIZE=<specific legitimate reason>"));
         assert!(guidance.contains("never use bypasses for convenience"));
     }
 
@@ -371,17 +414,23 @@ mod tests {
             "8:Coordinated rename of the protocol surface.",
             "BYPASS_CHANGE_FILE_COUNT",
             None,
+            &[],
         );
         assert!(findings.is_empty(), "findings: {findings:?}");
     }
 
     #[test]
     fn change_file_count_bypass_above_approved_max_fails_with_counts() {
+        let guest_remediations = vec![
+            "Feature work is resolved by splitting it into smaller stacked PRs.".to_owned(),
+            "request a one-off exception with `BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>`".to_owned(),
+        ];
         let findings = change_file_count_bypass_findings(
             &oversized_changeset(10),
             "8:Coordinated rename of the protocol surface.",
             "BYPASS_CHANGE_FILE_COUNT",
             None,
+            &guest_remediations,
         );
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Error);
@@ -389,6 +438,13 @@ mod tests {
             findings[0].message.contains("10 non-deleted files") && findings[0].message.contains('8'),
             "message was: {}",
             findings[0].message
+        );
+        assert_eq!(
+            findings[0].remediations,
+            vec![
+                "Feature work is resolved by splitting it into smaller stacked PRs.".to_owned(),
+                "The previous exception was bound to 8 files (current count 10). Request a new approval with `BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>` or split the change.".to_owned(),
+            ]
         );
     }
 
@@ -399,6 +455,7 @@ mod tests {
             "Coordinated rename of the protocol surface.",
             "BYPASS_CHANGE_FILE_COUNT",
             None,
+            &[],
         );
         assert_eq!(findings.len(), 1);
         assert!(
