@@ -600,7 +600,7 @@ pub fn parse_status_reply(input: &Value) -> ClaudeReply {
                 .unwrap_or("(no reason given)");
             let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
             let reason =
-                live_status_redact::redact_text(&boss_engine_utils::string_clip::clip_to_bytes(&one_line, 200));
+                boss_engine_utils::string_clip::clip_to_bytes(&live_status_redact::redact_text(&one_line), 200);
             return ClaudeReply::InsufficientInput { reason };
         }
         Some(Value::Bool(false)) | None => {}
@@ -932,12 +932,9 @@ mod tests {
             panic!("expected insufficient input, got {reply:?}");
         };
         assert!(!reason.contains("ghp_"), "{reason}");
-        assert!(reason.len() <= 200 + REDACTED_MARKER_SLACK, "{}", reason.len());
+        // The clip adds a 3-byte ellipsis past the 200-byte budget.
+        assert!(reason.len() <= 200 + '…'.len_utf8(), "{}", reason.len());
     }
-
-    /// `redact_text` can grow a clipped reason by replacing a short match
-    /// with the longer `<redacted>` marker; allow for one such swap.
-    const REDACTED_MARKER_SLACK: usize = 16;
 
     #[test]
     fn parse_status_reply_rejects_shapes_outside_the_schema() {
@@ -1068,8 +1065,8 @@ mod tests {
 
     #[tokio::test]
     async fn free_text_reply_is_malformed_not_a_status() {
-        // A reply that ignores the forced tool and answers in prose —
-        // the exact shape that used to land verbatim on the card.
+        // A free-text reply that ignores the forced tool is a malformed
+        // reply, never a status.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))

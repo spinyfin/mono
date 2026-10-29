@@ -6,11 +6,9 @@
 //! [`redact_and_assemble`], and checks what the model would actually be shown.
 //!
 //! The shape under test is a code-mode worker (`gpt-6-astra`) spending a long
-//! stretch on tool calls with no assistant prose — the segment that used to
-//! reach the summarizer as a column of `tool: Bash returned <truncated>` lines
-//! with every tool *call* missing, because a cell script longer than the
-//! redactor's per-value ceiling collapsed the whole `content` array to the
-//! marker.
+//! stretch on tool calls with no assistant prose. Every tool call in such a
+//! segment must appear as a `tool: Bash(...)` line even when the cell script
+//! exceeds the redactor's per-value ceiling.
 
 use super::test_support::status_reply;
 use super::*;
@@ -142,8 +140,7 @@ fn codex_oversize_cell_scripts_keep_their_tool_calls_in_the_prompt() {
     }
     let normalized = normalize_like_slot_loop(raw);
     let prompt = redact_and_assemble(&normalized);
-    // Before the structural fix this prompt was the turn-start marker, the
-    // prompt, and four bare `tool: Bash returned <truncated>` lines.
+    // Each oversize cell still contributes its call line and its result line.
     assert_eq!(tool_call_lines(&prompt).len(), 4, "{prompt}");
     assert_eq!(tool_result_lines(&prompt).len(), 4, "{prompt}");
     for line in tool_call_lines(&prompt) {

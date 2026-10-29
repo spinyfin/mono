@@ -128,17 +128,8 @@ fn count_occurrences(haystack: &str, needle: &str) -> usize {
 /// the original line around for debugging if needed.
 ///
 /// Only string leaves are ever replaced; objects and arrays are walked,
-/// never collapsed. An earlier version replaced any `content` / `input`
-/// container whose *serialised* size crossed the ceiling with the bare
-/// marker, which erased the entry's structure along with its payload: an
-/// assistant message whose content array held one `tool_use` block with a
-/// 2 KiB command became `"content": "<truncated>"`, the renderer could no
-/// longer tell a tool call had happened, and the entry vanished from the
-/// summarizer prompt. A Codex code-mode worker whose cells are long
-/// scripts, or a Claude worker writing a file, therefore looked idle to
-/// the summarizer even though every tool result still showed up as
-/// `<truncated>` — exactly the input that makes the model answer that it
-/// cannot tell what the worker is doing.
+/// never collapsed, so content blocks, tool names and keys always survive
+/// and the renderer can still tell a tool call happened.
 pub fn truncate_large_values(mut value: Value) -> Value {
     truncate_in_place(&mut value);
     value
@@ -147,7 +138,7 @@ pub fn truncate_large_values(mut value: Value) -> Value {
 fn truncate_in_place(value: &mut Value) {
     match value {
         Value::String(s) if s.len() > MAX_VALUE_BYTES => {
-            let head = floor_char_boundary(s, TRUNCATED_HEAD_BYTES);
+            let head = boss_engine_utils::string_clip::floor_char_boundary(s, TRUNCATED_HEAD_BYTES);
             *s = format!("{}{TRUNCATED}", &s[..head]);
         }
         Value::Object(obj) => {
@@ -162,15 +153,6 @@ fn truncate_in_place(value: &mut Value) {
         }
         _ => {}
     }
-}
-
-/// Largest index `<= idx` that sits on a UTF-8 character boundary of `s`.
-fn floor_char_boundary(s: &str, idx: usize) -> usize {
-    let mut at = idx.min(s.len());
-    while !s.is_char_boundary(at) {
-        at -= 1;
-    }
-    at
 }
 
 /// Decide whether to drop a transcript JSONL entry whole rather than
@@ -495,10 +477,8 @@ mod tests {
             },
         });
         let out = truncate_large_values(line);
-        // The oversize *command* is clipped; the block around it — its
-        // type and tool name — survives, so the renderer can still say a
-        // Bash call happened. Collapsing the whole `content` array to the
-        // marker is the bug that made tool-call-heavy turns look empty.
+        // The oversize command is clipped; the surrounding `tool_use`
+        // block keeps its type and tool name.
         let block = &out["message"]["content"][0];
         assert_eq!(block["type"], "tool_use");
         assert_eq!(block["name"], "Bash");
