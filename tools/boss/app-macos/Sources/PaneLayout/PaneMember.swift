@@ -30,11 +30,13 @@ public enum AgentType: String, CaseIterable, Hashable, Sendable {
         }
     }
 
-    /// Badge label for a run in the given engine-reported review stage. The
+    /// Badge label from the engine-reported execution kind and review stage.
+    /// Review-guide generation reads "Guiding". The
     /// consolidating agent of an AI review reads "Consolidating" rather than
     /// as one more reviewer; every other type, and every other stage, keeps
     /// [`badgeLabel`].
-    public func badgeLabel(reviewStage: String?) -> String {
+    public func badgeLabel(reviewStage: String?, executionKind: String? = nil) -> String {
+        if self == .review, executionKind == "pr_review_guide" { return "Guiding" }
         if self == .review, reviewStage == AgentReviewStage.consolidation { return "Consolidating" }
         return badgeLabel
     }

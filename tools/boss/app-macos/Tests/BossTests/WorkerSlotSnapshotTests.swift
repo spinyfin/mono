@@ -150,6 +150,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         "waitExpiresAt",
         "agentType",
         "reviewStage",
+        "executionKind",
         "projectName",
         "pool",
         "tmuxHosted",
@@ -336,6 +337,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             ("waitExpiresAt", Self.makeLiveState(waitExpiresAt: "2026-09-01T00:00:00Z")),
             ("agentType", Self.makeLiveState(agentType: "review")),
             ("reviewStage", Self.makeLiveState(reviewStage: "consolidation")),
+            ("executionKind", Self.makeLiveState(executionKind: "pr_review_guide")),
             ("projectName", Self.makeLiveState(projectName: "Nine")),
             ("pool", Self.makeLiveState(pool: "automation")),
             ("tmuxHosted", Self.makeLiveState(tmuxHosted: false)),
@@ -384,6 +386,32 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         XCTAssertEqual(cardState(stage: "reviewers"), .waiting(reason: "AI review in progress"))
         XCTAssertEqual(cardState(stage: "consolidation"), .waiting(reason: "Consolidating review findings"))
         XCTAssertNotEqual(cardState(stage: "reviewers"), cardState(stage: "consolidation"))
+    }
+
+    func testReviewGuideBadgeUsesEngineKind() throws {
+        let client = EngineClient(socketPath: "/tmp/guide-test-\(UUID().uuidString).sock")
+        func live(kind: String?) throws -> WorkerLiveState {
+            var payload: [String: Any] = [
+                "slot_id": 1, "run_id": "exec-1", "model": "m", "shell_pid": 1,
+                "activity": "working", "agent_type": "review",
+            ]
+            payload["kind"] = kind
+            return try XCTUnwrap(client.parseWorkerLiveState(payload))
+        }
+        let guide = try live(kind: "pr_review_guide")
+        let review = try live(kind: "pr_review")
+        XCTAssertEqual(guide.badgeLabel, "Guiding")
+        XCTAssertEqual(WorkerSlotLiveSlice(guide).badgeLabel, "Guiding")
+        XCTAssertEqual(review.badgeLabel, "Reviewing")
+        XCTAssertEqual(WorkerSlotLiveSlice(review).badgeLabel, "Reviewing")
+        XCTAssertEqual(try live(kind: nil).badgeLabel, "Reviewing")
+        XCTAssertEqual(try live(kind: "future_kind").badgeLabel, "Reviewing")
+        XCTAssertNotEqual(guide, review)
+        let slot = WorkerSlot(slotId: 1, runId: "exec-1", summary: "generating a review guide")
+        let guideSnapshot = WorkerSlotSnapshot.build(slot: slot, liveState: guide, liveStatusEnabled: true)
+        let reviewSnapshot = WorkerSlotSnapshot.build(slot: slot, liveState: review, liveStatusEnabled: true)
+        XCTAssertEqual(guideSnapshot.headerTitle, reviewSnapshot.headerTitle)
+        XCTAssertNotEqual(guideSnapshot, reviewSnapshot)
     }
 
     func testSlotIdentityFieldsFlipEquality() {
@@ -936,6 +964,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         waitExpiresAt: String? = nil,
         agentType: String? = nil,
         reviewStage: String? = nil,
+        executionKind: String? = nil,
         projectId: String? = nil,
         projectName: String? = nil,
         hostId: String? = nil,
@@ -961,6 +990,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             waitExpiresAt: waitExpiresAt,
             agentType: agentType,
             reviewStage: reviewStage,
+            executionKind: executionKind,
             projectId: projectId,
             projectName: projectName,
             hostId: hostId,

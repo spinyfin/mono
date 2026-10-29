@@ -302,7 +302,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
                 .font(.title3.weight(.semibold))
                 .foregroundStyle(Color.white.opacity(0.85))
             if let badge = snapshot.headerBadge {
-                AgentTypeBadge(type: badge, raw: snapshot.live?.agentType, reviewStage: snapshot.live?.reviewStage)
+                AgentTypeBadge(type: badge, raw: snapshot.live?.agentType, reviewStage: snapshot.live?.reviewStage, executionKind: snapshot.live?.executionKind)
             }
             if let live = snapshot.live, let label = snapshot.statusPillLabel {
                 statusPill(label, color: liveActivityColor(live))
@@ -360,7 +360,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
             Spacer(minLength: 0)
 
             if let badge = snapshot.headerBadge {
-                AgentTypeBadge(type: badge, raw: snapshot.live?.agentType, reviewStage: snapshot.live?.reviewStage)
+                AgentTypeBadge(type: badge, raw: snapshot.live?.agentType, reviewStage: snapshot.live?.reviewStage, executionKind: snapshot.live?.executionKind)
             }
 
             // Prefer engine-supplied LiveWorkerState — its activity is
@@ -553,8 +553,9 @@ struct AgentTypeBadge: View {
     /// Engine-reported review stage; the consolidating agent reads
     /// "Consolidating", not "Reviewing".
     var reviewStage: String? = nil
+    var executionKind: String? = nil
 
-    private var label: String { type.badgeLabel(reviewStage: reviewStage) }
+    private var label: String { type.badgeLabel(reviewStage: reviewStage, executionKind: executionKind) }
 
     var body: some View {
         Text(type == .unknown && !(raw ?? "").isEmpty ? "Unknown: \(raw ?? "")" : label)
