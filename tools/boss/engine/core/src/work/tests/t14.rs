@@ -256,6 +256,101 @@ async fn stalled_running_reviewer_stays_doing_without_double_dispatch() {
     );
 }
 
+/// A reviewer that never started on a damaged recovery pointer fails the same
+/// way every time: the fallback must not refile it on every sweep, and picks
+/// up again once the pointer failure is resolved.
+#[tokio::test]
+async fn stalled_reviewer_fallback_does_not_refire_a_review_blocked_before_start() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/1768";
+    let product = create_test_product_with_repo(&db, "blocked-review", Some("https://github.com/foo/bar"));
+    let chore = create_test_chore_manual(&db, product.id.clone(), "blocked-review");
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".into()),
+            pr_url: Some(pr.into()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    let dead = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Failed)
+                .build(),
+        )
+        .unwrap();
+    db.create_attention_item(CreateAttentionItemInput {
+        execution_id: Some(dead.id.clone()),
+        work_item_id: None,
+        kind: crate::execution_bookmark_recovery::RECOVERY_FAILED.to_owned(),
+        status: None,
+        title: "Execution bookmark recovery failed".to_owned(),
+        body_markdown: "preserved work is not contained in PR head".to_owned(),
+        resolved_at: None,
+    })
+    .unwrap();
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let publisher = crate::coordinator::NoopExecutionPublisher;
+    let mut outcome = crate::merge_poller::SweepOutcome::default();
+    for pass in 0..3 {
+        crate::merge_poller::sweep_stalled_reviewer(
+            &db,
+            &publisher,
+            crate::merge_poller::StalledReview {
+                task_id: &chore.id,
+                product_id: &product.id,
+                pr_url: pr,
+                review_result_written: false,
+                skip_unbatched_review_holds: false,
+            },
+            &checker,
+            &mut outcome,
+        )
+        .await;
+        assert_eq!(outcome.reviewer_fallback_review_refired, 0, "pass {pass}");
+    }
+    let executions = db.list_executions(Some(&chore.id)).unwrap();
+    assert_eq!(
+        executions
+            .iter()
+            .filter(|execution| execution.kind == ExecutionKind::PrReview)
+            .count(),
+        1,
+        "no replacement review: {executions:?}"
+    );
+    assert!(
+        !db.list_attention_items_for_work_item(&chore.id)
+            .unwrap()
+            .iter()
+            .any(|attention| attention.kind == crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND),
+        "a review that never started did not die without findings"
+    );
+
+    db.resolve_attention_kind_for_execution(&dead.id, crate::execution_bookmark_recovery::RECOVERY_FAILED)
+        .unwrap();
+    crate::merge_poller::sweep_stalled_reviewer(
+        &db,
+        &publisher,
+        crate::merge_poller::StalledReview {
+            task_id: &chore.id,
+            product_id: &product.id,
+            pr_url: pr,
+            review_result_written: false,
+            skip_unbatched_review_holds: false,
+        },
+        &checker,
+        &mut outcome,
+    )
+    .await;
+    assert_eq!(outcome.reviewer_fallback_review_refired, 1);
+}
+
 fn insert_completed_pr_review_verdict(db: &WorkDb, execution_id: &str, work_item_id: &str, gate_outcome: &'static str) {
     WorkDb::insert_review_verdict_in_tx(
         &db.connect().unwrap(),

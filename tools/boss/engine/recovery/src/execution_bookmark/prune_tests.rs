@@ -1,4 +1,4 @@
-use super::reconcile_tests::{bookmark, keep_visible, one, revision_on_pr_head};
+use super::reconcile_tests::{bookmark, carried_forward_by_rewrite, keep_visible, one, revision_on_pr_head};
 use super::*;
 use boss_engine_test_git::jj::JjRepo;
 
@@ -366,5 +366,64 @@ async fn a_later_voucher_that_descends_from_both_heads_publishes_them_after_an_e
     match outcome {
         PruneOutcome::Published { vouched_by, .. } => assert!(vouched_by.contains("head"), "{vouched_by}"),
         other => panic!("expected published: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn work_rewritten_by_recorded_lineage_counts_as_published() {
+    // A conflict-resolution rebase left the PR head carrying the preserved
+    // work only as a later rewrite of it, with a different patch.
+    for via_duplicate in [false, true] {
+        let (s, _work, _pr_commit, resolved) =
+            carried_forward_by_rewrite(&format!("exec_prune_lineage_{via_duplicate}"), via_duplicate, true).await;
+        let repo = &s.repo.repo;
+        let outcome = prune(&LocalJj, &s.record, &[voucher("PR #7 head", &resolved)], "main")
+            .await
+            .unwrap();
+        match outcome {
+            PruneOutcome::Published {
+                commit,
+                forgotten,
+                rewritten,
+                ..
+            } => {
+                assert_eq!(commit, resolved);
+                assert!(rewritten > 0, "via_duplicate = {via_duplicate}");
+                assert!(forgotten.contains(&s.record.head()), "{forgotten:?}");
+            }
+            other => panic!("expected published (via_duplicate = {via_duplicate}): {other:?}"),
+        }
+        for name in [s.record.head(), s.record.publication()] {
+            assert!(!bookmark_exists(repo, &name), "{name} survived");
+        }
+    }
+}
+
+#[tokio::test]
+async fn lineage_that_lost_the_preserved_file_keeps_the_pointers() {
+    // The conflict was resolved by taking main's side wholesale. jj records
+    // the rewrite, but nothing of the preserved work is left, so the PR head
+    // does not vouch and the recovery pointers stay.
+    for via_duplicate in [false, true] {
+        let (s, work, _pr_commit, resolved) = carried_forward_by_rewrite(
+            &format!("exec_prune_lineage_lost_{via_duplicate}"),
+            via_duplicate,
+            false,
+        )
+        .await;
+        let repo = &s.repo.repo;
+        let outcome = prune(&LocalJj, &s.record, &[voucher("PR #7 head", &resolved)], "main")
+            .await
+            .unwrap();
+        match outcome {
+            PruneOutcome::Unproven { kept, missing, .. } => {
+                assert!(kept.contains(&s.record.head()), "{kept:?}");
+                assert!(missing.iter().any(|change| change.commit == work), "{missing:?}");
+            }
+            other => panic!("expected unproven (via_duplicate = {via_duplicate}): {other:?}"),
+        }
+        for name in [s.record.head(), s.record.publication()] {
+            assert!(bookmark_exists(repo, &name), "{name} was forgotten");
+        }
     }
 }

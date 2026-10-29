@@ -1031,6 +1031,126 @@ async fn deterministic_pointer_failure_on_a_review_fails_once_and_puts_the_block
     assert!(chore.blocked_reason.is_none(), "{chore:?}");
 }
 
+/// The failed attempt records its own bookkeeping run, stamped with the same
+/// second the blocker is raised in. That run is not a start: the blocker must
+/// survive reconciliation until a replacement execution genuinely starts.
+#[tokio::test]
+async fn card_blocker_survives_the_failed_attempts_own_bookkeeping_run_until_a_real_start() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let (chore_id, execution) = review_ready_to_dispatch(&db);
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeExecutionRunner::default()),
+    ));
+    let error = boss_engine_recovery::execution_bookmark::pointer_integrity_error_of(
+        boss_engine_recovery::execution_bookmark::PointerIntegrityKind::NotContained,
+        "preserved work of execution exec_prior is not contained in PR head pr/9 (afe46bed)",
+    );
+    coordinator
+        .record_start_failure(
+            Arc::clone(&coordinator),
+            &execution,
+            "worker",
+            Some("mono"),
+            (
+                crate::execution_bookmark_recovery::RECOVERY_FAILED,
+                "Execution bookmark recovery failed",
+            ),
+            &error,
+        )
+        .await
+        .unwrap();
+    let blocker_status = |db: &WorkDb| {
+        db.list_attention_items_for_work_item(&chore_id)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.kind == crate::execution_bookmark_recovery::BLOCKED_BEFORE_START)
+            .map(|a| a.status)
+    };
+    assert_eq!(blocker_status(&db).as_deref(), Some("open"));
+
+    // Reconciling with only the failed attempt's own run (same second) must
+    // not clear it, however many times the sweep runs.
+    for _ in 0..3 {
+        db.reconcile_stale_attention_signals().unwrap();
+        assert_eq!(
+            blocker_status(&db).as_deref(),
+            Some("open"),
+            "the failed attempt cleared its own blocker"
+        );
+    }
+
+    // A replacement review that really starts is what clears it.
+    let replacement = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.start_execution_run(
+        &replacement.id,
+        "worker",
+        "host",
+        "lease",
+        "workspace",
+        "/tmp/workspace",
+    )
+    .unwrap();
+    db.reconcile_stale_attention_signals().unwrap();
+    assert_eq!(blocker_status(&db).as_deref(), Some("resolved"));
+}
+
+/// The card only names the `jj bookmark set` adoption command when the error
+/// carries one; other pointer failures get repair guidance that does not
+/// point at a command the error never names.
+#[tokio::test]
+async fn card_blocker_text_names_the_adoption_command_only_when_the_error_does() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let (chore_id, execution) = review_ready_to_dispatch(&db);
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeExecutionRunner::default()),
+    ));
+    let error = boss_engine_recovery::execution_bookmark::pointer_integrity_error_of(
+        boss_engine_recovery::execution_bookmark::PointerIntegrityKind::Diverged,
+        "preserved pointers boss-recovery/exec_prior and boss/exec_prior diverged",
+    );
+    coordinator
+        .record_start_failure(
+            Arc::clone(&coordinator),
+            &execution,
+            "worker",
+            Some("mono"),
+            (
+                crate::execution_bookmark_recovery::RECOVERY_FAILED,
+                "Execution bookmark recovery failed",
+            ),
+            &error,
+        )
+        .await
+        .unwrap();
+    let card_items = db.list_attention_items_for_work_item(&chore_id).unwrap();
+    let blocker = card_items
+        .iter()
+        .find(|a| a.kind == crate::execution_bookmark_recovery::BLOCKED_BEFORE_START)
+        .unwrap_or_else(|| panic!("{card_items:?}"));
+    assert!(blocker.body_markdown.contains("diverged"), "{}", blocker.body_markdown);
+    assert!(
+        !blocker.body_markdown.contains("jj bookmark set"),
+        "{}",
+        blocker.body_markdown
+    );
+}
+
 /// A missing or conflicted `pr/<n>` alias is a pointer failure a
 /// retry can repair (cube rewrites it from GitHub on every attempt), so a
 /// review keeps the ordinary backoff and gets no card blocker yet.

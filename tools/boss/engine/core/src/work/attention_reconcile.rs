@@ -98,6 +98,14 @@ fn work_resumed_evidence() -> String {
     // Run insertion precedes spawn. A pane-spawn failure therefore needs a
     // completed spawn run, not merely another attempt (active or failed).
     // Other WorkResumed signals retain their run-start clearing contract.
+    //
+    // A blocked-before-start item is filed straight after the execution's
+    // terminal pre-start failure, which records its own failed bookkeeping
+    // run stamped `started_at = now`. That run is not a start: counting it
+    // would let the failed attempt clear the blocker it just raised. Runs of
+    // an execution that ended through pre-start failure are therefore not
+    // evidence for that kind.
+    let blocked_kind = crate::execution_bookmark_recovery::BLOCKED_BEFORE_START;
     format!(
         "EXISTS (
              SELECT 1
@@ -106,6 +114,8 @@ fn work_resumed_evidence() -> String {
              WHERE e.work_item_id = {ATTENTION_WORK_ITEM}
                AND r.started_at IS NOT NULL
                AND (work_attention_items.kind != 'pane_spawn_failed' OR r.status = 'completed')
+               AND (work_attention_items.kind != '{blocked_kind}'
+                    OR NOT (r.status = 'failed' AND e.status = 'failed' AND e.pre_start_failure_count > 0))
                AND CAST(r.started_at AS INTEGER) >= CAST({ATTENTION_RAISED_AT} AS INTEGER)
                AND r.execution_id IS NOT work_attention_items.execution_id
          )"

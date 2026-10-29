@@ -2506,16 +2506,23 @@ impl ExecutionCoordinator {
             ExecutionKind::PrReview => "Automated review blocked before start",
             _ => "Execution blocked before start",
         };
-        let body = format!(
-            "{subject} (execution `{id}`, `{kind}`) could not start after {attempts} attempt(s): the \
-             preserved work recorded for an earlier execution of this item could not be reconciled \
-             with the PR head. A damaged recovery pointer does not repair itself and the PR head does \
-             not move on its own, so the engine will not retry this execution or re-fire a \
-             replacement automatically.\n\n\
-             **Error:** {error_text}\n\n\
-             To unblock it: if the error confirms which commits are missing and their content is in \
+        // Only a failure to reconcile preserved work against the PR head names
+        // a `jj bookmark set` adoption command; the other pointer-integrity
+        // kinds and retry-exhausted start failures do not.
+        let unblock = if error_text.contains("jj bookmark set") {
+            "To unblock it: if the error confirms which commits are missing and their content is in \
              the PR head, adopt the head with the `jj bookmark set` command the error names and \
-             request the review again; otherwise recover the commits first, or push a new PR head.",
+             request the review again; otherwise recover the commits first, or push a new PR head."
+        } else {
+            "To unblock it: repair the cause named in the error (the preserved recovery pointers, or \
+             whatever the start stage reports) and request the review again, or push a new PR head."
+        };
+        let body = format!(
+            "{subject} (execution `{id}`, `{kind}`) could not start after {attempts} attempt(s). A \
+             failure like this does not repair itself and the PR head does not move on its own, so \
+             the engine will not retry this execution or re-fire a replacement automatically.\n\n\
+             **Error:** {error_text}\n\n\
+             {unblock}",
             id = execution.id,
             kind = execution.kind.as_str(),
             attempts = execution.pre_start_failure_count,

@@ -378,6 +378,14 @@ fn recover_reviews(work_db: &WorkDb, pr_checker: &dyn PrStateChecker) -> (PrRevi
                 );
                 outcome.terminal_failed += 1;
             }
+            Ok(RetryDeadReviewBatchMember::Blocked) => {
+                tracing::info!(
+                    work_item_id = %work_item_id,
+                    dead_execution_id = %dead_execution_id,
+                    "pr_review recovery: batch member failed before start on a damaged recovery pointer; not auto-refiring while that attention is open",
+                );
+                outcome.blocked_skipped += 1;
+            }
             Ok(RetryDeadReviewBatchMember::NotRetried) => {
                 tracing::info!(
                     work_item_id = %work_item_id,
@@ -447,6 +455,14 @@ fn recover_reviews(work_db: &WorkDb, pr_checker: &dyn PrStateChecker) -> (PrRevi
                     "pr_review recovery: post-merge reviewer exhausted its retry; batch failed with attention",
                 );
                 outcome.terminal_failed += 1;
+            }
+            Ok(RetryDeadReviewBatchMember::Blocked) => {
+                tracing::info!(
+                    work_item_id = %work_item_id,
+                    dead_execution_id = %dead_execution_id,
+                    "pr_review recovery: batch member failed before start on a damaged recovery pointer; not auto-refiring while that attention is open",
+                );
+                outcome.blocked_skipped += 1;
             }
             Ok(RetryDeadReviewBatchMember::NotRetried) => {
                 tracing::info!(
@@ -1484,6 +1500,74 @@ mod tests {
             "a merged PR must settle a dead supervisor batch rather than leaving it supervising"
         );
     }
+    /// The batch-member and supervisor loops honour the same deterministic
+    /// pre-start guard as the legacy sweep: a dead supervisor whose start
+    /// failed on a damaged recovery pointer is not re-fired pass after pass,
+    /// and resumes once the blocker is resolved.
+    #[tokio::test]
+    async fn does_not_refire_a_batch_member_that_failed_before_start_on_a_damaged_pointer() {
+        let (_dir, db) = open_db();
+        let (work_item_id, dead_execution_id, batch_id) =
+            create_chore_with_dead_supervisor(&db, "https://github.com/test/repo/pull/24", "head-sha");
+        db.create_attention_item(CreateAttentionItemInput {
+            execution_id: Some(dead_execution_id.clone()),
+            work_item_id: None,
+            kind: crate::execution_bookmark_recovery::RECOVERY_FAILED.to_owned(),
+            status: None,
+            title: "Execution bookmark recovery failed".to_owned(),
+            body_markdown: "preserved work is not contained in PR head".to_owned(),
+            resolved_at: None,
+        })
+        .unwrap();
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let checker = FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha");
+
+        for pass in 0..3 {
+            let outcome = run_one_pass(
+                db.as_ref(),
+                coordinator.clone(),
+                sink.as_ref(),
+                Arc::new(checker.clone()),
+            )
+            .await;
+            assert_eq!(outcome.refired, 0, "pass {pass}");
+            assert_eq!(outcome.blocked_skipped, 1, "pass {pass}");
+            assert_eq!(outcome.error_skipped, 0, "pass {pass}");
+        }
+        assert_eq!(
+            db.list_executions(Some(&work_item_id))
+                .unwrap()
+                .iter()
+                .filter(|e| e.kind == ExecutionKind::PrReview)
+                .count(),
+            1,
+            "no replacement execution"
+        );
+        assert_eq!(db.review_batch_members(&batch_id).unwrap().len(), 1);
+        assert_eq!(
+            db.review_batch(&batch_id).unwrap().unwrap().status,
+            ReviewBatchStatus::Supervising
+        );
+
+        db.resolve_attention_kind_for_execution(
+            &dead_execution_id,
+            crate::execution_bookmark_recovery::RECOVERY_FAILED,
+        )
+        .unwrap();
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            Arc::new(checker.clone()),
+        )
+        .await;
+        assert_eq!(outcome.refired, 1);
+        assert_eq!(outcome.blocked_skipped, 0);
+    }
+
     /// A dead review whose dispatch failed on a damaged recovery pointer
     /// (an open `execution_bookmark_recovery_failed` item on the dead
     /// execution) is deterministic for the current PR head: the sweep must

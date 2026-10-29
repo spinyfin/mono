@@ -2784,6 +2784,84 @@ fn dead_post_merge_reviewer_retries_once_then_fails_the_batch() {
     assert!(attention.title.to_lowercase().contains("post-merge"));
 }
 
+/// A dead batch member whose start failed on a damaged recovery pointer (an
+/// open `execution_bookmark_recovery_failed` item on it) is not retried: the
+/// retry would fail identically. Repeated calls change nothing, the member
+/// stays a recovery candidate, and the retry proceeds once the item is
+/// resolved.
+#[test]
+fn dead_batch_member_blocked_before_start_is_not_retried_until_the_blocker_clears() {
+    let db = WorkDb::open(temp_db_path("dead-member-blocked-before-start")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            post_merge_batch_input(cycle_root.id.clone(), "merge-sha-blocked"),
+            &[member(
+                ReviewBatchMemberRole::PostMergeReviewer,
+                Some(execution.id.clone()),
+            )],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'done' WHERE id = ?1",
+            rusqlite::params![cycle_root.id],
+        )
+        .unwrap();
+    stamp_execution_status(&db, &execution.id, "failed");
+    db.create_attention_item(CreateAttentionItemInput {
+        execution_id: Some(execution.id.clone()),
+        work_item_id: None,
+        kind: crate::execution_bookmark_recovery::RECOVERY_FAILED.to_owned(),
+        status: None,
+        title: "Execution bookmark recovery failed".to_owned(),
+        body_markdown: "preserved work is not contained in PR head".to_owned(),
+        resolved_at: None,
+    })
+    .unwrap();
+
+    for pass in 0..3 {
+        assert!(
+            matches!(
+                db.retry_dead_review_batch_member(&execution.id).unwrap(),
+                RetryDeadReviewBatchMember::Blocked
+            ),
+            "pass {pass}"
+        );
+        assert_eq!(db.review_batch_members(&batch.id).unwrap().len(), 1, "pass {pass}");
+        assert_eq!(
+            db.list_executions(Some(&cycle_root.id)).unwrap().len(),
+            1,
+            "pass {pass}: no replacement execution"
+        );
+        assert_eq!(
+            db.list_dead_post_merge_review_batch_member_candidates().unwrap().len(),
+            1,
+            "pass {pass}: the member stays a candidate for when the blocker clears"
+        );
+    }
+    assert_eq!(
+        db.resolve_attention_kind_for_execution(&execution.id, crate::execution_bookmark_recovery::RECOVERY_FAILED)
+            .unwrap(),
+        1
+    );
+    assert!(matches!(
+        db.retry_dead_review_batch_member(&execution.id).unwrap(),
+        RetryDeadReviewBatchMember::Retried(_)
+    ));
+}
+
 /// A revision task is never its own review-cycle root — its batches are
 /// filed under the chain root that owns the PR. `resolve_review_cycle_root`
 /// must walk a revision id to that root so `bossctl review batches` (and

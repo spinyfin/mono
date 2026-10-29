@@ -659,39 +659,12 @@ async fn unpublished_amendments_are_not_contained_by_matching_change_ids() {
         let error = reconcile(&LocalJj, &s.record, Some("pr/7"), "main").await.unwrap_err();
         assert_eq!(pointer_integrity_kind(&error), Some(PointerIntegrityKind::NotContained));
         assert_eq!(snapshot_pointers(&LocalJj, &s.record).await.unwrap(), before);
-        if unique_edits_on_both_sides {
-            // Two different successors of the pushed commit: neither was
-            // rewritten from the other, so neither head vouches for the other.
-            let error = reconcile(&LocalJj, &s.record, None, "main").await.unwrap_err();
-            assert_eq!(pointer_integrity_kind(&error), Some(PointerIntegrityKind::NotContained));
-            assert_eq!(snapshot_pointers(&LocalJj, &s.record).await.unwrap(), before);
-        } else {
-            // With no PR, the amended head is a recorded rewrite of the
-            // pushed one and carries it; resuming from the amendment drops
-            // nothing, so the stale publication pointer joins it.
-            let reconciled = reconcile(&LocalJj, &s.record, None, "main")
-                .await
-                .unwrap()
-                .expect("diverged heads");
-            assert_eq!(
-                reconciled.anchor,
-                Anchor::ContainingHead {
-                    bookmark: s.record.head(),
-                    commit: local.clone()
-                }
-            );
-            assert_eq!(reconciled.superseded.len(), 1);
-            match &reconciled.superseded[0].containment {
-                Containment::Rewritten { matched } => {
-                    assert_eq!(matched.len(), 1, "{matched:?}");
-                    assert_eq!(matched[0].preserved, published);
-                    assert_eq!(matched[0].published, local);
-                    assert_eq!(matched[0].evidence, RewriteEvidence::RecordedLineage);
-                }
-                other => panic!("{other:?}"),
-            }
-            assert_eq!(one(&s.repo.repo, &revision(&s.record.publication())), local);
-        }
+        // With no PR, identity alone cannot vouch for an unpublished
+        // amendment: recorded lineage only applies to the PR-head path, so
+        // neither head of the execution carries the other.
+        let error = reconcile(&LocalJj, &s.record, None, "main").await.unwrap_err();
+        assert_eq!(pointer_integrity_kind(&error), Some(PointerIntegrityKind::NotContained));
+        assert_eq!(snapshot_pointers(&LocalJj, &s.record).await.unwrap(), before);
     }
 }
 
@@ -856,6 +829,23 @@ async fn pointer_snapshot_and_restore_spawn_one_jj_per_batch() {
     assert_eq!(snapshot_pointers(&LocalJj, &s.record).await.unwrap(), before);
 }
 
+fn has_conflict(repo: &std::path::Path, commit: &str) -> bool {
+    !JjRepo::run(
+        repo,
+        &[
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            &format!("conflicts() & {commit}"),
+            "-T",
+            "commit_id",
+        ],
+    )
+    .trim()
+    .is_empty()
+}
+
 /// The two shapes a conflict-resolution rebase leaves behind, both seen on
 /// live PRs: the preserved work is rewritten in place (same change id, a
 /// resolution squashed in, so the patch differs), or recovery restaging
@@ -863,18 +853,34 @@ async fn pointer_snapshot_and_restore_spawn_one_jj_per_batch() {
 /// resolution is squashed into the copy. Neither has a change-id match with
 /// an empty interdiff; both have the preserved commit in the PR commit's
 /// recorded predecessors.
-async fn carried_forward_by_rewrite(execution_id: &str, via_duplicate: bool) -> (Scene, String, String, String) {
+pub(super) async fn carried_forward_by_rewrite(
+    execution_id: &str,
+    via_duplicate: bool,
+    keep_work: bool,
+) -> (Scene, String, String, String) {
     let s = revision_on_pr_head(execution_id).await;
     let repo = &s.repo.repo;
     let pr_commit = one(repo, "pr/7");
     let work = one(repo, &revision(&s.record.head()));
     bookmark(repo, "pr/7", &work);
     bookmark(repo, "boss/root", &work);
-    // Main moved; the PR branch is rebased onto it. Every bookmark follows,
+    // Main moved and added the same file the revision adds, with different
+    // content; the PR branch is rebased onto it. Every bookmark follows,
     // including the baseline, whose change is rewritten too.
+    JjRepo::run(
+        repo,
+        &["new", "bookmarks(exact:\"main\")", "-m", "Main adds revision.txt"],
+    );
+    std::fs::write(repo.join("revision.txt"), "main's own revision.txt\n").unwrap();
+    JjRepo::run(repo, &["status"]);
+    JjRepo::run(repo, &["bookmark", "set", "main", "-r", "@"]);
     JjRepo::run(repo, &["rebase", "-b", &work, "-d", "bookmarks(exact:\"main\")"]);
     let rebased_work = one(repo, &revision(&s.record.head()));
     assert_ne!(rebased_work, work);
+    assert!(
+        has_conflict(repo, &rebased_work),
+        "rebasing onto an incompatible edit of the same file must conflict"
+    );
     assert_ne!(
         one(repo, &revision(&s.record.base())),
         pr_commit,
@@ -913,15 +919,18 @@ async fn carried_forward_by_rewrite(execution_id: &str, via_duplicate: bool) -> 
     // The worker resolves the conflict by squashing a fix into the commit:
     // its patch now differs from the preserved one.
     JjRepo::run(repo, &["new", &resolution_target, "-m", "wip-resolve"]);
-    std::fs::write(
-        repo.join("revision.txt"),
-        "revision work, resolved against newer main\n",
-    )
-    .unwrap();
+    // `keep_work = false` resolves by taking main's side wholesale.
+    let resolution = if keep_work {
+        "revision work, resolved against newer main\n"
+    } else {
+        "main's own revision.txt\n"
+    };
+    std::fs::write(repo.join("revision.txt"), resolution).unwrap();
     JjRepo::run(repo, &["status"]);
     JjRepo::run(repo, &["squash", "-u"]);
     let resolved = one(repo, "@-");
     assert_ne!(resolved, resolution_target);
+    assert!(!has_conflict(repo, &resolved), "the resolution removes the conflict");
     bookmark(repo, "pr/7", &resolved);
     bookmark(repo, "boss/root", &resolved);
     let patch = JjRepo::run(
@@ -937,7 +946,7 @@ async fn carried_forward_by_rewrite(execution_id: &str, via_duplicate: bool) -> 
         ],
     );
     assert!(
-        patch.contains("revision.txt"),
+        patch.contains("revision.txt") || !keep_work,
         "the resolution must change the patch, or the old interdiff rule would already pass: {patch}"
     );
     if via_duplicate {
@@ -974,7 +983,7 @@ async fn carried_forward_by_rewrite(execution_id: &str, via_duplicate: bool) -> 
 async fn work_rewritten_from_the_preserved_commit_is_contained_by_recorded_lineage() {
     for via_duplicate in [false, true] {
         let (s, work, pr_commit, resolved) =
-            carried_forward_by_rewrite(&format!("exec_lineage_{via_duplicate}"), via_duplicate).await;
+            carried_forward_by_rewrite(&format!("exec_lineage_{via_duplicate}"), via_duplicate, true).await;
         let repo = &s.repo.repo;
         let rebased_base = one(repo, &revision(&s.record.base()));
 
@@ -1036,7 +1045,7 @@ async fn work_added_after_the_rewrite_is_still_missing() {
     // top of it.
     for follow_up_commit in [false, true] {
         let (s, work, _pr_commit, resolved) =
-            carried_forward_by_rewrite(&format!("exec_lineage_missing_{follow_up_commit}"), true).await;
+            carried_forward_by_rewrite(&format!("exec_lineage_missing_{follow_up_commit}"), true, true).await;
         let repo = &s.repo.repo;
         if follow_up_commit {
             JjRepo::run(repo, &["new", &work, "-m", "Unpublished follow-up"]);
@@ -1073,4 +1082,115 @@ async fn work_added_after_the_rewrite_is_still_missing() {
         );
         assert_eq!(snapshot_pointers(&LocalJj, &s.record).await.unwrap(), before);
     }
+}
+
+#[tokio::test]
+async fn conflict_resolved_by_taking_the_other_side_is_not_contained() {
+    // jj records the resolution as a rewrite of the preserved commit, but the
+    // preserved file is gone from it: lineage alone must not vouch.
+    for via_duplicate in [false, true] {
+        let (s, work, _pr_commit, resolved) =
+            carried_forward_by_rewrite(&format!("exec_lineage_theirs_{via_duplicate}"), via_duplicate, false).await;
+        let before = snapshot_pointers(&LocalJj, &s.record).await.unwrap();
+        let error = reconcile(&LocalJj, &s.record, Some("pr/7"), "main").await.unwrap_err();
+        assert_eq!(
+            pointer_integrity_kind(&error),
+            Some(PointerIntegrityKind::NotContained),
+            "via_duplicate = {via_duplicate}: {error}"
+        );
+        assert!(error.to_string().contains(&work[..12]), "{error}");
+        assert_eq!(snapshot_pointers(&LocalJj, &s.record).await.unwrap(), before);
+        let _ = resolved;
+    }
+}
+
+/// Add a second file to the revision work and return the commit holding both
+/// files, the baseline it sits on, and the repo.
+async fn revision_with_two_files(execution_id: &str) -> (Scene, String, String) {
+    let s = revision_on_pr_head(execution_id).await;
+    std::fs::write(s.repo.worker.join("second.txt"), "second file\n").unwrap();
+    JjRepo::run(&s.repo.worker, &["status"]);
+    let work = one(&s.repo.repo, &revision(&s.record.head()));
+    let base = s.record.base_commit.clone().unwrap();
+    (s, work, base)
+}
+
+fn evolog_contains(repo: &std::path::Path, successor: &str, predecessor: &str) -> bool {
+    JjRepo::run(
+        repo,
+        &[
+            "--ignore-working-copy",
+            "evolog",
+            "-r",
+            successor,
+            "--no-graph",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
+    )
+    .lines()
+    .any(|line| line == predecessor)
+}
+
+#[tokio::test]
+async fn amendment_that_drops_part_of_the_preserved_patch_is_not_contained() {
+    for drop_second_file in [true, false] {
+        let (s, work, base) = revision_with_two_files(&format!("exec_amend_drop_{drop_second_file}")).await;
+        let repo = &s.repo.repo;
+        JjRepo::run(repo, &["new", &work, "-m", "wip-amend"]);
+        if drop_second_file {
+            JjRepo::run(repo, &["restore", "--from", &format!("{work}-"), "root:second.txt"]);
+        } else {
+            std::fs::write(repo.join("second.txt"), "second file, edited\n").unwrap();
+        }
+        JjRepo::run(repo, &["status"]);
+        JjRepo::run(repo, &["squash", "-u"]);
+        let amended = one(repo, "@-");
+        assert_ne!(amended, work);
+        keep_visible(repo, &work);
+        assert!(evolog_contains(repo, &amended, &work), "jj records the amendment");
+        let containment = super::reconcile::containment(&LocalJj, repo, Some(&base), &work, &amended, "main")
+            .await
+            .unwrap();
+        if drop_second_file {
+            assert!(
+                matches!(&containment, Containment::Missing { missing } if missing.len() == 1),
+                "{containment:?}"
+            );
+        } else {
+            let Containment::Rewritten { matched } = &containment else {
+                panic!("an amendment that keeps every path is a faithful rewrite: {containment:?}");
+            };
+            assert_eq!(matched.len(), 1, "{matched:?}");
+            assert_eq!(matched[0].evidence, RewriteEvidence::RecordedLineage);
+        }
+    }
+}
+
+#[tokio::test]
+async fn publishing_only_part_of_a_split_is_not_contained() {
+    let (s, work, base) = revision_with_two_files("exec_split_part").await;
+    let repo = &s.repo.repo;
+    // Split by hand: the first half takes revision.txt out of the work
+    // commit, the second half (the rest) is what stays unpublished.
+    JjRepo::run(repo, &["new", &format!("{work}-"), "-m", "First half"]);
+    JjRepo::run(repo, &["squash", "--from", &work, "--into", "@", "root:revision.txt"]);
+    let first_half = one(repo, "@");
+    keep_visible(repo, &work);
+    assert!(evolog_contains(repo, &first_half, &work), "jj records the split");
+    let containment = super::reconcile::containment(&LocalJj, repo, Some(&base), &work, &first_half, "main")
+        .await
+        .unwrap();
+    assert!(
+        matches!(&containment, Containment::Missing { missing } if missing.len() == 1),
+        "{containment:?}"
+    );
+}
+
+#[test]
+fn records_persisted_before_lineage_evidence_default_to_equivalent_patch() {
+    let change: RewrittenChange = serde_json::from_str(r#"{"change_id":"c","preserved":"p","published":"q"}"#).unwrap();
+    assert_eq!(change.evidence, RewriteEvidence::EquivalentPatch);
+    let round_trip: RewrittenChange = serde_json::from_str(&serde_json::to_string(&change).unwrap()).unwrap();
+    assert_eq!(round_trip, change);
 }

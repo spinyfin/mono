@@ -92,7 +92,12 @@ const DELIBERATE_PARK_ATTENTION_KINDS: &[&str] = &[
 
 /// Execution-scoped attention half of [`work_item_is_deliberately_parked`].
 /// Always called with the latest execution id so superseded executions cannot latch the park.
-fn has_open_execution_attention_of_kind_on(conn: &Connection, execution_id: &str, kinds: &[&str]) -> Result<bool> {
+/// "Open" is `status = 'open'`: attention items are only ever `open` or `resolved`.
+pub(crate) fn has_open_execution_attention_of_kind_on(
+    conn: &Connection,
+    execution_id: &str,
+    kinds: &[&str],
+) -> Result<bool> {
     if kinds.is_empty() {
         return Ok(false);
     }

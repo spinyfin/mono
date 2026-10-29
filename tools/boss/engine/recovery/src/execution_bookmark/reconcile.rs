@@ -54,9 +54,10 @@ pub enum RewriteEvidence {
     /// reaches the preserved commit itself: the vouching commit is a later
     /// rewrite of it, under the same or a new change id, and its patch may
     /// differ (a `jj duplicate` copy made by recovery restaging, a conflict
-    /// resolution squashed into it). The preserved commit was an input to the
-    /// rewrite, so nothing was dropped that the rewrite did not deliberately
-    /// change.
+    /// resolution squashed into it). jj records a rewrite whether or not it
+    /// kept the content, so lineage is provenance only: a match also needs
+    /// the content floor ([`preserves_touched_paths`]), that the vouching
+    /// commit still touches every path the preserved commit touched.
     RecordedLineage,
 }
 
@@ -282,6 +283,22 @@ pub(crate) async fn containment(
     vouching: &str,
     trunk: &str,
 ) -> Result<Containment> {
+    containment_with(jj, repo, base, head, vouching, trunk, true).await
+}
+
+/// [`containment`] with recorded lineage switched on or off. Off, only
+/// ancestry and content-equivalent variants count: the rule for one head of an
+/// execution vouching for another with no PR in between, where nothing but
+/// identity ties an unpublished amendment to the other head.
+pub(crate) async fn containment_with(
+    jj: &dyn Jj,
+    repo: &Path,
+    base: Option<&str>,
+    head: &str,
+    vouching: &str,
+    trunk: &str,
+    use_lineage: bool,
+) -> Result<Containment> {
     if descends(jj, repo, head, vouching).await? {
         return Ok(Containment::Ancestor);
     }
@@ -340,11 +357,13 @@ pub(crate) async fn containment(
             });
             continue;
         }
-        if let Some(base) = base {
+        if let (true, Some(base)) = (use_lineage, base) {
             if lineage.is_none() {
                 lineage = Some(recorded_lineage(jj, repo, base, vouching, trunk).await?);
             }
-            if let Some(successor) = lineage.as_ref().and_then(|lineage| lineage.get(commit)) {
+            if let Some(successor) = lineage.as_ref().and_then(|lineage| lineage.get(commit))
+                && preserves_touched_paths(jj, repo, commit, successor).await?
+            {
                 matched.push(RewrittenChange {
                     change_id: change.to_owned(),
                     preserved: commit.to_owned(),
@@ -388,6 +407,29 @@ async fn equivalent_patch(jj: &dyn Jj, repo: &Path, preserved: &str, variant: &s
         .text
         .trim()
         .is_empty())
+}
+
+/// The content floor for a recorded-lineage match: the successor still
+/// touches every path (bookkeeping files aside) the preserved commit touched.
+/// A rewrite that dropped a file, took the other side of a conflict
+/// wholesale, or published only half of a split fails it, and the change is
+/// then reported missing. It does not prove the hunks survived; it rules out
+/// the whole-file losses that jj's rewrite records cannot distinguish from a
+/// faithful rewrite.
+async fn preserves_touched_paths(jj: &dyn Jj, repo: &Path, preserved: &str, successor: &str) -> Result<bool> {
+    let preserved_paths = touched_paths(jj, repo, preserved).await?;
+    let successor_paths = touched_paths(jj, repo, successor).await?;
+    Ok(preserved_paths.is_subset(&successor_paths))
+}
+
+async fn touched_paths(jj: &dyn Jj, repo: &Path, commit: &str) -> Result<std::collections::HashSet<String>> {
+    let patch = jj
+        .run(repo, &["--ignore-working-copy", "diff", "-r", commit, "--git"])
+        .await?;
+    Ok(crate::recovery_apply::filter_bookkeeping(&patch)
+        .kept_paths
+        .into_iter()
+        .collect())
 }
 
 /// Every commit jj records as a predecessor (transitively) of a non-empty
@@ -449,10 +491,11 @@ async fn superseded_pointers(
     base: Option<&str>,
     vouching: &str,
     trunk: &str,
+    use_lineage: bool,
 ) -> Result<Vec<SupersededPointer>> {
     let mut superseded = Vec::new();
     for (bookmark, commit) in heads {
-        let containment = containment(jj, &record.repo_path, base, commit, vouching, trunk).await?;
+        let containment = containment_with(jj, &record.repo_path, base, commit, vouching, trunk, use_lineage).await?;
         superseded.push(SupersededPointer {
             bookmark: bookmark.clone(),
             commit: commit.clone(),
@@ -618,7 +661,7 @@ pub async fn reconcile(
     let named = heads.named(record);
     if let Some(pr_bookmark) = pr_bookmark {
         let pr_head = resolve_pr_head(jj, record, pr_bookmark).await?;
-        let superseded = superseded_pointers(jj, record, &named, base.as_deref(), &pr_head, trunk).await?;
+        let superseded = superseded_pointers(jj, record, &named, base.as_deref(), &pr_head, trunk, true).await?;
         if superseded.iter().any(|pointer| !pointer.containment.is_contained()) {
             return Err(not_contained_error(
                 record,
@@ -648,8 +691,16 @@ pub async fn reconcile(
     // from it drops nothing.
     if let (Some(base), Some(PointerIntegrityKind::Diverged)) = (&base, pointer_integrity_kind(&failure)) {
         for (candidate, other) in [(&named[0], &named[1]), (&named[1], &named[0])] {
-            let superseded =
-                superseded_pointers(jj, record, std::slice::from_ref(other), Some(base), &candidate.1, trunk).await?;
+            let superseded = superseded_pointers(
+                jj,
+                record,
+                std::slice::from_ref(other),
+                Some(base),
+                &candidate.1,
+                trunk,
+                false,
+            )
+            .await?;
             if superseded.iter().all(|pointer| pointer.containment.is_contained()) {
                 set_bookmarks(jj, record, std::slice::from_ref(&other.0), &candidate.1).await?;
                 return Ok(Some(Reconciliation {
@@ -671,6 +722,7 @@ pub async fn reconcile(
             Some(base),
             &named[1].1,
             trunk,
+            false,
         )
         .await?;
         return Err(not_contained_error(
@@ -714,7 +766,7 @@ pub async fn adopt_pushed_head(
     let heads = resolve_heads(jj, record).await?;
     let (base, _) = resolve_base(jj, record, &heads).await?;
     let named = heads.named(record);
-    let superseded = superseded_pointers(jj, record, &named, Some(&base), pushed_head, trunk).await?;
+    let superseded = superseded_pointers(jj, record, &named, Some(&base), pushed_head, trunk, true).await?;
     if superseded.iter().any(|pointer| !pointer.containment.is_contained()) {
         return Err(not_contained_error(
             record,

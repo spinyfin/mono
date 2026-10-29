@@ -795,6 +795,13 @@ pub enum RetryDeadReviewBatchMember {
     /// typically a supervisor whose last attempt died, or a leaf whose
     /// exhausted retry just made leaf quorum decidable as insufficient.
     BatchFailed,
+    /// The dead execution never started because its recovery pointers failed
+    /// to reconcile (an open `execution_bookmark_recovery_failed` item): the
+    /// retry would fail the same way against the same inputs. Nothing was
+    /// changed, so the member stays a recovery candidate and the next sweep
+    /// after that item is resolved (a repaired pointer, or a run that got
+    /// past the check) retries it; until then the batch stays open.
+    Blocked,
 }
 
 /// Stamp a batch `failed` and file the shared `pr_review_quorum_failed`
@@ -1788,6 +1795,14 @@ impl WorkDb {
         if !retryable_batch_member_role(member.role) {
             tx.commit()?;
             return Ok(RetryDeadReviewBatchMember::NotRetried);
+        }
+        if super::dispatch_admission::has_open_execution_attention_of_kind_on(
+            &tx,
+            execution_id,
+            &[crate::execution_bookmark_recovery::RECOVERY_FAILED],
+        )? {
+            tx.commit()?;
+            return Ok(RetryDeadReviewBatchMember::Blocked);
         }
         let now = now_string();
         tx.execute(

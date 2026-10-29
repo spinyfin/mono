@@ -147,20 +147,40 @@ impl WorkDb {
         reraise_open_execution_attention(&conn, execution_id, kind)
     }
 
-    /// Whether `execution_id` carries a non-resolved item of `kind`. A pure
+    /// Whether `execution_id` carries an open item of `kind`. A pure
     /// read: unlike [`Self::reraise_open_execution_attention`] it does not
     /// stamp a re-raise, so a sweep that consults it on every pass does not
     /// keep pushing the item's clearing reference point forward.
     pub(crate) fn has_open_execution_attention(&self, execution_id: &str, kind: &str) -> Result<bool> {
         let conn = self.connect()?;
-        let open: bool = conn.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM work_attention_items
-                 WHERE execution_id = ?1 AND kind = ?2 AND status != 'resolved'
-             )",
-            params![execution_id, kind],
-            |row| row.get(0),
-        )?;
-        Ok(open)
+        super::dispatch_admission::has_open_execution_attention_of_kind_on(&conn, execution_id, &[kind])
+    }
+
+    /// Whether the work item's latest `pr_review` execution never started
+    /// because its recovery pointers failed to reconcile (an open
+    /// `execution_bookmark_recovery_failed` item on it). Such a failure is
+    /// deterministic: the same inputs fail the same way until a pointer is
+    /// repaired or the PR head moves, so every automatic re-fire path
+    /// consults this before creating a replacement review.
+    pub(crate) fn latest_pr_review_blocked_before_start(&self, work_item_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let latest: Option<String> = conn
+            .query_row(
+                "SELECT id FROM work_executions
+                 WHERE work_item_id = ?1 AND kind = ?2
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                params![work_item_id, boss_protocol::ExecutionKind::PrReview.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match latest {
+            Some(execution_id) => super::dispatch_admission::has_open_execution_attention_of_kind_on(
+                &conn,
+                &execution_id,
+                &[crate::execution_bookmark_recovery::RECOVERY_FAILED],
+            ),
+            None => Ok(false),
+        }
     }
 }

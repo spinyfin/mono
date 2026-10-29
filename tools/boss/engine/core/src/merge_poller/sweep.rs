@@ -2847,6 +2847,30 @@ pub(crate) async fn sweep_stalled_reviewer(
         return;
     }
 
+    // A review that never started on a damaged recovery pointer fails the
+    // same way every time; its blocker is on the card. Leave it until that
+    // item is resolved rather than refiling "died without findings".
+    match work_db.latest_pr_review_blocked_before_start(task_id) {
+        Ok(true) => {
+            tracing::info!(
+                task_id,
+                pr_url,
+                "merge poller: reviewer-fallback skipped a review blocked before start on a damaged recovery pointer",
+            );
+            return;
+        }
+        Ok(false) => {}
+        Err(err) => {
+            tracing::warn!(
+                task_id,
+                pr_url,
+                ?err,
+                "merge poller: failed to check for a blocked-before-start review; not re-firing"
+            );
+            return;
+        }
+    }
+
     let prior_pr_review_id = match work_db.list_executions(Some(task_id)) {
         Ok(executions) => executions
             .into_iter()
