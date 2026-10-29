@@ -248,28 +248,62 @@ fn bazel_override_on_missing_local_path_gets_bazel_gate_not_non_bazel() {
     assert!(!revision.contains("non-Bazel repository"), "{revision}");
 }
 
+fn missing_path() -> &'static std::path::Path {
+    let p = std::path::Path::new("/this/remote/workspace/does-not-exist-locally");
+    assert!(!p.exists());
+    p
+}
+
+fn assert_unresolved_gate_neutral(prompt: &str) {
+    let gated = without_cache_rule(prompt);
+    assert!(
+        gated.contains("build system unresolved") || gated.contains("could not confirm this workspace's build system"),
+        "expected discovery gate:\n{gated}"
+    );
+    assert!(
+        gated.contains("no build command was found") || gated.contains("stop as blocked"),
+        "expected blocked instruction:\n{gated}"
+    );
+    assert!(!gated.contains("do NOT run `bazel`"), "{gated}");
+    assert!(!gated.contains("This repository is not a Bazel workspace"), "{gated}");
+    assert!(
+        !gated.contains("## Pre-push build gate (Bazel workspace)"),
+        "Bazel-only gate leaked:\n{gated}"
+    );
+    assert!(
+        !gated.contains("## Pre-push build gate (non-Bazel repository)"),
+        "non-Bazel gate leaked:\n{gated}"
+    );
+    assert!(
+        !gated.contains("## Pre-push gate for conflict resolution (Bazel workspace)"),
+        "Bazel-only conflict gate leaked:\n{gated}"
+    );
+    assert!(
+        !gated.contains("## Pre-push gate for conflict resolution (non-Bazel repository)"),
+        "non-Bazel conflict gate leaked:\n{gated}"
+    );
+}
+
+fn queue_ci_section(prompt: &str) -> String {
+    prompt
+        .split("## Merge-queue CI verification")
+        .nth(1)
+        .unwrap_or("")
+        .to_owned()
+}
+
 #[test]
 fn missing_local_path_without_override_is_not_treated_as_non_bazel() {
-    let missing = std::path::Path::new("/this/remote/workspace/does-not-exist-locally");
-    assert!(!missing.exists());
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
             .execution(&base_execution())
             .work_item(&chore_without_pr())
-            .workspace_path(missing)
+            .workspace_path(missing_path())
             .pr_template_set(&crate::pr_template::PrTemplateSet::default())
             .run_done_proposals_seam_enabled(true)
             .build(),
     );
-    assert!(
-        !prompt.contains("This repository is not a Bazel workspace"),
-        "missing path must not be treated as confirmed non-Bazel:\n{prompt}"
-    );
-    assert!(!prompt.contains("do NOT run `bazel` commands"), "{prompt}");
-    assert!(
-        !prompt.contains("## Pre-push build gate (Bazel workspace)"),
-        "missing path without override must not guess Bazel either:\n{prompt}"
-    );
+    assert_unresolved_gate_neutral(&prompt);
 }
 
 #[test]
@@ -300,5 +334,91 @@ fn npm_merge_queue_ci_fix_requires_documented_invocation() {
     assert!(
         !prompt.contains("use `bazel test` for EVERY failed test target"),
         "{prompt}"
+    );
+}
+
+#[test]
+fn unresolved_conflict_revision_gets_discovery_gate() {
+    assert_unresolved_gate_neutral(&conflict_prompt(missing_path()));
+}
+
+#[test]
+fn unresolved_non_conflict_revision_gets_discovery_gate() {
+    assert_unresolved_gate_neutral(&revision_prompt(missing_path()));
+}
+
+#[test]
+fn unresolved_trunk_eviction_ci_fix_gets_discovery_gate() {
+    let prompt = ci_fix_prompt(missing_path(), "trunk_queue_eviction", "[]");
+    assert_unresolved_gate_neutral(&prompt);
+    let gated = without_cache_rule(&prompt);
+    assert!(
+        gated.contains("identify the job's build system") || gated.contains("stop as blocked"),
+        "{gated}"
+    );
+}
+
+#[test]
+fn unresolved_queue_ci_prompt_is_build_system_neutral() {
+    let prompt = ci_fix_prompt(
+        missing_path(),
+        "merge_queue_rebounce",
+        r#"[{"name":"frontend-test","conclusion":"FAILURE","target_url":"https://buildkite.com/o/p/builds/1"}]"#,
+    );
+    assert_unresolved_gate_neutral(&prompt);
+    let section = queue_ci_section(&prompt);
+    assert!(
+        section.contains("identify the build system") || section.contains("stop as blocked"),
+        "{section}"
+    );
+    assert!(!section.contains("do NOT run `bazel`"), "{section}");
+    assert!(!section.contains("Do not substitute `bazel` commands"), "{section}");
+}
+
+#[test]
+fn bazel_override_ci_fix_keeps_bazel_test_step3() {
+    let work_item = revision_task_with_created_via(None, "ci-fix:crm_frag_01");
+    let mut attempt = sample_ci_attempt();
+    attempt.failure_kind = Some("merge_queue_rebounce".into());
+    attempt.failed_checks =
+        r#"[{"name":"bazel-build-test","conclusion":"FAILURE","target_url":"https://buildkite.com/o/p/builds/1"}]"#
+            .into();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(missing_path())
+            .bazel_workspace(true)
+            .ci_attempt(&attempt)
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .run_done_proposals_seam_enabled(true)
+            .build(),
+    );
+    let section = queue_ci_section(&prompt);
+    assert!(
+        section.contains("use `bazel test` for EVERY failed test target"),
+        "{section}"
+    );
+    assert!(section.contains("bazel test //path:each_failed_target"), "{section}");
+}
+
+#[test]
+fn npm_queue_ci_prompt_advertises_only_validator_accepted_commands() {
+    let prompt = without_cache_rule(&ci_fix_prompt(
+        npm_workspace().path(),
+        "merge_queue_rebounce",
+        r#"[{"name":"frontend-test","conclusion":"FAILURE","target_url":"https://buildkite.com/o/p/builds/1"}]"#,
+    ));
+    let section = queue_ci_section(&prompt);
+    assert!(
+        section.contains("npm") || section.contains("pnpm") || section.contains("yarn"),
+        "{section}"
+    );
+    assert!(section.contains("BOSS_CI_VERIFICATION.json"), "{section}");
+    assert!(!section.contains("`cargo test`"), "{section}");
+    assert!(!section.contains("`go test"), "{section}");
+    assert!(
+        section.contains("stop as blocked") || section.contains("are rejected"),
+        "{section}"
     );
 }

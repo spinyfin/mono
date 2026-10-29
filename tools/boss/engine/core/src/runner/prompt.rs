@@ -413,9 +413,9 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
     // build system: Bazel workspaces keep the Bazel wording; every other
     // confirmed non-Bazel repo gets a gate built from its own documented
     // commands. An unresolved build system (missing local path, no
-    // override) is not treated as non-Bazel. Docs-only kinds
-    // (design/investigation) are excluded; revisions get the gate inside
-    // `compose_revision_directive`.
+    // override) gets a discovery gate rather than being treated as
+    // non-Bazel. Docs-only kinds (design/investigation) are excluded;
+    // revisions get the gate inside `compose_revision_directive`.
     if matches!(
         execution.kind,
         ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation
@@ -546,7 +546,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         worker_signal_proposals_seam_enabled,
         conflict_attempt.is_some(),
         worker_kind_for_execution(&execution.kind) == WorkerKind::Standard,
-        bazel_workspace.unwrap_or(false),
+        bazel_workspace,
     ));
     prompt.push_str("\nRespond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
@@ -588,7 +588,8 @@ fn resolved_bazel_workspace(workspace_path: &Path, bazel_workspace: Option<bool>
 }
 
 /// Pre-push gate matching the detected build system. `None` (unresolved)
-/// emits nothing: the composer does not guess Bazel or non-Bazel.
+/// emits a discovery gate: identify markers on the execution host, then
+/// apply the matching policy; if nothing is discoverable, stop as blocked.
 fn prepush_gate_text(
     bazel_workspace: Option<bool>,
     workspace_path: &Path,
@@ -600,7 +601,7 @@ fn prepush_gate_text(
         Some(true) if conflict_resolution => bazel_conflict_resolution_gate_text(worker_signal_seam_enabled),
         Some(true) => bazel_prepush_gate_text(worker_signal_seam_enabled, run_done_seam_enabled),
         Some(false) => repo_gate::non_bazel_gate_text(workspace_path, conflict_resolution, worker_signal_seam_enabled),
-        None => String::new(),
+        None => repo_gate::unresolved_gate_text(conflict_resolution, worker_signal_seam_enabled),
     }
 }
 
@@ -624,10 +625,9 @@ fn bazel_no_shell_timeout_clause(run_done_seam_enabled: bool) -> &'static str {
 /// loose "please verify" prose in chore descriptions did not hold, so
 /// this states the requirement as a hard gate in the worker prompt.
 ///
-/// Independent of any filesystem probe: remote (SSH) composition passes a
-/// Bazel override into [`ExecutionPromptParams`] after probing markers on
-/// the execution host, so this text is selected at compose time rather
-/// than appended after a second probe.
+/// Selected at compose time from the resolved build system; remote
+/// composition passes the result of a probe on the execution host as an
+/// override into [`ExecutionPromptParams`].
 ///
 /// `worker_signal_seam_enabled` mirrors `worker_signal_proposals_seam` (see
 /// [`worker_escalation_protocol_directive`]): `true` points a build-gate
@@ -1049,11 +1049,12 @@ fn worker_wait_protocol_directive() -> String {
 }
 
 /// Validation-failure / gate-exception paragraph for [`run_done_directive`].
-/// Built from named pieces chosen by the Bazel flag so a Bazel rewording
-/// cannot silently leave Bazel commands in a non-Bazel prompt.
-fn run_done_gate_exception(conflict_resolution: bool, bazel_workspace: bool) -> &'static str {
+/// Built from named pieces chosen by the resolved build system so a Bazel
+/// rewording cannot silently leave Bazel commands in a non-Bazel prompt,
+/// and an unresolved probe is not collapsed to non-Bazel.
+fn run_done_gate_exception(conflict_resolution: bool, bazel_workspace: Option<bool>) -> &'static str {
     match (conflict_resolution, bazel_workspace) {
-        (true, true) => {
+        (true, Some(true)) => {
             "The merge-correctness pre-push gate is not covered by any unattributable-failure exception. \
              If `bazel build` fails or times out, do NOT push: the merged code MUST COMPILE. \
              A still-red compile is a reason to stop without delivery, not a reason to push, even if the \
@@ -1063,7 +1064,7 @@ fn run_done_gate_exception(conflict_resolution: bool, bazel_workspace: bool) -> 
              approval to relax a check, missing credentials or authorization, genuine instruction \
              conflicts or contradictory requirements."
         }
-        (true, false) => {
+        (true, Some(false)) => {
             "The merge-correctness pre-push gate is not covered by any unattributable-failure exception. \
              If the repo's documented compile, type-check or test command fails or times out, do NOT push: \
              the merged code MUST compile, type-check, and pass those tests. \
@@ -1073,7 +1074,17 @@ fn run_done_gate_exception(conflict_resolution: bool, bazel_workspace: bool) -> 
              bypass or weaken checks, and still stop for required approval to relax a check, missing \
              credentials or authorization, genuine instruction conflicts or contradictory requirements."
         }
-        (false, true) => {
+        (true, None) => {
+            "The merge-correctness pre-push gate is not covered by any unattributable-failure exception. \
+             If the discovered compile, type-check or test command fails or times out, do NOT push: \
+             discover the build system on this execution host first, then apply the matching merge-correctness policy. \
+             A still-red command is a reason to stop without delivery, not a reason to push, even if the \
+             failure looks pre-existing or environmental. A successful run of the matching commands is \
+             a precondition for this push. Those checks remain the source of truth: do not \
+             bypass or weaken checks, and still stop for required approval to relax a check, missing \
+             credentials or authorization, genuine instruction conflicts or contradictory requirements."
+        }
+        (false, Some(true)) => {
             "For validation failures, this is a narrow exception to the earlier gate/stop rules, including \
              the pre-push Bazel gate: a failing gate warrants stopping without delivery only when it is \
              reproducible AND attributable to your change — fix it; if attribution remains unresolved, \
@@ -1090,7 +1101,7 @@ fn run_done_gate_exception(conflict_resolution: bool, bazel_workspace: bool) -> 
              bypass or weaken checks, and still stop for required approval to relax a check, missing \
              credentials or authorization, genuine instruction conflicts or contradictory requirements."
         }
-        (false, false) => {
+        (false, Some(false)) => {
             "For validation failures, this is a narrow exception to the earlier gate/stop rules, including \
              the pre-push build gate: a failing gate warrants stopping without delivery only when it is \
              reproducible AND attributable to your change — fix it; if attribution remains unresolved, \
@@ -1104,6 +1115,23 @@ fn run_done_gate_exception(conflict_resolution: bool, bazel_workspace: bool) -> 
              base reproduction, a passing rerun/isolation run, or a concrete code-path argument showing why \
              your change cannot cause it), recording the target, failure, attempts and evidence in the \
              PR body; merely calling it flaky is not evidence. The repo's own checks remain the source of truth: do not \
+             bypass or weaken checks, and still stop for required approval to relax a check, missing \
+             credentials or authorization, genuine instruction conflicts or contradictory requirements."
+        }
+        (false, None) => {
+            "For validation failures, this is a narrow exception to the earlier gate/stop rules, including \
+             the pre-push build gate: a failing gate warrants stopping without delivery only when it is \
+             reproducible AND attributable to your change — fix it; if attribution remains unresolved, \
+             the failure still stands. A test TIMEOUT result, a full-suite failure that passes in \
+             isolation, or a failure in untouched code is not by itself a reason to stop or to refuse the push: retry the \
+             specific failing command (two or three attempts maximum), and if it keeps failing, check whether \
+             it reproduces on an unmodified base revision. Separately, a shell-timeout of a build, test or `checkleft run` command is \
+             not a reason to rerun the same command under the same cap — keep polling a still-running \
+             command instead, and do not wrap those commands in `timeout`. You MAY push despite a still-red target, and \
+             declare `delivered`, only with evidence that the failure is pre-existing or environmental (a \
+             base reproduction, a passing rerun/isolation run, or a concrete code-path argument showing why \
+             your change cannot cause it), recording the target, failure, attempts and evidence in the \
+             PR body; merely calling it flaky is not evidence. The checks you discovered on this execution host remain the source of truth: do not \
              bypass or weaken checks, and still stop for required approval to relax a check, missing \
              credentials or authorization, genuine instruction conflicts or contradictory requirements."
         }
@@ -1138,10 +1166,11 @@ fn run_done_gate_exception(conflict_resolution: bool, bazel_workspace: bool) -> 
 /// must never be taught a verb the engine won't yet read proposals-first
 /// for. The `propose done` verb itself remains gated only on `seam_enabled`.
 ///
-/// `conflict_resolution` is true when this prompt also carries
-/// [`bazel_conflict_resolution_gate_text`]. That gate is an absolute
-/// compile-or-do-not-push stop and never receives the unattributable-failure
-/// exception; the closing paragraph here must not read as overriding it.
+/// `conflict_resolution` is true when this prompt also carries a
+/// conflict-resolution merge-correctness gate (Bazel or non-Bazel). That
+/// gate is an absolute compile-or-do-not-push stop and never receives the
+/// unattributable-failure exception; the closing paragraph here must not
+/// read as overriding it.
 /// The marker fallback (`worker_signal_seam_enabled` off) must also not
 /// claim a `[blocked]` marker records synchronously: that parser runs only
 /// at the Stop boundary (`completion::stop`), never from
@@ -1163,7 +1192,7 @@ pub(crate) fn run_done_directive(
     worker_signal_seam_enabled: bool,
     conflict_resolution: bool,
     standard_worker: bool,
-    bazel_workspace: bool,
+    bazel_workspace: Option<bool>,
 ) -> String {
     if !seam_enabled {
         return String::new();
@@ -1831,12 +1860,15 @@ fn compose_revision_directive(
     out.push('\n');
     out.push_str("Preserve revision history — each revision is a new commit on the PR branch; never amend, squash, or rename existing commits on the branch.\n");
     out.push('\n');
-    let rebase_gate_clause = if bazel_workspace != Some(true) {
-        repo_gate::non_bazel_rebase_clause(is_conflict_resolution)
-    } else if is_conflict_resolution {
-        "Rebase-only exception (VCS only — not a build-gate skip): if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces NO diff whatsoever (zero changed files), it is valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change. IMPORTANT: this exception covers VCS mechanics only — whether to add a new commit. It does NOT exempt you from the merge-correctness build gate. Any rebase, merge, or conflict resolution MUST run the `bazel build` merge-correctness gate (compile the touched/upstream targets, regenerate invalidated lockfiles) before pushing, even when the rebase appeared clean — a rebase merges upstream changes in and the resulting code is new and must compile. The full `bazel test` suite is NOT a precondition for this push; it runs in the PR's CI after you push (see the conflict-resolution gate above).\n"
-    } else {
-        "Rebase-only exception (VCS only — not a build-gate skip): if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces NO diff whatsoever (zero changed files), it is valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change. IMPORTANT: this exception covers VCS mechanics only — whether to add a new commit. It does NOT exempt you from the pre-push build gate. Any revision that involves a rebase, merge, or conflict resolution MUST run the full `bazel build` + `bazel test` gate before pushing, even when the rebase appeared clean. A rebase merges upstream changes into your branch — the resulting code is new and must be compiled and tested. This is exactly where compile errors get reintroduced.\n"
+    let rebase_gate_clause = match (bazel_workspace, is_conflict_resolution) {
+        (Some(true), true) => {
+            "Rebase-only exception (VCS only — not a build-gate skip): if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces NO diff whatsoever (zero changed files), it is valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change. IMPORTANT: this exception covers VCS mechanics only — whether to add a new commit. It does NOT exempt you from the merge-correctness build gate. Any rebase, merge, or conflict resolution MUST run the `bazel build` merge-correctness gate (compile the touched/upstream targets, regenerate invalidated lockfiles) before pushing, even when the rebase appeared clean — a rebase merges upstream changes in and the resulting code is new and must compile. The full `bazel test` suite is NOT a precondition for this push; it runs in the PR's CI after you push (see the conflict-resolution gate above).\n"
+        }
+        (Some(true), false) => {
+            "Rebase-only exception (VCS only — not a build-gate skip): if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces NO diff whatsoever (zero changed files), it is valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change. IMPORTANT: this exception covers VCS mechanics only — whether to add a new commit. It does NOT exempt you from the pre-push build gate. Any revision that involves a rebase, merge, or conflict resolution MUST run the full `bazel build` + `bazel test` gate before pushing, even when the rebase appeared clean. A rebase merges upstream changes into your branch — the resulting code is new and must be compiled and tested. This is exactly where compile errors get reintroduced.\n"
+        }
+        (Some(false), _) => repo_gate::non_bazel_rebase_clause(is_conflict_resolution),
+        (None, _) => repo_gate::unresolved_rebase_clause(is_conflict_resolution),
     };
     out.push_str(rebase_gate_clause);
     out.push('\n');
@@ -1866,13 +1898,14 @@ fn compose_revision_directive(
     out.push('\n');
     out.push_str(check_bypass_prohibition_text());
     out.push('\n');
-    // The Bazel pre-push gate above (both variants) points a build-failure
-    // sentence at `"$BOSS_BIN" propose blocked` and, on the non-conflict-resolution
-    // variant, at the "If you are blocked or the work is bigger than
-    // estimated" section for the exact syntax. Revisions never received that
-    // section, leaving the cross-reference dangling and the worker with no
-    // `--level` sibling verb or bootstrap-fallback guidance. Push it here so
-    // every path that renders the gate also renders what it points at.
+    // The pre-push gate above (Bazel or non-Bazel, including the unresolved
+    // discovery gate) points a build-failure sentence at `"$BOSS_BIN" propose
+    // blocked` and, on the non-conflict-resolution variant, at the "If you
+    // are blocked or the work is bigger than estimated" section for the
+    // exact syntax. Revisions never received that section, leaving the
+    // cross-reference dangling and the worker with no `--level` sibling
+    // verb or bootstrap-fallback guidance. Push it here so every path that
+    // renders the gate also renders what it points at.
     out.push_str(&worker_escalation_protocol_directive(
         worker_signal_proposals_seam_enabled,
     ));
@@ -1882,14 +1915,11 @@ fn compose_revision_directive(
     ));
     out.push_str("The revision's post-push steps remain your responsibility: finish them before your final response; a push or staged PR URL alone does not mean the revision is done. The driver-resolved boundary after that response is the completion handshake.\n");
     if let Some(attempt) = conflict_attempt {
-        out.push_str(&compose_conflict_resolution_fragment(
-            attempt,
-            bazel_workspace == Some(true),
-        ));
+        out.push_str(&compose_conflict_resolution_fragment(attempt, bazel_workspace));
         out.push_str(&compose_merge_order_preservation_fragment(merge_order_preservation));
     }
     if let Some(attempt) = ci_attempt {
-        out.push_str(&compose_ci_remediation_fragment(attempt, bazel_workspace == Some(true)));
+        out.push_str(&compose_ci_remediation_fragment(attempt, bazel_workspace));
     }
     out
 }
@@ -1945,7 +1975,7 @@ fn compose_merge_order_preservation_fragment(merged_siblings: &[String]) -> Stri
     out
 }
 
-fn compose_queue_ci_fragment(attempt: &CiRemediation, bazel_workspace: bool) -> String {
+fn compose_queue_ci_fragment(attempt: &CiRemediation, bazel_workspace: Option<bool>) -> String {
     let mut out = format!(
         "\n## Merge-queue CI verification\n\nFailure source: the failing merge-queue build, its jobs and logs below. The PR head's checks are not evidence.\n\nPR: {}\nBranch: `{}`\nAttempt: `{}`\nQueue commit: `{}`\n\n### Failing required checks\n\n",
         attempt.pr_url,
@@ -1969,18 +1999,22 @@ fn compose_queue_ci_fragment(attempt: &CiRemediation, bazel_workspace: bool) -> 
     if let Some(log) = &attempt.log_excerpt {
         out.push_str(&format!("\nQueue job log excerpt:\n```\n{log}\n```\n"));
     }
-    let (step3, evidence_command, evidence_output) = if bazel_workspace {
-        (
+    let (step3, evidence_command, evidence_output) = match bazel_workspace {
+        Some(true) => (
             "3. On that main-rebased tree, use `bazel test` for EVERY failed test target, and `bazel build` for every failed build target. A fast whole-job failure requires the job's FULL build/test invocation and target set from its script, not one isolated test. A job that does not use Bazel (e.g. an `npm ci && npm run build && npm run test` frontend job) is verified by running that job's own npm/pnpm/yarn invocation in full. Include all shards; do not use test filters, suppress tests, or bypass caches. Fix failures and repeat the affected verification. Record each command, output and real exit code. A passing rerun on the old PR branch does not count.",
             "bazel test //path:each_failed_target",
             "<Bazel result summary>",
-        )
-    } else {
-        (
-            "3. On that main-rebased tree, re-run each failing job's own documented invocation in full — the command the job's CI script actually runs (for example `npm ci && npm run build && npm test`, `cargo test`, `go test ./...`). Do not substitute `bazel` commands. A fast whole-job failure requires that full invocation and its documented target set, not one isolated test. Include all shards; do not use test filters, suppress tests, or bypass caches. Fix failures and repeat the affected verification. Record each command, output and real exit code. A passing rerun on the old PR branch does not count.",
+        ),
+        Some(false) => (
+            "3. On that main-rebased tree, re-run each failing job's own documented invocation in full — the captured verification contract (`BOSS_CI_VERIFICATION.json`) when present, otherwise the job's own npm/pnpm/yarn invocation (for example `npm ci && npm run build && npm test`) or `checkleft run` for a lint job. The engine accepts only those commands as evidence; cargo, go, make, and other undocumented invocations are rejected. If a job has no declaration and is not an npm/pnpm/yarn or lint job, stop as blocked naming that the engine will not accept the job's command as evidence. A fast whole-job failure requires that full invocation and its documented target set, not one isolated test. Include all shards; do not use test filters, suppress tests, or bypass caches. Fix failures and repeat the affected verification. Record each command, output and real exit code. A passing rerun on the old PR branch does not count.",
             "<the failing job's documented invocation, copied in full>",
             "<command result summary with the real exit code>",
-        )
+        ),
+        None => (
+            "3. On that main-rebased tree, identify the build system on this execution host (`MODULE.bazel`, `WORKSPACE`, `WORKSPACE.bazel`, or `BUILD.bazel` at the workspace root). If Bazel markers are present, use `bazel test` for EVERY failed test target and `bazel build` for every failed build target (a fast whole-job failure requires the job's FULL build/test invocation). If they are not, re-run each failing job's captured verification contract (`BOSS_CI_VERIFICATION.json`) in full; for jobs without a declaration the engine accepts only the job's own npm/pnpm/yarn invocation or `checkleft run` for a lint job. If nothing discoverable matches those, stop as blocked. Include all shards; do not use test filters, suppress tests, or bypass caches. Fix failures and repeat the affected verification. Record each command, output and real exit code. A passing rerun on the old PR branch does not count.",
+            "<the command the engine accepts for this job>",
+            "<command result summary with the real exit code>",
+        ),
     };
     out.push_str(&format!(
         r#"
@@ -2041,7 +2075,7 @@ If already queued, read its existing entry ID with `gh api graphql -f query='que
 /// is already covered by the shared revision directive, so this fragment
 /// covers only the signal-specific parts: the diagnosis block, rebase
 /// instructions, stop conditions, and post-resolution PR comment template.
-fn compose_conflict_resolution_fragment(attempt: &ConflictResolution, bazel_workspace: bool) -> String {
+fn compose_conflict_resolution_fragment(attempt: &ConflictResolution, bazel_workspace: Option<bool>) -> String {
     let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     let mut out = String::new();
     out.push_str("\n---\n\n");
@@ -2067,14 +2101,26 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution, bazel_work
          resolve the conflicts — **you are not adding new work to this PR.**\n\n",
     );
     out.push_str(&compose_conflict_ground_truth_fragment(attempt));
-    let lockfile_tools = if bazel_workspace {
-        "For `MODULE.bazel.lock`, run `bazel mod deps --lockfile_mode=update`; for `Cargo.lock`, \
-         use Cargo's lockfile generator through the repository's supported tooling."
-    } else {
-        "Use the package manager that owns the lockfile, as the repository documents it: for \
-         `package-lock.json`, run `npm install` (or `npm install --package-lock-only`); for \
-         `yarn.lock` or `pnpm-lock.yaml`, run `yarn install` or `pnpm install`; for `Cargo.lock`, \
-         use Cargo's lockfile generator through the repository's supported tooling."
+    let lockfile_tools = match bazel_workspace {
+        Some(true) => {
+            "For `MODULE.bazel.lock`, run `bazel mod deps --lockfile_mode=update`; for `Cargo.lock`, \
+             use Cargo's lockfile generator through the repository's supported tooling."
+        }
+        Some(false) => {
+            "Use the package manager that owns the lockfile, as the repository documents it: for \
+             `package-lock.json`, run `npm install` (or `npm install --package-lock-only`); for \
+             `yarn.lock` or `pnpm-lock.yaml`, run `yarn install` or `pnpm install`; for `Cargo.lock`, \
+             use Cargo's lockfile generator through the repository's supported tooling."
+        }
+        None => {
+            "If the workspace has Bazel markers, run `bazel mod deps --lockfile_mode=update` for \
+             `MODULE.bazel.lock` and use Cargo's lockfile generator through the repository's \
+             supported tooling for `Cargo.lock`. Otherwise use the package manager that owns the \
+             lockfile, as the repository documents it: for `package-lock.json`, run `npm install` \
+             (or `npm install --package-lock-only`); for `yarn.lock` or `pnpm-lock.yaml`, run \
+             `yarn install` or `pnpm install`; for `Cargo.lock`, use Cargo's lockfile generator \
+             through the repository's supported tooling."
+        }
     };
     out.push_str(&format!(
         "### Generated lockfiles\n\n\
@@ -2328,7 +2374,7 @@ fn compose_conflict_ground_truth_fragment(attempt: &ConflictResolution) -> Strin
 /// that the worker needs to fix the failing CI — identical in content to the
 /// bespoke `compose_ci_remediation_prompt` except that the branch/push spine
 /// is already covered by the shared revision directive.
-fn compose_ci_remediation_fragment(attempt: &CiRemediation, bazel_workspace: bool) -> String {
+fn compose_ci_remediation_fragment(attempt: &CiRemediation, bazel_workspace: Option<bool>) -> String {
     if crate::work::queue_ci_evidence::queue_ci_verification_required(attempt) {
         return compose_queue_ci_fragment(attempt, bazel_workspace);
     }
@@ -2413,10 +2459,14 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation, bazel_workspace: boo
     // saying nothing. `mark-failed` is the terminal the engine does accept —
     // it is what the rejection message itself recommends.
     if trunk_eviction_without_evidence {
-        let verify_failed_targets = if bazel_workspace {
-            "run every failed target with Bazel (the full job invocation for whole-job failures)"
-        } else {
-            "run every failed target with that job's own documented invocation in full (the command the job's CI script actually runs)"
+        let verify_failed_targets = match bazel_workspace {
+            Some(true) => "run every failed target with Bazel (the full job invocation for whole-job failures)",
+            Some(false) => {
+                "run every failed target with that job's own documented invocation in full (the command the job's CI script actually runs)"
+            }
+            None => {
+                "identify the job's build system on this execution host and re-run the command the engine accepts as evidence (a Bazel build/test of the job's targets if Bazel markers are present; otherwise the job's own npm/pnpm/yarn invocation, `checkleft run` for a lint job, or the exact command in BOSS_CI_VERIFICATION.json)"
+            }
         };
         out.push_str("### If there is no failing build to find (STOP — do not invent one)\n\n");
         out.push_str(&format!(
@@ -2639,7 +2689,7 @@ fn compose_ci_remediation_prompt(
     prompt.push_str(project_terms_directive().trim_start());
 
     if crate::work::queue_ci_evidence::queue_ci_verification_required(attempt) {
-        prompt.push_str(&compose_queue_ci_fragment(attempt, bazel_workspace == Some(true)));
+        prompt.push_str(&compose_queue_ci_fragment(attempt, bazel_workspace));
         prompt.push_str(check_bypass_prohibition_text());
         return prompt;
     }
