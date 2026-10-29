@@ -292,7 +292,8 @@ impl WorkDb {
         self.create_revision_as_actor(input, pr_checker, boss_protocol::LAST_STATUS_ACTOR_ENGINE)
     }
 
-    /// Preserve the resolved caller in the ledger, including manual-start holds.
+    /// Like [`Self::create_revision`], but records `actor` (the resolved RPC
+    /// caller) on the revision's ledger insert row instead of `engine`.
     pub fn create_revision_as_actor(
         &self,
         input: CreateRevisionInput,

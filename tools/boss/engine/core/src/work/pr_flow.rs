@@ -12,9 +12,16 @@ use boss_protocol::{
 /// silently clearing it.
 pub(crate) const DELETION_SIGNOFF_BLOCKED_REASON: &str = "deletion_signoff";
 
-/// Why a worker-failure status write happened. The ledger trigger records a
-/// new `worker_failed` observation for these bases even when the displayed
-/// reason is unchanged.
+/// Why a worker-failure status write happened.
+///
+/// The shipped `blocked_reason` trigger records a new `worker_failed`
+/// observation for [`Self::NudgeBreaker`], [`Self::DeclaredBlocked`],
+/// [`Self::DeliveredWithoutPr`], [`Self::ForeignPrBinding`], and
+/// [`Self::OperatorNo`] even when the displayed reason is unchanged.
+/// [`Self::ConflictDeliveryUnverified`] records on the first transition to
+/// `worker_failed`; a same-reason repeat does not, because that variant is
+/// not in the trigger IN-list. [`Self::all`] is the enum inventory the
+/// ledger tests pin against that list so a new variant cannot land untested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerFailureBasis {
     NudgeBreaker,
@@ -26,6 +33,17 @@ pub enum WorkerFailureBasis {
 }
 
 impl WorkerFailureBasis {
+    pub const fn all() -> &'static [Self] {
+        &[
+            Self::NudgeBreaker,
+            Self::DeclaredBlocked,
+            Self::DeliveredWithoutPr,
+            Self::ForeignPrBinding,
+            Self::OperatorNo,
+            Self::ConflictDeliveryUnverified,
+        ]
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::NudgeBreaker => "nudge_breaker",
@@ -668,6 +686,7 @@ impl WorkDb {
                     && (!trimmed.is_empty() || task.blocked_reason.as_deref() == Some("worker_failed")) =>
             {
                 let folded = match task.blocked_detail.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(existing) if trimmed.is_empty() => existing.to_owned(),
                     Some(existing) => format!("{existing}\n\n{trimmed}"),
                     None => trimmed.to_owned(),
                 };
@@ -676,9 +695,9 @@ impl WorkDb {
                     basis.as_str(),
                     "engine",
                     "UPDATE tasks
-                     SET blocked_detail = ?2, updated_at = ?3, blocked_reason = blocked_reason
+                     SET blocked_detail = ?2, updated_at = ?3, blocked_reason = ?4
                      WHERE id = ?1 AND deleted_at IS NULL AND status = 'blocked' AND blocked_reason IS NOT NULL",
-                    params![work_item_id, folded, now],
+                    params![work_item_id, folded, now, task.blocked_reason.as_deref()],
                 )?;
             }
             _ => {}
