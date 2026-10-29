@@ -1714,9 +1714,16 @@ mod failure_producers {
         let (_dir, db, _, _, revision, execution_id, _) = conflict_revision_fixture(workspace.path(), pr, "old-head");
         let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
             .handler
-            .with_merge_probe(Arc::new(FixedMergeabilityProbe {
-                mergeability: OpenPrMergeability::Conflict,
-            }));
+            .with_branch_verifier(conflict_delivery::published_verifier(
+                StubBranchVerifier::ok("my-feature"),
+                Ok("pushed-head"),
+            ))
+            .with_merge_probe(conflict_delivery::published_probe(
+                Arc::new(FixedMergeabilityProbe {
+                    mergeability: OpenPrMergeability::Conflict,
+                }),
+                "pushed-head",
+            ));
         let execution = db.get_execution(&execution_id).unwrap();
         let decision = handler.conflict_delivery_decision(&execution, Some(pr)).await;
         assert!(matches!(decision, ConflictDeliveryDecision::Failed(_)));
