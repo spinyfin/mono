@@ -55,6 +55,17 @@ pub trait CommandRunner {
         self.run(invocation)
     }
 
+    /// Bound maintenance-gate admission separately from subprocess execution.
+    /// Interactive inspections can refuse maintenance contention without waiting.
+    fn run_with_gate_wait(
+        &self,
+        invocation: &CommandInvocation,
+        timeout: Duration,
+        _gate_wait: Duration,
+    ) -> Result<String, CubeError> {
+        self.run_with_timeout(invocation, timeout)
+    }
+
     /// The `cube` binary a runner would start to run another cube command
     /// out of process. Only [`RealCommandRunner`] knows one: it is the
     /// running executable. A test double never resolves the running
@@ -151,6 +162,12 @@ impl JjGate {
                 return Ok(Self { _file: file });
             }
             if started.elapsed() >= wait {
+                if wait.is_zero() {
+                    return Err(CubeError::InvalidArgument(format!(
+                        "jj maintenance gate busy at {}; shared-store maintenance is active; workspace status cannot run",
+                        lock_path.display(),
+                    )));
+                }
                 return Err(CubeError::InvalidArgument(format!(
                     "timed out after {}s waiting for the jj maintenance gate {} ({})",
                     wait.as_secs(),
@@ -174,7 +191,7 @@ const JJ_GATE_WAIT: Duration = Duration::from_secs(120);
 /// Hold the maintenance gate shared for the run of a `jj` command. Anything
 /// else, and the maintenance pass's own `jj` commands, run ungated. A gate
 /// that cannot be opened (no resolvable data dir) does not stop the command.
-fn jj_gate(invocation: &CommandInvocation) -> Result<Option<JjGate>, CubeError> {
+fn jj_gate(invocation: &CommandInvocation, wait: Duration) -> Result<Option<JjGate>, CubeError> {
     let is_jj = Path::new(&invocation.program)
         .file_name()
         .is_some_and(|name| name == "jj");
@@ -184,7 +201,7 @@ fn jj_gate(invocation: &CommandInvocation) -> Result<Option<JjGate>, CubeError> 
     let Ok(data_dir) = crate::paths::data_dir() else {
         return Ok(None);
     };
-    JjGate::shared(&JjGate::path(&data_dir), JJ_GATE_WAIT).map(Some)
+    JjGate::shared(&JjGate::path(&data_dir), wait).map(Some)
 }
 
 impl RealCommandRunner {
@@ -252,7 +269,7 @@ impl CommandRunner for RealCommandRunner {
         std::fs::write(destination, output.stdout).map_err(CubeError::Io)
     }
     fn run(&self, invocation: &CommandInvocation) -> Result<String, CubeError> {
-        let _gate = jj_gate(invocation)?;
+        let _gate = jj_gate(invocation, JJ_GATE_WAIT)?;
         let mut cmd = Command::new(&invocation.program);
         cmd.args(&invocation.args).current_dir(&invocation.cwd);
         Self::configure_env(&mut cmd);
@@ -275,7 +292,7 @@ impl CommandRunner for RealCommandRunner {
     }
 
     fn run_cleanup(&self, invocation: &CommandInvocation, timeout: Duration) -> Result<String, CubeError> {
-        let _gate = jj_gate(invocation)?;
+        let _gate = jj_gate(invocation, JJ_GATE_WAIT)?;
         let output = self
             .run_with_timeout_capturing_output_and_heartbeat(
                 invocation,
@@ -311,7 +328,30 @@ impl CommandRunner for RealCommandRunner {
     }
 
     fn run_with_timeout(&self, invocation: &CommandInvocation, timeout: Duration) -> Result<String, CubeError> {
-        let _gate = jj_gate(invocation)?;
+        self.run_with_gate_wait(invocation, timeout, JJ_GATE_WAIT)
+    }
+
+    fn run_with_gate_wait(
+        &self,
+        invocation: &CommandInvocation,
+        timeout: Duration,
+        gate_wait: Duration,
+    ) -> Result<String, CubeError> {
+        let started = Instant::now();
+        let _phase = (gate_wait.is_zero())
+            .then(|| crate::app::workspace_status::StatusPhase::start("maintenance_gate", &invocation.cwd));
+        let _gate = jj_gate(invocation, gate_wait.min(timeout))?;
+        drop(_phase);
+        let timeout = timeout.saturating_sub(started.elapsed());
+        if timeout.is_zero() {
+            return Err(CubeError::CommandTimedOut {
+                program: invocation.program.clone(),
+                args: invocation.args.clone(),
+                timeout_secs: 0,
+            });
+        }
+        let _phase = (gate_wait.is_zero())
+            .then(|| crate::app::workspace_status::StatusPhase::start("jj_process", &invocation.cwd));
         let program = invocation.program.clone();
         let args = invocation.args.join(" ");
         self.run_with_timeout_and_heartbeat(invocation, timeout, HEARTBEAT_INTERVAL, |elapsed, timeout| {
@@ -373,7 +413,7 @@ impl RealCommandRunner {
         env_remove: &[&str],
         timeout: Duration,
     ) -> Result<Option<std::process::Output>, CubeError> {
-        let _gate = jj_gate(invocation)?;
+        let _gate = jj_gate(invocation, JJ_GATE_WAIT)?;
         let program = invocation.program.clone();
         let args = invocation.args.join(" ");
         self.run_with_timeout_capturing_output_and_heartbeat(

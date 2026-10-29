@@ -9,7 +9,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::cli::WorkspaceCommand;
-use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
+use crate::command_runner::{CommandInvocation, CommandRunner};
 use crate::lock::RepoLock;
 use crate::metadata::{WorkspaceHealth, WorkspaceRecord, WorkspaceState};
 use crate::setup::StepStatus;
@@ -23,7 +23,7 @@ use crate::app::bazel_output_base::{
 use crate::app::cleanup::{CleanupOptions, CleanupTrigger, run_cleanup_pass};
 use crate::app::display::{
     cleanup_marks_by_workspace, effective_state_display, format_age, format_retention_summary, format_workspace_list,
-    human_workspace_detail, retention_summary,
+    retention_summary,
 };
 use crate::app::errors::{CubeError, Result, RunResult};
 use crate::app::excludes::ensure_boss_infra_excluded;
@@ -33,7 +33,7 @@ use crate::app::gc::{
 use crate::app::health::{
     WorkspaceHealthOutcome, check_workspace_health, read_head_status, repair_conflicted_bookmarks,
 };
-use crate::app::jj::{cleanup_workspace_logs, current_workspace_commit, run_jj, workspace_path_exists};
+use crate::app::jj::{cleanup_workspace_logs, current_workspace_commit, workspace_path_exists};
 use crate::app::lease_reclaim::{
     ProvisionPath, ProvisioningContext, ReclaimLimits, ReclaimUndo, ScanProbes, reclaim_unhealthy_workspace_for_lease,
     report_provisioning,
@@ -228,11 +228,20 @@ pub(super) fn run_workspace(
     database_path: Option<&Path>,
     runner: &dyn CommandRunner,
 ) -> Result<RunResult> {
+    let status_phase = match &command {
+        WorkspaceCommand::Status { workspace } => Some(super::workspace_status::StatusPhase::start(
+            "registry_open",
+            Path::new(workspace),
+        )),
+        _ => None,
+    };
     let mut store = if let Some(path) = database_path {
         Store::open_at(path)?
     } else {
         Store::open_default()?
     };
+
+    drop(status_phase);
 
     match command {
         WorkspaceCommand::Lease {
@@ -1802,22 +1811,7 @@ pub(super) fn run_workspace(
             }
         }
         WorkspaceCommand::Status { workspace } => {
-            let path = PathBuf::from(&workspace);
-            let record = find_workspace_record(&mut store, &path)?
-                .ok_or_else(|| CubeError::WorkspaceNotFound(workspace.clone()))?;
-            let jj_status = run_jj(
-                runner,
-                database_path,
-                &RealCommandRunner::invocation(&path, "jj", &["status"]),
-            )?;
-
-            RunResult::new(
-                human_workspace_detail(&record, &jj_status),
-                json!({
-                    "workspace": record,
-                    "jj_status": jj_status,
-                }),
-            )
+            super::workspace_status::run(&mut store, runner, database_path, Path::new(&workspace))
         }
         WorkspaceCommand::Setup { workspace } => {
             let path = PathBuf::from(&workspace);
