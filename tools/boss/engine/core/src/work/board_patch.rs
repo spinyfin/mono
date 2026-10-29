@@ -113,7 +113,7 @@ pub(super) fn attach_board_derivations(
     // cards resolved and the statements that took.
     let t = Instant::now();
     match attach_ai_review_state_with(conn, &mut tasks, chores, review_cache.map(|cache| (cache, product_id))) {
-        Ok(stats) => trace.record_nplus1(segment::DB_AI_REVIEW_STATE, elapsed_ms(t), stats.cards, stats.queries),
+        Ok((stats, timings)) => record_ai_review_state(trace, elapsed_ms(t), stats, timings),
         Err(err) => {
             tracing::warn!(?err, "{caller}: failed to attach ai_review_state; ignoring");
             trace.record_plain(segment::DB_AI_REVIEW_STATE, elapsed_ms(t));

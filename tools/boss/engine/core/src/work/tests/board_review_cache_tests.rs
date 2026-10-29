@@ -119,6 +119,12 @@ impl Board {
             "cached board diverged from the uncached board"
         );
         let (_, _, queries) = trace.segment_counts(segment::DB_AI_REVIEW_STATE).unwrap();
+        let (hits, misses, owners) = trace.segment_review_counts(segment::DB_AI_REVIEW_STATE).unwrap();
+        assert_eq!(
+            hits.unwrap() + misses.unwrap(),
+            owners.unwrap(),
+            "cache hits and misses must cover every resolved owner"
+        );
         Pass {
             misses: self.caches.reviews.stats().misses - misses_before,
             queries: queries.unwrap(),
@@ -676,4 +682,32 @@ fn single_item_trace_counts_review_cards_and_queries() {
     )
     .unwrap();
     assert!(trace.request_id().ends_with(":get_work_item"), "{}", trace.request_id());
+}
+
+#[test]
+fn review_attach_emits_cache_counts_and_subsegments() {
+    let board = Board::new("review-cache-segments");
+    let root = board.in_review_chore(41);
+    board.observe(&root, "h1", "success", "mergeable");
+    board.verdict(&root, "h1", "completed_clean");
+    let mut trace = PopulationTrace::new(board.product_id.clone(), "review-segments", None, Instant::now());
+    board
+        .db
+        .get_work_tree_cached(&board.product_id, &mut trace, &board.caches)
+        .unwrap();
+    let (hits, misses, owners) = trace.segment_review_counts(segment::DB_AI_REVIEW_STATE).unwrap();
+    assert_eq!(hits, Some(0));
+    assert_eq!(misses, Some(1));
+    assert_eq!(owners, Some(1));
+    assert!(trace.segment_counts(segment::DB_AI_REVIEW_STATE_FAMILY_KEYS).is_some());
+    assert!(
+        trace
+            .segment_counts(segment::DB_AI_REVIEW_STATE_CURRENT_HEADS)
+            .is_some()
+    );
+    assert!(
+        trace
+            .segment_counts(segment::DB_AI_REVIEW_STATE_BADGE_HISTORIES)
+            .is_some()
+    );
 }

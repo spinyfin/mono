@@ -821,6 +821,17 @@ pub(crate) struct ReviewAttachStats {
     pub cache_hits: u64,
     /// PR owners recomputed from the database (every owner when uncached).
     pub cache_misses: u64,
+    /// Distinct on-board PR owners whose projection was resolved.
+    pub owners: usize,
+}
+
+/// Wall-clock of the three DB calls inside one review-state attach. Absent
+/// when that call was skipped (empty id list, or a cache hit covering it).
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct ReviewAttachTimings {
+    pub family_keys_ms: Option<f64>,
+    pub current_heads_ms: Option<f64>,
+    pub badge_histories_ms: Option<f64>,
 }
 
 /// Resolve the card's AI review from the PR owner's observed head and the
@@ -835,7 +846,7 @@ pub(crate) fn attach_ai_review_state(
     tasks: &mut [Task],
     chores: &mut [Task],
 ) -> Result<ReviewAttachStats> {
-    attach_ai_review_state_with(conn, tasks, chores, None)
+    attach_ai_review_state_with(conn, tasks, chores, None).map(|(stats, _)| stats)
 }
 
 /// [`attach_ai_review_state`] with an optional engine-wide review cache for
@@ -862,10 +873,12 @@ pub(crate) fn attach_ai_review_state_with(
     tasks: &mut [Task],
     chores: &mut [Task],
     cache: Option<(&BoardReviewCache, &str)>,
-) -> Result<ReviewAttachStats> {
+) -> Result<(ReviewAttachStats, ReviewAttachTimings)> {
     use super::review_badge::{OwnerReview, ReviewKey, fetch_badge_histories, fetch_current_heads};
+    use std::time::Instant;
 
     let mut stats = ReviewAttachStats::default();
+    let mut timings = ReviewAttachTimings::default();
     let chains = BoardChains::index(tasks, chores);
     let review_targets = review_execution_target_ids_with(conn, tasks, chores, &chains, &mut stats.queries);
 
@@ -903,10 +916,18 @@ pub(crate) fn attach_ai_review_state_with(
         ids.dedup();
         ids
     };
+    stats.owners = owner_ids.len();
 
     let mut owner_reviews: HashMap<String, std::sync::Arc<OwnerReview>> = HashMap::new();
     if let Some((cache, product_id)) = cache {
-        let keys = super::board_review_cache::read_family_keys(conn, &owner_ids)?;
+        let keys = if owner_ids.is_empty() {
+            HashMap::new()
+        } else {
+            let started = Instant::now();
+            let keys = super::board_review_cache::read_family_keys(conn, &owner_ids)?;
+            add_timing(&mut timings.family_keys_ms, started);
+            keys
+        };
         stats.queries += u64::from(!owner_ids.is_empty());
         let probe: Vec<_> = owner_ids
             .iter()
@@ -933,8 +954,12 @@ pub(crate) fn attach_ai_review_state_with(
         }
         let mut fresh = Vec::with_capacity(misses.len());
         if !misses.is_empty() {
+            let started = Instant::now();
             let mut heads = fetch_current_heads(conn, &misses, ReviewKey::Owner)?;
+            add_timing(&mut timings.current_heads_ms, started);
+            let started = Instant::now();
             let mut histories = fetch_badge_histories(conn, &misses, ReviewKey::Owner)?;
+            add_timing(&mut timings.badge_histories_ms, started);
             stats.queries += 2;
             for id in misses {
                 let current_head = heads.remove(&id);
@@ -950,7 +975,9 @@ pub(crate) fn attach_ai_review_state_with(
     } else {
         stats.cache_misses = owner_ids.len() as u64;
         if !owner_ids.is_empty() {
+            let started = Instant::now();
             let mut heads = fetch_current_heads(conn, &owner_ids, ReviewKey::Owner)?;
+            add_timing(&mut timings.current_heads_ms, started);
             stats.queries += 1;
             for id in &owner_ids {
                 let review = OwnerReview {
@@ -961,7 +988,14 @@ pub(crate) fn attach_ai_review_state_with(
             }
         }
     }
-    let fallback_heads = fetch_current_heads(conn, &fallback, ReviewKey::Card)?;
+    let fallback_heads = if fallback.is_empty() {
+        HashMap::new()
+    } else {
+        let started = Instant::now();
+        let heads = fetch_current_heads(conn, &fallback, ReviewKey::Card)?;
+        add_timing(&mut timings.current_heads_ms, started);
+        heads
+    };
     stats.queries += u64::from(!fallback.is_empty());
 
     // Queue lookup is for Active/InReview cards (`review_queued`), not the
@@ -1074,7 +1108,9 @@ pub(crate) fn attach_ai_review_state_with(
         ids.sort_unstable();
         ids.dedup();
         if !ids.is_empty() {
+            let started = Instant::now();
             owner_histories = fetch_badge_histories(conn, &ids, ReviewKey::Owner)?;
+            add_timing(&mut timings.badge_histories_ms, started);
             stats.queries += 1;
         }
     }
@@ -1084,7 +1120,14 @@ pub(crate) fn attach_ai_review_state_with(
         .map(|row| row.id.clone())
         .collect();
     drop(wanting);
-    let fallback_histories = fetch_badge_histories(conn, &fallback_wanting, ReviewKey::Card)?;
+    let fallback_histories = if fallback_wanting.is_empty() {
+        HashMap::new()
+    } else {
+        let started = Instant::now();
+        let histories = fetch_badge_histories(conn, &fallback_wanting, ReviewKey::Card)?;
+        add_timing(&mut timings.badge_histories_ms, started);
+        histories
+    };
     stats.queries += u64::from(!fallback_wanting.is_empty());
 
     super::review_badge::apply_review_badges(tasks, chores, |row| match owner_of.get(&row.id) {
@@ -1092,7 +1135,38 @@ pub(crate) fn attach_ai_review_state_with(
         Some(owner) => owner_histories.get(owner),
         None => fallback_histories.get(&row.id),
     })?;
-    Ok(stats)
+    Ok((stats, timings))
+}
+
+fn add_timing(slot: &mut Option<f64>, started: std::time::Instant) {
+    *slot = Some(slot.unwrap_or(0.0) + crate::population_timing::elapsed_ms(started));
+}
+
+/// Parent `db.ai_review_state` segment plus the three DB sub-segments.
+pub(crate) fn record_ai_review_state(
+    trace: &mut crate::population_timing::PopulationTrace,
+    duration_ms: f64,
+    stats: ReviewAttachStats,
+    timings: ReviewAttachTimings,
+) {
+    use crate::population_timing::segment;
+    trace.record_ai_review_state(
+        duration_ms,
+        stats.cards,
+        stats.queries,
+        stats.cache_hits,
+        stats.cache_misses,
+        stats.owners,
+    );
+    if let Some(ms) = timings.family_keys_ms {
+        trace.record_plain(segment::DB_AI_REVIEW_STATE_FAMILY_KEYS, ms);
+    }
+    if let Some(ms) = timings.current_heads_ms {
+        trace.record_plain(segment::DB_AI_REVIEW_STATE_CURRENT_HEADS, ms);
+    }
+    if let Some(ms) = timings.badge_histories_ms {
+        trace.record_plain(segment::DB_AI_REVIEW_STATE_BADGE_HISTORIES, ms);
+    }
 }
 
 /// The revision-chain shape of the rows on a board, for walking a card to

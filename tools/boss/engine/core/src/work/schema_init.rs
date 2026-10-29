@@ -79,6 +79,7 @@ impl WorkDb {
         // Required runtime data, not a historical migration. Capability
         // discovery remains outside DB startup (no processes or network).
         crate::host_registry::ensure_local_host(&tx)?;
+        refresh_query_planner_stats(&tx)?;
         tx.commit()?;
         Ok(())
     }
@@ -468,6 +469,33 @@ mod tests {
             )
             .unwrap();
         assert!(tmux_token_index_exists, "expected unique tmux token index");
+
+        let executions_item_index: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_master
+                     WHERE type = 'index' AND name = 'work_executions_item_kind_status_finished_idx'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            executions_item_index,
+            "expected work_executions(work_item_id, kind, status, finished_at) index"
+        );
+
+        let has_planner_stats: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'sqlite_stat1')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            has_planner_stats,
+            "expected ANALYZE to populate sqlite_stat1 on a fresh database"
+        );
     }
 }
 
@@ -482,6 +510,23 @@ pub(crate) fn table_has_column(conn: &Connection, table: &str, column: &str) -> 
         }
     }
     Ok(false)
+}
+
+/// Populate `sqlite_stat1` when it is missing, otherwise let SQLite refresh
+/// stale stats. Cold `fetch_badge_histories` / `fetch_current_heads` otherwise
+/// plan `work_executions` as `status=?` on the ready index.
+fn refresh_query_planner_stats(conn: &Connection) -> Result<()> {
+    let has_stats: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'sqlite_stat1')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_stats {
+        conn.execute_batch("PRAGMA optimize")?;
+    } else {
+        conn.execute_batch("ANALYZE")?;
+    }
+    Ok(())
 }
 
 pub(crate) fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
@@ -522,12 +567,16 @@ mod floor_tests {
     type SchemaObject = (String, String, String, Option<String>);
 
     fn capture(conn: &Connection) -> Vec<SchemaObject> {
-        conn.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
-            .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap()
+        conn.prepare(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_stat%'
+             ORDER BY type, name",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
     }
 
     fn normalize(objects: Vec<SchemaObject>) -> Vec<SchemaObject> {
@@ -727,6 +776,9 @@ mod floor_tests {
             expected.execute_batch(EXECUTION_BOOKMARK_PRUNE_COLUMNS_60).unwrap();
             expected.execute_batch(migrations::CREATE_LEDGER).unwrap();
             task_status_audit::migrate(&expected).unwrap();
+            expected
+                .execute_batch(WORK_EXECUTIONS_ITEM_KIND_STATUS_FINISHED_INDEX)
+                .unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

@@ -325,3 +325,13 @@ pub(super) const VERDICT_REVISION_INDEX_55: &str = "CREATE INDEX IF NOT EXISTS p
          ON pr_review_verdicts(work_item_id, revision_task_id)
          WHERE revision_task_id IS NOT NULL AND revision_task_id != '';
      DROP INDEX IF EXISTS idx_tasks_parent_task_id;";
+
+/// Cold board assembly looks up each findings revision's completed
+/// `revision_implementation` execution (`fetch_badge_histories` EXISTS and
+/// `fetch_current_heads` "latest completed" subquery). Without this index
+/// SQLite plans those correlated probes as `status=?` on
+/// `work_executions_ready_idx` and walks every completed execution per
+/// owner. Leading with `work_item_id` makes both probes per-item.
+pub(super) const WORK_EXECUTIONS_ITEM_KIND_STATUS_FINISHED_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS work_executions_item_kind_status_finished_idx
+     ON work_executions(work_item_id, kind, status, finished_at)";

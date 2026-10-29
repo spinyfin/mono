@@ -53,38 +53,7 @@ pub(super) fn fetch_current_heads(
         return Ok(HashMap::new());
     }
     let placeholders = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
-    let outcomes = super::review_verdicts::INFORMATIVE_GATE_OUTCOMES
-        .iter()
-        .map(|outcome| format!("'{outcome}'"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let family = review_family_cte(&placeholders, key);
-    let sql = format!(
-        "{family}
-         SELECT o.card, v.gate_outcome, v.revision_task_id,
-                root.ci_required_state, root.pr_mergeable_state,
-                root.status = 'active' OR EXISTS(SELECT 1 FROM family f JOIN tasks t ON t.id = f.id
-                       WHERE f.root = root.id AND t.kind = 'revision'
-                         AND t.deleted_at IS NULL AND t.status IN ('todo', 'active', 'blocked')),
-                EXISTS(SELECT 1 FROM tasks r
-                       WHERE r.id = v.revision_task_id AND r.kind = 'revision'
-                         AND r.deleted_at IS NULL AND r.status IN ('in_review', 'done')
-                         AND EXISTS(SELECT 1 FROM work_executions we
-                                    WHERE we.id = (SELECT e.id FROM work_executions e
-                                                   WHERE e.work_item_id = r.id AND e.status = 'completed'
-                                                     AND e.kind = 'revision_implementation'
-                                                   ORDER BY e.finished_at DESC, e.id DESC LIMIT 1)
-                                      AND (we.pr_head_after IS NULL OR we.pr_head_after = v.head_sha)))
-         FROM owners o JOIN tasks root ON root.id = o.id
-         LEFT JOIN pr_review_verdicts v ON v.id = (
-             SELECT rv.id FROM pr_review_verdicts rv
-             JOIN family f ON f.id = rv.work_item_id AND f.root = root.id
-             WHERE rv.head_sha = NULLIF(root.pr_head_sha, '')
-               AND rv.gate_outcome IN ({outcomes})
-             ORDER BY rv.created_at DESC, rv.id DESC LIMIT 1
-         )
-         WHERE NULLIF(root.pr_url, '') IS NOT NULL"
-    );
+    let sql = current_heads_sql(&placeholders, key);
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(ids), |row| {
         Ok((
@@ -141,36 +110,7 @@ pub(super) fn fetch_badge_histories(
         return Ok(HashMap::new());
     }
     let placeholders = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
-    let outcomes = super::review_verdicts::INFORMATIVE_GATE_OUTCOMES
-        .iter()
-        .map(|value| format!("'{value}'"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let family = review_family_cte(&placeholders, key);
-    let sql = format!(
-        "{family}, ranked AS (
-            SELECT o.card, v.*, ROW_NUMBER() OVER (
-                PARTITION BY o.card ORDER BY
-                    COALESCE(v.head_sha = NULLIF(root.pr_head_sha, ''), 0) DESC,
-                    v.created_at DESC, v.id DESC) AS rank
-            FROM owners o JOIN tasks root ON root.id = o.id
-            JOIN family f ON f.root = root.id
-            JOIN pr_review_verdicts v ON v.work_item_id = f.id
-            WHERE v.gate_outcome IN ({outcomes}) AND NULLIF(v.head_sha, '') IS NOT NULL
-         )
-         SELECT o.card, NULLIF(root.pr_head_sha, ''),
-                COALESCE(v.head_sha, NULLIF(root.last_reviewed_sha, '')),
-                v.created_at, v.gate_outcome, v.findings_count, r.name, r.status,
-                r.status IN ('in_review', 'done') AND r.deleted_at IS NULL AND EXISTS(
-                    SELECT 1 FROM work_executions e WHERE e.work_item_id = r.id
-                    AND e.kind = 'revision_implementation' AND e.status = 'completed'),
-                r.id, p.payload_json, r.description
-         FROM owners o JOIN tasks root ON root.id = o.id
-         LEFT JOIN ranked v ON v.card = o.card AND v.rank = 1
-         LEFT JOIN tasks r ON r.id = v.revision_task_id
-         LEFT JOIN worker_proposals p ON p.id = v.proposal_id
-             AND p.kind = 'review_verdict' AND p.state = 'applied'"
-    );
+    let sql = badge_histories_sql(&placeholders, key);
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(ids), |row| {
         Ok((
@@ -410,6 +350,78 @@ macro_rules! family_recursive_sql {
     };
 }
 pub(super) use family_recursive_sql;
+
+fn informative_gate_outcomes_sql() -> String {
+    super::review_verdicts::INFORMATIVE_GATE_OUTCOMES
+        .iter()
+        .map(|outcome| format!("'{outcome}'"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Production SQL for [`fetch_current_heads`]. Exposed so the query-plan test
+/// can `EXPLAIN` the same statement the board runs.
+pub(crate) fn current_heads_sql(placeholders: &str, key: ReviewKey) -> String {
+    let outcomes = informative_gate_outcomes_sql();
+    let family = review_family_cte(placeholders, key);
+    format!(
+        "{family}
+         SELECT o.card, v.gate_outcome, v.revision_task_id,
+                root.ci_required_state, root.pr_mergeable_state,
+                root.status = 'active' OR EXISTS(SELECT 1 FROM family f JOIN tasks t ON t.id = f.id
+                       WHERE f.root = root.id AND t.kind = 'revision'
+                         AND t.deleted_at IS NULL AND t.status IN ('todo', 'active', 'blocked')),
+                EXISTS(SELECT 1 FROM tasks r
+                       WHERE r.id = v.revision_task_id AND r.kind = 'revision'
+                         AND r.deleted_at IS NULL AND r.status IN ('in_review', 'done')
+                         AND EXISTS(SELECT 1 FROM work_executions we
+                                    WHERE we.id = (SELECT e.id FROM work_executions e
+                                                   WHERE e.work_item_id = r.id AND e.status = 'completed'
+                                                     AND e.kind = 'revision_implementation'
+                                                   ORDER BY e.finished_at DESC, e.id DESC LIMIT 1)
+                                      AND (we.pr_head_after IS NULL OR we.pr_head_after = v.head_sha)))
+         FROM owners o JOIN tasks root ON root.id = o.id
+         LEFT JOIN pr_review_verdicts v ON v.id = (
+             SELECT rv.id FROM pr_review_verdicts rv
+             JOIN family f ON f.id = rv.work_item_id AND f.root = root.id
+             WHERE rv.head_sha = NULLIF(root.pr_head_sha, '')
+               AND rv.gate_outcome IN ({outcomes})
+             ORDER BY rv.created_at DESC, rv.id DESC LIMIT 1
+         )
+         WHERE NULLIF(root.pr_url, '') IS NOT NULL"
+    )
+}
+
+/// Production SQL for [`fetch_badge_histories`]. Exposed so the query-plan test
+/// can `EXPLAIN` the same statement the board runs.
+pub(crate) fn badge_histories_sql(placeholders: &str, key: ReviewKey) -> String {
+    let outcomes = informative_gate_outcomes_sql();
+    let family = review_family_cte(placeholders, key);
+    format!(
+        "{family}, ranked AS (
+            SELECT o.card, v.*, ROW_NUMBER() OVER (
+                PARTITION BY o.card ORDER BY
+                    COALESCE(v.head_sha = NULLIF(root.pr_head_sha, ''), 0) DESC,
+                    v.created_at DESC, v.id DESC) AS rank
+            FROM owners o JOIN tasks root ON root.id = o.id
+            JOIN family f ON f.root = root.id
+            JOIN pr_review_verdicts v ON v.work_item_id = f.id
+            WHERE v.gate_outcome IN ({outcomes}) AND NULLIF(v.head_sha, '') IS NOT NULL
+         )
+         SELECT o.card, NULLIF(root.pr_head_sha, ''),
+                COALESCE(v.head_sha, NULLIF(root.last_reviewed_sha, '')),
+                v.created_at, v.gate_outcome, v.findings_count, r.name, r.status,
+                r.status IN ('in_review', 'done') AND r.deleted_at IS NULL AND EXISTS(
+                    SELECT 1 FROM work_executions e WHERE e.work_item_id = r.id
+                    AND e.kind = 'revision_implementation' AND e.status = 'completed'),
+                r.id, p.payload_json, r.description
+         FROM owners o JOIN tasks root ON root.id = o.id
+         LEFT JOIN ranked v ON v.card = o.card AND v.rank = 1
+         LEFT JOIN tasks r ON r.id = v.revision_task_id
+         LEFT JOIN worker_proposals p ON p.id = v.proposal_id
+             AND p.kind = 'review_verdict' AND p.state = 'applied'"
+    )
+}
 
 /// The `owners(card, id)` and `family(root, id, depth)` CTEs both review
 /// queries select from. `Card` resolves each id's owner by walking up its

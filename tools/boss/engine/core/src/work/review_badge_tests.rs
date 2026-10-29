@@ -251,3 +251,208 @@ fn trimming_keeps_findings_text_only_for_the_findings_state() {
         assert_eq!(trimmed.reviewed_sha.as_deref(), Some("abc"));
     }
 }
+
+const PLAN_OWNERS: usize = 2_700;
+const PLAN_COMPLETED_EXECS: usize = 18_400;
+
+/// Production-shaped fixture: thousands of owners and completed executions
+/// so the `status` index looks attractive without `sqlite_stat1`.
+fn seed_badge_history_plan_fixture(conn: &Connection) {
+    conn.execute_batch(
+        "INSERT INTO products(id,name,slug,status,created_at,updated_at)
+         VALUES ('plan-prod','Plan','plan-prod','active','1','1');
+         BEGIN",
+    )
+    .unwrap();
+    {
+        let mut owners = conn
+            .prepare(
+                "INSERT INTO tasks(id,product_id,kind,name,status,created_at,updated_at,pr_url,pr_head_sha)
+                 VALUES (?1,'plan-prod','project_task',?1,'in_review','1','1',?2,'head')",
+            )
+            .unwrap();
+        let mut revisions = conn
+            .prepare(
+                "INSERT INTO tasks(id,product_id,kind,name,status,created_at,updated_at,parent_task_id)
+                 VALUES (?1,'plan-prod','revision',?1,'in_review','1','1',?2)",
+            )
+            .unwrap();
+        for i in 0..PLAN_OWNERS {
+            let owner = format!("owner-{i}");
+            let revision = format!("rev-{i}");
+            owners
+                .execute(params![owner, format!("https://example.com/p/{i}")])
+                .unwrap();
+            revisions.execute(params![revision, owner]).unwrap();
+        }
+        let mut execs = conn
+            .prepare(
+                "INSERT INTO work_executions(id,work_item_id,kind,status,repo_remote_url,created_at,finished_at,pr_head_after)
+                 VALUES (?1,?2,?3,'completed','repo','1','2',?4)",
+            )
+            .unwrap();
+        for i in 0..PLAN_OWNERS {
+            execs
+                .execute(params![
+                    format!("rev-exec-{i}"),
+                    format!("rev-{i}"),
+                    "revision_implementation",
+                    "head"
+                ])
+                .unwrap();
+        }
+        for i in PLAN_OWNERS..PLAN_COMPLETED_EXECS {
+            execs
+                .execute(params![
+                    format!("noise-exec-{i}"),
+                    format!("owner-{}", i % PLAN_OWNERS),
+                    "pr_review",
+                    Option::<&str>::None
+                ])
+                .unwrap();
+        }
+        let mut verdict_execs = conn
+            .prepare(
+                "INSERT INTO work_executions(id,work_item_id,kind,status,repo_remote_url,created_at,finished_at)
+                 VALUES (?1,?2,'pr_review','completed','repo','1','2')",
+            )
+            .unwrap();
+        let mut verdicts = conn
+            .prepare(
+                "INSERT INTO pr_review_verdicts(id,execution_id,work_item_id,head_sha,findings_count,revision_warranted,gate_outcome,revision_task_id,created_at)
+                 VALUES (?1,?2,?3,'head',2,1,'completed_with_findings',?4,'3')",
+            )
+            .unwrap();
+        for i in 0..PLAN_OWNERS {
+            let execution = format!("verdict-exec-{i}");
+            verdict_execs.execute(params![execution, format!("owner-{i}")]).unwrap();
+            verdicts
+                .execute(params![
+                    format!("verdict-{i}"),
+                    execution,
+                    format!("owner-{i}"),
+                    format!("rev-{i}")
+                ])
+                .unwrap();
+        }
+    }
+    conn.execute_batch("COMMIT").unwrap();
+}
+
+fn explain_plan(conn: &Connection, sql: &str, ids: &[String]) -> String {
+    conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap()
+        .query_map(rusqlite::params_from_iter(ids.iter()), |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+        .join("\n")
+}
+
+fn work_executions_plan_lines(plan: &str) -> Vec<&str> {
+    plan.lines()
+        .filter(|line| {
+            line.contains("work_executions")
+                || line.contains("SEARCH e ")
+                || line.contains("SEARCH we ")
+                || line.contains("SCAN e ")
+                || line.contains("SCAN we ")
+        })
+        .collect()
+}
+
+fn is_work_item_led_access(line: &str) -> bool {
+    line.contains("work_item_id")
+        || line.contains("work_executions_item_kind_status_finished_idx")
+        || line.contains("work_executions_work_item_idx")
+}
+
+fn is_work_executions_pk_lookup(line: &str) -> bool {
+    line.contains("sqlite_autoindex_work_executions_1") && line.contains("id=?")
+}
+
+fn assert_work_item_led_plan(plan: &str, label: &str) {
+    let lines = work_executions_plan_lines(plan);
+    assert!(
+        !lines.is_empty(),
+        "{label}: expected a work_executions access in the plan:\n{plan}"
+    );
+    for line in &lines {
+        assert!(
+            !line.contains("work_executions_ready_idx"),
+            "{label}: work_executions used the status index:\n{plan}"
+        );
+        assert!(
+            is_work_item_led_access(line) || is_work_executions_pk_lookup(line),
+            "{label}: work_executions access is neither work_item_id-led nor a PK lookup:\n{line}\nfull:\n{plan}"
+        );
+    }
+    assert!(
+        lines.iter().any(|line| is_work_item_led_access(line)),
+        "{label}: no work_executions access used a work_item_id-led index:\n{plan}"
+    );
+}
+
+fn drop_planner_stats(conn: &Connection) {
+    conn.execute_batch("DROP TABLE IF EXISTS sqlite_stat1; DROP TABLE IF EXISTS sqlite_stat4;")
+        .unwrap();
+}
+
+#[test]
+fn badge_history_and_current_heads_use_the_work_item_index() {
+    let db = WorkDb::open_in_memory().unwrap();
+    let conn = db.connect().unwrap();
+    let index_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master
+             WHERE type = 'index' AND name = 'work_executions_item_kind_status_finished_idx')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(index_exists, "migration must create the covering work_item index");
+    seed_badge_history_plan_fixture(&conn);
+
+    let sample = vec!["owner-0".to_owned(), "owner-1".to_owned()];
+    let heads_sql = current_heads_sql("?1,?2", ReviewKey::Owner);
+    let histories_sql = badge_histories_sql("?1,?2", ReviewKey::Owner);
+
+    drop_planner_stats(&conn);
+    let heads_unstat = explain_plan(&conn, &heads_sql, &sample);
+    let histories_unstat = explain_plan(&conn, &histories_sql, &sample);
+    println!("current_heads without sqlite_stat1:\n{heads_unstat}");
+    println!("badge_histories without sqlite_stat1:\n{histories_unstat}");
+    // The covering (work_item_id, kind, status, finished_at) index is enough for
+    // bundled SQLite 3.51 to pick a work_item-led plan even with no sqlite_stat1.
+    // ANALYZE is still required at startup so other queries keep a good plan.
+    assert_work_item_led_plan(&heads_unstat, "fetch_current_heads without sqlite_stat1");
+    assert_work_item_led_plan(&histories_unstat, "fetch_badge_histories without sqlite_stat1");
+
+    conn.execute_batch("ANALYZE").unwrap();
+    let heads_plan = explain_plan(&conn, &heads_sql, &sample);
+    let histories_plan = explain_plan(&conn, &histories_sql, &sample);
+    println!("current_heads with sqlite_stat1:\n{heads_plan}");
+    println!("badge_histories with sqlite_stat1:\n{histories_plan}");
+    assert_work_item_led_plan(&heads_plan, "fetch_current_heads");
+    assert_work_item_led_plan(&histories_plan, "fetch_badge_histories");
+
+    let owners: Vec<String> = (0..PLAN_OWNERS).map(|i| format!("owner-{i}")).collect();
+    let started = std::time::Instant::now();
+    fetch_current_heads(&conn, &owners, ReviewKey::Owner).unwrap();
+    let heads_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let started = std::time::Instant::now();
+    fetch_badge_histories(&conn, &owners, ReviewKey::Owner).unwrap();
+    let histories_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    println!(
+        "review_badge_plan owners={PLAN_OWNERS} completed_execs={PLAN_COMPLETED_EXECS} \
+         current_heads_ms={heads_ms:.3} badge_histories_ms={histories_ms:.3}"
+    );
+    assert!(
+        heads_ms < 5_000.0,
+        "fetch_current_heads for {PLAN_OWNERS} owners took {heads_ms:.1} ms; expected well under 1 s on this fixture"
+    );
+    assert!(
+        histories_ms < 5_000.0,
+        "fetch_badge_histories for {PLAN_OWNERS} owners took {histories_ms:.1} ms; expected well under 1 s on this fixture"
+    );
+}
