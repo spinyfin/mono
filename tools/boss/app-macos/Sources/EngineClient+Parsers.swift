@@ -613,7 +613,12 @@ extension EngineClient {
             startedAt: payload["started_at"] as? String,
             pool: payload["pool"] as? String,
             viewerAttachError: payload["viewer_attach_error"] as? String,
-            hungSince: payload["hung_since"] as? String
+            hungSince: payload["hung_since"] as? String,
+            workItemId: payload["work_item_id"] as? String,
+            workItemName: payload["work_item_name"] as? String,
+            workItemShortId: (payload["work_item_short_id"] as? NSNumber)?.intValue,
+            productId: payload["product_id"] as? String,
+            prURL: payload["pr_url"] as? String
         )
     }
 

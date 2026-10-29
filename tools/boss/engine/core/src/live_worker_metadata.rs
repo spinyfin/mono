@@ -81,6 +81,7 @@ pub(crate) fn resolve_with_automation(
     has_source_automation: bool,
 ) -> LiveWorkerMetadata {
     let (project_id, project_name) = project_attribution(work_db, &execution.work_item_id);
+    let (product_id, work_item_short_id, pr_url) = work_item_header_fields(work_db, &execution.work_item_id);
     LiveWorkerMetadata {
         review_stage: review_stage(work_db, execution),
         agent_type: Some(
@@ -94,6 +95,25 @@ pub(crate) fn resolve_with_automation(
         started_at: execution
             .started_epoch()
             .map(boss_engine_utils::iso8601::format_epoch_iso8601),
+        product_id,
+        work_item_short_id,
+        pr_url,
+    }
+}
+
+/// Product id, short id, and bound PR URL for the Agents pane header.
+/// `None` triple when the execution is not pointed at a work-item row
+/// (automation id, review-guide comparison, missing row).
+fn work_item_header_fields(work_db: &WorkDb, work_item_id: &str) -> (Option<String>, Option<i64>, Option<String>) {
+    match work_db.get_work_item(work_item_id) {
+        Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => (
+            Some(task.product_id),
+            task.short_id,
+            task.pr_url.filter(|url| !url.trim().is_empty()),
+        ),
+        Ok(WorkItem::Project(project)) => (Some(project.product_id), project.short_id, None),
+        Ok(WorkItem::Product(product)) => (Some(product.id.clone()), None, None),
+        Err(_) => (None, None, None),
     }
 }
 

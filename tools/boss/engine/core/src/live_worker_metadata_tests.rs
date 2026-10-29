@@ -106,6 +106,34 @@ fn unfiled_chore_has_no_project() {
 
     assert_eq!(metadata.project_id, None);
     assert_eq!(metadata.project_name, None);
+    assert_eq!(metadata.product_id.as_deref(), Some(product.id.as_str()));
+    assert_eq!(metadata.work_item_short_id, chore.short_id);
+    assert_eq!(metadata.pr_url, None);
+}
+
+#[test]
+fn chore_with_pr_url_stamps_header_fields() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let chore = create_test_chore_manual(&db, product.id.clone(), "open a pr");
+    let execution = started_execution(&db, &chore.id, "local");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = ?1 WHERE id = ?2",
+            rusqlite::params!["https://github.com/spinyfin/mono/pull/3356", chore.id],
+        )
+        .unwrap();
+
+    let metadata = resolve(&db, &execution, "local");
+
+    assert_eq!(metadata.product_id.as_deref(), Some(product.id.as_str()));
+    assert_eq!(metadata.work_item_short_id, chore.short_id);
+    assert!(chore.short_id.is_some());
+    assert_eq!(
+        metadata.pr_url.as_deref(),
+        Some("https://github.com/spinyfin/mono/pull/3356")
+    );
 }
 
 #[test]

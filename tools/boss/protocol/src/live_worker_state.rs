@@ -218,6 +218,19 @@ pub struct LiveWorkerState {
     pub work_item_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_item_name: Option<String>,
+    /// Per-product short id of the bound work item (`T<n>` / `P<n>`).
+    /// `None` when the pane has no work item or the row predates short ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_short_id: Option<i64>,
+    /// Product that owns the bound work item. Lets the Agents pane
+    /// reveal the card without a second lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    /// GitHub PR URL bound to the work item, when one exists. Updated
+    /// mid-run once a `cube pr create` / `gh pr create` URL is verified
+    /// against this execution's branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_id: Option<String>,
     /// Attributed worker pool this run belongs to: `"main"`,
@@ -395,6 +408,9 @@ pub struct LiveWorkerMetadata {
     pub project_name: Option<String>,
     pub host_id: Option<String>,
     pub started_at: Option<String>,
+    pub product_id: Option<String>,
+    pub work_item_short_id: Option<i64>,
+    pub pr_url: Option<String>,
 }
 
 impl LiveWorkerState {
@@ -406,6 +422,9 @@ impl LiveWorkerState {
         self.project_name = metadata.project_name;
         self.host_id = metadata.host_id;
         self.started_at = metadata.started_at;
+        self.product_id = metadata.product_id;
+        self.work_item_short_id = metadata.work_item_short_id;
+        self.pr_url = metadata.pr_url;
     }
 }
 
@@ -483,6 +502,9 @@ impl LiveWorkerState {
             hung_since: None,
             work_item_id,
             work_item_name,
+            work_item_short_id: None,
+            product_id: None,
+            pr_url: None,
             execution_id,
             pool,
             kind,
@@ -653,6 +675,9 @@ mod tests {
             hung_since: None,
             work_item_id: Some("task_42".into()),
             work_item_name: Some("Fix fencer scraping".into()),
+            work_item_short_id: Some(42),
+            product_id: Some("prod_1".into()),
+            pr_url: Some("https://github.com/spinyfin/mono/pull/3356".into()),
             execution_id: Some("run-7".into()),
             pool: Some("main".into()),
             kind: Some("task_implementation".into()),
@@ -679,6 +704,9 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         assert!(!json.contains("work_item_id"), "json: {json}");
         assert!(!json.contains("work_item_name"), "json: {json}");
+        assert!(!json.contains("work_item_short_id"), "json: {json}");
+        assert!(!json.contains("\"product_id\""), "json: {json}");
+        assert!(!json.contains("\"pr_url\""), "json: {json}");
         assert!(!json.contains("execution_id"), "json: {json}");
         assert!(!json.contains("\"pool\""), "json: {json}");
         assert!(!json.contains("\"kind\""), "json: {json}");
@@ -717,6 +745,9 @@ mod tests {
             hung_since: None,
             work_item_id: None,
             work_item_name: None,
+            work_item_short_id: None,
+            product_id: None,
+            pr_url: None,
             execution_id: None,
             pool: None,
             kind: None,
@@ -840,6 +871,9 @@ mod tests {
             "project_name",
             "host_id",
             "started_at",
+            "product_id",
+            "work_item_short_id",
+            "pr_url",
         ] {
             assert!(!json.contains(key), "{key} leaked into {json}");
         }
@@ -862,6 +896,9 @@ mod tests {
             project_name: Some("Nine".into()),
             host_id: Some(LOCAL_HOST_ID.into()),
             started_at: Some("2026-10-09T00:00:00Z".into()),
+            product_id: Some("prod_1".into()),
+            work_item_short_id: Some(42),
+            pr_url: Some("https://github.com/spinyfin/mono/pull/3356".into()),
         });
         assert_eq!(state.agent_type.as_deref(), Some("review"));
         assert_eq!(state.review_stage.as_deref(), Some("consolidation"));
@@ -869,5 +906,11 @@ mod tests {
         assert_eq!(state.project_name.as_deref(), Some("Nine"));
         assert_eq!(state.host_id.as_deref(), Some("local"));
         assert_eq!(state.started_at.as_deref(), Some("2026-10-09T00:00:00Z"));
+        assert_eq!(state.product_id.as_deref(), Some("prod_1"));
+        assert_eq!(state.work_item_short_id, Some(42));
+        assert_eq!(
+            state.pr_url.as_deref(),
+            Some("https://github.com/spinyfin/mono/pull/3356")
+        );
     }
 }

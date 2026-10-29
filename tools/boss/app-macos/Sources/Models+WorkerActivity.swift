@@ -89,6 +89,15 @@ struct WorkerLiveState {
     /// succeeded), which is what lets the Agents card say "Connecting…"
     /// rather than guessing. Cleared by the engine on a later success.
     let viewerAttachError: String?
+    /// Bound work item for this pane. `nil` for ad-hoc / unbound runs.
+    let workItemId: String?
+    let workItemName: String?
+    let workItemShortId: Int?
+    /// Product that owns `workItemId`. Needed to reveal the Work card.
+    let productId: String?
+    /// GitHub PR URL bound to the work item; updates when a PR is opened
+    /// mid-run.
+    let prURL: String?
 
     /// Wire value the engine stamps on local workers. Keep in lock-step
     /// with `boss_protocol::LOCAL_HOST_ID`.
@@ -129,7 +138,12 @@ struct WorkerLiveState {
         startedAt: String? = nil,
         pool: String? = nil,
         viewerAttachError: String? = nil,
-        hungSince: String? = nil
+        hungSince: String? = nil,
+        workItemId: String? = nil,
+        workItemName: String? = nil,
+        workItemShortId: Int? = nil,
+        productId: String? = nil,
+        prURL: String? = nil
     ) {
         self.hungSince = hungSince
         self.name = name
@@ -156,6 +170,11 @@ struct WorkerLiveState {
         self.startedAt = startedAt
         self.pool = pool
         self.viewerAttachError = viewerAttachError
+        self.workItemId = workItemId
+        self.workItemName = workItemName
+        self.workItemShortId = workItemShortId
+        self.productId = productId
+        self.prURL = prURL
     }
 
     /// False when two entries share a `runId` or a `slotId`. A snapshot
@@ -222,6 +241,11 @@ extension WorkerLiveState: Hashable {
             && lhs.startedAt == rhs.startedAt
             && lhs.pool == rhs.pool
             && lhs.viewerAttachError == rhs.viewerAttachError
+            && lhs.workItemId == rhs.workItemId
+            && lhs.workItemName == rhs.workItemName
+            && lhs.workItemShortId == rhs.workItemShortId
+            && lhs.productId == rhs.productId
+            && lhs.prURL == rhs.prURL
     }
 
     func hash(into hasher: inout Hasher) {
@@ -248,6 +272,11 @@ extension WorkerLiveState: Hashable {
         hasher.combine(startedAt)
         hasher.combine(pool)
         hasher.combine(viewerAttachError)
+        hasher.combine(workItemId)
+        hasher.combine(workItemName)
+        hasher.combine(workItemShortId)
+        hasher.combine(productId)
+        hasher.combine(prURL)
     }
 }
 
