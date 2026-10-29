@@ -47,6 +47,21 @@ fn in_flight_tool_is_healthy_however_old_the_checkpoint() {
     );
 }
 
+#[test]
+fn yielded_command_remains_protected_from_destructive_reaping() {
+    assert_eq!(
+        classify_semantic_staleness(
+            SemanticToolCondition::Yielded,
+            Some(&iso8601_utc(0)),
+            &iso8601_utc(0),
+            ProgressFidelity::Rich,
+            10_000,
+            1_000
+        ),
+        SemanticStaleness::Healthy,
+    );
+}
+
 // A checkpoint inside the threshold is healthy regardless of tool
 // condition (idle or unknown).
 #[test]

@@ -355,6 +355,9 @@ message WorkerEvent {
     TurnStop stop = 14;
     string notification = 15;
     string session_end = 16;
+    bool model_progress = 17;
+    // True when a poll yielded to the model, false when a continuation starts.
+    bool tool_poll = 18;
   }
 }
 enum StartSource {

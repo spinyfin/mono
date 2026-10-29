@@ -287,3 +287,50 @@ Three things close the ordering hole:
 - **Never infer activity from pane output or timers.** `activity` is reduced from the hook stream, in emission order (`ingress_seq`). If a pane looks busy while the slot says `Idle`, the bug is in ingress ordering, the reducer, or — after an engine restart — the re-adoption seed or a tail that was never re-established; fix that, not the symptom.
 - **A balanced tool call is not a turn boundary.** `semantic_tool_condition = idle` says no tool is unbalanced; only `semantic_turn_condition = ended` (a driver `Stop`) says the worker is parked. Anything that restores or classifies a slot's activity from durable state must read the turn column, and a Codex worker polling its own background command — silent on both columns for as long as the wait lasts — is `Working`, not idle and not stuck.
 - **Don't lengthen a timeout to fix a contradiction.** A longer spawn-ack window narrows the race without closing it, and leaves the system with no answer for the times it still loses.
+
+## Suspected hung drivers
+
+The engine publishes a separate `hung_since` diagnostic and a “Worker hung”
+attention. It does not change the hook-derived activity, execution status, or
+the two-hour idle reap. The app shows “Hung” on the Doing card and worker pane,
+so an operator can inspect, interrupt, or restart the session without treating
+silence as a confirmed failure. The ten-second activity sweep reconciles the
+warning; resumed progress, a running tool, a declared wait, an operator hold,
+or release of the worker clears it.
+
+Only a Rich driver with a confirmed open turn and an idle or yielded tool state is
+eligible. Unknown state, ended turns, permission waits, and blocking tool calls
+are exempt. Codex poll results persist a yielded checkpoint: the command is still
+running, but the model must respond within 900 seconds. Starting the next poll
+restores the blocking exemption until its result returns. Yielded commands remain
+protected from the destructive stale-worker sweep.
+Codex model-message/reasoning events advance progress, but `token_count`
+records do not, including unchanged usage during retries. Notifications, including
+Grok background task completions, do not advance the semantic deadline. Hook-only drivers
+provide tool/turn boundaries rather than token-level output, so their warning
+is necessarily a suspicion based on that coarser evidence.
+
+The thresholds are 600 seconds before any tool has completed and 900 seconds
+after a tool completes within the current prompt; prompt submission resets the
+in-memory tool-completion marker. This threshold is approximate after restart:
+completed-tool history is not restored, so an idle checkpoint uses 600 seconds
+until another tool completes. A persisted yielded checkpoint always uses 900
+seconds. These are warning thresholds, not termination deadlines.
+They use the 2026-10-27 transcript measurement: 3,454 completed, never-reaped
+Codex sessions (September 10–October 27), 1,500 sampled Claude sessions out of
+3,829 (September 27–October 27), and 647 Grok sessions (September 10–October 27).
+Observed prompt/tool-result gaps were at most 268 seconds for Codex (128 for
+first response), 608 seconds per Claude request (984 for the worst
+single-request gap), and 413 for Grok; p99.9 was 75–165 seconds. The 600-second
+initial warning exceeds the observed Codex first-response maximum; 900 seconds
+after a tool leaves additional room for the slower Claude sample. Neither is
+a guarantee: the 984-second Claude outlier exceeds the latter threshold.
+
+At 600 seconds, recovered stalls affected 3.9% of Codex, 5.3% of Claude, and
+6.8% of Grok sessions. Long gaps involved retries/errors; a Grok stream could
+stall for 3.4 hours. Those observations justify an inspect/restart warning
+rather than killing a worker at the new threshold. Tool duration is not model
+latency: Claude Bash reached 2,991 seconds and Grok tools 900 seconds, so tools
+are exempt regardless of elapsed time. These measurements come from
+the local transcript survey; the detector's boundary tests use synthetic clocks
+and do not claim to repeat that survey.

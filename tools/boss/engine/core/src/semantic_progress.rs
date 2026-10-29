@@ -6,7 +6,7 @@
 //! stamp masquerade as agent progress after a restart.
 //!
 //! The load-bearing property is the last **driver-originated** event time
-//! plus a tri-state tool condition. Both are updated only from the shared
+//! plus a tool-control condition. Both are updated only from the shared
 //! progress-ingress fan-out (hook callbacks and JSONL tails), never from
 //! engine-synthesized live-state writes. `"unknown"` is a real state: it
 //! must never be coerced to `"idle"`, and a legacy NULL row stays unknown
@@ -16,12 +16,14 @@ use boss_protocol::WorkerEvent;
 
 /// What the engine knows about whether a tool is in flight on a run.
 ///
-/// Stored as a TEXT column (`in_flight` / `idle` / `unknown`). Unrecognised
+/// Stored as a TEXT column (`in_flight` / `yielded` / `idle` / `unknown`). Unrecognised
 /// or NULL values parse as [`Self::Unknown`], never as idle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SemanticToolCondition {
     /// An unbalanced `PreToolUse` is in flight.
     InFlight,
+    /// A command remains running, but its yield returned control to the model.
+    Yielded,
     /// A driver event established that no tool is in flight (`PostToolUse`,
     /// `Stop`, or `UserPromptSubmit`).
     Idle,
@@ -36,6 +38,7 @@ impl SemanticToolCondition {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::InFlight => "in_flight",
+            Self::Yielded => "yielded",
             Self::Idle => "idle",
             Self::Unknown => "unknown",
         }
@@ -46,6 +49,7 @@ impl SemanticToolCondition {
     pub fn parse(value: Option<&str>) -> Self {
         match value {
             Some("in_flight") => Self::InFlight,
+            Some("yielded") => Self::Yielded,
             Some("idle") => Self::Idle,
             Some("unknown") | None => Self::Unknown,
             Some(_) => Self::Unknown,
@@ -58,9 +62,9 @@ impl SemanticToolCondition {
 /// Distinct from [`SemanticToolCondition`], which answers a narrower
 /// question — "is a tool call unbalanced right now?" — and which is `Idle`
 /// for most of an ordinary turn: between one tool's `PostToolUse` and the
-/// next tool's `PreToolUse`, while the model thinks, and for the whole of a
-/// Codex background-terminal wait (its continuation polls are deliberately
-/// not re-announced, so they produce no tool-boundary event at all). None of
+/// next tool's `PreToolUse`, while the model thinks. Codex background commands
+/// are `InFlight` while a poll blocks and `Yielded` after its result returns
+/// control to the model without balancing the command. None of
 /// those is "the worker has ended its turn", so the tool condition alone
 /// cannot decide whether a re-adopted slot is busy.
 ///
@@ -108,7 +112,7 @@ impl SemanticTurnCondition {
 pub struct SemanticProgressCheckpoint {
     /// ISO-8601 UTC timestamp of the last driver-originated event.
     pub progress_at: String,
-    /// Tri-state tool condition established by that event (or still
+    /// Tool condition established by that event (or still
     /// unknown, if the event was not a tool-state signal).
     pub tool_condition: SemanticToolCondition,
     /// Tri-state turn condition established by that event (or still
@@ -116,10 +120,10 @@ pub struct SemanticProgressCheckpoint {
     pub turn_condition: SemanticTurnCondition,
 }
 
-/// Advance the tri-state tool condition for a driver-originated event.
+/// Advance the tool condition for a driver-originated event.
 ///
-/// `SessionStart`, `SessionEnd`, and `Notification` update the progress
-/// *time* but are not tool-state signals, so they leave `previous`
+/// `SessionStart`, `SessionEnd`, and `Notification` are not tool-state
+/// signals, so they leave `previous`
 /// untouched — including [`SemanticToolCondition::Unknown`]. A real
 /// tool-boundary event is what first establishes idle or in-flight on a
 /// legacy-null row.
@@ -150,11 +154,19 @@ pub fn next_tool_condition(event: &WorkerEvent, previous: SemanticToolCondition)
 /// `previous` just to hand it back unchanged.
 pub fn tool_condition_signal(event: &WorkerEvent) -> Option<SemanticToolCondition> {
     match event {
+        WorkerEvent::ToolPoll { awaiting_model, .. } => Some(if *awaiting_model {
+            SemanticToolCondition::Yielded
+        } else {
+            SemanticToolCondition::InFlight
+        }),
         WorkerEvent::PreToolUse { .. } => Some(SemanticToolCondition::InFlight),
         WorkerEvent::PostToolUse { .. } | WorkerEvent::UserPromptSubmit { .. } | WorkerEvent::Stop { .. } => {
             Some(SemanticToolCondition::Idle)
         }
-        WorkerEvent::SessionStart { .. } | WorkerEvent::SessionEnd { .. } | WorkerEvent::Notification { .. } => None,
+        WorkerEvent::ModelProgress { .. }
+        | WorkerEvent::SessionStart { .. }
+        | WorkerEvent::SessionEnd { .. }
+        | WorkerEvent::Notification { .. } => None,
     }
 }
 
@@ -179,7 +191,11 @@ pub fn turn_condition_signal(event: &WorkerEvent) -> Option<SemanticTurnConditio
             Some(SemanticTurnCondition::InTurn)
         }
         WorkerEvent::Stop { .. } => Some(SemanticTurnCondition::Ended),
-        WorkerEvent::SessionStart { .. } | WorkerEvent::SessionEnd { .. } | WorkerEvent::Notification { .. } => None,
+        WorkerEvent::ToolPoll { .. }
+        | WorkerEvent::ModelProgress { .. }
+        | WorkerEvent::SessionStart { .. }
+        | WorkerEvent::SessionEnd { .. }
+        | WorkerEvent::Notification { .. } => None,
     }
 }
 

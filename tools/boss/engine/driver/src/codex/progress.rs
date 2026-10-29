@@ -382,6 +382,18 @@ impl CodexRolloutProgressSession {
                     // Benign bookkeeping envelope: per-turn token accounting,
                     // no progress or lifecycle signal to report.
                     "token_count" => Ok(Vec::new()),
+                    "agent_message" | "agent_reasoning" => {
+                        let has_output = payload
+                            .get("message")
+                            .or_else(|| payload.get("text"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.is_empty());
+                        Ok(if has_output {
+                            vec![WorkerEvent::ModelProgress { session_id }]
+                        } else {
+                            Vec::new()
+                        })
+                    }
                     _ => Err(NormalizeError::UnknownEvent(format!("event_msg/{event_type}"))),
                 }
             }
@@ -391,6 +403,30 @@ impl CodexRolloutProgressSession {
                     .and_then(Value::as_str)
                     .ok_or(NormalizeError::MissingField("payload.type"))?;
                 let session_id = self.session_id()?;
+                // Current rollouts carry model output as response items;
+                // older versions also emitted the event_msg forms above.
+                let model_message = item_type == "message"
+                    && payload.get("role").and_then(Value::as_str) == Some("assistant")
+                    && payload.get("content").and_then(Value::as_array).is_some_and(|blocks| {
+                        blocks.iter().any(|block| {
+                            block
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .is_some_and(|text| !text.is_empty())
+                        })
+                    });
+                let model_reasoning = item_type == "reasoning"
+                    && (payload
+                        .get("encrypted_content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+                        || payload
+                            .get("summary")
+                            .and_then(Value::as_array)
+                            .is_some_and(|summary| !summary.is_empty()));
+                if model_message || model_reasoning {
+                    return Ok(vec![WorkerEvent::ModelProgress { session_id }]);
+                }
                 if let Some((call_id, call)) = canonical_rollout_tool_call(item_type, payload) {
                     let session_id_for_failure = session_id.clone();
                     let event = WorkerEvent::PreToolUse {
@@ -411,7 +447,10 @@ impl CodexRolloutProgressSession {
                         // command in every `PreToolUse` consumer — including
                         // the editorial audit, which writes a row per
                         // observed `gh pr`/`cube pr` invocation.
-                        Ok(CallDisposition::Continuation) => Ok(Vec::new()),
+                        Ok(CallDisposition::Continuation) => Ok(vec![WorkerEvent::ToolPoll {
+                            session_id: session_id_for_failure,
+                            awaiting_model: false,
+                        }]),
                         Err(err) => Ok(vec![correlation_failure_notification(&session_id_for_failure, &err)]),
                     };
                 }
@@ -428,7 +467,12 @@ impl CodexRolloutProgressSession {
                         // on a `wait`. Reporting the placeholder as this
                         // command's result is what made a still-running
                         // command look observed.
-                        Ok(OutputDisposition::StillRunning { .. }) => return Ok(Vec::new()),
+                        Ok(OutputDisposition::StillRunning { .. }) => {
+                            return Ok(vec![WorkerEvent::ToolPoll {
+                                session_id,
+                                awaiting_model: true,
+                            }]);
+                        }
                         Err(err) => return Ok(vec![correlation_failure_notification(&session_id, &err)]),
                     };
                     let mut events = vec![WorkerEvent::PostToolUse {
@@ -1374,15 +1418,21 @@ mod tests {
             session
                 .normalize_progress_events(&cell_yield_output("call-pr", 1))
                 .unwrap(),
-            Vec::new(),
+            vec![WorkerEvent::ToolPoll {
+                session_id: "thread-cell".into(),
+                awaiting_model: true
+            }],
             "a yield placeholder is not this command's result and must not be reported as one"
         );
         assert_eq!(
             session
                 .normalize_progress_events(&cell_wait_call("call-wait", 1))
                 .unwrap(),
-            Vec::new(),
-            "a wait poll re-announces nothing; the command was announced when its cell started"
+            vec![WorkerEvent::ToolPoll {
+                session_id: "thread-cell".into(),
+                awaiting_model: false
+            }],
+            "a wait poll reports control transfer without re-announcing the command"
         );
 
         let chunk = r#"{"chunk_id":"ab","exit_code":0,"output":"https://github.com/spinyfin/mono/pull/9\n"}"#;
@@ -1442,7 +1492,10 @@ mod tests {
             session
                 .normalize_progress_events(&cell_completed_output("call-p6-wait", P6_RUNNING_CHUNK))
                 .unwrap(),
-            Vec::new(),
+            vec![WorkerEvent::ToolPoll {
+                session_id: "thread-cell".into(),
+                awaiting_model: true
+            }],
             "a chunk with no exit code is not this command's result and must not be reported as one"
         );
 
@@ -2427,6 +2480,63 @@ mod tests {
     }
 
     #[test]
+    fn model_output_is_progress_but_usage_retries_and_background_exits_are_not() {
+        let mut session = CodexRolloutProgressSession::new(Some("run-progress".into()), None, None);
+        session
+            .normalize_progress_events(&json!({
+                "type": "session_meta", "payload": {"id": "thread-progress"}
+            }))
+            .unwrap();
+        for payload in [
+            json!({"type": "agent_message", "message": "Working on the fix"}),
+            json!({"type": "agent_reasoning", "text": "Consider the pending request"}),
+        ] {
+            let events = session
+                .normalize_progress_events(&json!({"type": "event_msg", "payload": payload}))
+                .unwrap();
+            assert!(matches!(events.as_slice(), [WorkerEvent::ModelProgress { .. }]));
+        }
+        for payload in [
+            json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Working"}]}),
+            json!({"type": "reasoning", "encrypted_content": "opaque-model-output", "summary": []}),
+            json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": "Reasoning"}]}),
+        ] {
+            let events = session
+                .normalize_progress_events(&json!({"type": "response_item", "payload": payload}))
+                .unwrap();
+            assert!(matches!(events.as_slice(), [WorkerEvent::ModelProgress { .. }]));
+        }
+        for payload in [
+            json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Initial prompt"}]}),
+            json!({"type": "message", "role": "assistant", "content": []}),
+            json!({"type": "reasoning", "summary": [], "encrypted_content": null}),
+        ] {
+            assert!(matches!(
+                session.normalize_progress_events(&json!({"type": "response_item", "payload": payload})),
+                Err(NormalizeError::UnknownEvent(_))
+            ));
+        }
+        for payload in [
+            json!({"type": "token_count", "info": {"total_token_usage": {"output_tokens": 10}}}),
+            json!({"type": "token_count", "info": {"total_token_usage": {"output_tokens": 10}}}),
+            json!({"type": "agent_message", "message": ""}),
+        ] {
+            assert!(
+                session
+                    .normalize_progress_events(&json!({"type": "event_msg", "payload": payload}))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(matches!(
+            session.normalize_progress_events(&json!({
+                "type": "event_msg", "payload": {"type": "background_terminal_exit", "exit_code": 0}
+            })),
+            Err(NormalizeError::UnknownEvent(_))
+        ));
+    }
+
+    #[test]
     fn rollout_custom_tool_variant_and_abort_preserve_ordered_fanout() {
         let mut session = CodexRolloutProgressSession::new(None, None, None);
         session
@@ -2677,9 +2787,8 @@ mod tests {
 
         // The wait itself: the cell yields, then the model polls it again
         // (a real wait can last many minutes; three rounds here).
-        // Every record is silent — no PostToolUse (the command has
-        // not finished), no Stop (the turn has not ended), nothing that a
-        // reducer could read as idle.
+        // Poll records transfer control without PostToolUse (the command
+        // has not finished) or Stop (the turn has not ended).
         let mut quiet = Vec::new();
         quiet.extend(
             session
@@ -2697,8 +2806,14 @@ mod tests {
         }
         assert_eq!(
             quiet,
-            Vec::new(),
-            "a background wait is a continuation of the announced command and emits nothing: {quiet:?}"
+            std::iter::once(true)
+                .chain((0..3).flat_map(|_| [false, true]))
+                .map(|awaiting_model| WorkerEvent::ToolPoll {
+                    session_id: "thread-cell".into(),
+                    awaiting_model
+                })
+                .collect::<Vec<_>>(),
+            "poll boundaries track model control without balancing the command"
         );
         assert!(
             session.calls.has_open_calls(),

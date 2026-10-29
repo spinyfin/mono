@@ -11,6 +11,87 @@ use boss_protocol::RequestExecutionInput;
 
 const SLOT: u8 = 1;
 
+#[tokio::test]
+async fn yielded_control_checkpoint_survives_persistence_and_resume() {
+    let (state, _dir) = test_server_state();
+    let execution = spawned_worker(&state);
+    dispatch_worker_event_fanout(&state, &pre_tool_use(&execution)).await;
+    for (awaiting_model, expected) in [
+        (true, SemanticToolCondition::Yielded),
+        (false, SemanticToolCondition::InFlight),
+    ] {
+        dispatch_worker_event_fanout(
+            &state,
+            &hook(
+                WorkerEvent::ToolPoll {
+                    session_id: "codex-session".into(),
+                    awaiting_model,
+                },
+                &execution,
+            ),
+        )
+        .await;
+        let checkpoint = state
+            .work_db
+            .get_run_semantic_progress_checkpoint(&execution)
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.tool_condition, expected);
+        assert_eq!(checkpoint.turn_condition, SemanticTurnCondition::InTurn);
+        let restored = crate::live_worker_state::LiveWorkerStateRegistry::new();
+        restored.register_spawn(2, "restored", "codex", 0, None);
+        restored.seed_semantic_progress(2, &checkpoint);
+        assert_eq!(restored.semantic_progress_for_slot(2), Some(checkpoint));
+    }
+}
+
+#[tokio::test]
+async fn background_notification_preserves_hang_deadline_through_ingress() {
+    let (state, _dir) = test_server_state();
+    let execution = spawned_worker(&state);
+    state.live_worker_states.set_awaiting_input_capable(SLOT, false);
+    let checkpoint = crate::semantic_progress::SemanticProgressCheckpoint {
+        progress_at: crate::live_worker_state::iso8601_utc(1000),
+        tool_condition: SemanticToolCondition::Idle,
+        turn_condition: SemanticTurnCondition::InTurn,
+    };
+    state.live_worker_states.seed_semantic_progress(SLOT, &checkpoint);
+    state
+        .work_db
+        .record_semantic_checkpoint(&execution, &checkpoint)
+        .unwrap();
+    dispatch_worker_event_fanout(
+        &state,
+        &hook(
+            WorkerEvent::Notification {
+                session_id: "grok-session".into(),
+                message: "Background task completed: build".into(),
+            },
+            &execution,
+        ),
+    )
+    .await;
+    assert_eq!(
+        state.work_db.get_run_semantic_progress_checkpoint(&execution).unwrap(),
+        Some(checkpoint.clone())
+    );
+    assert_eq!(
+        state.live_worker_states.semantic_progress_for_slot(SLOT),
+        Some(checkpoint.clone())
+    );
+    assert_eq!(
+        crate::hung_worker::hung_since(
+            &state.live_worker_states.get(SLOT).unwrap(),
+            Some(&checkpoint),
+            crate::driver::ProgressFidelity::Rich,
+            false,
+            state.live_worker_states.tool_completed_since_prompt(SLOT),
+            1900,
+        ),
+        Some(checkpoint.progress_at)
+    );
+}
+
 fn spawned_worker(server_state: &ServerState) -> String {
     spawned_worker_for_item(server_state).0
 }
@@ -544,4 +625,169 @@ async fn a_recycled_slot_never_leaks_its_checkpoint_to_the_prior_run() {
             .is_none(),
         "A's persistence must not write B's row"
     );
+}
+
+mod hung_workers {
+    use super::*;
+    use crate::driver::ProgressFidelity;
+    use crate::hung_worker::HUNG_WORKER_ATTENTION_KIND;
+    use crate::semantic_progress::{SemanticProgressCheckpoint, SemanticToolCondition, SemanticTurnCondition};
+    use crate::test_support::{create_active_chore, create_product};
+    use boss_protocol::{WorkItemBinding, WorkerEvent};
+    use std::collections::HashMap;
+
+    fn seed(state: &ServerState, item: &str, slot: u8) {
+        let run = format!("run-{slot}");
+        state.live_worker_states.register_spawn(
+            slot,
+            &run,
+            "grok",
+            0,
+            Some(WorkItemBinding {
+                work_item_id: item.into(),
+                work_item_name: "hung test".into(),
+                execution_id: run.clone(),
+            }),
+        );
+        state.live_worker_states.set_awaiting_input_capable(slot, false);
+        state
+            .live_worker_states
+            .set_progress_fidelity(slot, ProgressFidelity::Rich);
+        state.live_worker_states.seed_semantic_progress(
+            slot,
+            &SemanticProgressCheckpoint {
+                progress_at: crate::live_worker_state::iso8601_utc(1000),
+                tool_condition: SemanticToolCondition::Idle,
+                turn_condition: SemanticTurnCondition::InTurn,
+            },
+        );
+    }
+
+    fn open(state: &ServerState) -> usize {
+        state
+            .work_db
+            .list_open_attention_items_of_kind(HUNG_WORKER_ATTENTION_KIND)
+            .unwrap()
+            .len()
+    }
+
+    #[tokio::test]
+    async fn hung_warning_recovers_and_preserves_a_hung_sibling() {
+        let (state, _dir) = test_server_state();
+        let product = create_product(&state.work_db);
+        let item = create_active_chore(&state.work_db, &product, "hung warning");
+        seed(&state, &item, 1);
+        seed(&state, &item, 2);
+        let mut previous = HashMap::new();
+        assert!(state.refresh_hung_workers(&mut previous));
+        assert_eq!(open(&state), 1);
+        let checkpoint = state.live_worker_states.semantic_progress_for_slot(1);
+        state.live_worker_states.apply_event(
+            1,
+            &WorkerEvent::Notification {
+                session_id: "grok".into(),
+                message: "Background task completed: build".into(),
+            },
+        );
+        assert_eq!(state.live_worker_states.semantic_progress_for_slot(1), checkpoint);
+        assert!(!state.refresh_hung_workers(&mut previous));
+        assert_eq!(open(&state), 1);
+        state.live_worker_states.apply_event(
+            1,
+            &WorkerEvent::ModelProgress {
+                session_id: "grok".into(),
+            },
+        );
+        assert!(state.refresh_hung_workers(&mut previous));
+        assert_eq!(open(&state), 1);
+        state.live_worker_states.release_slot(2);
+        assert!(state.refresh_hung_workers(&mut previous));
+        assert_eq!(open(&state), 0);
+        state.live_worker_states.release_slot(1);
+        assert!(state.refresh_hung_workers(&mut previous));
+        assert!(!state.refresh_hung_workers(&mut previous));
+    }
+
+    #[tokio::test]
+    async fn dismissed_warning_stays_dismissed_until_owner_recovers() {
+        let (state, _dir) = test_server_state();
+        let product = create_product(&state.work_db);
+        let item = create_active_chore(&state.work_db, &product, "dismissed warning");
+        seed(&state, &item, 1);
+        let mut previous = HashMap::new();
+        assert!(state.refresh_hung_workers(&mut previous));
+        // Hung warnings use legacy work-attention rows, not attention groups.
+        // Closing that row models dismissal before the next producer sweep.
+        state
+            .work_db
+            .resolve_external_tracker_attention(&item, HUNG_WORKER_ATTENTION_KIND)
+            .unwrap();
+        assert!(!state.refresh_hung_workers(&mut previous));
+        assert_eq!(open(&state), 0);
+        // A hung sibling changes the snapshot without starting a new owner episode.
+        seed(&state, &item, 2);
+        assert!(state.refresh_hung_workers(&mut previous));
+        assert_eq!(open(&state), 0);
+        state.live_worker_states.release_slot(1);
+        state.live_worker_states.release_slot(2);
+        assert!(state.refresh_hung_workers(&mut previous));
+        seed(&state, &item, 3);
+        assert!(state.refresh_hung_workers(&mut previous));
+        assert_eq!(open(&state), 1);
+    }
+
+    #[tokio::test]
+    async fn persisted_warning_is_resolved_with_empty_restart_cache() {
+        let (state, _dir) = test_server_state();
+        let product = create_product(&state.work_db);
+        let item = create_active_chore(&state.work_db, &product, "orphan warning");
+        state
+            .work_db
+            .upsert_external_tracker_attention(&item, HUNG_WORKER_ATTENTION_KIND, "Hung", "No progress")
+            .unwrap();
+        assert_eq!(open(&state), 1);
+        let mut previous = HashMap::new();
+        assert!(state.refresh_hung_workers(&mut previous));
+        assert_eq!(open(&state), 0);
+        assert!(!state.refresh_hung_workers(&mut previous));
+    }
+
+    #[tokio::test]
+    async fn persisted_warning_protects_an_execution_pending_adoption() {
+        let (state, _dir) = test_server_state();
+        let product = create_product(&state.work_db);
+        let item = create_active_chore(&state.work_db, &product, "adopting warning");
+        let execution = crate::test_support::create_spawned_execution(&state.work_db, &item, 4242);
+        state
+            .work_db
+            .upsert_external_tracker_attention(&item, HUNG_WORKER_ATTENTION_KIND, "Hung", "No progress")
+            .unwrap();
+        let mut previous = HashMap::new();
+        assert!(!state.refresh_hung_workers(&mut previous));
+        assert_eq!(open(&state), 1);
+        state
+            .work_db
+            .mark_execution_orphaned(&execution, "worker departed")
+            .unwrap();
+        assert!(state.refresh_hung_workers(&mut previous));
+        assert_eq!(open(&state), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_warning_write_is_retried_without_advancing_cache() {
+        let (state, dir) = test_server_state();
+        let product = create_product(&state.work_db);
+        let item = create_active_chore(&state.work_db, &product, "retry warning");
+        seed(&state, &item, 1);
+        let conn = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_hung_attention BEFORE INSERT ON work_attention_items BEGIN SELECT RAISE(FAIL, 'test persistence failure'); END;").unwrap();
+        let mut previous = HashMap::new();
+        state.refresh_hung_workers(&mut previous);
+        assert!(previous.is_empty());
+        assert_eq!(open(&state), 0);
+        conn.execute_batch("DROP TRIGGER reject_hung_attention;").unwrap();
+        assert!(state.refresh_hung_workers(&mut previous));
+        assert_eq!(previous.len(), 1);
+        assert_eq!(open(&state), 1);
+    }
 }

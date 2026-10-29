@@ -282,6 +282,8 @@ fn kinds(events: &[WorkerEvent]) -> Vec<&'static str> {
             WorkerEvent::PostToolUse { .. } => "post_tool_use",
             WorkerEvent::Stop { .. } => "stop",
             WorkerEvent::Notification { .. } => "notification",
+            WorkerEvent::ToolPoll { .. } => "tool_poll",
+            WorkerEvent::ModelProgress { .. } => "model_progress",
             WorkerEvent::SessionEnd { .. } => "session_end",
         })
         .collect()

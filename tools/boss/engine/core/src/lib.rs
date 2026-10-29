@@ -154,6 +154,7 @@ pub mod postmortem_followups;
 pub use boss_pr_review as pr_review;
 pub use boss_pr_template as pr_template;
 pub mod board_notification_bridge;
+mod hung_worker;
 pub mod pr_review_recovery;
 pub mod pr_url_capture;
 pub mod pre_start_streak;

@@ -19,6 +19,7 @@ struct WorkerSlotLiveSlice: Equatable {
     let activity: WorkerActivity
     let liveStatus: String?
     let recoveryStatus: String?
+    let hungSince: String?
     let lastEventAt: String?
     /// Declared job wait, rendered as a caption and a Waiting pill when the
     /// engine reports the worker idle on it.
@@ -42,6 +43,7 @@ struct WorkerSlotLiveSlice: Equatable {
         self.activity = live.activity
         self.liveStatus = live.liveStatus
         self.recoveryStatus = live.recoveryStatus
+        self.hungSince = live.hungSince
         self.lastEventAt = live.lastEventAt
         self.waitReason = live.waitReason
         self.waitExpiresAt = live.waitExpiresAt
@@ -188,9 +190,14 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
 
     /// Titlebar status pill text. `nil` means no engine state yet: the view
     /// falls back to the session-observing pane-monitor pill.
+    var showsStatusPill: Bool {
+        isPlaceholder || live?.activity != .working || live?.isWaitingOnJob == true || live?.hungSince != nil
+    }
+
     var statusPillLabel: String? {
         if isPlaceholder { return "Finished" }
         if live?.isWaitingOnJob == true { return "Waiting" }
+        if live?.hungSince != nil { return "Hung" }
         return live?.activity.agentsPaneLabel
     }
 

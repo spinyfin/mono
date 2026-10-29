@@ -207,6 +207,9 @@ pub struct LiveWorkerState {
     /// picked the nudge back up), or when the slot is released.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_status: Option<String>,
+    /// Suspected driver hang; diagnostic only, never a terminal activity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hung_since: Option<String>,
     /// Work item this run was dispatched against. `None` for spawns
     /// that happen outside the work-item dispatch path (today: tests
     /// and any future direct-launch flow that bypasses the work
@@ -477,6 +480,7 @@ impl LiveWorkerState {
             live_status: None,
             live_status_at: None,
             recovery_status: None,
+            hung_since: None,
             work_item_id,
             work_item_name,
             execution_id,
@@ -646,6 +650,7 @@ mod tests {
             live_status: Some("investigating why the scroll handler doesn't fire".into()),
             live_status_at: Some("2026-05-06T12:00:01Z".into()),
             recovery_status: None,
+            hung_since: None,
             work_item_id: Some("task_42".into()),
             work_item_name: Some("Fix fencer scraping".into()),
             execution_id: Some("run-7".into()),
@@ -709,6 +714,7 @@ mod tests {
             live_status: Some("running tests after the layout fix".into()),
             live_status_at: Some("2026-05-06T12:00:30Z".into()),
             recovery_status: None,
+            hung_since: None,
             work_item_id: None,
             work_item_name: None,
             execution_id: None,

@@ -55,6 +55,8 @@ fn worker_event_kind(event: &crate::protocol::WorkerEvent) -> &'static str {
         WorkerEvent::PostToolUse { .. } => "post_tool_use",
         WorkerEvent::Stop { .. } => "stop",
         WorkerEvent::Notification { .. } => "notification",
+        WorkerEvent::ToolPoll { .. } => "tool_poll",
+        WorkerEvent::ModelProgress { .. } => "model_progress",
         WorkerEvent::SessionEnd { .. } => "session_end",
     }
 }
@@ -491,6 +493,9 @@ fn persist_semantic_progress(
     outcome: Option<&ApplyEventOutcome>,
     settled: Option<crate::semantic_progress::SemanticProgressCheckpoint>,
 ) {
+    if matches!(event, crate::protocol::WorkerEvent::Notification { .. }) {
+        return;
+    }
     let result = match (outcome, settled) {
         (Some(ApplyEventOutcome::ObservedDead), _) => return,
         (Some(ApplyEventOutcome::Stale { .. }), _) | (Some(ApplyEventOutcome::Applied { .. }), None) => {

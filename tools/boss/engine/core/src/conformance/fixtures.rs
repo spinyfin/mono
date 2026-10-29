@@ -207,6 +207,8 @@ pub fn normalize_session_id(mut event: WorkerEvent, session_id: &str) -> WorkerE
         | WorkerEvent::PostToolUse { session_id: s, .. }
         | WorkerEvent::Stop { session_id: s, .. }
         | WorkerEvent::Notification { session_id: s, .. }
+        | WorkerEvent::ToolPoll { session_id: s, .. }
+        | WorkerEvent::ModelProgress { session_id: s }
         | WorkerEvent::SessionEnd { session_id: s, .. } => {
             *s = session_id.to_owned();
         }
@@ -647,6 +649,8 @@ mod sticky_session_tests {
             | WorkerEvent::PostToolUse { session_id, .. }
             | WorkerEvent::Stop { session_id, .. }
             | WorkerEvent::Notification { session_id, .. }
+            | WorkerEvent::ToolPoll { session_id, .. }
+            | WorkerEvent::ModelProgress { session_id }
             | WorkerEvent::SessionEnd { session_id, .. } => session_id,
         }
     }

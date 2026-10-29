@@ -53,6 +53,7 @@ struct WorkerLiveState {
     /// worker's next hook event proves it resumed, or once the slot is
     /// released.
     let recoveryStatus: String?
+    let hungSince: String?
     /// Mirrors the engine's `LiveWorkerState.tmux_hosted`: `true` for a
     /// local worker hosted in a tmux session. `nil` when the engine hasn't
     /// reported it — remote SSH workers, which remain valid without a
@@ -127,8 +128,10 @@ struct WorkerLiveState {
         hostId: String? = nil,
         startedAt: String? = nil,
         pool: String? = nil,
-        viewerAttachError: String? = nil
+        viewerAttachError: String? = nil,
+        hungSince: String? = nil
     ) {
+        self.hungSince = hungSince
         self.name = name
         self.slotId = slotId
         self.runId = runId
@@ -206,6 +209,7 @@ extension WorkerLiveState: Hashable {
             && lhs.liveStatus == rhs.liveStatus
             && lhs.liveStatusAt == rhs.liveStatusAt
             && lhs.recoveryStatus == rhs.recoveryStatus
+            && lhs.hungSince == rhs.hungSince
             && lhs.tmuxHosted == rhs.tmuxHosted
             && lhs.waitReason == rhs.waitReason
             && lhs.waitExpiresAt == rhs.waitExpiresAt
@@ -231,6 +235,7 @@ extension WorkerLiveState: Hashable {
         hasher.combine(liveStatus)
         hasher.combine(liveStatusAt)
         hasher.combine(recoveryStatus)
+        hasher.combine(hungSince)
         hasher.combine(tmuxHosted)
         hasher.combine(waitReason)
         hasher.combine(waitExpiresAt)
@@ -350,6 +355,10 @@ enum AgentActivityState: Equatable {
                 self = .errored(reason: Self.identityUnavailableReason)
                 return
             }
+            if liveState.hungSince != nil {
+                self = .waiting(reason: "Hung — driver has stopped responding")
+                return
+            }
             switch liveState.activity {
             case .working:
                 self = .active
@@ -432,6 +441,9 @@ enum AgentActivityState: Equatable {
         }
         if liveState?.activity == .spawning {
             return .unknown(reason: "Worker state not yet reported")
+        }
+        if liveState?.hungSince != nil {
+            return .waiting(reason: "Hung — driver has stopped responding")
         }
         if liveState?.slotId != nil {
             return .active

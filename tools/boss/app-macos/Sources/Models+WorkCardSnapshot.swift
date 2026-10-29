@@ -524,6 +524,7 @@ enum WorkCardLiveStatus {
         if let liveState, liveState.isWaitingOnJob {
             return AgentActivityState.waitCaption(liveState)
         }
+        if liveState?.hungSince != nil { return "Hung — inspect or restart worker" }
         if isResolvingConflicts { return nil }
         if isRemediatingCI { return nil }
         if isAIReviewing { return nil }

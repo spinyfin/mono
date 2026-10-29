@@ -23,7 +23,7 @@ impl WorkDb {
     /// events in arrival order and knows nothing of ingress ordering or
     /// subagent origin.
     ///
-    /// Updates the last-progress timestamp on every call. The tri-state tool
+    /// Notifications leave the checkpoint unchanged; other calls update its timestamp. The tool
     /// condition advances through [`next_tool_condition`], but never by
     /// reading `previous` back from the row first: `next_tool_condition`
     /// only consults `previous` to carry it through unchanged (session
@@ -42,6 +42,9 @@ impl WorkDb {
     /// than erroring: the caller decides how loudly to log the no-row case,
     /// and a genuine DB failure still surfaces as `Err`.
     pub fn record_semantic_progress(&self, execution_id: &str, event: &WorkerEvent) -> Result<bool> {
+        if matches!(event, WorkerEvent::Notification { .. }) {
+            return Ok(false);
+        }
         let conn = self.connect()?;
         let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
             return Ok(false);
