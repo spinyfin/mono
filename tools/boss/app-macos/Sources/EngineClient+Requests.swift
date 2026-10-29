@@ -880,12 +880,6 @@ extension EngineClient {
         sendLine(["type": "update_automation", "id": id, "patch": patch])
     }
 
-    /// Get the count of open tasks produced by an automation. Engine replies
-    /// with `automation_open_task_count`.
-    func sendGetAutomationOpenTaskCount(automationId: String) {
-        sendLine(["type": "get_automation_open_task_count", "automation_id": automationId], queueIfDisconnected: true)
-    }
-
     /// List the run history for an automation (newest first). Engine replies
     /// with `automation_runs_list`.
     func sendListAutomationRuns(automationId: String) {
