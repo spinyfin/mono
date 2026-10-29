@@ -472,7 +472,6 @@ mod sys {
     //! Linux: `/proc/<pid>/stat`, `/proc/<pid>/cwd` and `/proc/<pid>/cmdline`.
 
     use std::io;
-    use std::path::PathBuf;
 
     use super::LiveProcess;
 
@@ -525,7 +524,7 @@ mod sys {
             start_micros: boot_micros().saturating_add(start_ticks.saturating_mul(1_000_000) / clock_ticks()),
             command,
             argv,
-            cwd: std::fs::read_link(format!("/proc/{pid}/cwd")).ok().map(PathBuf::from),
+            cwd: std::fs::read_link(format!("/proc/{pid}/cwd")).ok(),
             has_controlling_terminal: tty_nr != 0,
         })
     }
