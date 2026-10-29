@@ -241,7 +241,19 @@ fn run_done_seam_on_worker_signal_seam_off_teaches_summary_not_blocked_verb() {
         "blocked guidance must teach the prerequisite-task question type:\n{prompt}",
     );
     assert!(prompt.contains("The description must stand alone"));
-    assert!(prompt.contains("remains the non-blocking path for nice-to-have work later"));
+    assert!(prompt.contains("remains only the non-blocking path for nice-to-have work later"));
+    assert!(
+        prompt.contains("a capability split forced by a repo limit"),
+        "prerequisite guidance must cover a repo-limit capability split:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("exceed the `change/file-count` limit; carve out the first coherent capability"),
+        "prerequisite guidance must include the file-count split example:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("Do not file a plain blocker, a plain yes/no question or `followup-task` for either case."),
+        "prerequisite guidance must rule out the wrong routes for a split:\n{prompt}",
+    );
     assert!(
         prompt.contains("the marker is Stop-boundary-only"),
         "worker_signal seam off: must describe the marker as Stop-boundary-only:\n{prompt}",

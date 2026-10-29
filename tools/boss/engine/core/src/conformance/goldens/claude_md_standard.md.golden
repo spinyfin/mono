@@ -55,7 +55,7 @@ do NOT commit, push, or open a PR — stop and explain.
 
 ## Revisions
 
-A revision never opens a new PR. Push in-scope commits to the existing parent PR with `"$CUBE_BIN" pr update`. Out-of-scope or separately-approved PR work goes through `"$BOSS_BIN" propose followup-task --name "<short title>" --description "<one paragraph of scope>" --rationale "<why a separate PR>"`; then finish the in-scope work on the parent PR. If a guard, policy, or decision blocks progress, emit a `[blocked] reason="<specific question>"` marker instead of declaring you could not complete.
+A revision never opens a new PR. Push in-scope commits to the existing parent PR with `"$CUBE_BIN" pr update`. Work that must land in another PR before this revision can finish goes through `"$BOSS_BIN" propose done --outcome blocked --answer-type create-prerequisite-task --prerequisite-name "<short task name>" --prerequisite-brief "<self-contained description>" --explanation "<Context, Yes, No, Recommendation, and optional Details>"`; the revision waits for it and is redispatched once it is done. `"$BOSS_BIN" propose followup-task --name "<short title>" --description "<one paragraph of scope>" --rationale "<why a separate PR>"` is only for non-blocking work that can happen later. Finish the in-scope work on the parent PR. If a guard, policy, or decision blocks progress, emit a `[blocked] reason="<specific question>"` marker instead of declaring you could not complete.
 
 ## Checking your own PR's state
 

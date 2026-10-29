@@ -2085,7 +2085,7 @@ fn guide_comment_revision_directive_injects_guide_instructions() {
 }
 
 #[test]
-fn revision_directive_steers_separate_pr_work_to_followup_task() {
+fn revision_directive_routes_blocking_pr_work_to_prerequisite_and_later_work_to_followup() {
     let work_item = revision_task_with_created_via(None, "operator");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
@@ -2100,8 +2100,15 @@ fn revision_directive_steers_separate_pr_work_to_followup_task() {
         "revision prompt must state a revision never opens a new PR:\n{prompt}",
     );
     assert!(
-        prompt.contains("\"$BOSS_BIN\" propose followup-task --name \"<short title>\""),
-        "revision prompt must show the followup-task invocation shape:\n{prompt}",
+        prompt.contains("\"$BOSS_BIN\" propose done --outcome blocked --answer-type create-prerequisite-task")
+            && prompt.contains("--prerequisite-name")
+            && prompt.contains("--prerequisite-brief"),
+        "revision prompt must route a PR that must land first to create-prerequisite-task:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("\"$BOSS_BIN\" propose followup-task --name \"<short title>\"")
+            && prompt.contains("only for non-blocking work that can happen later"),
+        "revision prompt must keep followup-task as the non-blocking path:\n{prompt}",
     );
     assert!(
         prompt.contains("[blocked] reason=\"<specific question>\""),

@@ -439,7 +439,7 @@ fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir
          \n\
          ## Revisions\n\
          \n\
-         A revision never opens a new PR. Push in-scope commits to the existing parent PR with `{cube} pr update`. Out-of-scope or separately-approved PR work goes through `{boss} propose followup-task --name \"<short title>\" --description \"<one paragraph of scope>\" --rationale \"<why a separate PR>\"`; then finish the in-scope work on the parent PR. {revision_blocked_sentence}\n\
+         A revision never opens a new PR. Push in-scope commits to the existing parent PR with `{cube} pr update`. Work that must land in another PR before this revision can finish goes through `{boss} propose done --outcome blocked --answer-type create-prerequisite-task --prerequisite-name \"<short task name>\" --prerequisite-brief \"<self-contained description>\" --explanation \"<Context, Yes, No, Recommendation, and optional Details>\"`; the revision waits for it and is redispatched once it is done. `{boss} propose followup-task --name \"<short title>\" --description \"<one paragraph of scope>\" --rationale \"<why a separate PR>\"` is only for non-blocking work that can happen later. Finish the in-scope work on the parent PR. {revision_blocked_sentence}\n\
          \n\
          ## Checking your own PR's state\n\
          \n\

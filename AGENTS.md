@@ -98,6 +98,16 @@ When a CI check or repository check (checkleft, file-size, lint, test) is failin
 
 Required behavior: fix the real problem — split the oversized file, fix the lint/compile error, fix the test failure, resolve the root cause. If a check genuinely SHOULD be relaxed (a legitimately needed exclusion or threshold change), that is a human decision — STOP and surface it for operator approval with full justification. Do not decide this autonomously.
 
+### `change/file-count` failures: split the change, do not ask for an exception
+
+When `change/file-count` fires on feature work, the remedy is to split the change into stacked PRs along capability boundaries, each coherent and independently reviewable. Do not request a `BYPASS_CHANGE_FILE_COUNT` exception or a higher limit for feature work. Exceptions are only for the cases named in `CHECKS.yaml`: coordinated renames and generated trees that cannot be split.
+
+Check the footprint early, not after the work is built. Once the shape of the change is clear, and again before final validation, run the file-count check or `jj diff --stat` against the base. If the change is heading past the limit, stop and split it before building the rest:
+
+- Carve out the first coherent capability as a prerequisite with `"$BOSS_BIN" propose done --outcome blocked --answer-type create-prerequisite-task --prerequisite-name "<short task name>" --prerequisite-brief "<standalone description of that first PR>" --explanation "<Context, Yes, No, Recommendation, and optional Details>"`. The brief must stand alone: a different worker picks it up cold. The current task then delivers the remainder once the prerequisite has merged.
+- Keep the split on capability boundaries, as above.
+- Do not file a plain blocker, a plain yes/no question or `boss propose followup-task` for this. A yes/no approval only re-dispatches the same task, and `followup-task` is the non-blocking "nice to have later" path: it creates no task until a human batch-accepts it, and it adds no dependency edge, so the split never lands.
+
 ## Builder pattern convention
 
 Structs with **more than 5 fields** in `boss-protocol` (and in `boss-engine`'s internal types) use `#[derive(bon::Builder)]` with `#[builder(on(String, into))]`. This prevents additive-change PRs from touching every construction site across the repo.
