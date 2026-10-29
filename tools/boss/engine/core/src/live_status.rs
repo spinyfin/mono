@@ -16,8 +16,9 @@
 //!   the gerund-style sentence we want with no fuss.
 //! - Input cap: 800 tokens. The redactor trims oldest-first if the
 //!   transcript window overflows.
-//! - Output cap: 30 tokens. The prompt asks for ≤ 8 words; the
-//!   cap exists to catch a runaway response.
+//! - Output cap: 120 tokens. The reply is a forced tool call carrying
+//!   a ≤ 8 word phrase (or a one-sentence "insufficient input" reason);
+//!   the cap exists to catch a runaway response.
 //! - Timeout: 5 s. P99 is usually closer to 2 s; we'd rather keep
 //!   the prior value than block the loop.
 //! - Budget: ≤ $1/hour at 8 fully-busy workers — see the design doc's
@@ -35,9 +36,18 @@
 //!    model's reply; if the result is empty or > 90 % redaction
 //!    markers, we drop it and keep the prior value.
 //!
-//! Failure modes are silent on purpose. A flickering label that
-//! empties on every transient API hiccup is worse than a label
-//! that's two minutes old.
+//! Failure modes keep the prior label on purpose. A flickering label
+//! that empties on every transient API hiccup is worse than a label
+//! that's two minutes old. They are not silent: every non-success
+//! outcome is a typed [`SummarizerOutcome`] that the slot loop logs and
+//! exposes through the live-status debug verb.
+//!
+//! The model never answers in free text. The call forces a single tool
+//! ([`STATUS_TOOL_NAME`]) whose input is either a `status` phrase or an
+//! explicit `insufficient_input` flag with a reason. That is what keeps
+//! the model's own meta-reply ("I don't have enough context to tell…")
+//! off the kanban card: it arrives as a structured outcome the engine
+//! logs as an error, not as a sentence that happens to look like one.
 
 use std::time::Duration;
 
@@ -57,9 +67,10 @@ use crate::utility_model::{UtilityCall, UtilityModel, UtilityTask};
 /// named constant because the tests and the design doc both refer to it.
 pub const SUMMARY_MODEL: &str = UtilityTask::LiveStatus.default_model();
 
-/// Output ceiling. The prompt asks for ≤ 8 words; this is the
-/// safety net.
-pub const SUMMARY_MAX_TOKENS: u32 = 30;
+/// Output ceiling. The forced tool call wraps a ≤ 8 word phrase (or a
+/// one-sentence insufficient-input reason) in a small JSON object; this
+/// is the safety net for a runaway reply.
+pub const SUMMARY_MAX_TOKENS: u32 = 120;
 
 /// Worst-case wall-clock budget for the API round trip. P99 on Haiku
 /// for ~800 input tokens is comfortably under this.
@@ -87,6 +98,47 @@ pub const AWAITING_INPUT_LITERAL: &str = "awaiting input";
 
 /// Literal string written when `activity` flips to `Errored`.
 pub const ERRORED_LITERAL: &str = "errored — check logs";
+
+/// Name of the forced tool the summarizer must call. Its input schema
+/// ([`status_tool_schema`]) is the only reply shape the engine accepts.
+pub const STATUS_TOOL_NAME: &str = "report_status";
+
+/// Input schema of [`STATUS_TOOL_NAME`]. Exactly one of the two
+/// branches is meaningful per reply: a `status` phrase, or
+/// `insufficient_input: true` with a `reason`. The engine reads the flag
+/// first, so a model that sets it and also fills `status` with its
+/// explanation never gets that explanation onto the card.
+pub fn status_tool_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "description": "A 4–8 word present-continuous phrase, no subject, describing what the worker is doing right now (e.g. \"Reading work-board header view\"). Leave empty when insufficient_input is true.",
+            },
+            "insufficient_input": {
+                "type": "boolean",
+                "description": "true only when the transcript tail shows no worker activity to describe. Never explain this in `status`.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "When insufficient_input is true: one short sentence naming what the tail lacks.",
+            },
+        },
+        "required": ["insufficient_input"],
+        "additionalProperties": false,
+    })
+}
+
+/// Tool definitions block for the summarizer request: the single forced
+/// tool, shaped as the Messages API expects.
+pub fn status_tool_definitions() -> Value {
+    serde_json::json!([{
+        "name": STATUS_TOOL_NAME,
+        "description": "Report the worker's current activity for its status line, or report that the transcript tail has too little activity to tell.",
+        "input_schema": status_tool_schema(),
+    }])
+}
 
 /// Distinguishable outcomes for one summarizer call. Returned by
 /// [`summarize_transcript`] so the trigger fan-in can both log the
@@ -122,6 +174,21 @@ pub enum SummarizerOutcome {
     /// The model replied but the post-filter dropped the result —
     /// either fully-redacted or empty after trim. Caller keeps prior.
     PostFilterDropped,
+    /// The model reported, through the forced tool's
+    /// `insufficient_input` flag, that the tail it was shown carried
+    /// nothing it could describe. The payload is the model's (redacted,
+    /// clipped) reason plus what the engine actually sent, so the log line
+    /// names the cause. This is an engine error, not a status: the slot
+    /// loop keeps the prior label and never renders the reason.
+    InsufficientInput {
+        reason: String,
+        input_lines: usize,
+        input_bytes: usize,
+    },
+    /// The model's reply did not carry the forced tool call, or its input
+    /// did not match [`status_tool_schema`]. Payload is a short
+    /// description of what came back instead.
+    MalformedReply(String),
 }
 
 impl SummarizerOutcome {
@@ -135,6 +202,8 @@ impl SummarizerOutcome {
             SummarizerOutcome::ApiError { .. } => "api_error",
             SummarizerOutcome::Transport(_) => "transport_error",
             SummarizerOutcome::PostFilterDropped => "post_filter_dropped",
+            SummarizerOutcome::InsufficientInput { .. } => "insufficient_input",
+            SummarizerOutcome::MalformedReply(_) => "malformed_reply",
         }
     }
 
@@ -162,6 +231,16 @@ impl SummarizerOutcome {
             SummarizerOutcome::Transport(err) => err.clone(),
             SummarizerOutcome::PostFilterDropped => {
                 "model reply rejected by post-filter (empty / mostly redacted)".to_owned()
+            }
+            SummarizerOutcome::InsufficientInput {
+                reason,
+                input_lines,
+                input_bytes,
+            } => format!(
+                "model reported insufficient input over {input_lines} transcript lines / {input_bytes} redacted bytes: {reason}"
+            ),
+            SummarizerOutcome::MalformedReply(what) => {
+                format!("model reply did not carry a valid {STATUS_TOOL_NAME} call: {what}")
             }
         }
     }
@@ -192,6 +271,29 @@ pub async fn summarize_transcript(utility: &dyn UtilityModel, transcript_lines: 
         Ok(ClaudeReply::PostFilterDropped) => {
             tracing::warn!("live_status: post-filter dropped the model reply",);
             SummarizerOutcome::PostFilterDropped
+        }
+        Ok(ClaudeReply::InsufficientInput { reason }) => {
+            // The input is the engine's to account for: say what was sent
+            // alongside the model's reason, so the cause (a tail with no
+            // activity, or an input path that dropped it) is in the log.
+            let input_lines = redacted.lines().count();
+            let input_bytes = redacted.len();
+            tracing::error!(
+                reason = %reason,
+                input_lines,
+                input_bytes,
+                transcript_entries = transcript_lines.len(),
+                "live_status: summarizer reported insufficient input; keeping prior status",
+            );
+            SummarizerOutcome::InsufficientInput {
+                reason,
+                input_lines,
+                input_bytes,
+            }
+        }
+        Ok(ClaudeReply::Malformed(what)) => {
+            tracing::error!(what = %what, "live_status: summarizer reply did not match the status tool schema");
+            SummarizerOutcome::MalformedReply(what)
         }
         Err(ClaudeError::Api { status, body }) => {
             // Redact the body before logging so an error response
@@ -392,16 +494,19 @@ pub fn build_messages(transcript: &str) -> (String, String) {
     let mut user = String::new();
     user.push_str(
         "Below is a redacted tail of the worker's transcript. Lines may be \
-         truncated and any sensitive substrings are replaced with <redacted>. \
-         Return a 4–8 word verb-led phrase (no subject) describing what the \
-         worker is doing right now. Do not quote literal values longer than \
-         two words from the transcript. Do not include file paths, URLs, \
-         tokens, keys, or anything that looks like a password. \
-         If you cannot tell what the worker is doing, return the single word \
-         \"working\" with no other text.\n\nTranscript tail:\n",
+         truncated (marked <truncated>) and any sensitive substrings are \
+         replaced with <redacted>; treat both markers as censored values, not \
+         as the worker's words. Call report_status with a 4–8 word verb-led \
+         phrase (no subject) describing what the worker is doing right now. \
+         Lines starting with `tool:` are tool calls the worker made and their \
+         results; a tail made only of tool calls is normal and describes the \
+         worker's activity. Do not quote literal values longer than two words \
+         from the transcript. Do not include file paths, URLs, tokens, keys, \
+         or anything that looks like a password. Only if the tail shows no \
+         worker activity at all, set insufficient_input to true with a short \
+         reason instead of a status.\n\nTranscript tail:\n",
     );
     user.push_str(transcript);
-    user.push_str("\n\nShort status phrase:");
     (system, user)
 }
 
@@ -422,18 +527,29 @@ not \"reading file containing <value>\".\n\
 - Never quote any literal value longer than two words from the input.\n\
 - Never include file paths, URLs, API tokens, keys, passwords, or \
 strings that look like secrets.\n\
-- If the transcript is uninformative, reply with the single word \
-\"working\".\
+- Always reply by calling the report_status tool. Put the phrase in \
+`status`. If the tail shows no worker activity at all, set \
+`insufficient_input` to true and give a one-sentence `reason` instead; \
+never write an explanation into `status`.\
 ";
 
 /// Internal reply shape from [`claude_one_sentence`]. Success carries
 /// the cleaned summary; `PostFilterDropped` distinguishes "Anthropic
 /// returned a response but the post-filter rejected it" from any
-/// transport-level error.
-#[derive(Debug, Clone)]
+/// transport-level error; `InsufficientInput` and `Malformed` are the
+/// two ways a well-formed HTTP response can still carry no status.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaudeReply {
     Success(String),
     PostFilterDropped,
+    /// The forced tool call set `insufficient_input`. The reason has
+    /// been through the secret-pattern redactor and clipped.
+    InsufficientInput {
+        reason: String,
+    },
+    /// No forced tool call in the reply, or an input the schema does
+    /// not describe.
+    Malformed(String),
 }
 
 /// Ask for a one-sentence summary via the shared [`crate::claude_client`]
@@ -450,14 +566,74 @@ pub async fn claude_one_sentence(call: &UtilityCall, transcript: &str) -> Result
         .max_tokens(SUMMARY_MAX_TOKENS)
         .system(system)
         .messages(vec![Message::user(user)])
+        .tools(status_tool_definitions())
+        .tool_choice(serde_json::json!({"type": "tool", "name": STATUS_TOOL_NAME}))
         .build();
     let config = CallConfig::new(SUMMARY_TIMEOUT).with_endpoint(call.endpoint.clone());
     let response = claude_client::send_messages(&call.api_key, &request, &config).await?;
-    let cleaned = clean_summary(response.first_text().unwrap_or_default());
-    if cleaned.is_empty() {
-        return Ok(ClaudeReply::PostFilterDropped);
+    let Some(input) = response.tool_use_input(STATUS_TOOL_NAME) else {
+        let got = response
+            .content
+            .iter()
+            .map(|block| block.block_type.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        return Ok(ClaudeReply::Malformed(format!(
+            "no {STATUS_TOOL_NAME} tool_use block; content block types: [{got}]"
+        )));
+    };
+    Ok(parse_status_reply(input))
+}
+
+/// Interpret the forced tool call's input. The `insufficient_input`
+/// flag wins over any `status` text, so an explanation the model also
+/// typed into `status` can never be mistaken for a label.
+pub fn parse_status_reply(input: &Value) -> ClaudeReply {
+    let Some(object) = input.as_object() else {
+        return ClaudeReply::Malformed(format!("tool input is not an object: {}", kind_of(input)));
+    };
+    match object.get("insufficient_input") {
+        Some(Value::Bool(true)) => {
+            let raw = object
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("(no reason given)");
+            let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+            let reason =
+                live_status_redact::redact_text(&boss_engine_utils::string_clip::clip_to_bytes(&one_line, 200));
+            return ClaudeReply::InsufficientInput { reason };
+        }
+        Some(Value::Bool(false)) | None => {}
+        Some(other) => {
+            return ClaudeReply::Malformed(format!(
+                "insufficient_input is {} rather than a boolean",
+                kind_of(other)
+            ));
+        }
     }
-    Ok(ClaudeReply::Success(cleaned))
+    match object.get("status") {
+        Some(Value::String(status)) => {
+            let cleaned = clean_summary(status);
+            if cleaned.is_empty() {
+                ClaudeReply::PostFilterDropped
+            } else {
+                ClaudeReply::Success(cleaned)
+            }
+        }
+        Some(other) => ClaudeReply::Malformed(format!("status is {} rather than a string", kind_of(other))),
+        None => ClaudeReply::Malformed("neither status nor insufficient_input was set".to_owned()),
+    }
+}
+
+fn kind_of(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 /// Post-process the model reply: trim whitespace and quotes, drop a
@@ -479,8 +655,49 @@ pub fn clean_summary(raw: &str) -> String {
     boss_engine_utils::string_clip::clip_to_bytes(&one_line, MAX_LIVE_STATUS_LEN)
 }
 
+/// Mock-response builders shared by every test that stands in for the
+/// summarizer endpoint. The engine only accepts the forced
+/// [`STATUS_TOOL_NAME`] call, so a mock that answered in free text would
+/// exercise the malformed-reply path rather than the one under test.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::STATUS_TOOL_NAME;
+    use serde_json::{Value, json};
+
+    /// A Messages API body carrying `status` through the forced tool.
+    pub(crate) fn status_reply(status: &str) -> Value {
+        json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_status",
+                "name": STATUS_TOOL_NAME,
+                "input": {"insufficient_input": false, "status": status},
+            }],
+            "stop_reason": "tool_use",
+        })
+    }
+
+    /// A Messages API body in which the model declines to label the tail.
+    pub(crate) fn insufficient_input_reply(reason: &str) -> Value {
+        json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_status",
+                "name": STATUS_TOOL_NAME,
+                "input": {"insufficient_input": true, "reason": reason},
+            }],
+            "stop_reason": "tool_use",
+        })
+    }
+}
+
+#[cfg(test)]
+#[path = "live_status_codex_input_tests.rs"]
+mod codex_input_tests;
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::{insufficient_input_reply, status_reply};
     use super::*;
     use serde_json::json;
     use wiremock::matchers::{header, method, path};
@@ -676,6 +893,76 @@ mod tests {
     }
 
     #[test]
+    fn parse_status_reply_reads_the_status_branch() {
+        assert_eq!(
+            parse_status_reply(&json!({"insufficient_input": false, "status": "\"Reading auth config.\""})),
+            ClaudeReply::Success("Reading auth config".to_owned())
+        );
+        // Flag omitted entirely is also the status branch.
+        assert_eq!(
+            parse_status_reply(&json!({"status": "Running bazel build"})),
+            ClaudeReply::Success("Running bazel build".to_owned())
+        );
+    }
+
+    #[test]
+    fn parse_status_reply_insufficient_input_wins_over_status_text() {
+        // A model that sets the flag *and* types its explanation into
+        // `status` must not get that explanation onto the card.
+        let reply = parse_status_reply(&json!({
+            "insufficient_input": true,
+            "status": "I don't have enough context from the transcript to determine what the worker is doing",
+            "reason": "only the prompt and a turn-start marker are present",
+        }));
+        assert_eq!(
+            reply,
+            ClaudeReply::InsufficientInput {
+                reason: "only the prompt and a turn-start marker are present".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_status_reply_redacts_and_clips_the_reason() {
+        let reply = parse_status_reply(&json!({
+            "insufficient_input": true,
+            "reason": format!("saw token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345 and {}", "x".repeat(400)),
+        }));
+        let ClaudeReply::InsufficientInput { reason } = reply else {
+            panic!("expected insufficient input, got {reply:?}");
+        };
+        assert!(!reason.contains("ghp_"), "{reason}");
+        assert!(reason.len() <= 200 + REDACTED_MARKER_SLACK, "{}", reason.len());
+    }
+
+    /// `redact_text` can grow a clipped reason by replacing a short match
+    /// with the longer `<redacted>` marker; allow for one such swap.
+    const REDACTED_MARKER_SLACK: usize = 16;
+
+    #[test]
+    fn parse_status_reply_rejects_shapes_outside_the_schema() {
+        assert!(matches!(
+            parse_status_reply(&json!("working")),
+            ClaudeReply::Malformed(_)
+        ));
+        assert!(matches!(
+            parse_status_reply(&json!({"insufficient_input": "yes", "status": "x"})),
+            ClaudeReply::Malformed(_)
+        ));
+        assert!(matches!(
+            parse_status_reply(&json!({"status": 7})),
+            ClaudeReply::Malformed(_)
+        ));
+        assert!(matches!(parse_status_reply(&json!({})), ClaudeReply::Malformed(_)));
+        // An empty / fully-redacted status is the post-filter's call, not
+        // a schema violation.
+        assert_eq!(
+            parse_status_reply(&json!({"status": "<redacted> <redacted>"})),
+            ClaudeReply::PostFilterDropped
+        );
+    }
+
+    #[test]
     fn summarizer_outcome_tag_strings_match_chore_spec() {
         // The chore's debug-verb contract names these four outcomes
         // explicitly: success / no_api_key / api_error / empty_after_redaction.
@@ -691,6 +978,16 @@ mod tests {
             "api_error"
         );
         assert_eq!(SummarizerOutcome::EmptyAfterRedaction.tag(), "empty_after_redaction");
+        assert_eq!(
+            SummarizerOutcome::InsufficientInput {
+                reason: "r".into(),
+                input_lines: 2,
+                input_bytes: 40
+            }
+            .tag(),
+            "insufficient_input"
+        );
+        assert_eq!(SummarizerOutcome::MalformedReply("x".into()).tag(), "malformed_reply");
     }
 
     #[tokio::test]
@@ -705,12 +1002,9 @@ mod tests {
             .and(path("/v1/messages"))
             .and(header("x-api-key", "test-key"))
             .and(header("anthropic-version", claude_client::ANTHROPIC_API_VERSION))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [{
-                    "type": "text",
-                    "text": "running tests after the redactor lands",
-                }],
-            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(status_reply("running tests after the redactor lands")),
+            )
             .mount(&server)
             .await;
 
@@ -729,6 +1023,70 @@ mod tests {
             panic!("expected a summary, got {reply:?}");
         };
         assert_eq!(summary, "running tests after the redactor lands");
+
+        // The request forces the status tool so the reply can never be
+        // free text.
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["tool_choice"], json!({"type": "tool", "name": STATUS_TOOL_NAME}));
+        assert_eq!(body["tools"][0]["name"], STATUS_TOOL_NAME);
+        assert_eq!(body["tools"][0]["input_schema"], status_tool_schema());
+        assert_eq!(body["max_tokens"], SUMMARY_MAX_TOKENS);
+    }
+
+    #[tokio::test]
+    async fn insufficient_input_reply_is_a_logged_outcome_not_a_status() {
+        // The model's "I can't tell" arrives as a structured flag and is
+        // surfaced as its own outcome — never as a Success the loop would
+        // write to the card.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(insufficient_input_reply(
+                "the tail holds only a turn-start marker and the prompt",
+            )))
+            .mount(&server)
+            .await;
+        let provider = crate::utility_model::AnthropicUtilityModel::from_lookup(Some("test-key".to_owned()), |_| None)
+            .with_endpoint(format!("{}/v1/messages", server.uri()));
+        let lines = vec![json!({"type": "system", "message": "turn started"})];
+        let outcome = summarize_transcript(&provider, &lines).await;
+        let SummarizerOutcome::InsufficientInput {
+            reason,
+            input_lines,
+            input_bytes,
+        } = &outcome
+        else {
+            panic!("expected InsufficientInput, got {outcome:?}");
+        };
+        assert_eq!(reason, "the tail holds only a turn-start marker and the prompt");
+        assert_eq!(*input_lines, 1);
+        assert_eq!(*input_bytes, "system: turn started".len());
+        assert_eq!(outcome.tag(), "insufficient_input");
+        assert!(outcome.detail().contains("1 transcript lines"), "{}", outcome.detail());
+    }
+
+    #[tokio::test]
+    async fn free_text_reply_is_malformed_not_a_status() {
+        // A reply that ignores the forced tool and answers in prose —
+        // the exact shape that used to land verbatim on the card.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "content": [{"type": "text", "text": "I don't have enough context from the transcript to determine…"}],
+            })))
+            .mount(&server)
+            .await;
+        let provider = crate::utility_model::AnthropicUtilityModel::from_lookup(Some("test-key".to_owned()), |_| None)
+            .with_endpoint(format!("{}/v1/messages", server.uri()));
+        let lines = vec![assistant_text("Investigating the scroll handler bug")];
+        let outcome = summarize_transcript(&provider, &lines).await;
+        assert!(
+            matches!(&outcome, SummarizerOutcome::MalformedReply(what) if what.contains("text")),
+            "got {outcome:?}"
+        );
+        assert_eq!(outcome.tag(), "malformed_reply");
     }
 
     #[tokio::test]

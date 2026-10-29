@@ -1231,11 +1231,17 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             // next eligible event or from the Working timer floor
             // measured from last_refresh_attempt. The outcome is
             // already in the debug store + tracing above.
+            // `InsufficientInput` and `MalformedReply` belong here too: the
+            // model's own "I can't tell" is an engine error (already
+            // logged at `error` with its cause by the summarizer), never a
+            // sentence for the card.
             SummarizerOutcome::NoApiKey(_)
             | SummarizerOutcome::EmptyAfterRedaction
             | SummarizerOutcome::ApiError { .. }
             | SummarizerOutcome::Transport(_)
-            | SummarizerOutcome::PostFilterDropped => {}
+            | SummarizerOutcome::PostFilterDropped
+            | SummarizerOutcome::InsufficientInput { .. }
+            | SummarizerOutcome::MalformedReply(_) => {}
         }
     }
 }
@@ -1580,9 +1586,11 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content":[{"type":"text","text":"reading the Codex rollout"}]
-            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(crate::live_status::test_support::status_reply(
+                    "reading the Codex rollout",
+                )),
+            )
             .expect(1)
             .mount(&server)
             .await;
