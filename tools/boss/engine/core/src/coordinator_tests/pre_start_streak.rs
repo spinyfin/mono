@@ -297,9 +297,10 @@ async fn guide_refusals_remain_visible_after_a_failed_retry_and_reconcile() {
         .await
         .unwrap();
     wait_for_execution_status(&db, &retry.id, ExecutionStatus::Failed).await;
-    // Runtime confirmation of the old predicate: the failed retry's run
-    // was started after the first refusal, despite never spawning a pane.
-    let old_evidence: bool = db
+    // Fixture precondition: the failed retry's run started at or after the
+    // first refusal was raised, so run start alone would count as WorkResumed
+    // evidence; only the completed-spawn-run requirement keeps the refusal open.
+    let retry_started_after_refusal: bool = db
         .connect()
         .unwrap()
         .query_row(
@@ -312,8 +313,8 @@ async fn guide_refusals_remain_visible_after_a_failed_retry_and_reconcile() {
         )
         .unwrap();
     assert!(
-        old_evidence,
-        "the former run-start predicate incorrectly accepted the failed retry"
+        retry_started_after_refusal,
+        "fixture precondition: the failed retry's run must start at or after the refusal was raised"
     );
     db.reconcile_stale_attention_signals().unwrap();
     let items = db.list_attention_items_for_work_item(&root).unwrap();

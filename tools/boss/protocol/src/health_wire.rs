@@ -64,8 +64,8 @@ pub struct EngineHealthReport {
 }
 
 /// One fleet-level alert: a (driver, worker kind) combination has failed
-/// to spawn `consecutive_failures` times in a row before any worker pane
-/// existed, with no successful spawn for that combination in between.
+/// during spawn or spawn confirmation `consecutive_failures` times in a row
+/// (no worker started its first turn), with no successful spawn in between.
 /// Raised by the engine at its streak threshold, updated in place on every
 /// further failure, and dropped from the report on the combination's next
 /// successful spawn.

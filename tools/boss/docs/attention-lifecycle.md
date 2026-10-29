@@ -15,7 +15,7 @@ Every attention kind declares which shape of evidence applies to it, in `tools/b
 
 | `ClearedBy`                    | Evidence                                                                                                                                                    | Applied by             |
 | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
-| `WorkResumed`                  | A run for the same work item started at or after the signal was raised                                                                                      | the generic reconciler |
+| `WorkResumed`                  | A run for the same work item started at or after the signal was raised; for `pane_spawn_failed`, that later spawn run must also have status `completed`     | the generic reconciler |
 | `ExecutionKindCompleted(kind)` | An execution of that kind for the same work item (other than the one the attention was filed against) reached `completed` at or after the signal was raised | the generic reconciler |
 | `ProducerReconciles`           | The kind's own producer re-reads its condition every pass and resolves the item itself                                                                      | that producer          |
 | `HumanDecision`                | None is sufficient — the signal records something a later success does not undo, or is a gate a human is meant to open                                      | a human                |
@@ -55,7 +55,7 @@ It appears in three places, all rendered from the same engine health report:
 - `bossctl state` (a `spawn alerts:` section) and `bossctl state --json` (`spawn_failure_streaks`);
 - the `engine.health` topic, pushed on raise, on every update and on resolve.
 
-Each failed spawn still gets its own execution-scoped `pane_spawn_failed` attention item. For an execution whose work item is not a task row — a review guide binds a source-comparison id — no board or work-item listing reaches that item, so the streak alert and the execution's own dispatch event log are where the failure is visible. The engine log line `filed pane_spawn_failed attention item for the failed spawn` and the `attention_item_id` on the `pane_spawned` error event say that the row exists.
+Each failed spawn gets an execution-scoped `pane_spawn_failed` item. The work-item attention listing includes it, and resolves a review-guide execution through its source comparison to the series' root task. The product work-tree attention list includes only directly associated items, so execution-scoped spawn failures do not appear as external-tracker sync issues.
 
 State is in memory and starts empty on engine restart; a combination that is still broken re-raises after two more failures.
 
@@ -69,6 +69,6 @@ This is the actual defect being guarded against. Raising a signal always went th
 
 1. Find the kind: `SELECT id, kind, status, created_at, last_raised_at, resolved_at FROM work_attention_items WHERE work_item_id = '<id>' OR execution_id IN (SELECT id FROM work_executions WHERE work_item_id = '<id>')`.
 2. Look the kind up in `ATTENTION_LIFECYCLES`. If it is `HumanDecision` or `ProducerReconciles`, the reconciler is deliberately not touching it — read the entry's `rationale` for why.
-3. If it is automatic, check the evidence against `COALESCE(last_raised_at, created_at)`, not bare `created_at` — a re-raised row moves the reference point forward to the last re-raise, and comparing against the original `created_at` will find stale evidence that looks postdating but is not. For `WorkResumed`, the item needs a `work_runs` row whose `started_at` is at or after that value. For `ExecutionKindCompleted`, an execution of that kind with `status = 'completed'` and a `finished_at` at or after it, whose `id` is not the attention's own `execution_id` — an execution never clears an attention filed against itself. No such row means the condition genuinely has not been superseded, and the signal is correct to still be showing.
+3. If it is automatic, check the evidence against `COALESCE(last_raised_at, created_at)`, not bare `created_at` — a re-raised row moves the reference point forward to the last re-raise, and comparing against the original `created_at` will find stale evidence that looks postdating but is not. For `WorkResumed`, the item needs a `work_runs` row whose `started_at` is at or after that value. For `pane_spawn_failed`, the later spawn run must also have status `completed`; a mere run start does not clear it. For `ExecutionKindCompleted`, an execution of that kind with `status = 'completed'` and a `finished_at` at or after it, whose `id` is not the attention's own `execution_id` — an execution never clears an attention filed against itself. No such row means the condition genuinely has not been superseded, and the signal is correct to still be showing.
 
 All timestamp columns in this schema are epoch-seconds-as-text, so `CAST(… AS INTEGER)` comparisons are exact rather than lexicographic.

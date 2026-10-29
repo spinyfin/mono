@@ -189,7 +189,7 @@ impl WorkDb {
                 return Err(item_err);
             }
         }
-        super::attentions::reads::list_items(&conn, work_item_id)
+        super::attentions::reads::list_items_with_spawn_failures(&conn, work_item_id)
     }
 
     pub fn get_attention_item(&self, id: &str) -> Result<WorkAttentionItem> {
