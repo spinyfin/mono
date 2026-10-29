@@ -1,6 +1,5 @@
 //! Per-session outbound event queue and topic fan-out broker.
 //!
-//! Split out of `app.rs`; pure structural move — no behavioural change.
 //! Everything here is `pub(super)` (visible to `app` and, transitively, the
 //! rest of its module tree — `app::tests`, `app::tests::session_sink_queue`, and sibling
 //! handler modules) rather than `pub`, matching the encapsulation this code
@@ -105,6 +104,9 @@ pub(super) struct SessionQueue {
     /// overwrite stale invalidations instead of growing the queue.
     #[builder(default)]
     pub(super) pending_topics: HashMap<String, usize>,
+    /// Full-state pushes indexed by kind, with the same lifetime as topic slots.
+    #[builder(default)]
+    pending_snapshots: HashMap<&'static str, usize>,
     #[builder(default = false)]
     pub(super) closed: bool,
     /// One-shot backpressure latch. Set when an enqueue overflows
@@ -126,6 +128,7 @@ impl SessionQueue {
             priority: VecDeque::new(),
             items: VecDeque::new(),
             pending_topics: HashMap::new(),
+            pending_snapshots: HashMap::new(),
             closed: false,
             slow: false,
             last_write_progress: None,
@@ -162,32 +165,53 @@ impl SessionQueue {
             return EnqueueOutcome::Slow;
         }
 
-        if env.request_id.is_none()
-            && let Some(topic) = topic_event_topic(&env.payload)
-        {
-            if let Some(&idx) = self.pending_topics.get(&topic) {
+        if env.request_id.is_none() {
+            if let Some(idx) = topic_event_topic(&env.payload)
+                .and_then(|topic| self.pending_topics.get(&topic))
+                .copied()
+            {
                 debug_assert!(idx < self.items.len());
-                // Fold the stale invalidation into the new one in place,
-                // keeping the original enqueue instant so `oldest_age_ms`
-                // still reflects how long this queue slot has been waiting to
-                // flush.
+                // Preserve the original instant and position. Topic invalidations
+                // merge their changes into the pending envelope.
                 coalesce_topic_event(&mut self.items[idx].1, env);
                 return EnqueueOutcome::Coalesced;
             }
-            if self.items.len() >= MAX_SESSION_QUEUE {
-                return self.admit_under_pressure(env, Some(topic));
+            if let Some(idx) = snapshot_event_kind(&env.payload)
+                .and_then(|kind| self.pending_snapshots.get(kind))
+                .copied()
+            {
+                debug_assert!(idx < self.items.len());
+                // Preserve the original instant and position. Full snapshots
+                // replace the stale payload in place.
+                replace_pending_snapshot(&mut self.items[idx].1, env);
+                return EnqueueOutcome::Coalesced;
             }
-            let idx = self.items.len();
-            self.items.push_back((Instant::now(), env));
-            self.pending_topics.insert(topic, idx);
-            return EnqueueOutcome::Enqueued;
         }
 
         if self.items.len() >= MAX_SESSION_QUEUE {
-            return self.admit_under_pressure(env, None);
+            return self.admit_under_pressure(env);
+        }
+        self.push_bulk(env);
+        EnqueueOutcome::Enqueued
+    }
+
+    /// Register coalescing slots on every admission path, including pressure.
+    fn push_bulk(&mut self, env: FrontendEventEnvelope) {
+        let idx = self.items.len();
+        if env.request_id.is_none() {
+            if let Some(topic) = topic_event_topic(&env.payload) {
+                self.pending_topics.insert(topic, idx);
+            }
+            if let Some(kind) = snapshot_event_kind(&env.payload) {
+                self.pending_snapshots.insert(kind, idx);
+            }
+        } else if let Some(kind) = snapshot_event_kind(&env.payload) {
+            // A correlated snapshot reply is a barrier: later uncorrelated
+            // pushes of this kind must append after it rather than replace
+            // an earlier pending snapshot sitting before the reply.
+            self.pending_snapshots.remove(kind);
         }
         self.items.push_back((Instant::now(), env));
-        EnqueueOutcome::Enqueued
     }
 
     /// At capacity, disconnect when both the backlog and the last successful
@@ -196,7 +220,7 @@ impl SessionQueue {
     /// marker, preserving correlated replies and the queue bound. Eviction
     /// is not write progress; the writer also times out a stalled frame
     /// independently of further publishes.
-    fn admit_under_pressure(&mut self, env: FrontendEventEnvelope, topic: Option<String>) -> EnqueueOutcome {
+    fn admit_under_pressure(&mut self, env: FrontendEventEnvelope) -> EnqueueOutcome {
         let oldest_age_ms = self
             .items
             .front()
@@ -230,16 +254,10 @@ impl SessionQueue {
             self.evict_at(i);
         }
         if marker_idx.is_none() {
-            let idx = self.items.len();
-            self.items.push_back((Instant::now(), resync_envelope()));
-            self.pending_topics.insert(RESYNC_TOPIC.to_owned(), idx);
+            self.push_bulk(resync_envelope());
         }
 
-        let idx = self.items.len();
-        self.items.push_back((Instant::now(), env));
-        if let Some(topic) = topic {
-            self.pending_topics.insert(topic, idx);
-        }
+        self.push_bulk(env);
         EnqueueOutcome::Degraded
     }
 
@@ -250,12 +268,16 @@ impl SessionQueue {
         self.evict_at(0)
     }
 
-    /// Remove the bulk-lane entry at `index`, dropping its pending-topic
-    /// slot and shifting later topic indices down.
+    /// Remove a bulk entry and shift both topic and snapshot slot indices.
     fn evict_at(&mut self, index: usize) -> Option<(Instant, FrontendEventEnvelope)> {
         let removed = self.items.remove(index)?;
         self.pending_topics.retain(|_, idx| *idx != index);
-        for idx in self.pending_topics.values_mut() {
+        self.pending_snapshots.retain(|_, idx| *idx != index);
+        for idx in self
+            .pending_topics
+            .values_mut()
+            .chain(self.pending_snapshots.values_mut())
+        {
             if *idx > index {
                 *idx -= 1;
             }
@@ -316,8 +338,20 @@ impl SessionQueue {
     }
 }
 
+/// Replace a pending unsent snapshot in place with a newer uncorrelated push
+/// of the same kind. Snapshots are complete state, so the newest payload is
+/// sufficient; the original enqueue instant and queue position stay put.
+/// Snapshot replacement stays off the topic-merge path so WorkInvalidated
+/// unioning cannot change snapshot semantics.
+fn replace_pending_snapshot(pending: &mut FrontendEventEnvelope, next: FrontendEventEnvelope) {
+    *pending = next;
+}
+
 /// Replace the unsent push `pending` with the newer `next` for the same topic
 /// without losing what `pending` told the app.
+///
+/// Used only for topic invalidations. Session-wide snapshots replace in place
+/// via [`replace_pending_snapshot`].
 ///
 /// A [`TopicEventPayload::WorkInvalidated`] carries the class of the change and
 /// the cards it names, and the app chooses its refetch from both. Replacing one
@@ -380,6 +414,28 @@ pub(super) fn topic_event_topic(payload: &FrontendEvent) -> Option<String> {
     match payload {
         FrontendEvent::TopicEvent { topic, .. } => Some(topic.clone()),
         FrontendEvent::OperatorDecisionSnapshot { .. } => Some(super::decision_notifications::TOPIC.to_owned()),
+        _ => None,
+    }
+}
+
+/// Explicit allowlist of session-wide snapshots whose newest payload fully
+/// replaces the previous one. Callers must exclude correlated replies. Scoped
+/// lists/document results, row deltas, probes and control requests are not
+/// interchangeable by kind and must retain every pending envelope.
+fn snapshot_event_kind(payload: &FrontendEvent) -> Option<&'static str> {
+    match payload {
+        // Complete current OAuth state, including any pending device-flow UI.
+        FrontendEvent::GitHubAuthState { .. } => Some("git_hub_auth_state"),
+        // Every allocated worker slot's live state, not a changed-slot delta.
+        FrontendEvent::WorkerLiveStatesList { .. } => Some("worker_live_states_list"),
+        // Complete health report, including all current issues and pause flags.
+        FrontendEvent::EngineHealthResult { .. } => Some("engine_health_result"),
+        // All pool capacities and the coordinator model for this engine.
+        FrontendEvent::EnginePoolConfig { .. } => Some("engine_pool_config"),
+        // Entire feature registry with effective values; current RPC replies stay separate.
+        FrontendEvent::FeatureFlagsList { .. } => Some("feature_flags_list"),
+        // Quota refresh includes every driver, including explicit failure entries.
+        FrontendEvent::DriverQuotaUsageResult { .. } => Some("driver_quota_usage_result"),
         _ => None,
     }
 }
