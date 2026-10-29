@@ -316,7 +316,7 @@ impl Stages {
     }
 
     /// The error for a [`DELIVERY_TIMEOUT`] expiry, naming the furthest stage
-    /// reached so the operator learns which step stalled.
+    /// reached so a stall can be located.
     fn expiry_error(&self) -> anyhow::Error {
         anyhow::anyhow!(
             "coordinator prompt delivery deadline ({}s) expired {}",
@@ -326,7 +326,7 @@ impl Stages {
     }
 }
 
-/// Where a delivery stood when its deadline expired, in operator terms.
+/// Where a delivery stood when its deadline expired, in human-readable terms.
 fn expiry_location(last_stage: Option<&str>) -> &'static str {
     match last_stage {
         None => "before the coordinator's Claude inbox registration could be read",

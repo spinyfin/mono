@@ -45,7 +45,7 @@ pub struct CoordinatorHandoffView {
 #[builder(on(String, into))]
 pub struct CoordinatorHandoffAuthorizationDelivery {
     pub requested: bool,
-    /// Operator-facing explanation: where the credential now is, or which
+    /// Human-readable explanation: where the credential now is, or which
     /// step failed and why.
     pub detail: String,
 }

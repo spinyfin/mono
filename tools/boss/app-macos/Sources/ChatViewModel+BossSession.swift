@@ -59,6 +59,7 @@ extension ChatViewModel {
         pendingCoordinatorReset = (token, reason)
         coordinatorResetForced = false
         coordinatorResetDeliveryFailed = false
+        coordinatorResetDeliveryFailureReason = nil
         coordinatorResetWaiting = true
         engine.sendRecreateCoordinator(expectedSpawnToken: token, reason: reason)
     }

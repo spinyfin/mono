@@ -111,6 +111,33 @@ pub(crate) fn authorization_prompt(authorization: &str) -> String {
     )
 }
 
+/// How long a delivery whose confirmation is still outstanding suppresses a
+/// repeat request for the same session. Past this, a lost, held or denied
+/// frame is retried instead of being reported as pending.
+const PENDING_COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A credential delivery awaiting confirmation, keyed to the coordinator
+/// generation it targets so a replacement session is never suppressed by its
+/// predecessor's outstanding attempt.
+#[derive(Debug, Clone)]
+pub(super) struct PendingAuthorizationDelivery {
+    spawn_token: String,
+    attempt_id: u64,
+    started: std::time::Instant,
+}
+
+static NEXT_DELIVERY_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Clear the pending entry only if it is still the given attempt, so a stale
+/// confirmation cannot erase a newer attempt's state.
+fn clear_pending(pending: &std::sync::Mutex<Option<PendingAuthorizationDelivery>>, attempt_id: u64) {
+    if let Ok(mut pending) = pending.lock()
+        && pending.as_ref().is_some_and(|entry| entry.attempt_id == attempt_id)
+    {
+        *pending = None;
+    }
+}
+
 /// Deliver the live coordinator's handoff write credential to its main
 /// session inbox, minting one first when the session predates authorization
 /// (it outlived the deploy, or an engine restart adopted it). Never returns
@@ -128,17 +155,9 @@ pub(super) async fn deliver_authorization(
     trigger: &'static str,
 ) -> boss_protocol::CoordinatorHandoffAuthorizationDelivery {
     use std::sync::atomic::Ordering;
-    if state
-        .coordinator_authorization_delivery_in_flight
-        .swap(true, Ordering::AcqRel)
-    {
-        return boss_protocol::CoordinatorHandoffAuthorizationDelivery {
-            requested: true,
-            detail: "a delivery of the handoff credential to the main session's inbox is already pending; it is read at that session's next input boundary".to_owned(),
-        };
-    }
-    let in_flight = state.coordinator_authorization_delivery_in_flight.clone();
-    let accepted: anyhow::Result<(String, crate::coordinator_tmux::inbox::PendingConfirmation)> = async {
+    let pending = state.coordinator_authorization_delivery_pending.clone();
+    let attempt_id = NEXT_DELIVERY_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+    let accepted: anyhow::Result<Option<(String, crate::coordinator_tmux::inbox::PendingConfirmation)>> = async {
         let program = match &*state
             .tmux_preflight
             .read()
@@ -157,6 +176,21 @@ pub(super) async fn deliver_authorization(
             .work_db
             .coordinator_tmux_record()?
             .ok_or_else(|| anyhow::anyhow!("no coordinator session is on record"))?;
+        {
+            let mut pending = pending
+                .lock()
+                .map_err(|_| anyhow::anyhow!("credential delivery state lock poisoned"))?;
+            if pending.as_ref().is_some_and(|entry| {
+                entry.spawn_token == record.spawn_token && entry.started.elapsed() < PENDING_COALESCE_WINDOW
+            }) {
+                return Ok(None);
+            }
+            *pending = Some(PendingAuthorizationDelivery {
+                spawn_token: record.spawn_token.clone(),
+                attempt_id,
+                started: std::time::Instant::now(),
+            });
+        }
         let authorization = state
             .work_db
             .ensure_coordinator_handoff_authorization(&record.spawn_token)
@@ -166,12 +200,16 @@ pub(super) async fn deliver_authorization(
             .deliver_accepted(tmux, &record, &authorization_prompt(&authorization), guard)
             .await
             .context("delivering the credential to the coordinator's inbox")?;
-        Ok((record.spawn_token, confirmation))
+        Ok(Some((record.spawn_token, confirmation)))
     }
     .await;
     match accepted {
+        Ok(None) => boss_protocol::CoordinatorHandoffAuthorizationDelivery {
+            requested: true,
+            detail: "a delivery of the handoff credential to the main session's inbox is already pending; it is read at that session's next input boundary".to_owned(),
+        },
         Err(error) => {
-            in_flight.store(false, Ordering::Release);
+            clear_pending(&pending, attempt_id);
             let error = format!("{error:#}");
             crate::audit::record_event(
                 "coordinator_handoff_authorization_delivery",
@@ -183,7 +221,7 @@ pub(super) async fn deliver_authorization(
                 detail: format!("the handoff credential was not delivered: {error}"),
             }
         }
-        Ok((spawn_token, confirmation)) => {
+        Ok(Some((spawn_token, confirmation))) => {
             crate::audit::record_event(
                 "coordinator_handoff_authorization_delivery",
                 &serde_json::json!({ "trigger": trigger, "outcome": "accepted", "spawn_token": spawn_token }),
@@ -195,7 +233,7 @@ pub(super) async fn deliver_authorization(
                     confirmation,
                 )
                 .await;
-                in_flight.store(false, Ordering::Release);
+                clear_pending(&pending, attempt_id);
                 let (outcome, error) = match outcome {
                     Ok(Ok(())) => {
                         match work_db.record_coordinator_handoff_authorization_delivered(&spawn_token) {
@@ -228,7 +266,7 @@ pub(super) async fn deliver_authorization(
             });
             boss_protocol::CoordinatorHandoffAuthorizationDelivery {
                 requested: true,
-                detail: "the main session's inbox accepted the handoff credential; it is read as a [Boss handoff authorization] message at that session's next input boundary (the end of the current turn)".to_owned(),
+                detail: "the handoff credential was written to the main session's inbox socket; it is read as a [Boss handoff authorization] message at that session's next input boundary (the end of the current turn)".to_owned(),
             }
         }
     }

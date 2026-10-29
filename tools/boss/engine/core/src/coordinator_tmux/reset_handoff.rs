@@ -106,7 +106,7 @@ pub(crate) async fn request_and_wait(request: HandoffRequest<'_>) -> Result<bool
         _ => String::new(),
     };
     // Each step names itself in the error: the app shows that text verbatim
-    // so the operator learns which step failed and why, not only that the
+    // so the failing step and reason are visible, not only that the
     // request never arrived.
     let authorization = work_db
         .ensure_coordinator_handoff_authorization(&record.spawn_token)

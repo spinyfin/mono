@@ -225,6 +225,78 @@ async fn frame_send_releases_lifecycle_lock_before_confirmation() {
     assert!(result.is_ok());
 }
 
+/// The split path `ClaudeInbox::deliver_accepted` is built on: `inject`
+/// returns once the frame is written (before any receipt exists), and the
+/// confirmation resolves later from the receipts alone.
+async fn split_delivery(final_status: &'static str) -> (bool, bool, bool) {
+    let (_directory, path, listener, transcript) = private_inbox();
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+    let (final_tx, final_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let line = BufReader::new(stream).lines().next_line().await.unwrap().unwrap();
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        let reply = frame["from"].as_str().unwrap().strip_prefix("uds:").unwrap().to_owned();
+        let send = |status: &'static str| {
+            let reply = reply.clone();
+            let id = frame["msg_id"].clone();
+            async move {
+                let mut stream = UnixStream::connect(&reply).await.unwrap();
+                let receipt = json!({"action": "peer_message_status", "orig_msg_id": id, "status": status});
+                stream.write_all(format!("{receipt}\n").as_bytes()).await.unwrap();
+            }
+        };
+        held_rx.await.unwrap();
+        send("held").await;
+        final_rx.await.unwrap();
+        send(final_status).await;
+    };
+    let client = async move {
+        // No receipt has been sent, so returning here proves acceptance does
+        // not wait for confirmation.
+        let injected = tokio::time::timeout(
+            Duration::from_secs(5),
+            inject(
+                &path,
+                std::process::id() as libc::pid_t,
+                "session",
+                "prompt",
+                &transcript,
+                Arc::new(Stages::new()),
+                || {},
+            ),
+        )
+        .await
+        .expect("acceptance must not wait for a receipt")
+        .unwrap();
+        let mut confirmation = Box::pin(injected.confirm());
+        let pending_without_receipt = tokio::time::timeout(Duration::from_millis(300), &mut confirmation)
+            .await
+            .is_err();
+        held_tx.send(()).unwrap();
+        let pending_while_held = tokio::time::timeout(Duration::from_millis(300), &mut confirmation)
+            .await
+            .is_err();
+        final_tx.send(()).unwrap();
+        let resolved = tokio::time::timeout(Duration::from_secs(5), confirmation)
+            .await
+            .expect("a correlated final receipt must resolve the confirmation");
+        (pending_without_receipt, pending_while_held, resolved.is_ok())
+    };
+    let ((pending_without_receipt, pending_while_held, ok), ()) = tokio::join!(client, server);
+    (pending_without_receipt, pending_while_held, ok)
+}
+
+#[tokio::test]
+async fn accepted_delivery_stays_pending_on_held_and_confirms_on_a_later_delivered_receipt() {
+    assert_eq!(split_delivery("delivered").await, (true, true, true));
+}
+
+#[tokio::test]
+async fn accepted_delivery_fails_on_a_later_correlated_denied_receipt() {
+    assert_eq!(split_delivery("denied").await, (true, true, false));
+}
+
 #[test]
 fn descent_follows_parent_links_and_ignores_unrelated_processes() {
     let parents = std::collections::HashMap::from([(12, 11), (11, 10), (10, 1), (21, 20), (20, 1)]);

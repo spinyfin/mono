@@ -26,9 +26,18 @@ struct LiveCoordinatorRunner {
     token: StdMutex<String>,
     options: StdMutex<BTreeMap<String, String>>,
     calls: StdMutex<Vec<Vec<String>>>,
-    /// When set, every inbox delivery fails with this reason, the way a
-    /// missing registration or an expired delivery deadline would.
-    fail_delivery: StdMutex<Option<String>>,
+    faults: StdMutex<DeliveryFaults>,
+}
+
+/// Inbox delivery failure modes the runner can be told to simulate.
+#[derive(Default)]
+struct DeliveryFaults {
+    /// Every inbox delivery fails with this reason, the way a missing
+    /// registration or an expired delivery deadline would.
+    fail: Option<String>,
+    /// `deliver_accepted` accepts the frame but its confirmation never
+    /// resolves, the way a held or lost frame would.
+    hold_confirmation: bool,
 }
 
 impl Default for LiveCoordinatorRunner {
@@ -38,7 +47,7 @@ impl Default for LiveCoordinatorRunner {
             token: StdMutex::new(TOKEN.to_owned()),
             options: StdMutex::default(),
             calls: StdMutex::default(),
-            fail_delivery: StdMutex::default(),
+            faults: StdMutex::default(),
         }
     }
 }
@@ -126,7 +135,7 @@ impl CommandRunner for LiveCoordinatorRunner {
 #[async_trait::async_trait]
 impl crate::coordinator_tmux::inbox::HandoffDelivery for LiveCoordinatorRunner {
     async fn deliver(&self, _: &Tmux, _: &crate::work::CoordinatorTmuxRecord, prompt: &str) -> anyhow::Result<()> {
-        if let Some(reason) = self.fail_delivery.lock().unwrap().clone() {
+        if let Some(reason) = self.faults.lock().unwrap().fail.clone() {
             self.calls
                 .lock()
                 .unwrap()
@@ -138,6 +147,21 @@ impl crate::coordinator_tmux::inbox::HandoffDelivery for LiveCoordinatorRunner {
             .unwrap()
             .push(vec!["inbox".into(), prompt.into(), "delivered".into()]);
         Ok(())
+    }
+
+    async fn deliver_accepted<'a>(
+        &'a self,
+        tmux: &'a Tmux,
+        record: &'a crate::work::CoordinatorTmuxRecord,
+        prompt: &str,
+        guard: tokio::sync::MutexGuard<'_, ()>,
+    ) -> anyhow::Result<crate::coordinator_tmux::inbox::PendingConfirmation> {
+        self.deliver(tmux, record, prompt).await?;
+        drop(guard);
+        if self.faults.lock().unwrap().hold_confirmation {
+            return Ok(Box::pin(std::future::pending()));
+        }
+        Ok(Box::pin(std::future::ready(Ok(()))))
     }
 }
 
@@ -272,7 +296,10 @@ async fn handoff_show_recovers_authorization_only_through_main_session_inbox() {
         panic!("expected an empty handoff with a delivery report, got {response:?}");
     };
     assert!(delivery.requested, "{delivery:?}");
-    assert!(delivery.detail.contains("inbox accepted"), "{delivery:?}");
+    assert!(
+        delivery.detail.contains("written to the main session's inbox socket"),
+        "{delivery:?}"
+    );
     assert!(!format!("{response:?}").contains(&authorization));
     wait_for_credential_prompt(&f.runner).await;
     assert!(
@@ -901,7 +928,7 @@ async fn adopted_coordinator_from_before_authorization_receives_its_credential_a
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(runner.inbox_prompts("[Boss handoff authorization]").len(), 1);
 
-    // The operator resets: the request carries the credential the session already holds.
+    // A reset is requested: the request carries the credential the session already holds.
     sessions::handle_recreate_coordinator(dispatch(&state, &sink, "reset-1"), reset_request()).await;
     wait_for_prompt(&runner).await;
     let reset_prompts = runner.inbox_prompts("[Boss reset request");
@@ -986,7 +1013,7 @@ async fn adopted_coordinator_from_before_authorization_receives_its_credential_a
 }
 
 /// When the request cannot be delivered, the app's error must say which step
-/// failed and why, verbatim from the engine, so the operator is not left with
+/// failed and why, verbatim from the engine, rather than
 /// only "could not deliver" and a forced reset.
 #[tokio::test]
 async fn reset_delivery_failure_names_the_failing_step_and_reason() {
@@ -997,7 +1024,7 @@ async fn reset_delivery_failure_names_the_failing_step_and_reason() {
         _dir,
         ..
     } = fixture(Duration::from_secs(30)).await;
-    *runner.fail_delivery.lock().unwrap() =
+    runner.faults.lock().unwrap().fail =
         Some("no Claude inbox registration under coordinator pane process 4242".to_owned());
     sessions::handle_recreate_coordinator(dispatch(&state, &sink, "reset-1"), reset_request()).await;
     let (request_id, event) = next_event(&sink).await;
@@ -1033,7 +1060,7 @@ async fn handoff_show_reports_a_failed_credential_redelivery() {
     let f = fixture(Duration::from_secs(1)).await;
     f.state.work_db.clear_coordinator_handoff_authorization().unwrap();
     f.state.set_boss_pid(std::process::id() as libc::pid_t);
-    *f.runner.fail_delivery.lock().unwrap() = Some(
+    f.runner.faults.lock().unwrap().fail = Some(
         "coordinator prompt delivery deadline (15s) expired while connecting to the coordinator's inbox socket"
             .to_owned(),
     );
@@ -1080,4 +1107,67 @@ async fn handoff_show_reports_a_failed_credential_redelivery() {
             authorization_delivery: None,
         }
     ));
+}
+
+/// A predecessor's unconfirmed credential delivery must not suppress the
+/// replacement session's own: the pending state is keyed to the session it
+/// targets, not global.
+#[tokio::test]
+async fn a_pending_delivery_to_a_replaced_session_does_not_suppress_its_replacement() {
+    let f = fixture(Duration::from_secs(1)).await;
+    f.state.set_boss_pid(std::process::id() as libc::pid_t);
+    f.runner.faults.lock().unwrap().hold_confirmation = true;
+    let show = |request_id: &'static str| {
+        let mut ctx = dispatch(&f.state, &f.sink, request_id);
+        ctx.peer_pid = Some(std::process::id() as libc::pid_t);
+        coordinator_handoff::handle_get_coordinator_handoff(ctx, FrontendRequest::GetCoordinatorHandoff)
+    };
+    show("show-a").await;
+    next_event(&f.sink).await;
+    assert_eq!(f.runner.inbox_prompts("[Boss handoff authorization]").len(), 1);
+
+    // A repeat for the same session within the window coalesces.
+    show("show-a-again").await;
+    let (_, response) = next_event(&f.sink).await;
+    let FrontendEvent::CoordinatorHandoffResult {
+        authorization_delivery: Some(delivery),
+        ..
+    } = &response
+    else {
+        panic!("expected a delivery report, got {response:?}");
+    };
+    assert!(
+        delivery.requested && delivery.detail.contains("already pending"),
+        "{delivery:?}"
+    );
+    assert_eq!(f.runner.inbox_prompts("[Boss handoff authorization]").len(), 1);
+
+    // Session A is replaced by B while A's confirmation is still outstanding.
+    const REPLACEMENT: &str = "token-b";
+    f.state
+        .work_db
+        .record_coordinator_tmux_spawn_intent("boss-coordinator", REPLACEMENT, "opus", None)
+        .unwrap();
+    f.state
+        .work_db
+        .record_coordinator_tmux_session_created(REPLACEMENT)
+        .unwrap();
+    *f.runner.token.lock().unwrap() = REPLACEMENT.to_owned();
+    show("show-b").await;
+    let (_, response) = next_event(&f.sink).await;
+    let FrontendEvent::CoordinatorHandoffResult {
+        authorization_delivery: Some(delivery),
+        ..
+    } = &response
+    else {
+        panic!("expected a delivery report, got {response:?}");
+    };
+    assert!(
+        delivery.requested && !delivery.detail.contains("already pending"),
+        "{delivery:?}"
+    );
+    let prompts = f.runner.inbox_prompts("[Boss handoff authorization]");
+    assert_eq!(prompts.len(), 2, "{prompts:?}");
+    let credential_b = f.state.work_db.coordinator_handoff_authorization().unwrap().unwrap();
+    assert!(prompts[1].contains(&credential_b), "{prompts:?}");
 }

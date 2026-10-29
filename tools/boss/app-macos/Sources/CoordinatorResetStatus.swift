@@ -23,8 +23,8 @@ struct CoordinatorResetStatus: ViewModifier {
                     VStack(spacing: 8) {
                         Text("Boss could not deliver the handoff request to the coordinator. Its session is still running.")
                         // The engine names the step that failed and why; show it
-                        // verbatim so the operator can act on it instead of
-                        // guessing between a forced reset and keeping the session.
+                        // verbatim so the reset choice is informed rather than a guess
+                        // between a forced reset and keeping the session.
                         if let reason = model.coordinatorResetDeliveryFailureReason {
                             Text(reason)
                                 .font(.callout)
