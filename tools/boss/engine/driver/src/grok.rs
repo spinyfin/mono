@@ -147,6 +147,8 @@ const GROK_AGENT_RULES_PREAMBLE: &str = "You are running inside a managed worker
      For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
      `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
      strong stated justification.\n\
+     Do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run`\n\
+     in a shell `timeout`.\n\
      \n\
      Default to proceeding on a reasonable assumption instead of stopping to\n\
      ask the human: pick the interpretation a competent engineer would\n\

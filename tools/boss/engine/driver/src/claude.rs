@@ -699,7 +699,9 @@ const CLAUDE_AGENT_RULES_PREAMBLE: &str = "You are running inside a managed work
      via claude hooks.\n\
      For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
      `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
-     strong stated justification.";
+     strong stated justification.\n\
+     Do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run`\n\
+     in a shell `timeout`.";
 
 /// Reference implementation of [`AgentDriver`] for Claude Code.
 ///
@@ -1057,7 +1059,9 @@ impl AgentDriver for ClaudeDriver {
             );
             hooks.push(serde_json::json!({
                 "matcher": "Bash",
-                "hooks": [{"type": "command", "command": guard_command}],
+                // 7500s sits above the guard script's 7200s subprocess timeout
+                // so Claude's default 60s hook timeout does not cut the gate short.
+                "hooks": [{"type": "command", "command": guard_command, "timeout": 7500}],
             }));
         }
 
@@ -1738,6 +1742,25 @@ mod tests {
     }
 
     #[test]
+    fn checkleft_push_guard_gets_a_two_hour_hook_timeout() {
+        let wiring = ClaudeDriver.tool_use_interception_wiring(&local_standard_config());
+        let checkleft = wiring
+            .pre_tool_use_hooks
+            .iter()
+            .find(|entry| {
+                entry["hooks"][0]["command"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("boss-checkleft-push-guard.py"))
+            })
+            .expect("local standard worker must arm the checkleft push guard");
+        assert_eq!(
+            checkleft["hooks"][0]["timeout"].as_u64(),
+            Some(7500),
+            "Claude must not cut the checkleft gate at the 60s hook default: {checkleft}"
+        );
+    }
+
+    #[test]
     fn local_revision_worker_gets_all_five_guards() {
         let mut config = local_standard_config();
         config.is_revision = true;
@@ -2200,6 +2223,10 @@ mod tests {
         assert!(
             preamble.contains("checkleft run") && preamble.contains("checkleft --all"),
             "preamble must direct ordinary validation to scoped checkleft: {preamble}"
+        );
+        assert!(
+            preamble.contains("Do not wrap `bazel build`"),
+            "preamble must forbid wrapping Bazel/checkleft in a shell timeout: {preamble}"
         );
     }
 

@@ -10,19 +10,19 @@ use crate::command_runner::{CommandInvocation, RealCommandRunner};
 
 /// Upper bound on the `repobin exec checkleft --version` probe, which pays a
 /// cold dispatch-cache miss (a full `bazel build //tools/checkleft:checkleft`)
-/// on the first call after a source change. Bazel can otherwise block
-/// indefinitely on a held output-base lock, a wedged server, or a stalled
-/// repository-rule fetch -- a realistic failure mode on a host running
-/// several cube workspaces concurrently. A timeout here is treated the same
-/// as a failed probe: resolution falls through to the legacy
-/// `<cwd>/bin/checkleft` / PATH lookup.
-const CHECKLEFT_PROBE_TIMEOUT: Duration = Duration::from_secs(240);
+/// on the first call after a source change. On a host already running several
+/// Bazel compiles that build can take tens of minutes; a short kill cancels
+/// the client and throws away the compile. Two hours is the floor. A timeout
+/// here is treated the same as a failed probe: resolution falls through to
+/// the legacy `<cwd>/bin/checkleft` / PATH lookup.
+const CHECKLEFT_PROBE_TIMEOUT: Duration = Duration::from_secs(7200);
 
-/// Upper bound on the real `checkleft run` invocation. By the time this
-/// runs, the probe above has already warmed the dispatch cache, so this is
-/// bounded generously above the ~85-95s measured runtime while still
-/// guaranteeing the gate cannot hang a push forever on a wedged bazel.
-const CHECKLEFT_RUN_TIMEOUT: Duration = Duration::from_secs(300);
+/// Upper bound on the real `checkleft run` invocation. `checkleft` drives
+/// Bazel, and a still-compiling build is progress even when other builds
+/// share the machine. Two hours is the floor so the gate does not fail-open
+/// an unchecked push. A timeout is not a reason to rerun the same command
+/// under the same cap.
+const CHECKLEFT_RUN_TIMEOUT: Duration = Duration::from_secs(7200);
 
 /// Run the repository's checkleft against the outgoing changes before a
 /// push, refusing the push when checkleft reports errors.

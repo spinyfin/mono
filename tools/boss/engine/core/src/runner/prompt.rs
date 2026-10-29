@@ -581,6 +581,18 @@ fn bazel_prepush_gate_block(
     ))
 }
 
+/// Shared instruction: never kill Bazel / checkleft with a short shell
+/// `timeout`. A still-compiling build is progress; polling is the wait
+/// bound. If a hard cap is unavoidable it must be at least two hours, and
+/// a timeout must never restart the same command under the same cap.
+fn bazel_no_shell_timeout_clause(run_done_seam_enabled: bool) -> &'static str {
+    if run_done_seam_enabled {
+        "Do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run` in a shell `timeout`. Bazel's own per-test timeouts (test size and timeout attributes) are what bound tests. A build that is still compiling with no errors is making progress, even when it is slow because other builds share the machine. If a wait bound is needed (for example a polling yield), keep polling the running command instead of killing it. If a hard cap is ever unavoidable, it must be at least two hours, and a timeout must never be treated as a reason to rerun the same command under the same cap. On a timeout of some other command, follow the failure paragraph below (retry the specific target; a timeout is not by itself a reason to stop), do not idle."
+    } else {
+        "Do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run` in a shell `timeout`. Bazel's own per-test timeouts (test size and timeout attributes) are what bound tests. A build that is still compiling with no errors is making progress, even when it is slow because other builds share the machine. If a wait bound is needed (for example a polling yield), keep polling the running command instead of killing it. If a hard cap is ever unavoidable, it must be at least two hours, and a timeout must never be treated as a reason to rerun the same command under the same cap. On a timeout of some other command, treat it as a blocker (below), do not retry-and-idle."
+    }
+}
+
 /// The Bazel pre-push build-gate prompt block, independent of any
 /// filesystem probe. Extracted so the SSH remote adapter can append it
 /// when a *remote* workspace is a Bazel workspace: [`is_bazel_workspace`]
@@ -614,19 +626,15 @@ pub(crate) fn bazel_prepush_gate_text(worker_signal_seam_enabled: bool, run_done
     } else {
         "- Both `bazel build` and `bazel test` must finish clean — exit 0, no build errors, no failing tests — before you push. Clippy/lint is not reported by bazel; it runs at push time via the checkleft guard (and in CI).\n"
     };
-    let timeout_clause = if run_done_seam_enabled {
-        "If you need an upper bound, wrap the command itself in a timeout (e.g. `timeout 1800 bazel test //...`) so it returns control to you on expiry; on a timeout, follow the failure paragraph below (retry the specific target; a timeout is not by itself a reason to stop), do not idle."
-    } else {
-        "If you need an upper bound, wrap the command itself in a timeout (e.g. `timeout 1800 bazel test //...`) so it returns control to you on expiry; on a timeout, treat it as a blocker (below), do not retry-and-idle."
-    };
+    let timeout_clause = bazel_no_shell_timeout_clause(run_done_seam_enabled);
     let background_wait = crate::prompt_fragments::background_wait_declaration("\"$BOSS_BIN\"");
     let failure_sentence = if run_done_seam_enabled {
         format!(
-            "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout. A command still producing output is slow, not wedged — wait for it. A command producing no output and no progress is wedged: re-run it wrapped in an explicit `timeout` so it returns a real result you can act on, rather than waiting on it or guessing. For failure attribution, bounded retries, base reproduction, and the evidence-backed exception allowing a still-red target to be pushed, follow the validation-failure rule in \"Declaring your run finished\" below. That rule governs both this push and the terminal outcome. If the failure is attributable to your change and you cannot fix it, do NOT push red code. {blocked_action}. Escalating a blocker is correct; pushing a known-broken branch you caused — or hanging on a wedged build — is not.\n"
+            "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout. A command still producing output is slow, not wedged — wait for it. A command producing no output and no progress is wedged: inspect that invocation's logs rather than guessing, and do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run` in a shell `timeout` to force a result — keep polling a still-running command. For failure attribution, bounded retries, base reproduction, and the evidence-backed exception allowing a still-red target to be pushed, follow the validation-failure rule in \"Declaring your run finished\" below. That rule governs both this push and the terminal outcome. If the failure is attributable to your change and you cannot fix it, do NOT push red code. {blocked_action}. Escalating a blocker is correct; pushing a known-broken branch you caused — or hanging on a wedged build — is not.\n"
         )
     } else {
         format!(
-            "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT push red code and do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout, and is never a reason to stop short of a clean result. A command still producing output is slow, not wedged — wait for it. A command producing no output and no progress is wedged: re-run it wrapped in an explicit `timeout` so it returns a real result you can act on, rather than waiting on it or guessing. {blocked_action}. Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
+            "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT push red code and do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout, and is never a reason to stop short of a clean result. A command still producing output is slow, not wedged — wait for it. A command producing no output and no progress is wedged: inspect that invocation's logs rather than guessing, and do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run` in a shell `timeout` to force a result — keep polling a still-running command. {blocked_action}. Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
         )
     };
     format!(
@@ -689,7 +697,7 @@ pub(crate) fn bazel_conflict_resolution_gate_text(seam_enabled: bool) -> String 
          Required BEFORE you push (step 4):\n\
          - Regenerate any generated/lock artifact the rebase invalidated and include it in your commit. The common one is `MODULE.bazel.lock`: run `bazel mod deps --lockfile_mode=update` (or build any target, which refreshes it) and stage the result.\n\
          - `bazel build` the targets your resolution touched AND the targets the rebased-in upstream change touches. Use `bazel query` to resolve labels if unsure. The merged code MUST COMPILE — a conflict resolution that does not build is wrong and must not be pushed.\n\
-         - Run the build in the FOREGROUND with a timeout (e.g. `timeout 1800 bazel build <targets>`) and read its exit code directly. {background_wait}\n\
+         - Run the build in the FOREGROUND and read its exit code directly. Do not wrap `bazel build` in a shell `timeout`. {background_wait}\n\
          \n\
          Then PUSH (step 4) as soon as the build is clean. Do NOT block the push on a full `bazel test //...`.\n\
          \n\
@@ -1110,10 +1118,12 @@ pub(crate) fn run_done_directive(
         "For validation failures, this is a narrow exception to the earlier gate/stop rules, including \
          the pre-push Bazel gate: a failing gate warrants stopping without delivery only when it is \
          reproducible AND attributable to your change — fix it; if attribution remains unresolved, \
-         the failure still stands. A timeout, a full-suite failure that passes in isolation, or a \
+         the failure still stands. A full-suite failure that passes in isolation, or a \
          failure in untouched code is not by itself a reason to stop or to refuse the push: retry the \
          specific Bazel target (two or three attempts maximum), and if it keeps failing, check whether \
-         it reproduces on an unmodified base revision. You MAY push despite a still-red target, and \
+         it reproduces on an unmodified base revision. A shell-timeout of `bazel` or `checkleft run` is \
+         not a reason to rerun the same command under the same cap — keep polling a still-running \
+         command instead, and do not wrap those commands in `timeout`. You MAY push despite a still-red target, and \
          declare `delivered`, only with evidence that the failure is pre-existing or environmental (a \
          base reproduction, a passing rerun/isolation run, or a concrete code-path argument showing why \
          your change cannot cause it), recording the target, failure, attempts and evidence in the \

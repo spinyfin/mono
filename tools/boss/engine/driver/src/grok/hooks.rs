@@ -139,6 +139,10 @@ pub fn forwarder_hooks_map(config: &ProgressObservationConfig) -> serde_json::Ma
 struct Guard {
     command: String,
     matcher: &'static str,
+    /// Outer Grok hook-runner timeout in seconds. `None` omits the field
+    /// (Grok's default). The checkleft push guard sets this above its own
+    /// 7200s subprocess timeout so the inner fail-open wins.
+    timeout_sec: Option<u64>,
 }
 
 /// The five Boss `PreToolUse` guard commands, unchanged from Claude's. Order
@@ -161,6 +165,7 @@ fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
                 script = shell_quote(&guard_script.display().to_string()),
             ),
             matcher: "*",
+            timeout_sec: None,
         });
     }
 
@@ -171,6 +176,7 @@ fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
         out.push(Guard {
             command: crate::git_store_guard::hook_command(guard_script, config.workspace_path.as_deref()),
             matcher: "Bash",
+            timeout_sec: None,
         });
     }
 
@@ -178,6 +184,7 @@ fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
     out.push(Guard {
         command: BOSS_LAUNCH_GUARD_COMMAND.to_owned(),
         matcher: "Bash",
+        timeout_sec: None,
     });
 
     // 3. PR-redirect guard. Standard workers only (local + remote).
@@ -185,6 +192,7 @@ fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
         out.push(Guard {
             command: pr_redirect_guard_command(config.is_revision),
             matcher: "Bash",
+            timeout_sec: None,
         });
     }
 
@@ -198,6 +206,7 @@ fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
                 script = shell_quote(&checkleft_script.display().to_string())
             ),
             matcher: "Bash",
+            timeout_sec: Some(7500),
         });
     }
 
@@ -207,6 +216,7 @@ fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
         out.push(Guard {
             command: REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND.to_owned(),
             matcher: "Bash",
+            timeout_sec: None,
         });
     }
 
@@ -215,6 +225,7 @@ fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
         out.push(Guard {
             command: REVISION_PR_GUARD_COMMAND.to_owned(),
             matcher: "Bash",
+            timeout_sec: None,
         });
     }
 
@@ -225,6 +236,7 @@ fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
                 shell_quote(&crate::codex::codex_review_guide_guard_script())
             ),
             matcher: ".*",
+            timeout_sec: None,
         });
     }
     out
@@ -268,9 +280,16 @@ pub fn write_hooks(
             adapter = shell_quote(&adapter_path.display().to_string()),
             guard = shell_quote(&guard.command),
         );
+        let mut hook = json!({
+            "type": "command",
+            "command": wrapped_command,
+        });
+        if let Some(timeout) = guard.timeout_sec {
+            hook["timeout"] = json!(timeout);
+        }
         pre_tool_use.push(json!({
             "matcher": guard.matcher,
-            "hooks": [{"type": "command", "command": wrapped_command}],
+            "hooks": [hook],
         }));
     }
 
@@ -485,7 +504,7 @@ def main():
     # quoting, exactly as it would if Claude's hook runner invoked it
     # directly. No timeout is imposed here beyond whatever the outer Grok
     # hook runner enforces: the checkleft push guard already carries its own
-    # multi-minute internal timeout budget and fails open on its own terms;
+    # two-hour internal timeout budget and fails open on its own terms;
     # an adapter-imposed shorter timeout would cut that budget short and
     # fail-closed a guard that was about to fail open correctly on its own.
     try:
@@ -555,6 +574,15 @@ mod tests {
         assert_eq!(guards[1].command, BOSS_LAUNCH_GUARD_COMMAND);
         assert_eq!(guards[2].command, PR_REDIRECT_GUARD_COMMAND);
         assert!(guards[3].command.contains("boss-checkleft-push-guard.py"));
+        assert_eq!(
+            guards[3].timeout_sec,
+            Some(7500),
+            "checkleft hook must outlive a contended Bazel compile"
+        );
+        assert!(
+            guards.iter().take(3).all(|g| g.timeout_sec.is_none()),
+            "ordinary guards omit timeout so Grok's default applies"
+        );
     }
 
     #[test]
@@ -794,6 +822,40 @@ mod tests {
         assert!(guard_1.contains("BOSS_DATA_DIR="));
         let guard_2 = pre_tool_use[2]["hooks"][0]["command"].as_str().unwrap();
         assert!(guard_2.contains("python3 -c"));
+    }
+
+    #[test]
+    fn write_hooks_gives_checkleft_a_two_hour_timeout() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let grok_home = tmp.path().join("grok-home");
+        fs::create_dir_all(&grok_home).unwrap();
+        let obs_config = ProgressObservationConfig {
+            events_socket_path: PathBuf::from("/tmp/events.sock"),
+            lease_id: "lease-1".into(),
+            run_id: "run-1".into(),
+            workspace_path: PathBuf::from("/tmp/ws"),
+            forwarder_binary: PathBuf::from("/tmp/boss-event"),
+        };
+        let interception = interception_config(|c| {
+            c.checkleft_guard_script = Some(PathBuf::from("/tmp/settings/boss-checkleft-push-guard.py"));
+        });
+        write_hooks(&grok_home, &obs_config, &interception).unwrap();
+        let hooks_doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(hooks_file_path(&grok_home)).unwrap()).unwrap();
+        let pre_tool_use = hooks_doc["hooks"]["PreToolUse"].as_array().unwrap();
+        let checkleft = pre_tool_use
+            .iter()
+            .find(|entry| {
+                entry["hooks"][0]["command"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("boss-checkleft-push-guard.py"))
+            })
+            .expect("standard worker must arm the checkleft push guard");
+        assert_eq!(
+            checkleft["hooks"][0]["timeout"].as_u64(),
+            Some(7500),
+            "Grok must not cut the checkleft gate at a short default: {checkleft}"
+        );
     }
 
     fn python3_available() -> bool {

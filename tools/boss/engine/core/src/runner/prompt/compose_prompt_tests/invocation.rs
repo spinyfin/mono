@@ -380,6 +380,14 @@ fn bazel_prepush_gate_allows_evidenced_unattributable_push_when_run_done_seam_on
         prompt.contains("You MAY push despite a still-red target, and declare `delivered`"),
         "run_done directive must also state the push is allowed, not only the terminal outcome:\n{prompt}",
     );
+    assert!(
+        gate.contains("Do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run` in a shell `timeout`"),
+        "run_done seam on: the gate must forbid wrapping Bazel/checkleft in a shell timeout:\n{gate}",
+    );
+    assert!(
+        !gate.contains("timeout 1800"),
+        "run_done seam on: the gate must not teach a 30-minute Bazel shell timeout:\n{gate}",
+    );
 }
 
 #[test]
@@ -400,6 +408,15 @@ fn bazel_prepush_gate_keeps_absolute_stop_when_run_done_seam_off() {
     assert!(
         !prompt.contains("You MAY push with a still-red, evidence-backed-unattributable target"),
         "run_done seam off: the gate must not teach the unattributable-push exception:\n{prompt}",
+    );
+    assert!(
+        prompt
+            .contains("Do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run` in a shell `timeout`"),
+        "run_done seam off: the gate must forbid wrapping Bazel/checkleft in a shell timeout:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("timeout 1800"),
+        "run_done seam off: the gate must not teach a 30-minute Bazel shell timeout:\n{prompt}",
     );
 }
 
@@ -461,6 +478,14 @@ fn conflict_revision_keeps_absolute_compile_stop_when_run_done_seam_on() {
     assert!(
         gate.contains("The merged code MUST COMPILE"),
         "run_done seam on: conflict gate must still require a clean build verbatim:\n{gate}",
+    );
+    assert!(
+        gate.contains("Do not wrap `bazel build` in a shell `timeout`"),
+        "conflict gate must not wrap the compile in a shell timeout:\n{gate}",
+    );
+    assert!(
+        !gate.contains("timeout 1800"),
+        "conflict gate must not teach a 30-minute Bazel shell timeout:\n{gate}",
     );
     assert!(
         gate.contains(
