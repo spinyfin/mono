@@ -286,14 +286,14 @@ impl JjGate {
                 });
             }
             if started.elapsed() >= wait {
-                if !exclusive {
-                    return Err(CubeError::MaintenanceBusy);
-                }
                 if wait.is_zero() {
                     return Err(CubeError::InvalidArgument(format!(
                         "jj maintenance gate busy at {}; shared-store maintenance is active; workspace status cannot run",
                         lock_path.display(),
                     )));
+                }
+                if !exclusive {
+                    return Err(CubeError::MaintenanceBusy);
                 }
                 return Err(CubeError::InvalidArgument(format!(
                     "timed out after {}s waiting for the jj maintenance gate {} ({})",
