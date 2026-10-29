@@ -187,8 +187,19 @@ fn pr_redirect_ordinary_reason_recommends_cube_pr_create() {
 }
 
 #[test]
-fn pr_redirect_revision_reason_names_followup_task_and_not_cube_pr_create() {
+fn pr_redirect_revision_reason_routes_blocking_work_to_prerequisite_and_later_work_to_followup() {
     let reason = run_pr_redirect_guard_reason("gh pr create --title x --body y", true);
+    assert!(
+        reason.contains("BOSS_BIN")
+            && reason.contains("propose done --outcome blocked")
+            && reason.contains("--summary")
+            && reason.contains("Otherwise report the dependency")
+            && reason.contains("--answer-type create-prerequisite-task")
+            && reason.contains("--prerequisite-name")
+            && reason.contains("--prerequisite-brief")
+            && reason.contains("non-blocking work"),
+        "revision redirect must route blocking work to create-prerequisite-task, got: {reason}",
+    );
     assert!(
         reason.contains("BOSS_BIN")
             && reason.contains("propose followup-task --name")

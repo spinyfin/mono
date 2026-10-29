@@ -208,11 +208,22 @@ fn guard_block_message_reuses_head_branch_from_gh_pr_create() {
 }
 
 #[test]
-fn guard_block_message_points_at_followup_task_for_a_separate_pr() {
+fn guard_block_message_routes_blocking_pr_to_prerequisite_and_later_work_to_followup() {
     // The rejection must name the propose verb with its invocation shape
     // and tell the worker to finish in-scope work on the parent PR rather
     // than exit as could-not-complete.
     let reason = run_revision_guard_reason("cube pr create --branch boss/exec_abc123_01 --title 'x'");
+    assert!(
+        reason.contains("BOSS_BIN")
+            && reason.contains("propose done --outcome blocked")
+            && reason.contains("--summary")
+            && reason.contains("Otherwise report the dependency")
+            && reason.contains("--answer-type create-prerequisite-task")
+            && reason.contains("--prerequisite-name")
+            && reason.contains("--prerequisite-brief")
+            && reason.contains("non-blocking work"),
+        "block reason must route a PR that must land first to create-prerequisite-task, got: {reason}",
+    );
     assert!(
         reason.contains("BOSS_BIN")
             && reason.contains("propose followup-task --name")

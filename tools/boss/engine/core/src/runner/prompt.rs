@@ -1153,11 +1153,11 @@ pub(crate) fn run_done_directive(
      {boss} propose done --outcome blocked --summary \"<blocker>\" --question \"Which rollout should the migration use?\" --answer-type multiple-choice --choices \"Gradual\" \"All at once\" --explanation \"<Context, Recommendation, and optional Details>\"\n\
      ```\n\n\
      The same one-question-per-run rule applies. The chosen label is recorded verbatim and the task restarts in the preserved workspace; your next run's task description ends with a `## Recorded answer` section naming the question and the chosen option. Act on that choice; it grants no authorization beyond the decision itself.\n\n\
-     **When your task cannot proceed until some other, unrelated piece of work lands first, ask to create a prerequisite task instead of a plain Yes/No.** Example: a CI-fix revision finds that a pre-existing test fixture races retention cleanup; that needs its own fix on main before the PR's CI can go green, and it is out of scope for you. Propose that work as its own task:\n\n\
+     **When your task cannot finish until another PR lands first, ask to create a prerequisite task instead of a plain Yes/No.** That covers unrelated work and a capability split forced by a repo limit. Example 1: a CI-fix revision finds that a pre-existing test fixture races retention cleanup; that needs its own fix on main before the PR's CI can go green, and it is out of scope for you. Example 2: your change would exceed the `change/file-count` limit; carve out the first coherent capability as the prerequisite (a standalone description of that first PR, split along a capability boundary), and this task delivers the remainder once that PR has merged. Do not file a plain blocker, a plain yes/no question or `followup-task` for either case. Propose that work as its own task:\n\n\
      ```\n\
      {boss} propose done --outcome blocked --summary \"<blocker>\" --answer-type create-prerequisite-task --prerequisite-name \"<short task name>\" --prerequisite-brief \"<self-contained description>\" --explanation \"<Context, Yes, No, Recommendation, and optional Details; see above>\"\n\
      ```\n\n\
-     The description must stand alone: the prerequisite becomes a separate task that a different worker picks up cold, seeing only that description. Name the files, the failure and its evidence, and what done looks like; never refer to \"this task\", \"above\", or your own session. Do not pass `--question` — the engine words it for the repo owner (\"Create prerequisite task '<name>'? This task will wait for it.\"). The repo owner still answers Yes or No. Yes creates the task in this product (or, if an equivalent open task already exists, links to it instead), makes your task depend on it, appends a dated note to your task description, and redispatches your task once the prerequisite is done; No leaves the task blocked like any declined question. Use this only for work that blocks your task: `{boss} propose followup-task` remains the non-blocking path for nice-to-have work later. The one-question-per-run rule applies here too.\n\n\
+     The description must stand alone: the prerequisite becomes a separate task that a different worker picks up cold, seeing only that description. Name the files, the failure and its evidence, and what done looks like; never refer to \"this task\", \"above\", or your own session. Do not pass `--question` — the engine words it for the repo owner (\"Create prerequisite task '<name>'? This task will wait for it.\"). The repo owner still answers Yes or No. Yes creates the task in this product (or, if an equivalent open task already exists, links to it instead), makes your task depend on it, appends a dated note to your task description, and redispatches your task once the prerequisite is done; No leaves the task blocked like any declined question. Use this for any work that blocks your task, including a capability split; `{boss} propose followup-task` remains only the non-blocking path for nice-to-have work later. The one-question-per-run rule applies here too.\n\n\
      Before asking, check the task description for recorded approval of the requested action or an `## Recorded answer` section. If it already grants the authorization or makes the decision needed, proceed and cite it in the PR body. Do not ask for decisions you are allowed to make, or use questions to hand back work that is merely hard. The answer authorizes exactly the question; it does not disable or bypass repository checks.\n\n"
         )
     } else {
@@ -1783,14 +1783,14 @@ fn compose_revision_directive(
     out.push_str(&format!(
         "- A revision never opens a new PR. Do NOT run `gh pr create` or `{cube} pr create`. Push in-scope commits to the existing parent PR with `{cube} pr update --branch <parent-branch-name>`.\n"
     ));
-    // Named even when `followup_proposals_seam` is off: the revision PR
-    // guard always prints this invocation, SubmitProposal accepts the
-    // kind regardless of the scrape-vs-proposal read-path flag, and a
-    // revision that needs a separate PR must not be left with only "do
-    // not open a PR".
-    out.push_str(
-        "- Out-of-scope or separately-approved PR work goes through `\"$BOSS_BIN\" propose followup-task --name \"<short title>\" --description \"<one paragraph of scope>\" --rationale \"<why a separate PR>\"`. Then finish the in-scope work on this parent PR. Do not declare you could not complete.\n",
+    // Stored questions do not finalize the worker with the completion seam off.
+    if run_done_proposals_seam_enabled {
+        out.push_str(
+        "- Work that must land in another PR before this revision can finish goes through `\"$BOSS_BIN\" propose done --outcome blocked --summary \"<blocker>\" --answer-type create-prerequisite-task --prerequisite-name \"<short task name>\" --prerequisite-brief \"<self-contained description>\" --explanation \"<Context, Yes, No, Recommendation, and optional Details>\"`; the revision waits for it and is redispatched once it is done. `\"$BOSS_BIN\" propose followup-task --name \"<short title>\" --description \"<one paragraph of scope>\" --rationale \"<why a separate PR>\"` is only for non-blocking work that can happen later. Finish the in-scope work on this parent PR. Do not declare you could not complete.\n",
     );
+    } else {
+        out.push_str("- If another PR must land first, report the dependency using the blocker channel taught below. Use followup-task only for non-blocking work that can happen later. Finish the in-scope work on the parent PR.\n");
+    }
     if worker_signal_proposals_seam_enabled {
         out.push_str(
             "- If a guard, policy, or decision blocks progress, use `\"$BOSS_BIN\" propose blocked --reason \"<specific question>\"` instead of declaring you could not complete.\n",
