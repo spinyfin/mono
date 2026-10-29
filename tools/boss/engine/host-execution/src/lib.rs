@@ -61,7 +61,8 @@ pub mod cube {
                     exit_code: output.status.code(),
                     stderr,
                     stdout,
-                }.into());
+                }
+                .into());
             }
             serde_json::from_slice(&output.stdout).context("failed to decode Cube JSON output")
         }
@@ -377,7 +378,10 @@ pub mod cube {
     /// End-of-run release: skip cube's dirty-preservation probe so the
     /// workspace returns to the pool. Safe only after the recovery bookmark
     /// is confirmed; the shared store keeps the commits.
-    pub async fn release_workspace_with_reset<T: CubeJsonTransport + ?Sized>(transport: &T, lease_id: &str) -> Result<()> {
+    pub async fn release_workspace_with_reset<T: CubeJsonTransport + ?Sized>(
+        transport: &T,
+        lease_id: &str,
+    ) -> Result<()> {
         let _ = transport
             .run_cube_json(&["--json", "workspace", "release", "--lease", lease_id, "--force-reset"])
             .await?;
@@ -443,8 +447,9 @@ pub mod cube {
     }
 
     pub async fn list_repos<T: CubeJsonTransport + ?Sized>(transport: &T) -> Result<Vec<CubeRepoSummary>> {
-        let payload: ListReposPayload = serde_json::from_value(transport.run_cube_json(&["--json", "repo", "list"]).await?)
-            .context("decoding `cube repo list` payload")?;
+        let payload: ListReposPayload =
+            serde_json::from_value(transport.run_cube_json(&["--json", "repo", "list"]).await?)
+                .context("decoding `cube repo list` payload")?;
         Ok(payload.repos)
     }
 
@@ -461,6 +466,23 @@ pub mod cube {
         use super::*;
         use serde_json::json;
         use std::sync::Mutex;
+
+        #[tokio::test]
+        async fn local_failure_preserves_structured_diagnostics() {
+            let cwd = tempfile::tempdir().unwrap();
+            let cube = LocalCube {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "printf output; printf failure >&2; exit 7".into()],
+                cwd: cwd.path().to_path_buf(),
+            };
+            let error = cube.run(&[]).await.unwrap_err();
+            let detail = error.downcast_ref::<CubeCliError>().unwrap();
+            assert_eq!(detail.host, "local");
+            assert_eq!(detail.exit_code, Some(7));
+            assert_eq!(detail.stdout, "output");
+            assert_eq!(detail.stderr, "failure");
+            assert_eq!(error.to_string(), "Cube command failed: failure");
+        }
 
         // --- CubeCliError::detail() -------------------------------------------
 
