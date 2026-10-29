@@ -182,7 +182,7 @@ impl WorkDb {
 
     pub fn finish_execution_workspace_release(&self, execution: &WorkExecution) -> Result<()> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let changed = tx.execute(
             "UPDATE work_executions SET cube_workspace_id = NULL, workspace_path = NULL
             WHERE id = ?1 AND cube_lease_id IS NULL AND cube_workspace_id IS ?2 AND workspace_path IS ?3",
