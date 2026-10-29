@@ -1261,7 +1261,16 @@ impl ExecutionCoordinator {
                 // cannot start a lease would lose the worker and leave the
                 // mainline row waiting. A permit dropped on the cap-hold
                 // path below frees immediately and kicks nothing.
-                let Some(lease_attempt) = self.begin_repo_lease_or_wait(&execution, &mut changed_waits).await else {
+                //
+                // A permit miss still reports the cap: the row is also at
+                // the cap, and which constraint binds must not flip when a
+                // permit frees.
+                let cap_hold_reason =
+                    occupancy_at_cap_check.map(|occ| interactive_cap_wait_reason(occ.working, occ.lease_pending));
+                let Some(lease_attempt) = self
+                    .begin_repo_lease_or_wait(&execution, &mut changed_waits, cap_hold_reason.as_deref())
+                    .await
+                else {
                     continue;
                 };
                 let claimed = if preempted_this_pass {
@@ -1620,7 +1629,10 @@ impl ExecutionCoordinator {
             // that miss stay `ready` with a workspace wait reason; the
             // attempt guard kicks the scheduler when an in-flight lease
             // ends so they retry.
-            let Some(lease_attempt) = self.begin_repo_lease_or_wait(&execution, &mut changed_waits).await else {
+            let Some(lease_attempt) = self
+                .begin_repo_lease_or_wait(&execution, &mut changed_waits, None)
+                .await
+            else {
                 continue;
             };
 
@@ -1760,7 +1772,10 @@ impl ExecutionCoordinator {
         // mainline work.
         for execution in spill_candidates {
             let preferred_workspace_id = execution.preferred_workspace_id.clone();
-            let Some(lease_attempt) = self.begin_repo_lease_or_wait(&execution, &mut changed_waits).await else {
+            let Some(lease_attempt) = self
+                .begin_repo_lease_or_wait(&execution, &mut changed_waits, None)
+                .await
+            else {
                 continue;
             };
             // Re-read the cap per candidate so a runtime change to it is
@@ -2179,10 +2194,13 @@ impl ExecutionCoordinator {
     /// Take a per-repo lease-attempt permit, or record a workspace wait
     /// and return `None`. The permit covers the cube lease only; it is
     /// released as soon as `schedule_execution`'s lease call returns.
+    /// `miss_reason` overrides the recorded wait text when another
+    /// constraint (the interactive cap) is also holding the row.
     async fn begin_repo_lease_or_wait(
         self: &Arc<Self>,
         execution: &WorkExecution,
         changed_waits: &mut Vec<WorkExecution>,
+        miss_reason: Option<&str>,
     ) -> Option<super::lease_limiter::LeaseAttemptGuard> {
         match self
             .repo_lease_limiter
@@ -2212,7 +2230,11 @@ impl ExecutionCoordinator {
                             })),
                     )
                     .await;
-                changed_waits.extend(self.record_dispatch_wait_reason(execution, WAITING_FOR_WORKSPACE_REASON, None));
+                changed_waits.extend(self.record_dispatch_wait_reason(
+                    execution,
+                    miss_reason.unwrap_or(WAITING_FOR_WORKSPACE_REASON),
+                    None,
+                ));
                 None
             }
         }

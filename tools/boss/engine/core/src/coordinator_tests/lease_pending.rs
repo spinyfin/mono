@@ -318,6 +318,21 @@ async fn cap_hold_text_names_working_and_lease_pending() {
         "admission text must name lease-pending rows, got: {}",
         cap_blocker.message
     );
+
+    // A capped row that also misses the per-repo lease permit is still
+    // reported as cap-held, not as "Waiting for a workspace".
+    let held_permits: Vec<_> = (0..MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO)
+        .map(|i| {
+            coordinator
+                .repo_lease_limiter
+                .try_begin(&execution.repo_remote_url, &format!("other-exec-{i}"))
+                .expect("permit below the bound")
+        })
+        .collect();
+    coordinator.drain_ready_queue().await;
+    let held = db.get_execution(&execution.id).unwrap();
+    assert_eq!(held.dispatch_wait_reason.as_deref(), Some(expected.as_str()));
+    drop(held_permits);
 }
 
 fn seed_ready_chores(db: &WorkDb, n: usize, label: &str) -> Vec<String> {
@@ -475,9 +490,18 @@ async fn cap_overshoot_is_bounded_by_the_per_repo_lease_bound() {
         CAP - 1 + MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO,
         "overshoot is exactly the bounded number of in-flight leases"
     );
-    let third = db.get_execution(&execution_ids[2]).unwrap();
-    assert_eq!(third.status, ExecutionStatus::Ready);
+    // The hold reason is written by whichever drain ran last, and the
+    // drain kicked by a released permit is asynchronous: poll for it.
     let expected = interactive_cap_wait_reason(occupancy.working, 0);
+    let mut third = db.get_execution(&execution_ids[2]).unwrap();
+    for _ in 0..300 {
+        if third.dispatch_wait_reason.as_deref() == Some(expected.as_str()) {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+        third = db.get_execution(&execution_ids[2]).unwrap();
+    }
+    assert_eq!(third.status, ExecutionStatus::Ready);
     assert_eq!(third.dispatch_wait_reason.as_deref(), Some(expected.as_str()));
 }
 
