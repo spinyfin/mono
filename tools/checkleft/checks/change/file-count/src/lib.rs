@@ -81,11 +81,11 @@ pub fn change_file_count_check(input: CheckInput) -> Vec<Finding> {
             "changeset touches {count} non-deleted files, exceeding configured max_files={max_files}"
         ))
         .with_remediation(
-            "Feature work is resolved by splitting it into smaller stacked PRs along capability boundaries (each coherent and independently reviewable), not by requesting an exception."
+            "Break the work into smaller tasks/PRs so each change stays reviewable and within the file-count limit."
                 .to_owned(),
         )
         .with_remediation(
-            "Exceptions are reserved for coordinated renames and generated trees that cannot split. If that is genuinely the case, request a one-off exception with `BYPASS_CHANGE_FILE_COUNT=<specific legitimate reason>` in the commit description (read in every CI context) or the PR description (best-effort)."
+            "If this large surface is intentional (coordinated rename, generated tree that cannot split, etc.), request a one-off exception with `BYPASS_CHANGE_FILE_COUNT=<specific legitimate reason>` in the commit description (read in every CI context) or the PR description (best-effort)."
                 .to_owned(),
         ),
     ]
