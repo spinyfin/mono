@@ -731,6 +731,13 @@ pub trait CubeClient: Send + Sync {
         Vec::new()
     }
     async fn release_workspace(&self, lease_id: &str) -> Result<()>;
+    /// End-of-run release that resets the working copy so the workspace
+    /// returns to the free pool. Defaults to [`Self::release_workspace`] so
+    /// test doubles need no change; [`CommandCubeClient`] passes
+    /// `--force-reset`.
+    async fn release_workspace_with_reset(&self, lease_id: &str) -> Result<()> {
+        self.release_workspace(lease_id).await
+    }
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus>;
     async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()>;
     async fn force_release_lease(&self, lease_id: &str, reason: Option<&str>) -> Result<()>;
@@ -870,14 +877,13 @@ impl CommandCubeClient {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            let detail = if !stderr.is_empty() {
-                stderr
-            } else if !stdout.is_empty() {
-                stdout
-            } else {
-                format!("exit status {}", output.status)
-            };
-            return Err(anyhow!("Cube command failed: {detail}"));
+            return Err(crate::cube_commands::CubeCliError {
+                host: "local".to_owned(),
+                exit_code: output.status.code(),
+                stderr,
+                stdout,
+            }
+            .into());
         }
 
         serde_json::from_slice(&output.stdout).context("failed to decode Cube JSON output")
@@ -939,6 +945,10 @@ impl CubeClient for CommandCubeClient {
 
     async fn release_workspace(&self, lease_id: &str) -> Result<()> {
         crate::cube_commands::release_workspace(self, lease_id).await
+    }
+
+    async fn release_workspace_with_reset(&self, lease_id: &str) -> Result<()> {
+        crate::cube_commands::release_workspace_with_reset(self, lease_id).await
     }
 
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus> {

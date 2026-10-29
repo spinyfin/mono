@@ -19,9 +19,12 @@ fn abandonment_preserves_only_a_durable_blocked_declaration() {
         stamp_outcome(&db, &id, outcome);
         db.record_worker_failure(&id, "worker stopped").unwrap();
         let prior = db.get_execution(&id).unwrap();
-        assert!(prior.cube_workspace_id.is_none());
-        assert!(prior.cube_lease_id.is_none());
-        assert!(prior.workspace_path.is_none());
+        assert_eq!(prior.cube_workspace_id, workspace);
+        assert_eq!(prior.cube_lease_id.as_deref(), Some("lease-1"));
+        assert_eq!(prior.workspace_path.as_deref(), Some("/workspaces/ws-1"));
+        assert!(db.claim_execution_workspace_release(&id, "lease-1").unwrap());
+        db.finish_execution_workspace_release(&prior).unwrap();
+        assert!(db.get_execution(&id).unwrap().cube_lease_id.is_none());
         assert_eq!(
             prior.preferred_workspace_id,
             if outcome == Some("blocked") { workspace } else { None }

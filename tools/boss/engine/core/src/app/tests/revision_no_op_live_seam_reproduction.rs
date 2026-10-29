@@ -86,7 +86,7 @@ impl BranchVerifier for UnreachableBranchVerifier {
 /// `completion::tests::revision_fixture` builds for the handler-level
 /// tests, but against a real `ServerState`'s `WorkDb` so it is reachable
 /// through the real dispatch path.
-fn seed_parked_revision(server_state: &Arc<ServerState>, pr_url: &str, slot_id: u8) -> String {
+fn seed_parked_revision(server_state: &Arc<ServerState>, pr_url: &str, slot_id: u8) -> (String, tempfile::TempDir) {
     let work_db = &server_state.work_db;
     let product = crate::test_support::create_test_product_named(work_db, "live-seam-reproduction-product");
     let parent = crate::test_support::create_test_chore_manual(work_db, product.id.clone(), "Parent chore");
@@ -120,7 +120,7 @@ fn seed_parked_revision(server_state: &Arc<ServerState>, pr_url: &str, slot_id: 
                 .build(),
         )
         .unwrap();
-    let workspace = std::env::temp_dir();
+    let workspace = tempfile::tempdir().unwrap();
     let (execution, run) = work_db
         .start_execution_run(
             &execution.id,
@@ -128,15 +128,16 @@ fn seed_parked_revision(server_state: &Arc<ServerState>, pr_url: &str, slot_id: 
             "mono",
             "lease-1",
             "mono-agent-live-seam",
-            workspace.to_str().unwrap(),
+            workspace.path().to_str().unwrap(),
         )
         .unwrap();
     crate::test_support::finish_run_worker_pane_alive(work_db, &execution.id, &run.id, None);
     // Mirror `on_execution_started`'s dispatch-time snapshot so the
     // SHA-delta gate has a baseline to (fail to) compare against.
     work_db.set_execution_pr_head_before(&execution.id, "before").unwrap();
+    crate::test_support::preserve_test_workspace(work_db, &execution.id);
     register_working_worker(server_state, &execution.id, slot_id);
-    execution.id
+    (execution.id, workspace)
 }
 
 /// Write a final message carrying the retired `NO_CHANGES_NEEDED` text
@@ -202,7 +203,7 @@ async fn revision_no_op_declaration_terminalizes_through_the_real_dispatch_path(
 
     let pr = "https://github.com/spinyfin/mono/pull/1613";
     let slot_id = 5;
-    let execution_id = seed_parked_revision(&server_state, pr, slot_id);
+    let (execution_id, _workspace) = seed_parked_revision(&server_state, pr, slot_id);
     super::tmux_stub::install_teardown(&server_state, &execution_id, 4_194_303);
     declare_no_changes_needed(&server_state.work_db, &execution_id);
 
@@ -259,7 +260,7 @@ async fn revision_without_declaration_is_never_closed_as_a_no_op_by_inference() 
 
     let pr = "https://github.com/spinyfin/mono/pull/1613";
     let slot_id = 6;
-    let execution_id = seed_parked_revision(&server_state, pr, slot_id);
+    let (execution_id, _workspace) = seed_parked_revision(&server_state, pr, slot_id);
     super::tmux_stub::install_teardown(&server_state, &execution_id, 4_194_304);
     write_legacy_marker_transcript(&server_state.work_db, &std::env::temp_dir(), &execution_id);
     assert_eq!(

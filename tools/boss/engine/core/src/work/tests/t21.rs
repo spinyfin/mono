@@ -387,7 +387,7 @@ fn merged_resolves_comments_while_closed_unmerged_leaves_them_in_revision() {
 
 /// The PR-produced path: with `target = InReview`, the task advances to
 /// `in_review` with `pr_url` bound, and the execution finalises to `completed`
-/// with `pr_url` bound and its cube lease cleared.
+/// with `pr_url` bound and its cube lease retained for teardown.
 #[test]
 fn record_worker_pr_completion_binds_pr_and_advances_to_in_review() {
     let db = WorkDb::open(temp_db_path("rwpc-inreview-bind")).unwrap();
@@ -428,9 +428,10 @@ fn record_worker_pr_completion_binds_pr_and_advances_to_in_review() {
         Some(pr_head_after),
         "the execution row must record the post-teardown PR head",
     );
-    assert!(
-        completion.execution.cube_lease_id.is_none(),
-        "the cube lease must be released on completion",
+    assert_eq!(
+        completion.execution.cube_lease_id.as_deref(),
+        Some("lease-1"),
+        "terminal status must retain the lease until teardown claims it",
     );
 
     // Re-queried state confirms durability.

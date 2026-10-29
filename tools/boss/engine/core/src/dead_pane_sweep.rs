@@ -51,7 +51,7 @@
 //! lease + workspace *columns* on the row for provenance). This sweep's
 //! redispatch path creates a fresh execution that never reclaims that lease
 //! in place, so a successful reconcile follows up with a best-effort
-//! [`crate::execution_liveness::force_release_lease_best_effort`] — gated on
+//! [`crate::workspace_lease_release::release_lease_after_inferred_death`] — gated on
 //! the absence of a non-terminal live-registry entry, because this reconcile
 //! is DB-only and does not tear the worker process down. Triage
 //! automation-run bookkeeping is finalized the same way
@@ -505,9 +505,10 @@ pub async fn reconcile_if_pane_dead(
                      still tracks this execution — worker may still be writing the workspace",
                 );
             } else {
-                crate::execution_liveness::force_release_lease_best_effort(
-                    &execution.id,
-                    lease_id,
+                crate::workspace_lease_release::release_lease_after_inferred_death(
+                    work_db,
+                    execution,
+                    crate::workspace_lease_release::PaneStatus::Gone,
                     cube.force_release_lease(lease_id, Some("pane-death reconcile: worker pane gone")),
                 )
                 .await;
@@ -1140,7 +1141,7 @@ mod tests {
     /// row reaped without this release leaks its lease forever. This is the
     /// "leases leak durably" half of the false-reap incident.
     #[tokio::test]
-    async fn run_one_pass_force_releases_the_reaped_executions_lease() {
+    async fn run_one_pass_reaps_but_holds_a_lease_without_recovery_proof() {
         let (_d, db) = open_db();
         let product = create_product(&db);
         let automation = create_automation(&db, &product);
@@ -1160,10 +1161,16 @@ mod tests {
         let outcome = run_one_pass(db.as_ref(), coordinator, &sink, &convergence, &cube).await;
 
         assert_eq!(outcome.reaped, 1);
+        assert!(cube.force_release_calls().is_empty());
         assert_eq!(
-            cube.force_release_calls(),
-            vec!["lease-1".to_owned()],
-            "the reaped execution's cube lease must be force-released",
+            db.get_execution(&exec.id).unwrap().cube_lease_id.as_deref(),
+            Some("lease-1")
+        );
+        assert!(
+            db.list_attention_items(&exec.id)
+                .unwrap()
+                .iter()
+                .any(|item| item.kind == crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND)
         );
     }
 

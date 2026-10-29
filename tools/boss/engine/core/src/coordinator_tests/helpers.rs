@@ -57,6 +57,7 @@ pub(super) struct FakeCubeClient {
     pub(super) goto_revision_calls: Mutex<Vec<(String, String)>>,
     pub(super) create_calls: Mutex<Vec<(String, String)>>,
     pub(super) release_calls: Mutex<Vec<String>>,
+    pub(super) active_leases: Mutex<Vec<CubeWorkspaceStatus>>,
     pub(super) status_calls: Mutex<Vec<PathBuf>>,
     pub(super) heartbeat_calls: Mutex<Vec<(String, Option<u64>)>>,
     pub(super) force_release_calls: Mutex<Vec<(String, Option<String>)>>,
@@ -70,6 +71,9 @@ pub(super) struct FakeCubeClient {
     /// the empty list short-circuits before any attention item is
     /// written.
     pub(super) repos: Mutex<Vec<CubeRepoSummary>>,
+    /// Runs once the lease call is accepted, before it returns: models a
+    /// concurrent change (e.g. a sibling going live) landing mid-dispatch.
+    pub(super) on_lease: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) fail_ensure: bool,
     /// When set, `ensure_repo` for this origin blocks for
     /// [`Self::slow_ensure_delay`] before returning. Models one item
@@ -111,6 +115,12 @@ pub(super) struct FakeCubeClient {
     pub(super) real_bookmarks: bool,
     pub(super) bookmark_calls: Mutex<Vec<String>>,
     pub(super) fail_goto: bool,
+    /// Fail the first N `goto_workspace` calls, then succeed.
+    pub(super) fail_first_n_goto: usize,
+    /// Fail the first N `release_workspace` calls, then succeed.
+    pub(super) fail_first_n_releases: usize,
+    /// Fail the first N execution-bookmark creations, then succeed.
+    pub(super) fail_first_n_bookmark_creates: usize,
     pub(super) closed_pr: bool,
     pub(super) goto_reset_bookmark: Option<String>,
     /// Make `recovery_pr_base` fail, as for a non-GitHub origin or a deleted PR base.
@@ -142,6 +152,13 @@ pub(super) struct FakeCubeClient {
 }
 
 impl FakeCubeClient {
+    pub(super) fn with_real_workspace(mut self, root: &std::path::Path) -> Self {
+        boss_engine_test_git::jj::JjRepo::new(root);
+        self.workspace_root = Some(root.to_path_buf());
+        self.real_bookmarks = true;
+        self.with_next_workspace_id("worker")
+    }
+
     pub(super) fn with_next_workspace_id(self, id: impl Into<String>) -> Self {
         *self.next_workspace_id.try_lock().expect("uncontended") = Some(id.into());
         self
@@ -241,6 +258,9 @@ crate::stub_cube_client! { FakeCubeClient {
         if call_index < self.fail_first_n_leases {
             return Err(anyhow!("cube workspace lease failed: workspace has uncommitted work"));
         }
+        if let Some(hook) = &self.on_lease {
+            hook();
+        }
         // Queue takes priority; falls through to next_workspace_id, then prefer,
         // then the default. The queue lets tests model a sequence of
         // workspace responses (e.g. occupied-then-free for livelock tests).
@@ -252,6 +272,10 @@ crate::stub_cube_client! { FakeCubeClient {
             .or_else(|| self.next_workspace_id.try_lock().ok().and_then(|g| g.clone()))
             .or_else(|| prefer_workspace_id.map(str::to_owned))
             .unwrap_or_else(|| "mono-agent-001".to_owned());
+        self.active_leases.lock().await.push(CubeWorkspaceStatus::builder()
+            .workspace_id(workspace_id.clone())
+            .workspace_path(self.workspace_root.clone().unwrap_or_else(|| PathBuf::from("/tmp")).join(&workspace_id))
+            .state("leased").lease_id("lease-1").build());
         Ok(CubeWorkspaceLease {
             lease_id: "lease-1".to_owned(),
             workspace_id: workspace_id.clone(),
@@ -274,10 +298,14 @@ crate::stub_cube_client! { FakeCubeClient {
     }
 
     async fn goto_workspace(&self, workspace_path: &std::path::Path, pr: u64) -> Result<()> {
-        self.goto_calls
-            .lock()
-            .await
-            .push((workspace_path.display().to_string(), pr));
+        let call_index = {
+            let mut calls = self.goto_calls.lock().await;
+            calls.push((workspace_path.display().to_string(), pr));
+            calls.len() - 1
+        };
+        if call_index < self.fail_first_n_goto {
+            return Err(anyhow!("cube workspace goto failed"));
+        }
         if self.closed_pr {
             return Err(anyhow!("unexpected goto of a closed PR"));
         }
@@ -304,7 +332,15 @@ crate::stub_cube_client! { FakeCubeClient {
     async fn release_workspace(&self, lease_id: &str) -> Result<()> {
         // Record BEFORE parking on the gate, so a test can observe that the
         // release was entered and still hold it open.
-        self.release_calls.lock().await.push(lease_id.to_owned());
+        let call_index = {
+            let mut calls = self.release_calls.lock().await;
+            calls.push(lease_id.to_owned());
+            calls.len() - 1
+        };
+        if call_index < self.fail_first_n_releases {
+            return Err(anyhow!("cube workspace release failed"));
+        }
+        self.active_leases.lock().await.retain(|ws| ws.lease_id.as_deref() != Some(lease_id));
         if let Some(gate) = self.release_gate.as_ref() {
             gate.notified().await;
         }
@@ -337,6 +373,7 @@ crate::stub_cube_client! { FakeCubeClient {
     }
 
     async fn force_release_lease(&self, lease_id: &str, reason: Option<&str>) -> Result<()> {
+        self.active_leases.lock().await.retain(|ws| ws.lease_id.as_deref() != Some(lease_id));
         self.force_release_calls
             .lock()
             .await
@@ -345,7 +382,9 @@ crate::stub_cube_client! { FakeCubeClient {
     }
 
     async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
-        Ok(self.list_workspaces_response.lock().await.clone())
+        let mut rows = self.list_workspaces_response.lock().await.clone();
+        rows.extend(self.active_leases.lock().await.clone());
+        Ok(rows)
     }
 
     async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
@@ -372,8 +411,12 @@ crate::stub_cube_client! { FakeCubeClient {
         Ok(self.pr_base.lock().await.clone().unwrap_or_else(|| "main".into()))
     }
     async fn create_execution_bookmark(&self, workspace: &std::path::Path, execution_id: &str, predecessor: Option<&boss_engine_recovery::execution_bookmark::ExecutionBookmark>, inherited_base: Option<&str>) -> Result<boss_engine_recovery::execution_bookmark::ExecutionBookmark> {
-        self.bookmark_calls.lock().await.push(execution_id.to_owned());
-        if self.fail_bookmark_create { return Err(anyhow!("jj bookmark create failed")); }
+        let call_index = {
+            let mut calls = self.bookmark_calls.lock().await;
+            calls.push(execution_id.to_owned());
+            calls.len() - 1
+        };
+        if self.fail_bookmark_create || call_index < self.fail_first_n_bookmark_creates { return Err(anyhow!("jj bookmark create failed")); }
         if self.real_bookmarks {
             return boss_engine_recovery::execution_bookmark::create_from(
                 &boss_engine_recovery::execution_bookmark::LocalJj, workspace, execution_id, "local", predecessor, inherited_base
@@ -568,7 +611,9 @@ impl ExecutionRunner for FakeExecutionRunner {
 }
 
 pub(super) async fn wait_for_execution_status(db: &WorkDb, execution_id: &str, expected: ExecutionStatus) {
-    for _ in 0..100 {
+    // Dispatch fixtures with real recovery pointers execute several jj
+    // subprocesses before the terminal transition can be observed.
+    for _ in 0..3000 {
         let execution = db.get_execution(execution_id).unwrap();
         if execution.status == expected {
             return;

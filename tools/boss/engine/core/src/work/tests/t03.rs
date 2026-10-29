@@ -263,8 +263,8 @@ fn completes_pane_parked_execution_even_when_its_only_run_is_already_closed() {
         .expect("a live execution must be completed");
 
     assert_eq!(completed.status, ExecutionStatus::Completed);
-    assert!(completed.cube_lease_id.is_none());
-    assert!(completed.workspace_path.is_none());
+    assert_eq!(completed.cube_lease_id.as_deref(), Some("lease-1"));
+    assert_eq!(completed.workspace_path.as_deref(), Some("/tmp/mono-agent-001"));
     assert!(completed.finished_at.is_some());
 
     let _ = std::fs::remove_file(path);

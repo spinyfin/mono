@@ -352,11 +352,15 @@ async fn pr_review_goto_failure_records_positioning_failed() {
         .await;
     assert!(result.is_err(), "schedule_execution must fail when goto fails");
 
-    // The workspace was leased and must be released after goto failure.
-    assert_eq!(
-        cube.release_calls.lock().await.len(),
-        1,
-        "workspace must be released after goto failure"
+    // Positioning failed before any recovery bookmark existed, so the
+    // workspace holds nothing of this run's and is handed straight back.
+    assert!(!cube.release_calls.lock().await.is_empty());
+    assert_eq!(db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(), None);
+    assert!(
+        !db.list_attention_items(&execution.id)
+            .unwrap()
+            .iter()
+            .any(|i| i.kind == crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND),
     );
 
     // A cube_workspace_positioning_failed attention item must exist.

@@ -170,6 +170,75 @@ impl WorkDb {
         }
     }
 
+    /// Only one releaser may call cube for an execution's expected lease.
+    pub fn claim_execution_workspace_release(&self, execution_id: &str, lease_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        Ok(conn.execute(
+            "UPDATE work_executions SET cube_lease_id = NULL
+             WHERE id = ?1 AND cube_lease_id = ?2",
+            params![execution_id, lease_id],
+        )? == 1)
+    }
+
+    pub fn finish_execution_workspace_release(&self, execution: &WorkExecution) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE work_executions SET cube_workspace_id = NULL, workspace_path = NULL
+            WHERE id = ?1 AND cube_lease_id IS NULL AND cube_workspace_id IS ?2 AND workspace_path IS ?3",
+            params![execution.id, execution.cube_workspace_id, execution.workspace_path],
+        )?;
+        if changed > 0 {
+            tx.execute(
+                "UPDATE work_runs SET persona_lease_active = 0 WHERE execution_id = ?1",
+                [&execution.id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Record a newly acquired lease without overwriting a different lease.
+    pub fn restore_execution_workspace(
+        &self,
+        execution_id: &str,
+        lease_id: &str,
+        workspace_id: Option<&str>,
+        workspace_path: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE work_executions
+             SET cube_lease_id = ?2,
+                 cube_workspace_id = ?3,
+                 workspace_path = ?4
+             WHERE id = ?1 AND (cube_lease_id IS NULL OR cube_lease_id = ?2)",
+            params![execution_id, lease_id, workspace_id, workspace_path],
+        )?;
+        Ok(())
+    }
+
+    /// Restore a failed release only while its claimed workspace identity is
+    /// still present and no subsequent acquisition has installed a lease.
+    pub fn restore_claimed_execution_workspace(
+        &self,
+        execution_id: &str,
+        lease_id: &str,
+        workspace_id: Option<&str>,
+        workspace_path: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE work_executions
+             SET cube_lease_id = COALESCE(cube_lease_id, ?2),
+                 cube_workspace_id = COALESCE(cube_workspace_id, ?3),
+                 workspace_path = COALESCE(workspace_path, ?4)
+             WHERE id = ?1 AND cube_lease_id IS NULL AND cube_workspace_id IS ?3 AND workspace_path IS ?4",
+            params![execution_id, lease_id, workspace_id, workspace_path],
+        )?;
+        Ok(())
+    }
+
     /// Preserve the workspace the engine assigned to an execution as its
     /// durable recovery preference before teardown clears the live lease
     /// columns. Used when a parent-PR merge converts a live review revision

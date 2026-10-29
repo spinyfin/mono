@@ -611,31 +611,14 @@ async fn reap_confirmed_candidates(
         // reflects reality and `bossctl agents transcript` still resolves
         // the row. Best-effort: if the execution turns out already terminal
         // (a race with some other teardown) this is a conservative no-op.
-        if candidate.work_item_missing {
-            if let Err(err) = work_db.mark_execution_orphaned(&candidate.run_id, "bound work item row no longer exists")
-            {
-                tracing::warn!(
-                    run_id = %candidate.run_id,
-                    ?err,
-                    "terminal-work sweep: failed to mark orphaned execution for missing work item (may already be terminal)",
-                );
-            }
-
-            // `mark_execution_orphaned` keeps lease columns for provenance, and
-            // this sweep is the terminalizer for this candidate — nothing else
-            // will free the lease once the row drops out of every
-            // lease-reclaim path's non-terminal filter.
-            if let Some(lease_id) = candidate.cube_lease_id.as_deref() {
-                crate::execution_liveness::force_release_lease_best_effort(
-                    &candidate.run_id,
-                    lease_id,
-                    cube_client.force_release_lease(
-                        lease_id,
-                        Some("terminal-work sweep: bound work item row no longer exists"),
-                    ),
-                )
-                .await;
-            }
+        if candidate.work_item_missing
+            && let Err(err) = work_db.mark_execution_orphaned(&candidate.run_id, "bound work item row no longer exists")
+        {
+            tracing::warn!(
+                run_id = %candidate.run_id,
+                ?err,
+                "terminal-work sweep: failed to mark orphaned execution for missing work item (may already be terminal)",
+            );
         }
 
         // Reap via the canonical, idempotent, run-id-keyed teardown. If the
@@ -660,6 +643,27 @@ async fn reap_confirmed_candidates(
             crate::driver_teardown::TeardownReason::TerminalWorkReconcile,
         )
         .await;
+
+        if candidate.work_item_missing {
+            // `mark_execution_orphaned` keeps lease columns for provenance, and
+            // this sweep is the terminalizer for this candidate — nothing else
+            // will free the lease once the row drops out of every
+            // lease-reclaim path's non-terminal filter.
+            if let Some(lease_id) = candidate.cube_lease_id.as_deref()
+                && let Ok(execution) = work_db.get_execution(&candidate.run_id)
+            {
+                crate::workspace_lease_release::release_lease_after_inferred_death(
+                    work_db,
+                    &execution,
+                    crate::workspace_lease_release::PaneStatus::Gone,
+                    cube_client.force_release_lease(
+                        lease_id,
+                        Some("terminal-work sweep: bound work item row no longer exists"),
+                    ),
+                )
+                .await;
+            }
+        }
 
         dispatch_events
             .emit(
@@ -1316,6 +1320,23 @@ mod tests {
         let cube = RecordingCubeClient::default();
         let lease_id = "lease-25";
         force_cube_lease_id(&db, &execution_id, lease_id);
+        // A path that does not exist is provably empty, so the occupancy
+        // gate does not swallow the missing recovery pointer. A live
+        // tempfile would be UNKNOWN on a Linux sandbox whose /proc scan
+        // hits an unreadable same-uid cwd, and that keep reason does not
+        // file bookmark attention.
+        let missing_workspace = {
+            let dir = tempfile::tempdir().unwrap();
+            dir.path().join("never-created").display().to_string()
+        };
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET workspace_path = ?2 WHERE id = ?1",
+                rusqlite::params![execution_id, missing_workspace],
+            )
+            .unwrap();
+        }
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let teardown = TeardownRegistry::new();
         let mut seen = HashSet::new();
@@ -1360,17 +1381,15 @@ mod tests {
             "execution must be marked orphaned since deletion never tore it down",
         );
 
-        // The cube lease must be force-released: `mark_execution_orphaned`
-        // deliberately leaves `cube_lease_id` intact, and orphaning the
-        // execution drops it out of every other lease-reclaim path's
-        // non-terminal filter — this sweep is the only remaining owner.
-        assert_eq!(
-            cube.force_released.lock().unwrap().as_slice(),
-            [(
-                lease_id.to_owned(),
-                Some("terminal-work sweep: bound work item row no longer exists".to_owned())
-            )],
-            "the stranded cube lease must be force-released when the sweep orphans the execution",
+        // Reaping alone is insufficient: no recovery pointer was recorded
+        // for this fixture, so the lease must remain held with attention.
+        assert!(cube.force_released.lock().unwrap().is_empty());
+        assert_eq!(execution.cube_lease_id.as_deref(), Some(lease_id));
+        assert!(
+            db.list_attention_items(&execution_id)
+                .unwrap()
+                .iter()
+                .any(|item| item.kind == crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND)
         );
 
         let events = sink.events().await;

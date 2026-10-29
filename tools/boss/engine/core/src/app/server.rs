@@ -1866,6 +1866,13 @@ async fn serve_scoped(
         crate::dead_pane_sweep::DEFAULT_INTERVAL,
     );
 
+    let _ended_run_lease_sweep_handle = crate::workspace_lease_release::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.cube_client.clone(),
+        server_state.live_worker_states.clone(),
+        crate::workspace_lease_release::DEFAULT_INTERVAL,
+    );
+
     // Periodic stranded-`answering` recovery. Every sweep above reconciles
     // `work_executions`; none of them know `work_comments` exists. So an
     // answer-agent execution that dies without a Stop hook is correctly

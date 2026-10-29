@@ -487,6 +487,72 @@ pub fn finish_run_worker_pane_alive(db: &WorkDb, execution_id: &str, run_id: &st
     .unwrap();
 }
 
+/// Give a local completion fixture the same durable recovery references as a
+/// dispatched worker. Uses the fixture's existing directory and real jj.
+pub fn preserve_test_workspace(db: &WorkDb, execution_id: &str) {
+    use boss_engine_recovery::execution_bookmark::ExecutionBookmark;
+    use boss_engine_test_git::jj::JjRepo;
+    let execution = db.get_execution(execution_id).unwrap();
+    let workspace = std::path::Path::new(execution.workspace_path.as_deref().unwrap());
+    assert!(workspace.is_dir(), "fixture needs an existing workspace");
+    assert_ne!(
+        workspace.canonicalize().unwrap(),
+        std::path::Path::new("/tmp").canonicalize().unwrap()
+    );
+    if !workspace.join(".jj").exists() {
+        let output = std::process::Command::new(JjRepo::binary())
+            .args(["git", "init", "--colocate"])
+            .arg(workspace)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+    let record = ExecutionBookmark {
+        execution_id: execution_id.to_owned(),
+        repo_path: if workspace.join(".jj/repo").is_dir() {
+            workspace.canonicalize().unwrap()
+        } else {
+            boss_engine_recovery::execution_bookmark::shared_repo_from_pointer(
+                &std::fs::read_to_string(workspace.join(".jj/repo")).unwrap(),
+            )
+            .unwrap()
+        },
+        host_id: "local".to_owned(),
+        base_commit: None,
+    };
+    JjRepo::run(workspace, &["bookmark", "set", &record.base(), "-r", "@-"]);
+    JjRepo::run(
+        workspace,
+        &["bookmark", "set", &record.head(), &record.publication(), "-r", "@"],
+    );
+    db.record_execution_bookmark(&record).unwrap();
+}
+
+/// Recovery metadata for a simulated remote store; the test adapter must
+/// separately implement confirmation on that host.
+pub fn record_remote_test_recovery(db: &WorkDb, execution_id: &str, host: &str) {
+    let execution = db.get_execution(execution_id).unwrap();
+    db.record_execution_bookmark(&boss_engine_recovery::execution_bookmark::ExecutionBookmark {
+        execution_id: execution_id.to_owned(),
+        repo_path: std::path::PathBuf::from(execution.workspace_path.unwrap()),
+        host_id: host.to_owned(),
+        base_commit: None,
+    })
+    .unwrap();
+}
+
+pub fn confirm_remote_test_recovery(
+    record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark,
+    workspace: &std::path::Path,
+    host: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        record.host_id == host && record.repo_path == workspace,
+        "wrong remote recovery store"
+    );
+    Ok(())
+}
+
 /// Seed the standard "daily automation" fixture under `product_id`:
 /// name `daily`, a `0 14 * * *` UTC [`AutomationTrigger::Schedule`],
 /// standing instruction `"do the thing"`, every other field defaulted.
@@ -822,12 +888,21 @@ macro_rules! stub_cube_client {
 
     // ── release_workspace ───────────────────────────────────────────────────
     (@munch $ty:ty [$($acc:tt)*] @release_workspace async fn release_workspace $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn release_workspace $a -> $r $b] @workspace_status $($rest)*);
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn release_workspace $a -> $r $b] @release_workspace_with_reset $($rest)*);
     };
     (@munch $ty:ty [$($acc:tt)*] @release_workspace $($rest:tt)*) => {
         $crate::stub_cube_client!(@munch $ty [$($acc)*
             async fn release_workspace(&self, _lease_id: &str) -> ::anyhow::Result<()> { ::core::unimplemented!() }
-        ] @workspace_status $($rest)*);
+        ] @release_workspace_with_reset $($rest)*);
+    };
+
+    // ── release_workspace_with_reset ────────────────────────────────────────
+    // Has a trait default (delegates to release_workspace).
+    (@munch $ty:ty [$($acc:tt)*] @release_workspace_with_reset async fn release_workspace_with_reset $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn release_workspace_with_reset $a -> $r $b] @workspace_status $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @release_workspace_with_reset $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)*] @workspace_status $($rest)*);
     };
 
     // ── workspace_status ────────────────────────────────────────────────────
@@ -955,12 +1030,20 @@ macro_rules! stub_host_adapter {
 
     // ── release_workspace ───────────────────────────────────────────────────
     (@munch $ty:ty [$($acc:tt)*] @release_workspace async fn release_workspace $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn release_workspace $a -> $r $b] @probe_initial_input_alive $($rest)*);
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn release_workspace $a -> $r $b] @release_workspace_with_reset $($rest)*);
     };
     (@munch $ty:ty [$($acc:tt)*] @release_workspace $($rest:tt)*) => {
         $crate::stub_host_adapter!(@munch $ty [$($acc)*
             async fn release_workspace(&self, _lease_id: &str) -> ::anyhow::Result<()> { ::core::unimplemented!() }
-        ] @probe_initial_input_alive $($rest)*);
+        ] @release_workspace_with_reset $($rest)*);
+    };
+
+    // ── release_workspace_with_reset (trait default unless overridden) ──
+    (@munch $ty:ty [$($acc:tt)*] @release_workspace_with_reset async fn release_workspace_with_reset $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn release_workspace_with_reset $a -> $r $b] @probe_initial_input_alive $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @release_workspace_with_reset $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*] @probe_initial_input_alive $($rest)*);
     };
 
     // ── probe_initial_input_alive (trait default unless overridden) ────────
@@ -1103,10 +1186,22 @@ macro_rules! stub_host_adapter {
 
     // ── collect_structured_output (trait default unless overridden) ──────────
     (@munch $ty:ty [$($acc:tt)*] @collect_structured_output async fn collect_structured_output $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn collect_structured_output $a -> $r $b] @done $($rest)*);
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn collect_structured_output $a -> $r $b] @probe_workspace_occupancy $($rest)*);
     };
     (@munch $ty:ty [$($acc:tt)*] @collect_structured_output $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*] @probe_workspace_occupancy $($rest)*);
+    };
+
+    // ── probe_workspace_occupancy (trait default unless overridden) ──────────
+    (@munch $ty:ty [$($acc:tt)*] @probe_workspace_occupancy async fn probe_workspace_occupancy $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn probe_workspace_occupancy $a -> $r $b] @done $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @probe_workspace_occupancy $($rest:tt)*) => {
         $crate::stub_host_adapter!(@munch $ty [$($acc)*] @done $($rest)*);
+    };
+
+    (@munch $ty:ty [$($acc:tt)*] @done async fn confirm_workspace_recovery $a:tt -> $r:ty $b:block) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn confirm_workspace_recovery $a -> $r $b] @done);
     };
 
     // ── emit ────────────────────────────────────────────────────────────────

@@ -58,6 +58,7 @@ async fn parked_task_with_question_kind(
     revision: bool,
 ) -> (Arc<ServerState>, tempfile::TempDir, String, String) {
     let (state, dir, execution, mut task) = live_chore_execution();
+    prepare_workspace_teardown(&state, &execution);
     if revision {
         state
             .work_db
@@ -1243,6 +1244,12 @@ fn live_chore_execution() -> (Arc<ServerState>, tempfile::TempDir, String, Strin
     live_chore_execution_with_pr_status(crate::completion::PrStatus::None)
 }
 
+fn prepare_workspace_teardown(state: &Arc<ServerState>, execution: &str) {
+    crate::test_support::preserve_test_workspace(&state.work_db, execution);
+    register_working_worker(state, execution, 1);
+    super::tmux_stub::install_teardown(state, execution, 4_194_303);
+}
+
 fn live_chore_execution_with_pr_status(
     status: crate::completion::PrStatus,
 ) -> (Arc<ServerState>, tempfile::TempDir, String, String) {
@@ -1403,6 +1410,7 @@ mod run_done_finalize_retry;
 #[tokio::test]
 async fn mandated_check_approval_stop_fails_visibly_without_replacement_workers() {
     let (server_state, _dir, execution_id, work_item_id) = live_chore_execution();
+    prepare_workspace_teardown(&server_state, &execution_id);
     let peer_pid = std::process::id() as libc::pid_t;
     let reason = "Repository check requires an exclusion to proceed; AGENTS.md forbids relaxing it without approval";
     submitted(

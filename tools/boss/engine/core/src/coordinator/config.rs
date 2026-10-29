@@ -160,9 +160,10 @@ impl ExecutionCoordinator {
         } else {
             "execution-liveness reconcile: worker pane gone"
         };
-        crate::execution_liveness::force_release_lease_best_effort(
-            &execution.id,
-            lease_id,
+        crate::workspace_lease_release::release_lease_after_inferred_death(
+            &self.work_db,
+            execution,
+            crate::workspace_lease_release::PaneStatus::Gone,
             self.host_adapter().force_release_lease(lease_id, Some(reason)),
         )
         .await;

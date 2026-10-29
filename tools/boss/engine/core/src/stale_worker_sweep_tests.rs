@@ -1599,7 +1599,19 @@ async fn two_hour_idle_tmux_worker_is_auto_reaped() {
         "a successful auto-reap must not also count as a stuck attention"
     );
     assert_eq!(outcome.auto_reap_aborted, 0);
-    assert_eq!(cube.force_release_calls(), vec!["lease-1"]);
+    // Teardown is proven, but this fixture has no recovery pointer or
+    // inspectable workspace. Its lease must survive the inferred-death reap.
+    assert!(cube.force_release_calls().is_empty());
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().cube_lease_id.as_deref(),
+        Some("lease-1")
+    );
+    assert!(
+        db.list_attention_items(&execution_id)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND)
+    );
 
     let exec = db.get_execution(&execution_id).unwrap();
     assert_eq!(exec.status, ExecutionStatus::Orphaned);

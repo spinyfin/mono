@@ -1564,9 +1564,10 @@ async fn execute_auto_reap(
     // 6. Lease release comes last: it is a remote RPC and must not leave an
     // await between the pane reaper's release and this guarded cleanup.
     if let Some(lease_id) = execution.cube_lease_id.as_deref() {
-        crate::execution_liveness::force_release_lease_best_effort(
-            execution_id,
-            lease_id,
+        crate::workspace_lease_release::release_lease_after_inferred_death(
+            work_db,
+            execution,
+            crate::workspace_lease_release::PaneStatus::Gone,
             cube_client.force_release_lease(lease_id, Some("stale-worker auto-reap: two-hour idle tmux worker")),
         )
         .await;

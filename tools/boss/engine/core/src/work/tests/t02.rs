@@ -59,6 +59,94 @@ fn list_in_flight_executions_filters_by_status_and_lease() {
     let _ = std::fs::remove_file(path);
 }
 
+#[test]
+fn list_terminal_executions_holding_lease_filters_terminal_with_lease() {
+    let path = temp_db_path("list-terminal-lease");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+
+    let chore_a = create_test_chore(&db, product.id.clone(), "Done with leftover lease");
+    let leftover = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_a.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Completed)
+                .cube_lease_id("lease-left")
+                .cube_workspace_id("ws-left")
+                .workspace_path("/tmp/ws-left")
+                .build(),
+        )
+        .unwrap();
+
+    let chore_b = create_test_chore(&db, product.id.clone(), "Still running");
+    let running = create_ready_chore_execution(&db, chore_b.id.clone());
+    db.start_execution_run(&running.id, "worker-1", "mono", "lease-run", "ws-run", "/tmp/ws-run")
+        .unwrap();
+
+    let chore_c = create_test_chore(&db, product.id.clone(), "Done and released");
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(chore_c.id.clone())
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::Completed)
+            .build(),
+    )
+    .unwrap();
+
+    let held = db.list_terminal_executions_holding_lease().unwrap();
+    let ids: Vec<&str> = held.iter().map(|e| e.id.as_str()).collect();
+    assert_eq!(ids, vec![leftover.id.as_str()]);
+    assert_eq!(held[0].cube_lease_id.as_deref(), Some("lease-left"));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn record_pre_start_failure_keeps_a_recorded_lease() {
+    let path = temp_db_path("pre-start-keeps-lease");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "pre-start lease");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .cube_lease_id("lease-pre")
+                .cube_workspace_id("ws-pre")
+                .workspace_path("/tmp/ws-pre")
+                .build(),
+        )
+        .unwrap();
+
+    let (retry, _, outcome) = db
+        .record_pre_start_failure(
+            &execution.id,
+            "worker-1",
+            Some("mono"),
+            "positioning failed",
+            &[std::time::Duration::from_secs(1)],
+        )
+        .unwrap();
+    assert!(matches!(outcome, crate::work::PreStartFailureOutcome::Retry { .. }));
+    assert_eq!(retry.cube_lease_id.as_deref(), Some("lease-pre"));
+    assert_eq!(retry.workspace_path.as_deref(), Some("/tmp/ws-pre"));
+
+    let (failed, _, outcome) = db
+        .record_pre_start_failure(&execution.id, "worker-1", Some("mono"), "positioning failed", &[])
+        .unwrap();
+    assert!(matches!(outcome, crate::work::PreStartFailureOutcome::PermanentFail));
+    assert_eq!(failed.status, ExecutionStatus::Failed);
+    assert_eq!(failed.cube_lease_id.as_deref(), Some("lease-pre"));
+    let held = db.list_terminal_executions_holding_lease().unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].id, execution.id);
+
+    let _ = std::fs::remove_file(path);
+}
+
 /// `execution_host_id` reflects the scheduler's host selection: absent
 /// before a run has started, then the exact host stamped by
 /// `start_execution_run_on_host` — the read path `bossctl work

@@ -76,6 +76,7 @@ fn remote_pr_review_exec_fixture(
         )
         .unwrap();
 
+    crate::test_support::record_remote_test_recovery(&db, &pr_review_exec.id, host_id);
     (dir, db, chore.id, pr_review_exec.id, PR_URL.to_owned())
 }
 
@@ -108,6 +109,12 @@ crate::stub_host_adapter! { FixedCollectAdapter {
             Some(reason) => crate::host_adapter::CollectOutcome::Failed(reason.to_owned()),
             None => crate::host_adapter::CollectOutcome::NotAvailable,
         })
+    }
+    async fn probe_workspace_occupancy(&self, _: &std::path::Path) -> anyhow::Result<crate::workspace_lease_release::Occupancy> {
+        Ok(crate::workspace_lease_release::Occupancy::Empty)
+    }
+    async fn confirm_workspace_recovery(&self, record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark, workspace: &std::path::Path) -> anyhow::Result<()> {
+        crate::test_support::confirm_remote_test_recovery(record, workspace, self.host_id)
     }
 } }
 

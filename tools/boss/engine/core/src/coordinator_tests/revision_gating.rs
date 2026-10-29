@@ -1907,6 +1907,16 @@ async fn occupancy_refusal_excludes_workspace_on_retry() {
     );
     drop(calls);
 
+    assert!(
+        cube.release_calls.lock().await.is_empty(),
+        "occupied refusal must never reset the checkout"
+    );
+    assert_eq!(
+        cube.force_release_calls.lock().await.len(),
+        1,
+        "only the refused registry lease is released"
+    );
+
     // The execution must have landed on mono-agent-014, not 037.
     let execution = db.get_execution(&our_execution_id).unwrap();
     assert_eq!(

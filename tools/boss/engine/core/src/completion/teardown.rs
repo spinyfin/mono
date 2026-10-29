@@ -84,6 +84,24 @@ impl WorkerCompletionHandler {
         }
     }
 
+    pub(super) async fn recovery_adapter(
+        &self,
+        execution_id: &str,
+    ) -> Option<Arc<dyn crate::host_adapter::HostAdapter>> {
+        let host = self.work_db.execution_host_id(execution_id).ok().flatten()?;
+        if host == "local" {
+            return None;
+        }
+        let provider = self
+            .host_adapter_provider
+            .read()
+            .expect("host adapter provider lock poisoned")
+            .clone()?;
+        crate::host_adapter::resolve_host_adapter(&self.work_db, provider.as_ref(), &host)
+            .await
+            .ok()
+    }
+
     /// True when `execution_id` is not a remote run, or its remote worker
     /// process is provably gone (`kill -0` on the owning host reports no such
     /// process). A terminal status is NOT that proof: a cancelled remote
@@ -197,42 +215,114 @@ impl WorkerCompletionHandler {
 
         let cube_started = Instant::now();
         let mut cube_timed_out = false;
+        let mut lease_released = false;
         if let Some(lease_id) = lease_id {
+            let remote = match &owning_cube {
+                Ok(resolved) if !resolved.is_local() => Some(Arc::clone(&resolved.cube)),
+                _ => None,
+            };
+            let remote_host = if remote.is_some() {
+                self.recovery_adapter(execution_id).await
+            } else {
+                None
+            };
+            let pane_status = match pane_outcome {
+                PaneReleaseOutcome::Reaped => crate::workspace_lease_release::PaneStatus::Gone,
+                PaneReleaseOutcome::NoLiveWorker => crate::workspace_lease_release::PaneStatus::Present,
+            };
             let release = async {
                 match owning_cube {
-                    Ok(resolved) if resolved.is_local() => self.cube_client.release_workspace(lease_id).await,
+                    Ok(resolved) if resolved.is_local() => {
+                        self.cube_client.release_workspace_with_reset(lease_id).await
+                    }
                     Ok(resolved) => resolved.cube.force_release_lease(lease_id, Some(path)).await,
                     Err(err) => Err(err),
                 }
             };
-            match tokio::time::timeout(CUBE_RELEASE_TIMEOUT, release).await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => tracing::error!(
+            let timed = async {
+                match tokio::time::timeout(CUBE_RELEASE_TIMEOUT, release).await {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        cube_timed_out = true;
+                        Err(anyhow::anyhow!(
+                            "cube workspace release timed out after {}s",
+                            CUBE_RELEASE_TIMEOUT.as_secs()
+                        ))
+                    }
+                }
+            };
+            match self.work_db.get_execution(execution_id) {
+                Ok(execution) => {
+                    let outcome = if let Some(cube) = remote {
+                        // A remote worker cannot be stopped from here, so a
+                        // finished turn is not proof its workspace is idle:
+                        // gate on the owning host's occupancy and recovery.
+                        match remote_host {
+                            Some(host) => {
+                                crate::remote_lease_reconcile::release_remote_lease(
+                                    &self.work_db,
+                                    host.as_ref(),
+                                    execution_id,
+                                    pane_status,
+                                    |lease_id| async move {
+                                        tokio::time::timeout(
+                                            CUBE_RELEASE_TIMEOUT,
+                                            cube.force_release_lease(&lease_id, Some(path)),
+                                        )
+                                        .await
+                                        .unwrap_or_else(|_| {
+                                            Err(anyhow::anyhow!(
+                                                "cube workspace release timed out after {}s",
+                                                CUBE_RELEASE_TIMEOUT.as_secs()
+                                            ))
+                                        })
+                                    },
+                                )
+                                .await
+                            }
+                            None => crate::workspace_lease_release::LeaseReleaseOutcome::Kept {
+                                reason: crate::workspace_lease_release::KeepReason::OccupancyUnconfirmed,
+                            },
+                        }
+                    } else {
+                        crate::workspace_lease_release::apply_release(
+                            &self.work_db,
+                            &execution,
+                            lease_id,
+                            crate::workspace_lease_release::ReleaseEvidence {
+                                cause: crate::workspace_lease_release::TerminalCause::ProvenCompleted,
+                                pane: pane_status,
+                                occupancy: &crate::workspace_lease_release::EmptyOccupancy,
+                                bookmark: &crate::workspace_lease_release::DbBookmarkGate {
+                                    db: &self.work_db,
+                                    adapter: None,
+                                },
+                            },
+                            timed,
+                        )
+                        .await
+                    };
+                    lease_released = outcome == crate::workspace_lease_release::LeaseReleaseOutcome::Released;
+                    if !matches!(
+                        outcome,
+                        crate::workspace_lease_release::LeaseReleaseOutcome::Released
+                            | crate::workspace_lease_release::LeaseReleaseOutcome::NoLease
+                    ) {
+                        tracing::error!(
+                            execution_id,
+                            lease_id,
+                            outcome = ?outcome,
+                            "worker teardown: cube lease was not released",
+                        );
+                    }
+                }
+                Err(err) => tracing::error!(
                     execution_id,
                     path,
                     lease_id,
                     ?err,
-                    elapsed_ms = cube_started.elapsed().as_millis(),
-                    "worker teardown: cube workspace release failed",
+                    "worker teardown: execution lookup failed; cube release skipped",
                 ),
-                Err(_elapsed) => {
-                    cube_timed_out = true;
-                    // The lease columns were already cleared by the
-                    // terminalizing write, so nothing downstream will retry
-                    // this release. Cube's own lease TTL reclaims it once the
-                    // engine's heartbeat stops (it stops the moment the
-                    // execution goes terminal), so the workspace is not lost
-                    // — but the operator should see that it took the slow
-                    // path.
-                    tracing::error!(
-                        execution_id,
-                        path,
-                        lease_id,
-                        timeout_secs = CUBE_RELEASE_TIMEOUT.as_secs(),
-                        "worker teardown: cube workspace release timed out and was abandoned; \
-                         the lease is left to cube's TTL reclaim",
-                    );
-                }
             }
         }
         let cube_ms = cube_started.elapsed().as_millis();
@@ -263,7 +353,7 @@ impl WorkerCompletionHandler {
                     .with_details(serde_json::json!({
                         "path": path,
                         "pane_outcome": format!("{pane_outcome:?}"),
-                        "released_lease": lease_id.is_some(),
+                        "released_lease": lease_released,
                         "cube_timed_out": cube_timed_out,
                         "release_pane_ms": pane_ms,
                         "driver_teardown_ms": driver_ms,

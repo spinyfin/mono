@@ -1278,6 +1278,10 @@ impl ExecutionCoordinator {
             }
         };
 
+        // Record the lease before any fallible work so a later cube-release
+        // failure still leaves columns the leftover-lease sweep can retry.
+        self.persist_acquired_lease(execution, &lease);
+
         // The answer-agent run is already bound to this execution before it
         // can reach the dispatcher. Stamp the lease immediately so comment
         // inspection has the same workspace pivot as dispatch diagnostics.
@@ -1366,14 +1370,15 @@ impl ExecutionCoordinator {
                     .or_default()
                     .push(lease.workspace_id.clone());
 
-                // Hand the workspace straight back so it isn't stranded.
-                if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
-                    tracing::error!(
-                        ?release_err,
-                        lease_id = %lease.lease_id,
-                        "failed to release workspace after refusing an occupied lease",
-                    );
-                }
+                // Drop only the refused registry lease, never reset the live
+                // occupant's checkout. This execution has not positioned it.
+                crate::workspace_lease_release::release_refused_workspace(
+                    &self.work_db,
+                    execution,
+                    &lease.lease_id,
+                    adapter.as_ref(),
+                )
+                .await;
                 let err = anyhow!(
                     "leased workspace {} is occupied by live worker {}",
                     lease.workspace_id,
@@ -1451,13 +1456,13 @@ impl ExecutionCoordinator {
                 // so the row returns to `ready` (the deferral path) and
                 // `recover_failed_dispatch` does not count this serialization
                 // as a spawn failure.
-                if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
-                    tracing::error!(
-                        ?release_err,
-                        lease_id = %lease.lease_id,
-                        "failed to release workspace after refusing a chain-sibling-racing spawn",
-                    );
-                }
+                self.release_pre_start_workspace(
+                    execution,
+                    &lease,
+                    &adapter,
+                    crate::workspace_lease_release::PreStartStage::BeforeRecoveryBookmark,
+                )
+                .await;
                 if let Err(err) = self.work_db.release_dispatch_claim(&execution.id) {
                     tracing::error!(
                         execution_id = %execution.id,
@@ -1540,9 +1545,13 @@ impl ExecutionCoordinator {
         {
             Ok(recovered) => recovered,
             Err(err) => {
-                if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
-                    tracing::error!(?release_err, "failed to release lease after bookmark recovery failure");
-                }
+                self.release_pre_start_workspace(
+                    execution,
+                    &lease,
+                    &adapter,
+                    crate::workspace_lease_release::PreStartStage::BeforeRecoveryBookmark,
+                )
+                .await;
                 let pointer_damaged =
                     crate::execution_bookmark_recovery::block_unrecoverable(&self.work_db, execution, &err)?;
                 let attention = if pointer_damaged {
@@ -1700,13 +1709,13 @@ impl ExecutionCoordinator {
                             );
                         }
                     } else {
-                        if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
-                            tracing::error!(
-                                ?release_err,
-                                lease_id = %lease.lease_id,
-                                "failed to release workspace after goto positioning failure"
-                            );
-                        }
+                        self.release_pre_start_workspace(
+                            execution,
+                            &lease,
+                            &adapter,
+                            crate::workspace_lease_release::PreStartStage::BeforeRecoveryBookmark,
+                        )
+                        .await;
                         let failure_label = match target {
                             GotoTarget::Pr(_) => "Cube `workspace goto` positioning failed",
                             GotoTarget::Revision(_) => "Cube `workspace goto --revision` positioning failed",
@@ -1771,13 +1780,13 @@ impl ExecutionCoordinator {
                     Some(change)
                 }
                 Err(err) => {
-                    if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
-                        tracing::error!(
-                            ?release_err,
-                            lease_id = %lease.lease_id,
-                            "failed to release workspace after change creation failure"
-                        );
-                    }
+                    self.release_pre_start_workspace(
+                        execution,
+                        &lease,
+                        &adapter,
+                        crate::workspace_lease_release::PreStartStage::BeforeRecoveryBookmark,
+                    )
+                    .await;
                     self.dispatch_events
                         .emit(
                             DispatchEvent::new(Stage::CubeChangeCreated, DispatchOutcome::Error, &execution.id)
@@ -1841,9 +1850,14 @@ impl ExecutionCoordinator {
         }
         .await;
         if let Err(err) = bookmark_result {
-            if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
-                tracing::error!(?release_err, "failed to release lease after bookmark creation failure");
-            }
+            crate::execution_bookmark_recovery::report_failure(&self.work_db, execution, &format!("{err:#}"));
+            self.release_pre_start_workspace(
+                execution,
+                &lease,
+                &adapter,
+                crate::workspace_lease_release::PreStartStage::AtOrAfterRecoveryBookmark,
+            )
+            .await;
             self.record_start_failure(
                 Arc::clone(self),
                 execution,
@@ -1857,6 +1871,20 @@ impl ExecutionCoordinator {
             )
             .await?;
             return Err(err);
+        }
+        // This attempt wrote its own bookmark in a freshly leased workspace.
+        // Creation or backup failures filed by an earlier attempt describe a
+        // lease that is no longer this execution's (a retained one was
+        // released or detached before this lease), and would otherwise keep
+        // this lease held at completion. Failures raised from here on belong
+        // to this lease and stay open for the release gate.
+        for kind in [
+            crate::execution_bookmark_recovery::CREATE_FAILED,
+            crate::execution_bookmark_recovery::RECOVERY_FAILED,
+        ] {
+            if let Err(err) = self.work_db.resolve_attention_kind_for_execution(&execution.id, kind) {
+                tracing::warn!(execution_id = %execution.id, kind, ?err, "could not resolve superseded bookmark failure");
+            }
         }
 
         let tmux_hosted = selected_host.id == "local";
@@ -1973,14 +2001,13 @@ impl ExecutionCoordinator {
                 Ok(())
             }
             Err(err) => {
-                let release_result = adapter.release_workspace(&lease.lease_id).await;
-                if let Err(release_err) = release_result {
-                    tracing::error!(
-                        ?release_err,
-                        lease_id = %lease.lease_id,
-                        "failed to release workspace after run start failure"
-                    );
-                }
+                self.release_pre_start_workspace(
+                    execution,
+                    &lease,
+                    &adapter,
+                    crate::workspace_lease_release::PreStartStage::AtOrAfterRecoveryBookmark,
+                )
+                .await;
                 self.dispatch_events
                     .emit(
                         DispatchEvent::new(Stage::RunStarted, DispatchOutcome::Error, &execution.id)
@@ -2103,6 +2130,61 @@ impl ExecutionCoordinator {
         task: &str,
         adapter: &Arc<dyn HostAdapter>,
     ) -> Result<CubeWorkspaceLease> {
+        // A previous pre-start attempt may still hold a lease (cube release
+        // failed, or its recovery bookmark could not be confirmed). Try to
+        // free it. If the gates keep it, detach it from this execution so it
+        // does not block every retry: the workspace stays leased in cube, its
+        // unreleased-lease attention is already filed, and cube's TTL is the
+        // backstop. Recovery follows the shared-store bookmarks, not the
+        // detached checkout. If only cube's own call failed, the lease stays
+        // recorded and this attempt fails so the sweep and the next retry
+        // keep trying to return it. A lease retained after a bookmark
+        // failure keeps its bookmark gate (see `never_positioned`).
+        if let Some(existing_lease) = execution.cube_lease_id.as_deref() {
+            let outcome = crate::workspace_lease_release::release_lease_after_proven_never_started(
+                &self.work_db,
+                execution,
+                existing_lease,
+                adapter.as_ref(),
+                crate::workspace_lease_release::PreStartStage::BeforeRecoveryBookmark,
+            )
+            .await;
+            match outcome {
+                crate::workspace_lease_release::LeaseReleaseOutcome::Released
+                | crate::workspace_lease_release::LeaseReleaseOutcome::NoLease => {}
+                // Every gate passed and cube itself failed. The lease stays
+                // recorded on this execution so the leftover-lease sweep keeps
+                // retrying it; leasing a fresh workspace would overwrite it.
+                crate::workspace_lease_release::LeaseReleaseOutcome::CubeFailed { error } => {
+                    return Err(anyhow!(
+                        "previous cube workspace lease {existing_lease} could not be released yet: {error}"
+                    ));
+                }
+                crate::workspace_lease_release::LeaseReleaseOutcome::Kept { .. } => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        lease_id = existing_lease,
+                        ?outcome,
+                        "previous pre-start lease kept by its release gates; detaching it and leasing a fresh workspace",
+                    );
+                    match self
+                        .work_db
+                        .claim_execution_workspace_release(&execution.id, existing_lease)
+                    {
+                        Ok(_) => {
+                            if let Err(err) = self.work_db.finish_execution_workspace_release(execution) {
+                                tracing::error!(execution_id = %execution.id, ?err, "failed to detach kept lease metadata");
+                            }
+                        }
+                        Err(err) => {
+                            return Err(anyhow!(
+                                "previous cube workspace lease {existing_lease} is still held and could not be detached: {err:#}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         // Lease clean scratch space. Recovery follows the engine-created
         // reference in the shared store, never the old workspace's identity.
         let prefer: Option<&str> = None;
@@ -2347,6 +2429,39 @@ impl ExecutionCoordinator {
                     .with_details(details),
             )
             .await;
+    }
+
+    fn persist_acquired_lease(&self, execution: &WorkExecution, lease: &CubeWorkspaceLease) {
+        if let Err(err) = self.work_db.restore_execution_workspace(
+            &execution.id,
+            &lease.lease_id,
+            Some(lease.workspace_id.as_str()),
+            Some(&lease.workspace_path.display().to_string()),
+        ) {
+            tracing::error!(
+                execution_id = %execution.id,
+                lease_id = %lease.lease_id,
+                error = %format!("{err:#}"),
+                "failed to persist cube lease after acquire",
+            );
+        }
+    }
+
+    async fn release_pre_start_workspace(
+        &self,
+        execution: &WorkExecution,
+        lease: &CubeWorkspaceLease,
+        adapter: &Arc<dyn HostAdapter>,
+        stage: crate::workspace_lease_release::PreStartStage,
+    ) {
+        crate::workspace_lease_release::release_lease_after_proven_never_started(
+            &self.work_db,
+            execution,
+            &lease.lease_id,
+            adapter.as_ref(),
+            stage,
+        )
+        .await;
     }
 
     /// Record a pre-start failure and either schedule an automatic retry

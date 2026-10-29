@@ -704,11 +704,15 @@ async fn reap_dead_execution(
     // but THIS reap's redispatch path is the plain orphan-active sweep, which
     // creates an entirely fresh execution with no memory of the old lease — so
     // release here or the workspace stays leased to a terminal row forever.
-    if let Some(lease_id) = execution.cube_lease_id.as_deref() {
-        crate::execution_liveness::force_release_lease_best_effort(
-            execution_id,
-            lease_id,
-            cube_client.force_release_lease(lease_id, Some("dead-pid reconcile: worker process gone")),
+    if execution.cube_lease_id.is_some() {
+        crate::workspace_lease_release::release_lease_after_inferred_death(
+            work_db,
+            execution,
+            crate::workspace_lease_release::PaneStatus::Gone,
+            cube_client.force_release_lease(
+                execution.cube_lease_id.as_deref().expect("lease checked"),
+                Some("dead-pid reconcile: worker process gone"),
+            ),
         )
         .await;
     }

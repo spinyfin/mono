@@ -728,7 +728,7 @@ async fn lease_fallback_failure_transitions_execution_to_failed() {
 }
 
 #[tokio::test]
-async fn change_creation_failure_marks_execution_failed_and_releases_workspace() {
+async fn change_creation_failure_releases_workspace_before_any_recovery_bookmark() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let product = create_test_product(&db);
@@ -739,8 +739,7 @@ async fn change_creation_failure_marks_execution_failed_and_releases_workspace()
         fail_create: true,
         ..FakeCubeClient::default()
     });
-    // No retries: go straight to permanent failure to keep the
-    // release_calls assertion (exactly "lease-1") unambiguous.
+    // No retries: inspect the failed attempt and its retained lease.
     let coordinator = Arc::new(
         ExecutionCoordinator::new(
             db.clone(),
@@ -763,7 +762,14 @@ async fn change_creation_failure_marks_execution_failed_and_releases_workspace()
     let run = db.list_runs(&execution.id).unwrap().pop().unwrap();
     assert_eq!(run.status, "failed");
     assert_eq!(run.error_text.as_deref(), Some("cube change create failed"));
-    assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+    assert!(!cube.release_calls.lock().await.is_empty());
+    assert_eq!(execution.cube_lease_id.as_deref(), None);
+    assert!(
+        !db.list_attention_items(&execution.id)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND)
+    );
     assert_eq!(coordinator.worker_pool().idle_count().await, 1);
 }
 
@@ -783,7 +789,7 @@ async fn cancelled_during_spawn_releases_lease_and_skips_completion() {
     let chore = create_test_chore(&db, product.id.clone(), "Sort struct definitions");
     db.reconcile_product_executions(&product.id).unwrap();
 
-    let cube = Arc::new(FakeCubeClient::default());
+    let cube = Arc::new(FakeCubeClient::default().with_real_workspace(dir.path()));
     let runner = Arc::new(FakeExecutionRunner {
         cancelled_during_spawn: true,
         work_db: Some(db.clone()),
@@ -799,6 +805,14 @@ async fn cancelled_during_spawn_releases_lease_and_skips_completion() {
     // The runner cancels the row inside the spawn; wait for that
     // terminal status to settle.
     wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Cancelled).await;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while db.get_execution(&execution_id).unwrap().cube_lease_id.is_some() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("confirmed mid-spawn teardown must release the lease");
 
     let execution = db.get_execution(&execution_id).unwrap();
     assert_eq!(

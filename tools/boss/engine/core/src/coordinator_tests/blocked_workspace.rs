@@ -1161,3 +1161,54 @@ async fn pr_review_self_retry_with_a_record_still_positions_via_goto() {
     h.dispatch().await.unwrap();
     assert_eq!(h.cube.goto_calls.lock().await.len(), 1, "must run cube workspace goto");
 }
+
+/// A pre-start lease whose release gates keep it (unconfirmed recovery
+/// pointers) must not wedge every later dispatch of the same execution: it is
+/// detached and a fresh workspace is leased.
+#[tokio::test]
+async fn kept_pre_start_lease_does_not_block_redispatch() {
+    let dir = tempdir().unwrap();
+    let (db, _prior, next) = blocked_pair(&dir.path().join("boss.db"));
+    db.restore_execution_workspace(
+        &next.id,
+        "kept-lease",
+        Some("workspace-kept"),
+        Some("/tmp/workspace-kept-gone"),
+    )
+    .unwrap();
+    db.record_execution_bookmark(&boss_engine_recovery::execution_bookmark::ExecutionBookmark {
+        execution_id: next.id.clone(),
+        repo_path: PathBuf::from("/tmp/boss-no-such-repo"),
+        host_id: "local".to_owned(),
+        base_commit: None,
+    })
+    .unwrap();
+    let cube = Arc::new(FakeCubeClient::default());
+    *cube.list_workspaces_response.lock().await = vec![
+        CubeWorkspaceStatus::builder()
+            .workspace_id("workspace-kept")
+            .workspace_path(PathBuf::from("/tmp/workspace-kept-gone"))
+            .state("leased")
+            .lease_id("kept-lease")
+            .build(),
+    ];
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        cube.clone(),
+        Arc::new(FakeExecutionRunner::default()),
+    ));
+    let repo = CubeRepoHandle { repo_id: "mono".into() };
+    let next = db.get_execution(&next.id).unwrap();
+    let lease = coordinator
+        .lease_workspace_with_fallback(&next, "worker", &repo, "task", &coordinator.host_adapter)
+        .await
+        .expect("a kept lease must not block leasing a fresh workspace");
+    assert_ne!(lease.lease_id, "kept-lease");
+    assert!(
+        cube.release_calls.lock().await.is_empty(),
+        "the kept lease is not released"
+    );
+    let after = db.get_execution(&next.id).unwrap();
+    assert_ne!(after.cube_lease_id.as_deref(), Some("kept-lease"));
+}

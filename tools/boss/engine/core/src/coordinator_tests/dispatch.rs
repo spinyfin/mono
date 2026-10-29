@@ -94,7 +94,7 @@ async fn record_run_completion_tears_down_driver_workspace_on_terminal_outcome()
     let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
     db.reconcile_product_executions(&product.id).unwrap();
 
-    let cube = Arc::new(FakeCubeClient::default());
+    let cube = Arc::new(FakeCubeClient::default().with_real_workspace(dir.path()));
     let runner = Arc::new(FakeExecutionRunner {
         wait_state: Some(RunWaitState::Terminal),
         ..FakeExecutionRunner::default()

@@ -116,7 +116,7 @@ async fn pane_spawn_failure_raises_attention_item_and_dispatch_event() {
     let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
     db.reconcile_product_executions(&product.id).unwrap();
 
-    let cube = Arc::new(FakeCubeClient::default());
+    let cube = Arc::new(FakeCubeClient::default().with_real_workspace(dir.path()));
     let runner = Arc::new(FakeExecutionRunner {
         fail: true,
         ..FakeExecutionRunner::default()
@@ -260,7 +260,7 @@ async fn missing_turn_start_evidence_persists_pane_spawn_failed_status_and_reaso
         run_id: "exec-silent-turn".to_owned(),
         timeout_secs: 45,
     };
-    let cube = Arc::new(FakeCubeClient::default());
+    let cube = Arc::new(FakeCubeClient::default().with_real_workspace(dir.path()));
     let runner = Arc::new(FakeExecutionRunner {
         fail: true,
         fail_source: Some(fail_source),
@@ -327,7 +327,7 @@ async fn composer_never_ready_persists_pane_spawn_failed_without_claiming_the_dr
         run_id: "exec-missing-composer".to_owned(),
         timeout_secs: 20,
     };
-    let cube = Arc::new(FakeCubeClient::default());
+    let cube = Arc::new(FakeCubeClient::default().with_real_workspace(dir.path()));
     let runner = Arc::new(FakeExecutionRunner {
         fail: true,
         fail_source: Some(fail_source),
@@ -383,7 +383,8 @@ async fn wait_for_dispatch_event(
     predicate: impl Fn(&crate::dispatch_events::DispatchEvent) -> bool,
     what: &str,
 ) -> crate::dispatch_events::DispatchEvent {
-    for _ in 0..200 {
+    // Real recovery setup precedes spawn; allow its jj subprocesses to finish.
+    for _ in 0..3000 {
         let events = recording.events_for(execution_id).await;
         if let Some(found) = events.iter().find(|event| predicate(event)) {
             return found.clone();
@@ -400,7 +401,8 @@ async fn wait_for_dispatch_event(
 /// records the call before parking on its gate, so this returning means the
 /// release is in flight and being held open.
 async fn wait_for_release_entered(cube: &FakeCubeClient, lease_id: &str) {
-    for _ in 0..200 {
+    // Release now verifies the recovery pointers through real jj.
+    for _ in 0..3000 {
         if cube.release_calls.lock().await.iter().any(|id| id == lease_id) {
             return;
         }
@@ -445,10 +447,13 @@ async fn spawn_abort_is_reported_before_the_cube_release_completes() {
     db.reconcile_product_executions(&product.id).unwrap();
 
     let gate = Arc::new(tokio::sync::Notify::new());
-    let cube = Arc::new(FakeCubeClient {
-        release_gate: Some(gate.clone()),
-        ..FakeCubeClient::default()
-    });
+    let cube = Arc::new(
+        FakeCubeClient {
+            release_gate: Some(gate.clone()),
+            ..FakeCubeClient::default()
+        }
+        .with_real_workspace(dir.path()),
+    );
     let runner = Arc::new(FakeExecutionRunner {
         fail: true,
         ..FakeExecutionRunner::default()
@@ -545,10 +550,13 @@ async fn spawn_abort_survives_a_cancel_landing_during_the_cube_release() {
     db.reconcile_product_executions(&product.id).unwrap();
 
     let gate = Arc::new(tokio::sync::Notify::new());
-    let cube = Arc::new(FakeCubeClient {
-        release_gate: Some(gate.clone()),
-        ..FakeCubeClient::default()
-    });
+    let cube = Arc::new(
+        FakeCubeClient {
+            release_gate: Some(gate.clone()),
+            ..FakeCubeClient::default()
+        }
+        .with_real_workspace(dir.path()),
+    );
     let runner = Arc::new(FakeExecutionRunner {
         fail: true,
         ..FakeExecutionRunner::default()

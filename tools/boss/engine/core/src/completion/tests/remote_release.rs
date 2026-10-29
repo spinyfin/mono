@@ -5,6 +5,8 @@ struct RemoteReleaseAdapter {
     fail: bool,
     /// Verdict of the remote pid probe: `true` models a still-running process.
     alive: bool,
+    /// Verdict of the owning-host workspace occupancy probe.
+    occupancy: crate::workspace_lease_release::Occupancy,
 }
 
 crate::stub_host_adapter! { RemoteReleaseAdapter {
@@ -16,6 +18,12 @@ crate::stub_host_adapter! { RemoteReleaseAdapter {
     }
     async fn probe_remote_worker_alive(&self, _remote_pid: i64) -> Result<Option<bool>> {
         Ok(Some(self.alive))
+    }
+    async fn probe_workspace_occupancy(&self, _: &std::path::Path) -> Result<crate::workspace_lease_release::Occupancy> {
+        Ok(self.occupancy)
+    }
+    async fn confirm_workspace_recovery(&self, record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark, workspace: &std::path::Path) -> anyhow::Result<()> {
+        crate::test_support::confirm_remote_test_recovery(record, workspace, "remote")
     }
 } }
 
@@ -45,6 +53,7 @@ fn remote_fixture() -> (TempDir, Arc<WorkDb>, String) {
         "remote",
     )
     .unwrap();
+    crate::test_support::record_remote_test_recovery(&db, &execution.id, "remote");
     db.set_run_remote_pid_for_execution(&execution.id, 4242).unwrap();
     db.cancel_running_execution(&execution.id).unwrap();
     (dir, db, execution.id)
@@ -59,6 +68,7 @@ async fn cancelled_remote_release_uses_owning_host_and_is_idempotent() {
         calls: Default::default(),
         fail: false,
         alive: false,
+        occupancy: crate::workspace_lease_release::Occupancy::Empty,
     });
     handler.set_host_adapter_provider(Arc::new(Provider(adapter.clone())));
     assert!(matches!(
@@ -83,6 +93,7 @@ async fn failed_remote_release_retains_lease_for_retry() {
         calls: Default::default(),
         fail: true,
         alive: false,
+        occupancy: crate::workspace_lease_release::Occupancy::Empty,
     });
     handler.set_host_adapter_provider(Arc::new(Provider(adapter)));
     assert!(matches!(
@@ -104,14 +115,15 @@ async fn completion_teardown_releases_on_remote_host() {
         calls: Default::default(),
         fail: false,
         alive: false,
+        occupancy: crate::workspace_lease_release::Occupancy::Empty,
     });
     handler.set_host_adapter_provider(Arc::new(Provider(adapter.clone())));
-    let cleared = db.clear_execution_workspace(&id).unwrap().unwrap();
+    let lease = db.get_execution(&id).unwrap().cube_lease_id.unwrap();
     handler
         .finish_worker_teardown(
             &id,
             "work",
-            Some(&cleared.lease_id),
+            Some(&lease),
             Some(Path::new("/remote/workspace")),
             "test",
             handler.begin_teardown(&id),
@@ -145,6 +157,7 @@ async fn cancelling_a_running_remote_worker_holds_its_lease() {
         calls: Default::default(),
         fail: false,
         alive: true,
+        occupancy: crate::workspace_lease_release::Occupancy::Empty,
     });
     handler.set_host_adapter_provider(Arc::new(Provider(adapter.clone())));
     assert!(matches!(
@@ -167,4 +180,69 @@ async fn cancelling_a_running_remote_worker_holds_its_lease() {
         )
         .unwrap();
     assert!(held);
+}
+
+fn dead_pid_adapter(occupancy: crate::workspace_lease_release::Occupancy) -> Arc<RemoteReleaseAdapter> {
+    Arc::new(RemoteReleaseAdapter {
+        calls: Default::default(),
+        fail: false,
+        alive: false,
+        occupancy,
+    })
+}
+
+/// The recorded wrapper pid is gone, but a child may still hold the workspace
+/// (or the probe could not tell): neither path may hand the checkout back.
+#[tokio::test]
+async fn dead_recorded_pid_with_occupied_or_unknown_workspace_holds_force_release() {
+    use crate::workspace_lease_release::Occupancy;
+    for occupancy in [Occupancy::Occupied, Occupancy::Unknown] {
+        let (_dir, db, id) = remote_fixture();
+        let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+        let adapter = dead_pid_adapter(occupancy);
+        handler.set_host_adapter_provider(Arc::new(Provider(adapter.clone())));
+        assert!(
+            matches!(
+                handler.force_release(&id).await,
+                ForceReleaseOutcome::HeldForRemoteWorker
+            ),
+            "{occupancy:?}"
+        );
+        assert!(adapter.calls.lock().unwrap().is_empty(), "{occupancy:?}");
+        assert!(cube.release_calls.lock().await.is_empty());
+        assert_eq!(
+            db.get_execution(&id).unwrap().cube_lease_id.as_deref(),
+            Some("remote-lease"),
+            "{occupancy:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn completion_teardown_holds_a_remote_lease_while_the_workspace_is_occupied() {
+    use crate::workspace_lease_release::Occupancy;
+    for occupancy in [Occupancy::Occupied, Occupancy::Unknown] {
+        let (_dir, db, id) = remote_fixture();
+        let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+        let adapter = dead_pid_adapter(occupancy);
+        handler.set_host_adapter_provider(Arc::new(Provider(adapter.clone())));
+        let lease = db.get_execution(&id).unwrap().cube_lease_id.unwrap();
+        handler
+            .finish_worker_teardown(
+                &id,
+                "work",
+                Some(&lease),
+                Some(Path::new("/remote/workspace")),
+                "test",
+                handler.begin_teardown(&id),
+            )
+            .await;
+        assert!(adapter.calls.lock().unwrap().is_empty(), "{occupancy:?}");
+        assert!(cube.release_calls.lock().await.is_empty());
+        assert_eq!(
+            db.get_execution(&id).unwrap().cube_lease_id.as_deref(),
+            Some("remote-lease"),
+            "{occupancy:?}"
+        );
+    }
 }

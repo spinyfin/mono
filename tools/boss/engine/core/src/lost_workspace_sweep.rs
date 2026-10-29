@@ -334,7 +334,7 @@ async fn reconcile_if_execution_dead_at(
                 "lost-workspace reconcile: finalized execution whose workspace directory is gone",
             );
             release_reconciled_persona(work_db, execution);
-            maybe_force_release_reconciled_lease(execution, cube_client).await;
+            maybe_force_release_reconciled_lease(work_db, execution, cube_client).await;
         }
 
         return reconciled;
@@ -432,7 +432,7 @@ async fn reconcile_if_execution_dead_at(
             "execution-liveness reconcile: finalized execution whose worker pane never attached",
         );
         release_reconciled_persona(work_db, execution);
-        maybe_force_release_reconciled_lease(execution, cube_client).await;
+        maybe_force_release_reconciled_lease(work_db, execution, cube_client).await;
     }
 
     reconciled
@@ -457,20 +457,25 @@ fn release_reconciled_persona(work_db: &WorkDb, execution: &WorkExecution) {
     }
 }
 
-/// Best-effort cube lease release after a successful lost-workspace /
+/// Gated cube lease release after a successful lost-workspace /
 /// never-attached reconcile. The workspace is gone or the pane never came
-/// up, so there is no live writer to protect — unlike the pane-pid path,
-/// which gates on the live registry.
-async fn maybe_force_release_reconciled_lease(execution: &WorkExecution, cube_client: Option<&dyn CubeClient>) {
+/// up; occupancy and the recovery bookmark still have to pass before the
+/// lease is actually dropped.
+async fn maybe_force_release_reconciled_lease(
+    work_db: &WorkDb,
+    execution: &WorkExecution,
+    cube_client: Option<&dyn CubeClient>,
+) {
     let Some(cube) = cube_client else {
         return;
     };
     let Some(lease_id) = execution.cube_lease_id.as_deref() else {
         return;
     };
-    crate::execution_liveness::force_release_lease_best_effort(
-        &execution.id,
-        lease_id,
+    crate::workspace_lease_release::release_lease_after_inferred_death(
+        work_db,
+        execution,
+        crate::workspace_lease_release::PaneStatus::Gone,
         cube.force_release_lease(lease_id, Some("execution-liveness reconcile: worker pane gone")),
     )
     .await;
@@ -601,6 +606,46 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn workspace_gone_reconcile_releases_the_lease_without_attention() {
+        struct RecordingCube(std::sync::Mutex<Vec<String>>);
+        crate::stub_cube_client! { RecordingCube {
+            async fn force_release_lease(&self, lease_id: &str, _: Option<&str>) -> anyhow::Result<()> {
+                self.0.lock().unwrap().push(lease_id.to_owned());
+                Ok(())
+            }
+        } }
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let exec = parked_triage_execution(&db, &automation, "/nonexistent/old-root/mono-agent-030", "local");
+        seed_dispatch_run(&db, &automation, &exec.id, 1_700_000_000);
+        // The recovery pointers live in the shared store, which outlives the workspace.
+        let store = TempDir::new().unwrap();
+        let repo = boss_engine_test_git::jj::JjRepo::new(store.path());
+        let record = boss_engine_recovery::execution_bookmark::create(
+            &boss_engine_recovery::execution_bookmark::LocalJj,
+            &repo.worker,
+            &exec.id,
+            "local",
+        )
+        .await
+        .unwrap();
+        db.record_execution_bookmark(&record).unwrap();
+        let cube = RecordingCube(Default::default());
+
+        assert!(reconcile_if_execution_dead(&db, &NoopDispatchEventSink, &exec, Some(&cube)).await);
+
+        assert_eq!(*cube.0.lock().unwrap(), vec!["lease-1".to_owned()]);
+        assert_eq!(db.get_execution(&exec.id).unwrap().cube_lease_id, None);
+        assert!(
+            db.list_attention_items(&exec.id)
+                .unwrap()
+                .iter()
+                .all(|item| item.kind != crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND)
+        );
     }
 
     #[tokio::test]
