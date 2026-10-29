@@ -232,8 +232,28 @@ fn legacy_backfill_recovers_current_evidence_and_keeps_unknown_failures_visible(
             crate::work::pr_flow::insert_question(&db.connect().unwrap(), &execution, "proposal", &q).unwrap();
             db.record_worker_awaiting_operator_answer(&execution, "needs decision", &q)
                 .unwrap();
-            db.answer_operator_question(&id, boss_protocol::OperatorAnswer::YesNo { value: false })
+            // Historical shape: a declined answer used to park as worker_failed.
+            {
+                let conn = db.connect().unwrap();
+                conn.execute(
+                    "UPDATE operator_questions SET status = 'answered', answered_by = 'human',
+                 answer_json = '{\"kind\":\"yes_no\",\"value\":false}', answered_at = '200'
+                 WHERE execution_id = ?1",
+                    [&execution],
+                )
                 .unwrap();
+                conn.execute(
+                    "UPDATE tasks SET blocked_reason = 'worker_failed', blocked_detail = 'Operator declined'
+                 WHERE id = ?1",
+                    [&id],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE work_executions SET status = 'failed', finished_at = '200' WHERE id = ?1",
+                    [&execution],
+                )
+                .unwrap();
+            }
         } else {
             db.record_worker_failure(&execution, "Operator declined (untrusted prose)")
                 .unwrap();
@@ -302,8 +322,28 @@ fn legacy_backfill_does_not_reuse_an_older_execution_refusal() {
     crate::work::pr_flow::insert_question(&db.connect().unwrap(), &execution, "proposal", &q).unwrap();
     db.record_worker_awaiting_operator_answer(&execution, "decision", &q)
         .unwrap();
-    db.answer_operator_question(&id, boss_protocol::OperatorAnswer::YesNo { value: false })
+    // Historical shape: a declined answer used to park as worker_failed.
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE operator_questions SET status = 'answered', answered_by = 'human',
+         answer_json = '{\"kind\":\"yes_no\",\"value\":false}', answered_at = '200'
+         WHERE execution_id = ?1",
+            [&execution],
+        )
         .unwrap();
+        conn.execute(
+            "UPDATE tasks SET blocked_reason = 'worker_failed', blocked_detail = 'Operator declined'
+         WHERE id = ?1",
+            [&id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE work_executions SET status = 'failed', finished_at = '200' WHERE id = ?1",
+            [&execution],
+        )
+        .unwrap();
+    }
     let later = db
         .create_execution(
             CreateExecutionInput::builder()

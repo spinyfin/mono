@@ -713,11 +713,12 @@ pub struct OperatorQuestion {
 /// Yes still creates `name`. No authorizes a `change/file-count` exception for
 /// this PR only, bound to [`Self::files`], and redispatches so the next worker
 /// finishes in one PR. Absent on ordinary prerequisite questions, whose No
-/// still parks the task.
+/// records the declined path and redispatches with no authorization.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FileCountBypassSpec {
-    /// Non-deleted files the worker would land in one PR.
+    /// Projected upper-bound non-deleted file count of the single-PR change.
+    /// The bypass binds to this number.
     pub files: u32,
     /// The repository `change/file-count` `max_files` limit.
     pub limit: u32,
@@ -755,7 +756,7 @@ pub enum OperatorAnswerType {
     /// question's `explanation`.
     ///
     /// When `file_count_bypass` is set, No authorizes a file-count exception
-    /// for this PR instead of parking.
+    /// for this PR instead of taking the ordinary declined path.
     CreatePrerequisiteTask {
         name: String,
         brief: String,
@@ -848,7 +849,8 @@ impl OperatorAnswerType {
     }
 
     /// The question wording for a split-vs-file-count-bypass proposal. States
-    /// the current file count, the repository limit, and the first PR's name.
+    /// the projected upper-bound file count, the repository limit, and the
+    /// first PR's name.
     pub fn file_count_split_question_text(name: &str, spec: FileCountBypassSpec) -> String {
         format!(
             "Split this {}-file change (limit {}) by landing '{name}' first, or keep it in one PR?",
@@ -1016,6 +1018,11 @@ mod tests {
             })
         );
         assert_eq!(serde_json::from_value::<OperatorAnswerType>(json).unwrap(), split);
+        assert_eq!(
+            split.file_count_bypass(),
+            Some(super::FileCountBypassSpec { files: 48, limit: 30 })
+        );
+        assert_eq!(prerequisite.file_count_bypass(), None);
         assert!(
             serde_json::from_value::<OperatorAnswerType>(
                 serde_json::json!({"kind": "create_prerequisite_task", "name": "x"})

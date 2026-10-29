@@ -450,9 +450,11 @@ pub(crate) struct RunDoneArgs {
     )]
     prerequisite_brief: Option<String>,
 
-    /// Current non-deleted file count of this change. With `--file-count-limit`,
-    /// this is a split-vs-bypass question: Yes creates the prerequisite; No
-    /// authorizes a `change/file-count` exception for this PR only.
+    /// Projected upper-bound non-deleted file count of the single-PR change.
+    /// With `--file-count-limit`, this is a split-vs-bypass question: Yes
+    /// creates the prerequisite; No authorizes a `change/file-count` exception
+    /// for this PR only, bound to this number. Ask again if the finished
+    /// change exceeds the approved bound.
     #[arg(long, requires_all = ["answer_type", "file_count_limit"])]
     file_count: Option<u32>,
 

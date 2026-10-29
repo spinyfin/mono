@@ -43,26 +43,71 @@ const REMAIN_BLOCKED_PHRASES: &[&str] = &[
     "leave the task blocked",
     "a different approach would be needed",
 ];
+const STAY_WORDS: &[&str] = &[
+    "stay",
+    "stays",
+    "staying",
+    "remain",
+    "remains",
+    "remaining",
+    "leave",
+    "leaves",
+    "left",
+];
+const BLOCKED_WORDS: &[&str] = &["blocked", "parked"];
 
 fn no_section_names_remain_blocked(raw: &str) -> bool {
+    remain_blocked_language(&no_section_body(raw))
+}
+
+/// Collect the No section only, stopping at Recommendation. Later `No:` lines
+/// (including inside Details) never re-enter the scan.
+fn no_section_body(raw: &str) -> String {
     let mut in_no = false;
     let mut body = String::new();
     for line in raw.lines().map(str::trim) {
-        if line == "No:" {
-            in_no = true;
+        if !in_no {
+            if line == "No:" {
+                in_no = true;
+            }
             continue;
         }
-        if in_no && matches!(line, "Recommendation:" | "Details:") {
+        if line == "Recommendation:" {
             break;
         }
-        if in_no && !line.is_empty() {
+        if !line.is_empty() {
             if !body.is_empty() {
                 body.push(' ');
             }
             body.push_str(&line.to_ascii_lowercase());
         }
     }
-    REMAIN_BLOCKED_PHRASES.iter().any(|phrase| body.contains(phrase))
+    body
+}
+
+fn remain_blocked_language(body: &str) -> bool {
+    if REMAIN_BLOCKED_PHRASES.iter().any(|phrase| body.contains(phrase)) {
+        return true;
+    }
+    let tokens: Vec<&str> = body
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+    for (index, token) in tokens.iter().enumerate() {
+        if !STAY_WORDS.contains(token) {
+            continue;
+        }
+        let lo = index.saturating_sub(6);
+        let hi = (index + 6).min(tokens.len().saturating_sub(1));
+        let window = &tokens[lo..=hi];
+        if window.iter().any(|word| BLOCKED_WORDS.contains(word)) {
+            return true;
+        }
+        if window.windows(2).any(|pair| pair == ["on", "hold"]) {
+            return true;
+        }
+    }
+    false
 }
 
 fn check(raw: &str, headings: &[&str]) -> Result<String, ()> {
@@ -182,6 +227,8 @@ pub(super) mod tests {
             "The work remains blocked.",
             "No leaves the task blocked; a different approach would be needed.",
             "Stay blocked until a split is approved.",
+            "The work stays parked.",
+            "Leave this on hold until a split is approved.",
         ] {
             let text = VALID.replace("Ship the smaller change instead.", no);
             assert!(
@@ -189,5 +236,10 @@ pub(super) mod tests {
                 "{no}"
             );
         }
+        let details_no = format!("{VALID}\nDetails:\nEvidence\nNo:\nWork stays blocked.\nverbatim");
+        assert!(
+            validate_for(&details_no, false).is_ok(),
+            "a No: line inside Details must not re-enter the remain-blocked scan"
+        );
     }
 }

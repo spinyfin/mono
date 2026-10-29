@@ -582,8 +582,8 @@ async fn same_chain_revision_prerequisite_satisfies_at_in_review() {
 }
 
 #[tokio::test]
-async fn prerequisite_no_parks_in_backlog_like_a_yes_no_decline() {
-    let (state, _dir, _, task_id) = parked_task_with_question(prerequisite_question_payload()).await;
+async fn prerequisite_no_records_the_declined_path_and_redispatches() {
+    let (state, _dir, old_execution, task_id) = parked_task_with_question(prerequisite_question_payload()).await;
     let before = question_task(&state, &task_id);
     let tasks_before = state
         .work_db
@@ -595,14 +595,21 @@ async fn prerequisite_no_parks_in_backlog_like_a_yes_no_decline() {
         FrontendEvent::WorkItemUpdated { .. }
     ));
     let task = question_task(&state, &task_id);
-    assert_eq!(task.status, boss_protocol::TaskStatus::Blocked);
-    assert_eq!(task.blocked_reason.as_deref(), Some("worker_failed"));
-    assert!(!task.autostart);
+    assert_eq!(task.status, boss_protocol::TaskStatus::Todo);
+    assert!(task.autostart);
+    assert!(task.blocked_reason.is_none());
     assert!(task.operator_question.is_none());
-    assert_eq!(task.description, "Original brief");
-    assert!(task.blocked_detail.unwrap().contains(
-        "\"Create prerequisite task 'Fix the retention-cleanup fixture race'? This task will wait for it.\""
-    ));
+    assert!(
+        task.description
+            .starts_with("Original brief\n\n---\n\n## Recorded answer (")
+    );
+    assert!(task.description.contains("- **Answer:** No\n"));
+    assert!(
+        task.description
+            .contains("Create prerequisite task 'Fix the retention-cleanup fixture race'? This task will wait for it.")
+    );
+    assert!(task.description.contains("grants no authorization"));
+    assert!(task.description.contains(&format!("`{old_execution}`")));
     assert!(prerequisites_of(&state, &task_id).is_empty());
     assert_eq!(
         state
@@ -612,6 +619,15 @@ async fn prerequisite_no_parks_in_backlog_like_a_yes_no_decline() {
             .len(),
         tasks_before,
         "a No creates nothing"
+    );
+    assert!(
+        state
+            .work_db
+            .list_executions(Some(&task_id))
+            .unwrap()
+            .iter()
+            .any(|e| e.status == boss_protocol::ExecutionStatus::Ready && e.id != old_execution),
+        "No mints a ready execution so the next worker takes the declined path"
     );
 }
 
@@ -641,7 +657,7 @@ async fn racing_prerequisite_approvals_create_one_task_and_one_edge() {
 
 const FILE_COUNT_SPLIT_NAME: &str = "Extract the first capability";
 
-fn file_count_split_payload() -> Value {
+pub(super) fn file_count_split_payload() -> Value {
     json!({"outcome":"blocked", "summary":"The change is 48 files against a limit of 30", "question":{
         "answer_type":{"kind":"create_prerequisite_task",
             "name": FILE_COUNT_SPLIT_NAME,

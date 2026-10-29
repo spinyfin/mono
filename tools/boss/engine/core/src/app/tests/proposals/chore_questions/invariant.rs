@@ -308,3 +308,64 @@ async fn exercise(kind: &TaskKind, status: &TaskStatus, payload: Value, answer: 
     );
     assert_eq!(state.work_db.list_attentions_for_group(&group.id).unwrap().len(), 1);
 }
+
+/// An in-review parent cannot park, so the split-vs-bypass question becomes a
+/// worker-question attention. No on that card must still record the scoped
+/// file-count authorization on the successor that continues the same PR.
+#[tokio::test]
+async fn file_count_no_on_in_review_source_records_bypass_on_successor() {
+    let (state, _dir, execution, task) = fixture(&TaskKind::ProjectTask, &TaskStatus::InReview, false);
+    submitted(
+        call_with_peer(
+            &state,
+            Some(std::process::id() as libc::pid_t),
+            submit_request(
+                &execution,
+                ProposalKind::RunDone,
+                super::super::prerequisites::file_count_split_payload(),
+            ),
+        )
+        .await,
+    );
+    let attention: String = state
+        .work_db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT a.id FROM attentions a JOIN attention_groups g ON g.id = a.group_id
+         WHERE g.source_task_id = ?1 AND g.kind = 'question' AND g.state = 'open'",
+            [&task],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let group = state
+        .work_db
+        .answer_attention(&attention, Some("no".into()), false, false)
+        .unwrap();
+    let result = state
+        .work_db
+        .action_attention_group(
+            &group.id,
+            false,
+            &Default::default(),
+            &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
+        )
+        .unwrap();
+    assert_eq!(result.produced_work_item_ids.len(), 1);
+    let produced = &result.produced_work_item_ids[0];
+    let (description, produced_kind): (String, String) = state
+        .work_db
+        .connect()
+        .unwrap()
+        .query_row("SELECT description, kind FROM tasks WHERE id = ?1", [produced], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(produced_kind, "revision");
+    assert!(description.contains("**Answer:** no"));
+    assert!(description.contains("Repo owner approval"));
+    assert!(description.contains("No — keep this change in one PR"));
+    assert!(description.contains("change/file-count for this PR only, up to 48 files"));
+    assert!(description.contains("BYPASS_CHANGE_FILE_COUNT=48:approved by the repo owner"));
+    assert!(!description.contains("A No answer does not authorize the proposed action."));
+}
