@@ -1403,6 +1403,10 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
     let mut trace =
         crate::population_timing::PopulationTrace::new(product_id.clone(), request_id.clone(), fetch_seq, recv_instant);
     trace.record_plain(crate::population_timing::segment::DECODE, decode_ms);
+    // A cold build reports its stages on the product's work topic as it runs;
+    // a warm refresh never starts one, so the sink then sees nothing.
+    let (progress_sink, flush_progress) = super::board_progress::topic_progress_sink(&server_state, &product_id);
+    trace.set_progress_sink(progress_sink);
 
     sink.board_reads
         .lock()
@@ -1416,7 +1420,11 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
         &product_id,
         &mut trace,
     );
-    trace.record_plain("shared_load_wait", crate::population_timing::elapsed_ms(started));
+    trace.record_plain(
+        crate::population_timing::segment::SHARED_LOAD_WAIT,
+        crate::population_timing::elapsed_ms(started),
+    );
+    flush_progress.await;
     let result = loaded.and_then(|loaded| {
         loaded
             .value
@@ -1581,17 +1589,21 @@ pub(super) async fn handle_create_revision(ctx: Dispatch, req: FrontendRequest) 
         sink,
         session_id,
         request_id,
+        peer_pid,
         ..
     } = ctx;
     let FrontendRequest::CreateRevision { input } = req else {
         unreachable!()
     };
+    let created = resolve_write_actor(&server_state, peer_pid, input.priority.as_deref(), None)
+        .and_then(|actor| work_db.create_revision_as_actor(input, &GhPrStateChecker, actor))
+        .map(WorkItem::Task);
     finish_create_work_item(
         &server_state,
         &sink,
         &session_id,
         &request_id,
-        work_db.create_revision(input, &GhPrStateChecker).map(WorkItem::Task),
+        created,
         "revision_created",
         |err| FrontendEvent::WorkError {
             message: err.to_string(),
@@ -1633,5 +1645,54 @@ pub(super) async fn handle_set_task_doc_pointer(ctx: Dispatch, req: FrontendRequ
             send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
         }
         Err(err) => send_work_error(&sink, &request_id, &err),
+    }
+}
+
+#[cfg(test)]
+mod create_revision_actor_tests {
+    use super::*;
+    use crate::test_support::{create_test_chore, create_test_product};
+    use crate::work::{CreateRevisionInput, FakePrStateChecker, PrOpenState};
+    use rusqlite::params;
+
+    #[test]
+    fn human_peer_create_revision_records_human_on_the_insert_row() {
+        let (state, _dir) = super::tests::test_server_state();
+        let actor = resolve_write_actor(&state, None, None, None).unwrap();
+        assert_eq!(actor, boss_protocol::LAST_STATUS_ACTOR_HUMAN);
+
+        let db = &state.work_db;
+        let product = create_test_product(db);
+        let parent = create_test_chore(db, product.id, "Parent");
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+                params![parent.id, "https://github.com/spinyfin/mono/pull/42"],
+            )
+            .unwrap();
+        let revision = db
+            .create_revision_as_actor(
+                CreateRevisionInput::builder()
+                    .parent_task_id(&parent.id)
+                    .description("Human-filed revision")
+                    .build(),
+                &FakePrStateChecker::always(PrOpenState::Open),
+                actor,
+            )
+            .unwrap();
+        let (basis, ledger_actor): (String, String) = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT basis, actor FROM task_status_audit
+                 WHERE work_item_id = ?1 AND property = 'status' AND old_value IS NULL
+                 ORDER BY id ASC LIMIT 1",
+                [&revision.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(basis, "insert_revision_in_tx");
+        assert_eq!(ledger_actor, boss_protocol::LAST_STATUS_ACTOR_HUMAN);
     }
 }

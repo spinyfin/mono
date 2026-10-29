@@ -166,7 +166,10 @@ pub(crate) fn insert_design_postmortem_in_tx(
     let now = now_string();
     let name = format!("Design postmortem: {project_name}");
     let short_id = allocate_short_id(conn, product_id)?;
-    conn.execute(
+    crate::work::task_status_audit::execute(
+        conn,
+        "insert_design_postmortem_in_tx",
+        "engine",
         "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, short_id, effort_level)
          VALUES (?1, ?2, ?3, 'design_postmortem', ?6, ?7, 'todo', NULL, NULL, NULL, ?4, ?4, 1, 'medium', ?5, ?8, ?9)",
         params![

@@ -524,7 +524,10 @@ impl WorkDb {
             return Ok(false);
         }
         let now = now_string();
-        let n = tx.execute(
+        let n = crate::work::task_status_audit::execute(
+            &tx,
+            "reconciler_close_work_item",
+            "engine",
             "UPDATE tasks
              SET status             = 'done',
                  updated_at         = ?2,

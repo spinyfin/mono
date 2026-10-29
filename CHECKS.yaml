@@ -62,8 +62,11 @@ checks:
   # (30) sits just above p95 of the last 100 mono PRs; the generic check
   # default is 50 for unconfigured consumers. Legitimate large surfaces
   # (coordinated renames, unsplittable generated trees) use
-  # BYPASS_CHANGE_FILE_COUNT=<specific legitimate reason> in the commit
-  # description — not a silent higher default. The PR description also works
+  # BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason> in the commit
+  # description — not a silent higher default. The numeric maximum is the
+  # approved ceiling; if the change later grows past it, the check fails
+  # again until a new approval or a split. A bypass without a number is
+  # rejected, not treated as unlimited. The PR description also works
   # for bypass directives, but only when the host can resolve it (GitHub API
   # access); a failed fetch does not invent a bypass and leaves only the
   # commit description. Prefer the commit description: it is read in every

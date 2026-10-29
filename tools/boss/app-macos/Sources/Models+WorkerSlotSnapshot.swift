@@ -9,6 +9,18 @@ import PaneLayout
 // live-state tick) invalidates the parent.
 // ===========================================================================
 
+/// Compact Agents-header row: the bound work item's short id and, when a
+/// PR exists, `repo#n`. Clicking the id reveals the Work card; clicking
+/// the PR opens it in the browser.
+struct WorkerHeaderWorkLinks: Equatable {
+    let workItemId: String
+    let productId: String?
+    let shortIdLabel: String
+    let title: String
+    let prURL: String?
+    let prLabel: String?
+}
+
 /// Slim live-state slice that the Agents slot header actually paints.
 /// `WorkerLiveState` carries extra fields (`model`, `shellPid`,
 /// `currentTool`, …) the slot view never reads; folding
@@ -37,6 +49,11 @@ struct WorkerSlotLiveSlice: Equatable {
     /// Engine-reported reason the last viewer attach failed; `nil` while
     /// nothing has failed. Read by the viewer-missing card only.
     let viewerAttachError: String?
+    let workItemId: String?
+    let workItemName: String?
+    let workItemShortId: Int?
+    let productId: String?
+    let prURL: String?
 
     init(_ live: WorkerLiveState) {
         self.name = live.name
@@ -54,6 +71,11 @@ struct WorkerSlotLiveSlice: Equatable {
         self.pool = live.pool
         self.tmuxHosted = live.tmuxHosted
         self.viewerAttachError = live.viewerAttachError
+        self.workItemId = live.workItemId
+        self.workItemName = live.workItemName
+        self.workItemShortId = live.workItemShortId
+        self.productId = live.productId
+        self.prURL = live.prURL
     }
 
     var badgeType: AgentType { AgentType.resolve(wire: agentType, reviewStage: reviewStage, executionKind: executionKind) }
@@ -207,6 +229,37 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
     /// is historical text, not a worker: its slot may already belong to a
     /// new run.
     var showsLiveStatusToggle: Bool { !isPlaceholder }
+
+    /// Compact header row linking the bound work item and its PR.
+    /// `nil` when the pane has no work item (ad-hoc) or the engine has
+    /// not yet assigned a short id.
+    var headerWorkLinks: WorkerHeaderWorkLinks? {
+        guard let live,
+              let workItemId = live.workItemId, !workItemId.isEmpty,
+              let shortId = live.workItemShortId
+        else { return nil }
+        let prURL = live.prURL.flatMap { $0.isEmpty ? nil : $0 }
+        return WorkerHeaderWorkLinks(
+            workItemId: workItemId,
+            productId: live.productId.flatMap { $0.isEmpty ? nil : $0 },
+            shortIdLabel: Self.shortIdLabel(workItemId: workItemId, shortId: shortId),
+            title: live.workItemName ?? "",
+            prURL: prURL,
+            prLabel: prURL.flatMap(Self.pullRequestCompactLabel(from:))
+        )
+    }
+
+    /// `T<n>` for tasks and chores, `P<n>` for projects.
+    static func shortIdLabel(workItemId: String, shortId: Int) -> String {
+        workItemId.hasPrefix("proj_") ? "P\(shortId)" : "T\(shortId)"
+    }
+
+    /// `repo#n` from a GitHub PR URL, dropping the owner. `nil` when the
+    /// string is not a github.com `/pull/<n>` URL.
+    static func pullRequestCompactLabel(from urlString: String) -> String? {
+        guard let parsed = parseGitHubPRURL(urlString) else { return nil }
+        return "\(parsed.repo)#\(parsed.number)"
+    }
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.slotId == rhs.slotId

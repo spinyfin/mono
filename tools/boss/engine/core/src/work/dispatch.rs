@@ -216,7 +216,10 @@ impl WorkDb {
             // render "demoted by engine: dispatch never reached a
             // worker" instead of attributing the move to the human who
             // last touched the row.
-            let updated = tx.execute(
+            let updated = crate::work::task_status_audit::execute(
+                &tx,
+                "heal_ghost_active_chores",
+                "engine",
                 "UPDATE tasks
                  SET status = 'todo',
                      last_status_actor = 'engine',
@@ -324,7 +327,10 @@ impl WorkDb {
     pub fn demote_active_work_item_to_todo(&self, work_item_id: &str) -> Result<bool> {
         let conn = self.connect()?;
         let now = now_string();
-        let updated = conn.execute(
+        let updated = crate::work::task_status_audit::execute(
+            &conn,
+            "demote_active_work_item_to_todo",
+            "engine",
             "UPDATE tasks
              SET status = 'todo',
                  last_status_actor = 'engine',
@@ -397,7 +403,10 @@ impl WorkDb {
     ) -> Result<bool> {
         let conn = self.connect()?;
         let now = now_string();
-        let updated = conn.execute(
+        let updated = crate::work::task_status_audit::execute(
+            &conn,
+            reason,
+            "engine",
             "UPDATE tasks
              SET status = 'todo',
                  autostart = 0,
@@ -484,7 +493,10 @@ impl WorkDb {
     /// but no fresh execution — see that method's docs.
     fn reenable_autostart_after_dispatch_failure_in_tx(conn: &Connection, work_item_id: &str) -> Result<bool> {
         let now = now_string();
-        let updated = conn.execute(
+        let updated = crate::work::task_status_audit::execute(
+            conn,
+            "reenable_autostart_after_dispatch_failure_in_tx",
+            "engine",
             "UPDATE tasks
              SET autostart = 1,
                  last_status_actor = 'engine',
@@ -1755,7 +1767,10 @@ impl WorkDb {
         if execution_rows > 0 {
             stage_execution_terminal(&mut pending, &tx, execution_id, task_id)?;
         }
-        let task_rows = tx.execute(
+        let task_rows = crate::work::task_status_audit::execute(
+            &tx,
+            "retire_stale_revision_before_dispatch",
+            "engine",
             "UPDATE tasks
                 SET status             = 'in_review',
                     updated_at         = ?2,

@@ -819,3 +819,71 @@ async fn resumed_execution_still_rejects_a_foreign_head() {
         "{outcome:?}"
     );
 }
+
+/// Capture-time verification stamps the verified URL onto the live slot so
+/// the Agents pane header can show the PR while the worker is still running.
+#[tokio::test]
+async fn verify_staged_pr_url_after_capture_stamps_verified_url_onto_live_slot() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+    staged_pr_urls.record_command_observation(&execution_id, OWN_PR, true);
+    let verifier = StubBranchVerifier::ok(&own_branch(&execution_id));
+
+    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+    live_states.register_spawn(1, &execution_id, "claude-opus-5", std::process::id() as i32, None);
+
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let handler = handler
+        .with_staged_pr_urls(staged_pr_urls)
+        .with_live_worker_states(live_states.clone())
+        .with_branch_verifier(verifier);
+
+    handler.verify_staged_pr_url_after_capture(&execution_id, false).await;
+    assert_eq!(live_states.get(1).unwrap().pr_url.as_deref(), Some(OWN_PR));
+}
+
+/// A staged URL whose PR head is some other branch is not the worker's PR;
+/// the live slot stays unset so the header does not flash a foreign link.
+#[tokio::test]
+async fn verify_staged_pr_url_after_capture_leaves_live_slot_unset_on_branch_mismatch() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+    staged_pr_urls.record_command_observation(&execution_id, ORIGIN_PR, true);
+    let verifier = StubBranchVerifier::ok(ORIGIN_BRANCH);
+
+    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+    live_states.register_spawn(1, &execution_id, "claude-opus-5", std::process::id() as i32, None);
+
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let handler = handler
+        .with_staged_pr_urls(staged_pr_urls)
+        .with_live_worker_states(live_states.clone())
+        .with_branch_verifier(verifier);
+
+    handler.verify_staged_pr_url_after_capture(&execution_id, false).await;
+    assert_eq!(live_states.get(1).unwrap().pr_url, None);
+}
+
+/// An unverified candidate (GitHub unreachable) must not stamp the live
+/// slot; the header waits for a later successful verification.
+#[tokio::test]
+async fn verify_staged_pr_url_after_capture_leaves_live_slot_unset_when_unverified() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+    staged_pr_urls.record_command_observation(&execution_id, OWN_PR, true);
+
+    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+    live_states.register_spawn(1, &execution_id, "claude-opus-5", std::process::id() as i32, None);
+
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let handler = handler
+        .with_staged_pr_urls(staged_pr_urls)
+        .with_live_worker_states(live_states.clone())
+        .with_branch_verifier(StubBranchVerifier::err("gh: connect: network is unreachable"));
+
+    handler.verify_staged_pr_url_after_capture(&execution_id, false).await;
+    assert_eq!(live_states.get(1).unwrap().pr_url, None);
+}

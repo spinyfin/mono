@@ -56,6 +56,26 @@ pub enum FrontendEvent {
         #[serde(default)]
         absent: Vec<String>,
     },
+    /// Progress of a cold board build for `product_id`, pushed on the
+    /// product's work topic while a `GetWorkTree` full read runs. Purely
+    /// informational: it never carries board state and is never a reply, so
+    /// a consumer must not treat it as the snapshot arriving.
+    ///
+    /// `stage` names the current stage on [`BoardPopulationPhase::Stage`]
+    /// events (a `population_timing` segment such as `db.tasks`); `items`
+    /// and `bytes` are set once known (items from the task/chore query on,
+    /// bytes on [`BoardPopulationPhase::Done`]).
+    BoardPopulationProgress {
+        product_id: String,
+        phase: crate::BoardPopulationPhase,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stage: Option<String>,
+        elapsed_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        items: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bytes: Option<u64>,
+    },
     /// Ordered board update, independent of global topic revisions.
     WorkTreeUpdate {
         update: crate::work_tree_delta::WorkTreeUpdate,

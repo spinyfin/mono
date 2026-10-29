@@ -42,8 +42,11 @@ fn revision_implementation_adds_gh_pr_create_guard_to_pre_tool_use() {
         "revision guard block message must point workers at `$CUBE_BIN` pr update: {guard_cmd}",
     );
     assert!(
-        guard_cmd.contains("BOSS_BIN") && guard_cmd.contains("propose followup-task --name"),
-        "revision guard block message must point workers at `$BOSS_BIN` propose followup-task: {guard_cmd}",
+        guard_cmd.contains("BOSS_BIN")
+            && guard_cmd.contains("--summary")
+            && guard_cmd.contains("--answer-type create-prerequisite-task")
+            && guard_cmd.contains("propose followup-task --name"),
+        "revision guard block message must point workers at `$BOSS_BIN` create-prerequisite-task for blocking work and propose followup-task for later work: {guard_cmd}",
     );
     assert!(
         guard_cmd.contains("block"),
@@ -132,8 +135,11 @@ fn revision_worker_gh_pr_create_redirect_reason_names_followup_task() {
     );
     let reason = parsed["reason"].as_str().unwrap_or("");
     assert!(
-        reason.contains("propose followup-task"),
-        "revision worker's gh pr create reason must name propose followup-task, got: {reason}",
+        reason.contains("--summary")
+            && reason.contains("Otherwise report the dependency")
+            && reason.contains("--answer-type create-prerequisite-task")
+            && reason.contains("propose followup-task"),
+        "revision worker's gh pr create reason must name create-prerequisite-task and propose followup-task, got: {reason}",
     );
     assert!(
         !reason.contains("pr create --branch"),

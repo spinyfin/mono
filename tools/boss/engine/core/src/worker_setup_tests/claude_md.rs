@@ -428,8 +428,12 @@ fn every_worker_kind_claude_md_carries_the_absolute_paths_instruction() {
 }
 
 #[test]
-fn claude_md_steers_revision_workers_to_followup_task() {
-    let input = sample_input();
+fn claude_md_routes_revision_blocking_prs_to_prerequisite_and_later_work_to_followup() {
+    let mut input = sample_input();
+    let disabled = claude_md_for(&input);
+    assert!(!disabled.contains("--answer-type create-prerequisite-task"));
+    assert!(disabled.contains("report the dependency using the blocker channel"));
+    input.run_done_proposals_seam_enabled = true;
     let rendered = claude_md_for(&input);
     assert!(
         rendered.contains("## Revisions"),
@@ -440,8 +444,16 @@ fn claude_md_steers_revision_workers_to_followup_task() {
         "worker rules must state a revision never opens a new PR; got:\n{rendered}",
     );
     assert!(
-        rendered.contains("propose followup-task --name"),
-        "worker rules must show the followup-task invocation shape; got:\n{rendered}",
+        rendered
+            .contains("propose done --outcome blocked --summary \"<blocker>\" --answer-type create-prerequisite-task")
+            && rendered.contains("--prerequisite-name")
+            && rendered.contains("--prerequisite-brief"),
+        "worker rules must route a PR that must land first to create-prerequisite-task; got:\n{rendered}",
+    );
+    assert!(
+        rendered.contains("propose followup-task --name")
+            && rendered.contains("only for non-blocking work that can happen later"),
+        "worker rules must keep followup-task as the non-blocking path; got:\n{rendered}",
     );
     assert!(
         rendered.contains("[blocked] reason=\"<specific question>\""),

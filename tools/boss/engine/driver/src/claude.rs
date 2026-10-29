@@ -534,7 +534,9 @@ pub const PR_REDIRECT_REVISION_ENV: &str = "BOSS_REVISION_WORKER";
 /// revision-specific guard ([`REVISION_PR_GUARD_COMMAND`]) stacks on top for
 /// revision workers and adds additional blocks. When
 /// [`PR_REDIRECT_REVISION_ENV`] is `1`, the block names `cube pr update` and
-/// `"$BOSS_BIN" propose followup-task` instead of `cube pr create`.
+/// `"$BOSS_BIN" propose done --answer-type create-prerequisite-task` (blocking
+/// work) and `"$BOSS_BIN" propose followup-task` (non-blocking work) instead of
+/// `cube pr create`.
 pub const PR_REDIRECT_GUARD_COMMAND: &str = python_command_guard!(
     "DELIMS={'&&','||',';','|','&'}\n",
     "try:\n",
@@ -573,8 +575,9 @@ pub const PR_REDIRECT_GUARD_COMMAND: &str = python_command_guard!(
     "    cub=q+chr(36)+'CUBE_BIN'+q\n",
     "    if os.environ.get('BOSS_REVISION_WORKER')=='1':\n",
     "        bos=q+chr(36)+'BOSS_BIN'+q\n",
+    "        prereq=bos+' propose done --outcome blocked --summary '+q+'<blocker>'+q+' --answer-type create-prerequisite-task --prerequisite-name '+q+'<short task name>'+q+' --prerequisite-brief '+q+'<self-contained description>'+q+' --explanation '+q+'<Context, Yes, No, Recommendation, and optional Details>'+q\n",
     "        follow=bos+' propose followup-task --name '+q+'<short title>'+q+' --description '+q+'<one paragraph of scope>'+q+' --rationale '+q+'<why a separate PR>'+q\n",
-    "        msg='Workers must not push branches or open PRs with bare VCS commands (blocked: '+matched+'). A revision never opens a new PR. Push in-scope commits to the existing parent PR with '+cub+' pr update --branch <branch>. For work that needs its own PR, run '+follow+' and finish the in-scope work. Never use jj git push, git push, or gh pr create directly. Do not declare you could not complete.'\n",
+    "        msg='Workers must not push branches or open PRs with bare VCS commands (blocked: '+matched+'). A revision never opens a new PR. Push in-scope commits to the existing parent PR with '+cub+' pr update --branch <branch>. If another PR must land before this revision can finish and your instructions enable completion declarations, run '+prereq+' (the revision waits for it and is redispatched once it is done). Otherwise report the dependency using the blocker channel in your instructions; '+follow+' is only for non-blocking work that can happen later; finish the in-scope work meanwhile. Never use jj git push, git push, or gh pr create directly. Do not declare you could not complete.'\n",
     "    else:\n",
     "        msg='Workers must not push branches or open PRs with bare VCS commands (blocked: '+matched+'). Use cube instead: '+cub+' pr create --branch <branch> (new PR: pushes the branch and opens the PR in one step, jj-aware, no GIT_DIR) or '+cub+' pr update --branch <branch> (existing PR: pushes new commits to it). Never use jj git push, git push, or gh pr create directly.'\n",
     "    _block(msg)\n",
@@ -597,7 +600,9 @@ pub fn pr_redirect_guard_command(is_revision: bool) -> String {
 /// inside quoted arguments do NOT trigger the block. Blocks `gh pr create`,
 /// `cube pr create`, and the deprecated `cube pr ensure`; allows `cube pr update`.
 /// A block names `cube pr update` for in-scope commits and
-/// `"$BOSS_BIN" propose followup-task` for work that needs its own PR.
+/// `"$BOSS_BIN" propose done --answer-type create-prerequisite-task` for a PR
+/// that must land first, and `"$BOSS_BIN" propose followup-task` only for
+/// non-blocking work.
 pub const REVISION_PR_GUARD_COMMAND: &str = python_command_guard!(
     "DELIMS={'&&','||',';','|','&'}\n",
     "try:\n",
@@ -645,8 +650,9 @@ pub const REVISION_PR_GUARD_COMMAND: &str = python_command_guard!(
     "    bos=chr(34)+chr(36)+'BOSS_BIN'+chr(34)\n",
     "    sug=cub+' pr update --branch '+br if br else cub+' pr update --branch <your-pr-bookmark>'\n",
     "    q=chr(34)\n",
+    "    prereq=bos+' propose done --outcome blocked --summary '+q+'<blocker>'+q+' --answer-type create-prerequisite-task --prerequisite-name '+q+'<short task name>'+q+' --prerequisite-brief '+q+'<self-contained description>'+q+' --explanation '+q+'<Context, Yes, No, Recommendation, and optional Details>'+q\n",
     "    follow=bos+' propose followup-task --name '+q+'<short title>'+q+' --description '+q+'<one paragraph of scope>'+q+' --rationale '+q+'<why a separate PR>'+q\n",
-    "    msg='Revision tasks push commits to the existing parent PR; they must not open a new PR (matched command: '+matched+'). Push in-scope commits to the existing PR with: '+sug+'. If this work needs its own PR, run '+follow+' and finish the in-scope work on this parent PR. Do not declare you could not complete.'\n",
+    "    msg='Revision tasks push commits to the existing parent PR; they must not open a new PR (matched command: '+matched+'). Push in-scope commits to the existing PR with: '+sug+'. If another PR must land before this revision can finish and your instructions enable completion declarations, run '+prereq+' (the revision waits for it and is redispatched once it is done). Otherwise report the dependency using the blocker channel in your instructions; '+follow+' is only for non-blocking work that can happen later; finish the in-scope work on this parent PR. Do not declare you could not complete.'\n",
     "    _block(msg)\n",
     "_approve()\n",
 );

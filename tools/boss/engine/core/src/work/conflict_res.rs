@@ -962,7 +962,10 @@ impl WorkDb {
         // re-picks the row up. The flip is best-effort — if the parent
         // is already `blocked: merge_conflict` (or has been moved
         // somewhere unexpected by a human), we leave it alone.
-        tx.execute(
+        crate::work::task_status_audit::execute(
+            &tx,
+            "retry_conflict_resolution",
+            "engine",
             "UPDATE tasks
                 SET status             = 'blocked',
                     blocked_reason     = 'merge_conflict',
@@ -1259,7 +1262,10 @@ impl WorkDb {
             // Flip the parent back to in_review + clear the attempt pointer.
             // Guarded so a row a human moved out of blocked:merge_conflict in
             // the meantime is left alone.
-            let flipped = tx.execute(
+            let flipped = crate::work::task_status_audit::execute(
+                &tx,
+                "reconcile_orphaned_conflict_ladder_attempts",
+                "engine",
                 "UPDATE tasks
                     SET status             = 'in_review',
                         blocked_reason     = NULL,

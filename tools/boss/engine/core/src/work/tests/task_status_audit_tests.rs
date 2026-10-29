@@ -107,8 +107,8 @@ fn raw_sql_writes_are_recorded_and_unchanged_values_do_not_reset_age() {
     let initial: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM task_status_audit WHERE work_item_id = ?1 AND old_value IS NULL
-         AND basis = 'unattributed_write' AND actor = ?2 AND age_is_lower_bound = 0",
-            params![task.id, task.last_status_actor],
+         AND basis = 'insert_chore_with_project_in_tx_as_actor' AND actor = 'engine' AND age_is_lower_bound = 0",
+            params![task.id],
             |r| r.get(0),
         )
         .unwrap();
@@ -191,7 +191,7 @@ fn repeated_failure_and_clear_then_fail_do_not_reuse_old_provenance() {
     assert_eq!(
         bases,
         [
-            "unattributed_write",
+            "insert_chore_with_project_in_tx_as_actor",
             "declared_blocked",
             "nudge_breaker",
             "explicit_start_failure_clear",

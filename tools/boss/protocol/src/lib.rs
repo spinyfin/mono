@@ -4,6 +4,7 @@
 //! request/response envelope and the data shapes those carry — lives in this
 //! crate so that engine and clients link against the same types.
 
+mod board_population;
 mod boothby;
 mod doing_section;
 mod engine_app;
@@ -22,6 +23,7 @@ pub mod work_tree_delta;
 mod worker_event;
 mod worker_names;
 
+pub use board_population::*;
 pub use boothby::*;
 pub use doing_section::*;
 pub use engine_app::*;

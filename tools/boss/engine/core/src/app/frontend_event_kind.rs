@@ -13,6 +13,7 @@ pub(super) fn kind(event: &FrontendEvent) -> &'static str {
         FrontendEvent::TasksList { .. } => "TasksList",
         FrontendEvent::ChoresList { .. } => "ChoresList",
         FrontendEvent::RevisionsList { .. } => "RevisionsList",
+        FrontendEvent::BoardPopulationProgress { .. } => "BoardPopulationProgress",
         FrontendEvent::WorkTreeUpdate { .. } => "WorkTreeUpdate",
         FrontendEvent::WorkRuntimePatch { .. } => "WorkRuntimePatch",
         FrontendEvent::WorkTree { .. } => "WorkTree",

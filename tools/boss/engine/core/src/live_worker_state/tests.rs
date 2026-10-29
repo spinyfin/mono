@@ -1317,11 +1317,14 @@ fn readoption_of_a_tracked_run_backfills_missing_metadata_without_overwriting() 
         false,
         LiveSpawnRouting::none().with_metadata(LiveWorkerMetadata {
             agent_type: Some("review".to_owned()),
-            review_stage: None,
             project_id: Some("proj_1".to_owned()),
             project_name: Some("One".to_owned()),
             host_id: Some("local".to_owned()),
             started_at: Some("2026-10-09T00:00:00Z".to_owned()),
+            product_id: Some("prod_1".to_owned()),
+            work_item_short_id: Some(42),
+            pr_url: Some("https://github.com/spinyfin/mono/pull/12".to_owned()),
+            ..LiveWorkerMetadata::default()
         }),
         ReadoptionEvidence::LiveShellPid,
     );
@@ -1336,6 +1339,12 @@ fn readoption_of_a_tracked_run_backfills_missing_metadata_without_overwriting() 
     assert_eq!(state.project_name.as_deref(), Some("One"));
     assert_eq!(state.host_id.as_deref(), Some("local"));
     assert_eq!(state.started_at.as_deref(), Some("2026-10-09T00:00:00Z"));
+    assert_eq!(state.product_id.as_deref(), Some("prod_1"));
+    assert_eq!(state.work_item_short_id, Some(42));
+    assert_eq!(
+        state.pr_url.as_deref(),
+        Some("https://github.com/spinyfin/mono/pull/12")
+    );
 }
 
 #[test]
@@ -1358,6 +1367,21 @@ fn spawn_registration_stamps_routing_metadata_on_the_state() {
     assert_eq!(state.agent_type.as_deref(), Some("review"));
     assert_eq!(state.host_id.as_deref(), Some("zakalwe"));
     assert_eq!(state.project_id, None);
+}
+
+#[test]
+fn set_pr_url_for_run_updates_only_that_run() {
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn(1, "run-a", "opus", 0, None);
+    reg.register_spawn(2, "run-b", "opus", 0, None);
+    assert!(reg.set_pr_url_for_run("run-a", Some("https://github.com/spinyfin/mono/pull/3356".to_owned())));
+    assert!(!reg.set_pr_url_for_run("run-a", Some("https://github.com/spinyfin/mono/pull/3356".to_owned())));
+    assert!(!reg.set_pr_url_for_run("run-missing", Some("https://github.com/x/y/pull/1".to_owned())));
+    assert_eq!(
+        reg.get(1).unwrap().pr_url.as_deref(),
+        Some("https://github.com/spinyfin/mono/pull/3356")
+    );
+    assert_eq!(reg.get(2).unwrap().pr_url, None);
 }
 
 // ─── Resumed turns and emission-order application ─────────────────────

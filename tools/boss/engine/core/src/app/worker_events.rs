@@ -962,10 +962,12 @@ pub(super) async fn dispatch_live_worker_state(
                                 // needs no GitHub call of its own.
                                 let handler = Arc::clone(&server_state.completion_handler);
                                 let execution_id = run_id.to_owned();
+                                let server = Arc::clone(server_state);
                                 boss_task_scope::spawn(async move {
                                     handler
                                         .verify_staged_pr_url_after_capture(&execution_id, finalization_armed)
                                         .await;
+                                    server.broadcast_live_worker_states().await;
                                 });
                             }
                             crate::pr_url_capture::RecordCommandObservationOutcome::Unchanged => {

@@ -240,7 +240,7 @@ impl Vcs {
     }
 
     /// Return the concatenated commit descriptions for all commits in the range
-    /// `base_sha..HEAD` (git) / `base_sha..@` (jj).
+    /// `base_sha..HEAD` (git) / `base_sha..@` (jj), oldest first.
     ///
     /// Used for the host-only BYPASS surface (`ChangeSet::bypass_commit_descriptions`)
     /// so a directive in any content commit remains visible. Leakage checks scan
@@ -253,12 +253,12 @@ impl Vcs {
                 run_command(
                     &self.root,
                     "jj",
-                    &["log", "-r", &revset, "--no-graph", "-T", "description"],
+                    &["log", "--reversed", "-r", &revset, "--no-graph", "-T", "description"],
                 )
             }
             VcsKind::Git => {
                 let range = format!("{base_sha}..HEAD");
-                run_command(&self.root, "git", &["log", "--pretty=%B", &range])
+                run_command(&self.root, "git", &["log", "--reverse", "--pretty=%B", &range])
             }
         }
     }
@@ -1494,6 +1494,32 @@ R docs/old.md => docs/new.md
         let descriptions = vcs
             .commit_descriptions_since(&base_sha)
             .expect("commit_descriptions_since must not error");
+
+        // Real log output is newest-first by default. The range API must
+        // reverse commits, while preserving last-line precedence within each.
+        for (directive, expected) in [
+            ("100:older approval", "100:older approval"),
+            (
+                "100:first line\nBYPASS_CHANGE_FILE_COUNT=64:tighter approval",
+                "64:tighter approval",
+            ),
+            ("100:renewed approval", "100:renewed approval"),
+            ("", ""),
+        ] {
+            run_git(
+                temp.path(),
+                &[
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    &format!("BYPASS_CHANGE_FILE_COUNT={directive}"),
+                ],
+            );
+            run_git(temp.path(), &["commit", "--allow-empty", "-m", "tip without directive"]);
+            let range = vcs.commit_descriptions_since(&base_sha).expect("range");
+            let parsed = crate::bypass::parse_bypass_directives(&range);
+            assert_eq!(parsed["BYPASS_CHANGE_FILE_COUNT"], expected);
+        }
 
         assert!(
             descriptions.contains("BYPASS_FILE_SIZE="),

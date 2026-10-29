@@ -693,7 +693,10 @@ impl WorkDb {
         let reasoning_value = task.reasoning.map(|mode| mode.as_str().to_owned());
         let tags_value = encode_task_tags(&task.tags);
 
-        tx.execute(
+        crate::work::task_status_audit::execute(
+            &tx,
+            "update_task",
+            actor,
             "UPDATE tasks
              SET name = ?2, description = ?3, status = ?4, ordinal = ?5, pr_url = ?6, updated_at = ?7,
                  priority = ?9, repo_remote_url = ?10,

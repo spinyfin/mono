@@ -49,6 +49,11 @@ enum EngineEvent {
     case productsList(products: [WorkProduct])
     case projectsList(productId: String, projects: [WorkProject])
     case workTree(product: WorkProduct, projects: [WorkProject], tasks: [WorkTask], chores: [WorkTask], taskRuntimes: [WorkTaskRuntime], dependencies: [WorkItemDependency], ideas: [WorkIdea], attentionItems: [WorkAttentionItem] = [], attentionGroups: [AttentionGroup] = [], attentionMembers: [Attention] = [], plannerRuns: [PlannerRunSummary] = [], requestId: String? = nil, revision: UInt64? = nil)
+    /// The engine is running a full (cold) board build for `productId`
+    /// (`board_population_progress`). `phase` is `started`, `stage` or
+    /// `done`; `stage` names the current stage on `stage` events. Never a
+    /// reply and never board state: it only describes the wait.
+    case boardPopulationProgress(productId: String, phase: String, stage: String?, elapsedMs: Int, items: Int?, bytes: Int?)
     case workItemCreated(item: WorkItemPayload)
     /// Batch counterpart of `workItemCreated`, pushed on a product's work
     /// topic by background jobs that create many rows at once with no

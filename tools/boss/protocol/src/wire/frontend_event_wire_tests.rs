@@ -521,6 +521,18 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "work_runtime_patch",
         },
         TagCase {
+            label: "BoardPopulationProgress",
+            event: FrontendEvent::BoardPopulationProgress {
+                product_id: "prod_1".into(),
+                phase: crate::BoardPopulationPhase::Stage,
+                stage: Some("db.tasks".into()),
+                elapsed_ms: 1500,
+                items: Some(1949),
+                bytes: None,
+            },
+            expected_tag: "board_population_progress",
+        },
+        TagCase {
             label: "WorkTreeUpdate",
             event: FrontendEvent::WorkTreeUpdate {
                 update: crate::work_tree_delta::WorkTreeUpdate {
@@ -2225,6 +2237,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::ChoresList { .. }
         | FrontendEvent::RevisionsList { .. }
         | FrontendEvent::WorkRuntimePatch { .. }
+        | FrontendEvent::BoardPopulationProgress { .. }
         | FrontendEvent::WorkTreeUpdate { .. }
         | FrontendEvent::WorkTree { .. }
         | FrontendEvent::WorkItemResult { .. }

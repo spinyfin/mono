@@ -152,7 +152,10 @@ pub(crate) fn flip_in_review_revisions_to_done(conn: &Connection, chain_root_id:
         return Ok(());
     }
     for rev_id in &revision_ids {
-        conn.execute(
+        crate::work::task_status_audit::execute(
+            conn,
+            "flip_in_review_revisions_to_done",
+            "engine",
             "UPDATE tasks
              SET status            = 'done',
                  updated_at        = ?2,
@@ -321,7 +324,10 @@ pub(crate) fn archive_revision_task(
     now: &str,
     provenance: ArchiveProvenance<'_>,
 ) -> Result<usize> {
-    let rows_changed = conn.execute(
+    let rows_changed = crate::work::task_status_audit::execute(
+        conn,
+        "archive_revision_task",
+        "engine",
         "UPDATE tasks
          SET status            = 'archived',
              archived_by       = ?3,
@@ -448,7 +454,10 @@ pub(crate) fn resolve_revision_on_parent_close(
             |row| row.get(0),
         )?;
         if latest_implementation_completed {
-            conn.execute(
+            crate::work::task_status_audit::execute(
+                conn,
+                "resolve_revision_on_parent_close",
+                "engine",
                 "UPDATE tasks
                  SET status             = 'done',
                      updated_at         = ?2,

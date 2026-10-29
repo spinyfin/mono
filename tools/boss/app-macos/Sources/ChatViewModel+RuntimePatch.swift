@@ -61,6 +61,7 @@ extension ChatViewModel {
     }
 
     func noteWorkTreeRequested(productID: String, requestID: String) {
+        updateBoardLoad { $0.noteRequested(productID) }
         var fence = boardReadFences[productID] ?? BoardReadFence()
         fence.expire(isQueued: engine.isReadQueued(requestId:))
         fence.trees[requestID] = .now
@@ -126,6 +127,9 @@ extension ChatViewModel {
         for (productID, var fence) in boardReadFences {
             if fence.trees.removeValue(forKey: requestID) != nil {
                 fence.needsTreeSince = .now
+                if fence.trees.isEmpty {
+                    updateBoardLoad { $0.noteReadFailed(productID) }
+                }
             }
             let patchFailed = fence.patchRequestID == requestID
             if patchFailed {

@@ -133,7 +133,10 @@ pub(crate) fn convert_revision_to_review_findings_followup(
     if plan.description != rev.description {
         super::description_guard::validate_description_update(&rev.description, &plan.description, false)?;
     }
-    let rows_changed = conn.execute(
+    let rows_changed = crate::work::task_status_audit::execute(
+        conn,
+        "convert_revision_to_review_findings_followup",
+        "engine",
         "UPDATE tasks
          SET project_id           = NULL,
              kind                 = ?2,

@@ -26,6 +26,7 @@ struct WorkersDetailView: View, @MainActor Equatable {
     let isVisible: Bool
     let liveStatusDisabledSlotIDs: Set<Int>
     let onToggleLiveStatus: (Int, Bool) -> Void
+    let onRevealWorkItem: (String, String) -> Void
 
     @StateObject private var grid = AgentsGridModel()
     @State private var emptyFlavorCycle = Int.random(in: 0...10_000)
@@ -35,13 +36,15 @@ struct WorkersDetailView: View, @MainActor Equatable {
         liveStates: LiveWorkerStateStore,
         isVisible: Bool,
         liveStatusDisabledSlotIDs: Set<Int>,
-        onToggleLiveStatus: @escaping (Int, Bool) -> Void
+        onToggleLiveStatus: @escaping (Int, Bool) -> Void,
+        onRevealWorkItem: @escaping (String, String) -> Void = { _, _ in }
     ) {
         self.workspace = workspace
         self.liveStates = liveStates
         self.isVisible = isVisible
         self.liveStatusDisabledSlotIDs = liveStatusDisabledSlotIDs
         self.onToggleLiveStatus = onToggleLiveStatus
+        self.onRevealWorkItem = onRevealWorkItem
     }
 
     static func == (lhs: Self, rhs: Self) -> Bool {
@@ -98,7 +101,8 @@ struct WorkersDetailView: View, @MainActor Equatable {
                         focusRunId: runId,
                         onToggleLiveStatus: { enabled in
                             onToggleLiveStatus(snapshot.slotId, enabled)
-                        }
+                        },
+                        onRevealWorkItem: onRevealWorkItem
                     )
                     .equatable()
                 }
@@ -234,6 +238,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
     var focusCoordinator: AgentFocusCoordinator?
     var focusRunId: String?
     let onToggleLiveStatus: (Bool) -> Void
+    var onRevealWorkItem: ((String, String) -> Void)? = nil
     /// Builds the terminal surface for a slot that has a session. Production
     /// uses `WorkerPaneTerminalView`; tests inject a counting probe to observe
     /// the representable's create/dismantle lifecycle without a live libghostty
@@ -253,6 +258,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
         focusCoordinator: AgentFocusCoordinator? = nil,
         focusRunId: String? = nil,
         onToggleLiveStatus: @escaping (Bool) -> Void,
+        onRevealWorkItem: ((String, String) -> Void)? = nil,
         terminalContent: @escaping WorkerTerminalContent = WorkerSlotView.productionTerminalContent
     ) {
         self.runtime = runtime
@@ -261,6 +267,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
         self.focusCoordinator = focusCoordinator
         self.focusRunId = focusRunId
         self.onToggleLiveStatus = onToggleLiveStatus
+        self.onRevealWorkItem = onRevealWorkItem
         self.terminalContent = terminalContent
     }
 
@@ -380,6 +387,10 @@ struct WorkerSlotView: View, @MainActor Equatable {
                 slotTaskLine
 
                 slotSubtitle
+
+                if let links = snapshot.headerWorkLinks {
+                    slotWorkLinks(links)
+                }
             }
 
             Spacer(minLength: 0)
@@ -410,8 +421,50 @@ struct WorkerSlotView: View, @MainActor Equatable {
             }
         }
         .padding(.horizontal, 8)
-        .padding(.vertical, 6)
+        .padding(.vertical, snapshot.headerWorkLinks == nil ? 6 : 4)
         .help(slotTooltip)
+    }
+
+    /// Compact third header line: `T<n>` · `repo#n`. Truncates as a
+    /// single line. Omitted entirely when the pane has no work item.
+    @ViewBuilder
+    private func slotWorkLinks(_ links: WorkerHeaderWorkLinks) -> some View {
+        HStack(spacing: 4) {
+            Button {
+                if let productId = links.productId {
+                    onRevealWorkItem?(links.workItemId, productId)
+                }
+            } label: {
+                Text(links.shortIdLabel)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .buttonStyle(.plain)
+            .pointerStyle(.link)
+            .disabled(links.productId == nil)
+            .help(links.title)
+            .accessibilityLabel("ID \(links.shortIdLabel)")
+
+            if let prURL = links.prURL, let prLabel = links.prLabel {
+                Text("·")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                if let url = URL(string: prURL) {
+                    Link(destination: url) {
+                        Text(prLabel)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    .buttonStyle(.plain)
+                    .pointerStyle(.link)
+                    .help(prURL)
+                    .accessibilityLabel(prLabel)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     /// Tiny eye-icon toggle in the slot header that disables the
