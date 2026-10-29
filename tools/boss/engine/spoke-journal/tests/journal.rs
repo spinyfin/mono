@@ -226,3 +226,126 @@ fn failed_result_commit_keeps_command_pending_for_recovery() {
     assert_eq!(journal.applied_commands().unwrap(), 1);
     assert_eq!(journal.record_bounds().unwrap().1, bounds.1 + 1);
 }
+
+#[test]
+fn attempting_survives_restart_and_result_commits_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("state");
+    let mut journal = open(&root);
+    journal.welcome(&welcome(&journal, 0)).unwrap();
+    journal.receive_command(&command(1, "workspace")).unwrap();
+    let (pending, interrupted) = journal.begin_pending().unwrap().unwrap();
+    assert!(!interrupted);
+    assert_eq!(journal.applied_commands().unwrap(), 0);
+    let before = journal.bytes().unwrap();
+    journal
+        .save_recovery_snapshot(pending.sequence, b"saved pointers")
+        .unwrap();
+    assert_eq!(journal.bytes().unwrap(), before + 14);
+    drop(journal);
+    let mut journal = open(&root);
+    assert_eq!(
+        journal.recovery_snapshot(pending.sequence).unwrap().unwrap(),
+        b"saved pointers"
+    );
+    assert!(
+        journal
+            .save_recovery_snapshot(pending.sequence, b"replacement")
+            .is_err()
+    );
+    let (recovered, interrupted) = journal.begin_pending().unwrap().unwrap();
+    assert!(interrupted);
+    assert_eq!(recovered, pending);
+    let result = v1::CommandResult {
+        command_id: pending.command_id.clone(),
+        code: v1::ResultCode::OutcomeUncertain.into(),
+        reason: "reconcile interrupted host effect".into(),
+        value: None,
+    };
+    journal
+        .complete_command(&pending, result.clone(), &stamp(2000))
+        .unwrap();
+    assert!(journal.complete_command(&pending, result, &stamp(2000)).is_err());
+    drop(journal);
+    let mut journal = open(&root);
+    assert!(journal.begin_pending().unwrap().is_none());
+    assert_eq!(journal.applied_commands().unwrap(), 1);
+    assert_eq!(journal.record_bounds().unwrap().1, 1);
+    let retained = journal.next_record(0).unwrap().unwrap();
+    assert_eq!(journal.bytes().unwrap(), retained.bytes.len() as u64 + 256);
+}
+
+#[test]
+fn upgrades_received_commands_from_original_schema_without_losing_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("state");
+    let mut journal = open(&root);
+    let identity = journal.identity().unwrap();
+    journal.welcome(&welcome(&journal, 0)).unwrap();
+    journal.receive_command(&command(1, "before-upgrade")).unwrap();
+    drop(journal);
+    let db = rusqlite::Connection::open(root.join("journal.db")).unwrap();
+    db.execute_batch("ALTER TABLE commands DROP COLUMN attempting; ALTER TABLE commands DROP COLUMN recovery; ALTER TABLE identity DROP COLUMN result_limit; PRAGMA user_version=1;")
+        .unwrap();
+    drop(db);
+    let mut journal = open(&root);
+    assert_eq!(journal.identity().unwrap(), identity);
+    let (command, interrupted) = journal.begin_pending().unwrap().unwrap();
+    assert_eq!(command.command_id, "before-upgrade");
+    assert!(!interrupted);
+}
+
+#[test]
+fn negotiation_refuses_limits_below_retained_evidence_without_losing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = open(&dir.path().join("state"));
+    journal.welcome(&welcome(&journal, 0)).unwrap();
+    journal.receive_command(&command(1, &"identity".repeat(100))).unwrap();
+    let mut lowered = welcome(&journal, 0);
+    lowered.max_inflight_bytes = 512;
+    assert!(matches!(
+        journal.welcome(&lowered).unwrap_err().downcast_ref(),
+        Some(Fault::TransportLimit)
+    ));
+    assert_eq!(journal.received_commands().unwrap().unwrap().through, 1);
+    journal.welcome(&welcome(&journal, 0)).unwrap();
+    journal.reject_pending(&stamp(2000)).unwrap();
+    let bytes = journal.next_record(0).unwrap().unwrap().bytes;
+    lowered.max_frame_bytes = 512;
+    assert!(matches!(
+        journal.welcome(&lowered).unwrap_err().downcast_ref(),
+        Some(Fault::TransportLimit)
+    ));
+    assert_eq!(journal.next_record(0).unwrap().unwrap().bytes, bytes);
+}
+
+#[test]
+fn bounded_diagnostic_preserves_a_known_rejection() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = open(&dir.path().join("state"));
+    let mut limits = welcome(&journal, 0);
+    limits.max_frame_bytes = 2048;
+    limits.max_inflight_bytes = 1024;
+    journal.welcome(&limits).unwrap();
+    journal.receive_command(&command(1, "rejected")).unwrap();
+    let (pending, _) = journal.begin_pending().unwrap().unwrap();
+    journal
+        .complete_command(
+            &pending,
+            v1::CommandResult {
+                command_id: pending.command_id.clone(),
+                code: v1::ResultCode::Rejected.into(),
+                reason: "denied".repeat(1000),
+                value: None,
+            },
+            &stamp(2000),
+        )
+        .unwrap();
+    let bytes = journal.next_record(0).unwrap().unwrap().bytes;
+    assert!(bytes.len() + 16 <= 1024);
+    let record = v1::Record::decode(bytes.as_slice()).unwrap();
+    let Some(record::Body::Result(result)) = record.body else {
+        panic!("missing result")
+    };
+    assert_eq!(result.code, v1::ResultCode::Rejected as i32);
+}

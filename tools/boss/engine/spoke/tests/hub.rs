@@ -42,7 +42,7 @@ impl Connection {
     pub fn welcome_body(&self, through: u64) -> v1::Welcome {
         v1::Welcome {
             epoch: 1,
-            features: boss_spoke_outbound::contracts().features,
+            features: self.hello.features.clone(),
             hub_id: "hub".into(),
             authority_generation: "authority".into(),
             connection_generation: 1,
@@ -223,7 +223,10 @@ impl Fixture {
             .unwrap()
     }
     pub fn start(&self) -> Daemon {
-        Daemon::start(self.dir.path(), &self.endpoint)
+        Daemon::start(self.dir.path(), &self.endpoint, Path::new("cube"))
+    }
+    pub fn start_with_cube(&self, cube: &Path) -> Daemon {
+        Daemon::start(self.dir.path(), &self.endpoint, cube)
     }
     pub async fn connection(&mut self) -> Connection {
         tokio::time::timeout(STEP, self.connections.recv())
@@ -238,9 +241,11 @@ pub struct Daemon {
     log: PathBuf,
 }
 impl Daemon {
-    fn start(dir: &Path, endpoint: &str) -> Self {
+    fn start(dir: &Path, endpoint: &str, cube: &Path) -> Self {
         let log = dir.join("daemon.log");
         let child = Command::new(std::env::var("SPOKE_BIN").unwrap())
+            .arg("--cube-bin")
+            .arg(cube)
             .arg("--state-dir")
             .arg(dir.join("state"))
             .args(["--host-id", "host", "--hub", endpoint])

@@ -5,6 +5,7 @@ edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
+boss-host-execution = { path = "../host-execution" }
 anyhow = { workspace = true }
 boss-protocol-spoke = { path = "../../protocol-spoke" }
 boss-spoke-journal = { path = "../spoke-journal" }

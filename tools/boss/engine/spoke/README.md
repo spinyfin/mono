@@ -1,11 +1,12 @@
-# Journal-only spoke
+# Workspace-capable spoke
 
 `boss-spoke` owns a private SQLite WAL journal and initiates one mTLS gRPC
 stream. It samples capacity every five seconds even while disconnected, journals
 before sending, and replays original encoded records from the hub's durable
 receipt. Restart preserves its journal identity and sequence; reboot changes the
-OS boot identity. Only `journal/1` is advertised and capacity has zero worker
-slots. Commands receive durable receipts and explicit rejected results.
+OS boot identity. It advertises `journal/1` and `workspace/1`; capacity still has
+zero worker slots. Workspace commands execute through the shared host executor.
+Other commands receive durable receipts and explicit rejected results.
 
 This ships inert: neither installation nor production hub dispatch is wired.
 An administrator with a compatible test hub and provisioned client credentials
@@ -48,8 +49,29 @@ retains one raw command and retries admission after compaction, without requirin
 a reconnect or resend. It validates downward-negotiated frame/credit limits,
 deadlines, sequence continuity and connection generation. Receipts are never treated as command
 success. Raw command bytes and their digest survive duplicate delivery; a
-changed request under the same ID is rejected. Pending commands recover to one
-durable rejection result in the same transaction as their applied cursor.
+changed request under the same ID is rejected. The executor persists an attempting
+phase before host effects and commits each result with its applied cursor. It
+runs independently of the stream, retaining a completed result while the spool
+is full. An interrupted mutation returns uncertainty instead of being repeated.
+PR positioning saves its pointer snapshot in the command journal before goto;
+restart restores those pointers before returning the interrupted result.
+Pre-effect authorization refusals and failed reads return rejected results.
+
+Journal schema 3 adds durable pointer snapshots and the last negotiated result
+bound. Result admission measures the encoded record with envelope overhead and
+replaces an oversized payload with a bounded diagnostic. Reads are rejected;
+operations that may have changed the host report uncertainty. A later negotiation
+too small for retained records or pending command identities is retried without
+discarding evidence. Older journal readers refuse schema 3.
+
+`--cube-bin` selects the host's cube executable (default `cube`). Commands cannot
+select an executable or filesystem path. Workspace IDs resolve through cube's
+registry and lease operations require the recorded assignment owner. Recovery
+operations that do not need a working copy resolve the registered shared source,
+so recovery remains available after release. Interrupted acquisition reconciles
+the stable assignment identity in cube's task field; a recovered lease is reported
+as uncertain because its setup may not have completed. The hub retains decisions
+about release, retry, and GitHub PR state.
 
 Run `bazel test //tools/boss/engine/spoke-journal/... //tools/boss/engine/spoke/...`
 for storage and real daemon/tonic fault tests.

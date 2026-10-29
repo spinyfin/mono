@@ -8,7 +8,7 @@ mod schema {
     pub fn migrate(db: &mut Connection) -> Result<()> {
         let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         ensure!(
-            version <= 1,
+            version <= 3,
             "journal schema is newer than this reader; rollback refused"
         );
         if version == 0 {
@@ -42,6 +42,22 @@ mod schema {
                 END;
                 PRAGMA user_version=1;
             ",
+            )?;
+            tx.commit()?;
+        }
+        if version < 2 {
+            let tx = db.transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE commands ADD COLUMN attempting INTEGER NOT NULL DEFAULT 0; PRAGMA user_version=2;",
+            )?;
+            tx.commit()?;
+        }
+        if version < 3 {
+            let tx = db.transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE commands ADD COLUMN recovery BLOB;
+                 ALTER TABLE identity ADD COLUMN result_limit INTEGER NOT NULL DEFAULT 262144;
+                 PRAGMA user_version=3;",
             )?;
             tx.commit()?;
         }
@@ -90,6 +106,8 @@ pub enum Fault {
     ReplayGap(String),
     #[error("spoke spool full; producer must retain its source")]
     Full,
+    #[error("negotiated transport limits cannot carry retained command identities or records")]
+    TransportLimit,
 }
 
 impl Fault {
@@ -202,6 +220,33 @@ impl Journal {
                 welcome.command_journal_id,
                 receipt.through
             ],
+        )?;
+        let limits = boss_protocol_spoke::limits::Limits::default()
+            .negotiated(welcome.max_frame_bytes, welcome.max_inflight_bytes);
+        let largest_record: usize = tx.query_row(
+            "SELECT COALESCE(MAX(length(bytes)),0) FROM records WHERE sequence>?1",
+            [receipt.through],
+            |r| r.get(0),
+        )?;
+        let mut pending = tx.prepare("SELECT bytes FROM commands WHERE applied=0")?;
+        let mut rows = pending.query([])?;
+        while let Some(row) = rows.next()? {
+            let bytes: Vec<u8> = row.get(0)?;
+            let command = <boss_protocol_spoke::v1::Command as prost::Message>::decode(bytes.as_slice())?;
+            if commands::result_identity_bound(&command)
+                > limits.max_frame_bytes.min(limits.max_inflight_bytes) as usize
+            {
+                return Err(Fault::TransportLimit.into());
+            }
+        }
+        drop(rows);
+        drop(pending);
+        if largest_record > 0 && largest_record + 16 > limits.max_frame_bytes as usize {
+            return Err(Fault::TransportLimit.into());
+        }
+        tx.execute(
+            "UPDATE identity SET result_limit=?1",
+            [limits.max_frame_bytes.min(limits.max_inflight_bytes)],
         )?;
         tx.commit()?;
         Ok(())

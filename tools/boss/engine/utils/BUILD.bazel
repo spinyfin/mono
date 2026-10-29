@@ -23,6 +23,7 @@ rust_library(
         "//tools/boss/engine/dispatch-reader:__pkg__",
         "//tools/boss/engine/driver:__pkg__",
         "//tools/boss/engine/driver-quota:__pkg__",
+        "//tools/boss/engine/host-execution:__pkg__",
         "//tools/boss/engine/live-status-redact:__pkg__",
         "//tools/boss/engine/metrics:__pkg__",
         "//tools/boss/engine/metrics-registry:__pkg__",

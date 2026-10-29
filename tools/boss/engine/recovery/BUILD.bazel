@@ -12,6 +12,7 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/host-execution:__pkg__",
     ],
     deps = [
         "//lib/rust/git_utils",
@@ -44,4 +45,12 @@ rust_test(
         normal = True,
         normal_dev = True,
     ),
+)
+
+# Share the pinned recovery fixture tool without widening its repository exports.
+filegroup(
+    name = "jj_test_binary",
+    testonly = True,
+    srcs = ["@jj_test_tools//:jj"],
+    visibility = ["//tools/boss/engine/host-execution:__pkg__"],
 )

@@ -30,6 +30,7 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/engine/host-enrollment:__pkg__",
+        "//tools/boss/engine/host-execution:__pkg__",
         "//tools/boss/engine/spoke:__pkg__",
         "//tools/boss/engine/spoke-journal:__pkg__",
         "//tools/boss/engine/spoke-outbound:__pkg__",
