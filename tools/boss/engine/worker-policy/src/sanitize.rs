@@ -335,6 +335,7 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::ReviewGuideContent { .. }
         | FrontendEvent::ReviewGuideRetryQueued { .. }
         | FrontendEvent::ReviewTerminalReady { .. }
+        | FrontendEvent::ReviewTerminalProgress { .. }
         | FrontendEvent::LiveWorkspaceTerminalReady { .. }
         | FrontendEvent::MergeConfirmationRequired { .. }
         | FrontendEvent::MergeWhenReadyAccepted { .. }

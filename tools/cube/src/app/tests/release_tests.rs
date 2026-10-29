@@ -14,6 +14,52 @@ use crate::store::{Store, WorkspaceListFilter};
 use crate::app::dispatch::run_with_dependencies;
 use crate::app::errors::{CubeError, Result};
 use crate::app::reset::PRESERVED_UNPUSHED_RELEASE_REASON;
+
+#[test]
+fn terminal_lease_resets_locally_without_network_fetch() {
+    let (tempdir, database_path) = with_database_path();
+    let root = tempdir.path().join("workspaces");
+    let path = root.join("mono-agent-001");
+    std::fs::create_dir_all(path.join(".jj")).unwrap();
+    seed_mono_repo(&root, &database_path);
+    let runner = FakeRunner::new(vec![
+        ExpectedCommand::ok(path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
+        ExpectedCommand::ok(
+            path.clone(),
+            "jj",
+            &["git", "remote", "list"],
+            "origin\tgit@github.com:spinyfin/mono.git\n",
+        ),
+        ExpectedCommand::ok(
+            path.clone(),
+            "jj",
+            &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(path.clone(), "jj", &["new", "main@origin"], ""),
+        ExpectedCommand::ok(
+            path,
+            "jj",
+            &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+            "abc1234",
+        ),
+    ]);
+    run_with_dependencies(
+        Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "terminal",
+            "--local-reset",
+        ]),
+        Some(&database_path),
+        &runner,
+    )
+    .expect("local lease");
+    runner.assert_exhausted();
+}
 use crate::app::util::repo_lock_path;
 
 #[test]

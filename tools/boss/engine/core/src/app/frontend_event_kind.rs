@@ -183,6 +183,7 @@ pub(super) fn kind(event: &FrontendEvent) -> &'static str {
         FrontendEvent::CommentsReviseDocResult { .. } => "CommentsReviseDocResult",
         FrontendEvent::AnswerAgentRunsList { .. } => "AnswerAgentRunsList",
         FrontendEvent::ReviewTerminalReady { .. } => "ReviewTerminalReady",
+        FrontendEvent::ReviewTerminalProgress { .. } => "ReviewTerminalProgress",
         FrontendEvent::ReviewGuideSummary { .. } => "ReviewGuideSummary",
         FrontendEvent::ReviewGuideContent { .. } => "ReviewGuideContent",
         FrontendEvent::ReviewGuideRetryQueued { .. } => "ReviewGuideRetryQueued",

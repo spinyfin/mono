@@ -328,7 +328,9 @@ final class GhosttyTerminalHostView: NSView {
 
         let surface = launchSpec.workingDirectory.withCString { workingDirectory in
             launchSpec.initialInput.withCString { initialInput in
-                envVars.withUnsafeMutableBufferPointer { envBuf in
+                let command = launchSpec.command.map { strdup($0) }
+                defer { if let command { free(command) } }
+                return envVars.withUnsafeMutableBufferPointer { envBuf in
                     var config = ghostty_surface_config_new()
                     config.platform_tag = GHOSTTY_PLATFORM_MACOS
                     config.platform = ghostty_platform_u(macos: ghostty_platform_macos_s(
@@ -339,6 +341,7 @@ final class GhosttyTerminalHostView: NSView {
                     config.font_size = launchSpec.fontSize
                     config.working_directory = workingDirectory
                     config.initial_input = initialInput
+                    if let command { config.command = UnsafePointer(command) }
                     config.env_vars = envBuf.baseAddress
                     config.env_var_count = envBuf.count
                     return ghostty_surface_new(runtime.app, &config)
@@ -1051,6 +1054,11 @@ final class GhosttyTerminalHostView: NSView {
 
         let visibleContents = readVisibleContents(from: surface)
         session.updatePaneMonitor(snapshot: makePaneSnapshot(from: visibleContents))
+    }
+
+    var hasVisibleOutput: Bool {
+        guard let surface else { return false }
+        return !readVisibleContents(from: surface).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func readVisibleContents(from surface: ghostty_surface_t) -> String {

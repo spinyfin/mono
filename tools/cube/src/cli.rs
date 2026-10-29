@@ -160,6 +160,10 @@ pub enum WorkspaceCommand {
         /// retain-for-repair default.
         #[arg(long)]
         release_on_setup_failure: bool,
+        /// Reset to the locally known default branch without fetching.
+        /// Expired leases still use the full recovery guard before reuse.
+        #[arg(long)]
+        local_reset: bool,
     },
     /// Release a workspace lease.
     ///

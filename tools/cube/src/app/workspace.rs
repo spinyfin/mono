@@ -251,6 +251,7 @@ pub(super) fn run_workspace(
             allow_dirty,
             exclude,
             release_on_setup_failure,
+            local_reset,
         } => {
             let repo_record = store
                 .get_repo(&repo)?
@@ -1239,7 +1240,12 @@ pub(super) fn run_workspace(
             } else {
                 expired_by_workspace_id.get(workspace.workspace_id.as_str()).copied()
             };
-            if let Err(error) = reset_workspace_guarded(
+            let reset = if local_reset && prior_expired.is_none() {
+                super::reset::reset_workspace_after_fetch
+            } else {
+                reset_workspace_guarded
+            };
+            if let Err(error) = reset(
                 runner,
                 database_path,
                 &workspace.workspace_path,

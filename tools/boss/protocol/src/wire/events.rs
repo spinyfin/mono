@@ -1566,8 +1566,8 @@ pub enum FrontendEvent {
         answer_agent_runs: Vec<AnswerAgentRun>,
     },
     /// Response to [`FrontendRequest::OpenReviewTerminal`]: the engine
-    /// has leased a workspace, fetched the PR branch, and created a new
-    /// jj commit atop `<branch>@origin`. The app should open a Ghostty
+    /// has leased a workspace and positioned it on the locally known PR
+    /// head (fetching only when missing). The app should open a Ghostty
     /// terminal window rooted at `workspace_path` and send
     /// [`FrontendRequest::ReleaseReviewTerminal`] with `lease_id` when
     /// the window closes to avoid leaking the lease.
@@ -1575,6 +1575,11 @@ pub enum FrontendEvent {
         work_item_id: String,
         workspace_path: String,
         lease_id: String,
+    },
+    /// Progress while a terminal's checkout is prepared in the background.
+    ReviewTerminalProgress {
+        work_item_id: String,
+        stage: String,
     },
     /// Response to [`FrontendRequest::GetReviewGuideSummary`]. `None` when
     /// no comparison has been captured for this root task yet — distinct

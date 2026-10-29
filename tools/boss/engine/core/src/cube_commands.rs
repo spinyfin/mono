@@ -232,6 +232,35 @@ pub async fn lease_workspace<T: CubeJsonTransport + ?Sized>(
     allow_dirty: bool,
     exclude_workspace_ids: &[&str],
 ) -> Result<CubeWorkspaceLease> {
+    lease_workspace_with_reset(
+        transport,
+        repo_id,
+        task,
+        prefer_workspace_id,
+        allow_dirty,
+        exclude_workspace_ids,
+        false,
+    )
+    .await
+}
+
+pub async fn lease_terminal_workspace<T: CubeJsonTransport + ?Sized>(
+    transport: &T,
+    repo_id: &str,
+    task: &str,
+) -> Result<CubeWorkspaceLease> {
+    lease_workspace_with_reset(transport, repo_id, task, None, false, &[], true).await
+}
+
+async fn lease_workspace_with_reset<T: CubeJsonTransport + ?Sized>(
+    transport: &T,
+    repo_id: &str,
+    task: &str,
+    prefer_workspace_id: Option<&str>,
+    allow_dirty: bool,
+    exclude_workspace_ids: &[&str],
+    local_reset: bool,
+) -> Result<CubeWorkspaceLease> {
     // `--release-on-setup-failure`: the engine never wants a lease left
     // stranded when a post-lease setup step exits non-zero (the anaplian
     // failure-mode A leak — the engine treats the non-zero exit as a lease
@@ -250,6 +279,9 @@ pub async fn lease_workspace<T: CubeJsonTransport + ?Sized>(
     ];
     if let Some(prefer) = prefer_workspace_id {
         args.extend_from_slice(&["--prefer", prefer]);
+    }
+    if local_reset {
+        args.push("--local-reset");
     }
     if allow_dirty {
         args.push("--allow-dirty");
@@ -516,6 +548,17 @@ mod tests {
     }
 
     // --- Per-operation budgets -------------------------------------------
+
+    #[tokio::test]
+    async fn terminal_lease_uses_local_reset_and_retains_failure_cleanup() {
+        let t = RecordingTransport::new(json!({
+            "workspace": { "lease_id": "lease-1", "workspace_id": "ws-1", "workspace_path": "/tmp/ws-1" }
+        }));
+        lease_terminal_workspace(&t, "repo-1", "terminal").await.unwrap();
+        assert!(t.argv().contains(&"--local-reset".to_owned()));
+        assert!(t.argv().contains(&"--release-on-setup-failure".to_owned()));
+        assert_eq!(t.budget(), Some(crate::cube_op_budget::lease_transport_budget()));
+    }
 
     /// A remote lease must be run under the lease budget, not the
     /// transport's generic fast-command bound. This is the anaplian

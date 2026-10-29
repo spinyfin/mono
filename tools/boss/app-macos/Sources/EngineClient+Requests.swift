@@ -434,11 +434,11 @@ extension EngineClient {
     /// path for opening a Ghostty terminal. The engine replies with
     /// `review_terminal_ready` or `work_error`.
     @discardableResult
-    func sendOpenReviewTerminal(workItemID: String) -> String? {
+    func sendOpenReviewTerminal(workItemID: String, requestID: String = UUID().uuidString) -> String? {
         sendLine([
             "type": "open_review_terminal",
             "work_item_id": workItemID,
-        ])
+        ], envelopeRequestId: requestID)
     }
 
     /// Ask the engine for a terminal into a Doing-column work item's
@@ -446,11 +446,11 @@ extension EngineClient {
     /// The engine replies with `live_workspace_terminal_ready` or
     /// `work_error`.
     @discardableResult
-    func sendOpenLiveWorkspaceTerminal(workItemID: String) -> String? {
+    func sendOpenLiveWorkspaceTerminal(workItemID: String, requestID: String = UUID().uuidString) -> String? {
         sendLine([
             "type": "open_live_workspace_terminal",
             "work_item_id": workItemID,
-        ])
+        ], envelopeRequestId: requestID)
     }
 
     /// Refresh the open guide's engine-owned findings and tracking state.

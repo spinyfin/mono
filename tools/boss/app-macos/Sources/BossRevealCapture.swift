@@ -46,6 +46,10 @@ enum BossRevealCapture {
 
     static func start(updateModel: UpdateModel) {
         guard let state, let path = BossCaptureArgs.shared.captureTo else { return }
+        if state.hasPrefix("review-terminal") {
+            BossReviewTerminalCapture.start(path: path, state: state)
+            return
+        }
         if state == "agents-toolbar" {
             BossAgentsToolbarCapture.start(path: path)
             return

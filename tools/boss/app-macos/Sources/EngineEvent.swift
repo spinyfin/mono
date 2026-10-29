@@ -300,12 +300,13 @@ enum EngineEvent {
     /// workspace, fetched the PR branch, and created a new jj commit
     /// atop `<branch>@origin`. The app should open a Ghostty terminal
     /// window rooted at `workspacePath`.
-    case reviewTerminalReady(workItemID: String, workspacePath: String, leaseID: String)
+    case reviewTerminalProgress(workItemID: String, stage: String, requestID: String?)
+    case reviewTerminalReady(workItemID: String, workspacePath: String, leaseID: String, requestID: String? = nil)
     /// Response to `open_live_workspace_terminal` — the work item's live
     /// execution already holds a leased cube workspace at `workspacePath`.
     /// The app should open a Ghostty terminal window rooted there; there
     /// is no lease to release when the window closes.
-    case liveWorkspaceTerminalReady(workItemID: String, workspacePath: String)
+    case liveWorkspaceTerminalReady(workItemID: String, workspacePath: String, requestID: String? = nil)
     /// No merge initiated; these open revisions must be acknowledged before merging.
     case mergeConfirmationRequired(workItemID: String, revisions: [OpenMergeRevision])
     /// Response to `merge_when_ready` — the engine has successfully

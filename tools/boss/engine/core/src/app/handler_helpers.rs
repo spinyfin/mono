@@ -991,10 +991,11 @@ pub(super) async fn handle_create_many(
 /// human-readable rendering of the command reused in both the
 /// spawn-failure and non-zero-exit error messages. Callers feed the
 /// returned error through `fail_with_release!`.
-async fn run_jj(dir: &std::path::Path, args: &[&str], display: &str) -> Result<()> {
-    let out = TokioCommand::new("jj")
+pub(super) async fn run_jj(dir: &std::path::Path, args: &[&str], display: &str) -> Result<()> {
+    let out = TokioCommand::new(std::env::var_os("BOSS_JJ_BIN").unwrap_or_else(|| "jj".into()))
+        .arg("--repository")
+        .arg(dir)
         .args(args)
-        .current_dir(dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1007,66 +1008,6 @@ async fn run_jj(dir: &std::path::Path, args: &[&str], display: &str) -> Result<(
         anyhow::bail!("{display} failed: {}", stderr.trim());
     }
     Ok(())
-}
-
-/// Orchestrate the review-terminal workspace setup for
-/// [`FrontendRequest::OpenReviewTerminal`].
-///
-/// 1. Ensure the repo is registered with cube.
-/// 2. Lease a workspace for that repo.
-/// 3. Resolve the PR head branch via `gh pr view`.
-/// 4. Fetch remote state with `jj git fetch`.
-/// 5. Create a new jj commit atop `<branch>@origin` with `jj new`.
-/// 6. Return `(workspace_path, lease_id)` to the caller.
-///
-/// On any failure after a lease is acquired, the lease is released
-/// before returning the error so we don't leak idle workspaces.
-pub(super) async fn open_review_terminal_async(
-    cube_client: &Arc<dyn CubeClient>,
-    repo_remote_url: &str,
-    pr_url: &str,
-    work_item_id: &str,
-) -> Result<(String, String)> {
-    // Step 1: ensure repo
-    let repo = cube_client
-        .ensure_repo(repo_remote_url)
-        .await
-        .with_context(|| format!("cube repo ensure failed for {repo_remote_url}"))?;
-
-    // Step 2: lease workspace
-    let task_label = format!("review terminal for {work_item_id}");
-    let lease = cube_client
-        .lease_workspace(&repo.repo_id, &task_label, None, false, &[])
-        .await
-        .with_context(|| format!("cube workspace lease failed for repo {}", repo.repo_id))?;
-
-    // Helper: release lease and propagate the original error.
-    macro_rules! fail_with_release {
-        ($err:expr) => {{
-            let e = $err;
-            let _ = cube_client.release_workspace(&lease.lease_id).await;
-            return Err(e);
-        }};
-    }
-
-    // Step 3: resolve PR head branch
-    let head_branch = match get_pr_head_branch(pr_url).await {
-        Ok(b) => b,
-        Err(e) => fail_with_release!(e),
-    };
-
-    // Step 4: jj git fetch
-    if let Err(e) = run_jj(&lease.workspace_path, &["git", "fetch"], "jj git fetch").await {
-        fail_with_release!(e);
-    }
-
-    // Step 5: jj new -r <branch>@origin
-    let rev = format!("{head_branch}@origin");
-    if let Err(e) = run_jj(&lease.workspace_path, &["new", "-r", &rev], &format!("jj new -r {rev}")).await {
-        fail_with_release!(e);
-    }
-
-    Ok((lease.workspace_path.display().to_string(), lease.lease_id))
 }
 
 /// Call `gh pr view <pr_url> --json headRefName --jq .headRefName` and

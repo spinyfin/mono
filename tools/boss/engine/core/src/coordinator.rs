@@ -619,6 +619,9 @@ pub struct CubeRepoSummary {
 
 #[async_trait]
 pub trait CubeClient: Send + Sync {
+    async fn lease_terminal_workspace(&self, repo_id: &str, task: &str) -> Result<CubeWorkspaceLease> {
+        self.lease_workspace(repo_id, task, None, false, &[]).await
+    }
     async fn recovery_pr_base(&self, origin: &str, pr: u64) -> Result<String> {
         crate::host_adapter::fetch_recovery_pr_base(origin, pr).await
     }
@@ -893,6 +896,9 @@ impl crate::cube_commands::CubeJsonTransport for CommandCubeClient {
 
 #[async_trait]
 impl CubeClient for CommandCubeClient {
+    async fn lease_terminal_workspace(&self, repo_id: &str, task: &str) -> Result<CubeWorkspaceLease> {
+        crate::cube_commands::lease_terminal_workspace(self, repo_id, task).await
+    }
     async fn create_execution_bookmark(
         &self,
         workspace: &Path,

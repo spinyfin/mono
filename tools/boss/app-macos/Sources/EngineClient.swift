@@ -1464,6 +1464,10 @@ final class EngineClient: @unchecked Sendable {
             if !attentionID.isEmpty {
                 emit(.attentionMergesList(attentionID: attentionID, merges: merges))
             }
+        case "review_terminal_progress":
+            if let workItemID = payload["work_item_id"] as? String, let stage = payload["stage"] as? String {
+                emit(.reviewTerminalProgress(workItemID: workItemID, stage: stage, requestID: envelopeRequestId))
+            }
         case "review_terminal_ready":
             let workItemID = payload["work_item_id"] as? String ?? ""
             let workspacePath = payload["workspace_path"] as? String ?? ""
@@ -1472,7 +1476,8 @@ final class EngineClient: @unchecked Sendable {
                 emit(.reviewTerminalReady(
                     workItemID: workItemID,
                     workspacePath: workspacePath,
-                    leaseID: leaseID
+                    leaseID: leaseID,
+                    requestID: envelopeRequestId
                 ))
             }
         case "live_workspace_terminal_ready":
@@ -1481,7 +1486,8 @@ final class EngineClient: @unchecked Sendable {
             if !workItemID.isEmpty && !workspacePath.isEmpty {
                 emit(.liveWorkspaceTerminalReady(
                     workItemID: workItemID,
-                    workspacePath: workspacePath
+                    workspacePath: workspacePath,
+                    requestID: envelopeRequestId
                 ))
             }
         case "merge_confirmation_required":

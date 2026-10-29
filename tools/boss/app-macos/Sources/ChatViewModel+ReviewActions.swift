@@ -171,19 +171,25 @@ extension ChatViewModel {
 
     /// Ask the engine to lease a workspace for the given Review-column
     /// task's PR branch and open a terminal there. Opens the window
-    /// immediately with a loading spinner; the terminal becomes live once
+    /// immediately with a local shell; the PR checkout becomes available once
     /// the engine sends back `ReviewTerminalReady`.
     func openReviewTerminal(for task: WorkTask) {
         guard let prURL = task.prURL, !prURL.isEmpty else { return }
-        guard !openingReviewTerminalIDs.contains(task.id) else {
+        guard !openingReviewTerminalIDs.contains(task.id) || !reviewTerminalVM.isPreparing || reviewTerminalVM.workItemID != task.id else {
             // Same task still loading — just re-focus the window.
             reviewTerminalOpener?()
             return
         }
-        reviewTerminalVM.state = .loading(taskName: task.name)
+        if case .ready(let content) = reviewTerminalVM.state, let leaseID = content.leaseID {
+            releaseReviewTerminal(leaseID: leaseID)
+        }
+        let requestID = UUID().uuidString
+        reviewTerminalVM.begin(workItemID: task.id, taskName: task.name, requestID: requestID)
         reviewTerminalOpener?()
         openingReviewTerminalIDs.insert(task.id)
-        if engine.sendOpenReviewTerminal(workItemID: task.id) == nil {
+        let sentRequestID = engine.sendOpenReviewTerminal(workItemID: task.id, requestID: requestID)
+        reviewTerminalVM.track(requestID: sentRequestID)
+        if sentRequestID == nil {
             openingReviewTerminalIDs.remove(task.id)
             resetLoadingReviewTerminal()
         }
@@ -199,20 +205,26 @@ extension ChatViewModel {
     /// Ask the engine for a terminal into a Doing-column task's already-
     /// live execution workspace — no new lease, just the path the running
     /// worker is already using. Opens the same window as
-    /// `openReviewTerminal` with a loading spinner; becomes live once the
+    /// `openReviewTerminal` with a local shell; opens the workspace once the
     /// engine sends back `LiveWorkspaceTerminalReady`. Unlike the review
     /// flow, the window's `onDisappear` never releases a lease, since the
     /// worker owns it for the lifetime of its run.
     func openLiveWorkspaceTerminal(for task: WorkTask) {
-        guard !openingLiveWorkspaceTerminalIDs.contains(task.id) else {
+        guard !openingLiveWorkspaceTerminalIDs.contains(task.id) || !reviewTerminalVM.isPreparing || reviewTerminalVM.workItemID != task.id else {
             // Same task still loading — just re-focus the window.
             reviewTerminalOpener?()
             return
         }
-        reviewTerminalVM.state = .loading(taskName: task.name)
+        if case .ready(let content) = reviewTerminalVM.state, let leaseID = content.leaseID {
+            releaseReviewTerminal(leaseID: leaseID)
+        }
+        let requestID = UUID().uuidString
+        reviewTerminalVM.begin(workItemID: task.id, taskName: task.name, requestID: requestID)
         reviewTerminalOpener?()
         openingLiveWorkspaceTerminalIDs.insert(task.id)
-        if engine.sendOpenLiveWorkspaceTerminal(workItemID: task.id) == nil {
+        let sentRequestID = engine.sendOpenLiveWorkspaceTerminal(workItemID: task.id, requestID: requestID)
+        reviewTerminalVM.track(requestID: sentRequestID)
+        if sentRequestID == nil {
             openingLiveWorkspaceTerminalIDs.remove(task.id)
             resetLoadingReviewTerminal()
         }
@@ -220,7 +232,7 @@ extension ChatViewModel {
 
     private func resetLoadingReviewTerminal() {
         if case .loading = reviewTerminalVM.state {
-            reviewTerminalVM.state = .idle
+            reviewTerminalVM.fail("Could not contact the engine. Reopen the terminal to retry.")
         }
     }
 }

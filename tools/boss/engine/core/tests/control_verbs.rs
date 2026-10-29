@@ -65,6 +65,22 @@ async fn spawn_engine() -> Result<TestEngine> {
     .await
 }
 
+#[tokio::test]
+async fn terminal_unknown_work_item_returns_error_over_isolated_socket() -> Result<()> {
+    let engine = spawn_engine().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let response = client
+        .send_request(&FrontendRequest::OpenReviewTerminal {
+            work_item_id: "missing-terminal-task".into(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { message } => assert!(!message.is_empty()),
+        other => return Err(anyhow!("expected terminal error, got {other:?}")),
+    }
+    Ok(())
+}
+
 /// Returned by `seed_execution` so the test can verify both
 /// execution-row state (status flip) and work-item state (kanban
 /// column) in the same round-trip.

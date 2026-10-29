@@ -56,6 +56,11 @@ extension ChatViewModel {
         case .engineRequest(let requestId, let request):
             handleEngineRequest(requestId: requestId, request: request)
         case .disconnected:
+            if case .loading = reviewTerminalVM.state {
+                reviewTerminalVM.fail("Connection to the engine was lost. Reopen the terminal to retry.")
+            }
+            openingReviewTerminalIDs.removeAll()
+            openingLiveWorkspaceTerminalIDs.removeAll()
             failOutstandingMergeRequests(message: "Connection lost while requesting merge. Check the PR before retrying.")
             reviewNotifier.suspendDecisionReminders()
             remediationStateRequestID = nil
@@ -264,8 +269,8 @@ extension ChatViewModel {
             retryingReviewGuideRootTaskIDs.removeAll()
             plannerActionInFlightProjectIDs.removeAll()
             deferredScopeActionInFlightIDs.removeAll()
-            if case .loading = reviewTerminalVM.state {
-                reviewTerminalVM.state = .idle
+            if reviewTerminalVM.matches(requestID: requestId) {
+                reviewTerminalVM.fail(message)
             }
             // Error is likely from an in-flight kanban move: bounce the
             // card(s) back and show the notice inline on the card. Parked
@@ -320,6 +325,9 @@ extension ChatViewModel {
             if settleArchiveWorkError(message: message, requestId: requestId) { return }
             handle(.error(message: message))
         case .error(let message, let requestId):
+            if reviewTerminalVM.matches(requestID: requestId) {
+                reviewTerminalVM.fail(message)
+            }
             failBoardRead(requestID: requestId)
             if let requestId,
                let pending = pendingDragAdmissionChecks.values.first(where: { $0.requestID == requestId }),
@@ -606,21 +614,25 @@ extension ChatViewModel {
             applyAttentionGroupSnapshot(group, members: members)
         case .attentionMergesList(let attentionID, let merges):
             attentionMergesByAttentionID[attentionID] = merges
-        case .reviewTerminalReady(let workItemID, let workspacePath, let leaseID):
+        case .reviewTerminalProgress(let workItemID, let stage, let requestId):
+            if reviewTerminalVM.matches(requestID: requestId, workItemID: workItemID) {
+                reviewTerminalVM.noteProgress(stage)
+            }
+        case .reviewTerminalReady(let workItemID, let workspacePath, let leaseID, let requestId):
             openingReviewTerminalIDs.remove(workItemID)
             let content = reviewTerminalContent(
                 workItemID: workItemID,
                 workspacePath: workspacePath,
                 leaseID: leaseID
             )
-            if reviewTerminalVM.windowIsOpen {
-                reviewTerminalVM.state = .ready(content)
+            if reviewTerminalVM.windowIsOpen && reviewTerminalVM.matches(requestID: requestId, workItemID: workItemID) {
+                reviewTerminalVM.ready(content)
             } else {
                 // Window was closed while the engine was still setting up.
                 // Release the lease immediately since nobody will consume it.
                 engine.sendReleaseReviewTerminal(leaseID: leaseID)
             }
-        case .liveWorkspaceTerminalReady(let workItemID, let workspacePath):
+        case .liveWorkspaceTerminalReady(let workItemID, let workspacePath, let requestId):
             openingLiveWorkspaceTerminalIDs.remove(workItemID)
             let content = reviewTerminalContent(
                 workItemID: workItemID,
@@ -630,8 +642,8 @@ extension ChatViewModel {
             // No lease was created for this path, so unlike the review-
             // terminal case above there is nothing to release if the
             // window already closed — just drop the content.
-            if reviewTerminalVM.windowIsOpen {
-                reviewTerminalVM.state = .ready(content)
+            if reviewTerminalVM.windowIsOpen && reviewTerminalVM.matches(requestID: requestId, workItemID: workItemID) {
+                reviewTerminalVM.ready(content)
             }
         case .mergeConfirmationRequired(let workItemID, let revisions):
             handleMergeConfirmation(workItemID: workItemID, revisions: revisions)

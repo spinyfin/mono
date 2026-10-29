@@ -46,6 +46,8 @@ struct TerminalLaunchSpec {
     let fontSize: Float32
     let workingDirectory: String
     let initialInput: String
+    /// Explicit command for standalone shells; nil preserves the Ghostty configuration.
+    let command: String?
     /// Env vars to set on the spawned shell, layered over the app's
     /// inherited env. The engine builds a strict allowlist for worker
     /// spawns (sanitized PATH excluding `bossctl`, plus
@@ -59,12 +61,14 @@ struct TerminalLaunchSpec {
         fontSize: Float32,
         workingDirectory: String,
         initialInput: String,
-        env: [(String, String)] = []
+        env: [(String, String)] = [],
+        command: String? = nil
     ) {
         self.fontSize = fontSize
         self.workingDirectory = workingDirectory
         self.initialInput = initialInput
         self.env = env
+        self.command = command
     }
 }
 

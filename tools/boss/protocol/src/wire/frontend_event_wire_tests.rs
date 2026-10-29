@@ -1917,6 +1917,14 @@ fn tag_cases() -> Vec<TagCase> {
         },
         // --- Terminals & merge ---
         TagCase {
+            label: "ReviewTerminalProgress",
+            event: FrontendEvent::ReviewTerminalProgress {
+                work_item_id: "task".into(),
+                stage: "Positioning workspace".into(),
+            },
+            expected_tag: "review_terminal_progress",
+        },
+        TagCase {
             label: "ReviewTerminalReady",
             event: FrontendEvent::ReviewTerminalReady {
                 work_item_id: "task_1".into(),
@@ -2399,6 +2407,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::ReviewGuideContent { .. }
         | FrontendEvent::ReviewGuideRetryQueued { .. }
         | FrontendEvent::ReviewTerminalReady { .. }
+        | FrontendEvent::ReviewTerminalProgress { .. }
         | FrontendEvent::LiveWorkspaceTerminalReady { .. }
         | FrontendEvent::MergeConfirmationRequired { .. }
         | FrontendEvent::MergeWhenReadyAccepted { .. }

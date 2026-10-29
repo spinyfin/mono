@@ -638,11 +638,13 @@ pub(super) async fn handle_open_review_terminal(ctx: Dispatch, req: FrontendRequ
         work_db,
         sink,
         request_id,
+        recv_instant,
         ..
     } = ctx;
     let FrontendRequest::OpenReviewTerminal { work_item_id } = req else {
         unreachable!()
     };
+    tracing::info!(%request_id, %work_item_id, elapsed_ms = recv_instant.elapsed().as_millis(), "terminal request admitted");
     let work_item_id = match server_state.resolve_work_item_id(&work_item_id).await {
         Ok(id) => id,
         Err(err) => {
@@ -723,24 +725,56 @@ pub(super) async fn handle_open_review_terminal(ctx: Dispatch, req: FrontendRequ
                 return;
             }
         };
+        let known_head = work_db
+            .get_pr_status_snapshot(&work_item_id)
+            .ok()
+            .flatten()
+            .filter(|snapshot| snapshot.pr_url.as_deref() == Some(pr_url.as_str()))
+            .and_then(|snapshot| snapshot.head_sha);
         let cube_client = server_state.cube_client.clone();
         let sink2 = sink.clone();
         let request_id2 = request_id.clone();
         let work_item_id2 = work_item_id.clone();
         boss_task_scope::spawn(async move {
-            match open_review_terminal_async(&cube_client, &repo_remote_url, &pr_url, &work_item_id2).await {
+            let progress = |stage: &str| {
+                tracing::info!(request_id = %request_id2, work_item_id = %work_item_id2, %stage, elapsed_ms = recv_instant.elapsed().as_millis(), "terminal preparation");
+                send_response(
+                    &sink2,
+                    &request_id2,
+                    FrontendEvent::ReviewTerminalProgress {
+                        work_item_id: work_item_id2.clone(),
+                        stage: stage.to_owned(),
+                    },
+                );
+            };
+            match super::review_terminal::open_review_terminal_async(
+                &cube_client,
+                &repo_remote_url,
+                &pr_url,
+                &work_item_id2,
+                known_head.as_deref(),
+                progress,
+            )
+            .await
+            {
                 Ok((workspace_path, lease_id)) => {
-                    send_response(
+                    let delivered = super::handler_helpers::send_response_awaiting_delivery(
                         &sink2,
                         &request_id2,
                         FrontendEvent::ReviewTerminalReady {
-                            work_item_id: work_item_id2,
+                            work_item_id: work_item_id2.clone(),
                             workspace_path,
-                            lease_id,
+                            lease_id: lease_id.clone(),
                         },
-                    );
+                    )
+                    .await
+                    .unwrap_or(false);
+                    if !delivered && let Err(error) = cube_client.release_workspace(&lease_id).await {
+                        tracing::error!(request_id = %request_id2, work_item_id = %work_item_id2, %lease_id, %error, "disconnected terminal lease cleanup failed");
+                    }
                 }
                 Err(err) => {
+                    tracing::error!(request_id = %request_id2, work_item_id = %work_item_id2, elapsed_ms = recv_instant.elapsed().as_millis(), error = %err, "terminal preparation failed");
                     send_response(
                         &sink2,
                         &request_id2,

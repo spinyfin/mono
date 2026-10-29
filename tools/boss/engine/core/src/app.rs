@@ -130,6 +130,7 @@ pub(crate) mod readoption;
 mod review;
 mod review_guide;
 mod review_start;
+mod review_terminal;
 mod selected_product;
 mod server;
 mod sessions;
@@ -202,12 +203,11 @@ use handler_helpers::{
     build_chore_update_message, build_effort_audit_report, build_engine_health_report, build_live_status_debug_report,
     duplicate_or_work_error, handle_create_many, in_review_chore_execution, live_execution_for_task_id,
     load_automation_paused_state, load_dispatch_concurrency_limit, load_live_status_disabled_slots,
-    open_review_terminal_async, persist_live_status_disabled_slots, publish_comment_invalidation,
-    publish_runtime_work_invalidation, publish_work_invalidation, read_transcript_tail, resolve_transcript_for_tail,
-    restore_persisted_dispatch_pause, segment_to_wire, send_push, send_response, send_response_with_revision,
-    send_work_error, tail_lines_from_content, task_name_description_for_id, task_status_for_id,
-    task_transitioned_to_active, terminal_chore_execution, transport_default_created_via,
-    validate_external_tracker_config, work_item_id, work_item_needs_dispatch,
+    persist_live_status_disabled_slots, publish_comment_invalidation, publish_runtime_work_invalidation,
+    publish_work_invalidation, read_transcript_tail, resolve_transcript_for_tail, restore_persisted_dispatch_pause,
+    segment_to_wire, send_push, send_response, send_response_with_revision, send_work_error, tail_lines_from_content,
+    task_name_description_for_id, task_status_for_id, task_transitioned_to_active, terminal_chore_execution,
+    transport_default_created_via, validate_external_tracker_config, work_item_id, work_item_needs_dispatch,
 };
 
 /// Per-request handler context: the connection-scoped state every
