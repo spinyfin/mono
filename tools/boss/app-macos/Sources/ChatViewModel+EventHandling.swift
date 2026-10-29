@@ -56,6 +56,7 @@ extension ChatViewModel {
         case .engineRequest(let requestId, let request):
             handleEngineRequest(requestId: requestId, request: request)
         case .disconnected:
+            failOutstandingMergeRequests(message: "Connection lost while requesting merge. Check the PR before retrying.")
             reviewNotifier.suspendDecisionReminders()
             remediationStateRequestID = nil
             remediationEventsDuringRead.removeAll()
@@ -245,11 +246,7 @@ extension ChatViewModel {
             }
             openingReviewTerminalIDs.removeAll()
             openingLiveWorkspaceTerminalIDs.removeAll()
-            for taskId in mergingWhenReadyIDs {
-                mergeErrorNoticesByTaskID[taskId] = message
-            }
-            mergingWhenReadyIDs.removeAll()
-            mergeRevisionConfirmationOrigins.removeAll()
+            failOutstandingMergeRequests(message: message)
             // Mirror the disconnect path, but only when this WorkError is
             // the in-flight `get_review_guide_content` envelope — the
             // generic reply's message is otherwise as likely to belong to
@@ -287,6 +284,9 @@ extension ChatViewModel {
             refreshUnsentActions()
             showDisconnectedActionNotice()
         case .notConnected(let requestKind):
+            if requestKind == "merge_when_ready" {
+                failOutstandingMergeRequests(message: "Merge request could not be sent. Check the engine connection and retry.")
+            }
             if requestKind == "recreate_coordinator" {
                 if engine.hasUnsentAction(kind: requestKind) {
                     coordinatorResetWaiting = false
@@ -627,6 +627,7 @@ extension ChatViewModel {
         case .mergeConfirmationRequired(let workItemID, let revisions):
             handleMergeConfirmation(workItemID: workItemID, revisions: revisions)
         case .mergeWhenReadyAccepted(let workItemID, _, let action):
+            recordMergeAcknowledgement(for: workItemID)
             // Engine successfully initiated the merge. Clear the in-flight
             // guard so the button re-enables if the user wants to retry.
             // The PR-reconciler was kicked on the engine side, so a

@@ -2423,6 +2423,9 @@ async fn handle_frontend_connection(
                 .write_frame(&mut write_half, &line, &writer_session_id)
                 .await
                 .is_err();
+            if matches!(&event.payload, FrontendEvent::MergeWhenReadyAccepted { .. }) {
+                tracing::info!(request_id = ?event.request_id, elapsed_ms = write_start.elapsed().as_secs_f64() * 1000.0, write_failed, "merge acknowledgement socket write completed");
+            }
 
             if let Some(mut t) = trace {
                 t.record_plain(
@@ -2503,6 +2506,9 @@ async fn handle_frontend_connection(
         let decode_ms = crate::population_timing::elapsed_ms(decode_start);
         let request_id = envelope.request_id.clone();
         let request = envelope.payload;
+        if let FrontendRequest::MergeWhenReady { work_item_id, .. } = &request {
+            tracing::info!(%request_id, %work_item_id, decode_ms, "merge request socket received");
+        }
         let verb = variant_name(&request);
         frontend_metrics::record_request(&server_state.metrics, &verb);
         if let FrontendRequest::RecreateCoordinator {

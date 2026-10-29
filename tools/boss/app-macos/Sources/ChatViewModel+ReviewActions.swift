@@ -50,13 +50,17 @@ extension ChatViewModel {
         // a later accept shows the green notice for five seconds and then
         // falls through to the stale error for the rest of the session.
         mergeErrorNoticesByTaskID.removeValue(forKey: task.id)
+        if mergeFeedbackNotice?.taskID == task.id { clearMergeFeedback() }
         mergingWhenReadyIDs.insert(task.id)
         mergeRevisionConfirmationOrigins[task.id] = origin
+        beginMergeRequestFeedback(for: task.id)
         // A send dropped while disconnected never gets a reply; release the
         // in-flight state now so the control isn't stuck.
         if engine.sendMergeWhenReady(workItemID: task.id) == nil {
             mergingWhenReadyIDs.remove(task.id)
+            mergeRequestStartedAt.removeValue(forKey: task.id)
             mergeRevisionConfirmationOrigins.removeValue(forKey: task.id)
+            mergeErrorNoticesByTaskID[task.id] = "Merge request could not be sent. Check the engine connection and retry."
         }
     }
 
@@ -68,6 +72,7 @@ extension ChatViewModel {
     /// `cancelMergeRevisionConfirmation(workItemID:)` would ever run for it.
     func handleMergeConfirmation(workItemID: String, revisions: [OpenMergeRevision]) {
         guard mergingWhenReadyIDs.contains(workItemID) else { return }
+        mergeRequestStartedAt.removeValue(forKey: workItemID)
         let origin = mergeRevisionConfirmationOrigins[workItemID] ?? .board
         let confirmation = MergeRevisionConfirmation(
             workItemID: workItemID, revisions: revisions, origin: origin
@@ -105,7 +110,16 @@ extension ChatViewModel {
         guard let confirmation = pendingMergeRevisionConfirmation,
               confirmation.workItemID == workItemID else { return }
         pendingMergeRevisionConfirmation = nil
-        engine.sendMergeWhenReady(workItemID: confirmation.workItemID, confirmedRevisions: confirmation.revisions)
+        mergingWhenReadyIDs.insert(workItemID)
+        mergeErrorNoticesByTaskID.removeValue(forKey: workItemID)
+        mergeRevisionConfirmationOrigins[workItemID] = confirmation.origin
+        beginMergeRequestFeedback(for: workItemID)
+        if engine.sendMergeWhenReady(workItemID: confirmation.workItemID, confirmedRevisions: confirmation.revisions) == nil {
+            mergingWhenReadyIDs.remove(workItemID)
+            mergeRequestStartedAt.removeValue(forKey: workItemID)
+            mergeRevisionConfirmationOrigins.removeValue(forKey: workItemID)
+            mergeErrorNoticesByTaskID[workItemID] = "Merge request could not be sent. Check the engine connection and retry."
+        }
         presentNextQueuedMergeRevisionConfirmationIfNeeded()
     }
 

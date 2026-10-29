@@ -132,7 +132,7 @@ final class ChatViewModel: ObservableObject {
     /// `create_task_from_deferred_scope_attention` has been sent but neither
     /// the success push (`attentionItemUpdated`/`attentionItemConverted`) nor
     /// `work_error` has arrived yet. Drives the popover row's disabled
-    /// "acting" state — published (unlike `mergingWhenReadyIDs`) because the
+    /// "acting" state — published because the
     /// row reads it directly to know when to re-enable. Cleared wholesale on
     /// any `work_error` and on `.disconnected` (see
     /// `ChatViewModel+EventHandling.swift`) so a failed request or a dropped
@@ -800,7 +800,8 @@ final class ChatViewModel: ObservableObject {
     /// Work item IDs for which `merge_when_ready` has been sent but
     /// `merge_when_ready_accepted` (or `work_error`) has not yet arrived.
     /// Guards against a duplicate tap while the engine is running the merge.
-    var mergingWhenReadyIDs: Set<String> = []
+    @Published var mergingWhenReadyIDs: Set<String> = []
+    var mergeRequestStartedAt: [String: ContinuousClock.Instant] = [:]
 
     /// Which surface initiated each in-flight merge, keyed by work item id.
     /// Copied onto `MergeRevisionConfirmation.origin` when the engine asks

@@ -82,7 +82,8 @@ struct WorkBoardSectionItemsView: View {
                     dragRefusalMessage: dragRefusal?.taskID == task.id
                         ? dragRefusal?.message : nil,
                     mergeFeedbackMessage: mergeFeedback?.taskID == task.id
-                        ? mergeFeedback?.message : nil
+                        ? mergeFeedback?.message : nil,
+                    isRequestingMerge: model.mergingWhenReadyIDs.contains(task.id)
                 )
                 .id(task.id)
                 .background {
@@ -128,6 +129,7 @@ struct WorkBoardCardItem: View {
     var dragRefusalMessage: String? = nil
     /// Pre-resolved by the column container from `mergeFeedbackNotice`.
     var mergeFeedbackMessage: String? = nil
+    var isRequestingMerge = false
     @Environment(\.openWindow) private var openWindow
     @State private var showingDeleteConfirmation = false
 
@@ -217,6 +219,7 @@ struct WorkBoardCardItem: View {
                     },
                     onOpenTerminal: onOpenTerminal,
                     onMergeWhenReady: onMergeWhenReady,
+                    isRequestingMerge: isRequestingMerge,
                     onOpenReviewGuide: onOpenReviewGuide,
                     onRetryReviewGuide: onRetryReviewGuide,
                     onOpenAttachments: onOpenAttachments,
@@ -442,6 +445,7 @@ struct WorkBoardCardView: View, @MainActor Equatable {
     /// Invoked after the user confirms "Merge When Ready". `nil` hides
     /// the button (also gated by `snapshot.showsMergeWhenReady`).
     var onMergeWhenReady: (() -> Void)? = nil
+    var isRequestingMerge = false
     /// Invoked when the user taps the review-guide document button. `nil`
     /// hides it (also gated by `snapshot.reviewGuidePresentation`).
     var onOpenReviewGuide: (() -> Void)? = nil
@@ -473,6 +477,7 @@ struct WorkBoardCardView: View, @MainActor Equatable {
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.snapshot == rhs.snapshot
+            && lhs.isRequestingMerge == rhs.isRequestingMerge
             && lhs.isRevisionHighlighted == rhs.isRevisionHighlighted
             && lhs.aiReviewFindingsTooltipNote == rhs.aiReviewFindingsTooltipNote
     }
@@ -509,6 +514,7 @@ struct WorkBoardCardView: View, @MainActor Equatable {
                 onDepBadgeHover: onDepBadgeHover,
                 onOpenTerminal: onOpenTerminal,
                 onMergeWhenReady: onMergeWhenReady,
+                isRequestingMerge: isRequestingMerge,
                 onOpenReviewGuide: onOpenReviewGuide,
                 onRetryReviewGuide: onRetryReviewGuide,
                 onRevealAIReviewFindings: onRevealAIReviewFindings,

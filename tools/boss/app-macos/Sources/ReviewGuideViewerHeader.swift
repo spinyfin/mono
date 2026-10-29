@@ -51,7 +51,7 @@ struct ReviewGuideViewerHeader: View {
                         .foregroundStyle(.secondary)
                     Spacer(minLength: 8)
                     if task.isMergeWhenReadyEligible {
-                        MergeWhenReadyControl(onConfirm: {
+                        MergeWhenReadyControl(isRequesting: chatModel.mergingWhenReadyIDs.contains(task.id), onConfirm: {
                             chatModel.mergeWhenReady(for: task, origin: .reviewGuideViewer)
                         })
                     }
