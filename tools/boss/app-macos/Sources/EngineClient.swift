@@ -758,6 +758,19 @@ final class EngineClient: @unchecked Sendable {
             return
         }
         if type == "work_tree_update" {
+            if let update = payload["update"] as? [String: Any] {
+                do {
+                    guard let complete = try workTreeCache.collectPage(update) else { return }
+                    payload["update"] = complete
+                } catch {
+                    workTreeCache.resetBase()
+                    emit(.boardReadFailed(requestId: envelope["request_id"] as? String))
+                    if let productID = update["product_id"] as? String {
+                        sendGetWorkTree(productId: productID, flow: .itemRefetch, delta: false)
+                    }
+                    return
+                }
+            }
             guard let update = payload["update"] as? [String: Any],
                   let tree = workTreeCache.apply(update) else {
                 emit(.boardReadFailed(requestId: envelope["request_id"] as? String))

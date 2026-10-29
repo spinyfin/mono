@@ -1,4 +1,4 @@
-//! SQLite call observations and task attribution; never changes lock policy.
+//! SQLite call observations, task attribution and scoped maintenance deadlines.
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -77,9 +77,26 @@ pub(super) struct Observation {
 }
 
 thread_local! {
+    static QUERY_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
     // A connection guard cannot migrate between threads. Avoid a global lock
     // for every returned row; only writer transitions and BUSY touch the registry.
     static ACTIVE: RefCell<HashMap<usize, Rc<Observation>>> = RefCell::default();
+}
+
+/// Cooperatively interrupt maintenance SQL without replacing the connection's
+/// observation hook. Drop before releasing the connection, including on error.
+pub(super) struct QueryDeadline(Option<Instant>);
+
+impl QueryDeadline {
+    pub(super) fn after(duration: Duration) -> Self {
+        Self(QUERY_DEADLINE.replace(Some(Instant::now() + duration)))
+    }
+}
+
+impl Drop for QueryDeadline {
+    fn drop(&mut self) {
+        QUERY_DEADLINE.set(self.0);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -231,7 +248,7 @@ pub(super) fn install_update_observer(conn: &rusqlite::Connection) {
                     observation.set_writing(id, writing);
                 }
             });
-            false
+            QUERY_DEADLINE.get().is_some_and(|deadline| Instant::now() >= deadline)
         }),
     );
 }

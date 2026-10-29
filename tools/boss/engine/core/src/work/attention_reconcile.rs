@@ -98,11 +98,13 @@ fn work_resumed_evidence() -> String {
     // Run insertion precedes spawn. A pane-spawn failure therefore needs a
     // completed spawn run, not merely another attempt (active or failed).
     // Other WorkResumed signals retain their run-start clearing contract.
+    // CROSS JOIN fixes the loop order: indexed executions for this item,
+    // then indexed runs for those executions, never the global run history.
     format!(
         "EXISTS (
              SELECT 1
-             FROM work_runs r
-             JOIN work_executions e ON e.id = r.execution_id
+             FROM work_executions e
+             CROSS JOIN work_runs r ON r.execution_id = e.id
              WHERE e.work_item_id = {ATTENTION_WORK_ITEM}
                AND r.started_at IS NOT NULL
                AND (work_attention_items.kind != 'pane_spawn_failed' OR r.status = 'completed')
@@ -142,7 +144,7 @@ fn execution_kind_completed_evidence() -> String {
     )
 }
 
-fn resolve_one_kind(conn: &Connection, now: &str, lifecycle: &AttentionLifecycle) -> Result<usize> {
+fn resolve_one_kind(conn: &Connection, now: &str, lifecycle: &AttentionLifecycle, id: &str) -> Result<usize> {
     let rows = match &lifecycle.cleared_by {
         ClearedBy::WorkResumed => {
             let sql = format!(
@@ -150,10 +152,12 @@ fn resolve_one_kind(conn: &Connection, now: &str, lifecycle: &AttentionLifecycle
                  SET status = 'resolved', resolved_at = ?1
                  WHERE status = 'open'
                    AND kind = ?2
+                   AND id = ?4
                    AND {}",
                 work_resumed_evidence()
             );
-            conn.execute(&sql, params![now, lifecycle.kind])?
+            conn.prepare_cached(&sql)?
+                .execute(params![now, lifecycle.kind, rusqlite::types::Null, id])?
         }
         ClearedBy::ExecutionKindCompleted(execution_kind) => {
             let sql = format!(
@@ -161,10 +165,12 @@ fn resolve_one_kind(conn: &Connection, now: &str, lifecycle: &AttentionLifecycle
                  SET status = 'resolved', resolved_at = ?1
                  WHERE status = 'open'
                    AND kind = ?2
+                   AND id = ?4
                    AND {}",
                 execution_kind_completed_evidence()
             );
-            conn.execute(&sql, params![now, lifecycle.kind, execution_kind.as_str()])?
+            conn.prepare_cached(&sql)?
+                .execute(params![now, lifecycle.kind, execution_kind.as_str(), id])?
         }
         // `automatically_cleared()` never yields these; matched explicitly so
         // adding a fifth variant is a compile error here rather than a silent
@@ -192,22 +198,50 @@ impl WorkDb {
     /// that ended while a previous engine process was running, or via a code
     /// path nobody thought to hook.
     pub fn reconcile_stale_attention_signals(&self) -> Result<AttentionReconcileOutcome> {
+        // File-backed maintenance must never occupy the foreground connection,
+        // even while waiting for another SQLite writer. In-memory fixtures share
+        // their anchor connection; the same bounded batches apply there.
+        let db = self.query_connection()?;
+        // SQLite loads the schema lazily on this independent connection. Do
+        // that read-only setup before timing the bounded maintenance batches.
+        {
+            let conn = db.connect()?;
+            conn.prepare("SELECT id FROM work_attention_items LIMIT 0")?;
+        }
         let now = now_string();
         let mut outcome = AttentionReconcileOutcome::default();
+        let mut max_batch_hold_ms = 0.0_f64;
         for lifecycle in automatically_cleared() {
-            let resolved = {
-                let conn = self.connect()?;
-                let has_candidates: bool = conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM work_attention_items WHERE status = 'open' AND kind = ?1)",
-                    [lifecycle.kind],
-                    |row| row.get(0),
-                )?;
-                if has_candidates {
-                    resolve_one_kind(&conn, &now, lifecycle)?
-                } else {
-                    0
+            let mut after = String::new();
+            let mut resolved = 0;
+            loop {
+                let conn = db.connect()?;
+                let held = std::time::Instant::now();
+                let selection_deadline =
+                    super::db_diagnostics::QueryDeadline::after(std::time::Duration::from_millis(100));
+                let ids = {
+                    let mut stmt = conn.prepare_cached("SELECT id FROM work_attention_items WHERE status = 'open' AND kind = ?1 AND id > ?2 ORDER BY id LIMIT 32")?;
+                    super::collect_rows(stmt.query_map(params![lifecycle.kind, after], |row| row.get::<_, String>(0))?)?
+                };
+                drop(selection_deadline);
+                if ids.is_empty() {
+                    break;
                 }
-            };
+                for id in &ids {
+                    let deadline = super::db_diagnostics::QueryDeadline::after(std::time::Duration::from_millis(100));
+                    resolved += resolve_one_kind(&conn, &now, lifecycle, id)?;
+                    drop(deadline);
+                    after.clone_from(id);
+                    if held.elapsed() >= std::time::Duration::from_millis(10) {
+                        break;
+                    }
+                }
+                drop(conn);
+                max_batch_hold_ms = max_batch_hold_ms.max(held.elapsed().as_secs_f64() * 1000.0);
+                // Release the shared connection even when none of the batch
+                // has evidence. Keyset pagination cannot revisit unresolved rows.
+                std::thread::yield_now();
+            }
             if resolved > 0 {
                 tracing::info!(
                     kind = lifecycle.kind,
@@ -218,10 +252,33 @@ impl WorkDb {
             }
             outcome.attentions_resolved += resolved;
         }
-        outcome.dispatch_banners_cleared = {
-            let conn = self.connect()?;
-            clear_stale_dispatch_failures(&conn)?
-        };
+        let mut after = String::new();
+        loop {
+            let conn = db.connect()?;
+            let held = std::time::Instant::now();
+            let selection_deadline = super::db_diagnostics::QueryDeadline::after(std::time::Duration::from_millis(100));
+            let ids = {
+                let mut stmt = conn.prepare_cached("SELECT id FROM tasks WHERE dispatch_failed_reason IS NOT NULL AND dispatch_failed_at IS NOT NULL AND id > ?1 ORDER BY id LIMIT 32")?;
+                super::collect_rows(stmt.query_map([&after], |row| row.get::<_, String>(0))?)?
+            };
+            drop(selection_deadline);
+            if ids.is_empty() {
+                break;
+            }
+            for id in &ids {
+                let deadline = super::db_diagnostics::QueryDeadline::after(std::time::Duration::from_millis(100));
+                outcome.dispatch_banners_cleared += clear_stale_dispatch_failures(&conn, id)?;
+                drop(deadline);
+                after.clone_from(id);
+                if held.elapsed() >= std::time::Duration::from_millis(10) {
+                    break;
+                }
+            }
+            drop(conn);
+            max_batch_hold_ms = max_batch_hold_ms.max(held.elapsed().as_secs_f64() * 1000.0);
+            std::thread::yield_now();
+        }
+        tracing::info!(max_batch_hold_ms, "attention reconcile batch timing");
         Ok(outcome)
     }
 }
@@ -250,7 +307,7 @@ impl WorkDb {
 /// the item's orphan-active detection out by a full `min_age_secs` window —
 /// and would do so only on the sweep path, leaving the same logical
 /// operation with two different row outcomes depending on which path ran.
-fn clear_stale_dispatch_failures(conn: &Connection) -> Result<usize> {
+fn clear_stale_dispatch_failures(conn: &Connection, id: &str) -> Result<usize> {
     let rows = conn.execute(
         "UPDATE tasks
          SET dispatch_failed_reason = NULL,
@@ -258,15 +315,16 @@ fn clear_stale_dispatch_failures(conn: &Connection) -> Result<usize> {
              dispatch_failed_at     = NULL
          WHERE dispatch_failed_reason IS NOT NULL
            AND dispatch_failed_at IS NOT NULL
+           AND id = ?1
            AND EXISTS (
                SELECT 1
-               FROM work_runs r
-               JOIN work_executions e ON e.id = r.execution_id
+               FROM work_executions e
+               CROSS JOIN work_runs r ON r.execution_id = e.id
                WHERE e.work_item_id = tasks.id
                  AND r.started_at IS NOT NULL
                  AND CAST(r.started_at AS INTEGER) >= CAST(tasks.dispatch_failed_at AS INTEGER)
            )",
-        [],
+        [id],
     )?;
     if rows > 0 {
         tracing::info!(

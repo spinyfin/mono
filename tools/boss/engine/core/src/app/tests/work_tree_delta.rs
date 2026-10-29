@@ -38,6 +38,7 @@ async fn send_fetch(
     work_items::handle_get_work_tree(
         ctx,
         FrontendRequest::GetWorkTree {
+            snapshot_pages: false,
             product_id: product.into(),
             fetch_seq: None,
             delta,
@@ -52,6 +53,64 @@ fn update(event: FrontendEvent) -> boss_protocol::work_tree_delta::WorkTreeUpdat
         panic!("expected update")
     };
     update
+}
+
+#[tokio::test]
+async fn opted_in_cold_snapshot_is_paged_and_following_fetch_is_a_delta() {
+    let (state, _dir) = test_server_state();
+    let product = crate::test_support::create_test_product_named(&state.work_db, "paged");
+    for i in 0..4 {
+        let task = crate::test_support::create_test_chore(&state.work_db, &product.id, format!("page {i}"));
+        state
+            .work_db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET description = ?2 WHERE id = ?1",
+                rusqlite::params![task.id, "detail".repeat(40_000)],
+            )
+            .unwrap();
+    }
+    let sink = make_session_sink();
+    let ctx = Dispatch::builder()
+        .server_state(state.clone())
+        .work_db(state.work_db.clone())
+        .sink(sink.clone())
+        .session_id("board")
+        .request_id("paged-fetch")
+        .recv_instant(Instant::now())
+        .decode_ms(0.0)
+        .build();
+    work_items::handle_get_work_tree(
+        ctx,
+        FrontendRequest::GetWorkTree {
+            product_id: product.id.clone(),
+            fetch_seq: None,
+            delta: true,
+            snapshot_pages: true,
+        },
+    )
+    .await;
+    let mut count = 0;
+    let mut cards = 0;
+    loop {
+        let envelope = sink.next().await.unwrap();
+        assert_eq!(envelope.request_id.as_deref(), Some("paged-fetch"));
+        let page = update(envelope.payload);
+        assert!(serde_json::to_vec(&page).unwrap().len() < 513 * 1024);
+        cards += page.changes["snapshot_page"]["fields"]["chores"]
+            .as_array()
+            .map_or(0, Vec::len);
+        count += 1;
+        if page.is_last_page() {
+            break;
+        }
+    }
+    assert!(count > 1);
+    assert_eq!(cards, 4);
+    let next = update(fetch(&state, &sink, &product.id, true).await);
+    assert_eq!(next.base_sequence, Some(1));
+    assert_eq!(next.changes, serde_json::json!({}));
 }
 
 #[tokio::test]

@@ -2,6 +2,25 @@ use super::*;
 use crate::test_support::log_capture;
 use crate::work::WorkDb;
 
+#[test]
+fn maintenance_deadline_interrupts_sql_and_does_not_leak_to_next_caller() {
+    let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
+    let conn = db.connect().unwrap();
+    let query = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x < 10000) SELECT sum(x) FROM n";
+    {
+        let _deadline = QueryDeadline::after(Duration::ZERO);
+        let error = conn.query_row(query, [], |row| row.get::<_, i64>(0)).unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::OperationInterrupted)
+        );
+    }
+    assert_eq!(
+        conn.query_row(query, [], |row| row.get::<_, i64>(0)).unwrap(),
+        50_005_000
+    );
+}
+
 #[tokio::test]
 async fn attributed_hold_excludes_non_sql_work_from_query_time() {
     let logs = log_capture::install();

@@ -206,6 +206,7 @@ async fn active_permits_do_not_expire_after_the_admission_deadline() {
 fn execution_options_do_not_change_diagnostic_view_identity() {
     use boss_protocol::FrontendRequest as R;
     let tree = |delta, fetch_seq| R::GetWorkTree {
+        snapshot_pages: false,
         product_id: "a".into(),
         delta,
         fetch_seq,

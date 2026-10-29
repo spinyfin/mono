@@ -9,6 +9,7 @@ fn attention_reconcile_releases_connection_between_kinds() {
     struct CheckUnlocked {
         db: WorkDb,
         events: Arc<AtomicUsize>,
+        timing_events: Arc<AtomicUsize>,
     }
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CheckUnlocked {
         fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
@@ -17,7 +18,11 @@ fn attention_reconcile_releases_connection_between_kinds() {
                     self.db.conn.try_lock().is_ok(),
                     "connection held between attention kinds"
                 );
-                self.events.fetch_add(1, Ordering::Relaxed);
+                if event.metadata().fields().field("max_batch_hold_ms").is_some() {
+                    self.timing_events.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.events.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -45,15 +50,22 @@ fn attention_reconcile_releases_connection_between_kinds() {
         }
     }
     let events = Arc::new(AtomicUsize::new(0));
+    let timing_events = Arc::new(AtomicUsize::new(0));
     let subscriber = tracing_subscriber::registry().with(CheckUnlocked {
         db: db.clone(),
         events: events.clone(),
+        timing_events: timing_events.clone(),
     });
     tracing::subscriber::with_default(subscriber, || {
         assert_eq!(db.reconcile_stale_attention_signals().unwrap().attentions_resolved, 2);
         assert!(db.reconcile_stale_attention_signals().unwrap().is_empty());
     });
     assert_eq!(events.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        timing_events.load(Ordering::Relaxed),
+        2,
+        "one batch timing per pass, including the no-op pass"
+    );
 }
 
 #[test]

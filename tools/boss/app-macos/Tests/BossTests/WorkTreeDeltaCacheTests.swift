@@ -1,6 +1,26 @@
 import XCTest
 @testable import Boss
 
+extension WorkTreeDeltaCacheTests {
+    func testSnapshotPagesPublishAtomicallyAndRejectGaps() throws {
+        var cache = WorkTreeDeltaCache()
+        func page(_ index: Int, _ fields: [String: Any]) -> [String: Any] {
+            ["product_id": "product", "sequence": UInt64(1),
+             "changes": ["snapshot_page": ["index": index, "count": 2, "fields": fields]]]
+        }
+        let first = page(0, ["product": ["id": "product"], "tasks": [["id": "a"]]])
+        let last = page(1, ["tasks": [["id": "b"]], "chores": []])
+        XCTAssertThrowsError(try cache.collectPage(last))
+        XCTAssertNil(try cache.collectPage(first))
+        let update = try XCTUnwrap(cache.collectPage(last))
+        let tree = try XCTUnwrap(cache.apply(update))
+        XCTAssertEqual((tree["tasks"] as? [[String: Any]])?.compactMap { $0["id"] as? String }, ["a", "b"])
+        XCTAssertNil(try cache.collectPage(first))
+        cache.startConnection(2)
+        XCTAssertThrowsError(try cache.collectPage(last), "pages must not survive reconnect")
+    }
+}
+
 final class WorkTreeDeltaCacheTests: XCTestCase {
     func testAttentionDeltasRetainUnchangedRowsAndRemoveDismissedGroups() throws {
         var cache = WorkTreeDeltaCache()

@@ -301,6 +301,7 @@ extension EngineClient {
         sendLine([
             "type": "get_work_tree",
             "delta": delta,
+            "snapshot_pages": true,
             "product_id": productId,
             "fetch_seq": fetchSeq,
         ], queueIfDisconnected: true, envelopeRequestId: requestId)

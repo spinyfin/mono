@@ -451,15 +451,16 @@ fn dispatch_retry_at_for_execution(execution: &WorkExecution, now_secs: i64) -> 
 }
 
 pub(crate) fn query_latest_run(conn: &Connection, execution_id: &str) -> Result<Option<(String, String)>> {
-    conn.query_row(
+    conn.prepare_cached(
         "SELECT id, status
          FROM work_runs
          WHERE execution_id = ?1
          ORDER BY created_at DESC, id DESC
          LIMIT 1",
-        [execution_id],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-    )
+    )?
+    .query_row([execution_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })
     .optional()
     .map_err(Into::into)
 }
@@ -468,7 +469,7 @@ pub(crate) fn query_latest_execution_for_work_item(
     conn: &Connection,
     work_item_id: &str,
 ) -> Result<Option<WorkExecution>> {
-    conn.query_row(
+    conn.prepare_cached(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
@@ -477,6 +478,7 @@ pub(crate) fn query_latest_execution_for_work_item(
          WHERE work_item_id = ?1
          ORDER BY created_at DESC, id DESC
          LIMIT 1",
+    )?.query_row(
         [work_item_id],
         map_execution,
     )
@@ -498,7 +500,7 @@ pub(crate) fn query_live_execution_for_work_item(
     conn: &Connection,
     work_item_id: &str,
 ) -> Result<Option<WorkExecution>> {
-    conn.query_row(
+    conn.prepare_cached(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
@@ -508,6 +510,7 @@ pub(crate) fn query_live_execution_for_work_item(
            AND status IN ('running', 'waiting_human')
          ORDER BY created_at DESC, id DESC
          LIMIT 1",
+    )?.query_row(
         [work_item_id],
         map_execution,
     )
@@ -528,7 +531,7 @@ pub(crate) fn query_last_non_abandoned_execution_for_work_item(
     conn: &Connection,
     work_item_id: &str,
 ) -> Result<Option<WorkExecution>> {
-    conn.query_row(
+    conn.prepare_cached(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
@@ -538,6 +541,7 @@ pub(crate) fn query_last_non_abandoned_execution_for_work_item(
            AND status != 'abandoned'
          ORDER BY created_at DESC, id DESC
          LIMIT 1",
+    )?.query_row(
         [work_item_id],
         map_execution,
     )

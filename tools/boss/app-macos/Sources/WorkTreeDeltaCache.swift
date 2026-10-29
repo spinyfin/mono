@@ -6,6 +6,51 @@ struct WorkTreeDeltaCache {
     private var sequence: UInt64?
     private var tree: [String: Any]?
     private var connectionGeneration: Int?
+    private var pendingPages: (product: String, sequence: UInt64, next: Int, count: Int, fields: [String: Any])?
+
+    enum PageError: Error { case invalidSequence }
+
+    /// Assemble pages privately. No partial snapshot reaches the board, and
+    /// only the final frame completes the request's ledger entry.
+    mutating func collectPage(_ update: [String: Any]) throws -> [String: Any]? {
+        guard let changes = update["changes"] as? [String: Any],
+              let page = changes["snapshot_page"] as? [String: Any] else {
+            pendingPages = nil
+            return update
+        }
+        guard let product = update["product_id"] as? String,
+              let sequence = update["sequence"] as? UInt64,
+              let index = page["index"] as? Int,
+              let count = page["count"] as? Int, count > 0, index >= 0, index < count,
+              let fields = page["fields"] as? [String: Any],
+              update["base_sequence"] == nil || update["base_sequence"] is NSNull else {
+            throw PageError.invalidSequence
+        }
+        if index == 0 {
+            pendingPages = (product, sequence, 0, count, [:])
+        }
+        guard var pending = pendingPages,
+              pending.product == product, pending.sequence == sequence,
+              pending.next == index, pending.count == count else { throw PageError.invalidSequence }
+        pendingPages = nil
+        for (field, value) in fields {
+            let previous = pending.fields.removeValue(forKey: field)
+            if var rows = previous as? [Any], let extra = value as? [Any] {
+                rows.append(contentsOf: extra)
+                pending.fields[field] = rows
+            } else {
+                guard previous == nil else { throw PageError.invalidSequence }
+                pending.fields[field] = value
+            }
+        }
+        pending.next += 1
+        pendingPages = pending
+        guard pending.next == count else { return nil }
+        pendingPages = nil
+        var complete = update
+        complete["changes"] = pending.fields
+        return complete
+    }
 
     mutating func startConnection(_ generation: Int) {
         guard connectionGeneration != generation else { return }
@@ -16,6 +61,7 @@ struct WorkTreeDeltaCache {
     mutating func resetBase() {
         sequence = nil
         tree = nil
+        pendingPages = nil
     }
 
     /// The field each keyed collection is merged on; mirrors

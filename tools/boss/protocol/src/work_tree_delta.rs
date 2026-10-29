@@ -14,6 +14,83 @@ pub struct WorkTreeUpdate {
     pub changes: Value,
 }
 
+impl WorkTreeUpdate {
+    /// Bound cold snapshot frames without dropping history or detail fields.
+    /// Collections are split at record boundaries; a single oversized record
+    /// is indivisible. Deltas retain their existing encoding.
+    pub fn into_pages(self, target_bytes: usize) -> serde_json::Result<Vec<Self>> {
+        if self.base_sequence.is_some() {
+            return Ok(vec![self]);
+        }
+        let Value::Object(changes) = self.changes else {
+            unreachable!("snapshot object")
+        };
+        let mut pages = Vec::new();
+        let mut fields = Map::new();
+        let mut bytes = 0;
+        for (field, value) in changes {
+            let (collection, records) = match value {
+                Value::Array(rows) if !rows.is_empty() => (true, rows),
+                value => (false, vec![value]),
+            };
+            for record in records {
+                let size = serde_json::to_vec(&record)?.len() + field.len() + 8;
+                if bytes > 0 && bytes + size > target_bytes {
+                    pages.push(std::mem::take(&mut fields));
+                    bytes = 0;
+                }
+                if collection {
+                    fields
+                        .entry(field.clone())
+                        .or_insert_with(|| json!([]))
+                        .as_array_mut()
+                        .unwrap()
+                        .push(record);
+                } else {
+                    fields.insert(field.clone(), record);
+                }
+                bytes += size;
+            }
+        }
+        if !fields.is_empty() {
+            pages.push(fields);
+        }
+        let count = pages.len();
+        if count == 1 {
+            return Ok(vec![Self {
+                product_id: self.product_id,
+                sequence: self.sequence,
+                base_sequence: None,
+                changes: Value::Object(pages.pop().unwrap()),
+            }]);
+        }
+        Ok(pages
+            .into_iter()
+            .enumerate()
+            .map(|(index, fields)| {
+                let mut page = json!({"index": index, "count": count});
+                page["fields"] = Value::Object(fields);
+                Self {
+                    product_id: self.product_id.clone(),
+                    sequence: self.sequence,
+                    base_sequence: None,
+                    changes: Value::Object(Map::from_iter([("snapshot_page".into(), page)])),
+                }
+            })
+            .collect())
+    }
+
+    pub fn is_last_page(&self) -> bool {
+        let Some(page) = self.changes.get("snapshot_page") else {
+            return true;
+        };
+        page["index"]
+            .as_u64()
+            .zip(page["count"].as_u64())
+            .is_some_and(|(index, count)| index + 1 == count)
+    }
+}
+
 /// Bounded to one product per connection. Switching products or reconnecting
 /// yields a snapshot. Responses are ordered; queue shedding is detected by the
 /// client's base-sequence check and recovered with an explicit full request.
@@ -92,6 +169,38 @@ fn diff(old: &Value, next: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pages_preserve_every_record_and_collection_order() {
+        let original = json!({"product": {"id": "one"}, "tasks": (0..200).map(|i| json!({"id": i, "description": "λ".repeat(100)})).collect::<Vec<_>>(), "chores": [], "dependencies": [{"dependent_id": "a"}], "task_runtimes": []});
+        let update = WorkTreeUpdate {
+            product_id: "one".into(),
+            sequence: 1,
+            base_sequence: None,
+            changes: original.clone(),
+        };
+        let pages = update.into_pages(1024).unwrap();
+        assert!(pages.len() > 1);
+        let mut restored = Map::new();
+        for (index, page) in pages.iter().enumerate() {
+            assert_eq!(page.is_last_page(), index + 1 == pages.len());
+            assert!(serde_json::to_vec(page).unwrap().len() < 1300);
+            for (field, value) in page.changes["snapshot_page"]["fields"].as_object().unwrap() {
+                match restored.get_mut(field) {
+                    Some(Value::Array(rows)) => rows.extend(value.as_array().unwrap().iter().cloned()),
+                    None => {
+                        restored.insert(field.clone(), value.clone());
+                    }
+                    _ => panic!("duplicate scalar"),
+                }
+            }
+        }
+        assert_eq!(Value::Object(restored), original);
+        let mut cache = WorkTreeCache::default();
+        cache.update_value(original.clone());
+        let delta = cache.update_value(original);
+        assert_eq!(delta.into_pages(1).unwrap().len(), 1);
+    }
 
     #[test]
     fn updates_include_related_records_removals_and_order_without_unchanged_briefs() {

@@ -377,6 +377,24 @@ impl PopulationTrace {
         );
     }
 
+    /// Slow populations remain visible even if the diagnostics file is disabled.
+    pub fn log_slow(&self) {
+        if !self
+            .segments
+            .iter()
+            .any(|s| s.segment == segment::TOTAL && s.duration_ms >= 5_000.0)
+        {
+            return;
+        }
+        let payload_bytes: i64 = self.segments.iter().filter_map(|s| s.payload_bytes).sum();
+        for seg in &self.segments {
+            tracing::info!(product_id = %self.ctx.product_id, request_id = %self.ctx.request_id,
+                items = ?self.ctx.items, payload_bytes, segment = seg.segment,
+                duration_ms = seg.duration_ms, rows = ?seg.rows, db_queries = ?seg.db_queries,
+                "slow board population stage");
+        }
+    }
+
     /// Emit every recorded segment to `log`. No-op for a disabled trace.
     pub fn flush(&self, log: &PopulationTimingLog) {
         if !self.is_enabled() {
@@ -494,6 +512,29 @@ fn parse_diagnostics_dir_override(raw: Option<std::ffi::OsString>) -> Option<Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slow_population_logs_stages_without_a_file_logger() {
+        let logs = crate::test_support::log_capture::install();
+        let mut trace = PopulationTrace::new("slow-log-product", "slow-log-request", None, Instant::now());
+        trace.set_items(42);
+        trace.record_plain("db.connection_wait", 5100.0);
+        trace.record_query(segment::DB_TASKS, 10.0, 42);
+        trace.record_serialize(1.0, 100);
+        trace.record_serialize(1.0, 200);
+        trace.record_plain(segment::TOTAL, 5200.0);
+        trace.log_slow();
+        let output = String::from_utf8_lossy(&logs.lock()).into_owned();
+        let lines: Vec<_> = output
+            .lines()
+            .filter(|line| line.contains("slow-log-request"))
+            .collect();
+        assert_eq!(lines.len(), 5);
+        assert!(lines.iter().all(|line| line.contains("slow-log-product")
+            && line.contains("payload_bytes=300")
+            && line.contains("42")));
+        assert!(lines.iter().any(|line| line.contains("db.connection_wait")));
+    }
 
     #[test]
     fn disabled_trace_records_nothing() {

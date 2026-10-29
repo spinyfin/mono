@@ -35,7 +35,9 @@ impl WorkDb {
         caches: &board_caches::BoardCaches,
         now: i64,
     ) -> Result<(WorkTree, Refresh)> {
+        let waiting = std::time::Instant::now();
         let mut connection = self.connect()?;
+        trace.record_plain("db.connection_wait", crate::population_timing::elapsed_ms(waiting));
         let conn = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let (first, revision): (u64, u64) = conn.query_row(
             "SELECT COALESCE(MIN(sequence), 0), COALESCE(MAX(sequence), 0) FROM board_changes",
@@ -66,6 +68,7 @@ impl WorkDb {
         // Three bytes cover the changing comma counts in tasks, chores and
         // runtimes. Updating each record's size plus one then stays a
         // conservative bound (within six bytes) even across empty lanes.
+        let retention_start = std::time::Instant::now();
         let retained_bytes = serde_json::to_vec(&tree)?.len() + 3;
         *projection = if retainable(&tree, retained_bytes) {
             Some(CachedProjection {
@@ -76,6 +79,10 @@ impl WorkDb {
         } else {
             None
         };
+        trace.record_plain(
+            "projection.retain",
+            crate::population_timing::elapsed_ms(retention_start),
+        );
         Ok((tree, Refresh::Snapshot(reason)))
     }
 }

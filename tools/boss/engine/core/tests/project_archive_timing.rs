@@ -126,6 +126,7 @@ async fn fetch_work_tree(client: &mut BossClient, product_id: &str) -> Result<(D
     let started = Instant::now();
     let reply = client
         .send_request(&FrontendRequest::GetWorkTree {
+            snapshot_pages: false,
             product_id: product_id.to_owned(),
             fetch_seq: None,
             delta: false,

@@ -22,6 +22,7 @@ pub(in crate::app) fn key(request: &FrontendRequest) -> String {
         }
         // Sequence ids and snapshot/delta encoding do not change the product view.
         FrontendRequest::GetWorkTree { product_id, .. } => serde_json::to_string(&FrontendRequest::GetWorkTree {
+            snapshot_pages: false,
             product_id: product_id.clone(),
             fetch_seq: None,
             delta: false,

@@ -196,6 +196,7 @@ async fn eight_and_thirty_two_readers_preserve_worker_write_and_agents_latency()
                 let tree = call(
                     state,
                     FrontendRequest::GetWorkTree {
+                        snapshot_pages: false,
                         product_id,
                         fetch_seq: None,
                         delta: true,

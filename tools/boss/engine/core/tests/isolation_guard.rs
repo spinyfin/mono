@@ -508,6 +508,7 @@ async fn run_derives_isolated_token_and_diagnostics_paths_for_test_fixture() -> 
     };
     let reply = client
         .send_request(&FrontendRequest::GetWorkTree {
+            snapshot_pages: false,
             product_id: product.id.clone(),
             fetch_seq: Some(17),
             delta: false,

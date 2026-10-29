@@ -6,6 +6,7 @@ type BoardSlot = Arc<StdMutex<Option<crate::work::board_projection::CachedProjec
 
 #[derive(Default)]
 pub(super) struct WorkTreeLoads {
+    pub(super) first_served: Arc<tokio::sync::Notify>,
     flights: boss_single_flight::SingleFlight<String, (u64, i64), (u64, boss_protocol::WorkTree)>,
     // data_version is comparable only on the SAME connection. This dedicated
     // reader holds no transaction and never acquires the writer connection.

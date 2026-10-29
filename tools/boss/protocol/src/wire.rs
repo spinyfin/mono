@@ -1146,6 +1146,9 @@ pub enum FrontendRequest {
 
     GetWorkTree {
         product_id: String,
+        /// Accept bounded multipart cold snapshots (requires delta).
+        #[serde(default)]
+        snapshot_pages: bool,
         /// Opt in to session-local snapshot/delta replies.
         #[serde(default)]
         delta: bool,

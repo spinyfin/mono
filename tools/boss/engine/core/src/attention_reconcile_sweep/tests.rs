@@ -13,6 +13,65 @@ use crate::test_support::*;
 use crate::work::WorkDb;
 use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus};
 
+#[test]
+fn maintenance_does_not_borrow_the_foreground_connection() {
+    let (_dir, db) = open_db();
+    let worker_db = db.clone();
+    let foreground = db.connect().unwrap();
+    let (sent, received) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        sent.send(worker_db.reconcile_stale_attention_signals()).unwrap();
+    });
+    let result = received.recv_timeout(Duration::from_secs(5));
+    // Release before joining even on failure, so a regression cannot hang
+    // the test worker while the assertion reports the blocked maintenance.
+    drop(foreground);
+    worker.join().unwrap();
+    assert!(
+        result
+            .expect("maintenance acquired the foreground mutex")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn sweep_waits_for_delivered_board_before_clearing_signals() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id, "Startup gate");
+    let attention = open_attention_for_work_item(&db, &chore.id, crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND, 1000);
+    start_run_at(&db, &chore.id, 2000);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let db = Arc::new(db);
+    let handle = spawn_loop(db.clone(), Duration::from_secs(300), gate.clone());
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(attention_status(&db, &attention).0, "open");
+    gate.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while attention_status(&db, &attention).0 != "resolved" {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    handle.abort();
+}
+
+#[test]
+fn reconcile_advances_past_unresolved_batches() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id, "Batched evidence");
+    start_run_at(&db, &chore.id, 2000);
+    for i in 0..70 {
+        open_attention_for_work_item(&db, &chore.id, crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND, 3000 + i);
+    }
+    let cleared = open_attention_for_work_item(&db, &chore.id, crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND, 999);
+    assert_eq!(db.reconcile_stale_attention_signals().unwrap().attentions_resolved, 1);
+    assert_eq!(attention_status(&db, &cleared).0, "resolved");
+}
+
 /// Insert an `open` attention row directly, with an explicit `created_at`.
 ///
 /// Tests must be able to place a signal before or after its evidence, which

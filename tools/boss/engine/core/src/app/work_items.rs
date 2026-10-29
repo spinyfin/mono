@@ -1391,6 +1391,7 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
         product_id,
         fetch_seq,
         delta,
+        snapshot_pages,
     } = req
     else {
         unreachable!()
@@ -1426,27 +1427,49 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
     });
     match result {
         Ok((sequence, tree)) => {
-            let mut reads = sink.board_reads.lock().expect("board reads poisoned");
-            let (snapshot_revision, tree) = reads.finish_at(&request_id, sequence, tree);
-            trace.set_items(tree.tasks.len() + tree.chores.len());
-            let mut cache = sink.work_tree_cache.lock().expect("work tree cache poisoned");
-            if delta {
-                match cache.update(&tree) {
-                    Ok(update) => {
+            let encoding_start = std::time::Instant::now();
+            let (snapshot_revision, tree, pages) = {
+                let mut reads = sink.board_reads.lock().expect("board reads poisoned");
+                let (snapshot_revision, tree) = reads.finish_at(&request_id, sequence, tree);
+                trace.set_items(tree.tasks.len() + tree.chores.len());
+                let mut cache = sink.work_tree_cache.lock().expect("work tree cache poisoned");
+                let pages = if delta {
+                    Some(cache.update(&tree).and_then(|update| {
+                        if snapshot_pages {
+                            update.into_pages(512 * 1024)
+                        } else {
+                            Ok(vec![update])
+                        }
+                    }))
+                } else {
+                    cache.clear();
+                    None
+                };
+                (snapshot_revision, tree, pages)
+            };
+            trace.record_plain(
+                "snapshot.encode_pages",
+                crate::population_timing::elapsed_ms(encoding_start),
+            );
+            if let Some(pages) = pages {
+                match pages {
+                    Ok(pages) => {
                         trace.mark_enqueued();
                         sink.stash_population_trace(&request_id, trace);
-                        send_response_with_revision(
-                            &sink,
-                            &request_id,
-                            snapshot_revision,
-                            FrontendEvent::WorkTreeUpdate { update },
-                        );
+                        for update in pages {
+                            sink.wait_for_response_headroom(1).await;
+                            send_response_with_revision(
+                                &sink,
+                                &request_id,
+                                snapshot_revision,
+                                FrontendEvent::WorkTreeUpdate { update },
+                            );
+                        }
                     }
                     Err(err) => send_work_error(&sink, &request_id, &err),
                 }
                 return;
             }
-            cache.clear();
             // Mark the handoff instant so the writer task can attribute the
             // time this trace spends sitting in the session's writer queue
             // (queue_wait), then stash BEFORE enqueueing: the writer task

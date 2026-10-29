@@ -716,6 +716,7 @@ fn idea_verbs_stay_closed_and_get_work_tree_stays_allowed() {
         assert_eq!(denial.reason, WorkerTierDenialReason::CoordinatorOnly);
     }
     assert_allowed(FrontendRequest::GetWorkTree {
+        snapshot_pages: false,
         delta: false,
         product_id: "prod_1".into(),
         fetch_seq: None,

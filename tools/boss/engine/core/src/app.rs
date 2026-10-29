@@ -2388,6 +2388,7 @@ async fn handle_frontend_connection(
     // reconnected, which is not what a kill switch means.
     let writer_flags = server_state.feature_flags.clone();
     let writer_session_id = session_id.clone();
+    let first_board_served = server_state.work_tree_loads.first_served.clone();
     let writer_task = boss_task_scope::spawn(async move {
         while let Some(mut event) = writer_sink.next().await {
             // The exposure boundary's single write choke point. Every frame
@@ -2404,6 +2405,8 @@ async fn handle_frontend_connection(
             // If this response has a stashed population-timing trace, complete
             // it here: the serialize and socket-write costs live on this task,
             // not the handler's. `None` for every non-population event.
+            let last_board_page =
+                !matches!(&event.payload, FrontendEvent::WorkTreeUpdate { update } if !update.is_last_page());
             let mut trace = event
                 .request_id
                 .as_deref()
@@ -2435,12 +2438,20 @@ async fn handle_frontend_connection(
             }
 
             if let Some(mut t) = trace {
+                if !write_failed && last_board_page {
+                    first_board_served.notify_one();
+                }
                 t.record_plain(
                     crate::population_timing::segment::SOCKET_WRITE,
                     crate::population_timing::elapsed_ms(write_start),
                 );
+                if !last_board_page && !write_failed {
+                    writer_sink.stash_population_trace(event.request_id.as_deref().expect("board response id"), t);
+                    continue;
+                }
                 let total_ms = t.elapsed_ms();
                 t.record_plain(crate::population_timing::segment::TOTAL, total_ms);
+                t.log_slow();
                 if let Some(log) = crate::population_timing::global() {
                     t.flush(log);
                 }

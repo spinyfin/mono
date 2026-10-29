@@ -39,11 +39,42 @@ fn board_projection_scale_measurement() {
         println!("projection setup workers={workers}");
         let cache = BoardCaches::default();
         let mut model = None;
+        let cold_start = Instant::now();
+        let mut trace = PopulationTrace::new(product, "cold-scale", None, cold_start);
         let (initial, _) = db
-            .refresh_board_projection(product, &mut model, &mut PopulationTrace::disabled(), &cache, 100)
+            .refresh_board_projection(product, &mut model, &mut trace, &cache, 100)
             .unwrap();
+        println!(
+            "cold_scale build_ms={:.3} tasks={} chores={} descriptions={} runtimes={:?} tasks_stage={:?} reviews={:?} assemble={:?}",
+            cold_start.elapsed().as_secs_f64() * 1000.0,
+            initial.tasks.len(),
+            initial.chores.len(),
+            initial
+                .tasks
+                .iter()
+                .chain(&initial.chores)
+                .map(|t| t.description.len())
+                .sum::<usize>(),
+            trace.segment_counts("db.task_runtimes"),
+            trace.segment_counts("db.tasks"),
+            trace.segment_counts("db.ai_review_state"),
+            trace.segment_counts("assemble")
+        );
         let mut wire = boss_protocol::work_tree_delta::WorkTreeCache::default();
-        let snapshot_bytes = serde_json::to_vec(&wire.update(&initial).unwrap()).unwrap().len();
+        let snapshot = wire.update(&initial).unwrap();
+        let snapshot_bytes = serde_json::to_vec(&snapshot).unwrap().len();
+        let pages = snapshot.into_pages(512 * 1024).unwrap();
+        let max_page_bytes = pages
+            .iter()
+            .map(|page| serde_json::to_vec(page).unwrap().len())
+            .max()
+            .unwrap();
+        println!(
+            "cold_scale total_ms={:.3} full_bytes={snapshot_bytes} pages={} max_page_bytes={max_page_bytes}",
+            cold_start.elapsed().as_secs_f64() * 1000.0,
+            pages.len()
+        );
+        assert!(max_page_bytes < 513 * 1024);
         drop(initial);
         for sample in 0..samples {
             // One changed card per worker, including revision family effects.
@@ -114,4 +145,43 @@ fn board_projection_scale_measurement() {
             assert!(delta_bytes < snapshot_bytes / 10);
         }
     }
+}
+
+#[test]
+fn attention_reconcile_scale_measurement() {
+    let logs = crate::test_support::log_capture::install();
+    let (_dir, path) = disk_db_path("reconcile-scale");
+    let db = WorkDb::open(path).unwrap();
+    let conn = db.connect().unwrap();
+    super::work_tree_scale_tests::seed(&conn);
+    conn.execute_batch("UPDATE work_runs SET started_at = '1';
+        INSERT INTO work_attention_items(id, work_item_id, kind, status, title, body_markdown, created_at)
+        SELECT 'scale-attention-' || id, id, 'churn_guard_parked', 'open', 'scale', 'scale', '2' FROM tasks WHERE product_id = 'scale-product-0';").unwrap();
+    let legacy = "UPDATE work_attention_items SET status = 'resolved', resolved_at = '3'
+        WHERE status = 'open' AND kind = 'churn_guard_parked' AND EXISTS (
+        SELECT 1 FROM work_runs r JOIN work_executions e ON e.id = r.execution_id
+        WHERE e.work_item_id = COALESCE(work_attention_items.work_item_id,
+          (SELECT we.work_item_id FROM work_executions we WHERE we.id = work_attention_items.execution_id))
+        AND r.started_at IS NOT NULL AND CAST(r.started_at AS INTEGER) >= CAST(COALESCE(work_attention_items.last_raised_at, work_attention_items.created_at) AS INTEGER)
+        AND r.execution_id IS NOT work_attention_items.execution_id)";
+    let start = Instant::now();
+    assert_eq!(conn.execute(legacy, []).unwrap(), 0);
+    println!(
+        "reconcile_scale legacy_hold_ms={:.3}",
+        start.elapsed().as_secs_f64() * 1000.0
+    );
+    drop(conn);
+    let start = Instant::now();
+    let result = db.reconcile_stale_attention_signals();
+    println!(
+        "reconcile_scale batched_total_ms={:.3}",
+        start.elapsed().as_secs_f64() * 1000.0
+    );
+    for line in String::from_utf8_lossy(&logs.lock())
+        .lines()
+        .filter(|line| line.contains("attention reconcile batch timing"))
+    {
+        println!("{line}");
+    }
+    assert!(result.unwrap().is_empty());
 }

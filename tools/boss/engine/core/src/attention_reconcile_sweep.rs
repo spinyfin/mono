@@ -43,10 +43,28 @@ impl crate::sweep_loop::SweepOutcome for AttentionReconcileOutcome {
 }
 
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`.
-pub fn spawn_loop(work_db: Arc<WorkDb>, interval: Duration) -> tokio::task::JoinHandle<()> {
+pub fn spawn_loop(
+    work_db: Arc<WorkDb>,
+    interval: Duration,
+    first_board_served: Arc<tokio::sync::Notify>,
+) -> tokio::task::JoinHandle<()> {
     crate::sweep_loop::spawn_sweep_loop(interval, move || {
         let work_db = Arc::clone(&work_db);
-        async move { run_one_pass(work_db.as_ref()).await }
+        let first_board_served = first_board_served.clone();
+        async move {
+            // A Notify permit survives a snapshot delivered before this task
+            // starts. Keep the gate open for all subsequent passes.
+            first_board_served.notified().await;
+            first_board_served.notify_one();
+            crate::work::db_diagnostics::spawn_blocking(move || work_db.reconcile_stale_attention_signals())
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+                .unwrap_or_else(|err| {
+                    tracing::warn!(?err, "attention-reconcile sweep: pass failed; skipping");
+                    AttentionReconcileOutcome::default()
+                })
+        }
     })
 }
 
