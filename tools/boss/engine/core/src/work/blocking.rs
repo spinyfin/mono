@@ -199,7 +199,10 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
-        let rows = tx.execute(
+        let rows = crate::work::task_status_audit::execute(
+            &tx,
+            "recanonicalize_blocked_signal",
+            "engine",
             "UPDATE tasks
                 SET blocked_reason    = ?3,
                     last_status_actor = 'engine',
@@ -250,7 +253,10 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
-        let rows = tx.execute(
+        let rows = crate::work::task_status_audit::execute(
+            &tx,
+            "retarget_blocked_ci_failure_to_merge_conflict",
+            "engine",
             "UPDATE tasks
                 SET blocked_reason     = 'merge_conflict',
                     blocked_attempt_id = NULL,
@@ -295,7 +301,10 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
-        let rows = tx.execute(
+        let rows = crate::work::task_status_audit::execute(
+            &tx,
+            "mark_chore_blocked_merge_conflict",
+            "engine",
             "UPDATE tasks
                 SET status            = 'blocked',
                     blocked_reason    = 'merge_conflict',
@@ -342,7 +351,10 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
-        let rows = tx.execute(
+        let rows = crate::work::task_status_audit::execute(
+            &tx,
+            "mark_chore_blocked_deletion_signoff",
+            "engine",
             "UPDATE tasks
                 SET status             = 'blocked',
                     blocked_reason     = 'deletion_signoff',
@@ -386,7 +398,10 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
-        let rows = tx.execute(
+        let rows = crate::work::task_status_audit::execute(
+            &tx,
+            "clear_chore_blocked_merge_conflict",
+            "engine",
             "UPDATE tasks
                 SET status             = 'in_review',
                     blocked_reason     = NULL,
@@ -443,7 +458,10 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
-        let rows = tx.execute(
+        let rows = crate::work::task_status_audit::execute(
+            &tx,
+            "clear_chore_blocked_merge_conflict_for_attempt",
+            "engine",
             "UPDATE tasks
                 SET status             = 'in_review',
                     blocked_reason     = NULL,
@@ -566,7 +584,10 @@ impl WorkDb {
         let now = now_string();
         // Match either `in_review` (first failure, budget already 0) or
         // an active `ci_failure` row whose budget has now exhausted.
-        let rows = tx.execute(
+        let rows = crate::work::task_status_audit::execute(
+            &tx,
+            "mark_chore_blocked_ci_failure_exhausted",
+            "engine",
             "UPDATE tasks
                 SET status            = 'blocked',
                     blocked_reason    = 'ci_failure_exhausted',
@@ -603,7 +624,10 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
-        let rows = tx.execute(
+        let rows = crate::work::task_status_audit::execute(
+            &tx,
+            "mark_chore_blocked_ci_signal",
+            "engine",
             "UPDATE tasks
                 SET status             = 'blocked',
                     blocked_reason     = ?4,
@@ -637,7 +661,10 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
-        let rows = tx.execute(
+        let rows = crate::work::task_status_audit::execute(
+            &tx,
+            "clear_chore_blocked_ci_failure",
+            "engine",
             "UPDATE tasks
                 SET status             = 'in_review',
                     blocked_reason     = NULL,
@@ -1163,7 +1190,10 @@ impl WorkDb {
             // blocked_reason / blocked_attempt_id. The merge-poller's
             // next sweep observes CI=Failing and re-enters the
             // detection flow naturally.
-            tx.execute(
+            crate::work::task_status_audit::execute(
+                &tx,
+                "retry_ci_remediation_for_work_item",
+                "engine",
                 "UPDATE tasks
                     SET status             = 'in_review',
                         blocked_reason     = NULL,
@@ -1712,7 +1742,10 @@ impl WorkDb {
         // Parent transition out of the loop (mirrors
         // `clear_chore_blocked_ci_failure`): only fires when the parent
         // is actually `blocked: ci_failure[_exhausted]` on this PR.
-        tx.execute(
+        crate::work::task_status_audit::execute(
+            &tx,
+            "mark_ci_remediation_validated_green",
+            "engine",
             "UPDATE tasks
                 SET status             = 'in_review',
                     blocked_reason     = NULL,

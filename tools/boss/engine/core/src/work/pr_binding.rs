@@ -309,7 +309,10 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
-        let rows = tx.execute(
+        let rows = crate::work::task_status_audit::execute(
+            &tx,
+            "rebind_task_pr_from_execution_branch",
+            "engine",
             "UPDATE tasks
              SET pr_url             = ?3,
                  status             = CASE WHEN status IN ('todo', 'active', 'blocked', 'done', 'archived') THEN 'in_review' ELSE status END,
@@ -357,7 +360,10 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
-        let rows = tx.execute(
+        let rows = crate::work::task_status_audit::execute(
+            &tx,
+            "mark_task_pr_binding_unresolved",
+            "engine",
             "UPDATE tasks
              SET pr_url             = NULL,
                  status             = 'blocked',

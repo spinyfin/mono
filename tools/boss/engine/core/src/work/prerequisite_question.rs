@@ -97,7 +97,10 @@ pub(super) fn approve_in_tx(
     let schedulable = matches!(prerequisite.status, TaskStatus::Todo | TaskStatus::Blocked);
     let enabled_dispatch = !created && schedulable && !prerequisite.autostart;
     if enabled_dispatch {
-        conn.execute(
+        crate::work::task_status_audit::execute(
+            conn,
+            "approve_in_tx",
+            "engine",
             "UPDATE tasks SET autostart = 1, updated_at = ?2 WHERE id = ?1",
             params![prerequisite.id, now],
         )?;
@@ -128,7 +131,10 @@ pub(super) fn approve_in_tx(
     // `todo` + autostart first, so the edge below parks the task through the
     // ordinary engine auto-block (`blocked` / `dependency`) and the cascade
     // can later move it back to `todo` and dispatch it.
-    conn.execute(
+    crate::work::task_status_audit::execute(
+        conn,
+        "approve_in_tx",
+        "human",
         "UPDATE tasks SET description = ?2, status = 'todo', blocked_reason = NULL,
          blocked_detail = NULL, autostart = 1, last_status_actor = 'human', updated_at = ?3 WHERE id = ?1",
         params![task.id, description, now],

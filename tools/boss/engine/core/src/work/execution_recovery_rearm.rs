@@ -53,6 +53,9 @@ pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool) -> Result
         .map(|(id, _)| id)
         .collect();
     for id in &ids {
+        // Historical migrations (v039, v043, v059) call this before
+        // `task_status_audit_context` exists. The ledger backfill attributes
+        // the resulting rows once that table is created.
         conn.execute(
             "UPDATE tasks
              SET status = 'todo', blocked_reason = NULL, blocked_detail = NULL, autostart = 1,
@@ -555,5 +558,36 @@ mod tests {
         drop(db);
         let db = WorkDb::open(path).unwrap();
         assert_eq!(state(&db, &real).0, "blocked");
+    }
+
+    fn drop_audit_ledger(conn: &rusqlite::Connection) {
+        for property in ["status", "blocked_reason", "dispatch_failed_reason", "autostart"] {
+            conn.execute_batch(&format!(
+                "DROP TRIGGER IF EXISTS task_status_audit_insert_{property};
+                 DROP TRIGGER IF EXISTS task_status_audit_update_{property};"
+            ))
+            .unwrap();
+        }
+        conn.execute_batch("DROP TABLE IF EXISTS task_status_audit; DROP TABLE IF EXISTS task_status_audit_context;")
+            .unwrap();
+    }
+
+    #[test]
+    fn opening_a_pre_ledger_database_rearms_without_audit_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("work.db");
+        let stale = format!("{NOT_DESCENDED_MESSAGE} boss-base/exec_18dd050856e97880_290");
+        let wedged = {
+            let db = WorkDb::open(path.clone()).unwrap();
+            let product_id = product(&db);
+            let wedged = insert_blocked(&db, &product_id, "wedged", "execution_recovery_failed", &stale);
+            let conn = db.connect().unwrap();
+            drop_audit_ledger(&conn);
+            conn.execute_batch(RESET_TO_38).unwrap();
+            wedged
+        };
+        let db = WorkDb::open(path).unwrap();
+        assert_eq!(state(&db, &wedged), ("todo".to_owned(), None, None, 1));
+        super::super::schema_init::assert_all_migrations_applied(&db.connect().unwrap());
     }
 }

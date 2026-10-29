@@ -1986,6 +1986,7 @@ impl MergeProbe for FixedMergeabilityProbe {
 }
 
 mod conflict_delivery;
+mod status_ledger;
 mod t10;
 mod t11;
 mod t12;

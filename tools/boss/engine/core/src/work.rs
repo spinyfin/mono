@@ -857,6 +857,9 @@ pub(crate) use review_guide_sources::{
 pub use pr_binding::{BLOCKED_REASON_PR_BINDING_UNRESOLVED, PrBindingRepairCandidate, PrBindingSuspicion};
 pub use pr_flow::DeferredReviewAdmissionCandidate;
 pub use pr_flow::OperatorAnswerOutcome;
+pub use pr_flow::WorkerFailureBasis;
+#[cfg(test)]
+pub(crate) use pr_flow::insert_question;
 #[cfg(test)]
 pub(crate) use products_design::resolve_task_doc_pointer;
 pub(crate) use proposal_apply::*;
