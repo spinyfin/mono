@@ -189,6 +189,11 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         "pool",
         "tmuxHosted",
         "viewerAttachError",
+        "workItemId",
+        "workItemName",
+        "workItemShortId",
+        "productId",
+        "prURL",
     ]
 
     /// `WorkerLiveState` fields the slot snapshot intentionally ignores.
@@ -376,6 +381,11 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             ("pool", Self.makeLiveState(pool: "automation")),
             ("tmuxHosted", Self.makeLiveState(tmuxHosted: false)),
             ("viewerAttachError", Self.makeLiveState(viewerAttachError: "the app refused the viewer")),
+            ("workItemId", Self.makeLiveState(workItemId: "task_header")),
+            ("workItemName", Self.makeLiveState(workItemName: "Worker pane header")),
+            ("workItemShortId", Self.makeLiveState(workItemShortId: 42)),
+            ("productId", Self.makeLiveState(productId: "prod_boss")),
+            ("prURL", Self.makeLiveState(prURL: "https://github.com/spinyfin/mono/pull/12")),
         ]
         for (field, other) in flips {
             let otherSnap = WorkerSlotSnapshot.build(
@@ -876,6 +886,116 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         XCTAssertEqual(live.activity.agentsPaneLabel, "Starting")
     }
 
+    // MARK: - Header work-item / PR links
+
+    func testHeaderWorkLinksShowsTaskAndPR() {
+        let live = Self.makeLiveState(
+            workItemId: "task_header",
+            workItemName: "Worker pane header",
+            workItemShortId: 42,
+            productId: "prod_boss",
+            prURL: "https://github.com/spinyfin/mono/pull/3356"
+        )
+        let snap = WorkerSlotSnapshot.build(
+            slot: WorkerSlot(slotId: 1, runId: "exec-1"),
+            liveState: live,
+            liveStatusEnabled: true
+        )
+        let links = snap.headerWorkLinks
+        XCTAssertEqual(links?.workItemId, "task_header")
+        XCTAssertEqual(links?.productId, "prod_boss")
+        XCTAssertEqual(links?.shortIdLabel, "T42")
+        XCTAssertEqual(links?.title, "Worker pane header")
+        XCTAssertEqual(links?.prURL, "https://github.com/spinyfin/mono/pull/3356")
+        XCTAssertEqual(links?.prLabel, "mono#3356")
+    }
+
+    func testHeaderWorkLinksOmitsPRWhenNone() {
+        let live = Self.makeLiveState(
+            workItemId: "task_header",
+            workItemName: "Worker pane header",
+            workItemShortId: 42,
+            productId: "prod_boss"
+        )
+        let snap = WorkerSlotSnapshot.build(
+            slot: WorkerSlot(slotId: 1, runId: "exec-1"),
+            liveState: live,
+            liveStatusEnabled: true
+        )
+        let links = snap.headerWorkLinks
+        XCTAssertEqual(links?.shortIdLabel, "T42")
+        XCTAssertEqual(links?.title, "Worker pane header")
+        XCTAssertNil(links?.prURL)
+        XCTAssertNil(links?.prLabel)
+    }
+
+    func testHeaderWorkLinksNilWithoutWorkItem() {
+        let unbound = WorkerSlotSnapshot.build(
+            slot: WorkerSlot(slotId: 1, runId: "exec-1"),
+            liveState: Self.makeLiveState(),
+            liveStatusEnabled: true
+        )
+        XCTAssertNil(unbound.headerWorkLinks)
+
+        let emptyId = WorkerSlotSnapshot.build(
+            slot: WorkerSlot(slotId: 1, runId: "exec-1"),
+            liveState: Self.makeLiveState(workItemId: "", workItemShortId: 42, productId: "prod_boss"),
+            liveStatusEnabled: true
+        )
+        XCTAssertNil(emptyId.headerWorkLinks)
+
+        let noShortId = WorkerSlotSnapshot.build(
+            slot: WorkerSlot(slotId: 1, runId: "exec-1"),
+            liveState: Self.makeLiveState(workItemId: "task_header", productId: "prod_boss"),
+            liveStatusEnabled: true
+        )
+        XCTAssertNil(noShortId.headerWorkLinks)
+
+        let noLive = WorkerSlotSnapshot.build(
+            slot: WorkerSlot(slotId: 1),
+            liveState: nil,
+            liveStatusEnabled: true
+        )
+        XCTAssertNil(noLive.headerWorkLinks)
+    }
+
+    func testPullRequestCompactLabelDropsOwner() {
+        XCTAssertEqual(
+            WorkerSlotSnapshot.pullRequestCompactLabel(from: "https://github.com/spinyfin/mono/pull/3356"),
+            "mono#3356"
+        )
+        XCTAssertEqual(
+            WorkerSlotSnapshot.pullRequestCompactLabel(from: "https://www.github.com/spinyfin/checkleft/pull/12"),
+            "checkleft#12"
+        )
+        XCTAssertNil(WorkerSlotSnapshot.pullRequestCompactLabel(from: "https://gitlab.com/spinyfin/mono/-/merge_requests/1"))
+        XCTAssertNil(WorkerSlotSnapshot.pullRequestCompactLabel(from: "not-a-url"))
+        XCTAssertEqual(WorkerSlotSnapshot.shortIdLabel(workItemId: "task_header", shortId: 42), "T42")
+        XCTAssertEqual(WorkerSlotSnapshot.shortIdLabel(workItemId: "chore_header", shortId: 7), "T7")
+        XCTAssertEqual(WorkerSlotSnapshot.shortIdLabel(workItemId: "proj_header", shortId: 9), "P9")
+    }
+
+    func testParseHeaderWorkItemFields() throws {
+        let client = EngineClient(socketPath: "/tmp/header-links-\(UUID().uuidString).sock")
+        let payload: [String: Any] = [
+            "slot_id": 1, "run_id": "run-header", "model": "opus", "activity": "working",
+            "work_item_id": "task_header",
+            "work_item_name": "Worker pane header",
+            "work_item_short_id": 42,
+            "product_id": "prod_boss",
+            "pr_url": "https://github.com/spinyfin/mono/pull/3356",
+        ]
+        let live = try XCTUnwrap(client.parseWorkerLiveState(payload))
+        XCTAssertEqual(live.workItemId, "task_header")
+        XCTAssertEqual(live.workItemName, "Worker pane header")
+        XCTAssertEqual(live.workItemShortId, 42)
+        XCTAssertEqual(live.productId, "prod_boss")
+        XCTAssertEqual(live.prURL, "https://github.com/spinyfin/mono/pull/3356")
+        let links = WorkerSlotLiveSlice(live)
+        XCTAssertEqual(links.workItemShortId, 42)
+        XCTAssertEqual(links.prURL, "https://github.com/spinyfin/mono/pull/3356")
+    }
+
     // MARK: - WorkersDetailView Equatable
 
     /// Closures must not participate in `==` — otherwise every ContentView
@@ -1004,7 +1124,12 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         hostId: String? = nil,
         startedAt: String? = nil,
         pool: String? = nil,
-        viewerAttachError: String? = nil
+        viewerAttachError: String? = nil,
+        workItemId: String? = nil,
+        workItemName: String? = nil,
+        workItemShortId: Int? = nil,
+        productId: String? = nil,
+        prURL: String? = nil
     ) -> WorkerLiveState {
         WorkerLiveState(
             name: name,
@@ -1030,7 +1155,12 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             hostId: hostId,
             startedAt: startedAt,
             pool: pool,
-            viewerAttachError: viewerAttachError
+            viewerAttachError: viewerAttachError,
+            workItemId: workItemId,
+            workItemName: workItemName,
+            workItemShortId: workItemShortId,
+            productId: productId,
+            prURL: prURL
         )
     }
 }

@@ -107,7 +107,12 @@ enum BossAgentPaneActivityCapture {
             hostId: nil,
             startedAt: "2026-10-23T18:50:00Z",
             pool: nil,
-            viewerAttachError: nil
+            viewerAttachError: nil,
+            workItemId: "task_header_links",
+            workItemName: "Worker pane header: compact row linking the task and its PR",
+            workItemShortId: 7224,
+            productId: "prod_boss",
+            prURL: "https://github.com/spinyfin/mono/pull/3356"
         )
     }
 }

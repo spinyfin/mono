@@ -22,11 +22,11 @@ use crate::work::{WorkDb, WorkExecution};
 ///    unfiled, `None`. Never guessed from the worker pool.
 ///
 /// The name is `None` when a project is attributed but its row cannot be read.
-fn project_attribution(work_db: &WorkDb, work_item_id: &str) -> (Option<String>, Option<String>) {
-    let project_id = match work_db.get_work_item(work_item_id) {
-        Ok(WorkItem::Project(project)) => return (Some(project.id), Some(project.name)),
-        Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => task.project_id,
-        Ok(WorkItem::Product(_)) | Err(_) => None,
+fn project_attribution(work_db: &WorkDb, work_item: Option<&WorkItem>) -> (Option<String>, Option<String>) {
+    let project_id = match work_item {
+        Some(WorkItem::Project(project)) => return (Some(project.id.clone()), Some(project.name.clone())),
+        Some(WorkItem::Task(task) | WorkItem::Chore(task)) => task.project_id.clone(),
+        Some(WorkItem::Product(_)) | None => None,
     };
     let Some(project_id) = project_id else {
         return (None, None);
@@ -80,7 +80,9 @@ pub(crate) fn resolve_with_automation(
     host_id: &str,
     has_source_automation: bool,
 ) -> LiveWorkerMetadata {
-    let (project_id, project_name) = project_attribution(work_db, &execution.work_item_id);
+    let work_item = work_db.get_work_item(&execution.work_item_id).ok();
+    let (project_id, project_name) = project_attribution(work_db, work_item.as_ref());
+    let (product_id, work_item_short_id, pr_url) = work_item_header_fields(work_item.as_ref(), execution);
     LiveWorkerMetadata {
         review_stage: review_stage(work_db, execution),
         agent_type: Some(
@@ -94,7 +96,41 @@ pub(crate) fn resolve_with_automation(
         started_at: execution
             .started_epoch()
             .map(boss_engine_utils::iso8601::format_epoch_iso8601),
+        product_id,
+        work_item_short_id,
+        pr_url,
     }
+}
+
+/// Product id, short id, and bound PR URL for the Agents pane header.
+/// `None` triple (aside from a possible execution-level PR URL) when the
+/// execution is not pointed at a work-item row (automation id,
+/// review-guide comparison, missing row).
+///
+/// Prefers the work-item row's `pr_url`. Revision tasks are inserted with
+/// that column NULL; their bound PR lives on [`WorkExecution::pr_url`]
+/// (stamped from the chain root at dispatch). Fall back to a non-empty
+/// execution URL so revision workers show the PR they are updating.
+fn work_item_header_fields(
+    work_item: Option<&WorkItem>,
+    execution: &WorkExecution,
+) -> (Option<String>, Option<i64>, Option<String>) {
+    let (product_id, short_id, task_pr_url) = match work_item {
+        Some(WorkItem::Task(task) | WorkItem::Chore(task)) => (
+            Some(task.product_id.clone()),
+            task.short_id,
+            non_empty_pr_url(task.pr_url.as_deref()),
+        ),
+        Some(WorkItem::Project(project)) => (Some(project.product_id.clone()), project.short_id, None),
+        Some(WorkItem::Product(product)) => (Some(product.id.clone()), None, None),
+        None => (None, None, None),
+    };
+    let pr_url = task_pr_url.or_else(|| non_empty_pr_url(execution.pr_url.as_deref()));
+    (product_id, short_id, pr_url)
+}
+
+fn non_empty_pr_url(url: Option<&str>) -> Option<String> {
+    url.filter(|url| !url.trim().is_empty()).map(str::to_owned)
 }
 
 #[cfg(test)]

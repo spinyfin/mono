@@ -663,6 +663,9 @@ struct ContentView: View {
             liveStatusDisabledSlotIDs: model.liveStatusDisabledSlotIDs,
             onToggleLiveStatus: { slotId, enabled in
                 model.setLiveStatusEnabled(slotId: slotId, enabled: enabled)
+            },
+            onRevealWorkItem: { workItemId, productId in
+                model.revealWorkCard(workItemId, productID: productId)
             }
         )
             .equatable()

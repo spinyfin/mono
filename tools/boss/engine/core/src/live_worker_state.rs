@@ -925,6 +925,9 @@ impl LiveWorkerStateRegistry {
                     state.project_name = state.project_name.take().or(supplied.project_name);
                     state.host_id = state.host_id.take().or(supplied.host_id);
                     state.started_at = state.started_at.take().or(supplied.started_at);
+                    state.product_id = state.product_id.take().or(supplied.product_id);
+                    state.work_item_short_id = state.work_item_short_id.take().or(supplied.work_item_short_id);
+                    state.pr_url = state.pr_url.take().or(supplied.pr_url);
                     let repaired_shell_pid = (shell_pid > 0 && shell_pid != entry.state.shell_pid).then(|| {
                         let previous_shell_pid = entry.state.shell_pid;
                         entry.state.shell_pid = shell_pid;
@@ -1493,6 +1496,25 @@ impl LiveWorkerStateRegistry {
         }
         out.sort_by_key(|c| c.slot_id);
         out
+    }
+
+    /// Stamp (or clear) the bound work item's PR URL on the live slot
+    /// for `run_id`. Called when a `cube pr create` / `gh pr create`
+    /// URL is verified against this execution's branch, so the Agents
+    /// pane header can show the PR while the worker is still running.
+    /// Returns `true` iff the stored value changed.
+    pub fn set_pr_url_for_run(&self, run_id: &str, pr_url: Option<String>) -> bool {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        for entry in guard.values_mut() {
+            if entry.state.run_id == run_id {
+                if entry.state.pr_url == pr_url {
+                    return false;
+                }
+                entry.state.pr_url = pr_url;
+                return true;
+            }
+        }
+        false
     }
 
     /// Set the `held` flag for the slot that owns `run_id`. Walks the

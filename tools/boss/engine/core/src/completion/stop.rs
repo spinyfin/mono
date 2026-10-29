@@ -304,6 +304,9 @@ impl WorkerCompletionHandler {
             pr_url = %verified_url,
             "pr_url_capture: staged PR URL verified against this execution's branch",
         );
+        if let Some(states) = &self.live_worker_states {
+            states.set_pr_url_for_run(execution_id, Some(verified_url.clone()));
+        }
         if finalization_armed {
             self.reconcile_review_guide_source_for_execution(
                 execution_id,
