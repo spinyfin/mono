@@ -21,9 +21,13 @@ rust_library(
 
 rust_test(
     name = "recovery_test",
-    # Real-jj fixtures: every test spawns a throwaway colocated repo, so the
-    # suite exceeds the 60s `small` budget on a loaded CI host.
     size = "medium",
+    # Every bookmark/reconcile test drives a real `jj` subprocess against a
+    # scratch repo. Observed on the linux-amd64 CI runners over 60 recent
+    # main builds: p50 25 s, max 57 s against small's 60 s default budget;
+    # locally on an Apple Silicon dev box the whole target takes 12 s.
+    # Keep the moderate (300 s) timeout and medium size for loaded CI hosts.
+    timeout = "moderate",
     crate = ":recovery",
     data = ["@jj_test_tools//:jj"],
     edition = "2024",

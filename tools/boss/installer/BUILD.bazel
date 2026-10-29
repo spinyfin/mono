@@ -58,6 +58,9 @@ boss_pkg_payload(
 # macos_application rule actually produces.
 sh_test(
     name = "boss_pkg_payload_contains_engine_binary_test",
+    # A file-existence check inside an already-built payload; well under a
+    # second on CI.
+    size = "small",
     srcs = ["boss_pkg_payload_contains_engine_binary_test.sh"],
     args = [
         "$(location :boss_pkg_payload)/Boss.app/%s" % ENGINE_BINARY_BUNDLE_FRAGMENT,

@@ -220,9 +220,18 @@ final class TrekPortraitGridTests: XCTestCase {
         return try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
     }
 
+    /// Counts 8-connected opaque components with a pixel flood fill —
+    /// deliberately a different algorithm from the run-based labelling in
+    /// `TrekIconAssets.keepLargestComponent`, so the two cross-check each
+    /// other. Bookkeeping lives in raw buffers and plain `while` loops
+    /// because the test bundle is compiled without optimisation, where
+    /// each Swift array access costs on the order of a microsecond, so an
+    /// array-based fill over 56 full-size portraits takes tens of seconds.
     private func opaqueComponentCount(of image: CGImage) throws -> Int {
         let width = image.width, height = image.height
-        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let pixelCount = width * height
+        guard pixelCount > 0 else { return 0 }
+        var pixels = [UInt8](repeating: 0, count: pixelCount * 4)
         let space = try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB))
         try pixels.withUnsafeMutableBytes { buffer in
             let context = try XCTUnwrap(CGContext(
@@ -232,26 +241,46 @@ final class TrekPortraitGridTests: XCTestCase {
             ))
             context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
         }
-        var seen = [Bool](repeating: false, count: width * height)
-        var count = 0
-        for start in 0..<(width * height) where !seen[start] && pixels[start * 4 + 3] != 0 {
-            count += 1
-            seen[start] = true
-            var stack = [start]
-            while let index = stack.popLast() {
-                let x = index % width, y = index / width
-                for ny in max(y - 1, 0)...min(y + 1, height - 1) {
-                    for nx in max(x - 1, 0)...min(x + 1, width - 1) {
-                        let n = ny * width + nx
-                        if !seen[n], pixels[n * 4 + 3] != 0 {
-                            seen[n] = true
-                            stack.append(n)
+        let seen = UnsafeMutablePointer<Bool>.allocate(capacity: pixelCount)
+        seen.initialize(repeating: false, count: pixelCount)
+        defer { seen.deallocate() }
+        // Every pixel is pushed at most once (it is marked seen as it is
+        // pushed), so the stack never needs more than one slot per pixel.
+        let stack = UnsafeMutablePointer<Int>.allocate(capacity: pixelCount)
+        defer { stack.deallocate() }
+        return pixels.withUnsafeBufferPointer { buffer -> Int in
+            let alpha = buffer.baseAddress!
+            var components = 0
+            var start = 0
+            while start < pixelCount {
+                defer { start += 1 }
+                if seen[start] || alpha[start * 4 + 3] == 0 { continue }
+                components += 1
+                seen[start] = true
+                var top = 1
+                stack[0] = start
+                while top > 0 {
+                    top -= 1
+                    let index = stack[top]
+                    let x = index % width, y = index / width
+                    var ny = max(y - 1, 0)
+                    while ny <= min(y + 1, height - 1) {
+                        var nx = max(x - 1, 0)
+                        while nx <= min(x + 1, width - 1) {
+                            let n = ny * width + nx
+                            if !seen[n], alpha[n * 4 + 3] != 0 {
+                                seen[n] = true
+                                stack[top] = n
+                                top += 1
+                            }
+                            nx += 1
                         }
+                        ny += 1
                     }
                 }
             }
+            return components
         }
-        return count
     }
 
     private func alphaColumns(of image: CGImage) throws -> [UInt8] {
