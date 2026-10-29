@@ -76,7 +76,11 @@ struct QuotaLocks {
 
 #[derive(Default)]
 struct CacheState {
+    /// Last known figures, merged per driver as a running cycle's probes
+    /// land. `generated_at_epoch_s` only moves when the whole cycle ends.
     snapshot: DriverQuotaSnapshot,
+    /// Drivers whose probe is running in the current cycle, if any.
+    pending: Vec<String>,
 }
 
 impl QuotaCache {
@@ -124,13 +128,20 @@ impl QuotaCache {
     pub async fn lookup(&self, refresh: bool) -> QuotaLookup {
         let mut state = self.locks.state.lock().await;
         let (should_probe, throttled) = self.decide(state.snapshot.generated_at_epoch_s, refresh, now_epoch_s());
-        if !should_probe {
-            state.snapshot.refresh_throttled = throttled;
+        // The flag describes *this* request's decision, so it is rewritten on
+        // every lookup rather than left holding an earlier decline.
+        state.snapshot.refresh_throttled = throttled;
+        let mut snapshot = state.snapshot.clone();
+        // Only a request that will be followed by pushed results waits on
+        // anything; a joined in-flight cycle reports its remaining drivers.
+        if should_probe {
+            snapshot.pending_drivers = if state.pending.is_empty() {
+                self.probes.iter().map(|probe| probe.driver().to_owned()).collect()
+            } else {
+                state.pending.clone()
+            };
         }
-        QuotaLookup {
-            snapshot: state.snapshot.clone(),
-            should_probe,
-        }
+        QuotaLookup { snapshot, should_probe }
     }
 
     /// Return the current snapshot, probing first if policy says to.
@@ -141,30 +152,48 @@ impl QuotaCache {
     /// cycle via the cycle lock. The RPC handler uses [`Self::lookup`] to
     /// reply immediately, then this method on a background task.
     pub async fn snapshot(&self, refresh: bool) -> DriverQuotaSnapshot {
+        self.snapshot_with_progress(refresh, |_| {}).await
+    }
+
+    /// Like [`Self::snapshot`], but calls `progress` with a partial snapshot
+    /// each time one driver's probe completes, so a fast driver's result is
+    /// visible without waiting for the slowest. Every partial snapshot carries
+    /// the latest known entry for each driver (this cycle's where it has
+    /// landed, the previous cycle's otherwise) and lists the still-running
+    /// drivers in `pending_drivers`. The final snapshot is returned, not
+    /// passed to `progress`.
+    pub async fn snapshot_with_progress(
+        &self,
+        refresh: bool,
+        progress: impl Fn(DriverQuotaSnapshot),
+    ) -> DriverQuotaSnapshot {
         {
             let mut state = self.locks.state.lock().await;
             let (should_probe, throttled) = self.decide(state.snapshot.generated_at_epoch_s, refresh, now_epoch_s());
+            state.snapshot.refresh_throttled = throttled;
             if !should_probe {
-                state.snapshot.refresh_throttled = throttled;
                 return state.snapshot.clone();
             }
         }
         let _cycle = self.locks.cycle.lock().await;
         {
-            let state = self.locks.state.lock().await;
+            let mut state = self.locks.state.lock().await;
             let (should_probe, _) = self.decide(state.snapshot.generated_at_epoch_s, refresh, now_epoch_s());
             if !should_probe {
+                state.snapshot.refresh_throttled = false;
                 return state.snapshot.clone();
             }
+            state.pending = self.probes.iter().map(|probe| probe.driver().to_owned()).collect();
         }
-        let new_snapshot = self.run_cycle().await;
+        let new_snapshot = self.run_cycle(&progress).await;
         let mut state = self.locks.state.lock().await;
         state.snapshot = new_snapshot;
+        state.pending.clear();
         state.snapshot.clone()
     }
 
     /// Run every probe concurrently under its own deadline.
-    async fn run_cycle(&self) -> DriverQuotaSnapshot {
+    async fn run_cycle(&self, progress: &impl Fn(DriverQuotaSnapshot)) -> DriverQuotaSnapshot {
         let mut join_set = tokio::task::JoinSet::new();
         for probe in &self.probes {
             let probe = Arc::clone(probe);
@@ -188,7 +217,11 @@ impl QuotaCache {
         let mut entries: Vec<DriverQuotaEntry> = Vec::new();
         while let Some(joined) = join_set.join_next().await {
             match joined {
-                Ok(entry) => entries.push(entry),
+                Ok(entry) => {
+                    let partial = self.record_landed(&entry).await;
+                    entries.push(entry);
+                    progress(partial);
+                }
                 // A panicking probe must not take the whole cycle down; it
                 // simply contributes nothing, and the driver is then absent
                 // from the snapshot — which the UI renders as "no result",
@@ -196,13 +229,7 @@ impl QuotaCache {
                 Err(err) => tracing::error!(?err, "driver_quota: probe task failed"),
             }
         }
-        // Stable presentation order regardless of which probe answered first.
-        entries.sort_by_key(|entry| {
-            DRIVER_QUOTA_ORDER
-                .iter()
-                .position(|slug| *slug == entry.driver)
-                .unwrap_or(usize::MAX)
-        });
+        sort_for_display(&mut entries);
 
         for entry in &entries {
             match &entry.outcome {
@@ -225,8 +252,36 @@ impl QuotaCache {
             entries,
             generated_at_epoch_s: Some(now_epoch_s()),
             refresh_throttled: false,
+            pending_drivers: Vec::new(),
         }
     }
+
+    /// Fold one landed probe into the running cycle's state and return the
+    /// partial snapshot to publish.
+    async fn record_landed(&self, entry: &DriverQuotaEntry) -> DriverQuotaSnapshot {
+        let mut state = self.locks.state.lock().await;
+        let entries = &mut state.snapshot.entries;
+        match entries.iter_mut().find(|existing| existing.driver == entry.driver) {
+            Some(existing) => *existing = entry.clone(),
+            None => entries.push(entry.clone()),
+        }
+        sort_for_display(entries);
+        state.pending.retain(|driver| *driver != entry.driver);
+        let mut partial = state.snapshot.clone();
+        partial.refresh_throttled = false;
+        partial.pending_drivers = state.pending.clone();
+        partial
+    }
+}
+
+/// Stable presentation order regardless of which probe answered first.
+fn sort_for_display(entries: &mut [DriverQuotaEntry]) {
+    entries.sort_by_key(|entry| {
+        DRIVER_QUOTA_ORDER
+            .iter()
+            .position(|slug| *slug == entry.driver)
+            .unwrap_or(usize::MAX)
+    });
 }
 
 #[cfg(test)]
@@ -429,5 +484,94 @@ mod tests {
             1,
             "two windows opening at once must not double-probe the providers"
         );
+    }
+
+    struct GatedProbe {
+        driver: &'static str,
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl DriverQuotaProbe for GatedProbe {
+        fn driver(&self) -> &'static str {
+            self.driver
+        }
+        async fn probe(&self) -> DriverQuotaOutcome {
+            self.gate.notified().await;
+            DriverQuotaOutcome::Reading(DriverQuotaReading {
+                used_percent: 9.0,
+                window: DriverQuotaWindow::Weekly,
+                resets_at_epoch_s: None,
+                resets_at_text: None,
+                source: "test".to_owned(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fast_driver_is_published_while_a_slow_one_is_still_pending() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let cache = Arc::new(QuotaCache::new(vec![
+            CountingProbe::new("claude", 1.0),
+            Arc::new(GatedProbe {
+                driver: "codex",
+                gate: Arc::clone(&gate),
+            }),
+        ]));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let cycle = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                cache
+                    .snapshot_with_progress(false, move |partial| {
+                        let _ = tx.send(partial);
+                    })
+                    .await
+            })
+        };
+        let partial = rx.recv().await.expect("claude lands first");
+        assert_eq!(partial.entries.len(), 1);
+        assert_eq!(partial.entries[0].driver, "claude");
+        assert_eq!(partial.pending_drivers, vec!["codex".to_owned()]);
+        assert!(partial.generated_at_epoch_s.is_none(), "the cycle has not finished");
+
+        let mid = cache.lookup(false).await;
+        assert!(mid.should_probe);
+        assert_eq!(mid.snapshot.pending_drivers, vec!["codex".to_owned()]);
+
+        gate.notify_one();
+        let done = cycle.await.expect("join");
+        assert_eq!(done.entries.len(), 2);
+        assert!(done.pending_drivers.is_empty());
+        assert!(done.generated_at_epoch_s.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_accepted_refresh_after_a_declined_one_is_not_reported_throttled() {
+        let probe = CountingProbe::new("claude", 7.0);
+        let cache = QuotaCache::new(vec![probe.clone()]).with_policy(
+            DEFAULT_TTL,
+            Duration::from_secs(3600),
+            DEFAULT_PROBE_TIMEOUT,
+        );
+        cache.snapshot(false).await;
+        let declined = cache.lookup(true).await;
+        assert!(declined.snapshot.refresh_throttled);
+        assert!(!declined.should_probe);
+        assert!(declined.snapshot.pending_drivers.is_empty());
+
+        // Age the cached cycle past the floor instead of sleeping through it.
+        {
+            let mut state = cache.locks.state.lock().await;
+            let generated = state.snapshot.generated_at_epoch_s.expect("cycle ran");
+            state.snapshot.generated_at_epoch_s = Some(generated - 7200);
+        }
+        let accepted = cache.lookup(true).await;
+        assert!(accepted.should_probe);
+        assert!(
+            !accepted.snapshot.refresh_throttled,
+            "a stale decline must not describe the accepted request"
+        );
+        assert_eq!(accepted.snapshot.pending_drivers, vec!["claude".to_owned()]);
     }
 }

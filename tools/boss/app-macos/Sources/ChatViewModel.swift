@@ -541,12 +541,6 @@ final class ChatViewModel: ObservableObject {
     /// fetch, and Settings opens regardless of whether one is in flight.
     @Published var isRefreshingDriverQuota: Bool = false
 
-    /// Set while an explicit Refresh is outstanding; `generatedAtEpochS` of
-    /// the snapshot cached when it was sent. A reply is the refresh result
-    /// only once it is newer than this (or the engine declined the refresh).
-    var awaitingForcedDriverQuotaRefresh = false
-    var driverQuotaRefreshBaselineEpochS: Int?
-
     /// Whether a Trunk org API token is currently configured (env override
     /// or Keychain), sourced from `trunk_status` — on Settings-pane appear,
     /// after a `TrunkSetToken` save, and on product-settings appear so the

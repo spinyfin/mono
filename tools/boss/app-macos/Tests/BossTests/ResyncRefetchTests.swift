@@ -229,7 +229,9 @@ final class ResyncRefetchTests: XCTestCase {
     func testLostQuotaCompletionIsRecoveredAndRefreshControlReenabled() async {
         let (model, recorder) = makeModel()
         model.refreshDriverQuota(force: true)
-        model.applyEventForTest(.driverQuotaUsageResult(snapshot: .empty))
+        model.applyEventForTest(.driverQuotaUsageResult(
+            snapshot: DriverQuotaSnapshot(pendingDrivers: ["claude", "codex", "grok"])
+        ))
         XCTAssertTrue(model.isRefreshingDriverQuota, "the completion push is lost, so the pane stays on Checking")
         recorder.reset()
 

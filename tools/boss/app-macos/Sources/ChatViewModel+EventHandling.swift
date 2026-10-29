@@ -361,17 +361,12 @@ extension ChatViewModel {
             driverTrafficSplit = split
         case .driverQuotaUsageResult(let snapshot):
             driverQuota = snapshot
-            // A cold-cache reply is empty and arrives immediately; keep the
-            // checking flag until a completed cycle lands so the pane can
-            // show "Checking…" rather than a false "not checked yet".
-            if !snapshot.neverChecked, Self.driverQuotaReplyEndsRefresh(
-                snapshot,
-                awaitingForced: awaitingForcedDriverQuotaRefresh,
-                baselineEpochS: driverQuotaRefreshBaselineEpochS
-            ) {
-                isRefreshingDriverQuota = false
-                awaitingForcedDriverQuotaRefresh = false
-            }
+            // The engine lists the drivers still being probed. The in-flight
+            // state (spinner, "Checking…", disabled Refresh) lasts until that
+            // list is empty: the immediate reply to an accepted refresh names
+            // every driver, each pushed partial drops the ones that landed,
+            // and a cached read or declined refresh arrives already empty.
+            isRefreshingDriverQuota = !snapshot.pendingDrivers.isEmpty
         case .trunkStatus(let configured, let source, let queueCheck, let note):
             trunkTokenConfigured = configured
             trunkTokenSource = source
@@ -943,22 +938,5 @@ extension ChatViewModel {
     /// fan-out) can be asserted without booting a real engine.
     func applyEventForTest(_ event: EngineEvent) {
         handle(event)
-    }
-}
-
-extension ChatViewModel {
-    /// Whether a quota reply ends the in-flight refresh. A forced refresh gets
-    /// an immediate cached reply before the probes run, which must not clear
-    /// the indicator; the completed cycle is newer than the cached baseline,
-    /// and a throttled refresh is declined with no probe to wait for.
-    nonisolated static func driverQuotaReplyEndsRefresh(
-        _ snapshot: DriverQuotaSnapshot,
-        awaitingForced: Bool,
-        baselineEpochS: Int?
-    ) -> Bool {
-        guard awaitingForced else { return true }
-        if snapshot.refreshThrottled { return true }
-        guard let generated = snapshot.generatedAtEpochS else { return false }
-        return baselineEpochS.map { generated > $0 } ?? true
     }
 }

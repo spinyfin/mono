@@ -53,11 +53,6 @@ extension ChatViewModel {
     /// is in flight, so opening Settings is never delayed by a fetch.
     func refreshDriverQuota(force: Bool = false) {
         isRefreshingDriverQuota = true
-        // An explicit refresh is answered twice: immediately with the cached
-        // snapshot, then with a pushed one once the probes finish. Remember
-        // what was cached so only the second reply ends the in-flight state.
-        driverQuotaRefreshBaselineEpochS = force ? driverQuota.generatedAtEpochS : nil
-        awaitingForcedDriverQuotaRefresh = force
         engine.sendGetDriverQuotaUsage(refresh: force)
     }
 

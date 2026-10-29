@@ -132,6 +132,9 @@ struct DriverQuotaSnapshot: Equatable, Sendable {
     /// recently. Surfaced so a reader who pressed Refresh and saw nothing
     /// change learns why.
     var refreshThrottled: Bool = false
+    /// Drivers whose probe is still running for the request this snapshot
+    /// answers. Empty means nothing is left to wait for.
+    var pendingDrivers: [String] = []
 
     static let empty = DriverQuotaSnapshot()
 
@@ -154,7 +157,8 @@ extension DriverQuotaSnapshot {
         return DriverQuotaSnapshot(
             entries: rawEntries.compactMap(DriverQuotaEntry.decode),
             generatedAtEpochS: (payload["generated_at_epoch_s"] as? NSNumber)?.intValue,
-            refreshThrottled: (payload["refresh_throttled"] as? NSNumber)?.boolValue ?? false
+            refreshThrottled: (payload["refresh_throttled"] as? NSNumber)?.boolValue ?? false,
+            pendingDrivers: payload["pending_drivers"] as? [String] ?? []
         )
     }
 }
@@ -333,7 +337,7 @@ struct DriverQuotaSection: View {
                 DriverQuotaRow(
                     entry: entry,
                     now: now,
-                    checking: chatModel.isRefreshingDriverQuota
+                    checking: chatModel.driverQuota.pendingDrivers.contains(entry.driver)
                 )
             }
             HStack(spacing: 8) {

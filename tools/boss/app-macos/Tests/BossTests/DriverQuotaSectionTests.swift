@@ -202,17 +202,42 @@ final class DriverQuotaSectionTests: XCTestCase {
         )
     }
 
-    func testForcedRefreshIgnoresCachedReplyAndEndsOnNewerCycle() {
-        var cached = DriverQuotaSnapshot.empty
-        cached.generatedAtEpochS = 1_787_000_000
-        XCTAssertFalse(ChatViewModel.driverQuotaReplyEndsRefresh(cached, awaitingForced: true, baselineEpochS: 1_787_000_000))
-        var fresh = cached
-        fresh.generatedAtEpochS = 1_787_000_030
-        XCTAssertTrue(ChatViewModel.driverQuotaReplyEndsRefresh(fresh, awaitingForced: true, baselineEpochS: 1_787_000_000))
-        var declined = cached
+    func testDecodeReadsPendingDrivers() {
+        let decoded = snapshot(["entries": [], "pending_drivers": ["claude", "grok"]])
+        XCTAssertEqual(decoded.pendingDrivers, ["claude", "grok"])
+        XCTAssertEqual(snapshot(["entries": []]).pendingDrivers, [])
+    }
+
+    @MainActor
+    func testRefreshStateFollowsPendingDriversAsResultsArrive() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-quota-\(UUID().uuidString).sock")
+        model.isRefreshingDriverQuota = true
+        var snap = DriverQuotaSnapshot.empty
+        snap.generatedAtEpochS = 1_787_000_000
+        snap.pendingDrivers = ["claude", "codex", "grok"]
+        model.applyEventForTest(.driverQuotaUsageResult(snapshot: snap))
+        XCTAssertTrue(model.isRefreshingDriverQuota, "accepted refresh keeps the spinner")
+
+        // One driver finishes while another is still pending.
+        snap.pendingDrivers = ["claude"]
+        model.applyEventForTest(.driverQuotaUsageResult(snapshot: snap))
+        XCTAssertTrue(model.isRefreshingDriverQuota)
+        XCTAssertFalse(model.driverQuota.pendingDrivers.contains("grok"))
+
+        snap.pendingDrivers = []
+        model.applyEventForTest(.driverQuotaUsageResult(snapshot: snap))
+        XCTAssertFalse(model.isRefreshingDriverQuota, "cycle complete clears Refresh state")
+    }
+
+    @MainActor
+    func testDeclinedRefreshEndsInFlightState() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-quota-\(UUID().uuidString).sock")
+        model.isRefreshingDriverQuota = true
+        var declined = DriverQuotaSnapshot.empty
+        declined.generatedAtEpochS = 1_787_000_000
         declined.refreshThrottled = true
-        XCTAssertTrue(ChatViewModel.driverQuotaReplyEndsRefresh(declined, awaitingForced: true, baselineEpochS: 1_787_000_000))
-        XCTAssertTrue(ChatViewModel.driverQuotaReplyEndsRefresh(cached, awaitingForced: false, baselineEpochS: nil))
+        model.applyEventForTest(.driverQuotaUsageResult(snapshot: declined))
+        XCTAssertFalse(model.isRefreshingDriverQuota)
     }
 
     func testEveryFailureKindHasADistinguishableLabel() {
