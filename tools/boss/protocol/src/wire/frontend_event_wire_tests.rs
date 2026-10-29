@@ -433,6 +433,21 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "operator_question_error",
         },
+        TagCase {
+            label: "CriticalPriorityRequests",
+            event: FrontendEvent::CriticalPriorityRequests { requests: vec![] },
+            expected_tag: "critical_priority_requests",
+        },
+        TagCase {
+            label: "CriticalPriorityRequested",
+            event: FrontendEvent::CriticalPriorityRequested { id: "request".into() },
+            expected_tag: "critical_priority_requested",
+        },
+        TagCase {
+            label: "CriticalPriorityResolved",
+            event: FrontendEvent::CriticalPriorityResolved { id: "request".into() },
+            expected_tag: "critical_priority_resolved",
+        },
         // --- Connection lifecycle ---
         TagCase {
             label: "Hello",
@@ -2227,7 +2242,10 @@ fn tag_cases() -> Vec<TagCase> {
 #[allow(dead_code)]
 fn every_variant_is_pinned(e: &FrontendEvent) {
     match e {
-        FrontendEvent::Hello { .. }
+        FrontendEvent::CriticalPriorityRequested { .. }
+        | FrontendEvent::CriticalPriorityResolved { .. }
+        | FrontendEvent::CriticalPriorityRequests { .. }
+        | FrontendEvent::Hello { .. }
         | FrontendEvent::Subscribed { .. }
         | FrontendEvent::Unsubscribed { .. }
         | FrontendEvent::TopicEvent { .. }

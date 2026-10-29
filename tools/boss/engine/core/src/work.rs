@@ -724,6 +724,7 @@ mod coordinator_tmux;
 mod cost_report_db;
 mod create_entities;
 mod critical_priority;
+mod critical_requests;
 mod decisions;
 mod dep_helpers;
 mod design_postmortem;

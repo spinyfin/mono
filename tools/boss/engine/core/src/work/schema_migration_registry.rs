@@ -14,6 +14,11 @@ pub(super) fn all() -> Vec<Migration> {
         .collect();
     migrations.extend([
         Migration {
+            id: "20261029_1430_critical_requests".into(),
+            legacy_version: None,
+            apply: critical_requests::migrate,
+        },
+        Migration {
             id: "00000000_0000_v033_postmortem_signals".into(),
             legacy_version: Some(33),
             apply: |conn| {

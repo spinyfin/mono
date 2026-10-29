@@ -164,7 +164,10 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
             attention_members,
             planner_runs,
         },
-        passthrough @ (FrontendEvent::Hello { .. }
+        passthrough @ (FrontendEvent::CriticalPriorityRequested { .. }
+        | FrontendEvent::CriticalPriorityResolved { .. }
+        | FrontendEvent::CriticalPriorityRequests { .. }
+        | FrontendEvent::Hello { .. }
         | FrontendEvent::Subscribed { .. }
         | FrontendEvent::Unsubscribed { .. }
         | FrontendEvent::TopicEvent { .. }

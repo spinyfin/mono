@@ -23,6 +23,58 @@ use super::*;
 use boss_protocol::WorkerTierDenialReason;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+#[tokio::test]
+async fn critical_confirmation_authenticates_socket_peer_even_with_worker_gate_disabled() {
+    let (state, _dir) = test_server_state();
+    state.feature_flags.set("worker_rpc_tier", false).unwrap();
+    let product = crate::test_support::create_test_product(&state.work_db);
+    let chore = crate::test_support::create_test_chore(&state.work_db, product.id, "Priority confirmation");
+    let request = serde_json::json!({"request_id": "request-critical", "payload": {
+        "type": "request_critical_priority", "ids": [chore.id], "ask": "Please make this critical."
+    }})
+    .to_string();
+    let refused = round_trip(state.clone(), Some(self_pid()), &request).await;
+    assert_eq!(refused["payload"]["type"], "work_error");
+    state.set_boss_pid(self_pid());
+    state.set_app_pid(i32::MAX);
+    let register =
+        serde_json::json!({"request_id": "forge-app", "payload": {"type": "register_app_session"}}).to_string();
+    let refused = round_trip(state.clone(), Some(self_pid()), &register).await;
+    assert_eq!(refused["payload"]["type"], "error");
+    assert_eq!(state.current_app_pid(), Some(i32::MAX));
+    state.worker_registry.register(self_pid(), "worker");
+    let refused = round_trip(state.clone(), Some(self_pid()), &request).await;
+    assert_eq!(refused["payload"]["type"], "work_error");
+    state.worker_registry.unregister(self_pid());
+    let pending = round_trip(state.clone(), Some(self_pid()), &request).await;
+    assert_eq!(pending["payload"]["type"], "critical_priority_requested", "{pending}");
+    let confirm = serde_json::json!({"request_id": "confirm-critical", "payload": {
+        "type": "resolve_critical_priority_request", "id": pending["payload"]["id"], "confirm": true
+    }})
+    .to_string();
+    let refused = round_trip(state.clone(), Some(self_pid()), &confirm).await;
+    assert_eq!(refused["payload"]["type"], "work_error");
+    state.clear_boss_pid();
+    state.worker_registry.register(self_pid(), "worker");
+    let refused = round_trip(state.clone(), Some(self_pid()), &register).await;
+    assert_eq!(refused["payload"]["type"], "error");
+    assert_eq!(state.current_app_pid(), Some(i32::MAX));
+    state.worker_registry.unregister(self_pid());
+    state.set_app_pid(self_pid());
+    state.worker_registry.register(self_pid(), "worker");
+    let refused = round_trip(state.clone(), Some(self_pid()), &confirm).await;
+    assert_eq!(refused["payload"]["type"], "work_error");
+    state.worker_registry.unregister(self_pid());
+    let accepted = round_trip(state.clone(), Some(self_pid()), &confirm).await;
+    assert_eq!(accepted["payload"]["type"], "critical_priority_resolved", "{accepted}");
+    let WorkItem::Chore(updated) = state.work_db.get_work_item(&chore.id).unwrap() else {
+        panic!("chore")
+    };
+    assert_eq!(updated.priority, "critical");
+    let replay = round_trip(state.clone(), Some(self_pid()), &confirm).await;
+    assert_eq!(replay["payload"]["type"], "work_error");
+}
+
 fn self_pid() -> libc::pid_t {
     std::process::id() as libc::pid_t
 }

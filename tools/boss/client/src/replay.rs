@@ -192,6 +192,7 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::ListHosts
         | FrontendRequest::ListIdeas { .. }
         | FrontendRequest::ListLiveStatusDisabledSlots
+        | FrontendRequest::ListCriticalPriorityRequests
         | FrontendRequest::ListOperatorQuestions { .. }
         | FrontendRequest::ListPlannerRuns { .. }
         | FrontendRequest::ListProductDesignDocs { .. }
@@ -337,6 +338,8 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::Unsubscribe { .. }
         | FrontendRequest::UpdateAutomation { .. }
         | FrontendRequest::UpdateIdea { .. }
+        | FrontendRequest::RequestCriticalPriority { .. }
+        | FrontendRequest::ResolveCriticalPriorityRequest { .. }
         | FrontendRequest::UpdateWorkItem { .. } => ReplaySafety::Never,
     }
 }

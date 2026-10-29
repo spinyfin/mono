@@ -374,6 +374,9 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
         r @ FrontendRequest::UpdateAutomation { .. } => Box::pin(automations::handle_update_automation(ctx, r)),
         r @ FrontendRequest::UpdateIdea { .. } => Box::pin(ideas::handle_update_idea(ctx, r)),
         r @ FrontendRequest::MoveWorkItemOnBoard { .. } => Box::pin(work_items::handle_move_work_item_on_board(ctx, r)),
+        r @ (FrontendRequest::RequestCriticalPriority { .. }
+        | FrontendRequest::ListCriticalPriorityRequests
+        | FrontendRequest::ResolveCriticalPriorityRequest { .. }) => Box::pin(critical_requests::handle(ctx, r)),
         r @ FrontendRequest::UpdateWorkItem { .. } => Box::pin(work_items::handle_update_work_item(ctx, r)),
         r @ FrontendRequest::ReportSelectedProduct { .. } => {
             Box::pin(selected_product::handle_report_selected_product(ctx, r))
