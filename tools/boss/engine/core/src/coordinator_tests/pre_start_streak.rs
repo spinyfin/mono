@@ -266,7 +266,14 @@ async fn guide_refusals_remain_visible_after_a_failed_retry_and_reconcile() {
     let mut coordinator = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube, runner);
     coordinator.set_review_pool(WorkerPool::new_review(1));
     let coordinator = Arc::new(coordinator);
-    let first = run_guide(&coordinator, &db, &product, 10, ExecutionStatus::Failed).await;
+    let first = create_guide_execution(&db, &product, 10);
+    // Real jj workspace setup must finish before the short status wait starts,
+    // just as it does for the retries below.
+    coordinator
+        .force_dispatch(&first.id, crate::coordinator::DispatchAdmission::Queued)
+        .await
+        .unwrap();
+    wait_for_execution_status(&db, &first.id, ExecutionStatus::Failed).await;
     let root: String = db
         .connect()
         .unwrap()

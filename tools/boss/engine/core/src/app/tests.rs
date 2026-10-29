@@ -527,7 +527,6 @@ mod semantic_progress_ingress;
 mod session_sink_queue;
 mod session_write_progress;
 mod shutdown_workers;
-mod spawn_streak_health;
 mod t02;
 mod t03;
 mod t04;
