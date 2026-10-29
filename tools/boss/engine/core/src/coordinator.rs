@@ -222,13 +222,27 @@ pub const DEFAULT_REVIEW_POOL_SIZE: usize = 16;
 /// dispatched from* the automation or review pool is never held by this
 /// gate; those pools' own sizes govern their own home-pool dispatch. That
 /// is NOT the same as saying automation never counts toward the number
-/// this cap compares against: `busy_count()` counts every claimed
-/// `worker_pool` slot, and a spilled automation run (one that overflowed its
-/// full home pool onto a Lower Decks interactive slot via `claim_worker_spill`)
-/// IS one of those slots, so it DOES count against this cap. That is a
-/// deliberate policy choice, not an oversight: counting spilled automation
-/// keeps the cap's load-bearing promise (never more than the configured cap
-/// of live interactive-pool workers, spilled automation included) intact,
+/// this cap compares against: `busy_count()` counts claimed `worker_pool`
+/// slots whose workspace lease has already succeeded (`working`), and a
+/// spilled automation run (one that overflowed its full home pool onto a
+/// Lower Decks interactive slot via `claim_worker_spill`) IS one of those
+/// slots once it has a workspace, so it DOES count against this cap. A
+/// slot that is only acquiring a workspace is tracked separately as
+/// lease-pending and is excluded from this comparison — otherwise a
+/// cube-lease timeout storm saturates the cap with zero live workers and
+/// starves new mainline work. That is a deliberate policy choice, not an
+/// oversight. The price is a bounded overshoot: the cap is compared against
+/// `working` at admission, and a claim becomes `working` only when its lease
+/// returns, so claims admitted while `working` sat just below the cap can all
+/// complete their leases and push the live count above it. Pending claims
+/// are bounded by [`MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO`] per repo (a
+/// claim holds a permit until its lease returns), so the live count can
+/// exceed the cap by at most that bound times the number of repos with a
+/// lease in flight; further admissions are held until `working` drops back
+/// below the cap. Explicit critical/forced launches bypass the cap by design.
+/// Counting spilled automation that is actually running keeps
+/// the cap's promise (the configured number of live interactive-pool
+/// workers, spilled automation included, plus that bounded overshoot) intact,
 /// while the once-per-pass automation-preemption fallback in
 /// `drain_ready_queue` is what keeps mainline from starving behind spilled
 /// automation at the cap — a preemption is a trade (one live worker for
@@ -249,6 +263,27 @@ pub const DEFAULT_REVIEW_POOL_SIZE: usize = 16;
 /// enforced in `drain_ready_queue`, deliberately NOT in `claim_worker_force`,
 /// where an explicit `bossctl agents launch` may exceed the cap.
 pub const MAX_CONCURRENT_INTERACTIVE_WORKERS: usize = 8;
+
+/// Ceiling on concurrent `cube workspace lease` calls against one repo
+/// origin. Cube takes a per-repo `RepoLock` for the registry-mutation
+/// portion of a lease and then drops it before the local jj probe and
+/// setup so one other lease can overlap (`tools/cube/src/app/workspace.rs`).
+/// Concurrent leases on one repo therefore queue on that lock rather than
+/// run faster, and when a long operation such as `repo gc` holds it every
+/// waiter runs into the lease timeout ([`CUBE_LEASE_TIMEOUT`]), so extra
+/// attempts only add timeouts. The bound of 2 is derived from that lock
+/// design (one lease holding the lock plus one overlapping its post-lock
+/// setup); it is not a measured peak of healthy dispatch concurrency.
+///
+/// The permit covers the lease call only: it is taken before a slot is
+/// claimed and released as soon as the lease returns, success or failure.
+pub const MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO: usize = 2;
+
+/// User-visible wait reason for a ready row held because this origin
+/// already has [`MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO`] lease calls
+/// in flight. Distinct from the interactive-cap wording: these rows are
+/// not waiting for a worker slot.
+pub(crate) const WAITING_FOR_WORKSPACE_REASON: &str = "Waiting for a workspace";
 
 /// Worker ID prefix for automation-pool slots. Distinct from the main-pool
 /// `"worker-"` prefix so `pool_for_worker_id` can route releases to the
@@ -323,6 +358,16 @@ const MAX_INFLIGHT_DISPATCHES: usize = MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POO
 /// human already has a concrete execution to look at.
 const PRE_START_RETRY_DELAYS: [Duration; 3] =
     [Duration::from_secs(5), Duration::from_secs(15), Duration::from_secs(45)];
+
+/// User-visible interactive-cap hold text. Lease-pending slots are
+/// never called "working".
+pub(crate) fn interactive_cap_wait_reason(working: usize, lease_pending: usize) -> String {
+    if lease_pending == 0 {
+        format!("Waiting for an available worker ({working} working)")
+    } else {
+        format!("Waiting for an available worker ({working} working, {lease_pending} waiting for a workspace)")
+    }
+}
 
 /// How often `run_execution`'s [`HeartbeatGuard`] re-stamps the cube
 /// lease expiry. Cube's `DEFAULT_LEASE_TTL_SECS` (and the engine's
@@ -1107,6 +1152,21 @@ struct WorkerSlot {
     worker_id: String,
     execution_id: Option<String>,
     last_workspace_id: Option<String>,
+    /// `true` once this slot's execution has a cube workspace lease.
+    /// A claimed slot with `working == false` is only acquiring a
+    /// workspace and must not count toward the interactive concurrency cap.
+    working: bool,
+}
+
+/// Snapshot of interactive-pool occupancy, splitting live workers from
+/// slots that are only acquiring a workspace.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WorkerPoolOccupancy {
+    /// Claimed slots whose workspace lease has already succeeded.
+    pub working: usize,
+    /// Claimed slots still acquiring a workspace (`cube_lease_id` not yet
+    /// recorded). Excluded from [`WorkerPool::busy_count`].
+    pub lease_pending: usize,
 }
 
 /// Deterministic, page-aware free-slot selection shared by
@@ -1207,6 +1267,7 @@ impl WorkerPool {
                 worker_id: format!("{}{}", prefix, index + 1),
                 execution_id: None,
                 last_workspace_id: None,
+                working: false,
             })
             .collect();
         Self {
@@ -1244,6 +1305,7 @@ impl WorkerPool {
         let (chosen_idx, selection) = select_claim_index(&inner.workers, preferred_workspace_id)?;
         let worker = &mut inner.workers[chosen_idx];
         worker.execution_id = Some(execution_id.to_owned());
+        worker.working = false;
         let worker_id = worker.worker_id.clone();
         log_pool_claim(&worker_id, execution_id, selection);
         Some(worker_id)
@@ -1270,12 +1332,12 @@ impl WorkerPool {
     /// Claim a **Lower Decks** slot for an automation execution spilling
     /// out of a full automation pool. Returns `None` when page 1 has no
     /// free slot, or when the live-worker count is already at or above
-    /// `max_concurrent_interactive_workers` — a spilled claim counts
-    /// toward that cap exactly like a mainline claim does (see
-    /// `MAX_CONCURRENT_INTERACTIVE_WORKERS`'s doc), so it must be gated
-    /// the same way. The busy count and the claim happen under the same
-    /// lock hold, so the cap check can never race against a concurrent
-    /// claim on either path.
+    /// `max_concurrent_interactive_workers` — a spilled claim that has a
+    /// workspace counts toward that cap exactly like a mainline claim
+    /// does (see `MAX_CONCURRENT_INTERACTIVE_WORKERS`'s doc), so it must
+    /// be gated the same way. Lease-pending slots are excluded. The
+    /// working count and the claim happen under the same lock hold, so
+    /// the cap check can never race against a concurrent `mark_working`.
     ///
     /// Unlike [`Self::claim_worker`], this never considers page 0: a
     /// spilling automation may not take a Bridge Crew slot even when
@@ -1290,8 +1352,8 @@ impl WorkerPool {
         max_concurrent_interactive_workers: usize,
     ) -> Option<String> {
         let mut inner = self.inner.lock().await;
-        let busy = inner.workers.iter().filter(|w| w.execution_id.is_some()).count();
-        if busy >= max_concurrent_interactive_workers {
+        let working = inner.workers.iter().filter(|w| w.working).count();
+        if working >= max_concurrent_interactive_workers {
             return None;
         }
         let views: Vec<crate::dispatch_spillover::SlotView> = inner
@@ -1308,6 +1370,7 @@ impl WorkerPool {
             crate::dispatch_spillover::select_spill_claim_index(&views, preferred_workspace_id, WORKER_PAGE_SIZE)?;
         let worker = &mut inner.workers[chosen_idx];
         worker.execution_id = Some(execution_id.to_owned());
+        worker.working = false;
         let worker_id = worker.worker_id.clone();
         log_pool_claim(&worker_id, execution_id, "automation-spill");
         Some(worker_id)
@@ -1332,6 +1395,7 @@ impl WorkerPool {
         if let Some((chosen_idx, selection)) = select_claim_index(&inner.workers, preferred_workspace_id) {
             let worker = &mut inner.workers[chosen_idx];
             worker.execution_id = Some(execution_id.to_owned());
+            worker.working = false;
             let worker_id = worker.worker_id.clone();
             log_pool_claim(
                 &worker_id,
@@ -1355,6 +1419,7 @@ impl WorkerPool {
             worker_id: format!("{}{}", self.prefix, new_index + 1),
             execution_id: Some(execution_id.to_owned()),
             last_workspace_id: None,
+            working: false,
         };
         let id = worker.worker_id.clone();
         inner.workers.push(worker);
@@ -1389,10 +1454,14 @@ impl WorkerPool {
             return false;
         };
         match worker.execution_id.as_deref() {
-            Some(existing) if existing == execution_id => true,
+            Some(existing) if existing == execution_id => {
+                worker.working = true;
+                true
+            }
             Some(_) => false,
             None => {
                 worker.execution_id = Some(execution_id.to_owned());
+                worker.working = true;
                 log_pool_claim(worker_id, execution_id, "readopt");
                 true
             }
@@ -1406,6 +1475,7 @@ impl WorkerPool {
         let mut inner = self.inner.lock().await;
         if let Some(worker) = inner.workers.iter_mut().find(|worker| worker.worker_id == worker_id) {
             let released_execution = worker.execution_id.take();
+            worker.working = false;
             if let Some(workspace_id) = last_workspace_id {
                 worker.last_workspace_id = Some(workspace_id.to_owned());
             }
@@ -1442,6 +1512,7 @@ impl WorkerPool {
             && worker.execution_id.as_deref() == Some(execution_id)
         {
             worker.execution_id = None;
+            worker.working = false;
             if let Some(workspace_id) = last_workspace_id {
                 worker.last_workspace_id = Some(workspace_id.to_owned());
             }
@@ -1506,16 +1577,52 @@ impl WorkerPool {
         format!("worker-{}", slot_id)
     }
 
-    /// Number of slots currently claimed by an execution. Used by the
-    /// dispatcher's interactive-pool concurrency gate
-    /// ([`MAX_CONCURRENT_INTERACTIVE_WORKERS`]).
+    /// Number of slots whose execution already has a workspace lease.
+    /// Used by the dispatcher's interactive-pool concurrency gate
+    /// ([`MAX_CONCURRENT_INTERACTIVE_WORKERS`]). Slots that are only
+    /// acquiring a workspace are excluded — see [`Self::occupancy`].
     pub(crate) async fn busy_count(&self) -> usize {
+        self.occupancy().await.working
+    }
+
+    /// Split occupancy: live workers vs lease-pending claims.
+    pub(crate) async fn occupancy(&self) -> WorkerPoolOccupancy {
         let inner = self.inner.lock().await;
-        inner
-            .workers
-            .iter()
-            .filter(|worker| worker.execution_id.is_some())
-            .count()
+        let mut occupancy = WorkerPoolOccupancy::default();
+        for worker in &inner.workers {
+            if worker.execution_id.is_some() {
+                if worker.working {
+                    occupancy.working += 1;
+                } else {
+                    occupancy.lease_pending += 1;
+                }
+            }
+        }
+        occupancy
+    }
+
+    /// Mark `worker_id` as past workspace-lease: it now counts toward the
+    /// interactive concurrency cap. No-op if the slot is idle or missing.
+    pub(crate) async fn mark_working(&self, worker_id: &str) {
+        let mut inner = self.inner.lock().await;
+        if let Some(worker) = inner.workers.iter_mut().find(|worker| worker.worker_id == worker_id)
+            && worker.execution_id.is_some()
+        {
+            worker.working = true;
+        }
+    }
+
+    /// Claim a slot and mark it working. Test helper for filling the
+    /// interactive cap with live workers rather than lease-pending claims.
+    #[cfg(test)]
+    pub(crate) async fn claim_working(
+        &self,
+        execution_id: &str,
+        preferred_workspace_id: Option<&str>,
+    ) -> Option<String> {
+        let worker_id = self.claim_worker(execution_id, preferred_workspace_id).await?;
+        self.mark_working(&worker_id).await;
+        Some(worker_id)
     }
 
     #[cfg(test)]
@@ -2384,12 +2491,27 @@ pub struct ExecutionCoordinator {
     /// consults it. See [`crate::pre_start_streak`].
     #[builder(default)]
     pre_start_streaks: Arc<crate::pre_start_streak::PreStartStreakTracker>,
+    /// Per-repo bound on concurrent cube workspace-lease attempts. Drain
+    /// takes a permit before claiming a slot so a lease storm cannot fill
+    /// the interactive pool. Defaults to
+    /// [`MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO`]. Skipped on the builder
+    /// because [`lease_limiter::RepoLeaseLimiter`] is crate-private; tests
+    /// override via [`Self::with_max_concurrent_leases_per_repo`].
+    #[builder(skip = lease_limiter::RepoLeaseLimiter::new(MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO))]
+    repo_lease_limiter: lease_limiter::RepoLeaseLimiter,
+    /// Outer bound on a single `cube workspace lease` invocation. Defaults
+    /// to [`CUBE_LEASE_TIMEOUT`]. Tests override via
+    /// [`Self::with_cube_lease_timeout`] so a hang can fire without waiting
+    /// 90s.
+    #[builder(default = CUBE_LEASE_TIMEOUT)]
+    cube_lease_timeout: Duration,
 }
 
 mod blocked_workspace;
 mod config;
 mod dispatch_admission;
 mod execution;
+mod lease_limiter;
 mod run;
 mod scheduler;
 

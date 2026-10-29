@@ -150,6 +150,8 @@ fn queued_wait_payload_preserves_holds_and_clears_the_blocker() {
         "dispatch_paused",
         "pool_exhausted",
         "Waiting for an available worker (3 working)",
+        "Waiting for an available worker (2 working, 9 waiting for a workspace)",
+        "Waiting for a workspace",
         "custom hold",
     ] {
         db.set_dispatch_wait_reason(&execution.id, reason).unwrap();

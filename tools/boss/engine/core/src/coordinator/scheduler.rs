@@ -404,6 +404,22 @@ impl ExecutionCoordinator {
                  being dispatched — cannot force-dispatch"
             ));
         };
+        // A forced launch overrides the interactive cap, not the per-repo
+        // lease bound: extra concurrent leases on one repo only queue on
+        // cube's per-repo lock, so a forced launch during a lease storm
+        // would add timeouts rather than start sooner.
+        let Some(_lease_attempt) = self
+            .repo_lease_limiter
+            .try_begin(&execution.repo_remote_url, &execution.id)
+            .map(|guard| guard.with_kick(Arc::clone(self)))
+        else {
+            return Err(anyhow!(
+                "{bound} cube workspace leases are already in flight for {repo}; \
+                 cannot force-dispatch {execution_id} until one finishes",
+                bound = self.repo_lease_limiter_bound(),
+                repo = execution.repo_remote_url,
+            ));
+        };
         let preferred_workspace_id = execution.preferred_workspace_id.clone();
         let pool = self.pool_for_execution(&execution);
         let pool_label = self.attributed_pool_label(&execution);
@@ -1231,15 +1247,32 @@ impl ExecutionCoordinator {
             // `pool_exhausted` below and, being sorted first, is next in
             // line on the following pass. Running workers are never
             // preempted for it.
-            let live_workers_at_cap_check = if is_main {
-                Some(self.worker_pool.busy_count().await)
+            let occupancy_at_cap_check = if is_main {
+                Some(self.worker_pool.occupancy().await)
             } else {
                 None
             };
             let capped = !is_critical
-                && live_workers_at_cap_check.is_some_and(|live| live >= self.max_concurrent_interactive_workers());
+                && occupancy_at_cap_check.is_some_and(|occ| occ.working >= self.max_concurrent_interactive_workers());
 
             if capped {
+                // The lease permit is taken BEFORE a preemption: tearing
+                // down a live spilled automation worker for a row that then
+                // cannot start a lease would lose the worker and leave the
+                // mainline row waiting. A permit dropped on the cap-hold
+                // path below frees immediately and kicks nothing.
+                //
+                // A permit miss still reports the cap: the row is also at
+                // the cap, and which constraint binds must not flip when a
+                // permit frees.
+                let cap_hold_reason =
+                    occupancy_at_cap_check.map(|occ| interactive_cap_wait_reason(occ.working, occ.lease_pending));
+                let Some(lease_attempt) = self
+                    .begin_repo_lease_or_wait(&execution, &mut changed_waits, cap_hold_reason.as_deref())
+                    .await
+                else {
+                    continue;
+                };
                 let claimed = if preempted_this_pass {
                     None
                 } else {
@@ -1254,13 +1287,14 @@ impl ExecutionCoordinator {
                     }
                 };
                 let Some(worker_id) = claimed else {
-                    let live_workers = live_workers_at_cap_check.unwrap_or_default();
+                    let occupancy = occupancy_at_cap_check.unwrap_or_default();
                     let cap = self.max_concurrent_interactive_workers();
                     tracing::info!(
                         execution_id = %execution.id,
                         work_item_id = %execution.work_item_id,
                         pool = pool_label,
-                        live_workers,
+                        live_workers = occupancy.working,
+                        lease_pending = occupancy.lease_pending,
                         cap,
                         "spawn_attempt status=ready -> held reason=interactive_concurrency_cap"
                     );
@@ -1272,14 +1306,15 @@ impl ExecutionCoordinator {
                                     "reason": "interactive_concurrency_cap",
                                     "pool": pool_label,
                                     "execution_kind": execution.kind.as_str(),
-                                    "live_workers": live_workers,
+                                    "live_workers": occupancy.working,
+                                    "lease_pending": occupancy.lease_pending,
                                     "cap": cap,
                                 })),
                         )
                         .await;
                     changed_waits.extend(self.record_dispatch_wait_reason(
                         &execution,
-                        &format!("Waiting for an available worker ({live_workers} working)"),
+                        &interactive_cap_wait_reason(occupancy.working, occupancy.lease_pending),
                         None,
                     ));
                     continue;
@@ -1289,8 +1324,15 @@ impl ExecutionCoordinator {
                 } else {
                     DispatchAdmission::Queued
                 };
-                self.dispatch_claimed_execution(&execution, &worker_id, pool_label, false, admission)
-                    .await;
+                self.dispatch_claimed_execution(
+                    &execution,
+                    &worker_id,
+                    pool_label,
+                    false,
+                    admission,
+                    Some(lease_attempt),
+                )
+                .await;
                 continue;
             }
 
@@ -1582,6 +1624,18 @@ impl ExecutionCoordinator {
 
             let pool = self.pool_for_execution(&execution);
 
+            // Bound concurrent cube leases per repo BEFORE claiming a slot
+            // so a timeout storm cannot occupy the interactive pool. Rows
+            // that miss stay `ready` with a workspace wait reason; the
+            // attempt guard kicks the scheduler when an in-flight lease
+            // ends so they retry.
+            let Some(lease_attempt) = self
+                .begin_repo_lease_or_wait(&execution, &mut changed_waits, None)
+                .await
+            else {
+                continue;
+            };
+
             // Not capped (capped mainline rows already `continue`d above,
             // either dispatched via preemption or deferred with
             // `interactive_concurrency_cap`), so a genuinely idle slot is
@@ -1697,8 +1751,15 @@ impl ExecutionCoordinator {
                 DispatchAdmission::Queued
             };
             dispatch_claim.disarm();
-            self.dispatch_claimed_execution(&execution, &worker_id, pool_label, false, admission)
-                .await;
+            self.dispatch_claimed_execution(
+                &execution,
+                &worker_id,
+                pool_label,
+                false,
+                admission,
+                Some(lease_attempt),
+            )
+            .await;
         }
 
         // ---- Pass 2: automation spillover into Lower Decks ----
@@ -1711,10 +1772,17 @@ impl ExecutionCoordinator {
         // mainline work.
         for execution in spill_candidates {
             let preferred_workspace_id = execution.preferred_workspace_id.clone();
-            // Re-read per candidate: each successful spill in this loop
-            // raises the live-worker count, so a cap snapshotted once
-            // before the loop would let later candidates in the same
-            // pass slip past it. See `claim_worker_spill`'s doc for why
+            let Some(lease_attempt) = self
+                .begin_repo_lease_or_wait(&execution, &mut changed_waits, None)
+                .await
+            else {
+                continue;
+            };
+            // Re-read the cap per candidate so a runtime change to it is
+            // seen mid-pass. A spill claim is lease-pending until its
+            // lease returns, so it raises the working count only later;
+            // see `MAX_CONCURRENT_INTERACTIVE_WORKERS` for the bounded
+            // overshoot that allows, and `claim_worker_spill`'s doc for why
             // spilled automation counts toward this cap at all.
             let Some(worker_id) = self
                 .worker_pool
@@ -1788,8 +1856,15 @@ impl ExecutionCoordinator {
             } else {
                 DispatchAdmission::Queued
             };
-            self.dispatch_claimed_execution(&execution, &worker_id, "automation", true, admission)
-                .await;
+            self.dispatch_claimed_execution(
+                &execution,
+                &worker_id,
+                "automation",
+                true,
+                admission,
+                Some(lease_attempt),
+            )
+            .await;
         }
 
         // All deferred pickup claims have dropped before clients refetch their runtime.
@@ -2116,6 +2191,59 @@ impl ExecutionCoordinator {
         }
     }
 
+    /// Take a per-repo lease-attempt permit, or record a workspace wait
+    /// and return `None`. The permit covers the cube lease only; it is
+    /// released as soon as `schedule_execution`'s lease call returns.
+    /// `miss_reason` overrides the recorded wait text when another
+    /// constraint (the interactive cap) is also holding the row.
+    async fn begin_repo_lease_or_wait(
+        self: &Arc<Self>,
+        execution: &WorkExecution,
+        changed_waits: &mut Vec<WorkExecution>,
+        miss_reason: Option<&str>,
+    ) -> Option<super::lease_limiter::LeaseAttemptGuard> {
+        match self
+            .repo_lease_limiter
+            .try_begin(&execution.repo_remote_url, &execution.id)
+        {
+            // The kick is attached only in `dispatch_claimed_execution`,
+            // once a slot is claimed. A permit dropped here without a
+            // claimed slot must not kick: that would re-enter the drain for
+            // rows that cannot dispatch.
+            Some(guard) => Some(guard),
+            None => {
+                tracing::info!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    repo = %execution.repo_remote_url,
+                    bound = MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO,
+                    "spawn_attempt status=ready -> held reason=repo_lease_bound"
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Skipped, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_details(serde_json::json!({
+                                "reason": "repo_lease_bound",
+                                "repo": execution.repo_remote_url,
+                                "bound": self.repo_lease_limiter_bound(),
+                            })),
+                    )
+                    .await;
+                changed_waits.extend(self.record_dispatch_wait_reason(
+                    execution,
+                    miss_reason.unwrap_or(WAITING_FOR_WORKSPACE_REASON),
+                    None,
+                ));
+                None
+            }
+        }
+    }
+
+    fn repo_lease_limiter_bound(&self) -> usize {
+        self.repo_lease_limiter.max()
+    }
+
     /// Shared tail of a successful claim: record the landing slot, clear
     /// the wait reason, reserve the dispatch, and hand `schedule_execution`
     /// off to a concurrent task so a slow row cannot stall the rest of the
@@ -2136,7 +2264,13 @@ impl ExecutionCoordinator {
         pool_label: &str,
         spilled: bool,
         admission: DispatchAdmission,
+        lease_attempt: Option<super::lease_limiter::LeaseAttemptGuard>,
     ) {
+        // Kick bound-waiters when this permit frees (lease returned, or an
+        // early return below). Attached here rather than at try_begin so a
+        // drain that took a permit and then missed a slot does not
+        // re-enter the scheduler from Drop.
+        let lease_attempt = lease_attempt.map(|guard| guard.with_kick(Arc::clone(self)));
         // Cover paths that skip the drain-loop pickup claim (preemption,
         // automation spill, force_dispatch's sibling). AlreadyHeld is the
         // drain-loop case that claimed earlier and disarmed its Drop guard.
@@ -2262,6 +2396,11 @@ impl ExecutionCoordinator {
             // Held for the whole dispatch: the guard de-registers the
             // reservation on drop, on every path including a panic.
             let _reservation = reservation;
+            // Per-repo lease-attempt permit, taken before the slot was
+            // claimed. `schedule_execution` frees it as soon as the lease
+            // returns; the drop here covers every path that never reaches
+            // the lease (early return, failure, panic).
+            let _lease_attempt = lease_attempt;
             // Bounds concurrent cube subprocesses. Acquired inside the
             // task, never in the caller's loop, so a saturated cap would
             // delay only this dispatch rather than re-serializing the

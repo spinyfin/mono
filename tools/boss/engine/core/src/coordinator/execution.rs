@@ -1249,10 +1249,20 @@ impl ExecutionCoordinator {
             pr_number_for_workspace_goto(&self.work_db, execution, &work_item)
         };
 
-        let lease = match self
+        let lease_result = self
             .lease_workspace_with_fallback(execution, worker_id, &repo, &task, &adapter)
-            .await
-        {
+            .await;
+        // The per-repo permit bounds concurrent lease calls, which contend on
+        // cube's per-repo lock. Once the call has returned that contention is
+        // over, so free the permit now rather than holding it through the
+        // rest of the spawn pipeline.
+        if lease_result.is_ok() {
+            self.pool_for_worker_id(worker_id).mark_working(worker_id).await;
+        }
+        if self.repo_lease_limiter.release(&execution.id) {
+            self.kick();
+        }
+        let lease = match lease_result {
             Ok(lease) => lease,
             Err(err) => {
                 if had_requested_host {
@@ -2234,7 +2244,7 @@ impl ExecutionCoordinator {
                         "prefer_workspace_id": prefer,
                         "fallback_policy": fallback_policy,
                         "allow_dirty": allow_dirty,
-                        "timeout_ms": CUBE_LEASE_TIMEOUT.as_millis() as u64,
+                        "timeout_ms": self.cube_lease_timeout.as_millis() as u64,
                         "excluded_workspace_ids": refused,
                     })),
             )
@@ -2246,7 +2256,7 @@ impl ExecutionCoordinator {
                 repo,
                 task,
                 (prefer, allow_dirty),
-                CUBE_LEASE_TIMEOUT,
+                self.cube_lease_timeout,
                 adapter,
                 &refused_refs,
             )
@@ -2288,6 +2298,14 @@ impl ExecutionCoordinator {
                             .with_details(details),
                     )
                     .await;
+                if reason == "timeout" {
+                    // A timed-out lease must not immediately re-attempt
+                    // inside this dispatch (the fallback is for a refused
+                    // `--prefer`, not for a hang). Backoff lives on
+                    // `record_start_failure` / `dispatch_not_before`.
+                    CUBE_WORKSPACE_LEASE_FAILURE.inc(&self.metrics);
+                    return Err(err);
+                }
             }
         };
 
@@ -2316,7 +2334,7 @@ impl ExecutionCoordinator {
                         "attempt": 2,
                         "prefer_workspace_id": serde_json::Value::Null,
                         "fallback_policy": "none",
-                        "timeout_ms": CUBE_LEASE_TIMEOUT.as_millis() as u64,
+                        "timeout_ms": self.cube_lease_timeout.as_millis() as u64,
                         "fallback_from_prefer": prefer,
                         "excluded_workspace_ids": refused,
                     })),
@@ -2325,7 +2343,14 @@ impl ExecutionCoordinator {
 
         CUBE_WORKSPACE_LEASE_ATTEMPTS.inc(&self.metrics);
         match self
-            .invoke_lease(repo, task, (None, false), CUBE_LEASE_TIMEOUT, adapter, &refused_refs)
+            .invoke_lease(
+                repo,
+                task,
+                (None, false),
+                self.cube_lease_timeout,
+                adapter,
+                &refused_refs,
+            )
             .await
         {
             Ok(lease) => {
@@ -2397,6 +2422,10 @@ impl ExecutionCoordinator {
         .await
         {
             Ok(Ok(lease)) => Ok(lease),
+            // A transport that bounds itself (the SSH adapter's inner lease
+            // budget) reports its own elapsed deadline through the error
+            // chain; that is a timeout just as much as the outer backstop.
+            Ok(Err(err)) if err.chain().any(|cause| cause.is::<tokio::time::error::Elapsed>()) => Err(("timeout", err)),
             Ok(Err(err)) => Err(("cube_error", err)),
             Err(_elapsed) => Err((
                 "timeout",
@@ -2836,143 +2865,4 @@ impl ExecutionCoordinator {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::pr_number_for_workspace_goto;
-    use crate::test_support::{create_active_chore, create_product, open_db, seed_review_guide_series};
-    use crate::work::{CreateCommentInput, WorkItemPatch};
-    use boss_protocol::{CommentAnchor, ExecutionKind, ExecutionStatus, WorkExecution, WorkItem};
-
-    #[test]
-    fn answer_agent_on_open_guide_pr_positions_on_that_pr() {
-        let (_dir, db) = open_db();
-        let root = create_active_chore(&db, &create_product(&db), "impl");
-        db.update_work_item(
-            &root,
-            WorkItemPatch {
-                status: Some("in_review".to_owned()),
-                pr_url: Some("https://github.com/acme/widget/pull/9".to_owned()),
-                ..WorkItemPatch::default()
-            },
-        )
-        .unwrap();
-        let (series, comparison) = seed_review_guide_series(&db, &root);
-        let attempt = db
-            .create_pr_review_guide_attempt(&series, &comparison, "review-guide-v1")
-            .unwrap();
-        let crate::work::PublishReviewGuideOutcome::Published(version) = db
-            .publish_pr_review_guide_version(&attempt.id, "# Guide\n\nquote", "raw")
-            .unwrap()
-        else {
-            panic!("expected published guide")
-        };
-        let comment = db
-            .create_comment_with_guide_version(
-                CreateCommentInput::builder()
-                    .artifact_kind("pr_review_guide")
-                    .artifact_id(series)
-                    .anchor(CommentAnchor {
-                        exact: "quote".into(),
-                        ..Default::default()
-                    })
-                    .body("why retry?")
-                    .author("user:test")
-                    .doc_version("hash")
-                    .plain_text_projection_version(1)
-                    .build(),
-                Some(&version.id),
-            )
-            .unwrap();
-        let execution = WorkExecution::builder()
-            .id("exec_answer")
-            .work_item_id(comment.id)
-            .kind(ExecutionKind::AnswerAgent)
-            .status(ExecutionStatus::Ready)
-            .repo_remote_url("https://github.com/acme/widget")
-            .created_at("2026-01-01T00:00:00Z")
-            .build();
-        let work_item = db.get_work_item(&root).unwrap();
-        assert_eq!(pr_number_for_workspace_goto(&db, &execution, &work_item), Some(9));
-    }
-
-    #[test]
-    fn answer_agent_on_merged_guide_pr_does_not_position() {
-        let (_dir, db) = open_db();
-        let root = create_active_chore(&db, &create_product(&db), "impl");
-        db.update_work_item(
-            &root,
-            WorkItemPatch {
-                status: Some("done".to_owned()),
-                pr_url: Some("https://github.com/acme/widget/pull/9".to_owned()),
-                ..WorkItemPatch::default()
-            },
-        )
-        .unwrap();
-        let (series, comparison) = seed_review_guide_series(&db, &root);
-        let attempt = db
-            .create_pr_review_guide_attempt(&series, &comparison, "review-guide-v1")
-            .unwrap();
-        let crate::work::PublishReviewGuideOutcome::Published(version) = db
-            .publish_pr_review_guide_version(&attempt.id, "# Guide\n\nquote", "raw")
-            .unwrap()
-        else {
-            panic!("expected published guide")
-        };
-        let comment = db
-            .create_comment_with_guide_version(
-                CreateCommentInput::builder()
-                    .artifact_kind("pr_review_guide")
-                    .artifact_id(series)
-                    .anchor(CommentAnchor {
-                        exact: "quote".into(),
-                        ..Default::default()
-                    })
-                    .body("why retry?")
-                    .author("user:test")
-                    .doc_version("hash")
-                    .plain_text_projection_version(1)
-                    .build(),
-                Some(&version.id),
-            )
-            .unwrap();
-        let execution = WorkExecution::builder()
-            .id("exec_answer_merged")
-            .work_item_id(comment.id)
-            .kind(ExecutionKind::AnswerAgent)
-            .status(ExecutionStatus::Ready)
-            .repo_remote_url("https://github.com/acme/widget")
-            .created_at("2026-01-01T00:00:00Z")
-            .build();
-        let work_item = db.get_work_item(&root).unwrap();
-        assert_eq!(
-            pr_number_for_workspace_goto(&db, &execution, &work_item),
-            None,
-            "a merged PR's target is never Open, so goto must not be attempted"
-        );
-    }
-
-    #[test]
-    fn answer_agent_on_document_does_not_position_on_a_pr() {
-        let (_dir, db) = open_db();
-        let execution = WorkExecution::builder()
-            .id("exec_doc")
-            .work_item_id("cmt_missing")
-            .kind(ExecutionKind::AnswerAgent)
-            .status(ExecutionStatus::Ready)
-            .repo_remote_url("https://github.com/acme/widget")
-            .created_at("2026-01-01T00:00:00Z")
-            .build();
-        let work_item = WorkItem::Chore(
-            boss_protocol::Task::builder()
-                .id("task_x")
-                .product_id("prod")
-                .kind(boss_protocol::TaskKind::Chore)
-                .name("x")
-                .description("x")
-                .status(boss_protocol::TaskStatus::Active)
-                .created_at("2026-01-01T00:00:00Z")
-                .updated_at("2026-01-01T00:00:00Z")
-                .build(),
-        );
-        assert_eq!(pr_number_for_workspace_goto(&db, &execution, &work_item), None);
-    }
-}
+mod tests;

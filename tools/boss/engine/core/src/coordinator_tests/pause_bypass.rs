@@ -154,7 +154,7 @@ async fn force_start_refused_by_interactive_cap_leaves_no_residue() {
     for i in 0..MAX_CONCURRENT_INTERACTIVE_WORKERS {
         coordinator
             .worker_pool()
-            .claim_worker(&format!("exec-busy-{i}"), None)
+            .claim_working(&format!("exec-busy-{i}"), None)
             .await
             .expect("idle slot below the cap");
     }
@@ -575,7 +575,11 @@ async fn critical_force_start_creates_execution_under_pause_and_full_cap() {
         )
         .with_max_concurrent_interactive_workers(1),
     );
-    coordinator.worker_pool().claim_worker("exec_busy", None).await.unwrap();
+    coordinator
+        .worker_pool()
+        .claim_working("exec_busy", None)
+        .await
+        .unwrap();
     coordinator.pause_dispatch(42, DispatchPauseOrigin::Operator, PauseReason::new("paused").unwrap());
     let admission = coordinator.evaluate_dispatch_admission(&chore.id).await.unwrap();
     assert!(admission.would_dispatch);

@@ -1238,16 +1238,20 @@ impl ExecutionCoordinator {
         let pool = self.pool_for_execution(execution);
         let worker_id = match self.work_db.latest_run_agent_id_for_execution(&execution.id)? {
             Some(agent_id) if pool.reclaim_slot(&agent_id, &execution.id).await => agent_id,
-            _ => pool
-                .claim_worker(&execution.id, execution.cube_workspace_id.as_deref())
-                .await
-                .ok_or_else(|| {
-                    anyhow!(
-                        "cannot resume pane spawn for {}: no free worker slot in the {} pool",
-                        execution.id,
-                        self.attributed_pool_label(execution)
-                    )
-                })?,
+            _ => {
+                let worker_id = pool
+                    .claim_worker(&execution.id, execution.cube_workspace_id.as_deref())
+                    .await
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "cannot resume pane spawn for {}: no free worker slot in the {} pool",
+                            execution.id,
+                            self.attributed_pool_label(execution)
+                        )
+                    })?;
+                pool.mark_working(&worker_id).await;
+                worker_id
+            }
         };
 
         let host = self
