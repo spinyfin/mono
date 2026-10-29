@@ -34,7 +34,7 @@ pub(super) fn build(conn: &Connection, minimum_age_secs: i64, now: i64) -> Resul
         let failure_basis = latest_basis(conn, &id, "blocked_reason")?;
         let basis: String = conn
             .query_row(
-                "SELECT basis FROM task_status_audit WHERE work_item_id = ?1 ORDER BY id DESC LIMIT 1",
+                "SELECT basis FROM task_status_audit WHERE work_item_id = ?1 AND property != 'execution_waiting_human' ORDER BY id DESC LIMIT 1",
                 [&id],
                 |r| r.get(0),
             )
@@ -52,7 +52,8 @@ pub(super) fn build(conn: &Connection, minimum_age_secs: i64, now: i64) -> Resul
         let (mut changed_at, mut legacy): (i64, bool) = conn
             .query_row(
                 "SELECT CAST(changed_at AS INTEGER), age_is_lower_bound
-             FROM task_status_audit WHERE work_item_id = ?1 AND (?2 IS NULL OR property = ?2)
+             FROM task_status_audit WHERE work_item_id = ?1 AND property != 'execution_waiting_human'
+             AND (?2 IS NULL OR property = ?2)
              ORDER BY id DESC LIMIT 1",
                 params![id, age_property],
                 |r| Ok((r.get(0)?, r.get(1)?)),
@@ -109,7 +110,7 @@ pub(super) fn build(conn: &Connection, minimum_age_secs: i64, now: i64) -> Resul
         } else {
             StuckBucket::EngineStuck
         };
-        let classification = classification(conn, &task, wait.as_deref())?;
+        let classification = classification(conn, &task, wait.as_deref(), now)?;
         rows.push(
             StuckRow::builder()
                 .work_item_id(id)
@@ -171,12 +172,19 @@ fn human_hold(conn: &Connection, task: &Task, failure_basis: Option<&str>, now: 
     let queued_wait = super::queued_wait::for_execution(conn, execution.as_ref(), now)?
         .reason
         .is_some();
-    let manual_block: bool = conn.query_row(
-        "SELECT COALESCE((SELECT actor = 'human' FROM task_status_audit
-         WHERE work_item_id = ?1 AND property = 'status' ORDER BY id DESC LIMIT 1), 0)",
-        [&task.id],
-        |r| r.get(0),
-    )?;
+    let actor: String = conn
+        .query_row(
+            "SELECT actor FROM task_status_audit
+             WHERE work_item_id = ?1 AND property = 'status' ORDER BY id DESC LIMIT 1",
+            [&task.id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| task.last_status_actor.clone());
+    let manual_block = !actor
+        .parse::<boss_protocol::StatusActor>()
+        .ok()
+        .is_some_and(boss_protocol::StatusActor::is_engine_cascade);
     Ok(open_question
         || query_live_execution_for_work_item(conn, &task.id)?
             .is_some_and(|e| e.status == ExecutionStatus::WaitingHuman)
@@ -225,25 +233,19 @@ fn progressing_prerequisite(conn: &Connection, id: &str, now: i64) -> Result<boo
     Ok(false)
 }
 
-pub(super) fn classification(conn: &Connection, task: &Task, wait: Option<&str>) -> Result<String> {
+pub(super) fn classification(conn: &Connection, task: &Task, wait: Option<&str>, now: i64) -> Result<String> {
     if query_live_execution_for_work_item(conn, &task.id)?.is_some_and(|e| e.status == ExecutionStatus::WaitingHuman) {
         return Ok("S19_waiting_human".into());
     }
     if task.status == TaskStatus::Active {
         // Match the orphan sweep's local PID trust window, including inferred-terminal runs.
-        let pid = conn
-            .query_row(
-                "SELECT r.shell_pid FROM work_runs r JOIN work_executions e ON e.id = r.execution_id
-             WHERE e.work_item_id = ?1 AND r.host_id = 'local' AND r.shell_pid > 0
-             AND CAST(r.created_at AS INTEGER) >= ?2 ORDER BY r.created_at DESC, r.id DESC LIMIT 1",
-                params![
-                    task.id,
-                    boss_engine_utils::epoch_time::now_epoch_secs()
-                        - crate::durable_liveness::REDISPATCH_PID_TRUST_SECS
-                ],
-                |r| r.get::<_, i64>(0),
-            )
-            .optional()?;
+        let pid = super::run_rows::latest_local_worker_process_for_work_item(
+            conn,
+            &task.id,
+            crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
+            now,
+        )?
+        .map(|(_, pid)| pid);
         if crate::durable_liveness::probe_recorded_pid(pid).is_alive() {
             return Ok("S15_orphan_live_pid".into());
         }
@@ -351,16 +353,18 @@ pub(super) fn migrate_wait_history(conn: &Connection) -> Result<()> {
         "INSERT INTO task_status_audit
          (work_item_id, property, new_value, actor, changed_at, basis, age_is_lower_bound)
          SELECT work_item_id, 'execution_waiting_human', id, 'engine', strftime('%s','now'),
-                'unknown_legacy', 1 FROM work_executions e WHERE NOT EXISTS (SELECT 1 FROM task_status_audit a WHERE a.property = 'execution_waiting_human' AND a.new_value = e.id) AND status = 'waiting_human';
+                'unknown_legacy', 1 FROM work_executions e WHERE NOT EXISTS (SELECT 1 FROM task_status_audit a WHERE a.property = 'execution_waiting_human' AND a.new_value = e.id) AND status = 'waiting_human'
+         AND EXISTS (SELECT 1 FROM tasks WHERE id = e.work_item_id);
          CREATE TRIGGER IF NOT EXISTS execution_waiting_human_insert AFTER INSERT ON work_executions
-         WHEN NEW.status = 'waiting_human' BEGIN
+         WHEN NEW.status = 'waiting_human' AND EXISTS (SELECT 1 FROM tasks WHERE id = NEW.work_item_id) BEGIN
             INSERT INTO task_status_audit
                 (work_item_id, property, new_value, actor, changed_at, basis)
             VALUES (NEW.work_item_id, 'execution_waiting_human', NEW.id, 'engine',
                     strftime('%s','now'), 'execution_waiting_human');
          END;
          CREATE TRIGGER IF NOT EXISTS execution_waiting_human_update AFTER UPDATE OF status ON work_executions
-         WHEN NEW.status = 'waiting_human' AND OLD.status IS NOT NEW.status BEGIN
+         WHEN NEW.status = 'waiting_human' AND OLD.status IS NOT NEW.status
+         AND EXISTS (SELECT 1 FROM tasks WHERE id = NEW.work_item_id) BEGIN
             INSERT INTO task_status_audit
                 (work_item_id, property, new_value, actor, changed_at, basis)
             VALUES (NEW.work_item_id, 'execution_waiting_human', NEW.id, 'engine',

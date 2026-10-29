@@ -2267,7 +2267,7 @@ pub(crate) fn insert_question(
     };
     let parkable = task.deleted_at.is_none() && matches!(task.status, TaskStatus::Active | TaskStatus::Todo);
     let stuck_classification = if task.blocked_reason.is_some() || task.dispatch_failed_reason.is_some() {
-        super::stuck_report::classification(conn, &task, None)?
+        super::stuck_report::classification(conn, &task, None, boss_engine_utils::epoch_time::now_epoch_secs())?
     } else {
         "S8_operator_question".to_owned()
     };

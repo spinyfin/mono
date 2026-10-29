@@ -1,13 +1,6 @@
 use super::*;
 use boss_protocol::{CreateChoreInput, CreateProductInput, DispatchPauseScope, WorkItemPatch, WorkerActivity};
 
-#[test]
-fn dispatch_stuck_accepts_window_and_json() {
-    let cli = Cli::try_parse_from(["bossctl", "dispatch", "stuck", "--since", "2d", "--json"]).unwrap();
-    assert!(cli.json);
-    assert!(matches!(cli.command, Command::Dispatch { action: DispatchAction::Stuck { since } } if since == "2d"));
-}
-
 fn live(slot: u8, run: &str) -> LiveWorkerState {
     LiveWorkerState {
         slot_id: slot,

@@ -11,3 +11,16 @@ pub(crate) async fn run(socket_path: &Option<String>, json: bool, since: &str) -
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{Cli, Command, DispatchAction};
+    use clap::Parser;
+
+    #[test]
+    fn dispatch_stuck_accepts_window_and_json() {
+        let cli = Cli::try_parse_from(["bossctl", "dispatch", "stuck", "--since", "2d", "--json"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(cli.command, Command::Dispatch { action: DispatchAction::Stuck { since } } if since == "2d"));
+    }
+}

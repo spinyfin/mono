@@ -1030,23 +1030,7 @@ impl WorkDb {
         now_epoch_secs: i64,
     ) -> Result<Option<(String, i64)>> {
         let conn = self.connect()?;
-        let cutoff = now_epoch_secs - max_age_secs;
-        conn.query_row(
-            "SELECT r.execution_id, r.shell_pid
-             FROM work_runs r
-             JOIN work_executions e ON e.id = r.execution_id
-             WHERE e.work_item_id = ?1
-               AND r.host_id = 'local'
-               AND r.shell_pid IS NOT NULL
-               AND r.shell_pid > 0
-               AND CAST(r.created_at AS INTEGER) >= ?2
-             ORDER BY r.created_at DESC, r.id DESC
-             LIMIT 1",
-            params![work_item_id, cutoff],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-        )
-        .optional()
-        .map_err(Into::into)
+        latest_local_worker_process_for_work_item(&conn, work_item_id, max_age_secs, now_epoch_secs)
     }
 
     /// The latest run of every non-terminal execution dispatched to a
@@ -1736,6 +1720,32 @@ pub(in crate::work) fn resolve_run_id_for_execution_hooks(
          LIMIT 1",
         params![execution_id],
         |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Connection-level PID lookup shared by recovery and the stuck report.
+pub(super) fn latest_local_worker_process_for_work_item(
+    conn: &Connection,
+    work_item_id: &str,
+    max_age_secs: i64,
+    now_epoch_secs: i64,
+) -> Result<Option<(String, i64)>> {
+    let cutoff = now_epoch_secs - max_age_secs;
+    conn.query_row(
+        "SELECT r.execution_id, r.shell_pid
+             FROM work_runs r
+             JOIN work_executions e ON e.id = r.execution_id
+             WHERE e.work_item_id = ?1
+               AND r.host_id = 'local'
+               AND r.shell_pid IS NOT NULL
+               AND r.shell_pid > 0
+               AND CAST(r.created_at AS INTEGER) >= ?2
+             ORDER BY r.created_at DESC, r.id DESC
+             LIMIT 1",
+        params![work_item_id, cutoff],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
     )
     .optional()
     .map_err(Into::into)
