@@ -75,7 +75,9 @@
 //! declares (`Dependencies: none` → no edges). A prior "oversize task"
 //! re-prompt that forced multi-layer / multi-clause entries into invented
 //! per-subsystem DAGs is deliberately retired — that path undid design-time
-//! breakdown honesty (one entry → ten invented rows).
+//! breakdown honesty (one entry → ten invented rows). The populator validates
+//! author-declared footprints before planning and returns malformed or over-limit
+//! entries to the design author through the existing attention path.
 //!
 //! ## Bounded model / effort / timeout
 //!
@@ -84,6 +86,9 @@
 //! that `live_status` uses for its cheap one-liner. The model, effort,
 //! `max_tokens`, timeout, and retry count are all single constants, tunable
 //! without a schema change (design R5).
+
+mod footprint;
+pub(crate) use footprint::{attach_task_footprints, validate_breakdown_footprints};
 
 use std::time::Duration;
 
@@ -156,8 +161,8 @@ pub const PLANNER_BACKOFF: Duration = Duration::from_millis(500);
 /// model to invent tasks by splitting multi-clause / multi-layer design
 /// entries the author had already sized; that undid design-time breakdown
 /// honesty and is deliberately gone. The design doc's entry count is
-/// authoritative — an over-large single row is cheap to fix by hand; ten
-/// invented rows with a fabricated dependency graph are not.
+/// authoritative. The populator rejects missing or oversized footprints before
+/// planning; corrections belong in the design, never in invented task rows.
 pub const PLANNER_VALIDATION_ATTEMPTS: u32 = 2;
 
 /// Name of the forced tool whose `input_schema` is [`planner_output_schema`].
@@ -1002,7 +1007,7 @@ portion was excluded and why.\n
 \n\
 **Default: one row per breakdown entry, zero invented work.** The entry \
 boundary is a hard boundary. Transcribe each entry as one task whose `name` \
-comes from the entry title and whose `description` is the entry's Scope (plus \
+is exactly the entry title and whose `description` is the entry's Scope (plus \
 the `[effort-classification]` line). A one-entry breakdown produces one row \
 and an empty edge set when that entry declares no dependencies.\n\
 \n\
@@ -1016,17 +1021,10 @@ kept it as one entry;\n\
 - an entry longer than some number of words or characters;\n\
 - any comparison against a target or typical entry count.\n\
 \n\
-**The one permitted exception — a high bar.** You may split an entry only \
-where there is a *strong, articulable* reason to believe that entry is \
-genuinely too large to execute as a single task (for example: two unrelated \
-deliverables that cannot ship or be reviewed together, with no shared PR \
-boundary). Multi-clause Scope, multi-layer scope, and length alone never \
-meet this bar. When you do split, you **must** say so explicitly in \
-`notes` — name the entry, the reason the bar was met, and what you split it \
-into — so the decision is visible and reviewable rather than silent. When \
-in doubt, do **not** split: emit one row and raise the concern in `notes` \
-instead. An over-large single row is cheap to fix; ten invented rows with a \
-fabricated dependency graph are not.\n\
+Never split an entry. Missing footprint fields or estimates over 3 major \
+deliverables, 25 files, or 1,500 changed lines must be corrected by the design \
+author before planning. Preserve each entry's exact title in `name`; the \
+engine attaches its declared file list and size estimate to the task brief.\n\
 \n\
 - **Unknown-format discovery may stay an `investigation` kind** when the \
 entry itself is framed as research / reverse-engineering — that is a kind \
@@ -1148,10 +1146,8 @@ review regardless — but it flags the result for scrutiny.)\n\
 \n\
 Put a short free-text rationale in `notes`: which section you read, the \
 entry count you materialised, how you chose the edges (must cite doc-stated \
-dependencies), and anything a human reviewer should know. If you split an \
-entry under the high-bar exception, name the entry, the reason, and the \
-split results here. If you kept a large multi-layer entry as one row but \
-worry it is oversized, say so here rather than inventing a split.\
+dependencies), and anything a human reviewer should know. Never split an \
+entry; concerns about its scope belong here for the design author to address.\
 ";
 
 #[cfg(test)]
@@ -1314,7 +1310,7 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("breakdown is authoritative"));
         assert!(SYSTEM_PROMPT.contains("exactly one task per enumerated entry"));
         assert!(SYSTEM_PROMPT.contains("not** reasons to split"));
-        assert!(SYSTEM_PROMPT.contains("high bar"));
+        assert!(SYSTEM_PROMPT.contains("Never split an entry"));
         assert!(SYSTEM_PROMPT.contains("Dependencies: none"));
         assert!(SYSTEM_PROMPT.contains("only what the doc states"));
         assert!(SYSTEM_PROMPT.contains("do not re-expand entries"));

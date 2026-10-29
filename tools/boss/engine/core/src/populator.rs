@@ -655,6 +655,11 @@ impl Populator {
             }
         };
 
+        let footprints = match crate::planner::validate_breakdown_footprints(&doc) {
+            Ok(footprints) => footprints,
+            Err(reason) => return Ok(Self::bad_breakdown_attempt(reason)),
+        };
+
         // Assemble the Planner input. Existing task names are a dedup hint;
         // design tasks are excluded (the merged design already exists, and the
         // Planner must never re-propose it). Filtering on `kind != design`
@@ -713,7 +718,7 @@ impl Populator {
 
         // 5. Plan (the one LLM step).
         let plan_outcome = steps.plan(&planner_input).await;
-        let output = match plan_outcome {
+        let mut output = match plan_outcome {
             PlannerOutcome::Success(output) => output,
             failure => {
                 let detail = failure.detail();
@@ -733,6 +738,10 @@ impl Populator {
                 });
             }
         };
+
+        if let Err(reason) = crate::planner::attach_task_footprints(&mut output, &footprints) {
+            return Ok(Self::bad_breakdown_attempt(reason));
+        }
 
         // Persist the raw structured output + rationale + effort audit before
         // validating, so the operator can always read exactly what the model
@@ -806,6 +815,21 @@ impl Populator {
             ))),
             ValidationResult::Valid { low_confidence } => Ok(PlanAttempt::Valid { output, low_confidence }),
         }
+    }
+
+    fn bad_breakdown_attempt(reason: String) -> PlanAttempt {
+        let mut attempt = Self::bad_graph_attempt(reason.clone());
+        if let PlanAttempt::Terminal { title, body, .. } = &mut attempt {
+            *title = "Auto-populate rejected: revise design breakdown";
+            *body = format!(
+                "Return the design doc to its author. No tasks were created. Fix these entries:\n{reason}\n\n\
+                 Add numbered Major deliverables, Likely changed files (explicit paths or globs with \
+                 approximate counts), and Estimated size: ~N files / ~M changed lines. Split entries \
+                 exceeding 3 deliverables, 25 files, or 1,500 changed lines along capability boundaries, \
+                 then re-run `boss project plan <project>`. The planner never splits entries."
+            );
+        }
+        attempt
     }
 
     /// Build the terminal [`PlanAttempt`] for a rejected malformed graph
@@ -1170,6 +1194,7 @@ mod tests {
 
     /// Cloneable descriptors the fake maps to real (non-Clone) outcome enums.
     enum DocFetchOutcomeKind {
+        FromPlan,
         Content(String),
         Missing,
         Failed,
@@ -1183,6 +1208,13 @@ mod tests {
     impl PopulatorSteps for FakeSteps {
         async fn fetch_doc(&self, _repo: &str, _path: &str, _git_ref: &str) -> DocFetchOutcome {
             match &self.doc {
+                DocFetchOutcomeKind::FromPlan => {
+                    let doc = match &self.plan {
+                        PlannerOutcomeKind::Success(output) => footprint_tests::estimated_doc(output),
+                        PlannerOutcomeKind::NoApiKey => "# doc".to_owned(),
+                    };
+                    DocFetchOutcome::Content(doc)
+                }
                 DocFetchOutcomeKind::Content(s) => DocFetchOutcome::Content(s.clone()),
                 DocFetchOutcomeKind::Missing => DocFetchOutcome::DocMissing,
                 DocFetchOutcomeKind::Failed => DocFetchOutcome::FetchFailed {
@@ -1278,6 +1310,8 @@ mod tests {
             .count()
     }
 
+    mod footprint_tests;
+
     // ---- happy path: stage tasks ------------------------------------------
 
     #[tokio::test]
@@ -1293,10 +1327,7 @@ mod tests {
             Confidence::High,
             true,
         );
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::Success(output),
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::Success(output));
 
         let publisher = RecordingPublisher::default();
         let outcome = Populator::run(
@@ -1362,8 +1393,8 @@ mod tests {
 
         let codex_authored_doc = "# Codex driver follow-on: load balancing\n\n\
             ## Proposed implementation task breakdown\n\n\
-            ### T-01 Per-driver capacity accounting\n\nAttach an in-flight counter at the dispatch gate.\n\n\
-            ### T-02 Per-provider rate-limit state\n\nRecord Codex's per-turn `usage` fields. Depends on T-01.\n";
+            ### Per-driver capacity accounting\n\nAttach an in-flight counter at the dispatch gate.\nMajor deliverables:\n1. Capacity accounting.\nLikely changed files:\n- `src/dispatch.rs`\nEstimated size: ~1 files / ~100 changed lines\n\n\
+            ### Per-provider rate-limit state\n\nRecord Codex's per-turn `usage` fields. Depends on Per-driver capacity accounting.\nMajor deliverables:\n1. Rate-limit state.\nLikely changed files:\n- `src/usage.rs`\nEstimated size: ~1 files / ~100 changed lines\n";
         let output = plan_output(
             vec![
                 ptask("capacity", "Per-driver capacity accounting"),
@@ -1410,10 +1441,7 @@ mod tests {
         let db = open();
         let (product_id, project_id, design_id) = seed(&db);
         let output = plan_output(vec![ptask("a", "Task A")], vec![], Confidence::Low, true);
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::Success(output),
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::Success(output));
         let outcome = Populator::run(
             &db,
             &steps,
@@ -1444,7 +1472,7 @@ mod tests {
         let first = Populator::run(
             &db,
             &steps_with(
-                DocFetchOutcomeKind::Content("# doc".to_owned()),
+                DocFetchOutcomeKind::FromPlan,
                 PlannerOutcomeKind::Success(output.clone()),
             ),
             &ctx(&product_id, &project_id, &design_id),
@@ -1458,10 +1486,7 @@ mod tests {
         // holds the idempotency gate.
         let second = Populator::run(
             &db,
-            &steps_with(
-                DocFetchOutcomeKind::Content("# doc".to_owned()),
-                PlannerOutcomeKind::Success(output),
-            ),
+            &steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::Success(output)),
             &ctx(&product_id, &project_id, &design_id),
             DEFAULT_MAX_TASKS,
             &RecordingPublisher::default(),
@@ -1489,7 +1514,7 @@ mod tests {
         .unwrap();
 
         let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
+            DocFetchOutcomeKind::FromPlan,
             PlannerOutcomeKind::Success(plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true)),
         );
         let publisher = RecordingPublisher::default();
@@ -1539,7 +1564,7 @@ mod tests {
         insert_project_revision_row(&db, &product_id, &project_id, &design_id);
 
         let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
+            DocFetchOutcomeKind::FromPlan,
             PlannerOutcomeKind::Success(plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true)),
         );
         let publisher = RecordingPublisher::default();
@@ -1629,10 +1654,7 @@ mod tests {
     async fn planner_no_api_key_is_recorded() {
         let db = open();
         let (product_id, project_id, design_id) = seed(&db);
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::NoApiKey,
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::NoApiKey);
         let outcome = Populator::run(
             &db,
             &steps,
@@ -1655,10 +1677,7 @@ mod tests {
     async fn planner_failed_outcome_is_visible_via_the_attention_list_query_path() {
         let db = open();
         let (product_id, project_id, design_id) = seed(&db);
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::NoApiKey,
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::NoApiKey);
         let outcome = Populator::run(
             &db,
             &steps,
@@ -1696,10 +1715,7 @@ mod tests {
         let db = open();
         let (product_id, project_id, design_id) = seed(&db);
         let output = plan_output(vec![], vec![], Confidence::High, false);
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::Success(output),
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::Success(output));
         let outcome = Populator::run(
             &db,
             &steps,
@@ -1720,10 +1736,7 @@ mod tests {
         let (product_id, project_id, design_id) = seed(&db);
         let tasks: Vec<_> = (0..3).map(|i| ptask(&format!("h{i}"), &format!("Task {i}"))).collect();
         let output = plan_output(tasks, vec![], Confidence::High, true);
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::Success(output),
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::Success(output));
         // Cap of 2, proposal of 3.
         let outcome = Populator::run(
             &db,
@@ -1760,10 +1773,7 @@ mod tests {
         let n = DEFAULT_MAX_TASKS + 1;
         let tasks: Vec<_> = (0..n).map(|i| ptask(&format!("h{i}"), &format!("Task {i}"))).collect();
         let output = plan_output(tasks, vec![], Confidence::High, true);
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::Success(output),
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::Success(output));
         let ctx = ctx(&product_id, &project_id, &design_id);
 
         let rejected = Populator::run(&db, &steps, &ctx, DEFAULT_MAX_TASKS, &RecordingPublisher::default()).await;
@@ -1799,10 +1809,7 @@ mod tests {
         let (_product_id, project_id, _design_id) = seed(&db);
         let tasks: Vec<_> = (0..3).map(|i| ptask(&format!("h{i}"), &format!("Task {i}"))).collect();
         let output = plan_output(tasks, vec![], Confidence::High, true);
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::Success(output),
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::Success(output));
         let preview = Populator::preview(&db, &steps, &project_id, 2, false)
             .await
             .expect("preview");
@@ -1844,10 +1851,7 @@ mod tests {
             Confidence::High,
             true,
         );
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::Success(output),
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::Success(output));
         let outcome = Populator::run(
             &db,
             &steps,
@@ -1881,10 +1885,7 @@ mod tests {
         let db = open();
         let (product_id, project_id, _design_id) = seed(&db);
         let output = plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true);
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::Success(output),
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::Success(output));
         let outcome = Populator::run_operator(
             &db,
             &steps,
@@ -1922,7 +1923,7 @@ mod tests {
         )
         .unwrap();
         let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
+            DocFetchOutcomeKind::FromPlan,
             PlannerOutcomeKind::Success(plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true)),
         );
         let outcome = Populator::run_operator(
@@ -1952,7 +1953,7 @@ mod tests {
         )
         .unwrap();
         let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
+            DocFetchOutcomeKind::FromPlan,
             PlannerOutcomeKind::Success(plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true)),
         );
         let outcome = Populator::run_operator(
@@ -1985,10 +1986,7 @@ mod tests {
         let db = open();
         let (product_id, project_id, _design_id) = seed(&db);
         let output = plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true);
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::Success(output),
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::Success(output));
         let preview = Populator::preview(&db, &steps, &project_id, DEFAULT_MAX_TASKS, false)
             .await
             .unwrap();
@@ -2017,7 +2015,7 @@ mod tests {
         )
         .unwrap();
         let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
+            DocFetchOutcomeKind::FromPlan,
             PlannerOutcomeKind::Success(plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true)),
         );
         let preview = Populator::preview(&db, &steps, &project_id, DEFAULT_MAX_TASKS, false)
@@ -2032,10 +2030,7 @@ mod tests {
         let db = open();
         let (product_id, project_id, design_id) = seed(&db);
         let output = plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true);
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::Success(output),
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::Success(output));
         // A real run first stages the batch...
         let first = Populator::run(
             &db,
