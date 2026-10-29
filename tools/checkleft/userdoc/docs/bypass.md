@@ -73,11 +73,17 @@ For `file/size`:
 BYPASS_FILE_SIZE=Generated file mirrors upstream source and cannot be split safely.
 ```
 
-For `change/file-count`:
+For `change/file-count` the value is an approved maximum, then a reason:
 
 ```text
-BYPASS_CHANGE_FILE_COUNT=Coordinated rename of the protocol surface; splitting would leave the tree unbuildable mid-stack.
+BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>
 ```
+
+```text
+BYPASS_CHANGE_FILE_COUNT=64:Coordinated rename of the protocol surface; splitting would leave the tree unbuildable mid-stack.
+```
+
+The check passes only while the in-scope non-deleted file count is at or below that maximum (files outside the instance `include`/`applies_to` or matching an `exclude` are not counted). If later rebases or conflict resolution grow the in-scope change past it, the check fails again and names both the approved maximum and the current count — request a new approval or split the work. A directive with no numeric maximum is rejected (it is not treated as unlimited). When several directives exist, the most recent one wins, including an empty latest line, which revokes earlier approvals.
 
 For `no-usfa-typo`:
 
@@ -92,16 +98,20 @@ Checks parse directives from:
 - current commit description
 - PR description
 
-If both contain the same bypass name, PR description wins.
+If both contain the same bypass name, PR description wins. Later lines within a surface win over earlier ones. An empty latest value for a name revokes any earlier non-empty reason; it is not ignored.
 
 ## Behavior when bypass applies
 
-When a check has `[checks.policy] allow_bypass = true` and a matching directive with non-empty reason exists:
+When a check has `[checks.policy] allow_bypass = true` and a matching directive with a non-empty reason exists:
 
 - the normal failure is bypassed
 - the check emits a `warning` finding recording bypass use and reason
 
 This keeps bypass use visible in output and CI logs.
+
+An empty latest directive (`BYPASS_NAME=` with no reason) is still a matching declaration. It supersedes any earlier non-empty reason for that name, for every bypassable check, and does not apply a bypass. Other checks keep the original failure and add remediation that the empty line revoked the earlier reason. `change/file-count` treats the empty value as a malformed bound (same as a missing numeric maximum).
+
+`change/file-count` is bound rather than all-or-nothing: a matching `BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>` passes (no finding) only while the in-scope non-deleted file count is ≤ `max_files` — the same include/exclude universe the check counted. Above that ceiling, or when the value has no numeric maximum, the check fails with an error instead of a warning.
 
 ## Behavior when bypass is enabled but not used
 
