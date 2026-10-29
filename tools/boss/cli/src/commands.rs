@@ -1694,6 +1694,14 @@ pub(crate) enum EngineConflictsCommand {
     /// in-review `conflict_watch` path. Best-effort — this never
     /// blocks or reverts your actual work.
     RecordProducer(EngineConflictsRecordProducerArgs),
+    /// Regenerate the conflicted generated lockfiles (`Cargo.lock`,
+    /// `MODULE.bazel.lock`, package-manager lockfiles) in the current
+    /// workspace with their owning tools, starting from the PR base's
+    /// version of each file. Run it from the workspace mid-rebase; never
+    /// merge or hand-edit a generated lockfile yourself. Source-file
+    /// conflicts are left for you. Exits non-zero if a lockfile cannot be
+    /// regenerated — that is a tooling blocker, not permission to edit it.
+    RegenerateLockfiles(EngineConflictsRegenerateLockfilesArgs),
     /// Aggregate `conflict_diagnosis` for one product into a hotspot
     /// report: per-file conflict frequency, per-file-pair co-conflict
     /// frequency, and per-class counts (Layer 0 telemetry).
@@ -1786,6 +1794,19 @@ pub(crate) struct EngineConflictsRecordProducerArgs {
     /// rebase` printed.
     #[arg(long, value_delimiter = ',')]
     pub(crate) files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct EngineConflictsRegenerateLockfilesArgs {
+    /// The PR's base branch, e.g. `main`.
+    #[arg(long = "base-branch", default_value = "main")]
+    pub(crate) base_branch: String,
+
+    /// Remote-tracking ref to seed each lockfile from, e.g. `main@github`
+    /// (the `main_ref` field `cube workspace rebase` printed). Defaults to
+    /// `<base-branch>@origin`.
+    #[arg(long = "base-ref")]
+    pub(crate) base_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]

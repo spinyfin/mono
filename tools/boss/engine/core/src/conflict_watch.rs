@@ -620,9 +620,12 @@ pub async fn on_conflict_detected_with(
                                     // does not track `main` moving, so only a head
                                     // push (or a manual retry) re-arms the attempt.
                                     // The failed row is kept.
+                                    // A probe with no head oid cannot show the head
+                                    // moved, so fail closed: treat it as the same head
+                                    // rather than re-arming a failure every tick.
                                     let same_head = latest.as_ref().is_some_and(|failed| {
-                                        probe.head_ref_oid.is_some()
-                                            && probe.head_ref_oid.as_deref() == failed.head_sha_before.as_deref()
+                                        probe.head_ref_oid.is_none()
+                                            || probe.head_ref_oid.as_deref() == failed.head_sha_before.as_deref()
                                     });
                                     if same_head {
                                         tracing::debug!(

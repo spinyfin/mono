@@ -1091,6 +1091,7 @@ pub(super) fn rebase_workspace_branch(
                 "status": "conflicts",
                 "branch": boss_branch,
                 "main_branch": main_branch,
+                "main_ref": main_ref,
                 "conflicted_files": conflicted_files,
                 "conflicted_commit_count": conflicted_commit_ids.len(),
                 "pushed": false,

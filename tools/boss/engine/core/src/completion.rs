@@ -2566,6 +2566,13 @@ pub enum StopOutcome {
     /// and `no_changes_needed` reaches [`Self::NoChangesNeeded`] — both
     /// existing variants, reused because their semantics already fit.
     RunDoneDeclaredWithoutDelivery { detail: String },
+    /// The merge-conflict delivery gate refused a conflict revision's
+    /// completion (GitHub still reports the PR conflicting, could not report
+    /// it, or the bound PR URL was missing) and has already failed the
+    /// execution. Unlike [`Self::RunDoneDeclaredWithoutDelivery`] this is
+    /// reachable from every completion path the gate guards — the Stop
+    /// path and the merge-poller `pr_recheck` path as well as a declaration.
+    ConflictDeliveryUnverified { detail: String },
     /// A primary execution's completion resolved to a PR that is already
     /// bound to a different work item (`pr_binding_guard`). Nothing was
     /// bound: the execution failed visibly, the task row records `detail`

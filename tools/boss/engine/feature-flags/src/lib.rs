@@ -211,7 +211,7 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         description: "Piggyback on the merge poller's sweep to speculatively rebase in-flight (in-review) PR \
              branches onto main in a leased scratch workspace with `--no-push` — no worker, no push, the real \
              branch is never touched (design: merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md, \
-             Layer 4 / T10). A predicted conflict is recorded to `conflict_resolutions` telemetry early, before \
+             Layer 4 speculative-rebase sweep). A predicted conflict is recorded to `conflict_resolutions` telemetry early, before \
              the PR would otherwise reach `conflict_watch`; a clean prediction only increments a counter. \
              Rate-limited per work item and capped per sweep to bound workspace-lease churn. DEFAULT OFF — the \
              path leases a workspace per candidate; enable per operator once validated in staging. Kill switch: \
@@ -238,7 +238,7 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         description: "Piggyback on the merge poller's sweep to detect pairs of in-flight (in-review) PR branches \
              whose changed-file sets overlap on non-mechanical files — i.e. two branches predicted to conflict \
              with *each other*, not just with main (design: \
-             merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md, Layer 4 / T11). For each such \
+             merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md, Layer 4 stacked-PR auto-structuring). For each such \
              pair the engine emits an advisory `StackProposalOffered` frontend event offering to restack the \
              newer PR onto the older so the (future) auto_rebase machinery keeps them ordered. Detection + offer \
              only — nothing is mutated and no PR is retargeted (the accept-and-convert step ships with \

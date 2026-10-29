@@ -324,6 +324,10 @@ impl WorkerCompletionHandler {
             // finalizer's `outcome` can never be this variant. Covered for
             // exhaustiveness like the other unreachable arms above.
             StopOutcome::RunDoneDeclaredWithoutDelivery { .. } => false,
+            // The conflict delivery gate failed the execution because the
+            // resolution was not verified; the attempt it belonged to is
+            // retired as unsuccessful.
+            StopOutcome::ConflictDeliveryUnverified { .. } => true,
             // The foreign-PR guard already failed the execution visibly;
             // the attempt it belonged to is retired as unsuccessful.
             StopOutcome::ForeignPrRefused { .. } => true,

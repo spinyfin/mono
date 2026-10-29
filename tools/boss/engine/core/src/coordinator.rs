@@ -560,7 +560,8 @@ pub use boss_host_execution::types::{
 /// and sourced from `jj resolve --list`; [`parse_rebase_payload`] strips
 /// jj's trailing conflict-type descriptor from each entry, so callers always
 /// see bare paths here.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct RebaseOutcome {
     /// `true` for `REBASED_CLEAN`, `false` for `REBASED_WITH_CONFLICTS`.
     pub clean: bool,
@@ -583,6 +584,7 @@ pub struct RebaseOutcome {
     /// them *and* proved the pushed tree byte-identical to the rebased head;
     /// it is carried purely so the ladder can say so in its trace rather
     /// than reporting an indistinguishable "clean rebase".
+    #[builder(default)]
     pub linearized_commits: usize,
     /// Which guard refused the replay-only collapse, as cube's stable slug
     /// (`conflicted_head`, `bookmarked_ancestor`, `multiple_children`,
@@ -597,6 +599,11 @@ pub struct RebaseOutcome {
     /// silence undiagnosable. Stamped on the ladder's rung-1 fall-through
     /// trace so guard hits can be counted without a code change.
     pub linearize_decline: Option<String>,
+    /// The remote-tracking ref cube rebased onto (e.g. `main@github`), named
+    /// after whichever remote cube resolved as the GitHub upstream. `None` on
+    /// a clean rebase and on a cube that predates the field; rung 0 then
+    /// falls back to `<base>@origin`.
+    pub main_ref: Option<String>,
 }
 
 #[async_trait]
@@ -754,7 +761,7 @@ pub struct CommandCubeClient {
 /// precedes it, and treats everything before that (whitespace-trimmed) as
 /// the path. Lines that don't match the pattern (already-bare paths, or a
 /// future jj format change) are returned unchanged.
-fn strip_jj_conflict_descriptor(line: &str) -> &str {
+pub(crate) fn strip_jj_conflict_descriptor(line: &str) -> &str {
     const MARKER: &str = "-sided conflict";
     let trimmed = line.trim();
     let Some(marker_idx) = trimmed.rfind(MARKER) else {
@@ -813,13 +820,19 @@ fn parse_rebase_payload(payload: serde_json::Value) -> Result<RebaseOutcome> {
                 .collect()
         })
         .unwrap_or_default();
-    Ok(RebaseOutcome {
-        clean,
-        pushed,
-        conflicted_files,
-        linearized_commits,
-        linearize_decline,
-    })
+    let main_ref = payload
+        .get("main_ref")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+    Ok(RebaseOutcome::builder()
+        .clean(clean)
+        .pushed(pushed)
+        .conflicted_files(conflicted_files)
+        .linearized_commits(linearized_commits)
+        .maybe_linearize_decline(linearize_decline)
+        .maybe_main_ref(main_ref)
+        .build())
 }
 
 impl CommandCubeClient {
