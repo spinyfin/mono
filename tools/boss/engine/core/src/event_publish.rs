@@ -5,7 +5,7 @@
 //! A state-write path typically looks like:
 //!
 //! ```text
-//! let tx = conn.transaction()?;
+//! let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 //! // ... writes ...
 //! tx.commit()?;
 //! ```
@@ -89,7 +89,7 @@ pub fn commit_and_publish(
 #[cfg(test)]
 mod tests {
     use boss_event_bus::TopicFilter;
-    use rusqlite::Connection;
+    use rusqlite::{Connection, TransactionBehavior};
 
     use super::*;
 
@@ -106,7 +106,9 @@ mod tests {
         let bus = EventBus::new();
         let mut sub = bus.subscribe(TopicFilter::all());
 
-        let tx = conn.transaction().expect("open txn");
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("open txn");
         tx.execute("INSERT INTO t (id) VALUES (1)", []).expect("insert");
         let mut pending = PendingEvents::new();
         pending.push(Event::DispatchReady);
@@ -127,7 +129,9 @@ mod tests {
         let mut sub = bus.subscribe(TopicFilter::all());
 
         {
-            let tx = conn.transaction().expect("open txn");
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("open txn");
             tx.execute("INSERT INTO t (id) VALUES (2)", []).expect("insert");
             let mut pending = PendingEvents::new();
             pending.push(Event::DispatchReady);
@@ -176,7 +180,9 @@ mod tests {
         let bus = EventBus::new();
         let mut sub = bus.subscribe(TopicFilter::all());
 
-        let tx = conn.transaction().expect("open txn");
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("open txn");
         tx.execute("INSERT INTO child (id, parent_id) VALUES (1, 999)", [])
             .expect("deferred FK insert succeeds inside the txn");
         let mut pending = PendingEvents::new();

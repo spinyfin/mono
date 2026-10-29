@@ -7,7 +7,7 @@ checks:
   - id: boss/explicit-work-transactions
     check: text/forbidden-pattern
     include:
-      - "tools/boss/engine/core/src/work/**/*.rs"
+      - "tools/boss/engine/core/src/**/*.rs"
     policy:
       severity: error
     config:

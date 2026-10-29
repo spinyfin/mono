@@ -7,9 +7,8 @@
 //! `planner_runs.id`, and wires the dependency edges. It is the *only* thing
 //! in the auto-populate flow that writes task rows.
 //!
-//! See `tools/boss/docs/designs/auto-populate-project-tasks-on-design-pr-merge.md`
-//! (project P783) §3 "The deterministic materializer (apply)". This module is
-//! task 5 of that design.
+//! See `tools/boss/docs/designs/auto-populate-project-tasks-on-design-pr-merge.md`,
+//! section 3, "The deterministic materializer (apply)".
 //!
 //! ## Reuses the existing write paths — never a parallel creation path
 //!
@@ -96,7 +95,7 @@ impl Materializer {
         check_graph(output)?;
 
         let mut conn = db.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
 
         // Resolve the product from the project (also validates it exists).
