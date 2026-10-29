@@ -611,7 +611,8 @@ pub(super) async fn handle_set_dispatch_concurrency(ctx: Dispatch, req: Frontend
 /// The request loop is sequential, so this handler must not await a probe
 /// cycle: it replies immediately with whatever is cached, and if the TTL has
 /// expired or a refresh was explicitly requested, a background task runs the
-/// cycle and `send_push`es a second `DriverQuotaUsageResult` when it lands.
+/// cycle and `send_push`es a further `DriverQuotaUsageResult` as each driver's
+/// probe lands, then a final one (empty `pending_drivers`) when the cycle ends.
 /// Opening Preferences therefore does not stall every other app RPC behind
 /// three child-process probes. The figures here are each driver's
 /// *provider's* own view — never Boss's internal token accounting, which
@@ -641,7 +642,14 @@ pub(super) async fn handle_get_driver_quota_usage(ctx: Dispatch, req: FrontendRe
         let quota = Arc::clone(&server_state.driver_quota);
         let sink = Arc::clone(&sink);
         boss_task_scope::spawn(async move {
-            let snapshot = quota.snapshot(refresh).await;
+            // Each driver's result is pushed as its probe lands; the final
+            // snapshot (no pending drivers) closes the request.
+            let progress_sink = Arc::clone(&sink);
+            let snapshot = quota
+                .snapshot_with_progress(refresh, move |snapshot| {
+                    send_push(&progress_sink, FrontendEvent::DriverQuotaUsageResult { snapshot });
+                })
+                .await;
             send_push(&sink, FrontendEvent::DriverQuotaUsageResult { snapshot });
         });
     }

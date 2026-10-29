@@ -166,6 +166,14 @@ pub struct DriverQuotaSnapshot {
     /// leaving the maintainer to wonder why the timestamp did not move.
     #[serde(default)]
     pub refresh_throttled: bool,
+    /// Drivers whose probe is still running for the request this snapshot
+    /// answers. Non-empty on the immediate reply to an accepted refresh and
+    /// on each partial snapshot pushed as individual probes land; empty once
+    /// the cycle is complete, on a cached read, and on a declined refresh.
+    /// The UI keys each row's in-flight indicator off membership here and
+    /// treats an empty list as "nothing left to wait for".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_drivers: Vec<String>,
 }
 
 /// Display and probe order for the three implemented drivers. Alphabetical
@@ -254,6 +262,7 @@ mod tests {
             ],
             generated_at_epoch_s: Some(1_787_000_002),
             refresh_throttled: true,
+            pending_drivers: vec!["grok".to_owned()],
         };
         let json = serde_json::to_string(&snapshot).expect("serialize");
         let back: DriverQuotaSnapshot = serde_json::from_str(&json).expect("deserialize");
