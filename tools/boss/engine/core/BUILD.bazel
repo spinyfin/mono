@@ -92,6 +92,7 @@ rust_library(
     deps = [
         "//tools/boss/engine/host-execution",
         "//lib/rust/git_utils",
+        "//lib/rust/workspace_procs",
         "//tools/boss/backoff",
         # NOT "//tools/boss/build-provenance": that crate's source embeds
         # the commit sha and changes every commit. It is linked only by the

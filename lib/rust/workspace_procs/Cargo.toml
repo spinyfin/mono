@@ -1,0 +1,7 @@
+[package]
+name = "workspace-procs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+libc.workspace = true
