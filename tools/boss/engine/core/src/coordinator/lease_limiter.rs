@@ -13,17 +13,63 @@ use std::sync::{Arc, Mutex};
 
 use super::ExecutionCoordinator;
 
+#[derive(Default)]
+struct State {
+    /// In-flight attempts per repo origin.
+    repos: HashMap<String, RepoState>,
+    /// Execution id -> repo origin for every attempt that still holds a
+    /// permit, so a permit can be released by execution id from inside
+    /// `schedule_execution` the moment the lease returns.
+    held: HashMap<String, Held>,
+    next_token: u64,
+}
+
+struct Held {
+    repo: String,
+    /// Distinguishes successive permits for the same execution, so a
+    /// stale guard dropping late cannot free a newer attempt's permit.
+    token: u64,
+}
+
 struct RepoState {
     in_flight: usize,
     /// Set when `try_begin` misses because this repo is at the bound.
-    /// Cleared when a finishing attempt observes it so a successful
-    /// lease only re-kicks the scheduler if someone actually waited.
+    /// Cleared by the release that frees a permit, so the scheduler is
+    /// only re-kicked when some row actually waited.
     denied: bool,
 }
 
 struct Inner {
     max: usize,
-    counts: Mutex<HashMap<String, RepoState>>,
+    state: Mutex<State>,
+}
+
+impl Inner {
+    /// Release the permit held by `execution_id`, if any. The decrement
+    /// and the test-and-clear of `denied` happen in one critical section,
+    /// so a `try_begin` miss either lands before it (and is reported here)
+    /// or after it (and finds the freed permit). Returns whether a waiter
+    /// was denied in the meantime.
+    fn release(&self, execution_id: &str, token: Option<u64>) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if token.is_some_and(|token| state.held.get(execution_id).is_none_or(|held| held.token != token)) {
+            return false;
+        }
+        let Some(Held { repo, .. }) = state.held.remove(execution_id) else {
+            return false;
+        };
+        let Some(entry) = state.repos.get_mut(&repo) else {
+            return false;
+        };
+        entry.in_flight = entry.in_flight.saturating_sub(1);
+        let denied = std::mem::take(&mut entry.denied);
+        if entry.in_flight == 0 {
+            state.repos.remove(&repo);
+        }
+        denied
+    }
 }
 
 /// Counts in-flight lease attempts per repo origin URL.
@@ -32,11 +78,16 @@ pub(super) struct RepoLeaseLimiter {
     inner: Arc<Inner>,
 }
 
-/// Decrements the per-repo in-flight count when dropped, and kicks the
-/// scheduler so rows that waited on the bound get another drain pass.
+/// Holds one per-repo lease-attempt permit. The permit covers the lease
+/// itself: `schedule_execution` releases it as soon as the lease call
+/// returns ([`RepoLeaseLimiter::release`]), and dropping the guard frees it
+/// on every other path (early return, failure, panic). When the release
+/// freed a permit that a row was denied, the scheduler is kicked so that
+/// row is drained again.
 pub(super) struct LeaseAttemptGuard {
     inner: Arc<Inner>,
-    repo: String,
+    execution_id: String,
+    token: u64,
     kick: Option<Arc<ExecutionCoordinator>>,
 }
 
@@ -45,16 +96,20 @@ impl RepoLeaseLimiter {
         Self {
             inner: Arc::new(Inner {
                 max: max.max(1),
-                counts: Mutex::new(HashMap::new()),
+                state: Mutex::new(State::default()),
             }),
         }
     }
 
-    /// Try to start one more in-flight attempt for `repo`. `None` means
-    /// the bound is already sat; the caller must not claim a worker slot.
-    pub(super) fn try_begin(&self, repo: &str) -> Option<LeaseAttemptGuard> {
-        let mut counts = self.inner.counts.lock().expect("repo lease limiter lock poisoned");
-        let entry = counts.entry(repo.to_owned()).or_insert(RepoState {
+    /// Try to start one more in-flight attempt for `repo` on behalf of
+    /// `execution_id`. `None` means the bound is already sat; the caller
+    /// must not claim a worker slot.
+    pub(super) fn try_begin(&self, repo: &str, execution_id: &str) -> Option<LeaseAttemptGuard> {
+        let mut state = self.inner.state.lock().expect("repo lease limiter lock poisoned");
+        if state.held.contains_key(execution_id) {
+            return None;
+        }
+        let entry = state.repos.entry(repo.to_owned()).or_insert(RepoState {
             in_flight: 0,
             denied: false,
         });
@@ -63,19 +118,37 @@ impl RepoLeaseLimiter {
             return None;
         }
         entry.in_flight += 1;
+        state.next_token += 1;
+        let token = state.next_token;
+        state.held.insert(
+            execution_id.to_owned(),
+            Held {
+                repo: repo.to_owned(),
+                token,
+            },
+        );
         Some(LeaseAttemptGuard {
             inner: Arc::clone(&self.inner),
-            repo: repo.to_owned(),
+            execution_id: execution_id.to_owned(),
+            token,
             kick: None,
         })
+    }
+
+    /// Release the permit held for `execution_id` (a no-op when none is
+    /// held). Returns `true` when a row was denied while it was held, in
+    /// which case the caller must kick the scheduler.
+    pub(super) fn release(&self, execution_id: &str) -> bool {
+        self.inner.release(execution_id, None)
     }
 
     #[cfg(test)]
     pub(super) fn in_flight(&self, repo: &str) -> usize {
         self.inner
-            .counts
+            .state
             .lock()
             .expect("repo lease limiter lock poisoned")
+            .repos
             .get(repo)
             .map(|state| state.in_flight)
             .unwrap_or(0)
@@ -84,9 +157,10 @@ impl RepoLeaseLimiter {
     #[cfg(test)]
     pub(super) fn denied(&self, repo: &str) -> bool {
         self.inner
-            .counts
+            .state
             .lock()
             .expect("repo lease limiter lock poisoned")
+            .repos
             .get(repo)
             .is_some_and(|state| state.denied)
     }
@@ -97,47 +171,22 @@ impl RepoLeaseLimiter {
 }
 
 impl LeaseAttemptGuard {
-    /// Kick the scheduler when this attempt ends so rows held on the
-    /// per-repo bound are drained again as soon as a permit frees.
+    /// Kick the scheduler when this guard frees a permit that a row was
+    /// denied, so held rows are drained again without waiting for the
+    /// next heartbeat. Attached only once the permit backs a claimed slot:
+    /// a permit dropped by the drain before any slot was claimed must not
+    /// kick, because that would re-enter the drain for rows that cannot
+    /// dispatch.
     pub(super) fn with_kick(mut self, coordinator: Arc<ExecutionCoordinator>) -> Self {
         self.kick = Some(coordinator);
         self
-    }
-
-    /// On a successful spawn, only re-enter the scheduler if this repo
-    /// actually had a bound miss. Unconditional kick after spawn re-drains
-    /// duplicate `ready` rows for the same work item while the winner is
-    /// still attaching, and the lost-workspace reconciler then treats a
-    /// test (or otherwise empty) workspace dir as a dead winner.
-    pub(super) fn take_kick_if_denied(&mut self) -> Option<Arc<ExecutionCoordinator>> {
-        let kick = self.kick.take();
-        if self.take_denied() { kick } else { None }
-    }
-
-    fn take_denied(&self) -> bool {
-        let Ok(mut counts) = self.inner.counts.lock() else {
-            return false;
-        };
-        let Some(entry) = counts.get_mut(&self.repo) else {
-            return false;
-        };
-        let denied = entry.denied;
-        entry.denied = false;
-        denied
     }
 }
 
 impl Drop for LeaseAttemptGuard {
     fn drop(&mut self) {
-        if let Ok(mut counts) = self.inner.counts.lock()
-            && let Some(entry) = counts.get_mut(&self.repo)
-        {
-            entry.in_flight = entry.in_flight.saturating_sub(1);
-            if entry.in_flight == 0 {
-                counts.remove(&self.repo);
-            }
-        }
-        if let Some(coordinator) = self.kick.take() {
+        let denied = self.inner.release(&self.execution_id, Some(self.token));
+        if denied && let Some(coordinator) = self.kick.take() {
             coordinator.kick();
         }
     }
@@ -150,14 +199,14 @@ mod tests {
     #[test]
     fn try_begin_respects_the_bound_and_drop_frees_a_slot() {
         let limiter = RepoLeaseLimiter::new(2);
-        let a = limiter.try_begin("origin").expect("first");
-        let b = limiter.try_begin("origin").expect("second");
-        assert!(limiter.try_begin("origin").is_none());
+        let a = limiter.try_begin("origin", "exec-a").expect("first");
+        let b = limiter.try_begin("origin", "exec-b").expect("second");
+        assert!(limiter.try_begin("origin", "exec-c").is_none());
         assert_eq!(limiter.in_flight("origin"), 2);
         drop(a);
         assert_eq!(limiter.in_flight("origin"), 1);
-        let c = limiter.try_begin("origin").expect("after drop");
-        assert!(limiter.try_begin("origin").is_none());
+        let c = limiter.try_begin("origin", "exec-c").expect("after drop");
+        assert!(limiter.try_begin("origin", "exec-d").is_none());
         drop(b);
         drop(c);
         assert_eq!(limiter.in_flight("origin"), 0);
@@ -166,10 +215,10 @@ mod tests {
     #[test]
     fn bounds_are_per_repo() {
         let limiter = RepoLeaseLimiter::new(1);
-        let a = limiter.try_begin("repo-a").expect("a");
-        let b = limiter.try_begin("repo-b").expect("b");
-        assert!(limiter.try_begin("repo-a").is_none());
-        assert!(limiter.try_begin("repo-b").is_none());
+        let a = limiter.try_begin("repo-a", "exec-a").expect("a");
+        let b = limiter.try_begin("repo-b", "exec-b").expect("b");
+        assert!(limiter.try_begin("repo-a", "exec-c").is_none());
+        assert!(limiter.try_begin("repo-b", "exec-d").is_none());
         drop(a);
         drop(b);
     }
@@ -178,26 +227,38 @@ mod tests {
     fn zero_max_is_clamped_to_one() {
         let limiter = RepoLeaseLimiter::new(0);
         assert_eq!(limiter.max(), 1);
-        assert!(limiter.try_begin("origin").is_some());
+        assert!(limiter.try_begin("origin", "exec-a").is_some());
     }
 
     #[test]
-    fn denied_stays_false_when_nobody_waits() {
-        let limiter = RepoLeaseLimiter::new(2);
-        let a = limiter.try_begin("origin").expect("first");
-        assert!(!limiter.denied("origin"));
-        assert!(!a.take_denied());
-        drop(a);
-    }
-
-    #[test]
-    fn denied_is_one_shot_after_a_bound_miss() {
+    fn release_reports_denied_only_when_a_row_waited() {
         let limiter = RepoLeaseLimiter::new(1);
-        let a = limiter.try_begin("origin").expect("first");
-        assert!(limiter.try_begin("origin").is_none());
-        assert!(limiter.denied("origin"));
-        assert!(a.take_denied());
+        let a = limiter.try_begin("origin", "exec-a").expect("first");
         assert!(!limiter.denied("origin"));
+        assert!(!limiter.release("exec-a"));
         drop(a);
+
+        let b = limiter.try_begin("origin", "exec-b").expect("second");
+        assert!(limiter.try_begin("origin", "exec-c").is_none());
+        assert!(limiter.denied("origin"));
+        assert!(limiter.release("exec-b"), "a denied row must be reported");
+        assert!(!limiter.denied("origin"));
+        drop(b);
+    }
+
+    #[test]
+    fn release_by_execution_is_idempotent_and_frees_the_permit_early() {
+        let limiter = RepoLeaseLimiter::new(1);
+        let guard = limiter.try_begin("origin", "exec-a").expect("first");
+        assert!(!limiter.release("exec-a"));
+        assert_eq!(limiter.in_flight("origin"), 0);
+        let other = limiter.try_begin("origin", "exec-b").expect("freed by early release");
+        // The original guard's drop must not release a permit it no longer
+        // holds (it would steal `exec-b`'s).
+        drop(guard);
+        assert_eq!(limiter.in_flight("origin"), 1);
+        assert!(!limiter.release("exec-a"));
+        drop(other);
+        assert_eq!(limiter.in_flight("origin"), 0);
     }
 }

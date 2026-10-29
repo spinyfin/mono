@@ -231,9 +231,18 @@ pub const DEFAULT_REVIEW_POOL_SIZE: usize = 16;
 /// lease-pending and is excluded from this comparison — otherwise a
 /// cube-lease timeout storm saturates the cap with zero live workers and
 /// starves new mainline work. That is a deliberate policy choice, not an
-/// oversight: counting spilled automation that is actually running keeps
-/// the cap's load-bearing promise (never more than the configured cap of
-/// live interactive-pool workers, spilled automation included) intact,
+/// oversight. The price is a bounded overshoot: the cap is compared against
+/// `working` at admission, and a claim becomes `working` only when its lease
+/// returns, so claims admitted while `working` sat just below the cap can all
+/// complete their leases and push the live count above it. Pending claims
+/// are bounded by [`MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO`] per repo (a
+/// claim holds a permit until its lease returns), so the live count can
+/// exceed the cap by at most that bound times the number of repos with a
+/// lease in flight; further admissions are held until `working` drops back
+/// below the cap. Explicit critical/forced launches bypass the cap by design.
+/// Counting spilled automation that is actually running keeps
+/// the cap's promise (the configured number of live interactive-pool
+/// workers, spilled automation included, plus that bounded overshoot) intact,
 /// while the once-per-pass automation-preemption fallback in
 /// `drain_ready_queue` is what keeps mainline from starving behind spilled
 /// automation at the cap — a preemption is a trade (one live worker for
@@ -255,21 +264,23 @@ pub const DEFAULT_REVIEW_POOL_SIZE: usize = 16;
 /// where an explicit `bossctl agents launch` may exceed the cap.
 pub const MAX_CONCURRENT_INTERACTIVE_WORKERS: usize = 8;
 
-/// Ceiling on concurrent `cube workspace lease` attempts against one repo
+/// Ceiling on concurrent `cube workspace lease` calls against one repo
 /// origin. Cube takes a per-repo `RepoLock` for the registry-mutation
 /// portion of a lease and then drops it before the local jj probe and
 /// setup so one other lease can overlap (`tools/cube/src/app/workspace.rs`).
-/// Healthy provisioning after that drop is ~6s (`cube_op_budget::LEASE`).
-/// Steady-state dispatch starts workers one-at-a-time as slots free, so
-/// observed healthy concurrency is 1 overlapping a finishing lease.
-/// Bound 2 matches that designed overlap. A 9-wide storm on one origin
-/// (every pre-start retry immediately re-claiming a slot) is what filled
-/// the interactive cap with lease-pending rows while cube `repo gc` held
-/// the lock for the full 90s timeout.
+/// Concurrent leases on one repo therefore queue on that lock rather than
+/// run faster, and when a long operation such as `repo gc` holds it every
+/// waiter runs into the lease timeout ([`CUBE_LEASE_TIMEOUT`]), so extra
+/// attempts only add timeouts. The bound of 2 is derived from that lock
+/// design (one lease holding the lock plus one overlapping its post-lock
+/// setup); it is not a measured peak of healthy dispatch concurrency.
+///
+/// The permit covers the lease call only: it is taken before a slot is
+/// claimed and released as soon as the lease returns, success or failure.
 pub const MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO: usize = 2;
 
-/// Operator-facing wait reason for a ready row held because this origin
-/// already has [`MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO`] lease attempts
+/// User-visible wait reason for a ready row held because this origin
+/// already has [`MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO`] lease calls
 /// in flight. Distinct from the interactive-cap wording: these rows are
 /// not waiting for a worker slot.
 pub(crate) const WAITING_FOR_WORKSPACE_REASON: &str = "Waiting for a workspace";
@@ -348,7 +359,7 @@ const MAX_INFLIGHT_DISPATCHES: usize = MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POO
 const PRE_START_RETRY_DELAYS: [Duration; 3] =
     [Duration::from_secs(5), Duration::from_secs(15), Duration::from_secs(45)];
 
-/// Operator-facing interactive-cap hold text. Lease-pending slots are
+/// User-visible interactive-cap hold text. Lease-pending slots are
 /// never called "working".
 pub(crate) fn interactive_cap_wait_reason(working: usize, lease_pending: usize) -> String {
     if lease_pending == 0 {

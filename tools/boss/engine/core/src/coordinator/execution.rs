@@ -1249,14 +1249,21 @@ impl ExecutionCoordinator {
             pr_number_for_workspace_goto(&self.work_db, execution, &work_item)
         };
 
-        let lease = match self
+        let lease_result = self
             .lease_workspace_with_fallback(execution, worker_id, &repo, &task, &adapter)
-            .await
-        {
-            Ok(lease) => {
-                self.pool_for_worker_id(worker_id).mark_working(worker_id).await;
-                lease
-            }
+            .await;
+        // The per-repo permit bounds concurrent lease calls, which contend on
+        // cube's per-repo lock. Once the call has returned that contention is
+        // over, so free the permit now rather than holding it through the
+        // rest of the spawn pipeline.
+        if lease_result.is_ok() {
+            self.pool_for_worker_id(worker_id).mark_working(worker_id).await;
+        }
+        if self.repo_lease_limiter.release(&execution.id) {
+            self.kick();
+        }
+        let lease = match lease_result {
+            Ok(lease) => lease,
             Err(err) => {
                 if had_requested_host {
                     self.cancel_requested_host_pre_start_failure(execution, "cube workspace lease", &err)
@@ -2415,6 +2422,10 @@ impl ExecutionCoordinator {
         .await
         {
             Ok(Ok(lease)) => Ok(lease),
+            // A transport that bounds itself (the SSH adapter's inner lease
+            // budget) reports its own elapsed deadline through the error
+            // chain; that is a timeout just as much as the outer backstop.
+            Ok(Err(err)) if err.chain().any(|cause| cause.is::<tokio::time::error::Elapsed>()) => Err(("timeout", err)),
             Ok(Err(err)) => Err(("cube_error", err)),
             Err(_elapsed) => Err((
                 "timeout",

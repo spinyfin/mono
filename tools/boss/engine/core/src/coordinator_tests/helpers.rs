@@ -152,6 +152,14 @@ pub(super) struct FakeCubeClient {
     /// When true, `lease_workspace` records the call then waits forever.
     /// Models a cube lease hung behind `repo gc`.
     pub(super) hang_lease: bool,
+    /// When set, each `lease_workspace` call (counted in-flight) waits for
+    /// a permit from this semaphore before proceeding, so a test releases
+    /// leases one at a time.
+    pub(super) lease_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// When true, `lease_workspace` fails with an error whose chain holds a
+    /// `tokio` elapsed deadline — what a transport that bounds itself
+    /// reports — rather than hanging until the outer timeout.
+    pub(super) fail_lease_with_elapsed: bool,
     /// In-flight hung (or slow) lease calls. Tests for the per-repo bound
     /// read this to observe concurrency.
     pub(super) in_flight_leases: std::sync::atomic::AtomicUsize,
@@ -234,7 +242,13 @@ crate::stub_cube_client! { FakeCubeClient {
             exclude_workspace_ids.iter().map(|s| s.to_string()).collect(),
         ));
         drop(calls);
-        if self.hang_lease {
+        if self.fail_lease_with_elapsed {
+            let elapsed = tokio::time::timeout(Duration::ZERO, pending::<()>())
+                .await
+                .expect_err("a zero deadline over a pending future elapses");
+            return Err(anyhow::Error::new(elapsed).context("ssh run timed out for host fake"));
+        }
+        if self.hang_lease || self.lease_gate.is_some() {
             struct InflightGuard<'a>(&'a std::sync::atomic::AtomicUsize);
             impl Drop for InflightGuard<'_> {
                 fn drop(&mut self) {
@@ -245,7 +259,10 @@ crate::stub_cube_client! { FakeCubeClient {
             let _guard = InflightGuard(&self.in_flight_leases);
             self.peak_in_flight_leases.fetch_max(n, Ordering::SeqCst);
             self.lease_entered.notify_waiters();
-            pending::<()>().await;
+            match &self.lease_gate {
+                Some(gate) => gate.acquire().await.expect("lease gate open").forget(),
+                None => pending::<()>().await,
+            }
         }
         if self.panic_on_next_lease.swap(false, Ordering::SeqCst) {
             panic!("fake cube lease panicked (claimed-dispatch RAII test)");
