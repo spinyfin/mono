@@ -728,10 +728,6 @@ mod floor_tests {
             if version >= 60 {
                 conn.execute_batch(EXECUTION_BOOKMARK_PRUNE_COLUMNS_60).unwrap();
             }
-            if version >= 61 {
-                conn.execute_batch("ALTER TABLE work_executions ADD COLUMN pr_head_after_capture TEXT")
-                    .unwrap();
-            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],

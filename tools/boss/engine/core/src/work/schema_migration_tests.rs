@@ -223,3 +223,35 @@ fn historical_ids_preserve_integer_order() {
     let versions: Vec<_> = known.iter().filter_map(|m| m.legacy_version).collect();
     assert_eq!(versions, (1..=60).collect::<Vec<_>>());
 }
+
+#[test]
+fn completion_capture_migrates_existing_named_schema_and_survives_reopen() {
+    let db = WorkDb::open_in_memory().unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute_batch(
+        "DELETE FROM schema_migrations WHERE id = '20261028_1900_pr_head_after_capture';
+         ALTER TABLE work_executions DROP COLUMN pr_head_after_capture;",
+    )
+    .unwrap();
+    drop(conn);
+    db.init().unwrap();
+    let conn = db.connect().unwrap();
+    assert!(super::super::table_has_column(&conn, "work_executions", "pr_head_after_capture").unwrap());
+    assert!(applied(&conn).unwrap().contains("20261028_1900_pr_head_after_capture"));
+    conn.execute_batch(
+        "INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, created_at, pr_head_after_capture)
+         VALUES ('capture-execution', 'work', 'chore_implementation', 'completed', 'repo', '2026-01-01', 'recorded')",
+    )
+    .unwrap();
+    drop(conn);
+    db.init().unwrap();
+    let conn = db.connect().unwrap();
+    let capture: String = conn
+        .query_row(
+            "SELECT pr_head_after_capture FROM work_executions WHERE id = 'capture-execution'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(capture, "recorded");
+}
