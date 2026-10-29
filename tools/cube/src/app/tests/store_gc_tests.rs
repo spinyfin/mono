@@ -328,16 +328,14 @@ fn collection_is_deferred_to_the_two_week_threshold_when_jj_goes_busy_after_the_
             ],
             "",
         ),
-        // A jj command is in flight at every poll within the wait.
+        // A busy probe defers immediately rather than holding up leases.
         ps_command(&source, "/opt/homebrew/bin/jj\n/bin/sh\n"),
-        ps_command(&source, "/opt/homebrew/bin/jj\n"),
         // So the collection keeps jj's two-week threshold: no `--expire now`.
         ExpectedCommand::ok(source.clone(), "jj", &["--ignore-working-copy", "util", "gc"], ""),
     ];
     expected.extend(pr_ref_commands(&source, "", ""));
     let runner = FakeRunner::new(expected);
-    // A 400ms wait at the production 250ms poll observes the process table
-    // exactly twice (at 0ms and 250ms) before giving up.
+    // Even with a longer gate-acquisition budget, the probe is immediate.
     let report = gc_repo_store(
         &runner,
         Some(&database_path),
@@ -704,7 +702,6 @@ fn a_busy_store_is_neither_abandoned_nor_collected() {
     let mut expected = vec![
         op_log_command(&source, &op_log(now)),
         ps_command(&source, "/opt/homebrew/bin/jj\n"),
-        ps_command(&source, "/opt/homebrew/bin/jj\n"),
     ];
     expected.extend(pr_ref_commands(&source, "", ""));
     let runner = FakeRunner::new(expected);
@@ -787,6 +784,37 @@ fn mono_record(database_path: &std::path::Path) -> crate::metadata::RepoRecord {
 }
 
 #[test]
+fn slow_abandon_is_bounded_and_releases_the_gate_without_collecting() {
+    let (tempdir, database_path) = with_database_path();
+    seed_mono_repo(&tempdir.path().join("workspaces"), &database_path);
+    let source = seed_store_files(&source_of(&database_path));
+    let record = mono_record(&database_path);
+    let now = crate::app::util::current_epoch_s().unwrap();
+    let runner = FakeRunner::new(vec![
+        op_log_command(&source, &op_log(now)),
+        ps_command(&source, ""),
+        abandon_command(&source).taking(Duration::from_secs(30)),
+    ]);
+    let started = std::time::Instant::now();
+    let error = gc_repo_store(
+        &runner,
+        Some(&database_path),
+        &record,
+        DEFAULT_KEEP,
+        QUIESCENCE_WAIT,
+        false,
+    )
+    .expect_err("slow rewrite must yield to leases");
+    assert!(
+        matches!(error, CubeError::CommandTimedOut { timeout_secs: 2, .. }),
+        "{error}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(4));
+    runner.assert_exhausted();
+    crate::command_runner::JjGate::shared_for_database(Some(&database_path)).unwrap();
+}
+
+#[test]
 fn a_head_that_appears_after_the_abandon_returns_stops_the_pass_before_collecting() {
     let (tempdir, database_path) = with_database_path();
     seed_mono_repo(&tempdir.path().join("workspaces"), &database_path);
@@ -829,9 +857,8 @@ fn a_head_that_appears_while_the_post_abandon_wait_fails_stops_the_deferred_coll
         op_log_command(&source, &op_log(now)),
         ps_command(&source, ""),
         abandon_command(&source),
-        // Busy at every poll, so the wait fails; the racing head shows up
-        // meanwhile and the two-week collection must not run either.
-        ps_command(&source, "/opt/homebrew/bin/jj\n"),
+        // A busy probe also reveals a racing head. Even the two-week
+        // collection must not run in that case.
         ps_command(&source, "/opt/homebrew/bin/jj\n").creating_dir(source.join(".jj/repo/op_heads/heads/raced")),
     ]);
     let err = gc_repo_store(

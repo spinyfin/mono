@@ -260,6 +260,7 @@ pub(super) fn run_workspace(
             // Kick a background pool-wide gc pass at most once per 24h.
             maybe_trigger_pool_gc(runner, &mut store, database_path, leased_at_epoch_s)?;
 
+            let _maintenance = crate::command_runner::JjGate::shared_for_database(database_path)?;
             let _lock = RepoLock::acquire(&repo_lock_path(&repo, database_path)?)?;
             let mut candidates = discover_workspaces(&repo_record)?;
             store.sync_workspaces(&repo, &candidates)?;

@@ -18,6 +18,9 @@ use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner}
 #[path = "pr_gc_regression_tests.rs"]
 mod regression;
 
+#[path = "store_gc_concurrency_tests.rs"]
+mod store_gc_concurrency;
+
 /// Runs `jj` invocations with the Bazel-declared binary and a fixed identity,
 /// so the fixture needs no global jj config and cannot read the host's.
 pub(super) struct DeclaredJj {

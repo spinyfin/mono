@@ -104,7 +104,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 pub struct RealCommandRunner;
 
 /// Environment marker on a `jj` invocation made by the maintenance pass
-/// itself, which holds the exclusive [`JjGate`] and so must not wait on it.
+/// itself, which already holds the appropriate [`JjGate`] reservation.
 pub const JJ_GATE_HELD_ENV: &str = "CUBE_JJ_GATE_HELD";
 
 /// Host-wide gate between cube's own `jj` commands and shared-store
@@ -120,6 +120,17 @@ pub struct JjGate {
 }
 
 impl JjGate {
+    /// Take a reader reservation before claiming a workspace or waiting on
+    /// the lease registry lock. Maintenance contention must not leave a
+    /// partially prepared lease or a convoy behind the registry lock.
+    pub fn shared_for_database(database_path: Option<&Path>) -> Result<Self, CubeError> {
+        let data_dir = match database_path.and_then(Path::parent) {
+            Some(parent) => parent.to_path_buf(),
+            None => crate::paths::data_dir()?,
+        };
+        Self::shared(&Self::path(&data_dir), JJ_GATE_WAIT)
+    }
+
     pub fn path(data_dir: &Path) -> std::path::PathBuf {
         data_dir.join("locks").join("jj-maintenance.lock")
     }
@@ -162,6 +173,9 @@ impl JjGate {
                 return Ok(Self { _file: file });
             }
             if started.elapsed() >= wait {
+                if !exclusive {
+                    return Err(CubeError::MaintenanceBusy);
+                }
                 if wait.is_zero() {
                     return Err(CubeError::InvalidArgument(format!(
                         "jj maintenance gate busy at {}; shared-store maintenance is active; workspace status cannot run",
@@ -186,11 +200,11 @@ impl JjGate {
 
 /// How long a cube-started `jj` command waits for the maintenance gate
 /// (see [`JjGate`]) before failing loudly.
-const JJ_GATE_WAIT: Duration = Duration::from_secs(120);
+const JJ_GATE_WAIT: Duration = Duration::from_secs(2);
 
 /// Hold the maintenance gate shared for the run of a `jj` command. Anything
 /// else, and the maintenance pass's own `jj` commands, run ungated. A gate
-/// that cannot be opened (no resolvable data dir) does not stop the command.
+/// that cannot be opened fails closed rather than racing a rewrite.
 fn jj_gate(invocation: &CommandInvocation, wait: Duration) -> Result<Option<JjGate>, CubeError> {
     let is_jj = Path::new(&invocation.program)
         .file_name()
@@ -198,8 +212,9 @@ fn jj_gate(invocation: &CommandInvocation, wait: Duration) -> Result<Option<JjGa
     if !is_jj || invocation.env.iter().any(|(k, _)| k == JJ_GATE_HELD_ENV) {
         return Ok(None);
     }
-    let Ok(data_dir) = crate::paths::data_dir() else {
-        return Ok(None);
+    let data_dir = match invocation.env.iter().rev().find(|(key, _)| key == "CUBE_DATA_DIR") {
+        Some((_, value)) => PathBuf::from(value),
+        None => crate::paths::data_dir()?,
     };
     JjGate::shared(&JjGate::path(&data_dir), wait).map(Some)
 }

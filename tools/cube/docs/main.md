@@ -724,14 +724,20 @@ checkout and not aware of anything above jj:
    head and commits afterwards would leave a second operation head that
    shares only the root with the new one, and jj would merge the two views
    against an empty base. The abandon therefore runs only at an instant with
-   no `jj` process on the host (the pass waits up to five minutes for one and
-   otherwise skips the abandon and the collection until the next daily
+   no `jj` process on the host (one probe, bounded to one second; a busy host
+   skips the abandon and the collection until the next daily
    pass), and the pass stops before collecting if the store then holds
    anything but exactly one operation head. Every `jj` command cube itself
    starts holds a host-wide shared gate (`locks/jj-maintenance.lock`) for
    its run, and the pass holds the gate exclusive from before the abandon
    until the post-abandon head check, so no cube-started command can load the
-   pre-rewrite head (cube commands wait up to two minutes on it). A `jj`
+   pre-rewrite head. The rewrite has a two-second deadline; a timed-out
+   child is killed and reaped before the gate is released, and collection
+   does not follow a failed rewrite. Cube commands wait at most two seconds
+   for the gate and return exit 75 with a message to retry if it stays busy.
+   Leases reserve the shared gate before taking the registry lock or claiming
+   a workspace, avoiding partially prepared leases and a queue behind that lock.
+   A `jj`
    command that does not go through cube cannot take the gate; only the
    process probes and head checks cover those.
 2. `jj util gc`. By default jj deletes only unreferenced files older than
@@ -743,8 +749,10 @@ checkout and not aware of anything above jj:
    process on the host _after_ the abandon: every command that loaded the
    store before the rewrite has then finished, and any later command loads
    the rewritten head, whose files the collection keeps. If the host is
-   never quiet for five minutes, the pass falls back to the two-week
-   threshold.
+   busy at the post-abandon probe, the pass falls back to the two-week
+   threshold immediately. Collection holds the gate shared, so leases can
+   proceed throughout it. Reports and audit events include `exclusive_ms`
+   and `collection_ms` to distinguish rewrite contention from collection cost.
 3. `refs/heads/pr/<n>` git refs whose `pr/<n>` bookmark is gone are deleted;
    jj's next import drops them from the view.
 
