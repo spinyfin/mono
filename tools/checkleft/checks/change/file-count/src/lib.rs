@@ -45,11 +45,9 @@ use serde::Deserialize;
 /// `CHECKS.yaml` overrides this to 30 based on a recent PR-size audit.
 pub const DEFAULT_MAX_FILES: usize = 50;
 
-/// Bypass directive for this check. Value shape: `<max_files>:<reason>`.
-const BYPASS_DIRECTIVE_NAME: &str = "BYPASS_CHANGE_FILE_COUNT";
-
 /// Split a large change so it stays reviewable.
-const SPLIT_REMEDIATION: &str = "Break the work into smaller tasks/PRs so each change stays reviewable and within the file-count limit.";
+const SPLIT_REMEDIATION: &str =
+    "Break the work into smaller tasks/PRs so each change stays reviewable and within the file-count limit.";
 
 /// How to request a bound `change/file-count` exception.
 const BYPASS_REMEDIATION: &str = "If this large surface is intentional (coordinated rename, generated tree that cannot split, etc.), request a one-off exception with `BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>` in the commit description (read in every CI context) or the PR description (best-effort). The numeric maximum is the approved ceiling; growth past it needs a new approval or a split.";
