@@ -85,23 +85,20 @@ final class PlannerRunLiveReconciliationTests: XCTestCase {
         )
     }
 
-    /// Same completion via the snapshot-replace API the poller uses, so
-    /// a `limit = 0` reply that drops the planner item is enough on its
-    /// own — the project-scoped list does not have to race it.
+    /// Same completion via the pushed snapshot, so a push that drops the
+    /// planner item is enough on its own — the project-scoped list does not
+    /// have to race it.
     func testCompletionViaAppliedSnapshotHidesHourglass() {
         let model = makeModel()
         model.plannerRunsByProjectID["proj_1"] = [
             makeRun(id: "run_1", projectID: "proj_1", outcome: "running"),
         ]
-        XCTAssertTrue(
-            model.applyBackgroundWorkSnapshot(
-                [makePlannerItem(projectID: "proj_1", sourceID: "run_1")],
-                generation: 1
-            )
-        )
+        model.applyEventForTest(.backgroundWorkSnapshot(
+            items: [makePlannerItem(projectID: "proj_1", sourceID: "run_1")]
+        ))
         XCTAssertEqual(model.plannerAffordancePresentation(forProjectID: "proj_1")?.isRunning, true)
 
-        XCTAssertTrue(model.applyBackgroundWorkSnapshot([], generation: 2))
+        model.applyEventForTest(.backgroundWorkSnapshot(items: []))
         XCTAssertNil(model.plannerAffordancePresentation(forProjectID: "proj_1"))
         XCTAssertEqual(model.latestPlannerRun(forProjectID: "proj_1")?.outcome, "running")
     }

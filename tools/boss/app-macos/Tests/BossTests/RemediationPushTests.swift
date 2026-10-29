@@ -119,7 +119,7 @@ final class RemediationPushTests: XCTestCase {
         let requestID = try XCTUnwrap(model.remediationStateRequestID)
         model.applyEventForTest(.engineAttemptsList(
             attempts: [row("ci", "succeeded"), row("conflict", "succeeded"), row("ci_state", "clear")],
-            backgroundWork: [], requestId: requestID
+            requestId: requestID
         ))
         XCTAssertTrue(model.ciFailureBadges.isEmpty)
         XCTAssertNotNil(model.recentlyClearedCIPRs[pr])
@@ -129,7 +129,7 @@ final class RemediationPushTests: XCTestCase {
         model.refreshRemediationState()
         let next = try XCTUnwrap(model.remediationStateRequestID)
         model.applyEventForTest(.engineAttemptsList(
-            attempts: [row("ci_state", "exhausted")], backgroundWork: [], requestId: next
+            attempts: [row("ci_state", "exhausted")], requestId: next
         ))
         XCTAssertEqual(model.ciFailureBadges[pr]?.state, .exhausted)
         XCTAssertNil(model.recentlyClearedCIPRs[pr])
@@ -158,15 +158,15 @@ final class RemediationPushTests: XCTestCase {
         model.applyEventForTest(.connected)
         defer { model.applyEventForTest(.disconnected) }
         let stateID = try XCTUnwrap(model.remediationStateRequestID)
-        let historyID = try XCTUnwrap(model.backgroundWorkPending.first { $0.value.replacesAttempts }?.key)
+        let historyID = try XCTUnwrap(model.engineAttemptsPending.keys.first)
         let succeeded = row("ci", "succeeded")
         model.applyEventForTest(event(succeeded))
         model.applyEventForTest(.engineAttemptsList(
             attempts: [row("ci", "running"), row("ci_state", "in_flight")],
-            backgroundWork: [], requestId: stateID
+            requestId: stateID
         ))
         model.applyEventForTest(.engineAttemptsList(
-            attempts: [row("ci", "running")], backgroundWork: [], requestId: historyID
+            attempts: [row("ci", "running")], requestId: historyID
         ))
         XCTAssertEqual(model.engineAttempts, [succeeded])
         XCTAssertEqual(model.ciRemediations, [succeeded])
@@ -179,14 +179,14 @@ final class RemediationPushTests: XCTestCase {
         model.applyEventForTest(.connected)
         defer { model.applyEventForTest(.disconnected) }
         let stateID = try XCTUnwrap(model.remediationStateRequestID)
-        model.applyEventForTest(.engineAttemptsList(attempts: [], backgroundWork: [], requestId: stateID))
+        model.applyEventForTest(.engineAttemptsList(attempts: [], requestId: stateID))
         model.activityIsVisible = true
         model.refreshEngineAttempts()
-        let historyID = try XCTUnwrap(model.backgroundWorkPending.first { $0.value.replacesAttempts }?.key)
+        let historyID = try XCTUnwrap(model.engineAttemptsPending.keys.first)
         let succeeded = row("ci", "succeeded")
         model.applyEventForTest(event(succeeded))
         model.applyEventForTest(.engineAttemptsList(
-            attempts: [row("ci", "running")], backgroundWork: [], requestId: historyID
+            attempts: [row("ci", "running")], requestId: historyID
         ))
         XCTAssertEqual(model.engineAttempts, [succeeded])
         XCTAssertEqual(model.ciRemediations, [succeeded])
@@ -200,10 +200,10 @@ final class RemediationPushTests: XCTestCase {
         model.applyEventForTest(.connected)
         defer { model.applyEventForTest(.disconnected) }
         let firstState = try XCTUnwrap(model.remediationStateRequestID)
-        model.applyEventForTest(.engineAttemptsList(attempts: [], backgroundWork: [], requestId: firstState))
+        model.applyEventForTest(.engineAttemptsList(attempts: [], requestId: firstState))
         model.activityIsVisible = true
         model.refreshEngineAttempts()
-        let historyID = try XCTUnwrap(model.backgroundWorkPending.first { $0.value.replacesAttempts }?.key)
+        let historyID = try XCTUnwrap(model.engineAttemptsPending.keys.first)
         // H outstanding; a running push is buffered under it.
         model.applyEventForTest(event(row("ci", "running")))
         model.applyEventForTest(event(row("conflict", "running")))
@@ -212,9 +212,9 @@ final class RemediationPushTests: XCTestCase {
         let stateID = try XCTUnwrap(model.remediationStateRequestID)
         model.applyEventForTest(.engineAttemptsList(
             attempts: [row("ci", "succeeded"), row("conflict", "succeeded"), row("ci_state", "clear")],
-            backgroundWork: [], requestId: stateID
+            requestId: stateID
         ))
-        model.applyEventForTest(.engineAttemptsList(attempts: [], backgroundWork: [], requestId: historyID))
+        model.applyEventForTest(.engineAttemptsList(attempts: [], requestId: historyID))
 
         XCTAssertEqual(model.ciRemediations.map(\.status), ["succeeded"])
         XCTAssertEqual(model.conflictResolutions.map(\.status), ["succeeded"])

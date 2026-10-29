@@ -1205,24 +1205,19 @@ extension EngineClient {
 
     /// Fetch the merged, shallow engine-attempt feed. Detailed records remain
     /// behind their source-specific get requests so list refreshes stay small.
-    /// `limit: 0` is the background-only polling form: `attempts` comes back
-    /// empty while `background_work` is still populated when requested.
-    /// Returns the envelope `request_id` so the model can drop out-of-order
-    /// snapshot replies, or `nil` when the line was not written.
+    /// The app never sets `include_background_work`: that snapshot arrives on
+    /// the `engine.background_work` topic. Returns the envelope `request_id`
+    /// so the model can drop out-of-order replies, or `nil` when the line was
+    /// not written.
     @discardableResult
-    func sendListEngineAttempts(limit: Int? = nil, includeBackgroundWork: Bool = false, openPRsOnly: Bool = false) -> String? {
+    func sendListEngineAttempts(limit: Int? = nil, openPRsOnly: Bool = false) -> String? {
         var payload: [String: Any] = ["type": "list_engine_attempts"]
         if openPRsOnly { payload["open_prs_only"] = true }
         if let limit {
             payload["limit"] = limit
         }
-        if includeBackgroundWork {
-            payload["include_background_work"] = true
-        }
-        // Background-only polls restart on .connected and must not register
-        // a queued in-flight entry that suppresses the next poll. Activity's
-        // on-demand history read still queues for delivery after reconnect.
-        return sendLine(payload, queueIfDisconnected: limit != 0, reportIfDisconnected: limit != 0)
+        // Reads survive a reconnect backoff and are re-sent afterwards.
+        return sendLine(payload, queueIfDisconnected: true)
     }
 
     /// Fetch detailed fields for a selected unified attempt row. Rebase rows

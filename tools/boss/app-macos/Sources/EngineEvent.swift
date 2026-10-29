@@ -138,13 +138,16 @@ enum EngineEvent {
     /// Response to `list_engine_attempts`. This is the authoritative, merged
     /// Activity list; source-specific details are loaded only after selection.
     /// `requestId` is the envelope id of the originating request so a late
-    /// `limit = 0` poll can be dropped instead of overwriting a newer snapshot.
+    /// reply can be dropped instead of overwriting a newer one.
     /// The engine always echoes a request id; a nil id is ignored.
     case engineAttemptsList(
         attempts: [EngineAttemptListEntry],
-        backgroundWork: [BackgroundWorkItem],
         requestId: String?
     )
+    /// Push on the `engine.background_work` topic: the complete current
+    /// background-work set behind the toolbar badge, sent whenever it changes
+    /// and replayed when the app subscribes. Never a delta.
+    case backgroundWorkSnapshot(items: [BackgroundWorkItem])
     /// Full conflict-resolution record loaded for a selected Activity row.
     case conflictResolution(attempt: WorkConflictResolution)
     /// Full CI-remediation record loaded for a selected Activity row.

@@ -142,7 +142,7 @@ extension ChatViewModel {
     /// Returns whether the request id matched an archive.
     func settleArchiveWorkError(message: String, requestId: String?) -> Bool {
         guard let requestId, let projectID = archiveRequestProjectIDs[requestId] else { return false }
-        abandonBackgroundWorkRequest(requestId: requestId)
+        abandonEngineAttemptsRequest(requestId: requestId)
         settleArchiveRequest(projectID: projectID)
         workErrorMessage = message
         return true

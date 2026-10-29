@@ -2,9 +2,8 @@ import XCTest
 @testable import Boss
 
 /// A burst of `work_invalidated` pushes must cost one set of requests per
-/// product, not one set per push: the tree, the deferred-scope list, the
-/// background-work poll, and `list_executions` for the invalidated items that
-/// something is showing. Planner state rides in the tree, so a burst sends no
+/// product, not one set per push: the tree, the deferred-scope list, and
+/// `list_executions` for the invalidated items that something is showing. Planner state rides in the tree, so a burst sends no
 /// `list_planner_runs` however many projects the product has. See
 /// `ChatViewModel+InvalidationRefetch.swift`.
 ///
@@ -34,7 +33,6 @@ final class InvalidationRefetchCoalescingTests: XCTestCase {
             [
                 "get_work_tree": 1,
                 "list_deferred_scope_attentions": 1,
-                "list_engine_attempts": 1,
             ],
             "ten invalidations must cost exactly one set, and none of it is per project"
         )
@@ -131,7 +129,6 @@ final class InvalidationRefetchCoalescingTests: XCTestCase {
         XCTAssertEqual(recorder.counts["get_work_tree"], 1)
 
         recorder.reset()
-        model.backgroundWorkPending.removeAll()
         model.applyEventForTest(invalidation(itemIDs: ["task_3"]))
         await waitForBurst(model, recorder)
 
@@ -140,7 +137,6 @@ final class InvalidationRefetchCoalescingTests: XCTestCase {
             [
                 "get_work_tree": 1,
                 "list_deferred_scope_attentions": 1,
-                "list_engine_attempts": 1,
             ],
             "a trigger after a fired burst starts a new burst, whose trailing edge fires"
         )
@@ -203,7 +199,6 @@ final class InvalidationRefetchCoalescingTests: XCTestCase {
         model.endExecutionsConsumer(taskID: "task_1", token: popover)
         XCTAssertNotNil(model.executionsByTaskID["task_1"])
         recorder.reset()
-        model.backgroundWorkPending.removeAll()
         model.applyEventForTest(invalidation(itemIDs: ["task_1"]))
         await waitForBurst(model, recorder)
         XCTAssertEqual(recorder.executionFetches, ["task_1"])
@@ -212,7 +207,6 @@ final class InvalidationRefetchCoalescingTests: XCTestCase {
         model.endExecutionsConsumer(taskID: "task_1", token: viewer)
         XCTAssertNil(model.executionsByTaskID["task_1"], "history is dropped with its last consumer")
         recorder.reset()
-        model.backgroundWorkPending.removeAll()
         model.applyEventForTest(invalidation(itemIDs: ["task_1"]))
         await waitForBurst(model, recorder)
         XCTAssertEqual(recorder.executionFetches, [], "a closed popover must stop costing a request per burst")

@@ -65,7 +65,7 @@ extension ChatViewModel {
     /// answer alone: settle it onto the card. Returns whether it matched.
     func settleOperatorAnswerWorkError(message: String, requestId: String?) -> Bool {
         guard let taskID = taskIDForOperatorAnswer(requestId: requestId) else { return false }
-        abandonBackgroundWorkRequest(requestId: requestId)
+        abandonEngineAttemptsRequest(requestId: requestId)
         operatorAnswerInFlightByTaskID.removeValue(forKey: taskID)
         setOperatorAnswerError(message, taskID: taskID, questionID: task(withID: taskID)?.operatorQuestion?.id)
         workErrorMessage = message
