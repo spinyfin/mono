@@ -1,18 +1,13 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::input::{ChangeKind, ChangeSet};
+use crate::input::ChangeSet;
 use crate::output::{Finding, Location, Severity};
 
 /// Parse BYPASS directives from free-form text.
 ///
 /// Accepted format per line:
 ///   BYPASS_NAME=Reason text
-///
-/// Preserve explicit empty values: the latest declaration for a name supersedes
-/// older ones even when it is empty or otherwise malformed. An empty latest
-/// value revokes any earlier non-empty reason for that name; consumers decide
-/// whether the retained value is valid.
 pub fn parse_bypass_directives(text: &str) -> BTreeMap<String, String> {
     let mut directives = BTreeMap::new();
 
@@ -32,6 +27,9 @@ pub fn parse_bypass_directives(text: &str) -> BTreeMap<String, String> {
         }
 
         let reason = raw_reason.trim();
+        if reason.is_empty() {
+            continue;
+        }
 
         directives.insert(name, reason.to_owned());
     }
@@ -80,18 +78,9 @@ pub fn bypass_name_for_check_id(check_id: &str) -> String {
     format!("BYPASS_{normalized}")
 }
 
-fn bypass_value_shape(check_id: &str) -> &'static str {
-    if check_id == "change/file-count" {
-        "<max_files>:<reason>"
-    } else {
-        "<specific legitimate reason>"
-    }
-}
-
-pub fn bypass_failure_guidance(check_id: &str, bypass_name: &str) -> String {
-    let value_shape = bypass_value_shape(check_id);
+pub fn bypass_failure_guidance(bypass_name: &str) -> String {
     format!(
-        "Request a one-off exception using `{bypass_name}={value_shape}` in the commit description (read in every CI context, including the merge queue) or the PR description (best-effort; not read on all CI contexts). Only for a real exception or emergency - never use bypasses for convenience."
+        "Request a one-off exception using `{bypass_name}=<specific legitimate reason>` in the commit description (read in every CI context, including the merge queue) or the PR description (best-effort; not read on all CI contexts). Only for a real exception or emergency - never use bypasses for convenience."
     )
 }
 
@@ -105,103 +94,14 @@ pub fn bypass_failure_guidance(check_id: &str, bypass_name: &str) -> String {
 /// guidance points authors at a surface ([`bypass_failure_guidance`]'s "PR
 /// description") that this run structurally could not read, giving no hint
 /// that the directive might already exist there.
-pub fn bypass_unreachable_pr_description_guidance(check_id: &str, bypass_name: &str) -> String {
-    let value_shape = bypass_value_shape(check_id);
+pub fn bypass_unreachable_pr_description_guidance(bypass_name: &str) -> String {
     format!(
         "Could not resolve a PR description in this environment, so only the commit description was checked for \
          `{bypass_name}` (not found there). If the directive is declared only in the PR description, it is not \
          visible to this run — for example on a GitHub merge-queue build, or without GitHub API access. Declare \
-         the bypass in the commit description instead — `{bypass_name}={value_shape}` — which is \
+         the bypass in the commit description instead — `{bypass_name}=<specific legitimate reason>` — which is \
          read in every CI context. Only for a real exception or emergency - never use bypasses for convenience."
     )
-}
-
-/// Guidance when a matching directive is present but its latest value is empty.
-///
-/// An empty `BYPASS_NAME=` line is still a declaration: it wins over earlier
-/// non-empty reasons for the same name and does not apply a bypass.
-pub fn bypass_empty_directive_guidance(check_id: &str, bypass_name: &str) -> String {
-    let value_shape = bypass_value_shape(check_id);
-    format!(
-        "The latest `{bypass_name}` directive is empty, so it revoked any earlier non-empty reason for this check. \
-         Replace it with `{bypass_name}={value_shape}` or remove the empty line so a previous reason still applies. \
-         Only for a real exception or emergency - never use bypasses for convenience."
-    )
-}
-
-/// Parse `BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>`.
-///
-/// The numeric maximum is required; a bare reason is not treated as unlimited.
-pub fn parse_change_file_count_bypass_value(raw: &str) -> Option<(usize, String)> {
-    let (max_part, reason_part) = raw.split_once(':')?;
-    let max_files = max_part.trim().parse().ok()?;
-    let reason = reason_part.trim();
-    if reason.is_empty() {
-        return None;
-    }
-    Some((max_files, reason.to_owned()))
-}
-
-fn count_non_deleted_files(changeset: &ChangeSet) -> usize {
-    changeset
-        .changed_files
-        .iter()
-        .filter(|f| f.kind != ChangeKind::Deleted)
-        .count()
-}
-
-/// Apply the bound `change/file-count` bypass to an already-failing result.
-///
-/// Only the host evaluates directives, after enforcing the instance bypass policy.
-/// `changeset` must already be the path-scope-filtered view the guest counted.
-/// Exceeded-bound remediations keep the guest's split guidance and append the
-/// bound-specific follow-up; generic "how to request a bypass" lines from the
-/// guest are dropped because they are superseded once a bound exists.
-pub fn change_file_count_bypass_findings(
-    changeset: &ChangeSet,
-    raw: &str,
-    bypass_name: &str,
-    location: Option<Location>,
-    guest_remediations: &[String],
-) -> Vec<Finding> {
-    let count = count_non_deleted_files(changeset);
-    match parse_change_file_count_bypass_value(raw) {
-        Some((approved_max, _)) if count <= approved_max => Vec::new(),
-        Some((approved_max, _)) => {
-            let mut remediations: Vec<String> = guest_remediations
-                .iter()
-                .filter(|remediation| !remediation.contains("BYPASS_"))
-                .cloned()
-                .collect();
-            remediations.push(format!(
-                "The previous exception was bound to {approved_max} files (current count {count}). Request a new approval with `{bypass_name}=<max_files>:<reason>` or split the change."
-            ));
-            vec![Finding {
-                fixable: false,
-                severity: Severity::Error,
-                message: format!(
-                    "changeset touches {count} non-deleted files, exceeding the approved {bypass_name} maximum of {approved_max}"
-                ),
-                location,
-                surface: None,
-                remediations,
-                suggested_fix: None,
-            }]
-        }
-        None => vec![Finding {
-            fixable: false,
-            severity: Severity::Error,
-            message: format!(
-                "{bypass_name} requires an approved maximum: `{bypass_name}=<max_files>:<reason>` (got `{raw}`). A bypass without a numeric maximum is not treated as unlimited."
-            ),
-            location,
-            surface: None,
-            remediations: vec![format!(
-                "Replace the directive with `{bypass_name}=<max_files>:<reason>`, where max_files is the approved ceiling for this change."
-            )],
-            suggested_fix: None,
-        }],
-    }
 }
 
 pub fn bypass_applied_finding(bypass_name: &str, reason: &str, location: Option<Location>) -> Finding {
@@ -228,7 +128,7 @@ pub fn maybe_bypass_findings(
         return None;
     }
 
-    let reason = changeset.bypass_reason(bypass_name).filter(|value| !value.is_empty())?;
+    let reason = changeset.bypass_reason(bypass_name)?;
     let location = trigger_files.first().cloned().map(|path| Location {
         path,
         line: None,
@@ -253,9 +153,9 @@ fn is_valid_bypass_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        bypass_applied_finding, bypass_empty_directive_guidance, bypass_failure_guidance, bypass_name_for_check_id,
-        bypass_unreachable_pr_description_guidance, change_file_count_bypass_findings, maybe_bypass_findings,
-        parse_bypass_directives, parse_bypass_directives_from_descriptions, parse_change_file_count_bypass_value,
+        bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id,
+        bypass_unreachable_pr_description_guidance, maybe_bypass_findings, parse_bypass_directives,
+        parse_bypass_directives_from_descriptions,
     };
     use crate::input::{ChangeKind, ChangeSet, ChangedFile};
     use crate::output::{Location, Severity};
@@ -282,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn retains_empty_values_but_ignores_invalid_names() {
+    fn ignores_invalid_or_empty_bypass_directives() {
         let parsed = parse_bypass_directives(
             r#"
                 BYPASS_API_BREAKING_SURFACE=
@@ -291,8 +191,7 @@ mod tests {
             "#,
         );
 
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed["BYPASS_API_BREAKING_SURFACE"], "");
+        assert!(parsed.is_empty());
     }
 
     #[test]
@@ -332,25 +231,15 @@ mod tests {
     }
 
     #[test]
-    fn empty_latest_directive_revokes_earlier_reason() {
-        let parsed = parse_bypass_directives_from_descriptions(
-            Some("BYPASS_FILE_SIZE=Generated fixture cannot be split."),
-            Some("BYPASS_FILE_SIZE="),
-        );
-
-        assert_eq!(parsed.get("BYPASS_FILE_SIZE"), Some(&"".to_owned()));
-    }
-
-    #[test]
     fn bypass_failure_guidance_includes_strict_wording() {
-        let guidance = bypass_failure_guidance("api/breaking-surface", "BYPASS_API_BREAKING_SURFACE");
+        let guidance = bypass_failure_guidance("BYPASS_API_BREAKING_SURFACE");
         assert!(guidance.contains("BYPASS_API_BREAKING_SURFACE=<specific legitimate reason>"));
         assert!(guidance.contains("never use bypasses for convenience"));
     }
 
     #[test]
     fn bypass_failure_guidance_steers_to_commit_description_first() {
-        let guidance = bypass_failure_guidance("change/file-count", "BYPASS_CHANGE_FILE_COUNT");
+        let guidance = bypass_failure_guidance("BYPASS_CHANGE_FILE_COUNT");
         let commit_pos = guidance
             .find("commit description")
             .expect("mentions commit description");
@@ -363,107 +252,11 @@ mod tests {
 
     #[test]
     fn bypass_unreachable_pr_description_guidance_explains_why_and_names_directive() {
-        let guidance = bypass_unreachable_pr_description_guidance("change/file-count", "BYPASS_CHANGE_FILE_COUNT");
+        let guidance = bypass_unreachable_pr_description_guidance("BYPASS_CHANGE_FILE_COUNT");
         assert!(guidance.contains("Could not resolve a PR description"));
-        assert!(guidance.contains("BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>"));
+        assert!(guidance.contains("BYPASS_CHANGE_FILE_COUNT=<specific legitimate reason>"));
         assert!(guidance.contains("commit description"));
         assert!(guidance.contains("never use bypasses for convenience"));
-    }
-
-    #[test]
-    fn bypass_empty_directive_guidance_names_revocation_and_shape() {
-        let guidance = bypass_empty_directive_guidance("file/size", "BYPASS_FILE_SIZE");
-        assert!(guidance.contains("The latest `BYPASS_FILE_SIZE` directive is empty"));
-        assert!(guidance.contains("revoked any earlier non-empty reason"));
-        assert!(guidance.contains("BYPASS_FILE_SIZE=<specific legitimate reason>"));
-        assert!(guidance.contains("never use bypasses for convenience"));
-    }
-
-    fn oversized_changeset(n: usize) -> ChangeSet {
-        ChangeSet::new(
-            (0..n)
-                .map(|i| ChangedFile {
-                    path: PathBuf::from(format!("f{i}.rs")),
-                    kind: ChangeKind::Added,
-                    old_path: None,
-                })
-                .collect(),
-        )
-    }
-
-    #[test]
-    fn parse_change_file_count_bypass_value_requires_max_and_reason() {
-        assert_eq!(
-            parse_change_file_count_bypass_value("8:Coordinated rename."),
-            Some((8, "Coordinated rename.".to_owned()))
-        );
-        assert_eq!(
-            parse_change_file_count_bypass_value(" 64 : reason with: colons "),
-            Some((64, "reason with: colons".to_owned()))
-        );
-        assert_eq!(parse_change_file_count_bypass_value("Coordinated rename."), None);
-        assert_eq!(parse_change_file_count_bypass_value("many:rename"), None);
-        assert_eq!(parse_change_file_count_bypass_value("8:"), None);
-        assert_eq!(parse_change_file_count_bypass_value("8:   "), None);
-    }
-
-    #[test]
-    fn change_file_count_bypass_within_approved_max_passes() {
-        let findings = change_file_count_bypass_findings(
-            &oversized_changeset(6),
-            "8:Coordinated rename of the protocol surface.",
-            "BYPASS_CHANGE_FILE_COUNT",
-            None,
-            &[],
-        );
-        assert!(findings.is_empty(), "findings: {findings:?}");
-    }
-
-    #[test]
-    fn change_file_count_bypass_above_approved_max_fails_with_counts() {
-        let guest_remediations = vec![
-            "Feature work is resolved by splitting it into smaller stacked PRs.".to_owned(),
-            "request a one-off exception with `BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>`".to_owned(),
-        ];
-        let findings = change_file_count_bypass_findings(
-            &oversized_changeset(10),
-            "8:Coordinated rename of the protocol surface.",
-            "BYPASS_CHANGE_FILE_COUNT",
-            None,
-            &guest_remediations,
-        );
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].severity, Severity::Error);
-        assert!(
-            findings[0].message.contains("10 non-deleted files") && findings[0].message.contains('8'),
-            "message was: {}",
-            findings[0].message
-        );
-        assert_eq!(
-            findings[0].remediations,
-            vec![
-                "Feature work is resolved by splitting it into smaller stacked PRs.".to_owned(),
-                "The previous exception was bound to 8 files (current count 10). Request a new approval with `BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>` or split the change.".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn change_file_count_bypass_missing_numeric_max_is_rejected() {
-        let findings = change_file_count_bypass_findings(
-            &oversized_changeset(6),
-            "Coordinated rename of the protocol surface.",
-            "BYPASS_CHANGE_FILE_COUNT",
-            None,
-            &[],
-        );
-        assert_eq!(findings.len(), 1);
-        assert!(
-            findings[0].message.contains("approved maximum")
-                && findings[0].message.contains("not treated as unlimited"),
-            "message was: {}",
-            findings[0].message
-        );
     }
 
     #[test]

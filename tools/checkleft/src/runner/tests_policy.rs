@@ -196,81 +196,6 @@ allow_bypass = true
 }
 
 #[tokio::test]
-async fn runner_empty_latest_directive_revokes_generic_bypass() {
-    let temp = tempdir().expect("create temp dir");
-    fs::create_dir_all(temp.path().join("docs")).expect("create dirs");
-    fs::write(temp.path().join("docs/file.md"), "hello\n").expect("write file");
-    fs::write(
-        temp.path().join("CHECKS.toml"),
-        r#"
-[[checks]]
-id = "policy-check"
-check = "static-finding"
-
-[checks.policy]
-allow_bypass = true
-"#,
-    )
-    .expect("write config");
-
-    let mut registry = CheckRegistry::new();
-    registry
-        .register(StaticFindingCheck {
-            id: "static-finding".to_owned(),
-            severity: Severity::Error,
-            remediation: Some("fix me".to_owned()),
-        })
-        .expect("register check");
-
-    let runner = Runner::new(
-        Arc::new(registry),
-        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
-        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
-    );
-
-    let results = runner
-        .run_changeset(
-            &ChangeSet::new(vec![ChangedFile {
-                path: Path::new("docs/file.md").to_path_buf(),
-                kind: ChangeKind::Modified,
-                old_path: None,
-            }])
-            .with_commit_description(Some(
-                "BYPASS_POLICY_CHECK=Legitimate exception.\nBYPASS_POLICY_CHECK=".to_owned(),
-            ))
-            .with_pr_description(Some("resolved body without a later directive".to_owned())),
-        )
-        .await
-        .expect("run checks");
-
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].findings.len(), 1);
-    assert_eq!(results[0].findings[0].severity, Severity::Error);
-    assert!(
-        results[0].findings[0].message.contains("synthetic policy finding"),
-        "empty latest directive must not apply a bypass; message: {}",
-        results[0].findings[0].message
-    );
-    assert!(
-        results[0].findings[0]
-            .remediations
-            .iter()
-            .any(|r| r.contains("The latest `BYPASS_POLICY_CHECK` directive is empty")
-                && r.contains("revoked any earlier non-empty reason")),
-        "remediations: {:?}",
-        results[0].findings[0].remediations
-    );
-    assert!(
-        results[0].findings[0]
-            .remediations
-            .iter()
-            .all(|r| !r.contains("Could not resolve a PR description") && !r.contains("no bypass")),
-        "empty-directive guidance must not look like an absent declaration; remediations: {:?}",
-        results[0].findings[0].remediations
-    );
-}
-
-#[tokio::test]
 async fn runner_appends_unreachable_pr_description_guidance_when_pr_description_unresolved() {
     let temp = tempdir().expect("create temp dir");
     fs::create_dir_all(temp.path().join("docs")).expect("create dirs");
@@ -579,7 +504,7 @@ allow_bypass = true
     let bypass_results = runner
         .run_changeset(
             &oversized.clone().with_commit_description(Some(
-                "BYPASS_CHANGE_FILE_COUNT=4:Coordinated rename of the protocol surface; splitting would leave the tree unbuildable mid-stack.".to_owned(),
+                "BYPASS_CHANGE_FILE_COUNT=Coordinated rename of the protocol surface; splitting would leave the tree unbuildable mid-stack.".to_owned(),
             )),
         )
         .await
@@ -588,190 +513,42 @@ allow_bypass = true
         .iter()
         .find(|r| r.check_id == "change/file-count")
         .expect("change/file-count ran with bypass");
+    assert_eq!(bypassed.findings.len(), 1);
+    assert_eq!(bypassed.findings[0].severity, Severity::Warning);
     assert!(
-        bypassed.findings.is_empty(),
-        "count 4 is within approved max 4; findings: {:?}",
-        bypassed.findings
-    );
-
-    let grew_results = runner
-        .run_changeset(&oversized.clone().with_commit_description(Some(
-            "BYPASS_CHANGE_FILE_COUNT=3:Approved when the change still had 3 files.".to_owned(),
-        )))
-        .await
-        .expect("run with outgrown bypass");
-    let grew = grew_results
-        .iter()
-        .find(|r| r.check_id == "change/file-count")
-        .expect("change/file-count ran with outgrown bypass");
-    assert_eq!(grew.findings.len(), 1);
-    assert_eq!(grew.findings[0].severity, Severity::Error);
-    assert!(
-        grew.findings[0].message.contains("4 non-deleted files")
-            && grew.findings[0].message.contains("approved")
-            && grew.findings[0].message.contains('3'),
+        bypassed.findings[0].message.contains("BYPASS_CHANGE_FILE_COUNT"),
         "message was: {}",
-        grew.findings[0].message
-    );
-
-    let malformed_results = runner
-        .run_changeset(
-            &oversized.clone().with_commit_description(Some(
-                "BYPASS_CHANGE_FILE_COUNT=Coordinated rename of the protocol surface; splitting would leave the tree unbuildable mid-stack.".to_owned(),
-            )),
-        )
-        .await
-        .expect("run with malformed bypass");
-    let malformed = malformed_results
-        .iter()
-        .find(|r| r.check_id == "change/file-count")
-        .expect("change/file-count ran with malformed bypass");
-    assert_eq!(malformed.findings.len(), 1);
-    assert_eq!(malformed.findings[0].severity, Severity::Error);
-    assert!(
-        malformed.findings[0].message.contains("approved maximum")
-            && malformed.findings[0].message.contains("not treated as unlimited"),
-        "message was: {}",
-        malformed.findings[0].message
-    );
-
-    let latest_results = runner
-        .run_changeset(&oversized.clone().with_commit_description(Some(
-            "BYPASS_CHANGE_FILE_COUNT=3:first approval.\nBYPASS_CHANGE_FILE_COUNT=4:later approval.\n".to_owned(),
-        )))
-        .await
-        .expect("run with two bypass directives");
-    let latest = latest_results
-        .iter()
-        .find(|r| r.check_id == "change/file-count")
-        .expect("change/file-count ran with two bypass directives");
-    assert!(
-        latest.findings.is_empty(),
-        "latest directive approves 4; findings: {:?}",
-        latest.findings
-    );
-
-    // Historical content-commit directive is host-only (`bypass_commit_descriptions`);
-    // the guest check sees an empty tip. The bound still applies.
-    let historical_results = runner
-        .run_changeset(
-            &oversized
-                .clone()
-                .with_commit_description(Some("wip: empty working-copy tip".to_owned()))
-                .with_bypass_commit_descriptions(Some(
-                    "feat: large rename\n\nBYPASS_CHANGE_FILE_COUNT=4:Approved on the content commit.\n\nwip: empty working-copy tip".to_owned(),
-                )),
-        )
-        .await
-        .expect("run with historical bypass");
-    let historical = historical_results
-        .iter()
-        .find(|r| r.check_id == "change/file-count")
-        .expect("change/file-count ran with historical bypass");
-    assert!(
-        historical.findings.is_empty(),
-        "historical bound of 4 must still cover 4 files; findings: {:?}",
-        historical.findings
-    );
-}
-
-#[tokio::test]
-async fn runner_change_file_count_bound_counts_path_scope_filtered_files() {
-    use crate::external::BundledExternalCheckPackageProvider;
-    use crate::external::test_support::executor_with_precompiled_cache;
-
-    let temp = tempdir().expect("create temp dir");
-    fs::create_dir_all(temp.path().join("src")).expect("src");
-    fs::create_dir_all(temp.path().join("vendor")).expect("vendor");
-    for i in 0..5 {
-        fs::write(temp.path().join(format!("src/f{i}.txt")), format!("content {i}\n")).expect("write src file");
-    }
-    fs::write(temp.path().join("vendor/extra.txt"), "out of scope\n").expect("write vendor file");
-    fs::write(
-        temp.path().join("CHECKS.toml"),
-        r#"
-[[checks]]
-id = "change/file-count"
-include = ["src/**"]
-
-[checks.config]
-max_files = 3
-
-[checks.policy]
-severity = "error"
-allow_bypass = true
-"#,
-    )
-    .expect("write config");
-
-    let mut registry = CheckRegistry::new();
-    register_builtin_checks(&mut registry).expect("register built-ins");
-    let runner = Runner::with_external(
-        Arc::new(registry),
-        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
-        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
-        Arc::new(BundledExternalCheckPackageProvider),
-        Arc::new(executor_with_precompiled_cache(temp.path())),
-    );
-
-    let in_scope = |n: usize| -> Vec<ChangedFile> {
-        (0..n)
-            .map(|i| ChangedFile {
-                path: Path::new(&format!("src/f{i}.txt")).to_path_buf(),
-                kind: ChangeKind::Added,
-                old_path: None,
-            })
-            .collect()
-    };
-    let vendor = ChangedFile {
-        path: Path::new("vendor/extra.txt").to_path_buf(),
-        kind: ChangeKind::Added,
-        old_path: None,
-    };
-    let approval = "BYPASS_CHANGE_FILE_COUNT=4:Coordinated rename of the in-scope tree.".to_owned();
-
-    let mut four_plus_excluded = in_scope(4);
-    four_plus_excluded.push(vendor.clone());
-    let pass_results = runner
-        .run_changeset(&ChangeSet::new(four_plus_excluded).with_commit_description(Some(approval.clone())))
-        .await
-        .expect("run with in-scope count 4");
-    let passed = pass_results
-        .iter()
-        .find(|r| r.check_id == "change/file-count")
-        .expect("change/file-count ran");
-    assert!(
-        passed.findings.is_empty(),
-        "approval of 4 must cover 4 in-scope files plus excluded extras; findings: {:?}",
-        passed.findings
-    );
-
-    let mut five_plus_excluded = in_scope(5);
-    five_plus_excluded.push(vendor);
-    let fail_results = runner
-        .run_changeset(&ChangeSet::new(five_plus_excluded).with_commit_description(Some(approval)))
-        .await
-        .expect("run with in-scope count 5");
-    let failed = fail_results
-        .iter()
-        .find(|r| r.check_id == "change/file-count")
-        .expect("change/file-count ran over bound");
-    assert_eq!(failed.findings.len(), 1);
-    assert_eq!(failed.findings[0].severity, Severity::Error);
-    assert!(
-        failed.findings[0].message.contains("5 non-deleted files")
-            && failed.findings[0].message.contains("approved")
-            && failed.findings[0].message.contains('4'),
-        "bound must report the in-scope count 5, not 6; message was: {}",
-        failed.findings[0].message
+        bypassed.findings[0].message
     );
     assert!(
-        failed.findings[0]
+        bypassed.findings[0]
             .remediations
             .iter()
-            .any(|r| r.contains("Break the work into smaller tasks/PRs")),
-        "exceeded-bound remediations must keep the guest split guidance; got {:?}",
-        failed.findings[0].remediations
+            .any(|r| r.contains("Coordinated rename")),
+        "bypass reason should be recorded; got {:?}",
+        bypassed.findings[0].remediations
+    );
+
+    // Bypass reasons are free-form text: a numeric prefix is not parsed as a
+    // limit, and the whole value is recorded verbatim as the reason.
+    let numeric_reason = "2:Coordinated rename with a numeric-looking prefix.";
+    let numeric_results = runner
+        .run_changeset(&oversized.with_commit_description(Some(format!("BYPASS_CHANGE_FILE_COUNT={numeric_reason}"))))
+        .await
+        .expect("run with numeric-prefixed bypass reason");
+    let numeric_bypassed = numeric_results
+        .iter()
+        .find(|r| r.check_id == "change/file-count")
+        .expect("change/file-count ran with numeric-prefixed bypass");
+    assert_eq!(numeric_bypassed.findings.len(), 1);
+    assert_eq!(numeric_bypassed.findings[0].severity, Severity::Warning);
+    assert!(
+        numeric_bypassed.findings[0]
+            .remediations
+            .iter()
+            .any(|r| r.contains(numeric_reason)),
+        "numeric-prefixed reason should be recorded verbatim; got {:?}",
+        numeric_bypassed.findings[0].remediations
     );
 }
 
@@ -1108,236 +885,5 @@ check = "configurable-findings"
         results[0].findings.len(),
         2,
         "changed_lines_only defaults to false; both findings on the changed file must survive"
-    );
-}
-
-#[tokio::test]
-async fn runner_file_count_bypass_policy_and_latest_value() {
-    use crate::external::BundledExternalCheckPackageProvider;
-    use crate::external::test_support::executor_with_precompiled_cache;
-
-    for (policy, name, commit, pr, expected) in [
-        (
-            "allow_bypass = false",
-            "BYPASS_CHANGE_FILE_COUNT",
-            "100:rename",
-            None,
-            "max_files=3",
-        ),
-        ("", "BYPASS_CHANGE_FILE_COUNT", "100:rename", None, "max_files=3"),
-        (
-            "allow_bypass = true",
-            "BYPASS_CHANGE_FILE_COUNT",
-            "",
-            None,
-            "requires an approved maximum",
-        ),
-        (
-            "allow_bypass = true",
-            "BYPASS_CHANGE_FILE_COUNT",
-            "100:rename\nBYPASS_CHANGE_FILE_COUNT=",
-            None,
-            "requires an approved maximum",
-        ),
-        (
-            "allow_bypass = true",
-            "BYPASS_CHANGE_FILE_COUNT",
-            "100:rename",
-            Some(""),
-            "requires an approved maximum",
-        ),
-        (
-            "allow_bypass = true",
-            "BYPASS_CUSTOM",
-            "3:rename",
-            None,
-            "approved BYPASS_CUSTOM maximum of 3",
-        ),
-        ("allow_bypass = true", "BYPASS_CUSTOM", "4:rename", None, ""),
-        (
-            "allow_bypass = true",
-            "BYPASS_CUSTOM",
-            "rename",
-            None,
-            "BYPASS_CUSTOM requires an approved maximum",
-        ),
-        (
-            "allow_bypass = true",
-            "BYPASS_CHANGE_FILE_COUNT",
-            "100:old\nBYPASS_CHANGE_FILE_COUNT=3:new",
-            None,
-            "maximum of 3",
-        ),
-        (
-            "allow_bypass = true",
-            "BYPASS_CHANGE_FILE_COUNT",
-            "3:old\nBYPASS_CHANGE_FILE_COUNT=100:new",
-            None,
-            "",
-        ),
-    ] {
-        let temp = tempdir().expect("temp dir");
-        fs::write(temp.path().join("CHECKS.toml"), format!(
-            "[[checks]]\nid = \"count-instance\"\ncheck = \"change/file-count\"\n[checks.config]\nmax_files = 3\n[checks.policy]\n{policy}\nbypass_name = \"{name}\"\n"
-        )).expect("config");
-        let files = (0..4)
-            .map(|i| {
-                let path = Path::new(&format!("f{i}.txt")).to_path_buf();
-                fs::write(temp.path().join(&path), "content").expect("file");
-                ChangedFile {
-                    path,
-                    kind: ChangeKind::Added,
-                    old_path: None,
-                }
-            })
-            .collect();
-        let changeset = ChangeSet::new(files)
-            .with_commit_description(Some(format!("{name}={commit}")))
-            .with_pr_description(pr.map(|value| format!("{name}={value}")));
-        let mut registry = CheckRegistry::new();
-        register_builtin_checks(&mut registry).expect("builtins");
-        let runner = Runner::with_external(
-            Arc::new(registry),
-            Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
-            Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
-            Arc::new(BundledExternalCheckPackageProvider),
-            Arc::new(executor_with_precompiled_cache(temp.path())),
-        );
-        let results = runner.run_changeset(&changeset).await.expect("run");
-        let result = results
-            .iter()
-            .find(|r| r.check_id == "count-instance")
-            .expect("count ran");
-        if expected.is_empty() {
-            assert!(result.findings.is_empty(), "{policy} {commit}: {:?}", result.findings);
-        } else {
-            assert_eq!(result.findings.len(), 1);
-            assert_eq!(result.findings[0].severity, Severity::Error);
-            assert!(
-                result.findings[0].message.contains(expected),
-                "{policy} {commit}: {:?}",
-                result.findings
-            );
-        }
-    }
-}
-
-#[test]
-fn other_check_with_file_count_bypass_name_keeps_generic_semantics() {
-    let changeset =
-        ChangeSet::new(vec![]).with_commit_description(Some("BYPASS_CHANGE_FILE_COUNT=ordinary reason".to_owned()));
-    let result = super::apply_policy_to_result(
-        CheckResult {
-            check_id: "other-check".to_owned(),
-            findings: vec![Finding {
-                fixable: false,
-                severity: Severity::Error,
-                message: "failure".to_owned(),
-                location: None,
-                surface: None,
-                remediations: vec![],
-                suggested_fix: None,
-            }],
-        },
-        &super::EffectiveCheckPolicy {
-            check_id: "other-check".to_owned(),
-            severity_override: None,
-            allow_bypass: true,
-            bypass_name: "BYPASS_CHANGE_FILE_COUNT".to_owned(),
-            preserve_finding_severity: false,
-            changed_lines_only: false,
-        },
-        &changeset,
-        &super::PathScope::new(&[], &[]).expect("scope"),
-    );
-    assert_eq!(result.findings.len(), 1);
-    assert_eq!(result.findings[0].severity, Severity::Warning);
-    assert!(result.findings[0].message.contains("check was bypassed"));
-}
-
-#[test]
-fn file_count_bound_counts_path_scope_filtered_changeset() {
-    let changeset = ChangeSet::new(vec![
-        ChangedFile {
-            path: PathBuf::from("src/a.rs"),
-            kind: ChangeKind::Added,
-            old_path: None,
-        },
-        ChangedFile {
-            path: PathBuf::from("src/b.rs"),
-            kind: ChangeKind::Added,
-            old_path: None,
-        },
-        ChangedFile {
-            path: PathBuf::from("src/c.rs"),
-            kind: ChangeKind::Added,
-            old_path: None,
-        },
-        ChangedFile {
-            path: PathBuf::from("src/d.rs"),
-            kind: ChangeKind::Added,
-            old_path: None,
-        },
-        ChangedFile {
-            path: PathBuf::from("vendor/extra.rs"),
-            kind: ChangeKind::Added,
-            old_path: None,
-        },
-    ])
-    .with_commit_description(Some("BYPASS_CHANGE_FILE_COUNT=4:Coordinated rename.".to_owned()));
-    let incoming = CheckResult {
-        check_id: "change/file-count".to_owned(),
-        findings: vec![Finding {
-            fixable: false,
-            severity: Severity::Error,
-            message: "changeset touches 4 non-deleted files, exceeding configured max_files=3".to_owned(),
-            location: None,
-            surface: None,
-            remediations: vec![
-                "Feature work is resolved by splitting it into smaller stacked PRs.".to_owned(),
-                "request BYPASS_CHANGE_FILE_COUNT=<max_files>:<reason>".to_owned(),
-            ],
-            suggested_fix: None,
-        }],
-    };
-    let policy = super::EffectiveCheckPolicy {
-        check_id: "change/file-count".to_owned(),
-        severity_override: None,
-        allow_bypass: true,
-        bypass_name: "BYPASS_CHANGE_FILE_COUNT".to_owned(),
-        preserve_finding_severity: false,
-        changed_lines_only: false,
-    };
-    let include_src = super::PathScope::new(&["src/**".to_owned()], &[]).expect("scope");
-
-    let passed = super::apply_policy_to_result(incoming.clone(), &policy, &changeset, &include_src);
-    assert!(
-        passed.findings.is_empty(),
-        "4 in-scope files plus an excluded extra must pass an approval of 4; findings: {:?}",
-        passed.findings
-    );
-
-    let mut over = changeset.changed_files.clone();
-    over.push(ChangedFile {
-        path: PathBuf::from("src/e.rs"),
-        kind: ChangeKind::Added,
-        old_path: None,
-    });
-    let over_changeset =
-        ChangeSet::new(over).with_commit_description(Some("BYPASS_CHANGE_FILE_COUNT=4:Coordinated rename.".to_owned()));
-    let failed = super::apply_policy_to_result(incoming, &policy, &over_changeset, &include_src);
-    assert_eq!(failed.findings.len(), 1);
-    assert!(
-        failed.findings[0].message.contains("5 non-deleted files") && failed.findings[0].message.contains('4'),
-        "message was: {}",
-        failed.findings[0].message
-    );
-    assert!(
-        failed.findings[0]
-            .remediations
-            .iter()
-            .any(|r| r.contains("splitting it into smaller stacked PRs")),
-        "remediations: {:?}",
-        failed.findings[0].remediations
     );
 }
