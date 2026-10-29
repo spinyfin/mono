@@ -192,7 +192,10 @@ pub(crate) fn demote_active_if_latest_execution(
     execution_id: &str,
     now: &str,
 ) -> Result<bool> {
-    let affected = conn.execute(
+    let affected = crate::work::task_status_audit::execute(
+        conn,
+        "demote_active_if_latest_execution",
+        "engine",
         "UPDATE tasks
          SET status             = 'todo',
              last_status_actor  = 'engine',

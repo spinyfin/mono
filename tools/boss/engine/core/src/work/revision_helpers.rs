@@ -122,6 +122,22 @@ pub(crate) fn assert_parent_revisable_and_insert(
     input: CreateRevisionInput,
     pr_checker: &dyn PrStateChecker,
 ) -> Result<Task> {
+    assert_parent_revisable_and_insert_as_actor(
+        pending,
+        conn,
+        input,
+        pr_checker,
+        boss_protocol::LAST_STATUS_ACTOR_ENGINE,
+    )
+}
+
+pub(crate) fn assert_parent_revisable_and_insert_as_actor(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    input: CreateRevisionInput,
+    pr_checker: &dyn PrStateChecker,
+    actor: &str,
+) -> Result<Task> {
     // A review execution (legacy) or review-verdict proposal (batch) is the
     // idempotency key for materialising its findings. The finalizer / applier
     // normally reaches this function once, but a repeated Stop/reconciliation
@@ -196,7 +212,7 @@ pub(crate) fn assert_parent_revisable_and_insert(
     // work item so the UI's direct-child rollup sees the whole chain.
     let now = now_string();
     let depends_on = input.depends_on.clone();
-    let new_revision = insert_revision_in_tx(conn, input, &root_id, &root)?;
+    let new_revision = insert_revision_in_tx(conn, input, &root_id, &root, actor)?;
 
     // ── 7. Caller-supplied `--depends-on` gate ──────────────────────────────
     // Declared atomically with the row insert, same as `task create` /
@@ -1541,6 +1557,7 @@ pub(crate) fn insert_revision_in_tx(
     input: CreateRevisionInput,
     parent_id: &str,
     root: &Task,
+    actor: &str,
 ) -> Result<Task> {
     let id = next_id("task");
     let now = now_string();
@@ -1549,10 +1566,10 @@ pub(crate) fn insert_revision_in_tx(
         bail!("revision description must be non-empty");
     }
     let priority = normalize_priority(input.priority.as_deref())?;
-    // A revision is minted by the engine (CI fix, merge conflict, PR
-    // review) or filed over RPC with no resolved caller tier, and it must
-    // never inherit its parent's `critical` either — so it is created at
-    // an ordinary level and a human raises it afterwards if they mean it.
+    // Revisions start at an ordinary priority, whether minted by the
+    // engine or filed over RPC. They must not inherit a parent's critical
+    // priority; a human can raise them afterwards. The caller actor is
+    // preserved below for provenance, not for create-time priority policy.
     if super::critical_priority::is_critical(&priority) {
         bail!(
             "a revision cannot be created at priority `critical`; create it at a lower level and \
@@ -1611,7 +1628,10 @@ pub(crate) fn insert_revision_in_tx(
         .map(str::to_owned)
         .unwrap_or_else(|| revision_name_from_description(&description));
     let autostart_value: i64 = if input.autostart { 1 } else { 0 };
-    conn.execute(
+    crate::work::task_status_audit::execute(
+        conn,
+        "insert_revision_in_tx",
+        actor,
         "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, \
          pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, \
          effort_level, model_override, reasoning, driver, short_id, parent_task_id, repo_remote_url, effort_matched_rule, effort_reasons) \
@@ -1681,7 +1701,10 @@ pub(crate) fn insert_design_task_for_project_in_tx(
     let autostart_value: i64 = if autostart { 1 } else { 0 };
     let name = format!("Design {project_name}");
     let short_id = allocate_short_id(conn, product_id)?;
-    conn.execute(
+    crate::work::task_status_audit::execute(
+        conn,
+        "insert_design_task_for_project_in_tx",
+        "engine",
         "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, short_id, design_reasoning_effort_xhigh)
          VALUES (?1, ?2, ?3, 'design', ?7, ?10, 'todo', 0, NULL, NULL, ?4, ?4, ?5, 'medium', ?6, ?8, ?9)",
         params![

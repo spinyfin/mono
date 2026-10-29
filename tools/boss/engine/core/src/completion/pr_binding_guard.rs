@@ -128,7 +128,10 @@ impl WorkerCompletionHandler {
             "foreign-PR guard: refusing to bind a PR that belongs to another work item",
         );
         self.staged_pr_urls.forget(&execution.id);
-        if !self.finalize_worker_failure(execution, &detail).await {
+        if !self
+            .finalize_worker_failure(execution, &detail, crate::work::WorkerFailureBasis::ForeignPrBinding)
+            .await
+        {
             return StopOutcome::DbError;
         }
         if let Err(err) = self

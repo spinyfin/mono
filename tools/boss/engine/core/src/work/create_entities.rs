@@ -289,10 +289,20 @@ impl WorkDb {
     /// DB state alone cannot distinguish open from closed-unmerged. Pass
     /// `&GhPrStateChecker` in production; pass `&FakePrStateChecker` in tests.
     pub fn create_revision(&self, input: CreateRevisionInput, pr_checker: &dyn PrStateChecker) -> Result<Task> {
+        self.create_revision_as_actor(input, pr_checker, boss_protocol::LAST_STATUS_ACTOR_ENGINE)
+    }
+
+    /// Preserve the resolved caller in the ledger, including manual-start holds.
+    pub fn create_revision_as_actor(
+        &self,
+        input: CreateRevisionInput,
+        pr_checker: &dyn PrStateChecker,
+        actor: &str,
+    ) -> Result<Task> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut pending = PendingEvents::new();
-        let task = assert_parent_revisable_and_insert(&mut pending, &tx, input, pr_checker)?;
+        let task = assert_parent_revisable_and_insert_as_actor(&mut pending, &tx, input, pr_checker, actor)?;
         commit_and_publish(tx, pending, self.event_bus())?;
         Ok(task)
     }

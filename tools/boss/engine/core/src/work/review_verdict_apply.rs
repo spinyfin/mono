@@ -767,7 +767,10 @@ impl WorkDb {
         let now = now_string();
         {
             let conn = self.connect()?;
-            conn.execute(
+            crate::work::task_status_audit::execute(
+                &conn,
+                "hold_cycle_root_for_deletion_signoff",
+                "engine",
                 "UPDATE tasks
                  SET status             = 'blocked',
                      blocked_reason     = ?3,
@@ -888,7 +891,10 @@ fn advance_cycle_root_to_in_review_in_tx(
     if blocked_reason.as_deref() == Some(super::pr_flow::DELETION_SIGNOFF_BLOCKED_REASON) {
         return Ok(());
     }
-    let changed = tx.execute(
+    let changed = crate::work::task_status_audit::execute(
+        tx,
+        "advance_cycle_root_to_in_review_in_tx",
+        "engine",
         "UPDATE tasks
          SET status            = 'in_review',
              updated_at        = ?2,

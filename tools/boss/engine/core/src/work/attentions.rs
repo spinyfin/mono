@@ -831,7 +831,10 @@ fn insert_seeded_design_task_in_tx(
     let now = now_string();
     let ordinal = next_task_ordinal(conn, project_id)?;
     let short_id = allocate_short_id(conn, product_id)?;
-    conn.execute(
+    crate::work::task_status_audit::execute(
+        conn,
+        "insert_seeded_design_task_in_tx",
+        "engine",
         "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, \
          pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, short_id) \
          VALUES (?1, ?2, ?3, 'design', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, 1, 'medium', ?8, ?9)",
