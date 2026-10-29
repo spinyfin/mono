@@ -776,6 +776,7 @@ pub(crate) mod queue_ci_evidence;
 mod review_badge;
 mod review_batches;
 mod review_findings_followup;
+mod review_guide_context;
 mod review_guide_findings;
 mod review_guide_jobs;
 mod review_guide_sources;
