@@ -2085,7 +2085,7 @@ fn guide_comment_revision_directive_injects_guide_instructions() {
 }
 
 #[test]
-fn revision_directive_routes_blocking_pr_work_to_prerequisite_and_later_work_to_followup() {
+fn revision_prerequisite_route_requires_run_done_seam() {
     let work_item = revision_task_with_created_via(None, "operator");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
@@ -2095,12 +2095,28 @@ fn revision_directive_routes_blocking_pr_work_to_prerequisite_and_later_work_to_
             .pr_template_set(&crate::pr_template::PrTemplateSet::default())
             .build(),
     );
+    assert!(!prompt.contains("--answer-type create-prerequisite-task"));
+    assert!(prompt.contains("report the dependency using the blocker channel"));
+}
+
+#[test]
+fn revision_directive_routes_blocking_pr_work_to_prerequisite_and_later_work_to_followup() {
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .run_done_proposals_seam_enabled(true)
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
     assert!(
         prompt.contains("A revision never opens a new PR"),
         "revision prompt must state a revision never opens a new PR:\n{prompt}",
     );
     assert!(
-        prompt.contains("\"$BOSS_BIN\" propose done --outcome blocked --answer-type create-prerequisite-task")
+        prompt.contains("\"$BOSS_BIN\" propose done --outcome blocked --summary \"<blocker>\" --answer-type create-prerequisite-task")
             && prompt.contains("--prerequisite-name")
             && prompt.contains("--prerequisite-brief"),
         "revision prompt must route a PR that must land first to create-prerequisite-task:\n{prompt}",

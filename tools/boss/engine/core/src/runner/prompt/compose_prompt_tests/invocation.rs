@@ -237,7 +237,7 @@ fn run_done_seam_on_worker_signal_seam_off_teaches_summary_not_blocked_verb() {
     assert!(prompt.contains("Yes appends authorization and restarts in the preserved workspace"));
     assert!(prompt.contains("No leaves the task blocked."));
     assert!(
-        prompt.contains("--answer-type create-prerequisite-task --prerequisite-name"),
+        prompt.contains("--summary \"<blocker>\" --answer-type create-prerequisite-task --prerequisite-name"),
         "blocked guidance must teach the prerequisite-task question type:\n{prompt}",
     );
     assert!(prompt.contains("The description must stand alone"));

@@ -381,6 +381,14 @@ fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir
     } else {
         String::new()
     };
+    // Only teach declarations when their completion seam is enabled.
+    let revision_prerequisite_guidance = if input.run_done_proposals_seam_enabled {
+        format!(
+            "Work that must land in another PR before this revision can finish goes through `{boss} propose done --outcome blocked --summary \"<blocker>\" --answer-type create-prerequisite-task --prerequisite-name \"<short task name>\" --prerequisite-brief \"<self-contained description>\" --explanation \"<Context, Yes, No, Recommendation, and optional Details>\"`; the revision waits for it and is redispatched once it is done."
+        )
+    } else {
+        "If another PR must land first, report the dependency using the blocker channel below.".into()
+    };
     let revision_blocked_sentence = if input.worker_signal_proposals_seam_enabled {
         format!(
             "If a guard, policy, or decision blocks progress, use `{boss} propose blocked --reason \"<specific question>\"` instead of declaring you could not complete."
@@ -439,7 +447,7 @@ fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir
          \n\
          ## Revisions\n\
          \n\
-         A revision never opens a new PR. Push in-scope commits to the existing parent PR with `{cube} pr update`. Work that must land in another PR before this revision can finish goes through `{boss} propose done --outcome blocked --answer-type create-prerequisite-task --prerequisite-name \"<short task name>\" --prerequisite-brief \"<self-contained description>\" --explanation \"<Context, Yes, No, Recommendation, and optional Details>\"`; the revision waits for it and is redispatched once it is done. `{boss} propose followup-task --name \"<short title>\" --description \"<one paragraph of scope>\" --rationale \"<why a separate PR>\"` is only for non-blocking work that can happen later. Finish the in-scope work on the parent PR. {revision_blocked_sentence}\n\
+         A revision never opens a new PR. Push in-scope commits to the existing parent PR with `{cube} pr update`. {revision_prerequisite_guidance} `{boss} propose followup-task --name \"<short title>\" --description \"<one paragraph of scope>\" --rationale \"<why a separate PR>\"` is only for non-blocking work that can happen later. Finish the in-scope work on the parent PR. {revision_blocked_sentence}\n\
          \n\
          ## Checking your own PR's state\n\
          \n\

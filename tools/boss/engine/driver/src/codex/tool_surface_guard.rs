@@ -89,11 +89,11 @@ MCP_BLOCK = (
     "`cube pr update` for pull requests, `jj` for VCS. If you are a "
     "revision: never open a new PR; push in-scope work with "
     "`\"$CUBE_BIN\" pr update`. If another PR must land before this "
-    "revision can finish, run `\"$BOSS_BIN\" propose done --outcome blocked "
-    "--answer-type create-prerequisite-task --prerequisite-name \"<short "
+    "revision can finish and your instructions enable completion declarations, run `\"$BOSS_BIN\" propose done --outcome blocked "
+    "--summary \"<blocker>\" --answer-type create-prerequisite-task --prerequisite-name \"<short "
     "task name>\" --prerequisite-brief \"<self-contained description>\" "
     "--explanation \"<Context, Yes, No, Recommendation, and optional "
-    "Details>\"`; `\"$BOSS_BIN\" propose followup-task --name \"<short "
+    "Details>\"`; otherwise report the dependency using the blocker channel in your instructions. `\"$BOSS_BIN\" propose followup-task --name \"<short "
     "title>\" --description \"<one paragraph of scope>\" --rationale "
     "\"<why a separate PR>\"` is only for non-blocking work that can happen "
     "later; finish the in-scope work."
@@ -360,7 +360,9 @@ mod tests {
             "reason must redirect to cube: {reason}"
         );
         assert!(
-            reason.contains("--answer-type create-prerequisite-task")
+            reason.contains("--summary \"<blocker>\" --answer-type create-prerequisite-task")
+                && reason.contains("instructions enable completion declarations")
+                && reason.contains("otherwise report the dependency")
                 && reason.contains("propose followup-task --name"),
             "reason must name create-prerequisite-task for a PR that must land first: {reason}"
         );

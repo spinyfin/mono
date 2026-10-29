@@ -192,6 +192,8 @@ fn pr_redirect_revision_reason_routes_blocking_work_to_prerequisite_and_later_wo
     assert!(
         reason.contains("BOSS_BIN")
             && reason.contains("propose done --outcome blocked")
+            && reason.contains("--summary")
+            && reason.contains("Otherwise report the dependency")
             && reason.contains("--answer-type create-prerequisite-task")
             && reason.contains("--prerequisite-name")
             && reason.contains("--prerequisite-brief")

@@ -216,6 +216,8 @@ fn guard_block_message_routes_blocking_pr_to_prerequisite_and_later_work_to_foll
     assert!(
         reason.contains("BOSS_BIN")
             && reason.contains("propose done --outcome blocked")
+            && reason.contains("--summary")
+            && reason.contains("Otherwise report the dependency")
             && reason.contains("--answer-type create-prerequisite-task")
             && reason.contains("--prerequisite-name")
             && reason.contains("--prerequisite-brief")

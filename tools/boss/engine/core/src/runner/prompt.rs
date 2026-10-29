@@ -1783,14 +1783,14 @@ fn compose_revision_directive(
     out.push_str(&format!(
         "- A revision never opens a new PR. Do NOT run `gh pr create` or `{cube} pr create`. Push in-scope commits to the existing parent PR with `{cube} pr update --branch <parent-branch-name>`.\n"
     ));
-    // Named even when `followup_proposals_seam` is off: the revision PR
-    // guard always prints this invocation, SubmitProposal accepts the
-    // kind regardless of the scrape-vs-proposal read-path flag, and a
-    // revision that needs a separate PR must not be left with only "do
-    // not open a PR".
-    out.push_str(
-        "- Work that must land in another PR before this revision can finish goes through `\"$BOSS_BIN\" propose done --outcome blocked --answer-type create-prerequisite-task --prerequisite-name \"<short task name>\" --prerequisite-brief \"<self-contained description>\" --explanation \"<Context, Yes, No, Recommendation, and optional Details>\"`; the revision waits for it and is redispatched once it is done. `\"$BOSS_BIN\" propose followup-task --name \"<short title>\" --description \"<one paragraph of scope>\" --rationale \"<why a separate PR>\"` is only for non-blocking work that can happen later. Finish the in-scope work on this parent PR. Do not declare you could not complete.\n",
+    // Stored questions do not finalize the worker with the completion seam off.
+    if run_done_proposals_seam_enabled {
+        out.push_str(
+        "- Work that must land in another PR before this revision can finish goes through `\"$BOSS_BIN\" propose done --outcome blocked --summary \"<blocker>\" --answer-type create-prerequisite-task --prerequisite-name \"<short task name>\" --prerequisite-brief \"<self-contained description>\" --explanation \"<Context, Yes, No, Recommendation, and optional Details>\"`; the revision waits for it and is redispatched once it is done. `\"$BOSS_BIN\" propose followup-task --name \"<short title>\" --description \"<one paragraph of scope>\" --rationale \"<why a separate PR>\"` is only for non-blocking work that can happen later. Finish the in-scope work on this parent PR. Do not declare you could not complete.\n",
     );
+    } else {
+        out.push_str("- If another PR must land first, report the dependency using the blocker channel taught below. Use followup-task only for non-blocking work that can happen later. Finish the in-scope work on the parent PR.\n");
+    }
     if worker_signal_proposals_seam_enabled {
         out.push_str(
             "- If a guard, policy, or decision blocks progress, use `\"$BOSS_BIN\" propose blocked --reason \"<specific question>\"` instead of declaring you could not complete.\n",
