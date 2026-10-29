@@ -260,6 +260,14 @@ pub(super) fn all() -> Vec<Migration> {
             legacy_version: None,
             apply: task_status_audit::migrate,
         },
+        Migration {
+            id: "20261029_0735_work_executions_item_kind_status_finished_idx".into(),
+            legacy_version: None,
+            apply: |conn| {
+                conn.execute_batch(WORK_EXECUTIONS_ITEM_KIND_STATUS_FINISHED_INDEX)?;
+                Ok(())
+            },
+        },
     ]);
     migrations
 }

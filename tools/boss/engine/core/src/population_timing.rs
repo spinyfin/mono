@@ -100,6 +100,12 @@ pub mod segment {
     pub const DB_AI_REVIEWING: &str = "db.ai_reviewing";
     /// Batched `IN (...)` query for the resolved AI-review-state badge.
     pub const DB_AI_REVIEW_STATE: &str = "db.ai_review_state";
+    /// Family-key read that probes the review cache (`read_family_keys`).
+    pub const DB_AI_REVIEW_STATE_FAMILY_KEYS: &str = "db.ai_review_state.family_keys";
+    /// Current-head verdict query (`fetch_current_heads`).
+    pub const DB_AI_REVIEW_STATE_CURRENT_HEADS: &str = "db.ai_review_state.current_heads";
+    /// Badge-history query (`fetch_badge_histories`).
+    pub const DB_AI_REVIEW_STATE_BADGE_HISTORIES: &str = "db.ai_review_state.badge_histories";
     /// Batched `IN (...)` query for the screenshot-viewer card affordance.
     pub const DB_HAS_ATTACHMENTS: &str = "db.has_attachments";
     /// Batched `IN (...)` query for the PR review-guide card affordance.
@@ -155,6 +161,15 @@ pub struct EnginePopulationRecord {
     /// app-side `items` field).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub items: Option<i64>,
+    /// Review-cache hits for `db.ai_review_state` (owners served from cache).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_hits: Option<i64>,
+    /// Review-cache misses for `db.ai_review_state` (owners recomputed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_misses: Option<i64>,
+    /// Distinct PR owners resolved in `db.ai_review_state`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owners: Option<i64>,
 }
 
 impl boss_engine_day_rotated_log::TimestampedRecord for EnginePopulationRecord {
@@ -174,6 +189,9 @@ struct PendingSegment {
     rows: Option<i64>,
     db_queries: Option<i64>,
     payload_bytes: Option<i64>,
+    cache_hits: Option<i64>,
+    cache_misses: Option<i64>,
+    owners: Option<i64>,
 }
 
 /// Per-fetch correlation shared by every segment of one trace: the ids and
@@ -271,6 +289,34 @@ impl PopulationTrace {
         self.push(segment, duration_ms, Some(rows as i64), Some(db_queries as i64), None);
     }
 
+    /// Record the AI-review-state attach: cards, statements, cache traffic,
+    /// and the owner cardinality of the lookup.
+    pub fn record_ai_review_state(
+        &mut self,
+        duration_ms: f64,
+        cards: usize,
+        db_queries: u64,
+        cache_hits: u64,
+        cache_misses: u64,
+        owners: usize,
+    ) {
+        if !self.is_enabled() {
+            return;
+        }
+        self.segments.push(
+            PendingSegment::builder()
+                .ts_epoch_ms(boss_engine_day_rotated_log::now_ms())
+                .segment(segment::DB_AI_REVIEW_STATE)
+                .duration_ms(duration_ms)
+                .rows(cards as i64)
+                .db_queries(db_queries as i64)
+                .cache_hits(cache_hits as i64)
+                .cache_misses(cache_misses as i64)
+                .owners(owners as i64)
+                .build(),
+        );
+    }
+
     /// Record the serialize segment, carrying the payload size.
     pub fn record_serialize(&mut self, duration_ms: f64, payload_bytes: usize) {
         self.push(segment::SERIALIZE, duration_ms, None, None, Some(payload_bytes as i64));
@@ -348,6 +394,9 @@ impl PopulationTrace {
                     .maybe_rows(seg.rows)
                     .maybe_db_queries(seg.db_queries)
                     .maybe_payload_bytes(seg.payload_bytes)
+                    .maybe_cache_hits(seg.cache_hits)
+                    .maybe_cache_misses(seg.cache_misses)
+                    .maybe_owners(seg.owners)
                     .maybe_items(self.ctx.items)
                     .build(),
             );
@@ -365,6 +414,13 @@ impl PopulationTrace {
             .iter()
             .find(|s| s.segment == name)
             .map(|s| (s.duration_ms, s.rows, s.db_queries))
+    }
+
+    pub(crate) fn segment_review_counts(&self, name: &str) -> Option<(Option<i64>, Option<i64>, Option<i64>)> {
+        self.segments
+            .iter()
+            .find(|s| s.segment == name)
+            .map(|s| (s.cache_hits, s.cache_misses, s.owners))
     }
 
     pub(crate) fn request_id(&self) -> &str {
@@ -590,6 +646,9 @@ mod tests {
             db_queries: Some(4200),
             payload_bytes: None,
             items: Some(1949),
+            cache_hits: None,
+            cache_misses: None,
+            owners: None,
         };
         let json: serde_json::Value = serde_json::to_value(&rec).unwrap();
         assert_eq!(json["segment"], "db.task_runtimes");
@@ -613,6 +672,9 @@ mod tests {
             db_queries: None,
             payload_bytes: None,
             items: None,
+            cache_hits: None,
+            cache_misses: None,
+            owners: None,
         };
         let json: serde_json::Value = serde_json::to_value(&rec).unwrap();
         assert!(json.get("fetch_seq").is_none());
@@ -620,6 +682,39 @@ mod tests {
         assert!(json.get("db_queries").is_none());
         assert!(json.get("items").is_none());
         assert_eq!(json["request_id"], "req-1");
+    }
+
+    #[test]
+    fn ai_review_state_record_includes_cache_and_owner_counts() {
+        let mut trace = PopulationTrace::new("prod-1", "req-1", None, Instant::now());
+        trace.record_ai_review_state(12.5, 80, 4, 10, 20, 30);
+        assert_eq!(
+            trace.segment_counts(segment::DB_AI_REVIEW_STATE),
+            Some((12.5, Some(80), Some(4)))
+        );
+        assert_eq!(
+            trace.segment_review_counts(segment::DB_AI_REVIEW_STATE),
+            Some((Some(10), Some(20), Some(30)))
+        );
+        let rec = EnginePopulationRecord {
+            ts_epoch_ms: 1,
+            product_id: "prod-1".to_owned(),
+            request_id: "req-1".to_owned(),
+            fetch_seq: None,
+            segment: segment::DB_AI_REVIEW_STATE,
+            duration_ms: 12.5,
+            rows: Some(80),
+            db_queries: Some(4),
+            payload_bytes: None,
+            items: None,
+            cache_hits: Some(10),
+            cache_misses: Some(20),
+            owners: Some(30),
+        };
+        let json: serde_json::Value = serde_json::to_value(&rec).unwrap();
+        assert_eq!(json["cache_hits"], 10);
+        assert_eq!(json["cache_misses"], 20);
+        assert_eq!(json["owners"], 30);
     }
 
     #[tokio::test]
@@ -638,6 +733,9 @@ mod tests {
             db_queries: None,
             payload_bytes: None,
             items: Some(1949),
+            cache_hits: None,
+            cache_misses: None,
+            owners: None,
         });
 
         // Let the background task flush.
