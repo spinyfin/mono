@@ -7,9 +7,8 @@
 //! `planner_runs.id`, and wires the dependency edges. It is the *only* thing
 //! in the auto-populate flow that writes task rows.
 //!
-//! See `tools/boss/docs/designs/auto-populate-project-tasks-on-design-pr-merge.md`
-//! (project P783) §3 "The deterministic materializer (apply)". This module is
-//! task 5 of that design.
+//! See `tools/boss/docs/designs/auto-populate-project-tasks-on-design-pr-merge.md`,
+//! section 3, "The deterministic materializer (apply)".
 //!
 //! ## Reuses the existing write paths — never a parallel creation path
 //!
