@@ -60,7 +60,7 @@ final class EngineClient: @unchecked Sendable {
         "unpopulate_project", "answer_attention", "dismiss_attention",
         "comments_create", "comments_set_status", "comments_set_intent",
         "comments_dismiss", "comments_post_followup", "comments_update_anchor",
-        "set_setting", "set_feature_flag", "set_dispatch_paused", "set_live_status_enabled",
+        "set_setting", "set_feature_flag", "set_dispatch_paused",
         "set_driver_traffic_split", "set_offsite_backup", "set_product_editorial_rules",
         "set_product_external_tracker", "set_product_merge_mechanism", "set_host_enabled",
         "add_host", "remove_host", "add_host_tag", "remove_host_tag",
@@ -1056,14 +1056,6 @@ final class EngineClient: @unchecked Sendable {
             let rawSections = payload["doing_sections"] as? [String: String] ?? [:]
             let sections = rawSections.compactMapValues(DoingSection.init(rawValue:))
             emit(.workerLiveStatesList(states: states, doingSections: sections))
-        case "live_status_disabled_slots_list":
-            let raw = payload["slot_ids"] as? [Any] ?? []
-            let slotIds = raw.compactMap { ($0 as? NSNumber)?.intValue }
-            emit(.liveStatusDisabledSlotsList(slotIds: slotIds))
-        case "live_status_enabled_set":
-            let slotId = (payload["slot_id"] as? NSNumber)?.intValue ?? 0
-            let enabled = (payload["enabled"] as? NSNumber)?.boolValue ?? false
-            emit(.liveStatusEnabledSet(slotId: slotId, enabled: enabled))
         case "project_design_doc_resolved":
             guard let outputPayload = payload["output"] as? [String: Any],
                   let outputData = try? JSONSerialization.data(withJSONObject: outputPayload),

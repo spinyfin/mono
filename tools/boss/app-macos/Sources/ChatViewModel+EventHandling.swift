@@ -338,14 +338,6 @@ extension ChatViewModel {
                 cachedSectionsByColumn[.doing] = nil
                 doingSectionsByID = doingSections
             }
-        case .liveStatusDisabledSlotsList(let slotIds):
-            liveStatusDisabledSlotIDs = Set(slotIds)
-        case .liveStatusEnabledSet(let slotId, let enabled):
-            if enabled {
-                liveStatusDisabledSlotIDs.remove(slotId)
-            } else {
-                liveStatusDisabledSlotIDs.insert(slotId)
-            }
         case .featureFlagsList(let flags):
             featureFlags = flags
         case .featureFlagSet(let name, let enabled):

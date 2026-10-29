@@ -140,7 +140,7 @@ final class WorkFetchOwnershipTests: XCTestCase {
         XCTAssertEqual(trees.count, 1)
         XCTAssertEqual(trees.first?["delta"] as? Bool, true)
         for verb in ["subscribe", "register_app_session", "register_capabilities", "list_products",
-                     "list_worker_live_states", "list_live_status_disabled_slots", "get_engine_health",
+                     "list_worker_live_states", "get_engine_health",
                      "get_settings", "get_offsite_backup", "git_hub_auth_status"] {
             XCTAssertEqual(verbs.filter { $0 == verb }.count, 1, verb)
         }

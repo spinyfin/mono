@@ -92,14 +92,6 @@ enum EngineEvent {
     /// `list_worker_live_states` and as a topic push on
     /// `worker.live_states` whenever any slot changes.
     case workerLiveStatesList(states: [WorkerLiveState], doingSections: [String: DoingSection] = [:])
-    /// Snapshot of slot ids whose live-status summarizer has been
-    /// manually disabled by the human. Sourced from a one-shot reply
-    /// to `list_live_status_disabled_slots`.
-    case liveStatusDisabledSlotsList(slotIds: [Int])
-    /// Echoed result of a `set_live_status_enabled` toggle. The UI
-    /// uses this to confirm the engine accepted the change before
-    /// flipping local state.
-    case liveStatusEnabledSet(slotId: Int, enabled: Bool)
     /// Engine reply to a `ResolveProjectDesignDoc` RPC. Carries the
     /// per-project `ProjectDesignDocState` the kanban consumes to
     /// pick the right icon affordance and open dispatch.

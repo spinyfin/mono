@@ -487,13 +487,6 @@ final class ChatViewModel: ObservableObject {
     /// not for every tool/activity event in the high-rate live worker feed.
     @Published var doingSectionsByID: [String: DoingSection] = [:]
 
-    /// Slot ids whose live-status summarizer has been manually
-    /// disabled by the human via the Agents-tab toggle. Sourced from
-    /// `list_live_status_disabled_slots` at session start and kept
-    /// in sync via `live_status_enabled_set` echoes. Persisted on
-    /// the engine side so this is purely a UI mirror.
-    @Published var liveStatusDisabledSlotIDs: Set<Int> = []
-
     /// Per-installation settings snapshot, sourced from `get_settings`
     /// on Settings window open and kept in sync via `setting_set`
     /// echoes after every toggle. Empty until the Settings window is

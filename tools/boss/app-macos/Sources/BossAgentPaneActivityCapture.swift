@@ -66,15 +66,13 @@ enum BossAgentPaneActivityCapture {
                 taskTitle: nil
             ),
             liveState: live,
-            liveStatusDisabledSlotIDs: [],
             cachedPersona: nil
         )
         return VStack(alignment: .leading, spacing: 10) {
             Text(title).font(.headline)
             WorkerSlotView(
                 runtime: GhosttyRuntime.shared,
-                snapshot: snapshot,
-                onToggleLiveStatus: { _ in }
+                snapshot: snapshot
             )
             .frame(height: 220)
             .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))

@@ -395,14 +395,12 @@ extension AgentsGridModel {
     func renderSnapshot(
         runId: String,
         workspace: WorkersWorkspaceModel,
-        liveStates: LiveWorkerStateStore,
-        liveStatusDisabledSlotIDs: Set<Int>
+        liveStates: LiveWorkerStateStore
     ) -> WorkerSlotSnapshot {
         WorkerSlotSnapshot.render(
             runId: runId,
             viewer: workspace.viewersByRunId[runId],
             liveState: liveStates.byRunID[runId],
-            liveStatusDisabledSlotIDs: liveStatusDisabledSlotIDs,
             cachedPersona: personaName(for: runId),
             viewerAttachFailure: workspace.viewerAttachFailuresByRunId[runId]
         )

@@ -50,23 +50,4 @@ extension ChatViewModel {
         }
         engine.sendExecutionTranscript(executionId: executionId)
     }
-
-    /// Toggle the live-status summarizer for `slotId`. Sends the
-    /// RPC and optimistically updates local state; the engine echo
-    /// brings the two back in sync.
-    func setLiveStatusEnabled(slotId: Int, enabled: Bool) {
-        if enabled {
-            liveStatusDisabledSlotIDs.remove(slotId)
-        } else {
-            liveStatusDisabledSlotIDs.insert(slotId)
-        }
-        engine.sendSetLiveStatusEnabled(slotId: slotId, enabled: enabled)
-    }
-
-    /// `true` if the live-status summarizer is currently enabled for
-    /// `slotId`. Defaults to enabled — the disabled set is the
-    /// minority case.
-    func isLiveStatusEnabled(slotId: Int) -> Bool {
-        !liveStatusDisabledSlotIDs.contains(slotId)
-    }
 }

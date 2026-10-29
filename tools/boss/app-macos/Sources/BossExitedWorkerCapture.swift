@@ -19,10 +19,10 @@ enum BossExitedWorkerCapture {
         )
         let snapshot = WorkerSlotSnapshot(
             slotId: 4, runId: live.runId, summary: "working", taskTitle: "Fix worker liveness",
-            session: nil, liveStatusEnabled: true, live: WorkerSlotLiveSlice(live),
+            session: nil, live: WorkerSlotLiveSlice(live),
             isPlaceholder: false, cachedPersona: nil, viewerAttachFailure: nil
         )
-        let view = WorkerSlotView(runtime: .shared, snapshot: snapshot, onToggleLiveStatus: { _ in })
+        let view = WorkerSlotView(runtime: .shared, snapshot: snapshot)
             .frame(width: 600, height: 400)
         let captureWindow = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),

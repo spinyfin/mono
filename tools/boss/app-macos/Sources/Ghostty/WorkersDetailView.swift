@@ -24,8 +24,6 @@ struct WorkersDetailView: View, @MainActor Equatable {
     @ObservedObject var workspace: WorkersWorkspaceModel
     @ObservedObject var liveStates: LiveWorkerStateStore
     let isVisible: Bool
-    let liveStatusDisabledSlotIDs: Set<Int>
-    let onToggleLiveStatus: (Int, Bool) -> Void
     let onRevealWorkItem: (String, String) -> Void
 
     @StateObject private var grid = AgentsGridModel()
@@ -35,15 +33,11 @@ struct WorkersDetailView: View, @MainActor Equatable {
         workspace: WorkersWorkspaceModel,
         liveStates: LiveWorkerStateStore,
         isVisible: Bool,
-        liveStatusDisabledSlotIDs: Set<Int>,
-        onToggleLiveStatus: @escaping (Int, Bool) -> Void,
         onRevealWorkItem: @escaping (String, String) -> Void = { _, _ in }
     ) {
         self.workspace = workspace
         self.liveStates = liveStates
         self.isVisible = isVisible
-        self.liveStatusDisabledSlotIDs = liveStatusDisabledSlotIDs
-        self.onToggleLiveStatus = onToggleLiveStatus
         self.onRevealWorkItem = onRevealWorkItem
     }
 
@@ -51,7 +45,6 @@ struct WorkersDetailView: View, @MainActor Equatable {
         lhs.workspace === rhs.workspace
             && lhs.liveStates === rhs.liveStates
             && lhs.isVisible == rhs.isVisible
-            && lhs.liveStatusDisabledSlotIDs == rhs.liveStatusDisabledSlotIDs
     }
 
     var body: some View {
@@ -73,7 +66,6 @@ struct WorkersDetailView: View, @MainActor Equatable {
         .onChange(of: workspace.interactivePoolSize) { _, _ in syncGrid() }
         .onChange(of: workspace.automationPoolSize) { _, _ in syncGrid() }
         .onChange(of: workspace.reviewSlotCount) { _, _ in syncGrid() }
-        .onChange(of: liveStatusDisabledSlotIDs) { _, _ in syncGrid() }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willStartLiveResizeNotification)) { _ in
             grid.liveResizeWillStart()
         }
@@ -99,9 +91,6 @@ struct WorkersDetailView: View, @MainActor Equatable {
                         isHighlighted: grid.highlightedRunId == runId,
                         focusCoordinator: workspace.agentFocus,
                         focusRunId: runId,
-                        onToggleLiveStatus: { enabled in
-                            onToggleLiveStatus(snapshot.slotId, enabled)
-                        },
                         onRevealWorkItem: onRevealWorkItem
                     )
                     .equatable()
@@ -119,8 +108,7 @@ struct WorkersDetailView: View, @MainActor Equatable {
         grid.renderSnapshot(
             runId: runId,
             workspace: workspace,
-            liveStates: liveStates,
-            liveStatusDisabledSlotIDs: liveStatusDisabledSlotIDs
+            liveStates: liveStates
         )
     }
 
@@ -237,7 +225,6 @@ struct WorkerSlotView: View, @MainActor Equatable {
     var isHighlighted = false
     var focusCoordinator: AgentFocusCoordinator?
     var focusRunId: String?
-    let onToggleLiveStatus: (Bool) -> Void
     var onRevealWorkItem: ((String, String) -> Void)? = nil
 
     static func == (lhs: Self, rhs: Self) -> Bool {
@@ -386,10 +373,6 @@ struct WorkerSlotView: View, @MainActor Equatable {
             } else if let session = snapshot.session {
                 WorkerSlotFallbackMonitorPill(session: session)
             }
-
-            if snapshot.showsLiveStatusToggle {
-                liveStatusToggle
-            }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, snapshot.headerWorkLinks == nil ? 6 : 4)
@@ -436,31 +419,6 @@ struct WorkerSlotView: View, @MainActor Equatable {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    /// Tiny eye-icon toggle in the slot header that disables the
-    /// live-status summarizer for this slot. Off = engine stops
-    /// summarising and the UI falls back to pane_summary. Persisted
-    /// across engine restarts; the engine echoes the new state back
-    /// so reads via subscribe stay in sync. Tooltip explains the
-    /// trade-off so a curious user understands what the icon does.
-    @ViewBuilder
-    private var liveStatusToggle: some View {
-        let enabled = snapshot.liveStatusEnabled
-        Button {
-            onToggleLiveStatus(!enabled)
-        } label: {
-            Image(systemName: enabled ? "eye" : "eye.slash")
-                .font(.caption2)
-                .foregroundStyle(enabled ? Color.secondary : Color(nsColor: .tertiaryLabelColor))
-        }
-        .buttonStyle(.plain)
-        .help(
-            enabled
-                ? "Live status on — engine summarises this worker's transcript."
-                : "Live status off — falls back to the static pane summary."
-        )
-        .accessibilityLabel(enabled ? "Disable live status" : "Enable live status")
     }
 
     private func liveActivityColor(_ live: WorkerSlotLiveSlice?) -> Color {

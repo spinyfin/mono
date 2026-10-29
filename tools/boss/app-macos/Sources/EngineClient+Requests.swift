@@ -12,24 +12,6 @@ extension EngineClient {
         sendLine(["type": "list_worker_live_states"], queueIfDisconnected: true)
     }
 
-    /// Ask the engine for the current set of slot ids that have the
-    /// live-status summarizer disabled. Used at session start so the
-    /// Agents-tab toggle reflects the persisted state.
-    func sendListLiveStatusDisabledSlots() {
-        sendLine(["type": "list_live_status_disabled_slots"], queueIfDisconnected: true)
-    }
-
-    /// Toggle the live-status summarizer for one slot. The engine
-    /// persists the choice in its metadata KV so it survives an
-    /// engine restart.
-    func sendSetLiveStatusEnabled(slotId: Int, enabled: Bool) {
-        sendLine([
-            "type": "set_live_status_enabled",
-            "slot_id": slotId,
-            "enabled": enabled,
-        ])
-    }
-
     /// Report which product the work board's chooser is now set to, so
     /// the engine — not app-local view state — is the system of record
     /// for the current selection. `productId` is nil when nothing is
