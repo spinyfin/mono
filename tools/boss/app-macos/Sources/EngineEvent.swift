@@ -337,16 +337,16 @@ enum EngineEvent {
     /// (rotated, GC'd, or never recorded). `reason` is human-readable and
     /// surfaced as a "transcript unavailable" state, never an error.
     case executionTranscriptUnavailable(executionId: String, reason: String)
-    // MARK: Automation events (maintenance-tasks.md T7)
+    // MARK: Automation events
     /// Response to `list_automations` — all automations for a product.
     /// `openTaskCounts` maps automation id → open-task count, batched inline.
-    case automationsList(productID: String, automations: [AppAutomation], openTaskCounts: [String: Int])
+    case automationsList(productID: String, automations: [AppAutomation], openTaskCounts: [String: Int], lastRuns: [String: AppAutomationRun] = [:])
     /// Response to `create_automation` — the newly created automation.
-    case automationCreated(automation: AppAutomation)
+    case automationCreated(automation: AppAutomation, openTaskCount: Int? = nil, lastRun: AppAutomationRun? = nil)
     /// Response to `get_automation` — a single automation row.
-    case automationResult(automation: AppAutomation)
+    case automationResult(automation: AppAutomation, openTaskCount: Int? = nil, lastRun: AppAutomationRun? = nil)
     /// Response to `update_automation`, `enable_automation`, or `disable_automation`.
-    case automationUpdated(automation: AppAutomation)
+    case automationUpdated(automation: AppAutomation, openTaskCount: Int? = nil, lastRun: AppAutomationRun? = nil)
     /// Response to `delete_automation` — the id of the deleted row.
     case automationDeleted(automationID: String)
     /// Response to `get_automation_open_task_count`.

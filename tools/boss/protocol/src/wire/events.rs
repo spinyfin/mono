@@ -1613,10 +1613,19 @@ pub enum FrontendEvent {
         action: String,
     },
 
-    // --- Automation replies (maintenance-tasks.md T2) ---
+    // --- Automation replies ---
     /// Response to [`FrontendRequest::CreateAutomation`].
     AutomationCreated {
         automation: Automation,
+        /// Current open-task count for the automation, so the app need not follow up with `get_automation_open_task_count`.
+        /// Absent on old engines; the app then keeps what it already has.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        open_task_count: Option<i64>,
+        /// Newest `automation_runs` row (uncollapsed, so `repeat_count` is
+        /// `1`). Lets the app update a row's last-run summary in place
+        /// instead of asking for the whole run history after every push.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_run: Option<AutomationRun>,
     },
     /// Response to [`FrontendRequest::ListAutomations`].
     AutomationsList {
@@ -1627,16 +1636,41 @@ pub enum FrontendEvent {
         /// engines that do not populate this field.
         #[serde(default)]
         open_task_counts: std::collections::HashMap<String, i64>,
+        /// Newest `automation_runs` row keyed by automation id, for the
+        /// automations that have fired. Batched here so the sidebar can show
+        /// each row's last-run summary without the app fetching the whole run
+        /// history of every automation, hidden or not. Absent (empty map) on
+        /// old engines.
+        #[serde(default)]
+        last_runs: std::collections::HashMap<String, AutomationRun>,
     },
     /// Response to [`FrontendRequest::GetAutomation`].
     AutomationResult {
         automation: Automation,
+        /// Current open-task count for the automation, so the app need not follow up with `get_automation_open_task_count`.
+        /// Absent on old engines; the app then keeps what it already has.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        open_task_count: Option<i64>,
+        /// Newest `automation_runs` row (uncollapsed, so `repeat_count` is
+        /// `1`). Lets the app update a row's last-run summary in place
+        /// instead of asking for the whole run history after every push.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_run: Option<AutomationRun>,
     },
     /// Response to [`FrontendRequest::UpdateAutomation`],
     /// [`FrontendRequest::EnableAutomation`], or
     /// [`FrontendRequest::DisableAutomation`].
     AutomationUpdated {
         automation: Automation,
+        /// Current open-task count for the automation, so the app need not follow up with `get_automation_open_task_count`.
+        /// Absent on old engines; the app then keeps what it already has.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        open_task_count: Option<i64>,
+        /// Newest `automation_runs` row (uncollapsed, so `repeat_count` is
+        /// `1`). Lets the app update a row's last-run summary in place
+        /// instead of asking for the whole run history after every push.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_run: Option<AutomationRun>,
     },
     /// Response to [`FrontendRequest::DeleteAutomation`].
     AutomationDeleted {

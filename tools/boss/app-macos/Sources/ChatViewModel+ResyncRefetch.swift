@@ -153,6 +153,7 @@ extension ChatViewModel {
     /// - driver quota: a cached read when a snapshot is loaded or a refresh
     ///   is awaited, so a lost completion push can't leave the pane on
     ///   "Checking…" with Refresh disabled.
+    /// - automations: the list and open history, only while the tab is mounted.
     /// - design docs: the open reader and async-viewer documents, whose
     ///   revalidated bodies arrive as pushes.
     ///
@@ -178,10 +179,11 @@ extension ChatViewModel {
         }
     }
 
-    /// The reads a resync recovers that the connect burst does not send:
-    /// cached driver quota and the open design docs. Their cached state and
-    /// the open reader references survive a disconnect.
+    /// Recover cached driver quota and open design docs, whose state survives
+    /// disconnects, plus the automations list and open history only while its
+    /// tab is mounted. Connect delegates its automation refresh here when owed.
     func sendResyncOnlyReads() {
+        refreshVisibleAutomations()
         if resyncQuotaReadOwed || isRefreshingDriverQuota || !driverQuota.neverChecked {
             engine.sendGetDriverQuotaUsage(refresh: false)
         }

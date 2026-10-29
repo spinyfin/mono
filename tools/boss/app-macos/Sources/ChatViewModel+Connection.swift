@@ -55,6 +55,8 @@ extension ChatViewModel {
         if resyncOnlyReadsOwed {
             resyncOnlyReadsOwed = false
             sendResyncOnlyReads()
+        } else {
+            refreshVisibleAutomations()
         }
     }
 

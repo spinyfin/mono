@@ -51,7 +51,7 @@ pub(crate) use git_utils::repo_slug::short_name_for;
 ///     client,
 ///     FrontendRequest::GetAutomation { id: id.to_owned() },
 ///     "automation show",
-///     FrontendEvent::AutomationResult { automation } => automation,
+///     FrontendEvent::AutomationResult { automation, .. } => automation,
 /// )
 /// ```
 ///

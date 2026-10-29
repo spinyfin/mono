@@ -670,33 +670,34 @@ extension ChatViewModel {
         case .executionTranscriptUnavailable(let executionId, let reason):
             transcriptsByExecutionID[executionId] = .unavailable(reason: reason)
         // MARK: Automation events
-        case .automationsList(let productID, let automations, let openTaskCounts):
+        case .automationsList(let productID, let automations, let openTaskCounts, let lastRuns):
             automationsByProductID[productID] = automations
             automationsFetchStateByProductID[productID] = .loaded
             for (id, count) in openTaskCounts {
                 openTaskCountByAutomationID[id] = count
             }
             for automation in automations {
-                engine.sendListAutomationRuns(automationId: automation.id)
+                latestRunByAutomationID[automation.id] = lastRuns[automation.id]
             }
-        case .automationCreated(let automation):
+        case .automationCreated(let automation, let count, let lastRun):
             upsertAutomation(automation)
+            applyAutomationSummary(automation.id, count: count, lastRun: lastRun)
             selectedAutomationID = automation.id
-            engine.sendGetAutomationOpenTaskCount(automationId: automation.id)
-            engine.sendListAutomationRuns(automationId: automation.id)
-        case .automationResult(let automation):
+        case .automationResult(let automation, let count, let lastRun):
             upsertAutomation(automation)
-            engine.sendListAutomationRuns(automationId: automation.id)
-        case .automationUpdated(let automation):
+            applyAutomationSummary(automation.id, count: count, lastRun: lastRun)
+            refreshVisibleAutomationHistory(automation.id)
+        case .automationUpdated(let automation, let count, let lastRun):
             upsertAutomation(automation)
-            engine.sendGetAutomationOpenTaskCount(automationId: automation.id)
-            engine.sendListAutomationRuns(automationId: automation.id)
+            applyAutomationSummary(automation.id, count: count, lastRun: lastRun)
         case .automationDeleted(let automationID):
             for productID in automationsByProductID.keys {
                 automationsByProductID[productID]?.removeAll { $0.id == automationID }
             }
             openTaskCountByAutomationID.removeValue(forKey: automationID)
             automationRunsByID.removeValue(forKey: automationID)
+            latestRunByAutomationID.removeValue(forKey: automationID)
+            if visibleAutomationHistoryID == automationID { visibleAutomationHistoryID = nil }
         case .automationOpenTaskCount(let automationID, let count):
             openTaskCountByAutomationID[automationID] = count
         case .automationRunsList(let automationID, let runs):

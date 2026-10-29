@@ -52,9 +52,6 @@ extension ChatViewModel {
         if mode == .work && refreshWorkOnEntry {
             refreshWork()
         }
-        if mode == .automations {
-            refreshAutomations()
-        }
     }
 
     func selectWorkProduct(_ productID: String) {

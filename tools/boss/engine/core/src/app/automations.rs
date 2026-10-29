@@ -7,6 +7,59 @@
 
 use super::*;
 
+/// Build the automation reply every push-shaped handler sends: the row plus
+/// its open-task count and newest run, so the app updates the sidebar row in
+/// place rather than following up with `get_automation_open_task_count` and
+/// `list_automation_runs` for every automation that changes. A failed lookup
+/// leaves its field absent (the app keeps what it has) rather than failing a
+/// mutation that already succeeded.
+fn automation_summary(
+    work_db: &WorkDb,
+    automation: &boss_protocol::Automation,
+) -> (Option<i64>, Option<boss_protocol::AutomationRun>) {
+    let open_task_count = work_db
+        .count_open_tasks_for_automation(&automation.id)
+        .inspect_err(
+            |err| tracing::warn!(automation_id = %automation.id, ?err, "automation reply: open-task count unavailable"),
+        )
+        .ok();
+    let last_run = work_db
+        .latest_automation_run(&automation.id)
+        .inspect_err(
+            |err| tracing::warn!(automation_id = %automation.id, ?err, "automation reply: last run unavailable"),
+        )
+        .ok()
+        .flatten();
+    (open_task_count, last_run)
+}
+
+pub(super) fn automation_created_event(work_db: &WorkDb, automation: boss_protocol::Automation) -> FrontendEvent {
+    let (open_task_count, last_run) = automation_summary(work_db, &automation);
+    FrontendEvent::AutomationCreated {
+        automation,
+        open_task_count,
+        last_run,
+    }
+}
+
+pub(super) fn automation_result_event(work_db: &WorkDb, automation: boss_protocol::Automation) -> FrontendEvent {
+    let (open_task_count, last_run) = automation_summary(work_db, &automation);
+    FrontendEvent::AutomationResult {
+        automation,
+        open_task_count,
+        last_run,
+    }
+}
+
+pub(super) fn automation_updated_event(work_db: &WorkDb, automation: boss_protocol::Automation) -> FrontendEvent {
+    let (open_task_count, last_run) = automation_summary(work_db, &automation);
+    FrontendEvent::AutomationUpdated {
+        automation,
+        open_task_count,
+        last_run,
+    }
+}
+
 pub(super) async fn handle_create_automation(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -24,7 +77,7 @@ pub(super) async fn handle_create_automation(ctx: Dispatch, req: FrontendRequest
                 server_state
                     .event_bus
                     .publish(boss_event_bus::Event::AutomationMutation);
-                send_response(&sink, &request_id, FrontendEvent::AutomationCreated { automation });
+                send_response(&sink, &request_id, automation_created_event(&work_db, automation));
             }
             Err(err) => send_work_error(&sink, &request_id, &err),
         }
@@ -46,6 +99,12 @@ pub(super) async fn handle_list_automations(ctx: Dispatch, req: FrontendRequest)
             Ok(rows) => {
                 let open_task_counts = rows.iter().map(|(a, count)| (a.id.clone(), *count)).collect();
                 let automations = rows.into_iter().map(|(a, _)| a).collect();
+                let last_runs = work_db
+                    .latest_automation_runs_for_product(&product_id)
+                    .unwrap_or_else(|err| {
+                        tracing::warn!(%product_id, ?err, "automations_list: last runs unavailable");
+                        Default::default()
+                    });
                 send_response(
                     &sink,
                     &request_id,
@@ -53,6 +112,7 @@ pub(super) async fn handle_list_automations(ctx: Dispatch, req: FrontendRequest)
                         product_id,
                         automations,
                         open_task_counts,
+                        last_runs,
                     },
                 );
             }
@@ -73,7 +133,7 @@ pub(super) async fn handle_get_automation(ctx: Dispatch, req: FrontendRequest) {
     };
     {
         match work_db.get_automation(&id) {
-            Ok(Some(automation)) => send_response(&sink, &request_id, FrontendEvent::AutomationResult { automation }),
+            Ok(Some(automation)) => send_response(&sink, &request_id, automation_result_event(&work_db, automation)),
             Ok(None) => send_response(
                 &sink,
                 &request_id,
@@ -103,7 +163,7 @@ pub(super) async fn handle_update_automation(ctx: Dispatch, req: FrontendRequest
                 server_state
                     .event_bus
                     .publish(boss_event_bus::Event::AutomationMutation);
-                send_response(&sink, &request_id, FrontendEvent::AutomationUpdated { automation })
+                send_response(&sink, &request_id, automation_updated_event(&work_db, automation))
             }
             Err(err) => send_work_error(&sink, &request_id, &err),
         }
@@ -127,7 +187,7 @@ pub(super) async fn handle_enable_automation(ctx: Dispatch, req: FrontendRequest
                 server_state
                     .event_bus
                     .publish(boss_event_bus::Event::AutomationMutation);
-                send_response(&sink, &request_id, FrontendEvent::AutomationUpdated { automation })
+                send_response(&sink, &request_id, automation_updated_event(&work_db, automation))
             }
             Err(err) => send_work_error(&sink, &request_id, &err),
         }
@@ -151,7 +211,7 @@ pub(super) async fn handle_disable_automation(ctx: Dispatch, req: FrontendReques
                 server_state
                     .event_bus
                     .publish(boss_event_bus::Event::AutomationMutation);
-                send_response(&sink, &request_id, FrontendEvent::AutomationUpdated { automation })
+                send_response(&sink, &request_id, automation_updated_event(&work_db, automation))
             }
             Err(err) => send_work_error(&sink, &request_id, &err),
         }
