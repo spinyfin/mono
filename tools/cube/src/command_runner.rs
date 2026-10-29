@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 #[cfg(test)]
@@ -121,13 +121,48 @@ pub struct JjGate {
 }
 
 impl JjGate {
-    /// Fail closed across a killed maintenance process or a partial head update.
+    /// Fail closed across a killed maintenance process or a partial head
+    /// update. Refuses to replace a marker that is already present, so one
+    /// pass can never take over another store's unverified rewrite.
     pub fn quarantine(&self, source: &Path) -> Result<(), CubeError> {
-        fs::write(&self.quarantine, source.display().to_string()).map_err(CubeError::Io)
+        let mut marker = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.quarantine)
+            .map_err(CubeError::Io)?;
+        marker
+            .write_all(source.display().to_string().as_bytes())
+            .map_err(CubeError::Io)
     }
 
-    pub fn clear_quarantine(&self) -> Result<(), CubeError> {
-        fs::remove_file(&self.quarantine).map_err(CubeError::Io)
+    /// Lift the marker, but only when it names `source`, the store whose
+    /// heads were just verified. Another store's marker stays.
+    pub fn clear_quarantine(&self, source: &Path) -> Result<(), CubeError> {
+        match self.quarantine_owner()? {
+            Some(owner) if owner == source.display().to_string() => {
+                fs::remove_file(&self.quarantine).map_err(CubeError::Io)
+            }
+            Some(owner) => Err(CubeError::InvalidArgument(format!(
+                "jj maintenance marker {} names {owner}, not {}; leaving it in place",
+                self.quarantine.display(),
+                source.display()
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// The store the current marker names, if any.
+    pub fn quarantine_owner(&self) -> Result<Option<String>, CubeError> {
+        match fs::read_to_string(&self.quarantine) {
+            Ok(owner) => Ok(Some(owner)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(CubeError::Io(err)),
+        }
+    }
+
+    /// Where the marker for the gate at `lock_path` lives.
+    pub fn quarantine_path(lock_path: &Path) -> PathBuf {
+        lock_path.with_extension("blocked")
     }
 
     /// Take a reader reservation before claiming a workspace or waiting on
@@ -180,7 +215,7 @@ impl JjGate {
             }
             .map_err(io_error)?;
             if got {
-                let quarantine = lock_path.with_extension("blocked");
+                let quarantine = Self::quarantine_path(lock_path);
                 if !exclusive && quarantine.try_exists().map_err(CubeError::Io)? {
                     return Err(CubeError::InvalidArgument(format!(
                         "unverified jj operation-head rewrite in {}; repair the store and verify a single operation head before removing {}",

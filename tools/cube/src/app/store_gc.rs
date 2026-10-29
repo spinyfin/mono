@@ -349,15 +349,18 @@ fn require_single_op_head(record: &RepoRecord, source: &Path, when: &str) -> Res
     )))
 }
 
+fn gate_data_dir(database_path: Option<&Path>) -> Result<PathBuf> {
+    Ok(match database_path.and_then(Path::parent) {
+        Some(parent) => parent.to_path_buf(),
+        None => crate::paths::data_dir()?,
+    })
+}
+
 /// The exclusive [`JjGate`] for the store gate file under the data dir the
 /// run resolves. `None` when cube-started jj commands never drained within
 /// `wait`, which skips the abandon like a host that is never quiet.
 fn jj_maintenance_gate(database_path: Option<&Path>, wait: Duration) -> Result<Option<JjGate>> {
-    let data_dir = match database_path.and_then(Path::parent) {
-        Some(parent) => parent.to_path_buf(),
-        None => crate::paths::data_dir()?,
-    };
-    match JjGate::exclusive(&JjGate::path(&data_dir), wait) {
+    match JjGate::exclusive(&JjGate::path(&gate_data_dir(database_path)?), wait) {
         Ok(gate) => Ok(Some(gate)),
         Err(CubeError::InvalidArgument(message)) => {
             eprintln!("cube: store gc: {message}");
@@ -365,6 +368,26 @@ fn jj_maintenance_gate(database_path: Option<&Path>, wait: Duration) -> Result<O
         }
         Err(err) => Err(err),
     }
+}
+
+/// Settle a leftover host-wide marker while holding the exclusive gate. A
+/// marker naming this store whose heads are now a single one is a rewrite
+/// that was verified or never started (a killed pass), so it is lifted. More
+/// heads, or a marker naming another store, stop the pass: that store's own
+/// pass owns the repair, and clearing or replacing its marker would let
+/// readers merge abandoned ancestry.
+fn reconcile_quarantine(gate: &JjGate, record: &RepoRecord, source: &Path) -> Result<()> {
+    let Some(owner) = gate.quarantine_owner()? else {
+        return Ok(());
+    };
+    if owner != source.display().to_string() {
+        return Err(CubeError::InvalidArgument(format!(
+            "repo `{}`: another store ({owner}) has an unverified jj operation-head rewrite;              repair it and run `cube repo gc` for that repo before maintaining this one",
+            record.repo
+        )));
+    }
+    require_single_op_head(record, source, "under a leftover maintenance marker")?;
+    gate.clear_quarantine(source)
 }
 
 /// A maintenance `jj` command. It is marked as made by the pass that holds
@@ -486,6 +509,28 @@ pub(super) fn gc_repo_store(
     quiescence: Duration,
     dry_run: bool,
 ) -> Result<StoreGcReport> {
+    gc_repo_store_with_deadline(
+        runner,
+        database_path,
+        record,
+        keep,
+        quiescence,
+        EXCLUSIVE_COMMAND_TIMEOUT,
+        dry_run,
+    )
+}
+
+/// [`gc_repo_store`] with the bound on each command run under the exclusive
+/// gate given explicitly; production always uses [`EXCLUSIVE_COMMAND_TIMEOUT`].
+pub(super) fn gc_repo_store_with_deadline(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    record: &RepoRecord,
+    keep: Duration,
+    quiescence: Duration,
+    exclusive_timeout: Duration,
+    dry_run: bool,
+) -> Result<StoreGcReport> {
     let started = Instant::now();
     let source = record.source.clone().ok_or_else(|| {
         CubeError::InvalidArgument(format!(
@@ -501,6 +546,22 @@ pub(super) fn gc_repo_store(
         )));
     }
     let before = measure_op_store(&source);
+
+    // A marker left by a killed pass would reject the listing below, and
+    // nothing else lifts it. Settle it first, under the exclusive gate.
+    if !dry_run
+        && JjGate::quarantine_path(&JjGate::path(&gate_data_dir(database_path)?))
+            .try_exists()
+            .map_err(CubeError::Io)?
+    {
+        let gate = jj_maintenance_gate(database_path, quiescence)?.ok_or_else(|| {
+            CubeError::InvalidArgument(format!(
+                "repo `{}`: could not take the jj maintenance gate to settle a leftover marker",
+                record.repo
+            ))
+        })?;
+        reconcile_quarantine(&gate, record, &source)?;
+    }
 
     // Listing a neglected log is itself slow (35s for 137k operations on
     // the dev Mac), so it gets the maintenance bound, not the network one.
@@ -534,30 +595,45 @@ pub(super) fn gc_repo_store(
         if let Some(cut) = abandoned_through.clone() {
             // The abandon rewrites every kept operation under a new id, so
             // it runs only with the gate held and at an instant with no jj
-            // process to race it.
-            if wait_for_jj_quiescence(runner, &source, quiescence, QUIESCENCE_POLL)? {
-                gate = jj_maintenance_gate(database_path, quiescence)?;
+            // process to race it. Quiet-host polling, gate acquisition and
+            // the re-probe under the gate are retried within one budget,
+            // releasing the gate between attempts, so lease churn or a
+            // single racing jj does not skip the pass for a day.
+            let budget = Instant::now();
+            let mut host_quiet = true;
+            while gate.is_none() && host_quiet && budget.elapsed() < quiescence.max(Duration::from_millis(1)) {
+                let remaining = quiescence.saturating_sub(budget.elapsed());
+                host_quiet = wait_for_jj_quiescence(runner, &source, remaining, QUIESCENCE_POLL)?;
+                if !host_quiet {
+                    break;
+                }
+                let remaining = quiescence.saturating_sub(budget.elapsed());
+                let Some(candidate) = jj_maintenance_gate(database_path, remaining)? else {
+                    continue;
+                };
+                reconcile_quarantine(&candidate, record, &source)?;
+                if wait_for_jj_quiescence(runner, &source, Duration::ZERO, QUIESCENCE_POLL)? {
+                    exclusive_started = Some(Instant::now());
+                    gate = Some(candidate);
+                }
             }
-            if gate.is_some() {
-                exclusive_started = Some(Instant::now());
-            }
-            if let Some(active_gate) = gate.as_ref()
-                && wait_for_jj_quiescence(runner, &source, Duration::ZERO, QUIESCENCE_POLL)?
-            {
+            if let Some(active_gate) = gate.as_ref() {
                 let range = format!("..{cut}");
                 active_gate.quarantine(&source)?;
-                let rewrite_started = Instant::now();
                 let abandon = runner.run_with_timeout(
                     &gated_jj_invocation(&source, &["--ignore-working-copy", "op", "abandon", &range]),
-                    EXCLUSIVE_COMMAND_TIMEOUT,
+                    exclusive_timeout,
                 );
                 require_single_op_head(record, &source, "after the abandon")?;
-                active_gate.clear_quarantine()?;
+                active_gate.clear_quarantine(&source)?;
                 abandon?;
                 // Rewritten operation IDs invalidate jj's commit-index lookup.
                 // Build that read-only index before readers resume, rather than
-                // making the first lease pay for it while holding the registry lock.
-                runner.run_with_timeout(
+                // making the first lease pay for it while holding the registry
+                // lock. It has its own deadline, and failing it is not fatal:
+                // the rewrite is verified, and the first reader rebuilds the
+                // index instead.
+                if let Err(error) = runner.run_with_timeout(
                     &gated_jj_invocation(
                         &source,
                         &[
@@ -570,10 +646,14 @@ pub(super) fn gc_repo_store(
                             "commit_id",
                         ],
                     ),
-                    EXCLUSIVE_COMMAND_TIMEOUT.saturating_sub(rewrite_started.elapsed()),
-                )?;
+                    exclusive_timeout,
+                ) {
+                    eprintln!(
+                        "cube: store gc: {}: commit-index warm-up failed after a verified abandon: {error}",
+                        record.repo
+                    );
+                }
             } else {
-                exclusive_ms = exclusive_started.map_or(0, |start| start.elapsed().as_millis());
                 gate = None;
                 abandoned_through = None;
                 collection = Collection::Skipped;

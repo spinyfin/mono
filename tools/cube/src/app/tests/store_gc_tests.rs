@@ -10,8 +10,9 @@ use crate::app::dispatch::run_with_dependencies;
 use crate::app::errors::CubeError;
 use crate::app::store_gc::{
     Collection, DEFAULT_KEEP, OP_LOG_TEMPLATE, PR_BOOKMARK_NAMES_TEMPLATE, QUIESCENCE_WAIT, StoreGcOutcome,
-    gc_repo_store, jj_processes, measure_op_store, record_store_gc_outcome, select_abandon_cut, stale_pr_refs,
-    store_gc_attention, store_gc_due, store_gc_last_at_key, store_gc_lock_path, wait_for_jj_quiescence,
+    gc_repo_store, gc_repo_store_with_deadline, jj_processes, measure_op_store, record_store_gc_outcome,
+    select_abandon_cut, stale_pr_refs, store_gc_attention, store_gc_due, store_gc_last_at_key, store_gc_lock_path,
+    wait_for_jj_quiescence,
 };
 use crate::app::util::repo_lock_path;
 use crate::cli::Cli;
@@ -20,7 +21,7 @@ use crate::store::Store;
 
 const HOUR: i64 = 60 * 60;
 
-fn op_log(now: i64) -> String {
+pub(super) fn op_log(now: i64) -> String {
     // Newest first, as `jj op log` prints: the head is an hour old, then
     // one operation per day going back five days.
     let mut lines = vec![format!("{} {}", "a".repeat(64), now - HOUR)];
@@ -103,7 +104,7 @@ fn op_store_measurement_counts_operation_and_view_files() {
 
 /// A fake jj store under the seeded repo's source path, so the verb's
 /// pre-checks and measurements have something real to look at.
-fn seed_store_files(source: &std::path::Path) -> std::path::PathBuf {
+pub(super) fn seed_store_files(source: &std::path::Path) -> std::path::PathBuf {
     let op_store = source.join(".jj/repo/op_store");
     std::fs::create_dir_all(op_store.join("operations")).unwrap();
     std::fs::create_dir_all(op_store.join("views")).unwrap();
@@ -116,7 +117,7 @@ fn seed_store_files(source: &std::path::Path) -> std::path::PathBuf {
     source.to_path_buf()
 }
 
-fn source_of(database_path: &std::path::Path) -> std::path::PathBuf {
+pub(super) fn source_of(database_path: &std::path::Path) -> std::path::PathBuf {
     Store::open_at(database_path)
         .expect("store")
         .get_repo("mono")
@@ -126,11 +127,11 @@ fn source_of(database_path: &std::path::Path) -> std::path::PathBuf {
         .expect("source")
 }
 
-fn ps_command(source: &std::path::Path, output: &str) -> ExpectedCommand {
+pub(super) fn ps_command(source: &std::path::Path, output: &str) -> ExpectedCommand {
     ExpectedCommand::ok(source.to_path_buf(), "ps", &["-axo", "comm="], output)
 }
 
-fn op_log_command(source: &std::path::Path, output: &str) -> ExpectedCommand {
+pub(super) fn op_log_command(source: &std::path::Path, output: &str) -> ExpectedCommand {
     ExpectedCommand::ok(
         source.to_path_buf(),
         "jj",
@@ -146,7 +147,7 @@ fn op_log_command(source: &std::path::Path, output: &str) -> ExpectedCommand {
     )
 }
 
-fn pr_ref_commands(source: &std::path::Path, git_refs: &str, bookmarks: &str) -> Vec<ExpectedCommand> {
+pub(super) fn pr_ref_commands(source: &std::path::Path, git_refs: &str, bookmarks: &str) -> Vec<ExpectedCommand> {
     vec![
         ExpectedCommand::ok(
             source.to_path_buf(),
@@ -766,7 +767,7 @@ fn a_second_operation_head_after_the_abandon_stops_the_pass_before_collecting() 
     assert!(err.to_string().contains("2 operation heads"), "{err}");
 }
 
-fn index_command(source: &std::path::Path) -> ExpectedCommand {
+pub(super) fn index_command(source: &std::path::Path) -> ExpectedCommand {
     ExpectedCommand::ok(
         source.to_path_buf(),
         "jj",
@@ -783,7 +784,7 @@ fn index_command(source: &std::path::Path) -> ExpectedCommand {
     )
 }
 
-fn abandon_command(source: &std::path::Path) -> ExpectedCommand {
+pub(super) fn abandon_command(source: &std::path::Path) -> ExpectedCommand {
     ExpectedCommand::ok(
         source.to_path_buf(),
         "jj",
@@ -797,7 +798,7 @@ fn abandon_command(source: &std::path::Path) -> ExpectedCommand {
     )
 }
 
-fn mono_record(database_path: &std::path::Path) -> crate::metadata::RepoRecord {
+pub(super) fn mono_record(database_path: &std::path::Path) -> crate::metadata::RepoRecord {
     Store::open_at(database_path)
         .unwrap()
         .get_repo("mono")
@@ -816,23 +817,21 @@ fn slow_abandon_is_bounded_and_releases_the_gate_without_collecting() {
         op_log_command(&source, &op_log(now)),
         ps_command(&source, ""),
         ps_command(&source, ""),
-        abandon_command(&source).taking(Duration::from_secs(130)),
+        abandon_command(&source).taking(Duration::from_millis(900)),
     ]);
     let started = std::time::Instant::now();
-    let error = gc_repo_store(
+    let error = gc_repo_store_with_deadline(
         &runner,
         Some(&database_path),
         &record,
         DEFAULT_KEEP,
         QUIESCENCE_WAIT,
+        Duration::from_millis(300),
         false,
     )
     .expect_err("slow rewrite must yield to leases");
-    assert!(
-        matches!(error, CubeError::CommandTimedOut { timeout_secs: 120, .. }),
-        "{error}"
-    );
-    assert!(started.elapsed() < Duration::from_secs(122));
+    assert!(matches!(error, CubeError::CommandTimedOut { .. }), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(5));
     runner.assert_exhausted();
     crate::command_runner::JjGate::shared_for_database(Some(&database_path)).unwrap();
 }
