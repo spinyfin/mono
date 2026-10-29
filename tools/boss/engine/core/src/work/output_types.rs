@@ -240,6 +240,7 @@ pub struct WorkerPrCompletion {
 /// instead of failing the whole finalize and leaking the lease/pane.
 #[derive(Debug, Clone)]
 pub struct WorkerFailureCompletion {
+    pub question_attention: Option<(boss_protocol::Attention, boss_protocol::AttentionGroup)>,
     pub execution: WorkExecution,
     pub work_item: Option<WorkItem>,
     pub released_lease_id: Option<String>,

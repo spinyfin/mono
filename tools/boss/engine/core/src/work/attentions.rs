@@ -18,6 +18,7 @@
 //! one revision" true across iteration.
 
 pub(super) mod reads;
+pub(super) mod worker_questions;
 
 use super::proposals::mark_followup_proposal_decided_in_tx;
 use super::*;
@@ -760,6 +761,9 @@ fn parse_effort(raw: Option<&str>) -> Option<EffortLevel> {
 /// A concise card title for the revision / design task produced from a
 /// question group — derived from the source doc's basename when known.
 fn question_artifact_name(group: &AttentionGroup) -> String {
+    if group.grouping_key.starts_with("worker_question|") {
+        return "Apply answered worker questions".to_owned();
+    }
     match group.source_doc_path.as_deref().filter(|s| !s.is_empty()) {
         Some(path) => {
             let base = path.rsplit('/').next().unwrap_or(path);
@@ -782,6 +786,12 @@ fn build_qa_brief(group: &AttentionGroup, answered: &[&Attention]) -> String {
                 out,
                 "The operator answered open questions about the design doc `{path}`. \
                  Incorporate every answer below into the doc."
+            );
+        }
+        None if group.grouping_key.starts_with("worker_question|") => {
+            let _ = writeln!(
+                out,
+                "The operator answered a worker's questions. Apply the recorded decisions to the work below. A No answer does not authorize the proposed action."
             );
         }
         None => {
@@ -846,6 +856,7 @@ fn insert_seeded_design_task_in_tx(
 /// Prefer a revision against the source doc's still-open PR. The revision
 /// gate (parent PR open and unmerged) is the exact condition the design forks
 /// on, so we attempt the revision and fall back to a fresh design task
+/// (or a product-level chore when there is no project)
 /// *precisely* when the gate refuses (no PR / merged / closed). Any other
 /// failure (e.g. a `gh` probe error) is a real error and propagates.
 fn action_question_group(
@@ -863,25 +874,43 @@ fn action_question_group(
             group.id
         );
     }
-    let brief = build_qa_brief(group, &answered);
+    let mut brief = build_qa_brief(group, &answered);
+    let source = group
+        .source_task_id
+        .as_deref()
+        .map(|id| query_task(conn, id))
+        .transpose()?
+        .flatten();
+    if group.grouping_key.starts_with("worker_question|")
+        && let Some(task) = &source
+    {
+        brief.push_str(&format!("\n## Original work: {}\n\n{}\n", task.name, task.description));
+    }
+    let recovery_source = source.as_ref().filter(|task| {
+        group.grouping_key.starts_with("worker_question|")
+            && task.kind == TaskKind::Revision
+            && task.status == TaskStatus::Blocked
+    });
     let name = question_artifact_name(group);
 
     if let Some(parent_task_id) = group.source_task_id.as_deref().filter(|s| !s.is_empty()) {
         let input = CreateRevisionInput::builder()
             .parent_task_id(parent_task_id)
             .description(brief.clone())
+            .autostart(recovery_source.is_none())
             .name(name.clone())
             .created_via(CREATED_VIA_ATTENTION)
             // Deliberately left on the inherit side (unlike the
             // PR-review/CI/conflict producers, which pin `standard`): this
-            // fires from an operator-answered question group against a
-            // design-doc source task, and the deliverable is design
-            // thinking, not a described diff. The chain root's reasoning
-            // mode is real evidence about the shape of this work, so it
-            // should inherit rather than pin `standard`.
+            // fires from an operator-answered question group. The source
+            // may be design or implementation work, so the chain root's
+            // reasoning mode should be inherited.
             .build();
         match assert_parent_revisable_and_insert(pending, conn, input, pr_checker) {
             Ok(revision) => {
+                if let Some(source) = recovery_source {
+                    worker_questions::order_recovery_in_tx(pending, conn, source, &revision)?;
+                }
                 let reference = serde_json::json!({
                     "task_id": revision.id,
                     "short_id": revision.short_id,
@@ -901,25 +930,35 @@ fn action_question_group(
         }
     }
 
-    // Merged doc (or no source task / open PR): a fresh design task opens a
-    // new PR seeded with the Q&A.
-    let project_id = group
-        .association_project_id
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .with_context(|| {
-            format!(
-                "question group {} has no associated project; cannot create a design task",
-                group.id
-            )
-        })?;
-    let task = insert_seeded_design_task_in_tx(conn, &group.product_id, project_id, &name, &brief)?;
+    // No revisable PR: seed new work with the Q&A, retaining the project
+    // association when present and supporting standalone work otherwise.
+    let (task, artifact_kind) = if let Some(project_id) = group.association_project_id.as_deref() {
+        (
+            insert_seeded_design_task_in_tx(conn, &group.product_id, project_id, &name, &brief)?,
+            "design_task",
+        )
+    } else {
+        (
+            insert_chore_in_tx(
+                conn,
+                CreateChoreInput::builder()
+                    .product_id(&group.product_id)
+                    .name(&name)
+                    .description(&brief)
+                    .maybe_repo_remote_url(source.as_ref().and_then(|task| task.repo_remote_url.clone()))
+                    .created_via(CREATED_VIA_ATTENTION)
+                    .force_duplicate(true)
+                    .build(),
+            )?,
+            "chore",
+        )
+    };
     let reference = serde_json::json!({
         "task_id": task.id,
         "short_id": task.short_id,
     })
     .to_string();
-    Ok(("design_task".to_owned(), reference, vec![task.id]))
+    Ok((artifact_kind.to_owned(), reference, vec![task.id]))
 }
 
 /// Describe what a [`FollowupMemberOverride`] changed relative to a
@@ -1233,6 +1272,8 @@ impl WorkDb {
             other => bail!("cannot action attention group {} of kind {other:?}", group.id),
         };
 
+        worker_questions::apply_prerequisite_in_tx(&mut pending, &tx, &group, &members, &produced_work_item_ids)?;
+
         let now = now_string();
         tx.execute(
             "UPDATE attention_groups \
@@ -1252,9 +1293,8 @@ impl WorkDb {
 }
 
 // ===========================================================================
-// attention_merges — provenance ledger (P1203 task 1). `AttentionMerge`
-// itself lives in `boss_protocol` so it can ride the wire (P1203 task 8 —
-// the Notifications UI reads it via `ListAttentionMerges`).
+// attention_merges — provenance ledger. AttentionMerge lives in boss_protocol
+// so the Notifications UI can read it through ListAttentionMerges.
 // ===========================================================================
 
 /// Input for inserting one `attention_merges` row.

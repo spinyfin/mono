@@ -711,6 +711,22 @@ impl WorkerCompletionHandler {
                 return false;
             }
         };
+        let (label, event) = if question.is_some() {
+            ("worker_question", "worker_question_finalized")
+        } else {
+            ("worker_failure", "worker_failure_finalized")
+        };
+        if let Some((attention, group)) = &completion.question_attention {
+            self.publisher
+                .publish_frontend_event_on_product(
+                    &group.product_id,
+                    FrontendEvent::AttentionCreated {
+                        attention: attention.clone(),
+                        group: group.clone(),
+                    },
+                )
+                .await;
+        }
         self.staged_pr_urls.forget(&execution.id);
         self.nudge_breaker.forget(&execution.id);
         self.build_wait_tracker.forget(&execution.id);
@@ -721,7 +737,7 @@ impl WorkerCompletionHandler {
             &completion.execution.work_item_id,
             completion.released_lease_id.as_deref(),
             workspace_path.as_deref().map(std::path::Path::new),
-            "worker_failure",
+            label,
             teardown,
         )
         .await;
@@ -731,14 +747,14 @@ impl WorkerCompletionHandler {
                 &completion.execution.id,
                 &work_item_id,
                 completion.execution.status.as_str(),
-                "worker_failure_finalized",
+                event,
             )
             .await;
         match completion.work_item.as_ref() {
             Some(work_item) => {
                 let product_id = work_item.product_id().to_string();
                 self.publisher
-                    .publish_work_item_changed(&product_id, &work_item_id, "worker_failure_finalized")
+                    .publish_work_item_changed(&product_id, &work_item_id, event)
                     .await;
             }
             None => {

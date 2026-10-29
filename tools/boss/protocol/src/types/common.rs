@@ -425,6 +425,9 @@ pub const CREATED_VIA_PR_REVIEW_POST_MERGE_PREFIX: &str = "pr_review:post_merge:
 /// question group, or the batch of tasks/chores produced from a followup
 /// group. Design: `tools/boss/docs/designs/attentions.md`.
 pub const CREATED_VIA_ATTENTION: &str = "attention";
+/// Answer recovery for a blocked conflict revision. The suffix is the original
+/// conflict revision's task id, whose writer-exclusion ordering is inherited.
+pub const CREATED_VIA_CONFLICT_RECOVERY_PREFIX: &str = "attention_conflict_recovery:";
 /// Prefix for the revision/chore spawned by `CommentsReviseDoc`:
 /// `doc-comment:<artifact_kind>:<artifact_id>`. Design:
 /// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
@@ -467,6 +470,7 @@ pub const KNOWN_CREATED_VIA: &[&str] = &[
 /// a warning is logged at the insert site.
 pub fn is_known_created_via(value: &str) -> bool {
     KNOWN_CREATED_VIA.contains(&value)
+        || value.starts_with(CREATED_VIA_CONFLICT_RECOVERY_PREFIX)
         || value.starts_with(CREATED_VIA_MERGE_CONFLICT_PREFIX)
         || value.starts_with(CREATED_VIA_CI_FIX_PREFIX)
         || value.starts_with(CREATED_VIA_PR_REVIEW_PREFIX)

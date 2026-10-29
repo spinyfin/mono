@@ -571,15 +571,30 @@ impl WorkDb {
         // a task does. The question card is what makes the decision answerable,
         // so folding the question into a `worker_failed` detail would leave
         // the row looking failed when it is waiting on a human.
-        match query_task(&tx, &work_item_id)? {
-            Some(_)
-                if question.is_some()
-                    && !tx.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM operator_questions WHERE execution_id = ?1 AND status = 'open')",
-                        [execution_id],
-                        |row| row.get::<_, bool>(0),
-                    )? => {}
-            Some(task) if matches!(task.status, TaskStatus::Active | TaskStatus::Todo) => {
+        let mut question_attention = None;
+        let fallback_question = if let Some(question) = question {
+            let has_open_question = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM operator_questions WHERE execution_id = ?1 AND status = 'open')",
+                [execution_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            (!has_open_question).then_some(question)
+        } else {
+            None
+        };
+        match (
+            query_task(&tx, &work_item_id)?.filter(|task| task.deleted_at.is_none()),
+            fallback_question,
+        ) {
+            (Some(task), Some(question)) => {
+                question_attention = Some(super::attentions::worker_questions::create_in_tx(
+                    &tx,
+                    &task,
+                    execution_id,
+                    question,
+                )?);
+            }
+            (Some(task), _) if matches!(task.status, TaskStatus::Active | TaskStatus::Todo) => {
                 tx.execute(
                     "UPDATE tasks
                      SET status = 'blocked', blocked_reason = ?4, blocked_detail = ?2,
@@ -597,7 +612,7 @@ impl WorkDb {
                     ],
                 )?;
             }
-            Some(task)
+            (Some(task), _)
                 if task.status == TaskStatus::Blocked && task.blocked_reason.is_some() && !trimmed.is_empty() =>
             {
                 let folded = match task.blocked_detail.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -655,6 +670,7 @@ impl WorkDb {
         }
         commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(WorkerFailureCompletion {
+            question_attention,
             execution: updated_execution,
             work_item: task.map(task_to_item),
             released_lease_id: original_lease_id,
@@ -2132,7 +2148,7 @@ pub(super) fn insert_question(
     Ok(())
 }
 
-fn map_question(row: &Row<'_>) -> rusqlite::Result<OperatorQuestionRecord> {
+pub(super) fn map_question(row: &Row<'_>) -> rusqlite::Result<OperatorQuestionRecord> {
     let json: String = row.get("question_json")?;
     let question: OperatorQuestion = serde_json::from_str(&json)
         .map_err(|err| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err)))?;
@@ -2169,7 +2185,7 @@ fn map_question(row: &Row<'_>) -> rusqlite::Result<OperatorQuestionRecord> {
 
 /// The one select `map_question` reads: every `operator_questions` column
 /// plus the declaring run's summary. Append a `WHERE` clause.
-const OPERATOR_QUESTION_RECORD_SELECT: &str = "SELECT *, (SELECT json_extract(payload_json, '$.summary') \
+pub(super) const OPERATOR_QUESTION_RECORD_SELECT: &str = "SELECT *, (SELECT json_extract(payload_json, '$.summary') \
      FROM worker_proposals WHERE worker_proposals.id = operator_questions.proposal_id) AS run_summary \
      FROM operator_questions";
 
