@@ -977,6 +977,7 @@ fn tag_cases() -> Vec<TagCase> {
             event: FrontendEvent::WorkerLiveStatesList {
                 states: vec![],
                 doing_sections: Default::default(),
+                queued_dispatch: Default::default(),
             },
             expected_tag: "worker_live_states_list",
         },

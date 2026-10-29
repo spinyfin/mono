@@ -500,6 +500,9 @@ final class ChatViewModel: ObservableObject {
     /// Engine-owned membership; publish only when a card changes section,
     /// not for every tool/activity event in the high-rate live worker feed.
     @Published var doingSectionsByID: [String: DoingSection] = [:]
+    /// Engine-owned dispatch order for queued cards; same publish discipline
+    /// as `doingSectionsByID`.
+    @Published var queuedDispatchByID: [String: QueuedDispatch] = [:]
 
     /// Per-installation settings snapshot, sourced from `get_settings`
     /// on Settings window open and kept in sync via `setting_set`

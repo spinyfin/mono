@@ -217,6 +217,7 @@ impl ServerState {
                         "pause state changed — broadcasting engine health to subscribed frontends",
                     );
                     state.broadcast_engine_health().await;
+                    state.republish_queued_dispatch_if_changed().await;
                 }
                 // The sender lives inside the coordinator, which lives
                 // inside `ServerState`; `changed()` therefore only errors

@@ -335,12 +335,16 @@ extension ChatViewModel {
             }
             if handleCoordinatorResetError(message) { return }
             workErrorMessage = message
-        case .workerLiveStatesList(let states, let doingSections):
+        case .workerLiveStatesList(let states, let doingSections, let queuedDispatch):
             guard WorkerLiveState.hasUniqueIds(states) else { return }
             liveWorkerStates.update(states: states)
             if doingSectionsByID != doingSections {
                 cachedSectionsByColumn[.doing] = nil
                 doingSectionsByID = doingSections
+            }
+            if queuedDispatchByID != queuedDispatch {
+                cachedSectionsByColumn[.doing] = nil
+                queuedDispatchByID = queuedDispatch
             }
         case .featureFlagsList(let flags):
             featureFlags = flags

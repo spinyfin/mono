@@ -1060,7 +1060,9 @@ final class EngineClient: @unchecked Sendable {
             }
             let rawSections = payload["doing_sections"] as? [String: String] ?? [:]
             let sections = rawSections.compactMapValues(DoingSection.init(rawValue:))
-            emit(.workerLiveStatesList(states: states, doingSections: sections))
+            let rawDispatch = payload["queued_dispatch"] as? [String: [String: Any]] ?? [:]
+            let queuedDispatch = rawDispatch.compactMapValues(QueuedDispatch.init(payload:))
+            emit(.workerLiveStatesList(states: states, doingSections: sections, queuedDispatch: queuedDispatch))
         case "project_design_doc_resolved":
             guard let outputPayload = payload["output"] as? [String: Any],
                   let outputData = try? JSONSerialization.data(withJSONObject: outputPayload),

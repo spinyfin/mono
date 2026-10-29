@@ -91,6 +91,7 @@ mod events_accept;
 mod executions;
 mod external_tracker;
 mod github_auth;
+mod queued_dispatch;
 // `pub(crate)` so the spawn-capability circuit breaker (`crate::spawn_health`)
 // can persist its auto-pause through the same `METADATA_KEY_DISPATCH_PAUSED*`
 // keys the human dispatch toggle uses. Individual items stay `pub(crate)`/
@@ -729,6 +730,10 @@ struct ServerState {
     coordinator_tmux_lock: Arc<Mutex<()>>,
     #[builder(default)]
     coordinator_handoff_written: Arc<Notify>,
+    /// Queued-card dispatch order last pushed in a live-worker board snapshot,
+    /// so a ready-queue change re-pushes the board only when the order moved.
+    #[builder(default)]
+    published_queued_dispatch: StdMutex<std::collections::BTreeMap<String, boss_protocol::QueuedDispatch>>,
     /// How long a UI-confirmed coordinator reset waits for the fresh handoff.
     /// Tests inject a short value.
     #[builder(default = crate::coordinator_tmux::reset_handoff::HANDOFF_TIMEOUT)]
@@ -1373,13 +1378,14 @@ impl ServerState {
         let coordinator_model = cfg.work.coordinator_model.clone();
         let topic_broker = Arc::new(TopicBroker::default());
         let work_revision = Arc::new(AtomicU64::new(0));
-        let publisher_impl = Arc::new(BrokerExecutionPublisher {
-            work_db: work_db.clone(),
-            topic_broker: topic_broker.clone(),
-            work_revision: work_revision.clone(),
-            metrics: metrics_registry.clone(),
-            kick: std::sync::OnceLock::new(),
-        });
+        let publisher_impl = Arc::new(
+            BrokerExecutionPublisher::builder()
+                .work_db(work_db.clone())
+                .topic_broker(topic_broker.clone())
+                .work_revision(work_revision.clone())
+                .metrics(metrics_registry.clone())
+                .build(),
+        );
         let publisher: Arc<dyn ExecutionPublisher> = publisher_impl.clone();
         let cube_client: Arc<dyn CubeClient> =
             cube_client_override.unwrap_or_else(|| Arc::new(CommandCubeClient::new(cfg.clone())));
@@ -1846,6 +1852,15 @@ impl ServerState {
         // called — hence the late bind.
         let coord_for_kick = server_state.execution_coordinator.clone();
         publisher_impl.set_kick(move || coord_for_kick.kick());
+        let weak_for_queue = Arc::downgrade(&server_state);
+        publisher_impl.set_queue_changed(move || {
+            let weak = weak_for_queue.clone();
+            tokio::spawn(async move {
+                if let Some(state) = weak.upgrade() {
+                    state.republish_queued_dispatch_if_changed().await;
+                }
+            });
+        });
 
         // Seed the live-status manager's disabled-slot set from the
         // engine metadata KV — survives restarts of the engine
@@ -2213,6 +2228,7 @@ impl crate::transient_recovery::WorkerNudger for ServerState {
     }
 }
 
+#[derive(bon::Builder)]
 struct BrokerExecutionPublisher {
     work_db: Arc<WorkDb>,
     topic_broker: Arc<TopicBroker>,
@@ -2221,12 +2237,21 @@ struct BrokerExecutionPublisher {
     /// Late-bound kick function set after the coordinator is created.
     /// `None` until [`BrokerExecutionPublisher::set_kick`] is called;
     /// `kick_scheduler` is a no-op until the coordinator is wired up.
+    #[builder(default)]
     kick: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
+    /// Late-bound re-push of the queued-card order after a board invalidation:
+    /// the ready queue is reordered by the same writes that invalidate cards.
+    #[builder(default)]
+    queue_changed: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl BrokerExecutionPublisher {
     fn set_kick(&self, f: impl Fn() + Send + Sync + 'static) {
         let _ = self.kick.set(Arc::new(f));
+    }
+
+    fn set_queue_changed(&self, f: impl Fn() + Send + Sync + 'static) {
+        let _ = self.queue_changed.set(Arc::new(f));
     }
 
     async fn publish_classified_work_item_changed(
@@ -2268,6 +2293,9 @@ impl BrokerExecutionPublisher {
         self.topic_broker
             .publish(&topic, FrontendEventEnvelope::push_with_revision(revision, event))
             .await;
+        if let Some(queue_changed) = self.queue_changed.get() {
+            queue_changed();
+        }
     }
 }
 

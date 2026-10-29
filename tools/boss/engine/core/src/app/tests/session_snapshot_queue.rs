@@ -142,6 +142,7 @@ fn allowlisted_kinds_are_independent_and_correlated_replies_are_never_coalesced(
         FrontendEvent::WorkerLiveStatesList {
             states: vec![],
             doing_sections: Default::default(),
+            queued_dispatch: Default::default(),
         },
         FrontendEvent::EngineHealthResult {
             report: boss_protocol::EngineHealthReport::builder()

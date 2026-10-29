@@ -36,6 +36,14 @@ extension WorkCardLiveStatus {
         return label
     }
 
+    /// The first runnable main-pool card. A wait reason it still carries
+    /// (a full pool, say) stays visible after the marker.
+    static func nextUpLabel(queued label: String) -> String {
+        if label == "Queued — reason unknown" { return "Next up" }
+        let prefix = "Queued — "
+        return "Next up — " + (label.hasPrefix(prefix) ? String(label.dropFirst(prefix.count)) : label)
+    }
+
     private static func dispatchWaitReasonLabel(_ reason: String) -> String {
         switch reason {
         case "waiting_dependency": return "Queued — waiting for a dependency"

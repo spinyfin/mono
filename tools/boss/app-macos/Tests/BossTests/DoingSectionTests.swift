@@ -68,16 +68,20 @@ final class DoingSectionWireTests: XCTestCase {
         let client = EngineClient(socketPath: "/tmp/doing-wire-\(UUID().uuidString).sock")
         let delivered = expectation(description: "board membership")
         client.onEvent = { event in
-            guard case .workerLiveStatesList(let states, let sections) = event else {
+            guard case .workerLiveStatesList(let states, let sections, let dispatch) = event else {
                 XCTFail("expected worker board snapshot")
                 return
             }
             XCTAssertTrue(states.isEmpty)
             XCTAssertEqual(sections, ["code": .coding, "review": .reviewing, "queue": .queued])
+            XCTAssertEqual(dispatch, [
+                "queue": QueuedDispatch(pool: .main, position: 0, nextUp: true),
+                "held": QueuedDispatch(pool: .automation, position: nil),
+            ])
             delivered.fulfill()
         }
         client.consumeLineForTesting("""
-        {"payload":{"type":"worker_live_states_list","states":[],"doing_sections":{"code":"coding","review":"reviewing","queue":"queued"}}}
+        {"payload":{"type":"worker_live_states_list","states":[],"doing_sections":{"code":"coding","review":"reviewing","queue":"queued"},"queued_dispatch":{"queue":{"pool":"main","position":0,"next_up":true},"held":{"pool":"automation","position":null,"next_up":false},"bad":{"pool":"nowhere","position":1}}}}
         """)
         wait(for: [delivered], timeout: 2)
     }

@@ -15,6 +15,7 @@ mod live_status_debug;
 mod live_worker_state;
 mod metrics_wire;
 pub mod planner;
+mod queued_dispatch;
 mod tmux_worker_status;
 mod types;
 mod wire;
@@ -37,6 +38,7 @@ pub use planner::{
     ApplyResult, Confidence, DocRef, PlannerInput, PlannerOutput, ProductContext, ProjectContext, ProposedEdge,
     ProposedMergeOrderHint, ProposedTask, TaskBrief, planner_output_schema,
 };
+pub use queued_dispatch::*;
 pub use tmux_worker_status::*;
 pub use types::*;
 pub use wire::*;

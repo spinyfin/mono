@@ -444,6 +444,7 @@ extension ChatViewModel {
             column: column,
             runtime: runtime,
             liveState: liveState,
+            isNextUp: queuedDispatchByID[task.id]?.nextUp ?? false,
             now: now
         )
 

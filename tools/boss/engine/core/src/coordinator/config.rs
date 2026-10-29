@@ -975,7 +975,7 @@ impl ExecutionCoordinator {
     /// is deliberately excluded — see [`Self::execution_targets_review_pool`]
     /// — so it is never held by [`Self::is_automation_paused`] and never
     /// counted as automation-originated by [`Self::attributed_pool_label`].
-    pub(super) fn execution_targets_automation_pool(&self, execution: &WorkExecution) -> bool {
+    pub fn execution_targets_automation_pool(&self, execution: &WorkExecution) -> bool {
         if execution.kind == ExecutionKind::AutomationTriage {
             return true;
         }
@@ -983,6 +983,18 @@ impl ExecutionCoordinator {
             self.work_db.source_automation_id_for_work_item(&execution.work_item_id),
             Ok(Some(_))
         )
+    }
+
+    /// The pool `drain_ready_queue` routes `execution` to. Review is checked
+    /// first, so a reviewer of an automation-produced task counts as review.
+    pub fn dispatch_pool_for(&self, execution: &WorkExecution) -> boss_protocol::DispatchPool {
+        if self.execution_targets_review_pool(execution) {
+            boss_protocol::DispatchPool::Review
+        } else if self.execution_targets_automation_pool(execution) {
+            boss_protocol::DispatchPool::Automation
+        } else {
+            boss_protocol::DispatchPool::Main
+        }
     }
 
     /// Return the pool that owns `worker_id`. Automation-pool slots carry the
