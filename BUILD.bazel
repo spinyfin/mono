@@ -11,6 +11,7 @@ exports_files(
         ".ci.bazelrc",
     ],
     visibility = [
+        "//.buildkite/steps/tests:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/test-sandbox:__pkg__",
     ],

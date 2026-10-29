@@ -117,16 +117,24 @@ expect_error "found 2" "ambiguous rc" ci_disk_cache_path linux "${rc_dir}/dup.ba
 write_lines "${rc_dir}/empty-path.bazelrc" 'build:ci-linux --disk_cache='
 expect_error "found 1" "empty path" ci_disk_cache_path linux "${rc_dir}/empty-path.bazelrc"
 
+# Bazel expands `~` and `%workspace%` in --disk_cache; this library does not, so
+# anything but an absolute path must fail rather than be measured in the wrong
+# place.
+write_lines "${rc_dir}/tilde.bazelrc" 'build:ci-linux --disk_cache=~/.cache/bazelcache'
+expect_error "must be an absolute path" "tilde path" ci_disk_cache_path linux "${rc_dir}/tilde.bazelrc"
+write_lines "${rc_dir}/workspace.bazelrc" 'build:ci-linux --disk_cache=%workspace%/cache'
+expect_error "must be an absolute path" "%workspace% path" ci_disk_cache_path linux "${rc_dir}/workspace.bazelrc"
+write_lines "${rc_dir}/relative.bazelrc" 'build:ci-linux --disk_cache=cache/dir'
+expect_error "must be an absolute path" "relative path" ci_disk_cache_path linux "${rc_dir}/relative.bazelrc"
+
 # A final line without a trailing newline still counts.
 printf 'build:ci-linux --disk_cache=/mnt/ssd/bazel/disk_cache' > "${rc_dir}/no-newline.bazelrc"
 expect_output "/mnt/ssd/bazel/disk_cache" "no trailing newline" ci_disk_cache_path linux "${rc_dir}/no-newline.bazelrc"
 
 # The real rc must keep the lines the library looks for, on both OSes.
 real_rc="${workspace}/.ci.bazelrc"
-if [[ -r "$real_rc" ]]; then
-  expect_output "/mnt/ssd/bazel/disk_cache" "real .ci.bazelrc linux" ci_disk_cache_path linux "$real_rc"
-  expect_output "/Volumes/ssd/bazel/disk_cache" "real .ci.bazelrc darwin" ci_disk_cache_path darwin "$real_rc"
-fi
+expect_output "/mnt/ssd/bazel/disk_cache" "real .ci.bazelrc linux" ci_disk_cache_path linux "$real_rc"
+expect_output "/Volumes/ssd/bazel/disk_cache" "real .ci.bazelrc darwin" ci_disk_cache_path darwin "$real_rc"
 
 # ---------------------------------------------------------------------------
 # ci_disk_cache_fs_total_kb: reading the filesystem size via df.

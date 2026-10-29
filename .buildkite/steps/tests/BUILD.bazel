@@ -8,5 +8,8 @@ sh_test(
     name = "disk_cache_gc_cap_test",
     size = "small",
     srcs = ["disk_cache_gc_cap_test.sh"],
-    data = ["//.buildkite/steps:disk-cache-gc-cap.sh"],
+    data = [
+        "//:.ci.bazelrc",
+        "//.buildkite/steps:disk-cache-gc-cap.sh",
+    ],
 )

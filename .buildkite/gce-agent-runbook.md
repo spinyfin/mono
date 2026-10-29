@@ -74,12 +74,12 @@ To verify on the host (from the agent's checkout, e.g. `/var/lib/buildkite-agent
 df -P -k /mnt/ssd/bazel/disk_cache        # the 1024-blocks total is the cap's input
 bash -c 'source .buildkite/steps/disk-cache-gc-cap.sh &&
   ci_disk_cache_gc_cap_from_total_kb "$(ci_disk_cache_fs_total_kb /mnt/ssd/bazel/disk_cache)"'
-grep "Disk cache garbage collector" /mnt/ssd/bazel/output_base/*/java.log | tail
+grep -E "Disk cache garbage collector|Deleted [0-9]+ of [0-9]+ files" /mnt/ssd/bazel/output_base/*/java.log | tail
 ```
 
 The last command shows the GC actually running (`Deleted N of M files, reclaimed ...`); it runs about five minutes after a build, once the Bazel server goes idle.
 
-**Disk-full symptom.** An agent whose disk has filled up does not go offline. It stays connected in Buildkite and keeps accepting `bazel-any` jobs, which then sit in "accepted" with empty logs and stall the merge queue. If jobs are stuck that way, run `df -h /mnt/ssd /` on the host first. The cache cap is computed from the disk size, so a full disk now points at something other than the disk cache — or at a host whose CI steps are not going through `steps/ci-env.sh`. If the disk cache itself is what filled the disk, a one-time `sudo rm -rf /mnt/ssd/bazel/disk_cache` frees it; the computed cap keeps it from recurring, so do not add a cron job for this.
+**Disk-full symptom.** An agent whose disk has filled up does not go offline. It stays connected in Buildkite and keeps accepting `bazel-any` jobs, which then sit in "accepted" with empty logs and stall the merge queue. If jobs are stuck that way, run `df -h /mnt/ssd /` on the host first, then `du -sh /mnt/ssd/bazel/disk_cache /mnt/ssd/bazel/output_base /mnt/ssd/bazel/repo_cache /var/lib/buildkite-agent/.cache/bazelcache /var/lib/buildkite-agent/.cache/bazel`. The CI cache cap is computed from the disk size, so a full disk now points at something other than the CI disk cache — typically `.cache/bazelcache` (the off-CI cache, 250G cap) or `.cache/bazel` from a bazel call that bypassed the CI flags — or at a host whose CI steps are not going through `steps/ci-env.sh`. If the disk cache itself is what filled the disk, a one-time `sudo rm -rf /mnt/ssd/bazel/disk_cache` frees it; the computed cap keeps it from recurring, so do not add a cron job for this.
 
 **Do not edit `.ci.bazelrc`'s GC lines for a host's disk size** — the cap is computed per host; `.ci.bazelrc` is fleet-wide config.
 
