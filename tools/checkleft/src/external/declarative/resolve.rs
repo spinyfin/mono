@@ -425,11 +425,22 @@ fn override_npm_binding(name: &str, requirement: &BinaryRequirement, npm: &toml:
 
 /// Construct provisioning commands with canonical startup flags and environment.
 pub(super) fn bazel_resolve_command(repo_root: &Path, launcher: &Path, target: &str, build: bool) -> Command {
+    bazel_resolve_command_with_ci_flags(repo_root, launcher, target, build, &super::ci_bazel_flags())
+}
+
+/// As [`bazel_resolve_command`], with the CI per-command flags passed in so they can be pinned in tests.
+pub(super) fn bazel_resolve_command_with_ci_flags(
+    repo_root: &Path,
+    launcher: &Path,
+    target: &str,
+    build: bool,
+    ci_flags: &[String],
+) -> Command {
     let mut command = Command::new(crate::external::environment::locate(launcher));
     command
         .args(super::ci_bazel_startup_flags())
         .arg(if build { "build" } else { "cquery" })
-        .args(super::ci_bazel_flags())
+        .args(ci_flags)
         .args(["--color=no", "--curses=no", "--noshow_progress"]);
     if build {
         command

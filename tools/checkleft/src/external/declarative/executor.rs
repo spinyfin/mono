@@ -520,6 +520,17 @@ fn aspect_query_args(startup_flags: &[String], query: String) -> Vec<String> {
 }
 
 /// Args for the aspect `bazel build`; always led by `startup_flags`.
+/// Flags shared by the aspect build and cquery: CI's per-command flags first,
+/// then the aspect and its output groups.
+fn aspect_invocation_flags(ci_flags: Vec<String>, aspect: &BazelAspectInvocation) -> Vec<String> {
+    let mut flags = ci_flags;
+    flags.extend([
+        format!("--aspects={}", aspect.aspect),
+        format!("--output_groups={}", aspect.output_groups.join(",")),
+    ]);
+    flags
+}
+
 fn aspect_build_args(
     startup_flags: &[String],
     aspect_flags: &[String],
@@ -683,11 +694,7 @@ fn run_bazel_aspect_invocation(
     // CI's per-command flags (`--config=ci-<os>` and the host-sized disk-cache
     // GC cap) lead the build and cquery so this build writes to the same capped
     // cache as every other CI bazel invocation. See `ci_bazel_flags`.
-    let mut aspect_flags = super::ci_bazel_flags();
-    aspect_flags.extend([
-        format!("--aspects={}", aspect.aspect),
-        format!("--output_groups={}", aspect.output_groups.join(",")),
-    ]);
+    let aspect_flags = aspect_invocation_flags(super::ci_bazel_flags(), aspect);
     let expanded_build_flags: Vec<String> = aspect
         .build_flags
         .iter()

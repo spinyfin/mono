@@ -69,6 +69,37 @@ fn production_commands_preserve_environment_and_startup_flags() {
 }
 
 #[test]
+fn ci_flags_follow_the_subcommand_and_precede_other_flags() {
+    let repo = tempfile::tempdir().unwrap();
+    let ci = vec![
+        "--config=ci-linux".to_owned(),
+        "--experimental_disk_cache_gc_max_size=391G".to_owned(),
+    ];
+    for build in [true, false] {
+        let command =
+            resolve::bazel_resolve_command_with_ci_flags(repo.path(), Path::new("bazel"), "//:tool", build, &ci);
+        let args: Vec<_> = command.get_args().map(|v| v.to_string_lossy().into_owned()).collect();
+        let sub = args
+            .iter()
+            .position(|a| a == if build { "build" } else { "cquery" })
+            .unwrap();
+        assert_eq!(&args[sub + 1..sub + 3], ci.as_slice());
+        assert_eq!(args[sub + 3], "--color=no");
+    }
+
+    let aspect = BazelAspectInvocation {
+        aspect: "@x//:y.bzl%z".to_owned(),
+        output_groups: vec!["g".to_owned()],
+        build_flags: Vec::new(),
+        artifact_format: ArtifactFormat::Json,
+        test_rdeps_kinds: Vec::new(),
+    };
+    let flags = aspect_invocation_flags(ci.clone(), &aspect);
+    assert_eq!(&flags[..2], ci.as_slice());
+    assert_eq!(flags[2], "--aspects=@x//:y.bzl%z");
+}
+
+#[test]
 fn conflicting_version_selectors_fail_with_actionable_error() {
     let repo = tempfile::tempdir().unwrap();
     std::fs::write(repo.path().join(".bazelversion"), "7.4.1").unwrap();
