@@ -1136,6 +1136,10 @@ final class ChatViewModel: ObservableObject {
     @Published var coordinatorModelRecreateConfirmation: CoordinatorModelRecreateConfirmation?
     @Published var coordinatorResetWaiting = false
     @Published var coordinatorResetDeliveryFailed = false
+    /// Why the engine could not deliver the handoff request, as the engine
+    /// stated it (which step failed and its reason). Shown verbatim under the
+    /// delivery-failure banner; `nil` while no failure is being shown.
+    @Published var coordinatorResetDeliveryFailureReason: String?
     @Published var coordinatorResetForced = false
     var pendingCoordinatorReset: (token: String, reason: CoordinatorRecreateReason)?
 

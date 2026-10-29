@@ -138,7 +138,7 @@ pub(super) fn engine_pool_config_event(server_state: &ServerState) -> FrontendEv
     }
 }
 
-async fn attach_coordinator_to_registered_app(server_state: Arc<ServerState>) {
+pub(super) async fn attach_coordinator_to_registered_app(server_state: Arc<ServerState>) {
     // This is a genuine attach entry point (app launch/relaunch/reconnect),
     // not the supervisor's flat 10s unattached-retry loop that
     // `coordinator_installed_version_cache` exists to rate-limit. Clear it
@@ -201,7 +201,45 @@ async fn attach_coordinator_to_registered_app(server_state: Arc<ServerState>) {
         };
         (record, active_tmux)
     };
+    brief_adopted_coordinator_with_authorization(&server_state, &record);
     request_coordinator_attachment(server_state, &active_tmux, record).await;
+}
+
+/// A coordinator session the engine adopted — it outlived an engine or app
+/// restart, or the deploy that introduced handoff authorization — was never
+/// handed the current credential in a session-start brief. Deliver it to the
+/// main session's inbox now so rolling writes and reset requests work without
+/// the session first having to ask. Detached and best-effort: attach never
+/// waits on inbox delivery, and the outcome is audited by
+/// `deliver_authorization`.
+fn brief_adopted_coordinator_with_authorization(
+    server_state: &Arc<ServerState>,
+    record: &crate::work::CoordinatorTmuxRecord,
+) {
+    match server_state
+        .work_db
+        .coordinator_handoff_authorization_delivered_to(&record.spawn_token)
+    {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "could not read whether the adopted coordinator holds its handoff credential; delivering it"
+            );
+        }
+    }
+    tracing::info!(
+        spawn_token = %record.spawn_token,
+        "adopted coordinator session has not received its handoff credential; delivering it to the main session inbox"
+    );
+    let state = server_state.clone();
+    boss_task_scope::spawn(async move {
+        let outcome = super::coordinator_handoff::deliver_authorization(state, "adoption").await;
+        if !outcome.requested {
+            tracing::error!(detail = %outcome.detail, "adopted coordinator did not receive its handoff credential");
+        }
+    });
 }
 
 pub(super) async fn refresh_coordinator_pid(

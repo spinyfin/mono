@@ -1027,6 +1027,7 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
         reason,
         &guidance,
         guidance_error.as_deref(),
+        &spawn_token,
     );
 
     let mut environment = BTreeMap::from([
@@ -1114,6 +1115,7 @@ fn prepare_session_start_brief(
     reason: CoordinatorStartReason,
     guidance: &[boss_protocol::CoordinatorGuidanceView],
     guidance_error: Option<&str>,
+    spawn_token: &str,
 ) -> String {
     let state = work_db.coordinator_handoff_state();
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
@@ -1194,9 +1196,19 @@ fn prepare_session_start_brief(
         }
     };
     match work_db.coordinator_handoff_authorization() {
-        Ok(Some(authorization)) => delivered.push_str(&format!(
-            "\nPrivate handoff write authorization: {authorization}\nUse `boss handoff write --authorization {authorization} -`. Never share this credential with subagents or store it in shared files. After compaction, run `boss handoff show` to request delivery to the main session inbox.\n"
-        )),
+        Ok(Some(authorization)) => {
+            delivered.push_str(&format!(
+                "\nPrivate handoff write authorization: {authorization}\nUse `boss handoff write --authorization {authorization} -`. Never share this credential with subagents or store it in shared files. After compaction, run `boss handoff show` to request delivery to the main session inbox.\n"
+            ));
+            // The brief is the fresh session's first prompt, so adoption
+            // after a later engine restart must not redeliver the credential.
+            if let Err(error) = work_db.record_coordinator_handoff_authorization_delivered(spawn_token) {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "coordinator handoff: could not record that the brief carries the credential"
+                );
+            }
+        }
         result => {
             tracing::error!(?result, "coordinator handoff authorization unavailable");
             delivered.push_str("\nHandoff authorization is unavailable; report this to the operator.\n");
@@ -1308,9 +1320,21 @@ mod tests {
         let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
         db.record_coordinator_tmux_spawn_intent("boss-coordinator", "fallback-token", "opus", None)
             .unwrap();
-        let prompt =
-            prepare_session_start_brief(&db, dir.path(), None, CoordinatorStartReason::FirstCreation, &[], None);
+        let prompt = prepare_session_start_brief(
+            &db,
+            dir.path(),
+            None,
+            CoordinatorStartReason::FirstCreation,
+            &[],
+            None,
+            "fallback-token",
+        );
         assert!(prompt.contains(&db.coordinator_handoff_authorization().unwrap().unwrap()));
+        assert!(
+            db.coordinator_handoff_authorization_delivered_to("fallback-token")
+                .unwrap(),
+            "a brief that carries the credential counts as delivering it"
+        );
         assert!(prompt.contains("Product guidance was NOT delivered"), "{prompt}");
         assert!(
             prompt.contains("Before product-scoped work, run `boss guidance show`"),
@@ -2693,7 +2717,15 @@ mod tests {
                     .join("initial-prompt.txt")
             )
             .unwrap(),
-            prepare_session_start_brief(&db, dir.path(), None, CoordinatorStartReason::FirstCreation, &[], None),
+            prepare_session_start_brief(
+                &db,
+                dir.path(),
+                None,
+                CoordinatorStartReason::FirstCreation,
+                &[],
+                None,
+                &db.coordinator_tmux_record().unwrap().unwrap().spawn_token,
+            ),
         );
         let brief = start_brief(dir.path());
         assert!(

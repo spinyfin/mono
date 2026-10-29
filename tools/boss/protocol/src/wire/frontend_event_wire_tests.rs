@@ -20,10 +20,10 @@ use super::*;
 // Enum discriminants and inputs used only by these fixtures are not part of
 // the `wire` module's import set — bring them in explicitly from the crate root.
 use crate::{
-    AttachmentMediaType, AutomationTrigger, COORDINATOR_GUIDANCE_PATH, CoordinatorGuidanceState, Decision,
-    DecisionKind, DecisionStatus, DesignDocEntry, DesignDocTree, DispatchAdmissionBlocker, DispatchPauseSnapshot,
-    EffortLevel, ExecutionKind, ExecutionStatus, ListHostedPanesInput, ProjectDesignDocState, ProposalFieldError,
-    TaskKind, TaskStatus, WorkerTierDenialReason,
+    AttachmentMediaType, AutomationTrigger, COORDINATOR_GUIDANCE_PATH, CoordinatorGuidanceState,
+    CoordinatorHandoffAuthorizationDelivery, Decision, DecisionKind, DecisionStatus, DesignDocEntry, DesignDocTree,
+    DispatchAdmissionBlocker, DispatchPauseSnapshot, EffortLevel, ExecutionKind, ExecutionStatus, ListHostedPanesInput,
+    ProjectDesignDocState, ProposalFieldError, TaskKind, TaskStatus, WorkerTierDenialReason,
 };
 
 /// One representative event paired with the exact `"type"` tag it must
@@ -1544,6 +1544,12 @@ fn tag_cases() -> Vec<TagCase> {
             label: "CoordinatorHandoffResult",
             event: FrontendEvent::CoordinatorHandoffResult {
                 handoff: Some(coordinator_handoff()),
+                authorization_delivery: Some(
+                    CoordinatorHandoffAuthorizationDelivery::builder()
+                        .requested(true)
+                        .detail("accepted by the main session's inbox")
+                        .build(),
+                ),
             },
             expected_tag: "coordinator_handoff_result",
         },

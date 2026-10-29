@@ -105,9 +105,24 @@ pub(crate) async fn request_and_wait(request: HandoffRequest<'_>) -> Result<bool
         HandoffState::Present(h) => h.write_id,
         _ => String::new(),
     };
+    // Each step names itself in the error: the app shows that text verbatim
+    // so the failing step and reason are visible, not only that the
+    // request never arrived.
     let authorization = work_db
         .ensure_coordinator_handoff_authorization(&record.spawn_token)
-        .with_context(|| format!("{DELIVERY_FAILED_PREFIX}: coordinator handoff authorization is unavailable"))?;
+        .map_err(|error| {
+            audit::record_event(
+                "coordinator_handoff_delivery_failed",
+                &json!({
+                    "ts_epoch_ms": boss_engine_utils::epoch_time::now_epoch_ms(),
+                    "spawn_token": expected_token, "elapsed_ms": started.elapsed().as_millis(),
+                    "step": "credential", "error": format!("{error:#}"),
+                }),
+            );
+            anyhow!(
+                "{DELIVERY_FAILED_PREFIX}: the handoff credential for this session could not be minted ({error:#}). The coordinator session is still running."
+            )
+        })?;
     let turn_ended = delivery
         .deliver_locked(
             tmux,
@@ -122,12 +137,18 @@ pub(crate) async fn request_and_wait(request: HandoffRequest<'_>) -> Result<bool
                 &json!({
                     "ts_epoch_ms": boss_engine_utils::epoch_time::now_epoch_ms(),
                     "spawn_token": expected_token, "elapsed_ms": started.elapsed().as_millis(),
-                    "error": format!("{error:#}"),
+                    "step": "inbox_delivery", "error": format!("{error:#}"),
                 }),
             );
             // Delivery failure preserves the session and leaves a forced reset available.
-            anyhow!("{DELIVERY_FAILED_PREFIX}: {error:#}. The coordinator session is still running.")
+            anyhow!(
+                "{DELIVERY_FAILED_PREFIX}: inbox delivery failed: {error:#}. The coordinator session is still running."
+            )
         })?;
+    // The request carried the credential, so the live session now holds it.
+    if let Err(error) = work_db.record_coordinator_handoff_authorization_delivered(&record.spawn_token) {
+        tracing::warn!(error = %format!("{error:#}"), "could not record handoff credential delivery after a reset request");
+    }
     audit::record_event(
         "coordinator_handoff_requested",
         &json!({

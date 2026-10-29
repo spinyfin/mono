@@ -11,6 +11,11 @@ use super::WorkDb;
 
 const SESSION_NAME_KEY: &str = "coordinator.tmux_session_name";
 const HANDOFF_AUTHORIZATION_KEY: &str = "coordinator.handoff_authorization";
+/// Spawn token of the coordinator session whose main inbox (or session-start
+/// brief) is known to have received the handoff write credential. Empty when
+/// the live session has not: a session that outlived the authorization deploy
+/// or an engine restart is re-briefed from this marker, never by guessing.
+const HANDOFF_AUTHORIZATION_DELIVERED_KEY: &str = "coordinator.handoff_authorization_delivered_to";
 const SPAWN_TOKEN_KEY: &str = "coordinator.tmux_spawn_token";
 const SPAWN_STATE_KEY: &str = "coordinator.tmux_spawn_state";
 const MODEL_KEY: &str = "coordinator.tmux_model";
@@ -98,12 +103,45 @@ impl WorkDb {
         Ok(authorization)
     }
 
+    /// Whether the live coordinator session identified by `spawn_token` is
+    /// known to hold its handoff write credential (delivered in its brief or
+    /// confirmed into its main inbox).
+    pub(crate) fn coordinator_handoff_authorization_delivered_to(&self, spawn_token: &str) -> Result<bool> {
+        Ok(self
+            .get_metadata(HANDOFF_AUTHORIZATION_DELIVERED_KEY)?
+            .is_some_and(|delivered_to| !delivered_to.is_empty() && delivered_to == spawn_token))
+    }
+
+    /// Record that the credential reached the session identified by
+    /// `spawn_token`. Refused (returns `false`) when that token is no longer
+    /// the live record, so a confirmation that lands after a replacement
+    /// cannot mark the new session as briefed.
+    pub(crate) fn record_coordinator_handoff_authorization_delivered(&self, spawn_token: &str) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let live_token: Option<String> = tx
+            .query_row("SELECT value FROM metadata WHERE key = ?1", [SPAWN_TOKEN_KEY], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if live_token.as_deref() != Some(spawn_token) {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![HANDOFF_AUTHORIZATION_DELIVERED_KEY, spawn_token],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     #[cfg(test)]
     pub(crate) fn clear_coordinator_handoff_authorization(&self) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
-            "DELETE FROM metadata WHERE key = ?1",
-            params![HANDOFF_AUTHORIZATION_KEY],
+            "DELETE FROM metadata WHERE key IN (?1, ?2)",
+            params![HANDOFF_AUTHORIZATION_KEY, HANDOFF_AUTHORIZATION_DELIVERED_KEY],
         )?;
         Ok(())
     }
@@ -169,6 +207,7 @@ impl WorkDb {
         for (key, value) in [
             (SESSION_NAME_KEY, session_name),
             (HANDOFF_AUTHORIZATION_KEY, authorization.as_str()),
+            (HANDOFF_AUTHORIZATION_DELIVERED_KEY, ""),
             (SPAWN_TOKEN_KEY, spawn_token),
             (SPAWN_STATE_KEY, "intended"),
             (MODEL_KEY, model),

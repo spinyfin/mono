@@ -1142,8 +1142,14 @@ pub enum FrontendEvent {
     /// Reply for [`FrontendRequest::GetCoordinatorHandoff`]. `handoff` is
     /// `None` only when no coordinator session has ever written one; a
     /// stored-but-undecodable handoff is reported as `WorkError` instead.
+    /// `authorization_delivery` is present only for a caller with
+    /// coordinator ancestry, whose read also asks the engine to redeliver
+    /// the handoff write credential to the main session's inbox; it
+    /// reports whether that redelivery was accepted or which step failed.
     CoordinatorHandoffResult {
         handoff: Option<CoordinatorHandoffView>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        authorization_delivery: Option<CoordinatorHandoffAuthorizationDelivery>,
     },
     /// Reply for [`FrontendRequest::SetCoordinatorHandoff`]: the handoff
     /// as persisted, stamped with the write time and writer session.
