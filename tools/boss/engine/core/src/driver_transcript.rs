@@ -72,7 +72,8 @@ pub fn driver_for_execution(work_db: &WorkDb, execution_id: &str) -> Option<Arc<
 /// [`driver_for_execution`]: the latter re-derives from the current worker
 /// id and pool policy, which can paint a Codex spawn as Claude Code after
 /// an engine restart. When the launch tuple was never written (a crash
-/// between pane start and the stamp), falls through to
+/// between pane start and the stamp), first uses a review-guide attempt
+/// configuration persisted before spawn, then falls through to
 /// [`driver_for_execution`]. If live resolution also has no driver, uses
 /// the engine default for this unstamped legacy case only.
 ///
@@ -103,6 +104,11 @@ pub fn driver_for_spawned_execution(work_db: &WorkDb, execution_id: &str) -> Opt
                 "driver transcript: launched-driver lookup failed; falling back to live resolution",
             );
         }
+    }
+    if let Ok(execution) = work_db.get_execution(execution_id)
+        && let Some((slug, _)) = crate::live_worker_metadata::guide_launch_config(work_db, &execution)
+    {
+        return require_driver_slug(execution_id, &slug);
     }
     driver_for_execution(work_db, execution_id).or_else(|| {
         DriverRegistry::default()

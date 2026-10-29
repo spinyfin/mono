@@ -428,17 +428,8 @@ impl ServerState {
                 Ok(Some(_))
             );
             let pool = crate::live_worker_state::attributed_pool_label(restored.kind.clone(), has_source_automation);
-            let model_label = restored.model.clone().unwrap_or_else(|| {
-                driver
-                    .as_ref()
-                    .map(|driver| driver.descriptor().label.to_owned())
-                    .unwrap_or_else(|| "Unknown driver".to_owned())
-            });
-            let awaiting_input_capable = driver.as_ref().is_some_and(|driver| {
-                driver
-                    .capabilities()
-                    .provides(crate::driver::Capability::AwaitingInputSignal)
-            });
+            let (model_label, awaiting_input_capable) =
+                crate::live_worker_metadata::adopted_identity(&self.work_db, &restored, driver.as_deref());
             // Register through the re-adoption entry point, not the spawn
             // one. Registration stamps `spawned_at` with the current time,
             // which is a fiction here — this worker has been running,

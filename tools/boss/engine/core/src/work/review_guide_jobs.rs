@@ -404,7 +404,8 @@ impl WorkDb {
     }
 
     /// Record the resolved spawn configuration on the attempt once the
-    /// engine has pinned it — diagnostics only, does not change status.
+    /// engine has pinned it, before spawning. Recovery uses this configuration
+    /// if the execution launch stamp was not written; does not change status.
     pub(crate) fn record_pr_review_guide_attempt_spawn_config(
         &self,
         attempt_id: &str,

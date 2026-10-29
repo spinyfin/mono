@@ -25,6 +25,46 @@ pub(crate) fn execution_binding(work_db: &WorkDb, execution: &WorkExecution) -> 
     }
 }
 
+/// Guide launch configuration is persisted before the pane starts, unlike
+/// the execution launch stamp, which is written after spawn returns.
+pub(crate) fn guide_launch_config(work_db: &WorkDb, execution: &WorkExecution) -> Option<(String, String)> {
+    if execution.kind != ExecutionKind::PrReviewGuide {
+        return None;
+    }
+    match work_db.pr_review_guide_attempt_for_execution(&execution.id) {
+        Ok(Some(attempt)) => Some((attempt.driver?, attempt.model?)),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(execution_id = %execution.id, %error, "could not read guide launch configuration");
+            None
+        }
+    }
+}
+
+/// Shared identity for both restart registration paths, with the execution
+/// stamp taking precedence over the pre-spawn guide configuration.
+pub(crate) fn adopted_identity(
+    work_db: &WorkDb,
+    execution: &WorkExecution,
+    driver: Option<&dyn crate::driver::AgentDriver>,
+) -> (String, bool) {
+    let model = execution
+        .model
+        .clone()
+        .or_else(|| guide_launch_config(work_db, execution).map(|(_, model)| model))
+        .unwrap_or_else(|| {
+            driver
+                .map(|driver| driver.descriptor().label.to_owned())
+                .unwrap_or_else(|| "Unknown driver".to_owned())
+        });
+    let awaiting_input_capable = driver.is_some_and(|driver| {
+        driver
+            .capabilities()
+            .provides(crate::driver::Capability::AwaitingInputSignal)
+    });
+    (model, awaiting_input_capable)
+}
+
 /// Project attribution for a dispatched work item, in precedence order:
 ///
 /// 1. The work item *is* a project (project-level work): that project.
