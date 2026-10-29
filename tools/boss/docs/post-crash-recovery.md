@@ -137,6 +137,50 @@ Once the predecessor is `orphaned`:
    the orphan was working on; from there it can push and open / update
    the PR as if no crash had happened.
 
+## Review-guide attempts across a restart
+
+A `pr_review_guide` execution carries a `pr_review_guide_attempts` row that
+the orphan reap closes together with the execution (`failed`, reason
+"execution orphaned"). Because `orphaned` is an inferred death, that closure
+has to be as reversible as the status it was derived from:
+
+- **Re-adoption reopens the attempt.** When a live worker disproves the
+  inference (`execution re-adopted: inferred death disproven by a live
+worker`), the same transaction puts the attempt back to `running` and the
+  series back to `generating`, provided the attempt failed _after_ a worker
+  ran, its comparison is still the series' selected one, nothing has been
+  published for it and no other attempt is live for the series. The trace
+  line names the reopened attempt in `reopened_review_guide_attempt`. A
+  pre-start failure stays failed (the re-enqueue pass owns those).
+- **The startup reconcile checks liveness before closing.** The pass that
+  finishes attempts bound to terminal executions
+  (`review_guide_attempt_reconcile`) runs after the tmux adoption pass and
+  treats an `orphaned` execution as live when adoption observed its pane
+  (adopted, or handed to re-adoption) or when its durable shell pid is
+  alive. Such an attempt is logged `action = "kept_open"` and left for
+  re-adoption; every attempt it does finish, fail or dispatch is logged with
+  `attempt_id`, `execution_id`, `reason` and `action`. A failed _read_ of
+  the execution leaves the attempt untouched rather than failing it. The
+  periodic terminal-work sweep applies the same pid probe.
+- **A guide submitted against a closed attempt stores nothing.**
+  `boss propose review-guide` is refused with `not_accepted` (exit 6) before
+  any `worker_proposals` row is written, so the worker's retry after
+  re-adoption is a fresh submission rather than a replay of the refusal.
+- **Guides older engines stored as refused are recovered on startup.**
+  `review_guide_submission_recovery` finds `rejected` review-guide
+  proposals whose reason was "this execution has no running review-guide
+  attempt", validates the stored body against the recorded comparison at
+  the execution's workspace, reopens the attempt under the fences above,
+  applies the proposal against it and publishes. A body that no longer
+  validates (for example because the workspace is gone) is logged and left
+  untouched; regenerate that PR's guide by hand.
+
+The restart-during-spawn shape — a guide run spawned seconds before an
+engine restart, orphaned by the restarted engine's recovery probe, re-adopted
+on the worker's next hook, and submitting its guide minutes later — is
+covered by `restart_during_spawn_reopens_the_attempt_with_the_readopted_execution_and_publishes_the_guide`
+in `engine/core/src/work/review_guide_jobs_tests.rs`.
+
 ## Automatic workspace patch backup
 
 Preserving the lease keeps the in-flight work _reachable_ only as long as

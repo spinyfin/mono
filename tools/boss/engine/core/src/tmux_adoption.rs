@@ -393,6 +393,13 @@ pub struct TmuxAdoptionOutcome {
     /// already proved them alive more directly than a cube lease snapshot
     /// can.
     pub adopted_execution_ids: HashSet<String>,
+    /// Execution ids behind [`Self::terminal_handoffs`]: terminal rows whose
+    /// live session this pass observed and handed to re-adoption. Startup
+    /// treats them as live when judging review-guide attempts, so an attempt
+    /// is not closed on the strength of a status re-adoption is about to
+    /// reverse.
+    #[builder(default)]
+    pub terminal_handoff_execution_ids: HashSet<String>,
     /// Adopted runs whose `tmux_spawn_state` was still `intended` and got
     /// durably repaired to `created` by this pass.
     pub repaired_intents: usize,
@@ -1126,6 +1133,7 @@ async fn classify_untracked_session<S>(
             .converge_live_worker(&execution_id, TERMINAL_HANDOFF_TRIGGER)
             .await;
         outcome.terminal_handoffs += 1;
+        outcome.terminal_handoff_execution_ids.insert(execution_id.clone());
         return;
     }
 

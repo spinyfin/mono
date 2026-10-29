@@ -398,6 +398,15 @@ impl WorkDb {
                )",
             params![existing.work_item_id, now.as_str(), execution_id],
         )?;
+        // The orphan reap closed this execution's review-guide attempt on
+        // the strength of the same inferred death this write reverses. Bring
+        // the attempt back with the execution, or the live worker has no
+        // running attempt to submit its guide to.
+        let reopened_review_guide_attempt = if existing.kind == ExecutionKind::PrReviewGuide {
+            super::review_guide_jobs::reopen_review_guide_attempt_for_readoption(&tx, execution_id, &now, false)?
+        } else {
+            None
+        };
 
         let updated = query_execution(&tx, execution_id)?
             .with_context(|| format!("unknown execution after re-adoption: {execution_id}"))?;
@@ -414,6 +423,7 @@ impl WorkDb {
             from_status = %existing.status,
             to_status = %updated.status,
             evidence = %evidence,
+            reopened_review_guide_attempt = ?reopened_review_guide_attempt,
             "execution re-adopted: inferred death disproven by a live worker",
         );
         // No bus event: `Event` carries only terminal-direction lifecycle

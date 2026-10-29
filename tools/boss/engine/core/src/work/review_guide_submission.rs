@@ -5,6 +5,12 @@ use super::*;
 
 type PacketReference = (String, Option<String>, String);
 
+/// Refusal reason when the attributed execution has no `running` attempt (or
+/// is not itself `running`). Shared with
+/// [`super::review_guide_recovery`], which recovers the guides that older
+/// engines stored as `rejected` rows under exactly this reason.
+pub(super) const NO_RUNNING_ATTEMPT_REASON: &str = "this execution has no running review-guide attempt";
+
 pub(super) struct PreparedGuide {
     reference: PacketReference,
     validation: std::result::Result<(), String>,
@@ -53,9 +59,7 @@ pub(super) fn accept(
         )
         .optional()?;
     let Some(attempt) = attempt else {
-        return Ok(ApplyDecision::Rejected(
-            "this execution has no running review-guide attempt".into(),
-        ));
+        return Ok(ApplyDecision::Rejected(NO_RUNNING_ATTEMPT_REASON.into()));
     };
     let already_accepted: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM worker_proposals WHERE execution_id = ?1
@@ -212,22 +216,96 @@ mod tests {
                     payload_json: &payload,
                     idempotency_key: "guide",
                 })
-                .unwrap()
                 .unwrap();
             eprintln!("4 MiB packet submission, mutation={mutation:?}: {:?}", start.elapsed());
             assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
-            match mutation {
-                None => assert_eq!(outcome.proposal.state, boss_protocol::ProposalState::Applied),
-                Some(_) => {
-                    assert_eq!(outcome.proposal.state, boss_protocol::ProposalState::Rejected);
-                    let reason = outcome.proposal.decision_reason.unwrap();
+            match (mutation, outcome) {
+                (None, Ok(outcome)) => assert_eq!(outcome.proposal.state, boss_protocol::ProposalState::Applied),
+                (Some(_), Err(refusal)) => {
+                    // A concurrent change is refused before anything is
+                    // stored, so the worker's retry is a fresh submission.
+                    assert_eq!(refusal.code, boss_protocol::ProposalErrorCode::NotAccepted);
                     assert!(
-                        reason.contains("changed during validation")
-                            || reason.contains("no running review-guide attempt"),
-                        "{reason}"
+                        refusal.message.contains("changed during validation")
+                            || refusal.message.contains(NO_RUNNING_ATTEMPT_REASON),
+                        "{}",
+                        refusal.message
                     );
+                    assert_eq!(stored_proposal_count(&db, &execution.id), 0);
                 }
+                (mutation, _) => panic!("unexpected submission outcome for mutation {mutation:?}"),
             }
         }
+    }
+
+    fn stored_proposal_count(db: &WorkDb, execution_id: &str) -> i64 {
+        db.connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM worker_proposals WHERE execution_id = ?1",
+                [execution_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    const VALID_GUIDE: &str = "# Guide\n## Orientation\nA change.\n## Problem\n## Implementation\n## Example\n## Review\n## Evidence\nNo validation results reported; no screenshots registered.";
+
+    /// A guide submitted while its attempt is closed is refused without a
+    /// stored row, so once re-adoption reopens the attempt the same
+    /// submission (same body, same idempotency key) is judged afresh and
+    /// accepted — never replayed as the earlier refusal.
+    #[test]
+    fn refused_submission_stores_nothing_and_the_retry_after_readoption_is_fresh() {
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        let root = create_active_chore(&db, &product, "guide submission");
+        let (series, comparison) = crate::test_support::seed_review_guide_series(&db, &root);
+        let attempt = db
+            .create_pr_review_guide_attempt(&series, &comparison, boss_review_guide::PROMPT_VERSION)
+            .unwrap();
+        let execution = db.create_pr_review_guide_execution(&comparison, "acme/widget").unwrap();
+        db.bind_pr_review_guide_attempt_execution(&attempt.id, &execution.id)
+            .unwrap();
+        db.start_execution_run(&execution.id, "review", "mono", "lease", "ws", "/tmp/ws")
+            .unwrap();
+        // The engine wrongly infers the worker dead: the reap orphans the
+        // execution and closes the attempt with it.
+        db.mark_execution_orphaned(&execution.id, "test: wrongly inferred death")
+            .unwrap();
+        let payload = serde_json::json!({ "body_markdown": VALID_GUIDE }).to_string();
+        let submit = || {
+            db.submit_worker_proposal(SubmitWorkerProposalInput {
+                execution_id: &execution.id,
+                work_item_id: &comparison,
+                kind: boss_protocol::ProposalKind::ReviewGuide,
+                payload_json: &payload,
+                idempotency_key: "guide",
+            })
+            .unwrap()
+        };
+
+        let refusal = submit().expect_err("no running attempt must refuse the submission");
+        assert_eq!(refusal.code, boss_protocol::ProposalErrorCode::NotAccepted);
+        assert_eq!(refusal.message, NO_RUNNING_ATTEMPT_REASON);
+        assert_eq!(stored_proposal_count(&db, &execution.id), 0, "a refusal stores nothing");
+
+        // The worker's next hook disproves the death; the attempt comes
+        // back with the execution.
+        db.readopt_inferred_terminal_execution(&execution.id, "hook_after_terminal", None)
+            .unwrap();
+        let accepted = submit().expect("the retry is judged on the live state");
+        assert!(
+            !accepted.already_submitted,
+            "nothing was stored, so nothing is replayed"
+        );
+        assert_eq!(accepted.proposal.state, boss_protocol::ProposalState::Applied);
+        assert_eq!(accepted.proposal.applied_ref.as_deref(), Some(attempt.id.as_str()));
+        assert_eq!(
+            db.submitted_review_guide(&execution.id, &attempt.id)
+                .unwrap()
+                .as_deref(),
+            Some(VALID_GUIDE)
+        );
     }
 }

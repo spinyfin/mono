@@ -550,6 +550,15 @@ pub enum ProposalErrorCode {
     /// work item is unreadable) — a stale registry entry for a pruned
     /// execution.
     UnknownExecution,
+    /// The engine declined the submission on state or content grounds and
+    /// stored **nothing**: the message says why (for a review guide: the
+    /// execution has no running attempt, the comparison changed, or the
+    /// guide body failed validation). Distinct from a stored `rejected`
+    /// proposal row — there is no row, so a later retry is a fresh
+    /// submission that is judged on the engine's state at that moment,
+    /// never a replay of this refusal. Remediation: fix the content, or
+    /// wait for the state the message names, then submit again.
+    NotAccepted,
     /// The engine failed to persist or read the proposal. Distinguished
     /// from every code above so a worker does not "fix" a payload that was
     /// never the problem.
@@ -564,6 +573,7 @@ impl ProposalErrorCode {
         ProposalErrorCode::AttributionUnresolved,
         ProposalErrorCode::AttributionMismatch,
         ProposalErrorCode::UnknownExecution,
+        ProposalErrorCode::NotAccepted,
         ProposalErrorCode::Internal,
     ];
 
@@ -575,6 +585,7 @@ impl ProposalErrorCode {
             ProposalErrorCode::AttributionUnresolved => "attribution_unresolved",
             ProposalErrorCode::AttributionMismatch => "attribution_mismatch",
             ProposalErrorCode::UnknownExecution => "unknown_execution",
+            ProposalErrorCode::NotAccepted => "not_accepted",
             ProposalErrorCode::Internal => "internal",
         }
     }

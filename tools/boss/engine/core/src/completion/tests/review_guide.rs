@@ -124,9 +124,15 @@ async fn finalize_review_guide_fails_the_attempt_when_the_output_does_not_valida
     // No title, no section headings — `validate_guide_output` must reject
     // this as a guide even though the driver did produce assistant text.
     write_codex_rollout_transcript(&db, workspace.path(), &execution_id, "looks fine to me, shipped it");
-    let proposal = submit_guide(&db, &execution_id, "looks fine to me, shipped it");
-    assert_eq!(proposal.state, boss_protocol::ProposalState::Rejected);
-    assert!(proposal.decision_reason.is_some());
+    // The refusal stores nothing, so the run ends with no submission on
+    // record and the finalizer fails the attempt for that.
+    let refusal = submit_guide_refused(&db, &execution_id, "looks fine to me, shipped it");
+    assert_eq!(refusal.code, boss_protocol::ProposalErrorCode::NotAccepted);
+    assert!(
+        db.list_worker_proposals_for_execution(&execution_id, boss_protocol::ProposalKind::ReviewGuide)
+            .unwrap()
+            .is_empty()
+    );
     let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None)).handler;
     let execution = db.get_execution(&execution_id).unwrap();
 
@@ -149,6 +155,20 @@ async fn finalize_review_guide_fails_the_attempt_when_the_output_does_not_valida
 }
 
 fn submit_guide(db: &WorkDb, execution_id: &str, markdown: &str) -> boss_protocol::WorkerProposal {
+    submit_guide_outcome(db, execution_id, markdown)
+        .expect("the guide is accepted")
+        .proposal
+}
+
+fn submit_guide_refused(db: &WorkDb, execution_id: &str, markdown: &str) -> boss_protocol::ProposalSubmissionError {
+    submit_guide_outcome(db, execution_id, markdown).expect_err("the guide is refused")
+}
+
+fn submit_guide_outcome(
+    db: &WorkDb,
+    execution_id: &str,
+    markdown: &str,
+) -> std::result::Result<crate::work::SubmitWorkerProposalOutcome, boss_protocol::ProposalSubmissionError> {
     let execution = db.get_execution(execution_id).unwrap();
     db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
         execution_id,
@@ -158,6 +178,4 @@ fn submit_guide(db: &WorkDb, execution_id: &str, markdown: &str) -> boss_protoco
         idempotency_key: "guide",
     })
     .unwrap()
-    .unwrap()
-    .proposal
 }

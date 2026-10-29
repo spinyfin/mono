@@ -1359,15 +1359,52 @@ async fn serve_scoped(
 
     post_bind.mark("release_stale_claimed");
 
-    match server_state.work_db.reconcile_pr_review_guide_attempts() {
+    // Judge review-guide attempts only with the tmux adoption pass's
+    // liveness in hand: an attempt bound to an `orphaned` execution whose
+    // pane adoption just observed alive (adopted, or handed to re-adoption)
+    // must not be closed on the strength of a status re-adoption is about
+    // to reverse. The pass also probes the durable pid of every other
+    // orphaned execution itself; each attempt it acts on or keeps open is
+    // logged with its ids and reason.
+    let review_guide_live_runs: HashSet<String> = tmux_adoption_report
+        .adopted_execution_ids
+        .iter()
+        .chain(tmux_adoption_report.terminal_handoff_execution_ids.iter())
+        .cloned()
+        .collect();
+    match server_state
+        .work_db
+        .reconcile_pr_review_guide_attempts_with_live_runs(&review_guide_live_runs)
+    {
         Ok(acted) if acted > 0 => tracing::info!(
             acted,
-            "engine startup: reconciled stranded or unbound review-guide attempts"
+            "engine startup: reconciled stranded or unbound review-guide attempts (per-attempt lines above)"
         ),
         Ok(_) => {}
         Err(err) => tracing::warn!(?err, "engine startup: review-guide attempt reconcile failed"),
     }
     post_bind.mark("review_guide_attempt_reconcile");
+
+    // Publish guides that were submitted while their attempt was wrongly
+    // closed by an earlier engine (stored as `rejected` proposals). The
+    // pass validates each body with `git`, so it runs off the runtime
+    // workers.
+    {
+        let state = server_state.clone();
+        match tokio::task::spawn_blocking(move || state.work_db.recover_orphaned_review_guide_submissions()).await {
+            Ok(Ok(report)) if !report.is_empty() => tracing::info!(
+                published = report.published.len(),
+                skipped = report.skipped.len(),
+                published_ids = ?report.published,
+                skipped_ids = ?report.skipped,
+                "engine startup: recovered review-guide submissions that had been refused for a wrongly closed attempt",
+            ),
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => tracing::warn!(?err, "engine startup: review-guide submission recovery failed"),
+            Err(err) => tracing::warn!(?err, "engine startup: review-guide submission recovery task failed"),
+        }
+    }
+    post_bind.mark("review_guide_submission_recovery");
 
     // The pass probes each candidate PR with a blocking `gh pr view`, so run
     // it off the async runtime workers.
