@@ -19,6 +19,7 @@ use boss_protocol::{
 };
 
 use crate::cost_pricing;
+
 pub mod sol {
     //! PR-family aggregation. Retried and revised work stays in its enrollment arm.
     use super::{Accumulator, CostRunRecord};
@@ -49,18 +50,21 @@ pub mod sol {
                 let findings = cohort.iter().map(|pr| pr.findings).sum();
                 let mut cost = Accumulator::default();
                 let mut gaps = BTreeSet::new();
+                let (mut measured_tokens, mut measured_prs) = (0u64, 0u64);
                 for pr in cohort.iter().filter(|pr| pr.merged) {
+                    let mut family = Accumulator::default();
                     for run in &pr.runs {
                         cost.add(run, false, &mut gaps);
+                        family.add(run, false, &mut gaps);
+                    }
+                    let family = family.finish(false);
+                    if !pr.runs.is_empty() && family.runs_unmeasured == 0 {
+                        measured_tokens += family.total_tokens as u64;
+                        measured_prs += 1;
                     }
                 }
                 let measured = cost.finish(false);
-                let tokens_per_pr =
-                    if measured.runs_unmeasured == 0 && !cohort.iter().any(|pr| pr.merged && pr.runs.is_empty()) {
-                        ratio(measured.total_tokens as u64, merged)
-                    } else {
-                        None
-                    };
+                let tokens_per_pr = ratio(measured_tokens, measured_prs);
                 SolArmReport::builder()
                     .arm(arm)
                     .ci_observed_prs(observed)
@@ -74,6 +78,7 @@ pub mod sol {
                     .maybe_findings_per_pr(ratio(findings, count))
                     .maybe_revisions_per_merged_pr(ratio(revisions, merged))
                     .maybe_tokens_per_merged_pr(tokens_per_pr)
+                    .merged_prs_tokens_unmeasured(merged - measured_prs)
                     .build()
             })
             .collect();
@@ -81,7 +86,7 @@ pub mod sol {
         "PRs enroll in the arm of their first launched Sol-eligible execution; later revisions and Astra retries remain charged to that arm. Families without a recorded eligible assignment are excluded.".into(),
         "CI is the first terminal observation on the first published head after enrollment. Unknown observations are excluded from the rate, with the denominator shown.".into(),
         "Revision counts include launched revision work items before merge. Findings sum accepted automated review verdicts before merge (or all verdicts for open PRs).".into(),
-        "Token cost includes all recorded runs in the merged PR family, including follow-up revisions and escalated retries. Unmeasured runs are reported, not priced as zero. No unverified dollar prices are assumed.".into(),
+        "Token cost includes all recorded runs in the merged PR family, including follow-up revisions and escalated retries. Tokens per merged PR average only the merged families whose every run was measured, with the excluded count reported; unmeasured runs are never priced as zero. No unverified dollar prices are assumed.".into(),
     ] }
     }
 
@@ -160,7 +165,24 @@ pub mod sol {
                 .runs(vec![run("gpt-6.1-sol", None)])
                 .build()]);
             assert_eq!(report.arms[0].tokens_per_merged_pr, None);
+            assert_eq!(report.arms[0].merged_prs_tokens_unmeasured, 1);
             assert_eq!(report.arms[0].merged_pr_cost.runs_unmeasured, 1);
+        }
+
+        #[test]
+        fn one_unmeasured_family_does_not_hide_measured_ones() {
+            let family = |tokens| {
+                SolPrRecord::builder()
+                    .arm("sol")
+                    .merged(true)
+                    .revisions(0)
+                    .findings(0)
+                    .runs(vec![run("gpt-6.1-sol", tokens)])
+                    .build()
+            };
+            let report = build_sol_report(&[family(Some(100)), family(Some(300)), family(None)]);
+            assert_eq!(report.arms[0].tokens_per_merged_pr, Some(200.0));
+            assert_eq!(report.arms[0].merged_prs_tokens_unmeasured, 1);
         }
     }
 }

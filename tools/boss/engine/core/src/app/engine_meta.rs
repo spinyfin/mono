@@ -671,6 +671,19 @@ pub(super) async fn handle_get_driver_traffic_split(ctx: Dispatch, req: Frontend
     }
 }
 
+pub(super) async fn handle_sol_comparison_report(ctx: Dispatch, _req: FrontendRequest) {
+    match ctx.work_db.sol_comparison_records() {
+        Ok(records) => send_response(
+            &ctx.sink,
+            &ctx.request_id,
+            FrontendEvent::SolComparisonReport {
+                report: crate::cost_report::sol::build_sol_report(&records),
+            },
+        ),
+        Err(err) => send_work_error(&ctx.sink, &ctx.request_id, &err),
+    }
+}
+
 pub(super) async fn handle_codex_sol_percentage(ctx: Dispatch, req: FrontendRequest) {
     let result = match req {
         FrontendRequest::GetCodexSolPercentage => ctx.work_db.get_codex_sol_percentage(),

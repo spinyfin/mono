@@ -212,6 +212,12 @@ impl WorkDb {
             ],
         )?;
 
+        // A worker that finds its PR already merged lands here with `Done`;
+        // the merge poller never sees these tasks again.
+        if matches!(target, WorkerPrCompletionTarget::Done) {
+            driver_allocation::sol_selection::record_merge(&tx, &task.id, &now)?;
+        }
+
         let mut pending = PendingEvents::new();
         if new_status != task.status {
             cascade_dependents_after_prereq_status_change(&mut pending, &tx, &task.id, new_status.as_str(), &now)?;
@@ -1393,12 +1399,7 @@ impl WorkDb {
         if task.deleted_at.is_some() {
             return Ok(None);
         }
-        let root = chain_root(&tx, work_item_id)?;
-        tx.execute(
-            "INSERT INTO sol_pr_outcomes(work_item_id,merged_at) VALUES (?1,?2)
-            ON CONFLICT(work_item_id) DO UPDATE SET merged_at=COALESCE(merged_at,excluded.merged_at)",
-            params![root, now_string()],
-        )?;
+        driver_allocation::sol_selection::record_merge(&tx, work_item_id, &now_string())?;
         if task.status == TaskStatus::Done || task.status == TaskStatus::Archived {
             // Already terminal — no status transition, but a task that
             // reached done/archived via a path that predates (or missed)

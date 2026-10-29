@@ -111,7 +111,7 @@ mod sol_report_db {
             let family = chain_helpers::cycle_root_walk_cte("1=1");
             let sql = format!(
                 "{family}
-            SELECT roots.cycle_root_id, d.arm
+            SELECT roots.cycle_root_id, d.arm, CAST(COALESCE(e.started_at,e.created_at) AS INTEGER)
             FROM execution_sol_decisions d
             JOIN work_executions e ON e.id=d.execution_id
             JOIN roots ON roots.task_id=e.work_item_id
@@ -121,11 +121,20 @@ mod sol_report_db {
             );
             let enrolled = tx
                 .prepare(&sql)?
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            // Only verdicts the engine acted on count; dropped-duplicate and
+            // stale-head passes repeat findings already counted or superseded.
+            let accepted = review_verdicts::INFORMATIVE_GATE_OUTCOMES
+                .iter()
+                .map(|outcome| format!("'{outcome}'"))
+                .collect::<Vec<_>>()
+                .join(",");
             let mut seen = std::collections::HashSet::new();
             let mut records = Vec::new();
-            for (root, arm) in enrolled {
+            for (root, arm, enrolled_at) in enrolled {
                 if !seen.insert(root.clone()) {
                     continue;
                 }
@@ -144,9 +153,10 @@ mod sol_report_db {
                 SELECT COUNT(*) FROM roots JOIN tasks t ON t.id=roots.task_id
                 WHERE roots.cycle_root_id=?1 AND t.kind='revision'
                   AND EXISTS (SELECT 1 FROM work_executions e WHERE e.work_item_id=t.id AND e.model IS NOT NULL
-                    AND (?2 IS NULL OR CAST(e.started_at AS INTEGER)<=CAST(?2 AS INTEGER)))"
+                    AND CAST(COALESCE(e.started_at,e.created_at) AS INTEGER)>=?3
+                    AND (?2 IS NULL OR CAST(COALESCE(e.started_at,e.created_at) AS INTEGER)<=CAST(?2 AS INTEGER)))"
                     ),
-                    params![root, merged_at],
+                    params![root, merged_at, enrolled_at],
                     |r| r.get(0),
                 )?;
                 let findings: u64 = tx.query_row(
@@ -154,9 +164,11 @@ mod sol_report_db {
                         "{family}
                 SELECT COALESCE(SUM(v.findings_count),0) FROM pr_review_verdicts v
                 JOIN roots ON roots.task_id=v.work_item_id WHERE roots.cycle_root_id=?1
+                AND v.gate_outcome IN ({accepted})
+                AND CAST(v.created_at AS INTEGER)>=?3
                 AND (?2 IS NULL OR CAST(v.created_at AS INTEGER)<=CAST(?2 AS INTEGER))"
                     ),
-                    params![root, merged_at],
+                    params![root, merged_at, enrolled_at],
                     |r| r.get(0),
                 )?;
                 let runs = tx
@@ -167,9 +179,10 @@ mod sol_report_db {
                 JOIN tasks t ON t.id=we.work_item_id
                 JOIN roots ON roots.task_id=t.id
                 WHERE roots.cycle_root_id=?1
+                AND CAST(wr.created_at AS INTEGER)>=?3
                 AND (?2 IS NULL OR CAST(wr.created_at AS INTEGER)<=CAST(?2 AS INTEGER))"
                     ))?
-                    .query_map(params![root, merged_at], map_cost_run_record)?
+                    .query_map(params![root, merged_at, enrolled_at], map_cost_run_record)?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 records.push(SolPrRecord {
                     arm,
@@ -223,6 +236,10 @@ mod sol_report_db {
             let task = create_test_chore(&db, &product, "root");
             let first = create_ready_chore_execution(&db, &task.id);
             db.set_codex_sol_percentage(100).unwrap();
+            db.connect()
+                .unwrap()
+                .execute("UPDATE tasks SET pr_head_sha='stale' WHERE id=?1", [&task.id])
+                .unwrap();
             assert_eq!(
                 db.select_codex_sol_model(&first.id, true, ASTRA_MODEL).unwrap(),
                 SOL_MODEL
@@ -233,18 +250,13 @@ mod sol_report_db {
                 .unwrap();
             let conn = db.connect().unwrap();
             conn.execute(
-                "UPDATE work_executions SET created_at='5',started_at='5',pr_head_after='stale',status='completed' WHERE id=?1",
+                "UPDATE work_executions SET created_at='5',started_at='5',status='completed' WHERE id=?1",
                 [&historical.id],
             )
             .unwrap();
             conn.execute(
                 "UPDATE tasks SET pr_url='https://github.com/org/repo/pull/1',status='in_review' WHERE id=?1",
                 [&task.id],
-            )
-            .unwrap();
-            conn.execute(
-                "UPDATE work_executions SET created_at='1',pr_head_after='first' WHERE id=?1",
-                [&first.id],
             )
             .unwrap();
             // A stale poll from before enrollment must not enter the experiment.
@@ -282,14 +294,28 @@ mod sol_report_db {
             db.select_codex_sol_model(&revision_execution.id, true, ASTRA_MODEL)
                 .unwrap();
             measured_run(&db, &revision_execution, SOL_MODEL, 300, 30);
-            db.connect()
-        .unwrap()
-        .execute(
-            "INSERT INTO pr_review_verdicts(id,execution_id,work_item_id,findings_count,gate_outcome,created_at)
-        VALUES ('verdict',?1,?2,3,'revision_required','25')",
-            params![retry.id, task.id],
-        )
-        .unwrap();
+            for (id, findings, outcome) in [
+                (
+                    "verdict",
+                    3,
+                    review_verdicts::REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS,
+                ),
+                (
+                    "duplicate",
+                    5,
+                    review_verdicts::REVIEW_GATE_OUTCOME_DROPPED_DUPLICATE_HEAD,
+                ),
+                ("stale", 4, review_verdicts::REVIEW_GATE_OUTCOME_STALE_HEAD),
+            ] {
+                db.connect()
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO pr_review_verdicts(id,execution_id,work_item_id,findings_count,gate_outcome,created_at)
+                        VALUES (?1,?2,?3,?4,?5,'25')",
+                        params![id, retry.id, task.id, findings, outcome],
+                    )
+                    .unwrap();
+            }
             db.mark_chore_pr_merged(&task.id, "https://github.com/org/repo/pull/1")
                 .unwrap();
             db.connect()
@@ -310,6 +336,42 @@ mod sol_report_db {
             assert_eq!(sol.review_findings, 3);
             assert_eq!(sol.tokens_per_merged_pr, Some(600.0));
             assert_eq!(report.arms[1].prs, 0);
+        }
+
+        #[test]
+        fn family_enrolled_through_a_revision_is_not_charged_earlier_ineligible_work() {
+            let (_dir, db) = open_db();
+            let product = create_product(&db);
+            db.set_codex_sol_percentage(100).unwrap();
+            let root = create_test_chore(&db, &product, "medium root");
+            let original = create_ready_chore_execution(&db, &root.id);
+            db.select_codex_sol_model(&original.id, false, ASTRA_MODEL).unwrap();
+            measured_run(&db, &original, ASTRA_MODEL, 1000, 5);
+            let fix = create_test_chore(&db, &product, "ci fix");
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET kind='revision',parent_task_id=?2 WHERE id=?1",
+                params![fix.id, root.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET pr_url='https://github.com/org/repo/pull/9' WHERE id=?1",
+                [&root.id],
+            )
+            .unwrap();
+            drop(conn);
+            let fix_execution = create_ready_chore_execution(&db, &fix.id);
+            assert_eq!(
+                db.select_codex_sol_model(&fix_execution.id, true, ASTRA_MODEL).unwrap(),
+                SOL_MODEL
+            );
+            measured_run(&db, &fix_execution, SOL_MODEL, 50, 20);
+            let records = db.sol_comparison_records().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].arm, "sol");
+            assert_eq!(records[0].revisions, 1);
+            assert_eq!(records[0].runs.len(), 1);
+            assert_eq!(records[0].runs[0].input_tokens, Some(50));
         }
 
         #[test]

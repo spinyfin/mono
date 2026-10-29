@@ -4,13 +4,18 @@
 //! precedence logic (design §Q2 / §Q3 / §Mix-and-match).
 
 use std::fmt;
+use std::path::Path;
+
+use boss_protocol::{EffortLevel, ReasoningMode, TaskKind};
+
+use boss_engine_driver::DriverRegistry;
+
 pub mod sol {
     //! Codex's automatic Sol experiment. Explicit model and pool policies remain separate.
 
     use boss_protocol::{EffortLevel, ExecutionKind, ReasoningMode, TaskKind};
 
-    pub use boss_engine_driver::codex::SOL_MODEL;
-    pub const ASTRA_MODEL: &str = "gpt-6-astra";
+    pub use boss_engine_driver::codex::{ASTRA_MODEL, SOL_MODEL};
     pub const DEFAULT_SOL_PERCENTAGE: u8 = 50;
 
     /// Investigation and design always win over revision provenance.
@@ -131,11 +136,6 @@ pub mod sol {
         }
     }
 }
-use std::path::Path;
-
-use boss_protocol::{EffortLevel, ReasoningMode, TaskKind};
-
-use boss_engine_driver::DriverRegistry;
 
 /// Engine default driver used when neither `tasks.driver` nor
 /// `products.default_driver` is set (agent-driver design §Mix-and-match).

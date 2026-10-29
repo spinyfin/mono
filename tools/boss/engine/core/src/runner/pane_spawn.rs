@@ -60,24 +60,32 @@ mod sol_spawn {
         work_item: &WorkItem,
         config: &mut SpawnConfig,
     ) -> anyhow::Result<()> {
+        // Other drivers and explicitly chosen models never touch Sol state.
         let automatic_codex = config.driver == "codex"
             && !matches!(
                 config.model_source,
                 ModelResolutionSource::TaskOverride | ModelResolutionSource::PoolStrongTier
             );
-        let eligible = automatic_codex
-            && match work_item {
-                WorkItem::Task(task) | WorkItem::Chore(task) => boss_engine_effort::sol::eligible(
-                    task.effort_level,
-                    task.reasoning,
-                    Some(task.kind.clone()),
-                    &execution.kind,
-                    &task.created_via,
-                ),
-                _ => false,
-            };
+        if !automatic_codex {
+            return Ok(());
+        }
+        let eligible = match work_item {
+            WorkItem::Task(task) | WorkItem::Chore(task) => boss_engine_effort::sol::eligible(
+                task.effort_level,
+                task.reasoning,
+                Some(task.kind.clone()),
+                &execution.kind,
+                &task.created_via,
+            ),
+            _ => false,
+        };
+        if !eligible {
+            return Ok(());
+        }
         let selected = db.select_codex_sol_model(&execution.id, eligible, &config.model)?;
-        if eligible && selected != config.model {
+        // Only a Sol draw changes the launch; any other stored model is just the
+        // base model recorded at an earlier compose, not an experiment result.
+        if selected == boss_engine_effort::sol::SOL_MODEL && selected != config.model {
             config.model = selected;
             config.model_source = ModelResolutionSource::SolExperiment;
         }
@@ -123,6 +131,51 @@ mod sol_spawn {
                     );
                 }
             }
+        }
+
+        #[test]
+        fn non_codex_and_explicit_model_dispatch_never_touch_sol_state() {
+            let (_dir, db) = open_db();
+            // A corrupt share would fail any Sol read.
+            db.connect()
+                .unwrap()
+                .execute(
+                    "INSERT INTO metadata(key,value) VALUES ('codex_sol_percentage','bogus')",
+                    [],
+                )
+                .unwrap();
+            let mut task = create_test_chore(&db, create_product(&db), "dispatch");
+            task.effort_level = Some(EffortLevel::Small);
+            task.reasoning = Some(ReasoningMode::Standard);
+            let execution = create_ready_chore_execution(&db, &task.id);
+            for driver in ["claude", "grok"] {
+                let mut config = resolve_spawn_config(
+                    &SpawnResolutionInput::builder()
+                        .task_driver(driver)
+                        .effort_level(EffortLevel::Small)
+                        .reasoning(ReasoningMode::Standard)
+                        .build(),
+                )
+                .unwrap();
+                apply_sol_policy(&db, &execution, &WorkItem::Chore(task.clone()), &mut config).unwrap();
+            }
+            let mut config = resolve_spawn_config(
+                &SpawnResolutionInput::builder()
+                    .task_driver("codex")
+                    .model_override("gpt-6-terra")
+                    .effort_level(EffortLevel::Small)
+                    .reasoning(ReasoningMode::Standard)
+                    .build(),
+            )
+            .unwrap();
+            apply_sol_policy(&db, &execution, &WorkItem::Chore(task), &mut config).unwrap();
+            assert_eq!(config.model, "gpt-6-terra");
+            let rows: i64 = db
+                .connect()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM execution_sol_decisions", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 0);
         }
     }
 }

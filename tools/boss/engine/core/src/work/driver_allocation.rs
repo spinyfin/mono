@@ -640,9 +640,14 @@ pub(super) mod sol_selection {
     use crate::work::*;
     use boss_engine_effort::sol::{DEFAULT_SOL_PERCENTAGE, SOL_MODEL, use_sol};
 
+    /// Statuses that mean the worker itself failed. Cancellation, supersession
+    /// and post-crash orphan recovery are operator or engine events, so they
+    /// never push work off Sol.
+    const FAILURE_STATUSES: &str = "'failed','abandoned'";
+
     pub(in crate::work) fn migrate(conn: &Connection) -> Result<()> {
-        conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS execution_sol_decisions (
+        conn.execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS execution_sol_decisions (
             execution_id TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE,
             eligible INTEGER NOT NULL, bucket INTEGER NOT NULL,
             percentage INTEGER NOT NULL, escalated INTEGER NOT NULL,
@@ -650,19 +655,19 @@ pub(super) mod sol_selection {
          );
          CREATE TABLE IF NOT EXISTS sol_pr_outcomes (
             work_item_id TEXT PRIMARY KEY REFERENCES tasks(id),
-            first_head TEXT, first_ci TEXT, merged_at TEXT
+            baseline_head TEXT, first_head TEXT, first_ci TEXT, merged_at TEXT
          );
          CREATE TABLE IF NOT EXISTS sol_failed_work_items (work_item_id TEXT PRIMARY KEY);
          CREATE TRIGGER IF NOT EXISTS sol_failure_execution AFTER UPDATE OF status,model,run_undeclared_at,run_done_outcome ON work_executions
-         WHEN NEW.model='gpt-6.1-sol' AND (NEW.status IN ('failed','abandoned','cancelled','orphaned')
+         WHEN NEW.model='{SOL_MODEL}' AND (NEW.status IN ({FAILURE_STATUSES})
              OR NEW.run_undeclared_at IS NOT NULL OR NEW.run_done_outcome='blocked')
          BEGIN INSERT OR IGNORE INTO sol_failed_work_items VALUES (NEW.work_item_id); END;
          CREATE TRIGGER IF NOT EXISTS sol_failure_run AFTER UPDATE OF status ON work_runs
-         WHEN NEW.status IN ('failed','abandoned','cancelled','orphaned')
+         WHEN NEW.status IN ({FAILURE_STATUSES})
          BEGIN INSERT OR IGNORE INTO sol_failed_work_items
              SELECT work_item_id FROM work_executions WHERE id=NEW.execution_id
-             AND (model='gpt-6.1-sol' OR NEW.model='gpt-6.1-sol'); END;"
-    )?;
+             AND (model='{SOL_MODEL}' OR NEW.model='{SOL_MODEL}'); END;"
+        ))?;
         Ok(())
     }
 
@@ -685,6 +690,12 @@ pub(super) mod sol_selection {
 
         /// Idempotent across compose retries and restarts. The draw is namespaced
         /// separately from the work-item driver split and stored with its threshold.
+        ///
+        /// A stored decision is only reused where it still describes this
+        /// launch: an `ineligible` row is redrawn once the work becomes
+        /// eligible, and a Sol draw for an execution that never launched is
+        /// redrawn so a lowered share (or a failed preflight followed by a 0%
+        /// setting) takes effect on pre-start retries.
         pub fn select_codex_sol_model(
             &self,
             execution_id: &str,
@@ -698,35 +709,50 @@ pub(super) mod sol_selection {
             // A failed run also counts: some recovery paths reuse an execution row.
             // A durable prior failure never clears when a later Astra retry succeeds.
             let escalated: bool = tx.query_row(
-                "SELECT EXISTS (SELECT 1 FROM sol_failed_work_items WHERE work_item_id=?1) OR EXISTS (
+                &format!(
+                    "SELECT EXISTS (SELECT 1 FROM sol_failed_work_items WHERE work_item_id=?1) OR EXISTS (
                 SELECT 1 FROM work_executions e
                 WHERE e.work_item_id=?1 AND e.model=?2
-                  AND (e.status IN ('failed','abandoned','cancelled','orphaned')
+                  AND (e.status IN ({FAILURE_STATUSES})
                        OR e.run_undeclared_at IS NOT NULL
                        OR e.run_done_outcome='blocked'
                        OR EXISTS (SELECT 1 FROM work_runs r WHERE r.execution_id=e.id
-                           AND r.status IN ('failed','abandoned','cancelled','orphaned')))
-            )",
+                           AND r.status IN ({FAILURE_STATUSES})))
+            )"
+                ),
                 params![execution.work_item_id, SOL_MODEL],
                 |row| row.get(0),
             )?;
-            if let Some(model) = tx
+            let stored = tx
                 .query_row(
-                    "SELECT selected_model FROM execution_sol_decisions WHERE execution_id=?1",
+                    "SELECT arm, selected_model FROM execution_sol_decisions WHERE execution_id=?1",
                     [execution_id],
-                    |row| row.get::<_, String>(0),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
-                .optional()?
-            {
-                if model == SOL_MODEL && escalated {
-                    tx.execute(
-                        "UPDATE execution_sol_decisions SET selected_model=?2,escalated=1 WHERE execution_id=?1",
-                        params![execution_id, boss_engine_effort::sol::ASTRA_MODEL],
-                    )?;
-                    tx.commit()?;
-                    return Ok(boss_engine_effort::sol::ASTRA_MODEL.to_owned());
+                .optional()?;
+            if let Some((arm, model)) = stored {
+                let stale_ineligible = arm == "ineligible" && eligible;
+                let unlaunched_sol = model == SOL_MODEL && execution.model.is_none();
+                if !stale_ineligible && !unlaunched_sol {
+                    // A stored model is meaningless once the work is ineligible
+                    // (e.g. an override was added or cleared since).
+                    if !eligible {
+                        return Ok(current_model.to_owned());
+                    }
+                    if model == SOL_MODEL && escalated {
+                        tx.execute(
+                            "UPDATE execution_sol_decisions SET selected_model=?2,escalated=1 WHERE execution_id=?1",
+                            params![execution_id, current_model],
+                        )?;
+                        tx.commit()?;
+                        return Ok(current_model.to_owned());
+                    }
+                    return Ok(model);
                 }
-                return Ok(model);
+                tx.execute(
+                    "DELETE FROM execution_sol_decisions WHERE execution_id=?1",
+                    [execution_id],
+                )?;
             }
             let bucket = super::hash_bucket(&format!("codex-sol:{execution_id}"));
             let sol = use_sol(eligible, escalated, bucket, percentage);
@@ -742,9 +768,42 @@ pub(super) mod sol_selection {
                 "INSERT INTO execution_sol_decisions VALUES (?1,?2,?3,?4,?5,?6,?7)",
                 params![execution_id, eligible, bucket, percentage, escalated, arm, selected],
             )?;
+            if eligible {
+                enroll(&tx, &execution.work_item_id)?;
+            }
             tx.commit()?;
             Ok(selected.to_owned())
         }
+    }
+
+    /// Open the family's outcome row and remember the PR head already
+    /// published, so the first head pushed afterwards (while the enrolled
+    /// worker is still running, or later) is the one CI is judged on.
+    fn enroll(conn: &Connection, work_item_id: &str) -> Result<()> {
+        let root = crate::work::chain_helpers::chain_root(conn, work_item_id)?;
+        let head: Option<String> = conn
+            .query_row("SELECT pr_head_sha FROM tasks WHERE id=?1", [&root], |r| r.get(0))
+            .optional()?
+            .flatten();
+        conn.execute(
+            "INSERT INTO sol_pr_outcomes(work_item_id,baseline_head) VALUES (?1,?2)
+             ON CONFLICT(work_item_id) DO UPDATE SET baseline_head=excluded.baseline_head
+             WHERE first_head IS NULL",
+            params![root, head],
+        )?;
+        Ok(())
+    }
+
+    /// Idempotently stamp the family's merge time; a no-op for families that
+    /// never enrolled. Shared by the merge poller and the worker-completion
+    /// path that finds its PR already merged.
+    pub(in crate::work) fn record_merge(conn: &Connection, work_item_id: &str, now: &str) -> Result<()> {
+        let root = crate::work::chain_helpers::chain_root(conn, work_item_id)?;
+        conn.execute(
+            "UPDATE sol_pr_outcomes SET merged_at=COALESCE(merged_at,?2) WHERE work_item_id=?1",
+            params![root, now],
+        )?;
+        Ok(())
     }
 
     fn percentage(conn: &Connection) -> Result<u8> {
@@ -761,40 +820,24 @@ pub(super) mod sol_selection {
         Ok(value)
     }
 
-    /// Record only the first observed head's first terminal CI result. A new
-    /// head cannot turn an unknown first attempt into an apparent success.
+    /// Record only the first head published after enrollment and that head's
+    /// first terminal CI result, independent of whether the enrolled worker has
+    /// finished. A later head or CI rerun cannot turn a failed first attempt
+    /// into a success, and the head that existed at enrollment never counts.
+    /// Families that never enrolled have no outcome row, so this is two cheap
+    /// primary-key updates for them.
     pub(in crate::work) fn observe_ci(conn: &Connection, item: &str, head: Option<&str>, state: &str) -> Result<()> {
+        let Some(head) = head else { return Ok(()) };
         let root = crate::work::chain_helpers::chain_root(conn, item)?;
-        let family = family_cte();
-        let after_enrollment: bool = conn.query_row(
-        &format!(
-            "{family}
-        SELECT COALESCE(?2=(SELECT published.pr_head_after FROM work_executions published
-            JOIN roots p ON p.task_id=published.work_item_id
-            WHERE p.cycle_root_id=?1 AND published.pr_head_after IS NOT NULL
-            AND published.kind IN ('task_implementation','chore_implementation','revision_implementation','ci_remediation','conflict_resolution')
-            AND CAST(COALESCE(published.started_at,published.created_at) AS INTEGER) >= (
-                SELECT MIN(CAST(COALESCE(e.started_at,e.created_at) AS INTEGER)) FROM execution_sol_decisions d
-                JOIN work_executions e ON e.id=d.execution_id
-                JOIN roots r ON r.task_id=e.work_item_id
-                WHERE r.cycle_root_id=?1 AND d.eligible=1 AND e.model IS NOT NULL)
-            ORDER BY CAST(COALESCE(published.started_at,published.created_at) AS INTEGER),published.rowid LIMIT 1),0)"
-        ),
-        params![root, head],
-        |r| r.get(0),
-    )?;
-        if !after_enrollment {
-            return Ok(());
-        }
         conn.execute(
-            "INSERT OR IGNORE INTO sol_pr_outcomes(work_item_id,first_head) VALUES (?1,?2)",
+            "UPDATE sol_pr_outcomes
+             SET first_head=COALESCE(first_head, CASE WHEN ?2 IS NOT baseline_head THEN ?2 END)
+             WHERE work_item_id=?1 AND first_ci IS NULL",
             params![root, head],
         )?;
         conn.execute(
-            "UPDATE sol_pr_outcomes SET first_head=COALESCE(first_head,?2),
-        first_ci=CASE WHEN first_ci IS NULL AND (first_head IS NULL OR first_head=?2)
-            AND ?3 IN ('success','fail') THEN ?3 ELSE first_ci END
-        WHERE work_item_id=?1",
+            "UPDATE sol_pr_outcomes SET first_ci=?3
+             WHERE work_item_id=?1 AND first_ci IS NULL AND first_head=?2 AND ?3 IN ('success','fail')",
             params![root, head, state],
         )?;
         Ok(())
@@ -857,8 +900,8 @@ pub(super) mod sol_selection {
         }
 
         #[test]
-        fn every_unsuccessful_sol_terminal_state_escalates_permanently_for_the_same_item() {
-            for status in ["failed", "abandoned", "cancelled", "orphaned"] {
+        fn worker_failure_states_escalate_permanently_for_the_same_item() {
+            for status in ["failed", "abandoned"] {
                 let (_dir, db) = open_db();
                 let product = create_product(&db);
                 let task = create_test_chore(&db, &product, status);
@@ -913,6 +956,156 @@ pub(super) mod sol_selection {
                     SOL_MODEL
                 );
             }
+        }
+
+        #[test]
+        fn operator_and_recovery_states_do_not_escalate() {
+            for status in ["cancelled", "orphaned"] {
+                let (_dir, db) = open_db();
+                let task = create_test_chore(&db, create_product(&db), status);
+                db.set_codex_sol_percentage(100).unwrap();
+                let first = create_ready_chore_execution(&db, &task.id);
+                db.select_codex_sol_model(&first.id, true, ASTRA_MODEL).unwrap();
+                db.record_execution_launch_config(&first.id, "codex", SOL_MODEL, None)
+                    .unwrap();
+                db.connect()
+                    .unwrap()
+                    .execute(
+                        "UPDATE work_executions SET status=?2 WHERE id=?1",
+                        params![first.id, status],
+                    )
+                    .unwrap();
+                let second = create_ready_chore_execution(&db, &task.id);
+                assert_eq!(
+                    db.select_codex_sol_model(&second.id, true, ASTRA_MODEL).unwrap(),
+                    SOL_MODEL,
+                    "{status}"
+                );
+            }
+        }
+
+        #[test]
+        fn stale_ineligible_decision_is_redrawn_not_reapplied() {
+            let (_dir, db) = open_db();
+            let task = create_test_chore(&db, create_product(&db), "override cleared");
+            db.set_codex_sol_percentage(0).unwrap();
+            let execution = create_ready_chore_execution(&db, &task.id);
+            assert_eq!(
+                db.select_codex_sol_model(&execution.id, false, "custom-override")
+                    .unwrap(),
+                "custom-override"
+            );
+            // The override is gone: the stored override model must not come back.
+            assert_eq!(
+                db.select_codex_sol_model(&execution.id, true, ASTRA_MODEL).unwrap(),
+                ASTRA_MODEL
+            );
+            let arm: String = db
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT arm FROM execution_sol_decisions WHERE execution_id=?1",
+                    [&execution.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(arm, "astra");
+            // And an eligible row never leaks its model into a now-ineligible launch.
+            assert_eq!(
+                db.select_codex_sol_model(&execution.id, false, "custom-override")
+                    .unwrap(),
+                "custom-override"
+            );
+        }
+
+        #[test]
+        fn unlaunched_sol_draw_follows_a_lowered_share_but_a_launched_one_is_durable() {
+            let (_dir, db) = open_db();
+            let task = create_test_chore(&db, create_product(&db), "preflight failed");
+            db.set_codex_sol_percentage(100).unwrap();
+            let execution = create_ready_chore_execution(&db, &task.id);
+            assert_eq!(
+                db.select_codex_sol_model(&execution.id, true, ASTRA_MODEL).unwrap(),
+                SOL_MODEL
+            );
+            // The launch failed before a model was recorded; the operator sets 0%.
+            db.set_codex_sol_percentage(0).unwrap();
+            assert_eq!(
+                db.select_codex_sol_model(&execution.id, true, ASTRA_MODEL).unwrap(),
+                ASTRA_MODEL
+            );
+
+            let launched = create_ready_chore_execution(&db, &task.id);
+            db.set_codex_sol_percentage(100).unwrap();
+            assert_eq!(
+                db.select_codex_sol_model(&launched.id, true, ASTRA_MODEL).unwrap(),
+                SOL_MODEL
+            );
+            db.record_execution_launch_config(&launched.id, "codex", SOL_MODEL, None)
+                .unwrap();
+            db.set_codex_sol_percentage(0).unwrap();
+            assert_eq!(
+                db.select_codex_sol_model(&launched.id, true, ASTRA_MODEL).unwrap(),
+                SOL_MODEL
+            );
+        }
+
+        fn set_head_and_state(db: &WorkDb, task: &str, head: &str) {
+            db.connect()
+                .unwrap()
+                .execute("UPDATE tasks SET pr_head_sha=?2 WHERE id=?1", params![task, head])
+                .unwrap();
+        }
+
+        fn first_ci(db: &WorkDb, task: &str) -> Option<String> {
+            db.connect()
+                .unwrap()
+                .query_row(
+                    "SELECT first_ci FROM sol_pr_outcomes WHERE work_item_id=?1",
+                    [task],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        }
+
+        #[test]
+        fn first_ci_failure_is_kept_while_the_worker_is_live_and_after_reruns() {
+            let (_dir, db) = open_db();
+            let task = create_test_chore(&db, create_product(&db), "live ci");
+            db.set_codex_sol_percentage(100).unwrap();
+            set_head_and_state(&db, &task.id, "before");
+            let execution = create_ready_chore_execution(&db, &task.id);
+            db.select_codex_sol_model(&execution.id, true, ASTRA_MODEL).unwrap();
+            db.record_execution_launch_config(&execution.id, "codex", SOL_MODEL, None)
+                .unwrap();
+            let observe = |head: &str, state: &str| {
+                let conn = db.connect().unwrap();
+                observe_ci(&conn, &task.id, Some(head), state).unwrap();
+            };
+            // The execution is still running (no pr_head_after yet); the head
+            // that predates enrollment never counts.
+            observe("before", "success");
+            assert_eq!(first_ci(&db, &task.id), None);
+            observe("first", "in_progress");
+            observe("first", "fail");
+            // A rerun on the same head, or a fix on a new head, cannot rewrite it.
+            observe("first", "success");
+            observe("fix", "success");
+            assert_eq!(first_ci(&db, &task.id).as_deref(), Some("fail"));
+        }
+
+        #[test]
+        fn families_that_never_enrolled_record_nothing() {
+            let (_dir, db) = open_db();
+            let task = create_test_chore(&db, create_product(&db), "ineligible");
+            let execution = create_ready_chore_execution(&db, &task.id);
+            db.select_codex_sol_model(&execution.id, false, ASTRA_MODEL).unwrap();
+            let conn = db.connect().unwrap();
+            observe_ci(&conn, &task.id, Some("head"), "fail").unwrap();
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM sol_pr_outcomes", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 0);
         }
 
         #[test]

@@ -198,7 +198,7 @@ mod sol_preflight {
     pub async fn validate_sol_available() -> Result<()> {
         tokio::task::spawn_blocking(|| {
             let output = boss_command_runner::output_blocking_timeout(
-                std::process::Command::new("codex").args(["debug", "models", "--bundled"]),
+                std::process::Command::new(super::resolve_codex_bin()).args(["debug", "models", "--bundled"]),
                 std::time::Duration::from_secs(10),
             )
             .context("Cannot select gpt-6.1-sol: unable to read the installed Codex model catalog")?;
@@ -228,7 +228,7 @@ mod sol_preflight {
         });
         anyhow::ensure!(
             supported,
-            "Cannot select gpt-6.1-sol: the installed Codex CLI does not advertise Sol with the required effort levels; update Codex or set the Sol share to 0%"
+            "Cannot select gpt-6.1-sol: the installed Codex CLI does not advertise Sol with the required effort levels; update Codex or set the Sol share to 0% (launches not yet started will then fall back to Astra)"
         );
         Ok(())
     }
@@ -279,26 +279,29 @@ fn codex_effort_value_for_level(level: EffortLevel) -> Option<&'static str> {
     })
 }
 
+/// The Codex base model every automatic selection starts from.
+pub const ASTRA_MODEL: &str = "gpt-6-astra";
+
 /// Base model before the engine applies its eligible-work Sol experiment:
 /// both reasoning modes resolve to `gpt-6-astra`. Terra remains a known
 /// catalog SKU (`codex debug models`) but is not selected as a lower
 /// tier or fallback.
 fn codex_model_for_reasoning(_reasoning: ReasoningMode) -> &'static str {
-    "gpt-6-astra"
+    ASTRA_MODEL
 }
 
 /// One Codex model is selected for all review tiers: Fast, Balanced, and
 /// Strong all resolve to `gpt-6-astra`. This table does not infer anything
 /// from task effort or reasoning.
 fn codex_review_model_for_tier(_tier: ReviewModelTier) -> &'static str {
-    "gpt-6-astra"
+    ASTRA_MODEL
 }
 
 /// Legacy size-derived table. Consulted only for rows with no
 /// [`ReasoningMode`]. Keeps untagged rows on the frontier default rather than
 /// inventing a size→model progression Codex has not validated.
 fn codex_default_model_for_level(_level: EffortLevel) -> &'static str {
-    "gpt-6-astra"
+    ASTRA_MODEL
 }
 
 fn codex_prompt_addendum_for_level(level: EffortLevel) -> Option<&'static str> {
@@ -346,12 +349,12 @@ static CODEX_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
         // dispatched model is a product decision, not part of a CLI
         // qualification. Step-5 fall-through only — classified rows resolve
         // through `model_for_reasoning`.
-        engine_default: "gpt-6-astra",
+        engine_default: ASTRA_MODEL,
         effort_value_for_level: codex_effort_value_for_level,
         default_model_for_level: codex_default_model_for_level,
         model_for_reasoning: codex_model_for_reasoning,
         review_model_for_tier: codex_review_model_for_tier,
-        design_investigation_model: Some(|| "gpt-6-astra"),
+        design_investigation_model: Some(|| ASTRA_MODEL),
         prompt_addendum_for_level: codex_prompt_addendum_for_level,
         model_requires_auto_permissions: codex_model_requires_auto_permissions,
         model_belongs_to_driver: codex_model_belongs_to_driver,

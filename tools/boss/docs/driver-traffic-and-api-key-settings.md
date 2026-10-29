@@ -51,14 +51,15 @@ bytes as an unsigned big-endian integer modulo 100. Sol wins when that
 bucket is below the configured percentage. `execution_sol_decisions` records
 eligibility, bucket, percentage, arm, and selected model. The draw is fixed;
 an escalation can change only the selected model and escalation marker.
+The one exception is an execution that never launched: its Sol draw is redrawn on each pre-start retry, so lowering the share (for example to 0% after a failed Sol preflight) takes effect for it. A decision stored while the work was ineligible is likewise redrawn once it becomes eligible. Non-Codex drivers and explicit model choices never touch this state.
 `work_executions.model` records the model actually launched. Unlaunched
 decisions do not count as experimental observations. Selection fails with
 a clear error if the installed CLI catalog lacks Sol or its required effort
 levels; it never substitutes another model after that failure.
 
-A launched Sol execution that fails, is abandoned/cancelled/orphaned, declares
+A launched Sol execution that fails, is abandoned, declares
 itself blocked, or exits undeclared permanently escalates that work item to
-Astra. A failed run within an execution also records the escalation. New
+Astra. Operator cancellation, supersession and post-crash orphan recovery are not worker failures and do not escalate. A failed run within an execution also records the escalation. New
 executions cannot erase this history by succeeding or by changing the share.
 
 ### Comparing outcomes
@@ -68,21 +69,25 @@ of recorded eligible work. Each PR family enrolls in the arm of its first
 launched eligible execution. Subsequent revisions and retries, including
 escalation to Astra, remain charged to that enrollment arm. PR families
 without a recorded eligible assignment are excluded. A family first enrolled by a
-revision is included, but its CI measurement starts after enrollment.
+revision is included, but only runs, revisions, findings and CI observations
+from enrollment onward are counted; earlier ineligible work is not charged to
+the arm.
 
 The report shows both arms and their denominators:
 
 - First-attempt CI pass rate: first terminal CI observation on the first
-  published head after enrollment. Pending/missing observations do not count
-  as passes; later heads cannot replace the initial result.
+  published head after enrollment, captured when the PR is polled even while
+  the worker is still running. Pending/missing observations do not count
+  as passes; later heads and CI reruns cannot replace the initial result.
 - Revisions per merged PR: distinct revision work items with a launched
   execution before the observed merge, including nested revision chains.
-- Automated review findings per PR: recorded accepted verdict findings up
-  to merge, or all findings so far for open PRs.
+- Automated review findings per PR: findings from verdicts the engine acted on
+  (not dropped-duplicate or stale-head passes) up to merge, or all findings so far for open PRs.
 - Token cost per merged PR: all recorded runs in the PR family up to merge,
   including original work, revisions, and escalated retries. Input, output,
-  and cache token totals are included. Unmeasured runs are shown explicitly
-  and make the per-PR average unknown. These are token counts; no unverified
+  and cache token totals are included. Unmeasured runs are shown explicitly;
+  the per-PR average covers merged families whose every run was measured, and
+  the number of merged families left out is reported. These are token counts; no unverified
   Sol/Astra dollar prices are assumed.
 
 These are observed outcomes, not an assertion that Sol and Astra cost the

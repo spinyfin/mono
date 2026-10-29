@@ -184,7 +184,6 @@ pub struct TopCostReport {
 }
 
 /// Eligible Codex outcomes grouped by the original PR-family assignment.
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct SolArmReport {
@@ -199,8 +198,14 @@ pub struct SolArmReport {
     pub first_attempt_ci_pass_rate: Option<f64>,
     pub findings_per_pr: Option<f64>,
     pub revisions_per_merged_pr: Option<f64>,
-    /// NULL when any run in a merged family lacks token measurements.
+    /// Mean tokens over merged families whose every run was measured; NULL
+    /// when no merged family is fully measured.
     pub tokens_per_merged_pr: Option<f64>,
+    /// Merged families left out of `tokens_per_merged_pr` because at least one
+    /// of their runs has no token measurement.
+    #[serde(default)]
+    #[builder(default)]
+    pub merged_prs_tokens_unmeasured: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

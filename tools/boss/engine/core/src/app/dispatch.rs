@@ -140,7 +140,7 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
         r @ (FrontendRequest::GetCodexSolPercentage | FrontendRequest::SetCodexSolPercentage { .. }) => {
             Box::pin(engine_meta::handle_codex_sol_percentage(ctx, r))
         }
-        r @ FrontendRequest::GetSolComparisonReport => Box::pin(cost::handle_sol_comparison_report(ctx, r)),
+        r @ FrontendRequest::GetSolComparisonReport => Box::pin(engine_meta::handle_sol_comparison_report(ctx, r)),
         r @ FrontendRequest::GetCiRemediation { .. } => Box::pin(ci_remediation::handle_get_ci_remediation(ctx, r)),
         r @ FrontendRequest::GetConflictHotspots { .. } => {
             Box::pin(conflict_resolution::handle_get_conflict_hotspots(ctx, r))
