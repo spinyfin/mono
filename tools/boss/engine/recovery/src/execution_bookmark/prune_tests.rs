@@ -41,6 +41,18 @@ fn voucher(label: &str, commit: &str) -> Voucher {
 }
 
 #[tokio::test]
+async fn deletion_of_a_preserved_modified_file_keeps_both_pointers() {
+    let (s, _, successor) = super::reconcile_tests::modified_file_deleted_by_successor("exec_prune_deleted_edit").await;
+    let result = prune(&LocalJj, &s.record, &[voucher("PR head", &successor)], "main")
+        .await
+        .unwrap();
+    assert!(matches!(result, PruneOutcome::Unproven { .. }), "{result:?}");
+    for name in [s.record.head(), s.record.publication()] {
+        assert!(bookmark_exists(&s.repo.repo, &name), "{name} was forgotten");
+    }
+}
+
+#[tokio::test]
 async fn work_carried_by_the_pr_head_by_ancestry_forgets_every_pointer() {
     let s = revision_on_pr_head("exec_prune_ancestor").await;
     let repo = &s.repo.repo;

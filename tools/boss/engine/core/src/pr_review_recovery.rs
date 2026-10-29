@@ -382,7 +382,7 @@ fn recover_reviews(work_db: &WorkDb, pr_checker: &dyn PrStateChecker) -> (PrRevi
                 tracing::info!(
                     work_item_id = %work_item_id,
                     dead_execution_id = %dead_execution_id,
-                    "pr_review recovery: batch member failed before start on a damaged recovery pointer; not auto-refiring while that attention is open",
+                    "pr_review recovery: batch member failed before start on a damaged recovery pointer; batch settled without retry or duplicate attention",
                 );
                 outcome.blocked_skipped += 1;
             }
@@ -460,7 +460,7 @@ fn recover_reviews(work_db: &WorkDb, pr_checker: &dyn PrStateChecker) -> (PrRevi
                 tracing::info!(
                     work_item_id = %work_item_id,
                     dead_execution_id = %dead_execution_id,
-                    "pr_review recovery: batch member failed before start on a damaged recovery pointer; not auto-refiring while that attention is open",
+                    "pr_review recovery: batch member failed before start on a damaged recovery pointer; batch settled without retry or duplicate attention",
                 );
                 outcome.blocked_skipped += 1;
             }
@@ -1503,7 +1503,7 @@ mod tests {
     /// The batch-member and supervisor loops honour the same deterministic
     /// pre-start guard as the legacy sweep: a dead supervisor whose start
     /// failed on a damaged recovery pointer is not re-fired pass after pass,
-    /// and resumes once the blocker is resolved.
+    /// and its settled batch cannot retry after the blocker is resolved.
     #[tokio::test]
     async fn does_not_refire_a_batch_member_that_failed_before_start_on_a_damaged_pointer() {
         let (_dir, db) = open_db();
@@ -1534,7 +1534,7 @@ mod tests {
             )
             .await;
             assert_eq!(outcome.refired, 0, "pass {pass}");
-            assert_eq!(outcome.blocked_skipped, 1, "pass {pass}");
+            assert_eq!(outcome.blocked_skipped, usize::from(pass == 0), "pass {pass}");
             assert_eq!(outcome.error_skipped, 0, "pass {pass}");
         }
         assert_eq!(
@@ -1549,7 +1549,7 @@ mod tests {
         assert_eq!(db.review_batch_members(&batch_id).unwrap().len(), 1);
         assert_eq!(
             db.review_batch(&batch_id).unwrap().unwrap().status,
-            ReviewBatchStatus::Supervising
+            ReviewBatchStatus::Failed
         );
 
         db.resolve_attention_kind_for_execution(
@@ -1564,7 +1564,7 @@ mod tests {
             Arc::new(checker.clone()),
         )
         .await;
-        assert_eq!(outcome.refired, 1);
+        assert_eq!(outcome.refired, 0);
         assert_eq!(outcome.blocked_skipped, 0);
     }
 

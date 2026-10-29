@@ -142,6 +142,14 @@ fn failed_batch_is_automatically_remintable_in(conn: &rusqlite::Connection, batc
     {
         return Ok(false);
     }
+    let blocked: bool = conn.query_row(
+        &format!("SELECT {}", batch_has_open_recovery_failure_sql("?1")),
+        [&batch.id],
+        |row| row.get(0),
+    )?;
+    if blocked {
+        return Ok(false);
+    }
     let settled: Option<()> = conn
         .query_row(
             "SELECT 1 FROM pr_review_verdicts WHERE batch_id = ?1 AND gate_outcome != ?2 LIMIT 1",
@@ -150,6 +158,18 @@ fn failed_batch_is_automatically_remintable_in(conn: &rusqlite::Connection, batc
         )
         .optional()?;
     Ok(settled.is_none())
+}
+
+fn batch_has_open_recovery_failure_sql(batch_id_expr: &str) -> String {
+    format!(
+        "EXISTS (
+            SELECT 1 FROM pr_review_batch_members member
+            JOIN work_attention_items attention ON attention.execution_id = member.execution_id
+            WHERE member.batch_id = {batch_id_expr}
+              AND attention.kind = '{kind}' AND attention.status = 'open'
+        )",
+        kind = crate::execution_bookmark_recovery::RECOVERY_FAILED,
+    )
 }
 
 /// SQL boolean over a cycle-root id expression (`cycle_root_expr` is spliced
@@ -185,6 +205,9 @@ pub(crate) fn pre_merge_review_needs_readmission_sql(cycle_root_expr: &str) -> S
                 (
                     newest.status = 'failed'
                     AND newest.generation < {cap}
+                    AND (NOT {pointer_blocked} OR newest.target_sha != (
+                        SELECT pr_head_sha FROM tasks WHERE id = {cycle_root_expr}
+                    ))
                     AND NOT EXISTS (
                         SELECT 1 FROM pr_review_verdicts settled
                         WHERE settled.batch_id = newest.id AND settled.gate_outcome != '{stale_head}'
@@ -200,6 +223,7 @@ pub(crate) fn pre_merge_review_needs_readmission_sql(cycle_root_expr: &str) -> S
             )
         )",
         cap = MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS,
+        pointer_blocked = batch_has_open_recovery_failure_sql("newest.id"),
         stale_head = super::review_verdicts::REVIEW_GATE_OUTCOME_STALE_HEAD,
     )
 }
@@ -797,10 +821,8 @@ pub enum RetryDeadReviewBatchMember {
     BatchFailed,
     /// The dead execution never started because its recovery pointers failed
     /// to reconcile (an open `execution_bookmark_recovery_failed` item): the
-    /// retry would fail the same way against the same inputs. Nothing was
-    /// changed, so the member stays a recovery candidate and the next sweep
-    /// after that item is resolved (a repaired pointer, or a run that got
-    /// past the check) retries it; until then the batch stays open.
+    /// retry would fail the same way. The member and batch are settled failed
+    /// quietly, releasing capacity; normal admission owns any later review.
     Blocked,
 }
 
@@ -815,10 +837,7 @@ fn fail_review_batch_with_attention(
     title: &str,
     body_markdown: String,
 ) -> Result<()> {
-    tx.execute(
-        "UPDATE pr_review_batches SET status = 'failed', completed_at = ?2, updated_at = ?2 WHERE id = ?1",
-        params![batch.id, now],
-    )?;
+    fail_review_batch_quietly(tx, batch, now)?;
     super::workitems::insert_attention_item_row(
         tx,
         &CreateAttentionItemInput::builder()
@@ -827,6 +846,14 @@ fn fail_review_batch_with_attention(
             .title(title)
             .body_markdown(body_markdown)
             .build(),
+    )?;
+    Ok(())
+}
+
+fn fail_review_batch_quietly(tx: &Transaction<'_>, batch: &ReviewBatch, now: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE pr_review_batches SET status = 'failed', completed_at = ?2, updated_at = ?2 WHERE id = ?1",
+        params![batch.id, now],
     )?;
     // A batch failure is a terminal review decision too. Release only the
     // revision whose newest producing execution contributed this immutable
@@ -1796,11 +1823,23 @@ impl WorkDb {
             tx.commit()?;
             return Ok(RetryDeadReviewBatchMember::NotRetried);
         }
+        let Some(batch) = review_batch_by_id_in(&tx, &member.batch_id)? else {
+            return Ok(RetryDeadReviewBatchMember::NotRetried);
+        };
+        if matches!(batch.status, ReviewBatchStatus::Completed | ReviewBatchStatus::Failed) {
+            return Ok(RetryDeadReviewBatchMember::NotRetried);
+        }
         if super::dispatch_admission::has_open_execution_attention_of_kind_on(
             &tx,
             execution_id,
             &[crate::execution_bookmark_recovery::RECOVERY_FAILED],
         )? {
+            let now = now_string();
+            tx.execute(
+                "UPDATE pr_review_batch_members SET status = 'failed', terminal_at = ?1, updated_at = ?1 WHERE id = ?2",
+                params![now, member.id],
+            )?;
+            fail_review_batch_quietly(&tx, &batch, &now)?;
             tx.commit()?;
             return Ok(RetryDeadReviewBatchMember::Blocked);
         }

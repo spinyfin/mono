@@ -342,7 +342,7 @@ pub(crate) async fn containment_with(
     // Predecessor commit -> vouching commit rewritten from it. Read lazily:
     // one `jj evolog` per non-empty vouching commit, and only once a change
     // has no equivalent-patch variant.
-    let mut lineage: Option<std::collections::HashMap<String, String>> = None;
+    let mut lineage: Option<std::collections::HashMap<String, Vec<String>>> = None;
     let mut matched = Vec::new();
     let mut missing = Vec::new();
     for (change, commit, description) in change_commit_lines(&outside) {
@@ -367,7 +367,9 @@ pub(crate) async fn containment_with(
                 matched.push(RewrittenChange {
                     change_id: change.to_owned(),
                     preserved: commit.to_owned(),
-                    published: successor.clone(),
+                    // The map only contains nonempty successor lists; keep one
+                    // representative commit for the existing persisted match format.
+                    published: successor[0].clone(),
                     evidence: RewriteEvidence::RecordedLineage,
                 });
                 continue;
@@ -409,31 +411,39 @@ async fn equivalent_patch(jj: &dyn Jj, repo: &Path, preserved: &str, variant: &s
         .is_empty())
 }
 
-/// The content floor for a recorded-lineage match: the successor still
-/// touches every path (bookkeeping files aside) the preserved commit touched.
+/// The content floor for a recorded-lineage match: the published successors
+/// together touch every preserved path with matching deletion intent
+/// (bookkeeping files aside).
 /// A rewrite that dropped a file, took the other side of a conflict
 /// wholesale, or published only half of a split fails it, and the change is
 /// then reported missing. It does not prove the hunks survived; it rules out
 /// the whole-file losses that jj's rewrite records cannot distinguish from a
 /// faithful rewrite.
-async fn preserves_touched_paths(jj: &dyn Jj, repo: &Path, preserved: &str, successor: &str) -> Result<bool> {
+async fn preserves_touched_paths(jj: &dyn Jj, repo: &Path, preserved: &str, successors: &[String]) -> Result<bool> {
     let preserved_paths = touched_paths(jj, repo, preserved).await?;
-    let successor_paths = touched_paths(jj, repo, successor).await?;
+    let mut successor_paths = std::collections::HashSet::new();
+    for successor in successors {
+        successor_paths.extend(touched_paths(jj, repo, successor).await?);
+    }
     Ok(preserved_paths.is_subset(&successor_paths))
 }
 
-async fn touched_paths(jj: &dyn Jj, repo: &Path, commit: &str) -> Result<std::collections::HashSet<String>> {
+async fn touched_paths(jj: &dyn Jj, repo: &Path, commit: &str) -> Result<std::collections::HashSet<(String, bool)>> {
     let patch = jj
         .run(repo, &["--ignore-working-copy", "diff", "-r", commit, "--git"])
         .await?;
-    Ok(crate::recovery_apply::filter_bookkeeping(&patch)
-        .kept_paths
-        .into_iter()
+    // A deletion cannot preserve an edit, but can preserve another deletion.
+    let filtered = crate::recovery_apply::filter_bookkeeping(&patch);
+    Ok(filtered
+        .text
+        .split("\ndiff --git ")
+        .zip(filtered.kept_paths)
+        .map(|(section, path)| (path, section.lines().any(|line| line.starts_with("deleted file mode "))))
         .collect())
 }
 
 /// Every commit jj records as a predecessor (transitively) of a non-empty
-/// commit in the vouching history, mapped to that commit. jj writes these
+/// commit in the vouching history, mapped to all such commits. jj writes these
 /// records for the operations that rewrite a commit into another one:
 /// rebase, amend, squash, split and duplicate. A commit is never its own
 /// predecessor here, so the map only ever vouches for a commit that is *not*
@@ -444,7 +454,7 @@ async fn recorded_lineage(
     base: &str,
     vouching: &str,
     trunk: &str,
-) -> Result<std::collections::HashMap<String, String>> {
+) -> Result<std::collections::HashMap<String, Vec<String>>> {
     let commits = jj
         .run(
             repo,
@@ -459,7 +469,7 @@ async fn recorded_lineage(
             ],
         )
         .await?;
-    let mut lineage = std::collections::HashMap::new();
+    let mut lineage: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     for commit in commits.lines().filter(|line| !line.is_empty()) {
         let evolution = jj
             .run(
@@ -478,7 +488,8 @@ async fn recorded_lineage(
         for predecessor in evolution.lines().filter(|line| !line.is_empty() && *line != commit) {
             lineage
                 .entry(predecessor.to_owned())
-                .or_insert_with(|| commit.to_owned());
+                .or_default()
+                .push(commit.to_owned());
         }
     }
     Ok(lineage)

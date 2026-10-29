@@ -11,6 +11,9 @@ use super::*;
 #[path = "review_two_leaf_tests.rs"]
 mod two_leaf;
 
+#[path = "review_pointer_failure_tests.rs"]
+mod pointer_failure;
+
 fn classification() -> ReviewClassification {
     ReviewClassification::builder()
         .changed_files(vec!["tools/boss/engine/pr-review/src/parsing.rs".to_owned()])
@@ -2786,11 +2789,9 @@ fn dead_post_merge_reviewer_retries_once_then_fails_the_batch() {
 
 /// A dead batch member whose start failed on a damaged recovery pointer (an
 /// open `execution_bookmark_recovery_failed` item on it) is not retried: the
-/// retry would fail identically. Repeated calls change nothing, the member
-/// stays a recovery candidate, and the retry proceeds once the item is
-/// resolved.
+/// retry would fail identically. The batch settles without extra attention.
 #[test]
-fn dead_batch_member_blocked_before_start_is_not_retried_until_the_blocker_clears() {
+fn dead_batch_member_blocked_before_start_settles_batch_without_retry() {
     let db = WorkDb::open(temp_db_path("dead-member-blocked-before-start")).unwrap();
     let product = create_test_product(&db);
     let cycle_root = create_test_chore_manual(&db, product.id, "review target");
@@ -2832,12 +2833,15 @@ fn dead_batch_member_blocked_before_start_is_not_retried_until_the_blocker_clear
     .unwrap();
 
     for pass in 0..3 {
-        assert!(
-            matches!(
-                db.retry_dead_review_batch_member(&execution.id).unwrap(),
-                RetryDeadReviewBatchMember::Blocked
-            ),
-            "pass {pass}"
+        let result = db.retry_dead_review_batch_member(&execution.id).unwrap();
+        if pass == 0 {
+            assert!(matches!(result, RetryDeadReviewBatchMember::Blocked));
+        } else {
+            assert!(matches!(result, RetryDeadReviewBatchMember::NotRetried));
+        }
+        assert_eq!(
+            db.review_batch(&batch.id).unwrap().unwrap().status,
+            ReviewBatchStatus::Failed
         );
         assert_eq!(db.review_batch_members(&batch.id).unwrap().len(), 1, "pass {pass}");
         assert_eq!(
@@ -2847,8 +2851,8 @@ fn dead_batch_member_blocked_before_start_is_not_retried_until_the_blocker_clear
         );
         assert_eq!(
             db.list_dead_post_merge_review_batch_member_candidates().unwrap().len(),
-            1,
-            "pass {pass}: the member stays a candidate for when the blocker clears"
+            0,
+            "pass {pass}: the settled member must not remain retryable"
         );
     }
     assert_eq!(
@@ -2858,7 +2862,7 @@ fn dead_batch_member_blocked_before_start_is_not_retried_until_the_blocker_clear
     );
     assert!(matches!(
         db.retry_dead_review_batch_member(&execution.id).unwrap(),
-        RetryDeadReviewBatchMember::Retried(_)
+        RetryDeadReviewBatchMember::NotRetried
     ));
 }
 

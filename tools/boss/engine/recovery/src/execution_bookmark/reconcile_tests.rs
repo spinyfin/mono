@@ -1089,7 +1089,7 @@ async fn conflict_resolved_by_taking_the_other_side_is_not_contained() {
     // jj records the resolution as a rewrite of the preserved commit, but the
     // preserved file is gone from it: lineage alone must not vouch.
     for via_duplicate in [false, true] {
-        let (s, work, _pr_commit, resolved) =
+        let (s, work, _pr_commit, _) =
             carried_forward_by_rewrite(&format!("exec_lineage_theirs_{via_duplicate}"), via_duplicate, false).await;
         let before = snapshot_pointers(&LocalJj, &s.record).await.unwrap();
         let error = reconcile(&LocalJj, &s.record, Some("pr/7"), "main").await.unwrap_err();
@@ -1100,7 +1100,6 @@ async fn conflict_resolved_by_taking_the_other_side_is_not_contained() {
         );
         assert!(error.to_string().contains(&work[..12]), "{error}");
         assert_eq!(snapshot_pointers(&LocalJj, &s.record).await.unwrap(), before);
-        let _ = resolved;
     }
 }
 
@@ -1193,4 +1192,107 @@ fn records_persisted_before_lineage_evidence_default_to_equivalent_patch() {
     assert_eq!(change.evidence, RewriteEvidence::EquivalentPatch);
     let round_trip: RewrittenChange = serde_json::from_str(&serde_json::to_string(&change).unwrap()).unwrap();
     assert_eq!(round_trip, change);
+}
+
+pub(super) async fn modified_file_deleted_by_successor(execution_id: &str) -> (Scene, String, String) {
+    let s = revision_on_pr_head(execution_id).await;
+    std::fs::write(s.repo.worker.join("pr.txt"), "preserved edit\n").unwrap();
+    JjRepo::run(&s.repo.worker, &["status"]);
+    let work = one(&s.repo.repo, &revision(&s.record.head()));
+    JjRepo::run(&s.repo.repo, &["new", &work, "-m", "Delete edited file"]);
+    std::fs::remove_file(s.repo.repo.join("pr.txt")).unwrap();
+    JjRepo::run(&s.repo.repo, &["squash", "-m", "Rewrite deletes edited file"]);
+    bookmark(&s.repo.repo, "pr/7", &one(&s.repo.repo, "@-"));
+    JjRepo::run(
+        &s.repo.repo,
+        &["rebase", "-s", s.record.base_commit.as_deref().unwrap(), "-d", "main"],
+    );
+    let successor = one(&s.repo.repo, "pr/7");
+    keep_visible(&s.repo.repo, &work);
+    bookmark(&s.repo.repo, &s.record.head(), &work);
+    bookmark(&s.repo.repo, &s.record.publication(), &work);
+    bookmark(&s.repo.repo, "pr/7", &successor);
+    assert!(evolog_contains(&s.repo.repo, &successor, &work));
+    (s, work, successor)
+}
+
+#[tokio::test]
+async fn deleting_a_preserved_modified_file_is_not_contained() {
+    let (s, work, successor) = modified_file_deleted_by_successor("exec_deleted_edit").await;
+    let result = super::reconcile::containment(
+        &LocalJj,
+        &s.repo.repo,
+        s.record.base_commit.as_deref(),
+        &work,
+        &successor,
+        "main",
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, Containment::Missing { .. }), "{result:?}");
+    let before = snapshot_pointers(&LocalJj, &s.record).await.unwrap();
+    let error = reconcile(&LocalJj, &s.record, Some("pr/7"), "main").await.unwrap_err();
+    assert_eq!(pointer_integrity_kind(&error), Some(PointerIntegrityKind::NotContained));
+    assert_eq!(snapshot_pointers(&LocalJj, &s.record).await.unwrap(), before);
+}
+
+#[tokio::test]
+async fn publishing_both_halves_of_a_split_is_contained() {
+    let (s, work, base) = revision_with_two_files("exec_split_all").await;
+    let repo = &s.repo.repo;
+    JjRepo::run(repo, &["new", &format!("{work}-"), "-m", "First half"]);
+    JjRepo::run(
+        repo,
+        &[
+            "squash",
+            "--from",
+            &work,
+            "--into",
+            "@",
+            "-m",
+            "First half",
+            "root:revision.txt",
+        ],
+    );
+    let first = one(repo, "@");
+    let remainder = one(repo, &revision(&s.record.head()));
+    JjRepo::run(repo, &["rebase", "-r", &remainder, "-d", &first]);
+    let remainder = one(repo, &revision(&s.record.head()));
+    JjRepo::run(repo, &["new", &remainder, "-m", "Refine second half"]);
+    std::fs::write(repo.join("second.txt"), "second file, refined\n").unwrap();
+    JjRepo::run(repo, &["squash", "-m", "Second half"]);
+    let successor = one(repo, "@-");
+    keep_visible(repo, &work);
+    let result = super::reconcile::containment(&LocalJj, repo, Some(&base), &work, &successor, "main")
+        .await
+        .unwrap();
+    let Containment::Rewritten { matched } = result else {
+        panic!("{result:?}")
+    };
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].evidence, RewriteEvidence::RecordedLineage);
+}
+
+#[tokio::test]
+async fn preserved_deletions_survive_a_lineage_rewrite() {
+    let s = revision_on_pr_head("exec_preserved_deletion").await;
+    std::fs::remove_file(s.repo.worker.join("pr.txt")).unwrap();
+    JjRepo::run(&s.repo.worker, &["status"]);
+    let work = one(&s.repo.repo, &revision(&s.record.head()));
+    JjRepo::run(&s.repo.repo, &["new", &work, "-m", "Amend"]);
+    std::fs::write(s.repo.repo.join("revision.txt"), "amended revision\n").unwrap();
+    JjRepo::run(&s.repo.repo, &["squash", "-m", "Preserve deletion"]);
+    let successor = one(&s.repo.repo, "@-");
+    keep_visible(&s.repo.repo, &work);
+    let result = super::reconcile::containment(
+        &LocalJj,
+        &s.repo.repo,
+        s.record.base_commit.as_deref(),
+        &work,
+        &successor,
+        "main",
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, Containment::Rewritten { .. }), "{result:?}");
 }
