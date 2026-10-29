@@ -2388,7 +2388,8 @@ async fn handle_frontend_connection(
     // reconnected, which is not what a kill switch means.
     let writer_flags = server_state.feature_flags.clone();
     let writer_session_id = session_id.clone();
-    let first_board_served = server_state.work_tree_loads.first_served.clone();
+    let first_board_served = server_state.work_tree_loads.writes.first_served.clone();
+    let writer_state = server_state.clone();
     let writer_task = boss_task_scope::spawn(async move {
         while let Some(mut event) = writer_sink.next().await {
             // The exposure boundary's single write choke point. Every frame
@@ -2446,11 +2447,7 @@ async fn handle_frontend_connection(
                 },
                 trace,
                 &first_board_served,
-                |t| {
-                    if let Some(log) = crate::population_timing::global() {
-                        t.flush(log);
-                    }
-                },
+                |t| writer_state.work_tree_loads.flush_trace(t),
             );
             if write_failed {
                 break;
@@ -2695,6 +2692,9 @@ fn read_error_is_peer_disconnect(error: &std::io::Error) -> bool {
 /// An engine over an empty database and a way to serve connections to it, for
 /// socket-inclusive measurements that live beside the work fixtures they seed.
 #[cfg(test)]
+type TraceStages = (String, Vec<(&'static str, f64, i64)>);
+
+#[cfg(test)]
 pub(crate) struct MeasurementEngine {
     state: Arc<ServerState>,
     _dir: tempfile::TempDir,
@@ -2709,6 +2709,16 @@ impl MeasurementEngine {
 
     pub(crate) fn db(&self) -> &crate::work::WorkDb {
         &self.state.work_db
+    }
+
+    /// Receive `(request_id, [(segment, duration_ms, payload_bytes)])` for each
+    /// board population the writer finishes, in place of the process-wide log.
+    pub(crate) fn collect_traces(&self) -> tokio::sync::mpsc::UnboundedReceiver<TraceStages> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self.state.work_tree_loads.writes.trace_sink.lock().unwrap() = Some(Arc::new(move |trace| {
+            let _ = tx.send((trace.request_id().to_owned(), trace.segment_records()));
+        }));
+        rx
     }
 
     /// The client end of a new connection, and the task serving its other end.

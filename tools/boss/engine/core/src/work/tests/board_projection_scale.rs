@@ -238,8 +238,7 @@ async fn first_board(engine: &crate::app::MeasurementEngine, request_id: &str, p
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cold_snapshot_end_to_end_measurement() {
-    let diagnostics = tempfile::tempdir().unwrap();
-    crate::population_timing::install_global(Some(diagnostics.path().to_path_buf()));
+    let mut stage_lines = Vec::new();
     let modes = [
         (
             "single_frame",
@@ -251,6 +250,7 @@ async fn cold_snapshot_end_to_end_measurement() {
         // A fresh engine state per mode, so sample 0 is a genuinely cold first
         // snapshot (no shared board cache, no session cache); later samples are warm.
         let engine = crate::app::MeasurementEngine::new();
+        let mut traces = engine.collect_traces();
         super::work_tree_scale_tests::seed(&engine.db().connect().unwrap());
         for sample in 0..3 {
             let mut payload = serde_json::json!({"type": "get_work_tree", "product_id": "scale-product-0"});
@@ -272,35 +272,31 @@ async fn cold_snapshot_end_to_end_measurement() {
             if mode == "paged" {
                 assert!(m.max_frame_bytes < 513 * 1024 + 4096, "frame bound");
             }
+            // The connection has ended, so the writer has flushed this request's trace.
+            let (request, segments) = traces.try_recv().expect("the request's trace is collected");
+            assert_eq!(request, request_id);
+            if sample == 0 {
+                stage_lines.push((request, segments));
+            }
         }
     }
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    // One line per (request, stage): per-page stages are summed over the pages.
-    let mut stages: Vec<(String, String, f64, i64, usize)> = Vec::new();
-    for entry in std::fs::read_dir(diagnostics.path()).unwrap() {
-        for line in std::fs::read_to_string(entry.unwrap().path()).unwrap().lines() {
-            let rec: serde_json::Value = serde_json::from_str(line).unwrap();
-            let (Some(request), Some(segment)) = (rec["request_id"].as_str(), rec["segment"].as_str()) else {
-                continue;
-            };
-            if !request.ends_with("-0") {
-                continue;
-            }
-            let ms = rec["duration_ms"].as_f64().unwrap_or(0.0);
-            let bytes = rec["payload_bytes"].as_i64().unwrap_or(0);
-            match stages.iter_mut().find(|s| s.0 == request && s.1 == segment) {
+    for (request, segments) in stage_lines {
+        // Per-page stages are summed over the pages.
+        let mut stages: Vec<(&str, f64, i64, usize)> = Vec::new();
+        for (segment, ms, bytes) in segments {
+            match stages.iter_mut().find(|s| s.0 == segment) {
                 Some(stage) => {
-                    stage.2 += ms;
-                    stage.3 += bytes;
-                    stage.4 += 1;
+                    stage.1 += ms;
+                    stage.2 += bytes;
+                    stage.3 += 1;
                 }
-                None => stages.push((request.to_owned(), segment.to_owned(), ms, bytes, 1)),
+                None => stages.push((segment, ms, bytes, 1)),
             }
         }
-    }
-    for (request, segment, ms, bytes, count) in stages {
-        println!(
-            "e2e_stage request={request} segment={segment} duration_ms={ms:.1} payload_bytes={bytes} count={count}"
-        );
+        for (segment, ms, bytes, count) in stages {
+            println!(
+                "e2e_stage request={request} segment={segment} duration_ms={ms:.1} payload_bytes={bytes} count={count}"
+            );
+        }
     }
 }

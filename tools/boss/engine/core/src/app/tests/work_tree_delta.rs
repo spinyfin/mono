@@ -803,7 +803,15 @@ async fn writer_opens_first_board_gate_only_after_the_last_page() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let (state, _dir) = test_server_state();
     let product_id = seed_big_board(&state, "writer-gate");
-    let gate = state.work_tree_loads.first_served.clone();
+    let gate = state.work_tree_loads.writes.first_served.clone();
+    let (flushed_tx, mut flushed) = tokio::sync::mpsc::unbounded_channel();
+    *state.work_tree_loads.writes.trace_sink.lock().unwrap() = Some(Arc::new(move |trace| {
+        let _ = flushed_tx.send((
+            trace.request_id().to_owned(),
+            trace.payload_bytes(),
+            trace.segment_count("serialize"),
+        ));
+    }));
     let (client, server) = tokio::net::UnixStream::pair().unwrap();
     let handler = tokio::spawn(handle_frontend_connection(server, state, None));
     let (read, mut write) = client.into_split();
@@ -817,16 +825,20 @@ async fn writer_opens_first_board_gate_only_after_the_last_page() {
         .await
         .unwrap();
     let mut pages = 0;
+    let mut line_bytes = 0usize;
     loop {
-        let envelope: FrontendEventEnvelope = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let line = lines.next_line().await.unwrap().unwrap();
+        let envelope: FrontendEventEnvelope = serde_json::from_str(&line).unwrap();
         if envelope.request_id.as_deref() != Some("gate") {
             continue;
         }
+        line_bytes += line.len();
         let last = update(envelope.payload).is_last_page();
         pages += 1;
         if last {
             break;
         }
+        assert!(flushed.try_recv().is_err(), "trace flushed before the final page");
         assert!(
             tokio::time::timeout(Duration::from_millis(50), gate.notified())
                 .await
@@ -838,7 +850,18 @@ async fn writer_opens_first_board_gate_only_after_the_last_page() {
     tokio::time::timeout(Duration::from_secs(5), gate.notified())
         .await
         .expect("gate opens after the final page");
+    let (request_id, payload_bytes, serialize_segments) = tokio::time::timeout(Duration::from_secs(5), flushed.recv())
+        .await
+        .expect("the final page flushes the trace")
+        .unwrap();
+    assert_eq!(request_id, "gate");
+    assert_eq!(serialize_segments, pages, "one serialize segment per page");
+    assert_eq!(
+        payload_bytes, line_bytes as i64,
+        "payload bytes are the sum of the written page lines"
+    );
     drop(lines);
     drop(write);
     handler.await.unwrap().unwrap();
+    assert!(flushed.try_recv().is_err(), "exactly one trace is flushed");
 }

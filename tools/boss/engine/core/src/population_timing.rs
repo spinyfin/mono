@@ -451,6 +451,14 @@ impl PopulationTrace {
         self.segments.iter().filter(|s| s.segment == name).count()
     }
 
+    /// Test-only: `(segment, duration_ms, payload_bytes)` for every recorded segment.
+    pub(crate) fn segment_records(&self) -> Vec<(&'static str, f64, i64)> {
+        self.segments
+            .iter()
+            .map(|s| (s.segment, s.duration_ms, s.payload_bytes.unwrap_or(0)))
+            .collect()
+    }
+
     pub(crate) fn request_id(&self) -> &str {
         &self.ctx.request_id
     }

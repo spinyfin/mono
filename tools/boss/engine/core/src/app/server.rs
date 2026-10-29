@@ -2104,7 +2104,7 @@ async fn serve_scoped(
     let _attention_reconcile_sweep_handle = crate::attention_reconcile_sweep::spawn_loop(
         server_state.work_db.clone(),
         crate::attention_reconcile_sweep::DEFAULT_INTERVAL,
-        server_state.work_tree_loads.first_served.clone(),
+        server_state.work_tree_loads.writes.first_served.clone(),
         crate::attention_reconcile_sweep::FIRST_PASS_GRACE,
     );
 

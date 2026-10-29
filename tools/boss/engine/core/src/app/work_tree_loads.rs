@@ -16,7 +16,7 @@ struct Sources {
 
 #[derive(Default)]
 pub(super) struct WorkTreeLoads {
-    pub(super) first_served: Arc<tokio::sync::Notify>,
+    pub(super) writes: WriterHooks,
     flights: boss_single_flight::SingleFlight<String, (u64, i64), (u64, boss_protocol::WorkTree)>,
     // Per-item runtimes and per-owner review projections shared by every
     // product's assembly, validated against per-item epochs in each load's
@@ -27,7 +27,32 @@ pub(super) struct WorkTreeLoads {
     session_order: StdMutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 }
 
+/// What the session writer signals as board responses reach the socket.
+#[derive(Default)]
+pub(super) struct WriterHooks {
+    pub(super) first_served: Arc<tokio::sync::Notify>,
+    /// Test-owned receiver for finished population traces, taking the place of
+    /// the process-wide timing log so tests observe exactly what the writer flushes.
+    #[cfg(test)]
+    pub(super) trace_sink: StdMutex<Option<TraceSink>>,
+}
+
+#[cfg(test)]
+pub(super) type TraceSink = Arc<dyn Fn(&crate::population_timing::PopulationTrace) + Send + Sync>;
+
 impl WorkTreeLoads {
+    /// Emit one finished board population trace: to the test sink when one is
+    /// installed, otherwise to the process-wide timing log.
+    pub(super) fn flush_trace(&self, trace: &crate::population_timing::PopulationTrace) {
+        #[cfg(test)]
+        if let Some(sink) = self.writes.trace_sink.lock().expect("trace sink poisoned").clone() {
+            return sink(trace);
+        }
+        if let Some(log) = crate::population_timing::global() {
+            trace.flush(log);
+        }
+    }
+
     /// The lock that serializes one session's `GetWorkTree` replies: held from
     /// the cache update through the enqueue of every page, so response order
     /// matches cache sequence order even though admitted reads run concurrently.
