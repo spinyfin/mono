@@ -261,7 +261,7 @@ fn open_kind_probe_uses_partial_index_over_large_resolved_history() {
         .unwrap();
     assert!(
         plan.iter()
-            .any(|line| line.contains("work_attention_items_open_kind_idx")),
+            .any(|line| line.contains("work_attention_items_open_kind_id_idx")),
         "{plan:?}"
     );
     assert!(
