@@ -9,7 +9,9 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2024",
     visibility = [
-        "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/completion:__pkg__",
+        "//tools/boss/engine/host-execution:__pkg__",
+        "//tools/boss/engine/utils:__pkg__",
         "//tools/cube:__pkg__",
     ],
     deps = all_crate_deps(normal = True),
@@ -40,4 +42,17 @@ rust_test(
         normal = True,
         normal_dev = True,
     ),
+)
+
+rust_library(
+    name = "workspace_procs_testing",
+    testonly = True,
+    srcs = ["src/testing.rs"],
+    crate_root = "src/testing.rs",
+    edition = "2024",
+    visibility = [
+        "//tools/boss/engine/completion:__pkg__",
+        "//tools/cube:__pkg__",
+    ],
+    deps = [":workspace_procs"],
 )

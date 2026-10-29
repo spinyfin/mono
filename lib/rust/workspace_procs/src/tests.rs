@@ -1,3 +1,4 @@
+use crate::testing::{StaticProcessTable, fake_process};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -62,9 +63,9 @@ fn pids(owned: &[OwnedProcess]) -> Vec<i32> {
 #[test]
 fn scan_owns_orphans_by_working_directory_and_descendants_by_ancestry() {
     let table = incident_table();
-    let scope = Scope::for_workspace(WS).with_root(100);
+    let scope = Scope::for_workspace(WS).with_root(&table.snapshot(100).unwrap());
     let scan = scan(&table, &scope).unwrap();
-    assert_eq!(pids(&scan.owned), vec![100, 200, 400, 401, 500]);
+    assert_eq!(pids(&scan.owned), vec![100, 200, 400, 401, 500, 601, 700]);
     let by_pid = |pid: i32| {
         scan.owned
             .iter()
@@ -92,24 +93,12 @@ fn scan_owns_orphans_by_working_directory_and_descendants_by_ancestry() {
 }
 
 #[test]
-fn scan_spares_the_bazel_server_its_children_and_interactive_shells() {
+fn scan_spares_only_the_bazel_server() {
     let table = incident_table();
     let scan = scan(&table, &Scope::for_workspace(WS)).unwrap();
     let spared: Vec<(i32, SpareReason)> = scan.spared.iter().map(|s| (s.process.pid, s.reason.clone())).collect();
-    // Without a root, the pane shell and agent — which hold the pane's pty —
-    // are indistinguishable from a human's shell and are spared too; the
-    // engine passes the pane pid as a root precisely so they are not.
-    assert_eq!(
-        spared,
-        vec![
-            (100, SpareReason::Interactive),
-            (200, SpareReason::Interactive),
-            (600, SpareReason::BazelServer),
-            (601, SpareReason::BazelServerDescendant { server: 600 }),
-            (700, SpareReason::Interactive),
-        ]
-    );
-    assert_eq!(pids(&scan.owned), vec![400, 401, 500]);
+    assert_eq!(spared, vec![(600, SpareReason::BazelServer)]);
+    assert_eq!(pids(&scan.owned), vec![100, 200, 400, 401, 500, 601, 700]);
 }
 
 #[test]
@@ -128,7 +117,7 @@ fn a_root_below_a_bazel_server_still_owns_its_descendants() {
         1,
     );
     let scope = Scope {
-        roots: vec![620],
+        roots: vec![(620, table.snapshot(620).unwrap().start_micros)],
         paths: vec![],
         include_bazel_output_bases: false,
     };
@@ -140,7 +129,11 @@ fn a_root_below_a_bazel_server_still_owns_its_descendants() {
 #[test]
 fn scan_never_touches_the_caller_or_its_ancestors_or_unrelated_processes() {
     let table = incident_table();
-    let scan = scan(&table, &Scope::for_workspace(WS).with_root(100)).unwrap();
+    let scan = scan(
+        &table,
+        &Scope::for_workspace(WS).with_root(&table.snapshot(100).unwrap()),
+    )
+    .unwrap();
     for pid in [900, 901, 800, 1] {
         assert!(!scan.owned.iter().any(|o| o.process.pid == pid), "pid {pid} owned");
         assert!(!scan.spared.iter().any(|s| s.process.pid == pid), "pid {pid} spared");
@@ -156,7 +149,7 @@ fn scan_without_bazel_output_bases_stays_inside_the_workspace() {
         include_bazel_output_bases: false,
     };
     let scan = scan(&table, &scope).unwrap();
-    assert_eq!(pids(&scan.owned), vec![400, 401]);
+    assert_eq!(pids(&scan.owned), vec![100, 200, 400, 401, 700]);
     assert_eq!(scan.paths, vec![PathBuf::from(WS)]);
 }
 
@@ -176,7 +169,7 @@ fn reap_terms_then_kills_what_ignores_term_and_reports_survivors() {
     table.ignore_term(400);
     let report = reap(
         &table,
-        &Scope::for_workspace(WS).with_root(100),
+        &Scope::for_workspace(WS).with_root(&table.snapshot(100).unwrap()),
         Duration::from_millis(10),
     )
     .unwrap();
@@ -189,16 +182,18 @@ fn reap_terms_then_kills_what_ignores_term_and_reports_survivors() {
             (400, Signal::Term),
             (401, Signal::Term),
             (500, Signal::Term),
+            (601, Signal::Term),
+            (700, Signal::Term),
             (400, Signal::Kill),
         ]
     );
-    assert_eq!(report.killed_pids(), vec![100, 200, 400, 401, 500]);
+    assert_eq!(report.killed_pids(), vec![100, 200, 400, 401, 500, 601, 700]);
     assert!(report.is_clean());
     assert_eq!(report.passes, 3);
     assert!(!table.is_alive(400));
     assert!(table.is_alive(600), "bazel server spared");
-    assert!(table.is_alive(700), "interactive shell spared");
-    assert_eq!(report.spared.len(), 3);
+    assert!(!table.is_alive(700), "tty occupants are owned");
+    assert_eq!(report.spared.len(), 1);
     let loop_line = report
         .signalled
         .iter()
@@ -240,4 +235,65 @@ fn survivor_summary_names_pids_and_commands() {
     };
     assert_eq!(report.survivor_summary(), "400 (zsh)");
     assert!(!report.is_clean());
+}
+
+#[test]
+fn escalation_retains_reparented_targets_but_not_new_occupants_or_recycled_roots() {
+    let root = fake_process(10, 1, "shell", Some(WS));
+    let child = fake_process(11, 10, "tool", Some("/elsewhere"));
+    let table = StaticProcessTable::new(vec![root.clone(), child], 900);
+    table.ignore_term(11);
+    let initial = scan(&table, &Scope::for_workspace(WS).with_root(&root)).unwrap();
+    signal_owned(&table, &initial.owned, Signal::Term);
+    assert_eq!(table.snapshot(11).unwrap().ppid, 1);
+    let mut recycled = root.clone();
+    recycled.start_micros += 1;
+    table.replace(recycled);
+    table.replace(fake_process(12, 10, "new child", Some(WS)));
+    table.replace(fake_process(13, 1, "new occupant", Some(WS)));
+    let survivors = escalation_scan(&table, &initial.owned).unwrap();
+    assert_eq!(pids(&survivors.owned), vec![11]);
+    signal_owned(&table, &survivors.owned, Signal::Kill);
+    assert!(!table.is_alive(11));
+    for pid in [10, 12, 13] {
+        assert!(table.is_alive(pid));
+    }
+    let rooted = scan(&table, &Scope::default().with_root(&root)).unwrap();
+    assert!(rooted.owned.is_empty());
+}
+
+#[test]
+fn broad_path_roots_are_rejected() {
+    let table = incident_table();
+    assert!(scan(&table, &Scope::for_workspace("/")).is_err());
+    if let Some(home) = std::env::var_os("HOME") {
+        assert!(scan(&table, &Scope::for_workspace(PathBuf::from(home))).is_err());
+    }
+}
+
+#[test]
+fn final_verification_reports_new_occupants_without_signalling_them() {
+    struct Reoccupied(StaticProcessTable);
+    impl WorkspaceProcessTable for Reoccupied {
+        fn list(&self) -> std::io::Result<Vec<LiveProcess>> {
+            self.0.list()
+        }
+        fn snapshot(&self, pid: i32) -> std::io::Result<LiveProcess> {
+            self.0.snapshot(pid)
+        }
+        fn own_pid(&self) -> i32 {
+            self.0.own_pid()
+        }
+        fn signal(&self, pid: i32, signal: Signal) -> std::io::Result<()> {
+            self.0.signal(pid, signal)?;
+            self.0.replace(fake_process(12, 1, "new occupant", Some(WS)));
+            Ok(())
+        }
+    }
+    let table = Reoccupied(StaticProcessTable::new(vec![ws_process(10, 1, "old occupant")], 900));
+    let report = reap(&table, &Scope::for_workspace(WS), Duration::ZERO).unwrap();
+    assert_eq!(report.killed_pids(), vec![10]);
+    assert_eq!(pids(&report.survivors), vec![12]);
+    assert!(!report.is_clean());
+    assert!(table.0.is_alive(12));
 }

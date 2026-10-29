@@ -1270,6 +1270,7 @@ dependencies = [
  "fastrand 2.4.1",
  "libc",
  "tempfile",
+ "workspace-procs",
 ]
 
 [[package]]
