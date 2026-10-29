@@ -895,7 +895,7 @@ struct ContentView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                 .padding(24)
-            } else if model.selectedProduct != nil {
+            } else if let product = model.selectedProduct {
                 VStack(spacing: 0) {
                     if let query = model.activeWorkSearchQuery {
                         WorkFilterBanner(query: query) {
@@ -903,7 +903,25 @@ struct ContentView: View {
                             isSearchExpanded = false
                         }
                     }
-                    workBoard()
+                    if model.isBoardLoaded(product.id) {
+                        if model.boardLoad.isRefreshing(product.id) || model.boardLoad.hasFailed(product.id) {
+                            BoardRefreshBanner(
+                                since: model.boardLoad.waitingSince(product.id),
+                                progress: model.boardLoad.progress(for: product.id),
+                                failed: model.boardLoad.hasFailed(product.id),
+                                isConnected: model.isConnected,
+                                retry: { model.refetchBoard(productID: product.id) })
+                        }
+                        workBoard()
+                    } else {
+                        BoardLoadingView(
+                            isConnected: model.isConnected,
+                            since: model.boardLoad.waitingSince(product.id),
+                            progress: model.boardLoad.progress(for: product.id),
+                            failed: model.boardLoad.hasFailed(product.id),
+                            retry: { model.refetchBoard(productID: product.id) }
+                        )
+                    }
                 }
             } else {
                 VStack(alignment: .leading, spacing: 10) {

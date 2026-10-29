@@ -80,6 +80,7 @@ pub(super) fn attach_board_derivations(
     // Compute revision projections (revision_seq, revision_parent_pr_url)
     // for every `kind = 'revision'` task. These are derived fields —
     // not stored columns — so they are calculated fresh here.
+    trace.enter_stage(segment::ASSEMBLE);
     let t = Instant::now();
     let mut tasks = attach_revision_projections(tasks, chores);
     // Compute has_in_progress_revision for every chain-root task that
@@ -97,6 +98,7 @@ pub(super) fn attach_board_derivations(
     // execution is in flight. Surfaces the "Reviewing (AI)" badge on
     // the kanban card. Errors are non-fatal — log and continue with
     // the field defaulting to false. Single batched `IN (...)` query.
+    trace.enter_stage(segment::DB_AI_REVIEWING);
     let t = Instant::now();
     if let Err(err) = attach_ai_reviewing_flag(conn, &mut tasks, chores) {
         tracing::warn!(?err, "{caller}: failed to attach ai_reviewing flag; ignoring");
@@ -111,6 +113,7 @@ pub(super) fn attach_board_derivations(
     // the field at its default (no badge). Resolved per PR owner, from
     // the review cache when the caller has one; the segment records the
     // cards resolved and the statements that took.
+    trace.enter_stage(segment::DB_AI_REVIEW_STATE);
     let t = Instant::now();
     match attach_ai_review_state_with(conn, &mut tasks, chores, review_cache.map(|cache| (cache, product_id))) {
         Ok((stats, timings)) => record_ai_review_state(trace, elapsed_ms(t), stats, timings),
@@ -132,6 +135,7 @@ pub(super) fn attach_board_derivations(
     // gate its screenshot-viewer affordance without a per-card query.
     // Errors are non-fatal — log and leave the field at its default
     // (affordance hidden). Single batched `IN (...)` query.
+    trace.enter_stage(segment::DB_HAS_ATTACHMENTS);
     let t = Instant::now();
     let attachments = if matches!(scope, CardScope::WholeProduct) {
         attach_has_attachments_flag(conn, &mut tasks, chores)
@@ -148,6 +152,7 @@ pub(super) fn attach_board_derivations(
     // per-card query. Errors are non-fatal — log and leave the fields at
     // their default (affordance hidden). Board-sized sets join series by
     // product; single-item chains keep a root-id list.
+    trace.enter_stage(segment::DB_REVIEW_GUIDE_STATE);
     let t = Instant::now();
     if let Err(err) = attach_review_guide_state(conn, &mut tasks, chores) {
         tracing::warn!(?err, "{caller}: failed to attach review_guide_state; ignoring");
@@ -168,6 +173,7 @@ pub(super) fn attach_board_derivations(
     // each requested card. `resolved` counts pointer-bearing items (including
     // broken links), not all probed cards. `doc_pointer_queries` counts all
     // statements, including probes without pointers.
+    trace.enter_stage(segment::DB_DOC_POINTERS);
     let t = Instant::now();
     let (resolved, doc_pointer_queries) = if matches!(scope, CardScope::WholeProduct) {
         attach_task_doc_link_states_for_groups(conn, &mut [&mut tasks[..], &mut chores[..]], caller, product_id)

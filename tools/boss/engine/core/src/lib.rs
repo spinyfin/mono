@@ -148,6 +148,7 @@ pub mod orphan_sweep;
 pub mod pane_summary;
 pub mod planner;
 pub mod pool_claim_sweep;
+pub mod population_progress;
 pub mod population_timing;
 pub mod populator;
 pub mod postmortem_followups;

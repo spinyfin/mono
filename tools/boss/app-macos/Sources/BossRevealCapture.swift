@@ -50,6 +50,10 @@ enum BossRevealCapture {
             BossAgentsToolbarCapture.start(path: path)
             return
         }
+        if state == "board-loading" {
+            BossBoardLoadingCapture.start(path: path, updateModel: updateModel)
+            return
+        }
         if state == "exited-worker" {
             BossExitedWorkerCapture.start(path: path)
             return

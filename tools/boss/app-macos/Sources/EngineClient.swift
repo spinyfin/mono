@@ -1271,6 +1271,20 @@ final class EngineClient: @unchecked Sendable {
             if !name.isEmpty {
                 emit(.featureFlagSet(name: name, enabled: enabled))
             }
+        case "board_population_progress":
+            guard let productId = payload["product_id"] as? String,
+                  let phase = payload["phase"] as? String
+            else {
+                break
+            }
+            emit(.boardPopulationProgress(
+                productId: productId,
+                phase: phase,
+                stage: payload["stage"] as? String,
+                elapsedMs: (payload["elapsed_ms"] as? NSNumber)?.intValue ?? 0,
+                items: (payload["items"] as? NSNumber)?.intValue,
+                bytes: (payload["bytes"] as? NSNumber)?.intValue
+            ))
         case "engine_health_result":
             let report = payload["report"] as? [String: Any] ?? [:]
             let apiKeyPresent = (report["anthropic_api_key_present"] as? NSNumber)?.boolValue ?? false
