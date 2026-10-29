@@ -71,6 +71,7 @@ mod app_session;
 pub(crate) mod attachments;
 mod attentions;
 mod automations;
+mod board_progress;
 mod broadcasts;
 mod ci_remediation;
 mod comments;
@@ -2441,6 +2442,8 @@ async fn handle_frontend_connection(
                 );
                 let total_ms = t.elapsed_ms();
                 t.record_plain(crate::population_timing::segment::TOTAL, total_ms);
+                t.finish_progress();
+                t.log_if_slow();
                 if let Some(log) = crate::population_timing::global() {
                     t.flush(log);
                 }

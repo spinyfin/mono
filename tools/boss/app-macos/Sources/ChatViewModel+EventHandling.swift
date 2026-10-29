@@ -65,6 +65,7 @@ extension ChatViewModel {
             engine.resetConnectTreeClaims()
             // No reply is coming for a read the dropped connection carried.
             resetBoardReadFences()
+            updateBoardLoad { $0.noteDisconnected() }
             disconnectOffsiteBackupEdit()
             if engine.hasUnsentAction(kind: "recreate_coordinator") {
                 coordinatorResetWaiting = false
@@ -159,6 +160,7 @@ extension ChatViewModel {
             projectsByProductID[productId] = projects.sorted(by: projectSort)
         case .workTree(let product, let projects, let tasks, let chores, let taskRuntimes, let dependencies, let ideas, let attentionItems, let attentionGroups, let attentionMembers, let plannerRuns, let requestID, let revision):
             guard acceptWorkTree(productID: product.id, requestID: requestID, revision: revision) else { return }
+            updateBoardLoad { $0.noteSnapshot(product.id) }
             applyWorkTree(
                 product: product,
                 projects: projects,
@@ -172,6 +174,12 @@ extension ChatViewModel {
                 attentionMembers: attentionMembers,
                 plannerRuns: plannerRuns
             )
+        case .boardPopulationProgress(let productId, let phase, let stage, let elapsedMs, let items, _):
+            // `done` follows the snapshot frame, so only the stages describe a wait.
+            guard phase != "done" else { break }
+            updateBoardLoad {
+                $0.noteProgress(productId, BoardLoadProgress(stage: stage, engineElapsedMs: elapsedMs, items: items))
+            }
         case .workItemCreated(let item):
             handleCreatedWorkItem(item)
         case .workItemsCreated(let items):

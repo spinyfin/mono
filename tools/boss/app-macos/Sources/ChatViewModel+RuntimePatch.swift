@@ -61,6 +61,7 @@ extension ChatViewModel {
     }
 
     func noteWorkTreeRequested(productID: String, requestID: String) {
+        updateBoardLoad { $0.noteRequested(productID) }
         var fence = boardReadFences[productID] ?? BoardReadFence()
         fence.expire(isQueued: engine.isReadQueued(requestId:))
         fence.trees[requestID] = .now

@@ -71,6 +71,8 @@ use serde::Serialize;
 
 use boss_engine_day_rotated_log::DayRotatedLogger;
 
+use crate::population_progress::{ProgressReporter, ProgressSink, SLOW_POPULATION_MS, SlowPopulation};
+
 /// Environment override for the diagnostics directory. When set (and
 /// non-empty after trimming) the day files are written under this path
 /// instead of `<boss-state-root>/diagnostics`. Used by local runs against
@@ -108,6 +110,9 @@ pub mod segment {
     pub const DB_DOC_POINTERS: &str = "db.doc_pointers";
     /// In-memory projection / flag attachment (no DB).
     pub const ASSEMBLE: &str = "assemble";
+    /// Time the handler spent blocked on the shared board load (its own
+    /// build, or waiting on the request that owns it).
+    pub const SHARED_LOAD_WAIT: &str = "shared_load_wait";
     /// Handler enqueue → writer-task dequeue. Non-zero only when the
     /// session's writer queue has other events ahead of this response;
     /// otherwise the gap is negligible and this segment stays near zero.
@@ -209,6 +214,9 @@ pub struct PopulationTrace {
     /// the gap between that instant and its own call into the `queue_wait`
     /// segment, then clears this so a repeat call is a no-op.
     enqueued_at: Option<Instant>,
+    /// Live cold-build progress; inert unless a sink was installed with
+    /// [`Self::set_progress_sink`].
+    progress: ProgressReporter,
 }
 
 impl PopulationTrace {
@@ -230,6 +238,7 @@ impl PopulationTrace {
             started: Some(started),
             segments: Vec::new(),
             enqueued_at: None,
+            progress: ProgressReporter::default(),
         }
     }
 
@@ -246,6 +255,7 @@ impl PopulationTrace {
             started: None,
             segments: Vec::new(),
             enqueued_at: None,
+            progress: ProgressReporter::default(),
         }
     }
 
@@ -281,6 +291,71 @@ impl PopulationTrace {
         if self.is_enabled() {
             self.ctx.items = Some(items as i64);
         }
+    }
+
+    /// Report this trace's cold-build progress to `sink`. No-op on a
+    /// disabled trace, which records nothing to report.
+    pub fn set_progress_sink(&mut self, sink: ProgressSink) {
+        if self.is_enabled() {
+            self.progress.set_sink(sink);
+        }
+    }
+
+    /// Mark the start of a full board read (as opposed to an incremental
+    /// refresh) so progress is reported for it. Called by the board
+    /// projection immediately before it assembles the whole tree.
+    pub fn begin_cold_build(&mut self) {
+        if self.is_enabled() {
+            self.progress.start(self.elapsed_ms(), self.ctx.items);
+        }
+    }
+
+    /// Close a reported cold build with the snapshot's item count and
+    /// serialized size. The writer calls this once the frame is written; a
+    /// no-op unless [`Self::begin_cold_build`] reported a start.
+    pub fn finish_progress(&mut self) {
+        if self.is_enabled() {
+            let bytes = self.payload_bytes();
+            self.progress.finish(self.elapsed_ms(), self.ctx.items, bytes);
+        }
+    }
+
+    /// The breakdown of this population if its `total` exceeded
+    /// [`SLOW_POPULATION_MS`], else `None`. Needs the `total` segment, so the
+    /// writer asks after recording it.
+    pub fn slow_population(&self) -> Option<SlowPopulation> {
+        let total_ms = self.segments.iter().find(|s| s.segment == segment::TOTAL)?.duration_ms;
+        (total_ms > SLOW_POPULATION_MS).then(|| SlowPopulation {
+            total_ms,
+            items: self.ctx.items,
+            bytes: self.payload_bytes(),
+            stages: self
+                .segments
+                .iter()
+                .filter(|s| s.segment != segment::TOTAL)
+                .map(|s| (s.segment, s.duration_ms))
+                .collect(),
+        })
+    }
+
+    /// Log a slow population's stages at INFO with the product id and the
+    /// snapshot's item and byte counts. No-op when the population was fast.
+    pub fn log_if_slow(&self) {
+        if let Some(slow) = self.slow_population() {
+            tracing::info!(
+                product_id = %self.ctx.product_id,
+                request_id = %self.ctx.request_id,
+                total_ms = slow.total_ms,
+                items = ?slow.items,
+                bytes = ?slow.bytes,
+                stages = %slow.stages_summary(),
+                "slow board population"
+            );
+        }
+    }
+
+    fn payload_bytes(&self) -> Option<i64> {
+        self.segments.iter().find_map(|s| s.payload_bytes)
     }
 
     /// Elapsed ms since the window start, or `0.0` if disabled/unset.
@@ -329,6 +404,7 @@ impl PopulationTrace {
                 .maybe_payload_bytes(payload_bytes)
                 .build(),
         );
+        self.progress.stage(segment, self.elapsed_ms(), self.ctx.items);
     }
 
     /// Emit every recorded segment to `log`. No-op for a disabled trace.
@@ -470,6 +546,113 @@ mod tests {
         assert_eq!(runtimes.db_queries, Some(4200));
         let serialize = trace.segments.iter().find(|s| s.segment == segment::SERIALIZE).unwrap();
         assert_eq!(serialize.payload_bytes, Some(2_500_000));
+    }
+
+    /// Every report a trace sends to its sink, in order.
+    fn collecting_sink() -> (
+        ProgressSink,
+        std::sync::Arc<std::sync::Mutex<Vec<crate::population_progress::PopulationProgress>>>,
+    ) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_seen = seen.clone();
+        let sink: ProgressSink = std::sync::Arc::new(move |p| sink_seen.lock().unwrap().push(p));
+        (sink, seen)
+    }
+
+    #[test]
+    fn cold_build_reports_start_live_stages_and_done_with_counts() {
+        use boss_protocol::BoardPopulationPhase::{Done, Stage, Started};
+        let (sink, seen) = collecting_sink();
+        let mut trace = PopulationTrace::new("prod-1", "req-1", None, Instant::now());
+        trace.set_progress_sink(sink);
+        trace.record_plain(segment::DECODE, 0.5);
+        trace.begin_cold_build();
+        trace.record_query(segment::DB_TASKS, 12.0, 1949);
+        trace.set_items(1949);
+        trace.record_nplus1(segment::DB_TASK_RUNTIMES, 6000.0, 1949, 4200);
+        trace.record_plain(segment::ASSEMBLE, 3.0);
+        trace.record_plain(segment::SHARED_LOAD_WAIT, 6015.0);
+        trace.record_serialize(80.0, 31_500_000);
+        trace.record_plain(segment::SOCKET_WRITE, 9.0);
+        trace.record_plain(segment::TOTAL, 6200.0);
+        trace.finish_progress();
+
+        let seen = seen.lock().unwrap();
+        let shape: Vec<_> = seen.iter().map(|p| (p.phase, p.stage)).collect();
+        assert_eq!(
+            shape,
+            vec![
+                (Started, None),
+                (Stage, Some(segment::DB_TASKS)),
+                (Stage, Some(segment::DB_TASK_RUNTIMES)),
+                (Stage, Some(segment::ASSEMBLE)),
+                (Done, None),
+            ],
+            "decode, the shared-load wait and the writer-side tail are not live stages"
+        );
+        assert_eq!(
+            seen[2].items,
+            Some(1949),
+            "stage events carry the item count once known"
+        );
+        let done = seen.last().unwrap();
+        assert_eq!((done.items, done.bytes), (Some(1949), Some(31_500_000)));
+    }
+
+    #[test]
+    fn warm_refresh_without_begin_cold_build_reports_nothing() {
+        let (sink, seen) = collecting_sink();
+        let mut trace = PopulationTrace::new("prod-1", "req-1", None, Instant::now());
+        trace.set_progress_sink(sink);
+        trace.record_query(segment::DB_TASKS, 1.0, 10);
+        trace.record_plain(segment::TOTAL, 2.0);
+        trace.finish_progress();
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn begin_cold_build_reports_a_single_start() {
+        let (sink, seen) = collecting_sink();
+        let mut trace = PopulationTrace::new("prod-1", "req-1", None, Instant::now());
+        trace.set_progress_sink(sink);
+        trace.begin_cold_build();
+        trace.begin_cold_build();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn disabled_trace_ignores_a_progress_sink() {
+        let (sink, seen) = collecting_sink();
+        let mut trace = PopulationTrace::disabled();
+        trace.set_progress_sink(sink);
+        trace.begin_cold_build();
+        trace.record_query(segment::DB_TASKS, 1.0, 10);
+        trace.finish_progress();
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn slow_population_needs_total_over_the_threshold() {
+        let mut trace = PopulationTrace::new("prod-1", "req-1", None, Instant::now());
+        trace.record_query(segment::DB_TASKS, 100.0, 3);
+        assert_eq!(trace.slow_population(), None, "no total segment yet");
+        trace.record_plain(segment::TOTAL, SLOW_POPULATION_MS);
+        assert_eq!(trace.slow_population(), None, "exactly at the threshold is not slow");
+
+        let mut trace = PopulationTrace::new("prod-1", "req-1", None, Instant::now());
+        trace.record_query(segment::DB_TASKS, 100.0, 1949);
+        trace.record_nplus1(segment::DB_TASK_RUNTIMES, 113_000.0, 1949, 4200);
+        trace.set_items(1949);
+        trace.record_serialize(900.0, 31_500_000);
+        trace.record_plain(segment::TOTAL, 114_500.0);
+        let slow = trace.slow_population().expect("114s is slow");
+        assert_eq!(slow.total_ms, 114_500.0);
+        assert_eq!((slow.items, slow.bytes), (Some(1949), Some(31_500_000)));
+        assert_eq!(
+            slow.stages_summary(),
+            "db.tasks=100ms db.task_runtimes=113000ms serialize=900ms",
+            "stages in recorded order, total excluded"
+        );
     }
 
     #[test]

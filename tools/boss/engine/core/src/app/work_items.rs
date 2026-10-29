@@ -1403,6 +1403,9 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
     let mut trace =
         crate::population_timing::PopulationTrace::new(product_id.clone(), request_id.clone(), fetch_seq, recv_instant);
     trace.record_plain(crate::population_timing::segment::DECODE, decode_ms);
+    // A cold build reports its stages on the product's work topic as it runs;
+    // a warm refresh never starts one, so the sink then sees nothing.
+    trace.set_progress_sink(super::board_progress::topic_progress_sink(&server_state, &product_id));
 
     sink.board_reads
         .lock()
@@ -1416,7 +1419,10 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
         &product_id,
         &mut trace,
     );
-    trace.record_plain("shared_load_wait", crate::population_timing::elapsed_ms(started));
+    trace.record_plain(
+        crate::population_timing::segment::SHARED_LOAD_WAIT,
+        crate::population_timing::elapsed_ms(started),
+    );
     let result = loaded.and_then(|loaded| {
         loaded
             .value

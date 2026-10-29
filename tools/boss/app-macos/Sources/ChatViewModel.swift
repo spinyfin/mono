@@ -95,6 +95,11 @@ final class ChatViewModel: ObservableObject {
     /// Outstanding whole-board and runtime-patch reads per product; see
     /// [[BoardReadFence]].
     var boardReadFences: [String: BoardReadFence] = [:]
+    /// Which products have their first board snapshot, and how far the engine
+    /// says the others have got. Published: the board shows a loading state
+    /// instead of empty columns until the product is loaded. See
+    /// [[BoardLoadTracker]].
+    @Published var boardLoad = BoardLoadTracker()
     /// Views currently showing a task's execution history (card popover,
     /// transcript viewer), by task id, each identified by a per-view token.
     /// A task with no entry has no consumer: its history is not cached and
