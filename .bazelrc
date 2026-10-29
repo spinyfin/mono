@@ -1,3 +1,11 @@
+# Local Bazel server idle timeout: 2 hours. Keeps a workspace's server warm
+# between runs but stops finished-run servers from holding several GB of RAM
+# for Bazel's default 3h. CI overrides this to 1800s by passing
+# --max_idle_secs on the command line (CI_BAZEL_STARTUP_FLAGS in
+# .buildkite/steps/ci-env.sh); a command-line startup flag takes precedence
+# over any rc file. See .ci.bazelrc.
+startup --max_idle_secs=7200
+
 build --jobs=200
 build --disk_cache=~/.cache/bazelcache
 # Off-CI GC limits (coordinator laptop, cube worker workspaces). CI overrides
