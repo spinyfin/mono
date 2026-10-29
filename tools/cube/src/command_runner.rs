@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 #[cfg(test)]
@@ -104,7 +104,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 pub struct RealCommandRunner;
 
 /// Environment marker on a `jj` invocation made by the maintenance pass
-/// itself, which holds the exclusive [`JjGate`] and so must not wait on it.
+/// itself, which already holds the appropriate [`JjGate`] reservation.
 pub const JJ_GATE_HELD_ENV: &str = "CUBE_JJ_GATE_HELD";
 
 /// Host-wide gate between cube's own `jj` commands and shared-store
@@ -117,15 +117,130 @@ pub const JJ_GATE_HELD_ENV: &str = "CUBE_JJ_GATE_HELD";
 /// checks.
 pub struct JjGate {
     _file: File,
+    quarantine: PathBuf,
 }
 
 impl JjGate {
+    /// Fail closed across a killed maintenance process or a partial head
+    /// update. Refuses to replace a marker that is already present, so one
+    /// pass can never take over another store's unverified rewrite.
+    pub fn quarantine(&self, source: &Path) -> Result<(), CubeError> {
+        let parent = self.quarantine.parent().expect("gate has a parent");
+        let mut marker = tempfile::NamedTempFile::new_in(parent).map_err(CubeError::Io)?;
+        marker
+            .write_all(source.display().to_string().as_bytes())
+            .map_err(CubeError::Io)?;
+        marker.as_file().sync_all().map_err(CubeError::Io)?;
+        // Publish a complete owner without replacing another pass's marker.
+        fs::hard_link(marker.path(), &self.quarantine).map_err(CubeError::Io)?;
+        File::open(parent).and_then(|dir| dir.sync_all()).map_err(CubeError::Io)
+    }
+
+    /// Lift the marker, but only when it names `source`, the store whose
+    /// heads were just verified. Another store's marker stays.
+    pub fn clear_quarantine(&self, source: &Path) -> Result<(), CubeError> {
+        match self.quarantine_owner()? {
+            Some(owner) if owner == source.display().to_string() => {
+                fs::remove_file(&self.quarantine).map_err(CubeError::Io)
+            }
+            Some(owner) => Err(CubeError::InvalidArgument(format!(
+                "jj maintenance marker {} names {owner}, not {}; leaving it in place",
+                self.quarantine.display(),
+                source.display()
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// The store the current marker names, if any.
+    pub fn quarantine_owner(&self) -> Result<Option<String>, CubeError> {
+        match fs::read_to_string(&self.quarantine) {
+            Ok(owner) => Ok(Some(owner)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(CubeError::MaintenanceQuarantined(
+                "unknown owner (unreadable marker)".into(),
+            )),
+        }
+    }
+
+    /// Where the marker for the gate at `lock_path` lives.
+    pub fn quarantine_path(lock_path: &Path) -> PathBuf {
+        lock_path.with_extension("blocked")
+    }
+
+    /// Take a reader reservation before claiming a workspace or waiting on
+    /// the lease registry lock. Maintenance contention must not leave a
+    /// partially prepared lease or a convoy behind the registry lock.
+    pub fn shared_for_database(database_path: Option<&Path>) -> Result<Self, CubeError> {
+        Self::shared_for_database_with_runner(database_path, &RealCommandRunner)
+    }
+
+    pub(crate) fn shared_for_database_with_runner(
+        database_path: Option<&Path>,
+        runner: &dyn CommandRunner,
+    ) -> Result<Self, CubeError> {
+        let data_dir = match database_path.and_then(Path::parent) {
+            Some(parent) => parent.to_path_buf(),
+            None => crate::paths::data_dir()?,
+        };
+        Self::shared_with_runner(&Self::path(&data_dir), JJ_GATE_WAIT, runner)
+    }
+
     pub fn path(data_dir: &Path) -> std::path::PathBuf {
         data_dir.join("locks").join("jj-maintenance.lock")
     }
 
     pub fn shared(lock_path: &Path, wait: Duration) -> Result<Self, CubeError> {
-        Self::acquire_within(lock_path, wait, false)
+        Self::shared_with_runner(lock_path, wait, &RealCommandRunner)
+    }
+
+    pub(crate) fn shared_with_runner(
+        lock_path: &Path,
+        wait: Duration,
+        runner: &dyn CommandRunner,
+    ) -> Result<Self, CubeError> {
+        match Self::acquire_within(lock_path, wait, false) {
+            Err(CubeError::MaintenanceQuarantined(owner)) => {
+                // The shared handle has dropped. Never upgrade a shared flock:
+                // another reader may be attempting recovery at the same time.
+                let gate =
+                    Self::exclusive(lock_path, Duration::ZERO).map_err(|_| CubeError::MaintenanceQuarantined(owner))?;
+                gate.recover_quarantine(runner)?;
+                drop(gate);
+                Self::acquire_within(lock_path, wait, false)
+            }
+            result => result,
+        }
+    }
+
+    /// Under exclusivity, wait for any orphaned abandon child before trusting
+    /// even a single old head. No registration is needed for owner recovery.
+    pub(crate) fn recover_quarantine(&self, runner: &dyn CommandRunner) -> Result<(), CubeError> {
+        let Some(owner) = self.quarantine_owner()? else {
+            return Ok(());
+        };
+        let source = Path::new(&owner);
+        if owner.trim().is_empty() || !source.is_absolute() {
+            return Err(CubeError::MaintenanceQuarantined(
+                "unknown owner (invalid marker)".into(),
+            ));
+        }
+        if !crate::app::store_gc::wait_for_jj_quiescence(runner, source, Duration::ZERO, Duration::ZERO)
+            .map_err(|_| CubeError::MaintenanceQuarantined(owner.clone()))?
+        {
+            return Err(CubeError::MaintenanceQuarantined(owner));
+        }
+        let heads = crate::app::store_gc::count_op_heads(source)
+            .map_err(|_| CubeError::MaintenanceQuarantined(owner.clone()))?;
+        if heads == 0 {
+            return Err(CubeError::MaintenanceQuarantined(owner));
+        }
+        if heads > 1 {
+            return Err(CubeError::InvalidArgument(format!(
+                "store {owner} holds {heads} operation heads; repair the store before running `cube repo gc <repo>`"
+            )));
+        }
+        self.clear_quarantine(source)
     }
 
     pub fn exclusive(lock_path: &Path, wait: Duration) -> Result<Self, CubeError> {
@@ -159,7 +274,16 @@ impl JjGate {
             }
             .map_err(io_error)?;
             if got {
-                return Ok(Self { _file: file });
+                let quarantine = Self::quarantine_path(lock_path);
+                if !exclusive && quarantine.try_exists().map_err(CubeError::Io)? {
+                    return Err(CubeError::MaintenanceQuarantined(
+                        fs::read_to_string(&quarantine).unwrap_or_else(|_| "unknown owner (unreadable marker)".into()),
+                    ));
+                }
+                return Ok(Self {
+                    _file: file,
+                    quarantine,
+                });
             }
             if started.elapsed() >= wait {
                 if wait.is_zero() {
@@ -167,6 +291,9 @@ impl JjGate {
                         "jj maintenance gate busy at {}; shared-store maintenance is active; workspace status cannot run",
                         lock_path.display(),
                     )));
+                }
+                if !exclusive {
+                    return Err(CubeError::MaintenanceBusy);
                 }
                 return Err(CubeError::InvalidArgument(format!(
                     "timed out after {}s waiting for the jj maintenance gate {} ({})",
@@ -186,11 +313,11 @@ impl JjGate {
 
 /// How long a cube-started `jj` command waits for the maintenance gate
 /// (see [`JjGate`]) before failing loudly.
-const JJ_GATE_WAIT: Duration = Duration::from_secs(120);
+const JJ_GATE_WAIT: Duration = Duration::from_secs(2);
 
 /// Hold the maintenance gate shared for the run of a `jj` command. Anything
 /// else, and the maintenance pass's own `jj` commands, run ungated. A gate
-/// that cannot be opened (no resolvable data dir) does not stop the command.
+/// that cannot be opened fails closed rather than racing a rewrite.
 fn jj_gate(invocation: &CommandInvocation, wait: Duration) -> Result<Option<JjGate>, CubeError> {
     let is_jj = Path::new(&invocation.program)
         .file_name()
@@ -198,8 +325,9 @@ fn jj_gate(invocation: &CommandInvocation, wait: Duration) -> Result<Option<JjGa
     if !is_jj || invocation.env.iter().any(|(k, _)| k == JJ_GATE_HELD_ENV) {
         return Ok(None);
     }
-    let Ok(data_dir) = crate::paths::data_dir() else {
-        return Ok(None);
+    let data_dir = match invocation.env.iter().rev().find(|(key, _)| key == "CUBE_DATA_DIR") {
+        Some((_, value)) => PathBuf::from(value),
+        None => crate::paths::data_dir()?,
     };
     JjGate::shared(&JjGate::path(&data_dir), wait).map(Some)
 }

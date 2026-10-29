@@ -1910,6 +1910,53 @@ fn workspace_lease_revalidation_window_rotates_across_leases() {
 }
 
 #[test]
+fn workspace_lease_times_out_slow_health_probe_without_claiming_it() {
+    use crate::metadata::WorkspaceCandidate;
+    use std::time::{Duration, Instant};
+
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    std::fs::create_dir_all(&workspace_root).unwrap();
+    seed_mono_repo(&workspace_root, &database_path);
+    let slow_path = workspace_root.join("mono-agent-001");
+    std::fs::create_dir_all(slow_path.join(".jj")).unwrap();
+    let mut store = Store::open_at(&database_path).unwrap();
+    store
+        .sync_workspaces(
+            "mono",
+            &[WorkspaceCandidate {
+                workspace_id: "mono-agent-001".into(),
+                workspace_path: slow_path.clone(),
+            }],
+        )
+        .unwrap();
+    let mut commands = vec![
+        ExpectedCommand::ok(slow_path, "jj", &["status", "--no-pager"], jj_status_dirty())
+            .taking(Duration::from_secs(30)),
+    ];
+    commands.extend(auto_create_commands(&workspace_root, "mono-agent-002", "fresh002"));
+    let runner = FakeRunner::new(commands);
+    let started = Instant::now();
+    let result = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "slow probe"]),
+        Some(&database_path),
+        &runner,
+    )
+    .unwrap();
+    runner.assert_exhausted();
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-002");
+    assert_eq!(result.payload["health_scan"]["probed"], 1);
+    assert_eq!(result.payload["health_check"][0]["reason"], "health_check_error");
+    assert!(
+        result.payload["health_check"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("did not complete within")
+    );
+}
+
+#[test]
 fn workspace_lease_health_scan_stops_at_the_probe_cap() {
     // Twelve workspaces with no cached health at all (so every one is a
     // first-class candidate) that all turn out dirty on disk. The scan must

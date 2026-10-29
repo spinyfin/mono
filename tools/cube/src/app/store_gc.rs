@@ -19,9 +19,10 @@
 //!    only common ancestor is the root, and jj would merge the two views
 //!    against an empty base (conflicting bookmarks, undoing deletions,
 //!    moving a workspace's `@`). The abandon therefore runs only at an
-//!    instant with no `jj` process on the host (waiting up to
-//!    [`QUIESCENCE_WAIT`] for one); when none comes, the pass abandons and
-//!    collects nothing and the next daily pass tries again. After the
+//!    instant with no `jj` process on the host (polling outside the gate,
+//!    then a bounded probe under exclusivity, retrying within the budget);
+//!    when busy, the pass abandons and collects nothing and the next daily
+//!    pass tries again. After the
 //!    abandon the store must hold exactly one operation head; otherwise the
 //!    pass stops before collecting and reports the extra heads. The heads
 //!    are counted once more after the post-abandon quiet wait and before
@@ -36,16 +37,28 @@
 //!    no `jj` process *after* the abandon: every command that loaded the
 //!    store before the rewrite has then finished, and any command that
 //!    starts later loads the rewritten head, whose files the collection
-//!    keeps. If no such instant comes within [`QUIESCENCE_WAIT`], the pass
-//!    falls back to the two-week default. Either way it collects only
+//!    keeps. If the post-abandon polling never finds a quiet instant, the
+//!    pass falls back to the two-week default. Either way it collects only
 //!    when the head re-check found a single head.
 //!
 //! The abandon holds the exclusive host-wide [`JjGate`] from before the
-//! abandon until the second head check, and every `jj` command cube starts
+//! abandon through the head check and read-only commit-index warm-up. Every
+//! `jj` command cube starts
 //! (lease, goto, push, fetch; see `command_runner`) holds the gate shared for
 //! its run, so none of those can load the pre-rewrite head; cube commands
-//! wait on it for the length of the abandon. A `jj` command that does not go
-//! through cube (a worker's own shell, the engine) cannot take part, so for
+//! wait at most two seconds, then return a retryable maintenance error.
+//! Abandon has a two-minute deadline and index warm-up has a separate 20s
+//! deadline: at most 140s of subprocess work excludes readers. Warm-up failure
+//! is non-fatal; the next reader builds the index. Interrupted rewrites are
+//! checked before releasing exclusivity. A durable, atomically published
+//! marker rejects readers until recovery observes no jj processes and one
+//! head under the exclusive gate. Readers attempt this recovery immediately,
+//! even for unregistered stores; busy or unverifiable stores return exit 75.
+//! Multiple heads require repair, and an invalid owner requires explicit
+//! operator verification before marker removal. GC refuses foreign markers.
+//! Post-abandon polling and collection hold only a shared gate.
+//! A `jj` command that does not go through cube (a worker's own shell, the
+//! engine) cannot take part, so for
 //! those the process-table probes and the head checks detect a race rather
 //! than prevent it. Every run records its outcome (maintained,
 //! skipped, failed) in pool metadata, and `cube workspace list` reports
@@ -88,18 +101,21 @@ use crate::app::jj::run_jj;
 pub(super) const DEFAULT_KEEP: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 /// The periodic pass runs the upkeep for a repo at most this often.
 pub(super) const STORE_GC_INTERVAL_SECS: i64 = 24 * 60 * 60;
-/// Abandoning and collecting are not interruptible mid-file and collecting
-/// a large log deletes hundreds of thousands of files; this bounds each of
-/// the two jj calls.
+/// Listing and collecting a large log can touch hundreds of thousands of
+/// files. These reader operations do not exclude leases.
 const MAINTENANCE_CMD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-/// How long a pass waits for an instant with no `jj` process on the host,
-/// before the abandon and again before an immediate collection. jj commands
-/// take seconds, so a quiet instant comes within a few of them even on a
-/// busy pool; a pool that is never quiet for five minutes is not one to
-/// rewrite the op log under.
+/// How long maintenance may wait for a quiet host or the exclusive gate.
+/// Quiet-host polling happens outside exclusivity.
 pub(super) const QUIESCENCE_WAIT: Duration = Duration::from_secs(5 * 60);
 /// How often the quiescence wait looks at the process table.
 const QUIESCENCE_POLL: Duration = Duration::from_millis(250);
+/// Bound the rewrite while readers are excluded, allowing a large kept DAG.
+/// Timeout kills and reaps the child; heads are checked even on failure.
+/// The scale regression exercises 16,800 retained operations.
+const EXCLUSIVE_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+/// Best-effort warm-up keeps combined exclusive subprocess work to 140s.
+/// Leave the rewrite bound large enough for the measured retained DAG.
+const INDEX_WARMUP_TIMEOUT: Duration = Duration::from_secs(20);
 /// Template the cut-point selection reads: one `<operation id> <end epoch>`
 /// line per operation, newest first.
 pub(super) const OP_LOG_TEMPLATE: &str = r#"id ++ " " ++ time.end().format("%s") ++ "\n""#;
@@ -320,10 +336,10 @@ pub(super) fn jj_processes(ps_output: &str) -> Vec<String> {
 
 /// Number of operation heads in the store at `source`. One means every
 /// workspace's operations descend from a single head.
-pub(super) fn count_op_heads(source: &Path) -> Result<usize> {
+pub(crate) fn count_op_heads(source: &Path) -> Result<usize> {
     let heads = source.join(".jj/repo/op_heads/heads");
-    let entries = std::fs::read_dir(&heads).map_err(CubeError::Io)?;
-    Ok(entries.flatten().count())
+    let mut entries = std::fs::read_dir(&heads).map_err(CubeError::Io)?;
+    entries.try_fold(0, |count, entry| entry.map(|_| count + 1).map_err(CubeError::Io))
 }
 
 /// Stop the pass unless the store holds exactly one operation head. A second
@@ -336,22 +352,25 @@ fn require_single_op_head(record: &RepoRecord, source: &Path, when: &str) -> Res
     }
     Err(CubeError::InvalidArgument(format!(
         "repo `{}`: the store holds {heads} operation heads {when} (expected 1); \
-         a jj command raced the maintenance, so nothing was collected. The next jj command merges the heads; \
-         check `jj bookmark list --conflicted` in {}",
+         the rewrite is unsafe, so nothing was collected. Repair the operation heads in {} \
+         before allowing commands to merge abandoned ancestry",
         record.repo,
         source.display()
     )))
+}
+
+fn gate_data_dir(database_path: Option<&Path>) -> Result<PathBuf> {
+    Ok(match database_path.and_then(Path::parent) {
+        Some(parent) => parent.to_path_buf(),
+        None => crate::paths::data_dir()?,
+    })
 }
 
 /// The exclusive [`JjGate`] for the store gate file under the data dir the
 /// run resolves. `None` when cube-started jj commands never drained within
 /// `wait`, which skips the abandon like a host that is never quiet.
 fn jj_maintenance_gate(database_path: Option<&Path>, wait: Duration) -> Result<Option<JjGate>> {
-    let data_dir = match database_path.and_then(Path::parent) {
-        Some(parent) => parent.to_path_buf(),
-        None => crate::paths::data_dir()?,
-    };
-    match JjGate::exclusive(&JjGate::path(&data_dir), wait) {
+    match JjGate::exclusive(&JjGate::path(&gate_data_dir(database_path)?), wait) {
         Ok(gate) => Ok(Some(gate)),
         Err(CubeError::InvalidArgument(message)) => {
             eprintln!("cube: store gc: {message}");
@@ -359,6 +378,28 @@ fn jj_maintenance_gate(database_path: Option<&Path>, wait: Duration) -> Result<O
         }
         Err(err) => Err(err),
     }
+}
+
+/// Settle a leftover host-wide marker while holding the exclusive gate. A
+/// marker naming this store is lifted only after no jj process remains and
+/// its heads are a single one, including recovery after a killed pass. More
+/// heads, or a marker naming another store, stop the pass: that store's own
+/// pass owns the repair, and clearing or replacing its marker would let
+/// readers merge abandoned ancestry.
+fn reconcile_quarantine(runner: &dyn CommandRunner, gate: &JjGate, record: &RepoRecord, source: &Path) -> Result<()> {
+    let Some(owner) = gate.quarantine_owner()? else {
+        return Ok(());
+    };
+    if owner.trim().is_empty() || !Path::new(&owner).is_absolute() {
+        return gate.recover_quarantine(runner);
+    }
+    if owner != source.display().to_string() {
+        return Err(CubeError::InvalidArgument(format!(
+            "repo `{}`: another store ({owner}) has an unverified jj operation-head rewrite; repair it and run `cube repo gc` for that repo before maintaining this one",
+            record.repo
+        )));
+    }
+    gate.recover_quarantine(runner)
 }
 
 /// A maintenance `jj` command. It is marked as made by the pass that holds
@@ -371,7 +412,7 @@ fn gated_jj_invocation(source: &Path, args: &[&str]) -> CommandInvocation {
 
 /// Wait up to `timeout` for an instant with no `jj` process on the host,
 /// polling the process table every `poll`. `Ok(true)` when one was seen.
-pub(super) fn wait_for_jj_quiescence(
+pub(crate) fn wait_for_jj_quiescence(
     runner: &dyn CommandRunner,
     cwd: &Path,
     timeout: Duration,
@@ -380,7 +421,10 @@ pub(super) fn wait_for_jj_quiescence(
     let started = Instant::now();
     let mut announced = false;
     loop {
-        let ps = runner.run(&RealCommandRunner::invocation(cwd, "ps", &["-axo", "comm="]))?;
+        let ps = runner.run_with_timeout(
+            &RealCommandRunner::invocation(cwd, "ps", &["-axo", "comm="]),
+            Duration::from_secs(1),
+        )?;
         let busy = jj_processes(&ps);
         if busy.is_empty() {
             return Ok(true);
@@ -430,6 +474,10 @@ pub(super) struct StoreGcReport {
     pub abandoned_through: Option<String>,
     pub stale_pr_refs_removed: Vec<String>,
     pub duration_ms: u128,
+    /// Wall time excluding readers, including probes and the rewrite.
+    pub exclusive_ms: u128,
+    /// Wall time in jj's collector, which does not exclude readers.
+    pub collection_ms: u128,
 }
 
 impl StoreGcReport {
@@ -463,14 +511,36 @@ impl StoreGcReport {
 }
 
 /// Run the upkeep for one repo's shared store. See the module doc for the
-/// steps. `quiescence` is how long to wait for an instant with no jj
-/// process before collecting on jj's two-week threshold instead.
+/// steps. `quiescence` bounds quiet-host polling and gate acquisition;
+/// process probes under that gate never wait for the host to become quiet.
 pub(super) fn gc_repo_store(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
     record: &RepoRecord,
     keep: Duration,
     quiescence: Duration,
+    dry_run: bool,
+) -> Result<StoreGcReport> {
+    gc_repo_store_with_deadline(
+        runner,
+        database_path,
+        record,
+        keep,
+        quiescence,
+        EXCLUSIVE_COMMAND_TIMEOUT,
+        dry_run,
+    )
+}
+
+/// [`gc_repo_store`] with the bound on each command run under the exclusive
+/// gate given explicitly; production always uses [`EXCLUSIVE_COMMAND_TIMEOUT`].
+pub(super) fn gc_repo_store_with_deadline(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    record: &RepoRecord,
+    keep: Duration,
+    quiescence: Duration,
+    exclusive_timeout: Duration,
     dry_run: bool,
 ) -> Result<StoreGcReport> {
     let started = Instant::now();
@@ -488,6 +558,22 @@ pub(super) fn gc_repo_store(
         )));
     }
     let before = measure_op_store(&source);
+
+    // A marker left by a killed pass would reject the listing below, and
+    // readers would attempt recovery too. Settle it first under exclusivity.
+    if !dry_run
+        && JjGate::quarantine_path(&JjGate::path(&gate_data_dir(database_path)?))
+            .try_exists()
+            .map_err(CubeError::Io)?
+    {
+        let gate = jj_maintenance_gate(database_path, quiescence)?.ok_or_else(|| {
+            CubeError::InvalidArgument(format!(
+                "repo `{}`: could not take the jj maintenance gate to settle a leftover marker",
+                record.repo
+            ))
+        })?;
+        reconcile_quarantine(runner, &gate, record, &source)?;
+    }
 
     // Listing a neglected log is itself slow (35s for 137k operations on
     // the dev Mac), so it gets the maintenance bound, not the network one.
@@ -509,24 +595,76 @@ pub(super) fn gc_repo_store(
     let now = crate::app::util::current_epoch_s()?;
     let abandoned_through = select_abandon_cut(&op_log, now, keep);
     let mut collection = Collection::None;
+    let mut exclusive_started = None;
+    let mut exclusive_ms = 0;
+    let mut collection_ms = 0;
     let mut abandoned_through = abandoned_through;
     if !dry_run {
-        // Held from before the abandon until the heads are verified after
-        // the post-abandon wait: cube-started jj commands wait on it, so
+        // Held through the head check and commit-index warm-up:
+        // cube-started jj commands wait on it, so
         // none of them can load the pre-rewrite head in between.
         let mut gate = None;
         if let Some(cut) = abandoned_through.clone() {
             // The abandon rewrites every kept operation under a new id, so
             // it runs only with the gate held and at an instant with no jj
-            // process to race it.
-            gate = jj_maintenance_gate(database_path, quiescence)?;
-            if gate.is_some() && wait_for_jj_quiescence(runner, &source, quiescence, QUIESCENCE_POLL)? {
+            // process to race it. Quiet-host polling, gate acquisition and
+            // the re-probe under the gate are retried within one budget,
+            // releasing the gate between attempts, so lease churn or a
+            // single racing jj does not skip the pass for a day.
+            let budget = Instant::now();
+            let mut host_quiet = true;
+            while gate.is_none() && host_quiet && budget.elapsed() < quiescence.max(Duration::from_millis(1)) {
+                let remaining = quiescence.saturating_sub(budget.elapsed());
+                host_quiet = wait_for_jj_quiescence(runner, &source, remaining, QUIESCENCE_POLL)?;
+                if !host_quiet {
+                    break;
+                }
+                let remaining = quiescence.saturating_sub(budget.elapsed());
+                let Some(candidate) = jj_maintenance_gate(database_path, remaining)? else {
+                    continue;
+                };
+                reconcile_quarantine(runner, &candidate, record, &source)?;
+                if wait_for_jj_quiescence(runner, &source, Duration::ZERO, QUIESCENCE_POLL)? {
+                    exclusive_started = Some(Instant::now());
+                    gate = Some(candidate);
+                }
+            }
+            if let Some(active_gate) = gate.as_ref() {
                 let range = format!("..{cut}");
-                runner.run_with_timeout(
+                active_gate.quarantine(&source)?;
+                let abandon = runner.run_with_timeout(
                     &gated_jj_invocation(&source, &["--ignore-working-copy", "op", "abandon", &range]),
-                    MAINTENANCE_CMD_TIMEOUT,
-                )?;
+                    exclusive_timeout,
+                );
                 require_single_op_head(record, &source, "after the abandon")?;
+                active_gate.clear_quarantine(&source)?;
+                abandon?;
+                // Rewritten operation IDs invalidate jj's commit-index lookup.
+                // Build that read-only index before readers resume, rather than
+                // making the first lease pay for it while holding the registry
+                // lock. It has its own deadline, and failing it is not fatal:
+                // the rewrite is verified, and the first reader rebuilds the
+                // index instead.
+                if let Err(error) = runner.run_with_timeout(
+                    &gated_jj_invocation(
+                        &source,
+                        &[
+                            "--ignore-working-copy",
+                            "log",
+                            "-r",
+                            "root()",
+                            "--no-graph",
+                            "-T",
+                            "commit_id",
+                        ],
+                    ),
+                    INDEX_WARMUP_TIMEOUT.min(exclusive_timeout),
+                ) {
+                    eprintln!(
+                        "cube: store gc: {}: commit-index warm-up failed after a verified abandon: {error}",
+                        record.repo
+                    );
+                }
             } else {
                 gate = None;
                 abandoned_through = None;
@@ -538,20 +676,26 @@ pub(super) fn gc_repo_store(
             // after the abandon: it is the commands that loaded the store
             // before the rewrite that must have finished.
             let mut gc_args = vec!["--ignore-working-copy", "util", "gc"];
+            exclusive_ms = exclusive_started.map_or(0, |start| start.elapsed().as_millis());
+            drop(gate);
+            let _reader = JjGate::shared_for_database(database_path)?;
             let quiet = wait_for_jj_quiescence(runner, &source, quiescence, QUIESCENCE_POLL)?;
             // A command that started during the abandon loaded the old head
             // and may have committed on it since; its head only shows up
             // now, so the heads are counted again after the wait and before
             // any collection, on both the immediate and the deferred path.
             require_single_op_head(record, &source, "before the collection")?;
-            drop(gate);
             if quiet {
                 gc_args.extend(["--expire", "now"]);
                 collection = Collection::Immediate;
             } else {
                 collection = Collection::Deferred;
             }
+            // Collection is a reader: leases proceed, but another rewrite
+            // cannot invalidate the head this collector loaded.
+            let collection_started = Instant::now();
             runner.run_with_timeout(&gated_jj_invocation(&source, &gc_args), MAINTENANCE_CMD_TIMEOUT)?;
+            collection_ms = collection_started.elapsed().as_millis();
         }
     }
 
@@ -602,6 +746,8 @@ pub(super) fn gc_repo_store(
         abandoned_through,
         stale_pr_refs_removed,
         duration_ms: started.elapsed().as_millis(),
+        exclusive_ms,
+        collection_ms,
     };
     audit!(
         database_path,
@@ -618,6 +764,8 @@ pub(super) fn gc_repo_store(
         bytes_after = report.after.bytes,
         stale_pr_refs_removed = report.stale_pr_refs_removed.len(),
         duration_ms = report.duration_ms as u64,
+        exclusive_ms = report.exclusive_ms as u64,
+        collection_ms = report.collection_ms as u64,
     );
     Ok(report)
 }

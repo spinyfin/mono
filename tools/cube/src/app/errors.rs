@@ -28,6 +28,12 @@ impl RunResult {
 
 #[derive(Debug, Error)]
 pub enum CubeError {
+    #[error("shared-store maintenance is rewriting the operation log; retry shortly (temporary contention)")]
+    MaintenanceBusy,
+    #[error(
+        "jj maintenance recovery pending for {0}; retry shortly or run `cube repo gc <repo>` for the owning store; an unknown owner requires verified operator recovery"
+    )]
+    MaintenanceQuarantined(String),
     #[error("{0}")]
     InvalidArgument(String),
     #[error("{0}")]
@@ -198,6 +204,7 @@ impl CubeError {
             Self::InvalidArgument(_) | Self::NotImplemented(_) => ExitCode::from(2),
             Self::RepoNotFound(_) => ExitCode::from(3),
             Self::NoAvailableWorkspace(_) => ExitCode::from(4),
+            Self::MaintenanceBusy | Self::MaintenanceQuarantined(_) => ExitCode::from(75),
             Self::WorkspaceNotFound(_) | Self::LeaseNotFound(_) | Self::ChangeNotFound(_) => ExitCode::from(5),
             Self::SetupStepFailed { .. } => ExitCode::from(6),
             Self::Storage(_)

@@ -724,16 +724,36 @@ checkout and not aware of anything above jj:
    head and commits afterwards would leave a second operation head that
    shares only the root with the new one, and jj would merge the two views
    against an empty base. The abandon therefore runs only at an instant with
-   no `jj` process on the host (the pass waits up to five minutes for one and
-   otherwise skips the abandon and the collection until the next daily
-   pass), and the pass stops before collecting if the store then holds
+   no `jj` process on the host (poll for up to five minutes outside the
+   exclusive gate, then re-probe under it, retrying that sequence within the budget; a persistently busy host
+   skips the abandon and collection until the next daily pass), and the pass stops before collecting if the store then holds
    anything but exactly one operation head. Every `jj` command cube itself
    starts holds a host-wide shared gate (`locks/jj-maintenance.lock`) for
    its run, and the pass holds the gate exclusive from before the abandon
-   until the post-abandon head check, so no cube-started command can load the
-   pre-rewrite head (cube commands wait up to two minutes on it). A `jj`
-   command that does not go through cube cannot take the gate; only the
-   process probes and head checks cover those.
+   through the immediate head check and commit-index warm-up, so no cube-started command
+   can load the pre-rewrite head. The rewrite has a two-minute safety deadline
+   to accommodate large kept-operation DAGs; read-only index warm-up has its own
+   20-second deadline, bounding their combined exclusive subprocess work at
+   140 seconds. Warm-up failure is non-fatal: the next reader builds the index. A timed-out child is killed and
+   reaped, and heads are checked before releasing the gate even on failure.
+   A durable, atomically published `locks/jj-maintenance.blocked` marker prevents cube readers
+   from resuming after an unverified rewrite. Readers immediately attempt recovery
+   under a nonblocking exclusive gate: only a quiet host with exactly one head
+   in the named store permits removal, including when that store is no longer
+   registered. Busy or unverifiable stores return retryable exit 75 with the
+   owning store and guidance to run `cube repo gc <repo>`. Multiple heads require
+   repair; an empty or unreadable owner requires explicit operator verification
+   before removing the marker. GC also reconciles its own marker at startup and
+   under each exclusive acquisition, but refuses another store's marker. Collection does not
+   follow a failed rewrite. Post-abandon quiet polling uses a shared gate,
+   and heads are checked again before collection. Cube commands wait at most two seconds
+   for the gate and return exit 75 with a message to retry if it stays busy.
+   Leases reserve the shared gate before taking the registry lock or claiming
+   a workspace, avoiding partially prepared leases and a queue behind that lock.
+   A `jj` command that does not go through cube cannot take the gate; only the
+   process probes and head checks cover those. Gate setup deliberately fails
+   closed: an unresolved data directory or an unreadable gate aborts cube
+   commands rather than allowing them to race an operation-head rewrite.
 2. `jj util gc`. By default jj deletes only unreferenced files older than
    two weeks, and jj 0.26 accepts no other threshold than `--expire now`.
    A command that loaded the store before the abandon still names the old
@@ -743,8 +763,17 @@ checkout and not aware of anything above jj:
    process on the host _after_ the abandon: every command that loaded the
    store before the rewrite has then finished, and any later command loads
    the rewritten head, whose files the collection keeps. If the host is
-   never quiet for five minutes, the pass falls back to the two-week
-   threshold.
+   still busy after five minutes of post-abandon polling, the pass falls
+   back to the two-week threshold. Collection holds the gate shared, so leases can
+   proceed throughout it. Reports and audit events include `exclusive_ms`
+   and `collection_ms` to distinguish rewrite contention from collection cost.
+   Working-copy health checks can also be expensive after the operation IDs
+   change: jj rebuilds its commit index by walking operation ancestry, so
+   maintenance warms that index before releasing exclusivity. A large-store experiment measured 23 seconds in `jj status` before
+   collection even started. Lease health probes and stale recovery share a
+   two-second per-workspace deadline within the five-second scan budget.
+   A timeout never authorizes reuse; cube tries another candidate or provisions
+   fresh capacity, preserving the existing dirty-workspace checks.
 3. `refs/heads/pr/<n>` git refs whose `pr/<n>` bookmark is gone are deleted;
    jj's next import drops them from the view.
 
