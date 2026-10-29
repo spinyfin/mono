@@ -225,8 +225,6 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::DependencyRemoved { .. }
         | FrontendEvent::DependencyList { .. }
         | FrontendEvent::DependencyDetail { .. }
-        | FrontendEvent::LiveStatusEnabledSet { .. }
-        | FrontendEvent::LiveStatusDisabledSlotsList { .. }
         | FrontendEvent::LiveStatusDebugReportEvent { .. }
         | FrontendEvent::ProjectDesignDocResolved { .. }
         // Markdown read out of a product's own GitHub repo. Carries no

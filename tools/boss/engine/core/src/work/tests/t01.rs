@@ -87,8 +87,8 @@ fn metadata_get_returns_none_for_missing_key() {
 fn metadata_set_then_get_round_trips() {
     let path = temp_db_path("meta-roundtrip");
     let db = WorkDb::open(path).unwrap();
-    db.set_metadata("live_status_disabled_slots", "1,3,7").unwrap();
-    let value = db.get_metadata("live_status_disabled_slots").unwrap();
+    db.set_metadata("example_metadata_key", "1,3,7").unwrap();
+    let value = db.get_metadata("example_metadata_key").unwrap();
     assert_eq!(value.as_deref(), Some("1,3,7"));
 }
 
@@ -96,9 +96,9 @@ fn metadata_set_then_get_round_trips() {
 fn metadata_set_replaces_prior_value_for_same_key() {
     let path = temp_db_path("meta-replace");
     let db = WorkDb::open(path).unwrap();
-    db.set_metadata("live_status_disabled_slots", "1,3").unwrap();
-    db.set_metadata("live_status_disabled_slots", "5,7").unwrap();
-    let value = db.get_metadata("live_status_disabled_slots").unwrap();
+    db.set_metadata("example_metadata_key", "1,3").unwrap();
+    db.set_metadata("example_metadata_key", "5,7").unwrap();
+    let value = db.get_metadata("example_metadata_key").unwrap();
     assert_eq!(value.as_deref(), Some("5,7"));
 }
 

@@ -400,12 +400,7 @@ Status text never includes the workspace path or other workers' workspace paths.
 
 ### Per-worker toggle
 
-Yes. Settings UI in the Agents tab, per slot:
-
-- **Live status: On / Off**. Default: On.
-- Off → engine stops calling the summarizer for that slot, clears the field, and the UI falls back to `pane_summary`-derived header subtitle and an empty subtitle row on Doing cards.
-
-Storage: a small `live_status_disabled_slots: HashSet<u8>` on `ServerState`, persisted in the engine's settings KV (the same one that stores other per-slot prefs). Honoured in `live_status::tick`.
+Removed. The original design offered a per-slot On/Off toggle in the Agents tab; it was never used and its RPC, persisted slot list and header button have been deleted. Live status is always on for every worker pane.
 
 ### Global cadence override
 

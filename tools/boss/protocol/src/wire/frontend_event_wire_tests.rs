@@ -322,7 +322,6 @@ fn live_status_debug_report() -> crate::LiveStatusDebugReport {
         engine_process_started_at: "2026-01-01T00:00:00Z".into(),
         anthropic_api_key_present: true,
         tracked_slot_count: 0,
-        disabled_slot_count: 0,
         review_guide_reenqueue: None,
         dispatcher_stats: crate::DispatcherStatsReport::default(),
         slots: vec![],
@@ -1063,19 +1062,6 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "dependency_detail",
         },
         // --- Live status ---
-        TagCase {
-            label: "LiveStatusEnabledSet",
-            event: FrontendEvent::LiveStatusEnabledSet {
-                slot_id: 3,
-                enabled: true,
-            },
-            expected_tag: "live_status_enabled_set",
-        },
-        TagCase {
-            label: "LiveStatusDisabledSlotsList",
-            event: FrontendEvent::LiveStatusDisabledSlotsList { slot_ids: vec![] },
-            expected_tag: "live_status_disabled_slots_list",
-        },
         TagCase {
             label: "LiveStatusDebugReportEvent",
             event: FrontendEvent::LiveStatusDebugReportEvent {
@@ -2283,8 +2269,6 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::DependencyRemoved { .. }
         | FrontendEvent::DependencyList { .. }
         | FrontendEvent::DependencyDetail { .. }
-        | FrontendEvent::LiveStatusEnabledSet { .. }
-        | FrontendEvent::LiveStatusDisabledSlotsList { .. }
         | FrontendEvent::LiveStatusDebugReportEvent { .. }
         | FrontendEvent::ProjectDesignDocResolved { .. }
         | FrontendEvent::ProductDesignDocsList { .. }

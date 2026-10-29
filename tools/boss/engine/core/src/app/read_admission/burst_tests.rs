@@ -375,7 +375,7 @@ async fn one_socket_pipelining_sixteen_bulk_reads_never_sees_busy() {
         let payload = match index % 4 {
             0 => FrontendRequest::ListProducts,
             1 => FrontendRequest::GetSettings,
-            2 => FrontendRequest::ListLiveStatusDisabledSlots,
+            2 => FrontendRequest::ListFeatureFlags,
             _ => FrontendRequest::ListHosts,
         };
         let request = FrontendRequestEnvelope {

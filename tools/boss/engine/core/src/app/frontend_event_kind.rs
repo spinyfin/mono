@@ -83,8 +83,6 @@ pub(super) fn kind(event: &FrontendEvent) -> &'static str {
         FrontendEvent::DependencyRemoved { .. } => "DependencyRemoved",
         FrontendEvent::DependencyList { .. } => "DependencyList",
         FrontendEvent::DependencyDetail { .. } => "DependencyDetail",
-        FrontendEvent::LiveStatusEnabledSet { .. } => "LiveStatusEnabledSet",
-        FrontendEvent::LiveStatusDisabledSlotsList { .. } => "LiveStatusDisabledSlotsList",
         FrontendEvent::LiveStatusDebugReportEvent { .. } => "LiveStatusDebugReportEvent",
         FrontendEvent::ProjectDesignDocResolved { .. } => "ProjectDesignDocResolved",
         FrontendEvent::ProductDesignDocsList { .. } => "ProductDesignDocsList",

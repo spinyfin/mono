@@ -1,6 +1,6 @@
 //! Live-status frontend handlers and the production transcript-path resolver.
 //!
-//! The `FrontendRequest` handlers (enable/disable, pipeline debug) are a
+//! The `FrontendRequest` handlers (pipeline debug) are a
 //! structural split from `app.rs`. [`TranscriptPathResolver`] for
 //! [`ServerState`] additionally consults
 //! [`crate::worker_refresh_liveness`]: the same confirmed-death predicate
@@ -9,57 +9,6 @@
 //! See [`super::Dispatch`] for the per-request context every handler receives.
 
 use super::*;
-
-pub(super) async fn handle_set_live_status_enabled(ctx: Dispatch, req: FrontendRequest) {
-    let Dispatch {
-        server_state,
-        work_db,
-        sink,
-        request_id,
-        ..
-    } = ctx;
-    let FrontendRequest::SetLiveStatusEnabled { slot_id, enabled } = req else {
-        unreachable!()
-    };
-    {
-        server_state.live_status_manager.set_enabled(slot_id, enabled);
-        if let Err(err) =
-            persist_live_status_disabled_slots(&work_db, &server_state.live_status_manager.disabled_snapshot())
-        {
-            tracing::warn!(
-                slot_id,
-                enabled,
-                ?err,
-                "live_status: failed to persist disabled-slot toggle",
-            );
-        }
-        send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::LiveStatusEnabledSet { slot_id, enabled },
-        );
-    }
-}
-
-pub(super) async fn handle_list_live_status_disabled_slots(ctx: Dispatch, req: FrontendRequest) {
-    let Dispatch {
-        server_state,
-        sink,
-        request_id,
-        ..
-    } = ctx;
-    let FrontendRequest::ListLiveStatusDisabledSlots = req else {
-        unreachable!()
-    };
-    {
-        let slot_ids = server_state.live_status_manager.disabled_snapshot();
-        send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::LiveStatusDisabledSlotsList { slot_ids },
-        );
-    }
-}
 
 pub(super) async fn handle_debug_live_status_pipeline(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {

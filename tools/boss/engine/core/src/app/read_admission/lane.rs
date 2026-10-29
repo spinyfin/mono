@@ -114,7 +114,6 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::ListFeatureFlags
         | R::ListHosts
         | R::ListIdeas { .. }
-        | R::ListLiveStatusDisabledSlots
         | R::ListPlannerRuns { .. }
         | R::ListProductDesignDocs { .. }
         | R::ListProducts
@@ -230,7 +229,6 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::SetDriverTrafficSplit { .. }
         | R::SetFeatureFlag { .. }
         | R::SetHostEnabled { .. }
-        | R::SetLiveStatusEnabled { .. }
         | R::SetOffsiteBackup { .. }
         | R::SetProductDefaultDriver { .. }
         | R::SetProductDefaultModel { .. }

@@ -200,12 +200,11 @@ use handler_helpers::{
     TRANSCRIPT_NOT_YET_AVAILABLE_PREFIX, TranscriptResolution, active_chore_run_id, active_to_todo_execution,
     build_chore_update_message, build_effort_audit_report, build_engine_health_report, build_live_status_debug_report,
     duplicate_or_work_error, handle_create_many, in_review_chore_execution, live_execution_for_task_id,
-    load_automation_paused_state, load_dispatch_concurrency_limit, load_live_status_disabled_slots,
-    open_review_terminal_async, persist_live_status_disabled_slots, publish_comment_invalidation,
-    publish_runtime_work_invalidation, publish_work_invalidation, read_transcript_tail, resolve_transcript_for_tail,
-    restore_persisted_dispatch_pause, segment_to_wire, send_push, send_response, send_response_with_revision,
-    send_work_error, tail_lines_from_content, task_name_description_for_id, task_status_for_id,
-    task_transitioned_to_active, terminal_chore_execution, transport_default_created_via,
+    load_automation_paused_state, load_dispatch_concurrency_limit, open_review_terminal_async,
+    publish_comment_invalidation, publish_runtime_work_invalidation, publish_work_invalidation, read_transcript_tail,
+    resolve_transcript_for_tail, restore_persisted_dispatch_pause, segment_to_wire, send_push, send_response,
+    send_response_with_revision, send_work_error, tail_lines_from_content, task_name_description_for_id,
+    task_status_for_id, task_transitioned_to_active, terminal_chore_execution, transport_default_created_via,
     validate_external_tracker_config, work_item_id, work_item_needs_dispatch,
 };
 
@@ -1837,12 +1836,6 @@ impl ServerState {
         // called — hence the late bind.
         let coord_for_kick = server_state.execution_coordinator.clone();
         publisher_impl.set_kick(move || coord_for_kick.kick());
-
-        // Seed the live-status manager's disabled-slot set from the
-        // engine metadata KV — survives restarts of the engine
-        // process. Empty on first boot.
-        let persisted = load_live_status_disabled_slots(&server_state.work_db);
-        server_state.live_status_manager.set_initial_disabled_slots(persisted);
 
         // Seed the dispatch-pause flag from the engine metadata KV.
         // A persisted pause survives an engine restart — the flag is set
