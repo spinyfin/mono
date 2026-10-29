@@ -78,7 +78,7 @@ pub enum ReviewBatchDispatch {
         batch: ReviewBatch,
         executions: Vec<WorkExecution>,
     },
-    LegacyExecution(WorkExecution),
+    LegacyExecution(Box<WorkExecution>),
     /// The review pool's weighted reservation accounting (see
     /// [`can_admit_review_batch_in_tx`]) has no room for a new batch of this
     /// target's phase right now, or dispatch focus / an all-spawns pause is
@@ -1896,7 +1896,7 @@ impl WorkDb {
                 }
                 super::completion_evidence::record_review_admission_wait_in(&tx, &task_id, false)?;
                 tx.commit()?;
-                return Ok(ReviewBatchDispatch::LegacyExecution(execution));
+                return Ok(ReviewBatchDispatch::LegacyExecution(Box::new(execution)));
             }
         }
         // Checked here — after ExistingBatch/LegacyExecution, before the
