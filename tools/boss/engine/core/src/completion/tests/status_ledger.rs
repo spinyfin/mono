@@ -1297,6 +1297,7 @@ fn operator_yes_and_prerequisite_approval_record_exact_bases() {
         answer_type: OperatorAnswerType::CreatePrerequisiteTask {
             name: "Prerequisite work".into(),
             brief: "Do the other thing first.".into(),
+            file_count_bypass: None,
         },
     };
     crate::work::insert_question(&db.connect().unwrap(), &gated_exec.id, "proposal", &prereq_q).unwrap();
@@ -1315,6 +1316,7 @@ fn operator_yes_and_prerequisite_approval_record_exact_bases() {
         answer_type: OperatorAnswerType::CreatePrerequisiteTask {
             name: "Parked prerequisite".into(),
             brief: "Do the other thing first.".into(),
+            file_count_bypass: None,
         },
     };
     crate::work::insert_question(&db.connect().unwrap(), &waiting_exec.id, "proposal", &parked_q).unwrap();
