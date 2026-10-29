@@ -2859,7 +2859,6 @@ fn print_live_status_debug_human(report: &LiveStatusDebugReport) {
         },
     );
     println!("  tracked_slots:              {}", report.tracked_slot_count);
-    println!("  disabled_slots:             {}", report.disabled_slot_count);
     if let Some(reenqueue) = &report.review_guide_reenqueue {
         println!(
             "  review_guides_reenqueued:   {} after a build change (build {})",
@@ -2941,7 +2940,6 @@ fn print_live_status_slot_debug(slot: &LiveStatusSlotDebug) {
             "no (notifies will drop)"
         },
     );
-    println!("  disabled:            {}", if slot.disabled { "yes" } else { "no" },);
     println!(
         "  transcript_path:     {}",
         slot.transcript_path

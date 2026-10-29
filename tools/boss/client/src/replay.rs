@@ -191,7 +191,6 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::ListHostedPaneStatuses
         | FrontendRequest::ListHosts
         | FrontendRequest::ListIdeas { .. }
-        | FrontendRequest::ListLiveStatusDisabledSlots
         | FrontendRequest::ListOperatorQuestions { .. }
         | FrontendRequest::ListPlannerRuns { .. }
         | FrontendRequest::ListProductDesignDocs { .. }
@@ -221,7 +220,6 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::SetFeatureFlag { .. }
         | FrontendRequest::SetOffsiteBackup { .. }
         | FrontendRequest::SetHostEnabled { .. }
-        | FrontendRequest::SetLiveStatusEnabled { .. }
         | FrontendRequest::SetProductDefaultDriver { .. }
         | FrontendRequest::SetProductDefaultModel { .. }
         | FrontendRequest::SetProductEditorialRules { .. }

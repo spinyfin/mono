@@ -627,20 +627,6 @@ pub enum FrontendEvent {
     DependencyDetail {
         detail: WorkItemDependencyDetail,
     },
-    /// Response to [`FrontendRequest::SetLiveStatusEnabled`]. Carries
-    /// the resulting enabled flag for the slot so the caller can
-    /// distinguish "applied" from "already in that state" if it
-    /// wants.
-    LiveStatusEnabledSet {
-        slot_id: u8,
-        enabled: bool,
-    },
-    /// Snapshot of which slots currently have the live-status
-    /// summarizer disabled. The UI uses this to render the toggle
-    /// state on the Agents-tab worker row.
-    LiveStatusDisabledSlotsList {
-        slot_ids: Vec<u8>,
-    },
     /// One-shot diagnostic snapshot of the live-status pipeline, in
     /// response to [`FrontendRequest::DebugLiveStatusPipeline`]. The
     /// full shape is documented on [`crate::LiveStatusDebugReport`].

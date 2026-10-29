@@ -481,7 +481,6 @@ fn worker_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::ListEngineAttempts { .. }
         | FrontendRequest::ListFeatureFlags
         | FrontendRequest::ListHostedPaneStatuses
-        | FrontendRequest::ListLiveStatusDisabledSlots
         | FrontendRequest::ListTmuxWorkerStatuses
         | FrontendRequest::ListWorkerLiveStates
         | FrontendRequest::MetricsListLive
@@ -503,7 +502,6 @@ fn worker_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::SetDispatchConcurrency { .. }
         | FrontendRequest::SetDispatchPaused { .. }
         | FrontendRequest::SetFeatureFlag { .. }
-        | FrontendRequest::SetLiveStatusEnabled { .. }
         | FrontendRequest::SetSetting { .. }
         | FrontendRequest::SetOffsiteBackup { .. }
         | FrontendRequest::StopRun { .. }

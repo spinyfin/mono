@@ -40,11 +40,6 @@ pub(super) fn build_effort_audit_report(
     ))
 }
 
-/// Metadata key used to persist the live-status disabled-slot list.
-/// Stored as a comma-separated list of u8 slot ids — the set is at
-/// most 8 entries, so we don't bother with JSON.
-const META_LIVE_STATUS_DISABLED_SLOTS: &str = "live_status_disabled_slots";
-
 /// Metadata key for the global dispatch-pause flag. `"1"` = paused, `"0"` or
 /// absent = running. Persisted at every toggle so the pause survives an engine
 /// restart. `pub(crate)` so the spawn-capability circuit breaker
@@ -137,16 +132,6 @@ pub(super) const METADATA_KEY_AUTOMATION_PAUSED_SINCE: &str = "automation_paused
 /// see [`crate::coordinator::ExecutionCoordinator::pause_automation`] /
 /// `resume_automation`.
 pub(super) const METADATA_KEY_AUTOMATION_PAUSE_REASON: &str = "automation_paused_reason";
-
-/// Persist the disabled-slot snapshot to the metadata KV. Called
-/// from the toggle handler. Errors bubble up so the caller can log
-/// them — persistence failure is non-fatal (the in-memory set still
-/// honours the toggle until restart).
-pub(super) fn persist_live_status_disabled_slots(work_db: &WorkDb, slot_ids: &[u8]) -> Result<()> {
-    let joined = slot_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
-    work_db.set_metadata(META_LIVE_STATUS_DISABLED_SLOTS, &joined)?;
-    Ok(())
-}
 
 /// Build the user-visible engine health snapshot returned by
 /// [`FrontendRequest::GetEngineHealth`]. The macOS app polls this on
@@ -386,7 +371,6 @@ pub(super) fn build_live_status_debug_report(
     let store = manager.debug_store();
     let store_snapshots = store.snapshot_all();
     let active_slots = manager.active_slot_ids();
-    let disabled_set: std::collections::HashSet<u8> = manager.disabled_snapshot().into_iter().collect();
 
     // Union of every slot id we have *any* signal for — live state,
     // diagnostic snapshot, or active task. Sorted ascending so the
@@ -395,7 +379,6 @@ pub(super) fn build_live_status_debug_report(
     slot_ids.extend(live_states.iter().map(|s| s.slot_id));
     slot_ids.extend(store_snapshots.keys().copied());
     slot_ids.extend(active_slots.iter().copied());
-    slot_ids.extend(disabled_set.iter().copied());
 
     let mut slots: Vec<LiveStatusSlotDebug> = Vec::with_capacity(slot_ids.len());
     for slot_id in slot_ids {
@@ -421,7 +404,6 @@ pub(super) fn build_live_status_debug_report(
         slots.push(LiveStatusSlotDebug {
             slot_id,
             task_running: active_slots.contains(&slot_id),
-            disabled: disabled_set.contains(&slot_id),
             last_trigger_kind: snap.last_trigger_kind.clone(),
             last_trigger_at: snap.last_trigger_at_epoch_s.map(format_epoch_iso8601),
             last_real_trigger_kind: snap.last_real_trigger_kind.clone(),
@@ -463,21 +445,9 @@ pub(super) fn build_live_status_debug_report(
         dispatcher_stats,
         anthropic_api_key_present: server_state.anthropic_api_key.is_some(),
         tracked_slot_count: active_slots.len(),
-        disabled_slot_count: disabled_set.len(),
         review_guide_reenqueue: server_state.review_guide_reenqueue_summary(),
         slots,
     }
-}
-
-/// Read the persisted disabled-slot list from the metadata KV.
-/// Returns an empty vec on first boot or if the row is missing /
-/// malformed (a stray comma is treated as "no entries" rather than
-/// failing the engine startup).
-pub(super) fn load_live_status_disabled_slots(work_db: &WorkDb) -> Vec<u8> {
-    let Ok(Some(raw)) = work_db.get_metadata(META_LIVE_STATUS_DISABLED_SLOTS) else {
-        return Vec::new();
-    };
-    raw.split(',').filter_map(|s| s.trim().parse::<u8>().ok()).collect()
 }
 
 /// Read the persisted dispatch-pause state from the metadata KV. Returns

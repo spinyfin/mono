@@ -1,5 +1,4 @@
-//! Metadata-KV persistence round-trip tests: live-status disabled slots,
-//! dispatch/automation pause state (including the operator-reason
+//! Metadata-KV persistence round-trip tests: dispatch/automation pause state (including the operator-reason
 //! restore rules), and the dispatch concurrency limit. Split out of
 //! `t02.rs` to keep that file under the repo's file-size cap — these
 //! tests share nothing with the rest of `t02.rs` beyond the
@@ -10,8 +9,6 @@ use super::*;
 use crate::app::handler_helpers::load_dispatch_paused_state;
 use crate::coordinator::DispatchPauseOrigin;
 
-// ── live-status disabled-slot persistence ────────────────────────────────
-
 /// Open a bare `WorkDb` on a throwaway temp path — enough for the pure
 /// metadata-KV helpers below, which need no product/chore fixtures. The
 /// returned `TempDir` must be kept alive by the caller for the DB's
@@ -21,57 +18,6 @@ fn open_temp_work_db() -> (tempfile::TempDir, WorkDb) {
     let path = dir.path().join("boss.db");
     let db = WorkDb::open(path).unwrap();
     (dir, db)
-}
-
-#[test]
-fn disabled_slots_roundtrip_preserves_set() {
-    let (_dir, db) = open_temp_work_db();
-    persist_live_status_disabled_slots(&db, &[3, 1, 7]).unwrap();
-    let mut loaded = load_live_status_disabled_slots(&db);
-    loaded.sort();
-    assert_eq!(
-        loaded,
-        vec![1, 3, 7],
-        "persisting a slice of slot ids must load back as the same set"
-    );
-}
-
-#[test]
-fn disabled_slots_empty_roundtrips_to_empty() {
-    let (_dir, db) = open_temp_work_db();
-    persist_live_status_disabled_slots(&db, &[]).unwrap();
-    assert!(
-        load_live_status_disabled_slots(&db).is_empty(),
-        "persisting an empty slice must load back as an empty Vec"
-    );
-}
-
-#[test]
-fn disabled_slots_absent_key_loads_empty() {
-    let (_dir, db) = open_temp_work_db();
-    // Never persisted — the metadata row is absent. Must degrade to an
-    // empty Vec rather than erroring (first-boot behaviour).
-    assert!(
-        load_live_status_disabled_slots(&db).is_empty(),
-        "an unset disabled-slot key must load as an empty Vec"
-    );
-}
-
-#[test]
-fn disabled_slots_malformed_entries_are_filtered() {
-    let (_dir, db) = open_temp_work_db();
-    // Write raw malformed metadata directly (bypassing the persist
-    // helper, which only ever emits clean output): whitespace-padded,
-    // non-numeric, empty, and out-of-u8-range entries must all be
-    // dropped, leaving only the valid u8 slots.
-    db.set_metadata("live_status_disabled_slots", " 3 ,x,5,,999").unwrap();
-    let mut loaded = load_live_status_disabled_slots(&db);
-    loaded.sort();
-    assert_eq!(
-        loaded,
-        vec![3, 5],
-        "only well-formed u8 slot ids survive: whitespace is trimmed, junk/empty/overflow dropped"
-    );
 }
 
 // ── dispatch-pause state persistence ─────────────────────────────────────

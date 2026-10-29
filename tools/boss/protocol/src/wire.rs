@@ -1549,11 +1549,6 @@ pub enum FrontendRequest {
         status: Option<crate::IdeaStatus>,
     },
 
-    /// Snapshot of which slots currently have the live-status
-    /// summarizer disabled. The UI uses this to render the toggle
-    /// state on the Agents-tab worker row.
-    ListLiveStatusDisabledSlots,
-
     /// Open and historical operator questions for a task.
     ListOperatorQuestions {
         id: String,
@@ -2496,17 +2491,6 @@ pub enum FrontendRequest {
     /// on success or [`FrontendEvent::Error`] when the id is unknown.
     SetHostEnabled {
         id: String,
-        enabled: bool,
-    },
-
-    /// Per-slot toggle for the live-status summarizer. When
-    /// `enabled = false`, the engine stops calling the summarizer for
-    /// `slot_id` and clears any existing `live_status`; the UI falls
-    /// back to the static pane_summary. Persisted in the engine
-    /// metadata table so the choice survives engine restarts.
-    /// Idempotent — toggling to the current state is a benign no-op.
-    SetLiveStatusEnabled {
-        slot_id: u8,
         enabled: bool,
     },
 

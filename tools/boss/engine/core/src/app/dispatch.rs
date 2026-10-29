@@ -229,9 +229,6 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
         r @ FrontendRequest::ListHosts => Box::pin(hosts::handle_list_hosts(ctx, r)),
         r @ FrontendRequest::ListHostedPaneStatuses => Box::pin(panes::handle_list_hosted_pane_statuses(ctx, r)),
         r @ FrontendRequest::ListIdeas { .. } => Box::pin(ideas::handle_list_ideas(ctx, r)),
-        r @ FrontendRequest::ListLiveStatusDisabledSlots => {
-            Box::pin(live_status::handle_list_live_status_disabled_slots(ctx, r))
-        }
         r @ FrontendRequest::ListPlannerRuns { .. } => Box::pin(planner_ops::handle_list_planner_runs(ctx, r)),
         r @ FrontendRequest::ListProductDesignDocs { .. } => {
             Box::pin(design_docs::handle_list_product_design_docs(ctx, r))
@@ -321,9 +318,6 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
         r @ FrontendRequest::SetDispatchPaused { .. } => Box::pin(engine_meta::handle_set_dispatch_paused(ctx, r)),
         r @ FrontendRequest::SetFeatureFlag { .. } => Box::pin(engine_meta::handle_set_feature_flag(ctx, r)),
         r @ FrontendRequest::SetHostEnabled { .. } => Box::pin(hosts::handle_set_host_enabled(ctx, r)),
-        r @ FrontendRequest::SetLiveStatusEnabled { .. } => {
-            Box::pin(live_status::handle_set_live_status_enabled(ctx, r))
-        }
         r @ FrontendRequest::SetProductDefaultModel { .. } => {
             Box::pin(products::handle_set_product_default_model(ctx, r))
         }

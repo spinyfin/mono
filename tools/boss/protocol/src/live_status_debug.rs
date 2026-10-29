@@ -65,9 +65,6 @@ pub struct LiveStatusDebugReport {
     /// Total number of slots the live-status manager currently has
     /// a per-slot task spawned for.
     pub tracked_slot_count: usize,
-    /// Total number of slots whose summarizer is disabled by the
-    /// per-slot toggle.
-    pub disabled_slot_count: usize,
     /// Review guides re-enqueued at startup after failing before start on
     /// a different build; `None` when none were.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -170,11 +167,6 @@ pub struct LiveStatusSlotDebug {
     /// attached to; if a hook event lands and this is false, the
     /// notify falls into the "no per-slot task" warn path.
     pub task_running: bool,
-    /// True iff the per-slot summarizer toggle is currently in the
-    /// disabled position. Surfaced separately from `task_running` so
-    /// "task running but disabled" (the toggle is what's gating the
-    /// model call) is distinguishable from "task missing entirely".
-    pub disabled: bool,
     /// Last trigger kind received by the per-slot loop:
     /// `stop` / `post_tool_use` / `activity_changed` / `shutdown`.
     /// `None` until the loop has serviced its first trigger.
@@ -247,7 +239,6 @@ mod tests {
             engine_process_started_at: "2026-05-12T06:45:38Z".into(),
             anthropic_api_key_present: true,
             tracked_slot_count: 2,
-            disabled_slot_count: 1,
             review_guide_reenqueue: None,
             dispatcher_stats: DispatcherStatsReport {
                 hook_events_total: 7,
@@ -266,7 +257,6 @@ mod tests {
             slots: vec![LiveStatusSlotDebug {
                 slot_id: 1,
                 task_running: true,
-                disabled: false,
                 last_trigger_kind: Some("stop".into()),
                 last_trigger_at: Some("2026-05-11T20:00:01Z".into()),
                 last_real_trigger_kind: Some("stop".into()),
@@ -302,7 +292,6 @@ mod tests {
             engine_process_started_at: "2026-05-11T20:00:00Z".into(),
             anthropic_api_key_present: false,
             tracked_slot_count: 0,
-            disabled_slot_count: 0,
             review_guide_reenqueue: None,
             dispatcher_stats: DispatcherStatsReport::default(),
             slots: vec![],
@@ -372,7 +361,6 @@ mod tests {
             engine_process_started_at: "2026-05-12T20:00:00Z".into(),
             anthropic_api_key_present: false,
             tracked_slot_count: 0,
-            disabled_slot_count: 0,
             review_guide_reenqueue: None,
             dispatcher_stats: DispatcherStatsReport {
                 transcript_path_persist_row_missing: 7,
@@ -401,7 +389,6 @@ mod tests {
         let slot = LiveStatusSlotDebug {
             slot_id: 1,
             task_running: false,
-            disabled: false,
             last_trigger_kind: None,
             last_trigger_at: None,
             last_real_trigger_kind: None,

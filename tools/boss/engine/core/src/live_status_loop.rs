@@ -33,7 +33,7 @@
 //! See `tools/boss/docs/designs/worker-live-status.md` (Q2 cadence,
 //! Q3 budget, Q4 quiet states) for the policy that shapes this loop.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -102,9 +102,6 @@ pub struct SlotDebugSnapshot {
     /// summarizer call. Helpful for telling "transcript is empty" from
     /// "transcript is huge".
     pub last_redacted_bytes: Option<usize>,
-    /// True if the disabled-slot toggle was active at the time of the
-    /// last loop iteration that observed it.
-    pub disabled: bool,
 }
 
 /// Manager-level diagnostic store. Mutated by per-slot tasks; read by
@@ -539,56 +536,11 @@ struct SlotConfig {
     registry: Arc<LiveWorkerStateRegistry>,
     broadcaster: Arc<dyn LiveStatusBroadcaster>,
     resolver: Arc<dyn TranscriptPathResolver>,
-    disabled: Arc<DisabledSlots>,
     debug_store: Arc<LiveStatusDebugStore>,
-}
-
-/// Shared, lock-protected list of slots whose summarizer has been
-/// manually disabled by the human (Q9 per-worker toggle). The manager
-/// reads it whenever it considers a refresh; a frontend RPC mutates
-/// it. Holding the slot in here makes the running per-slot task skip
-/// the model call and clear its existing `live_status`. Persistence
-/// is handled by the engine layer (metadata KV) and threaded through
-/// `LiveStatusManager::set_initial_disabled_slots` at startup.
-#[derive(Default)]
-pub struct DisabledSlots(StdMutex<HashSet<u8>>);
-
-impl DisabledSlots {
-    pub fn is_disabled(&self, slot_id: u8) -> bool {
-        self.0.lock().expect("disabled-slots mutex poisoned").contains(&slot_id)
-    }
-
-    fn set(&self, slot_id: u8, disabled: bool) -> bool {
-        let mut guard = self.0.lock().expect("disabled-slots mutex poisoned");
-        if disabled {
-            guard.insert(slot_id)
-        } else {
-            guard.remove(&slot_id)
-        }
-    }
-
-    fn snapshot(&self) -> Vec<u8> {
-        let mut v: Vec<u8> = self
-            .0
-            .lock()
-            .expect("disabled-slots mutex poisoned")
-            .iter()
-            .copied()
-            .collect();
-        v.sort_unstable();
-        v
-    }
-
-    fn load(&self, slots: impl IntoIterator<Item = u8>) {
-        let mut guard = self.0.lock().expect("disabled-slots mutex poisoned");
-        guard.clear();
-        guard.extend(slots);
-    }
 }
 
 pub struct LiveStatusManager {
     slots: StdMutex<HashMap<u8, SlotHandle>>,
-    disabled: Arc<DisabledSlots>,
     debug_store: Arc<LiveStatusDebugStore>,
 }
 
@@ -596,7 +548,6 @@ impl Default for LiveStatusManager {
     fn default() -> Self {
         Self {
             slots: StdMutex::new(HashMap::new()),
-            disabled: Arc::new(DisabledSlots::default()),
             debug_store: Arc::new(LiveStatusDebugStore::default()),
         }
     }
@@ -607,44 +558,6 @@ impl LiveStatusManager {
         Self::default()
     }
 
-    /// Shared handle to the disabled-slot set, used by the engine's
-    /// frontend RPC handler to mutate the toggle without taking the
-    /// manager's slots mutex. The set is also passed into every
-    /// per-slot task so the task can consult it on each refresh.
-    pub fn disabled_slots(&self) -> Arc<DisabledSlots> {
-        self.disabled.clone()
-    }
-
-    /// Seed the disabled set from persisted engine state at startup.
-    /// Replaces the current set wholesale — callers should pass the
-    /// full list from the metadata KV.
-    pub fn set_initial_disabled_slots(&self, slot_ids: impl IntoIterator<Item = u8>) {
-        self.disabled.load(slot_ids);
-    }
-
-    /// Flip the disabled state for `slot_id`. Returns the new state
-    /// so callers can persist a delta. If `enabled` is false the
-    /// running task picks the change up on its next tick — see
-    /// the disable-arm in [`run_slot_loop`].
-    pub fn set_enabled(&self, slot_id: u8, enabled: bool) -> bool {
-        let changed = self.disabled.set(slot_id, !enabled);
-        if changed {
-            // Wake the per-slot task so a freshly-enabled slot
-            // catches up immediately and a freshly-disabled one
-            // clears its prior status without waiting for the next
-            // hook event.
-            self.notify(slot_id, Trigger::PostToolUse);
-        }
-        enabled
-    }
-
-    /// Snapshot of slot ids currently disabled. Used for the
-    /// `ListLiveStatusDisabledSlots` RPC and for persistence in the
-    /// metadata KV.
-    pub fn disabled_snapshot(&self) -> Vec<u8> {
-        self.disabled.snapshot()
-    }
-
     /// Shared handle to the diagnostic store. The `live-status debug`
     /// RPC handler reads this; per-slot tasks already hold their own
     /// clone via `SlotConfig`.
@@ -652,10 +565,7 @@ impl LiveStatusManager {
         self.debug_store.clone()
     }
 
-    /// Slot ids currently running a per-slot task. Distinct from
-    /// `disabled_snapshot()` — a slot can have a running task that is
-    /// also disabled, and both pieces of information are surfaced
-    /// separately in the debug verb.
+    /// Slot ids currently running a per-slot task.
     pub fn active_slot_ids(&self) -> Vec<u8> {
         let mut v: Vec<u8> = self
             .slots
@@ -701,14 +611,9 @@ impl LiveStatusManager {
             let _ = sender.send(Trigger::ActivityChanged(state.activity));
         }
         // Reset the diagnostic snapshot for this slot — the prior
-        // entry, if any, belongs to a previous run that just
-        // released. The disabled flag is sticky across re-spawns so
-        // it gets read from the live set on first iteration.
+        // entry, if any, belongs to a previous run that just released.
         self.debug_store.update(slot_id, |snap| {
-            *snap = SlotDebugSnapshot {
-                disabled: self.disabled.is_disabled(slot_id),
-                ..SlotDebugSnapshot::default()
-            };
+            *snap = SlotDebugSnapshot::default();
         });
         let cfg = SlotConfig {
             slot_id,
@@ -718,7 +623,6 @@ impl LiveStatusManager {
             registry,
             broadcaster,
             resolver,
-            disabled: self.disabled.clone(),
             debug_store: self.debug_store.clone(),
         };
         let join = boss_task_scope::spawn(run_slot_loop(cfg, receiver));
@@ -864,7 +768,6 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         registry,
         broadcaster,
         resolver,
-        disabled,
         debug_store,
     } = cfg;
     let mut tail: Option<TranscriptTail> = None;
@@ -1040,23 +943,6 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         skip_retry_at = None;
 
         last_refresh_attempt = Instant::now();
-
-        // Per-slot off-switch (Q9). When the human has disabled this
-        // slot, drop any prior `live_status` (so the UI falls back to
-        // pane_summary) and skip the model call until the toggle
-        // flips back on. The toggle flip itself sends a wake-up
-        // trigger so this branch fires within a tick of the change.
-        let disabled_now = disabled.is_disabled(slot_id);
-        debug_store.update(slot_id, |snap| {
-            snap.disabled = disabled_now;
-        });
-        if disabled_now {
-            tracing::info!(slot_id, "live_status: skip — slot disabled by per-slot toggle",);
-            if registry.set_live_status(slot_id, None) {
-                broadcaster.broadcast_live_worker_states().await;
-            }
-            continue;
-        }
 
         // Idle-clear: if we've been idle longer than IDLE_CLEAR_AFTER
         // and a prior `live_status` is still set, drop it.
@@ -1870,56 +1756,6 @@ mod tests {
             let d = compute_timer_delay(activity, None, None, now);
             assert_eq!(d, Duration::from_secs(3_600), "{activity:?}");
         }
-    }
-
-    #[tokio::test]
-    async fn disabled_slot_clears_prior_status_and_skips_model_call() {
-        // Toggle the slot off; the loop should clear any prior
-        // status, broadcast the change, and (since there's no
-        // transcript path) not even attempt a model call. With
-        // the slot disabled, repeated triggers must not lead to
-        // a non-None status reappearing.
-        let mgr = LiveStatusManager::new();
-        let registry = Arc::new(LiveWorkerStateRegistry::new());
-        registry.register_spawn(6, "run-6", "claude-opus-4-7", 0, None);
-        registry.set_live_status(6, Some("doing a thing".into()));
-        let bc = Arc::new(CountingBroadcaster::default());
-        let res = Arc::new(CannedResolver::new(None));
-        let bc_dyn: Arc<dyn LiveStatusBroadcaster> = bc.clone();
-        let res_dyn: Arc<dyn TranscriptPathResolver> = res.clone();
-        mgr.start_slot(
-            6,
-            live_run("run-6"),
-            keyless_utility(),
-            registry.clone(),
-            bc_dyn,
-            res_dyn,
-        );
-        // Mark Working so the disable arm is the only barrier.
-        mgr.notify(6, Trigger::ActivityChanged(WorkerActivity::Working));
-        mgr.set_enabled(6, false);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(registry.get(6).unwrap().live_status.is_none());
-        // Subsequent triggers stay quiet.
-        mgr.notify(6, Trigger::Stop);
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        assert!(registry.get(6).unwrap().live_status.is_none());
-        mgr.stop_slot(6);
-    }
-
-    #[test]
-    fn disabled_snapshot_returns_sorted_slot_ids() {
-        let mgr = LiveStatusManager::new();
-        mgr.set_initial_disabled_slots([3, 1, 7]);
-        assert_eq!(mgr.disabled_snapshot(), vec![1, 3, 7]);
-    }
-
-    #[test]
-    fn set_initial_disabled_slots_replaces_prior_set() {
-        let mgr = LiveStatusManager::new();
-        mgr.set_initial_disabled_slots([1, 2, 3]);
-        mgr.set_initial_disabled_slots([5]);
-        assert_eq!(mgr.disabled_snapshot(), vec![5]);
     }
 
     #[test]
