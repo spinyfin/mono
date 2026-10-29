@@ -606,6 +606,7 @@ extension EngineClient {
             waitExpiresAt: payload["wait_expires_at"] as? String,
             agentType: payload["agent_type"] as? String,
             reviewStage: payload["review_stage"] as? String,
+            executionKind: payload["kind"] as? String,
             projectId: payload["project_id"] as? String,
             projectName: payload["project_name"] as? String,
             hostId: payload["host_id"] as? String,

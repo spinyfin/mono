@@ -70,6 +70,8 @@ struct WorkerLiveState {
     /// Engine-reported stage of an AI review (`"reviewers"` or
     /// `"consolidation"`); `nil` for non-review runs and older engines.
     let reviewStage: String?
+    /// Durable execution kind reported by the engine.
+    let executionKind: String?
     let projectId: String?
     let projectName: String?
     /// Host the run executes on. Agents membership is
@@ -92,7 +94,7 @@ struct WorkerLiveState {
     static let localHostId = "local"
 
     var badgeType: AgentType { AgentType.fromWire(agentType) }
-    var badgeLabel: String { badgeType.badgeLabel(reviewStage: reviewStage) }
+    var badgeLabel: String { badgeType.badgeLabel(reviewStage: reviewStage, executionKind: executionKind) }
 
     var agentProject: AgentProject {
         if let projectId, !projectId.isEmpty { return .project(id: projectId) }
@@ -119,6 +121,7 @@ struct WorkerLiveState {
         waitExpiresAt: String? = nil,
         agentType: String? = nil,
         reviewStage: String? = nil,
+        executionKind: String? = nil,
         projectId: String? = nil,
         projectName: String? = nil,
         hostId: String? = nil,
@@ -143,6 +146,7 @@ struct WorkerLiveState {
         self.waitExpiresAt = waitExpiresAt
         self.agentType = agentType
         self.reviewStage = reviewStage
+        self.executionKind = executionKind
         self.projectId = projectId
         self.projectName = projectName
         self.hostId = hostId
@@ -207,6 +211,7 @@ extension WorkerLiveState: Hashable {
             && lhs.waitExpiresAt == rhs.waitExpiresAt
             && lhs.agentType == rhs.agentType
             && lhs.reviewStage == rhs.reviewStage
+            && lhs.executionKind == rhs.executionKind
             && lhs.projectId == rhs.projectId
             && lhs.projectName == rhs.projectName
             && lhs.hostId == rhs.hostId
@@ -231,6 +236,7 @@ extension WorkerLiveState: Hashable {
         hasher.combine(waitExpiresAt)
         hasher.combine(agentType)
         hasher.combine(reviewStage)
+        hasher.combine(executionKind)
         hasher.combine(projectId)
         hasher.combine(projectName)
         hasher.combine(hostId)

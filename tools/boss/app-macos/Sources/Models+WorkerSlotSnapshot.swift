@@ -26,6 +26,7 @@ struct WorkerSlotLiveSlice: Equatable {
     let waitExpiresAt: String?
     let agentType: String?
     let reviewStage: String?
+    let executionKind: String?
     let projectName: String?
     let pool: String?
     /// Read by the viewer-missing card only: `false` means the engine can
@@ -46,6 +47,7 @@ struct WorkerSlotLiveSlice: Equatable {
         self.waitExpiresAt = live.waitExpiresAt
         self.agentType = live.agentType
         self.reviewStage = live.reviewStage
+        self.executionKind = live.executionKind
         self.projectName = live.projectName
         self.pool = live.pool
         self.tmuxHosted = live.tmuxHosted
@@ -53,7 +55,7 @@ struct WorkerSlotLiveSlice: Equatable {
     }
 
     var badgeType: AgentType { AgentType.fromWire(agentType) }
-    var badgeLabel: String { badgeType.badgeLabel(reviewStage: reviewStage) }
+    var badgeLabel: String { badgeType.badgeLabel(reviewStage: reviewStage, executionKind: executionKind) }
     var isExited: Bool { activity == .terminated }
     var isEngineTerminal: Bool { activity == .terminated || activity == .errored }
 
