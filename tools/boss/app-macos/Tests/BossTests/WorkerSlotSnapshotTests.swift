@@ -407,7 +407,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         XCTAssertEqual(try slice(stage: nil).badgeLabel, "Reviewing")
         XCTAssertEqual(try slice(stage: "consolidation").badgeLabel, "Consolidating")
         // A stage never relabels a non-review run.
-        XCTAssertEqual(AgentType.coding.badgeLabel(reviewStage: "consolidation"), "Coding")
+        XCTAssertEqual(AgentType.resolve(wire: "coding", reviewStage: "consolidation"), .coding)
 
         XCTAssertEqual(AgentActivityState.aiReviewCaption(stage: "reviewers"), "AI review in progress")
         XCTAssertEqual(AgentActivityState.aiReviewCaption(stage: "consolidation"), "Consolidating review findings")
