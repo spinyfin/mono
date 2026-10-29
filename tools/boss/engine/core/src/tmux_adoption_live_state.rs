@@ -27,28 +27,14 @@ pub(crate) async fn register_adopted_live_state<S>(
     let Some(live_states) = spawner.live_worker_state_registry() else {
         return;
     };
-    let binding = work_db
-        .get_work_item(&execution.work_item_id)
-        .ok()
-        .map(|item| boss_protocol::WorkItemBinding {
-            work_item_id: execution.work_item_id.clone(),
-            work_item_name: crate::runner::work_item_name(&item).to_owned(),
-            execution_id: execution_id.to_owned(),
-        });
+    let binding = Some(crate::live_worker_metadata::execution_binding(work_db, execution));
     let has_source_automation = matches!(
         work_db.source_automation_id_for_work_item(&execution.work_item_id),
         Ok(Some(_))
     );
     let pool = attributed_pool_label(execution.kind.clone(), has_source_automation);
-    let model_label = driver
-        .as_ref()
-        .map(|driver| driver.descriptor().label.to_owned())
-        .unwrap_or_else(|| "Unknown driver".to_owned());
-    let awaiting_input_capable = driver.as_ref().is_some_and(|driver| {
-        driver
-            .capabilities()
-            .provides(crate::driver::Capability::AwaitingInputSignal)
-    });
+    let (model_label, awaiting_input_capable) =
+        crate::live_worker_metadata::adopted_identity(work_db, execution, driver.as_deref());
     // A live tmux session is tmux-hosted by construction. Do not read
     // `latest_run_tmux_hosting_for_execution` here: that query takes the
     // newest run row, and a later local bookkeeping sibling (the shape
@@ -147,6 +133,30 @@ mod tests {
             )
             .unwrap();
         execution
+    }
+
+    #[tokio::test]
+    async fn restart_preserves_codex_launch_identity_and_non_task_binding() {
+        let (_dir, db) = open_db();
+        let execution = crate::test_support::unstamped_codex_guide(&db);
+        assert_eq!(
+            crate::driver_transcript::driver_for_execution(&db, &execution.id)
+                .unwrap()
+                .descriptor()
+                .name,
+            "claude",
+            "live policy must disagree with the launch"
+        );
+        let spawner = LiveStateSpawner::default();
+        let driver = crate::driver_transcript::driver_for_spawned_execution(&db, &execution.id).unwrap();
+        assert_eq!(driver.descriptor().name, "codex");
+        register_adopted_live_state(&db, &spawner, &execution, &execution.id, 1, 4321, Some(driver)).await;
+        let after = spawner.live_states.get(1).unwrap();
+        assert_eq!(after.model, "gpt-6-astra");
+        assert_eq!(after.work_item_id.as_deref(), Some(execution.work_item_id.as_str()));
+        assert_eq!(after.work_item_name.as_deref(), Some(execution.work_item_id.as_str()));
+        assert_eq!(after.run_id, execution.id);
+        assert!(!spawner.live_states.awaiting_input_capable(1));
     }
 
     #[tokio::test]

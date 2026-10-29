@@ -486,7 +486,7 @@ async fn readoption_derives_the_awaiting_input_capability_from_the_runs_driver()
 
 #[tokio::test]
 async fn readoption_does_not_substitute_an_unregistered_launch_driver() {
-    assert_readoption_driver(Some("removed-driver"), "Unknown driver").await;
+    assert_readoption_driver(Some("removed-driver"), "test-model").await;
 }
 
 async fn assert_readoption_driver(launch_driver: Option<&str>, expected_label: &str) {
@@ -1153,4 +1153,30 @@ async fn concurrent_hooks_for_one_run_converge_once() {
         server_state.work_db.get_execution(&execution_id).unwrap().status,
         ExecutionStatus::Running,
     );
+}
+
+#[tokio::test]
+async fn readoption_recovers_unstamped_guide_launch_identity() {
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let execution = unstamped_codex_guide(db);
+    db.mark_execution_orphaned(&execution.id, "restart before launch stamp")
+        .unwrap();
+    let execution = db.get_execution(&execution.id).unwrap();
+    assert_eq!(
+        server_state
+            .converge_terminal_execution(&execution, "hook_after_terminal")
+            .await,
+        "readopt"
+    );
+    let state = server_state
+        .live_worker_states
+        .snapshot()
+        .into_iter()
+        .find(|state| state.run_id == execution.id)
+        .expect("guide readopted");
+    assert_eq!(state.model, "gpt-6-astra");
+    assert_eq!(state.work_item_id.as_deref(), Some(execution.work_item_id.as_str()));
+    assert_eq!(state.work_item_name.as_deref(), Some(execution.work_item_id.as_str()));
+    assert!(!server_state.live_worker_states.awaiting_input_capable(state.slot_id));
 }

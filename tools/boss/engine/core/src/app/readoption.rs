@@ -422,29 +422,14 @@ impl ServerState {
             // Durable pids can be recycled across restart. Process identity is
             // registered by tmux adoption (adopt_one, or the terminal-handoff
             // branch of the session sweep) after observing the live pane pid.
-            let binding =
-                self.work_db
-                    .get_work_item(&restored.work_item_id)
-                    .ok()
-                    .map(|item| boss_protocol::WorkItemBinding {
-                        work_item_id: restored.work_item_id.clone(),
-                        work_item_name: crate::runner::work_item_name(&item).to_owned(),
-                        execution_id: run_id.to_owned(),
-                    });
+            let binding = Some(crate::live_worker_metadata::execution_binding(&self.work_db, &restored));
             let has_source_automation = matches!(
                 self.work_db.source_automation_id_for_work_item(&restored.work_item_id),
                 Ok(Some(_))
             );
             let pool = crate::live_worker_state::attributed_pool_label(restored.kind.clone(), has_source_automation);
-            let model_label = driver
-                .as_ref()
-                .map(|driver| driver.descriptor().label.to_owned())
-                .unwrap_or_else(|| "Unknown driver".to_owned());
-            let awaiting_input_capable = driver.as_ref().is_some_and(|driver| {
-                driver
-                    .capabilities()
-                    .provides(crate::driver::Capability::AwaitingInputSignal)
-            });
+            let (model_label, awaiting_input_capable) =
+                crate::live_worker_metadata::adopted_identity(&self.work_db, &restored, driver.as_deref());
             // Register through the re-adoption entry point, not the spawn
             // one. Registration stamps `spawned_at` with the current time,
             // which is a fiction here — this worker has been running,

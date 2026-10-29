@@ -1444,3 +1444,25 @@ pub async fn wait_for_source_capture(db: &WorkDb, root: &str) {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
+
+/// Running guide in the crash window before the execution launch stamp.
+pub(crate) fn unstamped_codex_guide(db: &WorkDb) -> crate::work::WorkExecution {
+    let root = create_active_chore(db, &create_product(db), "guide restart");
+    let (series, comparison) = seed_review_guide_series(db, &root);
+    let attempt = db
+        .create_pr_review_guide_attempt(&series, &comparison, "review-guide-v1")
+        .unwrap();
+    let execution = db.create_pr_review_guide_execution(&comparison, "acme/widget").unwrap();
+    db.bind_pr_review_guide_attempt_execution(&attempt.id, &execution.id)
+        .unwrap();
+    db.record_pr_review_guide_attempt_spawn_config(&attempt.id, "codex", "gpt-6-astra", "high")
+        .unwrap();
+    db.start_execution_run(&execution.id, "review-1", "mono", "lease-1", "ws-1", "/tmp/ws-1")
+        .unwrap();
+    db.set_run_shell_pid_for_execution(&execution.id, i64::from(std::process::id()))
+        .unwrap();
+    let execution = db.get_execution(&execution.id).unwrap();
+    assert!(execution.model.is_none());
+    assert!(db.launched_driver_slug(&execution.id).unwrap().is_none());
+    execution
+}

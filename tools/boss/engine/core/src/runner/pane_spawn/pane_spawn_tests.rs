@@ -2535,7 +2535,17 @@ async fn run_execution_reaps_and_signals_when_cancelled_during_confirmation() {
     let runner = PaneSpawnRunner::new(cfg, work_db.clone(), flags);
     bind_runner(&runner, weak, &spawner);
     runner.set_skip_spawn_confirm(false);
-    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(80));
+    // Confirmation polls composer chrome and turn-start concurrently, and the
+    // turn-start arm is biased. An 80ms window is shorter than the 100ms poll
+    // and can expire on a loaded host after one SQLite read, before capture-pane
+    // runs, so cancel_on_capture never fires. 500ms matches the passing
+    // confirmation tests' order of magnitude and still stays far below production.
+    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(500));
+    // Once capture runs, record a hook so confirmation can finish instead of
+    // waiting out the turn-start timeout after the cancel has already landed.
+    spawner
+        .auto_confirm_turn
+        .store(true, std::sync::atomic::Ordering::SeqCst);
 
     // Synchronize cancellation with confirmation instead of racing a sleep
     // against its timeout on a loaded test host.

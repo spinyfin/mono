@@ -293,3 +293,44 @@ fn started_at_is_the_execution_start_as_sortable_iso8601() {
     };
     assert_eq!(resolve(&db, &unstarted, "local").started_at, None);
 }
+
+#[test]
+fn guide_recovery_prefers_execution_stamp_and_preserves_unknown_driver() {
+    for (slug, model, capable) in [
+        ("claude", "claude-opus-4-7", true),
+        ("removed-driver", "retired-model", false),
+    ] {
+        let (_dir, db) = open_db();
+        let execution = crate::test_support::unstamped_codex_guide(&db);
+        let stamped = db
+            .record_execution_launch_config(&execution.id, slug, model, None)
+            .unwrap();
+        let driver = crate::driver_transcript::driver_for_spawned_execution(&db, &execution.id);
+        assert_eq!(
+            driver.as_ref().map(|driver| driver.descriptor().name),
+            if capable { Some("claude") } else { None }
+        );
+        assert_eq!(
+            adopted_identity(&db, &stamped, driver.as_deref()),
+            (model.to_owned(), capable)
+        );
+    }
+}
+
+#[test]
+fn guide_recovery_does_not_replace_an_unknown_attempt_driver_with_live_policy() {
+    let (_dir, db) = open_db();
+    let execution = crate::test_support::unstamped_codex_guide(&db);
+    let attempt = db
+        .pr_review_guide_attempt_for_execution(&execution.id)
+        .unwrap()
+        .unwrap();
+    db.record_pr_review_guide_attempt_spawn_config(&attempt.id, "removed-driver", "retired-model", "high")
+        .unwrap();
+    let driver = crate::driver_transcript::driver_for_spawned_execution(&db, &execution.id);
+    assert!(driver.is_none());
+    assert_eq!(
+        adopted_identity(&db, &execution, driver.as_deref()),
+        ("retired-model".to_owned(), false)
+    );
+}
