@@ -59,6 +59,10 @@ Each failed spawn gets an execution-scoped `pane_spawn_failed` item. The work-it
 
 State is in memory and starts empty on engine restart; a combination that is still broken re-raises after two more failures.
 
+## Workspace-lease attention
+
+`workspace_lease_unreleased` (a release gate kept the lease: unconfirmed recovery bookmark) and `workspace_lease_release_failed` (every gate passed but cube's release call failed) are both `ProducerReconciles`. `apply_release` (`engine/core/src/workspace_lease_release.rs`) resolves them for the execution as soon as the lease is released or found already gone, so a later sweep or gate pass that returns the workspace lowers them. `workspace_lease_release_failed` is also the durable proof the leftover-lease sweep uses to retry a row that never recorded a worker pid.
+
 ## Adding a new attention kind
 
 Add an entry to `ATTENTION_LIFECYCLES` at the same time you add the kind. `ClearedBy::HumanDecision` is a perfectly good answer — an _undeclared_ kind is not. Filing an unregistered kind emits a `tracing::warn!` from `warn_if_lifecycle_undeclared`, and `every_attention_kind_constant_in_the_crate_is_registered` fails if a constant exists with no entry.

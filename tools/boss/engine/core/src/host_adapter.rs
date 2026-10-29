@@ -2361,6 +2361,73 @@ mod tests {
     use super::*;
     use crate::driver::AgentDriver;
 
+    fn run_occupancy_script(workspace: &Path) -> String {
+        let output = std::process::Command::new("sh")
+            .args(["-c", REMOTE_OCCUPANCY_SCRIPT, "sh"])
+            .arg(workspace)
+            .output()
+            .expect("run the occupancy script");
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// The script decides whether a remote lease is returned, so its verdicts
+    /// are pinned against real processes rather than canned probe results.
+    #[test]
+    fn remote_occupancy_script_reports_empty_occupied_and_prefix_siblings() {
+        struct Reaped(std::process::Child);
+        impl Drop for Reaped {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("ws");
+        let sibling = root.path().join("ws-sibling");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        assert_eq!(run_occupancy_script(&root.path().join("missing")), "EMPTY");
+        if run_occupancy_script(&workspace) == "UNKNOWN" && !Path::new("/proc/self").exists() {
+            // A host without /proc relies on `lsof`, which a hermetic macOS
+            // sandbox denies; the script then fails safe to UNKNOWN. The
+            // /proc branch is exercised wherever it exists.
+            return;
+        }
+        assert_eq!(run_occupancy_script(&workspace), "EMPTY");
+
+        // A process whose cwd merely shares the workspace name as a prefix is not inside it.
+        let _prefix = Reaped(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .current_dir(&sibling)
+                .spawn()
+                .unwrap(),
+        );
+        assert_eq!(run_occupancy_script(&workspace), "EMPTY");
+
+        let nested = workspace.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let _inside = Reaped(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .current_dir(&nested)
+                .spawn()
+                .unwrap(),
+        );
+        // The child's chdir happens in the forked process; poll until visible.
+        let mut seen = String::new();
+        for _ in 0..100 {
+            seen = run_occupancy_script(&workspace);
+            if seen == "OCCUPIED" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(seen, "OCCUPIED");
+    }
+
     /// A `WorkerSetupInput` shaped like the one the remote spawn builds.
     /// Only the fields `progress_observation_wiring` reads matter here.
     fn remote_settings_input() -> WorkerSetupInput {

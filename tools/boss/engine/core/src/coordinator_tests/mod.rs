@@ -8,6 +8,7 @@ mod claimed_dispatch;
 mod dispatch;
 mod execution_bookmarks;
 mod helpers;
+mod lease_retry;
 mod local_worker_quarantine;
 mod pause_admission;
 mod pause_all_spawns;

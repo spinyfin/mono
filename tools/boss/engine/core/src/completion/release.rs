@@ -84,28 +84,34 @@ impl WorkerCompletionHandler {
                 let Some(lease_id) = execution.cube_lease_id.clone() else {
                     return ForceReleaseOutcome::NoLeaseHeld;
                 };
-                let recovery_adapter = self.recovery_adapter(execution_id).await;
-                let outcome = crate::workspace_lease_release::apply_release(
-                    &self.work_db,
-                    &execution,
-                    &lease_id,
-                    crate::workspace_lease_release::ReleaseEvidence {
-                        cause: crate::workspace_lease_release::TerminalCause::ProvenStopped,
-                        pane: crate::workspace_lease_release::PaneStatus::Gone,
-                        occupancy: &crate::workspace_lease_release::EmptyOccupancy,
-                        bookmark: &crate::workspace_lease_release::DbBookmarkGate {
-                            db: &self.work_db,
-                            adapter: recovery_adapter.as_deref(),
-                        },
+                // The recorded pid is gone, but this engine cannot stop a
+                // remote worker, so a child may still occupy the workspace.
+                // Release through the same owning-host gates as the
+                // reconciler: bookmark confirmation plus an occupancy probe.
+                let outcome = match self.recovery_adapter(execution_id).await {
+                    Some(host) => crate::remote_lease_reconcile::release_remote_lease(
+                        &self.work_db,
+                        host.as_ref(),
+                        execution_id,
+                        crate::workspace_lease_release::PaneStatus::Gone,
+                        |lease_id| async move { adapter.force_release_lease(&lease_id, Some("force release")).await },
+                    )
+                    .await,
+                    // No host adapter to probe occupancy or confirm recovery.
+                    None => crate::workspace_lease_release::LeaseReleaseOutcome::Kept {
+                        reason: crate::workspace_lease_release::KeepReason::OccupancyUnconfirmed,
                     },
-                    adapter.force_release_lease(&lease_id, Some("force release")),
-                )
-                .await;
+                };
                 return match outcome {
                     crate::workspace_lease_release::LeaseReleaseOutcome::Released => {
                         ForceReleaseOutcome::Released { lease_id }
                     }
                     crate::workspace_lease_release::LeaseReleaseOutcome::NoLease => ForceReleaseOutcome::NoLeaseHeld,
+                    crate::workspace_lease_release::LeaseReleaseOutcome::Kept {
+                        reason:
+                            crate::workspace_lease_release::KeepReason::ProcessInWorkspace
+                            | crate::workspace_lease_release::KeepReason::OccupancyUnconfirmed,
+                    } => ForceReleaseOutcome::HeldForRemoteWorker,
                     _ => ForceReleaseOutcome::LeaseReleaseFailed { lease_id },
                 };
             }

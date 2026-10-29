@@ -217,6 +217,19 @@ impl WorkerCompletionHandler {
         let mut cube_timed_out = false;
         let mut lease_released = false;
         if let Some(lease_id) = lease_id {
+            let remote = match &owning_cube {
+                Ok(resolved) if !resolved.is_local() => Some(Arc::clone(&resolved.cube)),
+                _ => None,
+            };
+            let remote_host = if remote.is_some() {
+                self.recovery_adapter(execution_id).await
+            } else {
+                None
+            };
+            let pane_status = match pane_outcome {
+                PaneReleaseOutcome::Reaped => crate::workspace_lease_release::PaneStatus::Gone,
+                PaneReleaseOutcome::NoLiveWorker => crate::workspace_lease_release::PaneStatus::Present,
+            };
             let release = async {
                 match owning_cube {
                     Ok(resolved) if resolved.is_local() => {
@@ -240,26 +253,55 @@ impl WorkerCompletionHandler {
             };
             match self.work_db.get_execution(execution_id) {
                 Ok(execution) => {
-                    let recovery_adapter = self.recovery_adapter(execution_id).await;
-                    let outcome = crate::workspace_lease_release::apply_release(
-                        &self.work_db,
-                        &execution,
-                        lease_id,
-                        crate::workspace_lease_release::ReleaseEvidence {
-                            cause: crate::workspace_lease_release::TerminalCause::ProvenCompleted,
-                            pane: match pane_outcome {
-                                PaneReleaseOutcome::Reaped => crate::workspace_lease_release::PaneStatus::Gone,
-                                PaneReleaseOutcome::NoLiveWorker => crate::workspace_lease_release::PaneStatus::Present,
+                    let outcome = if let Some(cube) = remote {
+                        // A remote worker cannot be stopped from here, so a
+                        // finished turn is not proof its workspace is idle:
+                        // gate on the owning host's occupancy and recovery.
+                        match remote_host {
+                            Some(host) => {
+                                crate::remote_lease_reconcile::release_remote_lease(
+                                    &self.work_db,
+                                    host.as_ref(),
+                                    execution_id,
+                                    pane_status,
+                                    |lease_id| async move {
+                                        tokio::time::timeout(
+                                            CUBE_RELEASE_TIMEOUT,
+                                            cube.force_release_lease(&lease_id, Some(path)),
+                                        )
+                                        .await
+                                        .unwrap_or_else(|_| {
+                                            Err(anyhow::anyhow!(
+                                                "cube workspace release timed out after {}s",
+                                                CUBE_RELEASE_TIMEOUT.as_secs()
+                                            ))
+                                        })
+                                    },
+                                )
+                                .await
+                            }
+                            None => crate::workspace_lease_release::LeaseReleaseOutcome::Kept {
+                                reason: crate::workspace_lease_release::KeepReason::OccupancyUnconfirmed,
                             },
-                            occupancy: &crate::workspace_lease_release::EmptyOccupancy,
-                            bookmark: &crate::workspace_lease_release::DbBookmarkGate {
-                                db: &self.work_db,
-                                adapter: recovery_adapter.as_deref(),
+                        }
+                    } else {
+                        crate::workspace_lease_release::apply_release(
+                            &self.work_db,
+                            &execution,
+                            lease_id,
+                            crate::workspace_lease_release::ReleaseEvidence {
+                                cause: crate::workspace_lease_release::TerminalCause::ProvenCompleted,
+                                pane: pane_status,
+                                occupancy: &crate::workspace_lease_release::EmptyOccupancy,
+                                bookmark: &crate::workspace_lease_release::DbBookmarkGate {
+                                    db: &self.work_db,
+                                    adapter: None,
+                                },
                             },
-                        },
-                        timed,
-                    )
-                    .await;
+                            timed,
+                        )
+                        .await
+                    };
                     lease_released = outcome == crate::workspace_lease_release::LeaseReleaseOutcome::Released;
                     if !matches!(
                         outcome,

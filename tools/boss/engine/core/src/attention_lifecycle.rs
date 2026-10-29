@@ -182,6 +182,18 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         ClearedBy::HumanDecision,
         "The engine already started the item fresh; the superseded commits it names stay in the shared store until a human inspects or discards them, which no later run can prove happened.",
     ),
+    entry(
+        crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "A release gate kept the lease. The release path resolves the item itself when a later gate \
+         pass or sweep returns the workspace; a run starting elsewhere proves nothing about this lease.",
+    ),
+    entry(
+        crate::workspace_lease_release::LEASE_RELEASE_FAILED_ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "Cube's release call failed after every gate passed. The leftover-lease sweep retries it and \
+         the release path resolves the item once the lease is returned.",
+    ),
     // ── Cleared by work resuming ────────────────────────────────────────
     entry(
         crate::conflict_ladder::LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND,
@@ -739,6 +751,8 @@ mod tests {
             crate::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND,
             crate::worker_escalation::WORKER_BLOCKED_ATTENTION_KIND,
             crate::abandoned_branch_pr_sweep::ATTENTION_KIND_ABANDONED_BRANCH_NO_PR,
+            crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND,
+            crate::workspace_lease_release::LEASE_RELEASE_FAILED_ATTENTION_KIND,
             crate::execution_bookmark_recovery::CREATE_FAILED,
             crate::execution_bookmark_recovery::CHAIN_BLOCKED,
             crate::execution_bookmark_recovery::RECOVERY_FAILED,

@@ -1872,6 +1872,20 @@ impl ExecutionCoordinator {
             .await?;
             return Err(err);
         }
+        // This attempt wrote its own bookmark in a freshly leased workspace.
+        // Creation or backup failures filed by an earlier attempt describe a
+        // lease that is no longer this execution's (a retained one was
+        // released or detached before this lease), and would otherwise keep
+        // this lease held at completion. Failures raised from here on belong
+        // to this lease and stay open for the release gate.
+        for kind in [
+            crate::execution_bookmark_recovery::CREATE_FAILED,
+            crate::execution_bookmark_recovery::RECOVERY_FAILED,
+        ] {
+            if let Err(err) = self.work_db.resolve_attention_kind_for_execution(&execution.id, kind) {
+                tracing::warn!(execution_id = %execution.id, kind, ?err, "could not resolve superseded bookmark failure");
+            }
+        }
 
         let tmux_hosted = selected_host.id == "local";
         match self.work_db.start_execution_run_on_host_with_tmux_hosting(
@@ -2118,11 +2132,14 @@ impl ExecutionCoordinator {
     ) -> Result<CubeWorkspaceLease> {
         // A previous pre-start attempt may still hold a lease (cube release
         // failed, or its recovery bookmark could not be confirmed). Try to
-        // free it; if the gates keep it, detach it from this execution so it
-        // does not block every retry. The workspace stays leased in cube, its
+        // free it. If the gates keep it, detach it from this execution so it
+        // does not block every retry: the workspace stays leased in cube, its
         // unreleased-lease attention is already filed, and cube's TTL is the
         // backstop. Recovery follows the shared-store bookmarks, not the
-        // detached checkout.
+        // detached checkout. If only cube's own call failed, the lease stays
+        // recorded and this attempt fails so the sweep and the next retry
+        // keep trying to return it. A lease retained after a bookmark
+        // failure keeps its bookmark gate (see `never_positioned`).
         if let Some(existing_lease) = execution.cube_lease_id.as_deref() {
             let outcome = crate::workspace_lease_release::release_lease_after_proven_never_started(
                 &self.work_db,
@@ -2132,30 +2149,38 @@ impl ExecutionCoordinator {
                 crate::workspace_lease_release::PreStartStage::BeforeRecoveryBookmark,
             )
             .await;
-            if !matches!(
-                outcome,
+            match outcome {
                 crate::workspace_lease_release::LeaseReleaseOutcome::Released
-                    | crate::workspace_lease_release::LeaseReleaseOutcome::NoLease
-            ) {
-                tracing::warn!(
-                    execution_id = %execution.id,
-                    lease_id = existing_lease,
-                    ?outcome,
-                    "previous pre-start lease kept by its release gates; detaching it and leasing a fresh workspace",
-                );
-                match self
-                    .work_db
-                    .claim_execution_workspace_release(&execution.id, existing_lease)
-                {
-                    Ok(_) => {
-                        if let Err(err) = self.work_db.finish_execution_workspace_release(execution) {
-                            tracing::error!(execution_id = %execution.id, ?err, "failed to detach kept lease metadata");
+                | crate::workspace_lease_release::LeaseReleaseOutcome::NoLease => {}
+                // Every gate passed and cube itself failed. The lease stays
+                // recorded on this execution so the leftover-lease sweep keeps
+                // retrying it; leasing a fresh workspace would overwrite it.
+                crate::workspace_lease_release::LeaseReleaseOutcome::CubeFailed { error } => {
+                    return Err(anyhow!(
+                        "previous cube workspace lease {existing_lease} could not be released yet: {error}"
+                    ));
+                }
+                crate::workspace_lease_release::LeaseReleaseOutcome::Kept { .. } => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        lease_id = existing_lease,
+                        ?outcome,
+                        "previous pre-start lease kept by its release gates; detaching it and leasing a fresh workspace",
+                    );
+                    match self
+                        .work_db
+                        .claim_execution_workspace_release(&execution.id, existing_lease)
+                    {
+                        Ok(_) => {
+                            if let Err(err) = self.work_db.finish_execution_workspace_release(execution) {
+                                tracing::error!(execution_id = %execution.id, ?err, "failed to detach kept lease metadata");
+                            }
                         }
-                    }
-                    Err(err) => {
-                        return Err(anyhow!(
-                            "previous cube workspace lease {existing_lease} is still held and could not be detached: {err:#}"
-                        ));
+                        Err(err) => {
+                            return Err(anyhow!(
+                                "previous cube workspace lease {existing_lease} is still held and could not be detached: {err:#}"
+                            ));
+                        }
                     }
                 }
             }

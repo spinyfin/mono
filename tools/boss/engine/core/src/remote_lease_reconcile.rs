@@ -330,7 +330,7 @@ async fn reap_dead_remote_execution(
 
     let reason = format!(
         "remote-lease reconcile: worker pid {remote_pid} on host `{}` is gone (kill -0: no such process); \
-         reaping execution and force-releasing its cube lease (prior status `{prior_status}`){log_clause}",
+         reaping execution; its cube lease is released only once the release gates pass (prior status `{prior_status}`){log_clause}",
         handle.host_id,
     );
 
@@ -380,7 +380,7 @@ async fn reap_dead_remote_execution(
     // cwd in the workspace. Otherwise it stays recorded for a later pass
     // (`release_terminal_remote_resources`), with attention filed for a
     // failed gate; cube's own TTL is the backstop.
-    release_remote_lease(
+    let lease_outcome = release_dead_remote_lease(
         work_db,
         adapter,
         &execution.id,
@@ -446,6 +446,7 @@ async fn reap_dead_remote_execution(
                     "host_id": handle.host_id,
                     "remote_pid": remote_pid,
                     "cube_lease_id": execution.cube_lease_id,
+                    "lease_release_outcome": format!("{lease_outcome:?}"),
                     "cube_workspace_id": execution.cube_workspace_id,
                     "kind": execution.kind.as_str(),
                     "worker_log_tail": worker_log,
@@ -459,8 +460,9 @@ async fn reap_dead_remote_execution(
         host_id = %handle.host_id,
         remote_pid,
         prior_status = %prior_status,
+        lease_release_outcome = ?lease_outcome,
         worker_log_tail = worker_log.as_deref().unwrap_or("<unreadable>"),
-        "remote-lease reconcile: reaped remote execution whose worker is gone and force-released its lease",
+        "remote-lease reconcile: reaped remote execution whose worker is gone; lease release attempted",
     );
 
     true
@@ -526,7 +528,7 @@ async fn release_terminal_remote_resources(
         tracing::warn!(?error, "remote input cleanup failed; retaining lease for retry");
         return;
     }
-    release_remote_lease(
+    release_dead_remote_lease(
         work_db,
         adapter.as_ref(),
         &execution.id,
@@ -535,32 +537,42 @@ async fn release_terminal_remote_resources(
     .await;
 }
 
-/// Release a dead remote worker's lease through the claimed release policy.
-/// The pid probe is inferred death, so the owning host's recovery bookmark
-/// and workspace occupancy must both confirm; an inconclusive occupancy
-/// probe keeps the lease.
-async fn release_remote_lease(work_db: &WorkDb, adapter: &dyn HostAdapter, execution_id: &str, reason: &str) {
+/// Release a remote worker's lease through the claimed release policy, for
+/// every path that releases on the strength of a recorded pid or a finished
+/// turn rather than a confirmed stop. The remote worker cannot be stopped by
+/// this engine, so the owning host's recovery bookmark and workspace
+/// occupancy (both probed through `host`) must confirm; an inconclusive
+/// probe keeps the lease. `release` performs the cube call for the lease id
+/// it is handed. Returns what actually happened.
+pub(crate) async fn release_remote_lease<Fut: std::future::Future<Output = anyhow::Result<()>>>(
+    work_db: &WorkDb,
+    host: &dyn HostAdapter,
+    execution_id: &str,
+    pane: crate::workspace_lease_release::PaneStatus,
+    release: impl FnOnce(String) -> Fut,
+) -> crate::workspace_lease_release::LeaseReleaseOutcome {
+    use crate::workspace_lease_release::{LeaseReleaseOutcome, Occupancy};
     // Re-read: the row may have settled or lost its lease since the caller looked.
     let Ok(execution) = work_db.get_execution(execution_id) else {
-        return;
+        return LeaseReleaseOutcome::NoLease;
     };
     let Some(lease_id) = execution.cube_lease_id.clone() else {
-        return;
+        return LeaseReleaseOutcome::NoLease;
     };
     let occupancy = match execution.workspace_path.as_deref() {
-        Some(path) => adapter
+        Some(path) => host
             .probe_workspace_occupancy(std::path::Path::new(path))
             .await
             .unwrap_or_else(|err| {
                 tracing::debug!(
                     execution_id,
-                    host_id = adapter.host_id(),
+                    host_id = host.host_id(),
                     error = %format!("{err:#}"),
-                    "remote-lease reconcile: workspace occupancy probe failed; keeping the lease",
+                    "remote lease release: workspace occupancy probe failed; keeping the lease",
                 );
-                crate::workspace_lease_release::Occupancy::Unknown
+                Occupancy::Unknown
             }),
-        None => crate::workspace_lease_release::Occupancy::Unknown,
+        None => Occupancy::Unknown,
     };
     crate::workspace_lease_release::apply_release(
         work_db,
@@ -568,16 +580,34 @@ async fn release_remote_lease(work_db: &WorkDb, adapter: &dyn HostAdapter, execu
         &lease_id,
         crate::workspace_lease_release::ReleaseEvidence {
             cause: crate::workspace_lease_release::TerminalCause::Inferred,
-            pane: crate::workspace_lease_release::PaneStatus::Gone,
+            pane,
             occupancy: &crate::workspace_lease_release::OwningHostOccupancy(occupancy),
             bookmark: &crate::workspace_lease_release::DbBookmarkGate {
                 db: work_db,
-                adapter: Some(adapter),
+                adapter: Some(host),
             },
         },
-        adapter.force_release_lease(&lease_id, Some(reason)),
+        release(lease_id.clone()),
     )
-    .await;
+    .await
+}
+
+/// [`release_remote_lease`] for a dead worker, releasing through the same
+/// host's adapter.
+async fn release_dead_remote_lease(
+    work_db: &WorkDb,
+    adapter: &dyn HostAdapter,
+    execution_id: &str,
+    reason: &str,
+) -> crate::workspace_lease_release::LeaseReleaseOutcome {
+    release_remote_lease(
+        work_db,
+        adapter,
+        execution_id,
+        crate::workspace_lease_release::PaneStatus::Gone,
+        |lease_id| async move { adapter.force_release_lease(&lease_id, Some(reason)).await },
+    )
+    .await
 }
 
 async fn release_persona_only(

@@ -290,7 +290,11 @@ async fn apply_keeps_lease_and_files_attention_when_cube_release_fails() {
         Some("lease-fail")
     );
     let items = db.list_attention_items(&execution.id).unwrap();
-    assert!(items.iter().any(|item| item.kind == LEASE_UNRELEASED_ATTENTION_KIND));
+    assert!(
+        items
+            .iter()
+            .any(|item| item.kind == LEASE_RELEASE_FAILED_ATTENTION_KIND)
+    );
 }
 
 #[tokio::test]
