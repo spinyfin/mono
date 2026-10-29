@@ -22,7 +22,7 @@ final class AgentSurfaceCollectionTests: XCTestCase {
         func view(attached: Bool, listed: Bool) -> some View {
             let snapshot = WorkerSlotSnapshot.render(
                 runId: "one", viewer: attached ? viewer : nil, liveState: listed ? live : nil,
-                liveStatusDisabledSlotIDs: [], cachedPersona: "Riker"
+                cachedPersona: "Riker"
             )
             return WorkerSlotBody(
                 snapshot: snapshot,

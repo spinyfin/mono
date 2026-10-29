@@ -221,8 +221,7 @@ final class AgentsGridModelTests: XCTestCase {
         let live = makeState(runId: "run-a", activity: .terminated)
         let snapshot = WorkerSlotSnapshot.build(
             slot: WorkerSlot(slotId: 1, runId: "run-a"),
-            liveState: live,
-            liveStatusEnabled: true
+            liveState: live
         )
         XCTAssertTrue(snapshot.isExited)
         XCTAssertEqual(live.activity.agentsPaneLabel, "Exited")
@@ -536,7 +535,6 @@ final class AgentsGridModelTests: XCTestCase {
         XCTAssertEqual(finished.headerTitle, "Riker finished")
         XCTAssertNil(finished.headerBadge)
         XCTAssertEqual(finished.statusPillLabel, "Finished")
-        XCTAssertFalse(finished.showsLiveStatusToggle)
         XCTAssertFalse(finished.isViewerMissing)
     }
 
@@ -678,7 +676,7 @@ final class AgentsGridModelTests: XCTestCase {
         workspace: WorkersWorkspaceModel,
         store: LiveWorkerStateStore
     ) -> WorkerSlotSnapshot {
-        grid.renderSnapshot(runId: runId, workspace: workspace, liveStates: store, liveStatusDisabledSlotIDs: [])
+        grid.renderSnapshot(runId: runId, workspace: workspace, liveStates: store)
     }
 
     private func roomyGrid() -> AgentsGridModel {

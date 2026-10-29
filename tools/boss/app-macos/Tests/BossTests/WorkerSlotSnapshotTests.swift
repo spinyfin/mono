@@ -14,7 +14,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             let live = Self.makeLiveState(name: "Dax", activity: .terminated)
             let snapshot = WorkerSlotSnapshot(
                 slotId: 1, runId: "exec-1", summary: summary, taskTitle: nil,
-                session: nil, liveStatusEnabled: true, live: WorkerSlotLiveSlice(live),
+                session: nil, live: WorkerSlotLiveSlice(live),
                 isPlaceholder: false, cachedPersona: nil, viewerAttachFailure: nil
             )
             XCTAssertEqual(snapshot.headerTitle, "Dax: Exited")
@@ -26,13 +26,13 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         let live = Self.makeLiveState(name: "Dax", activity: .errored)
         let summarized = WorkerSlotSnapshot(
             slotId: 1, runId: "exec-1", summary: "running tests", taskTitle: nil,
-            session: nil, liveStatusEnabled: true, live: WorkerSlotLiveSlice(live),
+            session: nil, live: WorkerSlotLiveSlice(live),
             isPlaceholder: false, cachedPersona: nil, viewerAttachFailure: nil
         )
         XCTAssertEqual(summarized.headerTitle, "Dax is running tests")
         let titled = WorkerSlotSnapshot(
             slotId: 1, runId: "exec-1", summary: nil, taskTitle: "fix the scraper",
-            session: nil, liveStatusEnabled: true, live: WorkerSlotLiveSlice(live),
+            session: nil, live: WorkerSlotLiveSlice(live),
             isPlaceholder: false, cachedPersona: nil, viewerAttachFailure: nil
         )
         XCTAssertEqual(titled.headerTitle, "Dax: fix the scraper")
@@ -47,7 +47,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         let hung = try XCTUnwrap(client.parseWorkerLiveState(payload))
         XCTAssertNotNil(WorkerSlotLiveSlice(hung).hungSince)
         let hungSnapshot = WorkerSlotSnapshot.build(
-            slot: WorkerSlot(slotId: 1, runId: "run-hung"), liveState: hung, liveStatusEnabled: true
+            slot: WorkerSlot(slotId: 1, runId: "run-hung"), liveState: hung
         )
         XCTAssertEqual(hungSnapshot.statusPillLabel, "Hung")
         XCTAssertTrue(hungSnapshot.showsStatusPill)
@@ -62,7 +62,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         let recovered = try XCTUnwrap(client.parseWorkerLiveState(payload))
         XCTAssertNil(recovered.hungSince)
         let recoveredSnapshot = WorkerSlotSnapshot.build(
-            slot: WorkerSlot(slotId: 1, runId: "run-hung"), liveState: recovered, liveStatusEnabled: true
+            slot: WorkerSlot(slotId: 1, runId: "run-hung"), liveState: recovered
         )
         XCTAssertFalse(recoveredSnapshot.showsStatusPill)
         XCTAssertNotEqual(hungSnapshot, recoveredSnapshot)
@@ -94,7 +94,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             XCTAssertEqual(store.byRunID["run-persona"]?.displayName, expected)
             let snapshot = WorkerSlotSnapshot.build(
                 slot: WorkerSlot(slotId: 1, runId: "run-persona"),
-                liveState: live, liveStatusEnabled: true
+                liveState: live
             )
             XCTAssertEqual(snapshot.displayName, expected)
             XCTAssertEqual(TrekPortraitGrid.cell(forPersona: snapshot.live?.name) != nil, hasPortrait)
@@ -103,7 +103,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         }
         let fallback = WorkerSlotSnapshot.build(
             slot: WorkerSlot(slotId: 9, runId: "run-persona"),
-            liveState: nil, liveStatusEnabled: true
+            liveState: nil
         )
         XCTAssertEqual(fallback.displayName, "Worker run-persona")
     }
@@ -136,7 +136,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             let current = try XCTUnwrap(store.byRunID[run])
             let pane = WorkerSlotSnapshot.build(
                 slot: WorkerSlot(slotId: 1, runId: run),
-                liveState: current, liveStatusEnabled: true
+                liveState: current
             )
             let card = WorkCardSnapshot.build(
                 task: task,
@@ -251,8 +251,8 @@ final class WorkerSlotSnapshotTests: XCTestCase {
     func testIdenticalInputsProduceEqualSnapshots() {
         let slot = WorkerSlot(slotId: 1)
         let live = Self.makeLiveState()
-        let a = WorkerSlotSnapshot.build(slot: slot, liveState: live, liveStatusEnabled: true)
-        let b = WorkerSlotSnapshot.build(slot: slot, liveState: live, liveStatusEnabled: true)
+        let a = WorkerSlotSnapshot.build(slot: slot, liveState: live)
+        let b = WorkerSlotSnapshot.build(slot: slot, liveState: live)
         XCTAssertEqual(a, b)
     }
 
@@ -261,8 +261,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         let base = Self.makeLiveState()
         let baseSnap = WorkerSlotSnapshot.build(
             slot: slot,
-            liveState: base,
-            liveStatusEnabled: true
+            liveState: base
         )
 
         let variants: [WorkerLiveState] = [
@@ -280,8 +279,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         for other in variants {
             let otherSnap = WorkerSlotSnapshot.build(
                 slot: slot,
-                liveState: other,
-                liveStatusEnabled: true
+                liveState: other
             )
             XCTAssertEqual(
                 baseSnap,
@@ -337,7 +335,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             activity: .idle, liveStatus: nil,
             waitReason: "bazel test", waitExpiresAt: "2026-10-09T12:00:00Z"
         )
-        let snap = WorkerSlotSnapshot.build(slot: slot, liveState: idleWait, liveStatusEnabled: true)
+        let snap = WorkerSlotSnapshot.build(slot: slot, liveState: idleWait)
         XCTAssertEqual(snap.statusPillLabel, "Waiting")
         let caption = snap.live?.waitCaption
         XCTAssertTrue(caption?.hasPrefix("Waiting: bazel test · until ") == true, caption ?? "nil")
@@ -345,14 +343,14 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         // A prompt raised mid-turn keeps `.waitingForInput`: still the
         // owner's, so no wait caption even though the reason is carried.
         let midTurn = Self.makeLiveState(activity: .waitingForInput, waitReason: "bazel test")
-        let midSnap = WorkerSlotSnapshot.build(slot: slot, liveState: midTurn, liveStatusEnabled: true)
+        let midSnap = WorkerSlotSnapshot.build(slot: slot, liveState: midTurn)
         XCTAssertEqual(midSnap.statusPillLabel, "Waiting")
         XCTAssertNil(midSnap.live?.waitCaption)
         XCTAssertFalse(midSnap.live?.isWaitingOnJob ?? true)
 
         // A resumed worker with a leftover wait is not waiting.
         let resumed = Self.makeLiveState(activity: .working, waitReason: "bazel test")
-        let resumedSnap = WorkerSlotSnapshot.build(slot: slot, liveState: resumed, liveStatusEnabled: true)
+        let resumedSnap = WorkerSlotSnapshot.build(slot: slot, liveState: resumed)
         XCTAssertNil(resumedSnap.live?.waitCaption)
         XCTAssertEqual(resumedSnap.statusPillLabel, "Working")
     }
@@ -362,8 +360,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         let base = Self.makeLiveState()
         let baseSnap = WorkerSlotSnapshot.build(
             slot: slot,
-            liveState: base,
-            liveStatusEnabled: true
+            liveState: base
         )
 
         let flips: [(String, WorkerLiveState)] = [
@@ -390,8 +387,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         for (field, other) in flips {
             let otherSnap = WorkerSlotSnapshot.build(
                 slot: slot,
-                liveState: other,
-                liveStatusEnabled: true
+                liveState: other
             )
             XCTAssertNotEqual(
                 baseSnap,
@@ -452,8 +448,8 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         XCTAssertEqual(try live(kind: "future_kind").badgeLabel, "Reviewing")
         XCTAssertNotEqual(guide, review)
         let slot = WorkerSlot(slotId: 1, runId: "exec-1", summary: "generating a review guide")
-        let guideSnapshot = WorkerSlotSnapshot.build(slot: slot, liveState: guide, liveStatusEnabled: true)
-        let reviewSnapshot = WorkerSlotSnapshot.build(slot: slot, liveState: review, liveStatusEnabled: true)
+        let guideSnapshot = WorkerSlotSnapshot.build(slot: slot, liveState: guide)
+        let reviewSnapshot = WorkerSlotSnapshot.build(slot: slot, liveState: review)
         XCTAssertEqual(guideSnapshot.headerTitle, reviewSnapshot.headerTitle)
         XCTAssertNotEqual(guideSnapshot, reviewSnapshot)
     }
@@ -468,8 +464,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         let live = Self.makeLiveState()
         let baseSnap = WorkerSlotSnapshot.build(
             slot: base,
-            liveState: live,
-            liveStatusEnabled: true
+            liveState: live
         )
 
         XCTAssertNotEqual(
@@ -481,8 +476,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
                     summary: base.summary,
                     taskTitle: base.taskTitle
                 ),
-                liveState: live,
-                liveStatusEnabled: true
+                liveState: live
             )
         )
         XCTAssertNotEqual(
@@ -494,8 +488,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
                     summary: base.summary,
                     taskTitle: base.taskTitle
                 ),
-                liveState: live,
-                liveStatusEnabled: true
+                liveState: live
             )
         )
         XCTAssertNotEqual(
@@ -507,8 +500,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
                     summary: "rewriting the fencer",
                     taskTitle: base.taskTitle
                 ),
-                liveState: live,
-                liveStatusEnabled: true
+                liveState: live
             )
         )
         XCTAssertNotEqual(
@@ -520,34 +512,24 @@ final class WorkerSlotSnapshotTests: XCTestCase {
                     summary: base.summary,
                     taskTitle: "other title"
                 ),
-                liveState: live,
-                liveStatusEnabled: true
+                liveState: live
             )
         )
         var attached = base
         attached.session = Self.makeSession(id: "run-exec-1")
-        XCTAssertNotEqual(baseSnap, WorkerSlotSnapshot.build(slot: attached, liveState: live, liveStatusEnabled: true))
+        XCTAssertNotEqual(baseSnap, WorkerSlotSnapshot.build(slot: attached, liveState: live))
 
-    }
-
-    func testLiveStatusEnabledFlipsEquality() {
-        let slot = WorkerSlot(slotId: 1)
-        let a = WorkerSlotSnapshot.build(slot: slot, liveState: nil, liveStatusEnabled: true)
-        let b = WorkerSlotSnapshot.build(slot: slot, liveState: nil, liveStatusEnabled: false)
-        XCTAssertNotEqual(a, b)
     }
 
     func testNilVsPresentLiveStateFlipsEquality() {
         let slot = WorkerSlot(slotId: 1, runId: "exec-1")
         let with = WorkerSlotSnapshot.build(
             slot: slot,
-            liveState: Self.makeLiveState(),
-            liveStatusEnabled: true
+            liveState: Self.makeLiveState()
         )
         let without = WorkerSlotSnapshot.build(
             slot: slot,
-            liveState: nil,
-            liveStatusEnabled: true
+            liveState: nil
         )
         XCTAssertNotEqual(with, without)
     }
@@ -562,24 +544,30 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         var slotAAgain = WorkerSlot(slotId: 1, runId: "a")
         slotAAgain.session = sessionA
 
-        let snapA = WorkerSlotSnapshot.build(slot: slotA, liveState: nil, liveStatusEnabled: true)
-        let snapB = WorkerSlotSnapshot.build(slot: slotB, liveState: nil, liveStatusEnabled: true)
-        let snapA2 = WorkerSlotSnapshot.build(slot: slotAAgain, liveState: nil, liveStatusEnabled: true)
+        let snapA = WorkerSlotSnapshot.build(slot: slotA, liveState: nil)
+        let snapB = WorkerSlotSnapshot.build(slot: slotB, liveState: nil)
+        let snapA2 = WorkerSlotSnapshot.build(slot: slotAAgain, liveState: nil)
         XCTAssertEqual(snapA, snapA2)
         XCTAssertNotEqual(snapA, snapB)
     }
 
     // MARK: - WorkerSlotView Equatable
 
+    /// Distinct reveal-work-item handlers must not affect slot equality.
     func testSlotViewEquatableIgnoresClosures() {
         let snap = WorkerSlotSnapshot.build(
             slot: WorkerSlot(slotId: 1),
-            liveState: nil,
-            liveStatusEnabled: true
+            liveState: nil
         )
         let runtime = GhosttyRuntime.shared
-        let a = WorkerSlotView(runtime: runtime, snapshot: snap, onToggleLiveStatus: { _ in })
-        let b = WorkerSlotView(runtime: runtime, snapshot: snap, onToggleLiveStatus: { _ in })
+        let a = WorkerSlotView(
+            runtime: runtime, snapshot: snap,
+            onRevealWorkItem: { _, _ in XCTFail("First reveal handler must not run during equality") }
+        )
+        let b = WorkerSlotView(
+            runtime: runtime, snapshot: snap,
+            onRevealWorkItem: { _, _ in XCTFail("Second reveal handler must not run during equality") }
+        )
         XCTAssertEqual(a, b)
     }
 
@@ -589,19 +577,15 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             runtime: runtime,
             snapshot: WorkerSlotSnapshot.build(
                 slot: WorkerSlot(slotId: 1),
-                liveState: nil,
-                liveStatusEnabled: true
-            ),
-            onToggleLiveStatus: { _ in }
+                liveState: nil
+            )
         )
         let b = WorkerSlotView(
             runtime: runtime,
             snapshot: WorkerSlotSnapshot.build(
                 slot: WorkerSlot(slotId: 2),
-                liveState: nil,
-                liveStatusEnabled: true
-            ),
-            onToggleLiveStatus: { _ in }
+                liveState: nil
+            )
         )
         XCTAssertNotEqual(a, b)
     }
@@ -609,8 +593,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
     func testExitedMemberDoesNotConnect() {
         let snapshot = WorkerSlotSnapshot.build(
             slot: WorkerSlot(slotId: 1, runId: "exec-1"),
-            liveState: Self.makeLiveState(activity: .terminated, tmuxHosted: true),
-            liveStatusEnabled: true
+            liveState: Self.makeLiveState(activity: .terminated, tmuxHosted: true)
         )
         XCTAssertTrue(snapshot.isViewerMissing)
         XCTAssertFalse(snapshot.isViewerConnecting)
@@ -622,8 +605,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
     func testErroredMemberDoesNotConnect() {
         let snapshot = WorkerSlotSnapshot.build(
             slot: WorkerSlot(slotId: 1, runId: "exec-1"),
-            liveState: Self.makeLiveState(activity: .errored, tmuxHosted: true),
-            liveStatusEnabled: true
+            liveState: Self.makeLiveState(activity: .errored, tmuxHosted: true)
         )
         XCTAssertFalse(snapshot.isViewerConnecting)
         XCTAssertEqual(snapshot.viewerMissingMessage, "Worker exited")
@@ -632,8 +614,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
     func testAttachedErroredMemberIsNotDimmedAsExited() {
         let snapshot = WorkerSlotSnapshot.build(
             slot: WorkerSlot(slotId: 1, session: Self.makeSession(id: "errored"), runId: "exec-1"),
-            liveState: Self.makeLiveState(activity: .errored, tmuxHosted: true),
-            liveStatusEnabled: true
+            liveState: Self.makeLiveState(activity: .errored, tmuxHosted: true)
         )
         XCTAssertEqual(snapshot.bodyKind, .terminal)
         XCTAssertFalse(snapshot.isExited, "The header and attached terminal must retain full opacity")
@@ -644,8 +625,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         for reason in ["the execution has ended or is unavailable; waiting for engine cleanup", "no app session is registered"] {
             let snapshot = WorkerSlotSnapshot.build(
                 slot: WorkerSlot(slotId: 1, runId: "exec-1"),
-                liveState: Self.makeLiveState(tmuxHosted: true, viewerAttachError: reason),
-                liveStatusEnabled: true
+                liveState: Self.makeLiveState(tmuxHosted: true, viewerAttachError: reason)
             )
             XCTAssertFalse(snapshot.isViewerConnecting)
             XCTAssertEqual(snapshot.viewerMissingMessage, "Couldn't attach the terminal: \(reason)")
@@ -657,20 +637,20 @@ final class WorkerSlotSnapshotTests: XCTestCase {
     func testViewerMissingCardReadsConnectingWhileNothingHasFailed() {
         let slot = WorkerSlot(slotId: 1, runId: "exec-1")
         let connecting = WorkerSlotSnapshot.build(
-            slot: slot, liveState: Self.makeLiveState(tmuxHosted: true), liveStatusEnabled: true
+            slot: slot, liveState: Self.makeLiveState(tmuxHosted: true)
         )
         XCTAssertTrue(connecting.isViewerMissing)
         XCTAssertTrue(connecting.isViewerConnecting)
         XCTAssertEqual(connecting.viewerMissingMessage, "Connecting…")
 
         // Before any live state has arrived the card is equally honest.
-        let preLive = WorkerSlotSnapshot.build(slot: slot, liveState: nil, liveStatusEnabled: true)
+        let preLive = WorkerSlotSnapshot.build(slot: slot, liveState: nil)
         XCTAssertTrue(preLive.isViewerConnecting)
         XCTAssertEqual(preLive.viewerMissingMessage, "Connecting…")
 
         // A placeholder (released run) is not connecting to anything.
         let placeholder = WorkerSlotSnapshot.build(
-            slot: slot, liveState: Self.makeLiveState(tmuxHosted: true), liveStatusEnabled: true, isPlaceholder: true
+            slot: slot, liveState: Self.makeLiveState(tmuxHosted: true), isPlaceholder: true
         )
         XCTAssertFalse(placeholder.isViewerConnecting)
 
@@ -684,7 +664,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
                 ),
                 runId: "exec-1"
             ),
-            liveState: Self.makeLiveState(tmuxHosted: true), liveStatusEnabled: true
+            liveState: Self.makeLiveState(tmuxHosted: true)
         )
         XCTAssertFalse(attached.isViewerMissing)
         XCTAssertFalse(attached.isViewerConnecting)
@@ -698,8 +678,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
 
         let engineFailed = WorkerSlotSnapshot.build(
             slot: slot,
-            liveState: Self.makeLiveState(tmuxHosted: true, viewerAttachError: "request to the app failed: timed out"),
-            liveStatusEnabled: true
+            liveState: Self.makeLiveState(tmuxHosted: true, viewerAttachError: "request to the app failed: timed out")
         )
         XCTAssertFalse(engineFailed.isViewerConnecting)
         XCTAssertEqual(
@@ -710,7 +689,6 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         let appRefused = WorkerSlotSnapshot.build(
             slot: slot,
             liveState: Self.makeLiveState(tmuxHosted: true, viewerAttachError: "request to the app failed: timed out"),
-            liveStatusEnabled: true,
             viewerAttachFailure: "its slot is still hosting run exec-0"
         )
         XCTAssertFalse(appRefused.isViewerConnecting)
@@ -721,7 +699,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         )
 
         let noIdentity = WorkerSlotSnapshot.build(
-            slot: slot, liveState: Self.makeLiveState(tmuxHosted: false), liveStatusEnabled: true
+            slot: slot, liveState: Self.makeLiveState(tmuxHosted: false)
         )
         XCTAssertFalse(noIdentity.isViewerConnecting)
         XCTAssertEqual(noIdentity.viewerMissingMessage, AgentActivityState.identityUnavailableReason)
@@ -730,14 +708,14 @@ final class WorkerSlotSnapshotTests: XCTestCase {
     func testViewerAttachFailureFlipsEquality() {
         let slot = WorkerSlot(slotId: 1, runId: "exec-1")
         let live = Self.makeLiveState(tmuxHosted: true)
-        let plain = WorkerSlotSnapshot.build(slot: slot, liveState: live, liveStatusEnabled: true)
+        let plain = WorkerSlotSnapshot.build(slot: slot, liveState: live)
         let failed = WorkerSlotSnapshot.build(
-            slot: slot, liveState: live, liveStatusEnabled: true, viewerAttachFailure: "its slot is busy"
+            slot: slot, liveState: live, viewerAttachFailure: "its slot is busy"
         )
         XCTAssertNotEqual(plain, failed)
         XCTAssertEqual(
             failed,
-            WorkerSlotSnapshot.build(slot: slot, liveState: live, liveStatusEnabled: true, viewerAttachFailure: "its slot is busy")
+            WorkerSlotSnapshot.build(slot: slot, liveState: live, viewerAttachFailure: "its slot is busy")
         )
     }
 
@@ -758,12 +736,12 @@ final class WorkerSlotSnapshotTests: XCTestCase {
     func testPlaceholderAndViewerMissingFlipEquality() {
         let slot = WorkerSlot(slotId: 1, runId: "exec-1")
         let live = Self.makeLiveState()
-        let occupied = WorkerSlotSnapshot.build(slot: slot, liveState: live, liveStatusEnabled: true)
+        let occupied = WorkerSlotSnapshot.build(slot: slot, liveState: live)
         let placeholder = WorkerSlotSnapshot.build(
-            slot: slot, liveState: live, liveStatusEnabled: true, isPlaceholder: true
+            slot: slot, liveState: live, isPlaceholder: true
         )
         let named = WorkerSlotSnapshot.build(
-            slot: slot, liveState: live, liveStatusEnabled: true, cachedPersona: "Riker"
+            slot: slot, liveState: live, cachedPersona: "Riker"
         )
         XCTAssertTrue(occupied.isViewerMissing)
         XCTAssertFalse(placeholder.isViewerMissing)
@@ -784,7 +762,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         let attached = WorkerSlot(slotId: 1, session: session, runId: "exec-1", summary: "fixing the scraper", taskTitle: "scraper")
 
         let detachPending = WorkerSlotSnapshot.render(
-            runId: "exec-1", viewer: attached, liveState: nil, liveStatusDisabledSlotIDs: [], cachedPersona: "Riker"
+            runId: "exec-1", viewer: attached, liveState: nil, cachedPersona: "Riker"
         )
         XCTAssertTrue(detachPending.isPlaceholder)
         XCTAssertEqual(detachPending.bodyKind, .placeholder)
@@ -793,10 +771,9 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         XCTAssertEqual(detachPending.headerTitle, "Riker finished")
         XCTAssertNil(detachPending.headerBadge)
         XCTAssertEqual(detachPending.statusPillLabel, "Finished")
-        XCTAssertFalse(detachPending.showsLiveStatusToggle)
 
         let detached = WorkerSlotSnapshot.render(
-            runId: "exec-1", viewer: nil, liveState: nil, liveStatusDisabledSlotIDs: [], cachedPersona: "Riker"
+            runId: "exec-1", viewer: nil, liveState: nil, cachedPersona: "Riker"
         )
         XCTAssertEqual(detached.bodyKind, .placeholder)
         XCTAssertFalse(detached.isViewerMissing)
@@ -807,7 +784,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
 
         // Persona cache already gone: still finished, never "is working".
         let anonymous = WorkerSlotSnapshot.render(
-            runId: "exec-1", viewer: nil, liveState: nil, liveStatusDisabledSlotIDs: [], cachedPersona: nil
+            runId: "exec-1", viewer: nil, liveState: nil, cachedPersona: nil
         )
         XCTAssertEqual(anonymous.headerTitle, "Worker exec-1 finished")
         XCTAssertNil(anonymous.headerBadge)
@@ -816,23 +793,21 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         // real type and activity; a missing wire type is the one Unknown.
         let listed = WorkerSlotSnapshot.render(
             runId: "exec-1", viewer: nil, liveState: Self.makeLiveState(slotId: 7, agentType: "coding", pool: "main"),
-            liveStatusDisabledSlotIDs: [7], cachedPersona: "Riker"
+            cachedPersona: "Riker"
         )
         XCTAssertFalse(listed.isPlaceholder)
         XCTAssertEqual(listed.bodyKind, .viewerMissing)
         XCTAssertTrue(listed.isViewerMissing)
         XCTAssertEqual(listed.slotId, 7)
-        XCTAssertFalse(listed.liveStatusEnabled)
         XCTAssertEqual(listed.headerBadge, .coding)
         XCTAssertEqual(listed.statusPillLabel, "Working")
         XCTAssertEqual(listed.headerTitle, "Riker is working")
         let untyped = WorkerSlotSnapshot.render(
             runId: "exec-1", viewer: attached, liveState: Self.makeLiveState(agentType: nil),
-            liveStatusDisabledSlotIDs: [], cachedPersona: nil
+            cachedPersona: nil
         )
         XCTAssertEqual(untyped.headerBadge, .unknown)
         XCTAssertEqual(untyped.headerTitle, "Worker exec-1 is fixing the scraper")
-        XCTAssertTrue(untyped.showsLiveStatusToggle)
     }
 
     func testIdleReplacesKindBadgeUntilWorkResumes() {
@@ -841,7 +816,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
                 let snapshot = WorkerSlotSnapshot.render(
                     runId: "exec-1", viewer: nil,
                     liveState: Self.makeLiveState(activity: activity, agentType: kind),
-                    liveStatusDisabledSlotIDs: [], cachedPersona: nil
+                    cachedPersona: nil
                 )
                 if activity == .idle {
                     XCTAssertNil(snapshot.headerBadge, kind)
@@ -857,12 +832,12 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         let live = Self.makeLiveState(name: "Crusher")
         let titled = WorkerSlotSnapshot.build(
             slot: WorkerSlot(slotId: 1, runId: "exec-1", summary: nil, taskTitle: "kanban: revision cards"),
-            liveState: live, liveStatusEnabled: true
+            liveState: live
         )
         XCTAssertEqual(titled.headerTitle, "Crusher: kanban: revision cards")
-        let bare = WorkerSlotSnapshot.build(slot: WorkerSlot(slotId: 1, runId: "exec-1"), liveState: live, liveStatusEnabled: true)
+        let bare = WorkerSlotSnapshot.build(slot: WorkerSlot(slotId: 1, runId: "exec-1"), liveState: live)
         XCTAssertEqual(bare.headerTitle, "Crusher is working")
-        XCTAssertNil(WorkerSlotSnapshot.build(slot: WorkerSlot(slotId: 1), liveState: nil, liveStatusEnabled: true).statusPillLabel)
+        XCTAssertNil(WorkerSlotSnapshot.build(slot: WorkerSlot(slotId: 1), liveState: nil).statusPillLabel)
     }
 
     func testParseMembershipMetadata() throws {
@@ -898,8 +873,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         )
         let snap = WorkerSlotSnapshot.build(
             slot: WorkerSlot(slotId: 1, runId: "exec-1"),
-            liveState: live,
-            liveStatusEnabled: true
+            liveState: live
         )
         let links = snap.headerWorkLinks
         XCTAssertEqual(links?.workItemId, "task_header")
@@ -919,8 +893,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         )
         let snap = WorkerSlotSnapshot.build(
             slot: WorkerSlot(slotId: 1, runId: "exec-1"),
-            liveState: live,
-            liveStatusEnabled: true
+            liveState: live
         )
         let links = snap.headerWorkLinks
         XCTAssertEqual(links?.shortIdLabel, "T42")
@@ -932,29 +905,25 @@ final class WorkerSlotSnapshotTests: XCTestCase {
     func testHeaderWorkLinksNilWithoutWorkItem() {
         let unbound = WorkerSlotSnapshot.build(
             slot: WorkerSlot(slotId: 1, runId: "exec-1"),
-            liveState: Self.makeLiveState(),
-            liveStatusEnabled: true
+            liveState: Self.makeLiveState()
         )
         XCTAssertNil(unbound.headerWorkLinks)
 
         let emptyId = WorkerSlotSnapshot.build(
             slot: WorkerSlot(slotId: 1, runId: "exec-1"),
-            liveState: Self.makeLiveState(workItemId: "", workItemShortId: 42, productId: "prod_boss"),
-            liveStatusEnabled: true
+            liveState: Self.makeLiveState(workItemId: "", workItemShortId: 42, productId: "prod_boss")
         )
         XCTAssertNil(emptyId.headerWorkLinks)
 
         let noShortId = WorkerSlotSnapshot.build(
             slot: WorkerSlot(slotId: 1, runId: "exec-1"),
-            liveState: Self.makeLiveState(workItemId: "task_header", productId: "prod_boss"),
-            liveStatusEnabled: true
+            liveState: Self.makeLiveState(workItemId: "task_header", productId: "prod_boss")
         )
         XCTAssertNil(noShortId.headerWorkLinks)
 
         let noLive = WorkerSlotSnapshot.build(
             slot: WorkerSlot(slotId: 1),
-            liveState: nil,
-            liveStatusEnabled: true
+            liveState: nil
         )
         XCTAssertNil(noLive.headerWorkLinks)
     }
@@ -998,8 +967,8 @@ final class WorkerSlotSnapshotTests: XCTestCase {
 
     // MARK: - WorkersDetailView Equatable
 
-    /// Closures must not participate in `==` — otherwise every ContentView
-    /// re-render that rebuilds the toggle handler would defeat `.equatable()`
+    /// Reveal-work-item handlers must not participate in `==` — otherwise
+    /// every ContentView re-render would defeat `.equatable()`
     /// and re-lay-out all 40 slots.
     func testDetailViewEquatableIgnoresClosures() {
         let workspace = WorkersWorkspaceModel()
@@ -1008,57 +977,29 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             workspace: workspace,
             liveStates: liveStates,
             isVisible: true,
-            liveStatusDisabledSlotIDs: [],
-            onToggleLiveStatus: { _, _ in }
+            onRevealWorkItem: { _, _ in XCTFail("First reveal handler must not run during equality") }
         )
         let b = WorkersDetailView(
             workspace: workspace,
             liveStates: liveStates,
             isVisible: true,
-            liveStatusDisabledSlotIDs: [],
-            onToggleLiveStatus: { _, _ in }
+            onRevealWorkItem: { _, _ in XCTFail("Second reveal handler must not run during equality") }
         )
         XCTAssertEqual(a, b)
-    }
-
-    func testDetailViewEquatableTracksLiveStatusDisabledSet() {
-        let workspace = WorkersWorkspaceModel()
-        let liveStates = LiveWorkerStateStore()
-        let on: (Int, Bool) -> Void = { _, _ in }
-        let a = WorkersDetailView(
-            workspace: workspace,
-            liveStates: liveStates,
-            isVisible: true,
-            liveStatusDisabledSlotIDs: [],
-            onToggleLiveStatus: on
-        )
-        let b = WorkersDetailView(
-            workspace: workspace,
-            liveStates: liveStates,
-            isVisible: true,
-            liveStatusDisabledSlotIDs: [3],
-            onToggleLiveStatus: on
-        )
-        XCTAssertNotEqual(a, b)
     }
 
     func testDetailViewEquatableTracksVisibility() {
         let workspace = WorkersWorkspaceModel()
         let liveStates = LiveWorkerStateStore()
-        let on: (Int, Bool) -> Void = { _, _ in }
         let visible = WorkersDetailView(
             workspace: workspace,
             liveStates: liveStates,
-            isVisible: true,
-            liveStatusDisabledSlotIDs: [],
-            onToggleLiveStatus: on
+            isVisible: true
         )
         let hidden = WorkersDetailView(
             workspace: workspace,
             liveStates: liveStates,
-            isVisible: false,
-            liveStatusDisabledSlotIDs: [],
-            onToggleLiveStatus: on
+            isVisible: false
         )
         XCTAssertNotEqual(visible, hidden)
     }
@@ -1071,17 +1012,13 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         let a = WorkersDetailView(
             workspace: workspace,
             liveStates: liveStates,
-            isVisible: true,
-            liveStatusDisabledSlotIDs: [],
-            onToggleLiveStatus: { _, _ in }
+            isVisible: true
         )
         let otherWorkspace = WorkersWorkspaceModel()
         let c = WorkersDetailView(
             workspace: otherWorkspace,
             liveStates: liveStates,
-            isVisible: true,
-            liveStatusDisabledSlotIDs: [],
-            onToggleLiveStatus: { _, _ in }
+            isVisible: true
         )
         XCTAssertNotEqual(a, c)
     }

@@ -156,9 +156,6 @@ extension ChatViewModel {
     /// - automations: the list and open history, only while the tab is mounted.
     /// - design docs: the open reader and async-viewer documents, whose
     ///   revalidated bodies arrive as pushes.
-    ///
-    /// `list_live_status_disabled_slots` is not here: the engine never
-    /// pushes it, so there is nothing to have lost.
     func fireResyncRefetch() {
         pendingResyncRefetchTask = nil
         guard resyncRefetchGate.isDirty else { return }

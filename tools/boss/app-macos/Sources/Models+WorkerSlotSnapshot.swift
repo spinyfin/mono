@@ -95,10 +95,10 @@ struct WorkerSlotLiveSlice: Equatable {
     }
 }
 
-/// Per-slot view input. Closures stay off this type so a parent rebuild
-/// of `onToggleLiveStatus` cannot defeat `.equatable()`. `session` is
-/// compared by identity: the terminal `NSViewRepresentable` is keyed on
-/// the same object, and pointer equality is the cheap "same pane"
+/// Per-slot view input. Closures such as the reveal-work-item handler stay
+/// off this type so a parent rebuild cannot defeat `.equatable()`.
+/// `session` is compared by identity: the terminal `NSViewRepresentable`
+/// is keyed on the same object, and pointer equality is the cheap "same pane"
 /// signal. Equatable is isolated to the main actor (same shape as
 /// `WorkBoardCardView`) because `session` is a `@MainActor` class.
 struct WorkerSlotSnapshot: @MainActor Equatable {
@@ -110,7 +110,6 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
     /// viewer-missing card; non-nil means `WorkerPaneTerminalView`
     /// stays mounted.
     let session: TerminalPaneSession?
-    let liveStatusEnabled: Bool
     let live: WorkerSlotLiveSlice?
     /// Engine-released cell retained by a layout epoch ("Riker finished").
     let isPlaceholder: Bool
@@ -223,11 +222,6 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
         return live?.activity.agentsPaneLabel
     }
 
-    /// Whether the live-status toggle is addressable. A finished placeholder
-    /// is historical text, not a worker: its slot may already belong to a
-    /// new run.
-    var showsLiveStatusToggle: Bool { !isPlaceholder }
-
     /// Compact header row linking the bound work item and its PR.
     /// `nil` when the pane has no work item (ad-hoc) or the engine has
     /// not yet assigned a short id.
@@ -265,7 +259,6 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
             && lhs.summary == rhs.summary
             && lhs.taskTitle == rhs.taskTitle
             && lhs.session === rhs.session
-            && lhs.liveStatusEnabled == rhs.liveStatusEnabled
             && lhs.live == rhs.live
             && lhs.isPlaceholder == rhs.isPlaceholder
             && lhs.cachedPersona == rhs.cachedPersona
@@ -275,7 +268,6 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
     static func build(
         slot: WorkerSlot,
         liveState: WorkerLiveState?,
-        liveStatusEnabled: Bool,
         isPlaceholder: Bool = false,
         cachedPersona: String? = nil,
         viewerAttachFailure: String? = nil
@@ -286,7 +278,6 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
             summary: slot.summary,
             taskTitle: slot.taskTitle,
             session: slot.session,
-            liveStatusEnabled: liveStatusEnabled,
             live: liveState.map(WorkerSlotLiveSlice.init),
             isPlaceholder: isPlaceholder,
             cachedPersona: cachedPersona,
@@ -313,7 +304,6 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
         runId: String,
         viewer: WorkerSlot?,
         liveState: WorkerLiveState?,
-        liveStatusDisabledSlotIDs: Set<Int>,
         cachedPersona: String?,
         viewerAttachFailure: String? = nil
     ) -> WorkerSlotSnapshot {
@@ -322,7 +312,6 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
         return build(
             slot: slot,
             liveState: liveState,
-            liveStatusEnabled: !liveStatusDisabledSlotIDs.contains(slotId),
             isPlaceholder: liveState == nil,
             cachedPersona: cachedPersona,
             viewerAttachFailure: viewerAttachFailure

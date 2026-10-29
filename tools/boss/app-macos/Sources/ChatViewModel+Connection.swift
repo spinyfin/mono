@@ -29,7 +29,6 @@ extension ChatViewModel {
         // reads are required on reconnect too, including after an engine restart.
         engine.sendListProducts()
         engine.sendListWorkerLiveStates()
-        engine.sendListLiveStatusDisabledSlots()
         // Pull the engine's configuration health on every (re)connect
         // so the top-of-window banner reflects the *current* engine,
         // not the one we attached to before a restart (#699).

@@ -168,7 +168,7 @@ final class ResyncRefetchTests: XCTestCase {
         XCTAssertEqual(recorder.sent.filter {
             $0["type"] as? String == "list_engine_attempts" && $0["limit"] as? Int == 200
         }.count, 0, "hidden Activity needs no history read")
-        for verb in ["list_live_status_disabled_slots", "list_planner_runs", "list_attention_groups", "list_attention_items_for_work_item"] {
+        for verb in ["list_planner_runs", "list_attention_groups", "list_attention_items_for_work_item"] {
             XCTAssertNil(recorder.counts[verb], "\(verb) is not state that a dropped push carries")
         }
     }
