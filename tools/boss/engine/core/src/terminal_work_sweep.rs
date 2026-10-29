@@ -1320,12 +1320,20 @@ mod tests {
         let cube = RecordingCubeClient::default();
         let lease_id = "lease-25";
         force_cube_lease_id(&db, &execution_id, lease_id);
-        let workspace = tempfile::tempdir().unwrap();
+        // A path that does not exist is provably empty, so the occupancy
+        // gate does not swallow the missing recovery pointer. A live
+        // tempfile would be UNKNOWN on a Linux sandbox whose /proc scan
+        // hits an unreadable same-uid cwd, and that keep reason does not
+        // file bookmark attention.
+        let missing_workspace = {
+            let dir = tempfile::tempdir().unwrap();
+            dir.path().join("never-created").display().to_string()
+        };
         {
             let conn = db.connect().unwrap();
             conn.execute(
                 "UPDATE work_executions SET workspace_path = ?2 WHERE id = ?1",
-                rusqlite::params![execution_id, workspace.path().display().to_string()],
+                rusqlite::params![execution_id, missing_workspace],
             )
             .unwrap();
         }
