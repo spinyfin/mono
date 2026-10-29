@@ -448,9 +448,22 @@ pub fn spawn_group_leader_sleeper() -> std::process::Child {
     use std::os::unix::process::CommandExt;
     use std::process::Command;
 
+    // A private working directory per sleeper: the run-process reap treats
+    // anything whose cwd is inside the pane shell's cwd as the run's, so
+    // sleepers sharing the test process's cwd would be killed by whichever
+    // sibling test reaps first.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let cwd = std::env::temp_dir().join(format!(
+        "boss-sleeper-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&cwd).expect("create sleeper cwd");
+
     unsafe {
         Command::new("sleep")
             .arg("300")
+            .current_dir(&cwd)
             .pre_exec(|| {
                 // setpgid(0, 0): become our own process group leader.
                 if libc::setpgid(0, 0) != 0 {
