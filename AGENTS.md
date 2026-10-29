@@ -96,6 +96,12 @@ When a CI check or repository check (checkleft, file-size, lint, test) is failin
 
 Required behavior: fix the real problem — split the oversized file, fix the lint/compile error, fix the test failure, resolve the root cause. If a check genuinely SHOULD be relaxed (a legitimately needed exclusion or threshold change), that is a human decision — STOP and surface it for operator approval with full justification. Do not decide this autonomously.
 
+### `change/file-count` failures: split the change, do not ask for an exception
+
+When `change/file-count` fires on feature work, the remedy is to split the change into stacked PRs along capability boundaries, each coherent and independently reviewable. Do not request a `BYPASS_CHANGE_FILE_COUNT` exception or a higher limit for feature work. Exceptions are only for the cases named in `CHECKS.yaml`: coordinated renames and generated trees that cannot be split.
+
+Check the footprint early, not after the work is built. Once the shape of the change is clear, and again before final validation, run the file-count check or `jj diff --stat` against the base. If the change is heading past the limit, stop and propose the split with `boss propose blocked`, listing the concrete PRs, before building the rest.
+
 ## Builder pattern convention
 
 Structs with **more than 5 fields** in `boss-protocol` (and in `boss-engine`'s internal types) use `#[derive(bon::Builder)]` with `#[builder(on(String, into))]`. This prevents additive-change PRs from touching every construction site across the repo.
