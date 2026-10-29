@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use workspace_procs::{Ownership, Scope, Signal, SpareReason, SystemProcessTable, reap, scan};
+use workspace_procs::{
+    Ownership, Scope, Signal, SpareReason, SystemWorkspaceProcessTable, WorkspaceProcessTable, reap, scan,
+};
 
 fn fresh_dir(name: &str) -> PathBuf {
     let base = std::env::var_os("TEST_TMPDIR")
@@ -58,7 +60,7 @@ fn wait_until(limit: Duration, mut ready: impl FnMut() -> bool) -> bool {
 #[test]
 fn detached_loop_is_killed_and_bazel_server_lookalike_is_spared() {
     let workspace = fresh_dir("reap-ws");
-    let table = SystemProcessTable;
+    let table = SystemWorkspaceProcessTable;
 
     let loop_pid = leave_a_loop_behind(&workspace);
     assert!(alive(loop_pid), "loop must be running after its shell exited");
@@ -123,7 +125,7 @@ fn loop_inside_a_renamed_workspace_is_still_found_under_its_new_name() {
     let staged = parent.join(".removing-mono-agent-042");
     std::fs::rename(&live, &staged).unwrap();
 
-    let table = SystemProcessTable;
+    let table = SystemWorkspaceProcessTable;
     let seen = scan(&table, &Scope::for_workspace(&staged)).unwrap();
     assert!(
         seen.owned.iter().any(|o| o.process.pid == loop_pid),
@@ -150,12 +152,12 @@ fn descendant_of_a_root_is_owned_even_outside_the_paths() {
         .stdin(Stdio::null())
         .spawn()
         .unwrap();
-    let table = SystemProcessTable;
+    let table = SystemWorkspaceProcessTable;
     let me = std::process::id() as i32;
     // Scope rooted at this test process, with no paths: our own sleeper is a
     // descendant; we ourselves are protected.
     let scope = Scope {
-        roots: vec![me],
+        roots: vec![(me, table.snapshot(me).unwrap().start_micros)],
         paths: vec![],
         include_bazel_output_bases: false,
     };

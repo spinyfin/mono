@@ -56,6 +56,7 @@ rust_test(
     ),
     deps = [
         "//lib/rust/workspace_procs",
+        "//lib/rust/workspace_procs:workspace_procs_testing",
         "//tools/boss/engine/test-git",
     ] + all_crate_deps(
         normal = True,

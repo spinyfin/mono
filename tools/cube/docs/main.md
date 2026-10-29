@@ -585,8 +585,8 @@ workspace — under whatever name it currently has, so a staged
 and age on stderr and in a `workspace.processes_reaped` audit event. The
 workspace's Bazel server is spared on purpose (it exits on its own idle
 timeout) and recognised by the `bazel(<workspace>)` name the client gives it;
-an interactive shell a human has `cd`'d into the workspace is reported, not
-killed. A release proceeds regardless, naming any survivor. A removal does
+all other occupants, including tty-attached tools and server action children,
+are subject to cleanup. A release proceeds regardless, naming any survivor. A removal also refuses an unreadable process table; it does
 not: unlinking a directory with live occupants is how the leak above hid, so it
 fails with the survivors' pids and leaves the directory for a later pass. The
 scan itself lives in `lib/rust/workspace_procs`, shared with the engine; see

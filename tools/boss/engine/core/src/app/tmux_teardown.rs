@@ -228,14 +228,24 @@ impl ServerState {
         // The group ladder alone misses what the run left in *other* groups
         // — detached tool shells, their backgrounded subshells, anything
         // already re-parented to launchd — so the ownership-based reap runs
-        // first, while the pane shell is still alive to report the workspace
-        // path through its working directory (`crate::run_process_reap`).
+        // first, using the recorded workspace and the pane's process identity
+        // (`crate::run_process_reap`).
         if let Some(pane_pid) = identity
             .pane_pid
             .and_then(|pid| i32::try_from(pid).ok())
             .filter(|pid| *pid > 0)
         {
-            crate::run_process_reap::reap_pane_tree(execution_id, pane_pid);
+            let workspace = self
+                .work_db
+                .get_execution(execution_id)
+                .ok()
+                .and_then(|run| run.workspace_path);
+            crate::run_process_reap::reap_pane_tree(
+                execution_id,
+                pane_pid,
+                workspace.as_deref().map(std::path::Path::new),
+            )
+            .await;
             reap_worker_process_tree(pane_pid, Duration::from_secs(5));
         }
 

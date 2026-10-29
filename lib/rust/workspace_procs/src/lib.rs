@@ -1,61 +1,10 @@
-//! Find and kill the processes a finished run left behind in a workspace.
-//!
-//! # The leak this closes
-//!
-//! A worker run ends, its terminal pane is torn down, and yet processes the
-//! run started keep going: a `( while :; do …; done ) &` subshell from a tool
-//! command that was cut short before its `kill`, a test binary stranded in a
-//! Bazel sandbox, a daemon. They re-parent to launchd (pid 1), so nothing
-//! that walks *down* from the pane's shell finds them, and killing the pane
-//! shell's process group misses them too: an agent's tool shells are spawned
-//! detached into their own groups, and a backgrounded subshell inherits the
-//! tool shell's group, not the pane's. Observed live: a pane shell in group
-//! 30509, the agent in group 31286, its tool shell in group 35428, and a
-//! `( sleep 30 ) &` from that shell in 35428 — three groups, one run. The
-//! workspace is then released and even removed underneath the survivors,
-//! which is how four fork loops ran for four days with their working
-//! directory in a `.removing-*` directory.
-//!
-//! # Ownership
-//!
-//! A process belongs to a run when either holds:
-//!
-//! - **Descendant**: its parent chain reaches one of the run's root pids
-//!   (the pane shell). Catches everything still attached, whatever its
-//!   process group.
-//! - **Working directory**: its current directory is inside one of the run's
-//!   paths — the workspace (under whatever name it currently has, so a
-//!   staged `.removing-<id>` directory counts) or the workspace's Bazel output
-//!   base, where Bazel runs test actions. The working directory is read from
-//!   the kernel, so it survives re-parenting and names the directory's
-//!   *current* path after a rename.
-//!
-//! Three kinds of process are deliberately **spared** and reported instead
-//! of killed:
-//!
-//! - the workspace's Bazel server ([`bazel::is_bazel_server`]): long-lived
-//!   on purpose, exits on its own idle timeout; its `--output_base=` is what
-//!   extends the sweep to the output base in the first place;
-//! - live descendants of that server (actions it is still running; it
-//!   cancels them itself when its client goes away);
-//! - a process with a controlling terminal that is owned only by working
-//!   directory: a human's interactive shell that happens to be `cd`'d into
-//!   the workspace. Nothing a worker's detached tool runner spawns has one.
-//!
-//! The caller's own process and its ancestors are never candidates, so a
-//! `cube workspace release` typed from a shell inside the workspace cannot
-//! kill the shell it was typed into.
-//!
-//! # Killing
-//!
-//! [`reap`] sends `SIGTERM` to every owned process, waits up to a grace
-//! period for them to exit, rescans (a fork loop keeps producing children
-//! until its loop process is gone), sends `SIGKILL` to whatever is left,
-//! rescans once more and reports the survivors. Every signal is checked
-//! against the process start time recorded at the scan, so a pid recycled
-//! in between is never signalled.
+//! Reap descendants and workspace occupants, including re-parented tools.
+//! Escalation follows captured identities; only Bazel servers are spared.
 
 pub mod bazel;
+#[cfg(target_os = "macos")]
+pub mod darwin;
+pub mod process_args;
 pub mod process_table;
 
 use std::collections::{HashMap, HashSet};
@@ -63,7 +12,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-pub use process_table::{LiveProcess, ProcessTable, Signal, StaticProcessTable, SystemProcessTable, fake_process};
+pub use process_table::{LiveProcess, Signal, SystemWorkspaceProcessTable, WorkspaceProcessTable};
 
 /// Bound on an ancestry walk; the launcher chain between a pane shell and a
 /// tool's own subprocesses is a dozen deep at most.
@@ -80,7 +29,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Scope {
     /// Pids whose live descendants belong to the run (the pane shell).
-    pub roots: Vec<i32>,
+    pub roots: Vec<(i32, u64)>,
     /// Directories whose occupants belong to the run: the workspace path (or
     /// its staged removal path) and anything else the caller knows about.
     pub paths: Vec<PathBuf>,
@@ -100,9 +49,9 @@ impl Scope {
         }
     }
 
-    pub fn with_root(mut self, pid: i32) -> Self {
-        if pid > 1 {
-            self.roots.push(pid);
+    pub fn with_root(mut self, process: &LiveProcess) -> Self {
+        if process.pid > 1 {
+            self.roots.push((process.pid, process.start_micros));
         }
         self
     }
@@ -135,16 +84,12 @@ impl Ownership {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SpareReason {
     BazelServer,
-    BazelServerDescendant { server: i32 },
-    Interactive,
 }
 
 impl SpareReason {
     pub fn describe(&self) -> String {
         match self {
             Self::BazelServer => "bazel server (left to its idle timeout)".to_owned(),
-            Self::BazelServerDescendant { server } => format!("child of live bazel server pid {server}"),
-            Self::Interactive => "has a controlling terminal; owned only by working directory".to_owned(),
         }
     }
 }
@@ -214,6 +159,8 @@ pub struct ReapReport {
     /// Owned-but-spared processes, from the final scan.
     pub spared: Vec<SparedProcess>,
     pub passes: usize,
+    /// Inconclusive verification, retaining the partial signal audit.
+    pub error: Option<String>,
 }
 
 impl ReapReport {
@@ -228,7 +175,7 @@ impl ReapReport {
     }
 
     pub fn is_clean(&self) -> bool {
-        self.survivors.is_empty()
+        self.survivors.is_empty() && self.error.is_none()
     }
 
     /// `pid (command)` for each survivor, for an error message.
@@ -242,11 +189,15 @@ impl ReapReport {
 }
 
 /// Classify every live process against `scope`. Read-only.
-pub fn scan(table: &dyn ProcessTable, scope: &Scope) -> io::Result<Scan> {
+pub fn scan(table: &dyn WorkspaceProcessTable, scope: &Scope) -> io::Result<Scan> {
     let processes = table.list()?;
     let by_pid: HashMap<i32, &LiveProcess> = processes.iter().map(|p| (p.pid, p)).collect();
     let protected = ancestry(table.own_pid(), &by_pid);
-    let roots: HashSet<i32> = scope.roots.iter().copied().filter(|p| *p > 1).collect();
+    let roots: HashSet<i32> = scope
+        .roots
+        .iter()
+        .filter_map(|(pid, start)| by_pid.get(pid).filter(|p| p.start_micros == *start).map(|_| *pid))
+        .collect();
 
     let mut paths: Vec<PathBuf> = scope.paths.iter().map(|p| canonical(p)).collect();
     let servers: Vec<&LiveProcess> = processes.iter().filter(|p| bazel::is_bazel_server(p)).collect();
@@ -264,6 +215,9 @@ pub fn scan(table: &dyn ProcessTable, scope: &Scope) -> io::Result<Scan> {
                 paths.push(canonical(&base));
             }
         }
+    }
+    for path in &paths {
+        validate_path(path)?;
     }
     paths.sort();
     paths.dedup();
@@ -288,25 +242,7 @@ pub fn scan(table: &dyn ProcessTable, scope: &Scope) -> io::Result<Scan> {
         } else {
             continue;
         };
-        // A server's live descendants are its own to cancel — unless one of
-        // the run's roots sits between them and the server, in which case
-        // the server is merely an ancestor of the run (the case under
-        // `bazel test`, where every test process descends from one) and the
-        // process is the run's.
-        let server_ancestor = chain
-            .iter()
-            .take_while(|p| !roots.contains(p))
-            .skip(1)
-            .find(|p| server_pids.contains(p));
-        let reason = if server_pids.contains(&process.pid) {
-            Some(SpareReason::BazelServer)
-        } else if let Some(server) = server_ancestor {
-            Some(SpareReason::BazelServerDescendant { server: *server })
-        } else if process.has_controlling_terminal && descendant_root.is_none() {
-            Some(SpareReason::Interactive)
-        } else {
-            None
-        };
+        let reason = server_pids.contains(&process.pid).then_some(SpareReason::BazelServer);
         match reason {
             Some(reason) => spared.push(SparedProcess {
                 process: process.clone(),
@@ -327,7 +263,11 @@ pub fn scan(table: &dyn ProcessTable, scope: &Scope) -> io::Result<Scan> {
 /// Deliver `signal` to each of `owned`, skipping any whose pid now belongs to
 /// a different process (start time changed) or has already exited. Returns
 /// the signals actually sent.
-pub fn signal_owned(table: &dyn ProcessTable, owned: &[OwnedProcess], signal: Signal) -> Vec<SignalledProcess> {
+pub fn signal_owned(
+    table: &dyn WorkspaceProcessTable,
+    owned: &[OwnedProcess],
+    signal: Signal,
+) -> Vec<SignalledProcess> {
     let now = table.now_micros();
     let mut sent = Vec::new();
     for target in owned {
@@ -353,14 +293,14 @@ pub fn signal_owned(table: &dyn ProcessTable, owned: &[OwnedProcess], signal: Si
 }
 
 /// Whether any of `targets` is still the same live process.
-pub fn any_alive(table: &dyn ProcessTable, targets: &[OwnedProcess]) -> bool {
+pub fn any_alive(table: &dyn WorkspaceProcessTable, targets: &[OwnedProcess]) -> bool {
     targets
         .iter()
         .any(|t| matches!(table.snapshot(t.process.pid), Ok(live) if live.start_micros == t.process.start_micros))
 }
 
 /// Wait until none of `targets` is alive or `limit` has elapsed.
-pub fn wait_for_exit(table: &dyn ProcessTable, targets: &[OwnedProcess], limit: Duration) {
+pub fn wait_for_exit(table: &dyn WorkspaceProcessTable, targets: &[OwnedProcess], limit: Duration) {
     let deadline = Instant::now() + limit;
     while any_alive(table, targets) && Instant::now() < deadline {
         std::thread::sleep(POLL_INTERVAL);
@@ -370,7 +310,7 @@ pub fn wait_for_exit(table: &dyn ProcessTable, targets: &[OwnedProcess], limit: 
 /// The blocking `SIGTERM` → grace → rescan → `SIGKILL` → rescan ladder. See
 /// the crate docs. Never returns early on a signalling failure; an owned
 /// process that cannot be signalled shows up as a survivor.
-pub fn reap(table: &dyn ProcessTable, scope: &Scope, grace: Duration) -> io::Result<ReapReport> {
+pub fn reap(table: &dyn WorkspaceProcessTable, scope: &Scope, grace: Duration) -> io::Result<ReapReport> {
     let first = scan(table, scope)?;
     let mut report = ReapReport {
         passes: 1,
@@ -383,7 +323,13 @@ pub fn reap(table: &dyn ProcessTable, scope: &Scope, grace: Duration) -> io::Res
     report.signalled.extend(signal_owned(table, &first.owned, Signal::Term));
     wait_for_exit(table, &first.owned, grace);
 
-    let second = scan(table, scope)?;
+    let second = match escalation_scan(table, &first.owned) {
+        Ok(scan) => scan,
+        Err(err) => {
+            report.error = Some(err.to_string());
+            return Ok(report);
+        }
+    };
     report.passes = 2;
     if !second.owned.is_empty() {
         report
@@ -392,7 +338,23 @@ pub fn reap(table: &dyn ProcessTable, scope: &Scope, grace: Duration) -> io::Res
         wait_for_exit(table, &second.owned, KILL_SETTLE);
     }
 
-    let third = scan(table, scope)?;
+    // Verify the directory as well as retained identities. A newly orphaned
+    // occupant must block removal even when it was not an escalation target.
+    let mut verification_scope = scope.clone();
+    verification_scope.roots.extend(
+        first
+            .owned
+            .iter()
+            .chain(&second.owned)
+            .map(|target| (target.process.pid, target.process.start_micros)),
+    );
+    let third = match scan(table, &verification_scope) {
+        Ok(scan) => scan,
+        Err(err) => {
+            report.error = Some(err.to_string());
+            return Ok(report);
+        }
+    };
     report.passes = 3;
     report.survivors = third.owned;
     report.spared = third.spared;
@@ -422,3 +384,39 @@ fn canonical(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests;
+
+/// Follow captured identities and their descendants, never new path occupants.
+pub fn escalation_scan(table: &dyn WorkspaceProcessTable, targets: &[OwnedProcess]) -> io::Result<Scan> {
+    scan(
+        table,
+        &Scope {
+            roots: targets
+                .iter()
+                .map(|t| (t.process.pid, t.process.start_micros))
+                .collect(),
+            ..Scope::default()
+        },
+    )
+}
+
+fn validate_path(path: &Path) -> io::Result<()> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if !path.is_absolute()
+        || path.parent().is_none()
+        || home.is_some_and(|home| {
+            canonical(&home).starts_with(path)
+                || canonical(&home.join(".local/share/cube/workspaces")).starts_with(path)
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing broad process ownership path {}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+extern crate self as workspace_procs;
+#[cfg(test)]
+mod testing;

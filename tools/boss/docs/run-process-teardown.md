@@ -30,15 +30,11 @@ The rules live in `lib/rust/workspace_procs` and are shared by the engine and cu
 
 The process running the sweep and its own ancestors are never candidates, so `cube workspace release` typed from a shell inside the workspace cannot kill that shell.
 
-Three kinds of owned process are spared and reported instead of killed:
-
-- **The workspace's Bazel server.** It is meant to stay warm across runs and exits on its own idle timeout. Its working directory is the workspace root, so it would otherwise be the first thing a working-directory sweep killed. It is recognised by its command line, never by being a `java` process: the Bazel client renames the server's `argv[0]` to `bazel(<workspace basename>)` and passes `--output_base=` and `--workspace_directory=`; the kernel still reports the executable as `java`. Either the renamed `argv[0]` or the `A-server.jar` plus `--output_base=` pair identifies it.
-- **Live descendants of that server**, which are actions it is still running and cancels itself when its client goes away. A run's own root always wins over this rule, because under `bazel test` every test process descends from a server.
-- **A process with a controlling terminal that is owned only by working directory**: a human's interactive shell `cd`'d into the workspace. Nothing a worker's detached tool runner spawns has a controlling terminal, so this spares humans without sparing orphans. A tty-attached descendant of the pane shell is still killed.
+Only the workspace's Bazel server is spared and reported. It is recognised by the renamed argv[0] form `bazel(<workspace>)`, or the `A-server.jar` and `--output_base=` pair, never by the executable name alone. Server action children and processes holding a controlling terminal are subject to the same ownership rules as other tools.
 
 ## Killing and logging
 
-The ladder is `SIGTERM` to every owned process, a grace period waiting for them to exit, a rescan (a fork loop keeps producing children until its loop process is gone), `SIGKILL` to whatever is still owned, a short settle and a final rescan that reports survivors. Every signal is checked against the process start time recorded at the scan, so a pid recycled in between is never signalled.
+The ladder sends `SIGTERM` to owned processes and retains their (pid, start-time) identities through the grace period. Escalation scans those identities and descendants of targets still alive with the same start time; it never discovers new targets by workspace path. This keeps re-parented TERM-resistant tools in scope without touching a later lease's occupants or a recycled root pid. The KILL pass uses that identity fence. Final verification also reports new directory occupants without signalling them, so a newly orphaned process blocks removal. Process-list failures retain the partial signal report and make verification inconclusive.
 
 Every process killed is logged with pid, command, age, which signal, why it was owned and its argument vector:
 
@@ -47,11 +43,14 @@ Every process killed is logged with pid, command, age, which signal, why it was 
 
 ## Where it runs
 
-- **Pane release** (`tmux_teardown.rs`, every path that reaps a verified tmux worker): `run_process_reap::reap_pane_tree`. The pane pid is the ancestry root and the pane shell's own working directory supplies the workspace path while the shell is still alive. `SIGTERM` is synchronous so the release stays prompt; the `SIGKILL` pass runs detached after the grace period. The pane process-group ladder still runs after it.
+- **Pane release** (`tmux_teardown.rs`): the pane pid and start time supply the ancestry root; the execution's recorded workspace supplies the path. The pane's mutable cwd is never trusted. The full ladder runs on a blocking thread and is awaited before lease release. Broad path roots (root, home, ancestors of the default cube workspace pool) are rejected.
 - **Lease release** (`finish_worker_teardown` and `force_release`): `run_process_reap::reap_workspace` with the workspace path captured before the terminalizing write nulled it, immediately before `cube workspace release`.
 - **cube `workspace release` and `force-release`**: sweep and kill before the reset; the release proceeds whatever happened, with survivors in the message, stderr and audit log. Every engine termination path releases its lease through this command, so it is the net under the engine-side passes.
-- **cube removal** (`workspace remove --expunge`, pool trim): sweep and kill before the directory is staged, again under the staged `.removing-<id>` name before it is unlinked, and before a leftover staged directory is cleared. A survivor fails the removal with `refusing to remove workspace directory …: processes are still running inside it after SIGTERM and SIGKILL: <pid (command)>`; the directory is left in place for a later pass.
+- **cube removal** (`workspace remove --expunge`, pool trim): sweep and kill before the directory is staged, again under the staged `.removing-<id>` name before it is unlinked, and before a leftover staged directory is cleared. A survivor or inconclusive process scan fails the removal with `refusing to remove workspace directory …: processes are still running inside it after SIGTERM and SIGKILL: <pid (command)>`; the directory is left in place for a later pass.
+
+- **Expired leases and setup failures**: cube sweeps and audits these transitions too, and verifies the selected workspace before setup. Expiry sweeps use the `expire` phase. A failed verification refuses reuse.
+- **Removal audit**: a spared Bazel server is noteworthy even when no signals were sent; its pid remains in the removal audit.
 
 ## Verifying
 
-`bazel test //lib/rust/workspace_procs/...` includes an integration test that starts a worker-like `sh` which backgrounds an infinite `sleep` loop and exits, leaving the loop re-parented to pid 1 with its working directory in a temporary "workspace", alongside a `sleep` renamed to `bazel(…)`. The reap kills the loop with `SIGTERM` alone and leaves the look-alike server running. A second test renames the workspace to `.removing-<id>` first and finds the loop under its new name. `bazel test //tools/cube/... //tools/boss/engine/core:engine_lib_test` covers the cube guard and the engine's two passes against a fabricated process table.
+`bazel test //lib/rust/workspace_procs/...` includes an integration test that starts a worker-like `sh` which backgrounds an infinite `sleep` loop and exits, leaving the loop re-parented to pid 1 with its working directory in a temporary "workspace", alongside a `sleep` renamed to `bazel(…)`. The reap kills the loop with `SIGTERM` alone and leaves the look-alike server running. A second test renames the workspace to `.removing-<id>` first and finds the loop under its new name. `bazel test //tools/cube/... //tools/boss/engine/core:engine_lib_test` covers scan failures at removal, deterministic identity fencing across workspace reuse and re-parenting, and the engine's real `reap_workspace` entry point with a detached loop and Bazel look-alike.

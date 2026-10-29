@@ -32,7 +32,7 @@ rust_library(
         "//tools/boss/engine/transcript-markdown:__pkg__",
         "//tools/boss/github_tracker:__pkg__",
     ],
-    deps = all_crate_deps(normal = True),
+    deps = ["//lib/rust/workspace_procs"] + all_crate_deps(normal = True),
 )
 
 rust_test(
