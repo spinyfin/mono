@@ -68,7 +68,21 @@ impl WorkDb {
     }
 }
 
+/// Direct associations only: product tree attentions feed the tracker-sync banner.
 pub(in crate::work) fn list_items(conn: &Connection, work_item_id: &str) -> Result<Vec<WorkAttentionItem>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at, converted_task_id
+         FROM work_attention_items WHERE work_item_id = ?1
+         ORDER BY created_at ASC, id ASC",
+    )?;
+    collect_rows(stmt.query_map([work_item_id], map_attention_item)?)
+}
+
+/// Work-item details also include spawn failures, resolving guides to their root task.
+pub(in crate::work) fn list_items_with_spawn_failures(
+    conn: &Connection,
+    work_item_id: &str,
+) -> Result<Vec<WorkAttentionItem>> {
     let mut stmt = conn.prepare(
             "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at, converted_task_id
              FROM work_attention_items

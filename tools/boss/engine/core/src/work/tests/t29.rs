@@ -537,3 +537,37 @@ fn insert_attention_merge_rejects_a_duplicate_canonical_duplicate_pair() {
     );
     assert_eq!(db.list_attention_merges_for_canonical(&canonical).unwrap().len(), 1);
 }
+
+#[test]
+fn product_design_spawn_failure_stays_out_of_tracker_sync_attentions() {
+    let db = WorkDb::open(temp_db_path("product-spawn-attention")).unwrap();
+    let product = create_test_product_named(&db, "Product spawn attention");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(product.id.clone())
+                .kind(ExecutionKind::ProductDesign)
+                .repo_remote_url("https://github.com/test/repo")
+                .status(ExecutionStatus::Failed)
+                .build(),
+        )
+        .unwrap();
+    let failure = open_execution_attention(&db, &execution.id, "pane_spawn_failed");
+    let sync = db
+        .create_attention_item(CreateAttentionItemInput {
+            execution_id: None,
+            work_item_id: Some(product.id.clone()),
+            kind: "external_tracker_sync".to_owned(),
+            status: None,
+            title: "Sync failed".to_owned(),
+            body_markdown: "Tracker unavailable".to_owned(),
+            resolved_at: None,
+        })
+        .unwrap();
+    let details = db.list_attention_items_for_work_item(&product.id).unwrap();
+    assert!(details.iter().any(|item| item.id == failure));
+    assert!(details.iter().any(|item| item.id == sync.id));
+    let tree = db.get_work_tree(&product.id).unwrap();
+    assert_eq!(tree.attention_items.len(), 1);
+    assert_eq!(tree.attention_items[0].id, sync.id);
+}

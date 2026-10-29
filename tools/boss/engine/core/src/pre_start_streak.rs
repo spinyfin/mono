@@ -288,8 +288,8 @@ pub fn health_issue_for(alert: &SpawnFailureStreak, now_epoch_secs: i64) -> Engi
         ),
         body: format!(
             "Latest error ({latest}, execution {execution}):\n{error}\n\n\
-             Every {driver} {kind} spawn since the first failure {first} has failed before a worker \
-             pane existed; none has succeeded. This alert updates on each further failure and clears \
+             Every {driver} {kind} spawn since the first failure {first} has failed during spawn or \
+             spawn confirmation (no worker started its first turn). This alert updates on each further failure and clears \
              itself on the next successful {driver} {kind} spawn. Dispatch is not paused by it. Each \
              failed execution also has its own `spawn_failed` entry in its dispatch event log.",
             latest = phrase(alert.latest_failure_epoch_s),

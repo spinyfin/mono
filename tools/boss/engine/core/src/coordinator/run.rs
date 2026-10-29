@@ -422,7 +422,7 @@ impl ExecutionCoordinator {
                             execution_id = %execution.id,
                             error = %err_detail,
                             "pre-start spawn failure streak: consecutive spawns for this driver and \
-                             worker kind have failed before a pane existed, with no success in between",
+                             worker kind have failed during spawn or spawn confirmation, with no worker starting its first turn",
                         );
                     }
                 }
