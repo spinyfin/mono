@@ -70,9 +70,34 @@ async fn conflict_answer_recovery_preserves_writer_exclusion() {
             .answer_attention(&attention, Some("yes".into()), false, false)
             .unwrap();
         let result = db
-            .action_attention_group(&group.id, false, &Default::default(), &checker)
+            .action_attention_group_as_actor(
+                &group.id,
+                false,
+                &Default::default(),
+                &checker,
+                boss_protocol::LAST_STATUS_ACTOR_HUMAN,
+            )
             .unwrap();
         let recovery = &result.produced_work_item_ids[0];
+        for (property, basis, order) in [
+            ("status", "insert_revision_in_tx", "ASC"),
+            ("autostart", "order_recovery_in_tx", "DESC"),
+        ] {
+            let (ledger_basis, ledger_actor): (String, String) = db
+                .connect()
+                .unwrap()
+                .query_row(
+                    &format!(
+                        "SELECT basis, actor FROM task_status_audit
+                         WHERE work_item_id = ?1 AND property = ?2 ORDER BY id {order} LIMIT 1"
+                    ),
+                    params![recovery, property],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(ledger_basis, basis, "{property}");
+            assert_eq!(ledger_actor, boss_protocol::LAST_STATUS_ACTOR_HUMAN, "{property}");
+        }
         let consumer = db.list_executions(Some(recovery)).unwrap().remove(0);
         if writer_status != "failed" {
             assert_eq!(db.gating_prereqs_for(recovery).unwrap(), vec![writer.clone()]);

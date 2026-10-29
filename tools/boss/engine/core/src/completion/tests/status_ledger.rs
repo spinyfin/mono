@@ -1,3 +1,4 @@
+use super::super::ConflictDeliveryDecision;
 use super::*;
 use crate::work::{
     AddDependencyInput, CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_PR_REVIEW_PREFIX, CiRemediationInsertInput,
@@ -12,17 +13,6 @@ use boss_protocol::{
     CreateInvestigationInput, OperatorAnswer, OperatorAnswerType, OperatorQuestion, ProposalKind, ReviewLanguageBucket,
     ReviewProfile,
 };
-
-fn records_repeat_worker_failed_observation(basis: WorkerFailureBasis) -> bool {
-    match basis {
-        WorkerFailureBasis::NudgeBreaker
-        | WorkerFailureBasis::DeclaredBlocked
-        | WorkerFailureBasis::DeliveredWithoutPr
-        | WorkerFailureBasis::ForeignPrBinding
-        | WorkerFailureBasis::OperatorNo => true,
-        WorkerFailureBasis::ConflictDeliveryUnverified => false,
-    }
-}
 
 fn latest_ledger(db: &WorkDb, work_item_id: &str, property: &str) -> (String, String) {
     db.connect()
@@ -135,15 +125,6 @@ fn start_waiting_human(db: &WorkDb, work_item_id: &str) -> crate::work::WorkExec
 }
 
 #[test]
-fn worker_failure_basis_all_is_index_aligned() {
-    assert_eq!(WorkerFailureBasis::all().len(), WorkerFailureBasis::COUNT);
-    for (i, basis) in WorkerFailureBasis::all().iter().copied().enumerate() {
-        assert_eq!(basis.index(), i, "{}", basis.as_str());
-        assert_eq!(WorkerFailureBasis::all()[basis.index()], basis);
-    }
-}
-
-#[test]
 fn operator_declined_answer_records_operator_no() {
     let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
     let product = create_test_product(&db);
@@ -236,17 +217,6 @@ fn bounce_and_explicit_start_clears_record_exact_bases() {
     assert_eq!(basis, "nudge_breaker");
     assert_eq!(actor, "engine");
 
-    let unverified = create_test_chore(&db, product.id.clone(), "Conflict delivery");
-    let unverified_exec = start_waiting_human(&db, &unverified.id);
-    db.record_worker_failure_with_basis(
-        &unverified_exec.id,
-        "conflict delivery unverified",
-        WorkerFailureBasis::ConflictDeliveryUnverified,
-    )
-    .unwrap();
-    let (basis, actor) = latest_ledger(&db, &unverified.id, "blocked_reason");
-    assert_eq!(basis, "conflict_delivery_unverified");
-    assert_eq!(actor, "engine");
     db.request_execution(
         RequestExecutionInput::builder()
             .work_item_id(&failed.id)
@@ -294,7 +264,7 @@ fn merge_conflict_and_dependency_producers_record_their_basis() {
 #[test]
 fn worker_failure_bases_each_record_a_repeat_observation() {
     let (db, product) = memory_db();
-    for producer in WorkerFailureBasis::all() {
+    for producer in WorkerFailureBasis::ALL {
         let chore = create_test_chore(&db, product.clone(), producer.as_str());
         let exec = start_waiting_human(&db, &chore.id);
         db.record_worker_failure_with_basis(&exec.id, "first failure", WorkerFailureBasis::NudgeBreaker)
@@ -322,13 +292,8 @@ fn worker_failure_bases_each_record_a_repeat_observation() {
                 |r| r.get(0),
             )
             .unwrap();
-        if records_repeat_worker_failed_observation(*producer) {
-            assert_latest(&db, &chore.id, "blocked_reason", producer.as_str(), "engine");
-            assert!(second_id > first_id, "{}", producer.as_str());
-        } else {
-            assert_latest(&db, &chore.id, "blocked_reason", "nudge_breaker", "engine");
-            assert_eq!(second_id, first_id, "{}", producer.as_str());
-        }
+        assert_latest(&db, &chore.id, "blocked_reason", producer.as_str(), "engine");
+        assert!(second_id > first_id, "{}", producer.as_str());
     }
 }
 
@@ -1644,4 +1609,117 @@ fn reconcile_revision_execution_records_its_basis() {
         .unwrap();
     db.reconcile_product_executions(&parent.product_id).unwrap();
     assert_latest(&db, &revision.id, "status", "reconcile_revision_execution", "engine");
+}
+
+/// Production-path coverage: each failure producer is driven through the real
+/// completion handler and the exact ledger basis it records is asserted.
+mod failure_producers {
+    use super::*;
+    use crate::merge_poller::OpenPrMergeability;
+
+    fn declare(db: &WorkDb, execution_id: &str, outcome: &str) {
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET run_done_outcome = ?2, run_done_declared_at = '2026-10-13T00:00:00Z' \
+                 WHERE id = ?1",
+                rusqlite::params![execution_id, outcome],
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn nudge_breaker_records_nudge_breaker() {
+        let workspace = tempdir().unwrap();
+        let (_dir, db, _product, chore_id, execution_id) = fixture(workspace.path());
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_max_unproductive_nudges(1);
+        let mut parked = false;
+        for _ in 0..3 {
+            parked |= matches!(
+                handler.on_stop(&execution_id).await,
+                StopOutcome::NudgeBreakerParked { .. }
+            );
+        }
+        assert!(parked, "the breaker must trip");
+        assert_latest(&db, &chore_id, "blocked_reason", "nudge_breaker", "engine");
+    }
+
+    #[tokio::test]
+    async fn delivered_without_pr_records_delivered_without_pr() {
+        let workspace = tempdir().unwrap();
+        let (_dir, db, _product, chore_id, execution_id) = fixture(workspace.path());
+        declare(&db, &execution_id, "delivered");
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None)).handler;
+        let outcome = handler
+            .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
+            .await;
+        assert!(
+            matches!(outcome, StopOutcome::RunDoneDeclaredWithoutDelivery { .. }),
+            "{outcome:?}"
+        );
+        assert_latest(&db, &chore_id, "blocked_reason", "delivered_without_pr", "engine");
+    }
+
+    #[tokio::test]
+    async fn declared_blocked_records_declared_blocked() {
+        let workspace = tempdir().unwrap();
+        let (_dir, db, _product, chore_id, execution_id) = fixture(workspace.path());
+        declare(&db, &execution_id, "blocked");
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None)).handler;
+        let outcome = handler
+            .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::Blocked)
+            .await;
+        assert!(
+            matches!(outcome, StopOutcome::RunDoneDeclaredWithoutDelivery { .. }),
+            "{outcome:?}"
+        );
+        assert_latest(&db, &chore_id, "blocked_reason", "declared_blocked", "engine");
+    }
+
+    #[tokio::test]
+    async fn foreign_pr_guard_records_foreign_pr_binding() {
+        const OWN_PR: &str = "https://github.com/spinyfin/mono/pull/1764";
+        let workspace = tempdir().unwrap();
+        let (_dir, db, product_id, chore_id, execution_id) = fixture(workspace.path());
+        let other = create_test_chore(&db, product_id, "The real owner");
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET pr_url = ?2, status = 'done' WHERE id = ?1",
+                rusqlite::params![other.id, OWN_PR],
+            )
+            .unwrap();
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(Some(OWN_PR))).handler;
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(matches!(outcome, StopOutcome::ForeignPrRefused { .. }), "{outcome:?}");
+        assert_latest(&db, &chore_id, "blocked_reason", "foreign_pr_binding", "engine");
+    }
+
+    #[tokio::test]
+    async fn conflict_delivery_failures_record_delivered_without_pr() {
+        let pr = "https://github.com/spinyfin/mono/pull/2070";
+        // Missing bound PR URL arm.
+        let workspace = tempdir().unwrap();
+        let (_dir, db, _, _, revision, execution_id, _) = conflict_revision_fixture(workspace.path(), pr, "old-head");
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None)).handler;
+        let execution = db.get_execution(&execution_id).unwrap();
+        let decision = handler.conflict_delivery_decision(&execution, None).await;
+        assert!(matches!(decision, ConflictDeliveryDecision::Failed(_)));
+        assert_latest(&db, &revision, "blocked_reason", "delivered_without_pr", "engine");
+
+        // GitHub still reports a conflict arm.
+        let workspace = tempdir().unwrap();
+        let (_dir, db, _, _, revision, execution_id, _) = conflict_revision_fixture(workspace.path(), pr, "old-head");
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_merge_probe(Arc::new(FixedMergeabilityProbe {
+                mergeability: OpenPrMergeability::Conflict,
+            }));
+        let execution = db.get_execution(&execution_id).unwrap();
+        let decision = handler.conflict_delivery_decision(&execution, Some(pr)).await;
+        assert!(matches!(decision, ConflictDeliveryDecision::Failed(_)));
+        assert_latest(&db, &revision, "blocked_reason", "delivered_without_pr", "engine");
+    }
 }

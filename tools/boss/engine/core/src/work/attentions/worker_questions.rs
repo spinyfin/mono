@@ -48,6 +48,7 @@ pub(super) fn order_recovery_in_tx(
     conn: &Connection,
     source: &Task,
     recovery: &Task,
+    actor: &str,
 ) -> Result<()> {
     let now = now_string();
     let prefix = boss_protocol::CREATED_VIA_CONFLICT_RECOVERY_PREFIX;
@@ -65,7 +66,13 @@ pub(super) fn order_recovery_in_tx(
         deps::insert_edge(conn, &recovery.id, &edge.prerequisite_id, RELATION_BLOCKS, &now)?;
     }
     deps::insert_edge(conn, &source.id, &recovery.id, RELATION_BLOCKS, &now)?;
-    conn.execute("UPDATE tasks SET autostart = 1 WHERE id = ?1", [&recovery.id])?;
+    crate::work::task_status_audit::execute(
+        conn,
+        "order_recovery_in_tx",
+        actor,
+        "UPDATE tasks SET autostart = 1 WHERE id = ?1",
+        [&recovery.id],
+    )?;
     maybe_engine_unblock_dependent(pending, conn, &recovery.id, &now)?;
     let task = query_task(conn, &recovery.id).require("task", &recovery.id)?;
     reconcile_revision_execution(pending, conn, &mut ExecutionReconcileResult::default(), &task)?;

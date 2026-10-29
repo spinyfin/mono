@@ -595,6 +595,7 @@ pub(super) async fn handle_action_attention_group(ctx: Dispatch, req: FrontendRe
         sink,
         session_id,
         request_id,
+        peer_pid,
         ..
     } = ctx;
     let FrontendRequest::ActionAttentionGroup {
@@ -605,7 +606,8 @@ pub(super) async fn handle_action_attention_group(ctx: Dispatch, req: FrontendRe
     else {
         unreachable!()
     };
-    match work_db.action_attention_group(&id, skip_unanswered, &member_overrides, &GhPrStateChecker) {
+    let actor = super::process_signals::resolve_status_actor(&server_state, peer_pid);
+    match work_db.action_attention_group_as_actor(&id, skip_unanswered, &member_overrides, &GhPrStateChecker, actor) {
         Ok(ActionedAttentionGroup {
             group,
             produced_work_item_ids,

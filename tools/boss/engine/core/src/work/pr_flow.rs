@@ -15,15 +15,11 @@ pub(crate) const DELETION_SIGNOFF_BLOCKED_REASON: &str = "deletion_signoff";
 /// Why a worker-failure status write happened.
 ///
 /// The shipped `blocked_reason` trigger records a new `worker_failed`
-/// observation for [`Self::NudgeBreaker`], [`Self::DeclaredBlocked`],
-/// [`Self::DeliveredWithoutPr`], [`Self::ForeignPrBinding`], and
-/// [`Self::OperatorNo`] even when the displayed reason is unchanged.
-/// [`Self::ConflictDeliveryUnverified`] records on the first transition to
-/// `worker_failed`; a same-reason repeat does not, because that variant is
-/// not in the trigger IN-list. [`Self::index`] is exhaustive; [`Self::all`]
-/// is a `[Self; COUNT]` array whose `index` values must be `0..COUNT` in
-/// order, so a new variant must be added to `index`, `all`, `COUNT`, and
-/// `as_str` together.
+/// observation for every variant, even when the displayed reason is
+/// unchanged; its repeat-observation list is generated from [`Self::ALL`].
+/// A delivery whose conflict resolution cannot be verified is recorded as
+/// [`Self::DeliveredWithoutPr`]: the worker declared delivery that the engine
+/// could not confirm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerFailureBasis {
     NudgeBreaker,
@@ -31,57 +27,27 @@ pub enum WorkerFailureBasis {
     DeliveredWithoutPr,
     ForeignPrBinding,
     OperatorNo,
-    ConflictDeliveryUnverified,
 }
 
-impl WorkerFailureBasis {
-    /// Declaration order. A new variant must be added at the end, given the
-    /// next index, appended to [`Self::all`], and included in `as_str`.
-    pub const fn index(self) -> usize {
-        match self {
-            Self::NudgeBreaker => 0,
-            Self::DeclaredBlocked => 1,
-            Self::DeliveredWithoutPr => 2,
-            Self::ForeignPrBinding => 3,
-            Self::OperatorNo => 4,
-            Self::ConflictDeliveryUnverified => 5,
+macro_rules! worker_failure_basis_variants {
+    ($($variant:ident => $str:literal),+ $(,)?) => {
+        impl WorkerFailureBasis {
+            /// Every basis, sharing the exhaustive string mapping.
+            pub const ALL: &'static [WorkerFailureBasis] = &[$(WorkerFailureBasis::$variant),+];
+            pub fn as_str(self) -> &'static str {
+                match self { $(Self::$variant => $str),+ }
+            }
         }
-    }
-
-    pub const COUNT: usize = 6;
-
-    pub const fn all() -> &'static [Self] {
-        const ALL: [WorkerFailureBasis; WorkerFailureBasis::COUNT] = [
-            WorkerFailureBasis::NudgeBreaker,
-            WorkerFailureBasis::DeclaredBlocked,
-            WorkerFailureBasis::DeliveredWithoutPr,
-            WorkerFailureBasis::ForeignPrBinding,
-            WorkerFailureBasis::OperatorNo,
-            WorkerFailureBasis::ConflictDeliveryUnverified,
-        ];
-        &ALL
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::NudgeBreaker => "nudge_breaker",
-            Self::DeclaredBlocked => "declared_blocked",
-            Self::DeliveredWithoutPr => "delivered_without_pr",
-            Self::ForeignPrBinding => "foreign_pr_binding",
-            Self::OperatorNo => "operator_no",
-            Self::ConflictDeliveryUnverified => "conflict_delivery_unverified",
-        }
-    }
+    };
 }
 
-const _: () = {
-    assert!(WorkerFailureBasis::all().len() == WorkerFailureBasis::COUNT);
-    let mut i = 0;
-    while i < WorkerFailureBasis::COUNT {
-        assert!(WorkerFailureBasis::all()[i].index() == i);
-        i += 1;
-    }
-};
+worker_failure_basis_variants! {
+    NudgeBreaker => "nudge_breaker",
+    DeclaredBlocked => "declared_blocked",
+    DeliveredWithoutPr => "delivered_without_pr",
+    ForeignPrBinding => "foreign_pr_binding",
+    OperatorNo => "operator_no",
+}
 
 /// A task held in PendingReview with no live pre-merge batch, waiting for
 /// weighted admission to retry.
@@ -558,10 +524,6 @@ impl WorkDb {
     /// diagnostic is folded into `blocked_detail` when a blocked reason
     /// already exists. Resources are released even for a deleted task. A
     /// repeated call is a no-op. Explicit retries retain workspace recovery.
-    pub fn record_worker_failure(&self, execution_id: &str, detail: &str) -> Result<Option<WorkerFailureCompletion>> {
-        self.record_worker_failure_with_basis(execution_id, detail, WorkerFailureBasis::DeclaredBlocked)
-    }
-
     pub fn record_worker_failure_with_basis(
         &self,
         execution_id: &str,
@@ -569,6 +531,13 @@ impl WorkDb {
         basis: WorkerFailureBasis,
     ) -> Result<Option<WorkerFailureCompletion>> {
         self.record_worker_failure_or_question(execution_id, detail, None, basis)
+    }
+
+    /// Test-only shorthand recording [`WorkerFailureBasis::DeclaredBlocked`];
+    /// production callers must name the producing basis.
+    #[cfg(test)]
+    pub fn record_worker_failure(&self, execution_id: &str, detail: &str) -> Result<Option<WorkerFailureCompletion>> {
+        self.record_worker_failure_with_basis(execution_id, detail, WorkerFailureBasis::DeclaredBlocked)
     }
 
     pub fn record_worker_awaiting_operator_answer(

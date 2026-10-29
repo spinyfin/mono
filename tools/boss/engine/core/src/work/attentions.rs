@@ -868,6 +868,7 @@ fn action_question_group(
     group: &AttentionGroup,
     members: &[Attention],
     pr_checker: &dyn PrStateChecker,
+    actor: &str,
 ) -> Result<(String, String, Vec<String>)> {
     let answered: Vec<&Attention> = members.iter().filter(|m| m.answer_state == "answered").collect();
     if answered.is_empty() {
@@ -909,10 +910,10 @@ fn action_question_group(
             // may be design or implementation work, so the chain root's
             // reasoning mode should be inherited.
             .build();
-        match assert_parent_revisable_and_insert(pending, conn, input, pr_checker) {
+        match assert_parent_revisable_and_insert_as_actor(pending, conn, input, pr_checker, actor) {
             Ok(revision) => {
                 if let Some(source) = recovery_source {
-                    worker_questions::order_recovery_in_tx(pending, conn, source, &revision)?;
+                    worker_questions::order_recovery_in_tx(pending, conn, source, &revision, actor)?;
                 }
                 let reference = serde_json::json!({
                     "task_id": revision.id,
@@ -1211,6 +1212,25 @@ impl WorkDb {
         member_overrides: &std::collections::HashMap<String, FollowupMemberOverride>,
         pr_checker: &dyn PrStateChecker,
     ) -> Result<ActionedAttentionGroup> {
+        self.action_attention_group_as_actor(
+            id,
+            skip_unanswered,
+            member_overrides,
+            pr_checker,
+            boss_protocol::LAST_STATUS_ACTOR_ENGINE,
+        )
+    }
+
+    /// Like [`Self::action_attention_group`], but records `actor` on the
+    /// ledger rows of the revision an answered question group produces.
+    pub fn action_attention_group_as_actor(
+        &self,
+        id: &str,
+        skip_unanswered: bool,
+        member_overrides: &std::collections::HashMap<String, FollowupMemberOverride>,
+        pr_checker: &dyn PrStateChecker,
+        actor: &str,
+    ) -> Result<ActionedAttentionGroup> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
@@ -1270,7 +1290,7 @@ impl WorkDb {
 
         let mut pending = PendingEvents::new();
         let (produced_kind, produced_ref, produced_work_item_ids) = match group.kind.as_str() {
-            "question" => action_question_group(&mut pending, &tx, &group, &members, pr_checker)?,
+            "question" => action_question_group(&mut pending, &tx, &group, &members, pr_checker, actor)?,
             "followup" => action_followup_group(&tx, &group, &members, member_overrides)?,
             other => bail!("cannot action attention group {} of kind {other:?}", group.id),
         };

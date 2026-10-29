@@ -69,7 +69,9 @@ use crate::merge_poller::{
 };
 use crate::metrics::Registry;
 use crate::nudge_breaker::{DEFAULT_MAX_UNPRODUCTIVE_NUDGES, NudgeBreaker, NudgeDecision};
-use crate::work::{CreateAttentionItemInput, PendingMergeCheck, WorkDb, WorkItem, WorkerPrCompletionTarget};
+use crate::work::{
+    CreateAttentionItemInput, PendingMergeCheck, WorkDb, WorkItem, WorkerFailureBasis, WorkerPrCompletionTarget,
+};
 #[cfg(test)]
 use crate::work::{FinishExecutionRunInput, TaskStatus};
 use crate::worker_escalation::{self, WorkerSignal, WorkerSignalKind};
