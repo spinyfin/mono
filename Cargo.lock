@@ -694,6 +694,7 @@ dependencies = [
  "tokio",
  "tracing",
  "wiremock",
+ "workspace-procs",
 ]
 
 [[package]]
@@ -2891,6 +2892,7 @@ dependencies = [
  "toml",
  "uuid",
  "which",
+ "workspace-procs",
 ]
 
 [[package]]
@@ -7455,6 +7457,13 @@ dependencies = [
  "log",
  "thiserror 1.0.69",
  "wast 35.0.2",
+]
+
+[[package]]
+name = "workspace-procs"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
