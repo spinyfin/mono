@@ -36,9 +36,11 @@ export CI_BAZEL_FLAGS="--config=ci-${OS_TYPE} --experimental_disk_cache_gc_max_s
 export REPOBIN_BAZEL_FLAGS="$CI_BAZEL_FLAGS"
 
 # Bazel daemon idle TTL for every CI pipeline and OS: 30 minutes, so idle
-# servers on shared CI hosts (e.g. 16 GB Macs) release their memory. This is a
-# startup option set only here (CI), never in an rc file a developer's plain
-# `bazel` reads; startup options can't be selected via --config.
+# servers on shared CI hosts (e.g. 16 GB Macs) release their memory. Local
+# builds default to 2 hours via `startup --max_idle_secs=7200` in the root
+# .bazelrc. CI passes this flag on the command line so it overrides that local
+# default; startup options can't be selected via --config. This is the single
+# source of truth for CI's value.
 BAZEL_MAX_IDLE_SECS=1800
 
 BAZEL_STARTUP_FLAGS="--max_idle_secs=${BAZEL_MAX_IDLE_SECS}"

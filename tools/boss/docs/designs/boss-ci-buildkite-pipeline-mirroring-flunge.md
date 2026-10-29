@@ -11,9 +11,9 @@ The pipeline is live and branch protection on `main` is on. A PR to mono cannot 
 
 ## Motivating incident
 
-On 2026-05-12, the `#[cfg(test)]` blocks in the engine's `completion.rs` and `merge_poller.rs` drifted out of sync with their prod signatures. `cargo test -p boss-engine --no-run` reported six compile errors on `main`. The drift sat undetected on `main` for roughly twenty-four hours. La Forge's investigation in closed PR #438 (chore `task_18af35a1e855d7f0_24`) tracked down the cause; the doc didn't land on main, but the findings stand.
+On 2026-05-12, the `#[cfg(test)]` blocks in the engine's `completion.rs` and `merge_poller.rs` drifted out of sync with their prod signatures. `cargo test -p boss-engine --no-run` reported six compile errors on `main`. The drift sat undetected on `main` for roughly twenty-four hours. La Forge's investigation in closed PR #438 tracked down the cause; the doc didn't land on main, but the findings stand.
 
-Why nothing caught it: at the time, `bazel test //tools/boss/engine/...` resolved to only two integration test targets — there was no `rust_test(crate=":engine_lib")`, so bazel silently skipped 561 lib tests. Sibling chore `task_18af3caac58d9748_2c` ("P1") closed that gap; after the engine's crate split, the rule lives at `//tools/boss/engine/core:engine_lib_test`. With no other gate, every dispatched worker was a bet that what landed on `main` since the last green check was still buildable.
+Why nothing caught it: at the time, `bazel test //tools/boss/engine/...` resolved to only two integration test targets — there was no `rust_test(crate=":engine_lib")`, so bazel silently skipped 561 lib tests. Adding the missing `rust_test(crate=":engine_lib")` closed that gap; after the engine's crate split, the rule lives at `//tools/boss/engine/core:engine_lib_test`. With no other gate, every dispatched worker was a bet that what landed on `main` since the last green check was still buildable.
 
 This design is the structural fix: a buildkite pipeline for the mono repo, mirroring the shape of the existing flunge pipeline, gating merges on green.
 
@@ -30,7 +30,7 @@ This design is the structural fix: a buildkite pipeline for the mono repo, mirro
 - **Engine-side gating.** The engine never bypasses branch protection, but it does now perform merges directly when a human asks it to, via the `MergeWhenReady` RPC: `direct`-mechanism products shell out to `gh pr merge --auto --squash` (`merge_when_ready.rs`), which still honours required-status-checks rather than skipping them; `trunk_queue`-mechanism products (PR #2185) submit the PR to Trunk's merge queue via REST instead (`trunk_merge.rs`, `boss_trunk_client::TrunkClient`) and never touch `gh pr merge` at all. Branch protection remains the only enforcement layer — `MergeWhenReady` triggers a compliant merge, it doesn't route around one. PR #599's grep-guard `sh_test` (now at `tools/boss/engine/core/tests/no_gh_pr_merge_test.sh`) has been re-scoped accordingly: it no longer bans `gh pr merge` outright (that would now fail on the legitimate `direct`-mechanism call site) but instead fails if that invocation appears anywhere _other than_ `merge_when_ready.rs`, so a second, unreviewed merge call site can't creep in elsewhere.
 - **Performance dashboards.** Flunge doesn't have one; nor does this.
 - **macOS app code-signing / notarisation CI.** Still out of scope. Note the boundary moved, though: _building and testing_ the macOS app in CI turned out to be necessary and shipped as the required `mac-app-build` step (see below) — only signing/notarisation remains a follow-up.
-- **Engine test-suite perf work.** Tracked separately under P2 (`task_18af3cad1705c0a8_2d`).
+- **Engine test-suite perf work.** Separate from pipeline merge gating.
 - **Repobin dispatch-cache.** Landed separately in PR #439.
 - **Cross-repo CI orchestration.** This pipeline gates the mono repo only.
 - **Rewriting `ci_watch.rs`.** The engine already modelled buildkite as a CI provider; once real checks existed, the existing remediation pipeline picked them up without changes, as predicted.
@@ -53,7 +53,7 @@ The original design proposed a `bootstrap.sh` step that would install/pin the ru
 
 ### Alternative C — `cargo` only, drop `bazel` from CI
 
-Rejected, and in fact the outcome inverted it: **bazel-only, no cargo**. The original v1 kept `cargo check --workspace` as a cheap fast-failing compile guard alongside bazel (and PR #565 wired it), but it was dropped the same day (2026-05-15, commit `8ef4895b`) before checks were ever promoted to required. `bazel build` catches everything cargo-check would, P1 made `bazel test` the canonical rust test signal, and a second build system in CI was pure wall-clock and cache-pressure cost. Bazel is the single build/test authority in CI; per repo policy it is also the only sanctioned local path (no bare `cargo`).
+Rejected, and in fact the outcome inverted it: **bazel-only, no cargo**. The original v1 kept `cargo check --workspace` as a cheap fast-failing compile guard alongside bazel (and PR #565 wired it), but it was dropped the same day (2026-05-15, commit `8ef4895b`) before checks were ever promoted to required. `bazel build` catches everything cargo-check would, adding `engine_lib_test` made `bazel test` the canonical rust test signal, and a second build system in CI was pure wall-clock and cache-pressure cost. Bazel is the single build/test authority in CI; per repo policy it is also the only sanctioned local path (no bare `cargo`).
 
 ## As-built pipeline
 
@@ -133,7 +133,7 @@ The design's two-tier plan (v1 disk cache, remote cache as fast-follow) shipped 
 
 - Per-OS cache roots on dedicated SSDs, set in `.ci.bazelrc`: `--disk_cache` + `--repository_cache` under `/mnt/ssd/bazel/` (linux) and `/Volumes/ssd/bazel/` (darwin), selected via `--config=ci-linux` / `--config=ci-darwin` from `.buildkite/steps/ci-env.sh`.
 - Cache GC tuned for CI: `.buildkite/steps/ci-env.sh` computes the size cap per host as 80% of the cache filesystem; `3T` in `.ci.bazelrc` remains the manual-invocation fallback. The age limit is `60d` and the idle delay is 5 minutes, vs the conservative local defaults in `.bazelrc`.
-- Bazel daemon idle TTL (`ci-env.sh`): every CI bazel invocation on every pipeline and OS runs with `--max_idle_secs=1800`, set only in `ci-env.sh` via `CI_BAZEL_STARTUP_FLAGS` and never in an rc file read by local bazel, so idle servers on shared hosts free memory after 30 minutes. All CI bazel entry points read startup flags from one `CI_BAZEL_STARTUP_FLAGS` source of truth, because divergent startup flags spawn duplicate daemons.
+- Bazel daemon idle TTL (`ci-env.sh`): every CI bazel invocation on every pipeline and OS runs with `--max_idle_secs=1800`, passed on the command line via `CI_BAZEL_STARTUP_FLAGS` in `ci-env.sh`, which overrides the local default of `startup --max_idle_secs=7200` (2 hours) in the root `.bazelrc`, so idle servers on shared hosts free memory after 30 minutes. All CI bazel entry points read startup flags from one `CI_BAZEL_STARTUP_FLAGS` source of truth, because divergent startup flags spawn duplicate daemons.
 - Darwin agents pin the Xcode toolchain (`--xcode_version` + `--repo_env=DEVELOPER_DIR`) after two incidents of in-place Xcode updates corrupting cached toolchain state; `ci-env.sh` also detects Xcode-version drift and auto-expunges the stale output base.
 
 Remote cache remains the documented fast-follow, triggered if cold-agent wall-clock becomes painful or the fleet grows enough that inter-agent sharing matters.
@@ -167,5 +167,5 @@ The `.buildkite/` directory now hosts more than the PR gate this design covered.
 4. ~~Wire test steps~~ — **done**, PR #567 (pnpm-test subsequently removed).
 5. ~~Promote checks to required; enable branch protection~~ — **done**, PR #599 + operator enablement; re-ramped through the 2026-07-13 `bazel-build-test` rename.
 6. ~~Surface CI status in Boss UI~~ — **done** (`PrCiIndicator`).
-7. ~~Post-P1 cargo-test cleanup~~ — **moot**; pipeline shipped bazel-only.
+7. ~~Cargo-test cleanup~~ — **moot**; pipeline shipped bazel-only.
 8. Bazel remote cache — **still open as a conditional fast-follow**; no trigger condition met yet.

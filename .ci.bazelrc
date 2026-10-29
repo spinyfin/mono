@@ -29,7 +29,9 @@ build:ci --announce_rc
 # as a build/test flag after the subcommand, which only reaches `build:ci`/
 # `test:ci` lines. The idle TTL (--max_idle_secs=1800, the same for every CI
 # pipeline and OS) is set on the command line instead -- see
-# CI_BAZEL_STARTUP_FLAGS in .buildkite/steps/ci-env.sh.
+# CI_BAZEL_STARTUP_FLAGS in .buildkite/steps/ci-env.sh. That command-line
+# flag takes precedence over the local default of 7200s (2h) set by
+# `startup --max_idle_secs=7200` in the root .bazelrc.
 
 # Linux cache configuration
 build:ci-linux --config=ci
