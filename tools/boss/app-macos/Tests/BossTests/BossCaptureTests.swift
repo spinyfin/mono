@@ -35,8 +35,22 @@ final class BossCaptureTests: XCTestCase {
 
         let empty = BossCaptureArgs.parse(["Boss"])
         XCTAssertNil(empty.captureTo)
+        XCTAssertNil(empty.captureBriefMarkdown)
         XCTAssertFalse(empty.isCaptureMode)
         XCTAssertEqual(empty.captureAfter, BossCaptureArgs.defaultCaptureAfter, accuracy: 0.001)
+
+        let briefFile = BossCaptureArgs.parse([
+            "Boss",
+            "--capture-to=/tmp/brief.png",
+            "--capture-brief-markdown",
+            "/tmp/engine-shaped.md",
+        ])
+        XCTAssertEqual(briefFile.captureBriefMarkdown, "/tmp/engine-shaped.md")
+        let briefEquals = BossCaptureArgs.parse([
+            "Boss",
+            "--capture-brief-markdown=/tmp/eq.md",
+        ])
+        XCTAssertEqual(briefEquals.captureBriefMarkdown, "/tmp/eq.md")
     }
 
     func testSampleNonBlankPixelsDetectsSolidFill() {

@@ -19,6 +19,9 @@ struct BossCaptureArgs: Equatable, Sendable {
     var captureTo: String?
     /// Delay before capture, in seconds.
     var captureAfter: TimeInterval
+    /// Markdown file for `--capture-reveal-state=revision-brief`. Quiet
+    /// capture reads this path instead of compiling a sample into the app.
+    var captureBriefMarkdown: String?
 
     static let defaultCaptureAfter: TimeInterval = 0.6
 
@@ -27,6 +30,7 @@ struct BossCaptureArgs: Equatable, Sendable {
     static func parse(_ arguments: [String]) -> BossCaptureArgs {
         var captureTo: String?
         var captureAfter = defaultCaptureAfter
+        var captureBriefMarkdown: String?
         var i = 1 // skip argv[0]
         while i < arguments.count {
             let arg = arguments[i]
@@ -54,9 +58,23 @@ struct BossCaptureArgs: Equatable, Sendable {
                 i += 1
                 continue
             }
+            if arg == "--capture-brief-markdown", i + 1 < arguments.count {
+                captureBriefMarkdown = arguments[i + 1]
+                i += 2
+                continue
+            }
+            if arg.hasPrefix("--capture-brief-markdown=") {
+                captureBriefMarkdown = String(arg.dropFirst("--capture-brief-markdown=".count))
+                i += 1
+                continue
+            }
             i += 1
         }
-        return BossCaptureArgs(captureTo: captureTo, captureAfter: captureAfter)
+        return BossCaptureArgs(
+            captureTo: captureTo,
+            captureAfter: captureAfter,
+            captureBriefMarkdown: captureBriefMarkdown
+        )
     }
 
     var isCaptureMode: Bool { captureTo != nil }

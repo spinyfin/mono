@@ -354,7 +354,8 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         XCTAssertEqual(chunks, [.plain(source)])
     }
 
-    /// Revision boilerplate stops before findings, regardless of heading level.
+    /// Default-collapsed boilerplate stops at the next heading of any level,
+    /// so findings stay visible outside the fold.
     func testHeadingSectionsKeepsFindingsOutsideBoilerplate() {
         let chunks = MarkdownHeadingSections.chunks(
             in: Self.revisionBrief,
@@ -367,10 +368,9 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         XCTAssertEqual(heading, RevisionBriefCollapsibleHeadings.hardRule)
         XCTAssertTrue(body.contains("FORBIDDEN"))
         XCTAssertFalse(body.contains("### [high]"))
-        XCTAssertFalse(body.contains("Review summary"))
-        guard case .plain(let findings) = chunks[2] else { return XCTFail("expected visible findings") }
-        XCTAssertTrue(findings.contains("### [high]"))
-        XCTAssertTrue(findings.contains("**Review summary:**"))
+        guard case .plain(let finding) = chunks[2] else { return XCTFail("expected finding") }
+        XCTAssertTrue(finding.contains("### [high]"))
+        XCTAssertTrue(finding.contains("**Review summary:**"))
     }
 
     /// Concatenating the chunks (re-adding back the `## ` marker and
@@ -448,10 +448,11 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         ### Next
         """
         let chunks = MarkdownHeadingSections.chunks(in: doc, collapsibleHeadings: ["Indented heading"])
-        XCTAssertEqual(chunks.count, 2, "expected prefix and complete folded outline: \(chunks)")
+        XCTAssertEqual(chunks.count, 3, "expected prefix, fold, and next heading: \(chunks)")
         guard case .collapsible(let heading, let body) = chunks[1] else { return XCTFail("expected a .collapsible chunk") }
         XCTAssertEqual(heading, "Indented heading")
-        XCTAssertTrue(body.hasSuffix("### Next"))
+        XCTAssertFalse(body.contains("### Next"))
+        XCTAssertTrue(chunks[2].renderedText.contains("### Next"))
     }
 
     // MARK: - Find-in-document over a chunked document
@@ -508,6 +509,9 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         state.query = "FORBIDDEN"
         XCTAssertEqual(state.matches.count, 1)
         XCTAssertEqual(state.currentCollapsibleHeadingToExpand, heading)
+        state.query = "null check"
+        XCTAssertEqual(state.matches.count, 1)
+        XCTAssertNil(state.currentCollapsibleHeadingToExpand)
     }
 
     /// A match outside any collapsible chunk must not report a heading to
