@@ -620,12 +620,14 @@ mod work_item_write_tests;
 
 mod board_review_cache_tests;
 mod board_runtime_cache_tests;
+#[cfg(feature = "scale_measurements")]
 mod work_tree_scale_tests;
 
 mod board_patch_tests;
 
 mod design_doc_contention_tests;
 
+#[cfg(feature = "scale_measurements")]
 mod board_projection_scale;
 mod board_projection_tests;
 

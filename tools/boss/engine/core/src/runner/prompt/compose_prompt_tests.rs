@@ -1074,6 +1074,14 @@ fn revision_directive_with_conflict_provenance_injects_conflict_fragment() {
         prompt.contains("## Conflict resolution context"),
         "conflict fragment must be injected into revision directive:\n{prompt}",
     );
+    // Lockfiles go through the engine-owned, lock-preserving path and never
+    // through `cargo generate-lockfile`.
+    assert!(
+        prompt.contains("engine conflicts regenerate-lockfiles --base-branch")
+            && prompt.contains("`cargo update --workspace`")
+            && prompt.contains("never run `cargo generate-lockfile`"),
+        "conflict fragment must steer lockfiles to the lock-preserving path:\n{prompt}",
+    );
     // Must embed the attempt id.
     assert!(
         prompt.contains("`crz_frag_01`"),

@@ -43,6 +43,10 @@ pub(crate) fn builtin_resolvers(base_revision: &str) -> ResolverRegistry {
 pub(crate) struct RungWorkspace<'a> {
     pub(crate) lease: &'a CubeWorkspaceLease,
     pub(crate) resolvers: ResolverFactory<'a>,
+    /// Remote-tracking ref the PR was rebased onto, as cube reported it
+    /// (its GitHub remote is not necessarily named `origin`). `None` falls
+    /// back to `<base_branch>@origin`.
+    pub(crate) base_ref: Option<String>,
 }
 
 /// The escalation-ladder rung a resolution was produced at, recorded in
@@ -139,10 +143,12 @@ pub(crate) enum LadderOutcome {
     /// to close. The attempt stays `pending` with no `revision_task_id`, so
     /// the ladder is retried in full on the next `conflict_watch` tick.
     ///
-    /// Only the lease failure produces this; a resolver that ran and failed
-    /// is deterministic for the PR head and is reported through
+    /// Only the lease failure produces this. A resolver that ran and failed
+    /// on a conflict whose every leftover file is a generated lockfile is
+    /// deterministic for the PR head and is reported through
     /// [`Self::LockfileRegenerationFailed`] instead, so it cannot retry
-    /// silently forever.
+    /// silently forever; a resolver failure on a mixed conflict falls
+    /// through to a worker.
     MechanicalRungsUnavailable,
     /// Every residual conflicted file was a generated lockfile, but its
     /// regeneration failed operationally (tool missing from `PATH`, no
@@ -355,6 +361,7 @@ pub(crate) async fn try_mechanical_rungs_with(
     let workspace = RungWorkspace {
         lease: &lease,
         resolvers,
+        base_ref: None,
     };
     let outcome = run_rung1_in_lease_with(
         work_db,
@@ -447,6 +454,7 @@ pub(crate) async fn run_rung1_in_lease(
     let workspace = RungWorkspace {
         lease,
         resolvers: &builtin_resolvers,
+        base_ref: None,
     };
     run_rung1_in_lease_with(
         work_db,
@@ -594,13 +602,18 @@ pub(crate) async fn run_rung1_in_lease_with(
                 "conflict_ladder: failed to update in-flight marker to rung 0; restart recovery weakened",
             );
         }
+        let rung0_workspace = RungWorkspace {
+            lease: workspace.lease,
+            resolvers: workspace.resolvers,
+            base_ref: rebase.main_ref.clone().or_else(|| workspace.base_ref.clone()),
+        };
         let rung0_outcome = attempt_rung0_with(
             work_db,
             publisher,
             cube_client,
             candidate,
             attempt,
-            workspace,
+            &rung0_workspace,
             &rebase.conflicted_files,
         )
         .await;
@@ -790,6 +803,7 @@ pub(crate) async fn attempt_rung0(
     let workspace = RungWorkspace {
         lease,
         resolvers: &builtin_resolvers,
+        base_ref: None,
     };
     attempt_rung0_with(
         work_db,
@@ -846,7 +860,11 @@ pub(crate) async fn attempt_rung0_with(
         })
         .collect();
 
-    let registry = (workspace.resolvers)(&format!("{}@origin", attempt.base_branch));
+    let base_ref = workspace
+        .base_ref
+        .clone()
+        .unwrap_or_else(|| format!("{}@origin", attempt.base_branch));
+    let registry = (workspace.resolvers)(&base_ref);
     let resolved: Vec<ResolvedFile> = match registry.resolve_all(&lease.workspace_path, &files).await {
         RegistryResolution::AllResolved(resolved) => resolved,
         RegistryResolution::Declined {
@@ -926,6 +944,22 @@ pub(crate) async fn attempt_rung0_with(
     };
 
     if let Err(err) = cube_client.push_resolution(&lease.workspace_path, pr_number).await {
+        if files
+            .iter()
+            .all(|file| boss_deterministic_resolvers::is_generated_lockfile(&file.path))
+        {
+            // A lockfile-only conflict is never a semantic one: a worker would
+            // only hit the same push failure, so halt terminally for this head.
+            let specific = format!("push failed: {err:#}");
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr = pr_number,
+                error = %specific,
+                "conflict_ladder: rung 0 regenerated every lockfile but the push failed; halting without a worker",
+            );
+            halt_attempt_for_lockfile_failure(work_db, publisher, candidate, attempt, residual_paths, &specific).await;
+            return LadderOutcome::LockfileRegenerationFailed;
+        }
         tracing::warn!(
             work_item_id = %candidate.work_item_id,
             pr = pr_number,

@@ -254,11 +254,11 @@ crate::stub_cube_client! { RecoveryRebaseCube {
         Ok(())
     }
     async fn rebase_workspace(&self, _workspace: &std::path::Path, _pr: u64) -> anyhow::Result<crate::coordinator::RebaseOutcome> {
-        Ok(crate::coordinator::RebaseOutcome { clean: true, pushed: true, conflicted_files: vec![], linearized_commits: 0, linearize_decline: None })
+        Ok(crate::coordinator::RebaseOutcome::builder().clean(true).pushed(true).conflicted_files(vec![]).build())
     }
     async fn rebase_workspace_no_push(&self, workspace: &std::path::Path, _pr: u64) -> anyhow::Result<crate::coordinator::RebaseOutcome> {
         JjRepo::run(workspace, &["rebase", "-b", &self.record.head(), "-d", "upstream"]);
-        Ok(crate::coordinator::RebaseOutcome { clean: true, pushed: false, conflicted_files: vec![], linearized_commits: 0, linearize_decline: None })
+        Ok(crate::coordinator::RebaseOutcome::builder().clean(true).pushed(false).conflicted_files(vec![]).build())
     }
     async fn verify_deletion_tripwire(&self, _repo: &str, _head: &str, _base: &str, _pr: u64) -> Vec<String> {
         if self.deletions { vec!["merged parent feature removed".into()] } else { vec![] }
@@ -580,13 +580,13 @@ mod rebase_adoption {
                     self.lease_dir.join("lib.rs"),
                     "<<<<<<< Conflict 1 of 1\n%%%%%%% Changes from base to side #1\n+mod a;\n+++++++ Contents of side #2\nmod b;\n>>>>>>> Conflict 1 of 1 ends\n",
                 ).unwrap();
-                return Ok(crate::coordinator::RebaseOutcome { clean: false, pushed: false, conflicted_files: vec!["lib.rs".into()], linearized_commits: 0, linearize_decline: None });
+                return Ok(crate::coordinator::RebaseOutcome::builder().clean(false).pushed(false).conflicted_files(vec!["lib.rs".into()]).build());
             }
-            Ok(crate::coordinator::RebaseOutcome { clean: true, pushed: true, conflicted_files: vec![], linearized_commits: 0, linearize_decline: None })
+            Ok(crate::coordinator::RebaseOutcome::builder().clean(true).pushed(true).conflicted_files(vec![]).build())
         }
         async fn rebase_workspace_no_push(&self, _workspace: &std::path::Path, _pr: u64) -> anyhow::Result<crate::coordinator::RebaseOutcome> {
             self.rebase();
-            Ok(crate::coordinator::RebaseOutcome { clean: true, pushed: false, conflicted_files: vec![], linearized_commits: 0, linearize_decline: None })
+            Ok(crate::coordinator::RebaseOutcome::builder().clean(true).pushed(false).conflicted_files(vec![]).build())
         }
         async fn push_resolution(&self, _workspace: &std::path::Path, _pr: u64) -> anyhow::Result<()> {
             JjRepo::run(&self.root.repo_path, &["bookmark", "set", &self.root.publication(), "-r", &self.root.head(), "--allow-backwards"]);

@@ -2103,34 +2103,33 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution, bazel_work
     out.push_str(&compose_conflict_ground_truth_fragment(attempt));
     let lockfile_tools = match bazel_workspace {
         Some(true) => {
-            "For `MODULE.bazel.lock`, run `bazel mod deps --lockfile_mode=update`; for `Cargo.lock`, \
-             use Cargo's lockfile generator through the repository's supported tooling."
+            "`bazel mod deps --lockfile_mode=update` for `MODULE.bazel.lock`, the lock-preserving \
+             `cargo update --workspace` for `Cargo.lock`, and the owning package manager for other lockfiles"
         }
         Some(false) => {
-            "Use the package manager that owns the lockfile, as the repository documents it: for \
-             `package-lock.json`, run `npm install` (or `npm install --package-lock-only`); for \
-             `yarn.lock` or `pnpm-lock.yaml`, run `yarn install` or `pnpm install`; for `Cargo.lock`, \
-             use Cargo's lockfile generator through the repository's supported tooling."
+            "the owning package manager for `package-lock.json`, `yarn.lock`, or `pnpm-lock.yaml`, \
+             and the lock-preserving `cargo update --workspace` for `Cargo.lock`"
         }
         None => {
-            "If the workspace has Bazel markers, run `bazel mod deps --lockfile_mode=update` for \
-             `MODULE.bazel.lock` and use Cargo's lockfile generator through the repository's \
-             supported tooling for `Cargo.lock`. Otherwise use the package manager that owns the \
-             lockfile, as the repository documents it: for `package-lock.json`, run `npm install` \
-             (or `npm install --package-lock-only`); for `yarn.lock` or `pnpm-lock.yaml`, run \
-             `yarn install` or `pnpm install`; for `Cargo.lock`, use Cargo's lockfile generator \
-             through the repository's supported tooling."
+            "the repository's owning package manager, using `bazel mod deps --lockfile_mode=update` \
+             for `MODULE.bazel.lock` when Bazel markers exist, and the lock-preserving \
+             `cargo update --workspace` for `Cargo.lock`"
         }
     };
+    let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
     out.push_str(&format!(
         "### Generated lockfiles\n\n\
-         Never hand-merge generated lockfiles or ask a model to choose their entries. \
-         First reconcile the source manifests, then restore only the lockfile from the PR's \
-         base branch and regenerate it with its owning tool against those merged inputs. \
-         {lockfile_tools} Apply the same \
-         base-and-regenerate rule to other package-manager lockfiles. A tool failure is a tooling \
-         blocker, never permission to hand-edit the generated result. Verify GitHub reports the \
-         bound PR `MERGEABLE` after pushing; a local clean tree or a moved head is insufficient.\n\n"
+         Never hand-merge generated lockfiles or ask a model to choose their entries, and never \
+         run `cargo generate-lockfile` (it re-resolves every dependency and turns a conflict into \
+         an unrelated upgrade). First reconcile the source manifests, then run \
+         `{boss} engine conflicts regenerate-lockfiles --base-branch {base}`; pass `--base-ref \
+         <main_ref>` when `{cube} workspace rebase` reported a `main_ref` other than \
+         `{base}@origin`. The engine restores each conflicted lockfile from the PR's base and \
+         regenerates it with its owning tool ({lockfile_tools}). A failure of that command is a \
+         tooling blocker, never permission to hand-edit the generated result. Verify GitHub \
+         reports the bound PR `MERGEABLE` after pushing; a local clean tree or a moved head is \
+         insufficient.\n\n",
+        base = attempt.base_branch,
     ));
     out.push_str(
         "### Preservation rule (HARD CONSTRAINT — read before resolving)\n\n\

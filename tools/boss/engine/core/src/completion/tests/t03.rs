@@ -1282,6 +1282,7 @@ async fn conflict_revision_signal_cleared_retires_attempt_and_finalises() {
         async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
             Ok(PrLifecycleProbe::builder()
                 .url(url.to_owned())
+                .head_ref_oid("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
                 .state(PrLifecycleState::Open(crate::merge_poller::OpenPrStatus::clean()))
                 .labels(Vec::new())
                 .review(crate::merge_poller::PrReviewState::Unknown)
@@ -1297,7 +1298,7 @@ async fn conflict_revision_signal_cleared_retires_attempt_and_finalises() {
         probes,
     } = TestHarness::new(db.clone(), detector);
     let handler = handler
-        .with_branch_verifier(verifier)
+        .with_branch_verifier(super::conflict_delivery::published_verifier(verifier, Ok(head)))
         .with_merge_probe(Arc::new(CleanMergeProbe));
 
     let outcome = handler.on_stop(&execution_id).await;
@@ -1653,7 +1654,12 @@ async fn conflict_revision_on_stop_no_baseline_finalizes_without_false_failure()
     let TestHarness {
         handler, cube, probes, ..
     } = TestHarness::new(db.clone(), detector);
-    let handler = handler.with_merge_probe(probe);
+    let handler = handler
+        .with_branch_verifier(super::conflict_delivery::published_verifier(
+            StubBranchVerifier::ok("boss/exec_parent"),
+            Ok(head),
+        ))
+        .with_merge_probe(super::conflict_delivery::published_probe(probe, head));
 
     let outcome = handler.on_stop(&execution_id).await;
     assert!(
@@ -1961,7 +1967,9 @@ async fn conflict_revision_finalizes_on_mergeability_alone_even_when_ci_not_clea
     })));
 
     let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
-    let handler = handler.with_branch_verifier(verifier).with_merge_probe(probe);
+    let handler = handler
+        .with_branch_verifier(super::conflict_delivery::published_verifier(verifier, Ok(head)))
+        .with_merge_probe(super::conflict_delivery::published_probe(probe, head));
 
     let outcome = handler.on_stop(&execution_id).await;
     assert!(

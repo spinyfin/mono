@@ -413,7 +413,9 @@ impl WorkerCompletionHandler {
         let mut merged = merged;
         if !merged {
             match self.conflict_delivery_decision(execution, Some(&pr_url)).await {
-                ConflictDeliveryDecision::Failed(outcome) => return outcome,
+                ConflictDeliveryDecision::Failed(outcome) | ConflictDeliveryDecision::Unsettled(outcome) => {
+                    return outcome;
+                }
                 ConflictDeliveryDecision::Moot => merged = true,
                 ConflictDeliveryDecision::Proceed => {}
             }

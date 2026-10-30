@@ -48,6 +48,7 @@ pub mod config;
 mod conformance;
 pub use boss_conflict_diagnosis as conflict_diagnosis;
 pub mod conflict_ladder;
+pub mod conflict_lockfiles;
 pub mod conflict_remediation;
 pub mod conflict_stop_gate;
 pub mod conflict_watch;

@@ -153,10 +153,10 @@ crate::stub_cube_client! { ScriptCube {
             *self.marker_seen_during_rebase.lock().await = Some(marker);
         }
         match &self.script {
-            Script::CleanPushed => Ok(RebaseOutcome { clean: true, pushed: true, conflicted_files: Vec::new(), linearized_commits: 0, linearize_decline: None }),
-            Script::CleanUnpushed => Ok(RebaseOutcome { clean: true, pushed: false, conflicted_files: Vec::new(), linearized_commits: 0, linearize_decline: None }),
+            Script::CleanPushed => Ok(RebaseOutcome::builder().clean(true).pushed(true).conflicted_files(Vec::new()).build()),
+            Script::CleanUnpushed => Ok(RebaseOutcome::builder().clean(true).pushed(false).conflicted_files(Vec::new()).build()),
             Script::Conflicts(files) => {
-                Ok(RebaseOutcome { clean: false, pushed: false, conflicted_files: files.clone(), linearized_commits: 0, linearize_decline: None })
+                Ok(RebaseOutcome::builder().clean(false).pushed(false).conflicted_files(files.clone()).build())
             }
             Script::RebaseErrors => anyhow::bail!("rebase boom"),
             Script::EnsureRepoErrors => unreachable!("ensure_repo already errored"),
@@ -725,6 +725,7 @@ async fn attempt_rung0_hermetic(
     let workspace = RungWorkspace {
         lease,
         resolvers: &hermetic_resolvers,
+        base_ref: None,
     };
     attempt_rung0_with(
         work_db,
@@ -1012,7 +1013,7 @@ async fn rung0_declines_both_no_resolver_and_resolver_ran_files_together() {
 }
 
 #[tokio::test]
-async fn rung0_push_failure_falls_through_without_marking_succeeded() {
+async fn rung0_lockfile_only_push_failure_halts_without_a_worker() {
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
     let (candidate, attempt, chore_id) = blocked_with_attempt(&db);
@@ -1039,19 +1040,62 @@ async fn rung0_push_failure_falls_through_without_marking_succeeded() {
     )
     .await;
 
-    assert_eq!(
-        outcome,
-        LadderOutcome::FellThrough {
-            residual_conflict_files: None,
-            reason: "rung 0 resolved every residual file but pushing the resolution failed",
-        }
-    );
-    // Every file resolved, but the push failed — must not mark succeeded.
+    // A lockfile-only conflict whose push fails is terminal for this head: a
+    // worker would only hit the same failure, so none may be spawned.
+    assert_eq!(outcome, LadderOutcome::LockfileRegenerationFailed);
     let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
-    assert_eq!(row.status, "pending");
+    assert_eq!(row.status, "failed");
     assert_eq!(row.resolved_by_rung, None);
+    assert!(row.revision_task_id.is_none());
+    assert!(
+        row.failure_reason.as_deref().is_some_and(|r| r.contains("push failed")),
+        "failure reason must name the push failure: {:?}",
+        row.failure_reason
+    );
     let (_status, reason) = chore_state(&db, &chore_id);
     assert_eq!(reason.as_deref(), Some("merge_conflict"));
+}
+
+#[tokio::test]
+async fn rung0_seeds_resolvers_from_the_remote_cube_rebased_onto() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, _) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let ws = tempdir().unwrap();
+    write_conflicted_lock_workspace(ws.path());
+    let lease = CubeWorkspaceLease {
+        lease_id: "lease-ref".to_owned(),
+        workspace_id: "ws-ref".to_owned(),
+        workspace_path: ws.path().to_path_buf(),
+        dirty_verified: None,
+    };
+    let seen = std::sync::Mutex::new(Vec::<String>::new());
+    let factory = |base: &str| {
+        seen.lock().unwrap().push(base.to_owned());
+        hermetic_resolvers(base)
+    };
+    let cube = Rung0Cube::new(true);
+    for base_ref in [Some("main@github".to_owned()), None] {
+        let workspace = RungWorkspace {
+            lease: &lease,
+            resolvers: &factory,
+            base_ref,
+        };
+        attempt_rung0_with(
+            &db,
+            pub_.as_ref(),
+            &cube,
+            &candidate,
+            &attempt,
+            &workspace,
+            &["Cargo.lock".to_owned()],
+        )
+        .await;
+    }
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen[0], "main@github");
+    assert_eq!(seen[1], format!("{}@origin", attempt.base_branch));
 }
 
 // ── Restart-recovery: persist in-flight mechanical state, reconcile at startup ──

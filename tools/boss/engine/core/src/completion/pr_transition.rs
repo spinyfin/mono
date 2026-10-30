@@ -254,7 +254,9 @@ impl WorkerCompletionHandler {
 
         if !merged && let Ok(execution) = execution_result.as_ref() {
             match self.conflict_delivery_decision(execution, Some(&pr_url)).await {
-                ConflictDeliveryDecision::Failed(outcome) => return outcome,
+                ConflictDeliveryDecision::Failed(outcome) | ConflictDeliveryDecision::Unsettled(outcome) => {
+                    return outcome;
+                }
                 ConflictDeliveryDecision::Moot => {
                     target = WorkerPrCompletionTarget::Done;
                     merged = true;
@@ -1123,7 +1125,11 @@ impl WorkerCompletionHandler {
     /// Fetch the head that is about to be recorded on a PR-completion
     /// teardown. Forensic only: parse failures and `gh` errors log at WARN
     /// and return `None` so terminalization still proceeds.
-    async fn fetch_pr_head_after(&self, execution: &crate::work::WorkExecution, pr_url: &str) -> Option<String> {
+    pub(super) async fn fetch_pr_head_after(
+        &self,
+        execution: &crate::work::WorkExecution,
+        pr_url: &str,
+    ) -> Option<String> {
         let repo_slug = match parse_repo_slug(&execution.repo_remote_url) {
             Ok(repo_slug) => repo_slug,
             Err(err) => {

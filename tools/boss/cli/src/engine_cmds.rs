@@ -775,6 +775,54 @@ pub(crate) async fn run_engine_conflicts_command(
                 other => Err(unexpected_event("conflicts record-producer", &other)),
             }
         }
+        EngineConflictsCommand::RegenerateLockfiles(args) => {
+            let listed = std::process::Command::new("jj")
+                .args(["resolve", "--list"])
+                .output()
+                .map_err(|err| CliError::application(format!("failed to run `jj resolve --list`: {err}")))?;
+            let conflicted = boss_engine::conflict_lockfiles::checked_jj_resolve_list(
+                listed.status.code(),
+                &String::from_utf8_lossy(&listed.stdout),
+                &String::from_utf8_lossy(&listed.stderr),
+            )
+            .map_err(CliError::application)?;
+            let base_ref = args
+                .base_ref
+                .clone()
+                .unwrap_or_else(|| format!("{}@origin", args.base_branch));
+            let cwd = std::env::current_dir().map_err(CliError::internal)?;
+            let outcome = boss_engine::conflict_lockfiles::regenerate_conflicted_lockfiles(
+                &cwd,
+                &base_ref,
+                &conflicted,
+            )
+            .await
+            .map_err(|reason| {
+                CliError::application(format!(
+                    "lockfile regeneration failed: {reason}. This is a tooling blocker: do not hand-edit the lockfile."
+                ))
+            })?;
+            print_entity(
+                ctx,
+                &serde_json::json!({
+                    "regenerated": outcome.regenerated,
+                    "left_for_worker": outcome.left_for_worker,
+                }),
+                || {
+                    if !ctx.quiet {
+                        for line in &outcome.regenerated {
+                            println!("Regenerated {line}");
+                        }
+                        for path in &outcome.left_for_worker {
+                            println!("Left for you to resolve: {path}");
+                        }
+                        if outcome.regenerated.is_empty() {
+                            println!("No conflicted generated lockfiles found.");
+                        }
+                    }
+                },
+            )
+        }
         EngineConflictsCommand::Hotspots(args) => {
             let mut client = connect_for_work(ctx).await?;
             let product = resolve_product(&mut client, args.product.clone(), ctx).await?;
