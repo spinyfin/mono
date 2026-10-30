@@ -38,6 +38,9 @@ use crate::app::lease_reclaim::{
     ProvisionPath, ProvisioningContext, ReclaimLimits, ReclaimUndo, ScanProbes, reclaim_unhealthy_workspace_for_lease,
     report_provisioning,
 };
+use crate::app::process_guard::{
+    SweepPhase, ensure_no_live_processes_in, sweep_is_noteworthy, sweep_json, sweep_live_workspace_processes,
+};
 use crate::app::provision::{
     auto_create_workspace, discover_workspaces, find_workspace_record, format_lease_message, format_setup_message,
     gc_broken_empty_workspace, run_setup_for_workspace,
@@ -274,7 +277,30 @@ pub(super) fn run_workspace(
             // holder/task — when a worker's `@` is observed to move
             // mid-flight, this is the first thing to grep.
             let expired = store.expire_stale_leases(&repo, leased_at_epoch_s)?;
+            let mut sweep_failure = None;
             for swept in &expired {
+                if let Some(workspace) = candidates.iter().find(|w| w.workspace_id == swept.workspace_id) {
+                    let report = sweep_live_workspace_processes(
+                        &workspace.workspace_id,
+                        &workspace.workspace_path,
+                        SweepPhase::Expire,
+                    );
+                    audit!(
+                        database_path,
+                        "workspace.processes_reaped",
+                        repo = repo,
+                        workspace_id = workspace.workspace_id,
+                        phase = "expire",
+                        processes = sweep_json(&report)
+                    );
+                    if !report.is_clean() {
+                        sweep_failure = Some(CubeError::WorkspaceBusy {
+                            path: workspace.workspace_path.clone(),
+                            processes: report.error.clone().unwrap_or_else(|| report.survivor_summary()),
+                        });
+                    }
+                }
+
                 audit!(
                     database_path,
                     "lease.expired_reclaimed",
@@ -286,6 +312,9 @@ pub(super) fn run_workspace(
                     prior_leased_at_epoch_s = swept.leased_at_epoch_s,
                     prior_lease_expires_at_epoch_s = swept.lease_expires_at_epoch_s,
                 );
+            }
+            if let Some(error) = sweep_failure {
+                return Err(error);
             }
             let expired_ids: Vec<String> = expired.iter().map(|e| e.workspace_id.clone()).collect();
             let expired_by_workspace_id: std::collections::HashMap<&str, &crate::store::ExpiredLease> =
@@ -1190,6 +1219,12 @@ pub(super) fn run_workspace(
             // workspace wedge every other lease/release for the repo.
             drop(_lock);
 
+            // Verify before reset or setup can rewrite a prior holder's files.
+            if let Err(error) = ensure_no_live_processes_in(&workspace.workspace_id, &workspace.workspace_path) {
+                store.quarantine_workspace(&lease_id, "process cleanup could not verify an empty workspace")?;
+                return Err(error);
+            }
+
             // If the workspace had conflicted bookmarks, repair them before
             // the reset. `jj new main` would succeed with conflicts present,
             // but the conflicts would still appear in `jj status` for the
@@ -1204,6 +1239,18 @@ pub(super) fn run_workspace(
                 ) {
                     Ok(repair) => repair,
                     Err(error) => {
+                        let report = sweep_live_workspace_processes(
+                            &workspace.workspace_id,
+                            &workspace.workspace_path,
+                            SweepPhase::Release,
+                        );
+                        audit!(
+                            database_path,
+                            "workspace.processes_reaped",
+                            workspace_id = workspace.workspace_id,
+                            phase = "setup_failed",
+                            processes = sweep_json(&report)
+                        );
                         let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
                         if let Some(undo) = &lease_reclaim_undo {
                             undo.roll_back(&store, database_path, "bookmark_repair_failed");
@@ -1274,6 +1321,18 @@ pub(super) fn run_workspace(
                     ..
                 } = error
                 else {
+                    let report = sweep_live_workspace_processes(
+                        &workspace.workspace_id,
+                        &workspace.workspace_path,
+                        SweepPhase::Release,
+                    );
+                    audit!(
+                        database_path,
+                        "workspace.processes_reaped",
+                        workspace_id = workspace.workspace_id,
+                        phase = "setup_failed",
+                        processes = sweep_json(&report)
+                    );
                     let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
                     if let Some(undo) = &lease_reclaim_undo {
                         undo.roll_back(&store, database_path, "reset_failed");
@@ -1371,6 +1430,18 @@ pub(super) fn run_workspace(
                     &repo_record.main_branch,
                     None,
                 ) {
+                    let report = sweep_live_workspace_processes(
+                        &workspace.workspace_id,
+                        &workspace.workspace_path,
+                        SweepPhase::Release,
+                    );
+                    audit!(
+                        database_path,
+                        "workspace.processes_reaped",
+                        workspace_id = workspace.workspace_id,
+                        phase = "setup_failed",
+                        processes = sweep_json(&report)
+                    );
                     let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
                     return Err(error);
                 }
@@ -1420,6 +1491,19 @@ pub(super) fn run_workspace(
                     // workspace straight back (force-release skips the reset;
                     // the next lease resets and re-runs setup), then surface the
                     // original setup error with nothing left leased.
+                    let report = sweep_live_workspace_processes(
+                        &workspace.workspace_id,
+                        &workspace.workspace_path,
+                        SweepPhase::Release,
+                    );
+                    audit!(
+                        database_path,
+                        "workspace.processes_reaped",
+                        repo = workspace.repo,
+                        workspace_id = workspace.workspace_id,
+                        phase = "setup_failed",
+                        processes = sweep_json(&report)
+                    );
                     match store.force_release_lease(&lease_id, Some("setup_failed")) {
                         Ok(_) => audit!(
                             database_path,
@@ -1501,6 +1585,25 @@ pub(super) fn run_workspace(
                 );
                 store.forget_workspace(&workspace.repo, &workspace.workspace_id)?;
                 return Err(CubeError::LeaseNotFound(lease));
+            }
+
+            // Nothing the lease's holder started may outlive the lease. Kill
+            // whatever is still running inside the workspace (see
+            // `process_guard`) before the reset below rewrites the tree under
+            // it, and before the slot is handed to the next holder. The sweep
+            // never blocks the release: survivors are logged and audited.
+            let process_sweep =
+                sweep_live_workspace_processes(&workspace.workspace_id, &workspace.workspace_path, SweepPhase::Release);
+            if sweep_is_noteworthy(&process_sweep) {
+                audit!(
+                    database_path,
+                    "workspace.processes_reaped",
+                    repo = workspace.repo,
+                    workspace_id = workspace.workspace_id,
+                    lease_id = lease,
+                    phase = "release",
+                    processes = sweep_json(&process_sweep),
+                );
             }
 
             // Reset the workspace OUTSIDE the per-repo lock. This is the
@@ -1648,7 +1751,7 @@ pub(super) fn run_workspace(
                 reset_error = reset_error.as_ref().map(|e| e.to_string()),
             );
 
-            let message = if keep_dirty {
+            let mut message = if keep_dirty {
                 format!("Released {} (kept dirty).", released.workspace_id)
             } else if preserved.is_some() {
                 format!(
@@ -1660,6 +1763,16 @@ pub(super) fn run_workspace(
             } else {
                 format!("Released {}.", released.workspace_id)
             };
+            let killed = process_sweep.killed_pids();
+            if !killed.is_empty() {
+                message.push_str(&format!(" Killed {} leftover process(es) inside it.", killed.len()));
+            }
+            if !process_sweep.survivors.is_empty() {
+                message.push_str(&format!(
+                    " WARNING: still running inside it: {}.",
+                    process_sweep.survivor_summary()
+                ));
+            }
             RunResult::new(
                 message,
                 json!({
@@ -1668,6 +1781,7 @@ pub(super) fn run_workspace(
                     "preserved_unpushed_work": preserved.is_some(),
                     "preserved_head_change_id": preserved.as_ref().map(|p| p.head_change_id.clone()),
                     "preserved_unpushed_commits": preserved.as_ref().map(|p| p.unpushed_summary.clone()),
+                    "processes": sweep_json(&process_sweep),
                 }),
             )
         }
@@ -1765,6 +1879,23 @@ pub(super) fn run_workspace(
                     ))
                 })?;
                 let reason = reason.unwrap_or_else(|| "force-released".to_string());
+                // The holder is presumed gone, but what it started may not be.
+                let process_sweep = if workspace_path_exists(&target) {
+                    sweep_live_workspace_processes(&target.workspace_id, &target.workspace_path, SweepPhase::Release)
+                } else {
+                    Default::default()
+                };
+                if sweep_is_noteworthy(&process_sweep) {
+                    audit!(
+                        database_path,
+                        "workspace.processes_reaped",
+                        repo = target.repo,
+                        workspace_id = target.workspace_id,
+                        lease_id = lease_id,
+                        phase = "force-release",
+                        processes = sweep_json(&process_sweep),
+                    );
+                }
                 let released = store
                     .force_release_lease(&lease_id, Some(&reason))?
                     .ok_or_else(|| CubeError::LeaseNotFound(lease_id.clone()))?;
@@ -1778,10 +1909,16 @@ pub(super) fn run_workspace(
                     reason = reason,
                 );
 
+                let mut message = format!("Force-released {} (workspace not reset).", released.workspace_id);
+                let killed = process_sweep.killed_pids();
+                if !killed.is_empty() {
+                    message.push_str(&format!(" Killed {} leftover process(es) inside it.", killed.len()));
+                }
                 RunResult::new(
-                    format!("Force-released {} (workspace not reset).", released.workspace_id),
+                    message,
                     json!({
                         "workspace": released,
+                        "processes": sweep_json(&process_sweep),
                     }),
                 )
             } else if target.health_status == Some(WorkspaceHealth::Quarantined) {
@@ -1986,6 +2123,25 @@ pub(super) fn run_workspace(
                     "workspace `{}/{}` is currently leased; force-release it first or pass --force",
                     record.repo, record.workspace_id
                 )));
+            }
+
+            // Never unlink a directory with live processes inside it. Checked
+            // before the row is forgotten so a refusal leaves the registry
+            // and the directory consistent (see `process_guard`).
+            let process_sweep = if expunge && record.workspace_path.is_dir() {
+                ensure_no_live_processes_in(&record.workspace_id, &record.workspace_path)?
+            } else {
+                Default::default()
+            };
+            if sweep_is_noteworthy(&process_sweep) {
+                audit!(
+                    database_path,
+                    "workspace.processes_reaped",
+                    repo = record.repo,
+                    workspace_id = record.workspace_id,
+                    phase = "remove",
+                    processes = sweep_json(&process_sweep),
+                );
             }
 
             store.forget_workspace(&record.repo, &record.workspace_id)?;

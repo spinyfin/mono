@@ -58,6 +58,14 @@ pub enum CubeError {
     WorkspaceDirRead { path: PathBuf, source: io::Error },
     #[error("failed to remove workspace directory `{path}`: {source}")]
     WorkspaceDirRemove { path: PathBuf, source: io::Error },
+    /// Processes are still running inside a workspace directory after cube
+    /// tried to kill them, so the directory must not be removed under them.
+    /// `processes` lists `pid (command)` for each survivor.
+    #[error(
+        "refusing to remove workspace directory `{path}`: processes are still running inside it after \
+         SIGTERM and SIGKILL: {processes}"
+    )]
+    WorkspaceBusy { path: PathBuf, processes: String },
     #[error("failed to remove bazel output base `{path}`: {source}")]
     BazelOutputBaseRemove { path: PathBuf, source: io::Error },
     #[error("failed to create repo source directory `{path}`: {source}")]
@@ -212,6 +220,7 @@ impl CubeError {
             | Self::WorkspaceDirCreate { .. }
             | Self::WorkspaceDirRead { .. }
             | Self::WorkspaceDirRemove { .. }
+            | Self::WorkspaceBusy { .. }
             | Self::BazelOutputBaseRemove { .. }
             | Self::RepoSourceDirCreate { .. }
             | Self::StateDbIo { .. }

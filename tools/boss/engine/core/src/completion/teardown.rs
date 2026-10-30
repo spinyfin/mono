@@ -213,6 +213,21 @@ impl WorkerCompletionHandler {
         }
         let driver_ms = driver_started.elapsed().as_millis();
 
+        // Last engine-side pass before the lease goes back to cube: kill
+        // whatever the run left running inside its workspace (a detached
+        // subshell, a stranded test binary) so the workspace is released
+        // empty and nothing is removed underneath a live process. The pane
+        // reap above already reached everything still attached to the pane;
+        // this one reaches what re-parented to launchd, by working
+        // directory. See `crate::run_process_reap`.
+        let reap_started = Instant::now();
+        if let (Some(ws_path), Ok(resolved)) = (workspace_path, &owning_cube)
+            && resolved.is_local()
+        {
+            crate::run_process_reap::reap_workspace(execution_id, ws_path, path).await;
+        }
+        let process_reap_ms = reap_started.elapsed().as_millis();
+
         let cube_started = Instant::now();
         let mut cube_timed_out = false;
         let mut lease_released = false;
@@ -335,6 +350,7 @@ impl WorkerCompletionHandler {
             cube_timed_out,
             release_pane_ms = pane_ms,
             driver_teardown_ms = driver_ms,
+            process_reap_ms,
             cube_release_ms = cube_ms,
             total_ms = started.elapsed().as_millis(),
             "worker teardown complete",

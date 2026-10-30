@@ -78,6 +78,10 @@ root-cause rule as the section below.
   intervals for the two singleton sweeps, and what each one's cost scales
   with):
   [`tools/boss/docs/background-sweep-telemetry.md`](tools/boss/docs/background-sweep-telemetry.md)
+- Run process teardown (how the engine and cube find and kill what a run
+  left running in its workspace, why working directory rather than process
+  group, and how a workspace's Bazel server is told apart and spared):
+  [`tools/boss/docs/run-process-teardown.md`](tools/boss/docs/run-process-teardown.md)
 - Operator runbooks:
   [`tools/boss/docs/runbooks/`](tools/boss/docs/runbooks/)
 

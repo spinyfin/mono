@@ -30,6 +30,7 @@ async-trait = { workspace = true }
 bon = { workspace = true }
 chrono = { workspace = true }
 git-utils = { path = "../../../../lib/rust/git_utils" }
+workspace-procs = { path = "../../../../lib/rust/workspace_procs" }
 boss-conflict-diagnosis = { path = "../conflict-diagnosis" }
 boss-deterministic-resolvers = { path = "../deterministic-resolvers" }
 boss-dispatch-events = { path = "../dispatch-events" }

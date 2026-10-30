@@ -1,0 +1,57 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "workspace_procs",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    visibility = [
+        "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/utils:__pkg__",
+        "//tools/cube:__pkg__",
+    ],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "workspace_procs_test",
+    size = "small",
+    crate = ":workspace_procs",
+    edition = "2024",
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# Spawns a real detached `( while :; do sleep 1; done ) &` loop — the exact
+# shape a worker's tool shell leaves behind when it is cut short — and a
+# look-alike Bazel server, then checks the reap kills the former and spares
+# the latter. `sh` and `sleep` come from the audited test runtime.
+rust_test(
+    name = "reap_integration_test",
+    size = "small",
+    srcs = ["tests/reap_integration.rs"],
+    crate_root = "tests/reap_integration.rs",
+    edition = "2024",
+    deps = [":workspace_procs"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_library(
+    name = "workspace_procs_testing",
+    testonly = True,
+    srcs = ["src/testing.rs"],
+    crate_root = "src/testing.rs",
+    edition = "2024",
+    visibility = [
+        "//tools/boss/engine/core:__pkg__",
+        "//tools/cube:__pkg__",
+    ],
+    deps = [":workspace_procs"],
+)

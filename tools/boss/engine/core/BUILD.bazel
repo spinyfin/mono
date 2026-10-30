@@ -92,6 +92,7 @@ rust_library(
     deps = [
         "//tools/boss/engine/host-execution",
         "//lib/rust/git_utils",
+        "//lib/rust/workspace_procs",
         "//tools/boss/backoff",
         # NOT "//tools/boss/build-provenance": that crate's source embeds
         # the commit sha and changes every commit. It is linked only by the
@@ -277,6 +278,7 @@ rust_test(
     ),
     shard_count = 11,
     deps = [
+        "//lib/rust/workspace_procs:workspace_procs_testing",
         "//tools/boss/engine/task-scope",
         "//tools/boss/engine/test-git",
     ] + all_crate_deps(
@@ -322,6 +324,7 @@ network_enabled_rust_test(
     ),
     tags = ["manual"],
     deps = [
+        "//lib/rust/workspace_procs:workspace_procs_testing",
         "//tools/boss/engine/task-scope",
         "//tools/boss/engine/test-git",
     ] + all_crate_deps(

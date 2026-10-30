@@ -636,31 +636,11 @@ pub fn process_snapshot(pid: libc::pid_t) -> io::Result<ProcessSnapshot> {
 /// field 1 the parent pid and field 19 the start time (clock ticks since boot).
 #[cfg(target_os = "linux")]
 pub fn process_snapshot(pid: libc::pid_t) -> io::Result<ProcessSnapshot> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    let invalid = |what: String| io::Error::new(io::ErrorKind::InvalidData, what);
-    let (head, fields) = stat
-        .rsplit_once(')')
-        .ok_or_else(|| invalid(format!("/proc/{pid}/stat is missing its process-name terminator")))?;
-    let command = head
-        .split_once('(')
-        .map(|(_, name)| name)
-        .unwrap_or_default()
-        .to_owned();
-    let mut fields = fields.split_whitespace();
-    let parent = fields
-        .nth(1)
-        .ok_or_else(|| invalid(format!("/proc/{pid}/stat is missing ppid")))?
-        .parse::<libc::pid_t>()
-        .map_err(|err| invalid(format!("invalid ppid in /proc/{pid}/stat: {err}")))?;
-    let start = fields
-        .nth(17)
-        .ok_or_else(|| invalid(format!("/proc/{pid}/stat is missing starttime")))?
-        .parse::<u64>()
-        .map_err(|err| invalid(format!("invalid starttime in /proc/{pid}/stat: {err}")))?;
+    let info = workspace_procs::process_table::linux_identity(pid)?;
     Ok(ProcessSnapshot {
-        ppid: if parent <= 0 { None } else { Some(parent) },
-        start,
-        command,
+        ppid: if info.ppid <= 0 { None } else { Some(info.ppid) },
+        start: info.start_ticks,
+        command: info.command,
     })
 }
 

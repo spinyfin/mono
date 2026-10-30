@@ -570,6 +570,28 @@ Release should not discard successful setup state unless the reset invalidates
 it. For example, a `pnpm install` cache can remain valid across many leases,
 while decoded secrets may need a shorter lifetime or explicit rotation policy.
 
+### Nothing outlives the lease
+
+A lease's holder may leave processes running inside the workspace after it is
+done: a backgrounded subshell from a tool command that was cut short, a test
+binary stranded in a Bazel sandbox. They re-parent to launchd and nothing that
+walks down from the holder's shell finds them. cube owns workspace usability,
+so before a lease is released (`workspace release`, `force-release`) and before
+a directory is removed (`workspace remove --expunge`, the pool trim) cube
+sweeps the process table for processes whose working directory is inside the
+workspace — under whatever name it currently has, so a staged
+`.removing-<id>` directory counts — or inside its Bazel output base, kills them
+(`SIGTERM`, a two-second grace, `SIGKILL`), and logs each one with pid, command
+and age on stderr and in a `workspace.processes_reaped` audit event. The
+workspace's Bazel server is spared on purpose (it exits on its own idle
+timeout) and recognised by the `bazel(<workspace>)` name the client gives it;
+all other occupants, including tty-attached tools and server action children,
+are subject to cleanup. A release proceeds regardless, naming any survivor. A removal also refuses an unreadable process table; it does
+not: unlinking a directory with live occupants is how the leak above hid, so it
+fails with the survivors' pids and leaves the directory for a later pass. The
+scan itself lives in `lib/rust/workspace_procs`, shared with the engine; see
+`tools/boss/docs/run-process-teardown.md`.
+
 ## Disk Reclamation
 
 The pool grows on demand and has no cap on total workspaces — that is a design

@@ -3,6 +3,7 @@ members = [
   "lib/rust/broker-robinhood",
   "lib/rust/git_utils",
   "lib/rust/process_runner",
+  "lib/rust/workspace_procs",
   "tools/boss/bossctl",
   "tools/boss/build-info",
   "tools/boss/build-provenance",
