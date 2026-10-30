@@ -1195,8 +1195,35 @@ impl ExecutionCoordinator {
                 )?;
             }
             Err(err) => {
-                crate::execution_bookmark_recovery::report_failure(&self.work_db, execution, &format!("{err:#}"));
-                return Err(err);
+                let record = self.work_db.execution_bookmark(&execution.id)?;
+                let adapter = self.host_adapter();
+                self.retire_unvouched_record(execution, execution, &record, &adapter, &err)
+                    .await?;
+                let workspace = execution
+                    .workspace_path
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("running execution has no workspace"))?;
+                let work_item = self.resolve_execution_work_item(execution)?;
+                let pr = super::execution::pr_number_for_workspace_goto(&self.work_db, execution, &work_item).or_else(
+                    || match &work_item {
+                        WorkItem::Task(task) | WorkItem::Chore(task) => {
+                            task.pr_url.as_deref().and_then(boss_github::pr_url::pr_number_from_url)
+                        }
+                        _ => None,
+                    },
+                );
+                if let Some(sha) = self.immutable_execution_target(execution)? {
+                    adapter.goto_workspace_revision(Path::new(workspace), &sha).await?;
+                } else if let Some(pr) = pr {
+                    adapter.goto_workspace(Path::new(workspace), pr).await?;
+                } else {
+                    adapter.start_fresh_workspace(Path::new(workspace)).await?;
+                }
+                let fresh = adapter
+                    .create_execution_bookmark(Path::new(workspace), &execution.id, None, None)
+                    .await?;
+                self.work_db.record_execution_bookmark(&fresh)?;
+                self.work_db.delete_execution_restore_report(&execution.id)?;
             }
         }
         let lease_id = execution

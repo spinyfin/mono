@@ -32,8 +32,12 @@ impl HostAdapter for FlakyRestoreAdapter {
         self.inner.recovery_pr_base(origin, pr).await
     }
 
-    async fn release_execution_bookmark_heads(&self, record: &ExecutionBookmark) -> Result<Vec<(String, String)>> {
-        self.inner.release_execution_bookmark_heads(record).await
+    async fn release_execution_bookmark_heads(
+        &self,
+        record: &ExecutionBookmark,
+        release_names: bool,
+    ) -> Result<Vec<(String, String)>> {
+        self.inner.release_execution_bookmark_heads(record, release_names).await
     }
 
     async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {
@@ -188,6 +192,15 @@ async fn restore_failure_archives_work_and_starts_fresh_on_the_stacked_pr() {
             .is_none()
     );
     let archive = format!("preserved/{}/{preserved}", source.id);
+    let notes = h
+        .coordinator
+        .work_db
+        .list_attention_items_for_work_item(&source.work_item_id)
+        .unwrap();
+    assert!(notes.iter().any(
+        |note| note.body_markdown.contains("recovery operation (including transport)")
+            && note.body_markdown.contains("injected transient fetch failure")
+    ));
     assert_eq!(
         JjRepo::run(&h.repo.repo, &["file", "show", "-r", &archive, "root:revision.txt"]),
         "unpushed revision"

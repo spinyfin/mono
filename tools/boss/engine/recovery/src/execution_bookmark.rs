@@ -675,11 +675,15 @@ pub async fn discard_orphaned_baseline(jj: &dyn Jj, record: &ExecutionBookmark) 
     Ok(())
 }
 
-/// Archive every pointer target before releasing the execution's names for a
-/// fresh start. Conflicted bookmarks can have several targets; retain them all.
+/// Archive unpublished work before optionally releasing this execution's names.
+/// Baseline, trunk, remote history and empty-only ranges need no archive. Conflicted bookmarks can have several targets; retain them all.
 /// Archive names include the commit identity so repeated fallbacks never
 /// overwrite earlier preserved work. Pruning only touches the three run names.
-pub async fn release_heads(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<Vec<(String, String)>> {
+pub async fn release_heads(
+    jj: &dyn Jj,
+    record: &ExecutionBookmark,
+    release_names: bool,
+) -> Result<Vec<(String, String)>> {
     let names = [record.base(), record.head(), record.publication()];
     let targets = snapshot::resolve_bookmark_targets(jj, &record.repo_path, &names).await?;
     let mut commits: std::collections::BTreeSet<String> = targets.values().flatten().cloned().collect();
@@ -689,14 +693,40 @@ pub async fn release_heads(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<Ve
         commits.insert(base.clone());
     }
     let mut archived = Vec::new();
+    let baseline = record.base_commit.as_deref().or_else(|| {
+        targets
+            .get(&record.base())
+            .and_then(|commits| (commits.len() == 1).then(|| commits[0].as_str()))
+    });
     for commit in commits {
+        let base = format!("present({})", baseline.unwrap_or("root()"));
+        let unpublished = jj
+            .run(
+                &record.repo_path,
+                &[
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    &format!("({base}..{commit}) ~ (::remote_bookmarks() | ::trunk() | empty())"),
+                    "-T",
+                    "commit_id",
+                ],
+            )
+            .await?;
+        if unpublished.trim().is_empty() {
+            continue;
+        }
         let archive = format!("preserved/{}/{}", record.execution_id, commit);
         jj.run(&record.repo_path, &["bookmark", "set", &archive, "-r", &commit])
             .await?;
         archived.push((archive, commit));
     }
-    // No pointer is released until every archive has been written successfully.
-    let mut args = vec!["bookmark", "forget"];
+    // Preserve predecessor publication names, which may still be tracked PR branches.
+    if !release_names {
+        return Ok(archived);
+    }
+    // Delete retains remote tracking; forget would untrack a pushed PR branch.
+    let mut args = vec!["bookmark", "delete"];
     args.extend(
         names
             .iter()

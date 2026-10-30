@@ -335,7 +335,7 @@ crate::stub_cube_client! { FakeCubeClient {
             return Err(anyhow!("cube change create failed"));
         }
         if self.position_real_workspace {
-            boss_engine_test_git::jj::JjRepo::run(workspace_path, &["new", "main", "-m", title]);
+            boss_engine_test_git::jj::JjRepo::run(workspace_path, &["describe", "-m", title]);
         }
         Ok(CubeChangeHandle {
             change_id: "chg-1".to_owned(),

@@ -355,9 +355,12 @@ async fn non_implementation_with_deleted_predecessor_heads_continues_without_rec
         .unwrap();
     assert!(recovered.is_none());
     assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_none());
-    assert_eq!(db.list_attention_items(&prior.id).unwrap()[0].status, "resolved");
+    assert_eq!(
+        db.list_attention_items_for_work_item(&prior.work_item_id).unwrap()[0].status,
+        "resolved"
+    );
     assert!(
-        !boss_engine_test_git::jj::JjRepo::run(
+        boss_engine_test_git::jj::JjRepo::run(
             &repo.repo,
             &["bookmark", "list", &format!("glob:preserved/{}/*", prior.id)]
         )
@@ -584,7 +587,7 @@ async fn blocked_revision_dispatch_resumes_from_pr_head_or_retires_an_unvouched_
             ],
         );
         let retired_attention: Vec<_> = db
-            .list_attention_items(&prior.id)
+            .list_attention_items_for_work_item(&prior.work_item_id)
             .unwrap()
             .into_iter()
             .filter(|item| item.kind == crate::execution_bookmark_recovery::RECOVERY_RETIRED)
@@ -637,8 +640,8 @@ async fn blocked_revision_dispatch_resumes_from_pr_head_or_retires_an_unvouched_
             assert_eq!(retired_attention.len(), 1, "{retired_attention:?}");
             assert!(retired_attention[0].body_markdown.contains(&next.id));
             assert!(
-                !heads_exist.lines().any(|l| l == record.head()),
-                "archived pointers are released for fresh creation"
+                heads_exist.lines().any(|l| l == record.head()),
+                "predecessor names remain intact; only its recovery record is retired"
             );
             assert!(db.execution_restore_report(&next.id).unwrap().is_none());
         }
@@ -918,7 +921,11 @@ async fn revision_without_any_bound_pr_archives_and_starts_fresh() {
             .unwrap()
             .is_none()
     );
-    let notes = h.coordinator.work_db.list_attention_items(&prior.id).unwrap();
+    let notes = h
+        .coordinator
+        .work_db
+        .list_attention_items_for_work_item(&prior.work_item_id)
+        .unwrap();
     assert_eq!(notes[0].status, "resolved");
     assert!(notes[0].body_markdown.contains("bound PR"));
     assert!(
@@ -953,7 +960,11 @@ async fn transient_fetch_failure_archives_and_starts_fresh() {
             .unwrap()
             .is_none()
     );
-    let notes = h.coordinator.work_db.list_attention_items(&prior.id).unwrap();
+    let notes = h
+        .coordinator
+        .work_db
+        .list_attention_items_for_work_item(&prior.work_item_id)
+        .unwrap();
     assert_eq!(notes[0].status, "resolved");
     assert!(notes[0].body_markdown.contains("preserved/"));
     let (WorkItem::Chore(item) | WorkItem::Task(item)) =
