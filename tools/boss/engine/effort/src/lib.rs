@@ -11,12 +11,12 @@ use boss_protocol::{EffortLevel, ReasoningMode, TaskKind};
 use boss_engine_driver::DriverRegistry;
 
 pub mod sol {
-    //! Codex's automatic Sol experiment. Explicit model and pool policies remain separate.
+    //! Codex's automatic Sol selection: the standard model for eligible work. Explicit model and pool policies remain separate.
 
     use boss_protocol::{EffortLevel, ExecutionKind, ReasoningMode, TaskKind};
 
     pub use boss_engine_driver::codex::{ASTRA_MODEL, SOL_MODEL};
-    pub const DEFAULT_SOL_PERCENTAGE: u8 = 50;
+    pub const DEFAULT_SOL_PERCENTAGE: u8 = 100;
 
     /// Investigation and design always win over revision provenance.
     pub fn eligible(
@@ -132,6 +132,7 @@ pub mod sol {
                 assert!(!use_sol(true, true, bucket, 100));
                 assert!(!use_sol(false, false, bucket, 100));
                 assert_eq!(use_sol(true, false, bucket, 50), bucket < 50);
+                assert!(use_sol(true, false, bucket, DEFAULT_SOL_PERCENTAGE));
             }
         }
     }

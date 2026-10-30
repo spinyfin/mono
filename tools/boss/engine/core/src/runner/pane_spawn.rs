@@ -84,13 +84,13 @@ mod sol_spawn {
         }
         let selected = db.select_codex_sol_model(&execution.id, eligible, &config.model)?;
         // Only a Sol draw changes the launch; any other stored model is just the
-        // base model recorded at an earlier compose, not an experiment result.
+        // base model recorded at an earlier compose, not a Sol selection.
         if selected == boss_engine_effort::sol::SOL_MODEL && selected != config.model {
             config.model = selected;
             config.model_source = ModelResolutionSource::SolExperiment;
         }
         tracing::info!(execution_id=%execution.id, model=%config.model, eligible,
-        "resolved automatic worker model after experiment assignment");
+        "resolved automatic worker model after automatic selection");
         Ok(())
     }
 

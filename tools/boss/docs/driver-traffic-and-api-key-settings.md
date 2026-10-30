@@ -31,13 +31,16 @@ work is sent to each driver. They always sum to 100%.
 - **Any one or two drivers may sit at 0%.** A driver at zero receives no work
   at all, and every such state is reachable by repeated single-share edits.
 
-## Codex Sol rollout
+## Codex Sol model
 
 The **Sol for eligible Codex work** control beside Driver Traffic is an
-independent engine setting, `codex_sol_percentage`: 0–100%, default **50%**.
-It applies after the Codex driver has been selected; it never changes the
+independent engine setting, `codex_sol_percentage`: 0–100%, default **100%**:
+Sol is the standard model for eligible Codex work, and this share is an
+override that sends the remaining share back to Astra. It applies after the Codex driver has been selected; it never changes the
 Claude/Grok split. Changes apply to new model decisions. At 0%, automatic
 selection keeps its existing model. No running execution is reassigned.
+
+The share is only stored once someone sets it. Migration `20261030_0900_sol_default_full_share` moved an existing stored 50 to 100, because a stored 50 cannot be told apart from the former 50% default; any other stored value is kept.
 
 Sol (`gpt-6.1-sol`, verified against `codex debug models --bundled`) is
 eligible for standard reasoning with trivial or small effort, and standard
@@ -53,7 +56,7 @@ eligibility, bucket, percentage, arm, and selected model. The draw is fixed;
 an escalation can change only the selected model and escalation marker.
 The one exception is an execution that never launched: its Sol draw is redrawn on each pre-start retry, so lowering the share (for example to 0% after a failed Sol preflight) takes effect for it. A decision stored while the work was ineligible is likewise redrawn once it becomes eligible. Non-Codex drivers and explicit model choices never touch this state.
 `work_executions.model` records the model actually launched. Unlaunched
-decisions do not count as experimental observations. Selection fails with
+decisions are not counted as observations. Selection fails with
 a clear error if the installed CLI catalog lacks Sol or its required effort
 levels; it never substitutes another model after that failure.
 

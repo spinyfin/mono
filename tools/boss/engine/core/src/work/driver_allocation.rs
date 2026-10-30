@@ -645,6 +645,19 @@ pub(super) mod sol_selection {
     /// never push work off Sol.
     const FAILURE_STATUSES: &str = "'failed','abandoned'";
 
+    /// Sol became the standard model for eligible work (default share 100%).
+    /// The share row is only written by an explicit set, but a stored 50 cannot
+    /// be told apart from the former 50% default being stepped away from and
+    /// back, so a stored 50 moves to 100. Any other stored value was
+    /// deliberately chosen and is kept.
+    pub(in crate::work) fn migrate_default_full_share(conn: &Connection) -> Result<()> {
+        conn.execute(
+            "UPDATE metadata SET value='100' WHERE key='codex_sol_percentage' AND value='50'",
+            [],
+        )?;
+        Ok(())
+    }
+
     pub(in crate::work) fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(&format!(
             "CREATE TABLE IF NOT EXISTS execution_sol_decisions (
@@ -858,9 +871,25 @@ pub(super) mod sol_selection {
         use boss_engine_effort::sol::ASTRA_MODEL;
 
         #[test]
+        fn default_share_migration_moves_stored_fifty_only() {
+            for (stored, expected) in [("50", 100), ("35", 35), ("0", 0), ("100", 100)] {
+                let (_dir, db) = open_db();
+                db.connect()
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO metadata(key,value) VALUES ('codex_sol_percentage',?1)",
+                        [stored],
+                    )
+                    .unwrap();
+                migrate_default_full_share(&db.connect().unwrap()).unwrap();
+                assert_eq!(db.get_codex_sol_percentage().unwrap(), expected, "stored {stored}");
+            }
+        }
+
+        #[test]
         fn setting_and_draw_are_durable_and_zero_preserves_the_existing_model() {
             let (_dir, db) = open_db();
-            assert_eq!(db.get_codex_sol_percentage().unwrap(), 50);
+            assert_eq!(db.get_codex_sol_percentage().unwrap(), 100);
             assert!(db.set_codex_sol_percentage(101).is_err());
             let product = create_product(&db);
             let task = create_test_chore(&db, &product, "selection");
