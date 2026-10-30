@@ -374,12 +374,16 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         pr: u64,
     },
-    /// Fetch the PR's actual GitHub base and rebase preserved work locally.
+    /// Fetch the PR's actual GitHub base (or an explicit base before PR creation)
+    /// and rebase preserved work locally.
     /// Never publishes, collapses commits, or repositions the working copy.
     LocalRebase {
         /// PR whose current base branch is fetched from GitHub.
-        #[arg(long)]
-        pr: u64,
+        #[arg(long, required_unless_present = "base", conflicts_with = "base")]
+        pr: Option<u64>,
+        /// Intended PR base branch, for a branch that has no PR yet.
+        #[arg(long, required_unless_present = "pr", conflicts_with = "pr")]
+        base: Option<String>,
     },
     /// Rebase the current workspace's boss branch onto the repo's integration branch.
     ///
@@ -1307,6 +1311,23 @@ mod tests {
             _ => panic!("expected workspace repair-pr-bookmark command"),
         }
         assert!(Cli::try_parse_from(["cube", "workspace", "repair-pr-bookmark"]).is_err());
+    }
+
+    #[test]
+    fn workspace_local_rebase_requires_exactly_one_base_source() {
+        for (flag, value) in [("--pr", "77"), ("--base", "parent-pr")] {
+            let cli = Cli::try_parse_from(["cube", "workspace", "local-rebase", flag, value]).unwrap();
+            let Command::Workspace {
+                command: WorkspaceCommand::LocalRebase { pr, base },
+            } = cli.command
+            else {
+                panic!("expected local-rebase");
+            };
+            assert_eq!(pr, (flag == "--pr").then_some(77));
+            assert_eq!(base.as_deref(), (flag == "--base").then_some("parent-pr"));
+        }
+        assert!(Cli::try_parse_from(["cube", "workspace", "local-rebase"]).is_err());
+        assert!(Cli::try_parse_from(["cube", "workspace", "local-rebase", "--pr", "77", "--base", "main"]).is_err());
     }
 
     #[test]

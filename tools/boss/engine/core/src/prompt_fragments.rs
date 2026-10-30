@@ -39,6 +39,17 @@ pub(crate) fn boundaries_and_probes_fragment() -> &'static str {
      human reviewer — short, specific answers.\n"
 }
 
+/// Publication-time freshness check shared by PR-producing briefs and driver rules.
+pub(crate) fn prepush_rebase_fragment() -> String {
+    let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
+    format!(
+        "### Before every PR branch push\n\n\
+         Before the first push and every later push (`{cube} pr create` or `{cube} pr update`), fetch and compare the branch's base with its current upstream tip; do not rely on the base recorded at dispatch or an earlier check. Use `{cube} workspace local-rebase --pr <bound-pr-number> --json` for an existing PR: it resolves the actual GitHub remote and PR base, including a parent PR branch for stacked PRs. Before a PR exists, use the same flow with `{cube} workspace local-rebase --base <intended-pr-base-branch> --json`, naming the branch the PR will target (the configured integration branch, or the parent branch for a stack).\n\n\
+         The command fetches that remote and rebases the preserved working-copy history onto the freshly fetched tracking ref without publishing, repositioning the working copy, or collapsing commits. Use `jj` and the returned `destination` to compare ancestry and inspect the result. If the base has advanced, the branch must include the latest base before pushing. Resolve every conflicted commit from the base upward, integrating both sides' intent; never discard upstream changes, take either side wholesale, drop commits, squash, or reword existing descriptions. Preserve published PR bookmarks and advance the execution recovery bookmarks after rebasing.\n\n\
+         After a rebase, re-run the builds and tests affected by the upstream changes and conflict resolutions before pushing, even when the rebase looked clean. Verify with `jj` that no commit to be pushed has unresolved conflicts. If the rebase or resolution cannot be completed cleanly, stop and report the conflicting files and reason; never push a half-resolved branch. Only then publish with the existing PR tooling.\n\n"
+    )
+}
+
 /// The one-sentence rule for a command a worker deliberately runs in the
 /// background: declare the wait, and never idle in a wait-loop without one.
 ///

@@ -408,6 +408,15 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
             }
         }
     }
+    if matches!(
+        execution.kind,
+        ExecutionKind::TaskImplementation
+            | ExecutionKind::ChoreImplementation
+            | ExecutionKind::ProjectDesign
+            | ExecutionKind::InvestigationImplementation
+    ) {
+        prompt.push_str(&crate::prompt_fragments::prepush_rebase_fragment());
+    }
     // Issue #804: code-touching implementation chores were pushing to PR
     // branches without a local build, and CI repeatedly caught errors a
     // local `bazel build`/`bazel test` of the touched targets would have

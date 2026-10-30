@@ -2331,7 +2331,9 @@ pub(super) fn run_workspace(
         WorkspaceCommand::RepairPrBookmark { workspace, pr } => {
             workspace_repair_pr_bookmark(database_path, runner, workspace, pr)
         }
-        WorkspaceCommand::LocalRebase { pr } => super::workspace_local_rebase::local_rebase(database_path, runner, pr),
+        WorkspaceCommand::LocalRebase { pr, base } => {
+            super::workspace_local_rebase::local_rebase(database_path, runner, pr, base.as_deref())
+        }
         WorkspaceCommand::Rebase { bookmark, pr, no_push } => {
             workspace_rebase(&mut store, database_path, runner, bookmark, pr, no_push)
         }
