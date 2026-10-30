@@ -324,6 +324,7 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::RequestExecution { .. }
         | FrontendRequest::RequestWorkerPaneAttach { .. }
         | FrontendRequest::ResolveProjectDesignDoc { .. }
+        | FrontendRequest::ResolveWorkerRecoveryAttention { .. }
         | FrontendRequest::RetryCiRemediation { .. }
         | FrontendRequest::RetryConflictResolution { .. }
         | FrontendRequest::RetryReviewGuide { .. }
