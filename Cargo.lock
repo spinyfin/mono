@@ -694,7 +694,6 @@ dependencies = [
  "tokio",
  "tracing",
  "wiremock",
- "workspace-procs",
 ]
 
 [[package]]
