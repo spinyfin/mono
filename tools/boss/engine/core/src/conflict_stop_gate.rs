@@ -9,7 +9,7 @@
 //! conflict had "already been resolved and pushed in a prior attempt".
 //! GitHub said `mergeable: CONFLICTING` / `mergeStateStatus: DIRTY` — the
 //! worker had never queried the field, and never ran the mandatory
-//! `cube workspace rebase` either. Divergent jj change ids in the shared
+//! `cube workspace local-rebase --pr <bound-pr-number>` either. Divergent jj change ids in the shared
 //! cube object store made two local revsets resolve to two *different*
 //! commits, so `conflicts=false` and `descendants(main@origin)` were each
 //! true of a different copy and neither of both.
@@ -217,9 +217,9 @@ pub fn probe_conflict_still_present(pr_url: &str, raw_mergeable: &str, raw_merge
         "GitHub still reports `mergeable: {raw_mergeable}` / `mergeStateStatus: \
 {raw_merge_state_status}` on {pr_url}, and this run pushed nothing. The conflict is NOT resolved \
 — whatever your local `jj` state showed, GitHub is the authority here and it disagrees. Do NOT \
-claim \"already resolved\" or \"nothing left to do\": run `{cube} workspace rebase` and paste its \
-output before drawing any conclusion. If it reports `REBASED_WITH_CONFLICTS`, resolve every \
-conflicted commit and push with `{cube} pr update --branch <bookmark>`. If any `jj` output shows a \
+claim \"already resolved\" or \"nothing left to do\": run `{cube} workspace local-rebase --pr <bound-pr-number>` and paste its \
+output before drawing any conclusion. Resolve every \
+conflicted commit from the base upward, run the full build and test gate, and push with `{cube} pr update --branch <bookmark>`. If any `jj` output shows a \
 `??` suffix on a change id (e.g. `qtltpmoy??`), that change is DIVERGENT — change-id revsets \
 resolve to an arbitrary copy, so every `conflicts=` / `descendants()` answer you got is unsound; \
 re-check using full commit ids. If you genuinely cannot resolve it, run `{boss} engine conflicts \
@@ -238,9 +238,9 @@ pub fn probe_conflict_mergeability_unknown(pr_url: &str) -> String {
     format!(
         "This run pushed nothing, and GitHub's `mergeable` field for {pr_url} is still `UNKNOWN` \
 (mergeability recompute in flight) — that is NOT evidence the conflict cleared, so \"already \
-resolved\" is not a conclusion you may draw yet. Run `{cube} workspace rebase` and paste its output: \
-`REBASED_CLEAN` settles it in your favour, `REBASED_WITH_CONFLICTS` means resolve each conflicted \
-commit and push with `{cube} pr update --branch <bookmark>`. Then re-check with `gh pr view {pr_url} \
+resolved\" is not a conclusion you may draw yet. Run `{cube} workspace local-rebase --pr <bound-pr-number>` and paste its output: \
+Local success alone does not prove GitHub mergeability; resolve each conflicted \
+commit from the base upward, run the full build and test gate, and push with `{cube} pr update --branch <bookmark>`. Then re-check with `gh pr view {pr_url} \
 --json mergeable,mergeStateStatus`."
     )
 }
@@ -456,7 +456,7 @@ mod tests {
         assert!(text.contains(PR), "must name the PR: {text}");
         let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
         assert!(
-            text.contains(&format!("{cube} workspace rebase")),
+            text.contains(&format!("{cube} workspace local-rebase --pr <bound-pr-number>")),
             "must name the command that can contradict GitHub: {text}",
         );
         assert!(
@@ -475,7 +475,7 @@ mod tests {
         assert!(text.contains("UNKNOWN"), "must name the indeterminate value: {text}");
         let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
         assert!(
-            text.contains(&format!("{cube} workspace rebase")),
+            text.contains(&format!("{cube} workspace local-rebase --pr <bound-pr-number>")),
             "must name the settling command: {text}"
         );
         assert!(

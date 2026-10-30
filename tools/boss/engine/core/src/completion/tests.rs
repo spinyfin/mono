@@ -541,8 +541,9 @@ impl TestHarness {
             crate::work::PrOpenState::Open,
         )))
         .with_workspace_diff_verifier(StubWorkspaceDiffVerifier::empty())
-        // Ordinary successful revisions now require affirmative GitHub
-        // mergeability. Failure/UNKNOWN tests inject their own probe.
+        // Revisions complete only on affirmative GitHub mergeability, so
+        // the default probe reports a clean, CI-in-flight PR. Conflict,
+        // UNKNOWN, and probe-failure tests inject their own probe.
         .with_merge_probe(Arc::new(MergeableInFlightProbe))
         // Auto-advancing by default: most tests drive several `on_stop`
         // calls back-to-back to exercise the circuit breaker's *count*,

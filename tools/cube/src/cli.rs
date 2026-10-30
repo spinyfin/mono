@@ -374,6 +374,13 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         pr: u64,
     },
+    /// Fetch the PR's actual GitHub base and rebase preserved work locally.
+    /// Never publishes, collapses commits, or repositions the working copy.
+    LocalRebase {
+        /// PR whose current base branch is fetched from GitHub.
+        #[arg(long)]
+        pr: u64,
+    },
     /// Rebase the current workspace's boss branch onto the repo's integration branch.
     ///
     /// Fetches the latest integration branch (e.g. `main`, `master`, `trunk`)

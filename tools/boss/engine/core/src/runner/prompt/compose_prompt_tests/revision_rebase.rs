@@ -14,7 +14,7 @@ fn every_revision_rebases_before_edits_and_preserves_the_existing_gate() {
                     .pr_template_set(&crate::pr_template::PrTemplateSet::default())
                     .build(),
             );
-            let rebase = prompt.find("jj rebase --ignore-immutable -b @ -d main@origin").unwrap();
+            let rebase = prompt.find("workspace local-rebase --pr").unwrap();
             assert!(
                 rebase
                     < prompt
@@ -22,11 +22,15 @@ fn every_revision_rebases_before_edits_and_preserves_the_existing_gate() {
                         .unwrap()
             );
             assert!(prompt.contains("must retain every commit and its description"));
-            assert!(prompt.contains("integrating the PR's intent and main's changes"));
+            assert!(prompt.contains("integrating the PR's intent and the base branch's changes"));
             assert!(prompt.contains("Only `MERGEABLE` permits delivery"));
             assert!(prompt.contains("at most three reads"));
             assert!(prompt.contains("valid to have NO new commit"));
             assert!(!prompt.contains("Start making your changes directly"));
+            assert!(!prompt.contains("continue making changes directly"));
+            assert!(prompt.contains("including a parent PR branch for stacked PRs"));
+            assert!(prompt.contains("If it changed the head, validate"));
+            assert!(prompt.contains("no-op declaration is rejected unless GitHub reports"));
             if bazel {
                 assert!(prompt.contains("full `bazel build` + `bazel test` gate before pushing"));
             } else {

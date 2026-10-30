@@ -1465,6 +1465,7 @@ fn no_op_completion_directive(seam_enabled: bool) -> String {
 /// `revision_implementation` executions.
 fn revision_no_op_completion_directive(seam_enabled: bool) -> String {
     let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
+    let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     let blocked_pointer = if seam_enabled {
         "call `\"$BOSS_BIN\" propose blocked --reason \"...\"` instead"
     } else {
@@ -1479,7 +1480,10 @@ fn revision_no_op_completion_directive(seam_enabled: bool) -> String {
          it must be stated explicitly, not just implied by stopping without a push.\n\n",
     );
     out.push_str(&format!(
-        "In that case, do NOT push an empty or cosmetic commit to manufacture a diff. Instead, \
+        "In that case, the mandatory rebase still applies. If it changed the head, validate with the full pre-push build and test gate and \
+         publish the rebased head with `{cube} pr update --branch <parent-branch-name>` without \
+         adding a commit. The no-op declaration is rejected unless GitHub reports `MERGEABLE`. \
+         Do NOT push an empty or cosmetic commit to manufacture a diff. Instead, \
          explain in your final response exactly why the finding needs no change, then declare the \
          no-op as the very last thing you do:\n\n\
          ```\n\
@@ -1746,7 +1750,7 @@ fn compose_revision_directive(
             "The engine recovered this revision's prior work from its recorded execution bookmark. The engine did NOT run `cube workspace goto` for this \
              run, and running it now — or `jj new main` — would discard the preserved commits. Stay at `@`: \
              inspect `jj status`, `jj diff`, and `jj log -r '::@' -n 10` to see what the prior worker left, \
-             reconcile it with this task and current `main`, then continue making changes directly.\n",
+             rebase the preserved work using the mandatory steps below, then continue with the requested changes.\n",
         );
     } else if pr_number != "?" {
         if is_conflict_resolution {
@@ -2026,7 +2030,7 @@ fn compose_queue_ci_fragment(attempt: &CiRemediation, bazel_workspace: Option<bo
 Before any verdict (including flaky, infra, unfixable or cannot complete):
 
 1. Read the failing queue build's jobs and logs. Record its queue commit and queue base commit. Fetch the queue commit's parents with `gh api repos/<owner>/<repo>/commits/<queue-sha> --jq '.parents[].sha'` and use the build's checkout/merge metadata to identify the base (a batch can contain sibling PRs). This is the historical queue base, distinct from today's main. Fetch statuses at that queue SHA if the build was not captured: `gh api repos/<owner>/<repo>/commits/<queue-sha>/status`; also inspect `/check-runs`.
-2. Fetch `origin`, then rebase this PR's changes onto current `main@origin` using `jj rebase --ignore-immutable -b @ -d main@origin`. Resolve conflicts by integrating both sides. Record the full `main@origin` SHA and the final tested head SHA. Preserve and advance the execution recovery bookmarks after rebasing. Do this even if main is already an ancestor: verify and record that fact.
+2. Run `"$CUBE_BIN" workspace local-rebase --pr <bound-pr-number>` to fetch the actual GitHub remote and rebase onto the PR's actual base branch. Resolve conflicts by integrating both sides. Record the full destination SHA and the final tested head SHA. Preserve and advance the execution recovery bookmarks after rebasing. Do this even if the base is already an ancestor: verify and record that fact.
 {step3}
 4. Run `checkleft run`. Push substantive changes or a changed rebase through `"$CUBE_BIN" pr update` to the existing PR. If the verified head is unchanged, do not make an empty or cosmetic commit: requeue that same head as described below.
 
@@ -2165,8 +2169,11 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution, bazel_work
          working-copy tip does NOT clear conflicts baked into parent commits — this is the most \
          common failure mode on stacked branches.\n\n\
          **Step A — List every conflicted commit on the branch:**\n\
+         Keep a local bookmark on the rebased `@` tip before editing any ancestor. Use the exact \
+         `destination` from `workspace local-rebase --json` and that tip bookmark in every log below; \
+         the published PR bookmark still points to the published head.\n\
          ```\n\
-         jj log -r '::<branch>' -T 'commit_id ++ \" \" ++ description.first_line() ++ \" conflicts=\" ++ conflict ++ \"\\n\"'\n\
+         jj log -r '<destination>..<rebased-tip-bookmark>' -T 'commit_id ++ \" \" ++ description.first_line() ++ \" conflicts=\" ++ conflict ++ \"\\n\"'\n\
          ```\n\
          Note every commit with `conflicts=true`.\n\n\
          **Step B — Resolve from the BASE upward:**\n\
@@ -2175,13 +2182,14 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution, bazel_work
          ```\n\
          Fix the conflicted files in that commit (see structural-edit instructions below) so it \
          is conflict-free; descendants auto-rebase. Re-run the log from Step A and resolve the \
-         next-lowest still-conflicted commit. Repeat until **no commit** in `::<branch>` has \
+         next-lowest still-conflicted commit. Repeat until **no commit** in `<destination>..<rebased-tip-bookmark>` has \
          `conflicts=true`.\n\n\
          **Step C — Verify before pushing:**\n\
          ```\n\
-         jj log -r '::<branch>' -T 'conflict ++ \"\\n\"'\n\
+         jj log -r '<destination>..<rebased-tip-bookmark>' -T 'conflict ++ \"\\n\"'\n\
          ```\n\
-         Output must contain no `true`. Only then run `{cube} pr update --branch <branch>`.\n\n\
+         Output must contain no `true`. Return to the tip bookmark, advance the publication branch, \
+         and run the full build and test gate before `{cube} pr update --branch <branch>`.\n\n\
          **Do NOT** squash or resolve only at the working-copy tip — it cannot clear an \
          ancestor's conflict.\n\n\
          **Non-interactive env:** ALWAYS pass `-m \"…\"` to `jj describe`, `jj squash`, \
@@ -2306,6 +2314,7 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution, bazel_work
 /// ([`crate::conflict_stop_gate`]) — this fragment is the cooperative
 /// half, not the guarantee.
 fn compose_conflict_ground_truth_fragment(attempt: &ConflictResolution) -> String {
+    let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     format!(
         "### Ground truth: run these FIRST, in this order (HARD GATE)\n\n\
          After inspecting the preserved work, before forming any opinion about whether this \
@@ -2321,8 +2330,7 @@ fn compose_conflict_ground_truth_fragment(attempt: &ConflictResolution) -> Strin
          already resolved.\n\n\
          **2. Rebase — this is step 3 of these instructions and it is not optional:**\n\n\
          ```\n\
-         jj git fetch --remote origin\n\
-         jj rebase --ignore-immutable -b @ -d main@origin\n\
+         {cube} workspace local-rebase --pr {pr_number}\n\
          ```\n\n\
          Inspect every rebased commit for conflicts and quote the rebase result in your final response. Do not push until the build gate passes.\n\n\
          **3. You may NOT conclude \"already resolved\" from local `jj` state alone.** \
@@ -2350,6 +2358,7 @@ fn compose_conflict_ground_truth_fragment(attempt: &ConflictResolution) -> Strin
          the underlying cause, if the failure is not transient) and only draw a conclusion \
          from a command that actually exited 0.\n\n",
         pr_url = attempt.pr_url,
+        pr_number = attempt.pr_number,
     )
 }
 
@@ -2485,7 +2494,7 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation, bazel_workspace: Opt
              \"$BOSS_BIN\" engine ci mark-failed --attempt-id {attempt} --reason no-failing-build-found\n\
              ```\n\n\
              **If the search DOES find a failing `trunk-merge/pr-{pr_num}/*` build**, this is a real \
-             merge-queue CI failure: rebase onto current `main@origin`, {verify_failed_targets}, and give up or deliver only \
+             merge-queue CI failure: rebase onto the freshly fetched PR base, {verify_failed_targets}, and give up or deliver only \
              with `--queue-ci-evidence-file` (main_sha, verified_head_sha, queue_sha, queue_base_sha \
              and successful runs). Without that file the engine rejects the give-up.\n\n\
              **Do NOT** reset, force-push, or invent a CI fix unless one of the checks \
@@ -2540,18 +2549,14 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation, bazel_workspace: Opt
              experiment is rebasing onto `main` HEAD before changing any code — if CI goes \
              green after the rebase, no fix-attempt slot is consumed.\n\n",
         );
-        out.push_str("**Step 1 — Rebase onto base HEAD and force-push** (replaces step 3 above).\n\n");
+        out.push_str("**Step 1 — Rebase locally onto the PR base, then validate before publishing**.\n\n");
         out.push_str(&format!(
             "```\n\
-             jj edit {branch}\n\
-             jj rebase -d main -b {branch}\n\
-             # then push via step 5 of the revision directive\n\
+             {cube} workspace local-rebase --pr {pr_number}\n\
+             # resolve from the base upward, run the build gate, then publish via cube pr update\n\
              ```\n\n",
-            branch = if attempt.head_branch.is_empty() {
-                "<branch>"
-            } else {
-                attempt.head_branch.as_str()
-            },
+            cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION,
+            pr_number = attempt.pr_number,
         ));
         out.push_str(
             "**If the rebase produces conflicts on a stacked branch:** jj records conflicts \

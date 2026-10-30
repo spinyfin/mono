@@ -1169,7 +1169,7 @@ fn conflict_fragment_hard_gates_the_ground_truth_commands_before_local_jj_reason
         .find("--json mergeable,mergeStateStatus")
         .unwrap_or_else(|| panic!("brief must mandate the mergeable query:\n{prompt}"));
     let rebase = ground_truth
-        .find("jj rebase --ignore-immutable -b @ -d main@origin")
+        .find("workspace local-rebase --pr")
         .unwrap_or_else(|| panic!("brief must mandate the rebase:\n{prompt}"));
     assert!(
         gh_query < rebase,
@@ -1665,7 +1665,7 @@ fn trunk_eviction_prompt_keeps_the_rebase_playbook_when_a_build_was_captured() {
         "no bail-out when there is a real failing build to fix:\n{prompt}",
     );
     assert!(
-        prompt.contains("rebase this PR's changes onto current `main@origin`"),
+        prompt.contains("rebase onto the PR's actual base branch"),
         "the rebase-and-fix playbook must survive for a genuine test failure:\n{prompt}",
     );
     assert!(
@@ -1720,7 +1720,7 @@ fn merge_queue_brief_names_failure_source_and_requires_rebased_bazel_evidence() 
         "builds/20619",
         "queue-commit",
         "historical-base",
-        "current `main@origin`",
+        "workspace local-rebase --pr",
         "EVERY failed test target",
         "FULL build/test invocation",
         "--queue-ci-evidence-file",

@@ -2,6 +2,51 @@
 use super::*;
 
 #[tokio::test]
+async fn conflict_failure_names_diagnosed_files_or_explains_missing_diagnosis() {
+    for diagnosed in [false, true] {
+        let workspace = tempdir().unwrap();
+        let pr = "https://github.com/spinyfin/mono/pull/2070";
+        let (_dir, db, product, revision, execution) = revision_fixture(workspace.path(), pr, "old-head");
+        if diagnosed {
+            let root = db.get_revision_chain_root_task_id(&revision).unwrap();
+            let attempt = db
+                .insert_conflict_resolution(crate::work::ConflictResolutionInsertInput {
+                    product_id: product,
+                    work_item_id: root,
+                    pr_url: pr.into(),
+                    pr_number: 2070,
+                    head_branch: "feature".into(),
+                    base_branch: "main".into(),
+                    base_sha_at_trigger: None,
+                    head_sha_before: None,
+                })
+                .unwrap()
+                .unwrap();
+            db.set_conflict_resolution_diagnosis(&attempt.id,
+                r#"{"schema_version":1,"base_sha":"base","head_sha":"head","files":[{"path":"src/review.rs","shape":"content"},{"path":"src/other.rs","shape":"content"}],"error":null}"#).unwrap();
+        }
+        let handler = TestHarness::new(db, StubPrDetector::ok(None))
+            .handler
+            .with_merge_probe(Arc::new(FixedMergeabilityProbe {
+                mergeability: OpenPrMergeability::Conflict,
+            }));
+        let outcome = handler
+            .finalize_declared_run_done(&execution, boss_protocol::RunDoneOutcome::Delivered)
+            .await;
+        let StopOutcome::RunDoneDeclaredWithoutDelivery { detail } = outcome else {
+            panic!("{outcome:?}")
+        };
+        if diagnosed {
+            assert!(detail.contains("Known conflicting files:"), "{detail}");
+            assert!(detail.contains("src/review.rs"), "{detail}");
+            assert!(detail.contains("src/other.rs"), "{detail}");
+        } else {
+            assert!(detail.contains("Conflicting files were not captured"), "{detail}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn ordinary_revision_requires_mergeability_at_every_completion_boundary() {
     for boundary in ["declared", "stop", "no-op"] {
         for mergeability in [
