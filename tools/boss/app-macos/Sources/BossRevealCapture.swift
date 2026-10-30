@@ -70,6 +70,10 @@ enum BossRevealCapture {
             BossOperatorQuestionCapture.start(path: path)
             return
         }
+        if state == "queued-order" {
+            BossQueuedOrderCapture.start(path: path, updateModel: updateModel)
+            return
+        }
         if state == "attachment-viewer" {
             BossAttachmentViewerCapture.start(path: path)
             return

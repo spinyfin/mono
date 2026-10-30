@@ -565,22 +565,7 @@ impl ExecutionCoordinator {
     async fn live_chain_siblings(&self, execution: &WorkExecution) -> Result<Vec<WorkExecution>> {
         let work_item_id = execution.work_item_id.as_str();
         let inflight = self.inflight_chain_siblings(execution)?;
-        // Union DB-live siblings with in-flight ones, without double-counting
-        // a sibling that is momentarily both: a dispatch that has just
-        // committed `start_execution_run_on_host` is already `running` in the
-        // DB while its task still holds the reservation for the instant before
-        // the guard drops. `resolve_chain_hold` reports `siblings.len()` to the
-        // operator as "N revisions queued", so a duplicate would inflate the
-        // count on the kanban card.
-        let union_with_inflight = |mut db_siblings: Vec<WorkExecution>| {
-            let extra: Vec<WorkExecution> = inflight
-                .iter()
-                .filter(|i| !db_siblings.iter().any(|d| d.id == i.id))
-                .cloned()
-                .collect();
-            db_siblings.extend(extra);
-            db_siblings
-        };
+        let union_with_inflight = |db_siblings: Vec<WorkExecution>| union_with_inflight(db_siblings, &inflight);
         const MAX_RECONCILE_ATTEMPTS: u8 = 4;
         for _ in 0..MAX_RECONCILE_ATTEMPTS {
             let siblings = self.work_db.live_executions_elsewhere_in_chain(work_item_id)?;
@@ -693,8 +678,16 @@ impl ExecutionCoordinator {
     /// the row in a defer loop instead of actually dispatching it.
     pub(super) async fn resolve_chain_hold(&self, execution: &WorkExecution) -> Result<ChainHold> {
         let siblings = self.live_chain_siblings(execution).await?;
+        Ok(self.chain_hold_from_siblings(execution, siblings))
+    }
+
+    /// The hold policy of [`Self::resolve_chain_hold`], applied to an
+    /// already-gathered set of live chain siblings. Kept separate so the
+    /// read-only [`Self::is_chain_blocked`] projection cannot drift from the
+    /// decision the drain makes.
+    fn chain_hold_from_siblings(&self, execution: &WorkExecution, siblings: Vec<WorkExecution>) -> ChainHold {
         let Some(first_sibling) = siblings.first().cloned() else {
-            return Ok(ChainHold::Clear);
+            return ChainHold::Clear;
         };
         let is_revision = !matches!(
             self.work_db.classify_work_item_for_dispatch(&execution.work_item_id),
@@ -710,14 +703,14 @@ impl ExecutionCoordinator {
                 .filter(|s| !s.kind.is_read_only_review())
                 .cloned()
                 .collect();
-            return Ok(match writers.first().cloned() {
+            return match writers.first().cloned() {
                 None => ChainHold::ReviewBypassed(first_sibling),
                 Some(sibling) => ChainHold::Blocked {
                     sibling,
                     review_held: false,
                     queue_len: writers.len(),
                 },
-            });
+            };
         }
         // Non-revision work keeps serializing behind a review. Prefer
         // surfacing a non-review (writer) sibling in the `Blocked` outcome
@@ -730,11 +723,39 @@ impl ExecutionCoordinator {
             .find(|s| !s.kind.is_read_only_review())
             .cloned()
             .unwrap_or(first_sibling);
-        Ok(ChainHold::Blocked {
+        ChainHold::Blocked {
             sibling,
             review_held: all_review_siblings,
             queue_len,
-        })
+        }
+    }
+
+    /// `true` when [`Self::resolve_chain_hold`] would currently defer
+    /// `execution` behind a live chain sibling. Read-only: unlike the drain it
+    /// does not reconcile zombie siblings or write a wait reason, so a board
+    /// projection can ask it on every refresh. A query error reads as "not
+    /// blocked", the same fail-open policy the drain applies.
+    pub fn is_chain_blocked(&self, execution: &WorkExecution) -> bool {
+        let Ok(siblings) = self.chain_siblings_snapshot(execution) else {
+            return false;
+        };
+        matches!(
+            self.chain_hold_from_siblings(execution, siblings),
+            ChainHold::Blocked { .. }
+        )
+    }
+
+    /// Read-only snapshot of `execution`'s live chain siblings: the DB-live
+    /// ones unioned with in-flight hand-offs, exactly the set
+    /// [`Self::live_chain_siblings`] judges, minus its zombie reconciliation.
+    /// Either source failing is an error, so a projection built on this fails
+    /// open just as the drain does.
+    fn chain_siblings_snapshot(&self, execution: &WorkExecution) -> Result<Vec<WorkExecution>> {
+        let inflight = self.inflight_chain_siblings(execution)?;
+        let db_siblings = self
+            .work_db
+            .live_executions_elsewhere_in_chain(&execution.work_item_id)?;
+        Ok(union_with_inflight(db_siblings, &inflight))
     }
 
     /// Build the operator-facing string persisted into
@@ -2520,6 +2541,22 @@ impl ExecutionCoordinator {
             }
         }
     }
+}
+
+/// Union DB-live chain siblings with in-flight ones, without double-counting
+/// a sibling that is momentarily both: a dispatch that has just committed
+/// `start_execution_run_on_host` is already `running` in the DB while its task
+/// still holds the reservation for the instant before the guard drops.
+/// `resolve_chain_hold` reports `siblings.len()` to the operator as "N
+/// revisions queued", so a duplicate would inflate the count on the card.
+fn union_with_inflight(mut db_siblings: Vec<WorkExecution>, inflight: &[WorkExecution]) -> Vec<WorkExecution> {
+    let extra: Vec<WorkExecution> = inflight
+        .iter()
+        .filter(|i| !db_siblings.iter().any(|d| d.id == i.id))
+        .cloned()
+        .collect();
+    db_siblings.extend(extra);
+    db_siblings
 }
 
 /// RAII claim on a `ready` execution for the duration of one drain-loop

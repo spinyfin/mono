@@ -47,13 +47,14 @@ extension ChatViewModel {
         )
     }
 
-    /// Build Doing's Queued section. Cards awaiting an operator answer sort
-    /// first, oldest question first (`askedAt` ascending; missing or
-    /// unparseable timestamps last, ties by id); the remaining cards follow in
-    /// board order. Returns nil for empty input so the section is omitted.
-    static func queuedSection(items: [WorkTask]) -> WorkBoardSection? {
+    /// Build Doing's Needs Attention section: cards parked on an operator
+    /// Yes/No (or multiple-choice) answer. The dispatcher never picks these up,
+    /// so they are not part of the queue. Oldest question first (`askedAt`
+    /// ascending; missing or unparseable timestamps last, ties by id). Returns
+    /// nil for empty input so the section is hidden.
+    static func needsAttentionSection(items: [WorkTask]) -> WorkBoardSection? {
         guard !items.isEmpty else { return nil }
-        let sorted = items.filter(\.isAwaitingOperatorAnswer).sorted { lhs, rhs in
+        let sorted = items.sorted { lhs, rhs in
             let lhsAsked = lhs.operatorQuestion.flatMap { AutomationTime.parse($0.askedAt) }
             let rhsAsked = rhs.operatorQuestion.flatMap { AutomationTime.parse($0.askedAt) }
             switch (lhsAsked, rhsAsked) {
@@ -64,12 +65,37 @@ extension ChatViewModel {
             }
         }
         return WorkBoardSection(
-            id: "doing-queued",
-            title: "Queued",
-            items: sorted + items.filter { !$0.isAwaitingOperatorAnswer },
+            id: "doing-needs-attention",
+            title: "Needs Attention",
+            items: sorted,
             isCollapsible: true,
             defaultExpanded: true,
             countLabel: "\(sorted.count) \(sorted.count == 1 ? "decision" : "decisions") waiting"
+        )
+    }
+
+    /// Build Doing's Queued section in the engine's dispatch order. Cards the
+    /// dispatcher would take now come first, ordered by the engine-supplied
+    /// position (ties by id). Cards it will not currently take (held by a
+    /// pause, waiting on a dependency or a retry deadline, or carrying no
+    /// pending execution) follow in the incoming board order; each shows its
+    /// wait reason on the card. The app computes no order of its own. Returns
+    /// nil for empty input so the section is omitted.
+    static func queuedSection(items: [WorkTask], dispatch: [String: QueuedDispatch] = [:]) -> WorkBoardSection? {
+        guard !items.isEmpty else { return nil }
+        let ranked = items
+            .compactMap { task in dispatch[task.id]?.position.map { (task: task, position: $0) } }
+            .sorted { lhs, rhs in
+                lhs.position != rhs.position ? lhs.position < rhs.position : lhs.task.id < rhs.task.id
+            }
+            .map(\.task)
+        let rankedIDs = Set(ranked.map(\.id))
+        return WorkBoardSection(
+            id: "doing-queued",
+            title: "Queued",
+            items: ranked + items.filter { !rankedIDs.contains($0.id) },
+            isCollapsible: true,
+            defaultExpanded: true
         )
     }
 
@@ -351,7 +377,7 @@ extension ChatViewModel {
             return Self.reviewSections(items: items, missingSectionIsExpected: missingReviewSectionIsExpected(for:))
         }
         if column == .doing {
-            return Self.doingSections(items: items, membership: doingSectionsByID)
+            return Self.doingSections(items: items, membership: doingSectionsByID, dispatch: queuedDispatchByID)
         }
         guard workBoardGrouping == .project else {
             return [WorkBoardSection(id: column.rawValue, title: column.title, items: items)]

@@ -927,13 +927,7 @@ impl ExecutionCoordinator {
     /// code answering "which pool owns this slot?" (release routing) must
     /// keep using [`Self::pool_for_worker_id`].
     pub fn attributed_pool_label(&self, execution: &WorkExecution) -> &'static str {
-        if self.execution_targets_review_pool(execution) {
-            "review"
-        } else if self.execution_targets_automation_pool(execution) {
-            "automation"
-        } else {
-            "main"
-        }
+        self.dispatch_pool_for(execution).as_str()
     }
 
     /// Return the pool that should handle `execution`.
@@ -946,12 +940,10 @@ impl ExecutionCoordinator {
     /// when the owning task has `source_automation_id IS NOT NULL` (it was
     /// produced by an automation). All other executions go to the main pool.
     pub(super) fn pool_for_execution<'a>(&'a self, execution: &WorkExecution) -> &'a WorkerPool {
-        if self.execution_targets_review_pool(execution) {
-            &self.review_pool
-        } else if self.execution_targets_automation_pool(execution) {
-            &self.automation_pool
-        } else {
-            &self.worker_pool
+        match self.dispatch_pool_for(execution) {
+            boss_protocol::DispatchPool::Review => &self.review_pool,
+            boss_protocol::DispatchPool::Automation => &self.automation_pool,
+            boss_protocol::DispatchPool::Main => &self.worker_pool,
         }
     }
 
@@ -983,6 +975,18 @@ impl ExecutionCoordinator {
             self.work_db.source_automation_id_for_work_item(&execution.work_item_id),
             Ok(Some(_))
         )
+    }
+
+    /// The pool `drain_ready_queue` routes `execution` to. Review is checked
+    /// first, so a reviewer of an automation-produced task counts as review.
+    pub fn dispatch_pool_for(&self, execution: &WorkExecution) -> boss_protocol::DispatchPool {
+        if self.execution_targets_review_pool(execution) {
+            boss_protocol::DispatchPool::Review
+        } else if self.execution_targets_automation_pool(execution) {
+            boss_protocol::DispatchPool::Automation
+        } else {
+            boss_protocol::DispatchPool::Main
+        }
     }
 
     /// Return the pool that owns `worker_id`. Automation-pool slots carry the

@@ -548,6 +548,10 @@ pub enum FrontendEvent {
         /// Computed by the engine, including comparison-to-card attribution.
         #[serde(default)]
         doing_sections: std::collections::BTreeMap<String, crate::DoingSection>,
+        /// Dispatch order for queued cards, keyed like `doing_sections`. Only
+        /// cards with a pending execution appear; absent keys have no position.
+        #[serde(default)]
+        queued_dispatch: std::collections::BTreeMap<String, crate::QueuedDispatch>,
     },
     /// On-demand tmux evidence for the current live-worker snapshot. Kept
     /// separate from [`Self::WorkerLiveStatesList`] so hook broadcasts do not

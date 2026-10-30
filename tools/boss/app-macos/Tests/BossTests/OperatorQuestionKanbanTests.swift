@@ -2,8 +2,8 @@ import XCTest
 @testable import Boss
 
 /// A task parked with a typed operator question stays in Doing. Without a
-/// live worker it leads the Queued section, ordered oldest question first,
-/// and can still be answered with Yes/No from the card.
+/// live worker it sits in the Needs Attention section above Queued, ordered
+/// oldest question first, and can still be answered with Yes/No from the card.
 @MainActor
 final class OperatorQuestionKanbanTests: XCTestCase {
 
@@ -224,55 +224,58 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         )
     }
 
-    // MARK: - queuedSection
+    // MARK: - needsAttentionSection
 
-    func testQueuedSectionIsNilForEmptyItems() {
-        XCTAssertNil(ChatViewModel.queuedSection(items: []))
+    func testNeedsAttentionSectionIsNilForEmptyItems() {
+        XCTAssertNil(ChatViewModel.needsAttentionSection(items: []))
     }
 
-    func testQueuedSectionShape() throws {
-        let section = try XCTUnwrap(ChatViewModel.queuedSection(items: [awaiting(id: "task_a")]))
-        XCTAssertEqual(section.id, "doing-queued")
-        XCTAssertEqual(section.title, "Queued")
-        XCTAssertTrue(section.isCollapsible)
-        XCTAssertTrue(section.defaultExpanded)
-        XCTAssertNil(section.groupKey)
+    func testNeedsAttentionSectionShapeAndDecisionCount() throws {
+        let one = try XCTUnwrap(ChatViewModel.needsAttentionSection(items: [awaiting(id: "task_a")]))
+        XCTAssertEqual(one.id, "doing-needs-attention")
+        XCTAssertEqual(one.title, "Needs Attention")
+        XCTAssertTrue(one.isCollapsible)
+        XCTAssertTrue(one.defaultExpanded)
+        XCTAssertNil(one.groupKey)
+        XCTAssertEqual(one.countLabel, "1 decision waiting")
+        let two = try XCTUnwrap(ChatViewModel.needsAttentionSection(items: [awaiting(id: "task_a"), awaiting(id: "task_b")]))
+        XCTAssertEqual(two.countLabel, "2 decisions waiting")
     }
 
-    func testQueuedSectionOrdersOldestQuestionFirst() throws {
+    func testNeedsAttentionSectionOrdersOldestQuestionFirst() throws {
         let newest = awaiting(id: "task_a", askedAt: "1790000300")
         let oldest = awaiting(id: "task_c", askedAt: "1790000100")
         let middle = awaiting(id: "task_b", askedAt: "1790000200")
 
-        let section = try XCTUnwrap(ChatViewModel.queuedSection(items: [newest, oldest, middle]))
+        let section = try XCTUnwrap(ChatViewModel.needsAttentionSection(items: [newest, oldest, middle]))
 
         XCTAssertEqual(section.items.map(\.id), ["task_c", "task_b", "task_a"])
     }
 
-    func testQueuedSectionComparesInstantsAcrossTimestampFormats() throws {
+    func testNeedsAttentionSectionComparesInstantsAcrossTimestampFormats() throws {
         // 2026-10-05T00:00:00Z is epoch 1791158400; the RFC 3339 row is
         // earlier than the epoch row despite sorting later as a string.
         let epoch = awaiting(id: "task_a", askedAt: "1791158500")
         let rfc = awaiting(id: "task_b", askedAt: "2026-10-05T00:00:00Z")
 
-        let section = try XCTUnwrap(ChatViewModel.queuedSection(items: [epoch, rfc]))
+        let section = try XCTUnwrap(ChatViewModel.needsAttentionSection(items: [epoch, rfc]))
 
         XCTAssertEqual(section.items.map(\.id), ["task_b", "task_a"])
     }
 
-    func testQueuedSectionBreaksTiesAndSortsUnparseableLastByTaskID() throws {
+    func testNeedsAttentionSectionBreaksTiesAndSortsUnparseableLastByTaskID() throws {
         let tieB = awaiting(id: "task_b", askedAt: "1790000100")
         let tieA = awaiting(id: "task_a", askedAt: "1790000100")
         let garbage = awaiting(id: "task_0", askedAt: "not-a-time")
 
-        let section = try XCTUnwrap(ChatViewModel.queuedSection(items: [garbage, tieB, tieA]))
+        let section = try XCTUnwrap(ChatViewModel.needsAttentionSection(items: [garbage, tieB, tieA]))
 
         XCTAssertEqual(section.items.map(\.id), ["task_a", "task_b", "task_0"])
     }
 
     // MARK: - workSections(in: .doing)
 
-    func testDoingFlatGroupingQueuesQuestionsAndOtherCardsWithoutWorkers() {
+    func testDoingFlatGroupingSplitsQuestionsFromOtherCardsWithoutWorkers() {
         let model = makeModel()
         model.choresByProductID = ["prod_test": [
             awaiting(id: "task_q"),
@@ -281,9 +284,9 @@ final class OperatorQuestionKanbanTests: XCTestCase {
 
         let sections = model.workSections(in: .doing)
 
-        XCTAssertEqual(sections.map(\.title), ["Queued"])
-        XCTAssertEqual(sections[0].items.map(\.id), ["task_q", "task_active"])
-        XCTAssertEqual(sections[0].items.count, 2)
+        XCTAssertEqual(sections.map(\.title), ["Needs Attention", "Queued"])
+        XCTAssertEqual(sections[0].items.map(\.id), ["task_q"])
+        XCTAssertEqual(sections[1].items.map(\.id), ["task_active"])
     }
 
     func testOrdinaryDoingCardWithoutWorkerRendersQueued() {
@@ -299,16 +302,16 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         XCTAssertEqual(sections.flatMap(\.items).map(\.id), ["task_active"])
     }
 
-    func testDoingWithOnlyAQuestionRendersQueued() {
+    func testDoingWithOnlyAQuestionRendersOnlyNeedsAttention() {
         let model = makeModel()
         model.choresByProductID = ["prod_test": [awaiting(id: "task_q")]]
 
         let sections = model.workSections(in: .doing)
 
-        XCTAssertEqual(sections.map(\.title), ["Queued"])
+        XCTAssertEqual(sections.map(\.title), ["Needs Attention"])
     }
 
-    func testDoingProjectGroupingStillQueuesQuestionsAndOtherCardsWithoutWorkers() {
+    func testDoingProjectGroupingStillSplitsQuestionsFromOtherCardsWithoutWorkers() {
         let model = makeModel()
         model.workBoardGrouping = .project
         model.choresByProductID = ["prod_test": [
@@ -318,9 +321,8 @@ final class OperatorQuestionKanbanTests: XCTestCase {
 
         let sections = model.workSections(in: .doing)
 
-        XCTAssertEqual(sections.map(\.title), ["Queued"])
-        XCTAssertEqual(sections[0].items.map(\.id), ["task_q", "task_active"])
-        XCTAssertEqual(sections[0].items.count, 2, "each card must appear exactly once")
+        XCTAssertEqual(sections.map(\.title), ["Needs Attention", "Queued"])
+        XCTAssertEqual(sections.flatMap(\.items).map(\.id), ["task_q", "task_active"], "each card must appear exactly once")
     }
 
     func testBoardGroupIsNilForDoingCards() {

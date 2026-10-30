@@ -238,13 +238,12 @@ async fn the_doc_pointer_handler_answers_and_pushes_runtime_class_without_reconc
 #[tokio::test]
 async fn the_broker_publisher_tags_each_push_with_its_class_and_counts_it() {
     let seeded = seeded().await;
-    let publisher = BrokerExecutionPublisher {
-        work_db: seeded.state.work_db.clone(),
-        topic_broker: seeded.state.topic_broker.clone(),
-        work_revision: seeded.state.work_revision.clone(),
-        metrics: seeded.state.metrics.clone(),
-        kick: std::sync::OnceLock::new(),
-    };
+    let publisher = BrokerExecutionPublisher::builder()
+        .work_db(seeded.state.work_db.clone())
+        .topic_broker(seeded.state.topic_broker.clone())
+        .work_revision(seeded.state.work_revision.clone())
+        .metrics(seeded.state.metrics.clone())
+        .build();
 
     let mut classes = Vec::new();
     publisher

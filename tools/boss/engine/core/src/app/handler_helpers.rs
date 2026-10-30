@@ -801,6 +801,7 @@ async fn publish_classified_work_invalidation(
 
         let coordinator = server_state.execution_coordinator.clone();
         coordinator.kick();
+        server_state.notify_queued_dispatch_may_have_changed();
     }
 
     server_state
@@ -919,6 +920,7 @@ pub(super) async fn publish_batch_work_invalidation(
 
     if !by_product.is_empty() {
         server_state.execution_coordinator.clone().kick();
+        server_state.notify_queued_dispatch_may_have_changed();
     }
 
     let revision = server_state.bump_work_revision();

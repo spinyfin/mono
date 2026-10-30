@@ -93,7 +93,11 @@ enum EngineEvent {
     /// Delivered both as a one-shot reply to
     /// `list_worker_live_states` and as a topic push on
     /// `worker.live_states` whenever any slot changes.
-    case workerLiveStatesList(states: [WorkerLiveState], doingSections: [String: DoingSection] = [:])
+    case workerLiveStatesList(
+        states: [WorkerLiveState],
+        doingSections: [String: DoingSection] = [:],
+        queuedDispatch: [String: QueuedDispatch] = [:]
+    )
     /// Engine reply to a `ResolveProjectDesignDoc` RPC. Carries the
     /// per-project `ProjectDesignDocState` the kanban consumes to
     /// pick the right icon affordance and open dispatch.

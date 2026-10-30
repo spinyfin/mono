@@ -499,6 +499,7 @@ enum WorkCardLiveStatus {
         column: WorkBoardColumnKey,
         runtime: WorkTaskRuntime?,
         liveState: WorkerLiveState?,
+        isNextUp: Bool = false,
         now: Date = Date()
     ) -> String? {
         guard column == .doing else { return nil }
@@ -517,7 +518,9 @@ enum WorkCardLiveStatus {
 
         if runtime?.executionStatus == "claimed" { return "Starting worker" }
         if isQueued(task: task, runtime: runtime) {
-            return queuedLabel(runtime: runtime, now: now)
+            return isNextUp
+                ? nextUpLabel(runtime: runtime, now: now)
+                : queuedLabel(runtime: runtime, now: now)
         }
         // A declared job wait names what the worker is waiting on, so it
         // is shown even for conflict / CI-remediation runs.
