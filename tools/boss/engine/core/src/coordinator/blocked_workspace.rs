@@ -1,6 +1,7 @@
+use super::execution::GotoTarget;
 use super::*;
 use boss_engine_recovery::execution_bookmark::{
-    ExecutionBookmark, PointerIntegrityKind, Reconciliation, is_base_unresolvable_error, is_missing_pointer_error,
+    ExecutionBookmark, Reconciliation, is_base_unresolvable_error, is_missing_pointer_error,
     is_reconcilable_pointer_error, pointer_integrity_error, pointer_integrity_kind,
 };
 
@@ -13,22 +14,66 @@ pub(crate) struct Recovered {
     pub(crate) reconciliation: Option<Reconciliation>,
 }
 
-/// Outcome of inspecting a recovery source's pointers.
-enum Inspection {
-    /// The unpublished diff, after any reconciliation that was needed.
-    Patch(String, Option<Reconciliation>),
-    /// The baseline was gone and nothing the engine recorded vouched for
-    /// the heads: the record was retired and dispatch continues clean.
-    Retired,
-}
-
 impl ExecutionCoordinator {
+    /// Pointer creation also validates inherited baselines. A race or a
+    /// partially created record from an earlier attempt uses the same fallback.
+    pub(super) async fn create_or_start_fresh(
+        &self,
+        execution: &WorkExecution,
+        lease: &CubeWorkspaceLease,
+        adapter: &Arc<dyn HostAdapter>,
+        inheritance: (Option<&ExecutionBookmark>, Option<&str>),
+        positioning: (Option<GotoTarget<'_>>, &str),
+    ) -> Result<(ExecutionBookmark, bool)> {
+        let (predecessor, inherited_base) = inheritance;
+        let result = adapter
+            .create_execution_bookmark(&lease.workspace_path, &execution.id, predecessor, inherited_base)
+            .await;
+        let err = match result {
+            Ok(record) => return Ok((record, true)),
+            Err(err) => err,
+        };
+        let Some(failure) = err.downcast_ref::<boss_engine_recovery::execution_bookmark::CreationFailure>() else {
+            return Err(err);
+        };
+        if let Some(prior) = predecessor {
+            let prior_execution = self.work_db.get_execution(&prior.execution_id)?;
+            self.retire_unvouched_record(execution, &prior_execution, prior, adapter, &err)
+                .await?;
+        }
+        let archives = adapter.release_execution_bookmark_heads(&failure.record).await?;
+        let reason = format!("{err:#}");
+        tracing::warn!(execution_id = %execution.id, ?archives, reason,
+            "pointer initialization could not preserve recovery; starting fresh");
+        if let Err(note_error) = crate::execution_bookmark_recovery::record_fresh_start(
+            &self.work_db,
+            execution,
+            &execution.id,
+            &reason,
+            &archives,
+        ) {
+            tracing::error!(?note_error, "could not record pointer initialization archive note");
+        }
+        self.work_db.delete_execution_restore_report(&execution.id)?;
+        match positioning.0 {
+            Some(GotoTarget::Pr(pr)) => adapter.goto_workspace(&lease.workspace_path, pr).await?,
+            Some(GotoTarget::Revision(sha)) => adapter.goto_workspace_revision(&lease.workspace_path, sha).await?,
+            None => {
+                adapter.create_change(&lease.workspace_path, positioning.1).await?;
+            }
+        }
+        let record = adapter
+            .create_execution_bookmark(&lease.workspace_path, &execution.id, None, None)
+            .await?;
+        Ok((record, false))
+    }
+
     /// Restore the predecessor's engine-created reference into the new lease.
     /// No read of its old workspace or lease history occurs.
     ///
     /// Missing predecessor heads degrade to clean dispatch with a warning.
-    /// Invalid pointers still fail with `PointerIntegrityError`; transient
-    /// fetch/goto/SSH failures stay retryable.
+    /// Any unsuccessful recovery archives its source and dispatches fresh.
+    /// Failure to write the archive leaves all source pointers intact.
     ///
     /// `repo_id` is the handle `ensure_repo` returned for this execution; the
     /// registered repo is selected by it because `execution.repo_remote_url`
@@ -67,6 +112,38 @@ impl ExecutionCoordinator {
             self.work_db.delete_execution_restore_report(&execution.id)?;
             return Ok(None);
         };
+        let result = self
+            .recover_from_record(
+                execution,
+                (&prior, &record),
+                lease,
+                adapter,
+                repo_id,
+                (pr_for_goto, pr_for_reconcile),
+            )
+            .await;
+        match result {
+            Ok(recovered) => Ok(recovered),
+            Err(err) => {
+                self.retire_unvouched_record(execution, &prior, &record, adapter, &err)
+                    .await?;
+                self.work_db.delete_execution_restore_report(&execution.id)?;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn recover_from_record(
+        &self,
+        execution: &WorkExecution,
+        source: (&WorkExecution, &ExecutionBookmark),
+        lease: &CubeWorkspaceLease,
+        adapter: &Arc<dyn HostAdapter>,
+        repo_id: &str,
+        prs: (Option<u64>, Option<u64>),
+    ) -> Result<Option<Recovered>> {
+        let (prior, record) = source;
+        let (pr_for_goto, pr_for_reconcile) = prs;
         if record.host_id != adapter.host_id() {
             return Err(pointer_integrity_error(format!(
                 "execution {} recovery store is on host {}; dispatch selected {}",
@@ -84,52 +161,22 @@ impl ExecutionCoordinator {
         // Inspect (and if needed repair) the pointers before anything reads
         // them: both restore paths below assume a single line from the
         // baseline to the head.
-        let inspection = match adapter.execution_bookmark_diff(&record).await {
+        let (patch, reconciliation) = match adapter.execution_bookmark_diff(record).await {
             Ok(patch) => {
-                let base = adapter.checkpoint_execution_baseline(&record).await?;
+                let base = adapter.checkpoint_execution_baseline(record).await?;
                 self.work_db.update_execution_bookmark_base(&prior.id, &base)?;
-                Inspection::Patch(patch, None)
+                (patch, None)
             }
             Err(err) if is_missing_pointer_error(&err) => {
-                self.degrade_missing_pointers(execution, Some(&prior.id), &record, &err)
+                self.degrade_missing_pointers(execution, Some(&prior.id), record, &err)
                     .await;
-                // A report from an earlier attempt would make dispatch skip PR positioning.
-                self.work_db.delete_execution_restore_report(&execution.id)?;
-                if prior.id == execution.id {
-                    // The row names heads that no longer exist; keeping it
-                    // would make dispatch treat the run as already recovered
-                    // and skip creating fresh pointers. The surviving
-                    // baseline would also make fresh creation fail, so drop
-                    // it first (it refuses unless both heads are absent). Any
-                    // restore report from an earlier attempt goes with the row,
-                    // or dispatch would skip positioning on the bound PR.
-                    adapter.discard_orphaned_execution_baseline(&record).await?;
-                    self.work_db
-                        .delete_execution_bookmark_and_restore_report(&execution.id)?;
-                }
-                return Ok(None);
+                return Err(err);
             }
             Err(err) if is_reconcilable_pointer_error(&err) => {
-                self.reconcile_or_retire(
-                    execution,
-                    &prior,
-                    &record,
-                    lease,
-                    adapter,
-                    repo_id,
-                    pr_for_reconcile,
-                    err,
-                )
-                .await?
+                self.reconcile_for_recovery(execution, prior, record, lease, adapter, repo_id, pr_for_reconcile, err)
+                    .await?
             }
             Err(err) => return Err(err),
-        };
-        let (patch, reconciliation) = match inspection {
-            Inspection::Patch(patch, reconciliation) => (patch, reconciliation),
-            Inspection::Retired => {
-                self.work_db.delete_execution_restore_report(&execution.id)?;
-                return Ok(None);
-            }
         };
         let reconciled_pr = reconciliation.as_ref().and_then(|r| match &r.anchor {
             boss_engine_recovery::execution_bookmark::Anchor::PrHead { .. } => pr_for_reconcile,
@@ -148,7 +195,7 @@ impl ExecutionCoordinator {
                 Some(pr)
                     if reconciled_pr.is_some()
                         || adapter
-                            .prepare_recovery_pr(&record, &lease.workspace_path, repo_id, pr)
+                            .prepare_recovery_pr(record, &lease.workspace_path, repo_id, pr)
                             .await? =>
                 {
                     Some(pr)
@@ -168,8 +215,8 @@ impl ExecutionCoordinator {
                 match adapter.recovery_pr_base(&repo.origin, pr).await {
                     Ok(base) => base,
                     // Only a base that can never be resolved (e.g. a non-GitHub
-                    // origin) falls back; transient gh/network errors propagate to
-                    // the pre-start retry path with the base unchanged.
+                    // origin) substitutes main during restaging; other errors
+                    // use the archive-and-start-fresh path.
                     Err(err) if is_base_unresolvable_error(&err) => {
                         tracing::warn!(execution_id = %execution.id, ?err, fallback = %repo.main_branch, "PR base branch is unresolvable; restaging recovery onto the main branch");
                         base_fallback = Some(format!(
@@ -185,12 +232,7 @@ impl ExecutionCoordinator {
             };
             let pr_bookmark = positioning_pr.map(|pr| format!("pr/{pr}"));
             let restore = adapter
-                .restore_rebased_execution_bookmark(
-                    &record,
-                    &lease.workspace_path,
-                    pr_bookmark.as_deref(),
-                    &base_branch,
-                )
+                .restore_rebased_execution_bookmark(record, &lease.workspace_path, pr_bookmark.as_deref(), &base_branch)
                 .await;
             let mut report = match restore {
                 Ok(report) => report,
@@ -209,7 +251,7 @@ impl ExecutionCoordinator {
                     ));
                     adapter
                         .restore_rebased_execution_bookmark(
-                            &record,
+                            record,
                             &lease.workspace_path,
                             pr_bookmark.as_deref(),
                             &repo.main_branch,
@@ -224,7 +266,7 @@ impl ExecutionCoordinator {
         } else {
             adapter
                 .restore_execution_bookmark(
-                    &record,
+                    record,
                     &lease.workspace_path,
                     is_implementation && prior.id == execution.id,
                 )
@@ -244,25 +286,15 @@ impl ExecutionCoordinator {
             )
             .await;
         Ok(Some(Recovered {
-            predecessor: prior.id,
+            predecessor: prior.id.clone(),
             has_work,
             reconciliation,
         }))
     }
 
-    /// The pointers broke in a way [`reconcile`] can repair from an
-    /// engine-recorded anchor. Position the lease on the item's recorded PR
-    /// first when it has one, so cube writes the `pr/<n>` bookmark the
-    /// repair resumes from. When the baseline is gone and nothing recorded
-    /// vouches for the heads, the record is retired and the item starts
-    /// fresh, loudly: the rule is that recovery fires only on an unambiguous
-    /// durable pointer. A stranded baseline or diverged heads with work
-    /// nothing vouches for stays a hard failure, so the item blocks with the
-    /// precise reason.
-    ///
-    /// [`reconcile`]: boss_engine_recovery::execution_bookmark::reconcile
+    /// Try the existing reconciliation proofs before archiving and starting fresh.
     #[allow(clippy::too_many_arguments)]
-    async fn reconcile_or_retire(
+    async fn reconcile_for_recovery(
         &self,
         execution: &WorkExecution,
         prior: &WorkExecution,
@@ -272,7 +304,7 @@ impl ExecutionCoordinator {
         repo_id: &str,
         pr_for_reconcile: Option<u64>,
         failure: anyhow::Error,
-    ) -> Result<Inspection> {
+    ) -> Result<(String, Option<Reconciliation>)> {
         let kind = pointer_integrity_kind(&failure);
         tracing::warn!(
             execution_id = %execution.id,
@@ -322,25 +354,14 @@ impl ExecutionCoordinator {
                         .await;
                 }
                 let patch = adapter.execution_bookmark_diff(record).await?;
-                Ok(Inspection::Patch(patch, reconciliation))
-            }
-            Err(err)
-                if kind == Some(PointerIntegrityKind::MissingBaseline)
-                    && pointer_integrity_kind(&err) == Some(PointerIntegrityKind::NotContained) =>
-            {
-                self.retire_unvouched_record(execution, prior, record, adapter, &err)
-                    .await?;
-                Ok(Inspection::Retired)
+                Ok((patch, reconciliation))
             }
             Err(err) => Err(err),
         }
     }
 
-    /// Deliberate fresh start. The record stops being a recovery source, so
-    /// no later dispatch retries the same dead pointer; the commits stay in
-    /// the shared store and the attention item says where. A self-retry also
-    /// releases the head bookmarks so it can create fresh pointers under its
-    /// own names.
+    /// Archive first, then retire the recovery source so subsequent attempts
+    /// cannot get stuck inspecting the same damaged pointers.
     async fn retire_unvouched_record(
         &self,
         execution: &WorkExecution,
@@ -349,50 +370,31 @@ impl ExecutionCoordinator {
         adapter: &Arc<dyn HostAdapter>,
         reason: &anyhow::Error,
     ) -> Result<()> {
-        let heads = if prior.id == execution.id {
-            adapter.release_execution_bookmark_heads(record).await?
+        let source_adapter = if adapter.host_id() == record.host_id {
+            Arc::clone(adapter)
         } else {
-            Vec::new()
+            let host = self
+                .work_db
+                .get_host(&record.host_id)?
+                .ok_or_else(|| anyhow!("archive host {} is unavailable", record.host_id))?;
+            self.host_adapter_provider.adapter_for(&host).await?
         };
+        let heads = source_adapter.release_execution_bookmark_heads(record).await?;
+
         let reason = format!("{reason:#}");
-        tracing::error!(
+        tracing::info!(
             execution_id = %execution.id,
             predecessor = %prior.id,
             reason,
+            archives = ?heads,
             "recovery pointers retired; starting the item fresh"
         );
         self.work_db.retire_execution_bookmark(&prior.id, &reason)?;
-        let released = if heads.is_empty() {
-            format!(
-                "Its bookmarks `{}` and `{}` were left in place for inspection.",
-                record.head(),
-                record.publication()
-            )
-        } else {
-            format!(
-                "Its head bookmarks were released so the retry could create fresh pointers under the same names; the commits they held are still in the store: {}.",
-                heads
-                    .iter()
-                    .map(|(bookmark, commit)| format!("`{bookmark}` was at `{commit}` (`jj log -r {commit}`)"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        self.work_db.create_attention_item(CreateAttentionItemInput {
-            execution_id: Some(prior.id.clone()),
-            work_item_id: None,
-            kind: crate::execution_bookmark_recovery::RECOVERY_RETIRED.to_owned(),
-            status: None,
-            title: "Recovery pointers retired; item restarted fresh".to_owned(),
-            body_markdown: format!(
-                "The recovery record of execution `{}` could not be resumed: {reason}\n\nThe engine started execution `{}` fresh from the item's branch instead and retired the record, so this pointer is not retried on later dispatches. Nothing was deleted from the shared jj store at `{}` on host `{}`. {released}",
-                prior.id,
-                execution.id,
-                record.repo_path.display(),
-                record.host_id
-            ),
-            resolved_at: None,
-        })?;
+        if let Err(err) =
+            crate::execution_bookmark_recovery::record_fresh_start(&self.work_db, prior, &execution.id, &reason, &heads)
+        {
+            tracing::error!(execution_id = %execution.id, ?err, "could not record recovery archive note");
+        }
         self.dispatch_events
             .emit(
                 DispatchEvent::new(Stage::WorkspaceRecovery, DispatchOutcome::Skipped, &execution.id)

@@ -258,9 +258,9 @@ pub trait HostAdapter: Send + Sync {
         let _ = (record, pr_bookmark, trunk);
         bail!("execution bookmark reconciliation is not supported by this host adapter")
     }
-    /// Drop an execution's head bookmarks after a deliberate fresh start so
-    /// the same execution can create fresh pointers; returns what was
-    /// released so the caller can record the commits.
+    /// Archive every execution pointer target, including conflicted targets,
+    /// before releasing the old names for a fresh start. Returns archive names
+    /// and commit identities for the informational work-item note.
     async fn release_execution_bookmark_heads(&self, record: &ExecutionBookmark) -> Result<Vec<(String, String)>> {
         let _ = record;
         bail!("execution bookmark release is not supported by this host adapter")

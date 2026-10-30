@@ -1,8 +1,8 @@
 //! One-shot re-arm of work items wedged by a recovery failure that dispatch
-//! can now repair. The coordinator treats a pointer-integrity failure as
-//! permanent and blocks the item with `execution_recovery_failed` and
+//! can now repair. Older coordinators treated a pointer-integrity failure as
+//! permanent and blocked the item with `execution_recovery_failed` and
 //! `autostart = 0`, and every later execution recovers from the same
-//! predecessor and fails identically. Once the engine learns to repair a
+//! predecessor and failed identically. Once the engine learns to repair a
 //! class of failure, the items it wedged can run again, but nothing would
 //! ever restart them: this runs once per schema step, with the recognizer
 //! for exactly the blocker texts that step made repairable.
@@ -31,9 +31,8 @@ pub(super) fn is_false_not_descended_blocker(detail: &str) -> bool {
 /// Items whose recorded blocker `recognizes` as repairable are moved back to
 /// `todo` with autostart on. Failures outside this migration's recognizer
 /// stay blocked: this step makes no claim that dispatch can repair them.
-/// Rearmed items still run the integrity check, so a pointer that
-/// truly cannot be vouched for blocks again, loudly, with the new precise
-/// text that this recognizer does not match.
+/// Historical steps use narrow recognizers. The fresh-start migration below
+/// re-arms every recovery failure now that dispatch can archive unsafe work.
 pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool) -> Result<usize> {
     let candidates: Vec<(String, String)> = {
         let mut statement = conn.prepare(
@@ -120,6 +119,25 @@ pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool) -> Result
     Ok(rearmed)
 }
 
+/// All recovery checks now have an archive-and-start-fresh fallback. Re-arm
+/// legacy recovery blockers without touching human decisions or other failures.
+pub(super) fn migrate_fresh_start(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE tasks SET blocked_detail = 'Recovery could not be established'
+         WHERE status = 'blocked' AND blocked_reason = 'execution_recovery_failed'
+         AND blocked_detail IS NULL AND deleted_at IS NULL",
+        [],
+    )?;
+    migrate(conn, |_| true)?;
+    conn.execute(
+        "UPDATE work_attention_items SET status = 'resolved', resolved_at = ?1
+         WHERE status = 'open' AND kind IN
+         ('revision_chain_recovery_blocked', 'execution_bookmark_recovery_retired')",
+        [now_string()],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +194,53 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn fresh_start_upgrade_rearms_all_recovery_failures_but_keeps_human_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade.db");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = product(&db);
+        let recovery = insert_blocked(
+            &db,
+            &product,
+            "uncontained work",
+            "execution_recovery_failed",
+            "not contained in PR head",
+        );
+        let human = insert_blocked(&db, &product, "decision", "human", "needs a decision");
+        let deleted = insert_blocked(
+            &db,
+            &product,
+            "deleted",
+            "execution_recovery_failed",
+            "damaged pointers",
+        );
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET deleted_at = '1' WHERE id = ?1", [&deleted])
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "DELETE FROM schema_migrations WHERE id = '20261030_0033_recovery_fresh_start'",
+                [],
+            )
+            .unwrap();
+        drop(db);
+        let db = WorkDb::open(path.clone()).unwrap();
+        assert_eq!(state(&db, &recovery), ("todo".into(), None, None, 1));
+        assert_eq!(state(&db, &human).0, "blocked");
+        assert_eq!(state(&db, &deleted).0, "blocked");
+        let executions = db.list_executions(Some(&recovery)).unwrap();
+        drop(db);
+        let db = WorkDb::open(path.clone()).unwrap();
+        assert_eq!(
+            db.list_executions(Some(&recovery)).unwrap().len(),
+            executions.len(),
+            "migration only runs once"
+        );
     }
 
     #[test]
