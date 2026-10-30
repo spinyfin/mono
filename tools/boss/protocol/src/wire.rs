@@ -828,7 +828,7 @@ pub enum FrontendRequest {
         attempt_id: String,
     },
 
-    /// Current share of eligible Codex executions assigned to Sol (default 50).
+    /// Current share of eligible Codex executions assigned to Sol (default 100; lower values send the remainder to Astra).
     GetCodexSolPercentage,
 
     /// Read-only: aggregate `conflict_diagnosis` for one product into a
