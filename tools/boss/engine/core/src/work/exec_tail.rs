@@ -339,7 +339,7 @@ impl WorkDb {
     /// per-marker `matches` denominator. Excludes deleted rows and
     /// non-chore kinds — the audit is a per-product chore-corpus
     /// snapshot, not a cross-kind scan.
-    pub fn list_chores_for_audit(&self, product_id: &str) -> Result<Vec<crate::audit_effort::ChoreForAudit>> {
+    pub fn list_chores_for_audit(&self, product_id: &str) -> Result<Vec<boss_engine_storage_values::ChoreForAudit>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT name, description
@@ -349,7 +349,7 @@ impl WorkDb {
                AND deleted_at IS NULL",
         )?;
         let rows = stmt.query_map([product_id], |row| {
-            Ok(crate::audit_effort::ChoreForAudit {
+            Ok(boss_engine_storage_values::ChoreForAudit {
                 name: row.get(0)?,
                 description: row.get(1)?,
             })

@@ -282,7 +282,7 @@ impl WorkDb {
     pub(crate) fn set_run_cost_snapshot(
         &self,
         execution_id: &str,
-        snapshot: crate::run_cost::RunCostSnapshot,
+        snapshot: boss_engine_storage_values::RunCostSnapshot,
     ) -> Result<bool> {
         let conn = self.connect()?;
         // Attempts retain usage even if they fail, are cancelled, or have no

@@ -17,31 +17,7 @@ use tokio::sync::Mutex;
 
 use crate::transcript_tail::TranscriptTail;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
-#[builder(on(String, into))]
-pub(crate) struct RunCostSnapshot {
-    /// Assign every persisted cost field verbatim, including NULL. Set when a
-    /// transcript generation is replaced so values absent from the replay do
-    /// not survive from the obsolete generation.
-    #[builder(default)]
-    pub full_replacement: bool,
-    pub model: Option<String>,
-    pub output_tokens: Option<i64>,
-    pub input_tokens: Option<i64>,
-    pub cache_creation_tokens: Option<i64>,
-    pub cache_read_tokens: Option<i64>,
-    pub cache_creation_5m_tokens: Option<i64>,
-    pub cache_creation_1h_tokens: Option<i64>,
-    /// `None`: no usage observation in this snapshot. `Some(false)`: usage
-    /// was observed but at least one non-zero cache write lacked a TTL split,
-    /// so persisted split columns must be explicitly cleared to NULL.
-    pub cache_creation_ttl_split_known: Option<bool>,
-    pub rounds: Option<i64>,
-    pub agent_active_ms: Option<i64>,
-    /// Provider usage objects, keyed by provider and transcript/message identity.
-    /// Preserve missing fields and provider-specific categories verbatim.
-    pub provider_usage_json: Option<String>,
-}
+pub(crate) use boss_engine_storage_values::RunCostSnapshot;
 
 #[derive(Debug, Clone, Default, bon::Builder)]
 #[builder(on(String, into))]

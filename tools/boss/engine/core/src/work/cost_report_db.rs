@@ -1,11 +1,11 @@
 //! Query layer behind `boss cost` — projects `work_runs` rows (joined
-//! against their owning execution and task) into [`crate::cost_report::CostRunRecord`].
-//! All grouping, ranking, and pricing happens in the pure functions over
-//! there; this file's only job is the flat row fetch.
+//! against their owning execution and task) into [`boss_engine_storage_values::CostRunRecord`].
+//! All grouping, ranking, and pricing stays in [`crate::cost_report`];
+//! this file's only job is the flat row fetch.
 
 use super::*;
 
-use crate::cost_report::CostRunRecord;
+use boss_engine_storage_values::CostRunRecord;
 
 const COST_RECORD_COLUMNS: &str = "
     wr.id,
@@ -49,6 +49,66 @@ fn map_cost_run_record(row: &Row) -> rusqlite::Result<CostRunRecord> {
         agent_active_ms: row.get(16)?,
         started_at_epoch_s: row.get(17)?,
     })
+}
+
+#[cfg(test)]
+#[test]
+fn cost_row_mapping_preserves_every_owned_field_and_null() {
+    let conn = Connection::open_in_memory().unwrap();
+    let record: boss_engine_storage_values::CostRunRecord = conn
+        .query_row(
+            "SELECT 'run-a', 'exec-a', 'task-a', 'Work name', 'task_implementation',
+                    'completed', 'orphaned', 100, 42, 'model-a', 'high', 'medium',
+                    0, 11, 12, 13, 14, 99",
+            [],
+            map_cost_run_record,
+        )
+        .unwrap();
+    let builder: crate::cost_report::CostRunRecordBuilder = crate::cost_report::CostRunRecord::builder();
+    let expected = builder
+        .run_id("run-a")
+        .execution_id("exec-a")
+        .work_item_id("task-a")
+        .work_item_name("Work name")
+        .execution_kind("task_implementation")
+        .execution_status("completed")
+        .run_status("orphaned")
+        .created_at_epoch_s(100)
+        .work_item_short_id(42)
+        .model("model-a")
+        .reasoning("high")
+        .effort_level("medium")
+        .input_tokens(0)
+        .output_tokens(11)
+        .cache_creation_tokens(12)
+        .cache_read_tokens(13)
+        .agent_active_ms(14)
+        .started_at_epoch_s(99)
+        .build();
+    assert_eq!(record, expected);
+
+    let absent = conn
+        .query_row(
+            "SELECT 'run-a', 'exec-a', 'task-a', 'Work name', 'task_implementation',
+                    'completed', 'orphaned', 100, NULL, NULL, NULL, NULL,
+                    NULL, NULL, NULL, NULL, NULL, NULL",
+            [],
+            map_cost_run_record,
+        )
+        .unwrap();
+    assert_eq!(
+        absent,
+        CostRunRecord::builder()
+            .run_id("run-a")
+            .execution_id("exec-a")
+            .work_item_id("task-a")
+            .work_item_name("Work name")
+            .execution_kind("task_implementation")
+            .execution_status("completed")
+            .run_status("orphaned")
+            .created_at_epoch_s(100)
+            .build()
+    );
 }
 
 #[work_db_boundary::instrument]

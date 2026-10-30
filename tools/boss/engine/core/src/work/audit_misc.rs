@@ -12,24 +12,7 @@ pub const AUDIT_ACTOR_HUMAN: &str = "human";
 /// Q6, via `sync_project_design_doc_from_detector`).
 pub const AUDIT_ACTOR_DESIGN_DETECTOR: &str = "engine_design_detector";
 
-/// A single append-only row in the `project_property_audit` table.
-/// Records that `actor` changed `property` on `project_id` from
-/// `old_value` to `new_value` at `changed_at` (epoch seconds, the
-/// same format as `projects.updated_at`).
-#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
-#[builder(on(String, into))]
-pub struct ProjectPropertyAuditEntry {
-    pub id: String,
-    pub project_id: String,
-    pub property: String,
-    pub old_value: Option<String>,
-    pub new_value: Option<String>,
-    pub actor: String,
-    pub changed_at: String,
-    /// Human-readable basis for the transition. Present for `status`
-    /// entries; `None` for older rows and design-doc property edits.
-    pub basis: Option<String>,
-}
+pub use boss_engine_storage_values::ProjectPropertyAuditEntry;
 
 /// Emit one `project_property_audit` row for each of the three
 /// `design_doc_*` columns whose value actually changed between

@@ -46,7 +46,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use boss_engine_utils::iso8601::{format_elapsed_ago, format_epoch_iso8601};
 use boss_protocol::{CoordinatorGuidanceView, CoordinatorHandoffView, CoordinatorRecreateReason};
-use serde::{Deserialize, Serialize};
 
 use crate::work::{CoordinatorTmuxRecord, WorkDb};
 
@@ -64,43 +63,7 @@ pub(crate) const MAX_HANDOFF_BYTES: usize = 16 * 1024;
 /// `settings.local.json`) and handed to `claude` as its initial prompt.
 pub(crate) const START_BRIEF_FILENAME: &str = "handoff-brief.txt";
 
-/// The stored handoff record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CoordinatorHandoff {
-    /// Distinguishes two writes even when their timestamp and body are equal.
-    #[serde(default)]
-    pub(crate) write_id: String,
-    pub(crate) body: String,
-    /// Unix epoch seconds.
-    pub(crate) written_at: i64,
-    /// Spawn token of the coordinator record that was live at write time.
-    /// Empty when no coordinator record existed (a handoff written from a
-    /// plain terminal before any coordinator ever ran).
-    pub(crate) writer_spawn_token: String,
-}
-
-/// What the engine found when it looked for a handoff. `Missing` and
-/// `Unreadable` are deliberately separate variants: "no session ever wrote
-/// one" and "one was written but the engine cannot read it back" call for
-/// different operator responses, and collapsing them would hide the
-/// second behind the first.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum HandoffState {
-    Present(CoordinatorHandoff),
-    Missing,
-    Unreadable(String),
-}
-
-impl HandoffState {
-    /// Short label for the engine-audit log.
-    pub(crate) fn audit_outcome(&self) -> &'static str {
-        match self {
-            Self::Present(_) => "present",
-            Self::Missing => "missing",
-            Self::Unreadable(_) => "unreadable",
-        }
-    }
-}
+pub(crate) use boss_engine_storage_values::{CoordinatorHandoff, HandoffState};
 
 /// Why a fresh coordinator session is being created. Rendered into the
 /// session-start brief so the incoming session can tell the operator what

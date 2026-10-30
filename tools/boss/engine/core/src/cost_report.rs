@@ -194,32 +194,7 @@ pub mod sol {
 /// can be flagged rather than silently under-reported.
 pub const TOKEN_CAPTURE_START_EPOCH_S: i64 = 1_785_144_180;
 
-/// One `work_runs` row, projected with just enough context to group and
-/// rank it. The `work` DB layer's production mapper builds these with a
-/// struct literal (every column named explicitly, per this repo's DB
-/// mapper convention); tests may use the builder.
-#[derive(Debug, Clone, PartialEq, bon::Builder)]
-#[builder(on(String, into))]
-pub struct CostRunRecord {
-    pub run_id: String,
-    pub execution_id: String,
-    pub work_item_id: String,
-    pub work_item_name: String,
-    pub execution_kind: String,
-    pub execution_status: String,
-    pub run_status: String,
-    pub created_at_epoch_s: i64,
-    pub work_item_short_id: Option<i64>,
-    pub model: Option<String>,
-    pub reasoning: Option<String>,
-    pub effort_level: Option<String>,
-    pub input_tokens: Option<i64>,
-    pub output_tokens: Option<i64>,
-    pub cache_creation_tokens: Option<i64>,
-    pub cache_read_tokens: Option<i64>,
-    pub agent_active_ms: Option<i64>,
-    pub started_at_epoch_s: Option<i64>,
-}
+pub use boss_engine_storage_values::{CostRunRecord, CostRunRecordBuilder};
 
 const NO_VALUE_LABEL: &str = "(none)";
 const NO_MODEL_GAP_LABEL: &str = "(no model recorded)";

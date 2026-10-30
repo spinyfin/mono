@@ -606,6 +606,7 @@ dependencies = [
  "boss-engine-proposal-validation",
  "boss-engine-recovery",
  "boss-engine-stdout-progress",
+ "boss-engine-storage-values",
  "boss-engine-structured-output",
  "boss-engine-test-git",
  "boss-engine-transient-error",
@@ -930,6 +931,15 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "boss-engine-storage-values"
+version = "0.1.0"
+dependencies = [
+ "bon",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

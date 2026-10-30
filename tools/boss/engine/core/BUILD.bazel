@@ -138,6 +138,7 @@ rust_library(
         "//tools/boss/engine/single-flight",
         "//tools/boss/engine/ssh-transport",
         "//tools/boss/engine/stdout-progress",
+        "//tools/boss/engine/storage-values",
         "//tools/boss/engine/structured-output",
         "//tools/boss/engine/task-scope",
         "//tools/boss/engine/timer-wheel",

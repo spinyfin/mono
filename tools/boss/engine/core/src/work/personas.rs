@@ -99,9 +99,9 @@ impl WorkDb {
     pub(crate) fn reap_startup_dead_execution(
         &self,
         execution_id: &str,
-        verdict: &crate::run_reconcile::RunReconcileVerdict,
+        verdict: &boss_engine_storage_values::RunReconcileVerdict,
     ) -> Result<Option<WorkExecution>> {
-        if !matches!(verdict, crate::run_reconcile::RunReconcileVerdict::Dead) {
+        if !matches!(verdict, boss_engine_storage_values::RunReconcileVerdict::Dead) {
             return Ok(None);
         }
         if let Err(error) = self.release_persona(execution_id) {

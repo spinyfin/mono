@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+boss-engine-storage-values = { path = "../storage-values" }
 boss-board-projection = { path = "../board-projection" }
 boss-host-execution = { path = "../host-execution" }
 boss-task-scope = { path = "../task-scope" }
