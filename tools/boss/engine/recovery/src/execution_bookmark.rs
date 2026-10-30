@@ -16,7 +16,7 @@ mod baseline;
 pub use baseline::checkpoint_baseline;
 
 mod pr_anchor;
-pub use pr_anchor::{is_legacy_pr_anchor_blocker, repair_pr_anchor};
+pub use pr_anchor::is_legacy_pr_anchor_blocker;
 #[cfg(test)]
 mod pr_anchor_tests;
 

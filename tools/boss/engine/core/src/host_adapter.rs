@@ -595,7 +595,7 @@ impl HostAdapter for LocalHostAdapter {
             "recovery store belongs to another host"
         );
         let remote = boss_host_execution::workspace::recovery_remote(&LocalJj, workspace).await?;
-        pr_anchor::restore_rebased(&LocalJj, record, workspace, pr_bookmark, base_branch, &remote).await
+        pr_anchor::restore_rebased(&LocalJj, self, record, workspace, pr_bookmark, base_branch, &remote).await
     }
     async fn checkpoint_execution_baseline(&self, record: &ExecutionBookmark) -> Result<String> {
         anyhow::ensure!(
@@ -619,7 +619,7 @@ impl HostAdapter for LocalHostAdapter {
             return Ok(false);
         }
         boss_host_execution::workspace::preserve_recovery_pointers(record, self.goto_workspace(workspace, pr)).await?;
-        pr_anchor::ensure(&LocalJj, record, pr).await?;
+        pr_anchor::ensure(&LocalJj, self, record, pr).await?;
         Ok(true)
     }
     async fn reconcile_execution_bookmark(
@@ -633,7 +633,7 @@ impl HostAdapter for LocalHostAdapter {
             "recovery bookmark belongs to host {}",
             record.host_id
         );
-        pr_anchor::reconcile(&LocalJj, record, pr_bookmark, trunk).await
+        pr_anchor::reconcile(&LocalJj, self, record, pr_bookmark, trunk).await
     }
     async fn release_execution_bookmark_heads(&self, record: &ExecutionBookmark) -> Result<Vec<(String, String)>> {
         anyhow::ensure!(
@@ -1180,7 +1180,7 @@ impl HostAdapter for SshHostAdapter {
             "recovery store belongs to another host"
         );
         let remote = boss_host_execution::workspace::recovery_remote(self, workspace).await?;
-        pr_anchor::restore_rebased(self, record, workspace, pr_bookmark, base_branch, &remote).await
+        pr_anchor::restore_rebased(self, self, record, workspace, pr_bookmark, base_branch, &remote).await
     }
     async fn checkpoint_execution_baseline(&self, record: &ExecutionBookmark) -> Result<String> {
         anyhow::ensure!(
@@ -1207,7 +1207,7 @@ impl HostAdapter for SshHostAdapter {
         let result = self.goto_workspace(workspace, pr).await;
         execution_bookmark::restore_pointers(self, record, &saved).await?;
         result?;
-        pr_anchor::ensure(self, record, pr).await?;
+        pr_anchor::ensure(self, self, record, pr).await?;
         Ok(true)
     }
     async fn reconcile_execution_bookmark(
@@ -1220,7 +1220,7 @@ impl HostAdapter for SshHostAdapter {
             record.host_id == self.host_id(),
             "recovery store belongs to another host"
         );
-        pr_anchor::reconcile(self, record, pr_bookmark, trunk).await
+        pr_anchor::reconcile(self, self, record, pr_bookmark, trunk).await
     }
     async fn release_execution_bookmark_heads(&self, record: &ExecutionBookmark) -> Result<Vec<(String, String)>> {
         anyhow::ensure!(

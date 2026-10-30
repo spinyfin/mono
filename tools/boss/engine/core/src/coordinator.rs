@@ -643,6 +643,17 @@ pub trait CubeClient: Send + Sync {
         let _ = (workspace_path, sha);
         Err(anyhow!("goto_workspace_revision is not supported by this CubeClient"))
     }
+    /// Repair the shared `pr/<pr>` alias in the store at `store` from GitHub's
+    /// current head through Cube's guarded writer (`cube workspace
+    /// repair-pr-bookmark`). Never moves a working copy.
+    ///
+    /// The default implementation errors so the many test doubles and the
+    /// host-adapter layers need no change; only [`CommandCubeClient`]
+    /// provides a real implementation.
+    async fn repair_pr_bookmark(&self, store: &Path, pr: u64) -> Result<()> {
+        let _ = (store, pr);
+        Err(anyhow!("repair_pr_bookmark is not supported by this CubeClient"))
+    }
     /// Run an engine-direct `cube workspace rebase --pr <pr>` inside the
     /// leased workspace at `workspace_path`, rebasing the PR's boss branch
     /// onto the repo's integration branch. On a clean rebase the command
@@ -935,6 +946,10 @@ impl CubeClient for CommandCubeClient {
 
     async fn goto_workspace_revision(&self, workspace_path: &Path, sha: &str) -> Result<()> {
         crate::cube_commands::goto_workspace(self, workspace_path, "--revision", sha).await
+    }
+
+    async fn repair_pr_bookmark(&self, store: &Path, pr: u64) -> Result<()> {
+        crate::cube_commands::repair_pr_bookmark(self, store, pr, crate::cube_op_budget::REPAIR_PR_BOOKMARK).await
     }
 
     async fn rebase_workspace(&self, workspace_path: &Path, pr: u64) -> Result<RebaseOutcome> {

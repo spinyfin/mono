@@ -35,6 +35,15 @@ pub trait CommandRunner {
         crate::lock::RepoLock::for_workspace(cwd)
     }
 
+    /// [`Self::lock_pr_bookmarks`] bounded by `timeout`, so a caller that must
+    /// itself terminate on a deadline does not queue behind a stalled holder.
+    /// Test fakes that override `lock_pr_bookmarks` are never contended, so
+    /// the default ignores the bound.
+    fn lock_pr_bookmarks_within(&self, cwd: &Path, timeout: Duration) -> Result<crate::lock::RepoLock, CubeError> {
+        let _ = timeout;
+        self.lock_pr_bookmarks(cwd)
+    }
+
     fn run(&self, invocation: &CommandInvocation) -> Result<String, CubeError>;
 
     /// Cleanup runs in an isolated group and retains both output streams.
@@ -373,6 +382,10 @@ impl RealCommandRunner {
 }
 
 impl CommandRunner for RealCommandRunner {
+    fn lock_pr_bookmarks_within(&self, cwd: &Path, timeout: Duration) -> Result<crate::lock::RepoLock, CubeError> {
+        crate::lock::RepoLock::for_workspace_within(cwd, timeout)
+    }
+
     fn run_to_file(
         &self,
         invocation: &CommandInvocation,

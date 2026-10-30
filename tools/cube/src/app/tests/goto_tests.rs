@@ -229,13 +229,23 @@ fn goto_pr_resolves_branch_and_sets_pr_bookmark() {
             goto_cwd(),
             "gh",
             &["api", &format!("repos/{GOTO_OWNER_REPO}/pulls/42")],
-            &goto_pr_json(branch, "e42"),
+            &goto_pr_json(branch, "e42e42e42e42e42e42e42e42e42e42e42e42e42e"),
         ),
     ];
-    cmds.extend(goto_pr_head_cmds("e42", ""));
-    cmds.extend(goto_set_pr_bookmark_cmds(42, "e42"));
+    cmds.extend(goto_pr_head_cmds("e42e42e42e42e42e42e42e42e42e42e42e42e42e", ""));
+    cmds.extend(goto_set_pr_bookmark_cmds(
+        42,
+        "e42e42e42e42e42e42e42e42e42e42e42e42e42e",
+    ));
     cmds.push(goto_jj(
-        &["bookmark", "set", branch, "-r", "e42", "--allow-backwards"],
+        &[
+            "bookmark",
+            "set",
+            branch,
+            "-r",
+            "e42e42e42e42e42e42e42e42e42e42e42e42e42e",
+            "--allow-backwards",
+        ],
         "",
     ));
     let runner = FakeRunner::new(cmds);
@@ -329,11 +339,18 @@ fn goto_pr_repairs_conflicted_bookmark_when_other_side_is_an_ancestor() {
             goto_cwd(),
             "gh",
             &["api", &format!("repos/{GOTO_OWNER_REPO}/pulls/42")],
-            &goto_pr_json(branch, "e42"),
+            &goto_pr_json(branch, "e42e42e42e42e42e42e42e42e42e42e42e42e42e"),
         ),
     ];
-    cmds.extend(goto_pr_head_cmds("e42", "e42"));
-    cmds.extend(goto_pr_bookmark_prelude(42, "e42", "e42\nold1\n"));
+    cmds.extend(goto_pr_head_cmds(
+        "e42e42e42e42e42e42e42e42e42e42e42e42e42e",
+        "e42e42e42e42e42e42e42e42e42e42e42e42e42e",
+    ));
+    cmds.extend(goto_pr_bookmark_prelude(
+        42,
+        "e42e42e42e42e42e42e42e42e42e42e42e42e42e",
+        "e42e42e42e42e42e42e42e42e42e42e42e42e42e\nold1\n",
+    ));
     cmds.push(goto_jj(
         &[
             "log",
@@ -341,15 +358,25 @@ fn goto_pr_repairs_conflicted_bookmark_when_other_side_is_an_ancestor() {
             "-n",
             "101",
             "-r",
-            "(::old1) ~ (::e42) ~ ::(present(main@origin) | present(master@origin) | present(main@github) | present(master@github))",
+            "(::old1) ~ (::e42e42e42e42e42e42e42e42e42e42e42e42e42e) ~ ::(present(main@origin) | present(master@origin) | present(main@github) | present(master@github))",
             "-T",
             r#"change_id ++ "\t" ++ commit_id ++ "\n""#,
         ],
         "",
     ));
-    cmds.extend(goto_pr_bookmark_set_cmds(42, "e42"));
+    cmds.extend(goto_pr_bookmark_set_cmds(
+        42,
+        "e42e42e42e42e42e42e42e42e42e42e42e42e42e",
+    ));
     cmds.push(goto_jj(
-        &["bookmark", "set", branch, "-r", "e42", "--allow-backwards"],
+        &[
+            "bookmark",
+            "set",
+            branch,
+            "-r",
+            "e42e42e42e42e42e42e42e42e42e42e42e42e42e",
+            "--allow-backwards",
+        ],
         "",
     ));
     let runner = FakeRunner::new(cmds);
@@ -369,11 +396,18 @@ fn goto_pr_refuses_conflicted_bookmark_with_unique_content() {
             goto_cwd(),
             "gh",
             &["api", &format!("repos/{GOTO_OWNER_REPO}/pulls/42")],
-            &goto_pr_json(branch, "e42"),
+            &goto_pr_json(branch, "e42e42e42e42e42e42e42e42e42e42e42e42e42e"),
         ),
     ];
-    cmds.extend(goto_pr_head_cmds("e42", "e42"));
-    cmds.extend(goto_pr_bookmark_prelude(42, "e42", "e42\nuniq9\n"));
+    cmds.extend(goto_pr_head_cmds(
+        "e42e42e42e42e42e42e42e42e42e42e42e42e42e",
+        "e42e42e42e42e42e42e42e42e42e42e42e42e42e",
+    ));
+    cmds.extend(goto_pr_bookmark_prelude(
+        42,
+        "e42e42e42e42e42e42e42e42e42e42e42e42e42e",
+        "e42e42e42e42e42e42e42e42e42e42e42e42e42e\nuniq9\n",
+    ));
     cmds.push(goto_jj(
         &[
             "log",
@@ -381,7 +415,7 @@ fn goto_pr_refuses_conflicted_bookmark_with_unique_content() {
             "-n",
             "101",
             "-r",
-            "(::uniq9) ~ (::e42) ~ ::(present(main@origin) | present(master@origin) | present(main@github) | present(master@github))",
+            "(::uniq9) ~ (::e42e42e42e42e42e42e42e42e42e42e42e42e42e) ~ ::(present(main@origin) | present(master@origin) | present(main@github) | present(master@github))",
             "-T",
             r#"change_id ++ "\t" ++ commit_id ++ "\n""#,
         ],
@@ -392,7 +426,7 @@ fn goto_pr_refuses_conflicted_bookmark_with_unique_content() {
             "log",
             "--no-graph",
             "-r",
-            "present(chg1) & (::e42)",
+            "present(chg1) & (::e42e42e42e42e42e42e42e42e42e42e42e42e42e)",
             "-T",
             r#"commit_id ++ "\n""#,
         ],
@@ -403,7 +437,7 @@ fn goto_pr_refuses_conflicted_bookmark_with_unique_content() {
     runner.assert_exhausted();
     let msg = err.to_string();
     assert!(
-        msg.contains("e42") && msg.contains("uniq9"),
+        msg.contains("e42e42e42e42e42e42e42e42e42e42e42e42e42e") && msg.contains("uniq9"),
         "names both commits: {msg}"
     );
     assert!(msg.contains("will not pick a side"), "{msg}");

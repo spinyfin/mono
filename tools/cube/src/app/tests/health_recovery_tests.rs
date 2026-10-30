@@ -765,3 +765,36 @@ fn workspace_lease_gcs_broken_empty_and_keeps_dirty_then_auto_creates() {
         "dirty workspace should still be marked dirty"
     );
 }
+
+/// A conflicted shared pointer (`boss-recovery/`, `boss/`, `boss-base/`) is
+/// recovery state for Boss executions. Lease-time repair must leave it alone
+/// and say so, never run `jj bookmark forget` on it. The runner has no
+/// scripted commands, so any jj invocation at all would fail the test.
+#[test]
+fn conflicted_shared_pointers_are_skipped_not_forgotten() {
+    let (tempdir, database_path) = with_database_path();
+    let runner = FakeRunner::new(vec![]);
+    let bookmarks = ["boss-recovery/exec_x", "boss/exec_x", "boss-base/exec_x"].map(String::from);
+
+    let repair = crate::app::health::repair_conflicted_bookmarks(
+        &runner,
+        Some(&database_path),
+        &tempdir.path().join("workspace"),
+        &bookmarks,
+    )
+    .expect("skipping shared pointers cannot fail the lease");
+
+    assert!(repair.failures.is_empty());
+    runner.assert_exhausted();
+    let events = audit_events(&tempdir);
+    let skipped: Vec<_> = events
+        .iter()
+        .filter(|e| e["event"] == "workspace.bookmark_forget_skipped")
+        .map(|e| e["bookmark"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(skipped, bookmarks);
+    assert!(
+        !events.iter().any(|e| e["event"] == "workspace.bookmark_forgotten"),
+        "{events:?}"
+    );
+}

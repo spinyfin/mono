@@ -39,6 +39,25 @@ impl RepoLock {
         Self::open_and_lock(lock_path, true)?.ok_or_else(|| unreachable!("a blocking lock always acquires"))
     }
 
+    /// [`Self::for_workspace`] that gives up once `timeout` has elapsed rather
+    /// than waiting on a stalled holder indefinitely.
+    pub fn for_workspace_within(cwd: &Path, timeout: std::time::Duration) -> Result<Self, CubeError> {
+        let lock_path = shared_repo_dir(cwd)?.join("cube-pr-bookmarks.lock");
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(lock) = Self::try_acquire(&lock_path)? {
+                return Ok(lock);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(CubeError::InvalidArgument(format!(
+                    "timed out after {}s waiting for the PR-bookmark lock held by another cube process",
+                    timeout.as_secs()
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
     /// Take the lock if nobody holds it; `None` when it is held elsewhere.
     pub fn try_acquire(lock_path: &Path) -> Result<Option<Self>, CubeError> {
         Self::open_and_lock(lock_path, false)
@@ -98,6 +117,21 @@ mod tests {
         assert!(RepoLock::try_acquire(&lock_path).unwrap().is_none());
         drop(held);
         assert!(RepoLock::try_acquire(&lock_path).unwrap().is_some());
+    }
+
+    #[test]
+    fn for_workspace_within_times_out_while_held_then_succeeds_once_released() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".jj/repo")).unwrap();
+        let held = RepoLock::for_workspace(dir.path()).unwrap();
+        let started = Instant::now();
+        let err = RepoLock::for_workspace_within(dir.path(), Duration::from_millis(200))
+            .err()
+            .expect("held lock must time out");
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert!(err.to_string().contains("timed out"), "{err}");
+        drop(held);
+        RepoLock::for_workspace_within(dir.path(), Duration::from_millis(200)).expect("free lock");
     }
 
     #[test]

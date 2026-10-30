@@ -463,7 +463,7 @@ fn lease_repairs_obsolete_conflict() {
         &f.runner,
         format!(r#"{{"state":"open","head":{{"ref":"feat","sha":"{head}"}}}}"#),
     );
-    assert!(repair(&f, &runner).unrepaired.is_empty());
+    assert!(repair(&f, &runner).failures.is_empty());
     assert_eq!(f.pr_commits(1), vec![head.clone()]);
     assert_eq!(f.git_ref(1), Some(head));
 }
@@ -477,9 +477,102 @@ fn lease_succeeds_and_leaves_a_conflict_with_unique_content_untouched() {
         format!(r#"{{"state":"open","head":{{"ref":"feat","sha":"{head}"}}}}"#),
     );
     let repair = repair(&f, &runner);
-    assert_eq!(repair.unrepaired, ["pr/1"]);
+    assert_eq!(repair.unrepaired(), ["pr/1"]);
     assert_eq!(f.pr_commits(1).len(), 2, "still conflicted, no side picked");
     assert_eq!(f.git_ref(1), Some(other));
+}
+
+fn repair_command(f: &Fixture, runner: &LeaseRunner) -> Result<crate::app::errors::RunResult> {
+    let result =
+        crate::app::workspace_ops::workspace_repair_pr_bookmark(None, runner, Some(f.ws.display().to_string()), 1);
+    runner.assert_no_network_while_locked();
+    result
+}
+
+fn head_json(head: &str) -> String {
+    format!(r#"{{"state":"open","head":{{"ref":"feat","sha":"{head}"}}}}"#)
+}
+
+/// The engine's recovery repair goes through this command: a missing alias is
+/// recreated under the PR-bookmark lock and exported to git, and no working
+/// copy moves.
+#[test]
+fn repair_command_recreates_a_deleted_alias_under_the_lock() {
+    let f = Fixture::new();
+    let (head, _) = conflicted_pr_bookmark(&f, false);
+    f.jj(&f.ws, &["bookmark", "delete", "pr/1"]);
+    f.root_write();
+    assert!(f.pr_commits(1).is_empty(), "precondition: the alias is gone");
+    let working_copy = f.commit("@");
+    let runner = LeaseRunner::with_pr_json(&f.runner, head_json(&head));
+
+    repair_command(&f, &runner).expect("missing alias is repaired");
+
+    assert_eq!(f.pr_commits(1), vec![head.clone()]);
+    assert_eq!(f.git_ref(1), Some(head));
+    assert_eq!(f.commit("@"), working_copy, "the working copy does not move");
+    assert!(
+        runner.events.borrow().contains(&"lock"),
+        "the guarded writer takes the lock"
+    );
+}
+
+#[test]
+fn repair_command_repairs_an_obsolete_conflict() {
+    let f = Fixture::new();
+    let (head, _) = conflicted_pr_bookmark(&f, false);
+    let runner = LeaseRunner::with_pr_json(&f.runner, head_json(&head));
+    repair_command(&f, &runner).expect("obsolete conflict is repaired");
+    assert_eq!(f.pr_commits(1), vec![head.clone()]);
+    assert_eq!(f.git_ref(1), Some(head));
+}
+
+/// Unlike lease repair, which never fails a lease, the command fails loudly
+/// and names the refusal, and leaves the unique side untouched.
+#[test]
+fn repair_command_refuses_a_conflict_with_unique_content() {
+    let f = Fixture::new();
+    let (head, other) = conflicted_pr_bookmark(&f, true);
+    let runner = LeaseRunner::with_pr_json(&f.runner, head_json(&head));
+    let err = repair_command(&f, &runner).expect_err("unique side must not be overridden");
+    assert!(
+        err.to_string().contains(git_utils::pr_bookmark::UNSAFE_REPAIR_PHRASE),
+        "{err}"
+    );
+    assert_eq!(f.pr_commits(1).len(), 2, "still conflicted, no side picked");
+    assert_eq!(f.git_ref(1), Some(other));
+}
+
+#[test]
+fn repair_command_reports_a_response_without_a_head_sha() {
+    let f = Fixture::new();
+    let _ = conflicted_pr_bookmark(&f, false);
+    let runner = LeaseRunner::with_pr_json(&f.runner, r#"{"state":"open","head":{"ref":"feat"}}"#.to_string());
+    let err = repair_command(&f, &runner).expect_err("no head.sha");
+    assert!(
+        err.to_string().contains(git_utils::pr_bookmark::NO_PR_HEAD_PHRASE),
+        "{err}"
+    );
+}
+
+#[test]
+fn repair_command_rejects_an_empty_or_malformed_head_sha() {
+    let f = Fixture::new();
+    let _ = conflicted_pr_bookmark(&f, false);
+    for sha in [
+        "",
+        "abc123",
+        "main",
+        "z".repeat(40).as_str(),
+        &format!("{}0", "a".repeat(40)),
+    ] {
+        let runner = LeaseRunner::with_pr_json(&f.runner, head_json(sha));
+        let err = repair_command(&f, &runner).expect_err("malformed head.sha");
+        assert!(
+            err.to_string().contains(git_utils::pr_bookmark::NO_PR_HEAD_PHRASE),
+            "{sha:?}: {err}"
+        );
+    }
 }
 
 #[test]
@@ -490,7 +583,7 @@ fn lease_repairs_from_head_sha_when_the_source_branch_is_gone() {
         &f.runner,
         format!(r#"{{"state":"closed","merged":true,"head":{{"ref":"deleted-branch","sha":"{head}"}}}}"#),
     );
-    assert!(repair(&f, &runner).unrepaired.is_empty());
+    assert!(repair(&f, &runner).failures.is_empty());
     assert_eq!(f.pr_commits(1), vec![head]);
 }
 
@@ -504,7 +597,7 @@ fn lease_repairs_a_fork_headed_pr_from_head_sha() {
         &f.runner,
         format!(r#"{{"state":"open","head":{{"ref":"main","sha":"{head}","repo":{{"full_name":"fork/repo"}}}}}}"#),
     );
-    assert!(repair(&f, &runner).unrepaired.is_empty());
+    assert!(repair(&f, &runner).failures.is_empty());
     assert_eq!(f.pr_commits(1), vec![head]);
 }
 
@@ -519,7 +612,7 @@ fn lease_leaves_a_conflict_untouched_when_the_head_is_not_in_the_store() {
         &f.runner,
         LeaseRunner::fork_json("0123456789abcdef0123456789abcdef01234567", "feat", &missing),
     );
-    assert_eq!(repair(&f, &runner).unrepaired, ["pr/1"]);
+    assert_eq!(repair(&f, &runner).unrepaired(), ["pr/1"]);
     assert_eq!(f.pr_commits(1).len(), 2);
     assert!(f.pr_commits(1).contains(&other));
     assert!(
@@ -575,7 +668,7 @@ fn lease_fetches_a_fork_head_missing_from_the_store_and_repairs_to_it() {
     let (forge, sha) = fork_with_new_head(&f);
     let runner = LeaseRunner::with_pr_json(&f.runner, LeaseRunner::fork_json(&sha, "feat", &forge));
 
-    assert!(repair(&f, &runner).unrepaired.is_empty());
+    assert!(repair(&f, &runner).failures.is_empty());
 
     assert_eq!(f.pr_commits(1), vec![sha.clone()]);
     assert_eq!(f.git_ref(1), Some(sha));
@@ -587,7 +680,7 @@ fn lease_leaves_a_conflict_untouched_when_github_cannot_be_reached() {
     let f = Fixture::new();
     conflicted_pr_bookmark(&f, false);
     let runner = LeaseRunner::with_pr_json(&f.runner, "not json".to_string());
-    assert_eq!(repair(&f, &runner).unrepaired, ["pr/1"]);
+    assert_eq!(repair(&f, &runner).unrepaired(), ["pr/1"]);
     assert_eq!(f.pr_commits(1).len(), 2);
 }
 
@@ -1002,4 +1095,71 @@ fn gc_waits_until_positioning_has_made_the_bookmark_reachable() {
     goto.join().unwrap().unwrap();
     assert!(!gc.join().unwrap().unwrap().contains(&"pr/1".to_string()));
     assert_eq!(f.pr_commits(1), vec![f.commit("feat")]);
+}
+
+/// Delegates to a [`LeaseRunner`] but fails every bounded PR-bookmark lock
+/// wait, as a stalled holder would.
+struct ContendedLock<'a>(LeaseRunner<'a>);
+
+impl CommandRunner for ContendedLock<'_> {
+    fn run(&self, invocation: &CommandInvocation) -> Result<String> {
+        self.0.run(invocation)
+    }
+
+    fn lock_pr_bookmarks_within(&self, _cwd: &Path, _timeout: std::time::Duration) -> Result<crate::lock::RepoLock> {
+        Err(CubeError::InvalidArgument(
+            "timed out waiting for the PR-bookmark lock".into(),
+        ))
+    }
+}
+
+#[test]
+fn lease_survives_a_contended_pr_bookmark_lock() {
+    let f = Fixture::new();
+    let (head, _) = conflicted_pr_bookmark(&f, false);
+    let runner = ContendedLock(LeaseRunner::with_pr_json(&f.runner, head_json(&head)));
+    let repair = crate::app::health::repair_conflicted_bookmarks(&runner, None, &f.ws, &["pr/1".to_string()])
+        .expect("lock contention must not fail the lease");
+    assert_eq!(repair.unrepaired(), ["pr/1"]);
+    assert_eq!(f.pr_commits(1).len(), 2, "left conflicted and untouched");
+}
+
+/// A recording runner for the ambient deadline: it never runs anything, only
+/// reports the timeout each call was given.
+struct TimeoutProbe(std::cell::RefCell<Vec<std::time::Duration>>);
+
+impl CommandRunner for TimeoutProbe {
+    fn run(&self, _invocation: &CommandInvocation) -> Result<String> {
+        unreachable!("run_jj goes through run_with_timeout")
+    }
+
+    fn run_with_timeout(&self, _invocation: &CommandInvocation, timeout: std::time::Duration) -> Result<String> {
+        self.0.borrow_mut().push(timeout);
+        Ok(String::new())
+    }
+}
+
+#[test]
+fn scoped_deadline_bounds_every_jj_call_even_without_an_explicit_one() {
+    let probe = TimeoutProbe(Default::default());
+    let call = || {
+        crate::app::jj::run_jj(
+            &probe,
+            None,
+            &RealCommandRunner::invocation(Path::new("/"), "jj", &["git", "import"]),
+        )
+    };
+    {
+        let _scope = crate::app::jj::scope_deadline(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        call().unwrap();
+        assert!(probe.0.borrow()[0] <= std::time::Duration::from_secs(5));
+    }
+    call().unwrap();
+    assert!(
+        probe.0.borrow()[1] > std::time::Duration::from_secs(5),
+        "scope restored"
+    );
+    let _expired = crate::app::jj::scope_deadline(std::time::Instant::now());
+    assert!(matches!(call(), Err(CubeError::DeadlineExceeded { .. })));
+    assert_eq!(probe.0.borrow().len(), 2, "nothing spawned past the deadline");
 }
