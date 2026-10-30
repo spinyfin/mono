@@ -145,9 +145,7 @@ use crate::live_worker_state::{LiveWorkerStateRegistry, iso8601_utc};
 use crate::semantic_progress::SemanticToolCondition;
 use crate::work::WorkDb;
 
-/// Engine-owned attention kind for a worker that is alive but has stopped
-/// making observable terminal progress.
-pub const STALE_WORKER_ATTENTION_KIND: &str = "stale_worker";
+pub use boss_engine_storage_values::attention_kinds::STALE_WORKER_ATTENTION_KIND;
 
 /// Why a tmux pane is classified dead. Only [`DeadPaneEvidence::PaneExited`]
 /// observed a process exit; the other two are derived from session identity

@@ -239,13 +239,7 @@ pub const HUSK_LIVENESS_CORROBORATION_SECS: i64 = 120;
 /// counted partition and all five would still be spared.
 pub const MAX_UNCONFIRMED_RETIREMENTS_PER_PASS: usize = 3;
 
-/// Attention-item `kind` filed when the mass-retirement circuit breaker
-/// holds panes back. Distinct kind so the Notifications UI can surface
-/// "the pool is wedged and the engine is refusing to unwedge it" apart
-/// from the per-worker recovery escalations
-/// [`crate::transient_recovery`] files, and so repeated passes dedupe
-/// against the already-open item instead of piling up one row a minute.
-pub const HUSK_BREAKER_ATTENTION_KIND: &str = "husk_retirement_breaker_tripped";
+pub use boss_engine_storage_values::attention_kinds::HUSK_BREAKER_ATTENTION_KIND;
 
 /// Per-candidate evidence, sourced independently of the
 /// [`crate::live_worker_state::LiveWorkerStateRegistry`], about whether the

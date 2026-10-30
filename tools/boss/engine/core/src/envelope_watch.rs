@@ -52,9 +52,7 @@ pub const DEFAULT_ENVELOPE_SMALL_SECS: i64 = 15 * 60;
 pub const DEFAULT_ENVELOPE_MEDIUM_SECS: i64 = 30 * 60;
 pub const DEFAULT_ENVELOPE_LARGE_SECS: i64 = 60 * 60;
 
-/// `kind` of the attention item this sweep files on an overrun. One kind
-/// keeps the surface simple; the overrun specifics live in the title/body.
-pub const ENVELOPE_OVERRUN_ATTENTION_KIND: &str = "envelope_overrun";
+pub use boss_engine_storage_values::attention_kinds::ENVELOPE_OVERRUN_ATTENTION_KIND;
 
 /// Per-effort duration envelopes, in seconds. A per-class threshold of `<= 0`
 /// disables the envelope for that class (never signal). Configurable via

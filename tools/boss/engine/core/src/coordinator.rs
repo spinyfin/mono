@@ -351,18 +351,7 @@ pub(crate) fn interactive_cap_wait_reason(working: usize, lease_pending: usize) 
 /// matches the periodic sweep's cadence.
 const LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
-/// `work_attention_items.kind` filed when a `ready` execution has been
-/// repeatedly deferred behind the SAME `chain_serialized` live sibling for
-/// at least [`CHAIN_SERIALIZED_STALL_THRESHOLD_SECS`] — the 2026-07-09
-/// chain-serialization re-defer stall incident (`task_18c07e0a815e6bd0_1de`):
-/// the dispatcher re-evaluated and
-/// re-deferred every ~10s for ~20 minutes with zero durable, user-visible
-/// signal, so a human only noticed by grepping `engine-trace.jsonl`. Filed
-/// once per stall (idempotent via [`WorkDb::upsert_work_item_attention`])
-/// and resolved via [`WorkDb::resolve_external_tracker_attention`] the
-/// moment the row is no longer chain-serialized (dispatched, or the sibling
-/// was reconciled dead — see [`ExecutionCoordinator::live_chain_siblings`]).
-pub const CHAIN_SERIALIZED_STALL_ATTENTION_KIND: &str = "chain_serialized_stall";
+pub use boss_engine_storage_values::attention_kinds::CHAIN_SERIALIZED_STALL_ATTENTION_KIND;
 
 /// How long a `ready` execution may sit deferred behind the same live chain
 /// sibling before [`CHAIN_SERIALIZED_STALL_ATTENTION_KIND`] fires. Set

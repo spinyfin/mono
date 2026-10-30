@@ -21,7 +21,7 @@ use crate::durable_liveness::{WorkerProcess, probe_execution_worker};
 use crate::work::WorkDb;
 
 const METADATA_KEY: &str = "local_worker_startup_quarantine";
-pub(crate) const ATTENTION_KIND: &str = "local_worker_startup_quarantine";
+pub(crate) use boss_engine_storage_values::attention_kinds::LOCAL_WORKER_STARTUP_QUARANTINE_ATTENTION_KIND as ATTENTION_KIND;
 
 /// How far before the kernel boot a run's last durable write must fall before
 /// the boot alone proves its worker dead. The margin absorbs a wall clock that

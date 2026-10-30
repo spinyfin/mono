@@ -7,7 +7,7 @@ use crate::driver::ProgressFidelity;
 use crate::semantic_progress::{SemanticProgressCheckpoint, SemanticToolCondition, SemanticTurnCondition};
 use boss_protocol::{LiveWorkerState, WorkerActivity};
 
-pub(crate) const HUNG_WORKER_ATTENTION_KIND: &str = "hung_worker";
+pub(crate) use boss_engine_storage_values::attention_kinds::HUNG_WORKER_ATTENTION_KIND;
 
 pub(crate) const FIRST_RESPONSE_SECS: i64 = 600;
 pub(crate) const NEXT_RESPONSE_SECS: i64 = 900;

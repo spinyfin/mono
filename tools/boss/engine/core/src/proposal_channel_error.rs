@@ -28,10 +28,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// `work_attention_items.kind` for a filed proposal-channel-error
-/// attention. Mirrors [`crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND`]'s
-/// pattern of one constant per marker-class attention kind.
-pub const PROPOSAL_CHANNEL_ERROR_ATTENTION_KIND: &str = "proposal_channel_error";
+pub use boss_engine_storage_values::attention_kinds::PROPOSAL_CHANNEL_ERROR_ATTENTION_KIND;
 
 /// In-memory `execution_id → error text` staging map. Populated by the
 /// `PostToolUse` hook dispatcher; consumed (and cleared) by

@@ -153,7 +153,7 @@ pub trait WorkerViewerDetach: Send + Sync {
     async fn confirm_viewers_detached(&self, run_ids: &[String]) -> Vec<Result<(), String>>;
 }
 
-pub(crate) const TEARDOWN_ATTENTION_KIND: &str = "pool_claim_teardown_pending";
+pub(crate) use boss_engine_storage_values::attention_kinds::POOL_CLAIM_TEARDOWN_ATTENTION_KIND as TEARDOWN_ATTENTION_KIND;
 
 /// Consecutive failed confirmations, retained across sweep passes.
 #[derive(Default)]

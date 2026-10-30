@@ -25,13 +25,9 @@ use crate::work::WorkDb;
 /// previous engine process return to the pool without waiting a day.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Attention kind filed when a lease is kept because a gate failed.
-pub const LEASE_UNRELEASED_ATTENTION_KIND: &str = "workspace_lease_unreleased";
+pub use boss_engine_storage_values::attention_kinds::LEASE_UNRELEASED_ATTENTION_KIND;
 
-/// Attention kind filed when every gate passed but cube's own release call
-/// failed. It is also the durable evidence that the run had settled, which
-/// is what lets the leftover-lease sweep retry a row that recorded no pid.
-pub const LEASE_RELEASE_FAILED_ATTENTION_KIND: &str = "workspace_lease_release_failed";
+pub use boss_engine_storage_values::attention_kinds::LEASE_RELEASE_FAILED_ATTENTION_KIND;
 
 /// Why the run ended. Proven causes may release without an occupancy scan;
 /// inferred death may not.

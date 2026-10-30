@@ -290,33 +290,11 @@ crate::register_counter!(
      parked for a human and stamped `run_undeclared_at` — never recorded as a successful completion.",
 );
 
-/// Attention-item kind filed when the run-done backstop parks a run that
-/// never declared itself finished.
-///
-/// Distinct from [`NUDGE_BREAKER_ATTENTION_KIND`], which the park itself
-/// also files, because the two say different things to whoever reads the
-/// row: the breaker item says "we asked repeatedly and nothing changed",
-/// this one says "this run's outcome is unknown — the worker never told us
-/// it was finished, and the engine deliberately did not guess". That
-/// distinction is the whole point of the declaration, so it gets its own
-/// kind rather than being folded into a generic park.
-pub const RUN_UNDECLARED_ATTENTION_KIND: &str = "run_undeclared";
+pub use boss_engine_storage_values::attention_kinds::RUN_UNDECLARED_ATTENTION_KIND;
 
-/// Attention-item kind filed when a `run_done` declaration's synchronous
-/// finalize (see `completion::run_done_declaration`) could not fully trust
-/// the claim: `delivered` with no PR the engine could resolve, or a
-/// post-hoc audit finding the bound PR's head did not move. The execution
-/// still terminalizes either way — a worker's declaration is the completion
-/// signal, never a gate the engine gets to block on — this only flags the
-/// mismatch for a human, exactly as the design's "post-hoc audit" intends.
-pub const RUN_DONE_AUDIT_FLAGGED_ATTENTION_KIND: &str = "run_done_audit_flagged";
+pub use boss_engine_storage_values::attention_kinds::RUN_DONE_AUDIT_FLAGGED_ATTENTION_KIND;
 
-/// Attention-item kind filed when a `run_done --outcome blocked` declaration
-/// terminalizes its execution. Distinct from [`crate::worker_escalation::WORKER_BLOCKED_ATTENTION_KIND`],
-/// which the companion (still-live-run) `blocked` proposal files with the
-/// blocker's own reason — this one marks that the *run itself* has ended,
-/// not merely that it hit a blocker while continuing.
-pub const RUN_DONE_BLOCKED_ATTENTION_KIND: &str = "run_done_declared_blocked";
+pub use boss_engine_storage_values::attention_kinds::RUN_DONE_BLOCKED_ATTENTION_KIND;
 
 /// Register all PR-URL-capture counter handles with `registry`. Called from
 /// [`crate::metrics_init::init_all`] at engine startup so duplicate-name panics
@@ -1930,64 +1908,17 @@ fn health_alone_satisfies_deliverable(kind: &ExecutionKind, contribution: Contri
     }
 }
 
-/// Attention-item `kind` filed when the auto-nudge circuit breaker
-/// parks an execution. Distinct kind so the coordinator/UI can surface
-/// "worker parked: nudge loop bounded" separately from other attention
-/// flows, and so repeated Stops dedupe against an already-open item.
-pub const NUDGE_BREAKER_ATTENTION_KIND: &str = "nudge_breaker_tripped";
+pub use boss_engine_storage_values::attention_kinds::NUDGE_BREAKER_ATTENTION_KIND;
 
-/// Attention-item kind filed when a reviewer worker exhausts its re-prompts
-/// without ever producing a readable `ReviewResult` (neither the
-/// structured-output artifact nor the transcript fallback validated). The
-/// producing task is advanced to `in_review` without a revision, so this item
-/// is the human-visible record that the PR proceeded *unreviewed* — replacing
-/// the old silent drop.
-pub const REVIEW_RESULT_GIVEUP_ATTENTION_KIND: &str = "review_result_missing";
+pub use boss_engine_storage_values::attention_kinds::REVIEW_RESULT_GIVEUP_ATTENTION_KIND;
 
-/// Attention-item kind filed when a worker's driver reports its own terminal
-/// turn boundary as an unrecoverable error (e.g. Codex's rollout
-/// `task_complete.error`, or a stdout `turn.failed` / fatal `error`
-/// envelope). Distinct kind so the coordinator/UI can tell "the provider
-/// itself failed the run" apart from the nudge-breaker and give-up cases
-/// above, which both imply the worker ran to some kind of conclusion.
-pub const DRIVER_TERMINAL_ERROR_ATTENTION_KIND: &str = "driver_terminal_error";
+pub use boss_engine_storage_values::attention_kinds::DRIVER_TERMINAL_ERROR_ATTENTION_KIND;
 
-/// Attention-item kind filed when a `revision_implementation` worker ends
-/// on a `boss propose done --outcome no-changes-needed` declaration: it
-/// pushed nothing, and declared explicitly that the review finding it was
-/// dispatched for needs no code change.
-///
-/// Distinct kind, and always filed, because that terminal closes a
-/// revision without the finding ever being addressed. Unlike a primary
-/// implementation's no-op — where "the work was already on `main`" is
-/// self-evidently complete — a revision exists because a reviewer pass
-/// asked for something, so a worker declining it is a judgement a human
-/// should see rather than a silent close.
-pub const REVISION_NO_OP_ATTENTION_KIND: &str = "revision_no_changes_needed";
+pub use boss_engine_storage_values::attention_kinds::REVISION_NO_OP_ATTENTION_KIND;
 
-/// Attention-item kind filed when [`WorkerCompletionHandler::finalize_pr_transition`]
-/// observes the producing execution's live-state activity as `working`
-/// (mid-turn) rather than idle at the moment it decides to terminalize and
-/// tear the worker down — i.e. the worker had not reached its own Stop
-/// boundary. Fired from the one shared finalize/teardown funnel every
-/// completion path (`pr_recheck_staged`, the `pr_recheck` detector branch,
-/// `stop_satisfied_clean`, and any future source) routes through, so it is
-/// not scoped to any single reap path. Together with [`MID_TURN_REAP_TOTAL`]
-/// this is incident-004 AI-4: make a mid-turn reap countable and alertable
-/// in-system instead of requiring the offline trace reconstruction that
-/// postmortem needed. See
-/// tools/boss/docs/postmortems/incident-004-live-revision-workers-reaped-mid-turn.md.
-pub const MID_TURN_REAP_ATTENTION_KIND: &str = "mid_turn_reap";
+pub use boss_engine_storage_values::attention_kinds::MID_TURN_REAP_ATTENTION_KIND;
 
-/// Attention-item kind filed when the engine could not pull a completed
-/// remote worker's structured-output artifact off its host (positive proof
-/// per [`crate::host_adapter::CollectOutcome::Failed`] — an invalid
-/// descriptor, or an artifact whose copy into place failed). Distinct from
-/// [`DRIVER_TERMINAL_ERROR_ATTENTION_KIND`]: the worker's own driver
-/// reported nothing wrong here — the remote host has the result, the engine
-/// simply could not retrieve it — so this tells the true story instead of
-/// implying a provider-side failure that never happened.
-pub const REMOTE_COLLECTION_FAILED_ATTENTION_KIND: &str = "remote_collection_failed";
+pub use boss_engine_storage_values::attention_kinds::REMOTE_COLLECTION_FAILED_ATTENTION_KIND;
 
 /// Wait-declaration sentence shared verbatim by the produce-a-PR and
 /// push-to-existing-PR probes. A macro so [`PROBE_NO_PR`] can `concat!` the

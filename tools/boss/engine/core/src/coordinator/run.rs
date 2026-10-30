@@ -3,13 +3,7 @@
 //! module split; see [`super`] for the struct and shared types.
 use super::*;
 
-/// Filed against a run when spawn or spawn confirmation failed (tmux creation
-/// failure, viewer rejection, prompt composition error, composer never ready,
-/// or no turn-start evidence). The pane may have come up and then been reaped.
-/// See [`crate::attention_lifecycle::ATTENTION_LIFECYCLES`] for its clearing
-/// rule: `ClearedBy::WorkResumed`, since a later spawn completing for the item
-/// is direct evidence the pane-spawn problem is no longer blocking it.
-pub const PANE_SPAWN_FAILED_ATTENTION_KIND: &str = "pane_spawn_failed";
+pub use boss_engine_storage_values::attention_kinds::PANE_SPAWN_FAILED_ATTENTION_KIND;
 
 fn pane_spawn_failed_attention_body(
     exec_id: &str,
