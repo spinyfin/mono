@@ -276,7 +276,7 @@ pub const DEFERRED_SCOPE_ATTENTION_KIND: &str = "deferred_scope";
 pub const DIRECT_MERGE_PUSH_RESTRICTION_ATTENTION_KIND: &str = "direct_merge_push_restriction";
 
 /// `work_attention_items.kind` filed when the tripwire halts a task
-/// pending operator sign-off. Shared by the worker-driven `pr_review`
+/// pending explicit sign-off. Shared by the worker-driven `pr_review`
 /// path (`completion.rs`) and the escalation ladder's mechanical-rung
 /// result-gate (`conflict_ladder.rs`) so both surfaces file the
 /// identical attention kind.
@@ -339,19 +339,14 @@ pub const REVIEW_VERDICT_BATCH_NOT_APPLYING_ATTENTION_KIND: &str = "pr_review_ve
 
 /// `work_attention_items.kind` filed when `pr_review_recovery`
 /// trips its churn guard and parks a work item instead of
-/// auto-redispatching it. `orphan_sweep` used to file this same
-/// kind for its own (`active`-task) churn trip; it now bounces through
-/// `CHURN_GUARD_DISPATCH_FAILED_REASON` instead — see that constant's docs
-/// — so this kind is `pr_review_recovery`-only going forward. Before this
-/// kind existed at all, a trip was only a `tracing::warn!` in the engine
-/// trace — the work item stayed active with no live execution and nothing
-/// in `boss task show`, `bossctl agents status`, or the kanban card said
-/// why. Resolved automatically the next time
-/// `WorkDb::request_execution_with_live_check` is called for the work
-/// item (either the sweep succeeding once the trailing window drains, or an
-/// operator running `bossctl work start`, which bypasses the guard entirely
-/// since it only lives in the sweeps), and — as a backstop for every other
-/// way an item can start moving — whenever a run starts for it afterwards
+/// auto-redispatching it. `orphan_sweep` records
+/// `CHURN_GUARD_DISPATCH_FAILED_REASON` instead.
+///
+/// Resolved automatically by a later call to
+/// `WorkDb::request_execution_with_live_check` for the work item, either
+/// when the sweep succeeds after the trailing window drains or when a
+/// deliberate `bossctl work start` bypasses the sweep's guard.
+/// A later run start also resolves it
 /// (`attention_lifecycle::ClearedBy::WorkResumed`).
 pub const CHURN_GUARD_PARKED_ATTENTION_KIND: &str = "churn_guard_parked";
 
@@ -392,15 +387,13 @@ pub const REPO_UNRESOLVED_ATTENTION_KIND: &str = "repo_unresolved";
 
 /// `work_attention_items.kind` for the item recording an engine
 /// auto-archival of a moot revision. Bound by
-/// `record_revision_archived_attention`; see
-/// [`REPO_UNRESOLVED_ATTENTION_KIND`] for why it lives here.
+/// `record_revision_archived_attention`.
 pub const REVISION_ARCHIVED_ATTENTION_KIND: &str = "revision_archived";
 
-/// Attention-group kind for proposed followup work awaiting the operator's
-/// batch-accept gesture.
+/// Attention-group kind for proposed followup work awaiting explicit batch acceptance.
 pub const FOLLOWUP_ATTENTION_KIND: &str = "followup";
 
-/// Attention-group kind for a question posed to the operator.
+/// Attention-group kind for an unanswered question.
 pub const QUESTION_ATTENTION_KIND: &str = "question";
 
 /// A no-op completion contradicted by a PR still owned by the work item.
