@@ -20,6 +20,173 @@ use boss_protocol::{
 
 use crate::cost_pricing;
 
+pub mod sol {
+    //! PR-family aggregation. Retried and revised work stays in its enrollment arm.
+    use super::{Accumulator, CostRunRecord};
+    use boss_protocol::{SolArmReport, SolComparisonReport};
+    use std::collections::BTreeSet;
+
+    #[derive(Debug, bon::Builder)]
+    #[builder(on(String, into))]
+    pub struct SolPrRecord {
+        pub arm: String,
+        pub merged: bool,
+        pub revisions: u64,
+        pub findings: u64,
+        pub runs: Vec<CostRunRecord>,
+        pub first_ci: Option<bool>,
+    }
+
+    pub fn build_sol_report(prs: &[SolPrRecord]) -> SolComparisonReport {
+        let arms = ["sol", "astra"]
+            .into_iter()
+            .map(|arm| {
+                let cohort: Vec<_> = prs.iter().filter(|pr| pr.arm == arm).collect();
+                let count = cohort.len() as u64;
+                let observed = cohort.iter().filter(|pr| pr.first_ci.is_some()).count() as u64;
+                let passes = cohort.iter().filter(|pr| pr.first_ci == Some(true)).count() as u64;
+                let merged = cohort.iter().filter(|pr| pr.merged).count() as u64;
+                let revisions = cohort.iter().filter(|pr| pr.merged).map(|pr| pr.revisions).sum();
+                let findings = cohort.iter().map(|pr| pr.findings).sum();
+                let mut cost = Accumulator::default();
+                let mut gaps = BTreeSet::new();
+                let (mut measured_tokens, mut measured_prs) = (0u64, 0u64);
+                for pr in cohort.iter().filter(|pr| pr.merged) {
+                    let mut family = Accumulator::default();
+                    for run in &pr.runs {
+                        cost.add(run, false, &mut gaps);
+                        family.add(run, false, &mut gaps);
+                    }
+                    let family = family.finish(false);
+                    if !pr.runs.is_empty() && family.runs_unmeasured == 0 {
+                        measured_tokens += family.total_tokens as u64;
+                        measured_prs += 1;
+                    }
+                }
+                let measured = cost.finish(false);
+                let tokens_per_pr = ratio(measured_tokens, measured_prs);
+                SolArmReport::builder()
+                    .arm(arm)
+                    .ci_observed_prs(observed)
+                    .first_attempt_ci_passes(passes)
+                    .merged_prs(merged)
+                    .prs(count)
+                    .review_findings(findings)
+                    .revisions_before_merge(revisions)
+                    .merged_pr_cost(measured)
+                    .maybe_first_attempt_ci_pass_rate(ratio(passes, observed))
+                    .maybe_findings_per_pr(ratio(findings, count))
+                    .maybe_revisions_per_merged_pr(ratio(revisions, merged))
+                    .maybe_tokens_per_merged_pr(tokens_per_pr)
+                    .merged_prs_tokens_unmeasured(merged - measured_prs)
+                    .build()
+            })
+            .collect();
+        SolComparisonReport { arms, notes: vec![
+        "PRs enroll in the arm of their first launched Sol-eligible execution; later revisions and Astra retries remain charged to that arm. Families without a recorded eligible assignment are excluded.".into(),
+        "CI is the first terminal observation on the first published head after enrollment. Unknown observations are excluded from the rate, with the denominator shown.".into(),
+        "Revision counts include launched revision work items before merge. Findings sum accepted automated review verdicts before merge (or all verdicts for open PRs).".into(),
+        "Token cost includes all recorded runs in the merged PR family, including follow-up revisions and escalated retries. Tokens per merged PR average only the merged families whose every run was measured, with the excluded count reported; unmeasured runs are never priced as zero. No unverified dollar prices are assumed.".into(),
+    ] }
+    }
+
+    fn ratio(numerator: u64, denominator: u64) -> Option<f64> {
+        (denominator != 0).then(|| numerator as f64 / denominator as f64)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn run(model: &str, tokens: Option<i64>) -> CostRunRecord {
+            CostRunRecord::builder()
+                .run_id("run")
+                .execution_id("execution")
+                .work_item_id("item")
+                .work_item_name("work")
+                .execution_kind("task_implementation")
+                .execution_status("completed")
+                .run_status("completed")
+                .created_at_epoch_s(1)
+                .model(model)
+                .maybe_input_tokens(tokens)
+                .build()
+        }
+
+        #[test]
+        fn compares_arms_and_keeps_astra_retries_in_sol_cost() {
+            let prs = vec![
+                SolPrRecord::builder()
+                    .arm("sol")
+                    .merged(true)
+                    .revisions(2)
+                    .findings(3)
+                    .first_ci(false)
+                    .runs(vec![run("gpt-6.1-sol", Some(100)), run("gpt-6-astra", Some(300))])
+                    .build(),
+                SolPrRecord::builder()
+                    .arm("sol")
+                    .merged(false)
+                    .revisions(1)
+                    .findings(1)
+                    .runs(vec![run("gpt-6.1-sol", Some(900))])
+                    .build(),
+                SolPrRecord::builder()
+                    .arm("astra")
+                    .merged(true)
+                    .revisions(0)
+                    .findings(0)
+                    .first_ci(true)
+                    .runs(vec![run("gpt-6-astra", Some(200))])
+                    .build(),
+            ];
+            let report = build_sol_report(&prs);
+            let sol = &report.arms[0];
+            assert_eq!(sol.prs, 2);
+            assert_eq!(sol.ci_observed_prs, 1);
+            assert_eq!(sol.first_attempt_ci_pass_rate, Some(0.0));
+            assert_eq!(sol.findings_per_pr, Some(2.0));
+            assert_eq!(sol.revisions_per_merged_pr, Some(2.0));
+            assert_eq!(sol.tokens_per_merged_pr, Some(400.0));
+            assert_eq!(report.arms[1].tokens_per_merged_pr, Some(200.0));
+            assert_eq!(report.arms[1].first_attempt_ci_pass_rate, Some(1.0));
+        }
+
+        #[test]
+        fn missing_tokens_and_empty_denominators_remain_unknown() {
+            let empty = build_sol_report(&[]);
+            assert_eq!(empty.arms[0].tokens_per_merged_pr, None);
+            assert_eq!(empty.arms[0].first_attempt_ci_pass_rate, None);
+            let report = build_sol_report(&[SolPrRecord::builder()
+                .arm("sol")
+                .merged(true)
+                .revisions(0)
+                .findings(0)
+                .runs(vec![run("gpt-6.1-sol", None)])
+                .build()]);
+            assert_eq!(report.arms[0].tokens_per_merged_pr, None);
+            assert_eq!(report.arms[0].merged_prs_tokens_unmeasured, 1);
+            assert_eq!(report.arms[0].merged_pr_cost.runs_unmeasured, 1);
+        }
+
+        #[test]
+        fn one_unmeasured_family_does_not_hide_measured_ones() {
+            let family = |tokens| {
+                SolPrRecord::builder()
+                    .arm("sol")
+                    .merged(true)
+                    .revisions(0)
+                    .findings(0)
+                    .runs(vec![run("gpt-6.1-sol", tokens)])
+                    .build()
+            };
+            let report = build_sol_report(&[family(Some(100)), family(Some(300)), family(None)]);
+            assert_eq!(report.arms[0].tokens_per_merged_pr, Some(200.0));
+            assert_eq!(report.arms[0].merged_prs_tokens_unmeasured, 1);
+        }
+    }
+}
+
 /// 2026-07-27T09:23:00Z (2026-07-27 04:23 America/Chicago, CDT) — the
 /// instant per-run token capture went live. Every `work_runs` row created
 /// before this has NULL token columns by construction, not by data loss;

@@ -18,7 +18,167 @@ use boss_protocol::{ExecutionKind, ExecutionStatus, ReviewBatchMemberRole, WorkI
 
 use super::prompt::structured_output_env_vars;
 use super::work_item::{work_item_id, work_item_name, work_item_task_kind};
-use super::worker_spawn::{ComposedWorkerSpawn, WorkerSpawnOpts, compose_worker_spawn};
+use super::worker_spawn::{ComposedWorkerSpawn, WorkerSpawnOpts};
+use sol_spawn::prepare_worker_spawn;
+
+mod sol_spawn {
+    //! Apply durable experiment assignment at dispatch, after ordinary composition.
+    use super::super::worker_spawn::{ComposedWorkerSpawn, WorkerSpawnOpts, compose_worker_spawn};
+    use crate::effort::{ModelResolutionSource, SpawnConfig};
+    use crate::work::{WorkDb, WorkExecution, WorkItem};
+    use std::path::Path;
+
+    pub(crate) async fn prepare_worker_spawn(
+        db: &WorkDb,
+        worker_id: &str,
+        execution: &WorkExecution,
+        work_item: &WorkItem,
+        workspace_path: &Path,
+        cube_change_id: Option<&str>,
+        opts: WorkerSpawnOpts,
+    ) -> anyhow::Result<ComposedWorkerSpawn> {
+        let mut composed = compose_worker_spawn(
+            db,
+            worker_id,
+            execution,
+            work_item,
+            workspace_path,
+            cube_change_id,
+            opts,
+        )
+        .await?;
+        apply_sol_policy(db, execution, work_item, &mut composed.spawn_config)?;
+        if composed.spawn_config.model == boss_engine_effort::sol::SOL_MODEL {
+            crate::driver::codex::validate_sol_available().await?;
+        }
+        Ok(composed)
+    }
+
+    fn apply_sol_policy(
+        db: &WorkDb,
+        execution: &WorkExecution,
+        work_item: &WorkItem,
+        config: &mut SpawnConfig,
+    ) -> anyhow::Result<()> {
+        // Other drivers and explicitly chosen models never touch Sol state.
+        let automatic_codex = config.driver == "codex"
+            && !matches!(
+                config.model_source,
+                ModelResolutionSource::TaskOverride | ModelResolutionSource::PoolStrongTier
+            );
+        if !automatic_codex {
+            return Ok(());
+        }
+        let eligible = match work_item {
+            WorkItem::Task(task) | WorkItem::Chore(task) => boss_engine_effort::sol::eligible(
+                task.effort_level,
+                task.reasoning,
+                Some(task.kind.clone()),
+                &execution.kind,
+                &task.created_via,
+            ),
+            _ => false,
+        };
+        if !eligible {
+            return Ok(());
+        }
+        let selected = db.select_codex_sol_model(&execution.id, eligible, &config.model)?;
+        // Only a Sol draw changes the launch; any other stored model is just the
+        // base model recorded at an earlier compose, not an experiment result.
+        if selected == boss_engine_effort::sol::SOL_MODEL && selected != config.model {
+            config.model = selected;
+            config.model_source = ModelResolutionSource::SolExperiment;
+        }
+        tracing::info!(execution_id=%execution.id, model=%config.model, eligible,
+        "resolved automatic worker model after experiment assignment");
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::effort::{SpawnResolutionInput, resolve_spawn_config};
+        use crate::test_support::{create_product, create_ready_chore_execution, create_test_chore, open_db};
+        use boss_protocol::{EffortLevel, ReasoningMode};
+
+        #[test]
+        fn dispatch_applies_sol_only_to_eligible_codex_and_preserves_zero_percent() {
+            for percentage in [0, 100] {
+                for driver in ["codex", "claude", "grok"] {
+                    let (_dir, db) = open_db();
+                    db.set_codex_sol_percentage(percentage).unwrap();
+                    let mut task = create_test_chore(&db, create_product(&db), "dispatch");
+                    task.effort_level = Some(EffortLevel::Small);
+                    task.reasoning = Some(ReasoningMode::Standard);
+                    let execution = create_ready_chore_execution(&db, &task.id);
+                    let mut config = resolve_spawn_config(
+                        &SpawnResolutionInput::builder()
+                            .task_driver(driver)
+                            .effort_level(EffortLevel::Small)
+                            .reasoning(ReasoningMode::Standard)
+                            .build(),
+                    )
+                    .unwrap();
+                    let original = config.model.clone();
+                    apply_sol_policy(&db, &execution, &WorkItem::Chore(task), &mut config).unwrap();
+                    assert_eq!(
+                        config.model,
+                        if driver == "codex" && percentage == 100 {
+                            boss_engine_effort::sol::SOL_MODEL
+                        } else {
+                            &original
+                        }
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn non_codex_and_explicit_model_dispatch_never_touch_sol_state() {
+            let (_dir, db) = open_db();
+            // A corrupt share would fail any Sol read.
+            db.connect()
+                .unwrap()
+                .execute(
+                    "INSERT INTO metadata(key,value) VALUES ('codex_sol_percentage','bogus')",
+                    [],
+                )
+                .unwrap();
+            let mut task = create_test_chore(&db, create_product(&db), "dispatch");
+            task.effort_level = Some(EffortLevel::Small);
+            task.reasoning = Some(ReasoningMode::Standard);
+            let execution = create_ready_chore_execution(&db, &task.id);
+            for driver in ["claude", "grok"] {
+                let mut config = resolve_spawn_config(
+                    &SpawnResolutionInput::builder()
+                        .task_driver(driver)
+                        .effort_level(EffortLevel::Small)
+                        .reasoning(ReasoningMode::Standard)
+                        .build(),
+                )
+                .unwrap();
+                apply_sol_policy(&db, &execution, &WorkItem::Chore(task.clone()), &mut config).unwrap();
+            }
+            let mut config = resolve_spawn_config(
+                &SpawnResolutionInput::builder()
+                    .task_driver("codex")
+                    .model_override("gpt-6-terra")
+                    .effort_level(EffortLevel::Small)
+                    .reasoning(ReasoningMode::Standard)
+                    .build(),
+            )
+            .unwrap();
+            apply_sol_policy(&db, &execution, &WorkItem::Chore(task), &mut config).unwrap();
+            assert_eq!(config.model, "gpt-6-terra");
+            let rows: i64 = db
+                .connect()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM execution_sol_decisions", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 0);
+        }
+    }
+}
 use super::{
     ExecutionRunner, RunOutcome, RunWaitState, bound_control_token_path, bound_events_socket_path,
     bound_frontend_socket_path,
@@ -768,7 +928,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             prompt_text,
             spawn_config,
             embedded_output_path: _,
-        } = compose_worker_spawn(
+        } = prepare_worker_spawn(
             &self.work_db,
             worker_id,
             execution,

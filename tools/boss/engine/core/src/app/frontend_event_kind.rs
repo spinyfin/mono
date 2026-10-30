@@ -7,6 +7,8 @@ pub(super) fn kind(event: &FrontendEvent) -> &'static str {
         FrontendEvent::CriticalPriorityRequests { .. } => "CriticalPriorityRequests",
         FrontendEvent::CriticalPriorityRequested { .. } => "CriticalPriorityRequested",
         FrontendEvent::CriticalPriorityResolved { .. } => "CriticalPriorityResolved",
+        FrontendEvent::CodexSolPercentage { .. } => "CodexSolPercentage",
+        FrontendEvent::SolComparisonReport { .. } => "SolComparisonReport",
         FrontendEvent::Hello { .. } => "Hello",
         FrontendEvent::Subscribed { .. } => "Subscribed",
         FrontendEvent::Unsubscribed { .. } => "Unsubscribed",

@@ -635,5 +635,505 @@ pub(crate) fn record_execution_driver_decision(
     Ok(())
 }
 
+pub(super) mod sol_selection {
+    //! Durable automatic model decisions; independent of mutable task classification.
+    use crate::work::*;
+    use boss_engine_effort::sol::{DEFAULT_SOL_PERCENTAGE, SOL_MODEL, use_sol};
+
+    /// Statuses that mean the worker itself failed. Cancellation, supersession
+    /// and post-crash orphan recovery are operator or engine events, so they
+    /// never push work off Sol.
+    const FAILURE_STATUSES: &str = "'failed','abandoned'";
+
+    pub(in crate::work) fn migrate(conn: &Connection) -> Result<()> {
+        conn.execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS execution_sol_decisions (
+            execution_id TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE,
+            eligible INTEGER NOT NULL, bucket INTEGER NOT NULL,
+            percentage INTEGER NOT NULL, escalated INTEGER NOT NULL,
+            arm TEXT NOT NULL, selected_model TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS sol_pr_outcomes (
+            work_item_id TEXT PRIMARY KEY REFERENCES tasks(id),
+            baseline_head TEXT, first_head TEXT, first_ci TEXT, merged_at TEXT
+         );
+         CREATE TABLE IF NOT EXISTS sol_failed_work_items (work_item_id TEXT PRIMARY KEY);
+         CREATE TRIGGER IF NOT EXISTS sol_failure_execution AFTER UPDATE OF status,model,run_undeclared_at,run_done_outcome ON work_executions
+         WHEN NEW.model='{SOL_MODEL}' AND (NEW.status IN ({FAILURE_STATUSES})
+             OR NEW.run_undeclared_at IS NOT NULL OR NEW.run_done_outcome='blocked')
+         BEGIN INSERT OR IGNORE INTO sol_failed_work_items VALUES (NEW.work_item_id); END;
+         CREATE TRIGGER IF NOT EXISTS sol_failure_run AFTER UPDATE OF status ON work_runs
+         WHEN NEW.status IN ({FAILURE_STATUSES})
+         BEGIN INSERT OR IGNORE INTO sol_failed_work_items
+             SELECT work_item_id FROM work_executions WHERE id=NEW.execution_id
+             AND (model='{SOL_MODEL}' OR NEW.model='{SOL_MODEL}'); END;"
+        ))?;
+        Ok(())
+    }
+
+    #[work_db_boundary::instrument]
+    impl WorkDb {
+        pub fn get_codex_sol_percentage(&self) -> Result<u8> {
+            let conn = self.connect()?;
+            percentage(&conn)
+        }
+
+        pub fn set_codex_sol_percentage(&self, value: u8) -> Result<u8> {
+            anyhow::ensure!(value <= 100, "Codex Sol percentage must be between 0 and 100");
+            self.connect()?.execute(
+                "INSERT INTO metadata(key,value) VALUES ('codex_sol_percentage',?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [value.to_string()],
+            )?;
+            Ok(value)
+        }
+
+        /// Idempotent across compose retries and restarts. The draw is namespaced
+        /// separately from the work-item driver split and stored with its threshold.
+        ///
+        /// A stored decision is only reused where it still describes this
+        /// launch: an `ineligible` row is redrawn once the work becomes
+        /// eligible, and a Sol draw for an execution that never launched is
+        /// redrawn so a lowered share (or a failed preflight followed by a 0%
+        /// setting) takes effect on pre-start retries.
+        pub fn select_codex_sol_model(
+            &self,
+            execution_id: &str,
+            eligible: bool,
+            current_model: &str,
+        ) -> Result<String> {
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
+            let percentage = percentage(&tx)?;
+            // A failed run also counts: some recovery paths reuse an execution row.
+            // A durable prior failure never clears when a later Astra retry succeeds.
+            let escalated: bool = tx.query_row(
+                &format!(
+                    "SELECT EXISTS (SELECT 1 FROM sol_failed_work_items WHERE work_item_id=?1) OR EXISTS (
+                SELECT 1 FROM work_executions e
+                WHERE e.work_item_id=?1 AND e.model=?2
+                  AND (e.status IN ({FAILURE_STATUSES})
+                       OR e.run_undeclared_at IS NOT NULL
+                       OR e.run_done_outcome='blocked'
+                       OR EXISTS (SELECT 1 FROM work_runs r WHERE r.execution_id=e.id
+                           AND r.status IN ({FAILURE_STATUSES})))
+            )"
+                ),
+                params![execution.work_item_id, SOL_MODEL],
+                |row| row.get(0),
+            )?;
+            let stored = tx
+                .query_row(
+                    "SELECT arm, selected_model FROM execution_sol_decisions WHERE execution_id=?1",
+                    [execution_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            if let Some((arm, model)) = stored {
+                let stale_ineligible = arm == "ineligible" && eligible;
+                let unlaunched_sol = model == SOL_MODEL && execution.model.is_none();
+                if !stale_ineligible && !unlaunched_sol {
+                    // A stored model is meaningless once the work is ineligible
+                    // (e.g. an override was added or cleared since).
+                    if !eligible {
+                        return Ok(current_model.to_owned());
+                    }
+                    if model == SOL_MODEL && escalated {
+                        tx.execute(
+                            "UPDATE execution_sol_decisions SET selected_model=?2,escalated=1 WHERE execution_id=?1",
+                            params![execution_id, current_model],
+                        )?;
+                        tx.commit()?;
+                        return Ok(current_model.to_owned());
+                    }
+                    return Ok(model);
+                }
+                tx.execute(
+                    "DELETE FROM execution_sol_decisions WHERE execution_id=?1",
+                    [execution_id],
+                )?;
+            }
+            let bucket = super::hash_bucket(&format!("codex-sol:{execution_id}"));
+            let sol = use_sol(eligible, escalated, bucket, percentage);
+            let selected = if sol { SOL_MODEL } else { current_model };
+            let arm = if !eligible {
+                "ineligible"
+            } else if sol {
+                "sol"
+            } else {
+                "astra"
+            };
+            tx.execute(
+                "INSERT INTO execution_sol_decisions VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![execution_id, eligible, bucket, percentage, escalated, arm, selected],
+            )?;
+            if eligible {
+                enroll(&tx, &execution.work_item_id)?;
+            }
+            tx.commit()?;
+            Ok(selected.to_owned())
+        }
+    }
+
+    /// Open the family's outcome row and remember the PR head already
+    /// published, so the first head pushed afterwards (while the enrolled
+    /// worker is still running, or later) is the one CI is judged on.
+    fn enroll(conn: &Connection, work_item_id: &str) -> Result<()> {
+        let root = crate::work::chain_helpers::chain_root(conn, work_item_id)?;
+        let head: Option<String> = conn
+            .query_row("SELECT pr_head_sha FROM tasks WHERE id=?1", [&root], |r| r.get(0))
+            .optional()?
+            .flatten();
+        conn.execute(
+            "INSERT INTO sol_pr_outcomes(work_item_id,baseline_head) VALUES (?1,?2)
+             ON CONFLICT(work_item_id) DO UPDATE SET baseline_head=excluded.baseline_head
+             WHERE first_head IS NULL",
+            params![root, head],
+        )?;
+        Ok(())
+    }
+
+    /// Idempotently stamp the family's merge time; a no-op for families that
+    /// never enrolled. Shared by the merge poller and the worker-completion
+    /// path that finds its PR already merged.
+    pub(in crate::work) fn record_merge(conn: &Connection, work_item_id: &str, now: &str) -> Result<()> {
+        let root = crate::work::chain_helpers::chain_root(conn, work_item_id)?;
+        conn.execute(
+            "UPDATE sol_pr_outcomes SET merged_at=COALESCE(merged_at,?2) WHERE work_item_id=?1",
+            params![root, now],
+        )?;
+        Ok(())
+    }
+
+    fn percentage(conn: &Connection) -> Result<u8> {
+        let raw: Option<String> = conn
+            .query_row("SELECT value FROM metadata WHERE key='codex_sol_percentage'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let value = raw
+            .map(|v| v.parse::<u8>())
+            .transpose()?
+            .unwrap_or(DEFAULT_SOL_PERCENTAGE);
+        anyhow::ensure!(value <= 100, "persisted Codex Sol percentage must be between 0 and 100");
+        Ok(value)
+    }
+
+    /// Record only the first head published after enrollment and that head's
+    /// first terminal CI result, independent of whether the enrolled worker has
+    /// finished. A later head or CI rerun cannot turn a failed first attempt
+    /// into a success, and the head that existed at enrollment never counts.
+    /// Families that never enrolled have no outcome row, so this is two cheap
+    /// primary-key updates for them.
+    pub(in crate::work) fn observe_ci(conn: &Connection, item: &str, head: Option<&str>, state: &str) -> Result<()> {
+        let Some(head) = head else { return Ok(()) };
+        let root = crate::work::chain_helpers::chain_root(conn, item)?;
+        conn.execute(
+            "UPDATE sol_pr_outcomes
+             SET first_head=COALESCE(first_head, CASE WHEN ?2 IS NOT baseline_head THEN ?2 END)
+             WHERE work_item_id=?1 AND first_ci IS NULL",
+            params![root, head],
+        )?;
+        conn.execute(
+            "UPDATE sol_pr_outcomes SET first_ci=?3
+             WHERE work_item_id=?1 AND first_ci IS NULL AND first_head=?2 AND ?3 IN ('success','fail')",
+            params![root, head, state],
+        )?;
+        Ok(())
+    }
+
+    /// Reuse the indexed review-family walk, including tombstoned revisions.
+    pub(in crate::work) fn family_cte() -> String {
+        format!(
+            "{}, roots AS (SELECT DISTINCT id AS task_id,root AS cycle_root_id FROM family)",
+            review_badge::review_family_cte("?1", review_badge::ReviewKey::Owner)
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::test_support::{create_product, create_ready_chore_execution, create_test_chore, open_db};
+        use boss_engine_effort::sol::ASTRA_MODEL;
+
+        #[test]
+        fn setting_and_draw_are_durable_and_zero_preserves_the_existing_model() {
+            let (_dir, db) = open_db();
+            assert_eq!(db.get_codex_sol_percentage().unwrap(), 50);
+            assert!(db.set_codex_sol_percentage(101).is_err());
+            let product = create_product(&db);
+            let task = create_test_chore(&db, &product, "selection");
+            let execution = create_ready_chore_execution(&db, &task.id);
+            db.set_codex_sol_percentage(0).unwrap();
+            assert_eq!(
+                db.select_codex_sol_model(&execution.id, true, ASTRA_MODEL).unwrap(),
+                ASTRA_MODEL
+            );
+            db.set_codex_sol_percentage(100).unwrap();
+            assert_eq!(
+                db.select_codex_sol_model(&execution.id, true, ASTRA_MODEL).unwrap(),
+                ASTRA_MODEL
+            );
+            let conn = db.connect().unwrap();
+            let (eligible, threshold, bucket, arm): (bool, u8, u8, String) = conn
+                .query_row(
+                    "SELECT eligible,percentage,bucket,arm FROM execution_sol_decisions WHERE execution_id=?1",
+                    [&execution.id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            assert!(eligible);
+            assert_eq!(threshold, 0);
+            assert_eq!(
+                bucket,
+                crate::work::driver_allocation::hash_bucket(&format!("codex-sol:{}", execution.id))
+            );
+            assert_eq!(arm, "astra");
+            drop(conn);
+            let other = create_test_chore(&db, &product, "other driver");
+            let other_execution = create_ready_chore_execution(&db, &other.id);
+            assert_eq!(
+                db.select_codex_sol_model(&other_execution.id, false, "opus").unwrap(),
+                "opus"
+            );
+        }
+
+        #[test]
+        fn worker_failure_states_escalate_permanently_for_the_same_item() {
+            for status in ["failed", "abandoned"] {
+                let (_dir, db) = open_db();
+                let product = create_product(&db);
+                let task = create_test_chore(&db, &product, status);
+                db.set_codex_sol_percentage(100).unwrap();
+                let first = create_ready_chore_execution(&db, &task.id);
+                assert_eq!(
+                    db.select_codex_sol_model(&first.id, true, ASTRA_MODEL).unwrap(),
+                    SOL_MODEL
+                );
+                db.record_execution_launch_config(&first.id, "codex", SOL_MODEL, None)
+                    .unwrap();
+                db.connect()
+                    .unwrap()
+                    .execute(
+                        "UPDATE work_executions SET status=?2 WHERE id=?1",
+                        params![first.id, status],
+                    )
+                    .unwrap();
+                assert_eq!(
+                    db.select_codex_sol_model(&first.id, true, ASTRA_MODEL).unwrap(),
+                    ASTRA_MODEL
+                );
+                // Rearming the original row must not erase its failure history.
+                db.connect()
+                    .unwrap()
+                    .execute("UPDATE work_executions SET status='completed' WHERE id=?1", [&first.id])
+                    .unwrap();
+                let second = create_ready_chore_execution(&db, &task.id);
+                assert_eq!(
+                    db.select_codex_sol_model(&second.id, true, ASTRA_MODEL).unwrap(),
+                    ASTRA_MODEL,
+                    "{status}"
+                );
+                db.record_execution_launch_config(&second.id, "codex", ASTRA_MODEL, None)
+                    .unwrap();
+                db.connect()
+                    .unwrap()
+                    .execute(
+                        "UPDATE work_executions SET status='completed' WHERE id=?1",
+                        [&second.id],
+                    )
+                    .unwrap();
+                let third = create_ready_chore_execution(&db, &task.id);
+                assert_eq!(
+                    db.select_codex_sol_model(&third.id, true, ASTRA_MODEL).unwrap(),
+                    ASTRA_MODEL
+                );
+                let unrelated = create_test_chore(&db, &product, "unrelated");
+                let other = create_ready_chore_execution(&db, &unrelated.id);
+                assert_eq!(
+                    db.select_codex_sol_model(&other.id, true, ASTRA_MODEL).unwrap(),
+                    SOL_MODEL
+                );
+            }
+        }
+
+        #[test]
+        fn operator_and_recovery_states_do_not_escalate() {
+            for status in ["cancelled", "orphaned"] {
+                let (_dir, db) = open_db();
+                let task = create_test_chore(&db, create_product(&db), status);
+                db.set_codex_sol_percentage(100).unwrap();
+                let first = create_ready_chore_execution(&db, &task.id);
+                db.select_codex_sol_model(&first.id, true, ASTRA_MODEL).unwrap();
+                db.record_execution_launch_config(&first.id, "codex", SOL_MODEL, None)
+                    .unwrap();
+                db.connect()
+                    .unwrap()
+                    .execute(
+                        "UPDATE work_executions SET status=?2 WHERE id=?1",
+                        params![first.id, status],
+                    )
+                    .unwrap();
+                let second = create_ready_chore_execution(&db, &task.id);
+                assert_eq!(
+                    db.select_codex_sol_model(&second.id, true, ASTRA_MODEL).unwrap(),
+                    SOL_MODEL,
+                    "{status}"
+                );
+            }
+        }
+
+        #[test]
+        fn stale_ineligible_decision_is_redrawn_not_reapplied() {
+            let (_dir, db) = open_db();
+            let task = create_test_chore(&db, create_product(&db), "override cleared");
+            db.set_codex_sol_percentage(0).unwrap();
+            let execution = create_ready_chore_execution(&db, &task.id);
+            assert_eq!(
+                db.select_codex_sol_model(&execution.id, false, "custom-override")
+                    .unwrap(),
+                "custom-override"
+            );
+            // The override is gone: the stored override model must not come back.
+            assert_eq!(
+                db.select_codex_sol_model(&execution.id, true, ASTRA_MODEL).unwrap(),
+                ASTRA_MODEL
+            );
+            let arm: String = db
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT arm FROM execution_sol_decisions WHERE execution_id=?1",
+                    [&execution.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(arm, "astra");
+            // And an eligible row never leaks its model into a now-ineligible launch.
+            assert_eq!(
+                db.select_codex_sol_model(&execution.id, false, "custom-override")
+                    .unwrap(),
+                "custom-override"
+            );
+        }
+
+        #[test]
+        fn unlaunched_sol_draw_follows_a_lowered_share_but_a_launched_one_is_durable() {
+            let (_dir, db) = open_db();
+            let task = create_test_chore(&db, create_product(&db), "preflight failed");
+            db.set_codex_sol_percentage(100).unwrap();
+            let execution = create_ready_chore_execution(&db, &task.id);
+            assert_eq!(
+                db.select_codex_sol_model(&execution.id, true, ASTRA_MODEL).unwrap(),
+                SOL_MODEL
+            );
+            // The launch failed before a model was recorded; the operator sets 0%.
+            db.set_codex_sol_percentage(0).unwrap();
+            assert_eq!(
+                db.select_codex_sol_model(&execution.id, true, ASTRA_MODEL).unwrap(),
+                ASTRA_MODEL
+            );
+
+            let launched = create_ready_chore_execution(&db, &task.id);
+            db.set_codex_sol_percentage(100).unwrap();
+            assert_eq!(
+                db.select_codex_sol_model(&launched.id, true, ASTRA_MODEL).unwrap(),
+                SOL_MODEL
+            );
+            db.record_execution_launch_config(&launched.id, "codex", SOL_MODEL, None)
+                .unwrap();
+            db.set_codex_sol_percentage(0).unwrap();
+            assert_eq!(
+                db.select_codex_sol_model(&launched.id, true, ASTRA_MODEL).unwrap(),
+                SOL_MODEL
+            );
+        }
+
+        fn set_head_and_state(db: &WorkDb, task: &str, head: &str) {
+            db.connect()
+                .unwrap()
+                .execute("UPDATE tasks SET pr_head_sha=?2 WHERE id=?1", params![task, head])
+                .unwrap();
+        }
+
+        fn first_ci(db: &WorkDb, task: &str) -> Option<String> {
+            db.connect()
+                .unwrap()
+                .query_row(
+                    "SELECT first_ci FROM sol_pr_outcomes WHERE work_item_id=?1",
+                    [task],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        }
+
+        #[test]
+        fn first_ci_failure_is_kept_while_the_worker_is_live_and_after_reruns() {
+            let (_dir, db) = open_db();
+            let task = create_test_chore(&db, create_product(&db), "live ci");
+            db.set_codex_sol_percentage(100).unwrap();
+            set_head_and_state(&db, &task.id, "before");
+            let execution = create_ready_chore_execution(&db, &task.id);
+            db.select_codex_sol_model(&execution.id, true, ASTRA_MODEL).unwrap();
+            db.record_execution_launch_config(&execution.id, "codex", SOL_MODEL, None)
+                .unwrap();
+            let observe = |head: &str, state: &str| {
+                let conn = db.connect().unwrap();
+                observe_ci(&conn, &task.id, Some(head), state).unwrap();
+            };
+            // The execution is still running (no pr_head_after yet); the head
+            // that predates enrollment never counts.
+            observe("before", "success");
+            assert_eq!(first_ci(&db, &task.id), None);
+            observe("first", "in_progress");
+            observe("first", "fail");
+            // A rerun on the same head, or a fix on a new head, cannot rewrite it.
+            observe("first", "success");
+            observe("fix", "success");
+            assert_eq!(first_ci(&db, &task.id).as_deref(), Some("fail"));
+        }
+
+        #[test]
+        fn families_that_never_enrolled_record_nothing() {
+            let (_dir, db) = open_db();
+            let task = create_test_chore(&db, create_product(&db), "ineligible");
+            let execution = create_ready_chore_execution(&db, &task.id);
+            db.select_codex_sol_model(&execution.id, false, ASTRA_MODEL).unwrap();
+            let conn = db.connect().unwrap();
+            observe_ci(&conn, &task.id, Some("head"), "fail").unwrap();
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM sol_pr_outcomes", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 0);
+        }
+
+        #[test]
+        fn undeclared_exit_escalates_but_a_successful_sol_run_does_not() {
+            for undeclared in [false, true] {
+                let (_dir, db) = open_db();
+                let task = create_test_chore(&db, create_product(&db), "exit");
+                db.set_codex_sol_percentage(100).unwrap();
+                let first = create_ready_chore_execution(&db, &task.id);
+                db.select_codex_sol_model(&first.id, true, ASTRA_MODEL).unwrap();
+                db.record_execution_launch_config(&first.id, "codex", SOL_MODEL, None)
+                    .unwrap();
+                db.connect()
+                    .unwrap()
+                    .execute(
+                        "UPDATE work_executions SET status='completed',run_undeclared_at=?2 WHERE id=?1",
+                        params![first.id, undeclared.then_some("1")],
+                    )
+                    .unwrap();
+                let second = create_ready_chore_execution(&db, &task.id);
+                assert_eq!(
+                    db.select_codex_sol_model(&second.id, true, ASTRA_MODEL).unwrap(),
+                    if undeclared { ASTRA_MODEL } else { SOL_MODEL }
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

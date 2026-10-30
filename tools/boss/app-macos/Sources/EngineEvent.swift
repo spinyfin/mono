@@ -211,6 +211,7 @@ enum EngineEvent {
     /// `standard`-reasoning implementation work between the `grok`,
     /// `claude`, and `codex` drivers. Its shares always sum to 100.
     case driverTrafficSplitResult(split: DriverTrafficSplit)
+    case codexSolPercentage(percentage: Int)
     /// Response to `get_driver_quota_usage` — one entry per implemented
     /// driver, each either the provider's own reported figure or an explicit
     /// typed failure. Never a blank that could read as headroom.

@@ -212,6 +212,12 @@ impl WorkDb {
             ],
         )?;
 
+        // A worker that finds its PR already merged lands here with `Done`;
+        // the merge poller never sees these tasks again.
+        if matches!(target, WorkerPrCompletionTarget::Done) {
+            driver_allocation::sol_selection::record_merge(&tx, &task.id, &now)?;
+        }
+
         let mut pending = PendingEvents::new();
         if new_status != task.status {
             cascade_dependents_after_prereq_status_change(&mut pending, &tx, &task.id, new_status.as_str(), &now)?;
@@ -1393,6 +1399,7 @@ impl WorkDb {
         if task.deleted_at.is_some() {
             return Ok(None);
         }
+        driver_allocation::sol_selection::record_merge(&tx, work_item_id, &now_string())?;
         if task.status == TaskStatus::Done || task.status == TaskStatus::Archived {
             // Already terminal — no status transition, but a task that
             // reached done/archived via a path that predates (or missed)
@@ -1661,6 +1668,14 @@ impl WorkDb {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let before = read_pr_observation_columns(&tx, work_item_id)?;
+        if before.is_some() {
+            driver_allocation::sol_selection::observe_ci(
+                &tx,
+                work_item_id,
+                input.pr_head_sha,
+                input.ci_required_state,
+            )?;
+        }
         let prior_ci_state = before.as_ref().and_then(|row| row.ci_required_state.clone());
         let prior_mergeable = before.as_ref().and_then(|row| row.pr_mergeable_state.as_deref());
         let prior_merge_status = before.as_ref().and_then(|row| row.pr_merge_state_status.as_deref());

@@ -51,6 +51,14 @@ extension EngineClient {
         sendLine(["type": "get_driver_traffic_split"], queueIfDisconnected: true)
     }
 
+    func sendGetCodexSolPercentage() {
+        sendLine(["type": "get_codex_sol_percentage"], queueIfDisconnected: true)
+    }
+
+    func sendSetCodexSolPercentage(_ percentage: Int) {
+        sendLine(["type": "set_codex_sol_percentage", "percentage": percentage])
+    }
+
     /// Set the driver traffic split. The three shares must sum to exactly
     /// 100; the engine rejects anything else with a `work_error` rather
     /// than repairing it, so callers must send a split built by

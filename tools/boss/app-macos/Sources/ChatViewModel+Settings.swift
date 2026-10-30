@@ -43,6 +43,11 @@ extension ChatViewModel {
     /// value rather than whatever it last happened to show.
     func refreshDriverTrafficSplit() {
         engine.sendGetDriverTrafficSplit()
+        engine.sendGetCodexSolPercentage()
+    }
+
+    func setCodexSolPercentage(_ percentage: Int) {
+        engine.sendSetCodexSolPercentage(percentage)
     }
 
     /// Ask the engine for the per-driver provider quota snapshot. Called on

@@ -64,11 +64,13 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::GetConflictHotspots { .. }
         | R::GetConflictResolution { .. }
         | R::GetCoordinatorHandoff
+        | R::GetSolComparisonReport
         | R::GetCostWindowReport { .. }
         | R::GetDecision { .. }
         | R::GetDispatchConcurrency
         | R::GetDispatchState
         | R::GetDriverQuotaUsage { .. }
+        | R::GetCodexSolPercentage
         | R::GetDriverTrafficSplit
         | R::GetExecution { .. }
         | R::GetHost { .. }
@@ -228,6 +230,7 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::SetCoordinatorHandoff { .. }
         | R::SetDispatchConcurrency { .. }
         | R::SetDispatchPaused { .. }
+        | R::SetCodexSolPercentage { .. }
         | R::SetDriverTrafficSplit { .. }
         | R::SetFeatureFlag { .. }
         | R::SetHostEnabled { .. }

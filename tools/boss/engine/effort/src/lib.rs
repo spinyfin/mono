@@ -10,6 +10,133 @@ use boss_protocol::{EffortLevel, ReasoningMode, TaskKind};
 
 use boss_engine_driver::DriverRegistry;
 
+pub mod sol {
+    //! Codex's automatic Sol experiment. Explicit model and pool policies remain separate.
+
+    use boss_protocol::{EffortLevel, ExecutionKind, ReasoningMode, TaskKind};
+
+    pub use boss_engine_driver::codex::{ASTRA_MODEL, SOL_MODEL};
+    pub const DEFAULT_SOL_PERCENTAGE: u8 = 50;
+
+    /// Investigation and design always win over revision provenance.
+    pub fn eligible(
+        effort: Option<EffortLevel>,
+        reasoning: Option<ReasoningMode>,
+        kind: Option<TaskKind>,
+        execution_kind: &ExecutionKind,
+        created_via: &str,
+    ) -> bool {
+        if reasoning != Some(ReasoningMode::Standard)
+            || matches!(
+                kind,
+                Some(TaskKind::Design | TaskKind::DesignPostmortem | TaskKind::Investigation)
+            )
+            || !matches!(
+                execution_kind,
+                ExecutionKind::TaskImplementation
+                    | ExecutionKind::ChoreImplementation
+                    | ExecutionKind::RevisionImplementation
+                    | ExecutionKind::CiRemediation
+                    | ExecutionKind::ConflictResolution
+            )
+        {
+            return false;
+        }
+        let engine_revision = kind == Some(TaskKind::Revision)
+            && [
+                boss_protocol::CREATED_VIA_CI_FIX_PREFIX,
+                boss_protocol::CREATED_VIA_MERGE_CONFLICT_PREFIX,
+                boss_protocol::CREATED_VIA_PR_REVIEW_PREFIX,
+            ]
+            .iter()
+            .any(|prefix| created_via.starts_with(prefix));
+        engine_revision || matches!(effort, Some(EffortLevel::Trivial | EffortLevel::Small))
+    }
+
+    pub fn use_sol(eligible: bool, prior_sol_failure: bool, bucket: u8, percentage: u8) -> bool {
+        eligible && !prior_sol_failure && bucket < percentage
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn routing_table_covers_every_effort_reasoning_and_kind() {
+            for effort in [
+                EffortLevel::Trivial,
+                EffortLevel::Small,
+                EffortLevel::Medium,
+                EffortLevel::Large,
+                EffortLevel::Max,
+            ] {
+                for reasoning in [ReasoningMode::Standard, ReasoningMode::Investigation] {
+                    for kind in TaskKind::ALL {
+                        let expected = reasoning == ReasoningMode::Standard
+                            && matches!(effort, EffortLevel::Trivial | EffortLevel::Small)
+                            && !matches!(
+                                kind,
+                                TaskKind::Design | TaskKind::DesignPostmortem | TaskKind::Investigation
+                            );
+                        assert_eq!(
+                            eligible(
+                                Some(effort),
+                                Some(reasoning),
+                                Some(kind.clone()),
+                                &ExecutionKind::TaskImplementation,
+                                "human"
+                            ),
+                            expected,
+                            "{effort:?}/{reasoning:?}/{kind:?}"
+                        );
+                        for provenance in ["ci-fix:check", "merge-conflict:head", "pr_review:verdict"] {
+                            assert_eq!(
+                                eligible(
+                                    Some(effort),
+                                    Some(reasoning),
+                                    Some(TaskKind::Revision),
+                                    &ExecutionKind::RevisionImplementation,
+                                    provenance
+                                ),
+                                reasoning == ReasoningMode::Standard
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(!eligible(None, None, None, &ExecutionKind::TaskImplementation, "human"));
+            for kind in [
+                ExecutionKind::PrReview,
+                ExecutionKind::PrReviewGuide,
+                ExecutionKind::ProductDesign,
+                ExecutionKind::ProjectDesign,
+                ExecutionKind::InvestigationImplementation,
+                ExecutionKind::AnswerAgent,
+                ExecutionKind::AutomationTriage,
+            ] {
+                assert!(!eligible(
+                    Some(EffortLevel::Small),
+                    Some(ReasoningMode::Standard),
+                    Some(TaskKind::Task),
+                    &kind,
+                    "human"
+                ));
+            }
+        }
+
+        #[test]
+        fn percentage_endpoints_and_failure_override() {
+            for bucket in 0..100 {
+                assert!(!use_sol(true, false, bucket, 0));
+                assert!(use_sol(true, false, bucket, 100));
+                assert!(!use_sol(true, true, bucket, 100));
+                assert!(!use_sol(false, false, bucket, 100));
+                assert_eq!(use_sol(true, false, bucket, 50), bucket < 50);
+            }
+        }
+    }
+}
+
 /// Engine default driver used when neither `tasks.driver` nor
 /// `products.default_driver` is set (agent-driver design §Mix-and-match).
 pub const ENGINE_DEFAULT_DRIVER: &str = "claude";
@@ -65,6 +192,7 @@ impl DriverResolutionSource {
 /// Provenance for the model half of a resolved spawn pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelResolutionSource {
+    SolExperiment,
     TaskOverride,
     DesignInvestigationTier,
     PoolStrongTier,
@@ -79,6 +207,7 @@ pub enum ModelResolutionSource {
 impl ModelResolutionSource {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::SolExperiment => "sol_experiment",
             Self::TaskOverride => "task_override",
             Self::DesignInvestigationTier => "design_investigation_tier",
             Self::PoolStrongTier => "pool_strong_tier",

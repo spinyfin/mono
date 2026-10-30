@@ -165,6 +165,15 @@ private struct EngineConfigPane: View {
 
             Section {
                 DriverTrafficSplitRow()
+                Stepper(value: Binding(
+                    get: { chatModel.codexSolPercentage },
+                    set: { chatModel.setCodexSolPercentage($0) }
+                ), in: 0...100, step: 5) {
+                    Text("Sol for eligible Codex work: \(chatModel.codexSolPercentage)%")
+                }
+                Text("Uses Sol for standard small work and automated revisions; failed Sol work retries on Astra. Set to 0% to disable.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             } header: {
                 Text("Driver Traffic")
             } footer: {

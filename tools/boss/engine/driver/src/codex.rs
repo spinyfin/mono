@@ -180,8 +180,8 @@ pub(crate) fn guard_chain_broken_notification(detail: &str) -> String {
 // Re-captured on codex-cli 0.160.1 (2026-10-06): every slug above is still
 // listed with the same `tool_mode` (`code_mode_only` for the selected
 // `gpt-6-astra`); the catalog gained `gpt-6.1-sol` (priority 1), `gpt-6-sol`
-// and `gpt-6-luna` above/around astra, which stays at priority 2. None of
-// them is dispatched by this table.
+// and `gpt-6-luna` above/around astra, which stays at priority 2. The engine
+// effort policy can select Sol for its eligible-work experiment.
 //
 // `ModelMenu` is static function pointers today, so this is a baked snapshot
 // rather than a live `codex debug models` parse. Per-model effort filtering
@@ -189,6 +189,80 @@ pub(crate) fn guard_chain_broken_notification(detail: &str) -> String {
 // the ModelAndEffortMenu gap — Boss's five [`EffortLevel`]s already fit
 // inside every listed model's ladder, and `ultra` has no [`EffortLevel`] to
 // map from (see [`ModelMenu::effort_value_for_level`]).
+
+mod sol_preflight {
+    //! Verify the installed CLI advertises Sol before selecting it. Never fall back.
+    use anyhow::{Context, Result};
+    pub const SOL_MODEL: &str = "gpt-6.1-sol";
+
+    pub async fn validate_sol_available() -> Result<()> {
+        tokio::task::spawn_blocking(|| {
+            let output = boss_command_runner::output_blocking_timeout(
+                std::process::Command::new(super::resolve_codex_bin()).args(["debug", "models", "--bundled"]),
+                std::time::Duration::from_secs(10),
+            )
+            .context("Cannot select gpt-6.1-sol: unable to read the installed Codex model catalog")?;
+            anyhow::ensure!(
+                output.status.success(),
+                "Cannot select gpt-6.1-sol: Codex model catalog failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            validate_catalog(&output.stdout)
+        })
+        .await
+        .context("Codex Sol capability check failed")?
+    }
+
+    fn validate_catalog(bytes: &[u8]) -> Result<()> {
+        let catalog: serde_json::Value =
+            serde_json::from_slice(bytes).context("Cannot select gpt-6.1-sol: invalid Codex model catalog")?;
+        let supported = catalog["models"].as_array().is_some_and(|models| {
+            models.iter().any(|model| {
+                model["slug"] == SOL_MODEL
+                    && ["low", "medium", "high", "xhigh", "max"].iter().all(|level| {
+                        model["supported_reasoning_levels"]
+                            .as_array()
+                            .is_some_and(|levels| levels.iter().any(|entry| entry["effort"] == *level))
+                    })
+            })
+        });
+        anyhow::ensure!(
+            supported,
+            "Cannot select gpt-6.1-sol: the installed Codex CLI does not advertise Sol with the required effort levels; update Codex or set the Sol share to 0% (launches not yet started will then fall back to Astra)"
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn pinned_codex_catalog_advertises_the_exact_sol_model() {
+            let binary =
+                std::path::PathBuf::from(std::env::var_os("BOSS_TEST_CODEX").expect("Bazel provides pinned Codex"))
+                    .canonicalize()
+                    .unwrap();
+            let output = boss_command_runner::output_blocking_timeout(
+                std::process::Command::new(binary).args(["debug", "models", "--bundled"]),
+                std::time::Duration::from_secs(10),
+            )
+            .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            validate_catalog(&output.stdout).unwrap();
+        }
+
+        #[test]
+        fn requires_exact_slug_and_supported_efforts() {
+            assert!(validate_catalog(br#"{"models":[{"slug":"gpt-6-astra"}]}"#).is_err());
+            assert!(validate_catalog(br#"{"models":[{"slug":"gpt-6.1-sol"}]}"#).is_err());
+            let catalog = serde_json::json!({"models":[{"slug":"gpt-6.1-sol", "supported_reasoning_levels":
+            (["low", "medium", "high", "xhigh", "max"].map(|effort| serde_json::json!({"effort":effort})))}]});
+            validate_catalog(&serde_json::to_vec(&catalog).unwrap()).unwrap();
+            assert!(validate_catalog(b"broken").is_err());
+        }
+    }
+}
+pub use sol_preflight::{SOL_MODEL, validate_sol_available};
 
 /// Map a Boss effort level onto Codex's reasoning-effort vocabulary.
 ///
@@ -205,26 +279,29 @@ fn codex_effort_value_for_level(level: EffortLevel) -> Option<&'static str> {
     })
 }
 
-/// One Codex model is selected for all worker sessions: both `Standard`
-/// and `Investigation` resolve to `gpt-6-astra`. Terra remains a known
+/// The Codex base model every automatic selection starts from.
+pub const ASTRA_MODEL: &str = "gpt-6-astra";
+
+/// Base model before the engine applies its eligible-work Sol experiment:
+/// both reasoning modes resolve to `gpt-6-astra`. Terra remains a known
 /// catalog SKU (`codex debug models`) but is not selected as a lower
 /// tier or fallback.
 fn codex_model_for_reasoning(_reasoning: ReasoningMode) -> &'static str {
-    "gpt-6-astra"
+    ASTRA_MODEL
 }
 
 /// One Codex model is selected for all review tiers: Fast, Balanced, and
 /// Strong all resolve to `gpt-6-astra`. This table does not infer anything
 /// from task effort or reasoning.
 fn codex_review_model_for_tier(_tier: ReviewModelTier) -> &'static str {
-    "gpt-6-astra"
+    ASTRA_MODEL
 }
 
 /// Legacy size-derived table. Consulted only for rows with no
 /// [`ReasoningMode`]. Keeps untagged rows on the frontier default rather than
 /// inventing a size→model progression Codex has not validated.
 fn codex_default_model_for_level(_level: EffortLevel) -> &'static str {
-    "gpt-6-astra"
+    ASTRA_MODEL
 }
 
 fn codex_prompt_addendum_for_level(level: EffortLevel) -> Option<&'static str> {
@@ -272,12 +349,12 @@ static CODEX_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
         // dispatched model is a product decision, not part of a CLI
         // qualification. Step-5 fall-through only — classified rows resolve
         // through `model_for_reasoning`.
-        engine_default: "gpt-6-astra",
+        engine_default: ASTRA_MODEL,
         effort_value_for_level: codex_effort_value_for_level,
         default_model_for_level: codex_default_model_for_level,
         model_for_reasoning: codex_model_for_reasoning,
         review_model_for_tier: codex_review_model_for_tier,
-        design_investigation_model: Some(|| "gpt-6-astra"),
+        design_investigation_model: Some(|| ASTRA_MODEL),
         prompt_addendum_for_level: codex_prompt_addendum_for_level,
         model_requires_auto_permissions: codex_model_requires_auto_permissions,
         model_belongs_to_driver: codex_model_belongs_to_driver,

@@ -2904,6 +2904,8 @@ pub(crate) struct TaskReorderArgs {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum CostCommand {
+    /// Compare Sol-eligible PRs by Sol/Astra arm, including revisions and retries.
+    Sol,
     /// Token cost for one work item, aggregated across every execution
     /// and run it has ever had. The natural companion to `boss task
     /// show` / `boss chore show`.
