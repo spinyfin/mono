@@ -134,7 +134,7 @@ pub(super) fn fetch_badge_histories(
         ))
     })?;
     let mut history = rows.collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?;
-    for (card, failed_to_start) in failed_to_start_badges(conn, &ids)? {
+    for (card, failed_to_start) in failed_to_start_badges(conn, ids, key)? {
         if let Some(history) = history.get_mut(&card) {
             history.failed_to_start = Some(failed_to_start);
         }
@@ -185,9 +185,13 @@ pub(super) fn apply_review_badges<'h>(
 /// ever reached `started_at`. Returns each card's generation and last pre-start
 /// error. A batch at a superseded head drops out on its own, since the
 /// new head gets a fresh generation-1 batch; so does a later explicit batch.
-fn failed_to_start_badges(conn: &Connection, ids: &[String]) -> Result<Vec<(String, FailedReviewStart)>> {
+fn failed_to_start_badges(
+    conn: &Connection,
+    ids: &[String],
+    key: ReviewKey,
+) -> Result<Vec<(String, FailedReviewStart)>> {
     let placeholders = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
-    let family = review_family_cte(&placeholders);
+    let family = review_family_cte(&placeholders, key);
     let sql = format!(
         "{family}
          SELECT o.card, b.generation,
@@ -262,7 +266,8 @@ pub(crate) struct ReviewBadgeHistory {
     failed_to_start: Option<FailedReviewStart>,
 }
 
-struct FailedReviewStart {
+#[derive(Clone, Debug)]
+pub(crate) struct FailedReviewStart {
     generation: i64,
     last_error: Option<String>,
 }

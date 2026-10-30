@@ -190,6 +190,56 @@ async fn read_only_review_ignores_a_damaged_predecessor_record() {
     );
     assert!(db.list_attention_items(&prior.id).unwrap().is_empty());
     assert!(db.execution_restore_report(&next.id).unwrap().is_none());
+
+    let head = JjRepo::run(
+        &repo.repo,
+        &["log", "--no-graph", "-r", &record.head(), "-T", "commit_id"],
+    );
+    let operation = JjRepo::run(&repo.repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
+    for message in ["left rewrite", "right rewrite"] {
+        JjRepo::run(
+            &repo.repo,
+            &["--at-op", operation.trim(), "describe", head.trim(), "-m", message],
+        );
+    }
+    let error = recovery::diff(&LocalJj, &record).await.unwrap_err();
+    assert!(error.to_string().contains("exactly one"), "{error:#}");
+    let operation = JjRepo::run(&repo.repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
+
+    // An unreadable store makes any attempted lineage inspection fail. Cover
+    // both review kinds and their own retry record as well as the predecessor.
+    for kind in [ExecutionKind::PrReview, ExecutionKind::PrReviewGuide] {
+        next.kind = kind;
+        assert!(
+            coordinator
+                .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", Some(99), Some(99))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            JjRepo::run(&repo.repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]),
+            operation,
+            "conflicted predecessor bookmarks must not be touched"
+        );
+        let mut unreadable = record.clone();
+        unreadable.execution_id = next.id.clone();
+        unreadable.repo_path = dir.path().join("unreadable-store");
+        db.record_execution_bookmark(&unreadable).unwrap();
+        assert!(
+            coordinator
+                .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", Some(99), Some(99))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            db.execution_bookmark(&next.id).unwrap().repo_path,
+            unreadable.repo_path,
+            "the retry record is untouched"
+        );
+        db.delete_execution_bookmark_and_restore_report(&next.id).unwrap();
+    }
 }
 
 #[tokio::test]

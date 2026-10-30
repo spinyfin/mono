@@ -1,9 +1,6 @@
 use super::*;
 use boss_engine_test_git::jj::JjRepo;
 
-#[path = "reconcile_occurrence_tests.rs"]
-mod occurrence_tests;
-
 /// `(commit id)` of the single commit `revset` names.
 pub(super) fn one(repo: &std::path::Path, revset: &str) -> String {
     let out = JjRepo::run(
@@ -21,36 +18,6 @@ pub(super) fn one(repo: &std::path::Path, revset: &str) -> String {
     let ids: Vec<_> = out.lines().filter(|l| !l.is_empty()).collect();
     assert_eq!(ids.len(), 1, "{revset}: {out}");
     ids[0].to_owned()
-}
-
-fn change_id(repo: &std::path::Path, commit: &str) -> String {
-    JjRepo::run(
-        repo,
-        &[
-            "--ignore-working-copy",
-            "log",
-            "--no-graph",
-            "-r",
-            commit,
-            "-T",
-            "change_id",
-        ],
-    )
-}
-
-/// Re-import `commit`'s patch as a fresh change on top of `@`, the way jj
-/// sees a commit that was rebased or cherry-picked on the git side: same
-/// patch and message, new change id.
-fn reimport(repo: &std::path::Path, commit: &str, path: &str, message: &str) -> String {
-    JjRepo::run(repo, &["new", "-m", message]);
-    // The test's cwd is outside the workspace, so name the file by absolute
-    // path, canonicalised the way jj canonicalises the workspace root.
-    let path = repo.canonicalize().unwrap().join(path);
-    JjRepo::run(
-        repo,
-        &["restore", "--from", commit, "--to", "@", path.to_str().unwrap()],
-    );
-    one(repo, "@")
 }
 
 pub(super) fn bookmark(repo: &std::path::Path, name: &str, commit: &str) {
@@ -282,140 +249,6 @@ async fn work_rebased_onto_newer_main_is_contained_by_the_pr_that_received_the_r
     }
     pointers_at(repo, &s.record, &rebased);
     assert!(diff(&LocalJj, &s.record).await.unwrap().is_empty());
-}
-
-/// The PR's history was rewritten on the git side after the pointers were
-/// recorded (mono#3201): every PR commit came back under a fresh change id,
-/// a jj rewrite moved the baseline, and the heads stayed on the original
-/// variants. Nothing with the preserved change ids is in the PR head, but
-/// its patches are, so the head vouches for the work and the record is
-/// reconciled onto it instead of failing on every dispatch.
-#[tokio::test]
-async fn pr_history_rewritten_under_new_change_ids_vouches_for_the_preserved_work() {
-    let s = revision_on_pr_head("exec_git_rewrite").await;
-    let repo = &s.repo.repo;
-    let pr_head = one(repo, "pr/7");
-    let m1 = one(repo, "bookmarks(exact:\"main\")");
-    let work = one(repo, &revision(&s.record.head()));
-    // A jj-side rebase of the PR lineage rewrites the baseline's change; the
-    // bookmark follows while the heads are put back on the original variant.
-    JjRepo::run(&s.repo.worker, &["rebase", "-b", "boss/root", "-d", &m1]);
-    let stranded_base = one(repo, &revision(&s.record.base()));
-    assert_ne!(stranded_base, pr_head);
-    keep_visible(repo, &work);
-    bookmark(repo, &s.record.head(), &work);
-    bookmark(repo, &s.record.publication(), &work);
-    // The PR itself was rebased on the git side: both patches re-imported on
-    // newer main with fresh change ids, and the PR bookmark moved there.
-    JjRepo::run(repo, &["new", &m1]);
-    let reimported_base = reimport(repo, &pr_head, "pr.txt", "Published PR commit");
-    let reimported_work = reimport(repo, &work, "revision.txt", "Revision work");
-    assert_ne!(change_id(repo, &reimported_base), change_id(repo, &pr_head));
-    assert_ne!(change_id(repo, &reimported_work), change_id(repo, &work));
-    bookmark(repo, "pr/7", &reimported_work);
-    bookmark(repo, "boss/root", &reimported_work);
-
-    let error = diff(&LocalJj, &s.record).await.unwrap_err();
-    assert_eq!(pointer_integrity_kind(&error), Some(PointerIntegrityKind::NotDescended));
-    let reconciled = reconcile(&LocalJj, &s.record, Some("pr/7"), "main")
-        .await
-        .unwrap()
-        .expect("stranded");
-    assert_eq!(
-        reconciled.anchor,
-        Anchor::PrHead {
-            bookmark: "pr/7".into(),
-            commit: reimported_work.clone()
-        }
-    );
-    assert_eq!(reconciled.superseded.len(), 2);
-    for pointer in &reconciled.superseded {
-        let Containment::Rewritten { matched } = &pointer.containment else {
-            panic!("expected rewritten variants: {pointer:?}");
-        };
-        let mut pairs: Vec<_> = matched
-            .iter()
-            .map(|m| {
-                (
-                    m.preserved.as_str(),
-                    m.published.as_str(),
-                    m.published_change_id.as_deref(),
-                )
-            })
-            .collect();
-        pairs.sort();
-        let mut expected = [
-            (
-                pr_head.as_str(),
-                reimported_base.as_str(),
-                Some(change_id(repo, &reimported_base)),
-            ),
-            (
-                work.as_str(),
-                reimported_work.as_str(),
-                Some(change_id(repo, &reimported_work)),
-            ),
-        ];
-        expected.sort();
-        let expected: Vec<_> = expected.iter().map(|(a, b, c)| (*a, *b, c.as_deref())).collect();
-        assert_eq!(pairs, expected, "{matched:?}");
-    }
-    pointers_at(repo, &s.record, &reimported_work);
-    assert!(diff(&LocalJj, &s.record).await.unwrap().is_empty());
-    let note = reconciled.note();
-    assert!(note.contains("re-imported as change"), "{note}");
-    assert!(
-        !restore_for_retry(&LocalJj, &s.record, &s.repo.replacement, true)
-            .await
-            .unwrap()
-    );
-    let restored = files(&s.repo.replacement, "@");
-    for file in ["pr.txt", "revision.txt", "toolchain.txt"] {
-        assert!(restored.contains(&file.to_owned()), "{file}: {restored:?}");
-    }
-    // The superseded commits are still in the store for inspection.
-    assert_eq!(one(repo, &work), work);
-    assert_eq!(
-        reconcile(&LocalJj, &s.record, Some("pr/7"), "main").await.unwrap(),
-        None
-    );
-}
-
-/// The same git-side rewrite, but the re-imported revision commit does not
-/// reproduce the preserved patch (a conflict was resolved differently, or
-/// the work was edited while rebasing). The patch is the only identity that
-/// survives a re-import, so nothing vouches for the preserved commit: the
-/// failure names it and nothing moves.
-#[tokio::test]
-async fn pr_history_rewritten_with_a_different_patch_is_not_contained() {
-    let s = revision_on_pr_head("exec_git_rewrite_edited").await;
-    let repo = &s.repo.repo;
-    let pr_head = one(repo, "pr/7");
-    let m1 = one(repo, "bookmarks(exact:\"main\")");
-    let work = one(repo, &revision(&s.record.head()));
-    JjRepo::run(&s.repo.worker, &["rebase", "-b", "boss/root", "-d", &m1]);
-    keep_visible(repo, &work);
-    bookmark(repo, &s.record.head(), &work);
-    bookmark(repo, &s.record.publication(), &work);
-    JjRepo::run(repo, &["new", &m1]);
-    reimport(repo, &pr_head, "pr.txt", "Published PR commit");
-    JjRepo::run(repo, &["new", "-m", "Revision work"]);
-    std::fs::write(repo.join("revision.txt"), "revision work, edited while rebasing\n").unwrap();
-    JjRepo::run(repo, &["status"]);
-    let edited_work = one(repo, "@");
-    bookmark(repo, "pr/7", &edited_work);
-    bookmark(repo, "boss/root", &edited_work);
-    let before = snapshot_pointers(&LocalJj, &s.record).await.unwrap();
-
-    let error = reconcile(&LocalJj, &s.record, Some("pr/7"), "main").await.unwrap_err();
-    assert_eq!(pointer_integrity_kind(&error), Some(PointerIntegrityKind::NotContained));
-    let message = error.to_string();
-    assert!(
-        message.contains("Revision work") && message.contains(&work),
-        "{message}"
-    );
-    assert!(!message.contains("Published PR commit"), "{message}");
-    assert_eq!(snapshot_pointers(&LocalJj, &s.record).await.unwrap(), before);
 }
 
 #[tokio::test]

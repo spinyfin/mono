@@ -24,28 +24,15 @@
 //! that none of these carries is a hard failure naming each missing change,
 //! and nothing moves. Superseded commits stay in the store; only the
 //! references move.
-//!
-//! "Already in it" is decided per preserved change, by content: a change is
-//! carried when the vouching history has a distinct commit with an equivalent
-//! patch, in the same order, even under a different change id. The latter is what a git-side
-//! rebase, cherry-pick or force-push leaves behind (jj assigns the imported
-//! commits fresh change ids); see mono#3201.
-//! Identity alone never vouches: a same-change-id commit with a different
-//! patch is an unpublished amendment and stays missing.
 use super::*;
 
 /// One rewritten change: the preserved commit and the vouching history's
-/// commit that carries the same patch.
+/// commit that carries the same change id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RewrittenChange {
     pub change_id: String,
     pub preserved: String,
     pub published: String,
-    /// Set when the vouching commit carries the patch under a different
-    /// change id (a git-side rebase or cherry-pick re-imported by jj);
-    /// `None` when it is a jj rewrite of the same change.
-    #[serde(default)]
-    pub published_change_id: Option<String>,
 }
 
 /// A non-empty preserved change with no variant anywhere in the vouching
@@ -63,9 +50,7 @@ pub enum Containment {
     /// The head is that commit or one of its ancestors.
     Ancestor,
     /// Every non-empty change in `base..head` that is not itself in the
-    /// vouching history has a content-equivalent commit there: the same
-    /// change id, or any commit with an equivalent patch (the change id was
-    /// lost to a git-side rewrite).
+    /// vouching history has a content-equivalent variant with the same change id there.
     Rewritten { matched: Vec<RewrittenChange> },
     /// Changes the vouching history does not carry in any form.
     Missing { missing: Vec<MissingChange> },
@@ -154,21 +139,12 @@ impl Reconciliation {
                     matched.len(),
                     matched
                         .iter()
-                        .map(|m| match &m.published_change_id {
-                            Some(published_change) => format!(
-                                "{} ({} -> {}, re-imported as change {})",
-                                short(&m.change_id),
-                                short(&m.preserved),
-                                short(&m.published),
-                                short(published_change)
-                            ),
-                            None => format!(
-                                "{} ({} -> {})",
-                                short(&m.change_id),
-                                short(&m.preserved),
-                                short(&m.published)
-                            ),
-                        })
+                        .map(|m| format!(
+                            "{} ({} -> {})",
+                            short(&m.change_id),
+                            short(&m.preserved),
+                            short(&m.published)
+                        ))
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
@@ -244,46 +220,12 @@ fn vouching_range(base: &str, vouching: &str, trunk: &str) -> String {
     format!("((::({vouching}) ~ ::(({base})-)) ~ {})", upstream(trunk))
 }
 
-/// Is the patch of `commit` reproduced by `variant`? `jj interdiff` rebases
-/// the two commits onto a common parent before comparing their changes, so
-/// it is the same question across rebases, cherry-picks and re-imports; a
-/// rewrite that had to resolve a conflict leaves the markers in the
-/// interdiff and is not equivalent.
-async fn same_patch(jj: &dyn Jj, repo: &Path, commit: &str, variant: &str) -> Result<bool> {
-    let interdiff = jj
-        .run(
-            repo,
-            &[
-                "--ignore-working-copy",
-                "interdiff",
-                "--from",
-                commit,
-                "--to",
-                variant,
-                "--git",
-            ],
-        )
-        .await?;
-    Ok(crate::recovery_apply::filter_bookkeeping(&interdiff)
-        .text
-        .trim()
-        .is_empty())
-}
-
-/// Reaching this comparison limit fails closed with any unmatched work missing.
-pub(super) const MAX_PATCH_COMPARISONS: usize = 128;
-
 /// Is the preserved work of `head` already carried by `vouching`? Ancestry
 /// first; otherwise every non-empty preserved commit that is not an
-/// ancestor of `vouching` must have a visible commit with an equivalent
-/// patch in the vouching history, preserving occurrence order (a git-side rebase or
-/// cherry-pick gives the re-imported commit a fresh change id, so the patch
-/// is the only identity that survives). An empty interdiff proves
-/// equivalence; identity alone cannot vouch for an unpublished amendment.
-/// Without a base only ancestry counts.
-///
-/// Matches consume candidates in newest-first order. At most `MAX_PATCH_COMPARISONS` interdiffs
-/// run per head; exhausting that limit fails closed with missing changes.
+/// ancestor of `vouching` must have a visible commit with the same change
+/// id and an equivalent patch in the vouching history. An empty interdiff
+/// proves equivalence across rebases; identity alone cannot vouch for an
+/// unpublished amendment. Without a base only ancestry counts.
 pub(crate) async fn containment(
     jj: &dyn Jj,
     repo: &Path,
@@ -310,9 +252,7 @@ pub(crate) async fn containment(
             ],
         )
         .await?;
-    // `(change id, commit)` of every non-empty commit that may vouch, in
-    // log order (newest first).
-    let published: Vec<(String, String)> = match base {
+    let published: std::collections::HashMap<String, String> = match base {
         Some(base) => {
             let published = jj
                 .run(
@@ -322,7 +262,7 @@ pub(crate) async fn containment(
                         "log",
                         "--no-graph",
                         "-r",
-                        &format!("({} ~ ::({head})) ~ empty()", vouching_range(base, vouching, trunk)),
+                        &vouching_range(base, vouching, trunk),
                         "-T",
                         "change_id ++ \" \" ++ commit_id ++ \"\\n\"",
                     ],
@@ -332,36 +272,39 @@ pub(crate) async fn containment(
                 .map(|(change, commit, _)| (change.to_owned(), commit.to_owned()))
                 .collect()
         }
-        None => Vec::new(),
+        None => Default::default(),
     };
     let mut matched = Vec::new();
     let mut missing = Vec::new();
-    let mut next_candidate = 0;
-    let mut comparisons = 0;
     for (change, commit, description) in change_commit_lines(&outside) {
-        let mut variant = None;
-        for (index, (published_change, candidate)) in published.iter().enumerate().skip(next_candidate) {
-            if comparisons == MAX_PATCH_COMPARISONS {
-                break;
+        match published.get(change) {
+            Some(variant)
+                if crate::recovery_apply::filter_bookkeeping(
+                    &jj.run(
+                        repo,
+                        &[
+                            "--ignore-working-copy",
+                            "interdiff",
+                            "--from",
+                            commit,
+                            "--to",
+                            variant,
+                            "--git",
+                        ],
+                    )
+                    .await?,
+                )
+                .text
+                .trim()
+                .is_empty() =>
+            {
+                matched.push(RewrittenChange {
+                    change_id: change.to_owned(),
+                    preserved: commit.to_owned(),
+                    published: variant.clone(),
+                })
             }
-            comparisons += 1;
-            if same_patch(jj, repo, commit, candidate).await? {
-                next_candidate = index + 1;
-                variant = Some((
-                    candidate.clone(),
-                    (published_change != change).then(|| published_change.clone()),
-                ));
-                break;
-            }
-        }
-        match variant {
-            Some((published, published_change_id)) => matched.push(RewrittenChange {
-                change_id: change.to_owned(),
-                preserved: commit.to_owned(),
-                published,
-                published_change_id,
-            }),
-            None => missing.push(MissingChange {
+            _ => missing.push(MissingChange {
                 change_id: change.to_owned(),
                 commit: commit.to_owned(),
                 description: description.to_owned(),

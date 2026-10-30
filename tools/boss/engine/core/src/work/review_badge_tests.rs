@@ -221,6 +221,7 @@ fn review_badge_self_link_is_decided_per_card() {
         reviewed_sha: Some("head".into()),
         verdict: Some(("completed_with_findings".into(), "0".into(), 1)),
         revision: Some(("Fix findings".into(), "active".into(), false)),
+        failed_to_start: None,
     };
     let on_root = badge_presentation("reviewed_with_findings", None, Some(&history), "root");
     assert!(on_root.tooltip.contains("Findings revision: Fix findings (Doing)."));
@@ -469,7 +470,7 @@ fn review_badge_distinguishes_a_head_whose_reviewers_failed_to_start() {
     let history = ReviewBadgeHistory {
         verdict_payload: None,
         revision_description: None,
-        is_findings_revision: false,
+        findings_revision_id: None,
         head: Some("eecbba235e9".into()),
         reviewed_sha: Some("fc68c6bfeab".into()),
         verdict: None,

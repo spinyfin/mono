@@ -51,6 +51,10 @@ impl ExecutionCoordinator {
         pr_for_goto: Option<u64>,
         pr_for_reconcile: Option<u64>,
     ) -> Result<Option<Recovered>> {
+        // Reviews have no unpublished implementation work to recover, even on retry.
+        if execution.kind.is_read_only_review() {
+            return Ok(None);
+        }
         let prior = if self.work_db.execution_bookmark_optional(&execution.id)?.is_some() {
             execution.clone()
         } else if let Some(prior) = self.work_db.recovery_predecessor(execution)? {
