@@ -111,22 +111,7 @@ pub(super) fn approve_in_tx(
         }
     };
 
-    // Project dispatch follows ordinal order, including for reused tasks.
-    if let (Some(project_id), Some(dependent_ordinal), Some(prerequisite_ordinal)) =
-        (&task.project_id, task.ordinal, prerequisite.ordinal)
-        && prerequisite.project_id.as_ref() == Some(project_id)
-        && prerequisite_ordinal >= dependent_ordinal
-    {
-        conn.execute(
-            "UPDATE tasks SET ordinal = ordinal + 1, updated_at = ?4
-                 WHERE project_id = ?1 AND ordinal >= ?2 AND ordinal < ?3",
-            params![project_id, dependent_ordinal, prerequisite_ordinal, now],
-        )?;
-        conn.execute(
-            "UPDATE tasks SET ordinal = ?2, updated_at = ?3 WHERE id = ?1",
-            params![prerequisite.id, dependent_ordinal, now],
-        )?;
-    }
+    order_project_prerequisites(conn, task, &prerequisite, now)?;
 
     // A same-name task parked in the backlog (autostart off) would never be
     // dispatched, leaving the dependent waiting with no signal.
@@ -187,6 +172,79 @@ pub(super) fn approve_in_tx(
         id: prerequisite.id,
         created,
     })
+}
+
+/// Move the unfinished same-project dependency closure with the prerequisite.
+/// Revisions share their chain root's place in the project sequence.
+fn order_project_prerequisites(conn: &Connection, task: &Task, prerequisite: &Task, now: &str) -> Result<()> {
+    let Some(project_id) = &task.project_id else {
+        return Ok(());
+    };
+    let anchor = if task.ordinal.is_some() {
+        task.clone()
+    } else {
+        let Some(root) = get_chain_root_task(conn, &task.id)? else {
+            return Ok(());
+        };
+        root
+    };
+    if anchor.ordinal.is_none() || prerequisite.project_id.as_ref() != Some(project_id) {
+        return Ok(());
+    }
+    let mut visited = std::collections::HashSet::new();
+    let mut ordered = Vec::new();
+    let mut stack = vec![(prerequisite.id.clone(), false)];
+    while let Some((id, expanded)) = stack.pop() {
+        if expanded {
+            ordered.push(id);
+            continue;
+        }
+        if !visited.insert(id.clone()) {
+            continue;
+        }
+        let Some(member) = query_task(conn, &id)? else {
+            continue;
+        };
+        if member.project_id.as_ref() != Some(project_id)
+            || member.ordinal.is_none()
+            || matches!(member.status, TaskStatus::Done | TaskStatus::Archived)
+        {
+            continue;
+        }
+        stack.push((id.clone(), true));
+        for dependency in deps::prerequisites_of(conn, &id, Some(RELATION_BLOCKS))? {
+            stack.push((dependency.prerequisite_id, false));
+        }
+    }
+    let mut stmt = conn
+        .prepare("SELECT id, ordinal FROM tasks WHERE project_id = ?1 AND ordinal IS NOT NULL ORDER BY ordinal, id")?;
+    let members = stmt
+        .query_map([project_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let moving: std::collections::HashSet<_> = ordered.iter().cloned().collect();
+    let insertion = members
+        .iter()
+        .position(|(id, _)| id == &anchor.id || moving.contains(id));
+    let Some(insertion) = insertion else {
+        return Ok(());
+    };
+    let mut ids: Vec<_> = members
+        .iter()
+        .filter(|(id, _)| !moving.contains(id))
+        .map(|(id, _)| id.clone())
+        .collect();
+    ids.splice(insertion..insertion, ordered);
+    for (id, (previous_id, ordinal)) in ids.iter().zip(&members) {
+        if id != previous_id {
+            conn.execute(
+                "UPDATE tasks SET ordinal = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, ordinal, now],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Leave a `waiting_dependency` execution behind for the parked task.

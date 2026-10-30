@@ -1032,9 +1032,9 @@ fn describe_followup_override(
 /// / rejected). Returns `(produced_artifact_kind, produced_artifact_ref_json,
 /// produced_ids)`.
 ///
-/// The effective project determines membership and kind: project followups
-/// become project tasks, including proposals described as chores. Without a
-/// project, the followup is created as a product-level chore.
+/// An explicit chore kind from the proposal or human override creates a
+/// standalone product-level chore. Otherwise, the followup becomes a task in
+/// the effective project, or a chore when there is no project.
 fn action_followup_group(
     conn: &Connection,
     group: &AttentionGroup,
