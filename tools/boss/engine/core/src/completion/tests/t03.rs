@@ -2611,6 +2611,7 @@ async fn on_stop_staged_url_stamps_contributed_head_before_transient_finalize_fa
         pane.clone(),
         probes.clone(),
     )
+    .with_merge_probe(Arc::new(MergeableInFlightProbe))
     .with_branch_verifier(verifier.clone())
     .with_staged_pr_urls(staged_pr_urls.clone());
 

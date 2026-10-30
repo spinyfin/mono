@@ -10,6 +10,7 @@ use crate::work::Task;
 mod blocked_recovery;
 mod invocation;
 mod non_bazel_gate;
+mod revision_rebase;
 mod vocabulary_leakage;
 
 #[test]
@@ -1163,18 +1164,19 @@ fn conflict_fragment_hard_gates_the_ground_truth_commands_before_local_jj_reason
             .build(),
     );
 
-    let gh_query = prompt
+    let ground_truth = prompt.split("### Ground truth:").nth(1).unwrap();
+    let gh_query = ground_truth
         .find("--json mergeable,mergeStateStatus")
         .unwrap_or_else(|| panic!("brief must mandate the mergeable query:\n{prompt}"));
-    let rebase = prompt
-        .find("\"$CUBE_BIN\" workspace rebase")
+    let rebase = ground_truth
+        .find("jj rebase --ignore-immutable -b @ -d main@origin")
         .unwrap_or_else(|| panic!("brief must mandate the rebase:\n{prompt}"));
     assert!(
         gh_query < rebase,
         "the mergeable query must be ordered before the rebase:\n{prompt}",
     );
     // Both must precede the local-inspection recipe the worker jumped to.
-    let jj_recipe = prompt
+    let jj_recipe = ground_truth
         .find("List every conflicted commit on the branch")
         .unwrap_or_else(|| panic!("brief must still carry the jj recipe:\n{prompt}"));
     assert!(

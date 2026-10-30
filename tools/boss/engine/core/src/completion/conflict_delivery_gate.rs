@@ -1,10 +1,10 @@
-//! Conflict revisions may finish only after GitHub verifies the resolution.
+//! All revisions may finish only after GitHub verifies mergeability.
 use super::*;
 
 /// What the conflict-delivery gate decided for a declared or Stop completion.
 #[derive(Debug)]
 pub(super) enum ConflictDeliveryDecision {
-    /// Not a conflict revision, or GitHub reports the conflict cleared.
+    /// Not a revision, or GitHub reports the conflict cleared.
     /// Continue with the caller's existing target.
     Proceed,
     /// The PR merged or closed while the revision ran. Finalize through
@@ -20,12 +20,12 @@ impl WorkerCompletionHandler {
         execution: &crate::work::WorkExecution,
         pr_url: Option<&str>,
     ) -> ConflictDeliveryDecision {
-        if !self.is_merge_conflict_revision(execution) {
+        if execution.kind != ExecutionKind::RevisionImplementation {
             return ConflictDeliveryDecision::Proceed;
         }
         let Some(pr_url) = pr_url.map(str::trim).filter(|url| !url.is_empty()) else {
             let detail =
-                "Conflict resolution cannot be verified: this execution has no bound PR URL to check against GitHub."
+                "Revision mergeability cannot be verified: this execution has no bound PR URL to check against GitHub."
                     .to_owned();
             if !self
                 .finalize_worker_failure(execution, &detail, WorkerFailureBasis::DeliveredWithoutPr)
@@ -55,8 +55,17 @@ impl WorkerCompletionHandler {
             Ok(ConflictClearance::Unavailable) => "GitHub mergeability could not be verified (probe failed)".into(),
             Err(_) => "GitHub mergeability verification timed out".into(),
         };
+        let files = self
+            .work_db
+            .revision_conflicting_files(&execution.work_item_id)
+            .unwrap_or_default();
+        let files = if files.is_empty() {
+            "Conflicting files were not captured; inspect the rebased branch with jj resolve --list.".to_owned()
+        } else {
+            format!("Known conflicting files: {}.", files.join(", "))
+        };
         let detail = format!(
-            "Conflict resolution was not delivered to {pr_url}: {reason}. A changed local or remote head alone does not prove the conflict is resolved."
+            "A mergeable revision was not delivered to {pr_url}: {reason}. A changed local or remote head alone does not prove the conflict is resolved. {files}"
         );
         if !self
             .finalize_worker_failure(execution, &detail, WorkerFailureBasis::DeliveredWithoutPr)

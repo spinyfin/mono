@@ -87,8 +87,9 @@ async fn conflict_delivery_fails_closed_when_github_is_unavailable() {
     let workspace = tempdir().unwrap();
     let pr = "https://github.com/spinyfin/mono/pull/2070";
     let (_dir, db, _, _, _, execution_id, _) = conflict_revision_fixture(workspace.path(), pr, "old-head");
-    // The harness's NoopMergeProbe returns an error, as a failed GitHub request does.
-    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None)).handler;
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_merge_probe(Arc::new(NoopMergeProbe));
     let outcome = handler
         .finalize_pr_transition(&execution_id, pr.into(), WorkerPrCompletionTarget::InReview, "test")
         .await;

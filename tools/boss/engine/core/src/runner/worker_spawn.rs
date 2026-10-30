@@ -1124,6 +1124,14 @@ pub(crate) async fn compose_worker_spawn(
                 .build(),
         )
     };
+    let prompt_text = if execution.kind == ExecutionKind::RevisionImplementation {
+        format!(
+            "{}{prompt_text}",
+            super::prompt::revision_conflict_notice(work_db, execution)?
+        )
+    } else {
+        prompt_text
+    };
     let prompt_text = if execution.kind == ExecutionKind::PrReviewGuide {
         prompt_text
     } else {
