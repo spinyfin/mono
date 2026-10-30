@@ -4,51 +4,12 @@
 //! Every declared run is required; command strings are data, never executed here.
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RequiredRun {
-    pub kind: Kind,
-    pub tool: Tool,
-    pub command: String,
-}
+pub(crate) use boss_engine_storage_values::ci_contract::{Kind, RequiredRun, Tool, validate_contract};
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Kind {
-    Lint,
-    Build,
-    Test,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Tool {
-    Bazel,
-    Project,
-}
-
-pub(crate) fn validate_contract(runs: &[RequiredRun]) -> Result<()> {
-    anyhow::ensure!(!runs.is_empty(), "empty verification contract");
-    for run in runs {
-        anyhow::ensure!(!run.command.trim().is_empty(), "empty verification command");
-        if matches!(run.tool, Tool::Bazel) {
-            let words: Vec<_> = run.command.split_whitespace().collect();
-            let verb = match run.kind {
-                Kind::Build => "build",
-                Kind::Test => "test",
-                Kind::Lint => "run",
-            };
-            anyhow::ensure!(
-                words.first() == Some(&"bazel") && words.get(1) == Some(&verb),
-                "Bazel verification kind disagrees with command"
-            );
-        }
-    }
-    Ok(())
-}
+// Check the legacy field types while storage consumes the policy crate directly.
+const _: fn(&RequiredRun) -> (&Kind, &Tool) = |run| (&run.kind, &run.tool);
 
 #[async_trait::async_trait]
 pub trait ContractFetcher: Send + Sync {

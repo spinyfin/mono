@@ -1605,17 +1605,7 @@ async fn retire_exhausted_trunk_intent(
     }
 }
 
-/// `true` for a `failure_kind` whose failing evidence lives on a
-/// synthetic/ephemeral commit distinct from the PR's own head — the PR's
-/// own head-branch CI reads green for both, so a clean head-branch probe
-/// must never be trusted to clear (or validate a rebase claim against) the
-/// attempt. `'merge_queue_rebounce'` (GitHub's native merge queue) and
-/// `'trunk_queue_eviction'` (Trunk's merge queue) share this property —
-/// see `on_trunk_queue_eviction_detected`'s doc comment for the trunk case.
-/// `None` (pre-`failure_kind` rows) and `'pr_branch_ci'` are ordinary.
-pub(crate) fn is_queue_side_failure_kind(kind: Option<&str>) -> bool {
-    matches!(kind, Some("merge_queue_rebounce") | Some("trunk_queue_eviction"))
-}
+pub(crate) use boss_engine_storage_values::ci_contract::is_queue_side_failure_kind;
 
 /// Namespace a GitHub merge-queue episode's PR-head key so it cannot collide
 /// with an ordinary `pr_branch_ci` remediation for the same head.

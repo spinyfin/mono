@@ -267,8 +267,9 @@ fn validate_evidence(attempt: &CiRemediation, evidence: &QueueCiEvidence) -> Res
                 .as_str()
                 .filter(|key| !key.is_empty())
                 .context("Declared verification is missing its stable job key")?;
-            let required: Vec<crate::queue_ci_contract::RequiredRun> = serde_json::from_value(contract.clone())?;
-            crate::queue_ci_contract::validate_contract(&required)?;
+            let required: Vec<boss_engine_storage_values::ci_contract::RequiredRun> =
+                serde_json::from_value(contract.clone())?;
+            boss_engine_storage_values::ci_contract::validate_contract(&required)?;
             let runs: Vec<_> = evidence
                 .runs
                 .iter()
@@ -512,7 +513,7 @@ impl WorkDb {
             return Ok(None);
         };
         Ok(attempt_for_execution(&conn, execution_id)?
-            .filter(|a| crate::ci_watch::is_queue_side_failure_kind(a.failure_kind.as_deref()))
+            .filter(|a| boss_engine_storage_values::ci_contract::is_queue_side_failure_kind(a.failure_kind.as_deref()))
             .map(|attempt| QueueCiAuditInput {
                 attempt,
                 evidence,
@@ -553,8 +554,9 @@ impl WorkDb {
                 .queue_ci_evidence
                 .as_ref()
                 .is_some_and(|e| e.verified_head_sha == head_sha)
-            && attempt_for_execution(&conn, execution_id)?
-                .is_some_and(|a| crate::ci_watch::is_queue_side_failure_kind(a.failure_kind.as_deref()))
+            && attempt_for_execution(&conn, execution_id)?.is_some_and(|a| {
+                boss_engine_storage_values::ci_contract::is_queue_side_failure_kind(a.failure_kind.as_deref())
+            })
             && validate_declaration(&conn, execution_id, &payload).is_ok())
     }
 }

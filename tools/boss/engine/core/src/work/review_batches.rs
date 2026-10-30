@@ -258,7 +258,7 @@ fn reserved_batch_count_in_tx(tx: &Transaction<'_>, phase: ReviewBatchPhase) -> 
 fn reservation_capacity(review_pool_size: usize) -> i64 {
     review_pool_size.clamp(
         PRE_MERGE_BATCH_RESERVATION_UNITS as usize,
-        crate::coordinator::MAX_REVIEW_POOL_SIZE,
+        boss_engine_storage_values::pool_policy::MAX_REVIEW_POOL_SIZE,
     ) as i64
 }
 
@@ -266,7 +266,7 @@ fn reservation_capacity(review_pool_size: usize) -> i64 {
 /// review pool's weighted reservation accounting right now.
 ///
 /// `reservation_capacity` is the live configured review-pool size (clamped
-/// to [`crate::coordinator::MAX_REVIEW_POOL_SIZE`]), not the compile-time
+/// to [`boss_engine_storage_values::pool_policy::MAX_REVIEW_POOL_SIZE`]), not the compile-time
 /// hard cap: a smaller `BOSS_REVIEW_POOL_SIZE` must not oversubscribe the
 /// physical slots the reservation scheme exists to protect.
 ///
@@ -1167,12 +1167,12 @@ impl WorkDb {
     /// [`can_admit_review_batch_in_tx`] is likewise only reached from tests
     /// until post-merge batch creation is wired.
     pub fn can_admit_review_batch(&self, phase: ReviewBatchPhase) -> Result<bool> {
-        self.can_admit_review_batch_for_pool(phase, crate::coordinator::DEFAULT_REVIEW_POOL_SIZE)
+        self.can_admit_review_batch_for_pool(phase, boss_engine_storage_values::pool_policy::DEFAULT_REVIEW_POOL_SIZE)
     }
 
     /// Like [`Self::can_admit_review_batch`], but using `review_pool_size` as
     /// the reservation capacity (clamped to
-    /// [`crate::coordinator::MAX_REVIEW_POOL_SIZE`]). Production passes
+    /// [`boss_engine_storage_values::pool_policy::MAX_REVIEW_POOL_SIZE`]). Production passes
     /// `WorkConfig.review_pool_size` so a smaller `BOSS_REVIEW_POOL_SIZE`
     /// cannot oversubscribe the physical pool.
     pub fn can_admit_review_batch_for_pool(&self, phase: ReviewBatchPhase, review_pool_size: usize) -> Result<bool> {
@@ -1203,7 +1203,7 @@ impl WorkDb {
         self.create_pre_merge_review_batch_for_pool(
             input,
             repo_remote_url,
-            crate::coordinator::DEFAULT_REVIEW_POOL_SIZE,
+            boss_engine_storage_values::pool_policy::DEFAULT_REVIEW_POOL_SIZE,
         )
     }
 
@@ -1421,7 +1421,7 @@ impl WorkDb {
         if !can_admit_review_batch_in_tx(
             &tx,
             ReviewBatchPhase::PostMerge,
-            reservation_capacity(crate::coordinator::DEFAULT_REVIEW_POOL_SIZE),
+            reservation_capacity(boss_engine_storage_values::pool_policy::DEFAULT_REVIEW_POOL_SIZE),
         )? {
             tx.commit()?;
             return Ok(ReviewBatchDispatch::AdmissionDeferred);

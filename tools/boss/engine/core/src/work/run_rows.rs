@@ -575,7 +575,7 @@ impl WorkDb {
     /// This is the *spawned worker's* id, not the reviewed/automated row's
     /// own `driver` column — [`crate::driver_transcript::driver_for_execution`]
     /// uses it to detect a pool-dispatched run (review/automation pool
-    /// workers always run [`crate::coordinator::pool_dispatch_policy_for_worker_id`]'s
+    /// workers always run [`boss_engine_storage_values::pool_policy::pool_dispatch_policy_for_worker_id`]'s
     /// fixed driver, overriding whatever `tasks.driver` the row carries,
     /// exactly as `SpawnResolutionInput::pool_policy_driver` does at
     /// spawn time).

@@ -5,6 +5,10 @@ edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
+anyhow = { workspace = true }
+boss-engine-effort = { path = "../effort" }
+boss-protocol = { path = "../../protocol" }
+sha2 = { workspace = true }
 bon = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 
