@@ -936,7 +936,11 @@ fn action_question_group(
 
     // No revisable PR: seed new work with the Q&A, retaining the project
     // association when present and supporting standalone work otherwise.
-    let (task, artifact_kind) = if let Some(project_id) = group.association_project_id.as_deref() {
+    let (task, artifact_kind) = if let Some(project_id) = source
+        .as_ref()
+        .map(|task| task.project_id.as_deref())
+        .unwrap_or(group.association_project_id.as_deref())
+    {
         (
             insert_seeded_design_task_in_tx(conn, &group.product_id, project_id, &name, &brief)?,
             "design_task",
@@ -1028,11 +1032,9 @@ fn describe_followup_override(
 /// / rejected). Returns `(produced_artifact_kind, produced_artifact_ref_json,
 /// produced_ids)`.
 ///
-/// `proposed_work_kind` (or `overrides`' `work_kind`) is honoured as `chore`
-/// vs (project-)`task`; a `project` hint is materialised as a task in the
-/// effective project (v1 produces tasks/chores, per the Attn-3 scope). When
-/// the effective work item has no project, the followup is created as a
-/// product-level chore.
+/// The effective project determines membership and kind: project followups
+/// become project tasks, including proposals described as chores. Without a
+/// project, the followup is created as a product-level chore.
 fn action_followup_group(
     conn: &Connection,
     group: &AttentionGroup,
@@ -1110,10 +1112,9 @@ fn action_followup_group(
             None => origin.project_id.clone(),
         };
 
-        // A `chore` hint, or the absence of a project to file into, lands a
-        // product-level chore; everything else becomes a project task. The
-        // duplicate guard is bypassed: actioning is an explicit human gesture.
-        let as_chore = work_kind == Some("chore") || project_id.is_none();
+        // Preserve project membership even when the proposal calls the work a
+        // chore. Actioning is an explicit human gesture, so allow duplicates.
+        let as_chore = project_id.is_none();
 
         let created = if as_chore {
             insert_chore_in_tx(

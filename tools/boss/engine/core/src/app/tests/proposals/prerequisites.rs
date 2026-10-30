@@ -28,6 +28,86 @@ fn chore_named(state: &ServerState, product_id: &str, name: &str) -> Vec<boss_pr
 const PREREQUISITE_NAME: &str = "Fix the retention-cleanup fixture race";
 
 #[tokio::test]
+async fn prerequisite_answer_preserves_project_membership_and_dependency() {
+    let (state, _dir, _, task_id) = parked_task_with_question(prerequisite_question_payload()).await;
+    let original = question_task(&state, &task_id);
+    let unrelated =
+        crate::test_support::create_test_chore_manual(&state.work_db, original.product_id.clone(), PREREQUISITE_NAME);
+    let project = state
+        .work_db
+        .create_project(
+            boss_protocol::CreateProjectInput::builder()
+                .product_id(&original.product_id)
+                .name("Shared fixture repair")
+                .no_design_task(true)
+                .autostart(false)
+                .build(),
+        )
+        .unwrap();
+    state
+        .work_db
+        .update_work_item(
+            &task_id,
+            boss_protocol::WorkItemPatch {
+                project_id: Some(project.id.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    assert!(matches!(
+        answer_question(&state, &task_id, true).await,
+        FrontendEvent::WorkItemUpdated { .. }
+    ));
+    let members = state
+        .work_db
+        .list_tasks(&original.product_id, Some(&project.id), None, false)
+        .unwrap();
+    let prerequisite = members.iter().find(|t| t.name == PREREQUISITE_NAME).unwrap();
+    assert_eq!(prerequisite.kind, boss_protocol::TaskKind::ProjectTask);
+    assert_eq!(prerequisite.project_id.as_deref(), Some(project.id.as_str()));
+    assert!(prerequisite.ordinal.is_some());
+    assert_ne!(prerequisite.id, unrelated.id);
+    let crate::work::WorkItem::Chore(unchanged) = state.work_db.get_work_item(&unrelated.id).unwrap() else {
+        panic!("standalone candidate must remain a chore");
+    };
+    assert!(unchanged.project_id.is_none());
+    assert!(members.iter().any(|t| t.id == task_id));
+    assert_eq!(prerequisites_of(&state, &task_id), vec![prerequisite.id.clone()]);
+    let tree = state.work_db.get_work_tree(&original.product_id).unwrap();
+    assert!(tree.tasks.iter().any(|t| t.id == prerequisite.id));
+    assert!(tree.dependencies.iter().any(|edge| edge.dependent_id == task_id
+        && edge.prerequisite_id == prerequisite.id
+        && edge.relation == "blocks"));
+    assert!(
+        state
+            .work_db
+            .gating_prereqs_for(&task_id)
+            .unwrap()
+            .contains(&prerequisite.id)
+    );
+    state
+        .work_db
+        .update_work_item(
+            &prerequisite.id,
+            boss_protocol::WorkItemPatch {
+                status: Some("done".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(question_task(&state, &task_id).status, boss_protocol::TaskStatus::Todo);
+    assert!(
+        state
+            .work_db
+            .list_executions(Some(&task_id))
+            .unwrap()
+            .iter()
+            .any(|e| e.status == boss_protocol::ExecutionStatus::Ready)
+    );
+}
+
+#[tokio::test]
 async fn prerequisite_question_reads_like_the_yes_no_question_and_carries_the_proposed_task() {
     let (state, _dir, _, task_id) = parked_task_with_question(prerequisite_question_payload()).await;
     let task = question_task(&state, &task_id);
@@ -79,6 +159,7 @@ async fn prerequisite_yes_creates_chore_edge_and_note_then_redispatches_when_it_
     assert_eq!(created.len(), 1);
     let prerequisite = &created[0];
     assert_eq!(prerequisite.kind, boss_protocol::TaskKind::Chore);
+    assert!(prerequisite.project_id.is_none());
     assert_eq!(prerequisite.product_id, task.product_id);
     assert_eq!(
         prerequisite.description,

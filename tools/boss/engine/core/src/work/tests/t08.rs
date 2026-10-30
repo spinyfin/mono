@@ -450,8 +450,8 @@ fn action_question_with_open_pr_creates_revision() {
 }
 
 #[test]
-fn action_question_with_merged_doc_creates_design_task() {
-    let (db, _product, project_id, task_id) = fixture();
+fn action_question_with_merged_doc_inherits_current_source_project() {
+    let (db, product, project_id, task_id) = fixture();
     set_task_pr(&db, &task_id, "https://github.com/spinyfin/mono/pull/7", "in_review");
     let (a, _g) = db
         .create_attention(question_from_task(
@@ -464,6 +464,26 @@ fn action_question_with_merged_doc_creates_design_task() {
     let g = db
         .answer_attention(&a.id, Some("yes, flag it".to_owned()), false, false)
         .unwrap();
+
+    let project = db
+        .create_project(
+            CreateProjectInput::builder()
+                .product_id(product)
+                .name("Current source project")
+                .no_design_task(true)
+                .autostart(false)
+                .build(),
+        )
+        .unwrap();
+    db.update_work_item(
+        &task_id,
+        WorkItemPatch {
+            project_id: Some(project.id.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let project_id = project.id;
 
     // The live PR probe reports Merged, so the revision gate refuses and the
     // action falls back to a fresh design task.
@@ -786,8 +806,8 @@ fn dismissing_a_followup_group_with_everything_rejected_writes_back_rejected() {
 }
 
 #[test]
-fn action_followup_honours_chore_work_kind() {
-    let (db, _product, _project, task_id) = fixture();
+fn action_followup_chore_hint_preserves_project_membership() {
+    let (db, product, project, task_id) = fixture();
     let mut input = followup(&task_id, "tidy the logs");
     input.proposed_work_kind = Some("chore".to_owned());
     let (a, _g) = db.create_attention(input).unwrap();
@@ -798,8 +818,14 @@ fn action_followup_honours_chore_work_kind() {
         .action_attention_group(&g.id, false, &Default::default(), &checker)
         .unwrap();
     let chore = read_task(&db, &actioned.produced_work_item_ids[0]);
-    assert_eq!(chore.kind, TaskKind::Chore);
-    assert!(chore.project_id.is_none(), "chores are product-level");
+    assert_eq!(chore.kind, TaskKind::ProjectTask);
+    assert_eq!(chore.project_id.as_deref(), Some(project.as_str()));
+    assert!(
+        db.list_tasks(&product, Some(&project), None, false)
+            .unwrap()
+            .iter()
+            .any(|t| t.id == chore.id)
+    );
 }
 
 #[test]

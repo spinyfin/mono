@@ -5,7 +5,7 @@
 //! [`approve_in_tx`] runs inside the answer transaction and:
 //!
 //! 1. finds an equivalent open task in the product or creates the proposed
-//!    one as a chore with normal dispatch (autostart on),
+//!    one in the same project (or a standalone chore) with normal dispatch,
 //! 2. declares a `blocks` edge so the blocked task depends on it, which parks
 //!    the task as `blocked` / `dependency` behind the prerequisite — the
 //!    existing dependency cascade redispatches it once the prerequisite is
@@ -31,8 +31,9 @@ pub(super) struct LinkedPrerequisite {
     pub created: bool,
 }
 
-/// Open-task lookup for the dedup check: same product, same name once trimmed
-/// and case-folded, not yet satisfied (`done` / `archived`) and not deleted.
+/// Open-task lookup for the dedup check: same product and, for project work,
+/// same project; same name once trimmed and case-folded, not yet satisfied
+/// (`done` / `archived`) and not deleted. Never re-parent a name match.
 ///
 /// Oldest first, so a repeat resolves to the same task every time. The blocked
 /// task itself is never its own prerequisite, a task a human has blocked is
@@ -43,13 +44,16 @@ fn find_equivalent_open_task(conn: &Connection, task: &Task, name: &str) -> Resu
     let mut stmt = conn.prepare(
         "SELECT id FROM tasks
          WHERE product_id = ?1 AND id != ?2 AND deleted_at IS NULL
+           AND (?4 IS NULL OR project_id = ?4)
            AND status NOT IN ('done', 'archived') AND human_driven = 0 AND deferred = 0
            AND (status != 'blocked' OR blocked_reason = 'dependency')
            AND lower(trim(name)) = lower(trim(?3))
          ORDER BY created_at ASC, id ASC",
     )?;
     let candidates = stmt
-        .query_map(params![task.product_id, task.id, name], |row| row.get::<_, String>(0))?
+        .query_map(params![task.product_id, task.id, name, task.project_id], |row| {
+            row.get::<_, String>(0)
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for candidate in candidates {
         if !deps::would_create_cycle(conn, &task.id, &candidate)? {
@@ -72,23 +76,38 @@ pub(super) fn approve_in_tx(
     let (prerequisite, created) = match find_equivalent_open_task(conn, task, name)? {
         Some(existing) => (existing, false),
         None => {
-            let chore = insert_chore_in_tx(
-                conn,
-                CreateChoreInput::builder()
-                    .product_id(task.product_id.clone())
-                    .name(name)
-                    .description(brief)
-                    // Same repo as the task it unblocks, when the product
-                    // leaves the repo to the task.
-                    .maybe_repo_remote_url(task.repo_remote_url.clone())
-                    .created_via(CREATED_VIA_ENGINE_AUTO)
-                    // The equivalence check above is the duplicate guard here;
-                    // the recent-name guard would only reject a re-proposal of
-                    // a task that has just been completed.
-                    .force_duplicate(true)
-                    .build(),
-            )?;
-            (chore, true)
+            let prerequisite = if let Some(project_id) = &task.project_id {
+                insert_task_in_tx(
+                    conn,
+                    CreateTaskInput::builder()
+                        .product_id(&task.product_id)
+                        .project_id(project_id)
+                        .name(name)
+                        .description(brief)
+                        .maybe_repo_remote_url(task.repo_remote_url.clone())
+                        .created_via(CREATED_VIA_ENGINE_AUTO)
+                        .force_duplicate(true)
+                        .build(),
+                )?
+            } else {
+                insert_chore_in_tx(
+                    conn,
+                    CreateChoreInput::builder()
+                        .product_id(task.product_id.clone())
+                        .name(name)
+                        .description(brief)
+                        // Same repo as the task it unblocks, when the product
+                        // leaves the repo to the task.
+                        .maybe_repo_remote_url(task.repo_remote_url.clone())
+                        .created_via(CREATED_VIA_ENGINE_AUTO)
+                        // The equivalence check above is the duplicate guard here;
+                        // the recent-name guard would only reject a re-proposal of
+                        // a task that has just been completed.
+                        .force_duplicate(true)
+                        .build(),
+                )?
+            };
+            (prerequisite, true)
         }
     };
 
