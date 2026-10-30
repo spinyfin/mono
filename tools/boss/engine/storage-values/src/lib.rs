@@ -1,7 +1,12 @@
-//! Owned values exchanged between engine storage and its services.
-//! Calculations, database mapping, and I/O remain in their service owners.
+//! Owned values and pure shared policy needed by engine storage and its services.
+//! Database mapping, service orchestration, and I/O remain in their service owners.
 
 use serde::{Deserialize, Serialize};
+
+pub mod branch_identity;
+pub mod ci_contract;
+pub mod pool_policy;
+pub mod postmortem_brief;
 
 mod semantic_progress;
 pub use semantic_progress::{SemanticProgressCheckpoint, SemanticToolCondition, SemanticTurnCondition};

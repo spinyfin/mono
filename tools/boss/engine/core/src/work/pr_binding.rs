@@ -124,7 +124,7 @@ const SHARED_PR_SQL: &str = "EXISTS (
 
 #[work_db_boundary::instrument]
 impl WorkDb {
-    /// Expected branch names ([`crate::completion::expected_branch_name`]) of
+    /// Expected branch names ([`boss_engine_storage_values::branch_identity::expected_branch_name`]) of
     /// every primary implementation execution of `work_item_id`, newest first.
     /// A PR head matching any of them belongs to the work item: a resumed
     /// or bounced-back execution is told to push to its predecessor's branch,
@@ -139,7 +139,7 @@ impl WorkDb {
         let rows = stmt.query_map(params![work_item_id], |row| {
             let branch_naming: BranchNaming = deserialize_json_or_default(row.get::<_, Option<String>>(1)?.as_deref());
             let prefix = row.get::<_, Option<String>>(2)?.filter(|s| !s.is_empty());
-            Ok(crate::completion::expected_branch_name(
+            Ok(boss_engine_storage_values::branch_identity::expected_branch_name(
                 &row.get::<_, String>(0)?,
                 &branch_naming,
                 prefix.as_deref(),
@@ -265,9 +265,12 @@ impl WorkDb {
                 // NO primary execution of this row is evidence of a wrong PR;
                 // `main`, a human branch, or the opaque-hash shape are left
                 // alone, and a predecessor execution's branch is the row's own.
-                let doc_suffix = crate::completion::branch_work_item_suffix(doc_branch);
+                let doc_suffix = boss_engine_storage_values::branch_identity::branch_work_item_suffix(doc_branch);
                 if doc_suffix.starts_with("exec_")
-                    && !crate::completion::head_identifies_any_branch(doc_branch, &candidate.own_branches)
+                    && !boss_engine_storage_values::branch_identity::head_identifies_any_branch(
+                        doc_branch,
+                        &candidate.own_branches,
+                    )
                 {
                     candidate.reasons.push(PrBindingSuspicion::DocBranchForeign);
                 }

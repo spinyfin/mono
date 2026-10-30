@@ -844,8 +844,8 @@ fn supersede_prior_automation_outcomes(tx: &Transaction<'_>, execution_id: &str,
 /// hook-observed path: URL shape + product-repo slug
 /// ([`crate::pr_url_capture::validate_pr_url`], `pr_url_capture.rs:86`) and,
 /// when the worker supplied a `branch`, a branch-name match against the
-/// execution ([`crate::completion::expected_branch_name`] /
-/// [`crate::completion::branches_identify_same_work_item`] — the same
+/// execution ([`boss_engine_storage_values::branch_identity::expected_branch_name`] /
+/// [`boss_engine_storage_values::branch_identity::branches_identify_same_work_item`] — the same
 /// prefix-agnostic suffix match `verified_staged_pr_url` uses,
 /// `completion.rs:1248`).
 ///
@@ -898,12 +898,12 @@ fn apply_pr_created(tx: &Transaction<'_>, execution_id: &str, payload_json: &str
     }
 
     if let Some(branch) = payload.branch.as_deref() {
-        let expected = crate::completion::expected_branch_name(
+        let expected = boss_engine_storage_values::branch_identity::expected_branch_name(
             execution_id,
             &execution.branch_naming,
             execution.worker_branch_prefix.as_deref(),
         );
-        if !crate::completion::branches_identify_same_work_item(branch, &expected) {
+        if !boss_engine_storage_values::branch_identity::branches_identify_same_work_item(branch, &expected) {
             return Ok(ApplyDecision::Rejected(format!(
                 "branch `{branch}` does not identify this execution's work item (expected a branch \
                  matching `{expected}`)"

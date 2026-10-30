@@ -145,7 +145,7 @@ impl WorkDb {
             .iter()
             .map(|(name, url)| (name.as_str(), url.as_str()))
             .collect::<Vec<_>>();
-        let description = crate::project_postmortem_sweep::compose_postmortem_brief(&project, &refs);
+        let description = boss_engine_storage_values::postmortem_brief::compose_postmortem_brief(&project, &refs);
         let task = design_postmortem::insert_design_postmortem_in_tx(
             &tx,
             &project.product_id,

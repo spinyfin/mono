@@ -42,7 +42,7 @@
 //! **An execution whose driver is pinned by the pool it will run on** is
 //! decided before allocation ever runs (`pr_review` and `automation_triage`):
 //! those dispatch on
-//! [`crate::coordinator::pool_dispatch_policy_for_worker_id`]'s fixed
+//! [`boss_engine_storage_values::pool_policy::pool_dispatch_policy_for_worker_id`]'s fixed
 //! driver, so `decide_execution_driver` records that pool driver with
 //! reason `pool` up front, rather than an allocation or a row/product pin.
 //! See [`decide_execution_driver`] for the full reasoning.
@@ -409,7 +409,7 @@ pub(crate) fn driver_has_design_investigation_model(driver_slug: &str) -> bool {
 ///    pool driver. It overrides all row/product pins, matching dispatch.
 ///    Pool-bound executions take precedence because recording a row pin
 ///    would name a driver the worker never ran on:
-///    [`crate::coordinator::kind_always_dispatches_on_pool_driver`] covers
+///    [`boss_engine_storage_values::pool_policy::kind_always_dispatches_on_pool_driver`] covers
 ///    `pr_review` and `automation_triage`. Their `pool` decision names the
 ///    driver the worker actually ran on, matching what the events-socket resolver
 ///    ([`crate::work::driver_lookup::WorkDb::get_execution_driver_slug`])
@@ -494,7 +494,7 @@ pub(crate) fn decide_execution_driver(
     // `crate::work::driver_lookup`'s events-socket resolver uses, so there is
     // one resolution point per pool-bound shape rather than a re-derived
     // constant here.
-    if let Some(pool_driver) = crate::coordinator::pool_driver_slug_for_execution_kind(&kind) {
+    if let Some(pool_driver) = boss_engine_storage_values::pool_policy::pool_driver_slug_for_execution_kind(&kind) {
         return Ok(DriverDecision::pool(pool_driver));
     }
     let explicit_driver = row.explicit_driver.filter(|s| !s.trim().is_empty());

@@ -46,7 +46,7 @@ impl WorkDb {
     ///    same transaction as the leaf's execution row, so it is present
     ///    before any hook can arrive.
     /// 2. A claimed review/automation worker slot resolves to that pool's
-    ///    fixed driver via [`crate::coordinator::pool_dispatch_policy_for_worker_id`].
+    ///    fixed driver via [`boss_engine_storage_values::pool_policy::pool_dispatch_policy_for_worker_id`].
     ///    A claimed ordinary `worker-N` slot deliberately has no pool policy,
     ///    including work that spilled from automation, and therefore falls
     ///    through to its own driver resolution.
@@ -80,7 +80,7 @@ impl WorkDb {
         let claimed_worker_id = self.latest_run_agent_id_for_execution(execution_id)?;
         if let Some(pool_driver) = claimed_worker_id
             .as_deref()
-            .and_then(crate::coordinator::pool_dispatch_policy_for_worker_id)
+            .and_then(boss_engine_storage_values::pool_policy::pool_dispatch_policy_for_worker_id)
             .map(|policy| policy.driver)
         {
             return Ok(Some(pool_driver.to_owned()));
@@ -129,7 +129,8 @@ impl WorkDb {
                 // top of this method used its actual policy instead: a spill
                 // into an ordinary worker must honour the row's own driver.
                 if claimed_worker_id.is_none()
-                    && let Some(pool_driver) = crate::coordinator::pool_driver_slug_for_execution_kind(&exec_kind)
+                    && let Some(pool_driver) =
+                        boss_engine_storage_values::pool_policy::pool_driver_slug_for_execution_kind(&exec_kind)
                 {
                     return Ok(Some(pool_driver.to_owned()));
                 }
@@ -254,8 +255,13 @@ impl WorkDb {
             // join above never matches. Its driver is still the automation
             // pool's fixed pin — return that rather than `None`, which would
             // drop every hook event the triage worker sends.
-            kind if claimed_worker_id.is_none() && crate::coordinator::kind_always_dispatches_on_pool_driver(&kind) => {
-                Ok(crate::coordinator::pool_driver_slug_for_execution_kind(&kind).map(str::to_owned))
+            kind if claimed_worker_id.is_none()
+                && boss_engine_storage_values::pool_policy::kind_always_dispatches_on_pool_driver(&kind) =>
+            {
+                Ok(
+                    boss_engine_storage_values::pool_policy::pool_driver_slug_for_execution_kind(&kind)
+                        .map(str::to_owned),
+                )
             }
             _ => Ok(None),
         }
