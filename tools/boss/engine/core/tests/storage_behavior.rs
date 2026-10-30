@@ -1,6 +1,7 @@
 //! Public WorkDb storage behavior, compiled independently of core unit tests.
 //!
-//! Retain the original module paths so test filters and names stay stable.
+//! Module nesting mirrors `work::exec_tail::tests` so test names match the
+//! paths used by existing filters and tooling.
 
 use sha2::{Digest, Sha256};
 
@@ -16,7 +17,6 @@ fn content_checksum(title: &str, body: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
-// Retain the original module paths so test filters and names stay stable.
 mod work {
     mod exec_tail {
         mod tests {

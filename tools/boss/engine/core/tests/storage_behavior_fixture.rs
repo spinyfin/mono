@@ -1,19 +1,19 @@
 //! Minimal public WorkDb fixture for storage-behavior tests.
 //!
-//! Seeds the same `local` / `driver=claude` auto capability the crate-private
-//! helpers used to insert via raw SQL, using public construction and
-//! [`WorkDb::replace_auto_host_capabilities`]. Production code does not
-//! depend on this library.
+//! Seeds the `local` host with the `driver=claude` auto capability through
+//! public [`WorkDb::open`] and [`WorkDb::replace_auto_host_capabilities`], so
+//! dispatch-dependent storage tests need no installed agent CLIs. Production
+//! code does not depend on this library.
 
 use tempfile::TempDir;
 
 use boss_engine::work::{CreateChoreInput, CreateProductInput, WorkDb};
 use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus, Product, Task, WorkExecution};
 
-/// The mono repo remote used by the previous crate-private product helper.
+/// Repo remote used by [`create_test_product`].
 pub const TEST_REPO_REMOTE_URL: &str = "git@github.com:spinyfin/mono.git";
 
-/// Capability previously inserted as `("local", "driver=claude", "auto")`.
+/// Auto-sourced capability the local host advertises in these tests.
 pub const LOCAL_HOST_ID: &str = "local";
 pub const DRIVER_CLAUDE_CAPABILITY: &str = "driver=claude";
 
@@ -38,7 +38,6 @@ pub fn ensure_local_driver_capability(db: &WorkDb) {
 
 /// Create the standard test product: name `Boss`, the mono repo remote.
 pub fn create_test_product(db: &WorkDb) -> Product {
-    ensure_local_driver_capability(db);
     db.create_product(
         CreateProductInput::builder()
             .name("Boss")
@@ -50,7 +49,6 @@ pub fn create_test_product(db: &WorkDb) -> Product {
 
 /// Create a plain chore named `name` under `product_id` and return it.
 pub fn create_test_chore(db: &WorkDb, product_id: impl Into<String>, name: impl Into<String>) -> Task {
-    ensure_local_driver_capability(db);
     db.create_chore(CreateChoreInput::builder().product_id(product_id).name(name).build())
         .unwrap()
 }
