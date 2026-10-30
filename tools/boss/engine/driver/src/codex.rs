@@ -181,7 +181,7 @@ pub(crate) fn guard_chain_broken_notification(detail: &str) -> String {
 // listed with the same `tool_mode` (`code_mode_only` for the selected
 // `gpt-6-astra`); the catalog gained `gpt-6.1-sol` (priority 1), `gpt-6-sol`
 // and `gpt-6-luna` above/around astra, which stays at priority 2. The engine
-// effort policy can select Sol for its eligible-work experiment.
+// effort policy selects Sol automatically for eligible work, per the configured share.
 //
 // `ModelMenu` is static function pointers today, so this is a baked snapshot
 // rather than a live `codex debug models` parse. Per-model effort filtering
@@ -282,7 +282,7 @@ fn codex_effort_value_for_level(level: EffortLevel) -> Option<&'static str> {
 /// The Codex base model every automatic selection starts from.
 pub const ASTRA_MODEL: &str = "gpt-6-astra";
 
-/// Base model before the engine applies its eligible-work Sol experiment:
+/// Base model before the engine automatically selects Sol for eligible work:
 /// both reasoning modes resolve to `gpt-6-astra`. Terra remains a known
 /// catalog SKU (`codex debug models`) but is not selected as a lower
 /// tier or fallback.

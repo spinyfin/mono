@@ -171,7 +171,7 @@ private struct EngineConfigPane: View {
                 ), in: 0...100, step: 5) {
                     Text("Sol for eligible Codex work: \(chatModel.codexSolPercentage)%")
                 }
-                Text("Uses Sol for standard small work and automated revisions; failed Sol work retries on Astra. Set to 0% to disable.")
+                Text("Sol is the standard model for eligible Codex work: standard small work and automated revisions. Lower this to send a share of that work to Astra instead; failed Sol work always retries on Astra.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } header: {

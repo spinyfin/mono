@@ -543,7 +543,7 @@ final class ChatViewModel: ObservableObject {
     /// on Settings-pane appear and confirmed after every
     /// `setDriverTrafficShare` call.
     @Published var driverTrafficSplit: DriverTrafficSplit = .engineDefault
-    @Published var codexSolPercentage: Int = 50
+    @Published var codexSolPercentage: Int = 100
 
     /// Per-driver provider quota usage, sourced from
     /// `driver_quota_usage_result`. Starts empty (`neverChecked`), which the
