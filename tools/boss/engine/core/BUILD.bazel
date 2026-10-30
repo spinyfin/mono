@@ -341,6 +341,46 @@ rust_test(
     deps = [":engine_lib"],
 )
 
+# Public WorkDb behavior lives outside src/ so test edits do not invalidate
+# engine_lib. The fixture is a testonly library so later storage tests can
+# reuse it without compiling it into every consumer as srcs.
+rust_library(
+    name = "storage_behavior_fixture",
+    testonly = True,
+    srcs = ["tests/storage_behavior_fixture.rs"],
+    crate_root = "tests/storage_behavior_fixture.rs",
+    edition = "2024",
+    visibility = ["//visibility:private"],
+    deps = [
+        ":engine_lib",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "storage_behavior_test",
+    size = "small",
+    srcs = ["tests/storage_behavior.rs"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    visibility = ["//visibility:private"],
+    deps = [
+        ":engine_lib",
+        ":storage_behavior_fixture",
+        "//tools/boss/engine/event-bus",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 rust_test(
     name = "work_crud_test",
     size = "small",
