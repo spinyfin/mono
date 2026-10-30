@@ -291,7 +291,15 @@ pub mod cube {
         let pr = pr.to_string();
         transport
             .run_cube_json_within(
-                &["--json", "workspace", "repair-pr-bookmark", "--workspace", &store, "--pr", &pr],
+                &[
+                    "--json",
+                    "workspace",
+                    "repair-pr-bookmark",
+                    "--workspace",
+                    &store,
+                    "--pr",
+                    &pr,
+                ],
                 budget,
             )
             .await?;
@@ -654,7 +662,15 @@ pub mod cube {
                 .unwrap();
             assert_eq!(
                 t.argv(),
-                ["--json", "workspace", "repair-pr-bookmark", "--workspace", "/store", "--pr", "7"]
+                [
+                    "--json",
+                    "workspace",
+                    "repair-pr-bookmark",
+                    "--workspace",
+                    "/store",
+                    "--pr",
+                    "7"
+                ]
             );
             assert_eq!(t.budget(), Some(crate::cube_op_budget::REPAIR_PR_BOOKMARK));
         }
