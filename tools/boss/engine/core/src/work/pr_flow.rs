@@ -405,7 +405,7 @@ impl WorkDb {
             .filter(|_| task.kind != TaskKind::Revision && !task.status.is_terminal());
         let attention = if let Some(pr_url) = contradiction {
             Some(CreateAttentionItemInput {
-                kind: crate::attention_lifecycle::COMPLETION_WITH_BOUND_PR_ATTENTION_KIND.into(),
+                kind: boss_engine_storage_values::attention_kinds::COMPLETION_WITH_BOUND_PR_ATTENTION_KIND.into(),
                 title: "Completion refused: work still has a bound PR".into(),
                 body_markdown: format!(
                     "The worker declared no changes needed, but this work item owns {pr_url}. \

@@ -106,7 +106,7 @@ fn attach(check: &mut serde_json::Value, key: &str, contracts: &BTreeMap<String,
     Ok(())
 }
 
-pub(crate) const SNAPSHOT_ERROR_ATTENTION_KIND: &str = "queue_ci_contract_error";
+pub(crate) use boss_engine_storage_values::attention_kinds::QUEUE_CI_CONTRACT_ERROR_ATTENTION_KIND as SNAPSHOT_ERROR_ATTENTION_KIND;
 
 pub(crate) async fn surface_error(
     db: &crate::work::WorkDb,

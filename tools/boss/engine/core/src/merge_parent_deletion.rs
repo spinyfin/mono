@@ -176,12 +176,7 @@ pub fn compute_merged_parent_deletions_blocking(
     describe_deletions(&merged_parent_deletions(&added, &removed))
 }
 
-/// `work_attention_items.kind` filed when the tripwire halts a task
-/// pending operator sign-off. Shared by the worker-driven `pr_review`
-/// path (`completion.rs`) and the escalation ladder's mechanical-rung
-/// result-gate (`conflict_ladder.rs`, T9/T2562) so both surfaces file the
-/// identical attention kind.
-pub const SIGNOFF_ATTENTION_KIND: &str = "merged_parent_deletion_signoff";
+pub use boss_engine_storage_values::attention_kinds::MERGED_PARENT_DELETION_SIGNOFF_ATTENTION_KIND as SIGNOFF_ATTENTION_KIND;
 /// Title for the sign-off attention item filed by either surface above.
 pub const SIGNOFF_ATTENTION_TITLE: &str =
     "Merge resolution removed a merged parent's surface — operator sign-off required";

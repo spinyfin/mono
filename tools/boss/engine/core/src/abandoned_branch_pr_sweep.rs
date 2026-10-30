@@ -145,9 +145,7 @@ pub const MAX_LOOKBACK_SECS: i64 = 24 * 60 * 60;
 /// same execution before the sweep files an attention item.
 pub const ESCALATE_AFTER_CONSECUTIVE_FAILURES: u32 = 3;
 
-/// `work_attention_items.kind` filed once a candidate's auto-create attempts
-/// have failed [`ESCALATE_AFTER_CONSECUTIVE_FAILURES`] times in a row.
-pub const ATTENTION_KIND_ABANDONED_BRANCH_NO_PR: &str = "abandoned_branch_no_pr";
+pub use boss_engine_storage_values::attention_kinds::ATTENTION_KIND_ABANDONED_BRANCH_NO_PR;
 
 /// Outcome of one auto-create attempt for a single candidate.
 #[derive(Debug)]

@@ -24,7 +24,7 @@
 use super::*;
 
 /// Emit a trace warning when an attention `kind` has no entry in
-/// [`crate::attention_lifecycle::ATTENTION_LIFECYCLES`].
+/// [`boss_engine_storage_values::attention_lifecycle::ATTENTION_LIFECYCLES`].
 ///
 /// The original defect was structural, not local: raising a signal went
 /// through shared, well-tested plumbing while lowering it was left to each
@@ -40,11 +40,11 @@ use super::*;
 /// hand-maintained list against the registry, so a constant added to neither
 /// slips past it. A filing call cannot be forgotten the same way.
 pub fn warn_if_lifecycle_undeclared(kind: &str) {
-    if crate::attention_lifecycle::lifecycle_for(kind).is_none() {
+    if boss_engine_storage_values::attention_lifecycle::lifecycle_for(kind).is_none() {
         tracing::warn!(
             attention_kind = kind,
             "attention filed with no declared lifecycle — add an entry to \
-             crate::attention_lifecycle::ATTENTION_LIFECYCLES saying what lowers it (ClearedBy::HumanDecision \
+             boss_engine_storage_values::attention_lifecycle::ATTENTION_LIFECYCLES saying what lowers it (ClearedBy::HumanDecision \
              is a valid answer; leaving it undeclared means it can never be lowered automatically)",
         );
     }

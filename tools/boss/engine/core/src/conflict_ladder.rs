@@ -664,7 +664,7 @@ pub(crate) async fn run_rung1_in_lease_with(
 
 /// Attention kind filed when a lockfile-only conflict could not be
 /// regenerated mechanically.
-pub(crate) use crate::work::LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND;
+pub(crate) use boss_engine_storage_values::attention_kinds::LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND;
 
 /// Lower the lockfile-regeneration attention once the condition no longer
 /// holds: a mechanical retry, a human (or engine) clearing the conflict, or

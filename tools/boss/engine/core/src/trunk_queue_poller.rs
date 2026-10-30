@@ -196,24 +196,12 @@ const RECONCILE_MAX_PAGES: usize = 20;
 /// two or three backoff steps stays silent.
 const UNREACHABLE_ATTENTION_AFTER: Duration = Duration::from_secs(15 * 60);
 
-/// `work_attention_items.kind` for a queue Boss cannot reach.
-pub const TRUNK_QUEUE_UNREACHABLE_ATTENTION_KIND: &str = "trunk_queue_unreachable";
-/// `work_attention_items.kind` for a token Trunk rejected at poll time.
-pub const TRUNK_TOKEN_REJECTED_ATTENTION_KIND: &str = "trunk_token_rejected";
-/// `work_attention_items.kind` for a queue that is not `RUNNING`.
-pub const TRUNK_QUEUE_NOT_RUNNING_ATTENTION_KIND: &str = "trunk_queue_not_running";
-/// `work_attention_items.kind` for an entry that left the queue via
-/// cancellation rather than a merge or a test failure.
-pub const TRUNK_QUEUE_ENTRY_CANCELLED_ATTENTION_KIND: &str = "trunk_queue_entry_cancelled";
-/// `work_attention_items.kind` for an entry Trunk evicted *before testing*,
-/// because it could not construct the merge at all. Distinct from a test
-/// failure, which never files an attention item because it has a fix
-/// revision to speak for it.
-pub const TRUNK_QUEUE_MERGE_FAILURE_ATTENTION_KIND: &str = "trunk_queue_merge_failure";
-/// `work_attention_items.kind` for an intent that has been sitting out of
-/// the queue in a terminal Trunk state, with nothing remediating it, for
-/// longer than [`STALLED_RESUBMIT_ATTENTION_AFTER`].
-pub const TRUNK_QUEUE_RESUBMIT_STALLED_ATTENTION_KIND: &str = "trunk_queue_resubmit_stalled";
+pub use boss_engine_storage_values::attention_kinds::TRUNK_QUEUE_ENTRY_CANCELLED_ATTENTION_KIND;
+pub use boss_engine_storage_values::attention_kinds::TRUNK_QUEUE_MERGE_FAILURE_ATTENTION_KIND;
+pub use boss_engine_storage_values::attention_kinds::TRUNK_QUEUE_NOT_RUNNING_ATTENTION_KIND;
+pub use boss_engine_storage_values::attention_kinds::TRUNK_QUEUE_RESUBMIT_STALLED_ATTENTION_KIND;
+pub use boss_engine_storage_values::attention_kinds::TRUNK_QUEUE_UNREACHABLE_ATTENTION_KIND;
+pub use boss_engine_storage_values::attention_kinds::TRUNK_TOKEN_REJECTED_ATTENTION_KIND;
 
 /// How long an `active` intent may sit at a terminal `last_trunk_state`
 /// (`failed`/`pending_failure`) with **no** in-flight CI remediation before

@@ -136,8 +136,7 @@ struct FailedCheckRecord<'a> {
     job_key: Option<&'a str>,
 }
 
-/// Attention kind used when CI remediation exhausts its attempt budget.
-pub const CI_REMEDIATION_EXHAUSTED_ATTENTION_KIND: &str = "ci_remediation_exhausted";
+pub use boss_engine_storage_values::attention_kinds::CI_REMEDIATION_EXHAUSTED_ATTENTION_KIND;
 
 /// Retained audit record for a CI-watch evaluation that found an active
 /// attempt but deliberately left it in place. These decisions are `info`

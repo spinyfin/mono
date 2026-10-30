@@ -92,23 +92,11 @@ pub enum ReviewBatchDispatch {
     AlreadyReviewed,
 }
 
-/// `work_attention_items.kind` filed when a pre-merge batch cannot be
-/// admitted because the review pool's weighted reservation accounting is
-/// at capacity. The deferred-admission sweep resolves it when a batch is
-/// actually created (or an existing live batch/legacy reviewer covers the
-/// target).
-pub const PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND: &str = "pr_review_admission_deferred";
+pub use boss_engine_storage_values::attention_kinds::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND;
 
-/// `work_attention_items.kind` filed when a non-terminal review batch is
-/// reaped because its cycle root is gone or its members have been inert
-/// past [`REVIEW_BATCH_STALE_SECS`].
-pub const PR_REVIEW_BATCH_STALE_ATTENTION_KIND: &str = "pr_review_batch_stale";
+pub use boss_engine_storage_values::attention_kinds::PR_REVIEW_BATCH_STALE_ATTENTION_KIND;
 
-/// `work_attention_items.kind` filed when an accepted review report still
-/// owns a live execution. Report acceptance must immediately terminalize the
-/// leaf, so this is an invariant violation rather than a recoverable idle
-/// state.
-pub const PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND: &str = "pr_review_reported_member_live";
+pub use boss_engine_storage_values::attention_kinds::PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND;
 
 /// Staleness bound for reaping a wedged non-terminal review batch,
 /// matching the merge poller's stalled-reviewer cutoff.

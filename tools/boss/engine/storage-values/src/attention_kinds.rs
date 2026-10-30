@@ -1,5 +1,5 @@
-//! Stable worker and dispatch attention-kind names.
-//! Filing and clearing policy remains with the engine producers and lifecycle registry.
+//! Stable attention-kind names shared by storage and engine services.
+//! Clearing policy lives in [`super::attention_lifecycle`]; filing stays with producers.
 //! References to producer functions and policy types below refer to engine core.
 
 pub const ABANDONED_EXECUTION_BOOKMARK_ATTENTION_KIND: &str = "abandoned_execution_bookmark";
@@ -258,3 +258,183 @@ pub const LEASE_UNRELEASED_ATTENTION_KIND: &str = "workspace_lease_unreleased";
 /// failed. It is also the durable evidence that the run had settled, which
 /// is what lets the leftover-lease sweep retry a row that recorded no pid.
 pub const LEASE_RELEASE_FAILED_ATTENTION_KIND: &str = "workspace_lease_release_failed";
+
+/// `work_attention_items.kind` filed once a candidate's auto-create attempts
+/// have failed `ESCALATE_AFTER_CONSECUTIVE_FAILURES` times in a row.
+pub const ATTENTION_KIND_ABANDONED_BRANCH_NO_PR: &str = "abandoned_branch_no_pr";
+
+/// Attention kind used when CI remediation exhausts its attempt budget.
+pub const CI_REMEDIATION_EXHAUSTED_ATTENTION_KIND: &str = "ci_remediation_exhausted";
+
+/// Engine-owned `work_attention_items.kind` for a filed `[deferred-scope]` signal.
+pub const DEFERRED_SCOPE_ATTENTION_KIND: &str = "deferred_scope";
+
+/// `work_attention_items.kind` filed when a `direct`-mechanism merge is
+/// rejected by a push restriction / rule violation rather than an ordinary
+/// merge failure. Named so it can be distinguished from other attention
+/// kinds in the notifications UI.
+pub const DIRECT_MERGE_PUSH_RESTRICTION_ATTENTION_KIND: &str = "direct_merge_push_restriction";
+
+/// `work_attention_items.kind` filed when the tripwire halts a task
+/// pending operator sign-off. Shared by the worker-driven `pr_review`
+/// path (`completion.rs`) and the escalation ladder's mechanical-rung
+/// result-gate (`conflict_ladder.rs`) so both surfaces file the
+/// identical attention kind.
+pub const MERGED_PARENT_DELETION_SIGNOFF_ATTENTION_KIND: &str = "merged_parent_deletion_signoff";
+
+/// Attention-item kind filed when a dead review is auto-refired — lets the
+/// kanban surface and `bossctl attentions` distinguish "review died, was
+/// auto-recovered" from a clean pass with no findings.
+pub const PR_REVIEW_DIED_ATTENTION_KIND: &str = "pr_review_died_without_findings";
+
+pub const QUEUE_CI_CONTRACT_ERROR_ATTENTION_KIND: &str = "queue_ci_contract_error";
+
+/// `work_attention_items.kind` for a queue Boss cannot reach.
+pub const TRUNK_QUEUE_UNREACHABLE_ATTENTION_KIND: &str = "trunk_queue_unreachable";
+
+/// `work_attention_items.kind` for a token Trunk rejected at poll time.
+pub const TRUNK_TOKEN_REJECTED_ATTENTION_KIND: &str = "trunk_token_rejected";
+
+/// `work_attention_items.kind` for a queue that is not `RUNNING`.
+pub const TRUNK_QUEUE_NOT_RUNNING_ATTENTION_KIND: &str = "trunk_queue_not_running";
+
+/// `work_attention_items.kind` for an entry that left the queue via
+/// cancellation rather than a merge or a test failure.
+pub const TRUNK_QUEUE_ENTRY_CANCELLED_ATTENTION_KIND: &str = "trunk_queue_entry_cancelled";
+
+/// `work_attention_items.kind` for an entry Trunk evicted *before testing*,
+/// because it could not construct the merge at all. Distinct from a test
+/// failure, which never files an attention item because it has a fix
+/// revision to speak for it.
+pub const TRUNK_QUEUE_MERGE_FAILURE_ATTENTION_KIND: &str = "trunk_queue_merge_failure";
+
+/// `work_attention_items.kind` for an intent that has been sitting out of
+/// the queue in a terminal Trunk state, with nothing remediating it, for
+/// longer than `STALLED_RESUBMIT_ATTENTION_AFTER`.
+pub const TRUNK_QUEUE_RESUBMIT_STALLED_ATTENTION_KIND: &str = "trunk_queue_resubmit_stalled";
+
+/// `work_attention_items.kind` filed when a pre-merge batch cannot be
+/// admitted because the review pool's weighted reservation accounting is
+/// at capacity. The deferred-admission sweep resolves it when a batch is
+/// actually created (or an existing live batch/legacy reviewer covers the
+/// target).
+pub const PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND: &str = "pr_review_admission_deferred";
+
+/// `work_attention_items.kind` filed when a non-terminal review batch is
+/// reaped because its cycle root is gone or its members have been inert
+/// past `REVIEW_BATCH_STALE_SECS`.
+pub const PR_REVIEW_BATCH_STALE_ATTENTION_KIND: &str = "pr_review_batch_stale";
+
+/// `work_attention_items.kind` filed when an accepted review report still
+/// owns a live execution. Report acceptance must immediately terminalize the
+/// leaf, so this is an invariant violation rather than a recoverable idle
+/// state.
+pub const PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND: &str = "pr_review_reported_member_live";
+
+/// `work_attention_items.kind` filed when a staged `review_verdict` cannot
+/// apply because its batch is not (and could not be advanced to) `applying`.
+/// The producer (this applier) resolves it on a later pass that actually
+/// lands the verdict.
+pub const REVIEW_VERDICT_BATCH_NOT_APPLYING_ATTENTION_KIND: &str = "pr_review_verdict_batch_not_applying";
+
+/// `work_attention_items.kind` filed when `pr_review_recovery`
+/// trips its churn guard and parks a work item instead of
+/// auto-redispatching it. `orphan_sweep` used to file this same
+/// kind for its own (`active`-task) churn trip; it now bounces through
+/// `CHURN_GUARD_DISPATCH_FAILED_REASON` instead — see that constant's docs
+/// — so this kind is `pr_review_recovery`-only going forward. Before this
+/// kind existed at all, a trip was only a `tracing::warn!` in the engine
+/// trace — the work item stayed active with no live execution and nothing
+/// in `boss task show`, `bossctl agents status`, or the kanban card said
+/// why. Resolved automatically the next time
+/// `WorkDb::request_execution_with_live_check` is called for the work
+/// item (either the sweep succeeding once the trailing window drains, or an
+/// operator running `bossctl work start`, which bypasses the guard entirely
+/// since it only lives in the sweeps), and — as a backstop for every other
+/// way an item can start moving — whenever a run starts for it afterwards
+/// (`attention_lifecycle::ClearedBy::WorkResumed`).
+pub const CHURN_GUARD_PARKED_ATTENTION_KIND: &str = "churn_guard_parked";
+
+/// Attention kind filed when a lockfile-only conflict could not be
+/// regenerated mechanically. Lowered by the work layer whenever the
+/// `merge_conflict` blocked signal is cleared or the attempt is retried.
+pub const LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND: &str = "conflict_lockfile_regeneration_failed";
+
+/// `work_attention_items.kind` raised by `dispatch_stall_escalation`
+/// when a dispatch timeline sits stuck in one stage past
+/// `dispatch_stall_escalation::PERSISTENT_STALL_THRESHOLD`. The
+/// underlying `stage_stalled` dispatch event (`dispatch_events.rs`) is
+/// deliberately write-only telemetry with no alert behind it; this kind
+/// escalates a *persistent* stall (minutes, not the ~30-120s per-stage
+/// thresholds that drive `stage_stalled` itself) onto the operator-visible
+/// attention surface. Resolved the next time the execution successfully
+/// claims a worker slot (`Coordinator::dispatch_claimed_execution`) —
+/// mirrors how `CHURN_GUARD_PARKED_ATTENTION_KIND` resolves on the work
+/// item's next successful dispatch attempt rather than being proactively
+/// cleared by the sweep that raised it.
+pub const DISPATCH_STAGE_STALLED_ATTENTION_KIND: &str = "dispatch_stage_stalled";
+
+/// Attention-item `kind` raised when the engine stops auto-resuming a
+/// worker because its Claude API error is non-retryable (permanent or
+/// unrecognised). See `transient_recovery`.
+pub const ATTENTION_KIND_RECOVERY_PERMANENT: &str = "worker_recovery_permanent_error";
+
+/// Attention-item `kind` raised when the engine stops auto-resuming a
+/// worker because the transient-error retry cap was reached.
+pub const ATTENTION_KIND_RECOVERY_EXHAUSTED: &str = "worker_recovery_exhausted";
+
+/// `work_attention_items.kind` for the sticky item raised when a work item
+/// has no repo resolution. Shared by storage, its producer and the lifecycle
+/// registry. `record_repo_unresolved_attention` binds *this* constant rather than
+/// re-spelling the string, so there is exactly one definition of the value
+/// the reconciler matches on.
+pub const REPO_UNRESOLVED_ATTENTION_KIND: &str = "repo_unresolved";
+
+/// `work_attention_items.kind` for the item recording an engine
+/// auto-archival of a moot revision. Bound by
+/// `record_revision_archived_attention`; see
+/// [`REPO_UNRESOLVED_ATTENTION_KIND`] for why it lives here.
+pub const REVISION_ARCHIVED_ATTENTION_KIND: &str = "revision_archived";
+
+/// Attention-group kind for proposed followup work awaiting the operator's
+/// batch-accept gesture.
+pub const FOLLOWUP_ATTENTION_KIND: &str = "followup";
+
+/// Attention-group kind for a question posed to the operator.
+pub const QUESTION_ATTENTION_KIND: &str = "question";
+
+/// A no-op completion contradicted by a PR still owned by the work item.
+pub const COMPLETION_WITH_BOUND_PR_ATTENTION_KIND: &str = "completion_with_bound_pr";
+
+/// Product-scoped external-tracker fetch failures, resolved by the
+/// reconcile loop on the next successful fetch. The reconcile loop
+/// (`external_tracker::reconcile::logic`) both raises and resolves against
+/// these constants — the kind string is defined once, here.
+pub const EXTERNAL_TRACKER_AUTH_FAILED_ATTENTION_KIND: &str = "external_tracker_auth_failed";
+
+/// See [`EXTERNAL_TRACKER_AUTH_FAILED_ATTENTION_KIND`].
+pub const EXTERNAL_TRACKER_TOKEN_REVOKED_ATTENTION_KIND: &str = "external_tracker_token_revoked";
+
+/// See [`EXTERNAL_TRACKER_AUTH_FAILED_ATTENTION_KIND`].
+pub const EXTERNAL_TRACKER_TRANSIENT_ERRORS_ATTENTION_KIND: &str = "external_tracker_transient_errors";
+
+/// Product-scoped: an upstream issue vanished from the tracker.
+pub const EXTERNAL_TRACKER_REMOVED_UPSTREAM_ATTENTION_KIND: &str = "external_tracker_removed_upstream";
+
+/// Product-scoped: the tracker refused a write for permission reasons.
+pub const EXTERNAL_TRACKER_PERMISSION_DENIED_ATTENTION_KIND: &str = "external_tracker_permission_denied";
+
+/// `work_attention_items.kind` filed by the now-deleted app-reattach
+/// pane-death reconcile (`dead_pid_sweep::reconcile_orphans_on_reattach`,
+/// removed with the app-hosted pane path). Nothing files this kind any
+/// more — kept only so an already-persisted "App relaunch killed a worker
+/// pane" row from a pre-upgrade engine still has a lifecycle entry and can
+/// auto-clear via [`super::attention_lifecycle::ClearedBy::WorkResumed`] instead of staying open
+/// forever.
+pub const LEGACY_PANE_DEATH_RECONCILE_ATTENTION_KIND: &str = "pane_death_reconcile";
+
+/// Work-item-scoped: the review-brief assembler could not fetch or resolve
+/// the project's design doc. Filed and cleared by `runner::review_brief` on
+/// the review-cycle chain root, so a later successful fetch for any revision
+/// or the post-merge root review resolves it.
+pub const REVIEW_DESIGN_DOC_UNRESOLVED_ATTENTION_KIND: &str = "review_design_doc_unresolved";

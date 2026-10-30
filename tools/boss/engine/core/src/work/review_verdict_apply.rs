@@ -12,11 +12,7 @@ use boss_protocol::{
     CreateRevisionInput, ProposalKind, ProposalState, ReasoningMode, ReviewVerdictProposalPayload, WorkerProposal,
 };
 
-/// `work_attention_items.kind` filed when a staged `review_verdict` cannot
-/// apply because its batch is not (and could not be advanced to) `applying`.
-/// The producer (this applier) resolves it on a later pass that actually
-/// lands the verdict.
-pub const REVIEW_VERDICT_BATCH_NOT_APPLYING_ATTENTION_KIND: &str = "pr_review_verdict_batch_not_applying";
+pub use boss_engine_storage_values::attention_kinds::REVIEW_VERDICT_BATCH_NOT_APPLYING_ATTENTION_KIND;
 
 /// Count from one apply pass.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -785,7 +781,7 @@ impl WorkDb {
         }
         self.upsert_work_item_attention(
             cycle_root_id,
-            crate::merge_parent_deletion::SIGNOFF_ATTENTION_KIND,
+            boss_engine_storage_values::attention_kinds::MERGED_PARENT_DELETION_SIGNOFF_ATTENTION_KIND,
             crate::merge_parent_deletion::SIGNOFF_ATTENTION_TITLE,
             &crate::merge_parent_deletion::render_signoff_attention_body(deletions, pr_url),
         )?;
