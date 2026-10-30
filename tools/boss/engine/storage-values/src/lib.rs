@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod attention_kinds;
 pub mod branch_identity;
 pub mod ci_contract;
 pub mod pool_policy;

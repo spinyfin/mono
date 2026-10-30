@@ -39,11 +39,9 @@ pub const EFFORT_ESCALATION_MARKER: &str = "[effort-escalation]";
 /// [`crate::runner::prompt::worker_escalation_protocol_directive`].
 pub const BLOCKED_MARKER: &str = "[blocked]";
 
-/// Engine-owned `work_attention_items.kind` for a filed `[effort-escalation]` signal.
-pub const WORKER_ESCALATION_ATTENTION_KIND: &str = "worker_escalation";
+pub use boss_engine_storage_values::attention_kinds::WORKER_ESCALATION_ATTENTION_KIND;
 
-/// Engine-owned `work_attention_items.kind` for a filed `[blocked]` signal.
-pub const WORKER_BLOCKED_ATTENTION_KIND: &str = "worker_blocked";
+pub use boss_engine_storage_values::attention_kinds::WORKER_BLOCKED_ATTENTION_KIND;
 
 /// Which of the two sanctioned markers a [`WorkerSignal`] was parsed from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -29,9 +29,7 @@ use boss_engine_recovery::execution_bookmark::{PruneOutcome, Voucher};
 use crate::coordinator::ExecutionCoordinator;
 use crate::work::{CreateAttentionItemInput, PrStateChecker, PruneCandidate, WorkDb, prune_outcome};
 
-/// Attention kind raised when a finished PR's execution left preserved work
-/// that nothing the engine recorded can vouch for.
-pub(crate) const UNPROVEN: &str = "execution_bookmark_prune_unproven";
+pub(crate) use boss_engine_storage_values::attention_kinds::EXECUTION_BOOKMARK_PRUNE_UNPROVEN_ATTENTION_KIND as UNPROVEN;
 
 /// Records examined per pass. The backlog on first deployment is every
 /// execution ever run; at the sweep's five-minute cadence this drains a few

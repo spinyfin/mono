@@ -104,11 +104,7 @@ impl AnswerAgentFinalizer for WorkerCompletionHandler {
     }
 }
 
-/// Attention-item kind filed when this sweep completes an execution. Its
-/// presence means the answer-agent turn boundary never reached the engine for
-/// that run — the slot was reclaimed, but the ingress that lost the signal is
-/// still broken and wants a human.
-pub const ANSWER_AGENT_STRANDED_ATTENTION_KIND: &str = "answer_agent_completion_signal_lost";
+pub use boss_engine_storage_values::attention_kinds::ANSWER_AGENT_STRANDED_ATTENTION_KIND;
 
 /// Counts from one pass; logged at `info` when any execution was completed.
 #[derive(Debug, Default, PartialEq, Eq)]

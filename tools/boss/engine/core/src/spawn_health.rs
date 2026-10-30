@@ -112,9 +112,7 @@ pub const SPAWN_HEALTH_DISTINCT_WORK_ITEM_THRESHOLD: usize = 3;
 /// Sliding window (seconds) over which distinct failing work items are counted.
 pub const SPAWN_HEALTH_WINDOW_SECS: i64 = 300;
 
-/// Kind string for the single loud attention item raised when the breaker
-/// trips. Stable — external tooling and the app's attention pane pin it.
-pub const SPAWN_CAPABILITY_ATTENTION_KIND: &str = "app_spawn_capability_unhealthy";
+pub use boss_engine_storage_values::attention_kinds::SPAWN_CAPABILITY_ATTENTION_KIND;
 
 /// Backoff before the first half-open recovery probe after a trip, and the
 /// base of the exponential backoff applied after each subsequent probe

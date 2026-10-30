@@ -66,9 +66,7 @@ use crate::host_adapter::HostAdapter;
 use crate::host_adapter::HostAdapterProvider;
 use crate::work::{RemoteRunHandle, WorkDb};
 
-/// `work_attention_items.kind` for a remote worker the reconciler found
-/// dead. Declared in [`crate::attention_lifecycle::ATTENTION_LIFECYCLES`].
-pub const REMOTE_WORKER_DIED_ATTENTION_KIND: &str = "remote_worker_died";
+pub use boss_engine_storage_values::attention_kinds::REMOTE_WORKER_DIED_ATTENTION_KIND;
 
 /// Cadence for the periodic pass. Fires immediately on boot, then every
 /// interval.

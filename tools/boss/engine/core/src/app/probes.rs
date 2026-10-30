@@ -24,32 +24,7 @@ use super::*;
 
 use crate::work::CreateAttentionItemInput;
 
-/// `work_attention_items.kind` for a probe the engine accepted and then never
-/// delivered.
-///
-/// Filed against the *execution* the probe targeted, so the abandonment is
-/// visible in that run's own history rather than only through a
-/// `bossctl probe-status <probe-id>` query the issuer has no reason to make.
-/// That asymmetry was the defect: the engine recorded the terminal state
-/// correctly and told nobody, so a coordinator whose instruction was dropped
-/// carried on as if it had landed.
-///
-/// Registered in [`crate::attention_lifecycle::ATTENTION_LIFECYCLES`] as
-/// [`crate::attention_lifecycle::ClearedBy::HumanDecision`] — see there for
-/// why no automatic evidence lowers it.
-///
-/// **Deliberately one row per abandoned probe, not deduped onto a single
-/// open row per `(execution, kind)`** the way `work/attention_filing.rs`'s
-/// module doc otherwise documents as the filing contract (see
-/// `reraise_open_execution_attention`). Each lost probe is a distinct
-/// instruction a coordinator issued and must individually decide what to do
-/// about — a run that lost three different probes needs three answers, and
-/// collapsing them onto one row would silently drop the second and third
-/// probe ids from view the moment the first row existed. If this ever proves
-/// noisy in practice (the same run repeatedly losing probes), the dedup
-/// should key on the *probe*, not the execution: fold a probe's own retries
-/// onto its own row, never a sibling probe's.
-pub const PROBE_UNDELIVERED_ATTENTION_KIND: &str = "probe_undelivered";
+pub use boss_engine_storage_values::attention_kinds::PROBE_UNDELIVERED_ATTENTION_KIND;
 
 /// Adapter so the completion handler can queue probes onto
 /// `ServerState::pending_probes` without depending on `ServerState`

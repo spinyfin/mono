@@ -8,12 +8,10 @@ use boss_engine_recovery::recovery_backup::{backup_execution_patch, default_reco
 
 use crate::work::{CreateAttentionItemInput, WorkDb, WorkExecution};
 
-pub(crate) const RECOVERY_FAILED: &str = "execution_bookmark_recovery_failed";
-pub(crate) const CHAIN_BLOCKED: &str = "revision_chain_recovery_blocked";
-pub(crate) const CREATE_FAILED: &str = "execution_bookmark_create_failed";
-/// The engine retired a recovery record whose baseline was gone and whose
-/// heads nothing it recorded could vouch for, and started the item fresh.
-pub(crate) const RECOVERY_RETIRED: &str = "execution_bookmark_recovery_retired";
+pub(crate) use boss_engine_storage_values::attention_kinds::EXECUTION_BOOKMARK_CREATE_FAILED_ATTENTION_KIND as CREATE_FAILED;
+pub(crate) use boss_engine_storage_values::attention_kinds::EXECUTION_BOOKMARK_RECOVERY_FAILED_ATTENTION_KIND as RECOVERY_FAILED;
+pub(crate) use boss_engine_storage_values::attention_kinds::EXECUTION_BOOKMARK_RECOVERY_RETIRED_ATTENTION_KIND as RECOVERY_RETIRED;
+pub(crate) use boss_engine_storage_values::attention_kinds::REVISION_CHAIN_RECOVERY_BLOCKED_ATTENTION_KIND as CHAIN_BLOCKED;
 
 /// Only authoritative integrity failures park work; transport failures keep
 /// the coordinator's pre-start backoff and rerun repair on the next attempt.

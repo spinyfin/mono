@@ -19,13 +19,7 @@ use crate::agent_jsonl_progress::IngressCheckpointStore;
 use crate::work::WorkExecution;
 use crate::worker_readoption::{ContradictionVerdict, ReapReason, classify_contradiction};
 
-/// Filed when a re-adopted worker's file progress ingress cannot be put back.
-///
-/// The worker is live but unobservable: it holds a pane, a pool slot and a
-/// cube workspace lease, and nothing it does will produce a turn boundary. No
-/// sweep resolves that, because every sweep that could reads liveness — and
-/// the worker *is* alive. Only a human can.
-pub const PROGRESS_INGRESS_UNRECOVERABLE_ATTENTION_KIND: &str = "progress_ingress_unrecoverable";
+pub use boss_engine_storage_values::attention_kinds::PROGRESS_INGRESS_UNRECOVERABLE_ATTENTION_KIND;
 
 /// Bounded exponential backoff while the same app session stays registered.
 /// One failed stale detach must not wait for the next app relaunch.

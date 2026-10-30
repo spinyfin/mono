@@ -125,17 +125,9 @@ const TMUX_SESSION_SCHEMA_ENV: &str = "BOSS_SESSION_SCHEMA";
 /// doc's "Two engines briefly running at once" failure mode.
 const ENGINE_OWNER_OPTION: &str = "@boss_engine_owner";
 
-/// `work_attention_items.kind` filed when [`refuse_and_reap`] reaps a
-/// version-skewed session. Registered in [`crate::attention_lifecycle`] as
-/// [`crate::attention_lifecycle::ClearedBy::WorkResumed`] — a later run
-/// starting on the same work item is direct evidence the item is moving
-/// again.
-pub const TMUX_ADOPTION_SCHEMA_SKEW_ATTENTION_KIND: &str = "tmux_adoption_schema_skew";
+pub use boss_engine_storage_values::attention_kinds::TMUX_ADOPTION_SCHEMA_SKEW_ATTENTION_KIND;
 
-/// `work_attention_items.kind` filed when live sessions remain on the
-/// pre-move `tmux -L boss` server after the engine has switched to an
-/// explicit socket. Cleared when a later run starts on the same item.
-pub const TMUX_LEGACY_LABEL_SERVER_ATTENTION_KIND: &str = "tmux_legacy_label_server";
+pub use boss_engine_storage_values::attention_kinds::TMUX_LEGACY_LABEL_SERVER_ATTENTION_KIND;
 
 /// Trigger name recorded on the dispatch event and carried into
 /// [`LiveWorkerConvergence::converge_live_worker`] for a session whose token

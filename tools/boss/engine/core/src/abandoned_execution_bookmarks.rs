@@ -2,7 +2,7 @@
 use crate::coordinator::ExecutionCoordinator;
 use crate::work::{CreateAttentionItemInput, WorkDb};
 
-pub(crate) const RECOVERABLE_WORK: &str = "abandoned_execution_bookmark";
+pub(crate) use boss_engine_storage_values::attention_kinds::ABANDONED_EXECUTION_BOOKMARK_ATTENTION_KIND as RECOVERABLE_WORK;
 
 pub(crate) async fn run_one_pass(db: &WorkDb, coordinator: &ExecutionCoordinator) -> anyhow::Result<usize> {
     let executions = db.terminal_bookmark_executions(

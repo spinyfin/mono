@@ -24,16 +24,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// `work_attention_items.kind` for a filed unobserved-command attention.
-/// Mirrors [`crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND`]'s pattern
-/// of one constant per marker-class attention kind.
-pub const UNOBSERVED_COMMAND_ATTENTION_KIND: &str = "codex_unobserved_command";
+pub use boss_engine_storage_values::attention_kinds::UNOBSERVED_COMMAND_ATTENTION_KIND;
 
-/// `work_attention_items.kind` for the one-time "audit trail overflowed"
-/// attention — distinct from [`UNOBSERVED_COMMAND_ATTENTION_KIND`] because it
-/// reports a different fact (Boss stopped being able to name every abandoned
-/// command for this execution) rather than one more abandoned command.
-pub const UNOBSERVED_COMMAND_OVERFLOW_ATTENTION_KIND: &str = "codex_unobserved_command_overflow";
+pub use boss_engine_storage_values::attention_kinds::UNOBSERVED_COMMAND_OVERFLOW_ATTENTION_KIND;
 
 /// Bound on distinct commands kept in the per-execution **audit trail**
 /// (the list [`UnobservedCommandTracker::list`] returns for attention-item

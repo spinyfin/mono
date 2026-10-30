@@ -172,15 +172,9 @@ use crate::spawn_health::{
 use crate::transcript_liveness::{TranscriptLiveness, probe_transcript_liveness};
 use crate::work::WorkDb;
 
-/// Kind string for the attention item raised when a spawn produced a
-/// pane but no driver. Stable — operator tooling pins it.
-pub const DRIVER_START_ATTENTION_KIND: &str = "worker_driver_never_started";
+pub use boss_engine_storage_values::attention_kinds::DRIVER_START_ATTENTION_KIND;
 
-/// Kind string for the attention item raised when the liveness veto's
-/// answer has stayed [`crate::transcript_liveness::TranscriptLiveness::Undeterminable`]
-/// for [`UNDETERMINABLE_LIVENESS_ATTENTION_THRESHOLD`] consecutive passes.
-/// Stable — operator tooling pins it.
-pub const LIVENESS_UNDETERMINABLE_ATTENTION_KIND: &str = "worker_liveness_undeterminable";
+pub use boss_engine_storage_values::attention_kinds::LIVENESS_UNDETERMINABLE_ATTENTION_KIND;
 
 /// Consecutive `LivenessUndeterminable` reap outcomes for the same
 /// execution before [`raise_liveness_undeterminable_attention`] fires.
