@@ -1,4 +1,5 @@
 mod absence;
+mod teardown;
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -544,7 +545,7 @@ async fn set_option_capture_and_display_use_the_private_server() {
 
 #[tokio::test]
 async fn kill_session_verified_kills_only_on_an_exact_token_match() {
-    let (tmux, runner) = tmux([success("BOSS_SPAWN_TOKEN=secret\n"), success("")]);
+    let (tmux, runner) = tmux([success("BOSS_SPAWN_TOKEN=secret\n"), success(""), success("")]);
     let outcome = tmux.kill_session_verified("boss-1", "secret").await.unwrap();
     assert_eq!(outcome, KillSessionOutcome::Killed);
     assert_eq!(
@@ -558,7 +559,18 @@ async fn kill_session_verified_kills_only_on_an_exact_token_match() {
                 "boss-1",
                 "BOSS_SPAWN_TOKEN"
             ],
-            vec!["-S", TEST_SOCKET_PATH, "kill-session", "-t", "boss-1"],
+            vec!["-S", TEST_SOCKET_PATH, "detach-client", "-s", "=boss-1"],
+            vec![
+                "-S",
+                TEST_SOCKET_PATH,
+                "if-shell",
+                "-F",
+                "-t",
+                "=boss-1:",
+                "#{==:#{session_attached_list},}",
+                "kill-session -t '=boss-1'",
+                "display-message -p boss-viewers-attached"
+            ],
         ]
     );
 }
@@ -572,6 +584,7 @@ async fn kill_session_verified_treats_a_session_destroyed_just_before_the_kill_a
     // to Absent, not surface as a hard Tmux error.
     let (tmux, runner) = tmux([
         success("BOSS_SPAWN_TOKEN=secret\n"),
+        success(""),
         failure("can't find session: boss-1"),
     ]);
     let outcome = tmux.kill_session_verified("boss-1", "secret").await.unwrap();
@@ -587,7 +600,18 @@ async fn kill_session_verified_treats_a_session_destroyed_just_before_the_kill_a
                 "boss-1",
                 "BOSS_SPAWN_TOKEN"
             ],
-            vec!["-S", TEST_SOCKET_PATH, "kill-session", "-t", "boss-1"],
+            vec!["-S", TEST_SOCKET_PATH, "detach-client", "-s", "=boss-1"],
+            vec![
+                "-S",
+                TEST_SOCKET_PATH,
+                "if-shell",
+                "-F",
+                "-t",
+                "=boss-1:",
+                "#{==:#{session_attached_list},}",
+                "kill-session -t '=boss-1'",
+                "display-message -p boss-viewers-attached"
+            ],
         ],
     );
 }
@@ -963,6 +987,7 @@ async fn kill_session_verified_surfaces_a_kill_session_failure_after_a_matched_t
     // a hard error rather than being swallowed as Absent.
     let (tmux, _) = tmux([
         success("BOSS_SPAWN_TOKEN=secret\n"),
+        success(""),
         failure("server exited unexpectedly"),
     ]);
     let error = tmux.kill_session_verified("boss-1", "secret").await.unwrap_err();

@@ -639,6 +639,7 @@ pub async fn run_adoption_pass<S>(
 where
     S: WorkerSpawner + ?Sized,
 {
+    crate::tmux_health::server_observed(tmux);
     let mut outcome = TmuxAdoptionOutcome::default();
 
     let sessions = match tmux.list_sessions().await {
@@ -1762,9 +1763,10 @@ mod tests {
                     self.server_options.lock().unwrap().insert(option, value);
                     Ok(ok_output(String::new()))
                 }
-                Some("kill-session") => {
-                    assert_eq!(args[3], "-t");
-                    let session = args[4].clone();
+                Some("detach-client") => Ok(ok_output(String::new())),
+                Some("if-shell") => {
+                    assert_eq!(args[4], "-t");
+                    let session = args[5].trim_start_matches('=').trim_end_matches(':').to_owned();
                     self.killed_sessions.lock().unwrap().push(session.clone());
                     if self.kill_session_failures.contains(&session) {
                         // Must NOT look like an absent-session error: those

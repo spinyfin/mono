@@ -92,6 +92,7 @@ mod executions;
 mod external_tracker;
 mod github_auth;
 mod queued_dispatch;
+mod tmux_health;
 // `pub(crate)` so the spawn-capability circuit breaker (`crate::spawn_health`)
 // can persist its auto-pause through the same `METADATA_KEY_DISPATCH_PAUSED*`
 // keys the human dispatch toggle uses. Individual items stay `pub(crate)`/
@@ -716,6 +717,8 @@ struct ServerState {
     /// uses the resolved path recorded in the ready variant.
     #[builder(default = Arc::new(std::sync::RwLock::new(crate::tmux_preflight::TmuxPreflight::Unavailable { reason: "tmux preflight has not run yet".to_owned() })))]
     tmux_preflight: Arc<std::sync::RwLock<crate::tmux_preflight::TmuxPreflight>>,
+    #[builder(default)]
+    tmux_health_issues: std::sync::RwLock<Vec<boss_protocol::EngineHealthIssue>>,
     /// What the startup pass that retries pre-start-failed review guides
     /// did. Set once, before the engine serves requests; empty until then.
     #[builder(default)]

@@ -345,6 +345,27 @@ impl Tmux {
             .copied()
     }
 
+    /// Fresh executable version; unlike compatibility probes this detects upgrades.
+    pub async fn version_output(&self) -> Result<String> {
+        let mut args = self.server_args();
+        args.push("-V".into());
+        Ok(self.invoke(args).await?.stdout.trim().to_owned())
+    }
+
+    /// The running server may predate an executable upgrade. Never starts a server.
+    pub async fn server_version_output(&self) -> Result<Option<String>> {
+        let mut args = self.server_args();
+        args.extend(["display-message".into(), "-p".into(), "#{version}".into()]);
+        let output = self.run(&args).await?;
+        if output.success {
+            Ok(Some(format!("tmux {}", output.stdout.trim())))
+        } else if is_absent_server_stderr(&output.stderr) {
+            Ok(None)
+        } else {
+            command_failed(&args, &output)
+        }
+    }
+
     /// Starts the private server and applies settings before any window exists.
     ///
     /// tmux shuts down an empty server by default. Sending `start-server` and
@@ -657,23 +678,54 @@ impl Tmux {
         }
     }
 
-    /// Low-level `kill-session -t <name>`, with no identity verification.
-    /// Private: [`Self::kill_session_verified`] is this crate's only public
-    /// teardown entry point, by design — see its doc comment. Returns
-    /// `Ok(true)` when the session was actually killed, `Ok(false)` when it
-    /// had already vanished (a real command failure still becomes `Err`).
     async fn kill_session_unchecked(&self, session: &str) -> Result<bool> {
-        validate_value("session name", session)?;
-        let mut args = self.server_args();
-        args.extend(["kill-session".into(), "-t".into(), session.into()]);
-        let output = self.run(&args).await?;
-        if output.success {
-            return Ok(true);
+        let target = format!("={session}");
+        let mut detach = self.server_args();
+        detach.extend(["detach-client".into(), "-s".into(), target.clone().into()]);
+        let output = self.run(&detach).await?;
+        if !output.success {
+            if is_absent_session_stderr(&output.stderr) {
+                return Ok(false);
+            }
+            // tmux still resolves an implicit target client for detach-client
+            // even with -s. With no viewers it reports this diagnostic. The
+            // guarded kill below independently verifies that the list is empty.
+            if !is_diagnostic(&output.stderr, &["no current client"]) {
+                return command_failed(&detach, &output);
+            }
         }
-        if is_absent_session_stderr(&output.stderr) {
-            return Ok(false);
+
+        // detach-client requests an asynchronous handshake. Check inside tmux's
+        // command queue immediately before kill-session, so a new attachment
+        // between our subprocesses cannot leave a sessionless tty reader behind.
+        // session_attached excludes CLIENT_EXIT before the handshake finishes;
+        // session_attached_list includes every client whose session is still set.
+        let mut kill = self.server_args();
+        kill.extend([
+            "if-shell".into(),
+            "-F".into(),
+            "-t".into(),
+            // if-shell takes a pane target: the colon makes this an exact
+            // session, rather than an ambiguous pane/window name.
+            format!("{target}:").into(),
+            "#{==:#{session_attached_list},}".into(),
+            format!("kill-session -t {}", quote_for_shell(&target)).into(),
+            "display-message -p boss-viewers-attached".into(),
+        ]);
+        for _ in 0..50 {
+            let output = self.run(&kill).await?;
+            if !output.success {
+                if is_absent_session_stderr(&output.stderr) {
+                    return Ok(false);
+                }
+                return command_failed(&kill, &output);
+            }
+            if output.stdout.trim() != "boss-viewers-attached" {
+                return Ok(true);
+            }
+            sleep(std::time::Duration::from_millis(20)).await;
         }
-        command_failed(&args, &output)
+        bail!("refusing kill-session for {session:?}: viewers have not finished detaching")
     }
 
     /// Destroys the entire private tmux server, tearing down every session

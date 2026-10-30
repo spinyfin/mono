@@ -257,6 +257,7 @@ async fn release_worker_pane_still_reaps_a_tmux_hosted_worker() {
         ok("0"), // Pane-dead observation before the kill's token recheck.
         ok(&format!("BOSS_SPAWN_TOKEN={TOKEN}\n")),
         ok(""),
+        ok(""),
     ]);
     server_state.set_tmux_override_for_test(tmux);
 
@@ -283,7 +284,7 @@ async fn release_worker_pane_still_reaps_a_tmux_hosted_worker() {
         runner
             .calls()
             .iter()
-            .any(|call| call.windows(2).any(|pair| pair == ["kill-session", "-t"])),
+            .any(|call| call.windows(2).any(|pair| pair == ["if-shell", "-F"])),
         "genuine termination must issue kill-session, got {:?}",
         runner.calls(),
     );

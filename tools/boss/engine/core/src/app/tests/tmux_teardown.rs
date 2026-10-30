@@ -122,6 +122,7 @@ async fn matched_token_signals_kills_and_clears_identity() {
         ok("0"),
         ok("BOSS_SPAWN_TOKEN=tok-match\n"),
         ok(""),
+        ok(""),
     ]);
     let outcome = server_state
         .reap_tmux_worker_with(&tmux, &execution_id, &identity)
@@ -158,9 +159,20 @@ async fn matched_token_signals_kills_and_clears_identity() {
             vec![
                 "-S",
                 boss_tmux::TEST_SOCKET_PATH,
-                "kill-session",
+                "detach-client",
+                "-s",
+                "=boss-1-example"
+            ],
+            vec![
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
+                "if-shell",
+                "-F",
                 "-t",
-                "boss-1-example"
+                "=boss-1-example:",
+                "#{==:#{session_attached_list},}",
+                "kill-session -t '=boss-1-example'",
+                "display-message -p boss-viewers-attached"
             ],
         ],
     );
@@ -209,6 +221,7 @@ async fn matched_token_persists_dead_pane_observation_and_logs_at_info() {
         ok("1"),
         ok("7"),
         ok("BOSS_SPAWN_TOKEN=tok-dead\n"),
+        ok(""),
         ok(""),
     ]);
 

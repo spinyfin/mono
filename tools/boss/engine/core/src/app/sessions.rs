@@ -153,7 +153,8 @@ pub(super) async fn attach_coordinator_to_registered_app(server_state: Arc<Serve
         .expect("coordinator installed-version cache mutex poisoned") = None;
     let program = match server_state.tmux_preflight.read() {
         Ok(guard) => match &*guard {
-            crate::tmux_preflight::TmuxPreflight::Ready { program, .. } => program.clone(),
+            crate::tmux_preflight::TmuxPreflight::Ready { program, .. }
+            | crate::tmux_preflight::TmuxPreflight::ReadyUnknown { program } => program.clone(),
             crate::tmux_preflight::TmuxPreflight::Unavailable { reason } => {
                 tracing::warn!(%reason, "coordinator tmux attach skipped: tmux preflight is unavailable");
                 return;
@@ -635,7 +636,8 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
     }
     let program = match server_state.tmux_preflight.read() {
         Ok(guard) => match &*guard {
-            crate::tmux_preflight::TmuxPreflight::Ready { program, .. } => program.clone(),
+            crate::tmux_preflight::TmuxPreflight::Ready { program, .. }
+            | crate::tmux_preflight::TmuxPreflight::ReadyUnknown { program } => program.clone(),
             crate::tmux_preflight::TmuxPreflight::Unavailable { reason } => {
                 send_response(
                     &sink,

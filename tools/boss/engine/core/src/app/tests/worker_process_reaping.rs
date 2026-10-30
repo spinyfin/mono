@@ -153,6 +153,7 @@ async fn release_worker_pane_still_reaps_a_tmux_session_for_a_dead_recorded_pid(
         ok("0"),
         ok("BOSS_SPAWN_TOKEN=tok-x\n"),
         ok(""),
+        ok(""),
     ]);
     server_state.set_tmux_override_for_test(tmux);
 
@@ -198,9 +199,20 @@ async fn release_worker_pane_still_reaps_a_tmux_session_for_a_dead_recorded_pid(
             vec![
                 "-S",
                 boss_tmux::TEST_SOCKET_PATH,
-                "kill-session",
+                "detach-client",
+                "-s",
+                "=boss-1-example"
+            ],
+            vec![
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
+                "if-shell",
+                "-F",
                 "-t",
-                "boss-1-example"
+                "=boss-1-example:",
+                "#{==:#{session_attached_list},}",
+                "kill-session -t '=boss-1-example'",
+                "display-message -p boss-viewers-attached"
             ],
         ],
         "the dead-pid reap path must issue show-environment, the pane-state probe, then kill-session",

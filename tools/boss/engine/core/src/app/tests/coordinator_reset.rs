@@ -583,7 +583,7 @@ async fn timeout_is_reported_on_the_original_request_without_blocking_the_handle
         panic!("expected replacement attachment");
     };
     assert_ne!(attach.spawn_token, TOKEN);
-    assert!(runner.position("kill-session").unwrap() < runner.position("new-session").unwrap());
+    assert!(runner.position("if-shell").unwrap() < runner.position("new-session").unwrap());
     assert!(
         runner.position("send-keys").is_none(),
         "the composer must stay untouched"
@@ -671,7 +671,7 @@ async fn handoff_write_through_the_handler_replaces_the_coordinator() {
     assert_eq!(attach.session_name, "boss-coordinator");
 
     // Old session killed, then the replacement created.
-    let kill = runner.position("kill-session").expect("the old session is killed");
+    let kill = runner.position("if-shell").expect("the old session is killed");
     let new = runner.position("new-session").expect("a replacement is created");
     assert!(
         kill < new,
@@ -1038,7 +1038,7 @@ async fn reset_delivery_failure_names_the_failing_step_and_reason() {
          no Claude inbox registration under coordinator pane process 4242. The coordinator session is still running."
     );
     assert!(
-        runner.position("kill-session").is_none(),
+        runner.position("if-shell").is_none(),
         "the session must be left running"
     );
     assert!(runner.position("new-session").is_none());

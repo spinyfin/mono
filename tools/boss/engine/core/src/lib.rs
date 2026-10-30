@@ -214,6 +214,7 @@ pub(crate) mod tmux_session_options;
 pub use boss_transcript_tail as transcript_tail;
 pub mod trace_rotation;
 pub use boss_engine_transient_error as transient_error;
+mod tmux_health;
 pub mod tmux_preflight;
 pub mod transcript_liveness;
 pub mod transient_recovery;

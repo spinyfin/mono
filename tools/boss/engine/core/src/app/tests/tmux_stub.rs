@@ -388,7 +388,7 @@ pub(super) fn install_teardown(server: &super::ServerState, execution_id: &str, 
             .unwrap()
     );
     let env = format!("BOSS_SPAWN_TOKEN={token}\n");
-    let (tmux, _) = fake_tmux([ok(&env), ok("0"), ok(&env), ok("")]);
+    let (tmux, _) = fake_tmux([ok(&env), ok("0"), ok(&env), ok(""), ok("")]);
     server.set_tmux_override_for_test(tmux);
 }
 

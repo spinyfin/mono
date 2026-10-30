@@ -58,6 +58,18 @@ pub async fn run_tmux_preflight(json: bool) -> Result<()> {
             }
             Ok(())
         }
+        boss_engine::tmux_preflight::TmuxPreflight::ReadyUnknown { program } => {
+            let warning = "tmux version is unknown; upgrade to 3.8 or newer to avoid the focus-event crash";
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "ready": true, "program": program, "version": null, "warning": warning })
+                );
+            } else {
+                println!("tmux ready: {} (unknown version). {warning}", program.display());
+            }
+            Ok(())
+        }
         boss_engine::tmux_preflight::TmuxPreflight::Unavailable { reason } => {
             if json {
                 println!("{}", serde_json::json!({ "ready": false, "reason": reason }));

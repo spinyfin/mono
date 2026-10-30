@@ -11,6 +11,21 @@ import XCTest
 @MainActor
 final class EngineHealthBannerTests: XCTestCase {
 
+    func testTmuxCrashWarningRendersEngineTextAndClearsAfterUpgrade() {
+        let model = makeModel()
+        let warning = EngineHealthIssue(
+            kind: "tmux_focus_out_crash", severity: "warning",
+            title: "tmux may crash every session — upgrade to 3.8 or newer",
+            body: "Installed tmux (tmux 3.6a) has a known crash that can kill every session at once. Upgrade with `brew upgrade tmux`."
+        )
+        model.applyEventForTest(.engineHealthResult(apiKeyPresent: true, issues: [warning]))
+        XCTAssertEqual(model.bannerHealthIssues, [warning])
+        XCTAssertEqual(EngineHealthBanner.headline(for: model.bannerHealthIssues), warning.title)
+        XCTAssertTrue(EngineHealthBanner.accessibilityLabel(for: model.bannerHealthIssues).contains(warning.body))
+        model.applyEventForTest(.engineHealthResult(apiKeyPresent: true, issues: []))
+        XCTAssertTrue(model.bannerHealthIssues.isEmpty)
+    }
+
     /// The healthy case: engine reports the key is present with no
     /// issues. The banner-driving array must end up empty and the
     /// presence bit must flip to `true`.
