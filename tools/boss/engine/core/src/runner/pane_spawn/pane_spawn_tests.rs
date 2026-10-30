@@ -857,10 +857,10 @@ async fn large_standard_row_spawns_sonnet_but_keeps_xhigh_and_the_addendum() {
 }
 
 /// A `small` investigation row gets the dedicated Fable/Astra tier while
-/// preserving the driver's default effort. The row's work-size estimate
-/// stays honest and does not imply a driver effort override.
+/// preserving the driver's effort mapping. The row's work-size estimate
+/// stays honest and selects medium effort independently of the model tier.
 #[tokio::test]
-async fn small_investigation_row_spawns_fable_at_default_effort() {
+async fn small_investigation_row_spawns_fable_with_mapped_effort() {
     let workspace = TempDir::new().unwrap();
     let chore_input = CreateChoreInput::builder()
         .product_id(String::new())
@@ -882,8 +882,8 @@ async fn small_investigation_row_spawns_fable_at_default_effort() {
         "small + investigation must spawn Fable, got: {script:?}",
     );
     assert!(
-        !script.contains("--effort "),
-        "the dedicated tier must preserve the driver's default effort, got: {script:?}",
+        script.contains("--effort medium"),
+        "the dedicated tier must preserve the driver's small-effort mapping, got: {script:?}",
     );
     assert!(
         script.contains("--permission-mode auto"),
