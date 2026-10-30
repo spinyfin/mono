@@ -330,6 +330,16 @@ network_enabled_rust_test(
     ),
 )
 
+# Public contracts live outside src/ so test edits do not invalidate engine_lib.
+rust_test(
+    name = "policy_contract_test",
+    size = "small",
+    srcs = ["tests/policy_contract.rs"],
+    edition = "2024",
+    visibility = ["//visibility:private"],
+    deps = [":engine_lib"],
+)
+
 rust_test(
     name = "work_crud_test",
     size = "small",
