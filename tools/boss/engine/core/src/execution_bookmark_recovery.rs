@@ -23,19 +23,22 @@ pub(crate) fn record_fresh_start(
     reason: &str,
     archives: &[(String, String)],
 ) -> Result<()> {
-    let retained = archives
+    let mut retained = archives
         .iter()
         .map(|(name, commit)| format!("`{name}` retains `{commit}`"))
         .collect::<Vec<_>>()
         .join("\n");
+    if retained.is_empty() {
+        retained = "No unpublished commits required an archive.".to_owned();
+    }
     db.create_attention_item(CreateAttentionItemInput {
-        execution_id: Some(prior.id.clone()),
-        work_item_id: None,
+        execution_id: None,
+        work_item_id: Some(db.owning_work_item_id(&prior.work_item_id)),
         kind: RECOVERY_RETIRED.to_owned(),
         status: Some("resolved".to_owned()),
-        title: "Preserved work archived; starting fresh".to_owned(),
+        title: "Recovery source retired; starting fresh".to_owned(),
         body_markdown: format!(
-            "Execution `{}` could not safely resume: {reason}\n\nIts preserved commits were archived before releasing the recovery pointers:\n{retained}\n\nExecution `{next_id}` starts fresh from the current PR head, or main when there is no PR. No action is required.",
+            "Execution `{}` could not safely resume: {reason}\n\nRecovery archive:\n{retained}\n\nExecution `{next_id}` starts fresh from the current PR head, main when there is no PR, or the captured immutable review target. No action is required.",
             prior.id
         ),
         resolved_at: Some(crate::work::now_string()),

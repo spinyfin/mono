@@ -1928,7 +1928,7 @@ pub mod workspace {
                                 }
                                 Kind::ReleaseHeads => {
                                     *phase = Phase::Effect;
-                                    json!(recovery::release_heads(&LocalJj, &record).await?)
+                                    json!(recovery::release_heads(&LocalJj, &record, true).await?)
                                 }
                                 _ => anyhow::bail!("unsupported workspace operation"),
                             };

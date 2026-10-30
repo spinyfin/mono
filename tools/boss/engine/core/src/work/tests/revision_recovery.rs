@@ -170,7 +170,7 @@ fn archived_revision_records_an_informational_note_without_blocking_the_chain() 
             .unwrap()
             .is_empty()
     );
-    let notes = db.list_attention_items(&execution.id).unwrap();
+    let notes = db.list_attention_items_for_work_item(&execution.work_item_id).unwrap();
     assert_eq!(notes.len(), 1);
     assert_eq!(notes[0].status, "resolved");
     assert!(notes[0].body_markdown.contains("preserved/exec_prior/abc"));

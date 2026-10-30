@@ -120,8 +120,12 @@ async fn checkout_of_predecessor_publication_cannot_hide_unpublished_work() {
             .unwrap()
             .is_none()
     );
-    for (_, commit) in before {
+    for (name, commit) in before {
         if let Some(commit) = commit {
+            if name == record.base() {
+                assert_eq!(record.base_commit.as_deref(), Some(commit.as_str()));
+                continue;
+            }
             let archive = format!("preserved/{}/{commit}", prior.id);
             assert_eq!(
                 JjRepo::run(&repo.repo, &["log", "--no-graph", "-r", &archive, "-T", "commit_id"]),
@@ -129,7 +133,10 @@ async fn checkout_of_predecessor_publication_cannot_hide_unpublished_work() {
             );
         }
     }
-    let notes = coordinator.work_db.list_attention_items(&prior.id).unwrap();
+    let notes = coordinator
+        .work_db
+        .list_attention_items_for_work_item(&prior.work_item_id)
+        .unwrap();
     assert_eq!(notes[0].status, "resolved");
     assert!(notes[0].body_markdown.contains("not contained"));
 }

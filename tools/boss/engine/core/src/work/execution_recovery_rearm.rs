@@ -234,6 +234,13 @@ mod tests {
         assert_eq!(state(&db, &human).0, "blocked");
         assert_eq!(state(&db, &deleted).0, "blocked");
         let executions = db.list_executions(Some(&recovery)).unwrap();
+        let later = insert_blocked(
+            &db,
+            &product,
+            "later failure",
+            "execution_recovery_failed",
+            "damaged pointers",
+        );
         drop(db);
         let db = WorkDb::open(path.clone()).unwrap();
         assert_eq!(
@@ -241,6 +248,7 @@ mod tests {
             executions.len(),
             "migration only runs once"
         );
+        assert_eq!(state(&db, &later).0, "blocked");
     }
 
     #[test]

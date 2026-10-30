@@ -86,7 +86,7 @@ pub(in crate::work) fn list_items_with_spawn_failures(
     let mut stmt = conn.prepare(
             "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at, converted_task_id
              FROM work_attention_items
-             WHERE work_item_id = ?1 OR (work_item_id IS NULL AND kind = 'pane_spawn_failed' AND (
+             WHERE work_item_id = ?1 OR (work_item_id IS NULL AND kind IN ('pane_spawn_failed', 'execution_bookmark_recovery_retired') AND (
                  SELECT COALESCE(s.root_task_id, e.work_item_id)
                  FROM work_executions e
                  LEFT JOIN pr_review_guide_source_comparisons c
