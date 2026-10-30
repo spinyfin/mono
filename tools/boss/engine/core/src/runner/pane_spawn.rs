@@ -22,7 +22,7 @@ use super::worker_spawn::{ComposedWorkerSpawn, WorkerSpawnOpts};
 use sol_spawn::prepare_worker_spawn;
 
 mod sol_spawn {
-    //! Apply durable experiment assignment at dispatch, after ordinary composition.
+    //! Apply durable automatic Sol selection for eligible work at dispatch, after ordinary composition.
     use super::super::worker_spawn::{ComposedWorkerSpawn, WorkerSpawnOpts, compose_worker_spawn};
     use crate::effort::{ModelResolutionSource, SpawnConfig};
     use crate::work::{WorkDb, WorkExecution, WorkItem};

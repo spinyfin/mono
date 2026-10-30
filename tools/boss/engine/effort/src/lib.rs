@@ -193,8 +193,8 @@ impl DriverResolutionSource {
 /// Provenance for the model half of a resolved spawn pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelResolutionSource {
-    /// Stored as `sol_experiment`; the string is kept for compatibility with
-    /// persisted values and the cost report.
+    /// Recorded as `sol_experiment` in dispatch events (`spawn_config.model_source`);
+    /// the string is kept so earlier and later events stay comparable.
     SolExperiment,
     TaskOverride,
     DesignInvestigationTier,

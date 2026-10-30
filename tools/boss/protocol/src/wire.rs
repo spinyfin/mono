@@ -832,7 +832,7 @@ pub enum FrontendRequest {
     GetCodexSolPercentage,
 
     /// Read-only: aggregate `conflict_diagnosis` for one product into a
-    /// hotspot report (`boss engine conflicts hotspots`, Layer 0 / T5):
+    /// hotspot report (`boss engine conflicts hotspots`):
     /// per-file frequency, per-file-pair co-conflict frequency, per-class
     /// counts. `top` caps each ranked list. Replies with
     /// [`FrontendEvent::ConflictHotspots`].
