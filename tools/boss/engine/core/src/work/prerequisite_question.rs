@@ -206,12 +206,14 @@ fn order_project_prerequisites(conn: &Connection, task: &Task, prerequisite: &Ta
             continue;
         };
         if member.project_id.as_ref() != Some(project_id)
-            || member.ordinal.is_none()
             || matches!(member.status, TaskStatus::Done | TaskStatus::Archived)
         {
             continue;
         }
-        stack.push((id.clone(), true));
+        // Revisions have no ordinal, but their prerequisites still need to move.
+        if member.ordinal.is_some() {
+            stack.push((id.clone(), true));
+        }
         for dependency in deps::prerequisites_of(conn, &id, Some(RELATION_BLOCKS))? {
             stack.push((dependency.prerequisite_id, false));
         }

@@ -16,61 +16,127 @@ fn finish(state: &ServerState, id: &str) {
 
 #[tokio::test]
 async fn reused_project_prerequisite_moves_its_dependency_closure() {
-    let (state, _dir, _, task_id) = parked_task_with_question(prerequisite_question_payload()).await;
-    let db = &state.work_db;
-    let product_id = question_task(&state, &task_id).product_id;
-    let project = db
-        .create_project(
-            CreateProjectInput::builder()
-                .product_id(&product_id)
-                .name("Dependency order")
-                .no_design_task(true)
-                .build(),
+    for revision_path in [None, Some(false), Some(true)] {
+        let (state, _dir, _, task_id) = parked_task_with_question(prerequisite_question_payload()).await;
+        let db = &state.work_db;
+        let product_id = question_task(&state, &task_id).product_id;
+        let project = db
+            .create_project(
+                CreateProjectInput::builder()
+                    .product_id(&product_id)
+                    .name("Dependency order")
+                    .no_design_task(true)
+                    .build(),
+            )
+            .unwrap();
+        db.update_work_item(
+            &task_id,
+            WorkItemPatch {
+                project_id: Some(project.id.clone()),
+                ..Default::default()
+            },
         )
         .unwrap();
-    db.update_work_item(
-        &task_id,
-        WorkItemPatch {
-            project_id: Some(project.id.clone()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let create = |name: &str| {
-        db.create_task(
-            CreateTaskInput::builder()
-                .product_id(&product_id)
-                .project_id(&project.id)
-                .name(name)
-                .build(),
-        )
-        .unwrap()
-    };
-    let upstream = create("Upstream repair");
-    let candidate = create(PREREQUISITE_NAME);
-    db.add_dependency(boss_protocol::AddDependencyInput {
-        dependent: candidate.id.clone(),
-        prerequisite: upstream.id.clone(),
-        relation: None,
-    })
-    .unwrap();
-    assert!(question_task(&state, &task_id).ordinal < upstream.ordinal);
-    assert!(upstream.ordinal < candidate.ordinal);
-    assert!(matches!(
-        answer_question(&state, &task_id, true).await,
-        FrontendEvent::WorkItemUpdated { .. }
-    ));
-    assert_eq!(prerequisites_of(&state, &task_id), vec![candidate.id.clone()]);
-    db.reconcile_product_executions(&product_id).unwrap();
-    assert_execution_status(&state, &upstream.id, ExecutionStatus::Ready);
-    assert_execution_status(&state, &candidate.id, ExecutionStatus::WaitingDependency);
-    assert_execution_status(&state, &task_id, ExecutionStatus::WaitingDependency);
-    finish(&state, &upstream.id);
-    db.reconcile_product_executions(&product_id).unwrap();
-    assert_execution_status(&state, &candidate.id, ExecutionStatus::Ready);
-    finish(&state, &candidate.id);
-    db.reconcile_product_executions(&product_id).unwrap();
-    assert_execution_status(&state, &task_id, ExecutionStatus::Ready);
+        let create = |name: &str| {
+            db.create_task(
+                CreateTaskInput::builder()
+                    .product_id(&product_id)
+                    .project_id(&project.id)
+                    .name(name)
+                    .build(),
+            )
+            .unwrap()
+        };
+        let upstream = create("Upstream repair");
+        let candidate = create(PREREQUISITE_NAME);
+        let revision = revision_path.map(|direct| {
+            let root = create("Revision chain root");
+            db.update_work_item(
+                &root.id,
+                WorkItemPatch {
+                    status: Some("in_review".into()),
+                    pr_url: Some("https://github.com/example/repo/pull/1".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let revision = db
+                .create_revision(
+                    boss_protocol::CreateRevisionInput::builder()
+                        .parent_task_id(root.id.as_str())
+                        .description("Repair the shared fixture")
+                        .build(),
+                    &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
+                )
+                .unwrap();
+            db.add_dependency(boss_protocol::AddDependencyInput {
+                dependent: revision.id.clone(),
+                prerequisite: upstream.id.clone(),
+                relation: None,
+            })
+            .unwrap();
+            assert!(revision.ordinal.is_none());
+            if direct {
+                for (id, name) in [(&candidate.id, "Later project work"), (&revision.id, PREREQUISITE_NAME)] {
+                    db.update_work_item(
+                        id,
+                        WorkItemPatch {
+                            name: Some(name.into()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                }
+            }
+            revision
+        });
+        db.add_dependency(boss_protocol::AddDependencyInput {
+            dependent: candidate.id.clone(),
+            prerequisite: if revision_path == Some(false) {
+                revision.as_ref().unwrap().id.clone()
+            } else {
+                upstream.id.clone()
+            },
+            relation: None,
+        })
+        .unwrap();
+        assert!(question_task(&state, &task_id).ordinal < upstream.ordinal);
+        assert!(upstream.ordinal < candidate.ordinal);
+        assert!(matches!(
+            answer_question(&state, &task_id, true).await,
+            FrontendEvent::WorkItemUpdated { .. }
+        ));
+        let reused_id = if revision_path == Some(true) {
+            &revision.as_ref().unwrap().id
+        } else {
+            &candidate.id
+        };
+        assert_eq!(prerequisites_of(&state, &task_id), vec![reused_id.clone()]);
+        assert!(question_task(&state, &upstream.id).ordinal < question_task(&state, &task_id).ordinal);
+        if revision_path != Some(true) {
+            assert!(question_task(&state, &upstream.id).ordinal < question_task(&state, &candidate.id).ordinal);
+        }
+        db.reconcile_product_executions(&product_id).unwrap();
+        assert_execution_status(&state, &upstream.id, ExecutionStatus::Ready);
+        if revision_path != Some(true) {
+            assert_execution_status(&state, &candidate.id, ExecutionStatus::WaitingDependency);
+        }
+        assert_execution_status(&state, &task_id, ExecutionStatus::WaitingDependency);
+        finish(&state, &upstream.id);
+        db.reconcile_product_executions(&product_id).unwrap();
+        if let Some(revision) = &revision {
+            assert!(question_task(&state, &revision.id).ordinal.is_none());
+            assert_execution_status(&state, &revision.id, ExecutionStatus::Ready);
+            finish(&state, &revision.id);
+            db.reconcile_product_executions(&product_id).unwrap();
+        }
+        if revision_path != Some(true) {
+            assert_execution_status(&state, &candidate.id, ExecutionStatus::Ready);
+            finish(&state, &candidate.id);
+        }
+        db.reconcile_product_executions(&product_id).unwrap();
+        assert_execution_status(&state, &task_id, ExecutionStatus::Ready);
+    }
 }
 
 #[tokio::test]
