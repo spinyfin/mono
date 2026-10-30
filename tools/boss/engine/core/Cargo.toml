@@ -3,6 +3,10 @@ name = "boss-engine"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Enables production-scale measurement tests (the Bazel `work_tree_scale_test` target).
+scale_measurements = []
+
 [dependencies]
 boss-board-projection = { path = "../board-projection" }
 boss-host-execution = { path = "../host-execution" }

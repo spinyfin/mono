@@ -849,11 +849,25 @@ impl CommandBranchVerifier {
 impl BranchVerifier for CommandBranchVerifier {
     async fn fetch_remote_head(&self, remote: &str, branch: &str) -> Result<String> {
         let reference = format!("refs/heads/{branch}");
-        let output = tokio::process::Command::new("git")
-            .args(["ls-remote", "--exit-code", "--refs", "--", remote, &reference])
-            .kill_on_drop(true)
-            .output()
-            .await?;
+        let remote = remote.to_owned();
+        let args_reference = reference.clone();
+        // Run in its own process group with prompts disabled: a credential or
+        // host-key prompt must fail fast, and a timeout must also reap the
+        // ssh / git-remote-https grandchildren, not just `git`.
+        let output = tokio::task::spawn_blocking(move || {
+            let mut command = std::process::Command::new("git");
+            command
+                .args(["ls-remote", "--exit-code", "--refs", "--", &remote, &args_reference])
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+                .stdin(std::process::Stdio::null());
+            boss_command_runner::output_blocking_timeout_in_group(
+                &mut command,
+                run_done_declaration::DECLARED_DELIVERY_NETWORK_BUDGET,
+                |_| {},
+            )
+        })
+        .await??;
         anyhow::ensure!(
             output.status.success(),
             "remote head lookup failed: {}",
