@@ -111,6 +111,23 @@ pub(super) fn approve_in_tx(
         }
     };
 
+    // Project dispatch follows ordinal order, including for reused tasks.
+    if let (Some(project_id), Some(dependent_ordinal), Some(prerequisite_ordinal)) =
+        (&task.project_id, task.ordinal, prerequisite.ordinal)
+        && prerequisite.project_id.as_ref() == Some(project_id)
+        && prerequisite_ordinal >= dependent_ordinal
+    {
+        conn.execute(
+            "UPDATE tasks SET ordinal = ordinal + 1, updated_at = ?4
+                 WHERE project_id = ?1 AND ordinal >= ?2 AND ordinal < ?3",
+            params![project_id, dependent_ordinal, prerequisite_ordinal, now],
+        )?;
+        conn.execute(
+            "UPDATE tasks SET ordinal = ?2, updated_at = ?3 WHERE id = ?1",
+            params![prerequisite.id, dependent_ordinal, now],
+        )?;
+    }
+
     // A same-name task parked in the backlog (autostart off) would never be
     // dispatched, leaving the dependent waiting with no signal.
     let schedulable = matches!(prerequisite.status, TaskStatus::Todo | TaskStatus::Blocked);

@@ -806,7 +806,7 @@ fn dismissing_a_followup_group_with_everything_rejected_writes_back_rejected() {
 }
 
 #[test]
-fn action_followup_chore_hint_preserves_project_membership() {
+fn action_followup_chore_hint_creates_standalone_chore() {
     let (db, product, project, task_id) = fixture();
     let mut input = followup(&task_id, "tidy the logs");
     input.proposed_work_kind = Some("chore".to_owned());
@@ -818,14 +818,54 @@ fn action_followup_chore_hint_preserves_project_membership() {
         .action_attention_group(&g.id, false, &Default::default(), &checker)
         .unwrap();
     let chore = read_task(&db, &actioned.produced_work_item_ids[0]);
-    assert_eq!(chore.kind, TaskKind::ProjectTask);
-    assert_eq!(chore.project_id.as_deref(), Some(project.as_str()));
+    assert_eq!(chore.kind, TaskKind::Chore);
+    assert!(chore.project_id.is_none());
     assert!(
         db.list_tasks(&product, Some(&project), None, false)
             .unwrap()
             .iter()
-            .any(|t| t.id == chore.id)
+            .all(|t| t.id != chore.id)
     );
+}
+
+#[test]
+fn action_followup_human_chore_override_matches_the_recorded_decision() {
+    let (db, _product, _project, task_id) = fixture();
+    let execution = create_ready_chore_execution(&db, task_id.clone());
+    let submitted = db.submit_worker_proposal(SubmitWorkerProposalInput {
+        execution_id: &execution.id,
+        work_item_id: &task_id,
+        kind: boss_protocol::ProposalKind::FollowupTask,
+        payload_json: r#"{"proposed_name":"tidy logs","proposed_description":"d","rationale":"r","proposed_work_kind":"task"}"#,
+        idempotency_key: "chore-override",
+    }).unwrap().unwrap();
+    let member = &submitted.staged_followup.as_ref().unwrap().0;
+    let group = db.answer_attention(&member.id, None, false, false).unwrap();
+    let overrides = std::collections::HashMap::from([(
+        member.id.clone(),
+        FollowupMemberOverride {
+            work_kind: Some("chore".into()),
+            ..Default::default()
+        },
+    )]);
+    let actioned = db
+        .action_attention_group(
+            &group.id,
+            false,
+            &overrides,
+            &FakePrStateChecker::always(PrOpenState::Open),
+        )
+        .unwrap();
+    let created = read_task(&db, &actioned.produced_work_item_ids[0]);
+    assert_eq!(created.kind, TaskKind::Chore);
+    assert!(created.project_id.is_none());
+    let proposal = db
+        .list_worker_proposals_for_work_item(&task_id, None, None)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.id == submitted.proposal.id)
+        .unwrap();
+    assert!(proposal.decision_reason.unwrap().contains("work_kind -> chore"));
 }
 
 #[test]

@@ -1,5 +1,6 @@
 // Prerequisite question answer and dependency redispatch regressions.
 use super::*;
+mod project;
 
 fn prerequisites_of(state: &ServerState, task_id: &str) -> Vec<String> {
     state

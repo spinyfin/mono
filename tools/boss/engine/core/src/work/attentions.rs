@@ -1112,9 +1112,9 @@ fn action_followup_group(
             None => origin.project_id.clone(),
         };
 
-        // Preserve project membership even when the proposal calls the work a
-        // chore. Actioning is an explicit human gesture, so allow duplicates.
-        let as_chore = project_id.is_none();
+        // Honor an explicit chore kind from the proposal or human override.
+        // Actioning is an explicit human gesture, so allow duplicates.
+        let as_chore = work_kind == Some("chore") || project_id.is_none();
 
         let created = if as_chore {
             insert_chore_in_tx(
