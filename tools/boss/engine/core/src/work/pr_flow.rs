@@ -169,7 +169,8 @@ impl WorkDb {
             WorkerPrCompletionTarget::InReview if task.status == TaskStatus::InReview => task.status.clone(),
             WorkerPrCompletionTarget::InReview => TaskStatus::InReview,
             WorkerPrCompletionTarget::Done => TaskStatus::Done,
-            // Hold the task in its current status while the automated reviewer runs.
+            // The revision has delivered its implementation; review now belongs to the PR.
+            WorkerPrCompletionTarget::PendingReview if task.kind == TaskKind::Revision => TaskStatus::InReview,
             WorkerPrCompletionTarget::PendingReview => task.status.clone(),
             // Halt in `blocked` pending operator sign-off.
             WorkerPrCompletionTarget::BlockedDeletionSignoff => TaskStatus::Blocked,

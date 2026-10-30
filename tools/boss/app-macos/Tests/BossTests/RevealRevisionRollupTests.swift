@@ -1,23 +1,11 @@
 import XCTest
 @testable import Boss
 
-/// Regression coverage for revealing revisions rolled up onto parent cards: a
-/// revision that has reached `in_review`/`done` never gets a standalone
-/// kanban card — it only ever surfaces as a rollup line on its PARENT's
-/// card (see `ContentView`'s `inReviewRevisions` computation). Revealing
-/// such a revision by its own id previously scrolled/highlighted an id
-/// that no rendered card carried, so nothing visibly happened — and the
-/// app-side IPC handler answered `Ok` regardless, so `bossctl reveal`
-/// never surfaced the failure.
-///
-/// `revealCardTarget(for:)` redirects a rolled-up revision's reveal to its
-/// parent's card, and reports `.unreachable` (with a reason) when there is
-/// truly nothing to show — so `revealWorkCard` lands on a real card and the
-/// `reveal_work_item` IPC handler can answer bossctl truthfully.
+/// Review revisions reveal themselves; completed revisions reveal the parent rollup.
 @MainActor
 final class RevealRevisionRollupTests: XCTestCase {
 
-    func testRevealOfInReviewRevisionRedirectsToBlockedParentCard() {
+    func testRevealOfInReviewRevisionTargetsItsOwnCard() {
         let model = makeModel()
         model.applyEventForTest(makeWorkTreeEvent(tasks: [
             makeTask(id: "task_parent", name: "Parent", status: "blocked", blockedReason: "dependency"),
@@ -30,20 +18,15 @@ final class RevealRevisionRollupTests: XCTestCase {
             ),
         ]))
 
-        // Precondition mirroring the reported bug: the parent is blocked for
-        // a non-review reason, so it renders in Backlog — not Review/Done —
-        // and the revision itself never gets a standalone card anywhere.
-        XCTAssertEqual(model.effectiveBoardColumn(for: model.task(withID: "task_parent")!), .backlog)
-
         let outcome = model.revealCardTarget(for: "task_revision")
-        XCTAssertEqual(outcome, .revealed(cardID: "task_parent"), "reveal must redirect to the parent's card")
+        XCTAssertEqual(outcome, .revealed(cardID: "task_revision"), "reveal must redirect to the revision card")
 
         model.revealWorkCard("task_revision", productID: "prod_test")
         XCTAssertNil(model.revealHighlightID, "do not flash before the card is visible")
-        XCTAssertEqual(model.revealScrollTarget, "task_parent", "scroll must target the parent's card")
-        model.confirmReveal(cardID: "task_parent", generation: model.revealGeneration)
-        XCTAssertEqual(model.revealHighlightID, "task_parent", "highlight must land on the parent's card")
-        XCTAssertEqual(model.selectedWorkCardID, "task_parent")
+        XCTAssertEqual(model.revealScrollTarget, "task_revision", "scroll must target the revision card")
+        model.confirmReveal(cardID: "task_revision", generation: model.revealGeneration)
+        XCTAssertEqual(model.revealHighlightID, "task_revision", "highlight must land on the revision card")
+        XCTAssertEqual(model.selectedWorkCardID, "task_revision")
     }
 
     func testRevealOfDoneRevisionRedirectsToParentRegardlessOfParentColumn() {
@@ -68,7 +51,7 @@ final class RevealRevisionRollupTests: XCTestCase {
             makeTask(
                 id: "task_revision",
                 name: "Revision",
-                status: "in_review",
+                status: "done",
                 kind: "revision",
                 parentTaskId: "task_missing_parent"
             ),

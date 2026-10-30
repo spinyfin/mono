@@ -325,19 +325,10 @@ extension ChatViewModel {
         var items = visibleWorkItems
             .filter { effectiveBoardColumn(for: $0) == column }
             .sorted(by: sort)
-        // Revisions don't appear as standalone cards in Review or Done — they
-        // roll up as single lines on the parent task's card in both lanes.
-        // They are still visible in Backlog/Doing as distinct cards. An
-        // `in_review` revision normally routes to Review, but one whose own
-        // PR is in the merge queue / Merge When Ready
-        // (`isInMergingSection`) routes to Done instead (`boardColumn`), so
-        // the Done-column filter excludes `in_review` revisions too, not
-        // just `done` ones.
-        if column == .review {
-            items = items.filter { !($0.kind == "revision" && $0.status == "in_review") }
-        }
+        // Completed revisions roll up under the parent. Revisions awaiting
+        // review or merge use the same standalone card as primary tasks.
         if column == .done {
-            items = items.filter { !($0.kind == "revision" && ($0.status == "done" || $0.status == "in_review")) }
+            items = items.filter { !($0.kind == "revision" && $0.status == "done") }
         }
         cachedItemsByColumn[column] = items
         return items

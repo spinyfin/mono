@@ -1082,6 +1082,7 @@ pub(crate) fn reconcile_revision_execution(
         return Ok(());
     }
     if revision_implementation_completed(conn, &task.id)? {
+        super::revision_review_card::reconcile_completed(pending, conn, &task.id)?;
         return Ok(());
     }
     match query_latest_execution_for_work_item(conn, &task.id)? {

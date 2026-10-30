@@ -1,20 +1,65 @@
 import XCTest
 @testable import Boss
 
-/// Covers revision-kind kanban routing rules:
-///
-/// - An `in_review` revision must NOT appear as a standalone card in the
-///   Review column (it rolls up under the parent's card instead).
-/// - An `in_review` revision DOES NOT appear in Backlog or Doing either
-///   (it has no standalone card anywhere in that status).
-/// - A revision that is `todo` or `active` appears in Backlog/Doing as a
-///   distinct card — NOT hidden.
-/// - `inReviewRevisions(forParentTaskID:)` returns the right revisions,
-///   ordered by `revisionSeq`.
-/// - `workTask(withID:)` resolves tasks from both project-task and chore
-///   buckets.
+/// Revisions in review share the primary task card and column.
 @MainActor
 final class RevisionKanbanTests: XCTestCase {
+
+    func testReviewRevisionSharesReviewWorkersAndPRActions() {
+        let model = makeModel()
+        let primary = makeParent(status: "in_review")
+        var revision = makeRevision(status: "in_review", seq: 1, parentID: primary.id)
+        revision.prURL = primary.prURL
+        model.tasksByProjectID = ["proj_1": [primary, revision]]
+        XCTAssertEqual(model.reviewOwner(for: revision).id, primary.id)
+        func worker(_ id: String, slot: Int, pr: String?, stage: String = "reviewers") -> WorkerLiveState {
+            WorkerLiveState(
+                slotId: slot, runId: id, model: "fixture", shellPid: 0, lastEventAt: nil,
+                currentTool: nil, lastToolEndedAt: nil, activity: .working, liveStatus: nil,
+                liveStatusAt: nil, recoveryStatus: nil, tmuxHosted: true,
+                reviewStage: stage, executionKind: "pr_review", workItemId: primary.id, prURL: pr
+            )
+        }
+        let states = [worker("second", slot: 26, pr: primary.prURL),
+                      worker("first", slot: 25, pr: primary.prURL),
+                      worker("other", slot: 27, pr: "https://github.com/other/repo/pull/1")]
+        for task in [primary, revision] {
+            XCTAssertEqual(WorkBoardSectionItemsView.reviewWorkers(for: task, states: states).map(\.runId), ["first", "second"])
+            let supervisor = worker("supervisor", slot: 28, pr: primary.prURL, stage: "consolidation")
+            XCTAssertEqual(WorkBoardSectionItemsView.reviewWorkers(for: task, states: [supervisor]).map(\.runId), ["supervisor"])
+            XCTAssertTrue(WorkBoardSectionItemsView.reviewWorkers(for: task, states: []).isEmpty)
+        }
+    }
+
+    func testReviewRevisionUsesPrimarySectionsAndIndicators() {
+        for section in ReviewSection.allCases {
+            let model = makeModel()
+            var parent = makeParent(status: "in_review")
+            parent.reviewSection = section
+            parent.ciRequiredState = section == .pending ? "in_progress" : "success"
+            parent.reviewRequiredState = "pending"
+            parent.aiReviewState = section == .aiReview ? "reviewing" : "reviewed_all_clear"
+            var revision = makeRevision(status: "in_review", seq: 1, parentID: parent.id)
+            revision.prURL = parent.prURL
+            revision.reviewSection = parent.reviewSection
+            revision.ciRequiredState = parent.ciRequiredState
+            revision.reviewRequiredState = parent.reviewRequiredState
+            revision.aiReviewState = parent.aiReviewState
+            model.tasksByProjectID = ["proj_1": [parent, revision]]
+            XCTAssertEqual(revision.boardColumn, parent.boardColumn)
+            let sections = ChatViewModel.reviewSections(items: model.workItems(in: .review))
+            XCTAssertEqual(sections.count, 1)
+            XCTAssertEqual(Set(sections[0].items.map(\.id)), Set([parent.id, revision.id]))
+            XCTAssertFalse(model.workItems(in: .doing).contains { $0.id == revision.id })
+            let context = WorkCardSnapshotContext(column: .review)
+            let primary = WorkCardSnapshot.build(task: parent, context: context)
+            let card = WorkCardSnapshot.build(task: revision, context: context)
+            XCTAssertEqual(card.aiReviewState, primary.aiReviewState)
+            XCTAssertEqual(card.ciRequiredState, primary.ciRequiredState)
+            XCTAssertEqual(card.reviewRequiredState, primary.reviewRequiredState)
+            XCTAssertEqual(card.isAIReviewing, primary.isAIReviewing)
+        }
+    }
 
     // MARK: boardColumn routing
 
@@ -36,7 +81,7 @@ final class RevisionKanbanTests: XCTestCase {
 
     // MARK: workItems(in:) suppression
 
-    func testInReviewRevisionSuppressedFromReviewColumn() {
+    func testInReviewRevisionVisibleInReviewColumn() {
         let model = makeModel()
         let parent = makeParent(status: "in_review")
         let revision = makeRevision(status: "in_review", seq: 1, parentID: parent.id)
@@ -47,9 +92,9 @@ final class RevisionKanbanTests: XCTestCase {
             reviewItems.contains(where: { $0.id == parent.id }),
             "parent must appear in Review"
         )
-        XCTAssertFalse(
+        XCTAssertTrue(
             reviewItems.contains(where: { $0.id == revision.id }),
-            "in_review revision must NOT appear as a standalone card in Review"
+            "in_review revision must appear as a standalone card in Review"
         )
     }
 
@@ -270,8 +315,8 @@ final class RevisionKanbanTests: XCTestCase {
         let reviewItems = model.workItems(in: .review)
         XCTAssertTrue(reviewItems.contains { $0.id == chore.id },
                       "parent chore must appear in Review")
-        XCTAssertFalse(reviewItems.contains { $0.id == revision.id },
-                       "in-review revision must not also appear as a standalone Review card")
+        XCTAssertTrue(reviewItems.contains { $0.id == revision.id },
+                       "in-review revision must appear as a standalone Review card")
     }
 
     func testWorkTaskWithIDFindsChoreParentedRevision() {

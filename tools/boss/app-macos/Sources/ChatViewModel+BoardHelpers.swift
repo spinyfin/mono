@@ -5,7 +5,7 @@ import Foundation
 enum RevealCardResult: Equatable {
     /// A host card resolves to this id — either the requested
     /// item's own card, or (for a revision rolled up into its parent
-    /// because it reached `in_review`/`done`) the parent's card. This is
+    /// because it reached `done`) the parent's card. This is
     /// resolution only, not evidence that a view scrolled successfully.
     case revealed(cardID: String)
     /// The id isn't loaded locally yet — the common cross-product case,
@@ -23,16 +23,18 @@ enum RevealCardResult: Equatable {
 extension ChatViewModel {
     // MARK: Revisions
 
-    /// Resolves the reveal target for `taskID`. Tasks, chores, projects, and
-    /// products always host their own card. A revision that has reached
-    /// `in_review` or `done` never gets a standalone card — `workItems(in:)`
-    /// filters it out of the Review/Done columns, and it never had one in
-    /// Backlog/Doing since its own status already moved it past those — it
-    /// only ever surfaces as a rollup line on its PARENT's card (see the
-    /// `inReviewRevisions` computation in `ContentView`). So the reveal
-    /// target for such a revision is its parent's card, wherever that
-    /// parent's own status happens to place it (Backlog included — a parent
-    /// blocked for a non-review reason still renders there).
+    /// PR actions on a revision use the same owner as the engine's review projection.
+    func reviewOwner(for task: WorkTask) -> WorkTask {
+        var owner = task
+        var visited: Set<String> = []
+        while owner.kind == "revision", visited.insert(owner.id).inserted,
+              let parentID = owner.parentTaskId, let parent = workTask(withID: parentID) {
+            owner = parent
+        }
+        return owner
+    }
+
+    /// Review revisions host their own card; completed revisions reveal the parent rollup.
     func revealCardTarget(for taskID: String) -> RevealCardResult {
         guard let item = task(withID: taskID) else {
             return .deferred
@@ -40,7 +42,7 @@ extension ChatViewModel {
         guard item.deletedAt == nil else {
             return .unreachable(reason: "\(revealLabel(for: item)) is deleted")
         }
-        guard item.kind == "revision", item.status == "in_review" || item.status == "done" else {
+        guard item.kind == "revision", item.status == "done" else {
             return .revealed(cardID: item.id)
         }
         guard let parentID = item.parentTaskId, let parent = task(withID: parentID) else {

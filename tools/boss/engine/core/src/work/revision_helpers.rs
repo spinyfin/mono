@@ -545,9 +545,8 @@ pub(crate) fn attach_ready_for_review_flag(tasks: &mut [Task], chores: &mut [Tas
 /// revision derives `ai_reviewing = false` / `ai_review_state = None` even
 /// while the root has reviewer workers actively running against it.
 ///
-/// A revision not currently `active` (`todo`, or already `in_review`/`done`,
-/// which roll up into the parent's card — see `revision-tasks.md`) has no
-/// entry. A broken chain fails closed to own-id attribution.
+/// Active and in-review revisions share the cycle root's live reviewers.
+/// Other revision states have no entry. A broken chain uses own-id attribution.
 fn review_execution_target_ids(
     conn: &Connection,
     tasks: &[Task],
@@ -573,7 +572,7 @@ fn review_execution_target_ids_with(
         .chain(chores.iter())
         .filter_map(|row| {
             let targets = if row.kind == TaskKind::Revision {
-                if row.status != TaskStatus::Active {
+                if !matches!(row.status, TaskStatus::Active | TaskStatus::InReview) {
                     return None;
                 }
                 // Same answer `chain_root` gives for a chain that is wholly
@@ -1519,6 +1518,7 @@ pub(crate) fn attach_task_derived_projections_traced(
             "attach_task_derived_projections: review_guide_state failed; ignoring"
         );
     }
+    super::revision_review_card::attach(&mut tasks, &chores);
     if let Some(projected) = tasks.iter().chain(chores.iter()).find(|t| t.id == task.id) {
         copy_derived_projection_fields(task, projected);
     }
@@ -1526,6 +1526,9 @@ pub(crate) fn attach_task_derived_projections_traced(
 }
 
 fn copy_derived_projection_fields(dst: &mut Task, src: &Task) {
+    if dst.kind == TaskKind::Revision && dst.status == TaskStatus::InReview {
+        super::revision_review_card::copy_review_fields(dst, src);
+    }
     dst.revision_seq = src.revision_seq;
     dst.revision_parent_pr_url = src.revision_parent_pr_url.clone();
     dst.has_in_progress_revision = src.has_in_progress_revision;
@@ -1534,6 +1537,7 @@ fn copy_derived_projection_fields(dst: &mut Task, src: &Task) {
     dst.ai_reviewing = src.ai_reviewing;
     dst.ai_review_stage = src.ai_review_stage.clone();
     dst.ai_review_state = src.ai_review_state.clone();
+    dst.ai_review_badge = src.ai_review_badge.clone();
     dst.ai_review_findings_revision_id = src.ai_review_findings_revision_id.clone();
     dst.ready_for_review = src.ready_for_review;
     dst.review_section = src.review_section;

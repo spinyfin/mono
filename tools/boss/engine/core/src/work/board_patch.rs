@@ -187,6 +187,7 @@ pub(super) fn attach_board_derivations(
         (resolved, queries)
     };
     trace.record_nplus1(segment::DB_DOC_POINTERS, elapsed_ms(t), resolved, doc_pointer_queries);
+    super::revision_review_card::attach(&mut tasks, chores);
     tasks
 }
 
