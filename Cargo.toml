@@ -74,6 +74,7 @@ members = [
   "tools/boss/spoke-credentials",
   "tools/boss/engine/ssh-transport",
   "tools/boss/engine/stdout-progress",
+  "tools/boss/engine/storage-values",
   "tools/boss/engine/structured-output",
   "tools/boss/engine/test-git",
   "tools/boss/engine/task-scope",

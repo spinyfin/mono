@@ -1,0 +1,12 @@
+[package]
+name = "boss-engine-storage-values"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+bon = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }

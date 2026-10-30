@@ -7,10 +7,8 @@
 use super::run_rows::resolve_run_id_for_execution_hooks;
 use super::*;
 
-use crate::semantic_progress::{
-    SemanticProgressCheckpoint, SemanticToolCondition, SemanticTurnCondition, tool_condition_signal,
-    turn_condition_signal,
-};
+use crate::semantic_progress::{tool_condition_signal, turn_condition_signal};
+use boss_engine_storage_values::{SemanticProgressCheckpoint, SemanticToolCondition, SemanticTurnCondition};
 use boss_protocol::WorkerEvent;
 
 #[work_db_boundary::instrument]
