@@ -444,3 +444,95 @@ async fn blocked_chore_and_project_task_with_satisfied_prerequisite_dispatch() {
         assert!(!executions[0].status.is_terminal());
     }
 }
+
+/// A delivered hold is reordered in its displayed lane, including while its
+/// owner is blocked; neither a drop nor its reply may lift the durable hold.
+#[tokio::test]
+async fn held_review_revision_reorder_preserves_hold_and_blocked_reply() {
+    let (state, _dir) = test_server_state_with_fakes();
+    let db = &state.work_db;
+    let product = create_test_product_with_repo(db, "HeldReview", Some("https://github.com/example/repo"));
+    let root = create_test_chore_manual(db, &product.id, "Review owner");
+    let pr = "https://github.com/example/repo/pull/1";
+    db.update_work_item(
+        &root.id,
+        WorkItemPatch::builder().status("in_review").pr_url(pr).build(),
+    )
+    .unwrap();
+    let revision = create_manual_revision(&state, &root.id, "Delivered revision");
+    let execution = db
+        .create_execution(
+            boss_protocol::CreateExecutionInput::builder()
+                .work_item_id(&revision.id)
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(boss_protocol::ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.start_execution_run(
+        &execution.id,
+        "held-review-run",
+        "repo",
+        "lease",
+        "workspace",
+        "/tmp/held-review",
+    )
+    .unwrap();
+    db.record_worker_pr_completion(
+        &execution.id,
+        pr,
+        None,
+        None,
+        crate::work::WorkerPrCompletionTarget::PendingReview,
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    for blocked in [false, true] {
+        if blocked {
+            db.update_work_item(
+                &root.id,
+                WorkItemPatch::builder()
+                    .status("blocked")
+                    .blocked_reason("merge_conflict")
+                    .blocked_detail("conflicts in a.rs")
+                    .build(),
+            )
+            .unwrap();
+        }
+        let sink = make_session_sink();
+        handle_move_work_item_on_board(
+            dispatch(&state, &sink, "held-reorder"),
+            FrontendRequest::MoveWorkItemOnBoard {
+                id: revision.id.clone(),
+                target: BoardDropTarget::new(BoardColumn::Review, None),
+                bypass_dispatch_pause: false,
+                observed_pause_since_epoch_s: None,
+            },
+        )
+        .await;
+        let FrontendEvent::WorkItemUpdated {
+            item: WorkItem::Task(card),
+        } = sole_response(&sink).await
+        else {
+            panic!("expected projected revision reply")
+        };
+        assert_eq!(
+            card.status,
+            if blocked {
+                TaskStatus::Blocked
+            } else {
+                TaskStatus::InReview
+            }
+        );
+        assert_eq!(
+            card.blocked_reason.as_deref(),
+            if blocked { Some("merge_conflict") } else { None }
+        );
+        assert_eq!(
+            card.blocked_detail.as_deref(),
+            if blocked { Some("conflicts in a.rs") } else { None }
+        );
+        assert_eq!(task_row(&state, &revision.id).status, TaskStatus::Active);
+    }
+}

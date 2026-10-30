@@ -73,7 +73,7 @@ struct WorkCardSnapshotContext: Equatable {
     var designDocPresentation: ProjectDesignDocAffordancePresentation? = nil
     var externalRefLink: ExternalRefLinkPresentation? = nil
     var ambiguousRepoNames: Set<String> = []
-    var inReviewRevisions: [WorkCardRevisionRollup] = []
+    var doneRevisions: [WorkCardRevisionRollup] = []
     var parentShortID: Int? = nil
     var deferredScopeItems: [DeferredScopeAttention] = []
     var deferredScopeActionInFlightIDs: Set<String> = []
@@ -158,7 +158,7 @@ struct WorkCardSnapshot: Equatable {
     /// once the card leaves Review.
     let reviewGuidePresentation: ReviewGuideCardPresentation?
     let ambiguousRepoNames: Set<String>
-    let inReviewRevisions: [WorkCardRevisionRollup]
+    let doneRevisions: [WorkCardRevisionRollup]
     let parentShortID: Int?
     let terminalTooltip: String
     let deferredScopeItems: [DeferredScopeAttention]
@@ -228,7 +228,7 @@ struct WorkCardSnapshot: Equatable {
     let hasRevisionParentPRRow: Bool
     /// Standalone trailing short-id row when there is no PR URL.
     let hasStandaloneShortID: Bool
-    let hasInReviewRevisions: Bool
+    let hasDoneRevisions: Bool
     /// Orange blocked chrome (background + border) when not remediating.
     let showsBlockedChrome: Bool
 
@@ -418,7 +418,7 @@ struct WorkCardSnapshot: Equatable {
             externalRefLink: context.externalRefLink,
             reviewGuidePresentation: reviewGuidePresentation,
             ambiguousRepoNames: context.ambiguousRepoNames,
-            inReviewRevisions: context.inReviewRevisions,
+            doneRevisions: context.doneRevisions,
             parentShortID: context.parentShortID,
             terminalTooltip: context.terminalTooltip,
             deferredScopeItems: context.deferredScopeItems,
@@ -470,7 +470,7 @@ struct WorkCardSnapshot: Equatable {
             hasReviewRow: task.prURL != nil && reviewRequiredState != nil,
             hasRevisionParentPRRow: hasRevisionParentPRRow,
             hasStandaloneShortID: !prURLNonEmpty && task.shortID != nil,
-            hasInReviewRevisions: !context.inReviewRevisions.isEmpty,
+            hasDoneRevisions: !context.doneRevisions.isEmpty,
             showsBlockedChrome: !isResolvingConflicts
                 && !isRemediatingCI
                 && task.status == "blocked"

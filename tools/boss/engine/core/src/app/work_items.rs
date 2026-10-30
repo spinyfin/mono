@@ -99,7 +99,12 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
                 changed,
             )
             .await;
-            send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
+            match work_db.project_work_item_for_display(item) {
+                Ok(item) => {
+                    send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item })
+                }
+                Err(err) => send_work_error(&sink, &request_id, &err),
+            }
         }
         Err(err) => match err.downcast_ref::<boss_protocol::OperatorQuestionError>() {
             Some(error) => send_response(
@@ -226,10 +231,11 @@ pub(super) async fn handle_get_work_item(ctx: Dispatch, req: FrontendRequest) {
         // Shared choke point: bare long ids, T/P/#/bare short ids, and
         // product-scoped slug/n. Short ids are per-product (not globally
         // unique) — ambiguity is a hard error listing every candidate.
-        let result = server_state
-            .resolve_work_item_id(&id)
-            .await
-            .and_then(|primary| work_db.get_work_item(&primary).map_err(|err| anyhow::anyhow!("{err}")));
+        let result = server_state.resolve_work_item_id(&id).await.and_then(|primary| {
+            work_db
+                .get_work_item_for_display(&primary)
+                .map_err(|err| anyhow::anyhow!("{err}"))
+        });
         match result {
             Ok(item) => {
                 send_response_with_revision(
@@ -586,7 +592,7 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
                 ?reason,
                 "board drop is a reorder; leaving status unchanged",
             );
-            match ctx.work_db.get_work_item(&id) {
+            match ctx.work_db.get_work_item_for_display(&id) {
                 Ok(item) => send_response_with_revision(
                     &ctx.sink,
                     &ctx.request_id,
@@ -645,7 +651,7 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
 /// have no board position — they are not cards — so a drop naming one is an
 /// error rather than a silently ignored no-op.
 fn board_row_for_id(work_db: &WorkDb, id: &str) -> Result<BoardRow> {
-    match work_db.get_work_item(id)? {
+    match work_db.get_work_item_for_display(id)? {
         WorkItem::Task(task) | WorkItem::Chore(task) => Ok(BoardRow {
             status: task.status,
             autostart: task.autostart,
@@ -1197,7 +1203,15 @@ pub(super) async fn apply_work_item_patch(
                     // "dragged it and nothing happened" shape.
                     send_work_error(&sink, &request_id, reason);
                 } else {
-                    send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
+                    match work_db.project_work_item_for_display(item) {
+                        Ok(item) => send_response_with_revision(
+                            &sink,
+                            &request_id,
+                            revision,
+                            FrontendEvent::WorkItemUpdated { item },
+                        ),
+                        Err(err) => send_work_error(&sink, &request_id, &err),
+                    }
                 }
             }
             Err(err) => {
@@ -1642,7 +1656,12 @@ pub(super) async fn handle_set_task_doc_pointer(ctx: Dispatch, req: FrontendRequ
                 vec![work_item_id(&item)],
             )
             .await;
-            send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
+            match work_db.project_work_item_for_display(item) {
+                Ok(item) => {
+                    send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item })
+                }
+                Err(err) => send_work_error(&sink, &request_id, &err),
+            }
         }
         Err(err) => send_work_error(&sink, &request_id, &err),
     }

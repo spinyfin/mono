@@ -34,11 +34,29 @@ struct WorkBoardSectionItemsView: View {
     /// per section instead of invalidating every mounted card.
     @ObservedObject var liveStates: LiveWorkerStateStore
 
-    static func reviewWorkers(for task: WorkTask, states: [WorkerLiveState]) -> [WorkerLiveState] {
-        guard let prURL = task.prURL, !prURL.isEmpty else { return [] }
-        return states.filter {
-            $0.executionKind == "pr_review" && $0.prURL.map { sameGitHubPR($0, prURL) } == true
-        }.sorted { $0.slotId < $1.slotId }
+    enum ReviewPRIdentity: Hashable {
+        case github(org: String, repo: String, number: String)
+        case other(String)
+    }
+
+    static func reviewWorkers(for task: WorkTask, index: [ReviewPRIdentity: [WorkerLiveState]]) -> [WorkerLiveState] {
+        guard let url = task.prURL, !url.isEmpty else { return [] }
+        return index[reviewerKey(url)] ?? []
+    }
+
+    static func reviewerKey(_ url: String) -> ReviewPRIdentity {
+        guard let pr = parseGitHubPRURL(url) else { return .other(url) }
+        return .github(org: pr.org.lowercased(), repo: pr.repo.lowercased(), number: pr.number)
+    }
+
+    static func reviewerIndex(states: [WorkerLiveState]) -> [ReviewPRIdentity: [WorkerLiveState]] {
+        var index: [ReviewPRIdentity: [WorkerLiveState]] = [:]
+        for state in states where state.executionKind == "pr_review" {
+            guard let url = state.prURL, !url.isEmpty else { continue }
+            index[reviewerKey(url), default: []].append(state)
+        }
+        for key in index.keys { index[key]?.sort { $0.slotId < $1.slotId } }
+        return index
     }
 
     var body: some View {
@@ -49,7 +67,7 @@ struct WorkBoardSectionItemsView: View {
         let dragRefusal = model.dragRefusalNotice
         let mergeFeedback = model.mergeFeedbackNotice
         // One PR-URL -> reviewers index per section render, looked up per card.
-        let reviewerStates = column == .review ? Array(liveStates.byRunID.values) : []
+        let reviewersByPR = Self.reviewerIndex(states: column == .review ? Array(liveStates.byRunID.values) : [])
         // Lazy so off-screen cards aren't instantiated/hit-tested at all — with
         // the default (ungrouped) board layout each column is a single section,
         // so this was the actual eagerly-built list of every card in the
@@ -87,7 +105,7 @@ struct WorkBoardSectionItemsView: View {
                     column: column,
                     snapshot: snapshot,
                     reviewers: column == .review
-                        ? Self.reviewWorkers(for: task, states: reviewerStates) : [],
+                        ? Self.reviewWorkers(for: task, index: reviewersByPR) : [],
                     model: model,
                     revisionHighlight: model.revisionHighlightState(for: task.id),
                     isRevealed: highlightID == task.id,
@@ -328,12 +346,7 @@ struct WorkBoardCardItem: View {
             }
 
             ForEach(reviewers, id: \.runId) { reviewer in
-                Button { model.focusAgentFromWorkCard(reviewer.runId) } label: {
-                    Label("\(reviewer.displayName) — \(reviewer.badgeLabel)", systemImage: "person.crop.circle")
-                }
-                .buttonStyle(.plain)
-                .font(.caption)
-                .help("Show live review worker")
+                ReviewWorkerLink(reviewer: reviewer, model: model)
             }
 
             if let mergeFeedbackMessage {
@@ -400,6 +413,25 @@ struct WorkBoardCardItem: View {
             skipReason=\(skipReason, privacy: .public)
             """
         )
+    }
+}
+
+/// Shared reviewer presentation and run routing for primary and revision cards.
+struct ReviewWorkerLink: View {
+    let reviewer: WorkerLiveState
+    let model: ChatViewModel
+    var title: String { "\(reviewer.displayName) — \(reviewer.badgeLabel)" }
+    let tooltip = "Show live review worker"
+
+    func activate() { model.focusAgentFromWorkCard(reviewer.runId) }
+
+    var body: some View {
+        Button(action: activate) {
+            Label(title, systemImage: "person.crop.circle")
+        }
+        .buttonStyle(.plain)
+        .font(.caption)
+        .help(tooltip)
     }
 }
 

@@ -20,7 +20,7 @@ final class WorkCacheInvalidationTests: XCTestCase {
 
         XCTAssertNotNil(model.taskIndexByID)
         XCTAssertNotNil(model.cachedDependencyPrereqs)
-        XCTAssertNotNil(model.cachedInReviewRevisionsByParentID)
+        XCTAssertNotNil(model.cachedDoneRevisionsByParentID)
 
         let moved = makeTask(id: "task_x", projectID: "proj_b", status: task.status)
         model.applyEventForTest(.workItemUpdated(item: .task(moved)))
@@ -101,18 +101,18 @@ final class WorkCacheInvalidationTests: XCTestCase {
             id: "rev_1",
             projectID: "proj_a",
             kind: "revision",
-            status: "in_review"
+            status: "done"
         )
         revision.parentTaskId = "task_x"
         revision.revisionSeq = 1
         seedWorkTree(model, tasks: [task, revision])
 
         _ = model.task(withID: "task_x")
-        _ = model.inReviewRevisions(forParentTaskID: "task_x")
+        _ = model.doneRevisions(forParentTaskID: "task_x")
         _ = model.dependencyPrereqsByTaskID
         XCTAssertNotNil(model.taskIndexByID)
-        XCTAssertNotNil(model.cachedInReviewRevisionsByParentID)
-        let revisionCacheBefore = model.cachedInReviewRevisionsByParentID
+        XCTAssertNotNil(model.cachedDoneRevisionsByParentID)
+        let revisionCacheBefore = model.cachedDoneRevisionsByParentID
 
         let activated = makeTask(id: "task_x", projectID: "proj_a", status: "active")
         model.applyEventForTest(.workItemUpdated(item: .task(activated)))
@@ -127,11 +127,11 @@ final class WorkCacheInvalidationTests: XCTestCase {
 
         // Non-revision status flip does not touch revision rows.
         XCTAssertNotNil(
-            model.cachedInReviewRevisionsByParentID,
+            model.cachedDoneRevisionsByParentID,
             "revision cache must survive a non-revision same-bucket update"
         )
         XCTAssertEqual(
-            model.cachedInReviewRevisionsByParentID?["task_x"]?.map(\.id),
+            model.cachedDoneRevisionsByParentID?["task_x"]?.map(\.id),
             revisionCacheBefore?["task_x"]?.map(\.id)
         )
 
@@ -151,7 +151,7 @@ final class WorkCacheInvalidationTests: XCTestCase {
             id: "rev_1",
             projectID: "proj_a",
             kind: "revision",
-            status: "in_review"
+            status: "done"
         )
         revision.parentTaskId = "task_a"
         revision.revisionSeq = 1
@@ -165,9 +165,9 @@ final class WorkCacheInvalidationTests: XCTestCase {
         _ = model.task(withID: "task_a")
         _ = model.dependencyPrereqsByTaskID
         _ = model.gatingPrereqsByTaskID
-        _ = model.inReviewRevisions(forParentTaskID: "task_a")
+        _ = model.doneRevisions(forParentTaskID: "task_a")
         XCTAssertNotNil(model.cachedDependencyPrereqs)
-        XCTAssertNotNil(model.cachedInReviewRevisionsByParentID)
+        XCTAssertNotNil(model.cachedDoneRevisionsByParentID)
         XCTAssertEqual(
             model.dependencyPrereqs(for: "task_b").first?.title,
             "Task task_a"
@@ -199,7 +199,7 @@ final class WorkCacheInvalidationTests: XCTestCase {
         )
         // Non-revision name flip must not discard revision rollups.
         XCTAssertNotNil(
-            model.cachedInReviewRevisionsByParentID,
+            model.cachedDoneRevisionsByParentID,
             "non-revision name change must leave revision caches intact"
         )
         XCTAssertTrue(
@@ -215,7 +215,7 @@ final class WorkCacheInvalidationTests: XCTestCase {
             id: "rev_1",
             projectID: "proj_a",
             kind: "revision",
-            status: "in_review"
+            status: "done"
         )
         revision.parentTaskId = "task_x"
         revision.revisionSeq = 1
@@ -223,9 +223,9 @@ final class WorkCacheInvalidationTests: XCTestCase {
         seedWorkTree(model, tasks: [parent, revision])
 
         _ = model.task(withID: "rev_1")
-        let warmed = model.inReviewRevisions(forParentTaskID: "task_x")
+        let warmed = model.doneRevisions(forParentTaskID: "task_x")
         XCTAssertEqual(warmed.map(\.name), ["Old revision title"])
-        XCTAssertNotNil(model.cachedInReviewRevisionsByParentID)
+        XCTAssertNotNil(model.cachedDoneRevisionsByParentID)
 
         var renamed = revision
         renamed.name = "New revision title"
@@ -237,19 +237,15 @@ final class WorkCacheInvalidationTests: XCTestCase {
         )
         XCTAssertEqual(model.taskIndexByID?["rev_1"]?.name, "New revision title")
         XCTAssertNil(
-            model.cachedInReviewRevisionsByParentID,
+            model.cachedDoneRevisionsByParentID,
             "revision display-field change must drop the revision rollup caches"
         )
-        XCTAssertNil(
-            model.cachedDoneRevisionsByParentID,
-            "revision display-field change must drop both in-review and done caches"
-        )
         XCTAssertEqual(
-            model.inReviewRevisions(forParentTaskID: "task_x").map(\.name),
+            model.doneRevisions(forParentTaskID: "task_x").map(\.name),
             ["New revision title"]
         )
         XCTAssertEqual(
-            model.inReviewRevisions(forParentTaskID: "task_x").map(\.id),
+            model.doneRevisions(forParentTaskID: "task_x").map(\.id),
             ["rev_1"]
         )
     }
@@ -268,9 +264,9 @@ final class WorkCacheInvalidationTests: XCTestCase {
         seedWorkTree(model, tasks: [parent, revision])
 
         _ = model.task(withID: "rev_1")
-        _ = model.inReviewRevisions(forParentTaskID: "task_x")
+        _ = model.doneRevisions(forParentTaskID: "task_x")
         _ = model.dependencyPrereqsByTaskID
-        XCTAssertNotNil(model.cachedInReviewRevisionsByParentID)
+        XCTAssertNotNil(model.cachedDoneRevisionsByParentID)
         XCTAssertNotNil(model.cachedDependencyPrereqs)
 
         var done = revision
@@ -282,7 +278,7 @@ final class WorkCacheInvalidationTests: XCTestCase {
             "same-bucket revision status flip still patches the id index"
         )
         XCTAssertNil(
-            model.cachedInReviewRevisionsByParentID,
+            model.cachedDoneRevisionsByParentID,
             "revision row change must drop the revision rollup caches"
         )
         XCTAssertNil(
@@ -394,14 +390,6 @@ final class WorkCacheInvalidationTests: XCTestCase {
         XCTAssertNil(model.taskIndexByID, "\(context): taskIndexByID must be nil")
         XCTAssertNil(model.cachedDependencyPrereqs, "\(context): dependency cache must be nil")
         XCTAssertNil(model.cachedGatingPrereqs, "\(context): gating cache must be nil")
-        XCTAssertNil(
-            model.cachedInReviewRevisionsByParentID,
-            "\(context): in-review revision cache must be nil"
-        )
-        XCTAssertNil(
-            model.cachedDoneRevisionsByParentID,
-            "\(context): done revision cache must be nil"
-        )
         XCTAssertTrue(
             model.cachedItemsByColumn.isEmpty,
             "\(context): per-column item cache must be empty"
@@ -420,7 +408,6 @@ final class WorkCacheInvalidationTests: XCTestCase {
         _ = model.task(withID: parentIDForRevisions)
         _ = model.dependencyPrereqsByTaskID
         _ = model.gatingPrereqsByTaskID
-        _ = model.inReviewRevisions(forParentTaskID: parentIDForRevisions)
         _ = model.doneRevisions(forParentTaskID: parentIDForRevisions)
         _ = model.workItems(in: .backlog)
         _ = model.workSections(in: .backlog)

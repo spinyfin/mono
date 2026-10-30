@@ -38,6 +38,10 @@ fn assert_cards(db: &WorkDb, product: &str, root: &str, revision: &str, section:
     let tree = db.get_work_tree(product).unwrap();
     let primary = tree.chores.iter().find(|t| t.id == root).unwrap();
     let card = tree.tasks.iter().find(|t| t.id == revision).unwrap();
+    assert!(
+        !primary.has_in_progress_revision,
+        "delivered implementation is waiting on review"
+    );
     assert_eq!(card.status, primary.status, "revision card mirrors the owner's status");
     assert!(matches!(card.status, TaskStatus::InReview | TaskStatus::Blocked));
     assert_eq!(card.blocked_reason, primary.blocked_reason);
@@ -52,6 +56,13 @@ fn assert_cards(db: &WorkDb, product: &str, root: &str, revision: &str, section:
     assert_eq!(card.ai_review_stage, primary.ai_review_stage);
     assert_eq!(card.ai_review_state, primary.ai_review_state);
     assert_eq!(card.ai_review_badge, primary.ai_review_badge);
+    let WorkItem::Task(single) = db.get_work_item_for_display(revision).unwrap() else {
+        panic!("expected revision")
+    };
+    assert_eq!(single.status, card.status);
+    assert_eq!(single.blocked_reason, card.blocked_reason);
+    assert_eq!(single.blocked_detail, card.blocked_detail);
+    assert_eq!(single.review_section, card.review_section);
     let patch = db.get_work_runtime_patch(product, &[revision.to_owned()]).unwrap();
     let patched = patch
         .items
@@ -85,9 +96,8 @@ fn completed_revision_shares_primary_review_ci_and_ready_presentation() {
         .unwrap();
     db.start_execution_run(&review.id, "reviewer", "repo", "lease", "workspace", "/tmp/review-card")
         .unwrap();
-    // While the revision's own review is pending it still counts as in
-    // progress for the owner, and the card follows the owner.
-    assert_cards(&db, &product, &root, &revision, ReviewSection::InRevision);
+    // Delivered implementation waits on AI review on both cards.
+    assert_cards(&db, &product, &root, &revision, ReviewSection::AiReview);
     db.connect()
         .unwrap()
         .execute(
@@ -133,7 +143,27 @@ fn completed_revision_shares_primary_review_ci_and_ready_presentation() {
 fn held_revision_stays_active_while_shown_in_review() {
     let db = WorkDb::open(temp_db_path("revision-review-hold")).unwrap();
     let (product, root, revision) = completed_revision(&db);
-    assert_cards(&db, &product, &root, &revision, ReviewSection::InRevision);
+    let review = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&root)
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    assert_cards(&db, &product, &root, &revision, ReviewSection::AiReview);
+    assert_eq!(task_status(&db, &revision), "active");
+    db.start_execution_run(
+        &review.id,
+        "held-reviewer",
+        "repo",
+        "lease",
+        "workspace",
+        "/tmp/held-reviewer",
+    )
+    .unwrap();
+    assert_cards(&db, &product, &root, &revision, ReviewSection::AiReview);
     assert_eq!(task_status(&db, &revision), "active");
 }
 
@@ -152,4 +182,127 @@ fn restarted_revision_returns_to_doing() {
     let tree = db.get_work_tree(&product).unwrap();
     let card = tree.tasks.iter().find(|t| t.id == revision).unwrap();
     assert_eq!(card.status, TaskStatus::Active);
+}
+
+#[test]
+fn held_revision_keeps_its_status_outside_roots_review_lane() {
+    let db = WorkDb::open(temp_db_path("held-root-outside-review")).unwrap();
+    let (product, root, revision) = completed_revision(&db);
+    for (status, reason) in [
+        ("blocked", Some("awaiting_operator_answer")),
+        ("active", None),
+        ("done", None),
+    ] {
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = ?2, blocked_reason = ?3 WHERE id = ?1",
+                params![root, status, reason],
+            )
+            .unwrap();
+        let tree = db.get_work_tree(&product).unwrap();
+        assert_eq!(
+            tree.tasks.iter().find(|t| t.id == revision).unwrap().status,
+            TaskStatus::Active
+        );
+        let WorkItem::Task(card) = db.get_work_item_for_display(&revision).unwrap() else {
+            panic!("expected revision")
+        };
+        assert_eq!(card.status, TaskStatus::Active);
+    }
+}
+
+#[test]
+fn held_revision_drop_in_review_is_status_preserving() {
+    use boss_engine_board_gesture::{BoardRow, DropResolution, resolve_drop};
+    let db = WorkDb::open(temp_db_path("held-reorder")).unwrap();
+    let (_, _, revision) = completed_revision(&db);
+    let WorkItem::Task(card) = db.get_work_item_for_display(&revision).unwrap() else {
+        panic!("expected revision")
+    };
+    let row = BoardRow {
+        status: card.status,
+        autostart: card.autostart,
+        blocked_reason: card.blocked_reason,
+        merge_queue_state: card.merge_queue_state,
+    };
+    assert!(matches!(
+        resolve_drop(
+            &row,
+            boss_protocol::BoardDropTarget::new(boss_protocol::BoardColumn::Review, None)
+        ),
+        DropResolution::Reorder { .. }
+    ));
+    assert_eq!(task_status(&db, &revision), "active");
+}
+
+#[test]
+fn held_revision_gates_dependents_and_rejects_failed_review() {
+    let db = WorkDb::open(temp_db_path("held-safety")).unwrap();
+    let (product, root, revision) = completed_revision(&db);
+    let next = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(&root)
+                .description("Next revision")
+                .depends_on(vec![revision.clone()])
+                .build(),
+            &FakePrStateChecker::always(PrOpenState::Open),
+        )
+        .unwrap();
+    db.get_work_tree(&product).unwrap();
+    db.try_unblock_dependency_if_resolved(&next.id).unwrap();
+    assert_eq!(task_status(&db, &next.id), "blocked");
+    assert!(db.gating_prereqs_for(&next.id).unwrap().contains(&revision));
+    let review = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&root)
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    WorkDb::insert_review_verdict_in_tx(
+        &db.connect().unwrap(),
+        &review.id,
+        &root,
+        &ReviewVerdictInput {
+            head_sha: Some("head".into()),
+            findings_count: 0,
+            revision_warranted: false,
+            gate_outcome: super::super::review_verdicts::REVIEW_GATE_OUTCOME_GAVE_UP,
+        },
+    )
+    .unwrap();
+    assert!(
+        !db.advance_pending_review_task_to_in_review_with_verdict_source(&revision, &root)
+            .unwrap()
+    );
+    assert_eq!(task_status(&db, &revision), "active");
+}
+
+#[test]
+fn pending_review_completion_recovers_admission_without_post_effects() {
+    let db = WorkDb::open(temp_db_path("held-admission")).unwrap();
+    let (_, root, revision) = completed_revision(&db);
+    // No post-effects created a reviewer or a deferral marker; age the hold
+    // through the recovery grace period without changing lifecycle state.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET updated_at = ?2 WHERE id = ?1",
+            params![
+                revision,
+                (boss_engine_utils::epoch_time::now_epoch_secs() as u64 - crate::work::REVIEW_BATCH_STALE_SECS - 60)
+                    .to_string()
+            ],
+        )
+        .unwrap();
+    let candidates = db.list_tasks_awaiting_pre_merge_review_admission().unwrap();
+    assert!(
+        candidates
+            .iter()
+            .any(|c| c.task_id == revision && c.cycle_root_id == root)
+    );
 }

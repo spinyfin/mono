@@ -86,7 +86,9 @@ pub(super) fn attach_board_derivations(
     // Compute has_in_progress_revision for every chain-root task that
     // has at least one descendant revision that
     // `TaskStatus::can_still_change_pr`.
-    attach_in_progress_revision_flag(&mut tasks, chores);
+    if let Err(err) = attach_display_revision_flag(conn, &mut tasks, chores) {
+        tracing::warn!(?err, "failed to classify held revisions");
+    }
     // Compute ready_for_review for every Review-lane task that is
     // waiting on the operator and nothing else (no block, no
     // in-progress revision, CI green, no merge conflict). Must run

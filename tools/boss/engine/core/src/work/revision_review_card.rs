@@ -53,18 +53,19 @@ pub(super) fn attach(conn: &Connection, tasks: &mut [Task], chores: &[Task], pro
         .iter()
         .filter_map(|(_, id)| by_id.get(id.as_str()).map(|t| (id.clone(), (*t).clone())))
         .collect();
-    let shown_held: HashSet<usize> = tasks
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| t.status == TaskStatus::Active && held.contains(&t.id))
-        .map(|(i, _)| i)
-        .collect();
-    for index in shown_held {
-        tasks[index].status = TaskStatus::InReview;
-    }
     for (index, root_id) in targets {
         let task = &mut tasks[index];
         let root = &roots[&root_id];
+        let position = boss_engine_board_gesture::BoardRow {
+            status: root.status.clone(),
+            autostart: root.autostart,
+            blocked_reason: root.blocked_reason.clone(),
+            merge_queue_state: root.merge_queue_state.clone(),
+        }
+        .position();
+        if position.column != boss_protocol::BoardColumn::Review {
+            continue;
+        }
         // The owner decides the PR's review state, including blocked review
         // cards. When that state agrees, retain the shared badge resolver's
         // card-specific findings/self-link wording.
@@ -79,8 +80,7 @@ pub(super) fn attach(conn: &Connection, tasks: &mut [Task], chores: &[Task], pro
         task.ai_reviewing = root.ai_reviewing;
         task.ai_review_stage = root.ai_review_stage.clone();
         copy_review_fields(task, root);
-        // Board-only: mirror the owner's blocked indicator. Stored status
-        // is what engine logic reads, so single-item reads never get this.
+        // Display-only: lifecycle reads retain the durable status.
         task.status = if root.status == TaskStatus::Blocked {
             TaskStatus::Blocked
         } else {
@@ -94,7 +94,7 @@ pub(super) fn attach(conn: &Connection, tasks: &mut [Task], chores: &[Task], pro
 
 /// Active revisions whose latest `revision_implementation` execution
 /// completed: the implementation is delivered and nothing is restarting it.
-fn completed_revision_ids(conn: &Connection) -> Result<HashSet<String>> {
+pub(super) fn completed_revision_ids(conn: &Connection) -> Result<HashSet<String>> {
     let mut stmt = conn.prepare(
         "SELECT t.id FROM tasks t
          WHERE t.kind = 'revision' AND t.status = 'active' AND t.deleted_at IS NULL

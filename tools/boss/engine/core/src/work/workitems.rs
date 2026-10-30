@@ -1323,7 +1323,26 @@ impl WorkDb {
         Ok(names)
     }
 
+    /// Apply board presentation to a mutation result without dropping its
+    /// extra fields (for example an external reference fetched by its caller).
+    pub fn project_work_item_for_display(&self, mut item: WorkItem) -> Result<WorkItem> {
+        if let WorkItem::Task(task) | WorkItem::Chore(task) = &mut item {
+            let conn = self.connect()?;
+            attach_task_display_projections(&conn, task, "WorkItemUpdated")?;
+        }
+        Ok(item)
+    }
+
+    /// Frontend presentation; engine lifecycle callers use get_work_item.
+    pub fn get_work_item_for_display(&self, id: &str) -> Result<WorkItem> {
+        self.get_work_item_with_presentation(id, true)
+    }
+
     pub fn get_work_item(&self, id: &str) -> Result<WorkItem> {
+        self.get_work_item_with_presentation(id, false)
+    }
+
+    fn get_work_item_with_presentation(&self, id: &str, display: bool) -> Result<WorkItem> {
         let conn = self.connect()?;
         match classify_id(id)? {
             ItemKind::Product => query_product(&conn, id)?
@@ -1357,7 +1376,11 @@ impl WorkDb {
                 // path propagates a projection failure: a read has no
                 // committed write to protect, so an error beats serving a row
                 // the client would take for truth.
-                attach_task_derived_projections(&conn, &mut task, "get_work_item")?;
+                if display {
+                    attach_task_display_projections(&conn, &mut task, "get_work_item_for_display")?;
+                } else {
+                    attach_task_derived_projections(&conn, &mut task, "get_work_item")?;
+                }
                 Ok(task_to_item(task))
             }
             // Answer-agent executions bind a comment id, but comments are not

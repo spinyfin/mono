@@ -2,7 +2,7 @@ import SwiftUI
 
 // ===========================================================================
 // Card footer cluster — PR link / CI / merge-queue, review indicator,
-// revision-parent PR, standalone short-id, and in-review revision rollups.
+// revision-parent PR, standalone short-id, and done-revision rollups.
 //
 // Equatable over its own slice of [[WorkCardSnapshot]] so title / badge /
 // live-status churn does not re-lay-out the footer (design entry 9).
@@ -28,8 +28,8 @@ struct WorkBoardCardFooterSlice: Equatable {
     let hasRevisionParentPRRow: Bool
     let revisionParentPrUrl: String?
     let hasStandaloneShortID: Bool
-    let hasInReviewRevisions: Bool
-    let inReviewRevisions: [WorkCardRevisionRollup]
+    let hasDoneRevisions: Bool
+    let doneRevisions: [WorkCardRevisionRollup]
 
     init(snapshot: WorkCardSnapshot) {
         self.hasPRRow = snapshot.hasPRRow
@@ -49,8 +49,8 @@ struct WorkBoardCardFooterSlice: Equatable {
         self.hasRevisionParentPRRow = snapshot.hasRevisionParentPRRow
         self.revisionParentPrUrl = snapshot.revisionParentPrUrl
         self.hasStandaloneShortID = snapshot.hasStandaloneShortID
-        self.hasInReviewRevisions = snapshot.hasInReviewRevisions
-        self.inReviewRevisions = snapshot.inReviewRevisions
+        self.hasDoneRevisions = snapshot.hasDoneRevisions
+        self.doneRevisions = snapshot.doneRevisions
     }
 
     /// True when any footer section would render content.
@@ -59,7 +59,7 @@ struct WorkBoardCardFooterSlice: Equatable {
             && !hasReviewRow
             && !hasRevisionParentPRRow
             && !hasStandaloneShortID
-            && !hasInReviewRevisions
+            && !hasDoneRevisions
     }
 }
 
@@ -85,11 +85,11 @@ struct WorkBoardCardFooter: View, @MainActor Equatable {
     }
 
     /// True when a row sits below the PR / badge rows (review status,
-    /// revision-parent PR, or the in-review rollup list).
+    /// revision-parent PR, or the done-revision rollup list).
     private var hasRowsBelowPRRow: Bool {
         (slice.hasReviewRow && slice.reviewRequiredState != nil)
             || (slice.hasRevisionParentPRRow && slice.revisionParentPrUrl != nil)
-            || slice.hasInReviewRevisions
+            || slice.hasDoneRevisions
     }
 
     /// The id rides on the PR row (or the badge row) only when nothing renders
@@ -185,10 +185,10 @@ struct WorkBoardCardFooter: View, @MainActor Equatable {
                 }
             }
 
-            if slice.hasInReviewRevisions {
+            if slice.hasDoneRevisions {
                 Divider()
                     .padding(.vertical, 2)
-                ForEach(slice.inReviewRevisions) { revision in
+                ForEach(slice.doneRevisions) { revision in
                     RevisionRollupLine(revision: revision)
                 }
             }

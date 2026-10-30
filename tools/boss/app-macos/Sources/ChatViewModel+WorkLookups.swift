@@ -136,9 +136,8 @@ extension ChatViewModel {
             if includeChores && projectFilter.isEmpty {
                 items.append(contentsOf: (choresByProductID[productID] ?? []).sorted(by: taskSort))
                 // Chore-parented revisions have no project of their own; surface
-                // them with the chores so their Backlog/Doing cards appear. The
-                // in-review ones are rolled up under the parent and filtered out
-                // of the Review column by `workItems(in:)`.
+                // them with the chores in Backlog, Doing and Review. Only done
+                // revisions are filtered out in favor of the parent footer.
                 items.append(contentsOf: (productLevelRevisionsByProductID[productID] ?? []).sorted(by: taskSort))
             }
         }

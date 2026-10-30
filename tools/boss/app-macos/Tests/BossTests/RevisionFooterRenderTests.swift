@@ -37,7 +37,7 @@ final class RevisionFooterRenderTests: XCTestCase {
         }
         var context = WorkCardSnapshotContext(column: .review)
         if fixture.rollups {
-            context.inReviewRevisions = [
+            context.doneRevisions = [
                 WorkCardRevisionRollup(
                     id: "rev-1", revisionSeq: 1, name: "Revision one",
                     revisionParentPrUrl: nil
