@@ -11,6 +11,9 @@ use super::*;
 #[path = "review_two_leaf_tests.rs"]
 mod two_leaf;
 
+#[path = "review_start_failure_tests.rs"]
+mod start_failure;
+
 fn classification() -> ReviewClassification {
     ReviewClassification::builder()
         .changed_files(vec!["tools/boss/engine/pr-review/src/parsing.rs".to_owned()])
@@ -273,64 +276,6 @@ fn quorum_dispatches_supervisor_on_two_of_three_with_one_exhausted() {
         db.review_batch(&batch.id).unwrap().unwrap().status,
         ReviewBatchStatus::Supervising
     );
-}
-
-/// (c) One reported + two failed-exhausted: the batch fails outright with a
-/// human-visible `pr_review_quorum_failed` attention, rather than producing a
-/// clean verdict from a single source.
-#[test]
-fn quorum_fails_the_batch_when_fewer_than_two_leaves_report() {
-    let db = WorkDb::open(temp_db_path("quorum-insufficient")).unwrap();
-    let product = create_test_product(&db);
-    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
-    let executions: Vec<_> = (0..3)
-        .map(|_| {
-            db.create_execution(
-                CreateExecutionInput::builder()
-                    .work_item_id(cycle_root.id.clone())
-                    .kind(ExecutionKind::PrReview)
-                    .status(ExecutionStatus::Ready)
-                    .build(),
-            )
-            .unwrap()
-        })
-        .collect();
-    let (batch, _) = db
-        .create_review_batch(
-            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
-            &[
-                member_with(
-                    ReviewBatchMemberRole::ClaudeReviewer,
-                    Some(executions[0].id.clone()),
-                    1,
-                    ReviewBatchMemberStatus::Reported,
-                ),
-                member_with(
-                    ReviewBatchMemberRole::CodexReviewer,
-                    Some(executions[1].id.clone()),
-                    2,
-                    ReviewBatchMemberStatus::Failed,
-                ),
-                member_with(
-                    ReviewBatchMemberRole::GrokReviewer,
-                    Some(executions[2].id.clone()),
-                    2,
-                    ReviewBatchMemberStatus::Failed,
-                ),
-            ],
-        )
-        .unwrap();
-
-    let outcome = advance_quorum(&db, &batch.id);
-    assert!(matches!(outcome, ReviewBatchQuorumOutcome::InsufficientQuorum));
-
-    let updated = db.review_batch(&batch.id).unwrap().unwrap();
-    assert_eq!(updated.status, ReviewBatchStatus::Failed);
-    assert!(updated.completed_at.is_some());
-
-    let attention =
-        find_quorum_failed_attention(&db, &cycle_root.id).expect("a pr_review_quorum_failed attention must be filed");
-    assert!(attention.title.to_lowercase().contains("insufficient quorum"));
 }
 
 /// The zero-valid-reports degenerate case: every leaf exhausted its retry

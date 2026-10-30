@@ -371,6 +371,71 @@ async fn composer_never_ready_persists_pane_spawn_failed_without_claiming_the_dr
     );
 }
 
+/// Every pre-start failure, including stages without a stage-specific error
+/// event, carries the error, attempt number and retry/permanent decision
+/// in a `pre_start_failure` dispatch record.
+#[tokio::test]
+async fn pre_start_failure_is_recorded_in_the_dispatch_stream_with_its_decision() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+    db.reconcile_product_executions(&product.id).unwrap();
+
+    let cube = Arc::new(FakeCubeClient {
+        fail_create: true,
+        ..FakeCubeClient::default()
+    });
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner::default()),
+        )
+        .with_pre_start_retry_delays(vec![Duration::ZERO])
+        .with_dispatch_events(recording.clone()),
+    );
+    let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+    coordinator.kick();
+    wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
+    wait_for_dispatch_event(
+        &recording,
+        &execution_id,
+        |event| event.stage == "pre_start_failure" && event.details["decision"] == "permanent",
+        "permanent pre_start_failure",
+    )
+    .await;
+
+    let events = recording.events_for(&execution_id).await;
+    let failures: Vec<_> = events
+        .iter()
+        .filter(|event| event.stage == "pre_start_failure")
+        .collect();
+    assert_eq!(failures.len(), 2, "{events:?}");
+    for (event, attempt, decision) in [(failures[0], 1, "retry"), (failures[1], 2, "permanent")] {
+        assert_eq!(event.outcome, "error");
+        assert_eq!(event.work_item_id.as_deref(), Some(chore.id.as_str()));
+        assert!(event.worker_id.is_some());
+        assert!(
+            event
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("cube change create failed")),
+            "{event:?}"
+        );
+        assert_eq!(event.details["attention_kind"], "cube_change_create_failed");
+        assert_eq!(event.details["attempt"], attempt);
+        assert_eq!(event.details["max_attempts"], 2);
+        assert_eq!(event.details["decision"], decision);
+    }
+    assert_eq!(failures[0].details["retry_delay_secs"], 0);
+    assert!(failures[1].details["retry_delay_secs"].is_null());
+    assert_eq!(db.get_execution(&execution_id).unwrap().pre_start_failure_count, 2);
+}
+
 /// Poll `recording` until an event for `execution_id` matches `predicate`,
 /// returning it. Used by the spawn-abort tests below, which have to assert on
 /// what is visible at a specific instant *while the cube release is still

@@ -122,3 +122,68 @@ fn recovery_does_not_search_past_a_newer_failed_attempt_or_override_explicit_pin
     assert!(fresh.preferred_workspace_id.is_none());
     assert!(!fresh.allow_dirty);
 }
+
+/// A reviewer never writes to the PR branch, so a dead reviewer's recovery
+/// record must never become the next reviewer's predecessor: inheriting it
+/// would pin the host, reposition the review on the head the dead reviewer
+/// looked at, and fail the review before start whenever that record's
+/// pointers no longer match a rewritten PR history. An implementation kind
+/// of the same item still inherits.
+#[test]
+fn read_only_reviews_never_inherit_a_recovery_predecessor() {
+    let db = WorkDb::open(temp_db_path("read-only-review-predecessor")).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore_manual(&db, product.id, "reviewed PR");
+    for (kind, inherits) in [
+        (ExecutionKind::PrReview, false),
+        (ExecutionKind::ChoreImplementation, true),
+    ] {
+        let prior = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(kind.clone())
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        db.start_execution_run(
+            &prior.id,
+            "worker",
+            "mono",
+            "lease-old",
+            "workspace-old",
+            "/tmp/workspace-old",
+        )
+        .unwrap();
+        db.record_execution_bookmark(&boss_engine_recovery::execution_bookmark::ExecutionBookmark {
+            execution_id: prior.id.clone(),
+            repo_path: "/tmp/shared".into(),
+            host_id: "local".into(),
+            base_commit: None,
+        })
+        .unwrap();
+        db.record_worker_failure(&prior.id, "died before start").unwrap();
+        let next = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(kind.clone())
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        assert_eq!(
+            db.recovery_predecessor(&next).unwrap().map(|prior| prior.id),
+            inherits.then(|| prior.id.clone()),
+            "{kind:?}"
+        );
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET status = 'cancelled', finished_at = '2' WHERE id = ?1",
+                params![next.id],
+            )
+            .unwrap();
+    }
+}
