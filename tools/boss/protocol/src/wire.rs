@@ -1065,13 +1065,13 @@ pub enum FrontendRequest {
     /// [`FrontendEvent::SettingsList`]. Read-only; no side effects.
     GetSettings,
 
+    /// Compare eligible PR families by their original Sol/Astra arm.
+    GetSolComparisonReport,
+
     /// Read-only age and provenance report for inactive work items.
     GetStuckReport {
         minimum_age_secs: i64,
     },
-
-    /// Compare eligible PR families by their original Sol/Astra arm.
-    GetSolComparisonReport,
 
     /// Per-work-item runtime snapshot — single-item flavour of the
     /// `task_runtimes` block carried in `WorkTree`. Used by
