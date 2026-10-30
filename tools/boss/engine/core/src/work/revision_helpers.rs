@@ -4,6 +4,24 @@ use boss_protocol::ReviewStage;
 
 #[work_db_boundary::instrument]
 impl WorkDb {
+    /// Last diagnosed conflict paths on the PR owned by this revision's root.
+    /// These are context, not a substitute for a fresh mergeability probe.
+    pub(crate) fn revision_conflicting_files(&self, task_id: &str) -> Result<Vec<String>> {
+        let root = self
+            .get_revision_chain_root_task_id(task_id)
+            .unwrap_or_else(|| task_id.to_owned());
+        let Some(attempt) = self.latest_conflict_resolution_for_work_item(&root)? else {
+            return Ok(Vec::new());
+        };
+        let diagnosis = attempt
+            .conflict_diagnosis
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<crate::conflict_diagnosis::ConflictDiagnosis>(json).ok());
+        Ok(diagnosis
+            .map(|diagnosis| diagnosis.files.into_iter().map(|file| file.path).collect())
+            .unwrap_or_default())
+    }
+
     /// For a `revision` task, walk the parent chain to the chain root and
     /// return the chain root's bound `pr_url`, or `None` if the chain root
     /// cannot be resolved or has no bound PR yet.
@@ -57,7 +75,7 @@ impl WorkDb {
 /// descendant of `root_id`, or `None` when the chain has no prior live
 /// revision.
 ///
-/// This is used by [`assert_parent_revisable_and_insert`] to find the
+/// This is used by [`assert_parent_revisable_and_insert_as_actor`] to find the
 /// "tail" of the revision chain so the new revision can be automatically
 /// gated on it, serialising back-to-back revisions targeting the same PR.
 ///
@@ -132,21 +150,6 @@ pub(crate) fn find_latest_active_revision_in_chain(conn: &Connection, root_id: &
 /// 3. If chain root `status == "done"` → [`RevisionGateError::Merged`] (PR merged = task done).
 /// 4. Otherwise call `pr_checker.check(pr_url)` for the live state:
 ///    `Merged` → merged error; `ClosedUnmerged` → closed error; `Open` → insert.
-pub(crate) fn assert_parent_revisable_and_insert(
-    pending: &mut PendingEvents,
-    conn: &Connection,
-    input: CreateRevisionInput,
-    pr_checker: &dyn PrStateChecker,
-) -> Result<Task> {
-    assert_parent_revisable_and_insert_as_actor(
-        pending,
-        conn,
-        input,
-        pr_checker,
-        boss_protocol::LAST_STATUS_ACTOR_ENGINE,
-    )
-}
-
 pub(crate) fn assert_parent_revisable_and_insert_as_actor(
     pending: &mut PendingEvents,
     conn: &Connection,
@@ -1638,7 +1641,7 @@ pub(crate) fn revision_name_from_description(description: &str) -> String {
 /// Insert a `kind = 'revision'` task row. Called only after the gate passes.
 ///
 /// `parent_id` is the chain root (the non-revision work item that owns the
-/// PR). Callers of [`assert_parent_revisable_and_insert`] may pass a revision
+/// PR). Callers of [`assert_parent_revisable_and_insert_as_actor`] may pass a revision
 /// as the create-time parent selector; that helper resolves to the root and
 /// passes the root id here so `parent_task_id` never points at another
 /// revision. `root` is the same row, already loaded for inherit fields.

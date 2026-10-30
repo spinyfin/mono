@@ -1131,6 +1131,17 @@ pub(crate) async fn compose_worker_spawn(
         let (opening, rest) = prompt_text.split_once('\n').unwrap_or((&prompt_text, ""));
         format!("{opening}\n\n{bookmark_instructions}{rest}")
     };
+    let prompt_text = if execution.kind == ExecutionKind::RevisionImplementation {
+        format!(
+            "{prompt_text}\n\n{}",
+            super::prompt::revision_conflict_notice(work_db, execution).unwrap_or_else(|error| {
+                tracing::warn!(%error, "Could not load advisory revision conflict notice");
+                String::new()
+            })
+        )
+    } else {
+        prompt_text
+    };
     let prompt_text = match origin_pr_backlink {
         Some(backlink) => format!(
             "{prompt_text}\n\n## Origin PR backlink\n\n\
@@ -1545,6 +1556,39 @@ mod compose_worker_spawn_tests {
     use tempfile::TempDir;
 
     const MEDIUM_ADDENDUM: &str = "Sketch a brief plan before you start editing.";
+
+    #[tokio::test]
+    async fn revision_spawn_places_advisory_notice_after_opening_and_recovery_instructions() {
+        use crate::test_support::{create_test_chore_manual, create_test_product_named};
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let product = create_test_product_named(&db, "revision notice");
+        let task = create_test_chore_manual(&db, product.id, "Revision notice");
+        db.connect().unwrap().execute(
+            "UPDATE tasks SET pr_mergeable_state = 'CONFLICTING', pr_url = 'https://github.com/org/repo/pull/77' WHERE id = ?1",
+            [&task.id],
+        ).unwrap();
+        let mut execution = chore_execution();
+        execution.kind = ExecutionKind::RevisionImplementation;
+        execution.work_item_id = task.id.clone();
+        execution.pr_url = Some("https://github.com/org/repo/pull/77".into());
+        let composed = compose_worker_spawn(
+            &db,
+            "worker-1",
+            &execution,
+            &db.get_work_item(&task.id).unwrap(),
+            workspace.path(),
+            None,
+            WorkerSpawnOpts::default(),
+        )
+        .await
+        .unwrap();
+        let prompt = composed.prompt_text;
+        let opening = prompt.find("You are a reusable worker").unwrap();
+        let recovery = prompt.find("## Execution recovery bookmark").unwrap();
+        let notice = prompt.find("Conflict known at dispatch").unwrap();
+        assert!(opening < recovery && recovery < notice, "{prompt}");
+    }
     const LARGE_ADDENDUM_PREFIX: &str = "Begin with a written plan";
 
     fn pr_review_execution() -> WorkExecution {

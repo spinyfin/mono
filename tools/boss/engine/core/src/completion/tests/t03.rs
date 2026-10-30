@@ -1431,7 +1431,7 @@ async fn conflict_revision_signal_cleared_defers_on_unknown_mergeability() {
 // A merge-conflict revision worker stopped 26s in without pushing,
 // declaring "this conflict was already resolved and pushed in a prior
 // attempt". It had never queried `mergeable`, and never ran the
-// mandatory `cube workspace rebase`. GitHub reported CONFLICTING /
+// mandatory `cube workspace local-rebase --pr`. GitHub reported CONFLICTING /
 // DIRTY throughout. The only guard was the generic SHA-delta nudge,
 // whose text invites exactly that reply ("if there is nothing left to
 // do, say so"). These tests pin the engine-side enforcement: the
@@ -1482,7 +1482,7 @@ async fn conflict_revision_still_conflicting_gets_targeted_probe_not_the_generic
     );
     let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     assert!(
-        text.contains(&format!("{cube} workspace rebase")),
+        text.contains(&format!("{cube} workspace local-rebase --pr")),
         "probe must name the mandatory command the worker skipped: {text}",
     );
     assert!(
@@ -1547,7 +1547,7 @@ async fn conflict_revision_unknown_mergeability_is_never_read_as_resolved() {
     assert_eq!(queued.len(), 1, "exactly one probe must fire; got {queued:?}");
     let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     assert!(
-        queued[0].1.contains("UNKNOWN") && queued[0].1.contains(&format!("{cube} workspace rebase")),
+        queued[0].1.contains("UNKNOWN") && queued[0].1.contains(&format!("{cube} workspace local-rebase --pr")),
         "probe must name the indeterminate value and the command that settles it: {}",
         queued[0].1,
     );
@@ -2611,6 +2611,7 @@ async fn on_stop_staged_url_stamps_contributed_head_before_transient_finalize_fa
         pane.clone(),
         probes.clone(),
     )
+    .with_merge_probe(Arc::new(MergeableInFlightProbe))
     .with_branch_verifier(verifier.clone())
     .with_staged_pr_urls(staged_pr_urls.clone());
 

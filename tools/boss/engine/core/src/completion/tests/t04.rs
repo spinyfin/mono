@@ -2524,6 +2524,7 @@ async fn recheck_for_pr_sha_delta_fires_after_stop_seen() {
         pane.clone(),
         probes.clone(),
     )
+    .with_merge_probe(Arc::new(MergeableInFlightProbe))
     .with_branch_verifier(verifier)
     .with_staged_pr_urls(staged_pr_urls);
 
@@ -2907,6 +2908,7 @@ async fn on_stop_revision_own_push_post_stop_finalizes_and_reaps() {
         pane.clone(),
         probes.clone(),
     )
+    .with_merge_probe(Arc::new(MergeableInFlightProbe))
     .with_branch_verifier(verifier)
     .with_staged_revision_pushes(staged_pushes);
 

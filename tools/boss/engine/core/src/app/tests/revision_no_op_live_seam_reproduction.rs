@@ -3,7 +3,7 @@
 //! calling a completion-handler method directly.
 //!
 //! The unit tests in `completion::tests::t15` cover the same scenario
-//! (`revision_no_op_survives_unavailable_github_for_every_driver`) but call
+//! (head lookup failure with independently verified mergeability) but call
 //! `WorkerCompletionHandler::on_stop` on a bare handler wired to test
 //! doubles. That leaves the actual integration boundary the original
 //! incident occurred at unverified: a real driver's final response is
@@ -192,13 +192,13 @@ async fn stop_hook_through_the_events_socket(
 /// A revision worker whose `boss propose done --outcome no-changes-needed`
 /// declaration was recorded, with GitHub unreachable for the SHA-delta gate,
 /// must reach a terminal state, release its cube lease, free its worker
-/// slot, and leave a durable declined-finding attention record — driven
+/// slot, and leave a durable failure when mergeability is unverifiable — driven
 /// through the real events socket and the real production fan-out, not
 /// through a direct call to `WorkerCompletionHandler::on_stop`. The
 /// `run_done_proposals_seam` flag is left off: the no-op declaration is read
 /// from its durable stamp regardless of it.
 #[tokio::test]
-async fn revision_no_op_declaration_terminalizes_through_the_real_dispatch_path() {
+async fn revision_no_op_declaration_fails_closed_through_the_real_dispatch_path() {
     let (server_state, _dir) = test_server_state_with_fakes_and_branch_verifier(Arc::new(UnreachableBranchVerifier));
 
     let pr = "https://github.com/spinyfin/mono/pull/1613";
@@ -227,8 +227,8 @@ async fn revision_no_op_declaration_terminalizes_through_the_real_dispatch_path(
     let execution = server_state.work_db.get_execution(&execution_id).unwrap();
     assert_eq!(
         execution.status,
-        ExecutionStatus::Completed,
-        "a declared no-op must reach a terminal state even with GitHub unreachable",
+        ExecutionStatus::Failed,
+        "a declared no-op must fail closed when GitHub mergeability cannot be verified",
     );
     assert!(
         execution.cube_lease_id.is_none(),
@@ -240,11 +240,17 @@ async fn revision_no_op_declaration_terminalizes_through_the_real_dispatch_path(
     );
 
     let items = server_state.work_db.list_attention_items(&execution_id).unwrap();
-    let declined = items
-        .iter()
-        .find(|item| item.kind == REVISION_NO_OP_ATTENTION_KIND)
-        .expect("declined-finding record must be filed through the real dispatch path");
-    assert!(declined.body_markdown.contains("not independently verified"));
+    let crate::work::WorkItem::Task(task) = server_state.work_db.get_work_item(&execution.work_item_id).unwrap() else {
+        panic!("revision missing")
+    };
+    assert_eq!(task.status, boss_protocol::TaskStatus::Blocked);
+    assert_eq!(task.blocked_reason.as_deref(), Some("worker_failed"));
+    let detail = task
+        .blocked_detail
+        .expect("mergeability failure must be durably recorded");
+    assert!(detail.contains("mergeability could not be verified"));
+    assert!(detail.contains("probe failed"));
+    assert!(items.iter().all(|item| item.kind != REVISION_NO_OP_ATTENTION_KIND));
 }
 
 /// The converse, and the retirement guard: when `boss propose done` never

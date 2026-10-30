@@ -541,6 +541,10 @@ impl TestHarness {
             crate::work::PrOpenState::Open,
         )))
         .with_workspace_diff_verifier(StubWorkspaceDiffVerifier::empty())
+        // Revisions complete only on affirmative GitHub mergeability, so
+        // the default probe reports a clean, CI-in-flight PR. Conflict,
+        // UNKNOWN, and probe-failure tests inject their own probe.
+        .with_merge_probe(Arc::new(MergeableInFlightProbe))
         // Auto-advancing by default: most tests drive several `on_stop`
         // calls back-to-back to exercise the circuit breaker's *count*,
         // not its timing, and a synchronous test loop would otherwise
@@ -2005,6 +2009,25 @@ struct FixedMergeabilityProbe {
     mergeability: crate::merge_poller::OpenPrMergeability,
 }
 
+/// Successful mergeability does not imply CI has completed or that a
+/// metadata-only revision can skip the contribution check.
+struct MergeableInFlightProbe;
+
+#[async_trait]
+impl MergeProbe for MergeableInFlightProbe {
+    async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
+        let mut probe = FixedMergeabilityProbe {
+            mergeability: OpenPrMergeability::Clean,
+        }
+        .probe(url)
+        .await?;
+        if let PrLifecycleState::Open(open) = &mut probe.state {
+            open.ci = OpenPrCiStatus::InFlight;
+        }
+        Ok(probe)
+    }
+}
+
 #[async_trait]
 impl MergeProbe for FixedMergeabilityProbe {
     async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
@@ -2026,6 +2049,7 @@ impl MergeProbe for FixedMergeabilityProbe {
 }
 
 mod conflict_delivery;
+mod revision_delivery;
 mod status_ledger;
 mod t10;
 mod t11;

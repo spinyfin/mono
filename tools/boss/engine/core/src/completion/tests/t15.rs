@@ -72,7 +72,7 @@ async fn guide_no_op_attention_matches_outstanding_dispositions() {
 }
 
 #[tokio::test]
-async fn revision_no_op_survives_unavailable_github_for_every_driver() {
+async fn revision_no_op_survives_unavailable_head_lookup_with_verified_mergeability_for_every_driver() {
     for slug in ["claude", "codex", "grok"] {
         let workspace = tempdir().unwrap();
         let pr = "https://github.com/spinyfin/mono/pull/1613";
@@ -105,8 +105,9 @@ async fn revision_no_op_survives_unavailable_github_for_every_driver() {
         } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
         let handler = handler.with_branch_verifier(verifier);
 
-        // The declaration alone carries the claim: no merge probe can rescue
-        // this Stop, and the feature flags are at their defaults (off).
+        // The declaration carries the no-contribution claim when the head
+        // lookup fails, but the independent mergeability probe must succeed.
+        // CI remains in flight and feature flags retain their defaults.
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
             matches!(outcome, StopOutcome::NoChangesNeeded { .. }),

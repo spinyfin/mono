@@ -142,7 +142,7 @@ impl WorkerCompletionHandler {
                 return StopOutcome::DbError;
             }
         };
-        if self.is_merge_conflict_revision(execution) {
+        if execution.kind == ExecutionKind::RevisionImplementation {
             let pr_url = self.resolve_bound_pr_url(execution);
             match self.conflict_delivery_decision(execution, pr_url.as_deref()).await {
                 ConflictDeliveryDecision::Failed(outcome) => return outcome,
