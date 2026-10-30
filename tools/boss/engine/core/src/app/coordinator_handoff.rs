@@ -163,7 +163,8 @@ pub(super) async fn deliver_authorization(
             .read()
             .map_err(|_| anyhow::anyhow!("tmux preflight lock poisoned"))?
         {
-            crate::tmux_preflight::TmuxPreflight::Ready { program, .. } => program.clone(),
+            crate::tmux_preflight::TmuxPreflight::Ready { program, .. }
+            | crate::tmux_preflight::TmuxPreflight::ReadyUnknown { program } => program.clone(),
             crate::tmux_preflight::TmuxPreflight::Unavailable { reason } => {
                 anyhow::bail!("tmux is unavailable: {reason}")
             }

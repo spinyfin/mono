@@ -322,7 +322,9 @@ impl ServerState {
             return Ok(tmux);
         }
         let preflight = self.tmux_preflight.read().expect("tmux preflight lock poisoned");
-        let crate::tmux_preflight::TmuxPreflight::Ready { program, .. } = &*preflight else {
+        let (crate::tmux_preflight::TmuxPreflight::Ready { program, .. }
+        | crate::tmux_preflight::TmuxPreflight::ReadyUnknown { program }) = &*preflight
+        else {
             anyhow::bail!("tmux is unavailable for pane delivery")
         };
         let socket_tmux = Tmux::from_path_with_socket(program.clone(), self.tmux_socket_path.clone())

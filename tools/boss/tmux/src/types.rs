@@ -32,6 +32,7 @@ impl TmuxVersion {
             .trim()
             .strip_prefix("tmux ")
             .ok_or_else(|| anyhow::anyhow!("unexpected tmux version output: {output:?}"))?;
+        let version = version.strip_prefix("next-").unwrap_or(version);
         let mut components = version.splitn(3, '.');
         let major = components
             .next()
@@ -44,6 +45,12 @@ impl TmuxVersion {
         let minor_digits: String = minor_text.chars().take_while(char::is_ascii_digit).collect();
         if minor_digits.is_empty() {
             bail!("invalid tmux minor version in {output:?}");
+        }
+        let suffix = &minor_text[minor_digits.len()..];
+        if components.next().is_some()
+            || !(suffix.is_empty() || (suffix.len() == 1 && suffix.as_bytes()[0].is_ascii_lowercase()))
+        {
+            bail!("unknown tmux version suffix in {output:?}");
         }
         let minor = minor_digits
             .parse()

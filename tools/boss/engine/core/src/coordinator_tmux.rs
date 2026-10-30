@@ -1627,7 +1627,7 @@ mod tests {
                     }
                     (true, String::new(), String::new())
                 }
-                Some("start-server") | Some("new-session") | Some("kill-session") => {
+                Some("start-server") | Some("new-session") | Some("detach-client") | Some("if-shell") => {
                     (true, String::new(), String::new())
                 }
                 Some("send-keys") if self.send_keys_fails => (
@@ -2106,13 +2106,15 @@ mod tests {
         let calls = server.calls();
         let kill = calls
             .iter()
-            .position(|call| call.get(2).map(String::as_str) == Some("kill-session"))
+            .position(|call| call.get(2).map(String::as_str) == Some("if-shell"))
             .unwrap();
         let new = calls
             .iter()
             .position(|call| call.get(2).map(String::as_str) == Some("new-session"))
             .unwrap();
         assert!(kill < new);
+        assert_eq!(calls[kill - 1][2], "detach-client");
+        assert_eq!(calls[kill - 1][4], format!("={COORDINATOR_SESSION_NAME}"));
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -2195,7 +2197,7 @@ mod tests {
             !server
                 .calls()
                 .iter()
-                .any(|call| call.get(2).map(String::as_str) == Some("kill-session"))
+                .any(|call| call.get(2).map(String::as_str) == Some("if-shell"))
         );
     }
 
@@ -2217,7 +2219,7 @@ mod tests {
             !server
                 .calls()
                 .iter()
-                .any(|call| call.get(2).map(String::as_str) == Some("kill-session")
+                .any(|call| call.get(2).map(String::as_str) == Some("if-shell")
                     || call.get(2).map(String::as_str) == Some("new-session"))
         );
     }
@@ -2256,7 +2258,7 @@ mod tests {
             !server
                 .calls()
                 .iter()
-                .any(|call| call.get(2).map(String::as_str) == Some("kill-session"))
+                .any(|call| call.get(2).map(String::as_str) == Some("if-shell"))
         );
     }
 
@@ -2300,8 +2302,10 @@ mod tests {
         let kill = calls
             .iter()
             .position(|call| {
-                call.get(2).map(String::as_str) == Some("kill-session")
-                    && call.iter().any(|a| a == COORDINATOR_SESSION_NAME)
+                call.get(2).map(String::as_str) == Some("if-shell")
+                    && call
+                        .get(5)
+                        .is_some_and(|a| a == &format!("={COORDINATOR_SESSION_NAME}:"))
             })
             .expect("expected a kill-session for the coordinator");
         let old_pane_read = calls
@@ -2426,8 +2430,10 @@ mod tests {
 
         assert!(
             server.calls().iter().all(|call| {
-                call.get(2).map(String::as_str) != Some("kill-session")
-                    || call.iter().any(|a| a == COORDINATOR_SESSION_NAME)
+                call.get(2).map(String::as_str) != Some("if-shell")
+                    || call
+                        .get(5)
+                        .is_some_and(|a| a == &format!("={COORDINATOR_SESSION_NAME}:"))
             }),
             "no kill-session may name anything but the coordinator session"
         );
@@ -2452,7 +2458,7 @@ mod tests {
         let calls = server.calls();
         let kills = calls
             .iter()
-            .filter(|call| call.get(2).map(String::as_str) == Some("kill-session"))
+            .filter(|call| call.get(2).map(String::as_str) == Some("if-shell"))
             .count();
         let creates = calls
             .iter()

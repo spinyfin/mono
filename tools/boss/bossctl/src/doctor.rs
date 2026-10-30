@@ -33,22 +33,36 @@ pub async fn run_tmux_preflight(json: bool) -> Result<()> {
     // (emptier) one, so the engine's own startup log is authoritative for
     // the engine. See `tools/boss/docs/postmortems/`.
     let locale = boss_command_runner::LocaleDiagnostics::probe();
+    let warning = preflight.crash_warning().await.map(|issue| issue.body);
     match preflight {
-        boss_engine::tmux_preflight::TmuxPreflight::Ready { program, version } => {
+        ready @ (boss_engine::tmux_preflight::TmuxPreflight::Ready { .. }
+        | boss_engine::tmux_preflight::TmuxPreflight::ReadyUnknown { .. }) => {
+            let (program, version) = match ready {
+                boss_engine::tmux_preflight::TmuxPreflight::Ready { program, version } => {
+                    (program, Some(format!("{}.{}", version.major, version.minor)))
+                }
+                boss_engine::tmux_preflight::TmuxPreflight::ReadyUnknown { program } => (program, None),
+                _ => unreachable!(),
+            };
             if json {
                 println!(
                     "{}",
                     serde_json::json!({
-                        "ready": true,
-                        "program": program,
-                        "version": format!("{}.{}", version.major, version.minor),
+                        "ready": true, "program": program, "version": version, "warning": warning,
                         "locale_inherited": locale.inherited_summary(),
                         "locale_has_utf8": locale.has_utf8_locale,
                         "locale_forced_for_children": locale.forced.map(|(n, v)| format!("{n}={v}")),
                     })
                 );
             } else {
-                println!("tmux ready: {} {}.{}", program.display(), version.major, version.minor);
+                println!(
+                    "tmux ready: {} {}",
+                    program.display(),
+                    version.as_deref().unwrap_or("(unknown version)")
+                );
+                if let Some(warning) = warning {
+                    println!("{warning}");
+                }
                 println!("locale (this shell): {}", locale.inherited_summary());
                 if locale.has_utf8_locale {
                     println!("locale charset: UTF-8");

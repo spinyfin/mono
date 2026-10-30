@@ -27,6 +27,7 @@ async fn adoption_of_dead_registered_worker_preserves_owning_teardown() {
         ok("worker exited"),
         ok("BOSS_SPAWN_TOKEN=dead-token\n"),
         ok(""),
+        ok(""),
         failure("can't find session: dead-session"),
     ]);
     state.set_tmux_override_for_test(tmux.clone());
@@ -54,7 +55,10 @@ async fn adoption_of_dead_registered_worker_preserves_owning_teardown() {
     assert!(state.live_worker_states.get(1).is_none());
     assert!(pool.claims().await.is_empty());
     assert!(state.work_db.tmux_identity_for_execution(&run).unwrap().is_none());
-    assert_eq!(runner.calls().len(), 12);
+    let calls = runner.calls();
+    assert_eq!(calls.len(), 13);
+    assert_eq!(calls[10][2], "detach-client");
+    assert_eq!(calls[11][2], "if-shell");
 }
 
 pub(super) async fn answer_detach(state: &ServerState, sink: &SessionSink, slot: u8) {

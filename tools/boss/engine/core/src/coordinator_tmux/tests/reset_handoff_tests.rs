@@ -250,7 +250,7 @@ async fn assert_fresh_write_receives_present_brief(deadline_ready: bool) {
             !server
                 .calls()
                 .iter()
-                .any(|c| c.get(2).map(String::as_str) == Some("kill-session"))
+                .any(|c| c.get(2).map(String::as_str) == Some("if-shell"))
         );
         db.set_coordinator_handoff(
             "fresh operator facts",
@@ -299,7 +299,7 @@ async fn missing_old_or_wrong_writer_handoff_times_out_and_restarts_with_stale_c
             server
                 .calls()
                 .iter()
-                .any(|c| c.get(2).map(String::as_str) == Some("kill-session"))
+                .any(|c| c.get(2).map(String::as_str) == Some("if-shell"))
         );
         if handoff.is_some() {
             assert!(start_brief(dir.path()).contains("HANDOFF STALE:"));
@@ -419,7 +419,7 @@ async fn stale_confirmation_and_mismatched_live_token_never_prompt_or_kill() {
             !server
                 .calls()
                 .iter()
-                .any(|c| c.get(2).map(String::as_str) == Some("kill-session"))
+                .any(|c| c.get(2).map(String::as_str) == Some("if-shell"))
         );
     }
 }
@@ -526,7 +526,7 @@ async fn delivery_failure_leaves_the_session_and_reports_a_forceable_error() {
         !server
             .calls()
             .iter()
-            .any(|c| c.get(2).map(String::as_str) == Some("kill-session")),
+            .any(|c| c.get(2).map(String::as_str) == Some("if-shell")),
         "a failed delivery must leave the session running"
     );
     // Forced reset bypasses delivery, so a failed delivery cannot block it.

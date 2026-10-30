@@ -70,6 +70,7 @@ pub(crate) async fn prepare_server(tmux: &Tmux) -> Result<()> {
     ])
     .await
     .context("starting Boss private tmux server before its first window")?;
+    crate::tmux_health::server_observed(tmux);
     Ok(())
 }
 
@@ -97,6 +98,7 @@ pub(crate) fn assert_color_environment(new_session: &[String]) {
 /// Server options are set first so `terminal-features` is in place before
 /// the caller returns an identity used to attach a client.
 pub(crate) async fn apply(tmux: &Tmux, session_name: &str) -> Result<()> {
+    crate::tmux_health::server_observed(tmux);
     let mut settings = Vec::new();
     for &(option, value) in BOSS_SERVER_OPTIONS {
         if tmux.show_server_option(option).await? != Some(value.to_owned()) {

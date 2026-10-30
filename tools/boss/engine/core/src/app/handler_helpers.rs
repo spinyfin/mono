@@ -179,6 +179,14 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
             .map(|alert| crate::pre_start_streak::health_issue_for(alert, streak_now)),
     );
 
+    issues.extend(
+        server_state
+            .tmux_health_issues
+            .read()
+            .expect("tmux health lock poisoned")
+            .clone(),
+    );
+
     if !anthropic_api_key_present {
         issues.push(EngineHealthIssue {
             kind: "missing_anthropic_api_key".to_owned(),

@@ -208,6 +208,7 @@ async fn release_worker_pane_reaps_the_tmux_session_for_a_slot_mapped_run() {
         ok("0"),
         ok("BOSS_SPAWN_TOKEN=tok-y\n"),
         ok(""),
+        ok(""),
     ]);
     server_state.set_tmux_override_for_test(tmux);
 
@@ -250,9 +251,20 @@ async fn release_worker_pane_reaps_the_tmux_session_for_a_slot_mapped_run() {
             vec![
                 "-S",
                 boss_tmux::TEST_SOCKET_PATH,
-                "kill-session",
+                "detach-client",
+                "-s",
+                "=boss-1-example"
+            ],
+            vec![
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
+                "if-shell",
+                "-F",
                 "-t",
-                "boss-1-example"
+                "=boss-1-example:",
+                "#{==:#{session_attached_list},}",
+                "kill-session -t '=boss-1-example'",
+                "display-message -p boss-viewers-attached"
             ],
         ],
         "the slot-mapped reap path must issue show-environment, the narrow pane-state probe, then kill-session",

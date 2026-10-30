@@ -736,6 +736,7 @@ async fn serve_scoped(
         .tmux_preflight
         .write()
         .expect("tmux preflight lock poisoned") = tmux_preflight;
+    server_state.start_tmux_health_monitor().await;
 
     // A coordinator has no worker run to pull it through the ordinary tmux
     // adoption pass. Watch its singleton independently so an exited Claude
@@ -752,7 +753,8 @@ async fn serve_scoped(
             tokio::time::sleep(delay).await;
             let program = match coordinator_supervisor_state.tmux_preflight.read() {
                 Ok(guard) => match &*guard {
-                    crate::tmux_preflight::TmuxPreflight::Ready { program, .. } => program.clone(),
+                    crate::tmux_preflight::TmuxPreflight::Ready { program, .. }
+                    | crate::tmux_preflight::TmuxPreflight::ReadyUnknown { program } => program.clone(),
                     crate::tmux_preflight::TmuxPreflight::Unavailable { .. } => {
                         delay = crate::coordinator_tmux::CoordinatorRestartFailures::BACKOFF_CAP;
                         continue;

@@ -1547,6 +1547,7 @@ fn stamp_newest_run_tmux_identity(server: &ServerState, execution_id: &str, slot
         super::tmux_stub::ok("0"),
         super::tmux_stub::ok(&env),
         super::tmux_stub::ok(""),
+        super::tmux_stub::ok(""),
     ]);
     server.set_tmux_override_for_test(tmux);
     corroborate_slot_tmux_adopted(server, execution_id, slot_id);

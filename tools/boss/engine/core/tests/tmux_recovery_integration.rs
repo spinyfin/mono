@@ -43,6 +43,86 @@ use tmux_fixture::{TmuxServerGuard, declared_tmux_binary, write_fixture_shell};
 const REPAINTING_WORKER: &str = include_str!("fixtures/repainting-worker.sh");
 const SHORT_WINDOW: Duration = Duration::from_secs(1);
 
+#[tokio::test]
+async fn teardown_detaches_a_real_viewer_and_preserves_other_sessions() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let socket = dir.path().join("detach.sock");
+    let program = declared_tmux_binary()?;
+    let _guard = TmuxServerGuard::new(program.clone(), socket.clone());
+    let tmux = Tmux::from_path_with_socket(&program, &socket)?;
+    tmux.start_server_with_options(&[
+        boss_tmux::OptionSetting {
+            scope: boss_tmux::OptionScope::Server,
+            option: "exit-empty",
+            value: "off",
+        },
+        boss_tmux::OptionSetting {
+            scope: boss_tmux::OptionScope::Server,
+            option: "focus-events",
+            value: "on",
+        },
+    ])
+    .await?;
+    for name in ["survivor", "viewed"] {
+        tmux.new_session(&boss_tmux::NewSession {
+            name: name.to_owned(),
+            environment: [("BOSS_SPAWN_TOKEN".to_owned(), "token".to_owned())].into(),
+            working_directory: dir.path().to_path_buf(),
+            command: "sleep 60".to_owned(),
+        })
+        .await?;
+    }
+    let mut viewer = tokio::process::Command::new(&program)
+        .args(["-S"])
+        .arg(&socket)
+        .args(["-C", "attach-session", "-t", "viewed"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut attached = false;
+    for _ in 0..100 {
+        let output = tokio::process::Command::new(&program)
+            .arg("-S")
+            .arg(&socket)
+            .args(["display-message", "-p", "-t", "viewed", "#{session_attached}"])
+            .output()
+            .await?;
+        if output.status.success() && output.stdout == b"1\n" {
+            attached = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(attached, "the real viewer must attach before teardown");
+    let viewer_pid = i32::try_from(viewer.id().expect("viewer is running"))?;
+    // Keep the viewer from acknowledging detach. tmux's session_attached
+    // count can already be zero here, but its tty/session must remain valid.
+    assert_eq!(unsafe { libc::kill(viewer_pid, libc::SIGSTOP) }, 0);
+    let reaper_tmux = tmux.clone();
+    let reaper = tokio::spawn(async move { reaper_tmux.kill_session_verified("viewed", "token").await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !reaper.is_finished(),
+        "teardown must wait for the viewer's detach acknowledgement"
+    );
+    assert!(
+        tmux.list_sessions()
+            .await?
+            .iter()
+            .any(|session| session.name == "viewed")
+    );
+    assert_eq!(unsafe { libc::kill(viewer_pid, libc::SIGCONT) }, 0);
+    assert_eq!(reaper.await??, KillSessionOutcome::Killed);
+    let exit = tokio::time::timeout(Duration::from_secs(3), viewer.wait()).await??;
+    assert!(exit.success(), "viewer should finish its detach handshake: {exit}");
+    let remaining = tmux.list_sessions().await?;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].name, "survivor");
+    Ok(())
+}
+
 /// App facade for the production spawn path: it validates that the engine
 /// attached a viewer to the tmux-owned worker and acknowledges that attach.
 #[derive(Default)]
