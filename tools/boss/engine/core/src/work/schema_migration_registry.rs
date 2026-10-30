@@ -293,6 +293,11 @@ pub(super) fn all() -> Vec<Migration> {
             legacy_version: None,
             apply: driver_allocation::sol_selection::migrate_default_full_share,
         },
+        Migration {
+            id: "20261030_0033_recovery_fresh_start".into(),
+            legacy_version: None,
+            apply: execution_recovery_rearm::migrate_fresh_start,
+        },
     ]);
     migrations
 }

@@ -113,15 +113,25 @@ async fn checkout_of_predecessor_publication_cannot_hide_unpublished_work() {
         workspace_id: "replacement".into(),
         workspace_path: repo.replacement.clone(),
     };
-    let error = coordinator
-        .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", Some(99), Some(99))
-        .await
-        .unwrap_err();
-    assert_eq!(
-        recovery::pointer_integrity_kind(&error),
-        Some(recovery::PointerIntegrityKind::NotContained)
+    assert!(
+        coordinator
+            .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", Some(99), Some(99))
+            .await
+            .unwrap()
+            .is_none()
     );
-    assert_eq!(recovery::snapshot_pointers(&LocalJj, &record).await.unwrap(), before);
+    for (_, commit) in before {
+        if let Some(commit) = commit {
+            let archive = format!("preserved/{}/{commit}", prior.id);
+            assert_eq!(
+                JjRepo::run(&repo.repo, &["log", "--no-graph", "-r", &archive, "-T", "commit_id"]),
+                commit
+            );
+        }
+    }
+    let notes = coordinator.work_db.list_attention_items(&prior.id).unwrap();
+    assert_eq!(notes[0].status, "resolved");
+    assert!(notes[0].body_markdown.contains("not contained"));
 }
 
 /// A read-only review inherits nothing from the reviewer before it: the same

@@ -354,7 +354,15 @@ async fn non_implementation_with_deleted_predecessor_heads_continues_without_rec
         .await
         .unwrap();
     assert!(recovered.is_none());
-    assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
+    assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_none());
+    assert_eq!(db.list_attention_items(&prior.id).unwrap()[0].status, "resolved");
+    assert!(
+        !boss_engine_test_git::jj::JjRepo::run(
+            &repo.repo,
+            &["bookmark", "list", &format!("glob:preserved/{}/*", prior.id)]
+        )
+        .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -629,8 +637,8 @@ async fn blocked_revision_dispatch_resumes_from_pr_head_or_retires_an_unvouched_
             assert_eq!(retired_attention.len(), 1, "{retired_attention:?}");
             assert!(retired_attention[0].body_markdown.contains(&next.id));
             assert!(
-                heads_exist.lines().any(|l| l == record.head()),
-                "a predecessor's pointers stay for inspection"
+                !heads_exist.lines().any(|l| l == record.head()),
+                "archived pointers are released for fresh creation"
             );
             assert!(db.execution_restore_report(&next.id).unwrap().is_none());
         }
@@ -894,29 +902,60 @@ async fn rewritten_pr_dispatch_preserves_successor_work_through_second_recovery(
 }
 
 #[tokio::test]
-async fn revision_without_any_bound_pr_blocks_the_work_item() {
+async fn revision_without_any_bound_pr_archives_and_starts_fresh() {
     let h = chain_harness(false, true, false).await;
-    let error = h.dispatch().await.unwrap_err();
-    assert!(error.to_string().contains("bound PR"), "{error:#}");
+    let prior = h.coordinator.work_db.recovery_predecessor(&h.next).unwrap().unwrap();
+    h.dispatch().await.unwrap();
     assert!(h.cube.goto_calls.lock().await.is_empty());
+    assert_eq!(
+        h.coordinator.work_db.get_execution(&h.next.id).unwrap().status,
+        ExecutionStatus::Running
+    );
+    assert!(
+        h.coordinator
+            .work_db
+            .execution_bookmark_optional(&prior.id)
+            .unwrap()
+            .is_none()
+    );
+    let notes = h.coordinator.work_db.list_attention_items(&prior.id).unwrap();
+    assert_eq!(notes[0].status, "resolved");
+    assert!(notes[0].body_markdown.contains("bound PR"));
+    assert!(
+        !boss_engine_test_git::jj::JjRepo::run(
+            &h.repo.repo,
+            &["bookmark", "list", &format!("glob:preserved/{}/*", prior.id)]
+        )
+        .is_empty()
+    );
     let (WorkItem::Chore(item) | WorkItem::Task(item)) =
         h.coordinator.work_db.get_work_item(&h.next.work_item_id).unwrap()
     else {
         panic!("expected chore")
     };
-    assert_eq!(item.status, TaskStatus::Blocked);
-    assert!(!item.autostart);
+    assert_ne!(item.status, TaskStatus::Blocked);
 }
 
 #[tokio::test]
-async fn transient_fetch_failure_keeps_the_item_retryable() {
+async fn transient_fetch_failure_archives_and_starts_fresh() {
     // No origin remote: `jj git fetch` fails while the pointer is intact.
     let h = chain_harness(true, false, false).await;
     let autostart_before = match h.coordinator.work_db.get_work_item(&h.next.work_item_id).unwrap() {
         WorkItem::Chore(item) | WorkItem::Task(item) => item.autostart,
         _ => panic!("expected task"),
     };
-    h.dispatch().await.unwrap_err();
+    let prior = h.coordinator.work_db.recovery_predecessor(&h.next).unwrap().unwrap();
+    h.dispatch().await.unwrap();
+    assert!(
+        h.coordinator
+            .work_db
+            .execution_bookmark_optional(&prior.id)
+            .unwrap()
+            .is_none()
+    );
+    let notes = h.coordinator.work_db.list_attention_items(&prior.id).unwrap();
+    assert_eq!(notes[0].status, "resolved");
+    assert!(notes[0].body_markdown.contains("preserved/"));
     let (WorkItem::Chore(item) | WorkItem::Task(item)) =
         h.coordinator.work_db.get_work_item(&h.next.work_item_id).unwrap()
     else {
@@ -924,9 +963,9 @@ async fn transient_fetch_failure_keeps_the_item_retryable() {
     };
     assert_ne!(item.status, TaskStatus::Blocked, "transient failure must not block");
     assert_eq!(item.autostart, autostart_before, "autostart must not be cleared");
-    assert_ne!(
+    assert_eq!(
         h.coordinator.work_db.get_execution(&h.next.id).unwrap().status,
-        ExecutionStatus::Failed
+        ExecutionStatus::Running
     );
 }
 

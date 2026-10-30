@@ -16,7 +16,7 @@ pub(super) struct PreStartFailureReported;
 /// branch head, or (for a post-merge review batch member) a frozen
 /// revision such as a merge commit SHA.
 #[derive(Clone, Copy, Debug)]
-enum GotoTarget<'a> {
+pub(super) enum GotoTarget<'a> {
     Pr(u64),
     Revision(&'a str),
 }
@@ -387,16 +387,14 @@ impl ExecutionCoordinator {
                 None => None,
             },
         };
-        if let Some(record) = recovery_record {
-            for constraint in [pinned.as_deref(), requested.as_deref()].into_iter().flatten() {
-                anyhow::ensure!(
-                    constraint == record.host_id,
-                    "recovery store is on host {}, conflicting with requested host {constraint}",
-                    record.host_id
-                );
-            }
-            // The repository store is host-local. This constrains the host,
-            // never a cube workspace or its lease lifetime.
+        if let Some(record) = recovery_record
+            && pinned.is_none()
+            && requested.is_none()
+            && execution.kind != ExecutionKind::PrReviewGuide
+        {
+            // Prefer the source host when unconstrained. A requested host or
+            // local-only guide archives the source through its owning adapter
+            // and starts fresh instead of failing host selection.
             pinned = Some(record.host_id);
         }
         if execution.kind == ExecutionKind::PrReviewGuide {
@@ -1542,7 +1540,7 @@ impl ExecutionCoordinator {
                 .and_then(boss_github::pr_url::pr_number_from_url),
             _ => None,
         });
-        let recovered = match self
+        let mut recovered = match self
             .recover_execution_bookmark(
                 execution,
                 &lease,
@@ -1562,16 +1560,12 @@ impl ExecutionCoordinator {
                     crate::workspace_lease_release::PreStartStage::BeforeRecoveryBookmark,
                 )
                 .await;
-                let pointer_damaged =
-                    crate::execution_bookmark_recovery::block_unrecoverable(&self.work_db, execution, &err)?;
-                let attention = if pointer_damaged {
-                    (
-                        crate::execution_bookmark_recovery::RECOVERY_FAILED,
-                        "Execution bookmark recovery failed",
-                    )
-                } else {
-                    ("cube_workspace_positioning_failed", "Execution bookmark restore failed")
-                };
+                // Recovery fallback errors mean archiving itself failed. Keep the
+                // original refs intact and report the storage failure, never park work.
+                let attention = (
+                    "cube_workspace_positioning_failed",
+                    "Could not archive recovery pointers",
+                );
                 self.record_start_failure(
                     Arc::clone(self),
                     execution,
@@ -1584,6 +1578,7 @@ impl ExecutionCoordinator {
                 return Err(err);
             }
         };
+        let pr_for_goto = pr_for_goto.or(pr_for_reconcile);
         let is_implementation = matches!(
             execution.kind,
             ExecutionKind::ChoreImplementation
@@ -1836,14 +1831,27 @@ impl ExecutionCoordinator {
                     .map(|recovered| self.work_db.execution_bookmark(&recovered.predecessor))
                     .transpose()?;
                 let report = self.work_db.execution_restore_report(&execution.id)?;
-                let record = adapter
-                    .create_execution_bookmark(
-                        &lease.workspace_path,
-                        &execution.id,
-                        predecessor.as_ref(),
-                        report.as_ref().and_then(|r| r.inherited_base.as_deref()),
+                let (record, retained) = self
+                    .create_or_start_fresh(
+                        execution,
+                        &lease,
+                        &adapter,
+                        (
+                            predecessor.as_ref(),
+                            report.as_ref().and_then(|r| r.inherited_base.as_deref()),
+                        ),
+                        (
+                            immutable_target_sha
+                                .as_deref()
+                                .map(GotoTarget::Revision)
+                                .or_else(|| pr_for_goto.map(GotoTarget::Pr)),
+                            &change_title,
+                        ),
                     )
                     .await?;
+                if !retained {
+                    recovered = None;
+                }
                 self.work_db.record_execution_bookmark(&record)?;
             }
             if let Some(recovered) = &recovered {
@@ -2515,20 +2523,14 @@ impl ExecutionCoordinator {
     ) -> Result<()> {
         let (attention_kind, attention_title) = attention;
         let error_text = format!("{error:#}");
-        let retry_delays: &[Duration] = if attention_kind == crate::execution_bookmark_recovery::RECOVERY_FAILED
-            && matches!(
-                execution.kind,
-                ExecutionKind::ChoreImplementation
-                    | ExecutionKind::TaskImplementation
-                    | ExecutionKind::RevisionImplementation
-            ) {
-            &[]
-        } else {
-            &self.pre_start_retry_delays
-        };
-        let transition =
-            self.work_db
-                .record_pre_start_failure(&execution.id, worker_id, cube_repo_id, &error_text, retry_delays);
+        let retry_delays = &self.pre_start_retry_delays;
+        let transition = self.work_db.record_pre_start_failure(
+            &execution.id,
+            worker_id,
+            cube_repo_id,
+            &error_text,
+            retry_delays,
+        );
         let (execution, run, outcome) = match transition {
             Ok(recorded) => recorded,
             Err(bookkeeping_error) => {
