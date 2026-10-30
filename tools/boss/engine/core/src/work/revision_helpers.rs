@@ -1518,7 +1518,9 @@ pub(crate) fn attach_task_derived_projections_traced(
             "attach_task_derived_projections: review_guide_state failed; ignoring"
         );
     }
-    super::revision_review_card::attach(&mut tasks, &chores);
+    if let Err(err) = super::revision_review_card::attach(conn, &mut tasks, &chores, false) {
+        tracing::warn!(?err, task_id = %task.id, "attach_task_derived_projections: revision review card failed; ignoring");
+    }
     if let Some(projected) = tasks.iter().chain(chores.iter()).find(|t| t.id == task.id) {
         copy_derived_projection_fields(task, projected);
     }

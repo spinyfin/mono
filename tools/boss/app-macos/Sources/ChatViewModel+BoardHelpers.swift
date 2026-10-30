@@ -480,9 +480,9 @@ extension ChatViewModel {
         // representation at all whenever the parent's card landed somewhere
         // else — e.g. a parent blocked for a non-review reason renders in
         // Backlog (`reveal_work_item` had nothing to point at).
-        let inReviewRevisions: [WorkCardRevisionRollup] = (
-            inReviewRevisions(forParentTaskID: task.id) + doneRevisions(forParentTaskID: task.id)
-        )
+        // In-review revisions host their own Review card, so only done
+        // revisions roll up here.
+        let inReviewRevisions: [WorkCardRevisionRollup] = doneRevisions(forParentTaskID: task.id)
         .sorted { ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0) }
         .map(WorkCardRevisionRollup.init(revision:))
 

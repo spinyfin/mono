@@ -2,47 +2,110 @@
 //! root's resolved review presentation rather than polling or classifying a
 //! second, independently stale set of PR facts on the revision row.
 
-use super::{Connection, PendingEvents, Result, Task, TaskKind, TaskStatus};
-use std::collections::HashMap;
+use super::{Connection, Result, Task, TaskKind, TaskStatus};
+use std::collections::{HashMap, HashSet};
 
-pub(super) fn attach(tasks: &mut [Task], chores: &[Task]) {
-    let rows: HashMap<_, _> = tasks.iter().chain(chores).map(|t| (t.id.clone(), t.clone())).collect();
-    for task in tasks {
-        if task.kind != TaskKind::Revision || task.status != TaskStatus::InReview {
+/// Present revisions that delivered their implementation as Review cards.
+/// With `project_held`, an `active` revision whose latest implementation
+/// execution completed (it is held pending the automated review) is shown as
+/// `in_review`; the stored status is untouched, so the hold keeps gating
+/// verdict advancement, dependents and the review recovery sweeps. Every
+/// `in_review` revision then takes the chain root's review presentation:
+/// review/CI/ready fields plus its blocked status, reason and detail.
+pub(super) fn attach(conn: &Connection, tasks: &mut [Task], chores: &[Task], project_held: bool) -> Result<()> {
+    let is_candidate = |t: &Task| {
+        t.kind == TaskKind::Revision
+            && (t.status == TaskStatus::InReview || (project_held && t.status == TaskStatus::Active))
+    };
+    if !tasks.iter().any(is_candidate) {
+        return Ok(());
+    }
+    let held = if project_held
+        && tasks
+            .iter()
+            .any(|t| t.kind == TaskKind::Revision && t.status == TaskStatus::Active)
+    {
+        completed_revision_ids(conn)?
+    } else {
+        HashSet::new()
+    };
+    let by_id: HashMap<&str, &Task> = tasks.iter().chain(chores).map(|t| (t.id.as_str(), t)).collect();
+    let mut targets: Vec<(usize, String)> = Vec::new();
+    for (index, task) in tasks.iter().enumerate() {
+        let shown = task.kind == TaskKind::Revision
+            && (task.status == TaskStatus::InReview || (task.status == TaskStatus::Active && held.contains(&task.id)));
+        if !shown {
             continue;
         }
-        let mut ancestor = task.parent_task_id.as_ref();
+        let mut ancestor = task.parent_task_id.as_deref();
         for _ in 0..super::MAX_CHAIN_DEPTH {
-            let Some(root) = ancestor.and_then(|id| rows.get(id)) else {
+            let Some(root) = ancestor.and_then(|id| by_id.get(id)) else {
                 break;
             };
             if root.kind != TaskKind::Revision {
-                // The owner decides the PR's review state, including blocked
-                // review cards. When that state agrees, retain the shared
-                // badge resolver's card-specific findings/self-link wording.
-                if task.ai_review_state != root.ai_review_state || task.ai_review_stage != root.ai_review_stage {
-                    task.ai_review_state = root.ai_review_state.clone();
-                    task.ai_review_badge = root.ai_review_badge.clone();
-                    task.ai_review_findings_revision_id = root.ai_review_findings_revision_id.clone();
-                }
-                task.ai_reviewing = root.ai_reviewing;
-                task.ai_review_stage = root.ai_review_stage.clone();
-                copy_review_fields(task, root);
+                targets.push((index, root.id.clone()));
                 break;
             }
-            ancestor = root.parent_task_id.as_ref();
+            ancestor = root.parent_task_id.as_deref();
         }
     }
-}
-
-/// Catch up revisions completed by an older engine that kept the card in
-/// Doing during automated review. Call only after the latest implementation
-/// is known to be completed; explicit restarts must remain in Doing.
-pub(super) fn reconcile_completed(pending: &mut PendingEvents, conn: &Connection, id: &str) -> Result<()> {
-    if super::WorkDb::advance_held_pending_review_task_to_in_review_in_tx(conn, id, &super::now_string())? {
-        super::stage_task_board_change(pending, conn, id)?;
+    let roots: HashMap<String, Task> = targets
+        .iter()
+        .filter_map(|(_, id)| by_id.get(id.as_str()).map(|t| (id.clone(), (*t).clone())))
+        .collect();
+    let shown_held: HashSet<usize> = tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.status == TaskStatus::Active && held.contains(&t.id))
+        .map(|(i, _)| i)
+        .collect();
+    for index in shown_held {
+        tasks[index].status = TaskStatus::InReview;
+    }
+    for (index, root_id) in targets {
+        let task = &mut tasks[index];
+        let root = &roots[&root_id];
+        // The owner decides the PR's review state, including blocked review
+        // cards. When that state agrees, retain the shared badge resolver's
+        // card-specific findings/self-link wording.
+        if task.ai_review_state != root.ai_review_state
+            || task.ai_review_stage != root.ai_review_stage
+            || task.ai_review_badge.is_none()
+        {
+            task.ai_review_state = root.ai_review_state.clone();
+            task.ai_review_badge = root.ai_review_badge.clone();
+            task.ai_review_findings_revision_id = root.ai_review_findings_revision_id.clone();
+        }
+        task.ai_reviewing = root.ai_reviewing;
+        task.ai_review_stage = root.ai_review_stage.clone();
+        copy_review_fields(task, root);
+        // Board-only: mirror the owner's blocked indicator. Stored status
+        // is what engine logic reads, so single-item reads never get this.
+        task.status = if root.status == TaskStatus::Blocked {
+            TaskStatus::Blocked
+        } else {
+            TaskStatus::InReview
+        };
+        task.blocked_reason = root.blocked_reason.clone();
+        task.blocked_detail = root.blocked_detail.clone();
     }
     Ok(())
+}
+
+/// Active revisions whose latest `revision_implementation` execution
+/// completed: the implementation is delivered and nothing is restarting it.
+fn completed_revision_ids(conn: &Connection) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.id FROM tasks t
+         WHERE t.kind = 'revision' AND t.status = 'active' AND t.deleted_at IS NULL
+           AND (SELECT e.status FROM work_executions e
+                WHERE e.work_item_id = t.id AND e.kind = 'revision_implementation'
+                ORDER BY e.created_at DESC, e.id DESC LIMIT 1) = 'completed'",
+    )?;
+    let ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(ids)
 }
 
 pub(super) fn copy_review_fields(dst: &mut Task, src: &Task) {

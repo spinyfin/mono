@@ -48,6 +48,8 @@ struct WorkBoardSectionItemsView: View {
         let selectedRevisionParentID = model.selectedRevisionParentID
         let dragRefusal = model.dragRefusalNotice
         let mergeFeedback = model.mergeFeedbackNotice
+        // One PR-URL -> reviewers index per section render, looked up per card.
+        let reviewerStates = column == .review ? Array(liveStates.byRunID.values) : []
         // Lazy so off-screen cards aren't instantiated/hit-tested at all — with
         // the default (ungrouped) board layout each column is a single section,
         // so this was the actual eagerly-built list of every card in the
@@ -63,6 +65,7 @@ struct WorkBoardSectionItemsView: View {
         LazyVStack(alignment: .leading, spacing: 10) {
             ForEach(items) { task in
                 let isSelected = selectedID == task.id
+                let ownerID = model.reviewOwner(for: task).id
                 let isFrontierHighlighted = frontierIDs.contains(task.id)
                     || selectedRevisionParentID == task.id
                 let liveState: WorkerLiveState? = {
@@ -84,15 +87,15 @@ struct WorkBoardSectionItemsView: View {
                     column: column,
                     snapshot: snapshot,
                     reviewers: column == .review
-                        ? Self.reviewWorkers(for: task, states: Array(liveStates.byRunID.values)) : [],
+                        ? Self.reviewWorkers(for: task, states: reviewerStates) : [],
                     model: model,
                     revisionHighlight: model.revisionHighlightState(for: task.id),
                     isRevealed: highlightID == task.id,
                     dragRefusalMessage: dragRefusal?.taskID == task.id
                         ? dragRefusal?.message : nil,
-                    mergeFeedbackMessage: mergeFeedback?.taskID == model.reviewOwner(for: task).id
+                    mergeFeedbackMessage: mergeFeedback?.taskID == ownerID
                         ? mergeFeedback?.message : nil,
-                    isRequestingMerge: model.mergingWhenReadyIDs.contains(model.reviewOwner(for: task).id)
+                    isRequestingMerge: model.mergingWhenReadyIDs.contains(ownerID)
                 )
                 .id(task.id)
                 .background {

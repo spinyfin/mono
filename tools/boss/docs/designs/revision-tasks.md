@@ -302,7 +302,9 @@ A revision in `todo`/`active` renders as its **own** card, visually a sibling of
 
 ### Review — rolled up under the parent
 
-A revision in `in_review` does **not** render its own card. Instead the **chain root's** Review-lane card gains one single line per revision:
+> **Superseded for in-review revisions.** A revision that has delivered its implementation renders its own Review card, presented exactly like its chain root: the engine projects the root's review section, CI/review/ready fields, and blocked status/reason/detail onto it, and the board shows a still-held (`active`, implementation completed) revision as `in_review` without changing the stored status. Only `done` revisions roll up under the parent as described below.
+
+A revision in `in_review` originally did **not** render its own card. Instead the **chain root's** Review-lane card gains one single line per revision:
 
 ```
 ┌──────────────────────────────────────────┐

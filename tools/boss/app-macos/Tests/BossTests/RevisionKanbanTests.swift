@@ -61,6 +61,44 @@ final class RevisionKanbanTests: XCTestCase {
         }
     }
 
+    /// The engine projects a blocked owner's status, reason and detail onto
+    /// the completed revision's card, so both cards show the same badge and
+    /// neither offers Merge When Ready.
+    func testBlockedPrimaryAndRevisionShareBlockedIndicatorAndMergeEligibility() {
+        var parent = makeParent(status: "blocked")
+        parent.prURL = "https://github.com/org/repo/pull/1"
+        parent.blockedReason = "merge_conflict"
+        parent.blockedDetail = "conflicts in a.rs"
+        parent.reviewSection = .blocked
+        var revision = makeRevision(status: "blocked", seq: 1, parentID: parent.id)
+        revision.prURL = parent.prURL
+        revision.blockedReason = parent.blockedReason
+        revision.blockedDetail = parent.blockedDetail
+        revision.reviewSection = .blocked
+        let context = WorkCardSnapshotContext(column: .review)
+        let primary = WorkCardSnapshot.build(task: parent, context: context)
+        let card = WorkCardSnapshot.build(task: revision, context: context)
+        XCTAssertEqual(WorkBlockedBadge.badgeText(for: revision), "Merge Conflict")
+        XCTAssertEqual(WorkBlockedBadge.badgeText(for: revision), WorkBlockedBadge.badgeText(for: parent))
+        XCTAssertEqual(WorkBlockedBadge.badgeTooltip(for: revision), WorkBlockedBadge.badgeTooltip(for: parent))
+        XCTAssertEqual(revision.isMergeWhenReadyEligible, parent.isMergeWhenReadyEligible)
+        XCTAssertFalse(revision.isMergeWhenReadyEligible)
+        XCTAssertEqual(card.aiReviewState, primary.aiReviewState)
+    }
+
+    func testParentRollupExcludesInReviewRevisionWithOwnCard() {
+        let model = makeModel()
+        let parent = makeParent(status: "in_review")
+        let revision = makeRevision(status: "in_review", seq: 1, parentID: parent.id)
+        model.tasksByProjectID = ["proj_1": [parent, revision]]
+        XCTAssertTrue(model.workItems(in: .review).contains { $0.id == revision.id })
+        let snapshot = model.workCardSnapshot(
+            for: parent, column: .review, isSelected: false, isFrontierHighlighted: false,
+            boardStyle: .classic, liveState: nil
+        )
+        XCTAssertTrue(snapshot.inReviewRevisions.isEmpty)
+    }
+
     // MARK: boardColumn routing
 
     func testInReviewRevisionRoutesMappedToReview() {
