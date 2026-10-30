@@ -163,17 +163,10 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
     let anthropic_api_key_present = server_state.anthropic_api_key.is_some();
     let dispatch_paused = server_state.execution_coordinator.is_dispatch_paused();
     let mut issues: Vec<EngineHealthIssue> = Vec::new();
-    issues.extend(
-        server_state
-            .tmux_health_issues
-            .read()
-            .expect("tmux health lock poisoned")
-            .clone(),
-    );
 
     // Pre-start spawn-failure streaks: a (driver, worker kind) combination
     // whose spawns keep failing before a pane exists, with no success in
-    // between. Listed after tmux crash warnings because the banner's headline is the first
+    // between. Listed first because the banner's headline is the first
     // issue, and "a whole class of worker cannot start" is the one entry
     // here that is actively losing work while it sits unread. The engine
     // renders the text; the app shows it verbatim. See
@@ -184,6 +177,14 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
         spawn_failure_streaks
             .iter()
             .map(|alert| crate::pre_start_streak::health_issue_for(alert, streak_now)),
+    );
+
+    issues.extend(
+        server_state
+            .tmux_health_issues
+            .read()
+            .expect("tmux health lock poisoned")
+            .clone(),
     );
 
     if !anthropic_api_key_present {

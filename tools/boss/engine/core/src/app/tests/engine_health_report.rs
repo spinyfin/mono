@@ -3,11 +3,28 @@ use super::*;
 #[tokio::test]
 async fn tmux_warning_is_in_the_health_wire_report_and_clears_when_fixed() {
     let (state, _dir) = test_server_state();
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    for execution in ["exec_failure_a", "exec_failure_b"] {
+        state.execution_coordinator.pre_start_streaks().record_failure(
+            crate::pre_start_streak::StreakKey::for_execution(
+                Some("codex"),
+                &boss_protocol::ExecutionKind::PrReviewGuide,
+            ),
+            execution,
+            "spawn failed",
+            now,
+        );
+    }
     for version in ["tmux 3.6a", "tmux master", "unparseable", "tmux 3.8"] {
         *state.tmux_health_issues.write().unwrap() = crate::tmux_health::version_warning("Installed tmux", version)
             .into_iter()
             .collect();
         let report = build_engine_health_report(&state);
+        assert_eq!(
+            report.issues[0].kind,
+            crate::pre_start_streak::PRE_START_FAILURE_STREAK_ISSUE_KIND,
+            "active spawn failures must retain headline priority over tmux advisories",
+        );
         let event = FrontendEvent::EngineHealthResult { report };
         let wire = serde_json::to_value(&event).unwrap();
         let issues = wire["report"]["issues"]

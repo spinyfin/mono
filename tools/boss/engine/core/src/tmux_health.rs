@@ -16,7 +16,11 @@ pub(crate) fn subscribe() -> broadcast::Receiver<Tmux> {
 }
 
 pub(crate) fn version_warning(source: &str, output: &str) -> Option<EngineHealthIssue> {
-    let version = TmuxVersion::parse(output).ok();
+    let parsed = TmuxVersion::parse(output).ok();
+    let development = output.trim().starts_with("tmux next-");
+    let fixed = TmuxVersion { major: 3, minor: 8 };
+    // A development build targeting the fixed release may predate its fix.
+    let version = parsed.filter(|v| !development || *v > fixed);
     // Introduced by tmux 2bb0b9d6 (first released in 3.3); fixed by
     // 7a816f90 (first released in 3.8). Development names without a
     // numeric version cannot establish whether that fix is present.
@@ -69,7 +73,17 @@ mod tests {
 
     #[test]
     fn affected_and_unknown_versions_warn_without_a_refusal() {
-        for version in ["3.3", "3.6a", "3.7c", "master", "", "3.8garbage", "3.8.1", "999999.8"] {
+        for version in [
+            "next-3.8",
+            "3.3",
+            "3.6a",
+            "3.7c",
+            "master",
+            "",
+            "3.8garbage",
+            "3.8.1",
+            "999999.8",
+        ] {
             let issue = version_warning("Installed tmux", &format!("tmux {version}")).unwrap();
             assert_eq!(issue.severity, "warning");
             assert!(issue.body.contains("every session at once"));

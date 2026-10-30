@@ -44,17 +44,7 @@ impl ServerState {
         for server in servers.iter() {
             issues.extend(crate::tmux_health::server_warning(server).await);
         }
-        // The app identifies issues by kind. Keep one banner entry while
-        // retaining evidence from both the installed executable and live servers.
-        let issues: Vec<_> = issues
-            .into_iter()
-            .reduce(|mut combined, issue| {
-                combined.body.push_str("\n\n");
-                combined.body.push_str(&issue.body);
-                combined
-            })
-            .into_iter()
-            .collect();
+        let issues = merge_warnings(issues);
         let changed = {
             let mut current = self.tmux_health_issues.write().expect("tmux health lock poisoned");
             if *current == issues {
@@ -66,6 +56,51 @@ impl ServerState {
         };
         if changed {
             self.broadcast_engine_health().await;
+        }
+    }
+}
+
+// The app identifies issues by kind; retain evidence from every source in one entry.
+fn merge_warnings(issues: Vec<boss_protocol::EngineHealthIssue>) -> Vec<boss_protocol::EngineHealthIssue> {
+    issues
+        .into_iter()
+        .reduce(|mut combined, issue| {
+            combined.body.push_str("\n\n");
+            combined.body.push_str(&issue.body);
+            combined
+        })
+        .into_iter()
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installed_and_running_versions_merge_into_one_issue() {
+        for (installed, server, expected_sources) in [
+            ("3.8", Some("3.6a"), vec!["Running tmux server"]),
+            ("3.8", Some("3.8"), vec![]),
+            ("3.6a", None, vec!["Installed tmux"]),
+            ("3.6a", Some("3.7"), vec!["Installed tmux", "Running tmux server"]),
+        ] {
+            let mut warnings = Vec::new();
+            warnings.extend(crate::tmux_health::version_warning(
+                "Installed tmux",
+                &format!("tmux {installed}"),
+            ));
+            if let Some(server) = server {
+                warnings.extend(crate::tmux_health::version_warning(
+                    "Running tmux server",
+                    &format!("tmux {server}"),
+                ));
+            }
+            let merged = merge_warnings(warnings);
+            assert_eq!(merged.len(), usize::from(!expected_sources.is_empty()));
+            for source in expected_sources {
+                assert!(merged[0].body.contains(source), "{installed} / {server:?}: {source}");
+            }
         }
     }
 }

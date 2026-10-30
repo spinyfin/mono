@@ -42,6 +42,18 @@ impl TmuxPreflight {
         }
     }
 
+    /// Probe the original version label using the engine health warning policy.
+    pub async fn crash_warning(&self) -> Option<boss_protocol::EngineHealthIssue> {
+        let program = match self {
+            Self::Ready { program, .. } | Self::ReadyUnknown { program } => program,
+            Self::Unavailable { .. } => return None,
+        };
+        match Tmux::from_path_with_socket(program, "/unused-version-probe.sock") {
+            Ok(tmux) => crate::tmux_health::installed_warning(&tmux).await,
+            Err(error) => crate::tmux_health::version_warning("Installed tmux", &error.to_string()),
+        }
+    }
+
     pub fn unavailable_reason(&self) -> Option<&str> {
         match self {
             Self::Ready { .. } | Self::ReadyUnknown { .. } => None,

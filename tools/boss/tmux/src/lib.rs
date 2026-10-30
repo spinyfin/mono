@@ -678,22 +678,14 @@ impl Tmux {
         }
     }
 
+    /// Private teardown primitive; `kill_session_verified` is the public entry point.
+    /// Detaches viewers and kills only behind an in-queue empty-attached-list guard.
+    /// Returns `Ok(true)` when killed, `Ok(false)` when absent, or `Err` on failure.
+    /// If viewers remain after the polling budget, returns `Err` with the session alive.
     async fn kill_session_unchecked(&self, session: &str) -> Result<bool> {
         let target = format!("={session}");
         let mut detach = self.server_args();
         detach.extend(["detach-client".into(), "-s".into(), target.clone().into()]);
-        let output = self.run(&detach).await?;
-        if !output.success {
-            if is_absent_session_stderr(&output.stderr) {
-                return Ok(false);
-            }
-            // tmux still resolves an implicit target client for detach-client
-            // even with -s. With no viewers it reports this diagnostic. The
-            // guarded kill below independently verifies that the list is empty.
-            if !is_diagnostic(&output.stderr, &["no current client"]) {
-                return command_failed(&detach, &output);
-            }
-        }
 
         // detach-client requests an asynchronous handshake. Check inside tmux's
         // command queue immediately before kill-session, so a new attachment
@@ -712,7 +704,20 @@ impl Tmux {
             format!("kill-session -t {}", quote_for_shell(&target)).into(),
             "display-message -p boss-viewers-attached".into(),
         ]);
-        for _ in 0..50 {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let output = self.run(&detach).await?;
+            if !output.success {
+                if is_absent_session_stderr(&output.stderr) {
+                    return Ok(false);
+                }
+                // tmux still resolves an implicit target client for detach-client
+                // even with -s. With no viewers it reports this diagnostic. The
+                // guarded kill below independently verifies that the list is empty.
+                if !is_diagnostic(&output.stderr, &["no current client"]) {
+                    return command_failed(&detach, &output);
+                }
+            }
             let output = self.run(&kill).await?;
             if !output.success {
                 if is_absent_session_stderr(&output.stderr) {
@@ -723,9 +728,11 @@ impl Tmux {
             if output.stdout.trim() != "boss-viewers-attached" {
                 return Ok(true);
             }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("refusing kill-session for {session:?}: viewers have not finished detaching");
+            }
             sleep(std::time::Duration::from_millis(20)).await;
         }
-        bail!("refusing kill-session for {session:?}: viewers have not finished detaching")
     }
 
     /// Destroys the entire private tmux server, tearing down every session

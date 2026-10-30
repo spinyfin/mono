@@ -22,6 +22,7 @@ async fn waits_for_detach_handshake_before_guarded_kill() {
         success(""),
         success("boss-viewers-attached\n"),
         success(""),
+        success(""),
     ]);
     assert_eq!(
         tmux.kill_session_verified("boss-1", "secret").await.unwrap(),
@@ -43,7 +44,8 @@ async fn waits_for_detach_handshake_before_guarded_kill() {
             "display-message -p boss-viewers-attached"
         ]
     );
-    assert_eq!(calls[2], calls[3]);
+    assert_eq!(calls[1], calls[3]);
+    assert_eq!(calls[2], calls[4]);
 }
 
 #[tokio::test]
@@ -54,18 +56,19 @@ async fn detach_failure_never_reaches_kill() {
     assert_eq!(runner.calls()[1][2], "detach-client");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn slow_viewers_leave_the_session_alive_for_retry() {
-    let replies = [success("BOSS_SPAWN_TOKEN=secret\n"), success("")]
+    let replies = [success("BOSS_SPAWN_TOKEN=secret\n")]
         .into_iter()
-        .chain((0..50).map(|_| success("boss-viewers-attached\n")));
+        .chain((0..151).flat_map(|_| [success(""), success("boss-viewers-attached\n")]));
     let (tmux, runner) = tmux(replies);
     let error = tmux.kill_session_verified("boss-1", "secret").await.unwrap_err();
     assert!(error.to_string().contains("viewers have not finished detaching"));
-    assert_eq!(runner.calls().len(), 52);
+    assert_eq!(runner.calls().len(), 303);
     assert!(
         runner.calls()[2..]
             .iter()
+            .step_by(2)
             .all(|call| call[6] == "#{==:#{session_attached_list},}")
     );
 }
