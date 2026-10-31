@@ -1563,7 +1563,7 @@ pub(super) async fn handle_comments_record_guide_outcome(ctx: Dispatch, req: Fro
                         .ok()
                         .flatten()
                     {
-                        crate::review_verdict_apply_sweep::publication::notify_review_guide_changed(
+                        crate::execution_publisher::notify_review_guide_changed(
                             &work_db,
                             &server_state.publisher,
                             &root,

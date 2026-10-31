@@ -960,7 +960,7 @@ fn submit_guide(
     comparison_id: &str,
 ) -> std::result::Result<crate::work::SubmitWorkerProposalOutcome, boss_protocol::ProposalSubmissionError> {
     let payload = serde_json::json!({ "body_markdown": RESTART_GUIDE }).to_string();
-    crate::review_verdict_apply_sweep::guide_validation::submit_worker_proposal(
+    crate::review_guide_validation::submit_worker_proposal(
         db,
         crate::work::SubmitWorkerProposalInput {
             execution_id,
@@ -975,10 +975,8 @@ fn submit_guide(
 
 /// Run the startup recovery pass the way the engine does: validation above
 /// storage, adoption and publication inside it.
-fn recover_orphaned(
-    db: &WorkDb,
-) -> crate::review_verdict_apply_sweep::guide_validation::ReviewGuideSubmissionRecoveryReport {
-    crate::review_verdict_apply_sweep::guide_validation::recover_orphaned_submissions(db).unwrap()
+fn recover_orphaned(db: &WorkDb) -> crate::review_guide_validation::ReviewGuideSubmissionRecoveryReport {
+    crate::review_guide_validation::recover_orphaned_submissions(db).unwrap()
 }
 
 /// The restart-during-spawn ordering. A guide run is spawned seconds before

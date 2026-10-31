@@ -233,8 +233,8 @@ impl WorkDb {
     /// [`super::review_guide_submission::GuideForValidation::validated`]).
     /// `guide` is only consulted for [`ProposalKind::ReviewGuide`], where it is
     /// required; the validation verdict is judged inside the transaction after
-    /// the attempt-state checks, exactly as before validation moved out of
-    /// storage.
+    /// the attempt-state checks, so an attempt-state refusal takes precedence over
+    /// a validation failure.
     pub(crate) fn submit_worker_proposal_with_guide(
         &self,
         input: SubmitWorkerProposalInput<'_>,
