@@ -2533,13 +2533,9 @@ impl ExecutionCoordinator {
         let (attention_kind, attention_title) = attention;
         let error_text = format!("{error:#}");
         let retry_delays = &self.pre_start_retry_delays;
-        let transition = self.work_db.record_pre_start_failure(
-            &execution.id,
-            worker_id,
-            cube_repo_id,
-            &error_text,
-            retry_delays,
-        );
+        let transition =
+            self.work_db
+                .record_pre_start_failure(&execution.id, worker_id, cube_repo_id, &error_text, retry_delays);
         let (execution, run, outcome) = match transition {
             Ok(recorded) => recorded,
             Err(bookkeeping_error) => {
