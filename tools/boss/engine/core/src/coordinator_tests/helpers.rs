@@ -113,6 +113,8 @@ pub(super) struct FakeCubeClient {
     pub(super) fail_create: bool,
     pub(super) fail_bookmark_create: bool,
     pub(super) real_bookmarks: bool,
+    /// Exercise actual checkout positioning as well as recovery in scratch jj repos.
+    pub(super) position_real_workspace: bool,
     pub(super) bookmark_calls: Mutex<Vec<String>>,
     pub(super) fail_goto: bool,
     /// Fail the first N `goto_workspace` calls, then succeed.
@@ -332,6 +334,9 @@ crate::stub_cube_client! { FakeCubeClient {
         if self.fail_create {
             return Err(anyhow!("cube change create failed"));
         }
+        if self.position_real_workspace {
+            boss_engine_test_git::jj::JjRepo::run(workspace_path, &["describe", "-m", title]);
+        }
         Ok(CubeChangeHandle {
             change_id: "chg-1".to_owned(),
         })
@@ -352,6 +357,9 @@ crate::stub_cube_client! { FakeCubeClient {
         if self.fail_goto {
             return Err(anyhow!("cube workspace goto failed"));
         }
+        if self.position_real_workspace {
+            boss_engine_test_git::jj::JjRepo::run(workspace_path, &["new", &format!("pr/{pr}"), "-m", "PR checkout"]);
+        }
         if let Some(bookmark) = &self.goto_reset_bookmark {
             boss_engine_test_git::jj::JjRepo::run(workspace_path, &["bookmark", "set", bookmark, "-r", &format!("pr/{pr}"), "--allow-backwards"]);
         }
@@ -365,6 +373,9 @@ crate::stub_cube_client! { FakeCubeClient {
             .push((workspace_path.display().to_string(), sha.to_owned()));
         if self.fail_goto {
             return Err(anyhow!("cube workspace goto --revision failed"));
+        }
+        if self.position_real_workspace {
+            boss_engine_test_git::jj::JjRepo::run(workspace_path, &["new", sha, "-m", "Captured head checkout"]);
         }
         Ok(())
     }

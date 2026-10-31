@@ -8,6 +8,8 @@ The engine keeps three bookmarks per execution in the shared jj store of the rep
 
 The `execution_bookmarks` row for the execution records the shared store path, the host, and the last checkpointed baseline commit (`base_commit`). A missing bookmark can be rebuilt from that commit or a verified evolution successor that is an ancestor of every preserved head.
 
+Recovery is an optimisation. If pointer integrity checks cannot establish safe recovery, the engine archives the preserved commits and starts fresh. Transport failures retry through the ordinary positioning-failure path without retiring the recovery source. Redoing work is preferable to leaving an item unable to progress.
+
 Recovery resumes a later execution from `boss-base..<head>` of its predecessor. The integrity check requires a single line of history: every head must descend from the baseline, and when both heads exist one must descend from the other. A pointer that fails the check is never resumed from as-is.
 
 ## What each pointer is for, and how long it is needed
@@ -92,17 +94,50 @@ When the integrity check fails with one of the three kinds above, dispatch repai
 2. **The recorded baseline commit.** If only the bookmark is missing and the heads still descend from `base_commit`, the bookmark is recreated there.
 3. **The other head.** Without a PR, two diverged heads of one execution may vouch for each other: if one already carries every change of the other (by change id and equivalent patch), the stale one moves to it.
 
-Anything the engine cannot vouch for is a `NotContained` failure that names each missing change and the exact `jj bookmark set` that would adopt the vouching commit after the content is confirmed present. Nothing moves.
+Anything the engine cannot vouch for produces a diagnostic naming the missing changes. Dispatch consumes that diagnostic through the fresh-start fallback below. It does not ask a person to adopt pointers by hand.
 
 ## What happens to the item
 
-- Stranded baseline or diverged heads that nothing vouches for: the item blocks with the precise reason (`execution_recovery_failed`, autostart off). This is a real pointer problem.
-- Missing baseline that nothing vouches for: a deliberate fresh start. The record is retired (`retired_at`), so it is no longer a recovery source and no later dispatch retries the dead pointer; an `execution_bookmark_recovery_retired` attention item names the superseded commits, which stay in the store; and the execution proceeds with normal positioning. A self-retry also releases its head bookmarks so it can create fresh pointers under its own names.
-- Reconciled pointers: recovery continues as usual and the worker prompt gains an `## EXECUTION POINTER RECONCILIATION` section listing what moved and why.
+Every pointer-integrity verdict (Other, NotDescended, Diverged, NotContained, MissingBaseline and PrHeadUnavailable) that cannot be reconciled uses the same archive-and-start-fresh path. Transport failures such as unavailable SSH, GitHub or cube commands propagate to the ordinary retry path without archiving. For integrity failures, dispatch does the following:
+
+1. Resolve **all** targets of the baseline, recovery and publication bookmarks, including every side of a conflicted bookmark and any surviving recorded baseline commit.
+2. Write durable local bookmarks named `preserved/<execution id>/<commit id>` for targets with unpublished non-empty work beyond the baseline and published history. Every archive must succeed before any original pointer is released. Separate commit suffixes retain both diverged heads and repeated attempts. These bookmarks are never published or included in execution-pointer pruning.
+3. Retire the source record. Release baseline and recovery names; retain predecessor publication bookmarks and their remote tracking, releasing the publication name only when the same execution must reuse it. Use bookmark deletion, not forgetting, when releasing names. Log the cause, archive names and commit identities. Add a resolved informational note to the owning work item (the root task for review guides), displayed in the work-card details; it requires no acknowledgement and never disables autostart. Stale current-attempt archives are logged and disclosed before retrying adoption, even when the predecessor remains live.
+4. Discard stale restore reports and use normal fresh positioning: the current PR head for PR work, main for work without a PR, or the captured immutable commit for a review guide or post-merge review. Create the new execution's baseline and recovery/publication pointers there. Resumes follow the same sequence before reusing their own pointer names.
+
+Optional task PRs must still be open before fresh positioning; merged, closed, or unavailable task PRs fall back to trunk. Explicitly bound PRs and immutable review targets retain their positioning rules at initialization and startup resume too. A source host with no free slots applies backpressure while preserving recovery. An ineligible source host permits fresh dispatch elsewhere after its source adapter successfully archives the work. If that adapter or its transport is unavailable, dispatch retries and retains the source record and pointers. Every host requires successful archiving before source retirement.
+
+A failed archive write is a storage/host bug, not a containment decision. It leaves every original pointer intact and reports the concrete failure; it never creates an `execution_recovery_failed` blocked item or a chain-blocking card. Successful fallback retires the bad source, so later scheduler passes do not refire its failed check. Successful reconciliation still resumes preserved work normally and adds the reconciliation explanation to the worker prompt.
+
+Migration `20261030_0033_recovery_fresh_start` re-enables existing items parked specifically for `execution_recovery_failed`, including containment failures. Human decisions, other blocked reasons and deleted items remain unchanged. Legacy recovery-chain cards are resolved.
+
+Archive only heads containing unpublished, non-empty work beyond the baseline, trunk and remote history. Empty runs and already published commits need no permanent archive.
+
+### Startup entry points and checks
+
+Implementation execution kinds enter `ExecutionCoordinator::recover_execution_bookmark` in [coordinator/blocked_workspace.rs](../engine/core/src/coordinator/blocked_workspace.rs), called before worker startup by [coordinator/execution.rs](../engine/core/src/coordinator/execution.rs).
+
+| Entry point                                                   | Recovery checks and fresh-start coverage                                                                                             |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Task and chore implementation                                 | Predecessor diff and baseline checkpoint, reconciliation, PR preparation and restaging; fallback uses main or the task's current PR. |
+| Revision implementation, including review-findings revisions  | The same checks against the revision chain's bound PR; an uncontained predecessor is archived.                                       |
+| Conflict resolution and CI remediation                        | The shared pre-start check and direct restore path; failure archives and positions on the bound PR.                                  |
+| Automated PR review                                           | Skips recovery lineage inspection, including self-retry; starts at the current PR head.                                              |
+| Review guide                                                  | Skips recovery lineage inspection; positions on its required immutable review target.                                                |
+| Startup pane resume (resume_pane_spawn_for_running_execution) | Integrity failures archive and retire the record before fresh positioning and spawning; transport failures retry.                    |
+| Host selection                                                | Prefer the recovery source host; if it cannot admit work, select an eligible destination and archive through the source adapter.     |
+| Resume / same-execution pre-start retry                       | Its own record is inspected first; fallback archives all old targets before releasing names and creating new pointers.               |
+
+Pointer initialization is a second boundary: `create_from` validates inherited baselines and refuses existing names. `create_or_start_fresh` in the coordinator archives and releases partially initialized current-run pointers, retries adoption of a valid predecessor, and only then archives the source before positioning fresh and creating the new record. This also handles a crash between writing refs and persisting their database row. Immutable review targets remain immutable during this fallback.
+
+The low-level checks are `resolve_pointers`, `head_bookmark_of`, `checkpoint_baseline` and `restore_for_retry` in [execution_bookmark.rs](../engine/recovery/src/execution_bookmark.rs); `reconcile` in [reconcile.rs](../engine/recovery/src/execution_bookmark/reconcile.rs); PR alias repair in [host_adapter/pr_anchor.rs](../engine/core/src/host_adapter/pr_anchor.rs); and `restore_rebased` in [redispatch.rs](../engine/recovery/src/execution_bookmark/redispatch.rs). Their failures are handled by the common coordinator fallback rather than a blocking-card policy. Host placement honours explicit constraints; the source adapter archives work on its owning host if fresh dispatch uses another host.
+
+`adopt_pushed_head` is also used after mechanical rebases by [work/execution_bookmarks.rs](../engine/core/src/work/execution_bookmarks.rs). It is already best-effort and does not gate startup: a failed adoption retains the original consistent pointer set, which the next dispatch can archive through the same fallback.
+
+Regression tests in [recovery_fresh_start.rs](../engine/core/src/coordinator_tests/recovery_fresh_start.rs) cover each entry point, including review startup without recovery lineage and implementation resumes. [archive_tests.rs](../engine/recovery/src/execution_bookmark/archive_tests.rs) covers conflicted targets, archive-write failures, repeated archives and pruning.
+
 - Any pre-start failure, recovery included, is a `pre_start_failure` record in the execution's dispatch stream (`dispatch-events/executions/<id>/dispatch.jsonl`) at the moment it is classified: the error, the attempt number, and whether the engine retries after a backoff or fails the execution for good.
 - A review batch in which no member started (across all roles and attempts, including the supervisor) files its `pr_review_quorum_failed` attention as "reviewers never started", with each role's last pre-start error, and says when it has spent the last automatic generation for the head (`MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS`). The card's review badge then shows "AI review failed to start" instead of "Not reviewed: latest commit" until a review is started explicitly or a new head is pushed, so an unreviewed head that nothing will review again is never silent.
-
-Items wedged before schema 43 by any of the three legacy blocker texts are re-armed once by the schema 43 data migration (`execution_recovery_rearm`), the same way schema 39 re-armed the false not-descended failure.
 
 Engine-driven mechanical and speculative rebases snapshot the baseline and both heads of every live local record in the PR-owning chain (the root item and each of its revisions, which share the PR branch in the shared store) before cube positioning. The snapshot is best-effort per record: a record whose store cannot be read is logged and left out, so one damaged historical record cannot disable rung 1 or silence the speculative prediction metrics. The snapshot stays alive across the whole mechanical operation, including rung 0's resolver edits and `cube workspace push`, and is restored on every outcome. Speculative probes never push, so their temporary lineage is simply discarded. When the operation pushed a PR head, each record whose preserved work that head already carries (by ancestry, or by change id with an empty interdiff) has its baseline, recovery head and publication head moved onto the pushed head together and its `base_commit` persisted; a record with unpublished work keeps its saved identities as one consistent set, so no operation ever moves only one pointer of a record. Mechanical checkpoints are best-effort per record and can never skip the deletion tripwire or prevent retirement after a clean push. Recovery restaging checkpoints the baseline before fetching, preserves the pointers across the fetch, and gives the new execution its restaged baseline. A rewrite followed by loss of the baseline bookmark can still recover from jj evolution history; a matching change id without a recorded predecessor relationship is insufficient.
 

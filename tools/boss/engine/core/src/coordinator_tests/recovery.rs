@@ -321,7 +321,7 @@ async fn missing_baseline_is_rebuilt_from_the_record_or_retired_loudly_without_a
         .lines()
         .any(|l| l == format!("boss-base/{dead_id}"));
         let retired: Vec<_> = db
-            .list_attention_items(&dead_id)
+            .list_attention_items_for_work_item(&resume.work_item_id)
             .unwrap()
             .into_iter()
             .filter(|item| item.kind == crate::execution_bookmark_recovery::RECOVERY_RETIRED)
@@ -355,8 +355,8 @@ async fn missing_baseline_is_rebuilt_from_the_record_or_retired_loudly_without_a
             assert!(db.execution_bookmark_optional(&dead_id).unwrap().is_none());
             let reason = db.execution_bookmark_retired_reason(&dead_id).unwrap().unwrap();
             assert!(reason.contains("no recorded PR"), "{reason}");
-            // The predecessor's pointers are left for inspection.
-            let head = format!("boss-recovery/{dead_id}");
+            // Durable archives replace the predecessor's disposable pointers.
+            let head = format!("glob:preserved/{dead_id}/*");
             assert!(
                 JjRepo::run(
                     &repo.repo,
@@ -370,7 +370,7 @@ async fn missing_baseline_is_rebuilt_from_the_record_or_retired_loudly_without_a
                     ]
                 )
                 .lines()
-                .any(|l| l == head)
+                .any(|l| l.starts_with(&format!("preserved/{dead_id}/")))
             );
         }
     }
@@ -1023,6 +1023,10 @@ async fn resume_pane_spawn_still_reenters_when_the_bookmark_is_present() {
 
 pub(super) fn configure_recovery_origin(shared: &std::path::Path) {
     use boss_engine_test_git::jj::JjRepo;
+    JjRepo::run(
+        shared,
+        &["config", "set", "--repo", "revset-aliases.\"trunk()\"", "main"],
+    );
     JjRepo::run(shared, &["bookmark", "set", "main", "-r", "@"]);
     JjRepo::run(shared, &["git", "export"]);
     JjRepo::run(

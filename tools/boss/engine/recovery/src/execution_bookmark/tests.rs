@@ -331,3 +331,38 @@ async fn conflicted_pointer_bookmark_is_a_pointer_integrity_error() {
     assert!(is_pointer_integrity_error(&error), "{error:#}");
     assert!(error.to_string().contains("exactly one"), "{error:#}");
 }
+
+#[tokio::test]
+async fn existing_initialization_names_are_an_integrity_failure() {
+    let f = Fixture::new().await;
+    let record = f.record("exec_existing").await;
+    let error = create(&LocalJj, &f.worker, &record.execution_id, "local")
+        .await
+        .unwrap_err();
+    assert_eq!(pointer_integrity_kind(&error), Some(PointerIntegrityKind::Other));
+    assert!(error.downcast_ref::<CreationFailure>().is_some());
+}
+
+struct UnavailableInitialization;
+
+#[async_trait]
+impl Jj for UnavailableInitialization {
+    async fn run(&self, _repo: &Path, _args: &[&str]) -> Result<String> {
+        Err(anyhow::anyhow!("SSH unavailable during initialization"))
+    }
+
+    async fn shared_repo(&self, workspace: &Path) -> Result<PathBuf> {
+        Ok(workspace.to_path_buf())
+    }
+}
+
+#[tokio::test]
+async fn initialization_transport_error_remains_retryable() {
+    let f = Fixture::new().await;
+    let error = create(&UnavailableInitialization, &f.worker, "exec_transport", "local")
+        .await
+        .unwrap_err();
+    assert!(error.downcast_ref::<CreationFailure>().is_some());
+    assert!(!is_pointer_integrity_error(&error));
+    assert!(format!("{error:#}").contains("SSH unavailable"));
+}
