@@ -727,7 +727,7 @@ impl WorkerCompletionHandler {
                 }
                 Ok(Some(raw_output)) => match self.work_db.get_pr_review_guide_comparison_by_id(&comparison_id) {
                     Ok(Some(capture)) => {
-                        match crate::review_verdict_apply_sweep::guide_validation::validate_at_workspace(
+                        match crate::review_guide_validation::validate_at_workspace(
                             &self.work_db,
                             &execution.id,
                             &raw_output,
@@ -789,7 +789,7 @@ impl WorkerCompletionHandler {
         if let Some(attempt) = &attempt {
             match self.work_db.root_task_id_for_review_guide_series(&attempt.series_id) {
                 Ok(Some(root_task_id)) => {
-                    crate::review_verdict_apply_sweep::publication::notify_review_guide_changed(
+                    crate::execution_publisher::notify_review_guide_changed(
                         &self.work_db,
                         &self.publisher,
                         &root_task_id,

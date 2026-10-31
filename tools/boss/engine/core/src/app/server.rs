@@ -1401,7 +1401,7 @@ async fn serve_scoped(
     {
         let state = server_state.clone();
         match tokio::task::spawn_blocking(move || {
-            crate::review_verdict_apply_sweep::guide_validation::recover_orphaned_submissions(&state.work_db)
+            crate::review_guide_validation::recover_orphaned_submissions(&state.work_db)
         })
         .await
         {

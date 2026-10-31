@@ -2770,7 +2770,7 @@ impl ExecutionCoordinator {
             let Ok(Some(root_task_id)) = work_db.root_task_id_for_review_guide_series(&attempt.series_id) else {
                 return;
             };
-            crate::review_verdict_apply_sweep::publication::notify_review_guide_changed(
+            crate::execution_publisher::notify_review_guide_changed(
                 &work_db,
                 &publisher,
                 &root_task_id,

@@ -170,7 +170,7 @@ fn submit_guide_outcome(
     markdown: &str,
 ) -> std::result::Result<crate::work::SubmitWorkerProposalOutcome, boss_protocol::ProposalSubmissionError> {
     let execution = db.get_execution(execution_id).unwrap();
-    crate::review_verdict_apply_sweep::guide_validation::submit_worker_proposal(
+    crate::review_guide_validation::submit_worker_proposal(
         db,
         crate::work::SubmitWorkerProposalInput {
             execution_id,

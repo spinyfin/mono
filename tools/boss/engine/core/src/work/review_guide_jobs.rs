@@ -1332,7 +1332,7 @@ pub(super) fn publish_pr_review_guide_version_in_tx(
 /// (`WorkDb::readopt_inferred_terminal_execution`), the attempt has to come
 /// back with it, or the live worker has nothing to submit its guide to. The
 /// same reversal lets a guide submitted while the attempt was wrongly closed
-/// be recovered (`crate::review_verdict_apply_sweep::guide_validation::recover_orphaned_submissions`).
+/// be recovered (`crate::review_guide_validation::recover_orphaned_submissions`).
 ///
 /// Only an attempt that failed after a worker ran (`failed_pre_start = 0`),
 /// whose comparison is still the series' selected one at the same request

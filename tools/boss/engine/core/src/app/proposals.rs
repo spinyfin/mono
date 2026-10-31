@@ -543,7 +543,7 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
         None
     };
 
-    let outcome = crate::review_verdict_apply_sweep::guide_validation::submit_worker_proposal(
+    let outcome = crate::review_guide_validation::submit_worker_proposal(
         &work_db,
         SubmitWorkerProposalInput {
             execution_id: &caller.execution_id,

@@ -12,7 +12,7 @@
 //! `worker_proposals.payload_json` with nothing left to bind it to.
 //!
 //! The startup pass that finds those rows and publishes them as their PR's
-//! guide is orchestrated above storage (`crate::review_verdict_apply_sweep::guide_validation`):
+//! guide is orchestrated above storage (`crate::review_guide_validation`):
 //! validating a body shells out to `git`, which storage never does. This
 //! module is its storage half — [`WorkDb::list_orphaned_review_guide_submissions`]
 //! names the candidates and

@@ -37,6 +37,9 @@ pub(crate) struct ReviewVerdictComparisonInputs {
 /// The observation is fenced against the proposal, reviewed head and comparison inputs on apply.
 pub(crate) struct ReviewVerdictObservation {
     pub inputs: ReviewVerdictComparisonInputs,
+    /// Freshness of a pre-merge target, decided once by the service. `None` when the batch was not
+    /// ready to apply at observation time, or for a post-merge batch.
+    pub freshness: Option<PreMergeTargetFreshness>,
     pub deletions: Option<Vec<String>>,
 }
 
@@ -52,7 +55,8 @@ pub struct ReviewVerdictApplyStats {
 }
 
 /// Result of comparing a pre-merge batch's frozen target with the PR head.
-enum PreMergeTargetFreshness {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PreMergeTargetFreshness {
     /// The target is the live head.
     Current,
     /// The head has moved to this SHA.
@@ -79,41 +83,16 @@ impl WorkDb {
         }
         let payload: ReviewVerdictProposalPayload = serde_json::from_str(&proposal.payload_json)?;
         let verdict: boss_pr_review::SupervisorVerdict = serde_json::from_value(payload.verdict.clone())?;
-        let Some(mut batch) = self.review_batch(&payload.batch_id)? else {
+        let Some(batch) = self.review_batch(&payload.batch_id)? else {
             anyhow::bail!(
                 "review-verdict {} names missing batch {}",
                 proposal.id,
                 payload.batch_id
             );
         };
-        // The batch's own state machine is the authority on whether this
-        // verdict is ready to apply. `advance_review_batch_quorum_best_effort`
-        // is explicitly best-effort and can leave the batch stranded in
-        // `supervising` while this proposal still reads `proposed`. The
-        // recoverable case is exactly that: the supervisor already reported,
-        // so re-running the quorum machine here moves the batch to `applying`
-        // and this pass can continue. Bail only if it still is not `applying`
-        // after that nudge — and file a once-per-batch attention rather than
-        // warning on every 10s sweep.
-        if batch.status != boss_protocol::ReviewBatchStatus::Applying {
-            if batch.status == boss_protocol::ReviewBatchStatus::Supervising
-                && let Err(error) = self.try_advance_review_batch_quorum(&batch.id)
-            {
-                tracing::warn!(
-                    proposal_id = %proposal.id,
-                    batch_id = %batch.id,
-                    ?error,
-                    "review-verdict apply: quorum re-advance for a supervising batch failed",
-                );
-            }
-            if let Some(refreshed) = self.review_batch(&batch.id)? {
-                batch = refreshed;
-            }
-            if batch.status != boss_protocol::ReviewBatchStatus::Applying {
-                self.file_stranded_batch_attention_once(&batch, &proposal)?;
-                return Ok(None);
-            }
-        }
+        let Some(batch) = self.applying_batch_after_quorum_nudge(batch, &proposal)? else {
+            return Ok(None);
+        };
 
         let review_result = verdict.to_review_result();
         // The engine gate is authoritative: the supervisor's
@@ -137,7 +116,11 @@ impl WorkDb {
         // unreachable), the proposal stays `proposed` and a later sweep
         // retries it. PostMerge targets are merge commits and cannot move.
         let superseding_head = if batch.phase == boss_protocol::ReviewBatchPhase::PreMerge {
-            match self.pre_merge_target_freshness(&batch, pr_checker)? {
+            let Some(freshness) = observation.freshness.clone() else {
+                // The service observed before this batch was ready; a later sweep observes again.
+                return Ok(None);
+            };
+            match freshness {
                 PreMergeTargetFreshness::Current => None,
                 PreMergeTargetFreshness::SupersededBy(head) => Some(head),
                 PreMergeTargetFreshness::Unknown => {
@@ -354,6 +337,71 @@ impl WorkDb {
         }
 
         Ok(applied_ref)
+    }
+
+    /// The batch's own state machine is the authority on whether this verdict is ready to
+    /// apply. `advance_review_batch_quorum_best_effort` is explicitly best-effort and can leave
+    /// the batch stranded in `supervising` while the proposal still reads `proposed`. The
+    /// recoverable case is exactly that: the supervisor already reported, so re-running the
+    /// quorum machine moves the batch to `applying`. Returns the batch only if it is `applying`
+    /// after that nudge; otherwise files a once-per-batch attention rather than warning on every
+    /// 10s sweep.
+    fn applying_batch_after_quorum_nudge(
+        &self,
+        mut batch: boss_protocol::ReviewBatch,
+        proposal: &WorkerProposal,
+    ) -> Result<Option<boss_protocol::ReviewBatch>> {
+        if batch.status == boss_protocol::ReviewBatchStatus::Applying {
+            return Ok(Some(batch));
+        }
+        if batch.status == boss_protocol::ReviewBatchStatus::Supervising
+            && let Err(error) = self.try_advance_review_batch_quorum(&batch.id)
+        {
+            tracing::warn!(
+                proposal_id = %proposal.id,
+                batch_id = %batch.id,
+                ?error,
+                "review-verdict apply: quorum re-advance for a supervising batch failed",
+            );
+        }
+        if let Some(refreshed) = self.review_batch(&batch.id)? {
+            batch = refreshed;
+        }
+        if batch.status != boss_protocol::ReviewBatchStatus::Applying {
+            self.file_stranded_batch_attention_once(&batch, proposal)?;
+            return Ok(None);
+        }
+        Ok(Some(batch))
+    }
+
+    /// Whether the proposal's batch is ready to apply, after the quorum nudge. The service asks
+    /// this before spending GitHub calls on an observation storage would discard.
+    pub(crate) fn review_verdict_batch_applying(&self, proposal_id: &str) -> Result<bool> {
+        let proposal = self
+            .worker_proposal(proposal_id)?
+            .context("review verdict proposal is missing")?;
+        let payload: ReviewVerdictProposalPayload = serde_json::from_str(&proposal.payload_json)?;
+        let batch = self
+            .review_batch(&payload.batch_id)?
+            .context("review batch is missing")?;
+        Ok(self.applying_batch_after_quorum_nudge(batch, &proposal)?.is_some())
+    }
+
+    /// Decide once whether a pre-merge verdict's frozen target is still the live head (a newer
+    /// local batch first, then the PR's head).
+    pub(crate) fn review_verdict_target_freshness(
+        &self,
+        proposal_id: &str,
+        pr_checker: &dyn PrStateChecker,
+    ) -> Result<PreMergeTargetFreshness> {
+        let proposal = self
+            .worker_proposal(proposal_id)?
+            .context("review verdict proposal is missing")?;
+        let payload: ReviewVerdictProposalPayload = serde_json::from_str(&proposal.payload_json)?;
+        let batch = self
+            .review_batch(&payload.batch_id)?
+            .context("review batch is missing")?;
+        self.pre_merge_target_freshness(&batch, pr_checker)
     }
 
     /// Whether a pre-merge `batch`'s frozen `target_sha` is still the PR
