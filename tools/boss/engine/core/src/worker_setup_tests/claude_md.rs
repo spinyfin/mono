@@ -510,7 +510,7 @@ fn static_question_contract_lives_in_generated_rules() {
         "Details:\n",
         "no internal symbols",
         "rough size",
-        "No leaves the work blocked",
+        "\"No = remain blocked\" is not a real choice",
         "Never truncate evidence",
         "Before submitting",
         "This writing contract does not change when a question is warranted",

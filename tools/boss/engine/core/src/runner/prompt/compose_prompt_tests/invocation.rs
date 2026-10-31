@@ -223,7 +223,7 @@ fn run_done_seam_on_worker_signal_seam_off_teaches_summary_not_blocked_verb() {
         "worker_signal seam off: blocked outcome must preserve the reason on propose done --summary:\n{prompt}",
     );
     assert!(prompt.contains(
-        "--question \"Approve including the remaining files needed for this fix?\" --answer-type yes-no --explanation"
+        "--question \"Approve switching the retry to exponential backoff?\" --answer-type yes-no --explanation"
     ));
     assert!(
         prompt.contains(
@@ -234,8 +234,8 @@ fn run_done_seam_on_worker_signal_seam_off_teaches_summary_not_blocked_verb() {
     assert!(prompt.contains("your next run's task description ends with a `## Recorded answer` section"));
     assert!(prompt.contains("Follow the question-writing contract in the generated worker rules."));
     assert!(prompt.contains("Use the typed question flags on a blocked declaration"));
-    assert!(prompt.contains("Yes appends authorization and restarts in the preserved workspace"));
-    assert!(prompt.contains("No leaves the task blocked."));
+    assert!(prompt.contains("Both Yes and No must name an actionable path the engine or the next worker will take"));
+    assert!(prompt.contains("\"No = remain blocked\" is not a real choice"));
     assert!(
         prompt.contains("--summary \"<blocker>\" --answer-type create-prerequisite-task --prerequisite-name"),
         "blocked guidance must teach the prerequisite-task question type:\n{prompt}",
@@ -243,16 +243,30 @@ fn run_done_seam_on_worker_signal_seam_off_teaches_summary_not_blocked_verb() {
     assert!(prompt.contains("The description must stand alone"));
     assert!(prompt.contains("remains only the non-blocking path for nice-to-have work later"));
     assert!(
-        prompt.contains("a capability split forced by a repo limit"),
-        "prerequisite guidance must cover a repo-limit capability split:\n{prompt}",
+        prompt.contains("ask the split-vs-bypass question — both answers act"),
+        "file-count guidance must be a two-path question:\n{prompt}",
     );
     assert!(
-        prompt.contains("exceed the `change/file-count` limit; carve out the first coherent capability"),
+        prompt.contains("projected upper-bound file count of the single-PR change"),
+        "file-count guidance must treat --file-count as a projected upper bound:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("exceed the `change/file-count` limit"),
         "prerequisite guidance must include the file-count split example:\n{prompt}",
     );
     assert!(
-        prompt.contains("Do not file a plain blocker, a plain yes/no question or `followup-task` for either case."),
-        "prerequisite guidance must rule out the wrong routes for a split:\n{prompt}",
+        prompt.contains("--file-count <n> --file-count-limit <limit>"),
+        "file-count guidance must teach the split-vs-bypass flags:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("Never apply that bypass without the recorded authorization"),
+        "file-count guidance must forbid applying the bypass without approval:\n{prompt}",
+    );
+    assert!(
+        prompt.contains(
+            "Do not file a plain blocker, a plain yes/no question or `followup-task` for an over-limit change."
+        ),
+        "file-count guidance must rule out the wrong routes for a split:\n{prompt}",
     );
     assert!(
         prompt.contains("the marker is Stop-boundary-only"),

@@ -335,6 +335,7 @@ mod tests {
             .answer_type(boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
                 name: "Fix the shared fixture".to_owned(),
                 brief: "Fix the shared fixture on main.".to_owned(),
+                file_count_bypass: None,
             })
             .explanation("CI cannot go green until the fixture is fixed on main.")
             .asked_at("2026-10-23")
