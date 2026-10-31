@@ -1338,6 +1338,9 @@ mod no_op_declarations;
 #[path = "run_done_finalize_retry.rs"]
 mod run_done_finalize_retry;
 
+#[path = "unobserved_proposals.rs"]
+mod unobserved_proposals;
+
 /// A mandated stop fails visibly, without bypassing a check or cycling workers.
 #[tokio::test]
 async fn mandated_check_approval_stop_fails_visibly_without_replacement_workers() {

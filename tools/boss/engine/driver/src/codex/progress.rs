@@ -2411,18 +2411,15 @@ mod tests {
             WorkerEvent::SessionStart { session_id, .. } if session_id == "thread-0160"
         ));
         assert!(matches!(&events[1], WorkerEvent::UserPromptSubmit { .. }));
-        // The code-mode `exec` cell surfaces as a Bash call. Both 0.153.4 and
-        // 0.160.1 write the cell's argument object in JavaScript shorthand
-        // (`{cmd:"…"}`, unquoted key), which `codex-rollout`'s cell parser
-        // deliberately does not guess at, so the command text is the whole
-        // cell script rather than the inner `cmd` — unchanged across the pin.
-        let cell_1 = "text(await tools.exec_command({cmd:\"echo hello-boss-qual\"}));\n";
+        // Static JavaScript argument objects now expose their actual shell
+        // command, including the unquoted keys in this captured rollout.
+        let command_1 = "echo hello-boss-qual";
         assert_eq!(
             events[2],
             WorkerEvent::PreToolUse {
                 session_id: "thread-0160".into(),
                 tool_name: "Bash".into(),
-                tool_input: json!({"command": cell_1}),
+                tool_input: json!({"command": command_1}),
             }
         );
         assert!(matches!(
@@ -2441,13 +2438,13 @@ mod tests {
         // Second turn: the yielded cell, then the single-Escape abort lands as
         // Notification + Stop{Interrupted} on the ordinary boundary channel.
         assert!(matches!(&events[5], WorkerEvent::UserPromptSubmit { .. }));
-        let cell_2 = "text(await tools.exec_command({cmd:\"sleep 45 && echo late-output\",yield_time_ms:1000}));\n";
+        let command_2 = "sleep 45 && echo late-output";
         assert_eq!(
             events[6],
             WorkerEvent::PreToolUse {
                 session_id: "thread-0160".into(),
                 tool_name: "Bash".into(),
-                tool_input: json!({"command": cell_2}),
+                tool_input: json!({"command": command_2}),
             }
         );
         // The `sleep 45` cell's output chunk carries a `session_id` and no
