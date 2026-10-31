@@ -32,8 +32,12 @@ pub(super) fn spawn(database: Option<&Path>) -> std::io::Result<()> {
 }
 
 pub(super) fn spawn_command(command: &mut Command, log: &Path) -> std::io::Result<Child> {
+    spawn_command_with_input(command, log, Stdio::null())
+}
+
+pub(super) fn spawn_command_with_input(command: &mut Command, log: &Path, input: Stdio) -> std::io::Result<Child> {
     let log = std::fs::OpenOptions::new().create(true).append(true).open(log)?;
-    command.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
+    command.stdin(input).stdout(log.try_clone()?).stderr(log);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

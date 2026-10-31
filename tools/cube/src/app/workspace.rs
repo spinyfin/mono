@@ -1474,6 +1474,7 @@ pub(super) fn run_workspace(
             keep_dirty,
             force_reset,
         } => {
+            let release_started = Instant::now();
             let lease = resolve_release_lease(&mut store, workspace, lease, repo)?;
             let workspace = store
                 .get_workspace_by_lease(&lease)?
@@ -1515,6 +1516,7 @@ pub(super) fn run_workspace(
             // Set when the release-time reuse guard refused the destructive
             // reset because `@` still holds work that exists on no remote.
             let mut preserved: Option<PreservedWorkingCopy> = None;
+            let reset_started = Instant::now();
             if !keep_dirty {
                 let repo_record = store
                     .get_repo(&workspace.repo)?
@@ -1533,57 +1535,7 @@ pub(super) fn run_workspace(
                     &repo_record.main_branch,
                     force_reset,
                 ) {
-                    Ok(ReleaseResetOutcome::Reset) => {
-                        // Forget consumed boss/exec_* bookmarks and delete unused
-                        // pr/<n> bookmarks with proven published content. The
-                        // fetch above already updated main, so do_fetch = false.
-                        //
-                        // The reset has just moved `@` off whatever branch this
-                        // lease was working on, which is what makes this the
-                        // right moment: the bookmarks that lease was holding
-                        // become unreferenced exactly here, so the set is pruned
-                        // at the point the workspace is done with them rather
-                        // than accumulating for the workspace's whole lifetime.
-                        //
-                        // A failure is NOT swallowed. This sweep is the only
-                        // thing that prunes either bookmark namespace, so a
-                        // sweep that silently fails is unbounded growth with no
-                        // signal — precisely the feedback loop that let the
-                        // `pr/*` set reach sixty entries in the live `mono`
-                        // store. It still does not fail the release (the lease
-                        // must come back either way), but it is reported as an
-                        // error and recorded in the audit log so the failure is
-                        // recoverable evidence rather than a line on a stderr
-                        // nobody reads.
-                        match gc_workspace_bookmarks(runner, database_path, &workspace.workspace_path, false, false) {
-                            Ok(forgotten) if !forgotten.is_empty() => {
-                                eprintln!(
-                                    "cube: release gc: {} unreferenced bookmark(s) forgotten in {}",
-                                    forgotten.len(),
-                                    workspace.workspace_id,
-                                );
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                eprintln!(
-                                    "cube: error: bookmark gc on release of {} failed: {e}. \
-                                     Nothing was pruned, so consumed `boss/exec_*` and unreferenced \
-                                     `pr/<n>` bookmarks will keep accumulating in this repo's shared \
-                                     store until a sweep succeeds. Run `cube workspace gc --dry-run` \
-                                     to see the backlog, and `cube workspace gc` to clear it.",
-                                    workspace.workspace_id,
-                                );
-                                audit!(
-                                    database_path,
-                                    "workspace.release_bookmark_gc_failed",
-                                    repo = workspace.repo,
-                                    workspace_id = workspace.workspace_id,
-                                    lease_id = lease,
-                                    error = e.to_string(),
-                                );
-                            }
-                        }
-                    }
+                    Ok(ReleaseResetOutcome::Reset) => {}
                     Ok(ReleaseResetOutcome::PreservedUnpushedWork(kept)) => {
                         eprintln!(
                             "cube: release of {} preserved the working copy: `@` ({}) holds work that \
@@ -1605,6 +1557,8 @@ pub(super) fn run_workspace(
                     }
                 }
             }
+
+            let reset_ms = reset_started.elapsed().as_millis();
 
             // Take the lock only for the registry state transition.
             let _lock = RepoLock::acquire(&repo_lock_path(&workspace.repo, database_path)?)?;
@@ -1632,9 +1586,15 @@ pub(super) fn run_workspace(
             }
             drop(_lock);
 
+            if !keep_dirty && reset_error.is_none() && preserved.is_none() {
+                crate::app::release_bookmark_gc::trigger(database_path, &released.repo);
+            }
+
             audit!(
                 database_path,
                 "lease.released",
+                reset_ms = reset_ms,
+                duration_ms = release_started.elapsed().as_millis(),
                 repo = released.repo,
                 workspace_id = released.workspace_id,
                 lease_id = lease,

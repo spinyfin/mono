@@ -1,7 +1,7 @@
 use super::support::{
-    ExpectedCommand, FakeRunner, gc_exec_sweep_command, gc_git_import_command, gc_noop_command, gc_pr_noop_command,
-    head_status_command, head_status_output, jj_status_clean, jj_status_conflicted, lease_runner_for,
-    release_guard_reusable_command, release_runner_for, seed_mono_repo, unpushed_probe_command, with_database_path,
+    ExpectedCommand, FakeRunner, head_status_command, head_status_output, jj_status_clean, jj_status_conflicted,
+    lease_runner_for, release_guard_reusable_command, release_runner_for, seed_mono_repo, unpushed_probe_command,
+    with_database_path,
 };
 use clap::Parser;
 
@@ -56,10 +56,6 @@ fn workspace_release_clears_health_status() {
             "",
         ),
         ExpectedCommand::ok(ws_path.clone(), "jj", &["new", "main@origin"], ""),
-        ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "remote", "list"], ""),
-        gc_git_import_command(&ws_path),
-        gc_noop_command(&ws_path),
-        gc_pr_noop_command(&ws_path),
     ]);
     run_with_dependencies(
         Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
@@ -202,10 +198,6 @@ fn workspace_release_resets_and_frees_the_workspace() {
             "",
         ),
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], ""),
-        gc_git_import_command(&workspace_path),
-        gc_noop_command(&workspace_path),
-        gc_pr_noop_command(&workspace_path),
     ]);
     let release = Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]);
     let release_result = run_with_dependencies(release, Some(&database_path), &release_runner).expect("release");
@@ -276,10 +268,6 @@ fn lease_and_release_emit_audit_log_entries() {
             "",
         ),
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], ""),
-        gc_git_import_command(&workspace_path),
-        gc_noop_command(&workspace_path),
-        gc_pr_noop_command(&workspace_path),
     ]);
     let release = Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id, "--reason", "done"]);
     run_with_dependencies(release, Some(&database_path), &release_runner).expect("release");
@@ -326,6 +314,8 @@ fn lease_and_release_emit_audit_log_entries() {
     assert_eq!(released["lease_id"], lease_id);
     assert_eq!(released["reason"], "done");
     assert_eq!(released["keep_dirty"], false);
+    let reset_ms = released["reset_ms"].as_u64().expect("reset timing");
+    assert!(released["duration_ms"].as_u64().expect("total timing") >= reset_ms);
 
     // The instrumentation chore also requires that every `jj`
     // operation cube runs against a leased workspace is auditable.
@@ -401,10 +391,6 @@ fn workspace_release_by_workspace_id_resolves_active_lease() {
             "",
         ),
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], ""),
-        gc_git_import_command(&workspace_path),
-        gc_noop_command(&workspace_path),
-        gc_pr_noop_command(&workspace_path),
     ]);
     let release = Cli::parse_from(["cube", "workspace", "release", "mono-agent-004"]);
     let result = run_with_dependencies(release, Some(&database_path), &release_runner).expect("release by id");
@@ -658,10 +644,6 @@ fn workspace_release_force_reset_overrides_the_preservation_guard() {
             "",
         ),
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], ""),
-        gc_git_import_command(&workspace_path),
-        gc_noop_command(&workspace_path),
-        gc_pr_noop_command(&workspace_path),
     ]);
     let result = run_with_dependencies(
         Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id, "--force-reset"]),
@@ -788,7 +770,7 @@ fn workspace_force_release_skips_reset() {
 }
 
 #[test]
-fn workspace_release_gc_forgets_consumed_bookmarks() {
+fn workspace_release_returns_before_the_detached_sweep_runs() {
     let (tempdir, database_path) = with_database_path();
     let workspace_root = tempdir.path().join("workspaces");
     let workspace_path = workspace_root.join("mono-agent-001");
@@ -809,34 +791,10 @@ fn workspace_release_gc_forgets_consumed_bookmarks() {
         .unwrap()
         .to_string();
 
-    // Release runner returns a consumed bookmark from the gc log query.
-    let release_runner = FakeRunner::new(vec![
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-        release_guard_reusable_command(&workspace_path),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &["git", "remote", "list"],
-            "origin\tgit@github.com:spinyfin/mono.git\n",
-        ),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
-            "",
-        ),
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], ""),
-        gc_git_import_command(&workspace_path),
-        gc_exec_sweep_command(&workspace_path, "boss/exec_18abcd_01"),
-        gc_pr_noop_command(&workspace_path),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &["bookmark", "forget", "boss/exec_18abcd_01"],
-            "",
-        ),
-    ]);
+    crate::app::release_bookmark_gc::SPAWN_REQUESTS.with(|requests| requests.borrow_mut().clear());
+    // Strict runner: only reset commands are accepted. Any synchronous sweep
+    // would fail on an unexpected invocation before release could return.
+    let release_runner = release_runner_for(&workspace_path);
     run_with_dependencies(
         Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
         Some(&database_path),
@@ -844,6 +802,12 @@ fn workspace_release_gc_forgets_consumed_bookmarks() {
     )
     .expect("release");
     release_runner.assert_exhausted();
+    let store = Store::open_at(&database_path).unwrap();
+    assert!(store.get_workspace_by_lease(&lease_id).unwrap().is_none());
+    crate::app::release_bookmark_gc::SPAWN_REQUESTS.with(|requests| {
+        assert_eq!(requests.borrow().len(), 1);
+        assert_eq!(requests.borrow()[0].0, "mono");
+    });
 }
 
 /// Shared state for [`BlockingFetchRunner`]: the fetch signals `entered`

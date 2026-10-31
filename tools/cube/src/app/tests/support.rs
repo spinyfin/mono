@@ -147,7 +147,7 @@ pub(super) fn gc_exec_sweep_command(workspace_path: &std::path::Path, output: &s
 }
 
 /// Returns an expected gc-log command that reports no consumed bookmarks.
-/// Add to any release runner after `jj new main@origin` to satisfy the gc check.
+/// Used by bookmark-sweep tests.
 pub(super) fn gc_noop_command(workspace_path: &std::path::Path) -> ExpectedCommand {
     gc_exec_sweep_command(workspace_path, "")
 }
@@ -177,8 +177,7 @@ pub(super) fn gc_git_import_command(workspace_path: &std::path::Path) -> Expecte
 }
 
 /// The `pr/<n>` half reporting that every `pr/*` bookmark is still
-/// referenced, so nothing is swept. Add to any release runner after
-/// [`gc_noop_command`].
+/// referenced, so nothing is swept.
 pub(super) fn gc_pr_noop_command(workspace_path: &std::path::Path) -> ExpectedCommand {
     gc_pr_sweep_command(workspace_path, "")
 }
@@ -194,8 +193,7 @@ pub(super) fn release_guard_reusable_command(workspace_path: &std::path::Path) -
     )
 }
 
-/// Standard release runner: fetch, reuse-guard probe, reset, then gc-noop
-/// (exec + pr sweeps).
+/// Standard release runner: fetch, reuse-guard probe, and reset.
 pub(super) fn release_runner_for(workspace_path: &std::path::Path) -> FakeRunner {
     FakeRunner::new(vec![
         ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "fetch"], ""),
@@ -213,10 +211,6 @@ pub(super) fn release_runner_for(workspace_path: &std::path::Path) -> FakeRunner
             "",
         ),
         ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["new", "main@origin"], ""),
-        ExpectedCommand::ok((workspace_path).to_path_buf(), "jj", &["git", "remote", "list"], ""),
-        gc_git_import_command(workspace_path),
-        gc_noop_command(workspace_path),
-        gc_pr_noop_command(workspace_path),
     ])
 }
 

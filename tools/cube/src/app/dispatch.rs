@@ -33,6 +33,9 @@ pub(super) fn run_with_context(
     cube_config: Option<config::CubeConfig>,
 ) -> Result<RunResult> {
     match cli.command {
+        Command::ReleaseBookmarkGc { repo, database } => {
+            crate::app::release_bookmark_gc::run(database.as_deref(), &repo, runner)
+        }
         Command::PeriodicCleanup { database } => crate::app::periodic_cleanup::run(database.as_deref()),
         Command::Repo { command } => run_repo(command, database_path, runner, repo_ensure_defaults, cube_config),
         Command::Workspace { command } => run_workspace(command, database_path, runner),
