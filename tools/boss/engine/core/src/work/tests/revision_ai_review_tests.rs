@@ -1,5 +1,4 @@
-//! A revision held in Doing is "under AI review" only while the review of its
-//! pushed commit is actually running.
+//! A held revision stays under AI review throughout its started review cycle.
 
 use boss_protocol::{
     ReviewBatchMemberRole, ReviewBatchMemberStatus, ReviewBatchPhase, ReviewClassification, ReviewLanguageBucket,
@@ -91,7 +90,29 @@ fn start_review_batch(held: &HeldRevision) -> String {
         .pr_url(PR_URL)
         .target_sha("head-sha")
         .build();
-    held.db.create_review_batch(input, &[member]).unwrap().0.id
+    let batch = held.db.create_review_batch(input, &[member]).unwrap().0;
+    let execution = held
+        .db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&held.root_id)
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let conn = held.db.connect().unwrap();
+    conn.execute(
+        "UPDATE work_executions SET status = 'orphaned', started_at = '2026-10-31T00:00:00Z' WHERE id = ?1",
+        [&execution.id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE pr_review_batch_members SET execution_id = ?2 WHERE batch_id = ?1",
+        rusqlite::params![batch.id, execution.id],
+    )
+    .unwrap();
+    batch.id
 }
 
 #[test]
@@ -108,6 +129,13 @@ fn a_held_revision_is_under_review_while_the_roots_batch_is_live() {
         vec![held.revision_id.clone()]
     );
 
+    let projected = projected_revision(&held);
+    assert!(
+        projected.ai_reviewing,
+        "a started orphaned reviewer retains the cycle caption"
+    );
+    assert_eq!(projected.ai_review_stage.as_deref(), Some("reviewers"));
+
     // Consolidation and verdict apply are still the review in progress.
     for status in ["supervising", "applying"] {
         held.db
@@ -122,6 +150,16 @@ fn a_held_revision_is_under_review_while_the_roots_batch_is_live() {
             held.db.list_revisions_under_ai_review().unwrap(),
             vec![held.revision_id.clone()],
             "{status}"
+        );
+        let projected = projected_revision(&held);
+        assert!(projected.ai_reviewing, "{status}");
+        assert_eq!(
+            projected.ai_review_stage.as_deref(),
+            Some(if status == "applying" {
+                "applying"
+            } else {
+                "consolidation"
+            })
         );
     }
 
@@ -205,4 +243,50 @@ fn only_a_held_active_revision_with_the_stamped_pr_is_considered() {
     // Released by the verdict: folded into the parent, no longer in Doing.
     set("UPDATE tasks SET status = 'in_review' WHERE id = ?1");
     assert!(held.db.list_revisions_under_ai_review().unwrap().is_empty());
+}
+
+fn projected_revision(held: &HeldRevision) -> Task {
+    match held.db.get_work_item(&held.revision_id).unwrap() {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task,
+        other => panic!("unexpected row {other:?}"),
+    }
+}
+
+#[test]
+fn ready_only_reviewers_remain_queued_even_with_a_collecting_batch() {
+    let held = held_revision("revision-ai-review-ready-only");
+    start_review_batch(&held);
+    held.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'ready', started_at = NULL WHERE kind = 'pr_review'",
+            [],
+        )
+        .unwrap();
+    assert!(held.db.list_revisions_under_ai_review().unwrap().is_empty());
+    let projected = projected_revision(&held);
+    assert!(!projected.ai_reviewing);
+    assert_eq!(projected.ai_review_stage, None);
+}
+
+#[test]
+fn review_phase_blocked_revisions_are_folded_by_the_engine() {
+    let held = held_revision("revision-folded-blocks");
+    for reason in [
+        "merge_conflict",
+        "ci_failure",
+        "ci_failure_exhausted",
+        "review_feedback",
+    ] {
+        held.db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'blocked', blocked_reason = ?2 WHERE id = ?1",
+                rusqlite::params![held.revision_id, reason],
+            )
+            .unwrap();
+        assert!(projected_revision(&held).board_folded_revision, "{reason}");
+    }
 }

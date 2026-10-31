@@ -209,6 +209,13 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let kind = parse_text_column::<TaskKind>(3, &kind_raw)?;
     let status_raw: String = row.get(6)?;
     let status = parse_text_column::<TaskStatus>(6, &status_raw)?;
+    let board_folded_revision = kind == TaskKind::Revision
+        && (matches!(status, TaskStatus::InReview | TaskStatus::Done)
+            || (status == TaskStatus::Blocked
+                && matches!(
+                    row.get::<_, Option<String>>("blocked_reason")?.as_deref(),
+                    Some("merge_conflict" | "ci_failure" | "ci_failure_exhausted" | "review_feedback")
+                )));
     Ok(Task {
         id: row.get(0)?,
         operator_question: {
@@ -309,6 +316,7 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         review_cycle: row.get(34)?,
         last_reviewed_sha: row.get::<_, Option<String>>(35)?.filter(|s| !s.is_empty()),
         // Derived; populated after mapping by attach_ai_reviewing_flag.
+        board_folded_revision,
         ai_reviewing: false,
         ai_review_stage: None,
         // Derived; populated after mapping by attach_ai_review_state.

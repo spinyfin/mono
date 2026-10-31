@@ -221,7 +221,7 @@ final class RevisionKanbanTests: XCTestCase {
                 name: name, slotId: slot, runId: "review-\(slot)", model: "fixture", shellPid: 0,
                 lastEventAt: nil, currentTool: nil, lastToolEndedAt: nil, activity: .working,
                 liveStatus: nil, liveStatusAt: nil, recoveryStatus: nil, tmuxHosted: true,
-                agentType: "review", reviewStage: "reviewers", executionKind: "pr_review",
+                agentType: "review", reviewStage: slot == 2 ? "consolidation" : "reviewers", executionKind: "pr_review",
                 workItemId: "chore_c22", prURL: pr
             )
         }
@@ -236,6 +236,12 @@ final class RevisionKanbanTests: XCTestCase {
                       "no reviewers shown until the engine reports the review as running")
         revision.aiReviewing = true
         XCTAssertEqual(WorkBoardSectionItemsView.reviewWorkers(for: revision, index: index).map(\.slotId), [1, 2])
+        var primary = makeChore(id: "chore_c22", status: "in_review")
+        primary.prURL = pr
+        XCTAssertEqual(WorkBoardSectionItemsView.reviewWorkers(for: primary, index: index).map(\.slotId), [1, 2])
+        XCTAssertEqual(WorkBoardSectionItemsView.reviewWorkers(for: primary, index: index).map(\.reviewStage), ["reviewers", "consolidation"])
+        XCTAssertEqual(ReviewPRIdentity(pr), ReviewPRIdentity("https://github.com/Org/Repo/pull/250"))
+        XCTAssertEqual(AgentActivityState.aiReviewCaption(stage: "applying"), "Applying AI review verdict")
     }
 
     /// Once the review is consolidated the revision reaches `in_review` and
@@ -253,6 +259,33 @@ final class RevisionKanbanTests: XCTestCase {
                            "folded revision must not be a card in \(column)")
         }
         XCTAssertEqual(model.inReviewRevisions(forParentTaskID: chore.id).map(\.id), [revision.id])
+    }
+
+    func testParserPreservesEngineFoldDecision() throws {
+        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        var payload: [String: Any] = [
+            "id": "revision", "product_id": "product", "kind": "revision", "name": "Revision",
+            "description": "", "status": "blocked", "blocked_reason": "ci_failure",
+            "created_at": "0", "updated_at": "0", "board_folded_revision": true
+        ]
+        XCTAssertTrue(try XCTUnwrap(client.parseTask(payload)).isFoldedRevision)
+        payload["board_folded_revision"] = false
+        XCTAssertFalse(try XCTUnwrap(client.parseTask(payload)).isFoldedRevision)
+    }
+
+    func testFoldedProjectionControlsBoardMembershipIncludingBlockedRevisions() {
+        let model = makeModel()
+        var revision = makeRevision(status: "blocked", seq: 1)
+        revision.blockedReason = "ci_failure"
+        revision.boardFoldedRevision = true
+        model.tasksByProjectID = ["proj_1": [revision]]
+        for column in [WorkBoardColumnKey.backlog, .doing, .review, .done] {
+            XCTAssertFalse(model.workItems(in: column).contains { $0.id == revision.id })
+        }
+        revision.boardFoldedRevision = false
+        model.tasksByProjectID = ["proj_1": [revision]]
+        XCTAssertTrue(model.workItems(in: .review).contains { $0.id == revision.id },
+                      "the engine projection, rather than a client status predicate, owns folding")
     }
 
     func testRevisionInDoingIsNotFolded() {
@@ -499,7 +532,8 @@ final class RevisionKanbanTests: XCTestCase {
             updatedAt: "2026-05-26T00:00:00Z",
             parentTaskId: parentID,
             revisionSeq: seq,
-            revisionParentPrUrl: parentPrUrl
+            revisionParentPrUrl: parentPrUrl,
+            boardFoldedRevision: status == "in_review" || status == "done"
         )
     }
 
@@ -550,7 +584,8 @@ final class RevisionKanbanTests: XCTestCase {
             autostart: autostart,
             parentTaskId: parentID,
             revisionSeq: seq,
-            revisionParentPrUrl: "https://github.com/org/repo/pull/250"
+            revisionParentPrUrl: "https://github.com/org/repo/pull/250",
+            boardFoldedRevision: status == "in_review" || status == "done"
         )
     }
 
