@@ -34,7 +34,7 @@
 //! Runs every [`DEFAULT_INTERVAL`] and fires immediately on boot, so a host
 //! disabled while the engine was down is drained at startup without waiting
 //! for the first interval. It also subscribes to [`Event::HostDisabled`] —
-//! published by [`crate::host_registry::WorkDb::set_host_enabled`] and
+//! published by [`crate::work::WorkDb::set_host_enabled`] and
 //! [`crate::work::WorkDb::record_host_dispatch_failure`] on a genuine
 //! enabled → disabled transition — so a disable is drained immediately
 //! instead of waiting up to [`DEFAULT_INTERVAL`] for the next sweep tick.

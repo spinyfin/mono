@@ -659,6 +659,7 @@ impl WorkDb {
     /// [`Self::gc_unreferenced_pr_review_guide_source_artifacts_with`] with no
     /// process observation: no other process's staging file is provably
     /// orphaned, so none is removed. Production sweeps supply an observer.
+    #[cfg(test)]
     pub fn gc_unreferenced_pr_review_guide_source_artifacts(&self) -> Result<()> {
         self.gc_unreferenced_pr_review_guide_source_artifacts_with(&|_| false)
     }

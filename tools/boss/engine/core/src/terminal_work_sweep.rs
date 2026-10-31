@@ -311,7 +311,17 @@ pub(crate) fn gather_reap_candidates(
     let registry = work_db.metrics_registry();
     let timer = crate::sweep_metrics::TERMINAL_WORK_SWEEP.begin();
     let mut outcome = TerminalWorkSweepOutcome::default();
-    if let Err(err) = work_db.reconcile_pr_review_guide_attempts() {
+    if let Err(err) =
+        work_db.reconcile_pr_review_guide_attempts_with_live_runs(&std::collections::HashSet::new(), &|id| {
+            crate::durable_liveness::probe_execution_worker_within(
+                work_db,
+                id,
+                crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
+                boss_engine_utils::epoch_time::now_epoch_secs(),
+            )
+            .is_alive()
+        })
+    {
         tracing::warn!(?err, "terminal-work sweep: review-guide attempt reconcile failed",);
     }
     // One clock read per pass: every candidate's teardown mark is judged

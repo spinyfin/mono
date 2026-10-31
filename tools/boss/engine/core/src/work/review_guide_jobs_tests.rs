@@ -306,7 +306,9 @@ fn reconcile_finishes_a_running_attempt_whose_execution_is_already_terminal() {
         )
         .unwrap();
 
-    let acted = db.reconcile_pr_review_guide_attempts().unwrap();
+    let acted = db
+        .reconcile_pr_review_guide_attempts_with_live_runs(&std::collections::HashSet::new(), &|_| false)
+        .unwrap();
     assert_eq!(acted, 1);
     assert_eq!(attempt_status(&db, &attempt.id), "failed");
     let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
@@ -336,7 +338,9 @@ fn reconcile_prefers_execution_last_error_over_generic_status_reason() {
         )
         .unwrap();
 
-    let acted = db.reconcile_pr_review_guide_attempts().unwrap();
+    let acted = db
+        .reconcile_pr_review_guide_attempts_with_live_runs(&std::collections::HashSet::new(), &|_| false)
+        .unwrap();
     assert_eq!(acted, 1);
     assert_eq!(attempt_status(&db, &attempt.id), "failed");
     let stored: String = db
@@ -482,7 +486,9 @@ fn reconcile_dispatches_a_queued_attempt_with_no_execution() {
         .unwrap();
     assert!(attempt.execution_id.is_none());
 
-    let acted = db.reconcile_pr_review_guide_attempts().unwrap();
+    let acted = db
+        .reconcile_pr_review_guide_attempts_with_live_runs(&std::collections::HashSet::new(), &|_| false)
+        .unwrap();
     assert_eq!(acted, 1);
     let bound = db
         .connect()
@@ -520,7 +526,11 @@ fn reconcile_adopts_execution_inserted_before_a_crash() {
     let (_root, series, comparison) = seeded_series(&db);
     let attempt = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
     let execution = db.create_pr_review_guide_execution(&comparison, "acme/widget").unwrap();
-    assert_eq!(db.reconcile_pr_review_guide_attempts().unwrap(), 1);
+    assert_eq!(
+        db.reconcile_pr_review_guide_attempts_with_live_runs(&std::collections::HashSet::new(), &|_| false)
+            .unwrap(),
+        1
+    );
     let bound = db
         .pr_review_guide_attempt_for_execution(&execution.id)
         .unwrap()
@@ -721,12 +731,28 @@ fn reconcile_bounds_dispatch_failures_and_fails_missing_repository() {
             db.connect().unwrap().execute_batch(
                 "CREATE TRIGGER reject_execution BEFORE INSERT ON work_executions BEGIN SELECT RAISE(ABORT, 'injected dispatch failure'); END;"
             ).unwrap();
-            assert_eq!(db.reconcile_pr_review_guide_attempts().unwrap(), 0);
-            assert_eq!(db.reconcile_pr_review_guide_attempts().unwrap(), 0);
+            assert_eq!(
+                db.reconcile_pr_review_guide_attempts_with_live_runs(&std::collections::HashSet::new(), &|_| false)
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                db.reconcile_pr_review_guide_attempts_with_live_runs(&std::collections::HashSet::new(), &|_| false)
+                    .unwrap(),
+                0
+            );
         }
-        assert_eq!(db.reconcile_pr_review_guide_attempts().unwrap(), 1);
+        assert_eq!(
+            db.reconcile_pr_review_guide_attempts_with_live_runs(&std::collections::HashSet::new(), &|_| false)
+                .unwrap(),
+            1
+        );
         assert_eq!(attempt_status(&db, &attempt.id), "failed");
-        assert_eq!(db.reconcile_pr_review_guide_attempts().unwrap(), 0);
+        assert_eq!(
+            db.reconcile_pr_review_guide_attempts_with_live_runs(&std::collections::HashSet::new(), &|_| false)
+                .unwrap(),
+            0
+        );
         assert_eq!(
             db.get_pr_review_guide_summary_for_root(&root)
                 .unwrap()
@@ -892,7 +918,11 @@ fn restart_during_spawn_reopens_the_attempt_with_the_readopted_execution_and_pub
     let (attempt_id, execution_id) = spawned_guide_run(&db, &series_id, &comparison_id, "tok-28");
 
     // Restart. The startup reconcile sees a running execution: nothing to do.
-    assert_eq!(db.reconcile_pr_review_guide_attempts().unwrap(), 0);
+    assert_eq!(
+        db.reconcile_pr_review_guide_attempts_with_live_runs(&std::collections::HashSet::new(), &|_| false)
+            .unwrap(),
+        0
+    );
     assert_eq!(attempt_status(&db, &attempt_id), "running");
 
     // The startup recovery probe wrongly proves the worker dead; the reap
@@ -964,8 +994,15 @@ fn reconcile_keeps_the_attempt_of_an_orphaned_execution_whose_worker_is_live() {
         )
         .unwrap();
 
-    // The durable pid (this process) is alive: keep the attempt open.
-    assert_eq!(db.reconcile_pr_review_guide_attempts().unwrap(), 0);
+    // An injected live observation keeps the attempt open without an OS probe.
+    assert_eq!(
+        db.reconcile_pr_review_guide_attempts_with_live_runs(&std::collections::HashSet::new(), &|id| {
+            assert_eq!(id, execution_id);
+            true
+        })
+        .unwrap(),
+        0
+    );
     assert_eq!(attempt_status(&db, &attempt_id), "running");
 
     // No live pid, but the caller (the tmux adoption pass) observed the
@@ -976,15 +1013,21 @@ fn reconcile_keeps_the_attempt_of_an_orphaned_execution_whose_worker_is_live() {
     );
     let known_live = HashSet::from([execution_id.clone()]);
     assert_eq!(
-        db.reconcile_pr_review_guide_attempts_with_live_runs(&known_live)
-            .unwrap(),
+        db.reconcile_pr_review_guide_attempts_with_live_runs(&known_live, &|_| panic!(
+            "caller evidence must take precedence"
+        ))
+        .unwrap(),
         0
     );
     assert_eq!(attempt_status(&db, &attempt_id), "running");
 
     // Nothing alive anywhere: the attempt really is stranded and is finished
     // with the classified reason.
-    assert_eq!(db.reconcile_pr_review_guide_attempts().unwrap(), 1);
+    assert_eq!(
+        db.reconcile_pr_review_guide_attempts_with_live_runs(&std::collections::HashSet::new(), &|_| false)
+            .unwrap(),
+        1
+    );
     assert_eq!(attempt_status(&db, &attempt_id), "failed");
     assert_eq!(attempt_error(&db, &attempt_id), "execution orphaned");
     let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
@@ -1007,8 +1050,10 @@ fn reconcile_finishes_the_attempt_of_a_deliberately_terminal_execution_even_with
         .unwrap();
     let known_live = HashSet::from([execution_id.clone()]);
     assert_eq!(
-        db.reconcile_pr_review_guide_attempts_with_live_runs(&known_live)
-            .unwrap(),
+        db.reconcile_pr_review_guide_attempts_with_live_runs(&known_live, &|_| panic!(
+            "caller evidence must take precedence"
+        ))
+        .unwrap(),
         1
     );
     assert_eq!(attempt_status(&db, &attempt_id), "failed");

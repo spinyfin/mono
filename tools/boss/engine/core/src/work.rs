@@ -764,6 +764,7 @@ mod revise_doc;
 mod revision_helpers;
 pub(crate) mod revision_sequencing;
 mod run_rows;
+pub use run_rows::REDISPATCH_PID_TRUST_SECS;
 mod schema_init;
 pub(crate) use schema_init::table_exists;
 #[cfg(test)]

@@ -188,10 +188,30 @@ impl WorkDb {
     /// deliberate — the refusal is a state judgement about a single running
     /// attempt (one per execution), and persisting refusals to count them is
     /// the very replay behaviour the refusal avoids.
+    #[cfg(test)]
     pub fn submit_worker_proposal(
         &self,
         input: SubmitWorkerProposalInput<'_>,
     ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
+        self.submit_worker_proposal_with_liveness(input, &|_| false)
+    }
+
+    /// Observe a question's eligible worker before opening the apply transaction.
+    pub fn submit_worker_proposal_with_liveness(
+        &self,
+        input: SubmitWorkerProposalInput<'_>,
+        pid_is_alive: &dyn Fn(Option<i64>) -> bool,
+    ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
+        let question_worker = if input.kind == ProposalKind::RunDone {
+            let payload: boss_protocol::RunDoneProposalPayload = serde_json::from_str(input.payload_json)?;
+            if payload.question.is_some() {
+                super::stuck_report::observe_question_worker(self, input.execution_id, pid_is_alive)?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let prepared_guide = (input.kind == ProposalKind::ReviewGuide)
             .then(|| super::review_guide_submission::prepare(self, input.execution_id, input.payload_json));
         // The transaction-holding half. Scoped to a block so the `conn`
@@ -274,6 +294,7 @@ impl WorkDb {
                     input.kind,
                     &id,
                     prepared_guide.as_ref(),
+                    question_worker.as_ref(),
                 )?),
                 ProposalApplyPolicy::Gated => None,
             };

@@ -5,8 +5,13 @@ fn now() -> i64 {
     boss_engine_utils::epoch_time::now_epoch_secs()
 }
 
+// Deterministic process observation; no OS liveness probe.
+fn observed_live_pid(pid: Option<i64>) -> bool {
+    pid == Some(i64::from(std::process::id()))
+}
+
 fn row(db: &WorkDb, id: &str) -> boss_protocol::StuckRow {
-    db.stuck_report(0, now())
+    db.stuck_report(0, now(), &observed_live_pid)
         .unwrap()
         .rows
         .into_iter()
@@ -38,7 +43,7 @@ fn missing_ledger_uses_task_age_and_does_not_fail_the_report() {
     )
     .unwrap();
     drop(conn);
-    let report = db.stuck_report(0, timestamp).unwrap();
+    let report = db.stuck_report(0, timestamp, &observed_live_pid).unwrap();
     let entry = report.rows.iter().find(|r| r.work_item_id == task.id).unwrap();
     assert_eq!(entry.last_ledger_basis, "unknown_legacy");
     assert_eq!(entry.age_in_state_secs, 100);
@@ -166,7 +171,12 @@ fn report_fixtures_cover_human_capacity_dependency_and_engine_stuck() {
         .unwrap();
     assert_eq!(row(&db, &review.id).bucket, StuckBucket::EngineStuck);
     assert_eq!(row(&db, &review.id).classification, "S18_pr_behind");
-    assert_eq!(db.stuck_report(0, now()).unwrap().unconverted_declared_blockers, 1);
+    assert_eq!(
+        db.stuck_report(0, now(), &observed_live_pid)
+            .unwrap()
+            .unconverted_declared_blockers,
+        1
+    );
 }
 
 #[test]
@@ -175,20 +185,20 @@ fn minimum_age_filters_young_rows_and_negative_age_is_rejected() {
     let product = create_test_product_named(&db, "Ages");
     let task = create_test_chore_manual(&db, &product.id, "Fresh");
     assert!(
-        db.stuck_report(0, now())
+        db.stuck_report(0, now(), &observed_live_pid)
             .unwrap()
             .rows
             .iter()
             .any(|r| r.work_item_id == task.id)
     );
     assert!(
-        !db.stuck_report(604800, now())
+        !db.stuck_report(604800, now(), &observed_live_pid)
             .unwrap()
             .rows
             .iter()
             .any(|r| r.work_item_id == task.id)
     );
-    assert!(db.stuck_report(-1, now()).is_err());
+    assert!(db.stuck_report(-1, now(), &observed_live_pid).is_err());
 }
 
 #[test]
@@ -202,7 +212,7 @@ fn questions_keep_their_filed_classification_after_answer_and_state_changes() {
     assert_eq!(row(&db, &id).bucket, StuckBucket::WaitingOnHuman);
     db.answer_operator_question(&id, boss_protocol::OperatorAnswer::YesNo { value: false })
         .unwrap();
-    let report = db.stuck_report(604800, now()).unwrap();
+    let report = db.stuck_report(604800, now(), &observed_live_pid).unwrap();
     assert_eq!(report.questions_filed, 1);
     assert_eq!(report.questions_filed_by_stuck_kind["S8_operator_question"], 1);
     assert_eq!(report.unconverted_declared_blockers, 0);
@@ -224,7 +234,7 @@ fn waiting_human_age_tracks_execution_transition_and_live_work_is_excluded() {
         .unwrap()
         .execute("UPDATE tasks SET updated_at = ?1 WHERE id = ?2", params![timestamp, id])
         .unwrap();
-    let report = db.stuck_report(50, timestamp).unwrap();
+    let report = db.stuck_report(50, timestamp, &observed_live_pid).unwrap();
     let entry = report.rows.iter().find(|r| r.work_item_id == id).unwrap();
     assert_eq!(entry.classification, "S19_waiting_human");
     assert_eq!(entry.bucket, StuckBucket::WaitingOnHuman);
@@ -257,7 +267,7 @@ fn waiting_human_age_tracks_execution_transition_and_live_work_is_excluded() {
             )
             .unwrap();
         assert!(
-            !db.stuck_report(0, timestamp)
+            !db.stuck_report(0, timestamp, &observed_live_pid)
                 .unwrap()
                 .rows
                 .iter()
@@ -314,6 +324,39 @@ fn waiting_human_migration_backfills_lower_bound_and_survives_reopen() {
 }
 
 #[test]
+fn liveness_observer_runs_after_the_connection_lock_is_released() {
+    let db = WorkDb::open(temp_db_path("stuck-observer-lock")).unwrap();
+    let (_, id, execution) = make_waiting_human_chore(&db, "Observer lock");
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE work_executions SET status = 'orphaned' WHERE id = ?1",
+        [&execution],
+    )
+    .unwrap();
+    conn.execute("UPDATE tasks SET status = 'active' WHERE id = ?1", [&id])
+        .unwrap();
+    conn.execute(
+        "UPDATE work_runs SET shell_pid = ?1, host_id = 'local' WHERE execution_id = ?2",
+        params![std::process::id(), execution],
+    )
+    .unwrap();
+    drop(conn);
+    let calls = std::cell::Cell::new(0);
+    // Re-acquiring the non-reentrant connection lock would deadlock if the
+    // observer ran while `stuck_report` still held it.
+    let report = db
+        .stuck_report(0, now(), &|pid| {
+            calls.set(calls.get() + 1);
+            db.connect().unwrap();
+            pid == Some(i64::from(std::process::id()))
+        })
+        .unwrap();
+    assert_eq!(calls.get(), 1);
+    let entry = report.rows.iter().find(|r| r.work_item_id == id).unwrap();
+    assert_eq!(entry.classification, "S15_orphan_live_pid");
+}
+
+#[test]
 fn orphan_with_durable_live_pid_is_distinguished_from_missing_pid() {
     let db = WorkDb::open(temp_db_path("stuck-orphan-pid")).unwrap();
     let (_, id, execution) = make_waiting_human_chore(&db, "Orphan pid");
@@ -336,6 +379,21 @@ fn orphan_with_durable_live_pid_is_distinguished_from_missing_pid() {
         )
         .unwrap();
     assert_eq!(row(&db, &id).classification, "S15_orphan_live_pid");
+    let report = db
+        .stuck_report(0, now(), &|pid| {
+            assert_eq!(pid, Some(i64::from(std::process::id())));
+            false
+        })
+        .unwrap();
+    assert_eq!(
+        report
+            .rows
+            .iter()
+            .find(|row| row.work_item_id == id)
+            .unwrap()
+            .classification,
+        "orphan_active"
+    );
     let timestamp = 1_000_000;
     db.connect()
         .unwrap()
@@ -347,15 +405,12 @@ fn orphan_with_durable_live_pid_is_distinguished_from_missing_pid() {
     for (report_time, expected) in [
         (timestamp, "S15_orphan_live_pid"),
         (
-            timestamp + crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
+            timestamp + crate::work::REDISPATCH_PID_TRUST_SECS,
             "S15_orphan_live_pid",
         ),
-        (
-            timestamp + crate::durable_liveness::REDISPATCH_PID_TRUST_SECS + 1,
-            "orphan_active",
-        ),
+        (timestamp + crate::work::REDISPATCH_PID_TRUST_SECS + 1, "orphan_active"),
     ] {
-        let report = db.stuck_report(0, report_time).unwrap();
+        let report = db.stuck_report(0, report_time, &observed_live_pid).unwrap();
         assert_eq!(
             report
                 .rows
@@ -366,13 +421,9 @@ fn orphan_with_durable_live_pid_is_distinguished_from_missing_pid() {
             expected
         );
         assert_eq!(
-            db.latest_local_worker_process_for_work_item(
-                &id,
-                crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
-                report_time,
-            )
-            .unwrap()
-            .is_some(),
+            db.latest_local_worker_process_for_work_item(&id, crate::work::REDISPATCH_PID_TRUST_SECS, report_time,)
+                .unwrap()
+                .is_some(),
             expected == "S15_orphan_live_pid"
         );
     }
@@ -446,7 +497,9 @@ fn declared_blocker_count_includes_park_and_nudge_but_excludes_operator_no() {
         db.record_worker_failure_with_basis(&execution, "blocked", basis)
             .unwrap();
         assert_eq!(
-            db.stuck_report(604800, now()).unwrap().unconverted_declared_blockers,
+            db.stuck_report(604800, now(), &observed_live_pid)
+                .unwrap()
+                .unconverted_declared_blockers,
             expected
         );
     }
@@ -459,7 +512,12 @@ fn declared_blocker_count_includes_park_and_nudge_but_excludes_operator_no() {
             [&task.id],
         )
         .unwrap();
-    assert_eq!(db.stuck_report(604800, now()).unwrap().unconverted_declared_blockers, 3);
+    assert_eq!(
+        db.stuck_report(604800, now(), &observed_live_pid)
+            .unwrap()
+            .unconverted_declared_blockers,
+        3
+    );
 }
 
 #[test]
@@ -632,7 +690,7 @@ fn ended_human_wait_does_not_replace_task_age_or_basis() {
         )
         .unwrap();
         drop(conn);
-        let report = db.stuck_report(200, timestamp).unwrap();
+        let report = db.stuck_report(200, timestamp, &observed_live_pid).unwrap();
         let entry = report.rows.iter().find(|r| r.work_item_id == id).unwrap();
         assert_eq!(entry.bucket, StuckBucket::EngineStuck);
         assert_eq!(entry.age_in_state_secs, 500);
@@ -692,4 +750,101 @@ fn non_task_waits_never_enter_task_history() {
         )
         .unwrap();
     assert_eq!(count, 0);
+}
+
+#[test]
+fn question_classification_uses_pre_transaction_liveness_and_rechecks_eligibility() {
+    use boss_protocol::{ProposalKind, RunDoneOutcome, RunDoneProposalPayload};
+    use std::cell::Cell;
+
+    for (case, alive, expired, waiting_human, task_status, change_after_probe, expected) in [
+        ("live", true, false, false, "active", false, "S15_orphan_live_pid"),
+        ("dead", false, false, false, "active", false, "S2_churn_guard"),
+        ("expired", true, true, false, "active", false, "S2_churn_guard"),
+        ("human", true, false, true, "active", false, "S19_waiting_human"),
+        ("todo", true, false, false, "todo", false, "S2_churn_guard"),
+        ("replaced", true, false, false, "active", true, "S2_churn_guard"),
+    ] {
+        let db = WorkDb::open(temp_db_path(&format!("question-liveness-{case}"))).unwrap();
+        let (_, id, execution) = make_waiting_human_chore(&db, "Question failure reason");
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = ?2, dispatch_failed_reason = 'churn_guard' WHERE id = ?1",
+                params![id, task_status],
+            )
+            .unwrap();
+            if !waiting_human {
+                conn.execute(
+                    "UPDATE work_executions SET status = 'running' WHERE id = ?1",
+                    [&execution],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "UPDATE work_runs SET shell_pid = 12345, host_id = 'local', created_at = ?1 WHERE execution_id = ?2",
+                params![
+                    if expired {
+                        now() - REDISPATCH_PID_TRUST_SECS - 1
+                    } else {
+                        now()
+                    },
+                    execution
+                ],
+            )
+            .unwrap();
+        }
+        let payload = serde_json::to_string(&RunDoneProposalPayload {
+            outcome: RunDoneOutcome::Blocked,
+            summary: "Needs a decision".into(),
+            question: Some(question()),
+            queue_ci_evidence: None,
+        })
+        .unwrap();
+        let probes = Cell::new(0);
+        let outcome = db
+            .submit_worker_proposal_with_liveness(
+                crate::work::SubmitWorkerProposalInput {
+                    execution_id: &execution,
+                    work_item_id: &id,
+                    kind: ProposalKind::RunDone,
+                    payload_json: &payload,
+                    idempotency_key: "question-classification",
+                },
+                &|pid| {
+                    assert_eq!(pid, Some(12345));
+                    probes.set(probes.get() + 1);
+                    // Re-entering storage proves the connection lock is released.
+                    let conn = db.connect().unwrap();
+                    if change_after_probe {
+                        conn.execute(
+                            "UPDATE work_runs SET shell_pid = 54321 WHERE execution_id = ?1",
+                            [&execution],
+                        )
+                        .unwrap();
+                    }
+                    alive
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.proposal.state, boss_protocol::ProposalState::Applied);
+        assert_eq!(
+            probes.get(),
+            if expired || task_status != "active" { 0 } else { 1 },
+            "{case}"
+        );
+        let classification: String = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT stuck_classification FROM operator_questions WHERE execution_id = ?1",
+                [&execution],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(classification, expected, "{case}");
+        let report = db.stuck_report(604800, now(), &|_| false).unwrap();
+        assert_eq!(report.questions_filed_by_stuck_kind.get(expected), Some(&1), "{case}");
+    }
 }

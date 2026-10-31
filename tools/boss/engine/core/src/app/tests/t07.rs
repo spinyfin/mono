@@ -9,7 +9,7 @@
 // in what order — those are the implementation of the verb, not the
 // contract it owes the app, and pinning them would make every future
 // handler refactor a test change. The `WorkDb` layer under these handlers
-// has its own direct coverage in `host_registry.rs`.
+// has its own direct coverage in `work/host_storage.rs`.
 //
 // The add path eagerly contacts the remote host to install the wrapper, so
 // these drive `handle_add_host_with` and supply a `HostProvisioner` double

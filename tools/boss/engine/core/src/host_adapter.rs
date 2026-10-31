@@ -857,7 +857,7 @@ impl SshHostAdapter {
     }
 
     /// Record a dispatch-time cube invocation failure against this host's
-    /// health counter (see `host_registry::record_host_dispatch_failure`).
+    /// health counter (see [`WorkDb::record_host_dispatch_failure`] in `work/host_storage.rs`).
     /// Best-effort: a DB error here must never mask the real dispatch
     /// error the caller is already propagating, so failures just log.
     fn record_host_health_failure(&self, error_text: &str) {

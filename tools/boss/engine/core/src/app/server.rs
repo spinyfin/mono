@@ -1376,8 +1376,15 @@ async fn serve_scoped(
         .collect();
     match server_state
         .work_db
-        .reconcile_pr_review_guide_attempts_with_live_runs(&review_guide_live_runs)
-    {
+        .reconcile_pr_review_guide_attempts_with_live_runs(&review_guide_live_runs, &|id| {
+            crate::durable_liveness::probe_execution_worker_within(
+                &server_state.work_db,
+                id,
+                crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
+                boss_engine_utils::epoch_time::now_epoch_secs(),
+            )
+            .is_alive()
+        }) {
         Ok(acted) if acted > 0 => tracing::info!(
             acted,
             "engine startup: reconciled stranded or unbound review-guide attempts (per-attempt lines above)"

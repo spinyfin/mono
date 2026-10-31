@@ -174,6 +174,7 @@ pub(super) fn apply_in_transaction(
     kind: ProposalKind,
     proposal_id: &str,
     prepared_guide: Option<&Result<super::review_guide_submission::PreparedGuide>>,
+    question_worker: Option<&super::stuck_report::QuestionWorkerObservation>,
 ) -> Result<ApplyDecision> {
     match kind {
         ProposalKind::Attention => apply_attention(tx, execution_id, payload_json).map(ApplyDecision::Applied),
@@ -188,7 +189,7 @@ pub(super) fn apply_in_transaction(
             super::review_guide_submission::accept(tx, execution_id, prepared_guide.context("missing prepared guide")?)
         }
         ProposalKind::ReviewReport => apply_review_report(tx, execution_id, payload_json, proposal_id),
-        ProposalKind::RunDone => apply_run_done(tx, execution_id, payload_json, proposal_id),
+        ProposalKind::RunDone => apply_run_done(tx, execution_id, payload_json, proposal_id, question_worker),
         ProposalKind::Wait => apply_wait(payload_json).map(ApplyDecision::Applied),
         ProposalKind::ReviewVerdict => apply_review_verdict(tx, execution_id, payload_json, proposal_id),
         ProposalKind::FollowupTask => anyhow::bail!(
@@ -984,6 +985,7 @@ fn apply_run_done(
     execution_id: &str,
     payload_json: &str,
     proposal_id: &str,
+    question_worker: Option<&super::stuck_report::QuestionWorkerObservation>,
 ) -> Result<ApplyDecision> {
     let payload: RunDoneProposalPayload =
         serde_json::from_str(payload_json).context("run_done proposal payload_json did not deserialize")?;
@@ -1011,7 +1013,7 @@ fn apply_run_done(
     supersede_prior_run_done_declarations(tx, execution_id, proposal_id)?;
     super::queue_ci_evidence::record_delivery(tx, execution_id, &payload)?;
     if let Some(question) = &payload.question {
-        super::pr_flow::insert_question(tx, execution_id, proposal_id, question)?;
+        super::pr_flow::insert_question_with_liveness(tx, execution_id, proposal_id, question, question_worker)?;
     }
 
     Ok(ApplyDecision::Applied(ApplyOutcome {
@@ -1451,6 +1453,7 @@ mod tests {
             "{}",
             ProposalKind::FollowupTask,
             "prp_missing",
+            None,
             None,
         )
         .expect_err("no applier exists for FollowupTask; this must be an error, not a panic");

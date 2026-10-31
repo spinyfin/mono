@@ -377,10 +377,7 @@ fn sweep_cost_baseline_full_projection_vs_narrow_reads() {
             )
             .unwrap();
         let rows: Vec<_> = stmt
-            .query_map(
-                [now - crate::durable_liveness::REDISPATCH_PID_TRUST_SECS],
-                map_execution,
-            )
+            .query_map([now - crate::work::REDISPATCH_PID_TRUST_SECS], map_execution)
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
@@ -388,12 +385,9 @@ fn sweep_cost_baseline_full_projection_vs_narrow_reads() {
         drop(stmt);
         drop(conn);
         for execution in rows {
-            crate::durable_liveness::probe_execution_worker_within(
-                &db,
-                &execution.id,
-                crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
-                now,
-            );
+            // The pid read the host probe starts from; no OS probe in work/ tests.
+            db.latest_local_shell_pid_for_execution_within(&execution.id, crate::work::REDISPATCH_PID_TRUST_SECS, now)
+                .unwrap();
         }
         eprintln!(
             "pass {pass}: terminal full-row scan + probes (8 rows): {:?}",

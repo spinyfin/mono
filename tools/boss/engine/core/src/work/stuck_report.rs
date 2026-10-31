@@ -10,15 +10,39 @@ use std::collections::BTreeMap;
 
 #[work_db_boundary::instrument]
 impl WorkDb {
-    pub fn stuck_report(&self, minimum_age_secs: i64, now: i64) -> Result<StuckReport> {
+    pub fn stuck_report(
+        &self,
+        minimum_age_secs: i64,
+        now: i64,
+        pid_is_alive: &dyn Fn(Option<i64>) -> bool,
+    ) -> Result<StuckReport> {
         anyhow::ensure!(minimum_age_secs >= 0, "minimum age must be nonnegative");
-        let mut conn = self.connect()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        build(&tx, minimum_age_secs, now)
+        // Read everything durable inside the transaction, then release the
+        // connection guard before the host observer runs: the observer may
+        // probe the OS or read `WorkDb`, and the connection mutex is not
+        // reentrant.
+        let (mut report, probes) = {
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            build(&tx, minimum_age_secs, now)?
+        };
+        for (work_item_id, pid) in probes {
+            if pid_is_alive(pid)
+                && let Some(row) = report.rows.iter_mut().find(|r| r.work_item_id == work_item_id)
+            {
+                row.classification = "S15_orphan_live_pid".into();
+            }
+        }
+        Ok(report)
     }
 }
 
-pub(super) fn build(conn: &Connection, minimum_age_secs: i64, now: i64) -> Result<StuckReport> {
+/// An Active item's recorded worker pid still to be checked against the host
+/// once the connection lock is released.
+type PendingProbe = (String, Option<i64>);
+
+fn build(conn: &Connection, minimum_age_secs: i64, now: i64) -> Result<(StuckReport, Vec<PendingProbe>)> {
+    let mut probes: Vec<PendingProbe> = Vec::new();
     let mut stmt = conn.prepare(
         "SELECT id FROM tasks t WHERE deleted_at IS NULL AND status NOT IN ('done','archived')
          AND NOT EXISTS (SELECT 1 FROM work_executions e WHERE e.work_item_id = t.id
@@ -110,7 +134,20 @@ pub(super) fn build(conn: &Connection, minimum_age_secs: i64, now: i64) -> Resul
         } else {
             StuckBucket::EngineStuck
         };
-        let classification = classification(conn, &task, wait.as_deref(), now)?;
+        let classification = classification(conn, &task, wait.as_deref())?;
+        // A live recorded pid outranks every durable reason except S19, so
+        // only a non-S19 Active item is probed (the pid-age filter matches
+        // the orphan sweep's trust window).
+        if task.status == TaskStatus::Active && classification != "S19_waiting_human" {
+            let pid = super::run_rows::latest_local_worker_process_for_work_item(
+                conn,
+                &task.id,
+                crate::work::REDISPATCH_PID_TRUST_SECS,
+                now,
+            )?
+            .map(|(_, pid)| pid);
+            probes.push((id.clone(), pid));
+        }
         rows.push(
             StuckRow::builder()
                 .work_item_id(id)
@@ -135,14 +172,65 @@ pub(super) fn build(conn: &Connection, minimum_age_secs: i64, now: i64) -> Resul
         params![now.saturating_sub(minimum_age_secs), now],
         |r| r.get(0),
     )?;
-    Ok(StuckReport::builder()
+    let report = StuckReport::builder()
         .generated_at_epoch_s(now)
         .minimum_age_secs(minimum_age_secs)
         .rows(rows)
         .questions_filed(questions)
         .questions_filed_by_stuck_kind(questions_by_kind(conn, now.saturating_sub(minimum_age_secs), now)?)
         .unconverted_declared_blockers(unconverted)
-        .build())
+        .build();
+    Ok((report, probes))
+}
+
+/// An owned host observation; no callback runs under the apply connection lock.
+pub(super) struct QuestionWorkerObservation {
+    work_item_id: String,
+    process: (String, i64),
+}
+
+impl QuestionWorkerObservation {
+    pub(super) fn still_eligible(&self, conn: &Connection, task: &Task, durable: &str) -> Result<bool> {
+        Ok(task.id == self.work_item_id
+            && task.status == TaskStatus::Active
+            && durable != "S19_waiting_human"
+            && super::run_rows::latest_local_worker_process_for_work_item(
+                conn,
+                &task.id,
+                REDISPATCH_PID_TRUST_SECS,
+                boss_engine_utils::epoch_time::now_epoch_secs(),
+            )?
+            .as_ref()
+                == Some(&self.process))
+    }
+}
+
+pub(super) fn observe_question_worker(
+    db: &WorkDb,
+    execution_id: &str,
+    pid_is_alive: &dyn Fn(Option<i64>) -> bool,
+) -> Result<Option<QuestionWorkerObservation>> {
+    let candidate = {
+        let conn = db.connect()?;
+        let execution = query_execution(&conn, execution_id).require("execution", execution_id)?;
+        if let Some(task) = query_task(&conn, &execution.work_item_id)?
+            && task.status == TaskStatus::Active
+        {
+            super::run_rows::latest_local_worker_process_for_work_item(
+                &conn,
+                &task.id,
+                REDISPATCH_PID_TRUST_SECS,
+                boss_engine_utils::epoch_time::now_epoch_secs(),
+            )?
+            .map(|process| QuestionWorkerObservation {
+                work_item_id: task.id,
+                process,
+            })
+        } else {
+            None
+        }
+    };
+    Ok(candidate.filter(|worker| pid_is_alive(Some(worker.process.1))))
 }
 
 pub(super) fn latest_basis(conn: &Connection, id: &str, property: &str) -> Result<Option<String>> {
@@ -233,22 +321,13 @@ fn progressing_prerequisite(conn: &Connection, id: &str, now: i64) -> Result<boo
     Ok(false)
 }
 
-pub(super) fn classification(conn: &Connection, task: &Task, wait: Option<&str>, now: i64) -> Result<String> {
+/// Classify durable reasons before applying an owned host liveness observation.
+///
+/// S19 (waiting on a human) comes first; `stuck_report` relies on this when it
+/// layers the host-observed S15 live-pid override on top of the result.
+pub(super) fn classification(conn: &Connection, task: &Task, wait: Option<&str>) -> Result<String> {
     if query_live_execution_for_work_item(conn, &task.id)?.is_some_and(|e| e.status == ExecutionStatus::WaitingHuman) {
         return Ok("S19_waiting_human".into());
-    }
-    if task.status == TaskStatus::Active {
-        // Match the orphan sweep's local PID trust window, including inferred-terminal runs.
-        let pid = super::run_rows::latest_local_worker_process_for_work_item(
-            conn,
-            &task.id,
-            crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
-            now,
-        )?
-        .map(|(_, pid)| pid);
-        if crate::durable_liveness::probe_recorded_pid(pid).is_alive() {
-            return Ok("S15_orphan_live_pid".into());
-        }
     }
     if let Some(reason) = task.dispatch_failed_reason.as_deref() {
         return Ok(match reason {

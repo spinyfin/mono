@@ -583,7 +583,7 @@ pub fn seed_daily_automation(db: &WorkDb, product_id: &str) -> Automation {
 /// `auto`-sourced rows are discovered by the engine's own heartbeat and
 /// have no public insert path, so a test that needs one — to contrast
 /// against a user tag, or to check the refresh replaces it — has to seed
-/// it. Shared by the `host_registry` and `app::tests` modules, which
+/// it. Shared by the `work::host_storage` and `app::tests` modules, which
 /// otherwise hand-roll the same statement.
 pub fn insert_host_capability(db: &WorkDb, host_id: &str, capability: &str, source: &str) {
     let conn = db.connect().unwrap();

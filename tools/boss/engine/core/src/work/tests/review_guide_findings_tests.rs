@@ -530,10 +530,15 @@ fn dispatch_holds_the_update_while_a_revision_is_active_then_reconcile_binds_it(
     db.dispatch_pr_review_guide_attempt(&guide.update_attempt, &root.id)
         .unwrap();
     assert_eq!(attempt_execution(&db, &guide.update_attempt), None);
-    assert_eq!(db.reconcile_pr_review_guide_attempts().unwrap(), 1);
+    assert_eq!(
+        db.reconcile_pr_review_guide_attempts_with_live_runs(&std::collections::HashSet::new(), &|_| false)
+            .unwrap(),
+        1
+    );
     assert_eq!(attempt_execution(&db, &guide.update_attempt), None);
     set_status(&db, &guide.revision, "in_review");
-    db.reconcile_pr_review_guide_attempts().unwrap();
+    db.reconcile_pr_review_guide_attempts_with_live_runs(&std::collections::HashSet::new(), &|_| false)
+        .unwrap();
     assert!(attempt_execution(&db, &guide.update_attempt).is_some());
 }
 
@@ -595,7 +600,8 @@ fn poller_first_capture_is_held_then_becomes_the_incremental_update() {
     db.record_review_guide_revision_head(&root.id, PR_URL, "head-two", &revision, 2)
         .unwrap();
     set_status(&db, &revision, "in_review");
-    db.reconcile_pr_review_guide_attempts().unwrap();
+    db.reconcile_pr_review_guide_attempts_with_live_runs(&std::collections::HashSet::new(), &|_| false)
+        .unwrap();
     assert!(attempt_execution(&db, &attempt.id).is_some());
     let execution = attempt_execution(&db, &attempt.id).unwrap();
     let (old_head, markdown) = db
