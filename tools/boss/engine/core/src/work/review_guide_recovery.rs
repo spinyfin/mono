@@ -11,16 +11,21 @@
 //! replayed as that same rejection on every retry. The finished guide sat in
 //! `worker_proposals.payload_json` with nothing left to bind it to.
 //!
-//! This startup pass finds those rows and publishes them as their PR's guide,
-//! under exactly the fences a live submission would face: the attempt is
-//! reopened (or, when startup re-adoption already reopened it, confirmed
-//! running) only when its comparison is still the series' selected one and
-//! nothing else has been published or started for the series
-//! ([`super::review_guide_jobs::reopen_review_guide_attempt_for_readoption`]),
-//! and the body is validated against the recorded comparison at the
-//! execution's workspace before anything is written. A body that no longer
-//! validates (or whose workspace is gone) is logged and left untouched; that
-//! PR's guide must be regenerated manually.
+//! The startup pass that finds those rows and publishes them as their PR's
+//! guide is orchestrated above storage (`crate::review_guide_validation`):
+//! validating a body shells out to `git`, which storage never does. This
+//! module is its storage half — [`WorkDb::list_orphaned_review_guide_submissions`]
+//! names the candidates and
+//! [`WorkDb::adopt_and_publish_orphaned_review_guide_submission`] takes the
+//! caller's already-validated markdown and writes it under exactly the fences
+//! a live submission would face: the attempt is reopened (or, when startup
+//! re-adoption already reopened it, confirmed running) only when its
+//! comparison is still the series' selected one and nothing else has been
+//! published or started for the series
+//! ([`super::review_guide_jobs::reopen_review_guide_attempt_for_readoption`]).
+//! A body that no longer validates (or whose workspace is gone) never reaches
+//! this module; it is logged and left untouched, and that PR's guide must be
+//! regenerated manually.
 
 use super::*;
 use boss_protocol::ProposalDecider;
@@ -33,27 +38,12 @@ const RECOVERED_DECISION_REASON: &str = "accepted on engine startup: the attempt
 /// One stored guide body that could not bind to its attempt when it was
 /// submitted.
 #[derive(Debug, Clone)]
-struct OrphanedGuideSubmission {
-    proposal_id: String,
-    execution_id: String,
-    attempt_id: String,
-    comparison_id: String,
-    payload_json: String,
-}
-
-/// What [`WorkDb::recover_orphaned_review_guide_submissions`] did.
-#[derive(Debug, Default)]
-pub(crate) struct ReviewGuideSubmissionRecoveryReport {
-    /// `(proposal_id, attempt_id, version_id)` for every guide published.
-    pub published: Vec<(String, String, String)>,
-    /// `(proposal_id, reason)` for every candidate left untouched.
-    pub skipped: Vec<(String, String)>,
-}
-
-impl ReviewGuideSubmissionRecoveryReport {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.published.is_empty() && self.skipped.is_empty()
-    }
+pub(crate) struct OrphanedGuideSubmission {
+    pub(crate) proposal_id: String,
+    pub(crate) execution_id: String,
+    pub(crate) attempt_id: String,
+    pub(crate) comparison_id: String,
+    pub(crate) payload_json: String,
 }
 
 #[work_db_boundary::instrument]
@@ -61,7 +51,7 @@ impl WorkDb {
     /// Stored review-guide bodies whose submission was refused for want of a
     /// running attempt, where that attempt is still the one the series wants
     /// a guide for. Newest body per execution first.
-    fn list_orphaned_review_guide_submissions(&self) -> Result<Vec<OrphanedGuideSubmission>> {
+    pub(crate) fn list_orphaned_review_guide_submissions(&self) -> Result<Vec<OrphanedGuideSubmission>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT p.id, p.execution_id, a.id, a.comparison_id, p.payload_json
@@ -118,7 +108,7 @@ impl WorkDb {
     /// `None` when a fence refused it (the series moved on, or something else
     /// was published or started in the meantime) — nothing is written then,
     /// so a refused or failed publish never strands an `applied` proposal.
-    fn adopt_and_publish_orphaned_review_guide_submission(
+    pub(crate) fn adopt_and_publish_orphaned_review_guide_submission(
         &self,
         submission: &OrphanedGuideSubmission,
         markdown: &str,
@@ -178,66 +168,5 @@ impl WorkDb {
                 Ok(None)
             }
         }
-    }
-
-    /// Startup pass: publish every guide that was submitted while its attempt
-    /// was wrongly closed (see the module doc). Validation shells out to
-    /// `git`, so call this off the async runtime.
-    pub(crate) fn recover_orphaned_review_guide_submissions(&self) -> Result<ReviewGuideSubmissionRecoveryReport> {
-        let mut report = ReviewGuideSubmissionRecoveryReport::default();
-        for submission in self.list_orphaned_review_guide_submissions()? {
-            let proposal_id = submission.proposal_id.clone();
-            match self.recover_one_orphaned_review_guide_submission(&submission) {
-                Ok(Some(version_id)) => {
-                    tracing::warn!(
-                        proposal_id = %submission.proposal_id,
-                        execution_id = %submission.execution_id,
-                        attempt_id = %submission.attempt_id,
-                        version_id = %version_id,
-                        "review-guide recovery: published a guide whose submission had been refused for a wrongly \
-                         closed attempt",
-                    );
-                    report
-                        .published
-                        .push((proposal_id, submission.attempt_id.clone(), version_id));
-                }
-                Ok(None) => {
-                    report.skipped.push((
-                        proposal_id,
-                        "the attempt could not be reopened or the publish was fenced".to_owned(),
-                    ));
-                }
-                Err(err) => {
-                    let reason = format!("{err:#}");
-                    tracing::warn!(
-                        proposal_id = %submission.proposal_id,
-                        execution_id = %submission.execution_id,
-                        attempt_id = %submission.attempt_id,
-                        reason = %reason,
-                        "review-guide recovery: left a stored guide submission untouched",
-                    );
-                    report.skipped.push((proposal_id, reason));
-                }
-            }
-        }
-        Ok(report)
-    }
-
-    /// Validate, adopt and publish one stored submission. `Ok(None)` means
-    /// a fence refused it and nothing was written; `Err` means it could not be
-    /// validated (body, comparison or workspace), and nothing was written.
-    fn recover_one_orphaned_review_guide_submission(
-        &self,
-        submission: &OrphanedGuideSubmission,
-    ) -> Result<Option<String>> {
-        let payload: boss_protocol::ReviewGuideProposalPayload = serde_json::from_str(&submission.payload_json)
-            .context("stored review-guide proposal payload does not parse")?;
-        let capture = self
-            .get_pr_review_guide_comparison_by_id(&submission.comparison_id)?
-            .context("the comparison this attempt was generated from is gone")?;
-        let validated = self
-            .validate_review_guide_at_workspace(&submission.execution_id, &payload.body_markdown, &capture.packet)
-            .map_err(|err| anyhow::anyhow!("stored guide body failed validation: {err:#}"))?;
-        self.adopt_and_publish_orphaned_review_guide_submission(submission, &validated.markdown, &payload.body_markdown)
     }
 }

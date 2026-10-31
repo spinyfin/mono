@@ -1303,7 +1303,8 @@ impl ServerState {
         let work_db = Arc::new(
             WorkDb::open(cfg.work.db_path.clone())?
                 .with_event_bus(event_bus.clone())
-                .with_persona_metrics(metrics_registry.clone()),
+                .with_persona_metrics(metrics_registry.clone())
+                .with_engine_build_identity(crate::build_info::build_identity()),
         );
         timeline.mark("work_db_open");
         let anthropic_api_key = cfg.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());

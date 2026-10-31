@@ -90,7 +90,9 @@ pub const TEST_REPO_REMOTE_URL: &str = "git@github.com:spinyfin/mono.git";
 /// the byte-identical local `open_db()` each used to hand-roll.
 pub fn open_db() -> (TempDir, WorkDb) {
     let dir = TempDir::new().unwrap();
-    let db = WorkDb::open(dir.path().join("state.db")).unwrap();
+    let db = WorkDb::open(dir.path().join("state.db"))
+        .unwrap()
+        .with_engine_build_identity(crate::build_info::build_identity());
     (dir, db)
 }
 

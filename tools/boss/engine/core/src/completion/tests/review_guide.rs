@@ -170,12 +170,15 @@ fn submit_guide_outcome(
     markdown: &str,
 ) -> std::result::Result<crate::work::SubmitWorkerProposalOutcome, boss_protocol::ProposalSubmissionError> {
     let execution = db.get_execution(execution_id).unwrap();
-    db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
-        execution_id,
-        work_item_id: &execution.work_item_id,
-        kind: boss_protocol::ProposalKind::ReviewGuide,
-        payload_json: &serde_json::json!({"body_markdown": markdown}).to_string(),
-        idempotency_key: "guide",
-    })
+    crate::review_guide_validation::submit_worker_proposal(
+        db,
+        crate::work::SubmitWorkerProposalInput {
+            execution_id,
+            work_item_id: &execution.work_item_id,
+            kind: boss_protocol::ProposalKind::ReviewGuide,
+            payload_json: &serde_json::json!({"body_markdown": markdown}).to_string(),
+            idempotency_key: "guide",
+        },
+    )
     .unwrap()
 }

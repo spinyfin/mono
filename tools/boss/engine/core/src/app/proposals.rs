@@ -543,13 +543,16 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
         None
     };
 
-    let outcome = work_db.submit_worker_proposal(SubmitWorkerProposalInput {
-        execution_id: &caller.execution_id,
-        work_item_id: &caller.work_item_id,
-        kind,
-        payload_json: &validated.canonical_json,
-        idempotency_key: &idempotency_key,
-    });
+    let outcome = crate::review_guide_validation::submit_worker_proposal(
+        &work_db,
+        SubmitWorkerProposalInput {
+            execution_id: &caller.execution_id,
+            work_item_id: &caller.work_item_id,
+            kind,
+            payload_json: &validated.canonical_json,
+            idempotency_key: &idempotency_key,
+        },
+    );
 
     match outcome {
         Ok(Ok(SubmitWorkerProposalOutcome {
@@ -909,7 +912,12 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                 let publisher = server_state.publisher.clone();
                 crate::work::db_diagnostics::spawn(async move {
                     let created = crate::work::db_diagnostics::spawn_blocking(move || {
-                        work_db.apply_review_verdict_proposal(&proposal_id, &crate::work::GhPrStateChecker)
+                        crate::review_verdict_apply_sweep::apply_review_verdict_proposal(
+                            &work_db,
+                            &proposal_id,
+                            &crate::work::GhPrStateChecker,
+                            &crate::review_verdict_apply_sweep::observe_merge_parent_deletions,
+                        )
                     })
                     .await;
                     match created {

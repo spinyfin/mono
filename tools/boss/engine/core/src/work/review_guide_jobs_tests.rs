@@ -225,6 +225,92 @@ fn retry_without_any_captured_comparison_reports_no_comparison() {
     );
 }
 
+/// A failure records exactly the build the caller names, or none at all when
+/// the build is unknowable. A failure with no build is never a candidate for
+/// the build-change retry, which only considers attempts with a recorded build.
+#[test]
+fn a_failure_records_the_named_build_or_none_when_it_is_unknowable() {
+    let (_dir, db) = open_db();
+    let (_root, series_id, comparison_id) = seeded_series(&db);
+    let failed_by_build = |attempt_id: &str| -> Option<String> {
+        db.connect()
+            .unwrap()
+            .query_row(
+                "SELECT failed_by_build FROM pr_review_guide_attempts WHERE id = ?1",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+
+    let named = db
+        .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
+        .unwrap();
+    db.fail_pr_review_guide_attempt_at(&named.id, "spawn refused", true, "build-a")
+        .unwrap();
+    assert_eq!(failed_by_build(&named.id).as_deref(), Some("build-a"));
+
+    let unknown = db
+        .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
+        .unwrap();
+    db.fail_pr_review_guide_attempt_for_build(&unknown.id, "spawn refused", true, None)
+        .unwrap();
+    assert_eq!(failed_by_build(&unknown.id), None);
+    assert_eq!(attempt_status(&db, &unknown.id), "failed");
+}
+
+/// Failure provenance belongs to the database instance, including clones.
+#[test]
+fn failure_operations_record_the_database_build_and_remain_retry_eligible() {
+    for build in ["engine-one", "engine-two"] {
+        let (_dir, db) = open_db();
+        let db = db.with_engine_build_identity(build);
+        let (root, series_id, comparison_id) = seeded_series(&db);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET pr_url = 'https://github.com/acme/widget/pull/9' WHERE id = ?1",
+                [&root],
+            )
+            .unwrap();
+        let attempt = db
+            .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
+            .unwrap();
+        let execution = db
+            .create_pr_review_guide_execution(&comparison_id, "acme/widget")
+            .unwrap();
+        db.bind_pr_review_guide_attempt_execution(&attempt.id, &execution.id)
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET status = 'failed' WHERE id = ?1",
+                [&execution.id],
+            )
+            .unwrap();
+        db.clone()
+            .finish_pr_review_guide_attempt_for_terminal_execution(
+                &execution.id,
+                ExecutionStatus::Failed,
+                "pane never came up",
+                true,
+            )
+            .unwrap();
+        let recorded = query_pr_review_guide_attempt(&db.connect().unwrap(), &attempt.id)
+            .unwrap()
+            .unwrap();
+        assert!(recorded.failed_pre_start);
+        assert_eq!(recorded.failed_by_build.as_deref(), Some(build));
+        assert_eq!(
+            db.reenqueue_pre_start_failed_review_guides("next-build", &FakePrStateChecker::always(PrOpenState::Open))
+                .unwrap()
+                .reenqueued
+                .len(),
+            1
+        );
+    }
+}
+
 fn attempt_status(db: &WorkDb, attempt_id: &str) -> String {
     db.connect()
         .unwrap()
@@ -286,6 +372,7 @@ fn failing_a_stale_attempt_does_not_downgrade_a_newer_ready_series() {
 #[test]
 fn reconcile_finishes_a_running_attempt_whose_execution_is_already_terminal() {
     let (_dir, db) = open_db();
+    let db = db.with_engine_build_identity("reconcile-build");
     let (root, series_id, comparison_id) = seeded_series(&db);
     let attempt = db
         .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
@@ -309,6 +396,11 @@ fn reconcile_finishes_a_running_attempt_whose_execution_is_already_terminal() {
     let acted = db.reconcile_pr_review_guide_attempts().unwrap();
     assert_eq!(acted, 1);
     assert_eq!(attempt_status(&db, &attempt.id), "failed");
+    let recorded = db
+        .pr_review_guide_attempt_for_execution(&execution.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recorded.failed_by_build.as_deref(), Some("reconcile-build"));
     let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
     assert_eq!(summary.lifecycle, "failed");
 }
@@ -868,14 +960,23 @@ fn submit_guide(
     comparison_id: &str,
 ) -> std::result::Result<crate::work::SubmitWorkerProposalOutcome, boss_protocol::ProposalSubmissionError> {
     let payload = serde_json::json!({ "body_markdown": RESTART_GUIDE }).to_string();
-    db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
-        execution_id,
-        work_item_id: comparison_id,
-        kind: boss_protocol::ProposalKind::ReviewGuide,
-        payload_json: &payload,
-        idempotency_key: "guide",
-    })
+    crate::review_guide_validation::submit_worker_proposal(
+        db,
+        crate::work::SubmitWorkerProposalInput {
+            execution_id,
+            work_item_id: comparison_id,
+            kind: boss_protocol::ProposalKind::ReviewGuide,
+            payload_json: &payload,
+            idempotency_key: "guide",
+        },
+    )
     .unwrap()
+}
+
+/// Run the startup recovery pass the way the engine does: validation above
+/// storage, adoption and publication inside it.
+fn recover_orphaned(db: &WorkDb) -> crate::review_guide_validation::ReviewGuideSubmissionRecoveryReport {
+    crate::review_guide_validation::recover_orphaned_submissions(db).unwrap()
 }
 
 /// The restart-during-spawn ordering. A guide run is spawned seconds before
@@ -1099,7 +1200,7 @@ fn startup_recovery_publishes_a_guide_whose_submission_was_refused_for_a_closed_
     );
     let proposal_id = store_refused_guide_submission(&db, &execution_id, &comparison_id, RESTART_GUIDE);
 
-    let report = db.recover_orphaned_review_guide_submissions().unwrap();
+    let report = recover_orphaned(&db);
     assert_eq!(report.skipped, Vec::<(String, String)>::new());
     assert_eq!(report.published.len(), 1);
     let (published_proposal, published_attempt, version_id) = &report.published[0];
@@ -1131,7 +1232,7 @@ fn startup_recovery_publishes_a_guide_whose_submission_was_refused_for_a_closed_
         ExecutionStatus::Orphaned
     );
 
-    assert!(db.recover_orphaned_review_guide_submissions().unwrap().is_empty());
+    assert!(recover_orphaned(&db).is_empty());
 }
 
 /// Recovery never publishes over a series that has moved on: once another
@@ -1152,7 +1253,7 @@ fn startup_recovery_leaves_a_refused_guide_alone_when_the_series_has_a_live_atte
         .unwrap();
     assert_ne!(replacement.id, attempt_id);
 
-    assert!(db.recover_orphaned_review_guide_submissions().unwrap().is_empty());
+    assert!(recover_orphaned(&db).is_empty());
     assert_eq!(proposal_state(&db, &proposal_id).0, "rejected");
     assert_eq!(attempt_status(&db, &attempt_id), "failed");
 }
@@ -1176,7 +1277,7 @@ fn startup_recovery_publishes_a_refused_guide_for_an_attempt_readoption_already_
         .unwrap();
     assert_eq!(attempt_status(&db, &attempt_id), "running");
 
-    let report = db.recover_orphaned_review_guide_submissions().unwrap();
+    let report = recover_orphaned(&db);
     assert_eq!(report.skipped, Vec::<(String, String)>::new());
     assert_eq!(report.published.len(), 1);
     assert_eq!(
@@ -1186,7 +1287,7 @@ fn startup_recovery_publishes_a_refused_guide_for_an_attempt_readoption_already_
     assert_eq!(attempt_status(&db, &attempt_id), "succeeded");
     let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
     assert_eq!(summary.lifecycle, "ready");
-    assert!(db.recover_orphaned_review_guide_submissions().unwrap().is_empty());
+    assert!(recover_orphaned(&db).is_empty());
 }
 
 fn review_guide_version_count(db: &WorkDb) -> i64 {
@@ -1238,7 +1339,7 @@ fn startup_recovery_rolls_back_when_publish_insert_fails() {
             "CREATE TRIGGER reject_version BEFORE INSERT ON pr_review_guide_versions BEGIN SELECT RAISE(ABORT, 'injected'); END;",
         )
         .unwrap();
-    let report = db.recover_orphaned_review_guide_submissions().unwrap();
+    let report = recover_orphaned(&db);
     assert!(report.published.is_empty(), "{report:?}");
     assert_eq!(report.skipped.len(), 1);
     assert_eq!(report.skipped[0].0, proposal_id);
@@ -1258,7 +1359,7 @@ fn startup_recovery_rolls_back_when_publish_insert_fails() {
         .unwrap()
         .execute_batch("DROP TRIGGER reject_version")
         .unwrap();
-    let report = db.recover_orphaned_review_guide_submissions().unwrap();
+    let report = recover_orphaned(&db);
     assert_eq!(report.skipped, Vec::<(String, String)>::new());
     assert_eq!(report.published.len(), 1);
     assert_eq!(
@@ -1274,7 +1375,7 @@ fn startup_recovery_rolls_back_when_publish_insert_fails() {
         Some(report.published[0].2.as_str())
     );
 
-    assert!(db.recover_orphaned_review_guide_submissions().unwrap().is_empty());
+    assert!(recover_orphaned(&db).is_empty());
     assert_eq!(review_guide_version_count(&db), 1);
 }
 
@@ -1314,7 +1415,7 @@ fn startup_recovery_rolls_back_when_publish_is_fenced_as_superseded() {
              END;",
         )
         .unwrap();
-    let report = db.recover_orphaned_review_guide_submissions().unwrap();
+    let report = recover_orphaned(&db);
     assert!(report.published.is_empty(), "{report:?}");
     assert_eq!(report.skipped.len(), 1);
     assert_eq!(report.skipped[0].0, proposal_id);
@@ -1341,7 +1442,7 @@ fn startup_recovery_rolls_back_when_publish_is_fenced_as_superseded() {
     assert_eq!(review_guide_version_count(&db), 0);
 
     db.connect().unwrap().execute_batch("DROP TRIGGER bump_epoch").unwrap();
-    let report = db.recover_orphaned_review_guide_submissions().unwrap();
+    let report = recover_orphaned(&db);
     assert_eq!(report.skipped, Vec::<(String, String)>::new());
     assert_eq!(report.published.len(), 1);
     assert_eq!(
@@ -1349,5 +1450,5 @@ fn startup_recovery_rolls_back_when_publish_is_fenced_as_superseded() {
         ("applied".to_owned(), Some(attempt_id.clone()))
     );
     assert_eq!(review_guide_version_count(&db), 1);
-    assert!(db.recover_orphaned_review_guide_submissions().unwrap().is_empty());
+    assert!(recover_orphaned(&db).is_empty());
 }

@@ -2678,16 +2678,18 @@ async fn review_guide_submission_publishes_for_its_attributed_codex_execution() 
         ProposalKind::ReviewGuide,
         &validated.canonical_json,
     );
-    let persisted = db
-        .submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+    let persisted = crate::review_guide_validation::submit_worker_proposal(
+        db,
+        crate::work::SubmitWorkerProposalInput {
             execution_id: &execution.id,
             work_item_id: &execution.work_item_id,
             kind: ProposalKind::ReviewGuide,
             payload_json: &validated.canonical_json,
             idempotency_key: &key,
-        })
-        .unwrap()
-        .unwrap();
+        },
+    )
+    .unwrap()
+    .unwrap();
     assert!(!persisted.already_submitted);
     assert!(db.get_execution(&execution.id).unwrap().status.is_live());
     let response = call_with_peer(&state, Some(pid), request()).await;
