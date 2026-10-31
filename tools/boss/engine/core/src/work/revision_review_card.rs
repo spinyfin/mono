@@ -2,33 +2,22 @@
 //! root's resolved review presentation rather than polling or classifying a
 //! second, independently stale set of PR facts on the revision row.
 
-use super::{Connection, Result, Task, TaskKind, TaskStatus};
+use super::{Connection, Task, TaskKind, TaskStatus};
 use std::collections::{HashMap, HashSet};
 
 /// Present revisions that delivered their implementation as Review cards.
-/// With `project_held`, an `active` revision whose latest implementation
-/// execution completed (it is held pending the automated review) is shown as
-/// `in_review`; the stored status is untouched, so the hold keeps gating
-/// verdict advancement, dependents and the review recovery sweeps. Every
-/// `in_review` revision then takes the chain root's review presentation:
-/// review/CI/ready fields plus its blocked status, reason and detail.
-pub(super) fn attach(conn: &Connection, tasks: &mut [Task], chores: &[Task], project_held: bool) -> Result<()> {
-    let is_candidate = |t: &Task| {
-        t.kind == TaskKind::Revision
-            && (t.status == TaskStatus::InReview || (project_held && t.status == TaskStatus::Active))
-    };
-    if !tasks.iter().any(is_candidate) {
-        return Ok(());
-    }
-    let held = if project_held
-        && tasks
-            .iter()
-            .any(|t| t.kind == TaskKind::Revision && t.status == TaskStatus::Active)
-    {
-        completed_revision_ids(conn)?
-    } else {
-        HashSet::new()
-    };
+/// With `held` (`Some`), an `active` revision in that set (its latest
+/// implementation execution completed, so it is held pending the automated
+/// review) is shown as `in_review`; the stored status is untouched, so the
+/// hold keeps gating verdict advancement, dependents and the review recovery
+/// sweeps. Every `in_review` revision then takes the chain root's review
+/// presentation when the root sits in the Review column: review/CI/ready
+/// fields plus its blocked status, reason and detail. Under a root outside
+/// Review, a stored `in_review` revision still receives the root's PR
+/// identity and CI facts, but keeps its own status and section.
+pub(super) fn attach(tasks: &mut [Task], chores: &[Task], held: Option<&HashSet<String>>) {
+    let no_held = HashSet::new();
+    let held = held.unwrap_or(&no_held);
     let by_id: HashMap<&str, &Task> = tasks.iter().chain(chores).map(|t| (t.id.as_str(), t)).collect();
     let mut targets: Vec<(usize, String)> = Vec::new();
     for (index, task) in tasks.iter().enumerate() {
@@ -64,6 +53,13 @@ pub(super) fn attach(conn: &Connection, tasks: &mut [Task], chores: &[Task], pro
         }
         .position();
         if position.column != boss_protocol::BoardColumn::Review {
+            // The root is blocked or otherwise out of Review for a reason
+            // unrelated to the PR's review. A stored in_review revision
+            // stays in the Review lane, so it still needs the PR identity
+            // and CI facts; a held revision is not shown as in review.
+            if task.status == TaskStatus::InReview {
+                copy_pr_facts(task, root);
+            }
             continue;
         }
         // The owner decides the PR's review state, including blocked review
@@ -89,12 +85,11 @@ pub(super) fn attach(conn: &Connection, tasks: &mut [Task], chores: &[Task], pro
         task.blocked_reason = root.blocked_reason.clone();
         task.blocked_detail = root.blocked_detail.clone();
     }
-    Ok(())
 }
 
 /// Active revisions whose latest `revision_implementation` execution
 /// completed: the implementation is delivered and nothing is restarting it.
-pub(super) fn completed_revision_ids(conn: &Connection) -> Result<HashSet<String>> {
+fn completed_revision_ids(conn: &Connection) -> rusqlite::Result<HashSet<String>> {
     let mut stmt = conn.prepare(
         "SELECT t.id FROM tasks t
          WHERE t.kind = 'revision' AND t.status = 'active' AND t.deleted_at IS NULL
@@ -108,7 +103,19 @@ pub(super) fn completed_revision_ids(conn: &Connection) -> Result<HashSet<String
     Ok(ids)
 }
 
-pub(super) fn copy_review_fields(dst: &mut Task, src: &Task) {
+/// The held-revision set, read once per projection pass. A failed read
+/// degrades to "nothing held" (held revisions then count as in revision)
+/// rather than dropping the pass's other revision flags.
+pub(super) fn held_revision_ids(conn: &Connection) -> HashSet<String> {
+    completed_revision_ids(conn).unwrap_or_else(|err| {
+        tracing::warn!(?err, "failed to classify held revisions; treating none as held");
+        HashSet::new()
+    })
+}
+
+/// PR identity and polled facts, without the status, section or queue state
+/// that would move a card between lanes.
+fn copy_pr_facts(dst: &mut Task, src: &Task) {
     dst.pr_url = src.pr_url.clone();
     dst.ci_required_state = src.ci_required_state.clone();
     dst.ci_required_detail = src.ci_required_detail.clone();
@@ -117,6 +124,10 @@ pub(super) fn copy_review_fields(dst: &mut Task, src: &Task) {
     dst.pr_mergeable_state = src.pr_mergeable_state.clone();
     dst.pr_state_polled_at = src.pr_state_polled_at.clone();
     dst.pr_updated_at = src.pr_updated_at.clone();
+}
+
+pub(super) fn copy_review_fields(dst: &mut Task, src: &Task) {
+    copy_pr_facts(dst, src);
     dst.merge_queue_state = src.merge_queue_state.clone();
     dst.merge_queue_detail = src.merge_queue_detail.clone();
     dst.has_in_progress_revision = src.has_in_progress_revision;

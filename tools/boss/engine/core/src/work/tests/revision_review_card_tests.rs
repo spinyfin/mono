@@ -306,3 +306,66 @@ fn pending_review_completion_recovers_admission_without_post_effects() {
             .any(|c| c.task_id == revision && c.cycle_root_id == root)
     );
 }
+
+#[test]
+fn raw_single_item_read_keeps_durable_status_for_held_revision() {
+    let db = WorkDb::open(temp_db_path("held-raw-read")).unwrap();
+    let (_product, _root, revision) = completed_revision(&db);
+    let WorkItem::Task(raw) = db.get_work_item(&revision).unwrap() else {
+        panic!("expected revision")
+    };
+    assert_eq!(raw.status, TaskStatus::Active, "agent-facing reads stay durable");
+    let short_id = raw.short_id.expect("revision has a short id");
+    let Some(WorkItem::Task(by_short)) = db.get_work_item_by_short_id(&raw.product_id, short_id).unwrap() else {
+        panic!("expected revision by short id")
+    };
+    assert_eq!(by_short.status, raw.status);
+    assert_eq!(by_short.blocked_reason, raw.blocked_reason);
+    let WorkItem::Task(display) = db.get_work_item_for_display(&revision).unwrap() else {
+        panic!("expected revision")
+    };
+    assert_eq!(display.status, TaskStatus::InReview);
+}
+
+#[test]
+fn held_revision_keeps_root_out_of_ready_without_a_queued_review() {
+    let db = WorkDb::open(temp_db_path("held-not-ready")).unwrap();
+    let (product, root, revision) = completed_revision(&db);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET ci_required_state = 'success', pr_mergeable_state = 'mergeable' WHERE id = ?1",
+            [&root],
+        )
+        .unwrap();
+    let tree = db.get_work_tree(&product).unwrap();
+    let primary = tree.chores.iter().find(|t| t.id == root).unwrap();
+    let card = tree.tasks.iter().find(|t| t.id == revision).unwrap();
+    assert!(!primary.ready_for_review);
+    assert_ne!(primary.review_section, Some(ReviewSection::Ready));
+    assert_ne!(card.review_section, Some(ReviewSection::Ready));
+    assert_ne!(primary.review_section, Some(ReviewSection::InRevision));
+}
+
+#[test]
+fn in_review_revision_under_non_review_root_keeps_pr_facts() {
+    let db = WorkDb::open(temp_db_path("in-review-blocked-root")).unwrap();
+    let (product, root, revision) = completed_revision(&db);
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'in_review', pr_url = NULL WHERE id = ?1",
+            [&revision],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', blocked_reason = 'awaiting_operator_answer' WHERE id = ?1",
+            [&root],
+        )
+        .unwrap();
+    }
+    let tree = db.get_work_tree(&product).unwrap();
+    let card = tree.tasks.iter().find(|t| t.id == revision).unwrap();
+    assert_eq!(card.status, TaskStatus::InReview);
+    assert_eq!(card.pr_url.as_deref(), Some(PR));
+}

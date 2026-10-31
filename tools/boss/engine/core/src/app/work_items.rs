@@ -231,11 +231,10 @@ pub(super) async fn handle_get_work_item(ctx: Dispatch, req: FrontendRequest) {
         // Shared choke point: bare long ids, T/P/#/bare short ids, and
         // product-scoped slug/n. Short ids are per-product (not globally
         // unique) — ambiguity is a hard error listing every candidate.
-        let result = server_state.resolve_work_item_id(&id).await.and_then(|primary| {
-            work_db
-                .get_work_item_for_display(&primary)
-                .map_err(|err| anyhow::anyhow!("{err}"))
-        });
+        let result = server_state
+            .resolve_work_item_id(&id)
+            .await
+            .and_then(|primary| work_db.get_work_item(&primary).map_err(|err| anyhow::anyhow!("{err}")));
         match result {
             Ok(item) => {
                 send_response_with_revision(
