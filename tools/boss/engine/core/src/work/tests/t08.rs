@@ -450,8 +450,8 @@ fn action_question_with_open_pr_creates_revision() {
 }
 
 #[test]
-fn action_question_with_merged_doc_creates_design_task() {
-    let (db, _product, project_id, task_id) = fixture();
+fn action_question_with_merged_doc_inherits_current_source_project() {
+    let (db, product, project_id, task_id) = fixture();
     set_task_pr(&db, &task_id, "https://github.com/spinyfin/mono/pull/7", "in_review");
     let (a, _g) = db
         .create_attention(question_from_task(
@@ -464,6 +464,26 @@ fn action_question_with_merged_doc_creates_design_task() {
     let g = db
         .answer_attention(&a.id, Some("yes, flag it".to_owned()), false, false)
         .unwrap();
+
+    let project = db
+        .create_project(
+            CreateProjectInput::builder()
+                .product_id(product)
+                .name("Current source project")
+                .no_design_task(true)
+                .autostart(false)
+                .build(),
+        )
+        .unwrap();
+    db.update_work_item(
+        &task_id,
+        WorkItemPatch {
+            project_id: Some(project.id.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let project_id = project.id;
 
     // The live PR probe reports Merged, so the revision gate refuses and the
     // action falls back to a fresh design task.
@@ -786,8 +806,8 @@ fn dismissing_a_followup_group_with_everything_rejected_writes_back_rejected() {
 }
 
 #[test]
-fn action_followup_honours_chore_work_kind() {
-    let (db, _product, _project, task_id) = fixture();
+fn action_followup_chore_hint_creates_standalone_chore() {
+    let (db, product, project, task_id) = fixture();
     let mut input = followup(&task_id, "tidy the logs");
     input.proposed_work_kind = Some("chore".to_owned());
     let (a, _g) = db.create_attention(input).unwrap();
@@ -799,7 +819,53 @@ fn action_followup_honours_chore_work_kind() {
         .unwrap();
     let chore = read_task(&db, &actioned.produced_work_item_ids[0]);
     assert_eq!(chore.kind, TaskKind::Chore);
-    assert!(chore.project_id.is_none(), "chores are product-level");
+    assert!(chore.project_id.is_none());
+    assert!(
+        db.list_tasks(&product, Some(&project), None, false)
+            .unwrap()
+            .iter()
+            .all(|t| t.id != chore.id)
+    );
+}
+
+#[test]
+fn action_followup_human_chore_override_matches_the_recorded_decision() {
+    let (db, _product, _project, task_id) = fixture();
+    let execution = create_ready_chore_execution(&db, task_id.clone());
+    let submitted = db.submit_worker_proposal(SubmitWorkerProposalInput {
+        execution_id: &execution.id,
+        work_item_id: &task_id,
+        kind: boss_protocol::ProposalKind::FollowupTask,
+        payload_json: r#"{"proposed_name":"tidy logs","proposed_description":"d","rationale":"r","proposed_work_kind":"task"}"#,
+        idempotency_key: "chore-override",
+    }).unwrap().unwrap();
+    let member = &submitted.staged_followup.as_ref().unwrap().0;
+    let group = db.answer_attention(&member.id, None, false, false).unwrap();
+    let overrides = std::collections::HashMap::from([(
+        member.id.clone(),
+        FollowupMemberOverride {
+            work_kind: Some("chore".into()),
+            ..Default::default()
+        },
+    )]);
+    let actioned = db
+        .action_attention_group(
+            &group.id,
+            false,
+            &overrides,
+            &FakePrStateChecker::always(PrOpenState::Open),
+        )
+        .unwrap();
+    let created = read_task(&db, &actioned.produced_work_item_ids[0]);
+    assert_eq!(created.kind, TaskKind::Chore);
+    assert!(created.project_id.is_none());
+    let proposal = db
+        .list_worker_proposals_for_work_item(&task_id, None, None)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.id == submitted.proposal.id)
+        .unwrap();
+    assert!(proposal.decision_reason.unwrap().contains("work_kind -> chore"));
 }
 
 #[test]

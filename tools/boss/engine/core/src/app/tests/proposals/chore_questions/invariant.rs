@@ -236,6 +236,27 @@ async fn exercise(kind: &TaskKind, status: &TaskStatus, payload: Value, answer: 
             .unwrap();
         assert_eq!(name, "Fix the retention-cleanup fixture race");
         assert_eq!(brief, "The shared fixture races retention cleanup. Fix it on main.");
+        let conn = state.work_db.connect().unwrap();
+        let project_of = |id: &str| -> Option<String> {
+            conn.query_row("SELECT project_id FROM tasks WHERE id = ?1", [id], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(project_of(produced), project_of(&task));
+        let prerequisite_id = &deps.prerequisites[0].prerequisite_id;
+        assert_eq!(project_of(prerequisite_id), project_of(&task));
+        let kind: String = conn
+            .query_row("SELECT kind FROM tasks WHERE id = ?1", [prerequisite_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            kind,
+            if project_of(&task).is_some() {
+                "project_task"
+            } else {
+                "chore"
+            }
+        );
     } else {
         assert!(deps.prerequisites.is_empty());
     }

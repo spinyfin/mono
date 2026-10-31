@@ -235,3 +235,61 @@ async fn check_prerequisites_and_later_revision_order(conflict: bool) {
     );
     assert!(!db.try_unblock_dependency_if_resolved(&later.id).unwrap());
 }
+
+fn assert_execution_status(state: &ServerState, id: &str, expected: ExecutionStatus) {
+    let executions = state.work_db.list_executions(Some(id)).unwrap();
+    assert_eq!(executions.last().unwrap().status, expected, "{id}: {executions:?}");
+}
+
+#[tokio::test]
+async fn attention_project_design_successor_runs_after_its_prerequisite() {
+    let (state, _dir, execution, source) = invariant::fixture(&TaskKind::Design, &TaskStatus::Done, false);
+    submitted(
+        call_with_peer(
+            &state,
+            Some(std::process::id() as libc::pid_t),
+            submit_request(&execution, ProposalKind::RunDone, prerequisite_question_payload()),
+        )
+        .await,
+    );
+    let db = &state.work_db;
+    let attention: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT a.id FROM attentions a JOIN attention_groups g ON g.id = a.group_id WHERE g.source_task_id = ?1",
+            [&source],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let group = db
+        .answer_attention(&attention, Some("yes".into()), false, false)
+        .unwrap();
+    let result = db
+        .action_attention_group(
+            &group.id,
+            false,
+            &Default::default(),
+            &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
+        )
+        .unwrap();
+    let successor_id = &result.produced_work_item_ids[0];
+    let successor = super::super::question_task(&state, successor_id);
+    assert_eq!(successor.kind, TaskKind::Design);
+    let prerequisites = db.gating_prereqs_for(successor_id).unwrap();
+    let prerequisite_id = &prerequisites[0];
+    assert!(super::super::question_task(&state, prerequisite_id).ordinal < successor.ordinal);
+    db.reconcile_product_executions(&successor.product_id).unwrap();
+    assert_execution_status(&state, prerequisite_id, ExecutionStatus::Ready);
+    assert_execution_status(&state, successor_id, ExecutionStatus::WaitingDependency);
+    db.update_work_item(
+        prerequisite_id,
+        boss_protocol::WorkItemPatch {
+            status: Some("done".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.reconcile_product_executions(&successor.product_id).unwrap();
+    assert_execution_status(&state, successor_id, ExecutionStatus::Ready);
+}

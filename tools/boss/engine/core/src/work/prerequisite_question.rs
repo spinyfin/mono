@@ -5,7 +5,7 @@
 //! [`approve_in_tx`] runs inside the answer transaction and:
 //!
 //! 1. finds an equivalent open task in the product or creates the proposed
-//!    one as a chore with normal dispatch (autostart on),
+//!    one in the same project (or a standalone chore) with normal dispatch,
 //! 2. declares a `blocks` edge so the blocked task depends on it, which parks
 //!    the task as `blocked` / `dependency` behind the prerequisite — the
 //!    existing dependency cascade redispatches it once the prerequisite is
@@ -31,8 +31,9 @@ pub(super) struct LinkedPrerequisite {
     pub created: bool,
 }
 
-/// Open-task lookup for the dedup check: same product, same name once trimmed
-/// and case-folded, not yet satisfied (`done` / `archived`) and not deleted.
+/// Open-task lookup for the dedup check: same product and, for project work,
+/// same project; same name once trimmed and case-folded, not yet satisfied
+/// (`done` / `archived`) and not deleted. Never re-parent a name match.
 ///
 /// Oldest first, so a repeat resolves to the same task every time. The blocked
 /// task itself is never its own prerequisite, a task a human has blocked is
@@ -43,13 +44,16 @@ fn find_equivalent_open_task(conn: &Connection, task: &Task, name: &str) -> Resu
     let mut stmt = conn.prepare(
         "SELECT id FROM tasks
          WHERE product_id = ?1 AND id != ?2 AND deleted_at IS NULL
+           AND (?4 IS NULL OR project_id = ?4)
            AND status NOT IN ('done', 'archived') AND human_driven = 0 AND deferred = 0
            AND (status != 'blocked' OR blocked_reason = 'dependency')
            AND lower(trim(name)) = lower(trim(?3))
          ORDER BY created_at ASC, id ASC",
     )?;
     let candidates = stmt
-        .query_map(params![task.product_id, task.id, name], |row| row.get::<_, String>(0))?
+        .query_map(params![task.product_id, task.id, name, task.project_id], |row| {
+            row.get::<_, String>(0)
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for candidate in candidates {
         if !deps::would_create_cycle(conn, &task.id, &candidate)? {
@@ -72,25 +76,42 @@ pub(super) fn approve_in_tx(
     let (prerequisite, created) = match find_equivalent_open_task(conn, task, name)? {
         Some(existing) => (existing, false),
         None => {
-            let chore = insert_chore_in_tx(
-                conn,
-                CreateChoreInput::builder()
-                    .product_id(task.product_id.clone())
-                    .name(name)
-                    .description(brief)
-                    // Same repo as the task it unblocks, when the product
-                    // leaves the repo to the task.
-                    .maybe_repo_remote_url(task.repo_remote_url.clone())
-                    .created_via(CREATED_VIA_ENGINE_AUTO)
-                    // The equivalence check above is the duplicate guard here;
-                    // the recent-name guard would only reject a re-proposal of
-                    // a task that has just been completed.
-                    .force_duplicate(true)
-                    .build(),
-            )?;
-            (chore, true)
+            let prerequisite = if let Some(project_id) = &task.project_id {
+                insert_task_in_tx(
+                    conn,
+                    CreateTaskInput::builder()
+                        .product_id(&task.product_id)
+                        .project_id(project_id)
+                        .name(name)
+                        .description(brief)
+                        .maybe_repo_remote_url(task.repo_remote_url.clone())
+                        .created_via(CREATED_VIA_ENGINE_AUTO)
+                        .force_duplicate(true)
+                        .build(),
+                )?
+            } else {
+                insert_chore_in_tx(
+                    conn,
+                    CreateChoreInput::builder()
+                        .product_id(task.product_id.clone())
+                        .name(name)
+                        .description(brief)
+                        // Same repo as the task it unblocks, when the product
+                        // leaves the repo to the task.
+                        .maybe_repo_remote_url(task.repo_remote_url.clone())
+                        .created_via(CREATED_VIA_ENGINE_AUTO)
+                        // The equivalence check above is the duplicate guard here;
+                        // the recent-name guard would only reject a re-proposal of
+                        // a task that has just been completed.
+                        .force_duplicate(true)
+                        .build(),
+                )?
+            };
+            (prerequisite, true)
         }
     };
+
+    order_project_prerequisites(conn, task, &prerequisite, now)?;
 
     // A same-name task parked in the backlog (autostart off) would never be
     // dispatched, leaving the dependent waiting with no signal.
@@ -151,6 +172,81 @@ pub(super) fn approve_in_tx(
         id: prerequisite.id,
         created,
     })
+}
+
+/// Move the unfinished same-project dependency closure with the prerequisite.
+/// Revisions share their chain root's place in the project sequence.
+fn order_project_prerequisites(conn: &Connection, task: &Task, prerequisite: &Task, now: &str) -> Result<()> {
+    let Some(project_id) = &task.project_id else {
+        return Ok(());
+    };
+    let anchor = if task.ordinal.is_some() {
+        task.clone()
+    } else {
+        let Some(root) = get_chain_root_task(conn, &task.id)? else {
+            return Ok(());
+        };
+        root
+    };
+    if anchor.ordinal.is_none() || prerequisite.project_id.as_ref() != Some(project_id) {
+        return Ok(());
+    }
+    let mut visited = std::collections::HashSet::new();
+    let mut ordered = Vec::new();
+    let mut stack = vec![(prerequisite.id.clone(), false)];
+    while let Some((id, expanded)) = stack.pop() {
+        if expanded {
+            ordered.push(id);
+            continue;
+        }
+        if !visited.insert(id.clone()) {
+            continue;
+        }
+        let Some(member) = query_task(conn, &id)? else {
+            continue;
+        };
+        if member.project_id.as_ref() != Some(project_id)
+            || matches!(member.status, TaskStatus::Done | TaskStatus::Archived)
+        {
+            continue;
+        }
+        // Revisions have no ordinal, but their prerequisites still need to move.
+        if member.ordinal.is_some() {
+            stack.push((id.clone(), true));
+        }
+        for dependency in deps::prerequisites_of(conn, &id, Some(RELATION_BLOCKS))? {
+            stack.push((dependency.prerequisite_id, false));
+        }
+    }
+    let mut stmt = conn
+        .prepare("SELECT id, ordinal FROM tasks WHERE project_id = ?1 AND ordinal IS NOT NULL ORDER BY ordinal, id")?;
+    let members = stmt
+        .query_map([project_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let moving: std::collections::HashSet<_> = ordered.iter().cloned().collect();
+    let insertion = members
+        .iter()
+        .position(|(id, _)| id == &anchor.id || moving.contains(id));
+    let Some(insertion) = insertion else {
+        return Ok(());
+    };
+    let mut ids: Vec<_> = members
+        .iter()
+        .filter(|(id, _)| !moving.contains(id))
+        .map(|(id, _)| id.clone())
+        .collect();
+    ids.splice(insertion..insertion, ordered);
+    for (id, (previous_id, ordinal)) in ids.iter().zip(&members) {
+        if id != previous_id {
+            conn.execute(
+                "UPDATE tasks SET ordinal = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, ordinal, now],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Leave a `waiting_dependency` execution behind for the parked task.
