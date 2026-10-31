@@ -135,6 +135,23 @@ async fn fallback_preserves_publication_tracking_and_allows_another_push() {
         ],
     );
     release_heads(&LocalJj, &scene.record, false).await.unwrap();
+    for name in [scene.record.base(), scene.record.head()] {
+        assert!(
+            JjRepo::run(
+                repo,
+                &[
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    &format!("bookmarks(exact:{name})"),
+                    "-T",
+                    "commit_id"
+                ]
+            )
+            .is_empty()
+        );
+    }
+    assert!(!one(repo, &revision(&scene.record.publication())).is_empty());
     JjRepo::run(
         &scene.repo.worker,
         &["new", &scene.record.publication(), "-m", "Next published work"],

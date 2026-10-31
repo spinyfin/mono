@@ -1204,21 +1204,26 @@ impl ExecutionCoordinator {
                     .as_deref()
                     .ok_or_else(|| anyhow!("running execution has no workspace"))?;
                 let work_item = self.resolve_execution_work_item(execution)?;
-                let pr = super::execution::pr_number_for_workspace_goto(&self.work_db, execution, &work_item).or_else(
-                    || match &work_item {
-                        WorkItem::Task(task) | WorkItem::Chore(task) => {
-                            task.pr_url.as_deref().and_then(boss_github::pr_url::pr_number_from_url)
-                        }
-                        _ => None,
+                let bound_pr = super::execution::pr_number_for_workspace_goto(&self.work_db, execution, &work_item);
+                let task_pr = match &work_item {
+                    WorkItem::Task(task) | WorkItem::Chore(task) => {
+                        task.pr_url.as_deref().and_then(boss_github::pr_url::pr_number_from_url)
+                    }
+                    _ => None,
+                };
+                let immutable = self.immutable_execution_target(execution)?;
+                super::fresh_start::position_fresh_workspace(
+                    adapter.as_ref(),
+                    Path::new(workspace),
+                    &super::fresh_start::FreshStart {
+                        repo_id: execution.cube_repo_id.as_deref().unwrap_or_default(),
+                        immutable_target: immutable.as_deref(),
+                        bound_pr,
+                        task_pr,
+                        title: "",
                     },
-                );
-                if let Some(sha) = self.immutable_execution_target(execution)? {
-                    adapter.goto_workspace_revision(Path::new(workspace), &sha).await?;
-                } else if let Some(pr) = pr {
-                    adapter.goto_workspace(Path::new(workspace), pr).await?;
-                } else {
-                    adapter.start_fresh_workspace(Path::new(workspace)).await?;
-                }
+                )
+                .await?;
                 let fresh = adapter
                     .create_execution_bookmark(Path::new(workspace), &execution.id, None, None)
                     .await?;

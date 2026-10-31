@@ -24,23 +24,62 @@ pub(crate) fn record_fresh_start(
     reason: &str,
     archives: &[(String, String)],
 ) -> Result<()> {
+    record_archive_note(
+        db,
+        prior,
+        reason,
+        archives,
+        (
+            "Recovery source retired; starting fresh",
+            &format!(
+                "Execution `{next_id}` starts fresh from an open PR, trunk, or the captured immutable review target. No action is required."
+            ),
+        ),
+    )
+}
+
+pub(crate) fn record_adoption_archive(
+    db: &WorkDb,
+    execution: &WorkExecution,
+    reason: &str,
+    archives: &[(String, String)],
+) -> Result<()> {
+    record_archive_note(
+        db,
+        execution,
+        reason,
+        archives,
+        (
+            "Stale recovery names archived; continuing predecessor adoption",
+            "Stale current-attempt names were archived. Predecessor adoption continues; no action is required.",
+        ),
+    )
+}
+
+fn record_archive_note(
+    db: &WorkDb,
+    prior: &WorkExecution,
+    reason: &str,
+    archives: &[(String, String)],
+    wording: (&str, &str),
+) -> Result<()> {
     let mut retained = archives
         .iter()
         .map(|(name, commit)| format!("`{name}` retains `{commit}`"))
         .collect::<Vec<_>>()
         .join("\n");
     if retained.is_empty() {
-        retained = "No unpublished commits required an archive.".to_owned();
+        retained = "No archive bookmarks were created.".to_owned();
     }
     db.create_attention_item(CreateAttentionItemInput {
         execution_id: None,
         work_item_id: Some(db.owning_work_item_id(&prior.work_item_id)),
         kind: RECOVERY_RETIRED.to_owned(),
         status: Some("resolved".to_owned()),
-        title: "Recovery source retired; starting fresh".to_owned(),
+        title: wording.0.to_owned(),
         body_markdown: format!(
-            "Execution `{}` could not safely resume: {reason}\n\nRecovery archive:\n{retained}\n\nExecution `{next_id}` starts fresh from the current PR head, main when there is no PR, or the captured immutable review target. No action is required.",
-            prior.id
+            "Execution `{}` encountered a recovery problem: {reason}\n\nRecovery archive:\n{retained}\n\n{}",
+            prior.id, wording.1
         ),
         resolved_at: Some(crate::work::now_string()),
     })?;
