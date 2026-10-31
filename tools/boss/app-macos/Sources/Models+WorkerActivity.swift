@@ -493,7 +493,7 @@ enum AgentActivityState: Equatable {
     /// the consolidating agent reads differently from the parallel reviewers.
     static func aiReviewCaption(stage: String?) -> String {
         switch stage {
-        case "applying": "Applying AI review verdict"
+        case AgentReviewStage.applying: "Applying AI review verdict"
         case AgentReviewStage.consolidation: "Consolidating review findings"
         default: "AI review in progress"
         }

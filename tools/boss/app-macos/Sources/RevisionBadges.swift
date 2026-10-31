@@ -99,6 +99,11 @@ struct RevisionRollupLine: View {
                     .font(.system(.caption2, design: .monospaced).weight(.semibold))
                     .foregroundStyle(Color.accentColor)
             }
+            if let reason = revision.blockedReason {
+                Text("Blocked: " + reason.replacingOccurrences(of: "_", with: " "))
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            }
             Text(revision.name)
                 .font(.caption2)
                 .foregroundStyle(.secondary)

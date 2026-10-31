@@ -643,8 +643,8 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
 
 /// Read the four columns board layout is derived from. Products and projects
 /// have no board position — they are not cards — so a drop naming one is an
-/// error rather than a silently ignored no-op. A revision that is `in_review`
-/// or `done` is folded into its parent's card and is not a card either.
+/// error rather than a silently ignored no-op. Any revision the engine projects
+/// as folded (including review-phase blocks) has no standalone board position.
 fn board_row_for_id(work_db: &WorkDb, id: &str) -> Result<BoardRow> {
     match work_db.get_work_item(id)? {
         WorkItem::Task(task) | WorkItem::Chore(task) if task.board_folded_revision => {

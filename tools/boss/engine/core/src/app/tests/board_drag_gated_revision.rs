@@ -496,3 +496,32 @@ async fn held_active_revision_reorder_preserves_review_hold() {
         executions.len()
     );
 }
+
+#[tokio::test]
+async fn folded_ci_failure_revision_drop_is_refused_and_preserves_block() {
+    let (state, _dir) = test_server_state_with_fakes();
+    let (_, revision, _) = seed_ci_fix_behind_in_review_revision(&state);
+    state
+        .work_db
+        .update_work_item(
+            &revision.id,
+            WorkItemPatch::builder()
+                .status("blocked")
+                .blocked_reason("ci_failure")
+                .build(),
+        )
+        .unwrap();
+    let sink = make_session_sink();
+    handle_move_work_item_on_board(
+        dispatch(&state, &sink, "folded-blocked-drop"),
+        drop_on_doing(&revision.id),
+    )
+    .await;
+    match sole_response(&sink).await {
+        FrontendEvent::WorkError { message } => assert!(message.contains("no board position"), "{message}"),
+        other => panic!("expected folded-card refusal, got {other:?}"),
+    }
+    let after = task_row(&state, &revision.id);
+    assert_eq!(after.status, TaskStatus::Blocked);
+    assert_eq!(after.blocked_reason.as_deref(), Some("ci_failure"));
+}

@@ -1121,7 +1121,8 @@ pub struct Task {
 
     /// Which stage of the AI review cycle this is: `"reviewers"` (the
     /// parallel reviewers) or `"consolidation"` (the agent merging their
-    /// findings into one review), or `"applying"` (verdict application). Set
+    /// findings into one review), or `"applying"` (verdict application), using
+    /// [`crate::ReviewStage::as_str`]. Set
     /// only while `ai_reviewing` is true; a derived projection, not a stored
     /// column. Clients render it and never infer it themselves.
     #[serde(default, skip_serializing_if = "Option::is_none")]

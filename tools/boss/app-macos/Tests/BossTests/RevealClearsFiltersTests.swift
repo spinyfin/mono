@@ -346,6 +346,7 @@ final class RevealClearsFiltersTests: XCTestCase {
             updatedAt: "2026-05-26T00:00:00Z"
         )
         task.parentTaskId = parentTaskId
+        task.boardFoldedRevision = kind == "revision" && (status == "in_review" || status == "done")
         return task
     }
 

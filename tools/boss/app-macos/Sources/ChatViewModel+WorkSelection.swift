@@ -250,7 +250,7 @@ extension ChatViewModel {
         }
         switch revealCardTarget(for: revision.id) {
         case .revealed(let cardID) where cardID != revision.id:
-            return "Click to open the findings. The fix is already in review or done, so it is shown as a line on this card rather than as its own card."
+            return "Click to open the findings. The fix is folded into its parent, so it is shown as a line on this card rather than as its own card."
         default:
             return "Click to open the findings and reveal the fix task's card."
         }

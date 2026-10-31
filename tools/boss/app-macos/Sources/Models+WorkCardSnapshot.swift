@@ -24,15 +24,18 @@ struct WorkCardRevisionRollup: Equatable, Identifiable {
     let revisionSeq: Int?
     let name: String
     let revisionParentPrUrl: String?
+    let blockedReason: String?
 
-    init(id: String, revisionSeq: Int?, name: String, revisionParentPrUrl: String?) {
+    init(id: String, revisionSeq: Int?, name: String, revisionParentPrUrl: String?, blockedReason: String? = nil) {
         self.id = id
         self.revisionSeq = revisionSeq
         self.name = name
+        self.blockedReason = blockedReason
         self.revisionParentPrUrl = revisionParentPrUrl
     }
 
     init(revision: WorkTask) {
+        self.blockedReason = revision.status == "blocked" ? revision.blockedReason : nil
         self.id = revision.id
         self.revisionSeq = revision.revisionSeq
         self.name = revision.name

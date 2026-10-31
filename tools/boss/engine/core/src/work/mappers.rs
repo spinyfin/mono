@@ -209,13 +209,11 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let kind = parse_text_column::<TaskKind>(3, &kind_raw)?;
     let status_raw: String = row.get(6)?;
     let status = parse_text_column::<TaskStatus>(6, &status_raw)?;
+    let blocked_reason: Option<String> = row.get(16)?;
     let board_folded_revision = kind == TaskKind::Revision
         && (matches!(status, TaskStatus::InReview | TaskStatus::Done)
             || (status == TaskStatus::Blocked
-                && matches!(
-                    row.get::<_, Option<String>>("blocked_reason")?.as_deref(),
-                    Some("merge_conflict" | "ci_failure" | "ci_failure_exhausted" | "review_feedback")
-                )));
+                && boss_engine_board_gesture::is_review_phase_blocked_reason(blocked_reason.as_deref())));
     Ok(Task {
         id: row.get(0)?,
         operator_question: {
@@ -247,7 +245,7 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         last_status_actor: row.get(13)?,
         priority: row.get(14)?,
         created_via: row.get(15)?,
-        blocked_reason: row.get(16)?,
+        blocked_reason,
         blocked_attempt_id: row.get(17)?,
         // Not part of the base 33-column SELECT; populated only by the
         // extended mappers below (mirrors archived_reason/dispatch_failed_*).

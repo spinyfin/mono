@@ -407,13 +407,7 @@ func parseGitHubPRURL(_ urlString: String) -> (org: String, repo: String, number
     return (org: parts[0], repo: parts[1], number: parts[3])
 }
 
-/// Whether two PR URL strings identify the same GitHub pull request.
-/// Compares the parsed `(org, repo, number)` triple case-insensitively
-/// on org/repo so incidental formatting differences don't defeat the
-/// match; falls back to exact string equality when either URL isn't a
-/// parseable GitHub PR URL. Used to dedup a card's PR-link rows when
-/// two different task fields (e.g. a revision's own `prURL` and its
-/// `revisionParentPrUrl`) happen to resolve to the same PR.
+/// Normalized identity shared by review lookups and PR link deduplication.
 enum ReviewPRIdentity: Hashable {
     case github(org: String, repo: String, number: String)
     case other(String)
@@ -427,6 +421,13 @@ enum ReviewPRIdentity: Hashable {
     }
 }
 
+/// Whether two PR URL strings identify the same GitHub pull request.
+/// Compares the parsed `(org, repo, number)` triple case-insensitively
+/// on org/repo so incidental formatting differences don't defeat the
+/// match; falls back to exact string equality when either URL isn't a
+/// parseable GitHub PR URL. Used to dedup a card's PR-link rows when
+/// two different task fields (e.g. a revision's own `prURL` and its
+/// `revisionParentPrUrl`) happen to resolve to the same PR.
 func sameGitHubPR(_ a: String, _ b: String) -> Bool {
     ReviewPRIdentity(a) == ReviewPRIdentity(b)
 }

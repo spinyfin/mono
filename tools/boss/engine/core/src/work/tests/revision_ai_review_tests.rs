@@ -62,6 +62,10 @@ fn held_revision(label: &str) -> HeldRevision {
 
 /// A pre-merge review batch on the chain root, as the reviewers are launched.
 fn start_review_batch(held: &HeldRevision) -> String {
+    start_review_batch_for_target(held, "head-sha")
+}
+
+fn start_review_batch_for_target(held: &HeldRevision, target_sha: &str) -> String {
     let classification = ReviewClassification::builder()
         .changed_files(vec!["tools/boss/engine/pr-review/src/parsing.rs".to_owned()])
         .complexity_flags(vec![])
@@ -88,7 +92,7 @@ fn start_review_batch(held: &HeldRevision) -> String {
         .phase(ReviewBatchPhase::PreMerge)
         .pr_number(42)
         .pr_url(PR_URL)
-        .target_sha("head-sha")
+        .target_sha(target_sha)
         .build();
     let batch = held.db.create_review_batch(input, &[member]).unwrap().0;
     let execution = held
@@ -289,4 +293,55 @@ fn review_phase_blocked_revisions_are_folded_by_the_engine() {
             .unwrap();
         assert!(projected_revision(&held).board_folded_revision, "{reason}");
     }
+}
+
+#[test]
+fn reaped_started_review_stays_reviewing_before_and_after_readmission() {
+    let held = held_revision("revision-ai-review-reaped");
+    let failed = start_review_batch(&held);
+    held.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_batches SET status = 'failed' WHERE id = ?1",
+            [&failed],
+        )
+        .unwrap();
+    let assert_reviewing = || {
+        assert_eq!(
+            held.db.list_revisions_under_ai_review().unwrap(),
+            vec![held.revision_id.clone()]
+        );
+        assert!(projected_revision(&held).ai_reviewing);
+        assert_eq!(projected_revision(&held).ai_review_stage.as_deref(), Some("reviewers"));
+    };
+    assert_reviewing();
+    let replacement = start_review_batch_for_target(&held, "replacement-fixture");
+    let conn = held.db.connect().unwrap();
+    conn.execute(
+        "UPDATE pr_review_batches SET generation = 2, target_sha = 'head-sha' WHERE id = ?1",
+        [&replacement],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE work_executions SET status = 'ready', started_at = NULL WHERE id IN (
+            SELECT execution_id FROM pr_review_batch_members WHERE batch_id = ?1)",
+        [&replacement],
+    )
+    .unwrap();
+    drop(conn);
+    assert_reviewing();
+}
+
+#[test]
+fn a_review_started_before_the_latest_implementation_does_not_count() {
+    let held = held_revision("revision-ai-review-old-cycle");
+    start_review_batch(&held);
+    held.db
+        .connect()
+        .unwrap()
+        .execute("UPDATE pr_review_batches SET created_at = '1'", [])
+        .unwrap();
+    assert!(held.db.list_revisions_under_ai_review().unwrap().is_empty());
+    assert!(!projected_revision(&held).ai_reviewing);
 }

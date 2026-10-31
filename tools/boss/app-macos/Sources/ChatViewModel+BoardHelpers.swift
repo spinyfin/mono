@@ -5,7 +5,7 @@ import Foundation
 enum RevealCardResult: Equatable {
     /// A host card resolves to this id — either the requested
     /// item's own card, or (for a revision rolled up into its parent
-    /// because it reached `in_review`/`done`) the parent's card. This is
+    /// by the engine projection) the parent's card. This is
     /// resolution only, not evidence that a view scrolled successfully.
     case revealed(cardID: String)
     /// The id isn't loaded locally yet — the common cross-product case,
@@ -23,16 +23,8 @@ enum RevealCardResult: Equatable {
 extension ChatViewModel {
     // MARK: Revisions
 
-    /// Resolves the reveal target for `taskID`. Tasks, chores, projects, and
-    /// products always host their own card. A revision that has reached
-    /// `in_review` or `done` never gets a standalone card — `workItems(in:)`
-    /// filters it out of the Review/Done columns, and it never had one in
-    /// Backlog/Doing since its own status already moved it past those — it
-    /// only ever surfaces as a rollup line on its PARENT's card (see the
-    /// `inReviewRevisions` computation in `ContentView`). So the reveal
-    /// target for such a revision is its parent's card, wherever that
-    /// parent's own status happens to place it (Backlog included — a parent
-    /// blocked for a non-review reason still renders there).
+    /// Resolves the card hosting an item. Engine-folded revisions, including
+    /// review-phase blocked revisions, reveal their parent's inline rollup.
     func revealCardTarget(for taskID: String) -> RevealCardResult {
         guard let item = task(withID: taskID) else {
             return .deferred
@@ -40,7 +32,7 @@ extension ChatViewModel {
         guard item.deletedAt == nil else {
             return .unreachable(reason: "\(revealLabel(for: item)) is deleted")
         }
-        guard item.kind == "revision", item.status == "in_review" || item.status == "done" else {
+        guard item.isFoldedRevision else {
             return .revealed(cardID: item.id)
         }
         guard let parentID = item.parentTaskId, let parent = task(withID: parentID) else {
@@ -61,7 +53,7 @@ extension ChatViewModel {
     }
 
 
-    /// `kind == "revision"` tasks for parentID with status `"in_review"`.
+    /// Engine-folded review and review-blocked revisions for parentID.
     /// O(1) per card — reads the cache built by `rebuildRevisionCache()`,
     /// which groups every project- and product-level revision by parent id
     /// and status in a single pass. Called once per visible card on every
@@ -170,8 +162,8 @@ extension ChatViewModel {
     }
 
     /// Groups every project- and product-level revision task by parent id
-    /// for the two statuses the kanban card footer actually renders
-    /// (`in_review`, `done`), in one O(total revisions) pass. Populates
+    /// using engine folding membership, separating completed rows from review rows
+    /// in one O(total revisions) pass. Populates
     /// `cachedInReviewRevisionsByParentID` / `cachedDoneRevisionsByParentID`.
     /// Mirrors `rebuildPrereqCache` in ChatViewModel+Dependencies.swift —
     /// same buckets as the `revisions(...)` scan above with
@@ -182,14 +174,11 @@ extension ChatViewModel {
         var done: [String: [WorkTask]] = [:]
         func collect(_ tasks: [WorkTask]) {
             for task in tasks {
-                guard task.kind == "revision", let parentID = task.parentTaskId else { continue }
-                switch task.status {
-                case "in_review":
-                    inReview[parentID, default: []].append(task)
-                case "done":
+                guard task.isFoldedRevision, let parentID = task.parentTaskId else { continue }
+                if task.status == "done" {
                     done[parentID, default: []].append(task)
-                default:
-                    break
+                } else {
+                    inReview[parentID, default: []].append(task)
                 }
             }
         }
@@ -471,13 +460,8 @@ extension ChatViewModel {
         // falls through to the per-task `docLinkState`.
         let docPresentation = workItemDocPresentation(for: task)
 
-        // Roll-up rows must render wherever the parent's OWN card lands, not
-        // just in Review/Done. A revision that reaches in_review/done never
-        // gets a standalone card (see `workItems(in:)`'s rollup filter), so
-        // gating this on `column` left revisions with no visual
-        // representation at all whenever the parent's card landed somewhere
-        // else — e.g. a parent blocked for a non-review reason renders in
-        // Backlog (`reveal_work_item` had nothing to point at).
+        // Engine-folded revisions render inline wherever their parent's card lands,
+        // including review-phase blocks that have no standalone card.
         let inReviewRevisions: [WorkCardRevisionRollup] = (
             inReviewRevisions(forParentTaskID: task.id) + doneRevisions(forParentTaskID: task.id)
         )

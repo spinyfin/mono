@@ -454,7 +454,8 @@ final class WorkCacheInvalidationTests: XCTestCase {
             prURL: nil,
             deletedAt: nil,
             createdAt: "2026-07-10T00:00:00Z",
-            updatedAt: "2026-07-10T00:00:00Z"
+            updatedAt: "2026-07-10T00:00:00Z",
+            boardFoldedRevision: kind == "revision" && (status == "in_review" || status == "done")
         )
     }
 
