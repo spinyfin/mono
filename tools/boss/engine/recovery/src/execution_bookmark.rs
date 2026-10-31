@@ -675,7 +675,8 @@ pub async fn discard_orphaned_baseline(jj: &dyn Jj, record: &ExecutionBookmark) 
     Ok(())
 }
 
-/// Archive unpublished work before optionally releasing this execution's names.
+/// Archive unpublished work before releasing private recovery and baseline names.
+/// Release the publication name too only when this execution must reuse it.
 /// Baseline, trunk, remote history and empty-only ranges need no archive. Conflicted bookmarks can have several targets; retain them all.
 /// Archive names include the commit identity so repeated fallbacks never
 /// overwrite earlier preserved work. Pruning only touches the three run names.
@@ -722,15 +723,12 @@ pub async fn release_heads(
         archived.push((archive, commit));
     }
     // Preserve predecessor publication names, which may still be tracked PR branches.
-    if !release_names {
-        return Ok(archived);
-    }
     // Delete retains remote tracking; forget would untrack a pushed PR branch.
     let mut args = vec!["bookmark", "delete"];
     args.extend(
         names
             .iter()
-            .filter(|name| targets.contains_key(*name))
+            .filter(|name| targets.contains_key(*name) && (release_names || **name != record.publication()))
             .map(String::as_str),
     );
     if args.len() > 2 {

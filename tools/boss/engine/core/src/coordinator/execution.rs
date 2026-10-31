@@ -12,9 +12,20 @@ use super::*;
 #[error("pre-start failure bookkeeping failed")]
 pub(super) struct PreStartFailureReported;
 
-/// Where `cube workspace goto` should position the working copy: a PR
-/// branch head, or (for a post-merge review batch member) a frozen
-/// revision such as a merge commit SHA.
+#[derive(Debug)]
+struct HostSelectionFailure {
+    report: Vec<crate::host_scheduling::Eligibility>,
+    message: String,
+}
+
+impl std::fmt::Display for HostSelectionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HostSelectionFailure {}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) enum GotoTarget<'a> {
     Pr(u64),
@@ -353,14 +364,17 @@ impl ExecutionCoordinator {
                 .into_iter()
                 .find(|h| h.id == host_id)
                 .ok_or_else(|| anyhow!("selected host '{host_id}' is missing from the registry")),
-            None => Err(anyhow!(
-                "no eligible host for work item {}: {}{}",
-                work_item.primary_id(),
-                summarize_ineligibility(&report, required_driver.as_deref()),
-                quarantine_reason
-                    .map(|reason| format!("; {reason}"))
-                    .unwrap_or_default(),
-            )),
+            None => Err(anyhow!(HostSelectionFailure {
+                report: report.clone(),
+                message: format!(
+                    "no eligible host for work item {}: {}{}",
+                    work_item.primary_id(),
+                    summarize_ineligibility(&report, required_driver.as_deref()),
+                    quarantine_reason
+                        .map(|reason| format!("; {reason}"))
+                        .unwrap_or_default(),
+                ),
+            })),
         }
     }
 
@@ -395,13 +409,24 @@ impl ExecutionCoordinator {
             // Prefer the source host when unconstrained. A requested host or
             // local-only guide archives the source through its owning adapter
             // and starts fresh instead of failing host selection.
-            if let Ok(host) = self.pick_host(
+            match self.pick_host(
                 work_item,
-                Some(record.host_id),
                 None,
+                Some(record.host_id.clone()),
                 self.resolve_spawn_driver(execution, worker_id)?,
             ) {
-                return Ok(host);
+                Ok(host) => return Ok(host),
+                Err(err) => {
+                    let Some(failure) = err.downcast_ref::<HostSelectionFailure>() else {
+                        return Err(err);
+                    };
+                    if failure.report.iter().any(|entry| {
+                        entry.host_id == record.host_id
+                            && entry.reasons == [host_scheduling::IneligibilityReason::NoFreeSlots]
+                    }) {
+                        return Err(err);
+                    }
+                }
             }
         }
         if execution.kind == ExecutionKind::PrReviewGuide {
@@ -1849,13 +1874,13 @@ impl ExecutionCoordinator {
                             predecessor.as_ref(),
                             report.as_ref().and_then(|r| r.inherited_base.as_deref()),
                         ),
-                        (
-                            immutable_target_sha
-                                .as_deref()
-                                .map(GotoTarget::Revision)
-                                .or_else(|| pr_for_goto.or(pr_for_reconcile).map(GotoTarget::Pr)),
-                            &change_title,
-                        ),
+                        super::fresh_start::FreshStart {
+                            repo_id: &repo.repo_id,
+                            immutable_target: immutable_target_sha.as_deref(),
+                            bound_pr: pr_for_goto,
+                            task_pr: pr_for_reconcile,
+                            title: &change_title,
+                        },
                     )
                     .await?;
                 if !retained {

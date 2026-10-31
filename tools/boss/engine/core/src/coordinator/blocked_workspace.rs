@@ -1,4 +1,4 @@
-use super::execution::GotoTarget;
+use super::fresh_start::{FreshStart, position_fresh_workspace};
 use super::*;
 use boss_engine_recovery::execution_bookmark::{
     ExecutionBookmark, Reconciliation, is_base_unresolvable_error, is_missing_pointer_error,
@@ -23,7 +23,7 @@ impl ExecutionCoordinator {
         lease: &CubeWorkspaceLease,
         adapter: &Arc<dyn HostAdapter>,
         inheritance: (Option<&ExecutionBookmark>, Option<&str>),
-        positioning: (Option<GotoTarget<'_>>, &str),
+        positioning: FreshStart<'_>,
     ) -> Result<(ExecutionBookmark, bool)> {
         let (predecessor, inherited_base) = inheritance;
         let result = adapter
@@ -40,6 +40,10 @@ impl ExecutionCoordinator {
         // Stale names belong to this attempt, not to the successfully recovered
         // predecessor. Retry adoption before discarding that recovered work.
         if predecessor.is_some() {
+            let reason = format!("{err:#}");
+            tracing::warn!(execution_id = %execution.id, ?archives, reason,
+                "stale current-execution pointers archived; continuing predecessor adoption");
+            crate::execution_bookmark_recovery::record_adoption_archive(&self.work_db, execution, &reason, &archives)?;
             match adapter
                 .create_execution_bookmark(&lease.workspace_path, &execution.id, predecessor, inherited_base)
                 .await
@@ -74,14 +78,8 @@ impl ExecutionCoordinator {
             tracing::error!(?note_error, "could not record pointer initialization archive note");
         }
         self.work_db.delete_execution_restore_report(&execution.id)?;
-        match positioning.0 {
-            Some(GotoTarget::Pr(pr)) => adapter.goto_workspace(&lease.workspace_path, pr).await?,
-            Some(GotoTarget::Revision(sha)) => adapter.goto_workspace_revision(&lease.workspace_path, sha).await?,
-            None => {
-                adapter.start_fresh_workspace(&lease.workspace_path).await?;
-                adapter.create_change(&lease.workspace_path, positioning.1).await?;
-            }
-        }
+        position_fresh_workspace(adapter.as_ref(), &lease.workspace_path, &positioning).await?;
+        adapter.create_change(&lease.workspace_path, positioning.title).await?;
         let record = adapter
             .create_execution_bookmark(&lease.workspace_path, &execution.id, None, None)
             .await?;
@@ -148,31 +146,22 @@ impl ExecutionCoordinator {
                 self.retire_unvouched_record(execution, &prior, &record, adapter, &err)
                     .await?;
                 self.work_db.delete_execution_restore_report(&execution.id)?;
-                // Normal dispatch already positions bound PRs and immutable
-                // targets after this returns; only the otherwise describe-only
-                // path needs explicit positioning here.
-                if pr_for_goto.is_none() && self.immutable_execution_target(execution)?.is_none() {
-                    let open_pr = match pr_for_reconcile {
-                        Some(pr)
-                            if crate::host_adapter::recovery_pr_is_open(adapter.as_ref(), repo_id, pr)
-                                .await
-                                .unwrap_or_else(|err| {
-                                    tracing::warn!(
-                                        ?err,
-                                        pr,
-                                        "optional recovery PR is unavailable; starting from trunk"
-                                    );
-                                    false
-                                }) =>
-                        {
-                            Some(pr)
-                        }
-                        _ => None,
-                    };
-                    match open_pr {
-                        Some(pr) => adapter.goto_workspace(&lease.workspace_path, pr).await?,
-                        None => adapter.start_fresh_workspace(&lease.workspace_path).await?,
-                    }
+                let immutable = self.immutable_execution_target(execution)?;
+                // Dispatch positions bound PRs and immutable targets below;
+                // its describe-only path needs explicit fresh positioning here.
+                if pr_for_goto.is_none() && immutable.is_none() {
+                    position_fresh_workspace(
+                        adapter.as_ref(),
+                        &lease.workspace_path,
+                        &FreshStart {
+                            repo_id,
+                            immutable_target: None,
+                            bound_pr: None,
+                            task_pr: pr_for_reconcile,
+                            title: "",
+                        },
+                    )
+                    .await?;
                 }
                 Ok(None)
             }
@@ -416,25 +405,42 @@ impl ExecutionCoordinator {
         adapter: &Arc<dyn HostAdapter>,
         reason: &anyhow::Error,
     ) -> Result<()> {
-        let source_adapter = if adapter.host_id() == record.host_id {
-            Arc::clone(adapter)
-        } else {
-            let host = self
-                .work_db
-                .get_host(&record.host_id)?
-                .ok_or_else(|| anyhow!("archive host {} is unavailable", record.host_id))?;
-            self.host_adapter_provider.adapter_for(&host).await?
+        let archive = async {
+            let source_adapter = if adapter.host_id() == record.host_id {
+                Arc::clone(adapter)
+            } else {
+                let host = self
+                    .work_db
+                    .get_host(&record.host_id)?
+                    .ok_or_else(|| anyhow!("archive host {} is unavailable", record.host_id))?;
+                self.host_adapter_provider.adapter_for(&host).await?
+            };
+            source_adapter
+                .release_execution_bookmark_heads(record, prior.id == execution.id)
+                .await
+        }
+        .await;
+        let (heads, unavailable) = match archive {
+            Ok(heads) => (heads, String::new()),
+            Err(err) if adapter.host_id() != record.host_id => (
+                Vec::new(),
+                format!(
+                    "; source host {} unavailable: {err:#}; pointers {}, {}, {} left intact there",
+                    record.host_id,
+                    record.base(),
+                    record.head(),
+                    record.publication()
+                ),
+            ),
+            Err(err) => return Err(err),
         };
-        let heads = source_adapter
-            .release_execution_bookmark_heads(record, prior.id == execution.id)
-            .await?;
 
         let category = if pointer_integrity_kind(reason).is_some() || is_missing_pointer_error(reason) {
             "pointer integrity"
         } else {
             "recovery operation (including transport)"
         };
-        let reason = format!("{category}: {reason:#}");
+        let reason = format!("{category}: {reason:#}{unavailable}");
         tracing::info!(
             execution_id = %execution.id,
             predecessor = %prior.id,
