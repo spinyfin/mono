@@ -209,12 +209,37 @@ fn gc_preserves_in_progress_publication_and_live_staging_files() {
     for path in [&own, &live, &dead, &unknown] {
         fs::write(path, "staged").unwrap();
     }
-    db.gc_unreferenced_pr_review_guide_source_artifacts().unwrap();
+    // Only the injected observation decides a pid is gone: pid 1 is reported
+    // alive, this process's own staging file is never asked about, and an
+    // unparseable pid is not a pid at all.
+    let asked = std::sync::Mutex::new(Vec::new());
+    db.gc_unreferenced_pr_review_guide_source_artifacts_with(&|pid| {
+        asked.lock().unwrap().push(pid);
+        pid == i32::MAX
+    })
+    .unwrap();
     assert!(own.exists());
     assert!(live.exists());
     assert!(unknown.exists());
     assert!(!dead.exists());
     assert!(!dir.path().join(relative).exists());
+    let asked = asked.into_inner().unwrap();
+    assert!(!asked.contains(&(std::process::id() as i32)), "{asked:?}");
+}
+
+#[test]
+fn gc_without_a_process_observation_keeps_other_processes_staging_files() {
+    let (dir, db) = open_db();
+    let relative = publish_packet_artifact(
+        dir.path(),
+        &packet("base", "head").content_hash().unwrap(),
+        &serde_json::to_vec(&packet("base", "head")).unwrap(),
+    )
+    .unwrap();
+    let dead = dir.path().join(format!("{relative}.{}.1.tmp", i32::MAX));
+    fs::write(&dead, "staged").unwrap();
+    db.gc_unreferenced_pr_review_guide_source_artifacts().unwrap();
+    assert!(dead.exists());
 }
 use crate::test_support::{create_active_chore, create_product, open_db};
 use crate::work::{FakePrStateChecker, PrOpenState};

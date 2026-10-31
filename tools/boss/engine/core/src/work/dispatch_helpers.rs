@@ -1281,7 +1281,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
     input: RequestExecutionInput,
     is_live: F,
 ) -> Result<WorkExecution> {
-    crate::local_worker_quarantine::ensure_work_item_not_quarantined_in(conn, &input.work_item_id)?;
+    super::local_worker_quarantine_store::ensure_work_item_not_quarantined_in(conn, &input.work_item_id)?;
     let RequestExecutionInput {
         work_item_id,
         priority,

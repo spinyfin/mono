@@ -13,14 +13,11 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension};
-use serde::{Deserialize, Serialize};
+use anyhow::Result;
 
 use crate::durable_liveness::{WorkerProcess, probe_execution_worker};
-use crate::work::WorkDb;
+use crate::work::{LocalWorkerQuarantine, WorkDb};
 
-const METADATA_KEY: &str = "local_worker_startup_quarantine";
 pub(crate) use boss_engine_storage_values::attention_kinds::LOCAL_WORKER_STARTUP_QUARANTINE_ATTENTION_KIND as ATTENTION_KIND;
 
 /// How far before the kernel boot a run's last durable write must fall before
@@ -32,87 +29,11 @@ pub(crate) use boss_engine_storage_values::attention_kinds::LOCAL_WORKER_STARTUP
 /// pid probe or a later boot can prove it.
 pub(crate) const PRE_BOOT_MARGIN_SECS: i64 = 3600;
 
-#[derive(Default, Serialize, Deserialize)]
-struct Quarantine {
-    executions: BTreeMap<String, String>,
-    scan_error: Option<String>,
-}
-
 #[derive(Default)]
 pub(crate) struct StartupQuarantineReport {
     pub protected_execution_ids: HashSet<String>,
     pub dead_execution_ids: HashSet<String>,
     pub scan_failed: bool,
-}
-
-#[work_db_boundary::instrument]
-impl WorkDb {
-    fn read_local_worker_quarantine(&self) -> Result<Quarantine> {
-        self.get_metadata(METADATA_KEY)?
-            .map(|value| serde_json::from_str(&value).context("reading local worker quarantine"))
-            .unwrap_or_else(|| Ok(Quarantine::default()))
-    }
-
-    pub(crate) fn local_dispatch_quarantine_reason(&self) -> Result<Option<String>> {
-        let quarantine = self.read_local_worker_quarantine()?;
-        if quarantine.executions.is_empty() && quarantine.scan_error.is_none() {
-            return Ok(None);
-        }
-        Ok(Some(format!(
-            "local dispatch quarantined: historical workers lack tmux identity; roll back or drain them and restart (executions: {}; scan error: {})",
-            quarantine.executions.keys().cloned().collect::<Vec<_>>().join(", "),
-            quarantine.scan_error.as_deref().unwrap_or("none"),
-        )))
-    }
-
-    pub(crate) fn is_execution_quarantined(&self, execution_id: &str) -> Result<bool> {
-        let quarantine = self.read_local_worker_quarantine()?;
-        Ok(quarantine.scan_error.is_some() || quarantine.executions.contains_key(execution_id))
-    }
-
-    pub(crate) fn ensure_work_item_not_quarantined(&self, work_item_id: &str) -> Result<()> {
-        let conn = self.connect()?;
-        ensure_work_item_not_quarantined_in(&conn, work_item_id)
-    }
-
-    /// Epoch seconds of the newest durable write on the latest local run of
-    /// `execution_id`: the greatest of `created_at`, `started_at` and
-    /// `finished_at`. `None` when the execution has no local run.
-    fn latest_local_run_last_write_epoch(&self, execution_id: &str) -> Result<Option<i64>> {
-        let conn = self.connect()?;
-        conn.query_row(
-            "SELECT MAX(
-                 CAST(created_at AS INTEGER),
-                 CAST(COALESCE(started_at, '0') AS INTEGER),
-                 CAST(COALESCE(finished_at, '0') AS INTEGER)
-             ) FROM work_runs
-             WHERE execution_id = ?1 AND host_id = 'local'
-             ORDER BY created_at DESC, id DESC
-             LIMIT 1",
-            [execution_id],
-            |row| row.get::<_, Option<i64>>(0),
-        )
-        .optional()
-        .map(Option::flatten)
-        .map_err(Into::into)
-    }
-
-    fn local_workers_without_tmux_identity(&self) -> Result<Vec<(String, String)>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(
-            "SELECT e.id, e.work_item_id FROM work_executions e
-             JOIN work_runs r ON r.id = (
-                 SELECT latest.id FROM work_runs latest WHERE latest.execution_id = e.id
-                 ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
-             )
-             WHERE e.status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
-               AND r.host_id = 'local'
-               AND (r.tmux_session_name IS NULL OR r.tmux_spawn_token IS NULL OR r.tmux_server_label IS NULL)",
-        )?;
-        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
-    }
 }
 
 pub(crate) fn quarantine_historical_local_workers(db: &WorkDb) -> Result<StartupQuarantineReport> {
@@ -180,7 +101,7 @@ fn quarantine_with_probe(
     boot_epoch_secs: Option<i64>,
 ) -> Result<StartupQuarantineReport> {
     let previous = db.read_local_worker_quarantine()?;
-    let mut quarantine = Quarantine::default();
+    let mut quarantine = LocalWorkerQuarantine::default();
     let mut report = StartupQuarantineReport::default();
     match db.local_workers_without_tmux_identity() {
         Ok(rows) => {
@@ -235,7 +156,7 @@ fn quarantine_with_probe(
             report.scan_failed = true;
         }
     }
-    db.set_metadata(METADATA_KEY, &serde_json::to_string(&quarantine)?)?;
+    db.write_local_worker_quarantine(&quarantine)?;
     // The hold above is what dispatch admission reads; the attention items
     // below are the operator-facing explanation. Filing them is best-effort:
     // a held execution can belong to a work item that was soft-deleted after
@@ -271,28 +192,6 @@ fn quarantine_with_probe(
         }
     }
     Ok(report)
-}
-
-pub(crate) fn ensure_work_item_not_quarantined_in(conn: &Connection, work_item_id: &str) -> Result<()> {
-    if work_item_is_quarantined_in(conn, work_item_id)? {
-        bail!("work item has a quarantined historical local worker; roll back or drain it and restart");
-    }
-    Ok(())
-}
-
-pub(crate) fn work_item_is_quarantined_in(conn: &Connection, work_item_id: &str) -> Result<bool> {
-    let value: Option<String> = conn
-        .query_row("SELECT value FROM metadata WHERE key = ?1", [METADATA_KEY], |row| {
-            row.get(0)
-        })
-        .optional()?;
-    if let Some(value) = value {
-        let quarantine: Quarantine = serde_json::from_str(&value)?;
-        if quarantine.scan_error.is_some() || quarantine.executions.values().any(|id| id == work_item_id) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 #[cfg(test)]
@@ -351,7 +250,6 @@ mod tests {
             );
             assert!(db.mark_execution_orphaned(execution, "lease expired").is_err());
             assert!(db.ensure_work_item_not_quarantined(item).is_err());
-            assert!(ensure_work_item_not_quarantined_in(&db.connect().unwrap(), item).is_err());
             assert!(!db.get_execution(execution).unwrap().status.is_terminal());
         }
         db.mark_execution_orphaned(&dead, "process proven gone").unwrap();

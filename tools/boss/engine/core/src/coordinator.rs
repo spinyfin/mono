@@ -2158,7 +2158,7 @@ pub struct ExecutionCoordinator {
     /// every execution instead of failing it with "driver discovery has
     /// not run". Distinct from `dispatch_preflight_block_reason` so lifting
     /// this hold can never lift a failed tmux preflight. See
-    /// [`crate::work::WorkDb::refresh_local_host_auto_capabilities`].
+    /// [`crate::host_registry::refresh_local_host_auto_capabilities`].
     #[builder(default)]
     local_capability_discovery_pending: AtomicBool,
     /// `true` from engine startup until tmux adoption and the boot-only
