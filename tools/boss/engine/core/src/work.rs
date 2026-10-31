@@ -755,6 +755,7 @@ mod review_guide_context;
 mod review_guide_findings;
 mod review_guide_jobs;
 mod review_guide_recovery;
+pub(crate) use review_guide_recovery::OrphanedGuideSubmission;
 mod review_guide_sources;
 mod review_guide_submission;
 mod review_section;
@@ -819,7 +820,7 @@ pub(crate) use products_design::{
 };
 pub(crate) use review_guide_jobs::{
     PrReviewGuideAttempt, PrReviewGuideVersion, PublishReviewGuideOutcome, RetryReviewGuideOutcome,
-    ReviewGuideReenqueueReport, notify_review_guide_changed, to_wire_review_guide_summary,
+    ReviewGuideReenqueueReport, install_engine_build_identity, to_wire_review_guide_summary,
 };
 pub(crate) use review_guide_sources::{
     PrReviewGuideSourceCapture, PrSourceCapturePersistOutcome, PrSourceCaptureTrigger,

@@ -67,7 +67,7 @@ pub(super) async fn handle_generate_review_guide(ctx: Dispatch, req: FrontendReq
     let result = generate_review_guide(&ctx, &root_task_id, idempotency_token.as_deref()).await;
     match result {
         Ok((resolved_root_id, outcome)) => {
-            crate::work::notify_review_guide_changed(
+            crate::execution_publisher::notify_review_guide_changed(
                 &ctx.work_db,
                 &ctx.server_state.publisher,
                 &resolved_root_id,
@@ -244,7 +244,7 @@ pub(super) async fn handle_retry_review_guide(ctx: Dispatch, req: FrontendReques
         boss_review_guide::PROMPT_VERSION,
     ) {
         Ok(crate::work::RetryReviewGuideOutcome::Created(attempt)) => {
-            crate::work::notify_review_guide_changed(
+            crate::execution_publisher::notify_review_guide_changed(
                 &work_db,
                 &server_state.publisher,
                 &root_task_id,

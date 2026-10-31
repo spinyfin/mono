@@ -1393,7 +1393,11 @@ async fn serve_scoped(
     // workers.
     {
         let state = server_state.clone();
-        match tokio::task::spawn_blocking(move || state.work_db.recover_orphaned_review_guide_submissions()).await {
+        match tokio::task::spawn_blocking(move || {
+            crate::review_guide_validation::recover_orphaned_submissions(&state.work_db)
+        })
+        .await
+        {
             Ok(Ok(report)) if !report.is_empty() => tracing::info!(
                 published = report.published.len(),
                 skipped = report.skipped.len(),

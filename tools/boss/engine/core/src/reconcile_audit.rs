@@ -5,11 +5,11 @@
 //! line to a work item's description so an operator can see why a chore was
 //! reset or resumed. They previously reimplemented the identical
 //! get -> extract-description -> format -> update sequence. This module owns
-//! that sequence; each call site supplies only its caller-specific reason.
+//! the line formatting and the audit-marker vocabulary; the append itself is
+//! storage's [`WorkDb::append_work_item_description_line`]. Each call site
+//! supplies only its caller-specific reason.
 
 use std::path::Path;
-
-use boss_protocol::WorkItemPatch;
 
 use crate::work::WorkDb;
 
@@ -98,23 +98,12 @@ pub(crate) fn strip_engine_audit_lines(description: &str) -> String {
 /// [`append_reconcile_audit`] and [`crate::completion::WorkerCompletionHandler::record_deferred_scope_item`]
 /// (the `[deferred-scope]` audit trail) — both need the identical
 /// get -> extract-description -> format -> update sequence, differing only
-/// in the line they format.
+/// in the line they format. The sequence itself is
+/// [`WorkDb::append_work_item_description_line`]: storage owns the update so
+/// the proposal path can append its post-commit line without calling back
+/// into engine core.
 pub(crate) fn append_description_line(work_db: &WorkDb, work_item_id: &str, line: &str) -> anyhow::Result<()> {
-    let item = work_db.get_work_item(work_item_id)?;
-    let current_desc = match &item {
-        boss_protocol::WorkItem::Product(p) => p.description.as_str(),
-        boss_protocol::WorkItem::Project(p) => p.description.as_str(),
-        boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t.description.as_str(),
-    };
-    let new_desc = format!("{current_desc}{line}");
-    work_db.update_work_item(
-        work_item_id,
-        WorkItemPatch {
-            description: Some(new_desc),
-            ..WorkItemPatch::default()
-        },
-    )?;
-    Ok(())
+    work_db.append_work_item_description_line(work_item_id, line)
 }
 
 /// Best-effort variant of [`append_reconcile_audit`] with no recovery note:

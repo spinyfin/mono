@@ -177,36 +177,11 @@ pub fn compute_merged_parent_deletions_blocking(
 }
 
 pub use boss_engine_storage_values::attention_kinds::MERGED_PARENT_DELETION_SIGNOFF_ATTENTION_KIND as SIGNOFF_ATTENTION_KIND;
-/// Title for the sign-off attention item filed by either surface above.
-pub const SIGNOFF_ATTENTION_TITLE: &str =
-    "Merge resolution removed a merged parent's surface — operator sign-off required";
-
-/// Render the operator-facing attention body for a merged-parent deletion
-/// sign-off halt (incident-002 P2). Shared by `completion.rs` and
-/// `conflict_ladder.rs` (T9/T2562) so a deletion is presented identically
-/// to the operator regardless of which rung produced it.
-pub fn render_signoff_attention_body(deletions: &[String], pr_url: &str) -> String {
-    let removed_list = deletions
-        .iter()
-        .map(|d| format!("- {d}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "This PR resolves a merge / forward-port. The engine diffed the \
-         resolution against **both merge parents** and found it removes \
-         {n} surface(s) a **merged** parent had already added — the \
-         incident-002 failure class (a forward-port silently deleting a \
-         just-merged feature). This is anchored on the fact of the \
-         deletion, independent of any \"supersedes\" narrative.\n\n\
-         Auto-progression is **halted**; the task is blocked pending your \
-         sign-off. Removed merged-parent surfaces:\n\n{removed_list}\n\n\
-         If the removal is genuinely correct (a design-doc-authorised \
-         supersession), move this task back to Review to sign off. \
-         Otherwise the resolution must be revised to restore the \
-         surface (integrate both parents).\n\nPR: {pr_url}",
-        n = deletions.len(),
-    )
-}
+// The sign-off presentation is shared with storage, which files the attention
+// item for the review-verdict applier; it lives below both so storage does not
+// import this service. Re-exported so completion and the conflict ladder keep
+// their existing paths.
+pub use boss_engine_storage_values::merge_parent_signoff::{SIGNOFF_ATTENTION_TITLE, render_signoff_attention_body};
 
 /// Fetch a PR's current head commit sha via the shared REST head reader.
 /// Used by the escalation ladder's rung 0/1 result-gate (see
@@ -336,18 +311,6 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("RecommendationBadge.tsx"));
         assert!(lines[0].contains("merged parent"));
-    }
-
-    #[test]
-    fn signoff_body_lists_every_deletion_and_the_pr_url() {
-        let body = render_signoff_attention_body(
-            &["a.tsx".to_owned(), "b.tsx".to_owned()],
-            "https://github.com/org/repo/pull/1",
-        );
-        assert!(body.contains("- a.tsx"));
-        assert!(body.contains("- b.tsx"));
-        assert!(body.contains("2 surface(s)"));
-        assert!(body.contains("PR: https://github.com/org/repo/pull/1"));
     }
 
     #[test]

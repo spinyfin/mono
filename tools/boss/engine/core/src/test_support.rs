@@ -88,7 +88,12 @@ pub const TEST_REPO_REMOTE_URL: &str = "git@github.com:spinyfin/mono.git";
 /// `WorkDb` — dropping it deletes the backing `state.db`. The sweep and
 /// scheduler test modules all open a DB this exact way, so this replaces
 /// the byte-identical local `open_db()` each used to hand-roll.
+///
+/// Installs the test binary's [`crate::build_info::build_identity`], as the
+/// engine's composition root does at startup, so failures recorded through
+/// the implicit review-guide operations carry a build.
 pub fn open_db() -> (TempDir, WorkDb) {
+    crate::work::install_engine_build_identity(crate::build_info::build_identity());
     let dir = TempDir::new().unwrap();
     let db = WorkDb::open(dir.path().join("state.db")).unwrap();
     (dir, db)
