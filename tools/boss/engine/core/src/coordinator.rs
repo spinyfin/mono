@@ -2271,6 +2271,7 @@ mod blocked_workspace;
 mod config;
 mod dispatch_admission;
 mod execution;
+mod fresh_start;
 mod lease_limiter;
 mod run;
 mod scheduler;

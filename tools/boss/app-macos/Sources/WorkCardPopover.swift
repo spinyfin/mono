@@ -47,6 +47,7 @@ struct WorkCardPopoverView: View {
             .frame(width: 360, alignment: .leading)
             .onAppear {
                 model.beginExecutionsConsumer(taskID: task.id, token: executionsConsumerToken)
+                model.engine.sendLine(["type": "list_attention_items_for_work_item", "work_item_id": task.id])
             }
             .onDisappear {
                 model.endExecutionsConsumer(taskID: task.id, token: executionsConsumerToken)
@@ -143,6 +144,16 @@ struct WorkCardPopoverView: View {
                 sourceChipRow
                 if task.sourceAutomationId != nil {
                     automationRow
+                }
+            }
+
+            ForEach((model.attentionItemsByWorkItemID[task.id] ?? []).filter {
+                $0.kind == "execution_bookmark_recovery_retired"
+            }) { note in
+                DisclosureGroup(note.title) {
+                    Text(note.bodyMarkdown)
+                        .font(.caption)
+                        .textSelection(.enabled)
                 }
             }
 

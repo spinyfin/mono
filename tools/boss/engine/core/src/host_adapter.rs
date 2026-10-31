@@ -155,7 +155,7 @@ pub(crate) fn closed_recovery_pr_error() -> anyhow::Error {
 mod pr_anchor;
 
 /// Check the structured PR lookup before cube positioning, on either host.
-async fn recovery_pr_is_open(adapter: &dyn HostAdapter, repo_id: &str, pr: u64) -> Result<bool> {
+pub(crate) async fn recovery_pr_is_open(adapter: &dyn HostAdapter, repo_id: &str, pr: u64) -> Result<bool> {
     let repos = adapter.list_repos().await?;
     let repo = repos
         .iter()
@@ -258,11 +258,19 @@ pub trait HostAdapter: Send + Sync {
         let _ = (record, pr_bookmark, trunk);
         bail!("execution bookmark reconciliation is not supported by this host adapter")
     }
-    /// Drop an execution's head bookmarks after a deliberate fresh start so
-    /// the same execution can create fresh pointers; returns what was
-    /// released so the caller can record the commits.
-    async fn release_execution_bookmark_heads(&self, record: &ExecutionBookmark) -> Result<Vec<(String, String)>> {
-        let _ = record;
+    /// Position a fresh child of the repository's configured trunk.
+    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<()> {
+        let _ = workspace;
+        bail!("fresh workspace positioning is not supported by this host adapter")
+    }
+    /// Archive unpublished targets before optionally releasing names that the
+    /// current execution must reuse. Predecessor publication names stay tracked.
+    async fn release_execution_bookmark_heads(
+        &self,
+        record: &ExecutionBookmark,
+        release_names: bool,
+    ) -> Result<Vec<(String, String)>> {
+        let _ = (record, release_names);
         bail!("execution bookmark release is not supported by this host adapter")
     }
     /// Forget a finished execution's pointers once a voucher proves its
@@ -635,13 +643,21 @@ impl HostAdapter for LocalHostAdapter {
         );
         pr_anchor::reconcile(&LocalJj, self, record, pr_bookmark, trunk).await
     }
-    async fn release_execution_bookmark_heads(&self, record: &ExecutionBookmark) -> Result<Vec<(String, String)>> {
+    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<()> {
+        execution_bookmark::Jj::run(&LocalJj, workspace, &["new", "trunk()", "-m", "Fresh execution"]).await?;
+        Ok(())
+    }
+    async fn release_execution_bookmark_heads(
+        &self,
+        record: &ExecutionBookmark,
+        release_names: bool,
+    ) -> Result<Vec<(String, String)>> {
         anyhow::ensure!(
             record.host_id == "local",
             "recovery bookmark belongs to host {}",
             record.host_id
         );
-        execution_bookmark::release_heads(&LocalJj, record).await
+        execution_bookmark::release_heads(&LocalJj, record, release_names).await
     }
     async fn prune_execution_bookmark(
         &self,
@@ -1222,12 +1238,20 @@ impl HostAdapter for SshHostAdapter {
         );
         pr_anchor::reconcile(self, self, record, pr_bookmark, trunk).await
     }
-    async fn release_execution_bookmark_heads(&self, record: &ExecutionBookmark) -> Result<Vec<(String, String)>> {
+    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<()> {
+        execution_bookmark::Jj::run(self, workspace, &["new", "trunk()", "-m", "Fresh execution"]).await?;
+        Ok(())
+    }
+    async fn release_execution_bookmark_heads(
+        &self,
+        record: &ExecutionBookmark,
+        release_names: bool,
+    ) -> Result<Vec<(String, String)>> {
         anyhow::ensure!(
             record.host_id == self.host_id(),
             "recovery store belongs to another host"
         );
-        execution_bookmark::release_heads(self, record).await
+        execution_bookmark::release_heads(self, record, release_names).await
     }
 
     fn host_id(&self) -> &str {

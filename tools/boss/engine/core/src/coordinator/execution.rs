@@ -12,11 +12,22 @@ use super::*;
 #[error("pre-start failure bookkeeping failed")]
 pub(super) struct PreStartFailureReported;
 
-/// Where `cube workspace goto` should position the working copy: a PR
-/// branch head, or (for a post-merge review batch member) a frozen
-/// revision such as a merge commit SHA.
+#[derive(Debug)]
+struct HostSelectionFailure {
+    report: Vec<crate::host_scheduling::Eligibility>,
+    message: String,
+}
+
+impl std::fmt::Display for HostSelectionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HostSelectionFailure {}
+
 #[derive(Clone, Copy, Debug)]
-enum GotoTarget<'a> {
+pub(super) enum GotoTarget<'a> {
     Pr(u64),
     Revision(&'a str),
 }
@@ -353,14 +364,17 @@ impl ExecutionCoordinator {
                 .into_iter()
                 .find(|h| h.id == host_id)
                 .ok_or_else(|| anyhow!("selected host '{host_id}' is missing from the registry")),
-            None => Err(anyhow!(
-                "no eligible host for work item {}: {}{}",
-                work_item.primary_id(),
-                summarize_ineligibility(&report, required_driver.as_deref()),
-                quarantine_reason
-                    .map(|reason| format!("; {reason}"))
-                    .unwrap_or_default(),
-            )),
+            None => Err(anyhow!(HostSelectionFailure {
+                report: report.clone(),
+                message: format!(
+                    "no eligible host for work item {}: {}{}",
+                    work_item.primary_id(),
+                    summarize_ineligibility(&report, required_driver.as_deref()),
+                    quarantine_reason
+                        .map(|reason| format!("; {reason}"))
+                        .unwrap_or_default(),
+                ),
+            })),
         }
     }
 
@@ -370,7 +384,7 @@ impl ExecutionCoordinator {
         work_item: &WorkItem,
         worker_id: &str,
     ) -> Result<Host> {
-        let mut pinned = self
+        let pinned = self
             .work_db
             .execution_pinned_host(&execution.id)
             .context("host-selection: execution pinned host")?;
@@ -387,17 +401,33 @@ impl ExecutionCoordinator {
                 None => None,
             },
         };
-        if let Some(record) = recovery_record {
-            for constraint in [pinned.as_deref(), requested.as_deref()].into_iter().flatten() {
-                anyhow::ensure!(
-                    constraint == record.host_id,
-                    "recovery store is on host {}, conflicting with requested host {constraint}",
-                    record.host_id
-                );
+        if let Some(record) = recovery_record
+            && pinned.is_none()
+            && requested.is_none()
+            && execution.kind != ExecutionKind::PrReviewGuide
+        {
+            // Prefer the source host when unconstrained. A requested host or
+            // local-only guide archives the source through its owning adapter
+            // and starts fresh instead of failing host selection.
+            match self.pick_host(
+                work_item,
+                None,
+                Some(record.host_id.clone()),
+                self.resolve_spawn_driver(execution, worker_id)?,
+            ) {
+                Ok(host) => return Ok(host),
+                Err(err) => {
+                    let Some(failure) = err.downcast_ref::<HostSelectionFailure>() else {
+                        return Err(err);
+                    };
+                    if failure.report.iter().any(|entry| {
+                        entry.host_id == record.host_id
+                            && entry.reasons == [host_scheduling::IneligibilityReason::NoFreeSlots]
+                    }) {
+                        return Err(err);
+                    }
+                }
             }
-            // The repository store is host-local. This constrains the host,
-            // never a cube workspace or its lease lifetime.
-            pinned = Some(record.host_id);
         }
         if execution.kind == ExecutionKind::PrReviewGuide {
             for host in [pinned.as_deref(), requested.as_deref()].into_iter().flatten() {
@@ -415,6 +445,46 @@ impl ExecutionCoordinator {
         }
         let required_driver = self.resolve_spawn_driver(execution, worker_id)?;
         self.pick_host(work_item, pinned, requested, required_driver)
+    }
+
+    pub(super) fn immutable_execution_target(&self, execution: &WorkExecution) -> Result<Option<String>> {
+        Ok(if execution.kind == ExecutionKind::PrReviewGuide {
+            let capture = self
+                .work_db
+                .get_pr_review_guide_comparison_by_id(&execution.work_item_id)?
+                .ok_or_else(|| anyhow!("review-guide comparison is missing; cannot pin workspace"))?;
+            Some(capture.packet.head_sha)
+        } else if execution.kind == ExecutionKind::PrReview {
+            let member = self
+                .work_db
+                .review_batch_member_for_execution(&execution.id)
+                .unwrap_or_else(|err| {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        error = %format!("{err:#}"),
+                        "spawn: failed to resolve review batch member for post-merge target lookup; \
+                         falling back to `--pr` positioning",
+                    );
+                    None
+                });
+            member
+                .and_then(|member| {
+                    self.work_db.review_batch(&member.batch_id).unwrap_or_else(|err| {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            batch_id = %member.batch_id,
+                            error = %format!("{err:#}"),
+                            "spawn: failed to resolve review batch for post-merge target lookup; \
+                             falling back to `--pr` positioning",
+                        );
+                        None
+                    })
+                })
+                .filter(|batch| batch.phase == ReviewBatchPhase::PostMerge)
+                .map(|batch| batch.target_sha)
+        } else {
+            None
+        })
     }
 
     /// Resolve the driver used by both host placement and spawn-failure alerts.
@@ -1202,43 +1272,7 @@ impl ExecutionCoordinator {
         // PR. Resolved once here so both `pr_for_goto` below and the
         // post-lease positioning step special-case it via
         // `goto_workspace_revision` instead of `goto_workspace`.
-        let immutable_target_sha: Option<String> = if execution.kind == ExecutionKind::PrReviewGuide {
-            let capture = self
-                .work_db
-                .get_pr_review_guide_comparison_by_id(&execution.work_item_id)?
-                .ok_or_else(|| anyhow!("review-guide comparison is missing; cannot pin workspace"))?;
-            Some(capture.packet.head_sha)
-        } else if execution.kind == ExecutionKind::PrReview {
-            let member = self
-                .work_db
-                .review_batch_member_for_execution(&execution.id)
-                .unwrap_or_else(|err| {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        error = %format!("{err:#}"),
-                        "spawn: failed to resolve review batch member for post-merge target lookup; \
-                         falling back to `--pr` positioning",
-                    );
-                    None
-                });
-            member
-                .and_then(|member| {
-                    self.work_db.review_batch(&member.batch_id).unwrap_or_else(|err| {
-                        tracing::warn!(
-                            execution_id = %execution.id,
-                            batch_id = %member.batch_id,
-                            error = %format!("{err:#}"),
-                            "spawn: failed to resolve review batch for post-merge target lookup; \
-                             falling back to `--pr` positioning",
-                        );
-                        None
-                    })
-                })
-                .filter(|batch| batch.phase == ReviewBatchPhase::PostMerge)
-                .map(|batch| batch.target_sha)
-        } else {
-            None
-        };
+        let immutable_target_sha = self.immutable_execution_target(execution)?;
 
         // PR number to pass to `cube workspace goto` after the lease.
         // Set for pr_review, revision_implementation, and answer_agent
@@ -1542,7 +1576,7 @@ impl ExecutionCoordinator {
                 .and_then(boss_github::pr_url::pr_number_from_url),
             _ => None,
         });
-        let recovered = match self
+        let mut recovered = match self
             .recover_execution_bookmark(
                 execution,
                 &lease,
@@ -1562,16 +1596,11 @@ impl ExecutionCoordinator {
                     crate::workspace_lease_release::PreStartStage::BeforeRecoveryBookmark,
                 )
                 .await;
-                let pointer_damaged =
-                    crate::execution_bookmark_recovery::block_unrecoverable(&self.work_db, execution, &err)?;
-                let attention = if pointer_damaged {
-                    (
-                        crate::execution_bookmark_recovery::RECOVERY_FAILED,
-                        "Execution bookmark recovery failed",
-                    )
-                } else {
-                    ("cube_workspace_positioning_failed", "Execution bookmark restore failed")
-                };
+                // Report the failed recovery operation without guessing its cause.
+                let attention = (
+                    "cube_workspace_positioning_failed",
+                    "Could not prepare workspace recovery",
+                );
                 self.record_start_failure(
                     Arc::clone(self),
                     execution,
@@ -1836,14 +1865,27 @@ impl ExecutionCoordinator {
                     .map(|recovered| self.work_db.execution_bookmark(&recovered.predecessor))
                     .transpose()?;
                 let report = self.work_db.execution_restore_report(&execution.id)?;
-                let record = adapter
-                    .create_execution_bookmark(
-                        &lease.workspace_path,
-                        &execution.id,
-                        predecessor.as_ref(),
-                        report.as_ref().and_then(|r| r.inherited_base.as_deref()),
+                let (record, retained) = self
+                    .create_or_start_fresh(
+                        execution,
+                        &lease,
+                        &adapter,
+                        (
+                            predecessor.as_ref(),
+                            report.as_ref().and_then(|r| r.inherited_base.as_deref()),
+                        ),
+                        super::fresh_start::FreshStart {
+                            repo_id: &repo.repo_id,
+                            immutable_target: immutable_target_sha.as_deref(),
+                            bound_pr: pr_for_goto,
+                            task_pr: pr_for_reconcile,
+                            title: &change_title,
+                        },
                     )
                     .await?;
+                if !retained {
+                    recovered = None;
+                }
                 self.work_db.record_execution_bookmark(&record)?;
             }
             if let Some(recovered) = &recovered {
@@ -2515,17 +2557,7 @@ impl ExecutionCoordinator {
     ) -> Result<()> {
         let (attention_kind, attention_title) = attention;
         let error_text = format!("{error:#}");
-        let retry_delays: &[Duration] = if attention_kind == crate::execution_bookmark_recovery::RECOVERY_FAILED
-            && matches!(
-                execution.kind,
-                ExecutionKind::ChoreImplementation
-                    | ExecutionKind::TaskImplementation
-                    | ExecutionKind::RevisionImplementation
-            ) {
-            &[]
-        } else {
-            &self.pre_start_retry_delays
-        };
+        let retry_delays = &self.pre_start_retry_delays;
         let transition =
             self.work_db
                 .record_pre_start_failure(&execution.id, worker_id, cube_repo_id, &error_text, retry_delays);

@@ -33,6 +33,9 @@ pub use prune::{PruneOutcome, Voucher, prune};
 mod prune_tests;
 
 #[cfg(test)]
+mod archive_tests;
+
+#[cfg(test)]
 mod redispatch_tests;
 
 mod reconcile;
@@ -149,8 +152,8 @@ fn is_execution_id(text: &str) -> bool {
 /// Items blocked with any of these can run again now that dispatch
 /// reconciles them against the pointers the engine recorded; anything else
 /// (missing or conflicted heads, a foreign store, a precise not-contained
-/// report) is still a real pointer problem and stays blocked. Exact shapes
-/// only: a trailing context or a changed wording is not recognised.
+/// report) was handled by later migrations, including the archive-and-start-
+/// fresh migration. Exact shapes only: a trailing context or a changed wording is not recognised.
 pub fn is_legacy_reconcilable_blocker(detail: &str) -> bool {
     if let Some(rest) = detail.strip_prefix(NOT_DESCENDED_MESSAGE)
         && let Some(id) = rest.strip_prefix(" boss-base/exec_")
@@ -581,9 +584,24 @@ pub async fn create(jj: &dyn Jj, workspace: &Path, execution_id: &str, host_id: 
     create_from(jj, workspace, execution_id, host_id, None, None).await
 }
 
-/// Preserve inherited unpublished work across consecutive interrupted runs,
-/// even when the next worker makes no additional edits. A staged revision
-/// supplies its copied PR baseline through the persisted restore report.
+/// Pointer initialization failed after identifying the shared store. Dispatch
+/// archives these pointers before creating fresh ones.
+#[derive(Debug)]
+pub struct CreationFailure {
+    /// Includes partially created pointers, even before the database row exists.
+    pub record: ExecutionBookmark,
+}
+
+impl std::fmt::Display for CreationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("could not initialize execution recovery pointers")
+    }
+}
+
+impl std::error::Error for CreationFailure {}
+
+/// Preserve inherited unpublished work across consecutive interrupted runs.
+/// A staged revision supplies its copied PR baseline through the restore report.
 pub async fn create_from(
     jj: &dyn Jj,
     workspace: &Path,
@@ -602,30 +620,34 @@ pub async fn create_from(
         host_id: host_id.to_owned(),
         base_commit: None,
     };
-    let baseline = if let Some(prior) = predecessor {
-        ensure!(
-            prior.repo_path == record.repo_path && prior.host_id == record.host_id,
-            "inherited baseline belongs to another recovery store"
-        );
-        diff(jj, prior).await?;
-        inherited_base
-            .map(str::to_owned)
-            .unwrap_or_else(|| revision(&prior.base()))
-    } else {
-        baseline::durable_baseline(jj, workspace).await?
-    };
-    jj.run(workspace, &["bookmark", "create", &record.base(), "-r", &baseline])
+    let result = async {
+        let baseline = if let Some(prior) = predecessor {
+            ensure!(
+                prior.repo_path == record.repo_path && prior.host_id == record.host_id,
+                "inherited baseline belongs to another recovery store"
+            );
+            diff(jj, prior).await?;
+            inherited_base
+                .map(str::to_owned)
+                .unwrap_or_else(|| revision(&prior.base()))
+        } else {
+            baseline::durable_baseline(jj, workspace).await?
+        };
+        jj.run(workspace, &["bookmark", "create", &record.base(), "-r", &baseline])
+            .await?;
+        jj.run(
+            workspace,
+            &["bookmark", "create", &record.head(), &record.publication(), "-r", "@"],
+        )
         .await?;
-    jj.run(
-        workspace,
-        &["bookmark", "create", &record.head(), &record.publication(), "-r", "@"],
-    )
-    .await?;
-    // The bookmark is the convenience; the commit is the baseline's identity.
-    record.base_commit = Some(resolve_created_base(jj, &record).await?);
-    // Validate through the shared store, not the workspace we just positioned.
-    diff(jj, &record).await?;
-    Ok(record)
+        // The bookmark is the convenience; the commit is the baseline's identity.
+        record.base_commit = Some(resolve_created_base(jj, &record).await?);
+        // Validate through the shared store, not the workspace we just positioned.
+        diff(jj, &record).await?;
+        Ok(record.clone())
+    }
+    .await;
+    result.map_err(|error: anyhow::Error| error.context(CreationFailure { record }))
 }
 
 async fn resolve_created_base(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
@@ -653,22 +675,66 @@ pub async fn discard_orphaned_baseline(jj: &dyn Jj, record: &ExecutionBookmark) 
     Ok(())
 }
 
-/// Deliberate fresh start: drop both head bookmarks so the same execution
-/// can create fresh pointers. Returns `(bookmark, commit)` for each head that
-/// existed so the caller records where the superseded commits are; the
-/// commits themselves stay in the store. Any surviving baseline goes too.
-pub async fn release_heads(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<Vec<(String, String)>> {
-    let heads = resolve_heads(jj, record).await?;
-    let named = heads.named(record);
-    let mut names: Vec<&str> = named.iter().map(|(bookmark, _)| bookmark.as_str()).collect();
-    let base = record.base();
-    if resolve_optional(jj, &record.repo_path, &base).await?.is_some() {
-        names.push(&base);
+/// Archive unpublished work before releasing private recovery and baseline names.
+/// Release the publication name too only when this execution must reuse it.
+/// Baseline, trunk, remote history and empty-only ranges need no archive. Conflicted bookmarks can have several targets; retain them all.
+/// Archive names include the commit identity so repeated fallbacks never
+/// overwrite earlier preserved work. Pruning only touches the three run names.
+pub async fn release_heads(
+    jj: &dyn Jj,
+    record: &ExecutionBookmark,
+    release_names: bool,
+) -> Result<Vec<(String, String)>> {
+    let names = [record.base(), record.head(), record.publication()];
+    let targets = snapshot::resolve_bookmark_targets(jj, &record.repo_path, &names).await?;
+    let mut commits: std::collections::BTreeSet<String> = targets.values().flatten().cloned().collect();
+    if let Some(base) = &record.base_commit
+        && commit_exists(jj, &record.repo_path, base).await?
+    {
+        commits.insert(base.clone());
     }
+    let mut archived = Vec::new();
+    let baseline = record.base_commit.as_deref().or_else(|| {
+        targets
+            .get(&record.base())
+            .and_then(|commits| (commits.len() == 1).then(|| commits[0].as_str()))
+    });
+    for commit in commits {
+        let base = format!("present({})", baseline.unwrap_or("root()"));
+        let unpublished = jj
+            .run(
+                &record.repo_path,
+                &[
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    &format!("({base}..{commit}) ~ (::remote_bookmarks() | ::trunk() | empty())"),
+                    "-T",
+                    "commit_id",
+                ],
+            )
+            .await?;
+        if unpublished.trim().is_empty() {
+            continue;
+        }
+        let archive = format!("preserved/{}/{}", record.execution_id, commit);
+        jj.run(&record.repo_path, &["bookmark", "set", &archive, "-r", &commit])
+            .await?;
+        archived.push((archive, commit));
+    }
+    // Preserve predecessor publication names, which may still be tracked PR branches.
+    // Delete retains remote tracking; forget would untrack a pushed PR branch.
     let mut args = vec!["bookmark", "delete"];
-    args.extend(names);
-    jj.run(&record.repo_path, &args).await?;
-    Ok(named)
+    args.extend(
+        names
+            .iter()
+            .filter(|name| targets.contains_key(*name) && (release_names || **name != record.publication()))
+            .map(String::as_str),
+    );
+    if args.len() > 2 {
+        jj.run(&record.repo_path, &args).await?;
+    }
+    Ok(archived)
 }
 
 /// A successful empty diff proves an empty run. Missing/conflicted references,

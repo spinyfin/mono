@@ -10,53 +10,79 @@ use crate::work::{CreateAttentionItemInput, WorkDb, WorkExecution};
 
 pub(crate) use boss_engine_storage_values::attention_kinds::EXECUTION_BOOKMARK_CREATE_FAILED_ATTENTION_KIND as CREATE_FAILED;
 pub(crate) use boss_engine_storage_values::attention_kinds::EXECUTION_BOOKMARK_RECOVERY_FAILED_ATTENTION_KIND as RECOVERY_FAILED;
+/// The engine archived an unsafe recovery source and started the item fresh.
 pub(crate) use boss_engine_storage_values::attention_kinds::EXECUTION_BOOKMARK_RECOVERY_RETIRED_ATTENTION_KIND as RECOVERY_RETIRED;
+#[cfg(test)]
 pub(crate) use boss_engine_storage_values::attention_kinds::REVISION_CHAIN_RECOVERY_BLOCKED_ATTENTION_KIND as CHAIN_BLOCKED;
 
-/// Only authoritative integrity failures park work; transport failures keep
-/// the coordinator's pre-start backoff and rerun repair on the next attempt.
-pub(crate) fn block_unrecoverable(db: &WorkDb, execution: &WorkExecution, err: &anyhow::Error) -> Result<bool> {
-    use crate::work::ExecutionKind;
-    let damaged = boss_engine_recovery::execution_bookmark::is_pointer_integrity_error(err);
-    if damaged
-        && matches!(
-            execution.kind,
-            ExecutionKind::ChoreImplementation
-                | ExecutionKind::TaskImplementation
-                | ExecutionKind::RevisionImplementation
-        )
-    {
-        db.update_work_item_as_actor(
-            &execution.work_item_id,
-            boss_protocol::WorkItemPatch::builder()
-                .status("blocked")
-                .blocked_reason("execution_recovery_failed")
-                .blocked_detail(format!("{err:#}"))
-                .autostart(false)
-                .build(),
-            "engine",
-        )?;
-        report_chain_block(db, execution, &format!("{err:#}"))?;
-    }
-    Ok(damaged)
+/// A resolved informational note: archiving is successful recovery handling,
+/// never a request for intervention or a reason to disable autostart.
+pub(crate) fn record_fresh_start(
+    db: &WorkDb,
+    prior: &WorkExecution,
+    next_id: &str,
+    reason: &str,
+    archives: &[(String, String)],
+) -> Result<()> {
+    record_archive_note(
+        db,
+        prior,
+        reason,
+        archives,
+        (
+            "Recovery source retired; starting fresh",
+            &format!(
+                "Execution `{next_id}` starts fresh from an open PR, trunk, or the captured immutable review target. No action is required."
+            ),
+        ),
+    )
 }
 
-pub(crate) fn report_chain_block(db: &WorkDb, execution: &WorkExecution, reason: &str) -> Result<()> {
-    if execution.kind != crate::work::ExecutionKind::RevisionImplementation {
-        return Ok(());
-    }
-    let Some(root) = db.get_revision_chain_root_task_id(&execution.work_item_id) else {
-        return Ok(());
-    };
-    db.upsert_refreshing_work_item_attention(
-        &root,
-        CHAIN_BLOCKED,
-        "PR revision chain blocked on recovery",
-        &format!(
-            "Revision `{}` cannot recover its preserved work: {reason}\n\nLater revisions on this PR remain sequenced behind it. Repair the reported state and explicitly restart the blocked revision; do not discard its work or bypass sequencing. Execution: `{}`.",
-            execution.work_item_id, execution.id
+pub(crate) fn record_adoption_archive(
+    db: &WorkDb,
+    execution: &WorkExecution,
+    reason: &str,
+    archives: &[(String, String)],
+) -> Result<()> {
+    record_archive_note(
+        db,
+        execution,
+        reason,
+        archives,
+        (
+            "Stale recovery names archived; continuing predecessor adoption",
+            "Stale current-attempt names were archived. Predecessor adoption continues; no action is required.",
         ),
-    )?;
+    )
+}
+
+fn record_archive_note(
+    db: &WorkDb,
+    prior: &WorkExecution,
+    reason: &str,
+    archives: &[(String, String)],
+    wording: (&str, &str),
+) -> Result<()> {
+    let mut retained = archives
+        .iter()
+        .map(|(name, commit)| format!("`{name}` retains `{commit}`"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if retained.is_empty() {
+        retained = "No archive bookmarks were created.".to_owned();
+    }
+    db.create_attention_item(CreateAttentionItemInput {
+        execution_id: None,
+        work_item_id: Some(db.owning_work_item_id(&prior.work_item_id)),
+        kind: RECOVERY_RETIRED.to_owned(),
+        status: Some("resolved".to_owned()),
+        title: wording.0.to_owned(),
+        body_markdown: format!(
+            "Execution `{}` encountered a recovery problem: {reason}\n\nRecovery archive:\n{retained}\n\n{}",
+            prior.id, wording.1
+        ),
+        resolved_at: Some(crate::work::now_string()),
+    })?;
     Ok(())
 }
 

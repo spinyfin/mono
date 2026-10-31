@@ -708,6 +708,12 @@ fn dispatch_and_execution_producers_record_exact_bases() {
         .unwrap();
     db.bounce_dispatch_failed_to_backlog(&banner.id, "lease_failed", "lease")
         .unwrap();
+    // The banner predates the run; do not depend on both fixture writes
+    // happening within the same wall-clock second.
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET dispatch_failed_at = '1' WHERE id = ?1", [&banner.id])
+        .unwrap();
     db.reconcile_stale_attention_signals().unwrap();
     assert_latest(
         &db,

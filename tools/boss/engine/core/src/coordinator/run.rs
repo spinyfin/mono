@@ -1195,8 +1195,40 @@ impl ExecutionCoordinator {
                 )?;
             }
             Err(err) => {
-                crate::execution_bookmark_recovery::report_failure(&self.work_db, execution, &format!("{err:#}"));
-                return Err(err);
+                let record = self.work_db.execution_bookmark(&execution.id)?;
+                let adapter = self.host_adapter();
+                self.retire_unvouched_record(execution, execution, &record, &adapter, &err)
+                    .await?;
+                let workspace = execution
+                    .workspace_path
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("running execution has no workspace"))?;
+                let work_item = self.resolve_execution_work_item(execution)?;
+                let bound_pr = super::execution::pr_number_for_workspace_goto(&self.work_db, execution, &work_item);
+                let task_pr = match &work_item {
+                    WorkItem::Task(task) | WorkItem::Chore(task) => {
+                        task.pr_url.as_deref().and_then(boss_github::pr_url::pr_number_from_url)
+                    }
+                    _ => None,
+                };
+                let immutable = self.immutable_execution_target(execution)?;
+                super::fresh_start::position_fresh_workspace(
+                    adapter.as_ref(),
+                    Path::new(workspace),
+                    &super::fresh_start::FreshStart {
+                        repo_id: execution.cube_repo_id.as_deref().unwrap_or_default(),
+                        immutable_target: immutable.as_deref(),
+                        bound_pr,
+                        task_pr,
+                        title: "",
+                    },
+                )
+                .await?;
+                let fresh = adapter
+                    .create_execution_bookmark(Path::new(workspace), &execution.id, None, None)
+                    .await?;
+                self.work_db.record_execution_bookmark(&fresh)?;
+                self.work_db.delete_execution_restore_report(&execution.id)?;
             }
         }
         let lease_id = execution

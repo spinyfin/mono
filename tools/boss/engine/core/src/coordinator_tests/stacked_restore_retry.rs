@@ -32,6 +32,14 @@ impl HostAdapter for FlakyRestoreAdapter {
         self.inner.recovery_pr_base(origin, pr).await
     }
 
+    async fn release_execution_bookmark_heads(
+        &self,
+        record: &ExecutionBookmark,
+        release_names: bool,
+    ) -> Result<Vec<(String, String)>> {
+        self.inner.release_execution_bookmark_heads(record, release_names).await
+    }
+
     async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {
         self.inner.execution_bookmark_diff(record).await
     }
@@ -128,7 +136,7 @@ impl HostAdapter for FlakyRestoreAdapter {
 }
 
 #[tokio::test]
-async fn transient_restore_failure_keeps_the_stacked_parent_base_on_retry() {
+async fn restore_failure_archives_work_and_starts_fresh_on_the_stacked_pr() {
     use boss_engine_test_git::jj::JjRepo;
     let h = chain_harness(true, true, false).await;
     JjRepo::run(&h.repo.repo, &["new", "main", "-m", "Stacked parent"]);
@@ -142,10 +150,6 @@ async fn transient_restore_failure_keeps_the_stacked_parent_base_on_retry() {
         &["bookmark", "set", "pr/99", "-r", "@", "--allow-backwards"],
     );
     JjRepo::run(&h.repo.repo, &["git", "export"]);
-    let parent_sha = JjRepo::run(
-        &h.repo.repo,
-        &["log", "-r", "stack-parent", "--no-graph", "-T", "commit_id"],
-    );
     *h.cube.pr_base.lock().await = Some("stack-parent".into());
     let lease = CubeWorkspaceLease {
         lease_id: "lease-transient".into(),
@@ -153,27 +157,26 @@ async fn transient_restore_failure_keeps_the_stacked_parent_base_on_retry() {
         workspace_path: h.repo.replacement.clone(),
         dirty_verified: Some(true),
     };
-    let flaky = FlakyRestoreAdapter {
+    let flaky = Arc::new(FlakyRestoreAdapter {
         inner: h.coordinator.host_adapter.clone(),
         bases: std::sync::Mutex::new(Vec::new()),
-    };
-    let adapter: Arc<dyn HostAdapter> = Arc::new(flaky);
-
-    // The first restore fails with an ordinary error after the base lookup
-    // succeeded: it must propagate, with only the parent base attempted and no
-    // fallback restage onto main.
-    let err = h
-        .coordinator
-        .recover_execution_bookmark(&h.next, &lease, &adapter, "mono", Some(99), Some(99))
-        .await
-        .expect_err("a transient restore failure must propagate, not fall back");
-    assert!(
-        format!("{err:#}").contains("injected transient fetch failure"),
-        "{err:#}"
+    });
+    let adapter: Arc<dyn HostAdapter> = flaky.clone();
+    let source = h.coordinator.work_db.recovery_predecessor(&h.next).unwrap().unwrap();
+    let record = h.coordinator.work_db.execution_bookmark(&source.id).unwrap();
+    let preserved = JjRepo::run(
+        &h.repo.repo,
+        &["log", "-r", &record.head(), "--no-graph", "-T", "commit_id"],
     );
-    assert!(!boss_engine_recovery::execution_bookmark::is_base_unresolvable_error(
-        &err
-    ));
+
+    // Recovery is optional even when the PR base was resolved successfully.
+    assert!(
+        h.coordinator
+            .recover_execution_bookmark(&h.next, &lease, &adapter, "mono", Some(99), Some(99))
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(
         h.coordinator
             .work_db
@@ -181,24 +184,50 @@ async fn transient_restore_failure_keeps_the_stacked_parent_base_on_retry() {
             .unwrap()
             .is_none()
     );
-
-    // The retry restages onto the same parent and keeps the preserved work.
-    h.coordinator
-        .recover_execution_bookmark(&h.next, &lease, &adapter, "mono", Some(99), Some(99))
-        .await
-        .unwrap();
-    let report = h
+    assert!(
+        h.coordinator
+            .work_db
+            .execution_bookmark_optional(&source.id)
+            .unwrap()
+            .is_none()
+    );
+    let archive = format!("preserved/{}/{preserved}", source.id);
+    let notes = h
         .coordinator
         .work_db
-        .execution_restore_report(&h.next.id)
-        .unwrap()
-        .expect("report");
-    assert_eq!(report.base_fallback, None);
-    assert_eq!(report.base_sha, parent_sha.trim());
+        .list_attention_items_for_work_item(&source.work_item_id)
+        .unwrap();
+    assert!(notes.iter().any(
+        |note| note.body_markdown.contains("recovery operation (including transport)")
+            && note.body_markdown.contains("injected transient fetch failure")
+    ));
     assert_eq!(
-        std::fs::read_to_string(h.repo.replacement.join("revision.txt")).unwrap(),
+        JjRepo::run(&h.repo.repo, &["file", "show", "-r", &archive, "root:revision.txt"]),
         "unpushed revision"
     );
+    // A later attempt never re-enters the failed restage.
+    assert!(
+        h.coordinator
+            .recover_execution_bookmark(&h.next, &lease, &adapter, "mono", Some(99), Some(99))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(*flaky.bases.lock().unwrap(), vec!["stack-parent"]);
+    JjRepo::run(&h.repo.replacement, &["new", "pr/99", "-m", "Fresh revision"]);
+    let fresh = boss_engine_recovery::execution_bookmark::create(
+        &boss_engine_recovery::execution_bookmark::LocalJj,
+        &h.repo.replacement,
+        &h.next.id,
+        "local",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fresh.base_commit.unwrap(),
+        JjRepo::run(&h.repo.repo, &["log", "-r", "pr/99", "--no-graph", "-T", "commit_id"])
+    );
+    assert!(!h.repo.replacement.join("revision.txt").exists());
     let parent_commits = JjRepo::run(
         &h.repo.replacement,
         &[
