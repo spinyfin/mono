@@ -1,4 +1,11 @@
 //! Bind guide submissions to the socket-attributed execution's active attempt.
+//!
+//! Storage never validates a guide body against the pinned workspace: that
+//! spawns `git` and belongs above the connection. The caller loads the
+//! submission with [`WorkDb::load_review_guide_for_validation`], validates the
+//! owned body and packet wherever it likes, and hands the verdict back through
+//! [`GuideForValidation::validated`]; [`accept`] then judges the submission
+//! against live attempt state inside the proposal transaction.
 
 use super::proposal_apply::{ApplyDecision, ApplyOutcome};
 use super::*;
@@ -11,24 +18,48 @@ type PacketReference = (String, Option<String>, String);
 /// engines stored as `rejected` rows under exactly this reason.
 pub(super) const NO_RUNNING_ATTEMPT_REASON: &str = "this execution has no running review-guide attempt";
 
-pub(super) struct PreparedGuide {
+/// A submitted guide body and the comparison packet it must satisfy, loaded
+/// without holding the connection mutex or a write transaction. Everything a
+/// validator needs is owned here; nothing has been judged yet.
+pub(crate) struct GuideForValidation {
+    reference: PacketReference,
+    pub(crate) packet: boss_pr_review_sources::SourcePacket,
+    pub(crate) body_markdown: String,
+}
+
+impl GuideForValidation {
+    /// Attach the caller's validation verdict. A failure carries its detail so
+    /// [`accept`] can refuse the submission with it — after the attempt-state
+    /// refusals, which take precedence.
+    pub(crate) fn validated(self, validation: std::result::Result<(), String>) -> PreparedGuide {
+        PreparedGuide {
+            reference: self.reference,
+            validation,
+        }
+    }
+}
+
+/// A submission whose body has been validated by the caller, ready for
+/// [`accept`] inside the proposal transaction.
+pub(crate) struct PreparedGuide {
     reference: PacketReference,
     validation: std::result::Result<(), String>,
 }
 
-/// Load and validate without holding the connection mutex or a write transaction.
-pub(super) fn prepare(db: &WorkDb, execution_id: &str, payload_json: &str) -> Result<PreparedGuide> {
+/// Load the submission for validation without holding the connection mutex or
+/// a write transaction.
+fn load_for_validation(db: &WorkDb, execution_id: &str, payload_json: &str) -> Result<GuideForValidation> {
     let reference = {
         let conn = db.connect()?;
         packet_reference(&conn, execution_id)?.context("the comparison this attempt was generated from is gone")?
     };
     let packet = super::review_guide_sources::load_packet(&db.artifact_root()?, reference.1.as_deref(), &reference.2)?;
     let payload: boss_protocol::ReviewGuideProposalPayload = serde_json::from_str(payload_json)?;
-    let validation = db
-        .validate_review_guide_at_workspace(execution_id, &payload.body_markdown, &packet)
-        .map(|_| ())
-        .map_err(|error| error.to_string());
-    Ok(PreparedGuide { reference, validation })
+    Ok(GuideForValidation {
+        reference,
+        packet,
+        body_markdown: payload.body_markdown,
+    })
 }
 
 fn packet_reference(conn: &rusqlite::Connection, execution_id: &str) -> Result<Option<PacketReference>> {
@@ -99,23 +130,16 @@ pub(super) fn accept(
 
 #[work_db_boundary::instrument]
 impl WorkDb {
-    pub(crate) fn validate_review_guide_at_workspace(
+    /// Load the guide a worker submitted, with the packet it must satisfy, for
+    /// validation above storage. The packet read can be large, so it holds no
+    /// lock; [`accept`] re-checks the packet reference inside the transaction
+    /// and refuses a submission whose comparison changed in between.
+    pub(crate) fn load_review_guide_for_validation(
         &self,
         execution_id: &str,
-        raw: &str,
-        packet: &boss_pr_review_sources::SourcePacket,
-    ) -> Result<boss_review_guide::ValidatedGuide> {
-        if self.review_guide_update_context(execution_id)?.is_some() {
-            boss_review_guide::validate_update_section(raw).map_err(anyhow::Error::msg)?;
-        }
-        let execution = self.get_execution(execution_id)?;
-        let path = execution
-            .workspace_path
-            .context("review-guide execution has no pinned workspace")?;
-        // Every linked range spawns `git`; do not pin a runtime worker for it.
-        crate::review_guide_workspace::off_runtime_worker(|| {
-            crate::review_guide_workspace::validate(std::path::Path::new(&path), packet, raw)
-        })
+        payload_json: &str,
+    ) -> Result<GuideForValidation> {
+        load_for_validation(self, execution_id, payload_json)
     }
 
     pub(crate) fn submitted_review_guide(&self, execution_id: &str, attempt_id: &str) -> Result<Option<String>> {
@@ -208,15 +232,18 @@ mod tests {
                 serde_json::json!({"body_markdown": "# Guide\n## Orientation\nA change.\n## Problem\n## Implementation\n## Example\n## Review\n## Evidence\nNo validation results reported; no screenshots registered."})
                     .to_string();
             let start = std::time::Instant::now();
-            let outcome = db
-                .submit_worker_proposal(SubmitWorkerProposalInput {
+            let outcome = submit_validated_guide(
+                &db,
+                SubmitWorkerProposalInput {
                     execution_id: &execution.id,
                     work_item_id: &capture.comparison_id,
                     kind: boss_protocol::ProposalKind::ReviewGuide,
                     payload_json: &payload,
                     idempotency_key: "guide",
-                })
-                .unwrap();
+                },
+                Ok(()),
+            )
+            .unwrap();
             eprintln!("4 MiB packet submission, mutation={mutation:?}: {:?}", start.elapsed());
             assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
             match (mutation, outcome) {
@@ -236,6 +263,20 @@ mod tests {
                 (mutation, _) => panic!("unexpected submission outcome for mutation {mutation:?}"),
             }
         }
+    }
+
+    /// Submit a review guide the way the engine does, with the validation
+    /// step supplied by the test: `Ok(())` stands for a body the workspace
+    /// validator accepted, `Err(detail)` for one it refused.
+    fn submit_validated_guide(
+        db: &WorkDb,
+        input: SubmitWorkerProposalInput<'_>,
+        validation: std::result::Result<(), String>,
+    ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, boss_protocol::ProposalSubmissionError>> {
+        let guide = db
+            .load_review_guide_for_validation(input.execution_id, input.payload_json)
+            .map(|guide| guide.validated(validation));
+        db.submit_worker_proposal_with_guide(input, Some(&guide))
     }
 
     fn stored_proposal_count(db: &WorkDb, execution_id: &str) -> i64 {
@@ -275,13 +316,17 @@ mod tests {
             .unwrap();
         let payload = serde_json::json!({ "body_markdown": VALID_GUIDE }).to_string();
         let submit = || {
-            db.submit_worker_proposal(SubmitWorkerProposalInput {
-                execution_id: &execution.id,
-                work_item_id: &comparison,
-                kind: boss_protocol::ProposalKind::ReviewGuide,
-                payload_json: &payload,
-                idempotency_key: "guide",
-            })
+            submit_validated_guide(
+                &db,
+                SubmitWorkerProposalInput {
+                    execution_id: &execution.id,
+                    work_item_id: &comparison,
+                    kind: boss_protocol::ProposalKind::ReviewGuide,
+                    payload_json: &payload,
+                    idempotency_key: "guide",
+                },
+                Ok(()),
+            )
             .unwrap()
         };
 
@@ -307,5 +352,127 @@ mod tests {
                 .as_deref(),
             Some(VALID_GUIDE)
         );
+    }
+
+    /// A seeded series with a bound, running guide execution.
+    /// Returns `(execution_id, comparison_id, attempt_id)`.
+    fn running_guide(db: &WorkDb) -> (String, String, String) {
+        let product = create_product(db);
+        let root = create_active_chore(db, &product, "guide submission");
+        let (series, comparison) = crate::test_support::seed_review_guide_series(db, &root);
+        let attempt = db
+            .create_pr_review_guide_attempt(&series, &comparison, boss_review_guide::PROMPT_VERSION)
+            .unwrap();
+        let execution = db.create_pr_review_guide_execution(&comparison, "acme/widget").unwrap();
+        db.bind_pr_review_guide_attempt_execution(&attempt.id, &execution.id)
+            .unwrap();
+        db.start_execution_run(&execution.id, "review", "mono", "lease", "ws", "/tmp/ws")
+            .unwrap();
+        (execution.id, comparison, attempt.id)
+    }
+
+    fn guide_input<'a>(
+        execution_id: &'a str,
+        comparison_id: &'a str,
+        payload: &'a str,
+    ) -> SubmitWorkerProposalInput<'a> {
+        SubmitWorkerProposalInput {
+            execution_id,
+            work_item_id: comparison_id,
+            kind: boss_protocol::ProposalKind::ReviewGuide,
+            payload_json: payload,
+            idempotency_key: "guide",
+        }
+    }
+
+    /// The caller's validation failure is a refusal, not a stored row: the
+    /// worker sees the validator's detail and its retry is judged afresh.
+    #[test]
+    fn a_body_the_caller_rejected_is_refused_with_its_detail_and_stores_nothing() {
+        let (_dir, db) = open_db();
+        let (execution, comparison, _attempt) = running_guide(&db);
+        let payload = serde_json::json!({ "body_markdown": VALID_GUIDE }).to_string();
+
+        let refusal = submit_validated_guide(
+            &db,
+            guide_input(&execution, &comparison, &payload),
+            Err("caller.rs:L9: linked range does not exist".to_owned()),
+        )
+        .unwrap()
+        .expect_err("a failed validation must refuse the submission");
+
+        assert_eq!(refusal.code, boss_protocol::ProposalErrorCode::NotAccepted);
+        assert_eq!(refusal.message, "caller.rs:L9: linked range does not exist");
+        assert_eq!(stored_proposal_count(&db, &execution), 0);
+    }
+
+    /// Attempt state is judged before the body: an execution with no running
+    /// attempt reports that, whatever the validator said, so the recovery
+    /// pass that keys on this reason keeps working.
+    #[test]
+    fn attempt_state_is_refused_before_a_validation_failure_is_reported() {
+        let (_dir, db) = open_db();
+        let (execution, comparison, _attempt) = running_guide(&db);
+        db.mark_execution_orphaned(&execution, "test: inferred death").unwrap();
+        let payload = serde_json::json!({ "body_markdown": VALID_GUIDE }).to_string();
+
+        let refusal = submit_validated_guide(
+            &db,
+            guide_input(&execution, &comparison, &payload),
+            Err("would also fail validation".to_owned()),
+        )
+        .unwrap()
+        .expect_err("no running attempt must refuse the submission");
+
+        assert_eq!(refusal.message, NO_RUNNING_ATTEMPT_REASON);
+        assert_eq!(stored_proposal_count(&db, &execution), 0);
+    }
+
+    /// A load failure is also a refusal that stores nothing: the comparison
+    /// the guide must satisfy is gone, so there is nothing to validate against.
+    #[test]
+    fn a_submission_whose_comparison_cannot_be_loaded_is_refused_and_stores_nothing() {
+        let (_dir, db) = open_db();
+        let (execution, comparison, _attempt) = running_guide(&db);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE pr_review_guide_source_comparisons SET packet_hash = 'missing'",
+                [],
+            )
+            .unwrap();
+        let payload = serde_json::json!({ "body_markdown": VALID_GUIDE }).to_string();
+
+        let refusal = submit_validated_guide(&db, guide_input(&execution, &comparison, &payload), Ok(()))
+            .unwrap()
+            .expect_err("an unloadable packet must refuse the submission");
+
+        assert_eq!(refusal.code, boss_protocol::ProposalErrorCode::NotAccepted);
+        assert!(
+            refusal
+                .message
+                .starts_with("could not load the comparison for validation"),
+            "{}",
+            refusal.message
+        );
+        assert_eq!(stored_proposal_count(&db, &execution), 0);
+    }
+
+    /// Storage never judges a guide on its own: a review-guide submission that
+    /// reaches the plain entry point without a validation verdict is an error
+    /// and stores nothing, so skipping the validation step can never accept a
+    /// body by accident.
+    #[test]
+    fn a_review_guide_submitted_without_a_validation_verdict_is_an_error_and_stores_nothing() {
+        let (_dir, db) = open_db();
+        let (execution, comparison, _attempt) = running_guide(&db);
+        let payload = serde_json::json!({ "body_markdown": VALID_GUIDE }).to_string();
+
+        let error = db
+            .submit_worker_proposal(guide_input(&execution, &comparison, &payload))
+            .expect_err("an unvalidated review guide must not be accepted");
+
+        assert!(format!("{error:#}").contains("must be validated"), "{error:#}");
+        assert_eq!(stored_proposal_count(&db, &execution), 0);
     }
 }

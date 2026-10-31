@@ -726,36 +726,39 @@ impl WorkerCompletionHandler {
                     false
                 }
                 Ok(Some(raw_output)) => match self.work_db.get_pr_review_guide_comparison_by_id(&comparison_id) {
-                    Ok(Some(capture)) => match self.work_db.validate_review_guide_at_workspace(
-                        &execution.id,
-                        &raw_output,
-                        &capture.packet,
-                    ) {
-                        Ok(validated) => {
-                            match self.work_db.publish_pr_review_guide_version(
-                                &attempt.id,
-                                &validated.markdown,
-                                &raw_output,
-                            ) {
-                                Ok(crate::work::PublishReviewGuideOutcome::Published(_)) => true,
-                                Ok(other) => {
-                                    tracing::info!(execution_id = %execution.id, attempt_id = %attempt.id, ?other, "review-guide finalizer: attempt finished without publishing");
-                                    false
-                                }
-                                Err(err) => {
-                                    tracing::warn!(execution_id = %execution.id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to publish");
-                                    false
+                    Ok(Some(capture)) => {
+                        match crate::review_guide_validation::validate_at_workspace(
+                            &self.work_db,
+                            &execution.id,
+                            &raw_output,
+                            &capture.packet,
+                        ) {
+                            Ok(validated) => {
+                                match self.work_db.publish_pr_review_guide_version(
+                                    &attempt.id,
+                                    &validated.markdown,
+                                    &raw_output,
+                                ) {
+                                    Ok(crate::work::PublishReviewGuideOutcome::Published(_)) => true,
+                                    Ok(other) => {
+                                        tracing::info!(execution_id = %execution.id, attempt_id = %attempt.id, ?other, "review-guide finalizer: attempt finished without publishing");
+                                        false
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(execution_id = %execution.id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to publish");
+                                        false
+                                    }
                                 }
                             }
-                        }
-                        Err(issues) => {
-                            let detail = issues.to_string();
-                            if let Err(err) = self.work_db.fail_pr_review_guide_attempt(&attempt.id, &detail) {
-                                tracing::warn!(execution_id = %execution.id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to record the validation failure");
+                            Err(issues) => {
+                                let detail = issues.to_string();
+                                if let Err(err) = self.work_db.fail_pr_review_guide_attempt(&attempt.id, &detail) {
+                                    tracing::warn!(execution_id = %execution.id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to record the validation failure");
+                                }
+                                false
                             }
-                            false
                         }
-                    },
+                    }
                     Ok(None) => {
                         if let Err(err) = self.work_db.fail_pr_review_guide_attempt(
                             &attempt.id,
@@ -786,7 +789,7 @@ impl WorkerCompletionHandler {
         if let Some(attempt) = &attempt {
             match self.work_db.root_task_id_for_review_guide_series(&attempt.series_id) {
                 Ok(Some(root_task_id)) => {
-                    crate::work::notify_review_guide_changed(
+                    crate::execution_publisher::notify_review_guide_changed(
                         &self.work_db,
                         &self.publisher,
                         &root_task_id,

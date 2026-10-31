@@ -9,6 +9,7 @@
 //! suite uses.
 
 use super::*;
+use crate::execution_publisher::NoopExecutionPublisher;
 use tempfile::tempdir;
 
 // ── list_tasks_with_stalled_reviewer ────────────────────────────────────────
@@ -129,7 +130,7 @@ async fn stalled_reviewer_fallback_refires_and_restores_reviewing_state() {
     .unwrap();
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let publisher = crate::coordinator::NoopExecutionPublisher;
+    let publisher = NoopExecutionPublisher;
     let mut outcome = crate::merge_poller::SweepOutcome::default();
     crate::merge_poller::sweep_stalled_reviewer(
         &db,
@@ -229,7 +230,7 @@ async fn stalled_running_reviewer_stays_doing_without_double_dispatch() {
     .unwrap();
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let publisher = crate::coordinator::NoopExecutionPublisher;
+    let publisher = NoopExecutionPublisher;
     let mut outcome = crate::merge_poller::SweepOutcome::default();
     crate::merge_poller::sweep_stalled_reviewer(
         &db,
@@ -316,7 +317,7 @@ async fn stalled_reviewer_churn_guard_parks_without_refire() {
     let before = db.list_executions(Some(&chore.id)).unwrap().len();
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let publisher = crate::coordinator::NoopExecutionPublisher;
+    let publisher = NoopExecutionPublisher;
     let mut outcome = crate::merge_poller::SweepOutcome::default();
     crate::merge_poller::sweep_stalled_reviewer(
         &db,
@@ -375,7 +376,7 @@ async fn stalled_reviewer_churn_guard_below_threshold_still_refires() {
     }
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let publisher = crate::coordinator::NoopExecutionPublisher;
+    let publisher = NoopExecutionPublisher;
     let mut outcome = crate::merge_poller::SweepOutcome::default();
     crate::merge_poller::sweep_stalled_reviewer(
         &db,
@@ -424,7 +425,7 @@ async fn stale_queued_reviewer_is_not_refired_on_repeated_sweeps() {
     let ready_id = pr_review_execution(&db, &chore.id, ExecutionStatus::Ready, &(now - 7200).to_string());
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let publisher = crate::coordinator::NoopExecutionPublisher;
+    let publisher = NoopExecutionPublisher;
     for _ in 0..2 {
         let mut outcome = crate::merge_poller::SweepOutcome::default();
         crate::merge_poller::sweep_stalled_reviewer(
@@ -1100,7 +1101,7 @@ async fn stalled_reviewer_does_not_skip_a_new_head_when_fanout_owns_the_hold() {
     insert_completed_pr_review_verdict(&db, &exec_id, &chore.id, REVIEW_GATE_OUTCOME_DROPPED_DUPLICATE_HEAD);
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let publisher = crate::coordinator::NoopExecutionPublisher;
+    let publisher = NoopExecutionPublisher;
     let mut outcome = crate::merge_poller::SweepOutcome::default();
     crate::merge_poller::sweep_stalled_reviewer(
         &db,
