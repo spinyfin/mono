@@ -78,7 +78,7 @@ impl WorkDb {
         migrations::apply(&tx, &known, version)?;
         // Required runtime data, not a historical migration. Capability
         // discovery remains outside DB startup (no processes or network).
-        crate::host_registry::ensure_local_host(&tx)?;
+        super::host_storage::ensure_local_host(&tx)?;
         refresh_query_planner_stats(&tx)?;
         tx.commit()?;
         Ok(())

@@ -656,11 +656,26 @@ impl WorkDb {
             })
     }
 
+    /// [`Self::gc_unreferenced_pr_review_guide_source_artifacts_with`] with no
+    /// process observation: no other process's staging file is provably
+    /// orphaned, so none is removed. Production sweeps supply an observer.
+    pub fn gc_unreferenced_pr_review_guide_source_artifacts(&self) -> Result<()> {
+        self.gc_unreferenced_pr_review_guide_source_artifacts_with(&|_| false)
+    }
+
     /// Belt-and-braces sweep for packet blobs orphaned by a crash between
     /// publish and commit. Collects the live path set under `connect()`,
     /// then walks the store after dropping that guard so the process-wide
     /// connection mutex is not held for a directory walk.
-    pub fn gc_unreferenced_pr_review_guide_source_artifacts(&self) -> Result<()> {
+    ///
+    /// `staging_owner_is_dead` is the host's process observation: it must
+    /// return `true` only when the pid is proven gone. A staging file named
+    /// for a pid it does not report dead is left alone. Storage never probes
+    /// processes itself.
+    pub fn gc_unreferenced_pr_review_guide_source_artifacts_with(
+        &self,
+        staging_owner_is_dead: &dyn Fn(i32) -> bool,
+    ) -> Result<()> {
         let artifact_root = self.artifact_root()?;
         // connect() is process-local. The store lock also excludes publishers
         // in other processes; skip this pass if a publisher is active.
@@ -668,7 +683,7 @@ impl WorkDb {
             return Ok(());
         };
         self.prune_pr_review_guide_sources(SourceRetentionPolicy::default())?;
-        delete_orphan_tmp_packet_artifacts(&artifact_root)?;
+        delete_orphan_tmp_packet_artifacts(&artifact_root, staging_owner_is_dead)?;
         let live = {
             let conn = self.connect()?;
             live_packet_paths(&conn)?
@@ -898,7 +913,7 @@ fn delete_unreferenced_packet_artifact(conn: &Connection, artifact_root: &Path, 
     Ok(())
 }
 
-fn delete_orphan_tmp_packet_artifacts(artifact_root: &Path) -> Result<()> {
+fn delete_orphan_tmp_packet_artifacts(artifact_root: &Path, owner_is_dead: &dyn Fn(i32) -> bool) -> Result<()> {
     let root = artifact_root.join(PACKET_ARTIFACT_DIR);
     let Ok(shards) = fs::read_dir(&root) else {
         return Ok(());
@@ -922,10 +937,7 @@ fn delete_orphan_tmp_packet_artifacts(artifact_root: &Path) -> Result<()> {
             if let Some(pid) = pid
                 && pid > 0
                 && pid != std::process::id() as i32
-                && matches!(
-                    crate::dead_pid_sweep::probe_pid(pid),
-                    crate::dead_pid_sweep::PidStatus::Dead
-                )
+                && owner_is_dead(pid)
             {
                 let _ = fs::remove_file(file.path());
             }

@@ -71,7 +71,15 @@ pub async fn run_one_pass(work_db: &WorkDb) -> ExecutionRetentionSweepOutcome {
 
     let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
 
-    if let Err(err) = work_db.gc_unreferenced_pr_review_guide_source_artifacts() {
+    // Storage does not probe processes; the sweep supplies the observation
+    // that lets it reap staging files whose writer is proven gone.
+    let staging_owner_is_dead = |pid| {
+        matches!(
+            crate::dead_pid_sweep::probe_pid(pid),
+            crate::dead_pid_sweep::PidStatus::Dead
+        )
+    };
+    if let Err(err) = work_db.gc_unreferenced_pr_review_guide_source_artifacts_with(&staging_owner_is_dead) {
         tracing::warn!(
             ?err,
             "execution-retention sweep: review-guide source artifact gc failed; continuing"
@@ -146,5 +154,28 @@ mod tests {
         let db = Arc::new(db);
         let outcome = run_one_pass(db.as_ref()).await;
         assert_eq!(outcome.deleted, 0);
+    }
+
+    #[tokio::test]
+    async fn sweep_reaps_source_staging_files_only_for_pids_the_host_probe_reports_dead() {
+        let (dir, db) = open_db();
+        let shard = dir.path().join("review-guide-sources").join("ab");
+        std::fs::create_dir_all(&shard).unwrap();
+        let dead = shard.join(format!("blob.{}.1.tmp", i32::MAX));
+        // pid 1 always exists, so the probe never reports it dead.
+        let alive = shard.join("blob.1.1.tmp");
+        let own = shard.join(format!("blob.{}.1.tmp", std::process::id()));
+        for path in [&dead, &alive, &own] {
+            std::fs::write(path, "staged").unwrap();
+        }
+
+        run_one_pass(&db).await;
+
+        assert!(!dead.exists(), "a staging file whose writer is gone is reaped");
+        assert!(own.exists(), "this process's own staging file is never reaped");
+        assert!(
+            alive.exists(),
+            "a staging file is kept while its writer's pid is not proven dead"
+        );
     }
 }
