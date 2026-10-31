@@ -33,20 +33,12 @@ pub(crate) fn apply_review_verdict_proposal(
     {
         return Ok(None);
     }
-    let inputs = db.review_verdict_comparison(proposal_id)?;
-    // A batch that is not ready to apply is left to storage, which files its attention once;
-    // observing for it would spend GitHub quota on every sweep pass for nothing.
+    // The readiness check nudges quorum and files attention for stranded batches once.
+    // Leave unready proposals for a later sweep without nudging them a second time.
     if !db.review_verdict_batch_applying(proposal_id)? {
-        return db.apply_observed_review_verdict_proposal(
-            proposal_id,
-            pr_checker,
-            ReviewVerdictObservation {
-                inputs,
-                freshness: None,
-                deletions: None,
-            },
-        );
+        return Ok(None);
     }
+    let inputs = db.review_verdict_comparison(proposal_id)?;
     // Freshness is decided once here and carried to storage, so `gh pr view` runs once per apply.
     let freshness = if inputs.pre_merge {
         Some(db.review_verdict_target_freshness(proposal_id, pr_checker)?)
