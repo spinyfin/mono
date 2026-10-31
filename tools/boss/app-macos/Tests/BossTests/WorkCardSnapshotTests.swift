@@ -110,6 +110,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         "readyForReview",
         "reviewSection",
         "reviewSectionReported",
+        "boardFoldedRevision",
         "prUpdatedAt",
         "docLinkState",
         "reviewGuideSelectedComparisonId",
@@ -260,6 +261,7 @@ final class WorkCardSnapshotTests: XCTestCase {
             }),
             ("parentTaskId", { t in var t = t; t.parentTaskId = "task_parent"; return t }),
             ("readyForReview", { t in var t = t; t.readyForReview = true; return t }),
+            ("boardFoldedRevision", { t in var t = t; t.boardFoldedRevision = true; return t }),
             ("reviewSection", { t in var t = t; t.reviewSection = .blocked; return t }),
             ("reviewSectionReported", { t in var t = t; t.reviewSectionReported = true; return t }),
             ("prUpdatedAt", { t in var t = t; t.prUpdatedAt = "2026-05-25T00:00:00Z"; return t }),
@@ -1472,7 +1474,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         XCTAssertTrue(snap.hasPRRow)
     }
 
-    func testDoneRevisionsParticipateInEquality() {
+    func testInReviewRevisionsParticipateInEquality() {
         let task = Self.makeTask()
         let rollup = WorkCardRevisionRollup(
             id: "rev_1",
@@ -1482,14 +1484,14 @@ final class WorkCardSnapshotTests: XCTestCase {
         )
         let with = WorkCardSnapshot.build(
             task: task,
-            context: WorkCardSnapshotContext(column: .review, doneRevisions: [rollup])
+            context: WorkCardSnapshotContext(column: .review, inReviewRevisions: [rollup])
         )
         let without = WorkCardSnapshot.build(
             task: task,
-            context: WorkCardSnapshotContext(column: .review, doneRevisions: [])
+            context: WorkCardSnapshotContext(column: .review, inReviewRevisions: [])
         )
-        XCTAssertTrue(with.hasDoneRevisions)
-        XCTAssertFalse(without.hasDoneRevisions)
+        XCTAssertTrue(with.hasInReviewRevisions)
+        XCTAssertFalse(without.hasInReviewRevisions)
         XCTAssertNotEqual(with, without)
     }
 
@@ -2069,6 +2071,26 @@ final class WorkCardSnapshotTests: XCTestCase {
         let live = Self.makeLiveState(liveStatus: "Resolving")
         XCTAssertNil(WorkCardLiveStatus.resolve(
             task: task, column: .doing, runtime: nil, liveState: live
+        ))
+    }
+
+    /// A held card whose reviewers live on another work item (a revision's
+    /// PR review is bound to the chain root) still says it is in AI review.
+    func testLiveStatusNamesAIReviewWhenCardHasNoWorkerOfItsOwn() {
+        var task = Self.makeTask(status: "active")
+        task.aiReviewing = true
+        task.aiReviewStage = "reviewers"
+        XCTAssertEqual(
+            WorkCardLiveStatus.resolve(task: task, column: .doing, runtime: nil, liveState: nil),
+            "AI review in progress"
+        )
+        task.aiReviewStage = "consolidation"
+        XCTAssertEqual(
+            WorkCardLiveStatus.resolve(task: task, column: .doing, runtime: nil, liveState: nil),
+            "Consolidating review findings"
+        )
+        XCTAssertNil(WorkCardLiveStatus.resolve(
+            task: task, column: .doing, runtime: nil, liveState: Self.makeLiveState(liveStatus: "Reading")
         ))
     }
 

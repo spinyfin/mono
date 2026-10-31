@@ -46,8 +46,8 @@ enum BossRevealCapture {
 
     static func start(updateModel: UpdateModel) {
         guard let state, let path = BossCaptureArgs.shared.captureTo else { return }
-        if state == "revision-review" {
-            BossRevisionReviewCapture.start(path: path)
+        if state == "revision-ai-review" || state == "revision-folded" {
+            BossRevisionReviewCapture.start(path: path, folded: state == "revision-folded")
             return
         }
         if state == "revision-brief" {

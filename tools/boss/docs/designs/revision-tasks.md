@@ -11,7 +11,7 @@ There is no kind whose deliverable is _another commit on an existing PR_. Yet th
 
 This is also the substrate a future feature needs. A separate effort will let the operator triage GitHub PR-review comments on an in-review parent PR and act on selected ones. When that lands, each "act on this comment" decision should _create a revision task_ — the same mechanism this design defines — rather than inventing a parallel path. So the mechanism here has to be clean enough that the comment-triage UI is a thin producer on top of it.
 
-This doc proposes a first-class **`revision`** task kind: bound to a parent task, gated on the parent's PR being open and unmerged, dispatched into (ideally) the parent's warm workspace, and delivering a _new commit on the parent's existing branch_ — no new PR. Revision tasks render as distinct cards in Backlog, Doing and Review. Only done revisions roll up under their parent.
+This doc proposes a first-class **`revision`** task kind: bound to a parent task, gated on the parent's PR being open and unmerged, dispatched into (ideally) the parent's warm workspace, and delivering a _new commit on the parent's existing branch_ — no new PR. Revision tasks render as distinct cards while in Backlog/Doing and roll up under the parent's card as single-line affordances once they reach Review.
 
 ## Goals
 
@@ -253,11 +253,11 @@ The inversion honours the design's actual goal — never spawn against a merged 
 
 A revision worker pushes a commit to the parent's branch and prints the **parent's** PR URL. The completion detector (`PrDetector`-family) must handle this:
 
-- For a `revision_implementation` execution, the detector does **not** look for a _new_ PR. **As built (PR #778)**, the chain root's `pr_url` is stamped onto the _execution row_ at dispatch time (`work_executions.pr_url` — an addition relative to the original schema plan, back-filled if the execution was minted before the parent PR opened), `on_execution_started` snapshots the parent PR's HEAD SHA, and the existing **sha-delta gate** in `completion.rs` detects head advancement when the execution stops. On delivery the revision remains active under the durable automated-review hold while its standalone card presents in Review using the chain root’s projection; successful review admits it to `in_review`. The parent’s status is untouched. This snapshot-and-compare is exactly the higher-fidelity mechanism Risk R7 sketched as a follow-up — it shipped in v1.
-- The chain root remains the PR’s owner and source of review presentation. Pending-review and deletion-signoff holds also stamp the revision’s PR URL for recovery sweeps; a delivered revision without that stamp can still resolve the root’s PR for display.
+- For a `revision_implementation` execution, the detector does **not** look for a _new_ PR. **As built (PR #778)**, the chain root's `pr_url` is stamped onto the _execution row_ at dispatch time (`work_executions.pr_url` — an addition relative to the original schema plan, back-filled if the execution was minted before the parent PR opened), `on_execution_started` snapshots the parent PR's HEAD SHA, and the existing **sha-delta gate** in `completion.rs` detects head advancement when the execution stops. On success the revision row flips to `in_review`; the parent's status is untouched. This snapshot-and-compare is exactly the higher-fidelity mechanism Risk R7 sketched as a follow-up — it shipped in v1.
+- The revision row's own `pr_url` stays `NULL` (`record_worker_pr_completion` explicitly preserves this). The chain root remains the PR's owner; the execution row carries the pointer.
 - **`done`** (Decisions § OQ7): a revision has **no independent doneness gate** — it rides the parent's lifecycle. A revision transitions to `done` exactly when its parent (chain root) task transitions to `done`, i.e. when the parent PR **merges or is closed**. It does _not_ go `done` when its own commit is pushed, and it does _not_ go `done` when the parent PR returns to `in_review` after the push. **As built (PR #778):** `mark_chore_pr_merged` calls `flip_in_review_revisions_to_done`, a BFS over `parent_task_id` links (`collect_chain_revision_ids`) that flips every `in_review` revision in the chain to `done` alongside the root. A revision that is still in Backlog/Doing when the parent merges/closes hits the auto-block policy (Decisions § OQ1) instead.
 
-This keeps the revision's lifecycle entirely engine-driven off existing signals: spawn → push commit → durable active hold / displayed Review → `in_review` (successful review) → `done` (parent reaches `done` via the merge poller). No new poller, no new status column, no independent doneness gate.
+This keeps the revision's lifecycle entirely engine-driven off existing signals: spawn → push commit → `in_review` (detector) → `done` (parent reaches `done` via the merge poller). No new poller, no new status column, no independent doneness gate.
 
 ### Permission hard-guard
 
@@ -300,32 +300,37 @@ A revision in `todo`/`active` renders as its **own** card, visually a sibling of
 - **Parent reference line** shows the chain-root short id and the PR number, and is the click target to open the parent PR (`revisionParentPrUrl`).
 - **Same color family as the parent, smaller emphasis.** Not indented under the parent in Backlog/Doing (kanban columns are flat status lanes; indentation would fight the layout). Instead it is tagged: same accent color as the parent's product, with the `⟳ R<n>` chip as the distinguishing mark. This keeps it a "distinct card that resembles the original but clearly shows its revision sequence and a short description", per the brief.
 
-### Review — standalone cards sharing the chain root’s presentation
+### Review — rolled up under the parent
 
-An active implementation renders in Doing. Once its implementation execution completes, a revision held pending automated review keeps its durable `active` status but presents a standalone Review card when its chain root presents in Review. An admitted `in_review` revision uses the same projection. The engine derives its PR URL, Review section, CI state, AI-review state, ready indicator and blocked status/reason/detail from the chain root. Review workers and PR actions refer to the same PR and owner on both cards.
+A revision in `in_review` does **not** render its own card. Instead the **chain root's** Review-lane card gains one single line per revision:
 
 ```
-Review — AI Review
 ┌──────────────────────────────────────────┐
-│ Primary task                    #1234 ↗  │
-│ ✓ CI · Reviewing (AI)                     │
-└──────────────────────────────────────────┘
-┌──────────────────────────────────────────┐
-│ ⟳ R1  Address review comments            │
-│ Revises primary                 #1234 ↗  │
-│ ✓ CI · Reviewing (AI)                     │
+│ Task  Wire up --plan flag        #1234 ↗   │   ← parent card, unchanged header
+│ ✓ CI · ◷ review                            │   ← existing CI/review chips
+│ ──────────────────────────────────────    │
+│ ⟳ R1  addressing review comments      ↗    │   ← one line per in-review revision
+│ ⟳ R2  rename --dry-run to --plan      ↗    │     R-badge + short intent + link
 └──────────────────────────────────────────┘
 ```
 
-The durable hold continues to gate dependent revisions, verdict advancement and admission recovery. A same-column drop is a reorder against the displayed position; it does not persist the projected status. Mutation replies carry the same presentation as full-tree and incremental board responses. A delivered revision does not count as implementation in progress for the Review section, while the merge gate still checks stored lifecycle state.
+- Each line is `⟳ R<n>` + the revision's short intent (`tasks.description`, hard-truncated — this is why the brief insists the description stays short, and why the future Source-B description must be terse, e.g. "addressing @alice's comment on foo.rs:42").
+- The line's link target: **the parent PR** (`revisionParentPrUrl`). v1 links to the PR itself rather than a specific commit, because the revision row does not store the commit SHA (the worker pushes it; the engine does not capture it). If a future iteration wants per-commit links, the completion detector (Q4) can capture the pushed SHA into a new `revision_commit_sha` column and the line links to `…/pull/<n>/commits/<sha>`. Flagged, not built.
+- These lines read from engine state (`parentTaskId` + `revisionSeq` + status), so the app groups in-review revisions under their chain root purely by reading fields, never by inferring the relationship.
 
-### Parent in Review, revision in Doing
+A revision that has reached `done` (parent merged) drops off the Review affordance with the parent — the whole card moves to Done together.
 
-Creating a revision leaves its parent in Review while the implementation has its own Doing card. Delivery moves the revision’s displayed card to Review without changing the parent’s lifecycle. A new explicit implementation execution returns the revision to Doing; automated review executions do not restart implementation. If the root is outside Review, its revision retains its own stored status rather than mirroring an unrelated block or terminal state.
+### Doing while the PR's AI review runs
 
-### Done — parent footer rollup
+Anything agents are actively working on is in Doing. For a revision that is its implementation run **and** the automated review of the commit it pushed. When the implementation execution completes, the revision stays `active` (the `PendingReview` hold stamps the PR URL on it) until the consolidated verdict for that exact push releases it to `in_review`. While that review is running — a started pre-merge review batch on the chain root that has not finished (reviewers, consolidation, verdict apply), or a running `pr_review` execution on the revision or chain root — the card stays in Doing, in the **Reviewing** group (`WorkDb::list_revisions_under_ai_review`, consumed by `classify_doing_sections`), not **Queued**. It carries the engine's `ai_reviewing` / `ai_review_stage` state ("AI review in progress" / "Consolidating review findings") and links the live review workers of its PR (the reviewers are bound to the chain root, so the card finds them by PR URL). A reviewer merely waiting for its first pool slot remains Queued. Once a batch starts, a reaped reviewer awaiting re-admission stays Reviewing, as do consolidation and verdict-apply waits; the caption uses that same engine projection, including “Applying AI review verdict”. A live implementation worker still wins and puts the revision in Coding.
 
-Only `done` revisions lose their standalone card and appear in the parent footer, ordered by revision sequence, with short intent and a parent-PR link. The footer is available wherever the parent card renders. Review revisions never appear in that footer.
+A revision is **never** a Review card. The engine gives a revision no `review_section`, the engine projects `board_folded_revision` for consolidated, done, and review-phase blocked revisions, and both the board drop path and the app consume that decision to give them no standalone card. When the review is consolidated the revision flips to `in_review` and appears only as its `⟳ R<n>` line on the parent's card, with the parent's own review state and indicators reflecting the outcome.
+
+### Edge: parent in Review, revision still in Doing
+
+Common case: the operator files R1 while the parent sits in review; R1 is in Backlog/Doing (its own card) while the parent is in Review (its card, no R1 line yet). Once R1's worker pushes and R1 flips to `in_review`, R1's standalone card disappears and the `⟳ R1` line appears under the parent. The transition is purely status-driven and needs no special handling.
+
+**As built (PR #775):** shipped as specified. `WorkTask` gained `parentTaskId`/`revisionSeq`/`revisionParentPrUrl`, decoded leniently (nil against pre-revision engines, which is why this phase could merge before Phases 3–4 did); `workItems(in: .review)` suppresses `kind == "revision" && status == "in_review"` rows; the rollup lines render one `RevisionRollupLine` per in-review revision ordered by `revisionSeq`; the Backlog/Doing card carries a `RevisionBadge` chip plus "revises T\<n\>" and a parent-PR link row; no "Friendly ID" strings anywhere. A later addition projects `has_in_progress_revision` onto chain roots so the parent's Review card can also hint at revisions still in Backlog/Doing.
 
 ---
 
@@ -397,7 +402,7 @@ Parent PR CI is not part of the live-writer predicate. A dead halt has already r
 
 ### OQ4 — Source-B description shape (forward-looking constraint)
 
-**Decision: no strong opinion from the operator; this design picks a reasonable default, revisable when the B-path UI lands.** When the deferred comment-triage UI creates a revision, `--description` should read `Addressing comment from @<user> on <file>:<line>` (e.g. "Addressing comment from @alice on runner.rs:712") — short, attribution-bearing, and fitting in the revision card. The full `(repo, pr#, comment-id)` pointer is carried in `created_via` (Q1), not the description, per [[feedback_github_is_source_of_truth_for_pr_artifacts]]. _Why it matters: if B writes verbose descriptions, the done footer becomes unreadable; setting a terse convention now means B is built to it. The exact wording is not load-bearing and the B-path effort can refine it._
+**Decision: no strong opinion from the operator; this design picks a reasonable default, revisable when the B-path UI lands.** When the deferred comment-triage UI creates a revision, `--description` should read `Addressing comment from @<user> on <file>:<line>` (e.g. "Addressing comment from @alice on runner.rs:712") — short, attribution-bearing, and fitting in the Review-card single-line affordance. The full `(repo, pr#, comment-id)` pointer is carried in `created_via` (Q1), not the description, per [[feedback_github_is_source_of_truth_for_pr_artifacts]]. _Why it matters: if B writes verbose descriptions, the Review rollup becomes unreadable; setting a terse convention now means B is built to it. The exact wording is not load-bearing and the B-path effort can refine it._
 
 ### OQ5 — Cube workspace fallback when the preferred workspace is gone/leased
 
@@ -413,7 +418,7 @@ Parent PR CI is not part of the live-writer predicate. A dead halt has already r
 
 ### OQ7 — Does a revision ever reach `done` independently of the parent?
 
-**Decision: no.** Revisions reach `done` when the chain root’s PR merges or closes. Delivery first presents a standalone Review card, including while automated review holds the stored status at `active`; successful review admits it to `in_review`. Neither delivery nor returning the parent to Review independently marks a revision done. Once the root reaches done, its in-review revisions follow and roll up into the parent footer.
+**Decision: no.** `done == parent PR merged or closed`. Revisions have no independent doneness gate — they ride the parent's lifecycle. A revision is `in_review` (commit pushed, rolled up under the parent) and transitions to `done` exactly when its parent (chain root) task transitions to `done` — i.e. when the parent PR merges or is closed. Explicitly: _not_ when the revision's commit is pushed, and _not_ when the parent PR returns to `in_review` after the push (see Q4 § Completion). _Why it matters: if revisions could go `done` while the PR stays open, the Review rollup would lose them prematurely and the operator would lose sight of in-flight revision context._ **As built (PR #778):** `flip_in_review_revisions_to_done`, called from `mark_chore_pr_merged`, implements exactly this.
 
 ---
 
@@ -452,7 +457,7 @@ CreateRevision { request_id: String, input: CreateRevisionInput }
 // protocol/src/types.rs
 pub struct CreateRevisionInput {
     pub parent_task_id: String,          // resolved from --parent selector
-    pub description: String,             // short intent rendered on the revision card
+    pub description: String,             // the ask; rendered on Review rollup
     pub priority: Option<String>,        // defaults to parent's
     pub effort_level: Option<EffortLevel>, // defaults to 'small' (Q7), or 'large'
                                             // for a design-family chain root
@@ -477,7 +482,7 @@ The `revision_seq` and `revision_parent_pr_url` fields are **engine-computed** p
 - `coordinator.rs` — `lease_workspace_with_fallback` reads `prefer_is_soft` to select `fallback_policy = "any_free"`.
 - `completion.rs` — `on_execution_started` / `evaluate_sha_delta_gate` fall back to `execution.pr_url` for `revision_implementation`; `record_worker_pr_completion` preserves `task.pr_url = NULL`. (The drafted dispatch-time poller probe and `should_post_comment` hook point were not built — see Q4 and OQ6.)
 - `cli/src/main.rs` — `create-revision` verb + `RevisionCreateArgs`; gate-error messages (Q2).
-- `app-macos` — `WorkTask` fields (`Models.swift` + `EngineClient` parsing); revision card + done-revision footer (`ContentView.swift` and helpers).
+- `app-macos` — `WorkTask` fields (`Models.swift` + `EngineClient` parsing); revision card + Review rollup affordance (`ContentView.swift` and helpers).
 - coordinator system prompt — the Q6 paragraph in `bossSystemPrompt()` (`BossPaneModel.swift`).
 - worker spawn config — `execution_kind` on `WorkerSetupInput`/`StartWorkerInput`; per-kind PreToolUse guard in the generated `settings.json` (OQ3); no new binary, no PATH change.
 
@@ -493,7 +498,7 @@ The `revision_seq` and `revision_parent_pr_url` fields are **engine-computed** p
 
 **R4 — Soft-prefer regression on orphan-resume.** Adding a soft-prefer path risks loosening the orphan-resume path that legitimately needs a _hard_ prefer. _Mitigation:_ `prefer_is_soft` defaults to `0`; only `revision_implementation` sets it. Orphan-resume (`work.rs:671`) is untouched.
 
-**R5 — Done footer gets noisy.** Long revision descriptions can make the parent footer unreadable. _Mitigation:_ hard truncation in the affordance + the terse-description convention (OQ4) baked in before B is built.
+**R5 — Review rollup gets noisy.** Long revision descriptions (especially from future Source B) make the parent card unreadable. _Mitigation:_ hard truncation in the affordance + the terse-description convention (OQ4) baked in before B is built.
 
 **R6 — Sequence number drift.** A computed `R<n>` could surprise if a mid-chain revision is deleted. _Mitigation:_ sequence is creation-ordered over surviving revisions (Q1); deleting R1 renumbers R2→R1, which is the intuitive "now there's one revision and it's the first" reading. Stored numbers would have been worse (gaps).
 
@@ -515,7 +520,7 @@ All five phases merged on 2026-05-26. Phase 5 landed before Phases 3–4 (its fi
 
 4. **Permission hard-guard + coordinator prompt** — [#782](https://github.com/spinyfin/mono/pull/782). Inline-Python PreToolUse guard in the generated `settings.json`, keyed on the new `execution_kind` field of `WorkerSetupInput`/`StartWorkerInput`; coordinator paragraph in `bossSystemPrompt()`. Guard + no-guard tests for revision vs chore executions.
 
-5. **Kanban chrome** — [#775](https://github.com/spinyfin/mono/pull/775). `WorkTask` fields, distinct `⟳ R<n>` cards in Doing and Review, done-revision footer lines ordered by `revisionSeq`, no "Friendly ID" strings ([[feedback_no_friendly_id_in_ui]]). 15 unit tests.
+5. **Kanban chrome** — [#775](https://github.com/spinyfin/mono/pull/775). Shipped as planned: `WorkTask` fields, distinct `⟳ R<n>` cards, Review-column suppression + per-revision rollup lines ordered by `revisionSeq`, no "Friendly ID" strings ([[feedback_no_friendly_id_in_ui]]). 15 unit tests.
 
 The sixth item — the Source-B comment-triage UI — remains unbuilt as designed, but the thin-producer bet has already been validated from an unexpected direction: engine-spawned merge-conflict-resolution and CI-fix revisions (later projects) create revision tasks through this same substrate, carrying their provenance in `created_via` prefixes exactly as Q1 prescribed for B.
 

@@ -252,6 +252,7 @@ extension EngineClient {
             sourceAutomationId: payload["source_automation_id"] as? String,
             aiReviewing: (payload["ai_reviewing"] as? Bool) ?? false,
             aiReviewStage: payload["ai_review_stage"] as? String,
+            boardFoldedRevision: payload["board_folded_revision"] as? Bool ?? false,
             aiReviewState: payload["ai_review_state"] as? String,
             aiReviewBadge: AIReviewBadgePresentation.parse(payload["ai_review_badge"]),
             aiReviewFindingsRevisionId: payload["ai_review_findings_revision_id"] as? String,

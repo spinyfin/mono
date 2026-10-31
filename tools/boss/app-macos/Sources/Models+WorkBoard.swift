@@ -414,13 +414,21 @@ func parseGitHubPRURL(_ urlString: String) -> (org: String, repo: String, number
 /// parseable GitHub PR URL. Used to dedup a card's PR-link rows when
 /// two different task fields (e.g. a revision's own `prURL` and its
 /// `revisionParentPrUrl`) happen to resolve to the same PR.
-func sameGitHubPR(_ a: String, _ b: String) -> Bool {
-    if let pa = parseGitHubPRURL(a), let pb = parseGitHubPRURL(b) {
-        return pa.org.lowercased() == pb.org.lowercased()
-            && pa.repo.lowercased() == pb.repo.lowercased()
-            && pa.number == pb.number
+enum ReviewPRIdentity: Hashable {
+    case github(org: String, repo: String, number: String)
+    case other(String)
+
+    init(_ url: String) {
+        if let pr = parseGitHubPRURL(url) {
+            self = .github(org: pr.org.lowercased(), repo: pr.repo.lowercased(), number: pr.number)
+        } else {
+            self = .other(url)
+        }
     }
-    return a == b
+}
+
+func sameGitHubPR(_ a: String, _ b: String) -> Bool {
+    ReviewPRIdentity(a) == ReviewPRIdentity(b)
 }
 
 /// Repo names (lowercased) that appear with two or more distinct orgs

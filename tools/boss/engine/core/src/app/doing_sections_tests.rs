@@ -176,3 +176,102 @@ fn unbound_slots_do_not_create_cards_and_untyped_bound_slots_remain_active() {
         DoingSection::Coding
     );
 }
+
+/// A revision whose own worker has finished stays in Doing while the review
+/// of its commit runs. The reviewers are bound to the PR's chain root, so the
+/// revision has no live worker of its own, yet it is active work, not a card
+/// waiting for a slot.
+#[test]
+fn a_revision_held_for_ai_review_is_reviewing_without_a_worker_of_its_own() {
+    use boss_protocol::{CreateExecutionInput, CreateRevisionInput, TaskKind};
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id.clone(), "revision root");
+    let pr_url = "https://github.com/example/repo/pull/42";
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![root.id, pr_url],
+        )
+        .unwrap();
+    let revision = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(&root.id)
+                .description("address findings")
+                .build(),
+            &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
+        )
+        .unwrap();
+    assert_eq!(revision.kind, TaskKind::Revision);
+    let implementation = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(revision.id.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            rusqlite::params![implementation.id],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'active', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![revision.id, pr_url],
+        )
+        .unwrap();
+    let review = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+
+    // The reviewer is a live worker on the chain root, not on the revision.
+    let reviewer = worker(&root.id, ExecutionKind::PrReview, WorkerActivity::Working);
+    let sections = classify_doing_sections(&db, &[reviewer]);
+    assert_eq!(sections[&revision.id], DoingSection::Reviewing);
+    assert_eq!(sections[&root.id], DoingSection::Reviewing);
+
+    // Even between reviewer processes the review cycle is still running.
+    assert_eq!(classify_doing_sections(&db, &[])[&revision.id], DoingSection::Reviewing);
+
+    // A live implementation worker on the revision still wins.
+    let coding = worker(
+        &revision.id,
+        ExecutionKind::RevisionImplementation,
+        WorkerActivity::Working,
+    );
+    assert_eq!(
+        classify_doing_sections(&db, &[coding])[&revision.id],
+        DoingSection::Coding
+    );
+
+    // Review consolidated: the revision is released and has no Doing section.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            rusqlite::params![review.id],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+            rusqlite::params![revision.id],
+        )
+        .unwrap();
+    assert!(!classify_doing_sections(&db, &[]).contains_key(&revision.id));
+}

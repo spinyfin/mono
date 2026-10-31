@@ -5,7 +5,7 @@ import XCTest
 final class AIReviewStateBadgeTests: XCTestCase {
     /// The click opens the findings brief AND reveals the findings revision.
     /// A queued/active revision has its own card, so the reveal targets it;
-    /// a done revision is only a rollup line on the parent, so the
+    /// an in-review/done one is only a rollup line on the parent, so the
     /// reveal lands on the parent and the tooltip says so.
     @MainActor
     func testFindingsClickOpensBriefAndRevealsRevisionCard() {
@@ -17,7 +17,7 @@ final class AIReviewStateBadgeTests: XCTestCase {
         model.asyncMarkdownViewerOpener = { openCount += 1 }
         model.selectWorkProduct(parent.productID)
 
-        let expectedCard = ["todo": "revision", "active": "revision", "in_review": "revision", "done": "parent"]
+        let expectedCard = ["todo": "revision", "active": "revision", "in_review": "parent", "done": "parent"]
         for status in ["todo", "active", "in_review", "done"] {
             revision.status = status
             model.choresByProductID = [parent.productID: [parent, revision]]

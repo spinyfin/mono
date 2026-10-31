@@ -231,7 +231,7 @@ async fn recheck_for_pr_sha_delta_advances_revision_to_in_review() {
     match item {
         WorkItem::Task(t) => {
             assert_eq!(t.status, TaskStatus::InReview, "revision must move to in_review");
-            assert_revision_pr_projection(&db, &t);
+            assert!(t.pr_url.is_none(), "revision pr_url must stay NULL; parent owns the PR");
         }
         other => panic!("expected task, got {other:?}"),
     }
@@ -589,7 +589,7 @@ async fn on_stop_finalizes_metadata_only_revision_when_body_changed_and_ci_clean
     match db.get_work_item(&revision_id).unwrap() {
         WorkItem::Task(t) | WorkItem::Chore(t) => {
             assert_eq!(t.status, TaskStatus::InReview);
-            assert_revision_pr_projection(&db, &t);
+            assert!(t.pr_url.is_none(), "revision tasks must not own a pr_url");
         }
         other => panic!("expected revision task, got {other:?}"),
     }
@@ -865,7 +865,7 @@ async fn revision_on_stop_sha_delta_contributed_finalizes_with_no_nudge() {
     match db.get_work_item(&revision_id).unwrap() {
         WorkItem::Task(t) => {
             assert_eq!(t.status, TaskStatus::InReview, "revision must move to in_review");
-            assert_revision_pr_projection(&db, &t);
+            assert!(t.pr_url.is_none(), "revision task.pr_url must stay NULL");
         }
         other => panic!("expected task, got {other:?}"),
     }
@@ -1014,7 +1014,7 @@ async fn revision_on_stop_no_pr_head_before_snapshot_finalizes_via_satisfied_del
     match db.get_work_item(&revision_id).unwrap() {
         WorkItem::Task(t) => {
             assert_eq!(t.status, TaskStatus::InReview, "revision must move to in_review");
-            assert_revision_pr_projection(&db, &t);
+            assert!(t.pr_url.is_none(), "revision task.pr_url must stay NULL");
         }
         other => panic!("expected task, got {other:?}"),
     }
@@ -2667,19 +2667,4 @@ async fn on_stop_staged_url_stamps_contributed_head_before_transient_finalize_fa
         ["lease-1"],
         "cube lease must be released once recheck_for_pr finalizes",
     );
-}
-
-// Displaying the parent PR on a review card must not turn the revision into
-// a second persisted PR owner.
-fn assert_revision_pr_projection(db: &WorkDb, revision: &boss_protocol::Task) {
-    let stored: Option<String> = db
-        .connect()
-        .unwrap()
-        .query_row("SELECT pr_url FROM tasks WHERE id = ?1", [&revision.id], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert!(stored.is_none(), "revision must not store its own PR URL");
-    assert!(revision.pr_url.is_some(), "review card must display the parent PR");
-    assert_eq!(revision.pr_url, revision.revision_parent_pr_url);
 }
