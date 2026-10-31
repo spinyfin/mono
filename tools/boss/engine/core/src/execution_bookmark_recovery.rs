@@ -12,6 +12,7 @@ pub(crate) use boss_engine_storage_values::attention_kinds::EXECUTION_BOOKMARK_C
 pub(crate) use boss_engine_storage_values::attention_kinds::EXECUTION_BOOKMARK_RECOVERY_FAILED_ATTENTION_KIND as RECOVERY_FAILED;
 /// The engine archived an unsafe recovery source and started the item fresh.
 pub(crate) use boss_engine_storage_values::attention_kinds::EXECUTION_BOOKMARK_RECOVERY_RETIRED_ATTENTION_KIND as RECOVERY_RETIRED;
+#[cfg(test)]
 pub(crate) use boss_engine_storage_values::attention_kinds::REVISION_CHAIN_RECOVERY_BLOCKED_ATTENTION_KIND as CHAIN_BLOCKED;
 
 /// A resolved informational note: archiving is successful recovery handling,
