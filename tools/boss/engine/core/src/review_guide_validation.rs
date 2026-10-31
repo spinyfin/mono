@@ -67,7 +67,9 @@ pub(crate) fn submit_worker_proposal(
                 guide.validated(validation)
             })
     });
-    db.submit_worker_proposal_with_guide_and_liveness(input, guide.as_ref(), &|pid| { crate::durable_liveness::probe_recorded_pid(pid).is_alive() })
+    db.submit_worker_proposal_with_guide_and_liveness(input, guide.as_ref(), &|pid| {
+        crate::durable_liveness::probe_recorded_pid(pid).is_alive()
+    })
 }
 
 /// What [`recover_orphaned_submissions`] did.

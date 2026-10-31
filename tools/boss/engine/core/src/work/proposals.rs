@@ -228,7 +228,7 @@ impl WorkDb {
         self.submit_worker_proposal_with_guide(input, None)
     }
 
-    #[cfg(test)]
+    /// Submit a non-guide proposal with an injected worker-liveness observation.
     pub fn submit_worker_proposal_with_liveness(
         &self,
         input: SubmitWorkerProposalInput<'_>,
