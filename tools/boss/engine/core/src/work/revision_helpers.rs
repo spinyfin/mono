@@ -599,30 +599,9 @@ fn review_execution_target_ids_with(
         .collect()
 }
 
-/// Set `ai_reviewing = true` on every task (and chore) whose
-/// [`review_execution_target_ids_with`] has a non-terminal `pr_review` execution,
-/// restricted to rows in `active` (Doing, awaiting its first review before
-/// ever reaching `in_review`, OR a revision held pending its cycle root's
-/// review pass) or already `in_review` (Review, an automated review pass
-/// running against an already-open PR — e.g. triggered by a revision's
-/// push). Called from `get_work_tree` to surface the "Reviewing (AI)"
-/// badge on kanban cards while the reviewer pass is in flight.
-///
-/// The `in_review` case matters because `start_execution_run` and
-/// `request_pr_review_in_tx` deliberately never move a row that has already
-/// reached `in_review` back to `active` (see their doc comments and
-/// `tools/boss/docs/designs/work-kanban.md`'s cycle-root status contract) —
-/// so a review pass running against a Review-lane row must be surfaced from
-/// here, on the row's actual (`in_review`) status, rather than by moving it.
-///
-/// "In flight" means the `pr_review` execution is `running` — a reviewer agent
-/// is actually reviewing. A `ready` execution (queued for a review-pool slot,
-/// or stuck in the pre-start retry loop after a dispatch failure) is NOT
-/// counted: nothing is reviewing yet, so claiming "AI reviewing" would be a
-/// lie. The flag is derived — not a stored DB column — so it's always
-/// accurate: a task that never had a reviewer, whose reviewer is still queued,
-/// or whose reviewer has already finalised (or failed to dispatch) arrives
-/// with `ai_reviewing = false` (the default).
+/// Attach live reviewer stages and the shared held-revision review-cycle stage.
+/// A held revision keeps its caption across consolidation, apply and re-admission
+/// waits after the cycle starts; first admission to a review pool remains queued.
 pub(crate) fn attach_ai_reviewing_flag(
     conn: &Connection,
     tasks: &mut [Task],
@@ -702,9 +681,7 @@ pub(crate) fn attach_ai_reviewing_flag(
             .or_insert(stage);
     }
 
-    if reviewing.is_empty() {
-        return Ok(());
-    }
+    let held_stages = super::revision_ai_review::held_review_stages(conn)?;
     let running_stage = |id: &str| {
         let stages = target_ids.get(id)?.iter().filter_map(|target| reviewing.get(target));
         stages.copied().reduce(|a, b| {
@@ -716,7 +693,10 @@ pub(crate) fn attach_ai_reviewing_flag(
         })
     };
     for row in tasks.iter_mut().chain(chores.iter_mut()) {
-        if let Some(stage) = running_stage(&row.id) {
+        if let Some(stage) = held_stages.get(&row.id) {
+            row.ai_reviewing = true;
+            row.ai_review_stage = Some(stage.clone());
+        } else if let Some(stage) = running_stage(&row.id) {
             row.ai_reviewing = true;
             row.ai_review_stage = Some(stage.as_str().to_owned());
         }
@@ -1534,6 +1514,7 @@ fn copy_derived_projection_fields(dst: &mut Task, src: &Task) {
     dst.ai_reviewing = src.ai_reviewing;
     dst.ai_review_stage = src.ai_review_stage.clone();
     dst.ai_review_state = src.ai_review_state.clone();
+    dst.ai_review_badge = src.ai_review_badge.clone();
     dst.ai_review_findings_revision_id = src.ai_review_findings_revision_id.clone();
     dst.ready_for_review = src.ready_for_review;
     dst.review_section = src.review_section;

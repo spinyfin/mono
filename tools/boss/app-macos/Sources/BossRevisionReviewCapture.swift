@@ -39,6 +39,7 @@ enum BossRevisionReviewCapture {
         revision.parentTaskId = parent.id
         revision.revisionSeq = 1
         revision.revisionParentPrUrl = pr
+        revision.boardFoldedRevision = folded
         revision.aiReviewing = !folded
         revision.aiReviewStage = folded ? nil : "reviewers"
         model.choresByProductID = ["review-fixture": [parent]]

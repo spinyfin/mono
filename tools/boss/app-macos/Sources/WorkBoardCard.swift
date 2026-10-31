@@ -34,25 +34,17 @@ struct WorkBoardSectionItemsView: View {
     /// per section instead of invalidating every mounted card.
     @ObservedObject var liveStates: LiveWorkerStateStore
 
-    enum ReviewPRIdentity: Hashable {
-        case github(org: String, repo: String, number: String)
-        case other(String)
-    }
-
-    /// The live review workers of the PR a revision card is held for. The
-    /// engine binds the reviewers to the PR's chain root, not to the revision,
-    /// so a revision's own execution never reaches them; the PR is what they
-    /// share. Only a revision the engine reports as under AI review gets them.
+    /// Live reviewers and supervisors shared by PR identity: primary Review
+    /// cards and held revisions in Doing both link to the same review workers.
     static func reviewWorkers(for task: WorkTask, index: [ReviewPRIdentity: [WorkerLiveState]]) -> [WorkerLiveState] {
-        guard task.kind == "revision", task.aiReviewing,
+        guard (task.kind == "revision" && task.aiReviewing) || (task.kind != "revision" && task.boardColumn == .review),
               let url = task.prURL ?? task.revisionParentPrUrl, !url.isEmpty
         else { return [] }
         return index[reviewerKey(url)] ?? []
     }
 
     static func reviewerKey(_ url: String) -> ReviewPRIdentity {
-        guard let pr = parseGitHubPRURL(url) else { return .other(url) }
-        return .github(org: pr.org.lowercased(), repo: pr.repo.lowercased(), number: pr.number)
+        ReviewPRIdentity(url)
     }
 
     static func reviewerIndex(states: [WorkerLiveState]) -> [ReviewPRIdentity: [WorkerLiveState]] {
@@ -72,8 +64,8 @@ struct WorkBoardSectionItemsView: View {
         let selectedRevisionParentID = model.selectedRevisionParentID
         let dragRefusal = model.dragRefusalNotice
         let mergeFeedback = model.mergeFeedbackNotice
-        // One PR-URL -> reviewers index per Doing render, looked up per revision card.
-        let reviewersByPR = Self.reviewerIndex(states: column == .doing ? Array(liveStates.byRunID.values) : [])
+        // One PR identity index per section render.
+        let reviewersByPR = Self.reviewerIndex(states: (column == .doing || column == .review) ? Array(liveStates.byRunID.values) : [])
         // Lazy so off-screen cards aren't instantiated/hit-tested at all — with
         // the default (ungrouped) board layout each column is a single section,
         // so this was the actual eagerly-built list of every card in the
@@ -109,7 +101,7 @@ struct WorkBoardSectionItemsView: View {
                     task: task,
                     column: column,
                     snapshot: snapshot,
-                    reviewers: column == .doing ? Self.reviewWorkers(for: task, index: reviewersByPR) : [],
+                    reviewers: (column == .doing || column == .review) ? Self.reviewWorkers(for: task, index: reviewersByPR) : [],
                     model: model,
                     revisionHighlight: model.revisionHighlightState(for: task.id),
                     isRevealed: highlightID == task.id,

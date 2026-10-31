@@ -647,10 +647,7 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
 /// or `done` is folded into its parent's card and is not a card either.
 fn board_row_for_id(work_db: &WorkDb, id: &str) -> Result<BoardRow> {
     match work_db.get_work_item(id)? {
-        WorkItem::Task(task) | WorkItem::Chore(task)
-            if task.kind == boss_protocol::TaskKind::Revision
-                && matches!(task.status, TaskStatus::InReview | TaskStatus::Done) =>
-        {
+        WorkItem::Task(task) | WorkItem::Chore(task) if task.board_folded_revision => {
             bail!("{id} is a revision rolled up into its parent card: it has no board position")
         }
         WorkItem::Task(task) | WorkItem::Chore(task) => Ok(BoardRow {

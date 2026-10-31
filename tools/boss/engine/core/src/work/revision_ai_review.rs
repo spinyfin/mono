@@ -1,70 +1,51 @@
-//! Which revisions are waiting on, and being worked by, the automated review
-//! of their PR.
-//!
-//! A revision's implementation run ends when it pushes its commit. Its card
-//! then stays in Doing, held `active` with the PR URL stamped on it, until the
-//! consolidated verdict for that push lands and releases it to `in_review`
-//! (where it folds into its parent card). While the review is actually under
-//! way the revision is being worked on by agents, so the board groups it with
-//! the other active Doing work rather than with the cards waiting for a worker
-//! slot.
+//! Shared presentation of held revisions throughout a started AI review cycle.
+//! Pool admission alone is queued; consolidation, verdict apply and reviewer
+//! re-admission after a started attempt remain Reviewing until the cycle ends.
 
 use super::*;
 
 impl WorkDb {
-    /// Ids of revisions held in Doing by an automated review that is running
-    /// right now.
-    ///
-    /// A revision qualifies when it is `active`, its latest
-    /// `revision_implementation` execution completed (so nothing is
-    /// implementing or about to re-implement it), it carries the PR URL the
-    /// hold stamps, and its review cycle has live review work: a pre-merge
-    /// review batch that has not finished (reviewers, consolidation or
-    /// verdict apply) on the chain root, or a non-terminal `pr_review`
-    /// execution on the revision or the chain root. A held revision whose
-    /// review is not running (the reviewer was reaped and awaits
-    /// re-admission) is not listed: nothing is working on it.
+    /// Held revisions whose review cycle has started and has not finished.
     pub fn list_revisions_under_ai_review(&self) -> Result<Vec<String>> {
         let conn = self.connect()?;
-        let held = held_revision_ids(&conn)?;
-        let mut under_review = Vec::new();
-        for id in held {
-            let root = chain_root(&conn, &id)?;
-            if review_is_running(&conn, &id, &root)? {
-                under_review.push(id);
-            }
-        }
-        Ok(under_review)
+        Ok(held_review_stages(&conn)?.into_keys().collect())
     }
 }
 
-fn held_revision_ids(conn: &Connection) -> Result<Vec<String>> {
+/// One query for all held revisions, including arbitrarily deep revision chains.
+/// Both Doing membership and task captions consume this projection.
+pub(super) fn held_review_stages(conn: &Connection) -> rusqlite::Result<std::collections::HashMap<String, String>> {
     let mut stmt = conn.prepare(
-        "SELECT t.id FROM tasks t
-         WHERE t.kind = 'revision' AND t.status = 'active' AND t.deleted_at IS NULL
-           AND t.pr_url IS NOT NULL AND t.pr_url != ''
-           AND (SELECT e.status FROM work_executions e
-                WHERE e.work_item_id = t.id AND e.kind = 'revision_implementation'
-                ORDER BY e.created_at DESC, e.id DESC LIMIT 1) = 'completed'",
+        "WITH RECURSIVE chain(revision_id, ancestor_id) AS (
+            SELECT t.id, t.id FROM tasks t
+            WHERE t.kind = 'revision' AND t.status = 'active' AND t.deleted_at IS NULL
+              AND COALESCE(t.pr_url, '') != ''
+              AND (SELECT e.status FROM work_executions e
+                   WHERE e.work_item_id = t.id AND e.kind = 'revision_implementation'
+                   ORDER BY e.created_at DESC, e.id DESC LIMIT 1) = 'completed'
+            UNION
+            SELECT c.revision_id, t.parent_task_id FROM chain c
+            JOIN tasks t ON t.id = c.ancestor_id WHERE t.parent_task_id IS NOT NULL
+        ), stages AS (
+            SELECT c.revision_id, CASE b.status WHEN 'applying' THEN 3
+                       WHEN 'supervising' THEN 2 ELSE 1 END AS stage
+            FROM chain c JOIN pr_review_batches b ON b.cycle_root_id = c.ancestor_id
+            WHERE b.phase = 'pre_merge' AND b.status NOT IN ('completed', 'failed')
+              AND (b.status IN ('supervising', 'applying') OR EXISTS (
+                  SELECT 1 FROM pr_review_batch_members m
+                  LEFT JOIN work_executions e ON e.id = m.execution_id
+                  WHERE m.batch_id = b.id
+                    AND (e.started_at IS NOT NULL OR e.status = 'running' OR m.status = 'reported')))
+            UNION ALL
+            SELECT c.revision_id, CASE WHEN EXISTS (
+                SELECT 1 FROM pr_review_batch_members m WHERE m.execution_id = e.id AND m.role = 'supervisor'
+            ) THEN 2 ELSE 1 END
+            FROM chain c JOIN work_executions e ON e.work_item_id = c.ancestor_id
+            WHERE e.kind = 'pr_review' AND e.status = 'running'
+        ) SELECT revision_id, CASE MAX(stage) WHEN 3 THEN 'applying'
+                   WHEN 2 THEN 'consolidation' ELSE 'reviewers' END
+          FROM stages GROUP BY revision_id",
     )?;
-    let ids = stmt
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(ids)
-}
-
-fn review_is_running(conn: &Connection, revision_id: &str, root_id: &str) -> Result<bool> {
-    let running: bool = conn.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM pr_review_batches
-             WHERE cycle_root_id = ?1 AND phase = 'pre_merge'
-               AND status NOT IN ('completed', 'failed'))
-         OR EXISTS(
-             SELECT 1 FROM work_executions
-             WHERE kind = 'pr_review' AND work_item_id IN (?1, ?2)
-               AND status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned'))",
-        params![root_id, revision_id],
-        |row| row.get(0),
-    )?;
-    Ok(running)
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect()
 }
