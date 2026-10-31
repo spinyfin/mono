@@ -572,6 +572,16 @@ extension WorkTask {
         }
     }
 
+    /// `true` for a revision whose work is finished and reviewed (`in_review`)
+    /// or whose PR has landed (`done`). Such a revision has no card of its
+    /// own in any column: it is rolled up as a line on its parent's card.
+    /// While its PR's automated review runs, the revision is still `active`
+    /// and is a Doing card (the engine groups it as Reviewing); it folds into
+    /// the parent only once that review is consolidated.
+    var isFoldedRevision: Bool {
+        kind == "revision" && (status == "in_review" || status == "done")
+    }
+
     /// `true` when this task is blocked for a review-phase reason —
     /// it has an open PR and the block is transient (conflict resolution
     /// or CI fix in progress). These tasks render in Review, not Backlog.

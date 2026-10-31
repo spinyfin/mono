@@ -580,6 +580,7 @@ mod review_batches_tests;
 mod review_guide_state_tests;
 mod review_verdict_apply_tests;
 mod review_verdicts_tests;
+mod revision_ai_review_tests;
 mod revision_recovery;
 mod revision_sequencing;
 mod semantic_progress_tests;
@@ -623,7 +624,6 @@ mod board_runtime_cache_tests;
 mod work_tree_scale_tests;
 
 mod board_patch_tests;
-mod revision_review_card_tests;
 
 mod design_doc_contention_tests;
 

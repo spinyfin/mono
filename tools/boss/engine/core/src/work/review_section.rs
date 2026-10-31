@@ -8,7 +8,7 @@
 //! given and never re-derives it.
 
 use boss_engine_board_gesture::BoardRow;
-use boss_protocol::{BoardColumn, ReviewSection, Task, TaskStatus};
+use boss_protocol::{BoardColumn, ReviewSection, Task, TaskKind, TaskStatus};
 
 use super::{
     AI_REVIEW_STATE_REVIEW_QUEUED, AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS, AI_REVIEW_STATE_REVIEWING, Connection,
@@ -17,7 +17,12 @@ use super::{
 
 /// Resolve the Review-column section of `task`, or `None` when the row is not
 /// a Review-lane card (its board position is some other column, or it sits in
-/// Done's "Merging" group).
+/// Done's "Merging" group, or it is a revision).
+///
+/// A revision is never a Review card. While its PR's automated review runs it
+/// is held in Doing; once the review is consolidated it folds into its
+/// parent's card as an inline revision line. Its own `in_review` status
+/// describes that fold, not a place on the board.
 ///
 /// Each card lands in exactly one section — the first rule that matches, in
 /// this order:
@@ -53,6 +58,9 @@ use super::{
 /// `in_revision_blocked_only` and `ai_review_state`, so it must run after
 /// every one of them has been attached.
 pub(crate) fn classify_review_section(task: &Task) -> Option<ReviewSection> {
+    if task.kind == TaskKind::Revision {
+        return None;
+    }
     let position = BoardRow {
         status: task.status.clone(),
         autostart: task.autostart,
@@ -127,7 +135,6 @@ pub(crate) fn attach_pr_updated_at(conn: &Connection, tasks: &mut [Task], chores
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boss_protocol::TaskKind;
 
     /// A Review-lane card that is ready by every measure: open PR, CI green,
     /// mergeable, nothing running. Each test perturbs one fact from here.
@@ -158,6 +165,19 @@ mod tests {
         t.has_in_progress_revision = true;
         t.ready_for_review = false;
         t
+    }
+
+    /// A revision is never a Review card, whatever its status or PR facts:
+    /// in AI review it stays in Doing, and once consolidated it folds into
+    /// its parent's card.
+    #[test]
+    fn a_revision_never_has_a_review_section() {
+        for status in [TaskStatus::InReview, TaskStatus::Blocked, TaskStatus::Active] {
+            let mut revision = ready_card();
+            revision.kind = TaskKind::Revision;
+            revision.status = status.clone();
+            assert_eq!(classify_review_section(&revision), None, "{status:?}");
+        }
     }
 
     #[test]

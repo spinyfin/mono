@@ -155,9 +155,13 @@ impl ServerState {
 /// Every Doing card has exactly one section. A nonterminal slot is live even
 /// while spawning, idle between turns, held, or awaiting input. Execution/run
 /// status alone is not liveness: bookkeeping can finish before a worker exits.
-/// Live implementation wins over simultaneous review. All remaining cards
-/// are Queued, regardless of execution status or dispatch wait reason (pause,
-/// capacity, dependency, deadline, retry, between runs, or an operator question).
+/// Live implementation wins over simultaneous review. A revision held in Doing
+/// while the automated review of its pushed commit is running (reviewers,
+/// consolidation or verdict apply) is Reviewing even though its own worker has
+/// finished and the reviewers are bound to the PR's chain root: agents are
+/// working on it. All remaining cards are Queued, regardless of execution
+/// status or dispatch wait reason (pause, capacity, dependency, deadline,
+/// retry, between runs, or an operator question).
 /// The sparse map's absent-key default is part of the wire contract.
 pub(super) fn classify_doing_sections(db: &WorkDb, states: &[LiveWorkerState]) -> BTreeMap<String, DoingSection> {
     let mut sections = BTreeMap::new();
@@ -192,6 +196,14 @@ pub(super) fn classify_doing_sections(db: &WorkDb, states: &[LiveWorkerState]) -
                 }
             })
             .or_insert(section);
+    }
+    match db.list_revisions_under_ai_review() {
+        Ok(revisions) => {
+            for revision in revisions {
+                sections.entry(revision).or_insert(DoingSection::Reviewing);
+            }
+        }
+        Err(err) => tracing::warn!(?err, "failed to list revisions under AI review; leaving them Queued"),
     }
     sections
 }
