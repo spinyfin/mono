@@ -13,6 +13,13 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Internal worker; stdin carries the already-acquired sweep lock.
+    #[command(hide = true)]
+    ReleaseBookmarkGc {
+        repo: String,
+        #[arg(long)]
+        database: Option<std::path::PathBuf>,
+    },
     /// Internal process entry point for periodic cleanup outside lease dispatch.
     #[command(hide = true)]
     PeriodicCleanup {

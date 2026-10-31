@@ -28,6 +28,11 @@ pub fn shared_repo_dir(cwd: &Path) -> Result<PathBuf, CubeError> {
 }
 
 impl RepoLock {
+    /// Transfer the locked file to a detached child without a lock-free gap.
+    pub(crate) fn into_file(self) -> File {
+        self._file
+    }
+
     /// Serialize PR bookmark mutation and positioning across secondary workspaces.
     /// Reuse the existing file-lock implementation with a separate store-wide lock
     /// so callers already holding the pool/registry lock cannot deadlock.

@@ -27,6 +27,7 @@ mod pr_rebase;
 mod provision;
 mod reclaim;
 mod reconcile;
+mod release_bookmark_gc;
 mod repo;
 mod reset;
 mod salvage;

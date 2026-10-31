@@ -239,6 +239,8 @@ fn gc_forgets_pr_bookmark_no_workspace_is_positioned_on() {
         &release_runner,
     )
     .expect("release");
+    // Execute the detached worker's sweep separately, after release returned.
+    crate::app::release_bookmark_gc::sweep(&release_runner, Some(&database_path), "mono", &workspace_path);
     release_runner.assert_exhausted();
 }
 
@@ -273,6 +275,8 @@ fn gc_retains_pr_bookmark_a_workspace_is_still_positioned_on() {
         &release_runner,
     )
     .expect("release");
+    // Execute the detached worker's sweep separately, after release returned.
+    crate::app::release_bookmark_gc::sweep(&release_runner, Some(&database_path), "mono", &workspace_path);
     release_runner.assert_exhausted();
 }
 
@@ -334,6 +338,8 @@ fn gc_sweeps_an_accumulated_backlog_with_batched_local_commands_and_no_network()
         &release_runner,
     )
     .expect("release");
+    // Execute the detached worker's sweep separately, after release returned.
+    crate::app::release_bookmark_gc::sweep(&release_runner, Some(&database_path), "mono", &workspace_path);
     release_runner.assert_exhausted();
 }
 
@@ -372,6 +378,8 @@ fn gc_pr_sweep_runs_offline() {
         &release_runner,
     )
     .expect("release");
+    // Execute the detached worker's sweep separately, after release returned.
+    crate::app::release_bookmark_gc::sweep(&release_runner, Some(&database_path), "mono", &workspace_path);
     release_runner.assert_exhausted();
 }
 
@@ -413,6 +421,8 @@ fn gc_pr_sweep_ignores_co_located_bookmarks_in_other_namespaces() {
         &release_runner,
     )
     .expect("release");
+    // Execute the detached worker's sweep separately, after release returned.
+    crate::app::release_bookmark_gc::sweep(&release_runner, Some(&database_path), "mono", &workspace_path);
     release_runner.assert_exhausted();
 }
 
@@ -471,6 +481,8 @@ fn gc_release_records_an_audit_event_when_the_sweep_fails() {
         &release_runner,
     )
     .expect("release still succeeds — a failed sweep must not strand the lease");
+    // Execute the detached worker's sweep separately, after release returned.
+    crate::app::release_bookmark_gc::sweep(&release_runner, Some(&database_path), "mono", &workspace_path);
     release_runner.assert_exhausted();
 
     let events = audit_events(&tempdir);
@@ -478,7 +490,7 @@ fn gc_release_records_an_audit_event_when_the_sweep_fails() {
         .iter()
         .find(|e| e["event"] == "workspace.release_bookmark_gc_failed")
         .expect("a failed sweep is recorded, not swallowed");
-    assert_eq!(failure["workspace_id"], "mono-agent-001");
+    assert!(events.iter().any(|event| event["event"] == "lease.released"));
     assert_eq!(failure["repo"], "mono");
     assert!(
         failure["error"].as_str().unwrap().contains("working_copies()"),
