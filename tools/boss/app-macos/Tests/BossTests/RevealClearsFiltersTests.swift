@@ -135,7 +135,7 @@ final class RevealClearsFiltersTests: XCTestCase {
         XCTAssertEqual(model.selectedProjectFilterIDs, ["proj_test"])
     }
 
-    func testReviewRevisionUsesOwnProjectAndDoneRevisionUsesParentProject() {
+    func testRolledUpRevisionKeepsFilterViaParentHostCard() {
         for status in ["in_review", "done"] {
             let model = makeModel()
             model.applyEventForTest(makeWorkTreeEvent(tasks: [
@@ -145,7 +145,7 @@ final class RevealClearsFiltersTests: XCTestCase {
             ]))
             model.selectedProjectFilterIDs = ["proj_test"]
             model.revealWorkCard("rev", productID: "prod_test")
-            XCTAssertEqual(model.selectedProjectFilterIDs, [status == "in_review" ? "proj_other" : "proj_test"], status)
+            XCTAssertEqual(model.selectedProjectFilterIDs, ["proj_test"], status)
         }
     }
 

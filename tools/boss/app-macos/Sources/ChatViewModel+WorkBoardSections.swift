@@ -325,11 +325,10 @@ extension ChatViewModel {
         var items = visibleWorkItems
             .filter { effectiveBoardColumn(for: $0) == column }
             .sorted(by: sort)
-        // Completed revisions roll up under the parent. Revisions awaiting
-        // review or merge use the same standalone card as primary tasks.
-        if column == .done {
-            items = items.filter { !($0.kind == "revision" && $0.status == "done") }
-        }
+        // A revision with `isFoldedRevision` has no card in any column: it is
+        // rolled up as a line on its parent's card. While its PR is under AI
+        // review it is still `active`, so it stays a Doing card.
+        items = items.filter { !$0.isFoldedRevision }
         cachedItemsByColumn[column] = items
         return items
     }

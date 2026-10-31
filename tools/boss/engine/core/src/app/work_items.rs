@@ -99,12 +99,7 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
                 changed,
             )
             .await;
-            match work_db.project_work_item_for_display(item) {
-                Ok(item) => {
-                    send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item })
-                }
-                Err(err) => send_work_error(&sink, &request_id, &err),
-            }
+            send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
         }
         Err(err) => match err.downcast_ref::<boss_protocol::OperatorQuestionError>() {
             Some(error) => send_response(
@@ -591,7 +586,7 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
                 ?reason,
                 "board drop is a reorder; leaving status unchanged",
             );
-            match ctx.work_db.get_work_item_for_display(&id) {
+            match ctx.work_db.get_work_item(&id) {
                 Ok(item) => send_response_with_revision(
                     &ctx.sink,
                     &ctx.request_id,
@@ -648,9 +643,16 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
 
 /// Read the four columns board layout is derived from. Products and projects
 /// have no board position — they are not cards — so a drop naming one is an
-/// error rather than a silently ignored no-op.
+/// error rather than a silently ignored no-op. A revision that is `in_review`
+/// or `done` is folded into its parent's card and is not a card either.
 fn board_row_for_id(work_db: &WorkDb, id: &str) -> Result<BoardRow> {
-    match work_db.get_work_item_for_display(id)? {
+    match work_db.get_work_item(id)? {
+        WorkItem::Task(task) | WorkItem::Chore(task)
+            if task.kind == boss_protocol::TaskKind::Revision
+                && matches!(task.status, TaskStatus::InReview | TaskStatus::Done) =>
+        {
+            bail!("{id} is a revision rolled up into its parent card: it has no board position")
+        }
         WorkItem::Task(task) | WorkItem::Chore(task) => Ok(BoardRow {
             status: task.status,
             autostart: task.autostart,
@@ -1202,15 +1204,7 @@ pub(super) async fn apply_work_item_patch(
                     // "dragged it and nothing happened" shape.
                     send_work_error(&sink, &request_id, reason);
                 } else {
-                    match work_db.project_work_item_for_display(item) {
-                        Ok(item) => send_response_with_revision(
-                            &sink,
-                            &request_id,
-                            revision,
-                            FrontendEvent::WorkItemUpdated { item },
-                        ),
-                        Err(err) => send_work_error(&sink, &request_id, &err),
-                    }
+                    send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
                 }
             }
             Err(err) => {
@@ -1655,12 +1649,7 @@ pub(super) async fn handle_set_task_doc_pointer(ctx: Dispatch, req: FrontendRequ
                 vec![work_item_id(&item)],
             )
             .await;
-            match work_db.project_work_item_for_display(item) {
-                Ok(item) => {
-                    send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item })
-                }
-                Err(err) => send_work_error(&sink, &request_id, &err),
-            }
+            send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
         }
         Err(err) => send_work_error(&sink, &request_id, &err),
     }

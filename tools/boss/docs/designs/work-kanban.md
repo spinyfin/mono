@@ -367,9 +367,24 @@ move it out — in particular:
 - any execution on the cycle root entering `running` never moves a cycle root that has
   already reached `in_review`.
 
-A revision moves independently of its parent. Active implementation is a standalone Doing card. A completed implementation held for automated review keeps stored status `active` but displays a standalone Review card using the chain root’s Review section, PR state, CI/AI indicators and review-phase block. The displayed position also governs gestures and mutation replies; same-column reorders never lift the durable hold. Only done revisions roll up into the parent footer (`doneRevisions`).
+A revision's own row moves through its own statuses independently of its
+parent — the parent surfaces in-flight revisions to the operator through
+`has_in_progress_revision` and the Review-lane rollup (`inReviewRevisions`),
+never by leaving Review itself. Per
+[`revision-tasks.md`](revision-tasks.md): "On success the revision row
+flips to `in_review`; the parent's status is untouched."
 
-Starting a new explicit implementation execution returns that revision to Doing. An automated review does not restart it or move its root out of Review. Delivered held revisions do not set the root’s implementation-in-progress indicator; merge admission continues to use persisted status. See [revision tasks](revision-tasks.md).
+A revision whose implementation run has finished is held `active` in Doing
+while the automated review of its pushed commit runs (see
+[`revision-tasks.md`](revision-tasks.md) § Doing while the PR's AI review
+runs). The engine groups it as Reviewing, not Queued, for as long as that
+review is running; it never gets a Review card. Once the review is
+consolidated it is `in_review` and folds into the parent's card.
+
+A `kind = revision` row is not a cycle root and is outside this contract:
+`start_execution_run` still advances it from `in_review` to `active` on its
+own re-dispatch when it has no live revision child, because revisions rest in
+Review between attempts; see that function's rationale comment.
 
 A review pass MAY hold a row that has not yet reached `in_review` — the
 `PendingReview` outcome in

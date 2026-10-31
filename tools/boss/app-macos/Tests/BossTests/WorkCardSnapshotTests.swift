@@ -1472,7 +1472,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         XCTAssertTrue(snap.hasPRRow)
     }
 
-    func testDoneRevisionsParticipateInEquality() {
+    func testInReviewRevisionsParticipateInEquality() {
         let task = Self.makeTask()
         let rollup = WorkCardRevisionRollup(
             id: "rev_1",
@@ -1482,14 +1482,14 @@ final class WorkCardSnapshotTests: XCTestCase {
         )
         let with = WorkCardSnapshot.build(
             task: task,
-            context: WorkCardSnapshotContext(column: .review, doneRevisions: [rollup])
+            context: WorkCardSnapshotContext(column: .review, inReviewRevisions: [rollup])
         )
         let without = WorkCardSnapshot.build(
             task: task,
-            context: WorkCardSnapshotContext(column: .review, doneRevisions: [])
+            context: WorkCardSnapshotContext(column: .review, inReviewRevisions: [])
         )
-        XCTAssertTrue(with.hasDoneRevisions)
-        XCTAssertFalse(without.hasDoneRevisions)
+        XCTAssertTrue(with.hasInReviewRevisions)
+        XCTAssertFalse(without.hasInReviewRevisions)
         XCTAssertNotEqual(with, without)
     }
 
@@ -2069,6 +2069,26 @@ final class WorkCardSnapshotTests: XCTestCase {
         let live = Self.makeLiveState(liveStatus: "Resolving")
         XCTAssertNil(WorkCardLiveStatus.resolve(
             task: task, column: .doing, runtime: nil, liveState: live
+        ))
+    }
+
+    /// A held card whose reviewers live on another work item (a revision's
+    /// PR review is bound to the chain root) still says it is in AI review.
+    func testLiveStatusNamesAIReviewWhenCardHasNoWorkerOfItsOwn() {
+        var task = Self.makeTask(status: "active")
+        task.aiReviewing = true
+        task.aiReviewStage = "reviewers"
+        XCTAssertEqual(
+            WorkCardLiveStatus.resolve(task: task, column: .doing, runtime: nil, liveState: nil),
+            "AI review in progress"
+        )
+        task.aiReviewStage = "consolidation"
+        XCTAssertEqual(
+            WorkCardLiveStatus.resolve(task: task, column: .doing, runtime: nil, liveState: nil),
+            "Consolidating review findings"
+        )
+        XCTAssertNil(WorkCardLiveStatus.resolve(
+            task: task, column: .doing, runtime: nil, liveState: Self.makeLiveState(liveStatus: "Reading")
         ))
     }
 
