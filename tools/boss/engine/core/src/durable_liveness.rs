@@ -83,7 +83,7 @@ use crate::work::WorkDb;
 /// different (and much louder) problem that belongs to
 /// [`crate::stale_worker_sweep`] and [`crate::husk_pane_sweep`], not to a
 /// guard whose only job is "don't double-dispatch onto a live process".
-pub const REDISPATCH_PID_TRUST_SECS: i64 = 3600;
+pub use crate::work::REDISPATCH_PID_TRUST_SECS;
 
 /// A `Gone` (`kill(pid, 0) == ESRCH`) verdict from a durable-pid probe is
 /// only trusted if the execution has ALSO gone quiet for at least this long.

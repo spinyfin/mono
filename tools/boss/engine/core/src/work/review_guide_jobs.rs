@@ -638,15 +638,6 @@ impl WorkDb {
         }
     }
 
-    /// Sweep pass over every non-terminal attempt; see
-    /// [`Self::reconcile_pr_review_guide_attempts_with_live_runs`]. Callers
-    /// with no liveness evidence of their own (the periodic terminal-work
-    /// sweep) still get the durable process probe applied to every
-    /// `orphaned` execution.
-    pub(crate) fn reconcile_pr_review_guide_attempts(&self) -> Result<usize> {
-        self.reconcile_pr_review_guide_attempts_with_live_runs(&HashSet::new())
-    }
-
     /// Startup / sweep pass over every non-terminal attempt.
     ///
     /// - An attempt bound to an execution that has reached a terminal status
@@ -659,7 +650,7 @@ impl WorkDb {
     ///   closed in the meantime would leave that re-adopted run with nothing
     ///   to submit its guide to (a guide run still working after an engine
     ///   restart would otherwise have no running attempt to submit to). "Live" is the
-    ///   durable pid probe ([`crate::durable_liveness`]) or the caller's own
+    ///   injected bounded process observation or the caller's own
     ///   evidence in `known_live_execution_ids` — startup passes the
     ///   executions the tmux adoption pass just observed alive. A genuinely
     ///   stranded attempt (no live process) is still finished.
@@ -673,6 +664,7 @@ impl WorkDb {
     pub(crate) fn reconcile_pr_review_guide_attempts_with_live_runs(
         &self,
         known_live_execution_ids: &HashSet<String>,
+        execution_is_alive: &dyn Fn(&str) -> bool,
     ) -> Result<usize> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(&format!(
@@ -741,15 +733,7 @@ impl WorkDb {
                 let liveness = if known_live_execution_ids.contains(&execution_id) {
                     Some("observed_live_by_caller")
                 } else {
-                    // Bounded by the pid-reuse trust window: a recycled pid
-                    // must not keep a truly dead run's attempt open forever.
-                    let process = crate::durable_liveness::probe_execution_worker_within(
-                        self,
-                        &execution_id,
-                        crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
-                        boss_engine_utils::epoch_time::now_epoch_secs(),
-                    );
-                    process.alive_pid().is_some().then(|| process.reason())
+                    execution_is_alive(&execution_id).then_some("observed_live_by_process_observer")
                 };
                 if let Some(evidence) = liveness {
                     tracing::info!(

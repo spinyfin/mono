@@ -1,5 +1,9 @@
 use super::*;
 
+/// Maximum age of local PID records used to prevent duplicate dispatch.
+/// Older records may refer to recycled process IDs.
+pub const REDISPATCH_PID_TRUST_SECS: i64 = 3600;
+
 /// Shared column list for the tmux run handle queries below. Joined against
 /// `work_executions` so the adoptability predicate can filter on execution
 /// status.
@@ -906,7 +910,7 @@ impl WorkDb {
     /// for `execution_id` — the number `persist_tmux_identity_after_observation`
     /// stamps into `tmux_pane_pid`, which is a stored observation, not a live
     /// handle: callers that need to know whether the process behind it is
-    /// still alive must still probe it (`durable_liveness::probe_recorded_pid`),
+    /// still alive must obtain a process observation from the host,
     /// never trust the stored value on its own.
     pub fn latest_local_tmux_pane_pid_for_execution(&self, execution_id: &str) -> Result<Option<i64>> {
         self.latest_local_pane_pid_snapshot_for_execution(execution_id)
@@ -1015,7 +1019,7 @@ impl WorkDb {
     /// `max_age_secs` bounds pid reuse. A recorded pid is only meaningful while
     /// the OS has not recycled it, so a caller must state how far back it is
     /// willing to trust the number; see
-    /// [`crate::durable_liveness::REDISPATCH_PID_TRUST_SECS`] for the value the
+    /// [`super::REDISPATCH_PID_TRUST_SECS`] for the value the
     /// re-dispatch guard uses and why. Rows older than that are not returned at
     /// all, so a caller can never act on a pid this table can no longer vouch
     /// for.
