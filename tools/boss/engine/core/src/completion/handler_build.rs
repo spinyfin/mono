@@ -388,7 +388,7 @@ impl WorkerCompletionHandler {
                 tracing::warn!(?error, "review-guide capture task failed");
             }
             if let Ok(root) = db.review_guide_source_root_for_execution(&execution_id) {
-                crate::execution_publisher::notify_review_guide_changed(
+                crate::review_verdict_apply_sweep::publication::notify_review_guide_changed(
                     &db,
                     &publisher,
                     &root,

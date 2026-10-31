@@ -96,7 +96,7 @@ pub struct PrReviewGuideAttempt {
     #[builder(default)]
     pub failed_pre_start: bool,
     /// Identity of the engine build that recorded the failure (the one
-    /// installed through [`install_engine_build_identity`]). `None` for
+    /// configured on this database handle). `None` for
     /// attempts that did not fail, or failed before this column existed or
     /// with no identity installed (their build is unknowable, so they are
     /// never retried).
@@ -180,26 +180,6 @@ pub enum RetryReviewGuideOutcome {
     /// No source series/comparison exists yet for this root task — retry has
     /// nothing to regenerate from.
     NoComparison,
-}
-
-/// Identity of the engine build, installed once at startup by the composition
-/// root. Storage cannot read engine provenance itself, and the review-guide
-/// failure paths that need it (execution terminalization, attempt reconcile)
-/// run too deep to thread a parameter through. Like the engine's other
-/// process-wide stamps, the first installation wins and it never changes.
-static ENGINE_BUILD_IDENTITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-/// Install the running engine build's identity. Failures recorded afterwards
-/// carry it, so a later build can retry a guide this one failed to start
-/// ([`WorkDb::reenqueue_pre_start_failed_review_guides`]). Until it is
-/// installed, failures record no build and are never retried automatically —
-/// the same treatment as a failure that predates the column.
-pub fn install_engine_build_identity(build: &str) {
-    let _ = ENGINE_BUILD_IDENTITY.set(build.to_owned());
-}
-
-fn engine_build_identity() -> Option<&'static str> {
-    ENGINE_BUILD_IDENTITY.get().map(String::as_str)
 }
 
 /// What a failure records beyond the error text: whether it happened before
@@ -490,9 +470,9 @@ impl WorkDb {
     /// flip `guide_lifecycle` to `failed` — a newer published guide must
     /// not be downgraded by late output from an obsolete run.
     ///
-    /// Records the build installed through [`install_engine_build_identity`].
+    /// Records the build configured on this database handle.
     pub fn fail_pr_review_guide_attempt(&self, attempt_id: &str, error: &str) -> Result<()> {
-        self.fail_pr_review_guide_attempt_for_build(attempt_id, error, false, engine_build_identity())
+        self.fail_pr_review_guide_attempt_for_build(attempt_id, error, false, self.engine_build_identity.as_deref())
     }
 
     /// [`Self::fail_pr_review_guide_attempt`] for a failure that happened
@@ -500,7 +480,7 @@ impl WorkDb {
     /// build) so [`Self::reenqueue_pre_start_failed_review_guides`] can retry
     /// the attempt once a different build is running.
     pub fn fail_pr_review_guide_attempt_pre_start(&self, attempt_id: &str, error: &str) -> Result<()> {
-        self.fail_pr_review_guide_attempt_for_build(attempt_id, error, true, engine_build_identity())
+        self.fail_pr_review_guide_attempt_for_build(attempt_id, error, true, self.engine_build_identity.as_deref())
     }
 
     /// [`Self::fail_pr_review_guide_attempt`] with the failing build named by
@@ -1368,7 +1348,7 @@ pub(super) fn publish_pr_review_guide_version_in_tx(
 /// (`WorkDb::readopt_inferred_terminal_execution`), the attempt has to come
 /// back with it, or the live worker has nothing to submit its guide to. The
 /// same reversal lets a guide submitted while the attempt was wrongly closed
-/// be recovered (`crate::review_guide_validation::recover_orphaned_submissions`).
+/// be recovered (`crate::review_verdict_apply_sweep::guide_validation::recover_orphaned_submissions`).
 ///
 /// Only an attempt that failed after a worker ran (`failed_pre_start = 0`),
 /// whose comparison is still the series' selected one at the same request

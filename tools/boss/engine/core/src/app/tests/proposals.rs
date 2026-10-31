@@ -2678,7 +2678,7 @@ async fn review_guide_submission_publishes_for_its_attributed_codex_execution() 
         ProposalKind::ReviewGuide,
         &validated.canonical_json,
     );
-    let persisted = crate::review_guide_validation::submit_worker_proposal(
+    let persisted = crate::review_verdict_apply_sweep::guide_validation::submit_worker_proposal(
         db,
         crate::work::SubmitWorkerProposalInput {
             execution_id: &execution.id,
