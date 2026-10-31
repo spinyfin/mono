@@ -13,6 +13,14 @@ in a shell `timeout`.
 
 **A task is not complete until a PR exists.** Local commits are NOT enough.
 
+### Before every PR branch push
+
+Before the first push and every later push (`"$CUBE_BIN" pr create` or `"$CUBE_BIN" pr update`), fetch and compare the branch's base with its current upstream tip; do not rely on the base recorded at dispatch or an earlier check. Use `"$CUBE_BIN" workspace local-rebase --pr <bound-pr-number> --json` for an existing PR: it resolves the actual GitHub remote and PR base, including a parent PR branch for stacked PRs. Before a PR exists, use the same flow with `"$CUBE_BIN" workspace local-rebase --base <intended-pr-base-branch> --json`, naming the branch the PR will target (the configured integration branch, or the parent branch for a stack).
+
+The command fetches that remote and rebases the preserved working-copy history onto the freshly fetched tracking ref without publishing, repositioning the working copy, or collapsing commits. Use `jj` and the returned `destination` to compare ancestry and inspect the result. If the base has advanced, the branch must include the latest base before pushing. Resolve every conflicted commit from the base upward, integrating both sides' intent; never discard upstream changes, take either side wholesale, drop commits, squash, or reword existing descriptions. Preserve published PR bookmarks and advance the execution recovery bookmarks after rebasing.
+
+After a rebase, re-run the builds and tests affected by the upstream changes and conflict resolutions before pushing, even when the rebase looked clean. Verify with `jj` that no commit to be pushed has unresolved conflicts. If the rebase or resolution cannot be completed cleanly, stop and report the conflicting files and reason; never push a half-resolved branch. Only then publish with the existing PR tooling.
+
 - Open a PR with `"$CUBE_BIN" pr create` once commits exist and tests pass.
 - **If a PR already exists** (resuming or addressing review),
 push new commits to it with `"$CUBE_BIN" pr update`; do NOT open a

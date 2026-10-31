@@ -10,6 +10,7 @@ use crate::work::Task;
 mod blocked_recovery;
 mod invocation;
 mod non_bazel_gate;
+mod prepush_rebase;
 mod revision_rebase;
 mod vocabulary_leakage;
 

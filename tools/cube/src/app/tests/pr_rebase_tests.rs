@@ -5,30 +5,19 @@ use std::path::PathBuf;
 
 #[test]
 fn local_rebase_fetches_github_base_and_preserves_current_and_sibling_published_heads() {
-    for base in ["main", "parent-pr"] {
+    for (base, existing_pr) in [
+        ("main", true),
+        ("parent-pr", true),
+        ("main", false),
+        ("parent-pr", false),
+    ] {
         let cwd = PathBuf::from("/ws");
         let ok = |args: &[&str], output: &str| ExpectedCommand::ok(cwd.clone(), "jj", args, output);
         let destination = format!("\"{base}\"@\"github\"");
-        let runner = FakeRunner::new(vec![
+        let mut commands = vec![
             ok(
                 &["git", "remote", "list"],
                 "origin /stale/mirror\ngithub git@github.com:org/repo.git\n",
-            ),
-            ExpectedCommand::ok(
-                cwd.clone(),
-                "gh",
-                &[
-                    "pr",
-                    "view",
-                    "77",
-                    "-R",
-                    "org/repo",
-                    "--json",
-                    "baseRefName",
-                    "--jq",
-                    ".baseRefName",
-                ],
-                base,
             ),
             ok(&["git", "fetch", "--remote", "github"], ""),
             ok(&["git", "import"], ""),
@@ -63,8 +52,37 @@ fn local_rebase_fetches_github_base_and_preserves_current_and_sibling_published_
                 ],
                 "cccc conflicts=false\n",
             ),
-        ]);
-        let result = crate::app::workspace_local_rebase::rebase_at(&runner, None, &cwd, 77).unwrap();
+        ];
+        if existing_pr {
+            commands.insert(
+                1,
+                ExpectedCommand::ok(
+                    cwd.clone(),
+                    "gh",
+                    &[
+                        "pr",
+                        "view",
+                        "77",
+                        "-R",
+                        "org/repo",
+                        "--json",
+                        "baseRefName",
+                        "--jq",
+                        ".baseRefName",
+                    ],
+                    base,
+                ),
+            );
+        }
+        let runner = FakeRunner::new(commands);
+        let result = crate::app::workspace_local_rebase::rebase_at(
+            &runner,
+            None,
+            &cwd,
+            existing_pr.then_some(77),
+            (!existing_pr).then_some(base),
+        )
+        .unwrap();
         runner.assert_exhausted();
         assert_eq!(result.payload["destination"], destination);
         assert_eq!(result.payload["base_branch"], base);

@@ -405,6 +405,7 @@ fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir
          \n\
          **A task is not complete until a PR exists.** Local commits are NOT enough.\n\
          \n\
+         {prepush_rebase}\
          - Open a PR with `{cube} pr create` once commits exist and tests pass.\n\
          - **If a PR already exists** (resuming or addressing review),\n\
            push new commits to it with `{cube} pr update`; do NOT open a\n\
@@ -694,6 +695,14 @@ fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir
          Messages may arrive between turns. Treat them as questions from a\n\
          human reviewer — short, specific answers.\n\
          {draft_directive}",
+        prepush_rebase = if matches!(
+            input.execution_kind.as_str(),
+            "task_implementation" | "chore_implementation" | "project_design" | "investigation_implementation"
+        ) {
+            crate::prompt_fragments::prepush_rebase_fragment()
+        } else {
+            String::new()
+        },
         absolute_paths = crate::prompt_fragments::absolute_paths_fragment(),
         boss = boss,
         cube = cube,
