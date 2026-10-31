@@ -84,7 +84,7 @@ struct EngineRevisionBadge: View {
     }
 }
 
-/// One rollup line in a Review-lane parent card for an in-review revision.
+/// One done-revision rollup line in its parent card’s footer.
 /// Shows `⟳ R<n>  <description truncated>  ↗` linking to the parent PR.
 /// Consumes [[WorkCardRevisionRollup]] so the card body never needs a
 /// full `WorkTask` for nested rollups.

@@ -1207,23 +1207,13 @@ final class ChatViewModel: ObservableObject {
     /// full graph walk per event.
     var cachedDependencyPrereqs: [String: [WorkDependencyRow]]?
     var cachedGatingPrereqs: [String: [WorkDependencyRow]]?
-    /// Backing storage for `inReviewRevisions(forParentTaskID:)` /
-    /// `doneRevisions(forParentTaskID:)` (ChatViewModel+BoardHelpers). `nil`
-    /// means "invalidated — rebuild on next read". Before this cache
-    /// existed, both accessors re-scanned every project's tasks and every
-    /// product's revisions on EVERY call, and the kanban calls both once
-    /// per visible card on every render. Any broad `@Published` change on
-    /// this view model re-renders the whole board, so without this cache
-    /// each such change re-runs an O(total tasks) scan once per card — a
-    /// measured main-thread hot leaf during hover-while-scroll jank.
-    /// Rebuilt lazily, same pattern as `cachedGatingPrereqs`.
-    var cachedInReviewRevisionsByParentID: [String: [WorkTask]]?
+    /// Completed-revision footer cache, rebuilt lazily after revision updates.
     var cachedDoneRevisionsByParentID: [String: [WorkTask]]?
     /// Backing storage for `workBoardRepoMode` (ChatViewModel+BoardHelpers).
     /// `nil` means "invalidated — rebuild on next read". `WorkBoardRepoMode.compute`
     /// scans every visible card and used to re-run on each kanban render/scroll
     /// frame as a top-of-stack main-thread leaf; same pattern as
-    /// `cachedInReviewRevisionsByParentID`.
+    /// `cachedDoneRevisionsByParentID`.
     var cachedWorkBoardRepoMode: WorkBoardRepoMode?
 
     /// When true, published work-input `didSet` observers skip the blanket
@@ -1244,7 +1234,7 @@ final class ChatViewModel: ObservableObject {
         static let taskIndex = WorkCacheInvalidation(rawValue: 1 << 1)
         /// Dependency / gating prereq graphs.
         static let dependencies = WorkCacheInvalidation(rawValue: 1 << 2)
-        /// In-review / done revision rollup caches.
+        /// Done-revision rollup cache.
         static let revisions = WorkCacheInvalidation(rawValue: 1 << 3)
 
         static let all: WorkCacheInvalidation = [
@@ -1278,7 +1268,6 @@ final class ChatViewModel: ObservableObject {
             cachedGatingPrereqs = nil
         }
         if keys.contains(.revisions) {
-            cachedInReviewRevisionsByParentID = nil
             cachedDoneRevisionsByParentID = nil
         }
     }

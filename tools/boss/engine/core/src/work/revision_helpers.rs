@@ -427,17 +427,34 @@ pub(crate) fn attach_revision_projections(mut tasks: Vec<Task>, chores: &[Task])
 /// `kind = "revision"` tasks, never chores). The chain root can live in
 /// either `tasks` or `chores`, so both slices are mutated.
 ///
-/// Status rule: a revision counts when [`TaskStatus::can_still_change_pr`]
-/// holds (`todo`, `active`, `blocked`) — the same predicate the
-/// merge-when-ready gate (`open_merge_revisions`) uses, so the badge shows
-/// exactly when merging would warn. `in_review` means the revision's commit
-/// has already landed on the PR branch — NOT a merge blocker. `done`,
-/// `archived` and deleted revisions likewise don't trigger the flag.
+/// Delivered held revisions wait on review rather than implementation, so
+/// exclude them from this presentation flag. Merge admission independently
+/// checks stored status and continues to gate held revisions.
+/// Also sets in_revision_blocked_only when every counted revision is blocked.
 ///
-/// Also sets `in_revision_blocked_only` when every counted revision for a
-/// root is `blocked`, so the card can show the badge as blocked rather than
-/// as running work.
+/// `held` is the pass-wide held-revision set (see
+/// [`super::revision_review_card::held_revision_ids`]). Returns the chain
+/// roots that have a held revision: they are not "in revision", but they are
+/// not ready for the operator either, so [`attach_ready_for_review_flag_excluding`]
+/// must keep them out of Ready.
+pub(super) fn attach_display_revision_flag(
+    tasks: &mut [Task],
+    chores: &mut [Task],
+    held: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    attach_revision_flag(tasks, chores, held)
+}
+
+#[cfg(test)]
 pub(crate) fn attach_in_progress_revision_flag(tasks: &mut [Task], chores: &mut [Task]) {
+    attach_revision_flag(tasks, chores, &std::collections::HashSet::new());
+}
+
+fn attach_revision_flag(
+    tasks: &mut [Task],
+    chores: &mut [Task],
+    held: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
     // Build a compact lookup: id → (kind, parent_task_id) for chain walking.
     let mut lookup: std::collections::HashMap<String, (TaskKind, Option<String>)> = std::collections::HashMap::new();
     for t in tasks.iter().chain(chores.iter()) {
@@ -463,18 +480,23 @@ pub(crate) fn attach_in_progress_revision_flag(tasks: &mut [Task], chores: &mut 
 
     // root id → whether any of its open revisions is running (not blocked).
     let mut open_roots: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut held_roots: std::collections::HashSet<String> = std::collections::HashSet::new();
     for t in tasks.iter() {
         if t.kind == TaskKind::Revision
             && t.status.can_still_change_pr()
             && let Some(root_id) = walk_to_root(&t.id, &lookup)
         {
+            if held.contains(&t.id) {
+                held_roots.insert(root_id);
+                continue;
+            }
             let running = t.status != TaskStatus::Blocked;
             *open_roots.entry(root_id).or_insert(false) |= running;
         }
     }
 
     if open_roots.is_empty() {
-        return;
+        return held_roots;
     }
 
     for task in tasks.iter_mut() {
@@ -491,6 +513,7 @@ pub(crate) fn attach_in_progress_revision_flag(tasks: &mut [Task], chores: &mut 
             chore.in_revision_blocked_only = !running;
         }
     }
+    held_roots
 }
 
 // ── Ready-for-review flag ────────────────────────────────────────────────────
@@ -501,7 +524,7 @@ pub(crate) fn attach_in_progress_revision_flag(tasks: &mut [Task], chores: &mut 
 /// every required CI check green, and no merge conflict with the base
 /// branch.
 ///
-/// Called by `get_work_tree` after [`attach_in_progress_revision_flag`], so
+/// Called by `get_work_tree` after [`attach_display_revision_flag`], so
 /// `has_in_progress_revision` is already populated. Reads only fields
 /// already loaded onto `Task` by the `get_work_tree` SQL — no extra query.
 ///
@@ -516,9 +539,23 @@ pub(crate) fn attach_in_progress_revision_flag(tasks: &mut [Task], chores: &mut 
 /// ready. A still-running (`"in_progress"`) or not-yet-polled (`None`/
 /// `"unknown"`) CI state is treated as NOT ready — there's nothing to
 /// merge yet.
+#[cfg(test)]
 pub(crate) fn attach_ready_for_review_flag(tasks: &mut [Task], chores: &mut [Task]) {
+    attach_ready_for_review_flag_excluding(tasks, chores, &std::collections::HashSet::new());
+}
+
+/// As the test-only plain variant, additionally refusing roots in
+/// `held_roots` (chains with a delivered revision still held for review):
+/// merge admission treats that revision as open, so the root is not waiting
+/// on the operator alone.
+pub(crate) fn attach_ready_for_review_flag_excluding(
+    tasks: &mut [Task],
+    chores: &mut [Task],
+    held_roots: &std::collections::HashSet<String>,
+) {
     for task in tasks.iter_mut().chain(chores.iter_mut()) {
         task.ready_for_review = task.status == TaskStatus::InReview
+            && !held_roots.contains(&task.id)
             && task.pr_url.is_some()
             && task.blocked_reason.is_none()
             && !task.has_in_progress_revision
@@ -545,9 +582,8 @@ pub(crate) fn attach_ready_for_review_flag(tasks: &mut [Task], chores: &mut [Tas
 /// revision derives `ai_reviewing = false` / `ai_review_state = None` even
 /// while the root has reviewer workers actively running against it.
 ///
-/// A revision not currently `active` (`todo`, or already `in_review`/`done`,
-/// which roll up into the parent's card — see `revision-tasks.md`) has no
-/// entry. A broken chain fails closed to own-id attribution.
+/// Active and in-review revisions share the cycle root's live reviewers.
+/// Other revision states have no entry. A broken chain uses own-id attribution.
 fn review_execution_target_ids(
     conn: &Connection,
     tasks: &[Task],
@@ -573,7 +609,7 @@ fn review_execution_target_ids_with(
         .chain(chores.iter())
         .filter_map(|row| {
             let targets = if row.kind == TaskKind::Revision {
-                if row.status != TaskStatus::Active {
+                if !matches!(row.status, TaskStatus::Active | TaskStatus::InReview) {
                     return None;
                 }
                 // Same answer `chain_root` gives for a chain that is wholly
@@ -1427,13 +1463,18 @@ fn query_review_guide_card_states(
 /// `GetWorkItem`. Chain loading errors (BFS / point reads) propagate:
 /// those are the same class of failure as the row read itself.
 pub(crate) fn attach_task_derived_projections(conn: &Connection, task: &mut Task, caller: &str) -> Result<()> {
-    attach_task_derived_projections_labeled(conn, task, caller).1
+    attach_task_derived_projections_labeled(conn, task, caller, false).1
+}
+
+pub(super) fn attach_task_display_projections(conn: &Connection, task: &mut Task, caller: &str) -> Result<()> {
+    attach_task_derived_projections_labeled(conn, task, caller, true).1
 }
 
 fn attach_task_derived_projections_labeled(
     conn: &Connection,
     task: &mut Task,
     caller: &str,
+    display: bool,
 ) -> (crate::population_timing::PopulationTrace, Result<()>) {
     use crate::population_timing::{PopulationTrace, elapsed_ms, global};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1446,7 +1487,7 @@ fn attach_task_derived_projections_labeled(
         None,
         started,
     );
-    let result = attach_task_derived_projections_traced(conn, task, &mut trace);
+    let result = attach_task_projections_traced(conn, task, &mut trace, display);
     trace.record_plain("single_item.total", elapsed_ms(started));
     if let Some(log) = global() {
         trace.flush(log);
@@ -1460,23 +1501,29 @@ pub(crate) fn attach_task_derived_projections_for_test(
     task: &mut Task,
     caller: &str,
 ) -> Result<crate::population_timing::PopulationTrace> {
-    let (trace, result) = attach_task_derived_projections_labeled(conn, task, caller);
+    let (trace, result) = attach_task_derived_projections_labeled(conn, task, caller, false);
     result?;
     Ok(trace)
 }
 
 /// Records one single-item derivation, including the loaded chain's size
 /// and the review stage's actual card and SQL statement counts.
-pub(crate) fn attach_task_derived_projections_traced(
+fn attach_task_projections_traced(
     conn: &Connection,
     task: &mut Task,
     trace: &mut crate::population_timing::PopulationTrace,
+    display: bool,
 ) -> Result<()> {
     let (mut tasks, mut chores) = load_chain_slices_for_projection(conn, task)?;
     trace.set_items(tasks.len() + chores.len());
     tasks = attach_revision_projections(tasks, &chores);
-    attach_in_progress_revision_flag(&mut tasks, &mut chores);
-    attach_ready_for_review_flag(&mut tasks, &mut chores);
+    let held = if display {
+        super::revision_review_card::held_revision_ids(conn)
+    } else {
+        std::collections::HashSet::new()
+    };
+    let held_roots = attach_display_revision_flag(&mut tasks, &mut chores, &held);
+    attach_ready_for_review_flag_excluding(&mut tasks, &mut chores, &held_roots);
     if let Err(err) = attach_ai_reviewing_flag(conn, &mut tasks, &mut chores) {
         tracing::warn!(
             ?err,
@@ -1519,13 +1566,22 @@ pub(crate) fn attach_task_derived_projections_traced(
             "attach_task_derived_projections: review_guide_state failed; ignoring"
         );
     }
+    super::revision_review_card::attach(&mut tasks, &chores, display.then_some(&held));
     if let Some(projected) = tasks.iter().chain(chores.iter()).find(|t| t.id == task.id) {
-        copy_derived_projection_fields(task, projected);
+        copy_derived_projection_fields(task, projected, display);
     }
     Ok(())
 }
 
-fn copy_derived_projection_fields(dst: &mut Task, src: &Task) {
+fn copy_derived_projection_fields(dst: &mut Task, src: &Task, display: bool) {
+    if dst.kind == TaskKind::Revision && (display || dst.status == TaskStatus::InReview) {
+        if display {
+            dst.status = src.status.clone();
+            dst.blocked_reason = src.blocked_reason.clone();
+            dst.blocked_detail = src.blocked_detail.clone();
+        }
+        super::revision_review_card::copy_review_fields(dst, src);
+    }
     dst.revision_seq = src.revision_seq;
     dst.revision_parent_pr_url = src.revision_parent_pr_url.clone();
     dst.has_in_progress_revision = src.has_in_progress_revision;
@@ -1534,6 +1590,7 @@ fn copy_derived_projection_fields(dst: &mut Task, src: &Task) {
     dst.ai_reviewing = src.ai_reviewing;
     dst.ai_review_stage = src.ai_review_stage.clone();
     dst.ai_review_state = src.ai_review_state.clone();
+    dst.ai_review_badge = src.ai_review_badge.clone();
     dst.ai_review_findings_revision_id = src.ai_review_findings_revision_id.clone();
     dst.ready_for_review = src.ready_for_review;
     dst.review_section = src.review_section;

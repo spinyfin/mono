@@ -1472,7 +1472,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         XCTAssertTrue(snap.hasPRRow)
     }
 
-    func testInReviewRevisionsParticipateInEquality() {
+    func testDoneRevisionsParticipateInEquality() {
         let task = Self.makeTask()
         let rollup = WorkCardRevisionRollup(
             id: "rev_1",
@@ -1482,14 +1482,14 @@ final class WorkCardSnapshotTests: XCTestCase {
         )
         let with = WorkCardSnapshot.build(
             task: task,
-            context: WorkCardSnapshotContext(column: .review, inReviewRevisions: [rollup])
+            context: WorkCardSnapshotContext(column: .review, doneRevisions: [rollup])
         )
         let without = WorkCardSnapshot.build(
             task: task,
-            context: WorkCardSnapshotContext(column: .review, inReviewRevisions: [])
+            context: WorkCardSnapshotContext(column: .review, doneRevisions: [])
         )
-        XCTAssertTrue(with.hasInReviewRevisions)
-        XCTAssertFalse(without.hasInReviewRevisions)
+        XCTAssertTrue(with.hasDoneRevisions)
+        XCTAssertFalse(without.hasDoneRevisions)
         XCTAssertNotEqual(with, without)
     }
 

@@ -719,6 +719,7 @@ mod queued_wait;
 mod read_only_tests;
 mod remediation_state;
 pub(crate) mod remote_input_cleanup;
+mod revision_review_card;
 pub(crate) use feedback_target::FeedbackTarget;
 mod connection_wait;
 pub(crate) mod db_diagnostics;

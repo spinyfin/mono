@@ -86,12 +86,14 @@ pub(super) fn attach_board_derivations(
     // Compute has_in_progress_revision for every chain-root task that
     // has at least one descendant revision that
     // `TaskStatus::can_still_change_pr`.
-    attach_in_progress_revision_flag(&mut tasks, chores);
+    // One held-set read per pass, shared with the review-card projection.
+    let held = super::revision_review_card::held_revision_ids(conn);
+    let held_roots = attach_display_revision_flag(&mut tasks, chores, &held);
     // Compute ready_for_review for every Review-lane task that is
     // waiting on the operator and nothing else (no block, no
     // in-progress revision, CI green, no merge conflict). Must run
     // after attach_in_progress_revision_flag, which it reads.
-    attach_ready_for_review_flag(&mut tasks, chores);
+    attach_ready_for_review_flag_excluding(&mut tasks, chores, &held_roots);
     trace.record_plain(segment::ASSEMBLE, elapsed_ms(t));
 
     // Compute ai_reviewing for tasks held in Doing while a pr_review
@@ -187,6 +189,7 @@ pub(super) fn attach_board_derivations(
         (resolved, queries)
     };
     trace.record_nplus1(segment::DB_DOC_POINTERS, elapsed_ms(t), resolved, doc_pointer_queries);
+    super::revision_review_card::attach(&mut tasks, chores, Some(&held));
     tasks
 }
 
