@@ -1,5 +1,31 @@
 use super::*;
 
+/// Records the guide's readable pointer at the instant the publisher is
+/// called, so a test can prove the announcement follows the commit.
+struct ReadablePointerProbe {
+    db: Arc<WorkDb>,
+    root_task_id: String,
+    readable_at_publish: std::sync::Mutex<Vec<Option<String>>>,
+}
+
+#[async_trait::async_trait]
+impl ExecutionPublisher for ReadablePointerProbe {
+    async fn publish(&self, _: &str, _: &str, _: &str, _: &str) {}
+
+    async fn publish_work_item_changed(&self, _: &str, _: &str, _: &str) {
+        let summary = self
+            .db
+            .get_pr_review_guide_summary_for_root(&self.root_task_id)
+            .unwrap();
+        self.readable_at_publish
+            .lock()
+            .unwrap()
+            .push(summary.and_then(|summary| summary.readable_version_id));
+    }
+
+    async fn publish_frontend_event_on_product(&self, _: &str, _: boss_protocol::FrontendEvent) {}
+}
+
 /// A dispatched guide with the production Codex launch tuple.
 fn review_guide_execution_fixture(workspace_path: &Path) -> (TempDir, Arc<WorkDb>, String, String, String) {
     let dir = tempdir().unwrap();
@@ -66,7 +92,13 @@ async fn finalize_review_guide_publishes_a_valid_guide_and_advances_the_readable
         "# The Guide\n\n## Orientation\nA plain-language summary.\n## Problem\n## Implementation\n## Example\n## Review\n## Evidence\nNo validation reported.\n",
     );
     assert_eq!(proposal.state, boss_protocol::ProposalState::Applied, "{proposal:?}");
-    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None)).handler;
+    let probe = Arc::new(ReadablePointerProbe {
+        db: db.clone(),
+        root_task_id: root.clone(),
+        readable_at_publish: Default::default(),
+    });
+    let mut handler = TestHarness::new(db.clone(), StubPrDetector::ok(None)).handler;
+    handler.publisher = probe.clone();
     let execution = db.get_execution(&execution_id).unwrap();
 
     let outcome = handler.on_stop(&execution.id).await;
@@ -80,6 +112,11 @@ async fn finalize_review_guide_publishes_a_valid_guide_and_advances_the_readable
     let version_id = summary
         .readable_version_id
         .expect("a published attempt must set the readable version");
+    assert_eq!(
+        *probe.readable_at_publish.lock().unwrap(),
+        vec![Some(version_id.clone())],
+        "the finalizer must commit the readable pointer before announcing it"
+    );
     let version = db.get_pr_review_guide_version(&version_id).unwrap().unwrap();
     assert_eq!(
         version.markdown,

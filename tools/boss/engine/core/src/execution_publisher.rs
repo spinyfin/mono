@@ -100,36 +100,7 @@ pub(crate) async fn notify_review_guide_changed(
 mod tests {
     use super::*;
 
-    use crate::test_support::{
-        RecordingPublisher, create_active_chore, create_product, open_db, seed_review_guide_series,
-    };
-    use crate::work::PublishReviewGuideOutcome;
-
-    /// Records the guide's readable pointer at the instant the publisher is
-    /// called, so a test can prove the announcement follows the commit.
-    struct ReadablePointerProbe {
-        db: WorkDb,
-        root_task_id: String,
-        readable_at_publish: std::sync::Mutex<Vec<Option<String>>>,
-    }
-
-    #[async_trait::async_trait]
-    impl ExecutionPublisher for ReadablePointerProbe {
-        async fn publish(&self, _: &str, _: &str, _: &str, _: &str) {}
-
-        async fn publish_work_item_changed(&self, _: &str, _: &str, _: &str) {
-            let summary = self
-                .db
-                .get_pr_review_guide_summary_for_root(&self.root_task_id)
-                .unwrap();
-            self.readable_at_publish
-                .lock()
-                .unwrap()
-                .push(summary.and_then(|summary| summary.readable_version_id));
-        }
-
-        async fn publish_frontend_event_on_product(&self, _: &str, _: boss_protocol::FrontendEvent) {}
-    }
+    use crate::test_support::{RecordingPublisher, create_active_chore, create_product, open_db};
 
     #[tokio::test]
     async fn publishes_the_root_cards_product_invalidation_with_the_given_reason() {
@@ -156,44 +127,5 @@ mod tests {
         notify_review_guide_changed(&db, &publisher, "task_does_not_exist", "review_guide_failed").await;
 
         assert!(recorder.events.lock().await.is_empty());
-    }
-
-    /// The announcement is made by the caller after storage commits, never
-    /// from inside the transaction: when the publisher runs, a subscriber that
-    /// re-reads the card already sees the published guide.
-    #[tokio::test]
-    async fn the_announcement_follows_the_commit_that_published_the_guide() {
-        let (_dir, db) = open_db();
-        let product = create_product(&db);
-        let root = create_active_chore(&db, &product, "guide publication");
-        let (series_id, comparison_id) = seed_review_guide_series(&db, &root);
-        let attempt = db
-            .create_pr_review_guide_attempt(&series_id, &comparison_id, boss_review_guide::PROMPT_VERSION)
-            .unwrap();
-        let execution = db
-            .create_pr_review_guide_execution(&comparison_id, "acme/widget")
-            .unwrap();
-        db.bind_pr_review_guide_attempt_execution(&attempt.id, &execution.id)
-            .unwrap();
-        let probe = Arc::new(ReadablePointerProbe {
-            db: db.clone(),
-            root_task_id: root.clone(),
-            readable_at_publish: Default::default(),
-        });
-        let publisher: Arc<dyn ExecutionPublisher> = probe.clone();
-
-        let PublishReviewGuideOutcome::Published(version) = db
-            .publish_pr_review_guide_version(&attempt.id, "# Guide\n", "raw")
-            .unwrap()
-        else {
-            panic!("the guide must publish");
-        };
-        notify_review_guide_changed(&db, &publisher, &root, "review_guide_ready").await;
-
-        assert_eq!(
-            *probe.readable_at_publish.lock().unwrap(),
-            vec![Some(version.id)],
-            "a subscriber re-reading on the announcement must see the committed guide"
-        );
     }
 }

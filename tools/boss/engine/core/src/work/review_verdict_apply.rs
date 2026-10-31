@@ -37,8 +37,8 @@ pub(crate) struct ReviewVerdictComparisonInputs {
 /// The observation is fenced against the proposal, reviewed head and comparison inputs on apply.
 pub(crate) struct ReviewVerdictObservation {
     pub inputs: ReviewVerdictComparisonInputs,
-    /// Freshness of a pre-merge target, decided once by the service. `None` when the batch was not
-    /// ready to apply at observation time, or for a post-merge batch.
+    /// Freshness of a pre-merge target, decided once by the service. `None` for a post-merge
+    /// batch, whose target cannot move.
     pub freshness: Option<PreMergeTargetFreshness>,
     pub deletions: Option<Vec<String>>,
 }
@@ -116,10 +116,10 @@ impl WorkDb {
         // unreachable), the proposal stays `proposed` and a later sweep
         // retries it. PostMerge targets are merge commits and cannot move.
         let superseding_head = if batch.phase == boss_protocol::ReviewBatchPhase::PreMerge {
-            let Some(freshness) = observation.freshness.clone() else {
-                // The service observed before this batch was ready; a later sweep observes again.
-                return Ok(None);
-            };
+            let freshness = observation
+                .freshness
+                .clone()
+                .context("pre-merge verdict observation is missing target freshness")?;
             match freshness {
                 PreMergeTargetFreshness::Current => None,
                 PreMergeTargetFreshness::SupersededBy(head) => Some(head),

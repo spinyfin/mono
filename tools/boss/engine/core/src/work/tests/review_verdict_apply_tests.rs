@@ -189,6 +189,28 @@ async fn clean_verdict_advances_the_origin_to_review_without_a_revision() {
         .unwrap()
         .unwrap();
 
+    let error = db
+        .apply_observed_review_verdict_proposal(
+            &outcome.proposal.id,
+            &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+            ReviewVerdictObservation {
+                inputs: db.review_verdict_comparison(&outcome.proposal.id).unwrap(),
+                freshness: None,
+                deletions: Some(vec![]),
+            },
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("pre-merge verdict observation is missing target freshness"),
+        "{error:#}"
+    );
+    assert_eq!(
+        db.worker_proposal(&outcome.proposal.id).unwrap().unwrap().state,
+        ProposalState::Proposed
+    );
+
     // The supervisor has stopped before asynchronous application. Neither
     // the root's status nor a later worker event can refresh this clean pass.
     db.connect()

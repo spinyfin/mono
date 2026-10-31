@@ -153,25 +153,32 @@ impl WorkDb {
     /// The engine's audit trail (`[engine-reconcile]`, `[deferred-scope]`,
     /// `[doc-detector]`, …) is written into the description so the reason the engine acted
     /// stays visible on the card. Services format the line and own the
-    /// marker vocabulary; the read-modify-write stays with storage so no
-    /// caller has to re-enter the connection from a callback. Takes the
-    /// connection only for the duration of each step, so call it after any
-    /// enclosing transaction has committed.
+    /// marker vocabulary. A single SQL update appends to the current value
+    /// under the write lock, preserving concurrent edits and other appends.
+    /// Call it after any enclosing transaction has committed.
     pub fn append_work_item_description_line(&self, work_item_id: &str, line: &str) -> Result<()> {
-        let item = self.get_work_item(work_item_id)?;
-        let current_desc = match &item {
-            WorkItem::Product(p) => p.description.as_str(),
-            WorkItem::Project(p) => p.description.as_str(),
-            WorkItem::Task(t) | WorkItem::Chore(t) => t.description.as_str(),
+        let table = match classify_id(work_item_id)? {
+            ItemKind::Product => "products",
+            ItemKind::Project => "projects",
+            ItemKind::Task => "tasks",
+            ItemKind::Comment | ItemKind::Comparison => bail!("not a work item: {work_item_id}"),
         };
-        let new_desc = format!("{current_desc}{line}");
-        self.update_work_item(
-            work_item_id,
-            WorkItemPatch {
-                description: Some(new_desc),
-                ..WorkItemPatch::default()
-            },
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if table == "tasks" {
+            let task = query_task(&tx, work_item_id).require("task", work_item_id)?;
+            if task.deleted_at.is_some() {
+                bail!("cannot update a deleted task: {work_item_id}");
+            }
+        }
+        let changed = tx.execute(
+            &format!("UPDATE {table} SET description = description || ?2, updated_at = ?3 WHERE id = ?1"),
+            params![work_item_id, line, now_string()],
         )?;
+        if changed == 0 {
+            bail!("unknown work item: {work_item_id}");
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1247,6 +1254,36 @@ mod tests {
             db.append_work_item_description_line("task_that_does_not_exist", "\nx")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn concurrent_description_appends_preserve_every_line() {
+        let (_dir, db) = open_db();
+        let (_execution_id, chore_id) = execution_for_new_chore(&db, "Cleanup");
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for writer in 0..8 {
+                let db = &db;
+                let chore_id = &chore_id;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for line in 0..10 {
+                        db.append_work_item_description_line(chore_id, &format!("\nwriter {writer} line {line}"))
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        let WorkItem::Chore(task) = db.get_work_item(&chore_id).unwrap() else {
+            panic!("expected a chore");
+        };
+        for writer in 0..8 {
+            for line in 0..10 {
+                let expected = format!("writer {writer} line {line}");
+                assert_eq!(task.description.lines().filter(|text| *text == expected).count(), 1);
+            }
+        }
     }
 
     /// The attention item the applier writes must carry the real,
