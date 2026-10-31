@@ -324,6 +324,39 @@ fn waiting_human_migration_backfills_lower_bound_and_survives_reopen() {
 }
 
 #[test]
+fn liveness_observer_runs_after_the_connection_lock_is_released() {
+    let db = WorkDb::open(temp_db_path("stuck-observer-lock")).unwrap();
+    let (_, id, execution) = make_waiting_human_chore(&db, "Observer lock");
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE work_executions SET status = 'orphaned' WHERE id = ?1",
+        [&execution],
+    )
+    .unwrap();
+    conn.execute("UPDATE tasks SET status = 'active' WHERE id = ?1", [&id])
+        .unwrap();
+    conn.execute(
+        "UPDATE work_runs SET shell_pid = ?1, host_id = 'local' WHERE execution_id = ?2",
+        params![std::process::id(), execution],
+    )
+    .unwrap();
+    drop(conn);
+    let calls = std::cell::Cell::new(0);
+    // Re-acquiring the non-reentrant connection lock would deadlock if the
+    // observer ran while `stuck_report` still held it.
+    let report = db
+        .stuck_report(0, now(), &|pid| {
+            calls.set(calls.get() + 1);
+            db.connect().unwrap();
+            pid == Some(i64::from(std::process::id()))
+        })
+        .unwrap();
+    assert_eq!(calls.get(), 1);
+    let entry = report.rows.iter().find(|r| r.work_item_id == id).unwrap();
+    assert_eq!(entry.classification, "S15_orphan_live_pid");
+}
+
+#[test]
 fn orphan_with_durable_live_pid_is_distinguished_from_missing_pid() {
     let db = WorkDb::open(temp_db_path("stuck-orphan-pid")).unwrap();
     let (_, id, execution) = make_waiting_human_chore(&db, "Orphan pid");

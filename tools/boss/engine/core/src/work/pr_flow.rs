@@ -2225,6 +2225,10 @@ pub(super) fn withdraw_questions(conn: &Connection, work_item_id: &str, reason: 
     Ok(())
 }
 
+/// Records the durable stuck classification only. It runs inside the
+/// caller's write transaction, where no host process probe may run, so an
+/// Active task with a live recorded pid reports its durable reason here, not
+/// the report-time S15 override.
 pub(crate) fn insert_question(
     conn: &Connection,
     execution_id: &str,
