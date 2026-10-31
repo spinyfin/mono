@@ -602,6 +602,7 @@ pub(crate) type PooledConnection<'a> = connection_wait::ConnectionGuard<'a>;
 #[builder(on(String, into), builder_type(vis = "pub(self)"), start_fn(vis = "pub(self)"))]
 pub struct WorkDb {
     path: PathBuf,
+    engine_build_identity: Option<String>,
     /// Present only when the database is in-memory (path == ":memory:").
     memory: Option<InMemoryAnchor>,
     /// The single connection this `WorkDb` (and every clone of it) uses for
@@ -639,6 +640,7 @@ impl Clone for WorkDb {
     fn clone(&self) -> Self {
         Self {
             path: self.path.clone(),
+            engine_build_identity: self.engine_build_identity.clone(),
             memory: self.memory.clone(),
             conn: Arc::clone(&self.conn),
             boothby_action: Arc::clone(&self.boothby_action),
@@ -649,6 +651,12 @@ impl Clone for WorkDb {
 }
 
 impl WorkDb {
+    /// Configure provenance for failures recorded by this database handle and its clones.
+    pub fn with_engine_build_identity(mut self, build: &str) -> Self {
+        self.engine_build_identity = Some(build.to_owned());
+        self
+    }
+
     /// The engine-wide metrics [`Registry`](crate::metrics::Registry) this
     /// handle (and every clone of it) publishes into — the same registry
     /// `ServerState` flushes and `bossctl metrics` reads. Sweeps that only
@@ -821,7 +829,7 @@ pub(crate) use products_design::{
 };
 pub(crate) use review_guide_jobs::{
     PrReviewGuideAttempt, PrReviewGuideVersion, PublishReviewGuideOutcome, RetryReviewGuideOutcome,
-    ReviewGuideReenqueueReport, install_engine_build_identity, to_wire_review_guide_summary,
+    ReviewGuideReenqueueReport, to_wire_review_guide_summary,
 };
 pub(crate) use review_guide_sources::{
     PrReviewGuideSourceCapture, PrSourceCapturePersistOutcome, PrSourceCaptureTrigger,

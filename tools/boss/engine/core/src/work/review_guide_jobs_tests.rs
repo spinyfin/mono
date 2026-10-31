@@ -259,27 +259,56 @@ fn a_failure_records_the_named_build_or_none_when_it_is_unknowable() {
     assert_eq!(attempt_status(&db, &unknown.id), "failed");
 }
 
-/// The implicit operations record the identity the engine installed at
-/// startup — not anything storage reads from engine provenance itself.
+/// Failure provenance belongs to the database instance, including clones.
 #[test]
-fn the_implicit_failure_operations_record_the_installed_engine_build() {
-    let (_dir, db) = open_db();
-    let (_root, series_id, comparison_id) = seeded_series(&db);
-    let attempt = db
-        .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
-        .unwrap();
-
-    db.fail_pr_review_guide_attempt_pre_start(&attempt.id, "pane never came up")
-        .unwrap();
-
-    let recorded = query_pr_review_guide_attempt(&db.connect().unwrap(), &attempt.id)
-        .unwrap()
-        .unwrap();
-    assert!(recorded.failed_pre_start);
-    assert_eq!(
-        recorded.failed_by_build.as_deref(),
-        Some(crate::build_info::build_identity())
-    );
+fn failure_operations_record_the_database_build_and_remain_retry_eligible() {
+    for build in ["engine-one", "engine-two"] {
+        let (_dir, db) = open_db();
+        let db = db.with_engine_build_identity(build);
+        let (root, series_id, comparison_id) = seeded_series(&db);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET pr_url = 'https://github.com/acme/widget/pull/9' WHERE id = ?1",
+                [&root],
+            )
+            .unwrap();
+        let attempt = db
+            .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
+            .unwrap();
+        let execution = db
+            .create_pr_review_guide_execution(&comparison_id, "acme/widget")
+            .unwrap();
+        db.bind_pr_review_guide_attempt_execution(&attempt.id, &execution.id)
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET status = 'failed' WHERE id = ?1",
+                [&execution.id],
+            )
+            .unwrap();
+        db.clone()
+            .finish_pr_review_guide_attempt_for_terminal_execution(
+                &execution.id,
+                ExecutionStatus::Failed,
+                "pane never came up",
+                true,
+            )
+            .unwrap();
+        let recorded = query_pr_review_guide_attempt(&db.connect().unwrap(), &attempt.id)
+            .unwrap()
+            .unwrap();
+        assert!(recorded.failed_pre_start);
+        assert_eq!(recorded.failed_by_build.as_deref(), Some(build));
+        assert_eq!(
+            db.reenqueue_pre_start_failed_review_guides("next-build", &FakePrStateChecker::always(PrOpenState::Open))
+                .unwrap()
+                .reenqueued
+                .len(),
+            1
+        );
+    }
 }
 
 fn attempt_status(db: &WorkDb, attempt_id: &str) -> String {
@@ -343,6 +372,7 @@ fn failing_a_stale_attempt_does_not_downgrade_a_newer_ready_series() {
 #[test]
 fn reconcile_finishes_a_running_attempt_whose_execution_is_already_terminal() {
     let (_dir, db) = open_db();
+    let db = db.with_engine_build_identity("reconcile-build");
     let (root, series_id, comparison_id) = seeded_series(&db);
     let attempt = db
         .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
@@ -368,6 +398,11 @@ fn reconcile_finishes_a_running_attempt_whose_execution_is_already_terminal() {
         .unwrap();
     assert_eq!(acted, 1);
     assert_eq!(attempt_status(&db, &attempt.id), "failed");
+    let recorded = db
+        .pr_review_guide_attempt_for_execution(&execution.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recorded.failed_by_build.as_deref(), Some("reconcile-build"));
     let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
     assert_eq!(summary.lifecycle, "failed");
 }
@@ -951,7 +986,7 @@ fn submit_guide(
     comparison_id: &str,
 ) -> std::result::Result<crate::work::SubmitWorkerProposalOutcome, boss_protocol::ProposalSubmissionError> {
     let payload = serde_json::json!({ "body_markdown": RESTART_GUIDE }).to_string();
-    crate::review_guide_validation::submit_worker_proposal(
+    crate::review_verdict_apply_sweep::guide_validation::submit_worker_proposal(
         db,
         crate::work::SubmitWorkerProposalInput {
             execution_id,
@@ -966,8 +1001,10 @@ fn submit_guide(
 
 /// Run the startup recovery pass the way the engine does: validation above
 /// storage, adoption and publication inside it.
-fn recover_orphaned(db: &WorkDb) -> crate::review_guide_validation::ReviewGuideSubmissionRecoveryReport {
-    crate::review_guide_validation::recover_orphaned_submissions(db).unwrap()
+fn recover_orphaned(
+    db: &WorkDb,
+) -> crate::review_verdict_apply_sweep::guide_validation::ReviewGuideSubmissionRecoveryReport {
+    crate::review_verdict_apply_sweep::guide_validation::recover_orphaned_submissions(db).unwrap()
 }
 
 /// The restart-during-spawn ordering. A guide run is spawned seconds before

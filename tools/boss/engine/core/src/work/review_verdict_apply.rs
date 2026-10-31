@@ -14,6 +14,32 @@ use boss_protocol::{
 
 pub use boss_engine_storage_values::attention_kinds::REVIEW_VERDICT_BATCH_NOT_APPLYING_ATTENTION_KIND;
 
+/// Immutable GitHub compare inputs loaded by storage and observed by the review service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MergeParentComparison {
+    pub repo_slug: String,
+    pub head_before: String,
+    pub base_sha: String,
+    pub head_after: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub(crate) struct ReviewVerdictComparisonInputs {
+    pub proposal_id: String,
+    pub target_sha: String,
+    pub pr_url: String,
+    pub pre_merge: bool,
+    pub has_materialization: bool,
+    pub comparison: Option<MergeParentComparison>,
+}
+
+/// The observation is fenced against the proposal, reviewed head and comparison inputs on apply.
+pub(crate) struct ReviewVerdictObservation {
+    pub inputs: ReviewVerdictComparisonInputs,
+    pub deletions: Option<Vec<String>>,
+}
+
 /// Count from one apply pass.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ReviewVerdictApplyStats {
@@ -37,61 +63,13 @@ enum PreMergeTargetFreshness {
 
 #[work_db_boundary::instrument]
 impl WorkDb {
-    /// Apply every still-`proposed` `review_verdict`. Safe to call
-    /// redundantly: a proposal already applied is skipped, and the
-    /// `pr_review:` created_via key plus the batch/proposal unique indexes
-    /// make rematerialisation a no-op.
-    pub fn apply_pending_review_verdicts(&self, pr_checker: &dyn PrStateChecker) -> Result<ReviewVerdictApplyStats> {
-        let pending = self.list_proposed_review_verdicts()?;
-        let mut stats = ReviewVerdictApplyStats::default();
-        for proposal in pending {
-            match self.apply_review_verdict_proposal(&proposal.id, pr_checker) {
-                Ok(created) => {
-                    // `apply_review_verdict_proposal` also returns `Ok(None)`
-                    // for a proposal it deliberately left `proposed` for
-                    // retry (e.g. the batch hasn't reached `applying` yet)
-                    // and for a proposal that landed `superseded` in the
-                    // materialise-to-commit window. Re-check the row's own
-                    // state rather than trusting the call's `Ok`/`Err`
-                    // split, so `applied` means `ProposalState::Applied`.
-                    match self.worker_proposal(&proposal.id) {
-                        Ok(Some(WorkerProposal {
-                            state: ProposalState::Applied,
-                            ..
-                        })) => {
-                            stats.applied += 1;
-                            if created.is_some() {
-                                stats.created_work += 1;
-                            }
-                        }
-                        Ok(Some(WorkerProposal {
-                            state: ProposalState::Superseded,
-                            ..
-                        })) => {
-                            stats.superseded += 1;
-                        }
-                        _ => {}
-                    }
-                }
-                Err(error) => {
-                    stats.failed += 1;
-                    tracing::warn!(
-                        proposal_id = %proposal.id,
-                        ?error,
-                        "review-verdict apply failed; leaving the proposal proposed for retry",
-                    );
-                }
-            }
-        }
-        Ok(stats)
-    }
-
     /// Apply one staged `review_verdict`. Returns the remediation work-item
     /// id when findings warranted a revision or follow-up.
-    pub fn apply_review_verdict_proposal(
+    pub(crate) fn apply_observed_review_verdict_proposal(
         &self,
         proposal_id: &str,
         pr_checker: &dyn PrStateChecker,
+        observation: ReviewVerdictObservation,
     ) -> Result<Option<String>> {
         let Some(proposal) = self.worker_proposal(proposal_id)? else {
             return Ok(None);
@@ -301,7 +279,14 @@ impl WorkDb {
         let deletion_signoff = if stale_head {
             Vec::new()
         } else {
-            self.compute_batch_merge_parent_deletion_signoff(&origin_task, &verdict.target_sha, pr_checker)?
+            let current = self.review_verdict_comparison(proposal_id)?;
+            anyhow::ensure!(
+                observation.inputs == current,
+                "merge-parent comparison changed during observation"
+            );
+            observation
+                .deletions
+                .context("merge-parent observation was skipped for a previously stale head")?
         };
         if !deletion_signoff.is_empty() {
             self.hold_cycle_root_for_deletion_signoff(&batch.cycle_root_id, &batch.pr_url, &deletion_signoff)?;
@@ -626,7 +611,7 @@ impl WorkDb {
     /// want that); this applier processes oldest-first so proposals apply in
     /// the order the batches were decided, so the result is reversed here
     /// rather than by adding a second `ORDER BY` variant of the same query.
-    fn list_proposed_review_verdicts(&self) -> Result<Vec<WorkerProposal>> {
+    pub(crate) fn list_proposed_review_verdicts(&self) -> Result<Vec<WorkerProposal>> {
         let mut rows = self.list_worker_proposals(
             None,
             None,
@@ -638,7 +623,7 @@ impl WorkDb {
         Ok(rows)
     }
 
-    fn worker_proposal(&self, proposal_id: &str) -> Result<Option<WorkerProposal>> {
+    pub(crate) fn worker_proposal(&self, proposal_id: &str) -> Result<Option<WorkerProposal>> {
         let conn = self.connect()?;
         super::proposals::find_worker_proposal_by_id(&conn, proposal_id)
     }
@@ -683,15 +668,48 @@ impl WorkDb {
         Ok(())
     }
 
-    fn compute_batch_merge_parent_deletion_signoff(
+    /// Load an owned snapshot for the service's GitHub comparison.
+    pub(crate) fn review_verdict_comparison(&self, proposal_id: &str) -> Result<ReviewVerdictComparisonInputs> {
+        let proposal = self
+            .worker_proposal(proposal_id)?
+            .context("review verdict proposal is missing")?;
+        let payload: ReviewVerdictProposalPayload = serde_json::from_str(&proposal.payload_json)?;
+        let verdict: boss_pr_review::SupervisorVerdict = serde_json::from_value(payload.verdict)?;
+        let batch = self
+            .review_batch(&payload.batch_id)?
+            .context("review batch is missing")?;
+        let origin_task = {
+            let conn = self.connect()?;
+            query_task(&conn, &batch.cycle_root_id)?.context("review cycle root is missing")?
+        };
+        let created_via = if batch.phase == boss_protocol::ReviewBatchPhase::PostMerge {
+            format!("{CREATED_VIA_PR_REVIEW_POST_MERGE_PREFIX}{}", proposal.id)
+        } else {
+            format!("{CREATED_VIA_PR_REVIEW_PREFIX}{}", proposal.id)
+        };
+        let has_materialization = {
+            let conn = self.connect()?;
+            existing_review_findings_work_item(&conn, &created_via)?.is_some()
+        };
+        let comparison = self.merge_parent_comparison(&origin_task, &verdict.target_sha)?;
+        Ok(ReviewVerdictComparisonInputs {
+            proposal_id: proposal_id.to_owned(),
+            target_sha: verdict.target_sha,
+            pr_url: batch.pr_url,
+            pre_merge: batch.phase == boss_protocol::ReviewBatchPhase::PreMerge,
+            has_materialization,
+            comparison,
+        })
+    }
+
+    fn merge_parent_comparison(
         &self,
         origin_task: &Task,
         reviewed_head: &str,
-        pr_checker: &dyn PrStateChecker,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Option<MergeParentComparison>> {
         let cr = match self.latest_conflict_resolution_for_work_item(&origin_task.id) {
             Ok(Some(cr)) => cr,
-            Ok(None) => return Ok(Vec::new()),
+            Ok(None) => return Ok(None),
             Err(err) => {
                 tracing::warn!(
                     cycle_root_id = %origin_task.id,
@@ -699,33 +717,38 @@ impl WorkDb {
                     "review-verdict apply: conflict_resolution lookup failed; \
                      skipping merge-parent deletion tripwire",
                 );
-                return Ok(Vec::new());
+                return Ok(None);
             }
         };
         if !matches!(cr.status.as_str(), "running" | "succeeded") {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         let head_after = if !reviewed_head.is_empty() {
             reviewed_head
         } else {
             match cr.head_sha_after.as_deref().filter(|s| !s.is_empty()) {
                 Some(sha) => sha,
-                None => return Ok(Vec::new()),
+                None => return Ok(None),
             }
         };
         let (Some(head_before), Some(base_sha)) = (
             cr.head_sha_before.as_deref().filter(|s| !s.is_empty()),
             cr.base_sha_at_trigger.as_deref().filter(|s| !s.is_empty()),
         ) else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let Some(repo_url) = self.repo_remote_url_for_tripwire(origin_task) else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let Some(repo_slug) = git_utils::repo_slug::parse_github_slug(&repo_url) else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
-        Ok(pr_checker.merged_parent_deletions(&repo_slug, head_before, base_sha, head_after))
+        Ok(Some(MergeParentComparison {
+            repo_slug,
+            head_before: head_before.to_owned(),
+            base_sha: base_sha.to_owned(),
+            head_after: head_after.to_owned(),
+        }))
     }
 
     /// Per-task `repo_remote_url` is NULL when the product owns the repo

@@ -39,12 +39,8 @@ pub trait PrStateChecker: Send + Sync {
         })
     }
 
-    /// Both-parents deletion tripwire (incident-002): files a merged parent
-    /// added that this resolution removed. Empty means clean or fail-open.
-    /// Default is empty so test doubles that only implement `check` stay
-    /// hermetic. The production observation is a blocking GitHub compare
-    /// implemented by engine core and passed in by the callers that apply
-    /// review verdicts, so storage consumes only the owned result.
+    /// Hermetic compare response used only by the review-service test fixtures.
+    #[cfg(test)]
     fn merged_parent_deletions(
         &self,
         _repo_slug: &str,
@@ -120,11 +116,7 @@ pub fn classify_pr_merge_state(state: &str, merged_at: &str) -> PrMergeClass {
 
 /// Production implementation: shells out to `gh pr view`.
 ///
-/// It observes only PR lifecycle state. The merged-parent deletion tripwire
-/// is a separate GitHub compare owned by engine core, so a caller that
-/// applies review verdicts passes the checker core builds for that purpose
-/// instead; this one leaves [`PrStateChecker::merged_parent_deletions`] at its
-/// empty default.
+/// Deletion observations are a separate, required input to verdict storage.
 pub struct GhPrStateChecker;
 
 impl PrStateChecker for GhPrStateChecker {
