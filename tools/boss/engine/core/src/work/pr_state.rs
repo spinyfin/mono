@@ -42,8 +42,9 @@ pub trait PrStateChecker: Send + Sync {
     /// Both-parents deletion tripwire (incident-002): files a merged parent
     /// added that this resolution removed. Empty means clean or fail-open.
     /// Default is empty so test doubles that only implement `check` stay
-    /// hermetic; production [`GhPrStateChecker`] runs the blocking GitHub
-    /// compare the review-verdict applier needs inside `spawn_blocking`.
+    /// hermetic. The production observation is a blocking GitHub compare
+    /// implemented by engine core and passed in by the callers that apply
+    /// review verdicts, so storage consumes only the owned result.
     fn merged_parent_deletions(
         &self,
         _repo_slug: &str,
@@ -118,24 +119,15 @@ pub fn classify_pr_merge_state(state: &str, merged_at: &str) -> PrMergeClass {
 }
 
 /// Production implementation: shells out to `gh pr view`.
+///
+/// It observes only PR lifecycle state. The merged-parent deletion tripwire
+/// is a separate GitHub compare owned by engine core, so a caller that
+/// applies review verdicts passes the checker core builds for that purpose
+/// instead; this one leaves [`PrStateChecker::merged_parent_deletions`] at its
+/// empty default.
 pub struct GhPrStateChecker;
 
 impl PrStateChecker for GhPrStateChecker {
-    fn merged_parent_deletions(
-        &self,
-        repo_slug: &str,
-        head_before: &str,
-        base_sha: &str,
-        head_after: &str,
-    ) -> Vec<String> {
-        crate::merge_parent_deletion::compute_merged_parent_deletions_blocking(
-            repo_slug,
-            head_before,
-            base_sha,
-            head_after,
-        )
-    }
-
     fn check(&self, pr_url: &str) -> Result<PrOpenState> {
         Ok(self.inspect(pr_url)?.open_state)
     }

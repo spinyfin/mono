@@ -14,11 +14,9 @@
 
 use anyhow::ensure;
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
 
 use super::query_ensure::RequireRow;
 use super::*;
-use crate::coordinator::ExecutionPublisher;
 
 /// Lifecycle of one `pr_review_guide_attempts` row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,9 +95,11 @@ pub struct PrReviewGuideAttempt {
     /// [`WorkDb::reenqueue_pre_start_failed_review_guides`].
     #[builder(default)]
     pub failed_pre_start: bool,
-    /// [`crate::build_info::build_identity`] of the engine that recorded the
-    /// failure. `None` for attempts that did not fail, or failed before this
-    /// column existed (their build is unknowable, so they are never retried).
+    /// Identity of the engine build that recorded the failure (the one
+    /// installed through [`install_engine_build_identity`]). `None` for
+    /// attempts that did not fail, or failed before this column existed or
+    /// with no identity installed (their build is unknowable, so they are
+    /// never retried).
     pub failed_by_build: Option<String>,
 }
 
@@ -182,12 +182,33 @@ pub enum RetryReviewGuideOutcome {
     NoComparison,
 }
 
+/// Identity of the engine build, installed once at startup by the composition
+/// root. Storage cannot read engine provenance itself, and the review-guide
+/// failure paths that need it (execution terminalization, attempt reconcile)
+/// run too deep to thread a parameter through. Like the engine's other
+/// process-wide stamps, the first installation wins and it never changes.
+static ENGINE_BUILD_IDENTITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Install the running engine build's identity. Failures recorded afterwards
+/// carry it, so a later build can retry a guide this one failed to start
+/// ([`WorkDb::reenqueue_pre_start_failed_review_guides`]). Until it is
+/// installed, failures record no build and are never retried automatically —
+/// the same treatment as a failure that predates the column.
+pub fn install_engine_build_identity(build: &str) {
+    let _ = ENGINE_BUILD_IDENTITY.set(build.to_owned());
+}
+
+fn engine_build_identity() -> Option<&'static str> {
+    ENGINE_BUILD_IDENTITY.get().map(String::as_str)
+}
+
 /// What a failure records beyond the error text: whether it happened before
-/// a worker started, and which engine build observed it.
+/// a worker started, and which engine build observed it (`None` when the
+/// build is unknowable, which keeps the attempt out of build-change retries).
 #[derive(Clone, Copy)]
 struct FailureProvenance<'a> {
     pre_start: bool,
-    build: &'a str,
+    build: Option<&'a str>,
 }
 
 #[work_db_boundary::instrument]
@@ -468,8 +489,10 @@ impl WorkDb {
     /// `superseded` and does **not**
     /// flip `guide_lifecycle` to `failed` — a newer published guide must
     /// not be downgraded by late output from an obsolete run.
+    ///
+    /// Records the build installed through [`install_engine_build_identity`].
     pub fn fail_pr_review_guide_attempt(&self, attempt_id: &str, error: &str) -> Result<()> {
-        self.fail_pr_review_guide_attempt_at(attempt_id, error, false, crate::build_info::build_identity())
+        self.fail_pr_review_guide_attempt_for_build(attempt_id, error, false, engine_build_identity())
     }
 
     /// [`Self::fail_pr_review_guide_attempt`] for a failure that happened
@@ -477,15 +500,27 @@ impl WorkDb {
     /// build) so [`Self::reenqueue_pre_start_failed_review_guides`] can retry
     /// the attempt once a different build is running.
     pub fn fail_pr_review_guide_attempt_pre_start(&self, attempt_id: &str, error: &str) -> Result<()> {
-        self.fail_pr_review_guide_attempt_at(attempt_id, error, true, crate::build_info::build_identity())
+        self.fail_pr_review_guide_attempt_for_build(attempt_id, error, true, engine_build_identity())
     }
 
+    /// [`Self::fail_pr_review_guide_attempt`] with the failing build named by
+    /// the caller instead of the injected identity.
     pub(crate) fn fail_pr_review_guide_attempt_at(
         &self,
         attempt_id: &str,
         error: &str,
         pre_start: bool,
         build: &str,
+    ) -> Result<()> {
+        self.fail_pr_review_guide_attempt_for_build(attempt_id, error, pre_start, Some(build))
+    }
+
+    fn fail_pr_review_guide_attempt_for_build(
+        &self,
+        attempt_id: &str,
+        error: &str,
+        pre_start: bool,
+        build: Option<&str>,
     ) -> Result<()> {
         self.terminate_pr_review_guide_attempt(
             attempt_id,
@@ -1317,7 +1352,7 @@ pub(super) fn publish_pr_review_guide_version_in_tx(
 /// (`WorkDb::readopt_inferred_terminal_execution`), the attempt has to come
 /// back with it, or the live worker has nothing to submit its guide to. The
 /// same reversal lets a guide submitted while the attempt was wrongly closed
-/// be recovered (`WorkDb::recover_orphaned_review_guide_submissions`).
+/// be recovered (`crate::review_guide_validation::recover_orphaned_submissions`).
 ///
 /// Only an attempt that failed after a worker ran (`failed_pre_start = 0`),
 /// whose comparison is still the series' selected one at the same request
@@ -1438,41 +1473,6 @@ pub(crate) fn to_wire_review_guide_summary(summary: PrReviewGuideSummary) -> bos
         .maybe_readable_version_id(summary.readable_version_id)
         .maybe_error(summary.error)
         .build()
-}
-
-/// Broadcast a work-item invalidation for `root_task_id` after a review-guide
-/// lifecycle transition that did not itself touch the `tasks` row (guide
-/// state lives in `pr_review_guide_source_series` / `_attempts` /
-/// `_versions`, keyed by `root_task_id`, not in `tasks`). Mirrors the
-/// `"task_doc_pointer_set"` / `"design_doc_pointer_set"` precedent in
-/// `completion/pr_transition.rs`: a derived projection changed on read, so
-/// subscribers (the kanban view) need a refetch hint, not a payload push.
-/// Best-effort — a failure to resolve the task's product only means the
-/// card catches up on its next unrelated refresh instead of immediately.
-/// Takes the publisher directly (rather than `Arc<ServerState>`) so both a
-/// `Dispatch` request handler (`server_state.publisher`) and
-/// `WorkerCompletionHandler` (its own `publisher` field) can share it.
-pub(crate) async fn notify_review_guide_changed(
-    work_db: &WorkDb,
-    publisher: &Arc<dyn ExecutionPublisher>,
-    root_task_id: &str,
-    reason: &str,
-) {
-    match work_db.get_work_item(root_task_id) {
-        Ok(item) => {
-            publisher
-                .publish_work_item_changed(item.product_id(), root_task_id, reason)
-                .await;
-        }
-        Err(err) => {
-            tracing::warn!(
-                root_task_id,
-                reason,
-                ?err,
-                "notify_review_guide_changed: failed to resolve root task's product; skipping broadcast"
-            );
-        }
-    }
 }
 
 #[cfg(test)]

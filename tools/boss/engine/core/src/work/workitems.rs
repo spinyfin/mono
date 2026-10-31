@@ -873,6 +873,33 @@ impl WorkDb {
         }
     }
 
+    /// Append `line` verbatim to the work item's description.
+    ///
+    /// The engine's audit trail (`[engine-reconcile]`, `[deferred-scope]`,
+    /// `[doc-detector]`, …) is written into the description so an operator
+    /// sees why the engine acted. Services format the line and own the
+    /// marker vocabulary; the read-modify-write stays with storage so no
+    /// caller has to re-enter the connection from a callback. Takes the
+    /// connection only for the duration of each step, so call it after any
+    /// enclosing transaction has committed.
+    pub fn append_work_item_description_line(&self, work_item_id: &str, line: &str) -> Result<()> {
+        let item = self.get_work_item(work_item_id)?;
+        let current_desc = match &item {
+            WorkItem::Product(p) => p.description.as_str(),
+            WorkItem::Project(p) => p.description.as_str(),
+            WorkItem::Task(t) | WorkItem::Chore(t) => t.description.as_str(),
+        };
+        let new_desc = format!("{current_desc}{line}");
+        self.update_work_item(
+            work_item_id,
+            WorkItemPatch {
+                description: Some(new_desc),
+                ..WorkItemPatch::default()
+            },
+        )?;
+        Ok(())
+    }
+
     /// Soft-delete a task/chore (and cascade to its revision chain).
     /// Returns every id this call tombstoned — `id` itself followed by
     /// any cascade-deleted revision ids — so a caller that needs to

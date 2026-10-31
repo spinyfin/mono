@@ -722,9 +722,8 @@ impl WorkDb {
         let Some(repo_url) = self.repo_remote_url_for_tripwire(origin_task) else {
             return Ok(Vec::new());
         };
-        let repo_slug = match crate::completion::parse_repo_slug(&repo_url) {
-            Ok(slug) => slug,
-            Err(_) => return Ok(Vec::new()),
+        let Some(repo_slug) = git_utils::repo_slug::parse_github_slug(&repo_url) else {
+            return Ok(Vec::new());
         };
         Ok(pr_checker.merged_parent_deletions(&repo_slug, head_before, base_sha, head_after))
     }
@@ -782,8 +781,8 @@ impl WorkDb {
         self.upsert_work_item_attention(
             cycle_root_id,
             boss_engine_storage_values::attention_kinds::MERGED_PARENT_DELETION_SIGNOFF_ATTENTION_KIND,
-            crate::merge_parent_deletion::SIGNOFF_ATTENTION_TITLE,
-            &crate::merge_parent_deletion::render_signoff_attention_body(deletions, pr_url),
+            boss_engine_storage_values::merge_parent_signoff::SIGNOFF_ATTENTION_TITLE,
+            &boss_engine_storage_values::merge_parent_signoff::render_signoff_attention_body(deletions, pr_url),
         )?;
         tracing::warn!(
             cycle_root_id,

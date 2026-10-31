@@ -11,7 +11,42 @@ use std::time::Duration;
 
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::DispatchEventSink;
-use crate::work::{GhPrStateChecker, ReviewVerdictApplyStats, WorkDb};
+use crate::work::{GhPrStateChecker, PrInspect, PrOpenState, PrStateChecker, ReviewVerdictApplyStats, WorkDb};
+
+/// Production [`PrStateChecker`] for applying review verdicts.
+///
+/// Live PR state comes from [`GhPrStateChecker`]. The merged-parent deletion
+/// observation spawns `gh` for a GitHub compare, so it is supplied here, above
+/// storage, and the applier only receives the owned list of removed surfaces.
+/// Every caller that applies a verdict in production must pass this checker
+/// (not [`GhPrStateChecker`], whose tripwire is the empty default) or the
+/// both-parents deletion halt is silently skipped.
+pub(crate) struct GhReviewVerdictChecker;
+
+impl PrStateChecker for GhReviewVerdictChecker {
+    fn check(&self, pr_url: &str) -> anyhow::Result<PrOpenState> {
+        GhPrStateChecker.check(pr_url)
+    }
+
+    fn inspect(&self, pr_url: &str) -> anyhow::Result<PrInspect> {
+        GhPrStateChecker.inspect(pr_url)
+    }
+
+    fn merged_parent_deletions(
+        &self,
+        repo_slug: &str,
+        head_before: &str,
+        base_sha: &str,
+        head_after: &str,
+    ) -> Vec<String> {
+        crate::merge_parent_deletion::compute_merged_parent_deletions_blocking(
+            repo_slug,
+            head_before,
+            base_sha,
+            head_after,
+        )
+    }
+}
 
 /// Cadence for the crash-recovery pass. Fresh submissions are applied
 /// immediately from the proposal handler; this interval only covers
@@ -56,7 +91,8 @@ pub fn spawn_loop(
 pub async fn run_one_pass(work_db: &WorkDb, coordinator: Arc<ExecutionCoordinator>) -> ReviewVerdictApplyStats {
     let work_db_clone = work_db.clone();
     let stats =
-        match tokio::task::spawn_blocking(move || work_db_clone.apply_pending_review_verdicts(&GhPrStateChecker)).await
+        match tokio::task::spawn_blocking(move || work_db_clone.apply_pending_review_verdicts(&GhReviewVerdictChecker))
+            .await
         {
             Ok(Ok(stats)) => stats,
             Ok(Err(error)) => {
@@ -78,4 +114,38 @@ pub async fn run_one_pass(work_db: &WorkDb, coordinator: Arc<ExecutionCoordinato
         coordinator.kick();
     }
     stats
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The verdict checker's tripwire is the engine's compare-based
+    /// observation, which short-circuits (no `gh` call) when any ref is
+    /// missing — the same fail-open behaviour the completion path has.
+    #[test]
+    fn the_verdict_checker_observes_merged_parent_deletions_through_the_compare_tripwire() {
+        assert!(
+            GhReviewVerdictChecker
+                .merged_parent_deletions("org/repo", "", "base", "head")
+                .is_empty()
+        );
+        assert!(
+            GhReviewVerdictChecker
+                .merged_parent_deletions("org/repo", "before", "base", "")
+                .is_empty()
+        );
+    }
+
+    /// The plain PR-state checker never raises the deletion halt: its tripwire
+    /// is the trait default. Production verdict application therefore has to
+    /// use [`GhReviewVerdictChecker`], which is what both apply sites pass.
+    #[test]
+    fn the_plain_pr_state_checker_leaves_the_deletion_tripwire_at_its_empty_default() {
+        assert!(
+            GhPrStateChecker
+                .merged_parent_deletions("org/repo", "before", "base", "head")
+                .is_empty()
+        );
+    }
 }

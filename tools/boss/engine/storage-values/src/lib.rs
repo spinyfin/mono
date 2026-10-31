@@ -7,6 +7,7 @@ pub mod attention_kinds;
 pub mod attention_lifecycle;
 pub mod branch_identity;
 pub mod ci_contract;
+pub mod merge_parent_signoff;
 pub mod pool_policy;
 pub mod postmortem_brief;
 

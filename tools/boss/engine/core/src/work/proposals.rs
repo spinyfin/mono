@@ -188,18 +188,50 @@ impl WorkDb {
     /// deliberate — the refusal is a state judgement about a single running
     /// attempt (one per execution), and persisting refusals to count them is
     /// the very replay behaviour the refusal avoids.
+    ///
+    /// A [`ProposalKind::ReviewGuide`] needs its body validated against the
+    /// pinned workspace, which spawns `git` and so happens above storage; use
+    /// [`Self::submit_worker_proposal_with_guide`] for that kind. Submitting
+    /// one here is an error and stores nothing.
     #[cfg(test)]
     pub fn submit_worker_proposal(
         &self,
         input: SubmitWorkerProposalInput<'_>,
     ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
-        self.submit_worker_proposal_with_liveness(input, &|_| false)
+        self.submit_worker_proposal_with_guide(input, None)
     }
 
-    /// Observe a question's eligible worker before opening the apply transaction.
+    #[cfg(test)]
     pub fn submit_worker_proposal_with_liveness(
         &self,
         input: SubmitWorkerProposalInput<'_>,
+        pid_is_alive: &dyn Fn(Option<i64>) -> bool,
+    ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
+        self.submit_worker_proposal_with_guide_and_liveness(input, None, pid_is_alive)
+    }
+
+    /// [`Self::submit_worker_proposal`] for a submission whose review-guide
+    /// body the caller has already validated
+    /// ([`Self::load_review_guide_for_validation`] →
+    /// [`super::review_guide_submission::GuideForValidation::validated`]).
+    /// `guide` is only consulted for [`ProposalKind::ReviewGuide`], where it is
+    /// required; the validation verdict is judged inside the transaction after
+    /// the attempt-state checks, exactly as before validation moved out of
+    /// storage.
+    #[cfg(test)]
+    pub(crate) fn submit_worker_proposal_with_guide(
+        &self,
+        input: SubmitWorkerProposalInput<'_>,
+        guide: Option<&Result<super::review_guide_submission::PreparedGuide>>,
+    ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
+        self.submit_worker_proposal_with_guide_and_liveness(input, guide, &|_| false)
+    }
+
+    /// Observe question-worker liveness before applying a validated submission.
+    pub(crate) fn submit_worker_proposal_with_guide_and_liveness(
+        &self,
+        input: SubmitWorkerProposalInput<'_>,
+        guide: Option<&Result<super::review_guide_submission::PreparedGuide>>,
         pid_is_alive: &dyn Fn(Option<i64>) -> bool,
     ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
         let question_worker = if input.kind == ProposalKind::RunDone {
@@ -212,8 +244,10 @@ impl WorkDb {
         } else {
             None
         };
-        let prepared_guide = (input.kind == ProposalKind::ReviewGuide)
-            .then(|| super::review_guide_submission::prepare(self, input.execution_id, input.payload_json));
+        anyhow::ensure!(
+            input.kind != ProposalKind::ReviewGuide || guide.is_some(),
+            "a review-guide submission must be validated before it reaches storage"
+        );
         // The transaction-holding half. Scoped to a block so the `conn`
         // guard (a lock over `WorkDb`'s single shared connection — see
         // `WorkDb::connect`'s docs) is dropped before the post-commit
@@ -293,7 +327,7 @@ impl WorkDb {
                     input.payload_json,
                     input.kind,
                     &id,
-                    prepared_guide.as_ref(),
+                    guide,
                     question_worker.as_ref(),
                 )?),
                 ProposalApplyPolicy::Gated => None,
@@ -392,7 +426,7 @@ impl WorkDb {
         };
 
         if let Some(audit_line) = post_commit_audit_line
-            && let Err(err) = crate::reconcile_audit::append_description_line(self, input.work_item_id, &audit_line)
+            && let Err(err) = self.append_work_item_description_line(input.work_item_id, &audit_line)
         {
             tracing::warn!(
                 execution_id = %input.execution_id,
@@ -1121,6 +1155,70 @@ mod tests {
         assert!(
             description.contains(r#"reason="needs a new ingestion pipeline""#),
             "{description}"
+        );
+    }
+
+    /// The audit line is appended after the transaction commits, and a failure
+    /// to append it is not a failure of the submission: the proposal row and
+    /// its attention item are already durable, so the worker's acknowledgement
+    /// must stand. Here the proposal names a work item that does not exist, so
+    /// the post-commit append cannot succeed.
+    #[test]
+    fn a_failed_post_commit_audit_append_leaves_the_committed_proposal_standing() {
+        let (_dir, db) = open_db();
+        let (execution_id, _chore_id) = execution_for_new_chore(&db, "Cleanup");
+
+        let outcome = submit(
+            &db,
+            &execution_id,
+            "task_that_does_not_exist",
+            ProposalKind::DeferredScope,
+            r#"{"summary":"third data source wiring","reason":"needs a new ingestion pipeline"}"#,
+            "key-1",
+        )
+        .unwrap();
+
+        assert_eq!(outcome.proposal.state, ProposalState::Applied);
+        let applied_ref = outcome.proposal.applied_ref.unwrap();
+        assert!(
+            db.list_attention_items(&execution_id)
+                .unwrap()
+                .iter()
+                .any(|item| item.id == applied_ref),
+            "the attention item committed with the proposal row"
+        );
+        assert!(
+            db.find_worker_proposal_by_idempotency_key(&execution_id, "key-1")
+                .unwrap()
+                .is_some(),
+            "the proposal row is durable"
+        );
+    }
+
+    /// Storage owns the description append that every audit-line writer
+    /// shares: it adds the line verbatim after the existing text.
+    #[test]
+    fn append_work_item_description_line_adds_the_line_verbatim_to_the_description() {
+        let (_dir, db) = open_db();
+        let (_execution_id, chore_id) = execution_for_new_chore(&db, "Cleanup");
+        let description = |db: &WorkDb| match db.get_work_item(&chore_id).unwrap() {
+            boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t.description,
+            other => panic!("expected a task/chore work item, got {other:?}"),
+        };
+        let before = description(&db);
+
+        db.append_work_item_description_line(&chore_id, "\n[engine-reconcile] epoch 1: a reason.")
+            .unwrap();
+        db.append_work_item_description_line(&chore_id, "\n[doc-detector] second line")
+            .unwrap();
+
+        assert_eq!(
+            description(&db),
+            format!("{before}\n[engine-reconcile] epoch 1: a reason.\n[doc-detector] second line")
+        );
+        assert!(
+            db.append_work_item_description_line("task_that_does_not_exist", "\nx")
+                .is_err()
         );
     }
 
