@@ -6,6 +6,7 @@
 
 mod board_population;
 mod boothby;
+pub mod dedup;
 mod doing_section;
 mod engine_app;
 mod health_wire;
@@ -26,6 +27,10 @@ mod worker_names;
 
 pub use board_population::*;
 pub use boothby::*;
+pub use dedup::{
+    AttentionBrief, CANDIDATE_ID, CanonicalEdit, DedupDecision, DedupInput, DedupVerdict, EditableField, WorkItemBrief,
+    dedup_decision_schema,
+};
 pub use doing_section::*;
 pub use engine_app::*;
 pub use health_wire::*;
