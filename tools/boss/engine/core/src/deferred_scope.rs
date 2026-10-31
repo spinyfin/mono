@@ -35,8 +35,7 @@ use crate::worker_escalation::extract_quoted;
 /// `[deferred-scope]` marker prefix.
 pub const DEFERRED_SCOPE_MARKER: &str = "[deferred-scope]";
 
-/// Engine-owned `work_attention_items.kind` for a filed `[deferred-scope]` signal.
-pub const DEFERRED_SCOPE_ATTENTION_KIND: &str = "deferred_scope";
+pub use boss_engine_storage_values::attention_kinds::DEFERRED_SCOPE_ATTENTION_KIND;
 
 /// One `[deferred-scope]` marker detected in a worker's Stop-boundary text.
 #[derive(Debug, Clone, PartialEq, Eq)]

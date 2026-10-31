@@ -162,28 +162,9 @@ pub enum ChurnTrip {
     Consecutive,
 }
 
-/// `work_attention_items.kind` filed when [`crate::pr_review_recovery`]
-/// trips the churn guard above and parks a work item instead of
-/// auto-redispatching it. [`crate::orphan_sweep`] used to file this same
-/// kind for its own (`active`-task) churn trip; it now bounces through
-/// [`CHURN_GUARD_DISPATCH_FAILED_REASON`] instead — see that constant's docs
-/// — so this kind is `pr_review_recovery`-only going forward. Before this
-/// kind existed at all, a trip was only a `tracing::warn!` in the engine
-/// trace — the work item stayed active with no live execution and nothing
-/// in `boss task show`, `bossctl agents status`, or the kanban card said
-/// why. Resolved automatically the next time
-/// [`WorkDb::request_execution_with_live_check`] is called for the work
-/// item (either the sweep succeeding once the trailing window drains, or an
-/// operator running `bossctl work start`, which bypasses the guard entirely
-/// since it only lives in the sweeps), and — as a backstop for every other
-/// way an item can start moving — whenever a run starts for it afterwards
-/// ([`crate::attention_lifecycle::ClearedBy::WorkResumed`]).
-pub const CHURN_GUARD_PARKED_ATTENTION_KIND: &str = "churn_guard_parked";
+pub use boss_engine_storage_values::attention_kinds::CHURN_GUARD_PARKED_ATTENTION_KIND;
 
-/// Attention kind filed when a lockfile-only conflict could not be
-/// regenerated mechanically. Lowered by the work layer whenever the
-/// `merge_conflict` blocked signal is cleared or the attempt is retried.
-pub(crate) const LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND: &str = "conflict_lockfile_regeneration_failed";
+pub(crate) use boss_engine_storage_values::attention_kinds::LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND;
 
 /// `tasks.dispatch_failed_reason` value stamped by
 /// [`crate::work::WorkDb::bounce_churn_guard_parked_to_backlog`] when
@@ -293,19 +274,7 @@ mod dispatch_halt_headline_tests {
     }
 }
 
-/// `work_attention_items.kind` raised by [`crate::dispatch_stall_escalation`]
-/// when a dispatch timeline sits stuck in one stage past
-/// [`crate::dispatch_stall_escalation::PERSISTENT_STALL_THRESHOLD`]. The
-/// underlying `stage_stalled` dispatch event (`dispatch_events.rs`) is
-/// deliberately write-only telemetry with no alert behind it; this kind
-/// escalates a *persistent* stall (minutes, not the ~30-120s per-stage
-/// thresholds that drive `stage_stalled` itself) onto the operator-visible
-/// attention surface. Resolved the next time the execution successfully
-/// claims a worker slot (`Coordinator::dispatch_claimed_execution`) —
-/// mirrors how [`CHURN_GUARD_PARKED_ATTENTION_KIND`] resolves on the work
-/// item's next successful dispatch attempt rather than being proactively
-/// cleared by the sweep that raised it.
-pub const DISPATCH_STAGE_STALLED_ATTENTION_KIND: &str = "dispatch_stage_stalled";
+pub use boss_engine_storage_values::attention_kinds::DISPATCH_STAGE_STALLED_ATTENTION_KIND;
 
 /// Outcome of [`WorkDb::classify_dispatch_stall`] — whether a persistently
 /// stalled execution the escalation sweep detected should actually be
@@ -346,13 +315,8 @@ pub enum StallEscalation {
     Missing,
 }
 
-/// Attention-item `kind` raised when the engine stops auto-resuming a
-/// worker because its Claude API error is non-retryable (permanent or
-/// unrecognised). See [`crate::transient_recovery`].
-pub const ATTENTION_KIND_RECOVERY_PERMANENT: &str = "worker_recovery_permanent_error";
-/// Attention-item `kind` raised when the engine stops auto-resuming a
-/// worker because the transient-error retry cap was reached.
-pub const ATTENTION_KIND_RECOVERY_EXHAUSTED: &str = "worker_recovery_exhausted";
+pub use boss_engine_storage_values::attention_kinds::ATTENTION_KIND_RECOVERY_EXHAUSTED;
+pub use boss_engine_storage_values::attention_kinds::ATTENTION_KIND_RECOVERY_PERMANENT;
 
 /// Cooldown after a pre-spawn dispatch failure exhausts
 /// `PRE_START_RETRY_DELAYS` and `bounce_dispatch_failed_to_backlog` parks

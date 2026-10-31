@@ -650,14 +650,14 @@ pub(crate) fn block_pending_revisions_on_parent_close(
 /// Binds [`REVISION_ARCHIVED_ATTENTION_KIND`] rather than re-spelling the
 /// kind string, so the registry and the producer cannot drift apart.
 ///
-/// [`REVISION_ARCHIVED_ATTENTION_KIND`]: crate::attention_lifecycle::REVISION_ARCHIVED_ATTENTION_KIND
+/// [`REVISION_ARCHIVED_ATTENTION_KIND`]: boss_engine_storage_values::attention_kinds::REVISION_ARCHIVED_ATTENTION_KIND
 pub(crate) fn record_revision_archived_attention(
     conn: &Connection,
     revision_id: &str,
     title_suffix: &str,
     body: &str,
 ) -> Result<()> {
-    let kind = crate::attention_lifecycle::REVISION_ARCHIVED_ATTENTION_KIND;
+    let kind = boss_engine_storage_values::attention_kinds::REVISION_ARCHIVED_ATTENTION_KIND;
     warn_if_lifecycle_undeclared(kind);
     if reraise_open_work_item_attention(conn, revision_id, kind)?.is_some() {
         return Ok(());

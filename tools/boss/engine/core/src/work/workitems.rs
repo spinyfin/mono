@@ -211,7 +211,7 @@ impl WorkDb {
     /// it redispatches, so the next run start still clears the row against
     /// the most recent trip, not a stale earlier one.
     ///
-    /// [`ClearedBy::WorkResumed`]: crate::attention_lifecycle::ClearedBy::WorkResumed
+    /// [`ClearedBy::WorkResumed`]: boss_engine_storage_values::attention_lifecycle::ClearedBy::WorkResumed
     pub fn upsert_external_tracker_attention(
         &self,
         work_item_id: &str,
@@ -281,7 +281,7 @@ impl WorkDb {
     /// File (idempotently) the operator-visible attention item raised when
     /// [`crate::orphan_sweep`] or [`crate::pr_review_recovery`] trips the
     /// shared churn guard and parks a work item instead of auto-redispatching
-    /// it — see [`crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND`]. Reuses
+    /// it — see [`boss_engine_storage_values::attention_kinds::CHURN_GUARD_PARKED_ATTENTION_KIND`]. Reuses
     /// [`Self::upsert_external_tracker_attention`] so repeated trips across
     /// sweep passes (every ~60s) don't pile up duplicate rows: the item stays
     /// open until [`request_execution_in_tx_with_live_check`] resolves it on
@@ -554,7 +554,7 @@ impl WorkDb {
     /// [`crate::dispatch_stall_escalation`] finds a dispatch timeline stuck
     /// in one stage past
     /// [`crate::dispatch_stall_escalation::PERSISTENT_STALL_THRESHOLD`] —
-    /// see [`crate::work::DISPATCH_STAGE_STALLED_ATTENTION_KIND`]. Reuses
+    /// see [`boss_engine_storage_values::attention_kinds::DISPATCH_STAGE_STALLED_ATTENTION_KIND`]. Reuses
     /// [`Self::upsert_external_tracker_attention`] so repeated sweep ticks
     /// refresh the same row's elapsed-time text instead of piling up
     /// duplicates; the item stays open until the execution finally claims a
@@ -642,8 +642,8 @@ impl WorkDb {
             params![
                 now,
                 execution_id,
-                crate::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND,
-                crate::worker_escalation::WORKER_BLOCKED_ATTENTION_KIND,
+                boss_engine_storage_values::attention_kinds::WORKER_ESCALATION_ATTENTION_KIND,
+                boss_engine_storage_values::attention_kinds::WORKER_BLOCKED_ATTENTION_KIND,
             ],
         )?;
         Ok(rows)
@@ -675,7 +675,7 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let attention = query_attention_item(&tx, id)?.with_context(|| format!("unknown attention item: {id}"))?;
-        if attention.kind != crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND {
+        if attention.kind != boss_engine_storage_values::attention_kinds::DEFERRED_SCOPE_ATTENTION_KIND {
             bail!(
                 "attention item {id} is not a deferred_scope item (kind = {})",
                 attention.kind
@@ -710,7 +710,7 @@ impl WorkDb {
 
         let attention = query_attention_item(&tx, attention_id)?
             .with_context(|| format!("unknown attention item: {attention_id}"))?;
-        if attention.kind != crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND {
+        if attention.kind != boss_engine_storage_values::attention_kinds::DEFERRED_SCOPE_ATTENTION_KIND {
             bail!(
                 "attention item {attention_id} is not a deferred_scope item (kind = {})",
                 attention.kind
@@ -834,7 +834,10 @@ impl WorkDb {
              ORDER BY ai.created_at ASC, ai.id ASC",
         )?;
         let rows = stmt.query_map(
-            params![product_id, crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND],
+            params![
+                product_id,
+                boss_engine_storage_values::attention_kinds::DEFERRED_SCOPE_ATTENTION_KIND
+            ],
             |row| {
                 Ok(DeferredScopeAttention {
                     item: map_attention_item(row)?,

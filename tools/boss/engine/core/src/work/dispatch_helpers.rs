@@ -129,11 +129,11 @@ pub(crate) fn attention_target_from_input(
 /// Binds the registry constant rather than re-spelling the kind string:
 /// `repo_unresolved` is a `ClearedBy::WorkResumed` kind, so a producer-side
 /// typo would silently take it out of reconciliation — the exact class of
-/// un-lowerable signal [`crate::attention_lifecycle`] exists to prevent.
+/// un-lowerable signal [`boss_engine_storage_values::attention_lifecycle`] exists to prevent.
 ///
-/// [`REPO_UNRESOLVED_ATTENTION_KIND`]: crate::attention_lifecycle::REPO_UNRESOLVED_ATTENTION_KIND
+/// [`REPO_UNRESOLVED_ATTENTION_KIND`]: boss_engine_storage_values::attention_kinds::REPO_UNRESOLVED_ATTENTION_KIND
 pub(crate) fn record_repo_unresolved_attention(conn: &Connection, work_item_id: &str, kind_label: &str) -> Result<()> {
-    let kind = crate::attention_lifecycle::REPO_UNRESOLVED_ATTENTION_KIND;
+    let kind = boss_engine_storage_values::attention_kinds::REPO_UNRESOLVED_ATTENTION_KIND;
     warn_if_lifecycle_undeclared(kind);
     if reraise_open_work_item_attention(conn, work_item_id, kind)?.is_some() {
         return Ok(());

@@ -86,8 +86,8 @@ pub(crate) struct DispatchAdmissionFacts {
 /// do not auto-remint." Execution-scoped (`execution_id` set,
 /// `work_item_id` NULL), matched against a specific execution id.
 const DELIBERATE_PARK_ATTENTION_KINDS: &[&str] = &[
-    crate::completion::RUN_DONE_BLOCKED_ATTENTION_KIND,
-    crate::completion::NUDGE_BREAKER_ATTENTION_KIND,
+    boss_engine_storage_values::attention_kinds::RUN_DONE_BLOCKED_ATTENTION_KIND,
+    boss_engine_storage_values::attention_kinds::NUDGE_BREAKER_ATTENTION_KIND,
 ];
 
 /// Execution-scoped attention half of [`work_item_is_deliberately_parked`].
@@ -481,7 +481,7 @@ mod deliberate_parked_fact_tests {
         db.create_attention_item(boss_protocol::CreateAttentionItemInput {
             execution_id: Some(execution_id),
             work_item_id: None,
-            kind: crate::completion::NUDGE_BREAKER_ATTENTION_KIND.to_owned(),
+            kind: boss_engine_storage_values::attention_kinds::NUDGE_BREAKER_ATTENTION_KIND.to_owned(),
             status: None,
             title: "nudge breaker parked".to_owned(),
             body_markdown: "parked".to_owned(),
@@ -511,7 +511,7 @@ mod deliberate_parked_fact_tests {
         db.create_attention_item(boss_protocol::CreateAttentionItemInput {
             execution_id: Some(older.clone()),
             work_item_id: None,
-            kind: crate::completion::RUN_DONE_BLOCKED_ATTENTION_KIND.to_owned(),
+            kind: boss_engine_storage_values::attention_kinds::RUN_DONE_BLOCKED_ATTENTION_KIND.to_owned(),
             status: None,
             title: "Run ended: worker declared itself blocked".to_owned(),
             body_markdown: "blocked".to_owned(),

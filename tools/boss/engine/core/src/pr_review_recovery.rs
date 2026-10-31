@@ -50,10 +50,7 @@ use crate::work::{
     ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS, PrOpenState, PrStateChecker, RetryDeadReviewBatchMember, WorkDb,
 };
 
-/// Attention-item kind filed when a dead review is auto-refired — lets the
-/// kanban surface and `bossctl attentions` distinguish "review died, was
-/// auto-recovered" from a clean pass with no findings.
-pub const PR_REVIEW_DIED_ATTENTION_KIND: &str = "pr_review_died_without_findings";
+pub use boss_engine_storage_values::attention_kinds::PR_REVIEW_DIED_ATTENTION_KIND;
 
 /// Counts from one pass of the sweep; logged at `info` when non-zero.
 #[derive(Debug, Default)]

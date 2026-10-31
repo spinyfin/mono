@@ -48,11 +48,7 @@ impl MergeMechanism {
     }
 }
 
-/// `work_attention_items.kind` filed when a `direct`-mechanism merge is
-/// rejected by a push restriction / rule violation rather than an ordinary
-/// merge failure. Named so it can be distinguished from other attention
-/// kinds in the notifications UI.
-pub const PUSH_RESTRICTION_ATTENTION_KIND: &str = "direct_merge_push_restriction";
+pub use boss_engine_storage_values::attention_kinds::DIRECT_MERGE_PUSH_RESTRICTION_ATTENTION_KIND as PUSH_RESTRICTION_ATTENTION_KIND;
 /// Title for the push-restriction attention item filed by
 /// `app::review::handle_merge_when_ready`'s `Direct` branch.
 pub const PUSH_RESTRICTION_ATTENTION_TITLE: &str =

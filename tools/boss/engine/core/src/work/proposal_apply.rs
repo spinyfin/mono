@@ -57,7 +57,7 @@ use rusqlite::{OptionalExtension, Transaction};
 use super::automations::query_automation;
 use super::*;
 use crate::deferred_scope::DEFERRED_SCOPE_MARKER;
-use crate::worker_escalation::{WORKER_BLOCKED_ATTENTION_KIND, WORKER_ESCALATION_ATTENTION_KIND};
+use boss_engine_storage_values::attention_kinds::{WORKER_BLOCKED_ATTENTION_KIND, WORKER_ESCALATION_ATTENTION_KIND};
 use boss_protocol::{
     Attention, AttentionGroup, AttentionProposalPayload, AutomationOutcomeProposalPayload, BlockedProposalPayload,
     CreateAttentionInput, CreateAttentionItemInput, DeferredScopeProposalPayload, EffortEscalationProposalPayload,
@@ -658,7 +658,7 @@ fn apply_deferred_scope(tx: &Transaction<'_>, execution_id: &str, payload_json: 
     let mut outcome = create_attention_item_row(
         tx,
         execution_id,
-        crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND,
+        boss_engine_storage_values::attention_kinds::DEFERRED_SCOPE_ATTENTION_KIND,
         "Worker deferred scope",
         body,
     )?;

@@ -323,7 +323,7 @@ pub(super) fn no_op_attention_on(conn: &Connection, task_id: &str) -> Result<Opt
         return Ok(None);
     }
     Ok(Some(CreateAttentionItemInput {
-        kind: crate::completion::REVISION_NO_OP_ATTENTION_KIND.into(),
+        kind: boss_engine_storage_values::attention_kinds::REVISION_NO_OP_ATTENTION_KIND.into(),
         title: "Guide revision closed with outstanding comments".into(),
         body_markdown: format!(
             "The guide revision closed without recording a disposition for these comments: {}. They remain outstanding; inspect their threads and complete their outcomes.",

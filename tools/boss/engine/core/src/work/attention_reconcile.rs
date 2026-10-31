@@ -1,6 +1,6 @@
 //! Generic resolution pass for raised-but-never-lowered failure signals.
 //!
-//! Implements the automatic half of [`crate::attention_lifecycle`]: for every
+//! Implements the automatic half of [`boss_engine_storage_values::attention_lifecycle`]: for every
 //! attention kind that declares a [`ClearedBy`] variant the engine can prove,
 //! resolve the open items whose evidence has since arrived, and clear the
 //! `tasks.dispatch_failed_*` stamp behind the kanban card's
@@ -28,7 +28,7 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
 
-use crate::attention_lifecycle::{AttentionLifecycle, ClearedBy, automatically_cleared};
+use boss_engine_storage_values::attention_lifecycle::{AttentionLifecycle, ClearedBy, automatically_cleared};
 
 use super::WorkDb;
 use super::audit_misc::now_string;
