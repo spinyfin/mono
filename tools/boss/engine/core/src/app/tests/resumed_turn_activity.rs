@@ -141,7 +141,8 @@ async fn a_background_wakeup_turn_reads_as_working_and_ends_the_declared_wait() 
 
     dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 5)).await;
     let idle = snapshot(&server_state);
-    assert_eq!(idle.activity, WorkerActivity::Idle);
+    assert_eq!(idle.activity, WorkerActivity::WaitingOnWork);
+    assert!(!idle.activity.needs_human());
     assert!(idle.current_tool.is_none());
     assert_eq!(
         idle.wait_reason.as_deref(),
@@ -678,4 +679,21 @@ async fn an_expired_wait_reverts_a_normalized_idle_worker_to_waiting_for_input()
     let expired = snapshot(&server_state);
     assert_eq!(expired.activity, WorkerActivity::WaitingForInput);
     assert!(expired.wait_reason.is_none());
+}
+
+#[tokio::test]
+async fn a_blocking_prompt_after_stop_is_not_hidden_by_snapshot_wait_normalization() {
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 1)).await;
+    declare_wait(&server_state, &execution_id);
+    dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 3)).await;
+    dispatch_worker_event_fanout(&server_state, &notification(&execution_id, 2)).await;
+    let asking = snapshot(&server_state);
+    assert_eq!(asking.activity, WorkerActivity::WaitingForInput);
+    assert_eq!(asking.wait_reason.as_deref(), Some(WAIT_REASON));
+    assert_eq!(
+        asking.live_status.as_deref(),
+        Some(crate::live_status::AWAITING_INPUT_LITERAL)
+    );
 }
