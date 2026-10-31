@@ -543,13 +543,16 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
         None
     };
 
-    let outcome = work_db.submit_worker_proposal(SubmitWorkerProposalInput {
-        execution_id: &caller.execution_id,
-        work_item_id: &caller.work_item_id,
-        kind,
-        payload_json: &validated.canonical_json,
-        idempotency_key: &idempotency_key,
-    });
+    let outcome = work_db.submit_worker_proposal_with_liveness(
+        SubmitWorkerProposalInput {
+            execution_id: &caller.execution_id,
+            work_item_id: &caller.work_item_id,
+            kind,
+            payload_json: &validated.canonical_json,
+            idempotency_key: &idempotency_key,
+        },
+        &|pid| crate::durable_liveness::probe_recorded_pid(pid).is_alive(),
+    );
 
     match outcome {
         Ok(Ok(SubmitWorkerProposalOutcome {

@@ -183,6 +183,56 @@ fn build(conn: &Connection, minimum_age_secs: i64, now: i64) -> Result<(StuckRep
     Ok((report, probes))
 }
 
+/// An owned host observation; no callback runs under the apply connection lock.
+pub(super) struct QuestionWorkerObservation {
+    work_item_id: String,
+    process: (String, i64),
+}
+
+impl QuestionWorkerObservation {
+    pub(super) fn still_eligible(&self, conn: &Connection, task: &Task, durable: &str) -> Result<bool> {
+        Ok(task.id == self.work_item_id
+            && task.status == TaskStatus::Active
+            && durable != "S19_waiting_human"
+            && super::run_rows::latest_local_worker_process_for_work_item(
+                conn,
+                &task.id,
+                REDISPATCH_PID_TRUST_SECS,
+                boss_engine_utils::epoch_time::now_epoch_secs(),
+            )?
+            .as_ref()
+                == Some(&self.process))
+    }
+}
+
+pub(super) fn observe_question_worker(
+    db: &WorkDb,
+    execution_id: &str,
+    pid_is_alive: &dyn Fn(Option<i64>) -> bool,
+) -> Result<Option<QuestionWorkerObservation>> {
+    let candidate = {
+        let conn = db.connect()?;
+        let execution = query_execution(&conn, execution_id).require("execution", execution_id)?;
+        if let Some(task) = query_task(&conn, &execution.work_item_id)?
+            && task.status == TaskStatus::Active
+        {
+            super::run_rows::latest_local_worker_process_for_work_item(
+                &conn,
+                &task.id,
+                REDISPATCH_PID_TRUST_SECS,
+                boss_engine_utils::epoch_time::now_epoch_secs(),
+            )?
+            .map(|process| QuestionWorkerObservation {
+                work_item_id: task.id,
+                process,
+            })
+        } else {
+            None
+        }
+    };
+    Ok(candidate.filter(|worker| pid_is_alive(Some(worker.process.1))))
+}
+
 pub(super) fn latest_basis(conn: &Connection, id: &str, property: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row(
@@ -271,7 +321,7 @@ fn progressing_prerequisite(conn: &Connection, id: &str, now: i64) -> Result<boo
     Ok(false)
 }
 
-/// Classify durable reasons without treating a question-producing worker as an orphan.
+/// Classify durable reasons before applying an owned host liveness observation.
 ///
 /// S19 (waiting on a human) comes first; `stuck_report` relies on this when it
 /// layers the host-observed S15 live-pid override on top of the result.

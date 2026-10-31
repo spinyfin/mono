@@ -753,32 +753,98 @@ fn non_task_waits_never_enter_task_history() {
 }
 
 #[test]
-fn question_classification_preserves_failure_reason_without_probing_its_worker() {
-    let db = WorkDb::open(temp_db_path("question-durable-classification")).unwrap();
-    let (_, id, execution) = make_waiting_human_chore(&db, "Question failure reason");
-    let conn = db.connect().unwrap();
-    conn.execute(
-        "UPDATE tasks SET status = 'active', dispatch_failed_reason = 'churn_guard' WHERE id = ?1",
-        [&id],
-    )
-    .unwrap();
-    conn.execute(
-        "UPDATE work_executions SET status = 'running' WHERE id = ?1",
-        [&execution],
-    )
-    .unwrap();
-    conn.execute(
-        "UPDATE work_runs SET shell_pid = ?1, host_id = 'local' WHERE execution_id = ?2",
-        params![std::process::id(), execution],
-    )
-    .unwrap();
-    crate::work::pr_flow::insert_question(&conn, &execution, "question-classification", &question()).unwrap();
-    let classification: String = conn
-        .query_row(
-            "SELECT stuck_classification FROM operator_questions WHERE execution_id = ?1",
-            [&execution],
-            |row| row.get(0),
-        )
+fn question_classification_uses_pre_transaction_liveness_and_rechecks_eligibility() {
+    use boss_protocol::{ProposalKind, RunDoneOutcome, RunDoneProposalPayload};
+    use std::cell::Cell;
+
+    for (case, alive, expired, waiting_human, task_status, change_after_probe, expected) in [
+        ("live", true, false, false, "active", false, "S15_orphan_live_pid"),
+        ("dead", false, false, false, "active", false, "S2_churn_guard"),
+        ("expired", true, true, false, "active", false, "S2_churn_guard"),
+        ("human", true, false, true, "active", false, "S19_waiting_human"),
+        ("todo", true, false, false, "todo", false, "S2_churn_guard"),
+        ("replaced", true, false, false, "active", true, "S2_churn_guard"),
+    ] {
+        let db = WorkDb::open(temp_db_path(&format!("question-liveness-{case}"))).unwrap();
+        let (_, id, execution) = make_waiting_human_chore(&db, "Question failure reason");
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = ?2, dispatch_failed_reason = 'churn_guard' WHERE id = ?1",
+                params![id, task_status],
+            )
+            .unwrap();
+            if !waiting_human {
+                conn.execute(
+                    "UPDATE work_executions SET status = 'running' WHERE id = ?1",
+                    [&execution],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "UPDATE work_runs SET shell_pid = 12345, host_id = 'local', created_at = ?1 WHERE execution_id = ?2",
+                params![
+                    if expired {
+                        now() - REDISPATCH_PID_TRUST_SECS - 1
+                    } else {
+                        now()
+                    },
+                    execution
+                ],
+            )
+            .unwrap();
+        }
+        let payload = serde_json::to_string(&RunDoneProposalPayload {
+            outcome: RunDoneOutcome::Blocked,
+            summary: "Needs a decision".into(),
+            question: Some(question()),
+            queue_ci_evidence: None,
+        })
         .unwrap();
-    assert_eq!(classification, "S2_churn_guard");
+        let probes = Cell::new(0);
+        let outcome = db
+            .submit_worker_proposal_with_liveness(
+                crate::work::SubmitWorkerProposalInput {
+                    execution_id: &execution,
+                    work_item_id: &id,
+                    kind: ProposalKind::RunDone,
+                    payload_json: &payload,
+                    idempotency_key: "question-classification",
+                },
+                &|pid| {
+                    assert_eq!(pid, Some(12345));
+                    probes.set(probes.get() + 1);
+                    // Re-entering storage proves the connection lock is released.
+                    let conn = db.connect().unwrap();
+                    if change_after_probe {
+                        conn.execute(
+                            "UPDATE work_runs SET shell_pid = 54321 WHERE execution_id = ?1",
+                            [&execution],
+                        )
+                        .unwrap();
+                    }
+                    alive
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.proposal.state, boss_protocol::ProposalState::Applied);
+        assert_eq!(
+            probes.get(),
+            if expired || task_status != "active" { 0 } else { 1 },
+            "{case}"
+        );
+        let classification: String = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT stuck_classification FROM operator_questions WHERE execution_id = ?1",
+                [&execution],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(classification, expected, "{case}");
+        let report = db.stuck_report(604800, now(), &|_| false).unwrap();
+        assert_eq!(report.questions_filed_by_stuck_kind.get(expected), Some(&1), "{case}");
+    }
 }

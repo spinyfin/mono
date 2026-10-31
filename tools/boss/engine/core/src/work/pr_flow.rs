@@ -2225,15 +2225,24 @@ pub(super) fn withdraw_questions(conn: &Connection, work_item_id: &str, reason: 
     Ok(())
 }
 
-/// Records the durable stuck classification only. It runs inside the
-/// caller's write transaction, where no host process probe may run, so an
-/// Active task with a live recorded pid reports its durable reason here, not
-/// the report-time S15 override.
+/// Insert a question without host observations in storage-only tests.
+#[cfg(test)]
 pub(crate) fn insert_question(
     conn: &Connection,
     execution_id: &str,
     proposal_id: &str,
     question: &OperatorQuestion,
+) -> Result<()> {
+    insert_question_with_liveness(conn, execution_id, proposal_id, question, None)
+}
+
+/// Persist the pre-transaction observation, rechecking durable eligibility.
+pub(super) fn insert_question_with_liveness(
+    conn: &Connection,
+    execution_id: &str,
+    proposal_id: &str,
+    question: &OperatorQuestion,
+    worker: Option<&super::stuck_report::QuestionWorkerObservation>,
 ) -> Result<()> {
     let execution = query_execution(conn, execution_id).require("execution", execution_id)?;
     // Every work-item kind that can run a worker gets a question row: a
@@ -2246,7 +2255,14 @@ pub(crate) fn insert_question(
     };
     let parkable = task.deleted_at.is_none() && matches!(task.status, TaskStatus::Active | TaskStatus::Todo);
     let stuck_classification = if task.blocked_reason.is_some() || task.dispatch_failed_reason.is_some() {
-        super::stuck_report::classification(conn, &task, None)?
+        let durable = super::stuck_report::classification(conn, &task, None)?;
+        if let Some(worker) = worker
+            && worker.still_eligible(conn, &task, &durable)?
+        {
+            "S15_orphan_live_pid".to_owned()
+        } else {
+            durable
+        }
     } else {
         "S8_operator_question".to_owned()
     };

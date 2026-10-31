@@ -1287,8 +1287,8 @@ impl ServerState {
         // Constructed here (rather than left to `ServerState::builder`'s
         // default) so it can be injected into `work_db` via
         // `with_event_bus` below — without that, `WorkDb`'s state-transition
-        // publishers (e.g. `host_registry::set_host_enabled`'s
-        // `Event::HostDisabled`) and `ServerState`'s subscribers (e.g.
+        // publishers (e.g. `Event::HostDisabled` from `WorkDb::set_host_enabled`
+        // in `work/host_storage.rs`) and `ServerState`'s subscribers (e.g.
         // `host_reconcile`) would sit on two disjoint bus instances and no
         // event would ever reach a subscriber.
         let mut timeline = crate::startup_timing::StartupTimeline::begin("server_state");
