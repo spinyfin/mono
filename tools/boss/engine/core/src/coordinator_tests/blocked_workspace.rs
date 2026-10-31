@@ -769,7 +769,7 @@ pub(super) async fn chain_harness(chain_root_pr: bool, origin: bool, conflict: b
 }
 
 impl ChainHarness {
-    async fn dispatch(&self) -> Result<()> {
+    pub(super) async fn dispatch(&self) -> Result<()> {
         let worker = self
             .coordinator
             .pool_for_execution(&self.next)
@@ -949,39 +949,63 @@ async fn revision_without_any_bound_pr_archives_and_starts_fresh() {
 }
 
 #[tokio::test]
-async fn transient_fetch_failure_archives_and_starts_fresh() {
-    // No origin remote: `jj git fetch` fails while the pointer is intact.
-    let h = chain_harness(true, false, false).await;
-    let autostart_before = match h.coordinator.work_db.get_work_item(&h.next.work_item_id).unwrap() {
-        WorkItem::Chore(item) | WorkItem::Task(item) => item.autostart,
-        _ => panic!("expected task"),
-    };
-    let prior = h.coordinator.work_db.recovery_predecessor(&h.next).unwrap().unwrap();
-    h.dispatch().await.unwrap();
-    assert!(
-        h.coordinator
-            .work_db
-            .execution_bookmark_optional(&prior.id)
-            .unwrap()
-            .is_none()
+async fn ssh_fetch_failure_retries_without_archiving() {
+    use boss_engine_test_git::jj::JjRepo;
+    let h = chain_harness(true, true, false).await;
+    // Force SSH to fail locally without reaching a real server or credential.
+    JjRepo::run(
+        &h.repo.repo,
+        &["git", "remote", "set-url", "origin", "ssh://127.0.0.1:1/unavailable"],
     );
-    let notes = h
-        .coordinator
-        .work_db
-        .list_attention_items_for_work_item(&prior.work_item_id)
-        .unwrap();
-    assert_eq!(notes[0].status, "resolved");
-    assert!(notes[0].body_markdown.contains("preserved/"));
-    let (WorkItem::Chore(item) | WorkItem::Task(item)) =
-        h.coordinator.work_db.get_work_item(&h.next.work_item_id).unwrap()
-    else {
-        panic!("expected chore")
+    let db = &h.coordinator.work_db;
+    let prior = db.recovery_predecessor(&h.next).unwrap().unwrap();
+    let autostart = match db.get_work_item(&h.next.work_item_id).unwrap() {
+        WorkItem::Task(item) | WorkItem::Chore(item) => item.autostart,
+        _ => panic!("expected implementation item"),
     };
-    assert_ne!(item.status, TaskStatus::Blocked, "transient failure must not block");
-    assert_eq!(item.autostart, autostart_before, "autostart must not be cleared");
+    let record = db.execution_bookmark(&prior.id).unwrap();
+    let pointers = boss_engine_recovery::execution_bookmark::snapshot_pointers(
+        &boss_engine_recovery::execution_bookmark::LocalJj,
+        &record,
+    )
+    .await
+    .unwrap();
+    let error = h.dispatch().await.unwrap_err();
+    // libgit2 reports the socket failure without spelling out the SSH scheme.
+    assert!(
+        format!("{error:#}").contains("failed to connect to 127.0.0.1"),
+        "{error:#}"
+    );
+    assert!(!boss_engine_recovery::execution_bookmark::is_pointer_integrity_error(
+        &error
+    ));
+    let after = db.get_execution(&h.next.id).unwrap();
+    assert_eq!(after.pre_start_failure_count, 1);
+    assert!(after.dispatch_not_before.is_some());
+    assert!(after.started_at.is_none());
+    assert_ne!(after.status, ExecutionStatus::Failed);
+    let (WorkItem::Task(item) | WorkItem::Chore(item)) = db.get_work_item(&h.next.work_item_id).unwrap() else {
+        panic!("expected implementation item");
+    };
+    assert_ne!(item.status, TaskStatus::Blocked);
+    assert_eq!(item.autostart, autostart);
+    assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
+    assert!(db.execution_bookmark_retired_reason(&prior.id).unwrap().is_none());
     assert_eq!(
-        h.coordinator.work_db.get_execution(&h.next.id).unwrap().status,
-        ExecutionStatus::Running
+        boss_engine_recovery::execution_bookmark::snapshot_pointers(
+            &boss_engine_recovery::execution_bookmark::LocalJj,
+            &record,
+        )
+        .await
+        .unwrap(),
+        pointers
+    );
+    assert!(
+        JjRepo::run(
+            &h.repo.repo,
+            &["bookmark", "list", &format!("glob:preserved/{}/*", prior.id)]
+        )
+        .is_empty()
     );
 }
 

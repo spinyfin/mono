@@ -1194,6 +1194,9 @@ impl ExecutionCoordinator {
                     crate::execution_bookmark_recovery::RECOVERY_FAILED,
                 )?;
             }
+            Err(err) if !boss_engine_recovery::execution_bookmark::is_pointer_integrity_error(&err) => {
+                return Err(err);
+            }
             Err(err) => {
                 let record = self.work_db.execution_bookmark(&execution.id)?;
                 let adapter = self.host_adapter();

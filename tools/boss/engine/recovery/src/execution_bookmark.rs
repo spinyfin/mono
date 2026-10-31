@@ -621,11 +621,21 @@ pub async fn create_from(
         base_commit: None,
     };
     let result = async {
+        // Existing names are an integrity verdict. Command failures (including
+        // a race creating names after this read) remain retryable.
+        let names = [record.base(), record.head(), record.publication()];
+        let targets = snapshot::resolve_bookmark_targets(jj, &record.repo_path, &names).await?;
+        if !targets.is_empty() {
+            return Err(pointer_integrity_error(
+                "execution recovery pointer names already exist",
+            ));
+        }
         let baseline = if let Some(prior) = predecessor {
-            ensure!(
-                prior.repo_path == record.repo_path && prior.host_id == record.host_id,
-                "inherited baseline belongs to another recovery store"
-            );
+            if prior.repo_path != record.repo_path || prior.host_id != record.host_id {
+                return Err(pointer_integrity_error(
+                    "inherited baseline belongs to another recovery store",
+                ));
+            }
             diff(jj, prior).await?;
             inherited_base
                 .map(str::to_owned)

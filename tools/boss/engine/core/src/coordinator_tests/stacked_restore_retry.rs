@@ -10,6 +10,7 @@ use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, RestoreReport}
 struct FlakyRestoreAdapter {
     inner: Arc<dyn HostAdapter>,
     bases: std::sync::Mutex<Vec<String>>,
+    integrity: Option<boss_engine_recovery::execution_bookmark::PointerIntegrityKind>,
 }
 
 #[async_trait]
@@ -57,6 +58,12 @@ impl HostAdapter for FlakyRestoreAdapter {
             bases.len() == 1
         };
         if first {
+            if let Some(kind) = self.integrity {
+                return Err(boss_engine_recovery::execution_bookmark::pointer_integrity_error_of(
+                    kind,
+                    "injected integrity verdict",
+                ));
+            }
             return Err(anyhow!("injected transient fetch failure"));
         }
         self.inner
@@ -136,7 +143,7 @@ impl HostAdapter for FlakyRestoreAdapter {
 }
 
 #[tokio::test]
-async fn restore_failure_archives_work_and_starts_fresh_on_the_stacked_pr() {
+async fn restore_transport_failure_retries_on_the_same_stacked_base() {
     use boss_engine_test_git::jj::JjRepo;
     let h = chain_harness(true, true, false).await;
     JjRepo::run(&h.repo.repo, &["new", "main", "-m", "Stacked parent"]);
@@ -160,6 +167,7 @@ async fn restore_failure_archives_work_and_starts_fresh_on_the_stacked_pr() {
     let flaky = Arc::new(FlakyRestoreAdapter {
         inner: h.coordinator.host_adapter.clone(),
         bases: std::sync::Mutex::new(Vec::new()),
+        integrity: None,
     });
     let adapter: Arc<dyn HostAdapter> = flaky.clone();
     let source = h.coordinator.work_db.recovery_predecessor(&h.next).unwrap().unwrap();
@@ -169,65 +177,52 @@ async fn restore_failure_archives_work_and_starts_fresh_on_the_stacked_pr() {
         &["log", "-r", &record.head(), "--no-graph", "-T", "commit_id"],
     );
 
-    // Recovery is optional even when the PR base was resolved successfully.
-    assert!(
-        h.coordinator
-            .recover_execution_bookmark(&h.next, &lease, &adapter, "mono", Some(99), Some(99))
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        h.coordinator
-            .work_db
-            .execution_restore_report(&h.next.id)
-            .unwrap()
-            .is_none()
-    );
+    let error = h
+        .coordinator
+        .recover_execution_bookmark(&h.next, &lease, &adapter, "mono", Some(99), Some(99))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("injected transient fetch failure"));
     assert!(
         h.coordinator
             .work_db
             .execution_bookmark_optional(&source.id)
             .unwrap()
-            .is_none()
+            .is_some()
     );
-    let archive = format!("preserved/{}/{preserved}", source.id);
-    let notes = h
-        .coordinator
-        .work_db
-        .list_attention_items_for_work_item(&source.work_item_id)
-        .unwrap();
-    assert!(notes.iter().any(
-        |note| note.body_markdown.contains("recovery operation (including transport)")
-            && note.body_markdown.contains("injected transient fetch failure")
-    ));
-    assert_eq!(
-        JjRepo::run(&h.repo.repo, &["file", "show", "-r", &archive, "root:revision.txt"]),
-        "unpushed revision"
-    );
-    // A later attempt never re-enters the failed restage.
     assert!(
         h.coordinator
-            .recover_execution_bookmark(&h.next, &lease, &adapter, "mono", Some(99), Some(99))
-            .await
+            .work_db
+            .execution_bookmark_retired_reason(&source.id)
             .unwrap()
             .is_none()
     );
-    assert_eq!(*flaky.bases.lock().unwrap(), vec!["stack-parent"]);
-    JjRepo::run(&h.repo.replacement, &["new", "pr/99", "-m", "Fresh revision"]);
-    let fresh = boss_engine_recovery::execution_bookmark::create(
-        &boss_engine_recovery::execution_bookmark::LocalJj,
-        &h.repo.replacement,
-        &h.next.id,
-        "local",
-    )
-    .await
-    .unwrap();
     assert_eq!(
-        fresh.base_commit.unwrap(),
-        JjRepo::run(&h.repo.repo, &["log", "-r", "pr/99", "--no-graph", "-T", "commit_id"])
+        JjRepo::run(
+            &h.repo.repo,
+            &["log", "-r", &record.head(), "--no-graph", "-T", "commit_id"]
+        ),
+        preserved
     );
-    assert!(!h.repo.replacement.join("revision.txt").exists());
+    assert!(
+        JjRepo::run(
+            &h.repo.repo,
+            &["bookmark", "list", &format!("glob:preserved/{}/*", source.id)]
+        )
+        .is_empty()
+    );
+    let recovered = h
+        .coordinator
+        .recover_execution_bookmark(&h.next, &lease, &adapter, "mono", Some(99), Some(99))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(recovered.has_work);
+    assert_eq!(*flaky.bases.lock().unwrap(), vec!["stack-parent", "stack-parent"]);
+    assert_eq!(
+        std::fs::read_to_string(h.repo.replacement.join("revision.txt")).unwrap(),
+        "unpushed revision"
+    );
     let parent_commits = JjRepo::run(
         &h.repo.replacement,
         &[
@@ -240,4 +235,169 @@ async fn restore_failure_archives_work_and_starts_fresh_on_the_stacked_pr() {
         ],
     );
     assert_eq!(parent_commits.lines().count(), 1, "{parent_commits}");
+}
+
+#[tokio::test]
+async fn every_integrity_verdict_archives_and_allows_fresh_dispatch() {
+    use boss_engine_recovery::execution_bookmark::PointerIntegrityKind;
+    use boss_engine_test_git::jj::JjRepo;
+    for kind in [
+        PointerIntegrityKind::Other,
+        PointerIntegrityKind::NotDescended,
+        PointerIntegrityKind::Diverged,
+        PointerIntegrityKind::NotContained,
+        PointerIntegrityKind::MissingBaseline,
+        PointerIntegrityKind::PrHeadUnavailable,
+    ] {
+        let h = chain_harness(true, true, false).await;
+        let adapter: Arc<dyn HostAdapter> = Arc::new(FlakyRestoreAdapter {
+            inner: h.coordinator.host_adapter.clone(),
+            bases: std::sync::Mutex::new(Vec::new()),
+            integrity: Some(kind),
+        });
+        let lease = CubeWorkspaceLease {
+            lease_id: "lease-integrity".into(),
+            workspace_id: "replacement".into(),
+            workspace_path: h.repo.replacement.clone(),
+            dirty_verified: Some(true),
+        };
+        let db = &h.coordinator.work_db;
+        let prior = db.recovery_predecessor(&h.next).unwrap().unwrap();
+        assert!(
+            h.coordinator
+                .recover_execution_bookmark(&h.next, &lease, &adapter, "mono", Some(99), Some(99),)
+                .await
+                .unwrap()
+                .is_none(),
+            "{kind:?}"
+        );
+        assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_none(), "{kind:?}");
+        assert!(
+            !JjRepo::run(
+                &h.repo.repo,
+                &["bookmark", "list", &format!("glob:preserved/{}/*", prior.id)]
+            )
+            .is_empty(),
+            "{kind:?}"
+        );
+        let notes = db.list_attention_items_for_work_item(&prior.work_item_id).unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.body_markdown.contains("injected integrity verdict")),
+            "{kind:?}"
+        );
+        h.dispatch().await.unwrap();
+        let after = db.get_execution(&h.next.id).unwrap();
+        assert_eq!(after.status, ExecutionStatus::Running, "{kind:?}");
+        assert_eq!(after.pre_start_failure_count, 0, "{kind:?}");
+    }
+}
+
+#[tokio::test]
+async fn conflicted_recovery_bookmark_archives_both_heads_and_starts_worker() {
+    use boss_engine_recovery::execution_bookmark::{LocalJj, PointerIntegrityKind, diff, pointer_integrity_kind};
+    use boss_engine_test_git::jj::JjRepo;
+    for kind in [
+        ExecutionKind::AnswerAgent,
+        ExecutionKind::AutomationTriage,
+        ExecutionKind::ChoreImplementation,
+        ExecutionKind::CiRemediation,
+        ExecutionKind::ConflictResolution,
+        ExecutionKind::InvestigationImplementation,
+        ExecutionKind::PrReview,
+        ExecutionKind::PrReviewGuide,
+        ExecutionKind::ProductDesign,
+        ExecutionKind::ProjectDesign,
+        ExecutionKind::RevisionImplementation,
+        ExecutionKind::TaskImplementation,
+    ] {
+        let mut h = chain_harness(true, true, false).await;
+        let db = &h.coordinator.work_db;
+        // Resolve the fixture predecessor before changing its execution kind.
+        let prior = db.recovery_predecessor(&h.next).unwrap().unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET kind = ?1 WHERE id IN (?2, ?3)",
+                rusqlite::params![kind.as_str(), prior.id, h.next.id],
+            )
+            .unwrap();
+        h.next = db.get_execution(&h.next.id).unwrap();
+        let record = db.execution_bookmark(&prior.id).unwrap();
+        let head = JjRepo::run(
+            &h.repo.repo,
+            &["log", "-r", &record.head(), "--no-graph", "-T", "commit_id"],
+        );
+        let op = JjRepo::run(&h.repo.repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
+        for description in ["left recovery", "right recovery"] {
+            JjRepo::run(
+                &h.repo.repo,
+                &["--at-op", op.trim(), "describe", &head, "-m", description],
+            );
+        }
+        let twins = JjRepo::run(
+            &h.repo.repo,
+            &[
+                "log",
+                "-r",
+                &format!("bookmarks(exact:{})", record.head()),
+                "--no-graph",
+                "-T",
+                "commit_id ++ \"\\n\"",
+            ],
+        );
+        assert_eq!(twins.lines().count(), 2);
+        let error = diff(&LocalJj, &record).await.unwrap_err();
+        assert_eq!(pointer_integrity_kind(&error), Some(PointerIntegrityKind::Other));
+        if kind == ExecutionKind::RevisionImplementation {
+            h.dispatch().await.unwrap();
+            assert_eq!(db.get_execution(&h.next.id).unwrap().status, ExecutionStatus::Running);
+        } else {
+            let lease = CubeWorkspaceLease {
+                lease_id: "lease-conflicted".into(),
+                workspace_id: "replacement".into(),
+                workspace_path: h.repo.replacement.clone(),
+                dirty_verified: Some(true),
+            };
+            assert!(
+                h.coordinator
+                    .recover_execution_bookmark(
+                        &h.next,
+                        &lease,
+                        &h.coordinator.host_adapter,
+                        "mono",
+                        Some(99),
+                        Some(99),
+                    )
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            db.get_execution(&h.next.id).unwrap().pre_start_failure_count,
+            0,
+            "{kind:?}"
+        );
+        if kind.is_read_only_review() {
+            assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
+            assert_eq!(
+                pointer_integrity_kind(&diff(&LocalJj, &record).await.unwrap_err()),
+                Some(PointerIntegrityKind::Other)
+            );
+            continue;
+        }
+        assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_none());
+        let notes = db.list_attention_items_for_work_item(&prior.work_item_id).unwrap();
+        assert!(notes.iter().any(|note| note.body_markdown.contains("exactly one")));
+        for twin in twins.lines() {
+            let archive = format!("preserved/{}/{twin}", prior.id);
+            assert_eq!(
+                JjRepo::run(&h.repo.repo, &["log", "-r", &archive, "--no-graph", "-T", "commit_id"]),
+                twin
+            );
+        }
+    }
 }

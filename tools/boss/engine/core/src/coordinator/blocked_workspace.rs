@@ -2,7 +2,7 @@ use super::fresh_start::{FreshStart, position_fresh_workspace};
 use super::*;
 use boss_engine_recovery::execution_bookmark::{
     ExecutionBookmark, Reconciliation, is_base_unresolvable_error, is_missing_pointer_error,
-    is_reconcilable_pointer_error, pointer_integrity_error, pointer_integrity_kind,
+    is_pointer_integrity_error, is_reconcilable_pointer_error, pointer_integrity_error, pointer_integrity_kind,
 };
 
 /// What dispatch recovered into the new lease.
@@ -33,6 +33,9 @@ impl ExecutionCoordinator {
             Ok(record) => return Ok((record, true)),
             Err(err) => err,
         };
+        if !is_pointer_integrity_error(&err) && !is_missing_pointer_error(&err) {
+            return Err(err);
+        }
         let Some(failure) = err.downcast_ref::<boss_engine_recovery::execution_bookmark::CreationFailure>() else {
             return Err(err);
         };
@@ -50,6 +53,9 @@ impl ExecutionCoordinator {
             {
                 Ok(record) => return Ok((record, true)),
                 Err(retry) => {
+                    if !is_pointer_integrity_error(&retry) && !is_missing_pointer_error(&retry) {
+                        return Err(retry);
+                    }
                     if let Some(partial) =
                         retry.downcast_ref::<boss_engine_recovery::execution_bookmark::CreationFailure>()
                     {
@@ -90,7 +96,7 @@ impl ExecutionCoordinator {
     /// No read of its old workspace or lease history occurs.
     ///
     /// Missing predecessor heads degrade to clean dispatch with a warning.
-    /// Any unsuccessful recovery archives its source and dispatches fresh.
+    /// Integrity failures archive their source and dispatch fresh; transport failures retry.
     /// Failure to write the archive leaves all source pointers intact.
     ///
     /// `repo_id` is the handle `ensure_repo` returned for this execution; the
@@ -142,7 +148,7 @@ impl ExecutionCoordinator {
             .await;
         match result {
             Ok(recovered) => Ok(recovered),
-            Err(err) => {
+            Err(err) if is_pointer_integrity_error(&err) || is_missing_pointer_error(&err) => {
                 self.retire_unvouched_record(execution, &prior, &record, adapter, &err)
                     .await?;
                 self.work_db.delete_execution_restore_report(&execution.id)?;
@@ -165,6 +171,7 @@ impl ExecutionCoordinator {
                 }
                 Ok(None)
             }
+            Err(err) => Err(err),
         }
     }
 
@@ -251,7 +258,7 @@ impl ExecutionCoordinator {
                     Ok(base) => base,
                     // Only a base that can never be resolved (e.g. a non-GitHub
                     // origin) substitutes main during restaging; other errors
-                    // use the archive-and-start-fresh path.
+                    // retry without retiring the preserved work.
                     Err(err) if is_base_unresolvable_error(&err) => {
                         tracing::warn!(execution_id = %execution.id, ?err, fallback = %repo.main_branch, "PR base branch is unresolvable; restaging recovery onto the main branch");
                         base_fallback = Some(format!(
@@ -420,27 +427,8 @@ impl ExecutionCoordinator {
                 .await
         }
         .await;
-        let (heads, unavailable) = match archive {
-            Ok(heads) => (heads, String::new()),
-            Err(err) if adapter.host_id() != record.host_id => (
-                Vec::new(),
-                format!(
-                    "; source host {} unavailable: {err:#}; pointers {}, {}, {} left intact there",
-                    record.host_id,
-                    record.base(),
-                    record.head(),
-                    record.publication()
-                ),
-            ),
-            Err(err) => return Err(err),
-        };
-
-        let category = if pointer_integrity_kind(reason).is_some() || is_missing_pointer_error(reason) {
-            "pointer integrity"
-        } else {
-            "recovery operation (including transport)"
-        };
-        let reason = format!("{category}: {reason:#}{unavailable}");
+        let heads = archive?;
+        let reason = format!("pointer integrity: {reason:#}");
         tracing::info!(
             execution_id = %execution.id,
             predecessor = %prior.id,

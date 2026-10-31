@@ -8,7 +8,7 @@ The engine keeps three bookmarks per execution in the shared jj store of the rep
 
 The `execution_bookmarks` row for the execution records the shared store path, the host, and the last checkpointed baseline commit (`base_commit`). A missing bookmark can be rebuilt from that commit or a verified evolution successor that is an ancestor of every preserved head.
 
-Recovery is an optimisation, never a prerequisite for starting work. If safe recovery cannot be proved, the engine archives the preserved commits and starts fresh. Redoing work is preferable to leaving an item unable to progress.
+Recovery is an optimisation. If pointer integrity checks cannot establish safe recovery, the engine archives the preserved commits and starts fresh. Transport failures retry through the ordinary positioning-failure path without retiring the recovery source. Redoing work is preferable to leaving an item unable to progress.
 
 Recovery resumes a later execution from `boss-base..<head>` of its predecessor. The integrity check requires a single line of history: every head must descend from the baseline, and when both heads exist one must descend from the other. A pointer that fails the check is never resumed from as-is.
 
@@ -98,14 +98,14 @@ Anything the engine cannot vouch for produces a diagnostic naming the missing ch
 
 ## What happens to the item
 
-When reconciliation, containment, baseline validation, pointer adoption or restaging cannot establish safe recovery, dispatch does the following by default:
+Every pointer-integrity verdict (Other, NotDescended, Diverged, NotContained, MissingBaseline and PrHeadUnavailable) that cannot be reconciled uses the same archive-and-start-fresh path. Transport failures such as unavailable SSH, GitHub or cube commands propagate to the ordinary retry path without archiving. For integrity failures, dispatch does the following:
 
 1. Resolve **all** targets of the baseline, recovery and publication bookmarks, including every side of a conflicted bookmark and any surviving recorded baseline commit.
 2. Write durable local bookmarks named `preserved/<execution id>/<commit id>` for targets with unpublished non-empty work beyond the baseline and published history. Every archive must succeed before any original pointer is released. Separate commit suffixes retain both diverged heads and repeated attempts. These bookmarks are never published or included in execution-pointer pruning.
 3. Retire the source record. Release baseline and recovery names; retain predecessor publication bookmarks and their remote tracking, releasing the publication name only when the same execution must reuse it. Use bookmark deletion, not forgetting, when releasing names. Log the cause, archive names and commit identities. Add a resolved informational note to the owning work item (the root task for review guides), displayed in the work-card details; it requires no acknowledgement and never disables autostart. Stale current-attempt archives are logged and disclosed before retrying adoption, even when the predecessor remains live.
 4. Discard stale restore reports and use normal fresh positioning: the current PR head for PR work, main for work without a PR, or the captured immutable commit for a review guide or post-merge review. Create the new execution's baseline and recovery/publication pointers there. Resumes follow the same sequence before reusing their own pointer names.
 
-Optional task PRs must still be open before fresh positioning; merged, closed, or unavailable task PRs fall back to trunk. Explicitly bound PRs and immutable review targets retain their positioning rules at initialization and startup resume too. A source host with no free slots applies backpressure while preserving recovery. An ineligible source host permits fresh dispatch elsewhere; if its transport or registry entry is unavailable, its pointers are left intact and named in the retirement note rather than preventing destination startup. Same-host name release still requires successful archiving first.
+Optional task PRs must still be open before fresh positioning; merged, closed, or unavailable task PRs fall back to trunk. Explicitly bound PRs and immutable review targets retain their positioning rules at initialization and startup resume too. A source host with no free slots applies backpressure while preserving recovery. An ineligible source host permits fresh dispatch elsewhere after its source adapter successfully archives the work. If that adapter or its transport is unavailable, dispatch retries and retains the source record and pointers. Every host requires successful archiving before source retirement.
 
 A failed archive write is a storage/host bug, not a containment decision. It leaves every original pointer intact and reports the concrete failure; it never creates an `execution_recovery_failed` blocked item or a chain-blocking card. Successful fallback retires the bad source, so later scheduler passes do not refire its failed check. Successful reconciliation still resumes preserved work normally and adds the reconciliation explanation to the worker prompt.
 
@@ -124,7 +124,7 @@ Implementation execution kinds enter `ExecutionCoordinator::recover_execution_bo
 | Conflict resolution and CI remediation                        | The shared pre-start check and direct restore path; failure archives and positions on the bound PR.                                  |
 | Automated PR review                                           | Skips recovery lineage inspection, including self-retry; starts at the current PR head.                                              |
 | Review guide                                                  | Skips recovery lineage inspection; positions on its required immutable review target.                                                |
-| Startup pane resume (resume_pane_spawn_for_running_execution) | Inspection failures archive and retire the record, position fresh and create replacement pointers before spawning.                   |
+| Startup pane resume (resume_pane_spawn_for_running_execution) | Integrity failures archive and retire the record before fresh positioning and spawning; transport failures retry.                    |
 | Host selection                                                | Prefer the recovery source host; if it cannot admit work, select an eligible destination and archive through the source adapter.     |
 | Resume / same-execution pre-start retry                       | Its own record is inspected first; fallback archives all old targets before releasing names and creating new pointers.               |
 

@@ -304,7 +304,7 @@ impl crate::host_adapter::HostAdapterProvider for ScratchHostProvider {
 }
 
 #[tokio::test]
-async fn unreachable_source_transport_starts_on_destination_without_releasing_source() {
+async fn unreachable_source_transport_retries_without_retiring_source() {
     source_host_dispatch(false).await;
 }
 
@@ -380,24 +380,17 @@ async fn source_host_dispatch(full: bool) {
         assert!(db.execution_bookmark_retired_reason(&prior.id).unwrap().is_none());
         assert!(cube.lease_calls.lock().await.is_empty());
     } else {
-        result.unwrap();
-        let next = db.get_execution(&next.id).unwrap();
-        assert_eq!(next.status, ExecutionStatus::Running);
-        assert_eq!(next.pre_start_failure_count, 0);
-        assert_eq!(
-            db.latest_run_host_for_execution(&next.id).unwrap().as_deref(),
-            Some("destination")
-        );
-        let fresh = db.execution_bookmark(&next.id).unwrap();
-        assert_eq!(fresh.base_commit, Some(commit(&repo.repo, "main")));
-        let notes = db.list_attention_items_for_work_item(&next.work_item_id).unwrap();
+        let error = result.unwrap_err();
         assert!(
-            notes
-                .iter()
-                .any(|note| note.body_markdown.contains("source transport unavailable")
-                    && note.body_markdown.contains("left intact there")
-                    && note.body_markdown.contains(&record.head()))
+            format!("{error:#}").contains("source transport unavailable"),
+            "{error:#}"
         );
+        let next = db.get_execution(&next.id).unwrap();
+        assert!(next.started_at.is_none());
+        assert_eq!(next.pre_start_failure_count, 1);
+        assert!(next.dispatch_not_before.is_some());
+        assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
+        assert!(db.execution_bookmark_retired_reason(&prior.id).unwrap().is_none());
     }
     for name in [record.head(), record.publication()] {
         assert_eq!(commit(&repo.repo, &name), old);
