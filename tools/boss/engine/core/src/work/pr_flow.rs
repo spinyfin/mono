@@ -2546,9 +2546,6 @@ fn restart_after_answer(
     Ok(())
 }
 
-/// The brief addendum for a multiple-choice answer: the chosen option,
-/// verbatim. Unlike [`authorization_block`] it grants nothing beyond
-/// the decision itself.
 /// No on a plain yes-no or ordinary prerequisite question: record the
 /// declined path and grant nothing, matching [`choice_block`].
 fn declined_block(question: &OperatorQuestionView, timestamp: &str) -> String {
@@ -2592,6 +2589,9 @@ fn explanation_no_path(explanation: &str) -> Option<String> {
     if body.is_empty() { None } else { Some(body.join(" ")) }
 }
 
+/// The brief addendum for a multiple-choice answer: the chosen option,
+/// verbatim. Unlike [`authorization_block`] it grants nothing beyond
+/// the decision itself.
 fn choice_block(question: &OperatorQuestionView, choice: &str, timestamp: &str) -> String {
     format!(
         "\n\n---\n\n## Recorded answer ({timestamp})\n\n\
