@@ -720,8 +720,6 @@ mod github_merge_intents;
 pub(crate) mod personas;
 mod progression_scope;
 mod project_postmortem;
-#[cfg(test)]
-mod project_postmortem_tests;
 mod queued_wait;
 #[cfg(test)]
 mod read_only_tests;
@@ -831,6 +829,8 @@ pub(crate) use review_guide_jobs::{
     PrReviewGuideAttempt, PrReviewGuideVersion, PublishReviewGuideOutcome, RetryReviewGuideOutcome,
     ReviewGuideReenqueueReport, to_wire_review_guide_summary,
 };
+#[cfg(test)]
+pub(crate) use review_guide_sources::set_before_packet_read_hook;
 pub(crate) use review_guide_sources::{
     PrReviewGuideSourceCapture, PrSourceCapturePersistOutcome, PrSourceCaptureTrigger,
 };

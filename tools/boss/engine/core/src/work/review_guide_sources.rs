@@ -841,6 +841,14 @@ thread_local! {
     pub(super) static BEFORE_PACKET_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
+/// Install a one-shot hook that runs inside the next packet-artifact read on
+/// this thread, so a test outside storage can hold an artifact validation open
+/// while it drives other work.
+#[cfg(test)]
+pub(crate) fn set_before_packet_read_hook(hook: Box<dyn FnOnce()>) {
+    BEFORE_PACKET_READ.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
 pub(super) fn load_packet(
     artifact_root: &Path,
     packet_path: Option<&str>,

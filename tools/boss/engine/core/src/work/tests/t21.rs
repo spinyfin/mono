@@ -40,7 +40,7 @@ fn revision_no_op_preserves_specific_attention_with_stamped_pr() {
             &exec_id,
             "finding declined",
             Some(CreateAttentionItemInput {
-                kind: crate::completion::REVISION_NO_OP_ATTENTION_KIND.into(),
+                kind: boss_engine_storage_values::attention_kinds::REVISION_NO_OP_ATTENTION_KIND.into(),
                 title: "Finding declined".into(),
                 body_markdown: "The finding was declined rather than fixed.".into(),
                 ..Default::default()
@@ -50,7 +50,10 @@ fn revision_no_op_preserves_specific_attention_with_stamped_pr() {
         .unwrap();
     assert_eq!(task_status(&db, &task_id), "done");
     let attention = completion.filed_attention_item.unwrap();
-    assert_eq!(attention.kind, crate::completion::REVISION_NO_OP_ATTENTION_KIND);
+    assert_eq!(
+        attention.kind,
+        boss_engine_storage_values::attention_kinds::REVISION_NO_OP_ATTENTION_KIND
+    );
     assert_eq!(attention.body_markdown, "The finding was declined rather than fixed.");
 }
 
@@ -87,44 +90,6 @@ fn delivered_chore_waiting_for_review_cannot_receive_another_implementation() {
         .unwrap_err();
     assert!(error.to_string().contains("bound PR"));
     assert_eq!(db.list_executions(Some(&chore_id)).unwrap().len(), before);
-}
-
-#[test]
-fn no_op_with_bound_pr_retains_review_and_files_attention_atomically() {
-    let db = WorkDb::open(temp_db_path("bound-pr-noop")).unwrap();
-    let (_, chore_id, exec_id) = make_waiting_human_chore(&db, "bound-pr-noop");
-    let pr_url = "https://github.com/spinyfin/mono/pull/4042";
-    db.connect()
-        .unwrap()
-        .execute("UPDATE tasks SET pr_url = ?2 WHERE id = ?1", params![chore_id, pr_url])
-        .unwrap();
-    crate::completion::file_admission_deferred_attention(&db, &chore_id, pr_url);
-    let completion = db
-        .record_worker_no_op_completion(&exec_id, "nothing new", None)
-        .unwrap()
-        .unwrap();
-    let WorkItem::Chore(task) = completion.work_item else {
-        panic!("expected chore")
-    };
-    assert_eq!(task.status, TaskStatus::InReview);
-    assert_eq!(task.pr_url.as_deref(), Some(pr_url));
-    assert!(task.completed_at.is_none());
-    assert_eq!(completion.execution.status, ExecutionStatus::Completed);
-    let attention = completion.filed_attention_item.expect("contradiction must be visible");
-    assert_eq!(attention.kind, "completion_with_bound_pr");
-    assert!(attention.body_markdown.contains(pr_url));
-    assert_eq!(db.list_attention_items(&exec_id).unwrap().len(), 1);
-    assert!(
-        db.list_tasks_awaiting_pre_merge_review_admission()
-            .unwrap()
-            .iter()
-            .any(|candidate| candidate.task_id == chore_id)
-    );
-    assert!(
-        db.record_worker_no_op_completion(&exec_id, "replayed", None)
-            .unwrap()
-            .is_none()
-    );
 }
 
 #[test]

@@ -3,7 +3,7 @@
 
 use boss_protocol::{
     ProposalDecider, ProposalKind, ProposalState, ReviewBatch, ReviewBatchMemberRole, ReviewBatchMemberStatus,
-    ReviewBatchPhase, ReviewBatchStatus, ReviewClassification, ReviewLanguageBucket, ReviewProfile, ReviewStage,
+    ReviewBatchPhase, ReviewBatchStatus, ReviewClassification, ReviewLanguageBucket, ReviewProfile,
 };
 
 use super::*;

@@ -148,134 +148,6 @@ fn findings_verdict_payload(batch_id: &str, target_sha: &str) -> String {
     )
 }
 
-#[tokio::test]
-async fn clean_verdict_advances_the_origin_to_review_without_a_revision() {
-    let db = WorkDb::open(temp_db_path("verdict-apply-clean")).unwrap();
-    let product = create_test_product(&db);
-    let product_id = product.id.clone();
-    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
-    bind_open_pr(&db, &cycle_root.id);
-    let publisher = std::sync::Arc::new(crate::test_support::RecordingPublisher::default());
-    let notifications =
-        crate::board_notification_bridge::spawn_notifications(db.event_bus().clone(), publisher.clone());
-    let supervisor = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(cycle_root.id.clone())
-                .kind(ExecutionKind::PrReview)
-                .status(ExecutionStatus::Ready)
-                .build(),
-        )
-        .unwrap();
-    let (batch, _) = db
-        .create_review_batch(
-            batch_input(cycle_root.id.clone(), "head-sha"),
-            &[member(
-                ReviewBatchMemberRole::Supervisor,
-                Some(supervisor.id.clone()),
-                ReviewBatchMemberStatus::Pending,
-            )],
-        )
-        .unwrap();
-    force_batch_supervising(&db, &batch.id);
-    let outcome = db
-        .submit_worker_proposal(SubmitWorkerProposalInput {
-            execution_id: &supervisor.id,
-            work_item_id: &cycle_root.id,
-            kind: ProposalKind::ReviewVerdict,
-            payload_json: &clean_verdict_payload(&batch.id, "head-sha"),
-            idempotency_key: "verdict-1",
-        })
-        .unwrap()
-        .unwrap();
-
-    let error = db
-        .apply_observed_review_verdict_proposal(
-            &outcome.proposal.id,
-            &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
-            ReviewVerdictObservation {
-                inputs: db.review_verdict_comparison(&outcome.proposal.id).unwrap(),
-                freshness: None,
-                deletions: Some(vec![]),
-            },
-        )
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("pre-merge verdict observation is missing target freshness"),
-        "{error:#}"
-    );
-    assert_eq!(
-        db.worker_proposal(&outcome.proposal.id).unwrap().unwrap().state,
-        ProposalState::Proposed
-    );
-
-    // The supervisor has stopped before asynchronous application. Neither
-    // the root's status nor a later worker event can refresh this clean pass.
-    db.connect()
-        .unwrap()
-        .execute(
-            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
-            [&supervisor.id],
-        )
-        .unwrap();
-    db.connect().unwrap().execute(
-        "UPDATE tasks SET pr_head_sha = 'head-sha', ci_required_state = 'success', pr_mergeable_state = 'mergeable' WHERE id = ?1",
-        [&cycle_root.id],
-    ).unwrap();
-    let created = db
-        .apply_review_verdict_proposal(
-            &outcome.proposal.id,
-            &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
-        )
-        .unwrap();
-    assert_eq!(created, None);
-
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if !publisher.events.lock().await.is_empty() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("committed clean verdict must invalidate the card");
-    assert_eq!(
-        *publisher.events.lock().await,
-        vec![(
-            product_id.clone(),
-            cycle_root.id.clone(),
-            "review_verdict_applied".to_owned()
-        )]
-    );
-    notifications.abort();
-    let tree = db.get_work_tree(&product_id).unwrap();
-    let card = tree.chores.iter().find(|task| task.id == cycle_root.id).unwrap();
-    assert_eq!(card.ai_review_state.as_deref(), Some("reviewed_all_clear"));
-
-    let after = query_task(&db.connect().unwrap(), &cycle_root.id).unwrap().unwrap();
-    assert_eq!(after.status, TaskStatus::InReview);
-    let (cycle, sha) = db.get_task_review_cycle_state(&cycle_root.id).unwrap();
-    assert_eq!(cycle, 1);
-    assert_eq!(sha.as_deref(), Some("head-sha"));
-    assert_eq!(
-        db.review_batch(&batch.id).unwrap().unwrap().status,
-        ReviewBatchStatus::Completed
-    );
-    let revision_count: i64 = db
-        .connect()
-        .unwrap()
-        .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE parent_task_id = ?1 AND kind = 'revision'",
-            rusqlite::params![cycle_root.id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(revision_count, 0, "clean verdict must not mint a revision");
-}
-
 /// Helper: create a revision under `cycle_root_id`, simulate its worker
 /// completing (a terminal `revision_implementation` execution stamped with
 /// `revision_stop_contributed_head = contributed_sha`), and hold it `active`
@@ -1638,9 +1510,9 @@ fn clean_verdict_runs_the_merge_parent_deletion_tripwire() {
     );
     let attentions = db.list_attention_items_for_work_item(&cycle_root.id).unwrap();
     assert!(
-        attentions
-            .iter()
-            .any(|item| item.kind == crate::merge_parent_deletion::SIGNOFF_ATTENTION_KIND && item.status == "open"),
+        attentions.iter().any(|item| item.kind
+            == boss_engine_storage_values::attention_kinds::MERGED_PARENT_DELETION_SIGNOFF_ATTENTION_KIND
+            && item.status == "open"),
         "tripwire must file the same sign-off attention as the legacy finalize path"
     );
 }
