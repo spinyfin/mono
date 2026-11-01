@@ -125,7 +125,7 @@ fn start_waiting_human(db: &WorkDb, work_item_id: &str) -> crate::work::WorkExec
 }
 
 #[test]
-fn operator_declined_answer_records_operator_no() {
+fn operator_declined_answer_records_restart_after_answer() {
     let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, product.id, "Needs a decision");
@@ -140,9 +140,16 @@ fn operator_declined_answer_records_operator_no() {
         .unwrap();
     db.answer_operator_question(&chore.id, OperatorAnswer::YesNo { value: false })
         .unwrap();
-    let (basis, actor) = latest_ledger(&db, &chore.id, "blocked_reason");
-    assert_eq!(basis, WorkerFailureBasis::OperatorNo.as_str());
+    let (basis, actor) = latest_ledger(&db, &chore.id, "status");
+    assert_eq!(basis, "restart_after_answer");
     assert_eq!(actor, "human");
+    let item = db.get_work_item(&chore.id).unwrap();
+    let boss_protocol::WorkItem::Chore(chore) = item else {
+        panic!("expected chore");
+    };
+    assert_eq!(chore.status, boss_protocol::TaskStatus::Todo);
+    assert!(chore.description.contains("## Recorded answer ("));
+    assert!(chore.description.contains("- **Answer:** No\n"));
 }
 
 #[test]
@@ -1303,6 +1310,7 @@ fn operator_yes_and_prerequisite_approval_record_exact_bases() {
         answer_type: OperatorAnswerType::CreatePrerequisiteTask {
             name: "Prerequisite work".into(),
             brief: "Do the other thing first.".into(),
+            file_count_bypass: None,
         },
     };
     crate::work::insert_question(&db.connect().unwrap(), &gated_exec.id, "proposal", &prereq_q).unwrap();
@@ -1321,6 +1329,7 @@ fn operator_yes_and_prerequisite_approval_record_exact_bases() {
         answer_type: OperatorAnswerType::CreatePrerequisiteTask {
             name: "Parked prerequisite".into(),
             brief: "Do the other thing first.".into(),
+            file_count_bypass: None,
         },
     };
     crate::work::insert_question(&db.connect().unwrap(), &waiting_exec.id, "proposal", &parked_q).unwrap();

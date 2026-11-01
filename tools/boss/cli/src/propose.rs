@@ -396,7 +396,9 @@ pub(crate) struct RunDoneArgs {
     /// a pick among alternatives: also pass `--choices`. `create-prerequisite-task`
     /// when this task cannot proceed until some other, unrelated piece of work
     /// lands first: also pass `--prerequisite-name` and `--prerequisite-brief`,
-    /// and explain the dependency and both answers in `--explanation`.
+    /// and explain the dependency and both answers in `--explanation`. For an
+    /// over-limit file-count change, also pass `--file-count` and
+    /// `--file-count-limit` so No authorizes a file-count exception for this PR.
     #[arg(
         long,
         value_parser = ["yes-no", "multiple-choice", "create-prerequisite-task"],
@@ -423,10 +425,11 @@ pub(crate) struct RunDoneArgs {
     /// Details: (there are no Yes/No buttons); say in Context what each option
     /// leads to.
     /// Context opens with 1–2 plain-language sentences about the work and blocker.
-    /// Yes/No state the user-visible result and rough work size; No leaves work
-    /// blocked, rather than starting an alternative automatically. Recommend an
-    /// answer with a one-line reason. Keep symbols, types, file/API names and
-    /// links in Details only; preserve all technical evidence there.
+    /// Yes and No each name an actionable path the engine or the next worker
+    /// will take, with the user-visible result and rough work size. "No = remain
+    /// blocked" is rejected. Recommend an answer with a one-line reason. Keep
+    /// symbols, types, file/API names and links in Details only; preserve all
+    /// technical evidence there.
     #[arg(long, requires = "answer_type", value_parser = explanation::validate)]
     explanation: Option<String>,
 
@@ -446,6 +449,20 @@ pub(crate) struct RunDoneArgs {
         required_if_eq("answer_type", "create-prerequisite-task")
     )]
     prerequisite_brief: Option<String>,
+
+    /// Projected upper-bound non-deleted file count of the single-PR change.
+    /// With `--file-count-limit`, this is a split-vs-bypass question: Yes
+    /// creates the prerequisite; No authorizes a `change/file-count` exception
+    /// for this PR only. Checkleft does not enforce the approved count: before
+    /// pushing, compare the non-deleted count from `jj diff --stat` against
+    /// the PR base with this bound, and ask again if it is over.
+    #[arg(long, requires_all = ["answer_type", "file_count_limit"])]
+    file_count: Option<u32>,
+
+    /// The repository `change/file-count` `max_files` limit. Must travel with
+    /// `--file-count`; both apply only to `create-prerequisite-task`.
+    #[arg(long, requires_all = ["answer_type", "file_count"])]
+    file_count_limit: Option<u32>,
 
     #[command(flatten)]
     common: IdempotencyArgs,
@@ -771,6 +788,10 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
                     args.explanation,
                     args.prerequisite_name,
                     args.prerequisite_brief,
+                    match (args.file_count, args.file_count_limit) {
+                        (Some(files), Some(limit)) => Some(boss_protocol::FileCountBypassSpec { files, limit }),
+                        _ => None,
+                    },
                 )?,
             })
             .map_err(CliError::internal)?,
@@ -812,6 +833,7 @@ fn operator_question_from_flags(
     explanation: Option<String>,
     prerequisite_name: Option<String>,
     prerequisite_brief: Option<String>,
+    file_count_bypass: Option<boss_protocol::FileCountBypassSpec>,
 ) -> Result<Option<boss_protocol::OperatorQuestion>, CliError> {
     let explanation = match answer_type {
         None => explanation.unwrap_or_default(),
@@ -821,6 +843,11 @@ fn operator_question_from_flags(
     if answer_type != Some("multiple-choice") && !choices.is_empty() {
         return Err(CliError::usage(
             "--choices only applies to --answer-type multiple-choice",
+        ));
+    }
+    if answer_type != Some("create-prerequisite-task") && file_count_bypass.is_some() {
+        return Err(CliError::usage(
+            "--file-count and --file-count-limit only apply to --answer-type create-prerequisite-task",
         ));
     }
     match answer_type {
@@ -852,12 +879,20 @@ fn operator_question_from_flags(
                      the engine words the question from --prerequisite-name",
                 ));
             }
+            if let Some(spec) = file_count_bypass {
+                spec.validate().map_err(CliError::usage)?;
+            }
             let name = prerequisite_name.unwrap_or_default();
+            let text = match file_count_bypass {
+                Some(spec) => boss_protocol::OperatorAnswerType::file_count_split_question_text(name.trim(), spec),
+                None => boss_protocol::OperatorAnswerType::prerequisite_question_text(name.trim()),
+            };
             Ok(Some(boss_protocol::OperatorQuestion {
-                text: boss_protocol::OperatorAnswerType::prerequisite_question_text(name.trim()),
+                text,
                 answer_type: boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
                     name,
                     brief: prerequisite_brief.unwrap_or_default(),
+                    file_count_bypass,
                 },
                 explanation,
             }))
@@ -1034,6 +1069,7 @@ fn flag_hint_for_field(kind: ProposalKind, field: &str) -> Option<&'static str> 
         (ProposalKind::RunDone, "question.explanation") => Some("--explanation"),
         (ProposalKind::RunDone, "question.answer_type.name") => Some("--prerequisite-name"),
         (ProposalKind::RunDone, "question.answer_type.brief") => Some("--prerequisite-brief"),
+        (ProposalKind::RunDone, "question.answer_type.file_count_bypass") => Some("--file-count / --file-count-limit"),
         (ProposalKind::Wait, "reason") => Some("--reason"),
         (ProposalKind::Wait, "duration_secs") => Some("--duration"),
         (ProposalKind::Wait, "waiting_on") => Some("--waiting-on"),
@@ -1279,6 +1315,98 @@ mod tests {
             panic!("expected propose")
         };
         assert!(payload_for(args.command.unwrap()).is_err());
+    }
+
+    #[test]
+    fn file_count_flags_mark_a_split_vs_bypass_prerequisite_question() {
+        let base = [
+            "boss",
+            "propose",
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "The change is over the file-count limit",
+            "--answer-type",
+            "create-prerequisite-task",
+            "--explanation",
+            explanation::tests::VALID,
+            "--prerequisite-name",
+            "Extract the first PR",
+            "--prerequisite-brief",
+            "Land the first capability as its own PR.",
+        ];
+        assert!(Cli::try_parse_from(base.iter().copied().chain(["--file-count", "48"])).is_err());
+        let flags = ["--file-count", "48", "--file-count-limit", "30"];
+        let Commands::Propose(args) = Cli::try_parse_from(base.iter().copied().chain(flags)).unwrap().command else {
+            panic!("expected propose")
+        };
+        let (_, payload, _) = payload_for(args.command.unwrap()).unwrap();
+        let answer_type = &payload["question"]["answer_type"];
+        assert_eq!(answer_type["kind"], "create_prerequisite_task");
+        assert_eq!(answer_type["file_count_bypass"]["files"], 48);
+        assert_eq!(answer_type["file_count_bypass"]["limit"], 30);
+        assert_eq!(
+            payload["question"]["text"],
+            "Split this 48-file change (limit 30) by landing 'Extract the first PR' first, or keep it in one PR?"
+        );
+        for bad in [
+            ["--file-count", "30", "--file-count-limit", "30"],
+            ["--file-count", "0", "--file-count-limit", "30"],
+            ["--file-count", "48", "--file-count-limit", "0"],
+        ] {
+            let Commands::Propose(args) = Cli::try_parse_from(base.iter().copied().chain(bad)).unwrap().command else {
+                panic!("expected propose")
+            };
+            assert!(payload_for(args.command.unwrap()).is_err(), "{bad:?}");
+        }
+        let yes_no_with_file_count = [
+            "boss",
+            "propose",
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "s",
+            "--question",
+            "Approve?",
+            "--answer-type",
+            "yes-no",
+            "--explanation",
+            explanation::tests::VALID,
+            "--file-count",
+            "48",
+            "--file-count-limit",
+            "30",
+        ];
+        let Commands::Propose(args) = Cli::try_parse_from(yes_no_with_file_count).unwrap().command else {
+            panic!("expected propose")
+        };
+        assert!(payload_for(args.command.unwrap()).is_err());
+    }
+
+    #[test]
+    fn blocked_question_rejects_a_remain_blocked_no() {
+        let args = [
+            "boss",
+            "propose",
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "The scope needs authorization",
+            "--question",
+            "Approve the extra files?",
+            "--answer-type",
+            "yes-no",
+            "--explanation",
+            explanation::tests::REMAIN_BLOCKED,
+        ];
+        let Commands::Propose(args) = Cli::try_parse_from(args).unwrap().command else {
+            panic!("expected propose")
+        };
+        let err = payload_for(args.command.unwrap()).unwrap_err();
+        assert!(err.to_string().contains("remain blocked"), "{err}");
     }
 
     fn parse_propose(args: &[&str]) -> ProposeArgs {

@@ -308,3 +308,123 @@ async fn exercise(kind: &TaskKind, status: &TaskStatus, payload: Value, answer: 
     );
     assert_eq!(state.work_db.list_attentions_for_group(&group.id).unwrap().len(), 1);
 }
+
+/// An in-review parent cannot park, so the split-vs-bypass question becomes a
+/// worker-question attention. No on that card must still record the scoped
+/// file-count authorization on the successor that continues the same PR.
+#[tokio::test]
+async fn file_count_no_on_in_review_source_records_bypass_on_successor() {
+    file_count_successor(crate::work::PrOpenState::Open, true, true).await;
+}
+
+#[tokio::test]
+async fn file_count_no_after_pr_finished_requires_fresh_approval() {
+    for pr_state in [
+        crate::work::PrOpenState::Merged,
+        crate::work::PrOpenState::ClosedUnmerged,
+    ] {
+        file_count_successor(pr_state, true, false).await;
+    }
+}
+
+#[tokio::test]
+async fn file_count_no_without_a_pr_requires_fresh_approval() {
+    file_count_successor(crate::work::PrOpenState::Open, false, false).await;
+}
+
+async fn file_count_successor(pr_state: crate::work::PrOpenState, has_pr: bool, authorized: bool) {
+    for kind in [TaskKind::ProjectTask, TaskKind::Chore] {
+        file_count_successor_for_kind(pr_state.clone(), has_pr, authorized, &kind).await;
+    }
+}
+
+async fn file_count_successor_for_kind(
+    pr_state: crate::work::PrOpenState,
+    has_pr: bool,
+    authorized: bool,
+    kind: &TaskKind,
+) {
+    let (state, _dir, execution, task) = fixture(kind, &TaskStatus::InReview, false);
+    if !has_pr {
+        state
+            .work_db
+            .connect()
+            .unwrap()
+            .execute("UPDATE tasks SET pr_url = NULL WHERE id = ?1", [&task])
+            .unwrap();
+    }
+    submitted(
+        call_with_peer(
+            &state,
+            Some(std::process::id() as libc::pid_t),
+            submit_request(
+                &execution,
+                ProposalKind::RunDone,
+                super::super::prerequisites::file_count_split_payload(),
+            ),
+        )
+        .await,
+    );
+    let attention: String = state
+        .work_db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT a.id FROM attentions a JOIN attention_groups g ON g.id = a.group_id
+         WHERE g.source_task_id = ?1 AND g.kind = 'question' AND g.state = 'open'",
+            [&task],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let group = state
+        .work_db
+        .answer_attention(&attention, Some("no".into()), false, false)
+        .unwrap();
+    let result = state
+        .work_db
+        .action_attention_group(
+            &group.id,
+            false,
+            &Default::default(),
+            &crate::work::StaticPrStateChecker(pr_state),
+        )
+        .unwrap();
+    assert_eq!(result.produced_work_item_ids.len(), 1);
+    let produced = &result.produced_work_item_ids[0];
+    let (description, produced_kind): (String, String) = state
+        .work_db
+        .connect()
+        .unwrap()
+        .query_row("SELECT description, kind FROM tasks WHERE id = ?1", [produced], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(
+        produced_kind,
+        if has_pr && authorized {
+            "revision"
+        } else if *kind == TaskKind::Chore {
+            "chore"
+        } else {
+            "design"
+        }
+    );
+    if !authorized {
+        assert!(description.contains("**Answer:** no"));
+        assert!(description.contains("grants no authorization for a new PR"));
+        assert!(description.contains("requires fresh approval"));
+        assert!(!description.contains("Repo owner approval"));
+        assert!(!description.contains("BYPASS_CHANGE_FILE_COUNT="));
+        return;
+    }
+    assert!(description.contains("**Answer:** no"));
+    assert!(description.contains("Repo owner approval"));
+    assert!(description.contains("No — keep this change in one PR"));
+    assert!(description.contains("change/file-count for this PR only, up to 48 files"));
+    assert!(
+        description.contains("BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered No by the repo owner on ")
+    );
+    assert!(description.contains("one-PR exception for this PR only"));
+    assert!(description.contains("Checkleft does not enforce the approved count"));
+    assert!(!description.contains("A No answer does not authorize the proposed action."));
+}

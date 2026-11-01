@@ -234,7 +234,7 @@ mod multiple_choice;
 mod prerequisites;
 
 #[tokio::test]
-async fn question_answer_reports_a_minted_execution_only_for_the_first_yes() {
+async fn question_answer_reports_a_minted_execution_only_for_the_first_answer() {
     let yes = boss_protocol::OperatorAnswer::YesNo { value: true };
     let no = boss_protocol::OperatorAnswer::YesNo { value: false };
 
@@ -258,10 +258,19 @@ async fn question_answer_reports_a_minted_execution_only_for_the_first_yes() {
     let (state, _dir, _, task_id) = parked_question_task().await;
     let minted = state
         .work_db
+        .answer_operator_question(&task_id, no.clone())
+        .unwrap()
+        .minted_execution;
+    assert!(
+        minted,
+        "a No mints a ready execution so the next worker takes the declined path"
+    );
+    let minted = state
+        .work_db
         .answer_operator_question(&task_id, no)
         .unwrap()
         .minted_execution;
-    assert!(!minted, "a No mints nothing");
+    assert!(!minted, "an idempotent repeat mints nothing");
 }
 
 async fn parked_question_task_with_dispatch_bus() -> (Arc<ServerState>, tempfile::TempDir, String) {
@@ -410,34 +419,47 @@ async fn question_survives_external_ref_and_automation_reads() {
 }
 
 #[tokio::test]
-async fn question_no_records_decline_and_remains_in_backlog() {
-    let (state, _dir, _, task_id) = parked_question_task().await;
+async fn question_no_records_the_declined_path_and_redispatches() {
+    let (state, _dir, old_execution, task_id) = parked_question_task().await;
     assert!(matches!(
         answer_question(&state, &task_id, false).await,
         FrontendEvent::WorkItemUpdated { .. }
     ));
     let task = question_task(&state, &task_id);
-    assert_eq!(task.status, boss_protocol::TaskStatus::Blocked);
-    assert!(!task.autostart);
-    assert_eq!(task.blocked_reason.as_deref(), Some("worker_failed"));
-    assert_eq!(task.description, "Original brief");
+    assert_eq!(task.status, boss_protocol::TaskStatus::Todo);
+    assert!(task.autostart);
+    assert!(task.blocked_reason.is_none());
+    assert!(task.blocked_detail.is_none());
     assert!(task.operator_question.is_none());
-    let record = state.work_db.list_operator_questions(&task_id).unwrap().remove(0);
-    let date = chrono::DateTime::from_timestamp(record.answered_at.unwrap().parse().unwrap(), 0)
-        .unwrap()
-        .format("%Y-%m-%d")
-        .to_string();
-    assert_eq!(
-        task.blocked_detail.unwrap(),
-        format!(
-            "Operator declined on {date}: \"Approve raising the file limit from 30 to 48?\"\n\nWorker's explanation: All 48 files are needed for the requested migration.\n\nRun summary: The scope needs authorization"
-        )
+    assert!(
+        task.description
+            .starts_with("Original brief\n\n---\n\n## Recorded answer (")
+    );
+    assert!(task.description.contains("- **Answer:** No\n"));
+    assert!(
+        task.description
+            .contains("Approve raising the file limit from 30 to 48?")
+    );
+    assert!(
+        task.description
+            .contains("All 48 files are needed for the requested migration.")
+    );
+    assert!(task.description.contains("grants no authorization"));
+    assert!(task.description.contains(&format!("`{old_execution}`")));
+    assert!(
+        state
+            .work_db
+            .list_executions(Some(&task_id))
+            .unwrap()
+            .iter()
+            .any(|e| e.status == boss_protocol::ExecutionStatus::Ready && e.id != old_execution),
+        "No mints a ready execution so the next worker takes the declined path"
     );
     assert!(matches!(
         answer_question(&state, &task_id, false).await,
         FrontendEvent::WorkItemUpdated { .. }
     ));
-    assert_eq!(state.work_db.list_executions(Some(&task_id)).unwrap().len(), 1);
+    assert_eq!(state.work_db.list_executions(Some(&task_id)).unwrap().len(), 2);
 }
 
 #[tokio::test]

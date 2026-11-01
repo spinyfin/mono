@@ -777,7 +777,7 @@ fn question_artifact_name(group: &AttentionGroup) -> String {
 /// to the revision / design worker. Skipped and dismissed members contribute
 /// nothing (the design: "produces one downstream artifact from the answered
 /// set").
-fn build_qa_brief(group: &AttentionGroup, answered: &[&Attention]) -> String {
+fn build_qa_brief(group: &AttentionGroup, answered: &[&Attention], file_count_bypass_no: bool) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     match group.source_doc_path.as_deref().filter(|s| !s.is_empty()) {
@@ -789,9 +789,14 @@ fn build_qa_brief(group: &AttentionGroup, answered: &[&Attention]) -> String {
             );
         }
         None if group.grouping_key.starts_with("worker_question|") => {
+            let disclaimer = if file_count_bypass_no {
+                ""
+            } else {
+                " A No answer does not authorize the proposed action."
+            };
             let _ = writeln!(
                 out,
-                "The operator answered a worker's questions. Apply the recorded decisions to the work below. A No answer does not authorize the proposed action."
+                "The operator answered a worker's questions. Apply the recorded decisions to the work below.{disclaimer}"
             );
         }
         None => {
@@ -854,7 +859,7 @@ fn insert_seeded_design_task_in_tx(
 }
 
 /// Produce the downstream artifact for a **question** group. Returns
-/// `(produced_artifact_kind, produced_artifact_ref_json, produced_ids)`.
+/// `(produced_artifact_kind, produced_artifact_ref_json, produced_ids, successor)`.
 ///
 /// Prefer a revision against the source doc's still-open PR. The revision
 /// gate (parent PR open and unmerged) is the exact condition the design forks
@@ -869,7 +874,7 @@ fn action_question_group(
     members: &[Attention],
     pr_checker: &dyn PrStateChecker,
     actor: &str,
-) -> Result<(String, String, Vec<String>)> {
+) -> Result<(String, String, Vec<String>, worker_questions::QuestionSuccessor)> {
     let answered: Vec<&Attention> = members.iter().filter(|m| m.answer_state == "answered").collect();
     if answered.is_empty() {
         bail!(
@@ -878,7 +883,8 @@ fn action_question_group(
             group.id
         );
     }
-    let mut brief = build_qa_brief(group, &answered);
+    let file_count_bypass_no = worker_questions::file_count_bypass_no_spec(conn, group, members)?.is_some();
+    let mut brief = build_qa_brief(group, &answered, file_count_bypass_no);
     let source = group
         .source_task_id
         .as_deref()
@@ -897,6 +903,7 @@ fn action_question_group(
     });
     let name = question_artifact_name(group);
 
+    let mut successor = worker_questions::QuestionSuccessor::NoPr;
     if let Some(parent_task_id) = group.source_task_id.as_deref().filter(|s| !s.is_empty()) {
         let input = CreateRevisionInput::builder()
             .parent_task_id(parent_task_id)
@@ -920,15 +927,28 @@ fn action_question_group(
                     "short_id": revision.short_id,
                 })
                 .to_string();
-                return Ok(("revision".to_owned(), reference, vec![revision.id]));
+                return Ok((
+                    "revision".to_owned(),
+                    reference,
+                    vec![revision.id],
+                    worker_questions::QuestionSuccessor::Revision,
+                ));
             }
             Err(err) => {
                 // Fall back to a fresh design task only when the gate refused
                 // (the source doc has no open PR to revise). The gate's checks
                 // run before it inserts anything, so the transaction is still
                 // clean here.
-                if err.downcast_ref::<RevisionGateError>().is_none() {
-                    return Err(err);
+                successor = match err.downcast_ref::<RevisionGateError>() {
+                    Some(RevisionGateError::NoPr { .. }) => worker_questions::QuestionSuccessor::NoPr,
+                    Some(RevisionGateError::Merged { .. } | RevisionGateError::ClosedUnmerged { .. }) => {
+                        worker_questions::QuestionSuccessor::FinishedPr
+                    }
+                    None => return Err(err),
+                };
+                brief = build_qa_brief(group, &answered, false);
+                if let Some(task) = &source {
+                    brief.push_str(&format!("\n## Original work: {}\n\n{}\n", task.name, task.description));
                 }
             }
         }
@@ -966,7 +986,7 @@ fn action_question_group(
         "short_id": task.short_id,
     })
     .to_string();
-    Ok((artifact_kind.to_owned(), reference, vec![task.id]))
+    Ok((artifact_kind.to_owned(), reference, vec![task.id], successor))
 }
 
 /// Describe what a [`FollowupMemberOverride`] changed relative to a
@@ -1290,13 +1310,23 @@ impl WorkDb {
         }
 
         let mut pending = PendingEvents::new();
-        let (produced_kind, produced_ref, produced_work_item_ids) = match group.kind.as_str() {
+        let (produced_kind, produced_ref, produced_work_item_ids, successor) = match group.kind.as_str() {
             "question" => action_question_group(&mut pending, &tx, &group, &members, pr_checker, actor)?,
-            "followup" => action_followup_group(&tx, &group, &members, member_overrides)?,
+            "followup" => {
+                let (kind, reference, ids) = action_followup_group(&tx, &group, &members, member_overrides)?;
+                (kind, reference, ids, worker_questions::QuestionSuccessor::NoPr)
+            }
             other => bail!("cannot action attention group {} of kind {other:?}", group.id),
         };
 
-        worker_questions::apply_prerequisite_in_tx(&mut pending, &tx, &group, &members, &produced_work_item_ids)?;
+        worker_questions::apply_typed_answer_in_tx(
+            &mut pending,
+            &tx,
+            &group,
+            &members,
+            &produced_work_item_ids,
+            successor,
+        )?;
 
         let now = now_string();
         tx.execute(
@@ -1815,7 +1845,7 @@ mod tests {
     #[test]
     fn build_qa_brief_with_no_answered_has_header_but_no_entries() {
         let g = question_group(Some("docs/plan.md"));
-        let brief = build_qa_brief(&g, &[]);
+        let brief = build_qa_brief(&g, &[], false);
         assert!(brief.contains("docs/plan.md"));
         assert!(brief.contains("## Answered questions"));
         // No per-question entries.
@@ -1829,7 +1859,7 @@ mod tests {
         let m1 = answered_member("Ship on Friday?", "Yes", Some("Rollout"));
         let m2 = answered_member("Use feature flags?", "No", None);
         let answered = [&m1, &m2];
-        let brief = build_qa_brief(&g, &answered);
+        let brief = build_qa_brief(&g, &answered, false);
 
         assert!(brief.contains("### Ship on Friday?"));
         assert!(brief.contains("**Answer:** Yes"));
@@ -1840,10 +1870,10 @@ mod tests {
 
     #[test]
     fn build_qa_brief_intro_differs_when_doc_path_absent() {
-        let with_path = build_qa_brief(&question_group(Some("docs/plan.md")), &[]);
+        let with_path = build_qa_brief(&question_group(Some("docs/plan.md")), &[], false);
         assert!(with_path.contains("`docs/plan.md`"));
 
-        let without_path = build_qa_brief(&question_group(None), &[]);
+        let without_path = build_qa_brief(&question_group(None), &[], false);
         assert!(without_path.contains("about this design"));
         assert!(!without_path.contains('`'));
     }

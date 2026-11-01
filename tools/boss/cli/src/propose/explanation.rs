@@ -6,6 +6,7 @@ const HEADINGS: [&str; 5] = ["Context:", "Yes:", "No:", "Recommendation:", "Deta
 const CHOICE_HEADINGS: [&str; 3] = ["Context:", "Recommendation:", "Details:"];
 const EXPECTED: &str = "--explanation requires nonempty sections with labels on separate lines, in order:\nContext:\nWork and blocker\nYes:\nWhat approval authorizes\nNo:\nWhat declining means\nRecommendation:\nRecommended answer and reason\nDetails:\nTechnical evidence (omit this section if unnecessary)";
 const EXPECTED_CHOICE: &str = "--explanation for --answer-type multiple-choice requires nonempty sections with labels on separate lines, in order, and no Yes:/No: sections:\nContext:\nWork and blocker, and what each option leads to\nRecommendation:\nRecommended option and reason\nDetails:\nTechnical evidence (omit this section if unnecessary)";
+const REMAIN_BLOCKED: &str = "--explanation No: must name an actionable path the engine or the next worker will take; \"No = remain blocked\" is not a real choice. If there is only one viable path, do not ask a question.";
 
 /// Clap-time check: accepts either shape. The shape that must hold depends on
 /// `--answer-type`, which a value parser cannot see; `validate_for` enforces it.
@@ -20,8 +21,62 @@ pub(super) fn validate_for(raw: &str, multiple_choice: bool) -> Result<String, S
     if multiple_choice {
         check(raw, &CHOICE_HEADINGS).map_err(|()| EXPECTED_CHOICE.into())
     } else {
-        check(raw, &HEADINGS).map_err(|()| EXPECTED.into())
+        let text = check(raw, &HEADINGS).map_err(|()| EXPECTED.to_owned())?;
+        if no_section_names_remain_blocked(&text) {
+            return Err(REMAIN_BLOCKED.into());
+        }
+        Ok(text)
     }
+}
+
+/// Phrases that describe No as "stay blocked" rather than a second path.
+const REMAIN_BLOCKED_PHRASES: &[&str] = &[
+    "stay blocked",
+    "stays blocked",
+    "staying blocked",
+    "remain blocked",
+    "remains blocked",
+    "remaining blocked",
+    "leaves the work blocked",
+    "leave the work blocked",
+    "leaves the task blocked",
+    "leave the task blocked",
+    "a different approach would be needed",
+];
+const STAY_WORDS: &[&str] = &["stay", "stays", "staying", "remain", "remains", "leave", "leaves"];
+const BLOCKED_WORDS: &[&str] = &["blocked", "parked"];
+
+fn no_section_names_remain_blocked(raw: &str) -> bool {
+    remain_blocked_language(
+        &boss_protocol::explanation_no_section(raw)
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+    )
+}
+
+fn remain_blocked_language(body: &str) -> bool {
+    if REMAIN_BLOCKED_PHRASES.iter().any(|phrase| body.contains(phrase)) {
+        return true;
+    }
+    let tokens: Vec<&str> = body
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+    for (index, token) in tokens.iter().enumerate() {
+        if !STAY_WORDS.contains(token) {
+            continue;
+        }
+        let lo = index.saturating_sub(6);
+        let hi = (index + 6).min(tokens.len().saturating_sub(1));
+        let window = &tokens[lo..=hi];
+        if window.iter().any(|word| BLOCKED_WORDS.contains(word)) {
+            return true;
+        }
+        if window.windows(2).any(|pair| pair == ["on", "hold"]) {
+            return true;
+        }
+    }
+    false
 }
 
 fn check(raw: &str, headings: &[&str]) -> Result<String, ()> {
@@ -56,7 +111,8 @@ pub(super) mod tests {
     use crate::Cli;
     use clap::Parser;
 
-    pub(crate) const VALID: &str = "Context:\nWork is blocked.\nYes:\nApprove a small fix.\nNo:\nWork stays blocked.\nRecommendation:\nYes, to finish the work.";
+    pub(crate) const VALID: &str = "Context:\nWork is blocked.\nYes:\nApprove a small fix.\nNo:\nShip the smaller change instead.\nRecommendation:\nYes, to finish the work.";
+    pub(crate) const REMAIN_BLOCKED: &str = "Context:\nWork is blocked.\nYes:\nApprove a small fix.\nNo:\nWork stays blocked.\nRecommendation:\nYes, to finish the work.";
 
     #[test]
     fn accepts_optional_details_and_preserves_evidence() {
@@ -129,5 +185,38 @@ pub(super) mod tests {
                 assert!(error.to_string().contains(EXPECTED), "{error}");
             }
         }
+    }
+
+    #[test]
+    fn rejects_no_equals_remain_blocked() {
+        assert_eq!(validate_for(REMAIN_BLOCKED, false).unwrap_err(), super::REMAIN_BLOCKED);
+        assert!(validate_for(VALID, false).is_ok());
+        assert!(validate_for(VALID_CHOICE, true).is_ok());
+        for no in [
+            "The work remains blocked.",
+            "No leaves the task blocked; a different approach would be needed.",
+            "Stay blocked until a split is approved.",
+            "The work stays parked.",
+            "Leave this on hold until a split is approved.",
+        ] {
+            let text = VALID.replace("Ship the smaller change instead.", no);
+            assert!(
+                validate_for(&text, false).unwrap_err().contains("remain blocked"),
+                "{no}"
+            );
+        }
+        for no in [
+            "Fix the blocked import here and drop the remaining refactor.",
+            "Fix the blocked import here and drop the files left over.",
+            "Ship the 12 remaining files; the blocked job is fixed separately.",
+            "Ship the files left; the blocked job is fixed separately.",
+        ] {
+            assert!(validate_for(&VALID.replace("Ship the smaller change instead.", no), false).is_ok());
+        }
+        let details_no = format!("{VALID}\nDetails:\nEvidence\nNo:\nWork stays blocked.\nverbatim");
+        assert!(
+            validate_for(&details_no, false).is_ok(),
+            "a No: line inside Details must not re-enter the remain-blocked scan"
+        );
     }
 }

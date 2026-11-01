@@ -99,16 +99,22 @@ When a CI check or repository check (checkleft, file-size, lint, test) is failin
 
 Required behavior: fix the real problem — split the oversized file, fix the lint/compile error, fix the test failure, resolve the root cause. If a check genuinely SHOULD be relaxed (a legitimately needed exclusion or threshold change), that is a human decision — STOP and surface it for operator approval with full justification. Do not decide this autonomously.
 
-### `change/file-count` failures: split the change, do not ask for an exception
+### `change/file-count` failures: split vs keep in one PR
 
-When `change/file-count` fires on feature work, the remedy is to split the change into stacked PRs along capability boundaries, each coherent and independently reviewable. Do not request a `BYPASS_CHANGE_FILE_COUNT` exception or a higher limit for feature work. Exceptions are only for the cases named in `CHECKS.yaml`: coordinated renames and generated trees that cannot be split.
+When `change/file-count` fires on feature work, or the change is heading past the limit (30 files in `CHECKS.yaml`), ask a split-vs-bypass question. Both answers are real paths:
 
-Check the footprint early, not after the work is built. Once the shape of the change is clear, and again before final validation, run the file-count check or `jj diff --stat` against the base. If the change is heading past the limit, stop and split it before building the rest:
+- **Yes** creates a prerequisite for the first coherent capability (a stacked PR along a capability boundary). This task delivers the remainder once that PR has merged.
+- **No** authorizes a `change/file-count` exception for this PR only. The next run finishes in one PR by putting `BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered No by the repo owner on <date>; one-PR exception for this PR only` in the commit description. Never apply that bypass without the recorded authorization in the task description. The authorization does not relax any other check.
 
-- When the worker instructions enable completion declarations, carve out the first coherent capability as a prerequisite with `"$BOSS_BIN" propose done --outcome blocked --summary "<blocker>" --answer-type create-prerequisite-task --prerequisite-name "<short task name>" --prerequisite-brief "<standalone description of that first PR>" --explanation "<Context, Yes, No, Recommendation, and optional Details>"`. The brief must stand alone: a different worker picks it up cold. The current task then delivers the remainder once the prerequisite has merged.
-- If completion declarations are disabled, report the dependency through the blocker channel in the worker instructions so the repo owner can arrange the prerequisite.
-- Keep the split on capability boundaries, as above.
-- When completion declarations are enabled, do not file a plain blocker, a plain yes/no question or `boss propose followup-task` for this. A yes/no approval only re-dispatches the same task, and `followup-task` is the non-blocking "nice to have later" path: it creates no task until a human batch-accepts it, and it adds no dependency edge, so the split never lands.
+The question must state the projected upper-bound file count of the single-PR change, the limit, and the proposed split's PR boundaries. `--file-count` records the projected upper bound. Checkleft does not enforce the approved count: before pushing, compare the non-deleted file count from `jj diff --stat` against the PR base with the approved bound, and ask again if it is over. Use a free-form bypass reason without a numeric prefix, citing the recorded answer and date.
+
+Check the footprint early, not after the work is built. Once the shape of the change is clear, and again before final validation, run the file-count check or `jj diff --stat` against the base. If the change is heading past the limit, stop and ask before building the rest:
+
+- When the worker instructions enable completion declarations, ask with `"$BOSS_BIN" propose done --outcome blocked --summary "<blocker>" --answer-type create-prerequisite-task --prerequisite-name "<first PR title>" --prerequisite-brief "<standalone description of that first PR>" --file-count <n> --file-count-limit 30 --explanation "<Context, Yes, No, Recommendation, and optional Details>"`. Pass `--file-count` as the projected upper-bound file count of the single-PR change, not a partial in-progress count. The brief must stand alone: a different worker picks it up cold. Yes and No in the explanation must each name the path that follows (create the first PR and wait, or keep all files in this PR under the exception).
+- If completion declarations are disabled, report the dependency through the blocker channel in the worker instructions so the repo owner can arrange the split or the exception.
+- Keep any split on capability boundaries, as above.
+- When completion declarations are enabled, do not file a plain blocker, a plain yes/no question or `boss propose followup-task` for this. A yes/no without `--file-count` does not authorize the exception, and `followup-task` is the non-blocking "nice to have later" path: it creates no task until a human batch-accepts it, and it adds no dependency edge, so the split never lands.
+- Coordinated renames and unsplittable generated trees remain the cases named in `CHECKS.yaml` for a file-count exception. Feature work uses the question above; workers never apply the bypass on their own.
 
 ## Builder pattern convention
 

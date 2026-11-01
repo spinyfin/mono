@@ -697,6 +697,28 @@ pub struct ReviewGuideProposalPayload {
     pub body_markdown: String,
 }
 
+/// Body of a labelled `No:` section, stopping at `Recommendation:`.
+pub fn explanation_no_section(explanation: &str) -> Option<String> {
+    let mut in_no = false;
+    let mut body = Vec::new();
+    for line in explanation.lines() {
+        let trimmed = line.trim();
+        if !in_no {
+            if trimmed == "No:" {
+                in_no = true;
+            }
+            continue;
+        }
+        if trimmed == "Recommendation:" {
+            break;
+        }
+        if !trimmed.is_empty() {
+            body.push(trimmed);
+        }
+    }
+    if body.is_empty() { None } else { Some(body.join(" ")) }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OperatorQuestion {
@@ -706,6 +728,44 @@ pub struct OperatorQuestion {
     pub text: String,
     pub answer_type: OperatorAnswerType,
     pub explanation: String,
+}
+
+/// Counts that turn a `create_prerequisite_task` question into split-vs-bypass.
+///
+/// Yes still creates `name`. No authorizes a `change/file-count` exception for
+/// this PR only, and redispatches so the next worker
+/// finishes in one PR. Absent on ordinary prerequisite questions, whose No
+/// records the declined path and redispatches with no authorization.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FileCountBypassSpec {
+    /// Projected upper-bound non-deleted file count of the single-PR change.
+    /// Recorded approval bound; checkleft does not enforce it. Before pushing,
+    /// the worker must compare the non-deleted count from `jj diff --stat`
+    /// against the PR base with this bound and ask again if it is over.
+    pub files: u32,
+    /// The repository `change/file-count` `max_files` limit.
+    pub limit: u32,
+}
+
+impl FileCountBypassSpec {
+    /// `files` and `limit` must both be at least 1, and `files` must exceed
+    /// `limit` — otherwise there is no over-limit change to split or keep.
+    pub fn validate(self) -> Result<(), String> {
+        if self.files == 0 {
+            return Err("file count must be at least 1".into());
+        }
+        if self.limit == 0 {
+            return Err("file-count limit must be at least 1".into());
+        }
+        if self.files <= self.limit {
+            return Err(format!(
+                "file count ({}) must exceed the limit ({}) to ask a split-or-bypass question",
+                self.files, self.limit
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -718,9 +778,14 @@ pub enum OperatorAnswerType {
     /// description (or reuse an equivalent open task) and gate the blocked task
     /// behind it. The "why this task cannot unblock without it" line is the
     /// question's `explanation`.
+    ///
+    /// When `file_count_bypass` is set, No authorizes a file-count exception
+    /// for this PR instead of taking the ordinary declined path.
     CreatePrerequisiteTask {
         name: String,
         brief: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_count_bypass: Option<FileCountBypassSpec>,
     },
     /// One of `choices` is selected; the answer is
     /// [`OperatorAnswer::MultipleChoice`] carrying the chosen string verbatim.
@@ -805,6 +870,24 @@ impl OperatorAnswerType {
     /// engine owns the phrasing so every producer (CLI, validation) agrees.
     pub fn prerequisite_question_text(name: &str) -> String {
         format!("Create prerequisite task '{name}'? This task will wait for it.")
+    }
+
+    /// The question wording for a split-vs-file-count-bypass proposal. States
+    /// the projected upper-bound file count, the repository limit, and the
+    /// first PR's name.
+    pub fn file_count_split_question_text(name: &str, spec: FileCountBypassSpec) -> String {
+        format!(
+            "Split this {}-file change (limit {}) by landing '{name}' first, or keep it in one PR?",
+            spec.files, spec.limit
+        )
+    }
+
+    /// The recorded file-count approval spec on a split-vs-bypass prerequisite question.
+    pub fn file_count_bypass(&self) -> Option<FileCountBypassSpec> {
+        match self {
+            Self::CreatePrerequisiteTask { file_count_bypass, .. } => *file_count_bypass,
+            _ => None,
+        }
     }
 }
 
@@ -932,6 +1015,7 @@ mod tests {
         let prerequisite = OperatorAnswerType::CreatePrerequisiteTask {
             name: "Fix fixture race".into(),
             brief: "Stand-alone brief".into(),
+            file_count_bypass: None,
         };
         let json = serde_json::to_value(&prerequisite).unwrap();
         assert_eq!(
@@ -942,6 +1026,27 @@ mod tests {
             serde_json::from_value::<OperatorAnswerType>(json).unwrap(),
             prerequisite
         );
+        let split = OperatorAnswerType::CreatePrerequisiteTask {
+            name: "Extract the first PR".into(),
+            brief: "Stand-alone brief".into(),
+            file_count_bypass: Some(super::FileCountBypassSpec { files: 48, limit: 30 }),
+        };
+        let json = serde_json::to_value(&split).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "kind": "create_prerequisite_task",
+                "name": "Extract the first PR",
+                "brief": "Stand-alone brief",
+                "file_count_bypass": {"files": 48, "limit": 30}
+            })
+        );
+        assert_eq!(serde_json::from_value::<OperatorAnswerType>(json).unwrap(), split);
+        assert_eq!(
+            split.file_count_bypass(),
+            Some(super::FileCountBypassSpec { files: 48, limit: 30 })
+        );
+        assert_eq!(prerequisite.file_count_bypass(), None);
         assert!(
             serde_json::from_value::<OperatorAnswerType>(
                 serde_json::json!({"kind": "create_prerequisite_task", "name": "x"})
@@ -952,6 +1057,13 @@ mod tests {
         assert_eq!(
             OperatorAnswerType::prerequisite_question_text("Fix fixture race"),
             "Create prerequisite task 'Fix fixture race'? This task will wait for it."
+        );
+        assert_eq!(
+            OperatorAnswerType::file_count_split_question_text(
+                "Extract the first PR",
+                super::FileCountBypassSpec { files: 48, limit: 30 }
+            ),
+            "Split this 48-file change (limit 30) by landing 'Extract the first PR' first, or keep it in one PR?"
         );
         let old: super::RunDoneProposalPayload =
             serde_json::from_str(r#"{"outcome":"blocked","summary":"Waiting"}"#).unwrap();
@@ -1025,8 +1137,29 @@ mod tests {
         let prerequisite = OperatorAnswerType::CreatePrerequisiteTask {
             name: "n".into(),
             brief: "b".into(),
+            file_count_bypass: None,
         };
         assert!(prerequisite.check_answer(&yes).is_ok());
         assert!(prerequisite.check_answer(&choose("n")).is_err());
+        let spec = super::FileCountBypassSpec { files: 48, limit: 30 };
+        assert!(spec.validate().is_ok());
+        assert!(super::FileCountBypassSpec { files: 0, limit: 30 }.validate().is_err());
+        assert!(super::FileCountBypassSpec { files: 48, limit: 0 }.validate().is_err());
+        assert!(super::FileCountBypassSpec { files: 30, limit: 30 }.validate().is_err());
+        assert!(super::FileCountBypassSpec { files: 29, limit: 30 }.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod explanation_tests {
+    #[test]
+    fn no_section_stops_before_details() {
+        assert_eq!(
+            super::explanation_no_section(
+                "Context:\nContext\nYes:\nYes\nNo:\n  Ship the smaller change.\n\n Keep the rest.\nRecommendation:\nYes\nDetails:\nNo:\nStay blocked."
+            ),
+            Some("Ship the smaller change. Keep the rest.".into())
+        );
+        assert_eq!(super::explanation_no_section("Context:\nNo answer section"), None);
     }
 }

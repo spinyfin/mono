@@ -27,6 +27,9 @@ pub(crate) const STRUCTURED_MARKERS: &[&str] = &[
     "one of `task` | `chore` | `project` (defaults to `chore`)",
     // The flag that carries a prerequisite task's description.
     "--prerequisite-brief",
+    // Split-vs-file-count-bypass flags on a prerequisite question.
+    "--file-count",
+    "--file-count-limit",
     // The engine's on-disk state directory, which workers are told to keep
     // out of.
     "~/Library/Application Support/Boss/",

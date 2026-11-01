@@ -7,12 +7,15 @@
 - **Related operational docs:** [attention-lifecycle](../attention-lifecycle.md), [worker-liveness-contract](../worker-liveness-contract.md), [post-crash-recovery](../post-crash-recovery.md)
 - **Baseline:** origin `main` at `cc72dac8`. Open PR mono#3061 (`boss propose wait`) touches the same engine files; expect rebase conflicts, no semantic overlap.
 
+**As built (2026-10-31, mono#3396):** Both answers record the chosen path and redispatch. No records the actionable alternative without authorizing the declined action; it no longer parks the task in Backlog or writes `operator_no`. For a file-count split, No instead grants the scoped exception only while continuing the original PR (including work that has not opened its first PR); a successor after that PR merged or closed needs fresh approval. The original design below records the superseded parking behavior.
+
 **TL;DR:** A worker that cannot finish without a human decision still ends its run with `boss propose done --outcome blocked`, but may attach one typed question (`--question`, `--answer-type yes-no`, `--explanation`). The engine stores that question in a dedicated `operator_questions` table, terminalizes the run exactly as a blocked declaration does today, and parks the task as `blocked` with the new reason `awaiting_operator_answer`, which the app routes into a collapsible "Needs Attention" section inside Doing. The card shows the question inline with a detail disclosure and Yes/No buttons. Yes appends a dated operator authorization to the task description and restarts the task in the same workspace through the existing explicit-dispatch path. No converts the park into the existing `worker_failed` shape, which already means "Backlog, blocked, with explanation". The contested property, stated up front: **the question is durable engine state on the work item that the kanban reads directly, the worker that asked it is gone by the time it is answered, and Yes is a restart with the authorization written into the brief, not a resume.**
 
 ## Goals
 
 - A worker blocked on a decision only a human can make (relax a repository check, exceed a limit, proceed without a credential) ends with a _specific, answerable_ question rather than a prose summary the operator has to decode.
 - The question lives **on the kanban card** in a new "Needs Attention" section inside Doing, modelled on the Done column's collapsible "Merging" section, visible only while it has cards.
+- **As built:** Both answers record the chosen path and redispatch; the following original goal is superseded.
 - The operator answers inline on the card. Yes records an explicit, dated authorization in the task brief and restarts the task immediately. No parks the task in Backlog, blocked, with the question and explanation preserved as the reason.
 - A task that is waiting for an answer is never rescheduled with an agent by any automatic path.
 - Only Yes/No is required now, but the question model is a tagged enum so more answer types can be added without changing the storage shape, the wire shape, or the card's dispatch logic.
@@ -194,6 +197,8 @@ Worker's explanation: this PR sweeps residual non-tmux references and adds an ar
 Run summary: <the run_done summary>
 ```
 
+**As built (2026-10-31, mono#3396):** Both answers record the chosen path and redispatch. No records the actionable alternative without authorizing the declined action; it no longer parks the task in Backlog or writes `operator_no`. For a file-count split, No instead grants the scoped exception only while continuing the original PR (including work that has not opened its first PR); a successor after that PR merged or closed needs fresh approval. The original design below records the superseded parking behavior.
+
 `status` stays `blocked`, `autostart` stays `0`, so the card routes to Backlog through `boardColumn`'s default arm with the standard blocked badge and this text as its tooltip. This is the existing `worker_failed` representation, so `task_accepts_execution` keeps refusing it and an explicit Start later clears it exactly as it clears any worker failure. Nothing new is needed on the No path beyond the detail text.
 
 **CLI.** `boss task answer <task-id|oq-id> (--yes | --no)` calls the same RPC. It exists so the operator can answer from a terminal and so the engine tests can exercise the whole path without the app. `boss task show` prints the open question (text, answer type, asked-at, execution) and the answered history.
@@ -290,6 +295,8 @@ worker                 engine                                   app
 4. Leave a `waiting_dependency` execution on the blocked task (non-revision kinds), carrying the asking run's workspace preference. The dependency cascade only promotes an execution that already exists, and the ordinary reconcile deliberately never mints a replacement after a terminal run, so without this row the task would unblock to `todo` and stay there. When the prerequisite reaches its satisfied state the existing cascade moves the task to `todo` and promotes that execution to `ready`.
 
 Any failure (a cycle, a description guard) rolls the whole answer back and the question stays open. A repeated Yes finds the `answered` row first and returns the current task without touching anything; a No after a Yes is a `Conflict`.
+
+**As built (2026-10-31, mono#3396):** Both answers record the chosen path and redispatch. No records the actionable alternative without authorizing the declined action; it no longer parks the task in Backlog or writes `operator_no`. For a file-count split, No instead grants the scoped exception only while continuing the original PR (including work that has not opened its first PR); a successor after that PR merged or closed needs fresh approval. The original design below records the superseded parking behavior.
 
 **No** is the Yes/No decline unchanged: `worker_failed` in Backlog with the decline detail, which quotes the prerequisite question.
 

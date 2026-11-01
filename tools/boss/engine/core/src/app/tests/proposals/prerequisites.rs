@@ -1,6 +1,7 @@
 // Prerequisite question answer and dependency redispatch regressions.
 use super::*;
 mod project;
+use serde_json::{Value, json};
 
 fn prerequisites_of(state: &ServerState, task_id: &str) -> Vec<String> {
     state
@@ -128,6 +129,7 @@ async fn prerequisite_question_reads_like_the_yes_no_question_and_carries_the_pr
         boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
             name: PREREQUISITE_NAME.into(),
             brief: "The shared fixture races retention cleanup. Fix it on main.".into(),
+            file_count_bypass: None,
         }
     );
 }
@@ -580,8 +582,8 @@ async fn same_chain_revision_prerequisite_satisfies_at_in_review() {
 }
 
 #[tokio::test]
-async fn prerequisite_no_parks_in_backlog_like_a_yes_no_decline() {
-    let (state, _dir, _, task_id) = parked_task_with_question(prerequisite_question_payload()).await;
+async fn prerequisite_no_records_the_declined_path_and_redispatches() {
+    let (state, _dir, old_execution, task_id) = parked_task_with_question(prerequisite_question_payload()).await;
     let before = question_task(&state, &task_id);
     let tasks_before = state
         .work_db
@@ -593,14 +595,21 @@ async fn prerequisite_no_parks_in_backlog_like_a_yes_no_decline() {
         FrontendEvent::WorkItemUpdated { .. }
     ));
     let task = question_task(&state, &task_id);
-    assert_eq!(task.status, boss_protocol::TaskStatus::Blocked);
-    assert_eq!(task.blocked_reason.as_deref(), Some("worker_failed"));
-    assert!(!task.autostart);
+    assert_eq!(task.status, boss_protocol::TaskStatus::Todo);
+    assert!(task.autostart);
+    assert!(task.blocked_reason.is_none());
     assert!(task.operator_question.is_none());
-    assert_eq!(task.description, "Original brief");
-    assert!(task.blocked_detail.unwrap().contains(
-        "\"Create prerequisite task 'Fix the retention-cleanup fixture race'? This task will wait for it.\""
-    ));
+    assert!(
+        task.description
+            .starts_with("Original brief\n\n---\n\n## Recorded answer (")
+    );
+    assert!(task.description.contains("- **Answer:** No\n"));
+    assert!(
+        task.description
+            .contains("Create prerequisite task 'Fix the retention-cleanup fixture race'? This task will wait for it.")
+    );
+    assert!(task.description.contains("grants no authorization"));
+    assert!(task.description.contains(&format!("`{old_execution}`")));
     assert!(prerequisites_of(&state, &task_id).is_empty());
     assert_eq!(
         state
@@ -610,6 +619,15 @@ async fn prerequisite_no_parks_in_backlog_like_a_yes_no_decline() {
             .len(),
         tasks_before,
         "a No creates nothing"
+    );
+    assert!(
+        state
+            .work_db
+            .list_executions(Some(&task_id))
+            .unwrap()
+            .iter()
+            .any(|e| e.status == boss_protocol::ExecutionStatus::Ready && e.id != old_execution),
+        "No mints a ready execution so the next worker takes the declined path"
     );
 }
 
@@ -635,4 +653,114 @@ async fn racing_prerequisite_approvals_create_one_task_and_one_edge() {
     let product_id = question_task(&state, &task_id).product_id;
     assert_eq!(chore_named(&state, &product_id, PREREQUISITE_NAME).len(), 1);
     assert_eq!(prerequisites_of(&state, &task_id).len(), 1);
+}
+
+const FILE_COUNT_SPLIT_NAME: &str = "Extract the first capability";
+
+pub(super) fn file_count_split_payload() -> Value {
+    json!({"outcome":"blocked", "summary":"The change is 48 files against a limit of 30", "question":{
+        "answer_type":{"kind":"create_prerequisite_task",
+            "name": FILE_COUNT_SPLIT_NAME,
+            "brief":"Land the first capability as its own PR. The remainder stays on this task.",
+            "file_count_bypass":{"files":48,"limit":30}},
+        "explanation":"The change is 48 files against a limit of 30. Yes lands the first PR; No keeps this PR and applies a file-count exception."
+    }})
+}
+
+#[tokio::test]
+async fn file_count_split_question_states_count_limit_and_first_pr() {
+    let (state, _dir, _, task_id) = parked_task_with_question(file_count_split_payload()).await;
+    let question = question_task(&state, &task_id).operator_question.unwrap();
+    assert_eq!(
+        question.text,
+        "Split this 48-file change (limit 30) by landing 'Extract the first capability' first, or keep it in one PR?"
+    );
+    assert_eq!(
+        question.answer_type,
+        boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
+            name: FILE_COUNT_SPLIT_NAME.into(),
+            brief: "Land the first capability as its own PR. The remainder stays on this task.".into(),
+            file_count_bypass: Some(boss_protocol::FileCountBypassSpec { files: 48, limit: 30 }),
+        }
+    );
+}
+
+#[tokio::test]
+async fn file_count_split_yes_still_creates_the_prerequisite_and_edge() {
+    let (state, _dir, old_execution, task_id) = parked_task_with_question(file_count_split_payload()).await;
+    let FrontendEvent::WorkItemUpdated {
+        item: crate::work::WorkItem::Task(task),
+    } = answer_question(&state, &task_id, true).await
+    else {
+        panic!("expected updated task");
+    };
+    assert_eq!(task.status, boss_protocol::TaskStatus::Blocked);
+    assert_eq!(task.blocked_reason.as_deref(), Some("dependency"));
+    let created = chore_named(&state, &task.product_id, FILE_COUNT_SPLIT_NAME);
+    assert_eq!(created.len(), 1);
+    assert_eq!(prerequisites_of(&state, &task_id), vec![created[0].id.clone()]);
+    assert!(task.description.contains("Prerequisite approved by the repo owner"));
+    assert!(task.description.contains(&old_execution));
+    assert!(
+        state
+            .work_db
+            .list_executions(Some(&task_id))
+            .unwrap()
+            .iter()
+            .all(|e| e.status != boss_protocol::ExecutionStatus::Ready)
+    );
+}
+
+#[tokio::test]
+async fn file_count_split_no_records_scoped_authorization_and_redispatches() {
+    let (state, _dir, old_execution, task_id) = parked_task_with_question(file_count_split_payload()).await;
+    let tasks_before = state
+        .work_db
+        .list_tasks(&question_task(&state, &task_id).product_id, None, None, false)
+        .unwrap()
+        .len();
+    let FrontendEvent::WorkItemUpdated {
+        item: crate::work::WorkItem::Task(task),
+    } = answer_question(&state, &task_id, false).await
+    else {
+        panic!("expected updated task");
+    };
+    assert_eq!(task.status, boss_protocol::TaskStatus::Todo);
+    assert!(task.autostart);
+    assert!(task.blocked_reason.is_none());
+    assert!(task.operator_question.is_none());
+    assert!(prerequisites_of(&state, &task_id).is_empty());
+    assert_eq!(
+        state
+            .work_db
+            .list_tasks(&task.product_id, None, None, false)
+            .unwrap()
+            .len(),
+        tasks_before,
+        "No does not create a prerequisite"
+    );
+    assert!(task.description.contains("Repo owner approval"));
+    assert!(task.description.contains("No — keep this change in one PR"));
+    assert!(
+        task.description
+            .contains("change/file-count for this PR only, up to 48 files")
+    );
+    assert!(
+        task.description
+            .contains("BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered No by the repo owner on ")
+    );
+    assert!(
+        task.description
+            .contains("It does not authorize bypassing any other check")
+    );
+    assert!(task.description.contains(&old_execution));
+    assert!(
+        state
+            .work_db
+            .list_executions(Some(&task_id))
+            .unwrap()
+            .iter()
+            .any(|e| e.status == boss_protocol::ExecutionStatus::Ready && e.id != old_execution),
+        "No mints a ready execution so the worker finishes in one PR"
+    );
 }

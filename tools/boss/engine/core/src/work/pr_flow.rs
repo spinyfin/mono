@@ -17,6 +17,8 @@ pub(crate) const DELETION_SIGNOFF_BLOCKED_REASON: &str = "deletion_signoff";
 /// The shipped `blocked_reason` trigger records a new `worker_failed`
 /// observation for every variant, even when the displayed reason is
 /// unchanged; its repeat-observation list is generated from [`Self::ALL`].
+/// [`Self::OperatorNo`] remains the historical basis for a declined answer
+/// that parked the task; live No answers now redispatch.
 /// A delivery whose conflict resolution cannot be verified is recorded as
 /// [`Self::DeliveredWithoutPr`]: the worker declared delivery that the engine
 /// could not confirm.
@@ -2428,7 +2430,7 @@ impl WorkDb {
         let mut minted_execution = false;
         let mut prerequisite_work_item_id = None;
         match (answer, &question.question.answer_type) {
-            (OperatorAnswer::YesNo { value: true }, OperatorAnswerType::CreatePrerequisiteTask { name, brief }) => {
+            (OperatorAnswer::YesNo { value: true }, OperatorAnswerType::CreatePrerequisiteTask { name, brief, .. }) => {
                 let linked = super::prerequisite_question::approve_in_tx(
                     &mut pending,
                     &tx,
@@ -2452,23 +2454,23 @@ impl WorkDb {
                 restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
                 minted_execution = true;
             }
+            (
+                OperatorAnswer::YesNo { value: false },
+                OperatorAnswerType::CreatePrerequisiteTask {
+                    file_count_bypass: Some(spec),
+                    ..
+                },
+            ) => {
+                let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
+                let block = file_count_bypass_authorization_block(&question.question, *spec, &timestamp);
+                restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
+                minted_execution = true;
+            }
             (OperatorAnswer::YesNo { value: false }, _) => {
-                let summary = question.question.run_summary.as_deref().unwrap_or("(not recorded)");
-                let detail = format!(
-                    "Operator declined on {}: \"{}\"\n\nWorker's explanation: {}\n\nRun summary: {}",
-                    answered_at.format("%Y-%m-%d"),
-                    question.question.text,
-                    question.question.explanation,
-                    summary
-                );
-                crate::work::task_status_audit::execute(
-                    &tx,
-                    WorkerFailureBasis::OperatorNo.as_str(),
-                    "human",
-                    "UPDATE tasks SET blocked_reason = 'worker_failed', blocked_detail = ?2,
-                     last_status_actor = 'human', updated_at = ?3 WHERE id = ?1",
-                    params![task.id, detail, now],
-                )?;
+                let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
+                let block = declined_block(&question.question, &timestamp);
+                restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
+                minted_execution = true;
             }
             // `check_answer` above refuses every other pairing.
             (answer, answer_type) => anyhow::bail!("unhandled operator answer {answer:?} for {answer_type:?}"),
@@ -2544,6 +2546,27 @@ fn restart_after_answer(
     Ok(())
 }
 
+/// No on a plain yes-no or ordinary prerequisite question: record the
+/// declined path and grant nothing, matching [`choice_block`].
+fn declined_block(question: &OperatorQuestionView, timestamp: &str) -> String {
+    let mut lines = format!(
+        "\n\n---\n\n## Recorded answer ({timestamp})\n\n\
+- **Question the previous worker asked:** {}\n\
+- **Answer:** No\n",
+        question.text
+    );
+    if let Some(no_path) = boss_protocol::explanation_no_section(&question.explanation) {
+        lines.push_str(&format!("- **The worker's No path:** {no_path}\n"));
+    }
+    lines.push_str(&format!(
+        "- **The worker's explanation:** {}\n\
+- **Asked by run:** `{}`\n\n\
+The repo owner recorded this decline on the kanban. Proceed with the declined path named above. It grants no authorization: it does not authorize bypassing any check or exceeding any limit.\n",
+        question.explanation, question.execution_id
+    ));
+    lines
+}
+
 /// The brief addendum for a multiple-choice answer: the chosen option,
 /// verbatim. Unlike [`authorization_block`] it grants nothing beyond
 /// the decision itself.
@@ -2578,6 +2601,25 @@ The repo owner recorded this answer. It is explicit, human-granted approval for 
     )
 }
 
+/// No on a split-vs-file-count-bypass question: keep this change in one PR,
+/// recording the approved file count separately from the free-form bypass reason.
+pub(super) fn file_count_bypass_authorization_block(
+    question: &OperatorQuestionView,
+    spec: boss_protocol::FileCountBypassSpec,
+    timestamp: &str,
+) -> String {
+    format!(
+        "\n\n---\n\n## Repo owner approval ({timestamp})\n\n\
+- **Question the previous worker asked:** {}\n\
+- **Answer:** No — keep this change in one PR\n\
+- **Authorized exception:** change/file-count for this PR only, up to {} files (repository limit {})\n\
+- **The worker's explanation:** {}\n\
+- **Asked by run:** `{}`\n\n\
+The repo owner recorded this answer. It is explicit, human-granted approval to finish this change as a single PR by declaring `BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered No by the repo owner on {timestamp}; one-PR exception for this PR only` in the commit description. Checkleft does not enforce the approved count. Before pushing, compare the non-deleted file count from `jj diff --stat` against the PR base with the approved bound above and ask again if it is over. It does not authorize bypassing any other check, raising any other limit, or using the exception on a different PR. State in the PR body that this file-count exception was approved by the repo owner on the date above.\n",
+        question.text, spec.files, spec.limit, question.explanation, question.execution_id
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use crate::test_support::*;
@@ -2596,6 +2638,55 @@ mod tests {
         let text = super::authorization_block(&question, "2026-10-23");
         crate::prose_vocabulary::assert_no_forbidden_prose("recorded approval", &text);
         assert!(text.contains("## Repo owner approval (2026-10-23)"));
+    }
+
+    #[test]
+    fn file_count_bypass_approval_text_is_scoped_and_avoids_internal_vocabulary() {
+        let question = boss_protocol::OperatorQuestionView::builder()
+            .id("question-1")
+            .text("Split this 48-file change (limit 30) by landing 'Extract the first PR' first, or keep it in one PR?")
+            .answer_type(boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
+                name: "Extract the first PR".into(),
+                brief: "Land the first capability as its own PR.".into(),
+                file_count_bypass: Some(boss_protocol::FileCountBypassSpec { files: 48, limit: 30 }),
+            })
+            .explanation("The change is 48 files against a limit of 30.")
+            .asked_at("2026-10-23")
+            .execution_id("exec_example")
+            .build();
+        let text = super::file_count_bypass_authorization_block(
+            &question,
+            boss_protocol::FileCountBypassSpec { files: 48, limit: 30 },
+            "2026-10-23",
+        );
+        crate::prose_vocabulary::assert_no_forbidden_prose("file-count bypass approval", &text);
+        assert!(text.contains("## Repo owner approval (2026-10-23)"));
+        assert!(text.contains("change/file-count for this PR only, up to 48 files (repository limit 30)"));
+        assert!(text.contains("Checkleft does not enforce the approved count"));
+        assert!(text.contains("ask again if it is over"));
+        assert!(text.contains("BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered No by the repo owner on 2026-10-23; one-PR exception for this PR only"));
+        assert!(text.contains("It does not authorize bypassing any other check"));
+    }
+
+    #[test]
+    fn declined_answer_text_grants_no_authorization() {
+        let question = boss_protocol::OperatorQuestionView::builder()
+            .id("question-1")
+            .text("Ship the smaller retry change?")
+            .answer_type(boss_protocol::OperatorAnswerType::YesNo)
+            .explanation(
+                "Context:\nRetries fail open.\nYes:\nKeep the extra telemetry.\nNo:\nShip the smaller retry change instead.\nRecommendation:\nNo, to finish sooner.",
+            )
+            .asked_at("2026-10-23")
+            .execution_id("exec_example")
+            .build();
+        let text = super::declined_block(&question, "2026-10-23");
+        crate::prose_vocabulary::assert_no_forbidden_prose("declined answer", &text);
+        assert!(text.contains("## Recorded answer (2026-10-23)"));
+        assert!(text.contains("- **Answer:** No\n"));
+        assert!(text.contains("- **The worker's No path:** Ship the smaller retry change instead.\n"));
+        assert!(text.contains("It grants no authorization"));
+        assert!(text.contains("does not authorize bypassing any check"));
     }
 
     /// A task whose `review_cycle` is a known non-zero value must serialise

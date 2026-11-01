@@ -147,7 +147,7 @@ async fn question_on_chore_answers_like_a_task() {
     assert_eq!(next.status, boss_protocol::ExecutionStatus::Ready);
     assert_eq!(next.preferred_workspace_id.as_deref(), Some("workspace-run-done"));
 
-    // No on a fresh chore: the park becomes the ordinary declined shape.
+    // No on a fresh chore records the declined path and redispatches.
     let (state, _dir, execution_id, chore_id) = live_chore_execution();
     submitted(
         call_with_peer(
@@ -164,13 +164,26 @@ async fn question_on_chore_answers_like_a_task() {
     else {
         panic!("expected updated chore: {answer:?}");
     };
-    assert_eq!(chore.status, boss_protocol::TaskStatus::Blocked);
-    assert_eq!(chore.blocked_reason.as_deref(), Some("worker_failed"));
-    let detail = chore.blocked_detail.unwrap();
-    assert!(detail.contains("Operator declined on"));
-    assert!(detail.contains("Approve raising the file limit from 30 to 48?"));
+    assert_eq!(chore.status, boss_protocol::TaskStatus::Todo);
+    assert!(chore.autostart);
+    assert!(chore.blocked_reason.is_none());
     assert!(chore.operator_question.is_none());
-    assert_eq!(state.work_db.list_executions(Some(&chore_id)).unwrap().len(), 1);
+    assert!(chore.description.contains("## Recorded answer ("));
+    assert!(chore.description.contains("- **Answer:** No\n"));
+    assert!(
+        chore
+            .description
+            .contains("Approve raising the file limit from 30 to 48?")
+    );
+    assert!(chore.description.contains("grants no authorization"));
+    assert!(
+        state
+            .work_db
+            .list_executions(Some(&chore_id))
+            .unwrap()
+            .iter()
+            .any(|e| e.status == boss_protocol::ExecutionStatus::Ready && e.id != execution_id)
+    );
 }
 
 /// A task already `in_review` cannot park: its question is recorded as

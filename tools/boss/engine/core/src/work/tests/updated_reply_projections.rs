@@ -97,9 +97,9 @@ fn operator_answer_and_repeat_project_current_section() {
         .unwrap();
     let answer = OperatorAnswer::YesNo { value: false };
     let first = task_from_item(db.answer_operator_question(&task.id, answer.clone()).unwrap().item);
-    // First answers require a blocked task and cannot produce Ready: No
-    // keeps it in Backlog, while Yes resumes it in Doing. Pin another
-    // derived field so removing the first-answer projection still fails.
+    // First answers require a blocked task. No redispatches with the declined
+    // path, so the parent is Todo while a revision is still in progress. Pin
+    // another derived field so removing the first-answer projection still fails.
     assert_eq!(first.review_section, None);
     assert!(first.has_in_progress_revision);
     assert!(!first.ready_for_review);
