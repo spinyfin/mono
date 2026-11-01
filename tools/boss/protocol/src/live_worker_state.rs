@@ -49,6 +49,16 @@ pub enum WorkerActivity {
     /// kanban Doing icon should signal that the human's attention is
     /// needed.
     WaitingForInput,
+    /// The worker's turn ended and it is parked on **its own** work: a wait
+    /// it declared through `boss propose wait` that has not yet expired.
+    /// Nobody needs to answer it — the worker re-wakes itself when the
+    /// background command finishes. Never counted as "needs input".
+    WaitingOnWork,
+    /// A [`Self::WaitingOnWork`] wait expired and the worker has not been
+    /// re-woken. Still not a human prompt, but no longer healthy: it is the
+    /// engine's stalled/overdue signal for a worker whose own work should
+    /// have finished by now.
+    WaitOverdue,
     /// `Stop` with no pending probe and no preceding notification.
     /// The worker is between turns, alive but not currently doing
     /// work.
@@ -73,9 +83,18 @@ impl WorkerActivity {
         matches!(self, WorkerActivity::Terminated | WorkerActivity::Errored)
     }
 
+    /// True iff a human is what the worker is blocked on — the one state the
+    /// app counts under "Needs input". [`Self::WaitingOnWork`] and
+    /// [`Self::WaitOverdue`] are deliberately not: the worker is waiting on
+    /// work it started itself.
+    pub fn needs_human(self) -> bool {
+        matches!(self, WorkerActivity::WaitingForInput)
+    }
+
     /// True iff the pane's foreground worker is **parked at its prompt**:
-    /// [`Self::Idle`] (between turns) or [`Self::WaitingForInput`] (on a
-    /// permission prompt / human redirect). In those postures a typed /
+    /// [`Self::Idle`] (between turns), [`Self::WaitingForInput`] (on a
+    /// permission prompt / human redirect), or parked on its own declared
+    /// wait ([`Self::WaitingOnWork`] / [`Self::WaitOverdue`]). In those postures a typed /
     /// pane write becomes the worker's next prompt under any driver,
     /// so this is the driver-independent floor for pane injection.
     ///
@@ -104,7 +123,13 @@ impl WorkerActivity {
     /// `boss_engine_driver::AgentDriver::mid_turn_pane_input`; the engine
     /// combines both in `PaneInputPosture`.
     pub fn accepts_typed_input(self) -> bool {
-        matches!(self, WorkerActivity::Idle | WorkerActivity::WaitingForInput)
+        matches!(
+            self,
+            WorkerActivity::Idle
+                | WorkerActivity::WaitingForInput
+                | WorkerActivity::WaitingOnWork
+                | WorkerActivity::WaitOverdue
+        )
     }
 
     pub fn as_str(self) -> &'static str {
@@ -112,6 +137,8 @@ impl WorkerActivity {
             WorkerActivity::Spawning => "spawning",
             WorkerActivity::Working => "working",
             WorkerActivity::WaitingForInput => "waiting_for_input",
+            WorkerActivity::WaitingOnWork => "waiting_on_work",
+            WorkerActivity::WaitOverdue => "wait_overdue",
             WorkerActivity::Idle => "idle",
             WorkerActivity::Errored => "errored",
             WorkerActivity::Terminated => "terminated",
@@ -544,6 +571,8 @@ mod tests {
             WorkerActivity::Spawning,
             WorkerActivity::Working,
             WorkerActivity::WaitingForInput,
+            WorkerActivity::WaitingOnWork,
+            WorkerActivity::WaitOverdue,
             WorkerActivity::Idle,
             WorkerActivity::Errored,
             WorkerActivity::Terminated,
@@ -561,9 +590,29 @@ mod tests {
     }
 
     #[test]
+    fn only_waiting_for_input_needs_a_human() {
+        for activity in [
+            WorkerActivity::Spawning,
+            WorkerActivity::Working,
+            WorkerActivity::WaitingOnWork,
+            WorkerActivity::WaitOverdue,
+            WorkerActivity::Idle,
+            WorkerActivity::Errored,
+            WorkerActivity::Terminated,
+        ] {
+            assert!(!activity.needs_human(), "{activity:?}");
+        }
+        assert!(WorkerActivity::WaitingForInput.needs_human());
+        assert_eq!(WorkerActivity::WaitingOnWork.as_str(), "waiting_on_work");
+        assert_eq!(WorkerActivity::WaitOverdue.as_str(), "wait_overdue");
+    }
+
+    #[test]
     fn accepts_typed_input_only_when_parked_at_prompt() {
         assert!(WorkerActivity::Idle.accepts_typed_input());
         assert!(WorkerActivity::WaitingForInput.accepts_typed_input());
+        assert!(WorkerActivity::WaitingOnWork.accepts_typed_input());
+        assert!(WorkerActivity::WaitOverdue.accepts_typed_input());
         assert!(!WorkerActivity::Spawning.accepts_typed_input());
         assert!(!WorkerActivity::Working.accepts_typed_input());
         assert!(!WorkerActivity::Errored.accepts_typed_input());

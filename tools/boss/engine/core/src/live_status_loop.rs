@@ -975,6 +975,11 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                     WorkerActivity::Idle => Some(Instant::now()),
                     _ => None,
                 };
+                let prior = registry.get(slot_id).and_then(|s| s.live_status);
+                let subtitle = live_status::activity_subtitle(new_activity, prior.as_deref());
+                if subtitle != prior && registry.set_live_status(slot_id, subtitle) {
+                    broadcaster.broadcast_live_worker_states().await;
+                }
                 match new_activity {
                     WorkerActivity::Errored => {
                         if registry.set_live_status(slot_id, Some(live_status::ERRORED_LITERAL.to_owned())) {
@@ -982,16 +987,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                         }
                         continue;
                     }
-                    WorkerActivity::WaitingForInput => {
-                        // Per Q4: keep the prior sentence if there
-                        // was one, otherwise write the literal so the
-                        // card is not misleading.
-                        let prior = registry.get(slot_id).and_then(|s| s.live_status);
-                        if prior.is_none()
-                            && registry.set_live_status(slot_id, Some(live_status::AWAITING_INPUT_LITERAL.to_owned()))
-                        {
-                            broadcaster.broadcast_live_worker_states().await;
-                        }
+                    WorkerActivity::WaitingForInput | WorkerActivity::WaitingOnWork | WorkerActivity::WaitOverdue => {
                         continue;
                     }
                     WorkerActivity::Spawning | WorkerActivity::Terminated => {
@@ -1897,6 +1893,65 @@ mod tests {
             registry.get(2).unwrap().live_status.as_deref(),
             Some("investigating the bug"),
         );
+        mgr.stop_slot(2);
+    }
+
+    #[tokio::test]
+    async fn activity_transitions_replace_state_literals_and_preserve_summaries() {
+        let mgr = LiveStatusManager::new();
+        let registry = Arc::new(LiveWorkerStateRegistry::new());
+        registry.register_spawn(2, "run-2", "claude-opus-4-7", 0, None);
+        mgr.start_slot(
+            2,
+            live_run("run-2"),
+            keyless_utility(),
+            registry.clone(),
+            Arc::new(CountingBroadcaster::default()),
+            Arc::new(CannedResolver::new(None)),
+        );
+        for (activity, prior, expected) in [
+            (
+                WorkerActivity::WaitingOnWork,
+                live_status::AWAITING_INPUT_LITERAL,
+                Some(live_status::WAITING_ON_WORK_LITERAL),
+            ),
+            (
+                WorkerActivity::WaitOverdue,
+                live_status::WAITING_ON_WORK_LITERAL,
+                Some(live_status::WAIT_OVERDUE_LITERAL),
+            ),
+            (
+                WorkerActivity::WaitingForInput,
+                live_status::WAITING_ON_WORK_LITERAL,
+                Some(live_status::AWAITING_INPUT_LITERAL),
+            ),
+            (
+                WorkerActivity::WaitingForInput,
+                live_status::WAIT_OVERDUE_LITERAL,
+                Some(live_status::AWAITING_INPUT_LITERAL),
+            ),
+            (
+                WorkerActivity::WaitingOnWork,
+                "investigating the bug",
+                Some("investigating the bug"),
+            ),
+            (
+                WorkerActivity::WaitOverdue,
+                "investigating the bug",
+                Some("investigating the bug"),
+            ),
+            (WorkerActivity::Working, live_status::WAIT_OVERDUE_LITERAL, None),
+            (WorkerActivity::Idle, live_status::AWAITING_INPUT_LITERAL, None),
+        ] {
+            registry.set_live_status(2, Some(prior.into()));
+            mgr.notify(2, Trigger::ActivityChanged(activity));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(
+                registry.get(2).unwrap().live_status.as_deref(),
+                expected,
+                "{activity:?}"
+            );
+        }
         mgr.stop_slot(2);
     }
 

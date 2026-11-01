@@ -192,14 +192,11 @@ struct WorkerLiveState {
 }
 
 extension WorkerLiveState {
-    /// The worker declared a wait on a job and the owner is not needed.
-    /// The engine snapshot is authoritative: it normalizes a wait whose
-    /// declaring turn has ended to `.idle`, and keeps `.waitingForInput`
-    /// (which still carries `waitReason`) for a prompt raised mid-turn,
-    /// which is a real ask of the owner. So a job wait is exactly idle plus
-    /// a declared reason; any other activity is never a job wait.
+    /// Explicit wait states and legacy idle snapshots with a declared reason
+    /// are job waits. A blocking prompt still needs the owner.
     var isWaitingOnJob: Bool {
-        activity == .idle && !(waitReason ?? "").isEmpty
+        activity == .waitingOnWork || activity == .waitOverdue
+            || (activity == .idle && !(waitReason ?? "").isEmpty)
     }
 }
 
@@ -284,6 +281,11 @@ enum WorkerActivity: String, Hashable {
     case spawning
     case working
     case waitingForInput = "waiting_for_input"
+    /// Parked on a wait the worker declared itself (`boss propose wait`).
+    /// Nobody needs to answer it; the worker re-wakes on its own.
+    case waitingOnWork = "waiting_on_work"
+    /// The declared wait expired and the worker was not re-woken.
+    case waitOverdue = "wait_overdue"
     case idle
     case errored
     case terminated
@@ -297,11 +299,20 @@ enum WorkerActivity: String, Hashable {
         case .spawning: "Spawning"
         case .working: "Working"
         case .waitingForInput: "Waiting"
+        case .waitingOnWork: "Waiting on work"
+        case .waitOverdue: "Wait overdue"
         case .idle: "Idle"
         case .errored: "Errored"
         case .terminated: "Terminated"
         }
     }
+
+    /// True iff a person is what the worker is blocked on. The single
+    /// definition behind the top-bar "Needs input" count and the
+    /// "awaiting input" affordances; the engine decides the activity, so the
+    /// count, pill and subtitle cannot disagree. A worker parked on its own
+    /// declared wait (`waitingOnWork`, `waitOverdue`) is deliberately not one.
+    var needsHuman: Bool { self == .waitingForInput }
 
     /// Agents-pane activity pill. Spawning is a neutral "Starting"; an
     /// engine terminal state is "Exited" until the snapshot releases the run.
@@ -393,6 +404,10 @@ enum AgentActivityState: Equatable {
                 self = .active
             case .waitingForInput:
                 self = .waiting(reason: "Waiting on user input")
+            case .waitingOnWork:
+                self = .waiting(reason: Self.waitCaption(liveState))
+            case .waitOverdue:
+                self = .waiting(reason: Self.overdueCaption(liveState))
             case .idle:
                 if liveState.isWaitingOnJob {
                     self = .waiting(reason: Self.waitCaption(liveState))
@@ -426,11 +441,8 @@ enum AgentActivityState: Equatable {
     ///    missing identity is an invariant failure, never a supported
     ///    local hosting mode. Remote workers (`tmuxHosted == nil`) skip
     ///    this rule.
-    /// 3. An idle worker with a declared wait (`waitReason`) reads as
-    ///    *waiting* with the wait caption, matching
-    ///    `init(runtime:liveState:)`. The engine normalizes a wait whose
-    ///    declaring turn has ended to idle; any other activity falls
-    ///    through even if the wait has not yet expired.
+    /// 3. Explicit wait states and legacy idle snapshots with a declared
+    ///    reason read as waiting, with expired waits called out separately.
     /// 4. A worker paused on a permission prompt
     ///    (`activity == .waitingForInput`, including a prompt raised
     ///    mid-turn while a wait is declared) reads as *waiting on the
@@ -462,11 +474,17 @@ enum AgentActivityState: Equatable {
         if liveState?.tmuxHosted == false {
             return .errored(reason: Self.identityUnavailableReason)
         }
-        if let liveState, liveState.isWaitingOnJob {
+        if let liveState, liveState.activity == .idle, liveState.isWaitingOnJob {
             return .waiting(reason: waitCaption(liveState))
         }
         if liveState?.activity == .waitingForInput {
             return .waiting(reason: "Waiting on user input")
+        }
+        if let liveState, liveState.activity == .waitingOnWork {
+            return .waiting(reason: waitCaption(liveState))
+        }
+        if let liveState, liveState.activity == .waitOverdue {
+            return .waiting(reason: overdueCaption(liveState))
         }
         if liveState?.activity == .spawning {
             return .unknown(reason: "Worker state not yet reported")
@@ -505,6 +523,15 @@ enum AgentActivityState: Equatable {
         return date.formatted(date: .omitted, time: .shortened)
     }
 
+    static func overdueCaption(_ liveState: WorkerLiveState) -> String {
+        overdueCaption(reason: liveState.waitReason)
+    }
+
+    static func overdueCaption(reason: String?) -> String {
+        let reason = reason ?? "long-running job"
+        return "Wait expired without a wake-up: \(reason)"
+    }
+
     static func waitCaption(_ liveState: WorkerLiveState) -> String {
         waitCaption(reason: liveState.waitReason, expiresAt: liveState.waitExpiresAt)
     }
@@ -531,6 +558,22 @@ enum AgentActivityState: Equatable {
             return "No agent attached"
         case .dispatchPending:
             return "Queued — waiting for a worker slot"
+        }
+    }
+}
+
+extension WorkerActivity {
+    /// Keep a narrative summary, but project state literals from current activity.
+    func slotSubtitle(prior: String?) -> String? {
+        let literals = ["awaiting input", "waiting on its own work", "wait expired — check on it"]
+        if let prior, !prior.isEmpty, !literals.contains(prior) {
+            return prior
+        }
+        switch self {
+        case .waitingForInput: return literals[0]
+        case .waitingOnWork: return literals[1]
+        case .waitOverdue: return literals[2]
+        default: return nil
         }
     }
 }
