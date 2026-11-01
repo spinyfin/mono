@@ -114,10 +114,10 @@ pub const CUBE_CLI_BIN_ENV: &str = "CUBE_CLI_BIN";
 
 /// Env var naming the installed bundle's bin directory
 /// (`Boss.app/Contents/Resources/bin`). Set by the macOS app.
-const BOSS_BIN_DIR_ENV: &str = "BOSS_BIN_DIR";
+pub const BOSS_BIN_DIR_ENV: &str = "BOSS_BIN_DIR";
 
 /// Env var set by `bazel run` to the checkout it was launched from.
-const BUILD_WORKSPACE_DIRECTORY_ENV: &str = "BUILD_WORKSPACE_DIRECTORY";
+pub const BUILD_WORKSPACE_DIRECTORY_ENV: &str = "BUILD_WORKSPACE_DIRECTORY";
 
 /// Workspace-relative path of the `cube` CLI under runfiles / bazel-bin.
 const CUBE_CLI_RUNFILES_REL: &str = "tools/cube/cube";
@@ -295,19 +295,19 @@ pub fn resolve_cube_cli(
 /// executable path, `BUILD_WORKSPACE_DIRECTORY`, `CUBE_CLI_BIN` and
 /// `BOSS_BIN_DIR`.
 ///
-/// This is the one place engine-side code that must *run* `cube` (the Grok
-/// capability preflight, the engine's own cube client) asks for the path, so
-/// each of them gets the bundled binary by absolute path instead of handing a
-/// bare `cube` to the OS and letting a `PATH` search find the user's repobin
-/// shim. Returns `None` when no bundled `cube` exists; callers must surface
-/// that as a failure rather than substitute a `PATH` lookup.
+/// Returns `None` when no bundled cube exists; callers must fail rather
+/// than substitute a PATH lookup.
 pub fn resolve_cube_cli_from_process() -> Option<PathBuf> {
-    let engine_path = std::env::current_exe().unwrap_or_default();
+    resolve_cube_cli_for_engine(&std::env::current_exe().unwrap_or_default())
+}
+
+/// Resolve cube using the engine path and the shared process environment.
+pub fn resolve_cube_cli_for_engine(engine_path: &Path) -> Option<PathBuf> {
     let workspace_dir = std::env::var_os(BUILD_WORKSPACE_DIRECTORY_ENV).map(PathBuf::from);
     let env_override = std::env::var_os(CUBE_CLI_BIN_ENV).map(PathBuf::from);
     let boss_bin_dir = std::env::var_os(BOSS_BIN_DIR_ENV).map(PathBuf::from);
     resolve_cube_cli(
-        &engine_path,
+        engine_path,
         workspace_dir.as_deref(),
         env_override.as_deref(),
         boss_bin_dir.as_deref(),

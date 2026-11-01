@@ -297,6 +297,7 @@ fn run_push_guard_resolving_with_env(
         .arg(&script_path)
         .env_remove("BOSS_CHECKLEFT_BIN")
         .env_remove("BOSS_BIN_DIR")
+        .env_remove("BOSS_WORKER_BIN_DIR")
         .env("PATH", &path_var);
     for (key, value) in extra_env {
         guard.env(key, value);
@@ -439,27 +440,32 @@ fn push_guard_env_override_wins_over_a_present_repobin() {
 }
 
 #[test]
-fn push_guard_dispatches_through_repobin_found_only_on_path() {
-    // The realistic cube-workspace case: no <repo-root>/bin directory at
-    // all (nothing installs one), so repobin must still be found via a
-    // plain PATH search rather than only the <repo-root>/bin/repobin path.
+fn push_guard_uses_pinned_launcher_without_bundle_env() {
     let dir = TempDir::new().unwrap();
-    let path_dir = TempDir::new().unwrap();
-    let argv_out = dir.path().join("argv.txt");
-    write_fake_repobin_recording_argv(path_dir.path(), &argv_out);
-
-    let decision = run_push_guard_resolving("jj git push -b boss/foo --allow-new", dir.path(), &[path_dir.path()]);
-    assert_eq!(
-        decision["decision"], "approve",
-        "a clean PATH-resolved repobin-dispatched checkleft must allow the push: {decision}"
+    let engine_bin = TempDir::new().unwrap();
+    let worker_bin = TempDir::new().unwrap();
+    let decoy = TempDir::new().unwrap();
+    let engine_argv = dir.path().join("engine-argv.txt");
+    let decoy_argv = dir.path().join("decoy-argv.txt");
+    let repobin = write_fake_repobin_recording_argv(engine_bin.path(), &engine_argv);
+    write_fake_repobin_recording_argv(decoy.path(), &decoy_argv);
+    boss_engine_worker_bin::environment::write_repo_tool_launcher(worker_bin.path(), "checkleft", Some(&repobin))
+        .unwrap();
+    let decision = run_push_guard_resolving_with_env(
+        "jj git push -b boss/foo",
+        dir.path(),
+        &[decoy.path()],
+        &[("BOSS_WORKER_BIN_DIR", worker_bin.path())],
     );
-    let argv = std::fs::read_to_string(&argv_out).expect("fake repobin must have recorded its argv");
-    let args: Vec<&str> = argv.lines().collect();
+    assert_eq!(decision["decision"], "approve", "{decision}");
     assert_eq!(
-        args,
-        vec!["exec", "checkleft", "run"],
-        "guard must dispatch via `repobin exec checkleft run` found on PATH: {argv:?}"
+        std::fs::read_to_string(engine_argv)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["exec", "checkleft", "run"]
     );
+    assert!(!decoy_argv.exists(), "host repobin must never run");
 }
 
 #[test]

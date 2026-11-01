@@ -344,6 +344,100 @@ struct DeliveryEnvironment {
     prior: Vec<(&'static str, Option<std::ffi::OsString>)>,
 }
 
+#[test]
+fn actual_driver_spawn_prefix_pins_boss_and_cube_before_path_decoys() {
+    use crate::driver::{DriverRegistry, grok, test_support};
+    use crate::protocol::EnvVar;
+    use std::os::unix::fs::PermissionsExt;
+    let root = TempDir::new().unwrap();
+    let _codex = test_support::codex_auth_source_override(&root.path().join("codex"), &root.path().join("auth.json"));
+    let _grok = test_support::grok_homes_override(&root.path().join("grok"));
+    let bundle = root.path().join("bundle");
+    let decoy = root.path().join("decoy");
+    std::fs::create_dir_all(&bundle).unwrap();
+    std::fs::create_dir_all(&decoy).unwrap();
+    for name in ["boss", "cube"] {
+        for (dir, output) in [(&bundle, "bundled"), (&decoy, "decoy")] {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\necho {output}-{name}\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let mut restore = DeliveryEnvironment { prior: Vec::new() };
+    for key in [
+        "BOSS_BIN_DIR",
+        "BOSS_CLI_BIN",
+        "CUBE_CLI_BIN",
+        "BUILD_WORKSPACE_DIRECTORY",
+    ] {
+        restore.prior.push((key, std::env::var_os(key)));
+        unsafe { std::env::remove_var(key) };
+    }
+    unsafe { std::env::set_var("BOSS_BIN_DIR", &bundle) };
+    let run_id = "run-tool-prefix";
+    let grok_home = grok::grok_home_for_run(run_id).unwrap();
+    std::fs::create_dir_all(&grok_home).unwrap();
+    std::fs::write(
+        grok_home.join("boss-session-id"),
+        "22222222-3333-4444-8555-666666666666\n",
+    )
+    .unwrap();
+    std::fs::write(
+        grok_home.join("boss-workspace-path"),
+        format!("{}\n", root.path().display()),
+    )
+    .unwrap();
+    let worker_bin = super::ensure_worker_bin_dir_for_engine(root.path(), root.path(), &bundle.join("engine")).unwrap();
+    let inherited = format!("{}:/bin:/usr/bin", decoy.display());
+    let mut env = vec![
+        EnvVar {
+            key: "PATH".into(),
+            value: inherited.clone(),
+        },
+        EnvVar {
+            key: boss_engine_worker_bin::WORKER_BIN_DIR_ENV.into(),
+            value: worker_bin.display().to_string(),
+        },
+    ];
+    crate::spawn_flow::apply_worker_tool_env(&mut env, bundle.to_str());
+    let registry = DriverRegistry::default();
+    for slug in registry.slugs() {
+        let driver = registry.require(slug).unwrap();
+        let mut plan = driver.spawn_invocation(SpawnRequest {
+            model: driver.descriptor().model_menu.engine_default,
+            effort: None,
+            settings_path: None,
+            non_opus_auto_mode: false,
+            permission_mode_override: None,
+            run_id: Some(run_id),
+        });
+        // Keep the real driver env directives; substitute only its CLI so the
+        // assembled prefix can be exercised without starting an agent.
+        plan.command = format!(
+            "/bin/bash -c {}",
+            crate::ssh_transport::shell_quote("command -v boss; command -v cube; \"$BOSS_BIN\"; \"$CUBE_BIN\"")
+        );
+        let assembled = super::assemble_worker_command("", &worker_bin, &plan);
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &assembled])
+            .env("PATH", &inherited)
+            .envs(env.iter().map(|entry| (&entry.key, &entry.value)))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{slug}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected = format!(
+            "{}/boss\n{}/cube\nbundled-boss\nbundled-cube\n",
+            worker_bin.display(),
+            worker_bin.display()
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected, "{slug}: {assembled}");
+    }
+}
+
 impl Drop for DeliveryEnvironment {
     fn drop(&mut self) {
         for (key, value) in &self.prior {

@@ -123,11 +123,6 @@ pub const DEFAULT_ENABLE_DISPATCH_READY_BUS: bool = false;
 /// higher tier — no code change required.
 pub const DEFAULT_COORDINATOR_MODEL: &str = "opus";
 
-// Bare name used only when no bundled `cube` can be located at all (see
-// `resolve_cube_command`): an unbundled test or ad-hoc process, never an
-// installed Boss.app or a `bazel run` engine, which both carry a `cube`.
-const DEFAULT_CUBE_COMMAND: &str = "cube";
-
 #[derive(Debug, Clone)]
 pub struct CubeConfig {
     pub command: String,
@@ -434,14 +429,23 @@ pub struct AgentConfig {
 
 impl AgentConfig {
     pub fn load_from_env(work: &WorkConfig) -> Result<Self> {
+        Self::load_for_engine(work, &std::env::current_exe()?)
+    }
+
+    fn load_for_engine(work: &WorkConfig, engine_path: &Path) -> Result<Self> {
         let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
 
-        let (cube_command, cube_args) = parse_command_line(
-            "BOSS_CUBE_CMD",
-            std::env::var("BOSS_CUBE_CMD").unwrap_or_else(|_| resolve_cube_command()),
-        )?;
-
-        log_cube_resolution(&cube_command);
+        let (cube_command, cube_args) = match std::env::var("BOSS_CUBE_CMD") {
+            Ok(command) => parse_command_line("BOSS_CUBE_CMD", command)?,
+            Err(_) => (
+                boss_engine_worker_bin::resolve_cube_cli_for_engine(engine_path)
+                    .context("no bundled cube found; set BOSS_CUBE_CMD or CUBE_CLI_BIN to an executable path")?
+                    .to_string_lossy()
+                    .into_owned(),
+                Vec::new(),
+            ),
+        };
+        tracing::info!(command = cube_command, "cube command configured");
 
         Ok(Self {
             anthropic_api_key,
@@ -570,51 +574,6 @@ impl RuntimeConfig {
     }
 }
 
-/// Returns the cube command the engine itself runs.
-///
-/// Resolved by absolute path through the same bundled-binary lookup the
-/// worker `cube` launcher uses
-/// ([`boss_engine_worker_bin::resolve_cube_cli_from_process`]): `CUBE_CLI_BIN`,
-/// `$BOSS_BIN_DIR/cube`, the engine's runfiles, `bazel-bin`, then the engine's
-/// sibling directory. Build-from-source repobin shims are skipped, and `PATH` is
-/// never searched, so the user's `~/bin/cube` cannot win over the bundle.
-///
-/// The bare name `cube` is returned only when none of those exist (an
-/// unbundled test or ad-hoc process). That is logged at error level because it
-/// is the one remaining `PATH` lookup; `BOSS_CUBE_CMD` overrides all of this.
-fn resolve_cube_command() -> String {
-    match boss_engine_worker_bin::resolve_cube_cli_from_process() {
-        Some(path) => path.to_string_lossy().into_owned(),
-        None => {
-            tracing::error!(
-                "no bundled `cube` found (checked CUBE_CLI_BIN, BOSS_BIN_DIR, the engine's runfiles, \
-                 bazel-bin and its sibling directory); falling back to a PATH lookup of `cube`, which \
-                 may resolve to a build-from-source shim. Set BOSS_CUBE_CMD or CUBE_CLI_BIN."
-            );
-            DEFAULT_CUBE_COMMAND.to_owned()
-        }
-    }
-}
-
-/// Logs how cube was resolved and warns if the bare name cannot be found on PATH.
-fn log_cube_resolution(command: &str) {
-    if command.contains('/') {
-        tracing::info!(command, "cube resolved from bundle");
-        return;
-    }
-    let path_env = std::env::var("PATH").unwrap_or_default();
-    let found = std::env::split_paths(&path_env).any(|dir| dir.join(command).is_file());
-    if found {
-        tracing::info!(command, "cube resolved from PATH");
-    } else {
-        tracing::warn!(
-            command,
-            "cube executable not found on PATH; worker dispatch will fail — \
-             install cube or set BOSS_CUBE_CMD to its full path"
-        );
-    }
-}
-
 fn parse_command_line(env_var: &str, command_line: String) -> Result<(String, Vec<String>)> {
     let parts = shlex::split(&command_line).with_context(|| format!("could not parse {env_var}: {command_line}"))?;
 
@@ -655,6 +614,59 @@ mod tests {
     };
     use std::ffi::OsString;
     use std::path::Path;
+
+    #[test]
+    fn missing_bundled_cube_rejects_config_without_running_path_decoy() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::driver::grok::GROK_HOMES_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        struct Restore(Vec<(&'static str, Option<OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(key, value),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("decoy-ran");
+        let decoy = dir.path().join("cube");
+        std::fs::write(&decoy, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let keys = [
+            "PATH",
+            "BOSS_CUBE_CMD",
+            "CUBE_CLI_BIN",
+            "BOSS_BIN_DIR",
+            "BUILD_WORKSPACE_DIRECTORY",
+        ];
+        let _restore = Restore(keys.iter().map(|&key| (key, std::env::var_os(key))).collect());
+        for key in keys {
+            unsafe { std::env::remove_var(key) };
+        }
+        let inherited_path = std::env::join_paths(
+            std::iter::once(dir.path().to_path_buf())
+                .chain(_restore.0[0].1.as_ref().into_iter().flat_map(std::env::split_paths)),
+        )
+        .unwrap();
+        unsafe { std::env::set_var("PATH", inherited_path) };
+        let work = WorkConfig::load_from(|key| match key {
+            "BOSS_DB_PATH" => Some(dir.path().join("state.db").into_os_string()),
+            _ => None,
+        })
+        .unwrap();
+        // A synthetic engine path has neither runfiles nor sibling binaries.
+        let engine = dir.path().join("missing/engine");
+        let error = super::AgentConfig::load_for_engine(&work, &engine).unwrap_err();
+        assert!(error.to_string().contains("no bundled cube found"), "{error:#}");
+        assert!(!marker.exists(), "PATH cube must never be invoked");
+    }
 
     #[test]
     fn prefers_bazel_workspace_directory_when_present() {

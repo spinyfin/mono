@@ -264,6 +264,8 @@ rust_test(
     },
     crate = ":engine_lib",
     data = [
+        # Config loading requires an engine-owned cube, just like the engine.
+        "//tools/cube",
         # The checksum-pinned Codex release (codex_test_archives.bzl) that the
         # conformance live pins (version_pin, guard_conformance) exercise; the
         # hermetic wrapper strips PATH, so without it they could only skip.

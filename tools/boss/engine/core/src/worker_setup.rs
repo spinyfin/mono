@@ -1981,7 +1981,7 @@ def resolve_repobin(root):
     candidate = os.path.join(root, "bin", "repobin")
     if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
         return candidate
-    return shutil.which("repobin")
+    return None
 
 
 def probe_repobin_checkleft(repobin):
@@ -2032,6 +2032,12 @@ def resolve_checkleft_command(root):
     override = os.environ.get("BOSS_CHECKLEFT_BIN", "").strip()
     if override:
         return [override] if os.path.exists(override) else None
+
+    worker_bin = os.environ.get("BOSS_WORKER_BIN_DIR", "").strip()
+    if worker_bin:
+        pinned = os.path.join(worker_bin, "checkleft")
+        if os.path.isfile(pinned) and os.access(pinned, os.X_OK):
+            return [pinned]
 
     repobin = resolve_repobin(root)
     if repobin and probe_repobin_checkleft(repobin):
