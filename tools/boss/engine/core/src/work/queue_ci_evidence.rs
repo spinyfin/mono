@@ -570,9 +570,6 @@ impl WorkDb {
 mod tests {
     use super::*;
 
-    fn is_lint_check(name: &str) -> bool {
-        job_needs(name).lint
-    }
     use boss_protocol::{ProposalKind, ProposalState, QueueCiRun};
 
     const URL: &str = "https://buildkite.com/flunge/mono/builds/20619#failed-job";

@@ -72,3 +72,13 @@ pub fn apply_review_verdict_without_freshness(
         },
     )
 }
+
+/// Inspect whether an automatic guide update is held by a writing revision.
+pub fn guide_update_has_active_writer(db: &WorkDb, attempt: &str) -> bool {
+    super::review_guide_jobs::guide_updates::chain_has_active_writer(&db.connect().unwrap(), attempt).unwrap()
+}
+
+/// Exercise the orphan-remediation transaction without the service observation.
+pub fn tombstone_orphaned_remediation(db: &WorkDb, task: &str) {
+    db.test_tombstone_orphaned_remediation(task).unwrap();
+}

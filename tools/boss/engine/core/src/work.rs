@@ -852,8 +852,10 @@ pub use review_batches::{
     RetryDeadReviewBatchMember, ReviewBatchCreateInput, ReviewBatchDispatch, ReviewBatchMemberCreateInput,
     ReviewBatchQuorumOutcome,
 };
+pub use review_findings_followup::ReviewFindingsFollowupInsert;
 pub(crate) use review_findings_followup::*;
 pub(crate) use review_section::*;
+pub use review_verdict_apply::ReviewVerdictApplyStats;
 pub(crate) use review_verdict_apply::*;
 pub(crate) use revision_helpers::*;
 pub(crate) use task_targets::*;

@@ -182,7 +182,7 @@ pub(crate) fn convert_revision_to_review_findings_followup(
 /// single insert path the verdict applier and tests share.
 #[derive(Debug, Clone, bon::Builder)]
 #[builder(on(String, into))]
-pub(crate) struct ReviewFindingsFollowupInsert {
+pub struct ReviewFindingsFollowupInsert {
     pub product_id: String,
     pub name: String,
     pub created_via: String,
@@ -231,7 +231,7 @@ pub(crate) fn insert_review_findings_followup(conn: &Connection, input: ReviewFi
 impl WorkDb {
     /// Create a review-findings follow-up against `main` for a merged (or
     /// closed) origin PR. Idempotent on `created_via`.
-    pub(crate) fn create_review_findings_followup(&self, input: ReviewFindingsFollowupInsert) -> Result<Task> {
+    pub fn create_review_findings_followup(&self, input: ReviewFindingsFollowupInsert) -> Result<Task> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let task = insert_review_findings_followup(&tx, input)?;

@@ -255,7 +255,6 @@ rust_test(
     size = "small",
     timeout = "moderate",
     crate = ":engine_lib",
-    crate_features = ["test-support"],
     data = [
         # The checksum-pinned Codex release (codex_test_archives.bzl) that the
         # conformance live pins (version_pin, guard_conformance) exercise; the

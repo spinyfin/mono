@@ -151,12 +151,12 @@ async fn clean_verdict_advances_the_origin_to_review_without_a_revision() {
         "UPDATE tasks SET pr_head_sha = 'head-sha', ci_required_state = 'success', pr_mergeable_state = 'mergeable' WHERE id = ?1",
         [&cycle_root.id],
     ).unwrap();
-    let created = db
-        .apply_review_verdict_proposal(
-            &outcome.proposal.id,
-            &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
-        )
-        .unwrap();
+    let created = crate::test_support::apply_review_verdict(
+        &db,
+        &outcome.proposal.id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap();
     assert_eq!(created, None);
 
     tokio::time::timeout(std::time::Duration::from_secs(2), async {

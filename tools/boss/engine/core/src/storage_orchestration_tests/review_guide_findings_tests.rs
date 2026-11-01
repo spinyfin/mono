@@ -47,7 +47,8 @@ fn apply_findings(db: &WorkDb, root: &str, sha: &str) -> String {
         })
         .unwrap()
         .unwrap();
-    db.apply_review_verdict_proposal(
+    apply_verdict(
+        db,
         &outcome.proposal.id,
         &FakePrStateChecker::always(PrOpenState::Open).with_head_sha(sha),
     )
@@ -91,7 +92,7 @@ fn live_addendum_tracks_findings_and_status_without_mutating_guide() {
     assert!(findings(&db, &root.id).is_none());
     let revision = apply_findings(&db, &root.id, "head-one");
     let before = findings(&db, &root.id).unwrap();
-    let tracked = query_task(&db.connect().unwrap(), &revision).unwrap().unwrap();
+    let tracked = read_task(&db, &revision);
     let label = boss_protocol::short_id_label(tracked.short_id).unwrap();
     assert_eq!(before.status_text, "1 finding: 0 fixed on PR, 1 in progress, 0 open");
     assert_eq!(
@@ -107,8 +108,7 @@ fn live_addendum_tracks_findings_and_status_without_mutating_guide() {
         ("archived", "", "0 fixed on PR, 0 in progress, 1 open"),
         ("done", "✓ ~~", "1 fixed on PR, 0 in progress, 0 open"),
     ] {
-        db.connect()
-            .unwrap()
+        raw(&db)
             .execute("UPDATE tasks SET status = ?2 WHERE id = ?1", params![revision, status])
             .unwrap();
         let updated = findings(&db, &root.id).unwrap();
@@ -144,8 +144,7 @@ fn live_addendum_tracks_findings_and_status_without_mutating_guide() {
         2
     );
 
-    db.connect()
-        .unwrap()
+    raw(&db)
         .execute(
             "UPDATE tasks SET pr_url = 'https://github.com/example/repo/pull/43' WHERE id = ?1",
             [&root.id],
@@ -166,8 +165,7 @@ fn merge_gate_reports_all_open_revisions_and_ignores_terminal_or_deleted_items()
     assert!(db.open_merge_revisions(&root.id).unwrap().is_empty());
     let revision = apply_findings(&db, &root.id, "head-one");
     for status in ["todo", "active", "blocked", "in_review", "done", "archived"] {
-        db.connect()
-            .unwrap()
+        raw(&db)
             .execute("UPDATE tasks SET status = ?2 WHERE id = ?1", params![revision, status])
             .unwrap();
         let open = db.open_merge_revisions(&root.id).unwrap();
@@ -182,8 +180,7 @@ fn merge_gate_reports_all_open_revisions_and_ignores_terminal_or_deleted_items()
             );
         }
     }
-    db.connect()
-        .unwrap()
+    raw(&db)
         .execute(
             "UPDATE tasks SET status = 'active', deleted_at = 'now' WHERE id = ?1",
             [&revision],
@@ -191,10 +188,15 @@ fn merge_gate_reports_all_open_revisions_and_ignores_terminal_or_deleted_items()
         .unwrap();
     assert!(db.open_merge_revisions(&root.id).unwrap().is_empty());
     let child = db
-        .create_revision(revision_input(&root.id), &FakePrStateChecker::always(PrOpenState::Open))
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(&root.id)
+                .description("test revision ask")
+                .build(),
+            &FakePrStateChecker::always(PrOpenState::Open),
+        )
         .unwrap();
-    db.connect()
-        .unwrap()
+    raw(&db)
         .execute(
             "UPDATE tasks SET parent_task_id = ?2 WHERE id = ?1",
             params![child.id, revision],
@@ -213,12 +215,10 @@ fn merge_gate_reports_no_open_revisions_when_all_are_in_review_or_done() {
     bind_open_pr(&db, &root.id);
     let first = apply_findings(&db, &root.id, "head-one");
     let second = apply_findings(&db, &root.id, "head-two");
-    db.connect()
-        .unwrap()
+    raw(&db)
         .execute("UPDATE tasks SET status = 'in_review' WHERE id = ?1", [&first])
         .unwrap();
-    db.connect()
-        .unwrap()
+    raw(&db)
         .execute("UPDATE tasks SET status = 'done' WHERE id = ?1", [&second])
         .unwrap();
     assert!(
@@ -235,8 +235,7 @@ fn merge_gate_reports_a_running_or_queued_revision() {
     bind_open_pr(&db, &root.id);
     let revision = apply_findings(&db, &root.id, "head-one");
     for status in ["todo", "active"] {
-        db.connect()
-            .unwrap()
+        raw(&db)
             .execute("UPDATE tasks SET status = ?2 WHERE id = ?1", params![revision, status])
             .unwrap();
         let open = db.open_merge_revisions(&root.id).unwrap();
@@ -253,7 +252,7 @@ fn addendum_includes_followup_tracking_after_the_origin_merged() {
     let root = create_test_chore_manual(&db, product.id, "merged target");
     bind_merged_pr(&db, &root.id);
     let tracker = apply_findings(&db, &root.id, "head-one");
-    let item = query_task(&db.connect().unwrap(), &tracker).unwrap().unwrap();
+    let item = read_task(&db, &tracker);
     assert_eq!(item.kind, TaskKind::Followup);
     assert!(
         findings(&db, &root.id)
@@ -276,7 +275,7 @@ fn legacy_verdict_uses_engine_rendered_revision_titles() {
     let revision = apply_findings(&db, &root.id, "head-one");
     // Model a pre-batch verdict: the full finding is retained in the
     // generated revision brief and the reviewed PR in its execution.
-    let conn = db.connect().unwrap();
+    let conn = raw(&db);
     conn.execute("UPDATE work_executions SET pr_url = ?1 WHERE id IN (SELECT execution_id FROM pr_review_verdicts WHERE revision_task_id = ?2)", params![PR_URL, revision]).unwrap();
     conn.execute(
         "UPDATE pr_review_verdicts SET proposal_id = NULL, batch_id = NULL WHERE revision_task_id = ?1",
@@ -295,7 +294,7 @@ fn untracked_and_deleted_findings_stay_open() {
     let root = create_test_chore_manual(&db, product.id, "untracked findings");
     bind_open_pr(&db, &root.id);
     let revision = apply_findings(&db, &root.id, "head-one");
-    let conn = db.connect().unwrap();
+    let conn = raw(&db);
     conn.execute(
         "UPDATE tasks SET status = 'done', deleted_at = 'now' WHERE id = ?1",
         [&revision],
@@ -306,8 +305,7 @@ fn untracked_and_deleted_findings_stay_open() {
         findings(&db, &root.id).unwrap().status_text,
         "1 finding: 0 fixed on PR, 0 in progress, 1 open"
     );
-    db.connect()
-        .unwrap()
+    raw(&db)
         .execute(
             "UPDATE pr_review_verdicts SET revision_task_id = NULL WHERE revision_task_id = ?1",
             [&revision],
@@ -360,8 +358,7 @@ fn seed_update(db: &WorkDb, root: &str, published_head: &str) -> UpdatedGuide {
 }
 
 fn set_status(db: &WorkDb, id: &str, status: &str) {
-    db.connect()
-        .unwrap()
+    raw(db)
         .execute("UPDATE tasks SET status = ?2 WHERE id = ?1", params![id, status])
         .unwrap();
 }
@@ -484,10 +481,7 @@ fn update_waits_while_a_revision_in_the_chain_can_still_write() {
     let root = create_test_chore_manual(&db, product.id, "writer wait");
     bind_open_pr(&db, &root.id);
     let guide = seed_update(&db, &root.id, "head-two");
-    let has_writer = |db: &WorkDb| {
-        let conn = db.connect().unwrap();
-        super::review_guide_jobs::guide_updates::chain_has_active_writer(&conn, &guide.update_attempt).unwrap()
-    };
+    let has_writer = |db: &WorkDb| crate::work::test_support::guide_update_has_active_writer(db, &guide.update_attempt);
     set_status(&db, &guide.revision, "active");
     assert!(has_writer(&db));
     // Parked revisions are not writing.
@@ -498,19 +492,11 @@ fn update_waits_while_a_revision_in_the_chain_can_still_write() {
 }
 
 fn attempt_execution(db: &WorkDb, attempt: &str) -> Option<String> {
-    db.connect()
-        .unwrap()
-        .query_row(
-            "SELECT execution_id FROM pr_review_guide_attempts WHERE id = ?1",
-            [attempt],
-            |row| row.get(0),
-        )
-        .unwrap()
+    db.get_pr_review_guide_attempt(attempt).unwrap().unwrap().execution_id
 }
 
 fn give_root_a_repo(db: &WorkDb, root: &str) {
-    db.connect()
-        .unwrap()
+    raw(db)
         .execute(
             "UPDATE tasks SET repo_remote_url = 'https://github.com/acme/widget.git' WHERE id = ?1",
             [root],

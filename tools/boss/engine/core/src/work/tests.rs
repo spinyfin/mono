@@ -579,7 +579,6 @@ mod resolve_repo_tests;
 mod review_batch_remint_tests;
 mod review_batches_tests;
 mod review_guide_state_tests;
-mod review_verdict_apply_tests;
 mod review_verdicts_tests;
 mod revision_ai_review_tests;
 mod revision_recovery;

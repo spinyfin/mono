@@ -563,7 +563,7 @@ impl WorkDb {
     /// (not the whole work item — see [`Self::list_worker_proposals_for_work_item`]
     /// for that), newest first.
     ///
-    /// Used by [`boss_engine_storage_values::attention_kinds::WorkerCompletionHandler::execution_has_worker_signal_proposal`]
+    /// Used by `WorkerCompletionHandler::execution_has_worker_signal_proposal` in core completion
     /// to compare a legacy marker's content against what was actually
     /// proposed, rather than skipping on kind alone.
     pub fn list_worker_proposals_for_execution(

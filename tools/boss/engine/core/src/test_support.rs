@@ -1563,3 +1563,22 @@ pub(crate) fn unstamped_codex_guide(db: &WorkDb) -> crate::work::WorkExecution {
     assert!(db.launched_driver_slug(&execution.id).unwrap().is_none());
     execution
 }
+
+pub(crate) fn apply_review_verdict(
+    db: &WorkDb,
+    id: &str,
+    checker: &dyn crate::work::PrStateChecker,
+) -> anyhow::Result<Option<String>> {
+    crate::review_verdict_apply_sweep::apply_review_verdict_proposal(db, id, checker, &|input| {
+        checker.merged_parent_deletions(&input.repo_slug, &input.head_before, &input.base_sha, &input.head_after)
+    })
+}
+
+pub(crate) fn apply_pending_review_verdicts(
+    db: &WorkDb,
+    checker: &dyn crate::work::PrStateChecker,
+) -> anyhow::Result<crate::work::ReviewVerdictApplyStats> {
+    crate::review_verdict_apply_sweep::apply_pending_review_verdicts(db, checker, &|input| {
+        checker.merged_parent_deletions(&input.repo_slug, &input.head_before, &input.base_sha, &input.head_after)
+    })
+}
