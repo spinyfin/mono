@@ -487,11 +487,24 @@ mod tests {
             workspace: &Path,
             _environment: &GrokProcessEnvironment,
         ) -> anyhow::Result<PreflightOutput> {
-            let output = Command::new(program)
-                .args(args)
-                .current_dir(workspace)
-                .env("PATH", format!("{}:/usr/bin:/bin", self.decoy_dir.display()))
-                .output()?;
+            // Another test thread can fork while a freshly written script is still open
+            // for writing, which makes exec fail with ETXTBSY (os error 26) until the
+            // forked child execs. Retry that transient failure briefly.
+            let mut attempts = 0;
+            let output = loop {
+                let result = Command::new(program)
+                    .args(args)
+                    .current_dir(workspace)
+                    .env("PATH", format!("{}:/usr/bin:/bin", self.decoy_dir.display()))
+                    .output();
+                match result {
+                    Err(err) if err.raw_os_error() == Some(26) && attempts < 50 => {
+                        attempts += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    other => break other?,
+                }
+            };
             Ok(PreflightOutput {
                 success: output.status.success(),
                 status: output.status.to_string(),
