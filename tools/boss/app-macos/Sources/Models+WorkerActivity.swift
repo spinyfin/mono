@@ -492,7 +492,11 @@ enum AgentActivityState: Equatable {
     /// Doing-card caption for a held AI review. The engine reports the stage;
     /// the consolidating agent reads differently from the parallel reviewers.
     static func aiReviewCaption(stage: String?) -> String {
-        stage == AgentReviewStage.consolidation ? "Consolidating review findings" : "AI review in progress"
+        switch stage {
+        case AgentReviewStage.applying: "Applying AI review verdict"
+        case AgentReviewStage.consolidation: "Consolidating review findings"
+        default: "AI review in progress"
+        }
     }
 
     private static func clockTime(_ iso: String) -> String {

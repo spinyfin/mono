@@ -173,15 +173,7 @@ pub(super) async fn handle_link_work_item_external_ref(ctx: Dispatch, req: Front
                     vec![work_item_id(&item)],
                 )
                 .await;
-                match work_db.project_work_item_for_display(item) {
-                    Ok(item) => send_response_with_revision(
-                        &sink,
-                        &request_id,
-                        revision,
-                        FrontendEvent::WorkItemUpdated { item },
-                    ),
-                    Err(err) => send_work_error(&sink, &request_id, &err),
-                }
+                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
             }
             Err(err) => send_work_error(&sink, &request_id, &err),
         }
@@ -227,15 +219,7 @@ pub(super) async fn handle_unlink_work_item_external_ref(ctx: Dispatch, req: Fro
                     vec![work_item_id(&item)],
                 )
                 .await;
-                match work_db.project_work_item_for_display(item) {
-                    Ok(item) => send_response_with_revision(
-                        &sink,
-                        &request_id,
-                        revision,
-                        FrontendEvent::WorkItemUpdated { item },
-                    ),
-                    Err(err) => send_work_error(&sink, &request_id, &err),
-                }
+                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
             }
             Err(err) => send_work_error(&sink, &request_id, &err),
         }

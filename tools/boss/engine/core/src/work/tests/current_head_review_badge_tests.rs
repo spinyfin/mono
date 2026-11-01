@@ -475,3 +475,18 @@ fn review_badge_does_not_attribute_a_headless_verdict_to_a_legacy_reviewed_sha()
         assert!(!badge.tooltip.contains(": clean"));
     }
 }
+
+#[test]
+fn single_item_primary_review_badge_matches_the_board_projection() {
+    let db = WorkDb::open(temp_db_path("single-item-primary-review-badge")).unwrap();
+    let product = make_revision_product(&db, "single-item-badge");
+    let root = make_in_review_chore(&db, &product, "https://github.com/spinyfin/mono/pull/8007");
+    observe(&db, &root, Some("reviewed-head"), "success", "mergeable");
+    verdict(&db, &root, "reviewed-head", "completed_clean");
+    let board = card(&db, &product, &root);
+    let (WorkItem::Task(single) | WorkItem::Chore(single)) = db.get_work_item(&root).unwrap() else {
+        panic!("expected primary task");
+    };
+    assert!(board.ai_review_badge.is_some());
+    assert_eq!(single.ai_review_badge, board.ai_review_badge);
+}

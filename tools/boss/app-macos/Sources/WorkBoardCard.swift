@@ -34,19 +34,17 @@ struct WorkBoardSectionItemsView: View {
     /// per section instead of invalidating every mounted card.
     @ObservedObject var liveStates: LiveWorkerStateStore
 
-    enum ReviewPRIdentity: Hashable {
-        case github(org: String, repo: String, number: String)
-        case other(String)
-    }
-
+    /// Live reviewers and supervisors shared by PR identity: primary Review
+    /// cards and held revisions in Doing both link to the same review workers.
     static func reviewWorkers(for task: WorkTask, index: [ReviewPRIdentity: [WorkerLiveState]]) -> [WorkerLiveState] {
-        guard let url = task.prURL, !url.isEmpty else { return [] }
+        guard (task.kind == "revision" && task.aiReviewing) || (task.kind != "revision" && task.boardColumn == .review),
+              let url = task.prURL ?? task.revisionParentPrUrl, !url.isEmpty
+        else { return [] }
         return index[reviewerKey(url)] ?? []
     }
 
     static func reviewerKey(_ url: String) -> ReviewPRIdentity {
-        guard let pr = parseGitHubPRURL(url) else { return .other(url) }
-        return .github(org: pr.org.lowercased(), repo: pr.repo.lowercased(), number: pr.number)
+        ReviewPRIdentity(url)
     }
 
     static func reviewerIndex(states: [WorkerLiveState]) -> [ReviewPRIdentity: [WorkerLiveState]] {
@@ -66,8 +64,8 @@ struct WorkBoardSectionItemsView: View {
         let selectedRevisionParentID = model.selectedRevisionParentID
         let dragRefusal = model.dragRefusalNotice
         let mergeFeedback = model.mergeFeedbackNotice
-        // One PR-URL -> reviewers index per section render, looked up per card.
-        let reviewersByPR = Self.reviewerIndex(states: column == .review ? Array(liveStates.byRunID.values) : [])
+        // One PR identity index per section render.
+        let reviewersByPR = Self.reviewerIndex(states: (column == .doing || column == .review) ? Array(liveStates.byRunID.values) : [])
         // Lazy so off-screen cards aren't instantiated/hit-tested at all — with
         // the default (ungrouped) board layout each column is a single section,
         // so this was the actual eagerly-built list of every card in the
@@ -83,7 +81,6 @@ struct WorkBoardSectionItemsView: View {
         LazyVStack(alignment: .leading, spacing: 10) {
             ForEach(items) { task in
                 let isSelected = selectedID == task.id
-                let ownerID = model.reviewOwner(for: task).id
                 let isFrontierHighlighted = frontierIDs.contains(task.id)
                     || selectedRevisionParentID == task.id
                 let liveState: WorkerLiveState? = {
@@ -104,16 +101,15 @@ struct WorkBoardSectionItemsView: View {
                     task: task,
                     column: column,
                     snapshot: snapshot,
-                    reviewers: column == .review
-                        ? Self.reviewWorkers(for: task, index: reviewersByPR) : [],
+                    reviewers: (column == .doing || column == .review) ? Self.reviewWorkers(for: task, index: reviewersByPR) : [],
                     model: model,
                     revisionHighlight: model.revisionHighlightState(for: task.id),
                     isRevealed: highlightID == task.id,
                     dragRefusalMessage: dragRefusal?.taskID == task.id
                         ? dragRefusal?.message : nil,
-                    mergeFeedbackMessage: mergeFeedback?.taskID == ownerID
+                    mergeFeedbackMessage: mergeFeedback?.taskID == task.id
                         ? mergeFeedback?.message : nil,
-                    isRequestingMerge: model.mergingWhenReadyIDs.contains(ownerID)
+                    isRequestingMerge: model.mergingWhenReadyIDs.contains(task.id)
                 )
                 .id(task.id)
                 .background {
@@ -170,23 +166,22 @@ struct WorkBoardCardItem: View {
         // Action closures stay outside the snapshot so `.equatable()` on
         // the card body can skip re-evaluation when only handler identity
         // would differ (design entry 5 / `WorkCardSnapshot`).
-        let reviewOwner = model.reviewOwner(for: task)
         let onOpenTerminal: (() -> Void)? = {
             guard snapshot.showsTerminalButton else { return nil }
             if (column == .review || column == .done),
                let prURL = task.prURL, !prURL.isEmpty {
-                return { model.openReviewTerminal(for: reviewOwner) }
+                return { model.openReviewTerminal(for: task) }
             }
             return { model.openLiveWorkspaceTerminal(for: task) }
         }()
         let onMergeWhenReady: (() -> Void)? = snapshot.showsMergeWhenReady
-            ? { model.mergeWhenReady(for: reviewOwner, origin: .board) }
+            ? { model.mergeWhenReady(for: task, origin: .board) }
             : nil
         let onOpenReviewGuide: (() -> Void)? = snapshot.reviewGuidePresentation?.showsDocumentButton == true
-            ? { model.openReviewGuide(for: reviewOwner) }
+            ? { model.openReviewGuide(for: task) }
             : nil
         let onRetryReviewGuide: (() -> Void)? = snapshot.reviewGuidePresentation?.showsRetry == true
-            ? { model.retryReviewGuide(for: reviewOwner) }
+            ? { model.retryReviewGuide(for: task) }
             : nil
         let reviewGuideMenuPresentation = ReviewGuideCardPresentation.from(
             lifecycle: task.reviewGuideLifecycle,
@@ -238,7 +233,7 @@ struct WorkBoardCardItem: View {
                         model.setRevisionBadgeHover(hovering ? task.id : nil)
                     },
                     onRevisionBadgeTap: {
-                        guard let revision = model.mostRecentActiveRevision(forParentID: reviewOwner.id) else {
+                        guard let revision = model.mostRecentActiveRevision(forParentID: task.id) else {
                             model.workErrorMessage = "Couldn't find the in-progress revision for \(task.name) — it may have just finished or been deleted."
                             return
                         }
@@ -308,7 +303,7 @@ struct WorkBoardCardItem: View {
                             .help(reviewGuideMenuPresentation?.tooltip ?? failureTitle)
                     }
                     Button(title) {
-                        model.generateReviewGuide(for: reviewOwner)
+                        model.generateReviewGuide(for: task)
                     }
                     .help(reviewGuideMenuPresentation?.tooltip ?? title)
                 }
@@ -416,7 +411,7 @@ struct WorkBoardCardItem: View {
     }
 }
 
-/// Shared reviewer presentation and run routing for primary and revision cards.
+/// A live review worker on a revision card held in Doing for AI review.
 struct ReviewWorkerLink: View {
     let reviewer: WorkerLiveState
     let model: ChatViewModel

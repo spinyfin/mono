@@ -84,7 +84,7 @@ struct EngineRevisionBadge: View {
     }
 }
 
-/// One done-revision rollup line in its parent card’s footer.
+/// One rollup line in a Review-lane parent card for an in-review revision.
 /// Shows `⟳ R<n>  <description truncated>  ↗` linking to the parent PR.
 /// Consumes [[WorkCardRevisionRollup]] so the card body never needs a
 /// full `WorkTask` for nested rollups.
@@ -98,6 +98,11 @@ struct RevisionRollupLine: View {
                 Text("⟳ R\(seq)")
                     .font(.system(.caption2, design: .monospaced).weight(.semibold))
                     .foregroundStyle(Color.accentColor)
+            }
+            if let reason = revision.blockedReason {
+                Text("Blocked: " + reason.replacingOccurrences(of: "_", with: " "))
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
             }
             Text(revision.name)
                 .font(.caption2)

@@ -24,15 +24,18 @@ struct WorkCardRevisionRollup: Equatable, Identifiable {
     let revisionSeq: Int?
     let name: String
     let revisionParentPrUrl: String?
+    let blockedReason: String?
 
-    init(id: String, revisionSeq: Int?, name: String, revisionParentPrUrl: String?) {
+    init(id: String, revisionSeq: Int?, name: String, revisionParentPrUrl: String?, blockedReason: String? = nil) {
         self.id = id
         self.revisionSeq = revisionSeq
         self.name = name
+        self.blockedReason = blockedReason
         self.revisionParentPrUrl = revisionParentPrUrl
     }
 
     init(revision: WorkTask) {
+        self.blockedReason = revision.status == "blocked" ? revision.blockedReason : nil
         self.id = revision.id
         self.revisionSeq = revision.revisionSeq
         self.name = revision.name
@@ -73,7 +76,7 @@ struct WorkCardSnapshotContext: Equatable {
     var designDocPresentation: ProjectDesignDocAffordancePresentation? = nil
     var externalRefLink: ExternalRefLinkPresentation? = nil
     var ambiguousRepoNames: Set<String> = []
-    var doneRevisions: [WorkCardRevisionRollup] = []
+    var inReviewRevisions: [WorkCardRevisionRollup] = []
     var parentShortID: Int? = nil
     var deferredScopeItems: [DeferredScopeAttention] = []
     var deferredScopeActionInFlightIDs: Set<String> = []
@@ -158,7 +161,7 @@ struct WorkCardSnapshot: Equatable {
     /// once the card leaves Review.
     let reviewGuidePresentation: ReviewGuideCardPresentation?
     let ambiguousRepoNames: Set<String>
-    let doneRevisions: [WorkCardRevisionRollup]
+    let inReviewRevisions: [WorkCardRevisionRollup]
     let parentShortID: Int?
     let terminalTooltip: String
     let deferredScopeItems: [DeferredScopeAttention]
@@ -228,7 +231,7 @@ struct WorkCardSnapshot: Equatable {
     let hasRevisionParentPRRow: Bool
     /// Standalone trailing short-id row when there is no PR URL.
     let hasStandaloneShortID: Bool
-    let hasDoneRevisions: Bool
+    let hasInReviewRevisions: Bool
     /// Orange blocked chrome (background + border) when not remediating.
     let showsBlockedChrome: Bool
 
@@ -418,7 +421,7 @@ struct WorkCardSnapshot: Equatable {
             externalRefLink: context.externalRefLink,
             reviewGuidePresentation: reviewGuidePresentation,
             ambiguousRepoNames: context.ambiguousRepoNames,
-            doneRevisions: context.doneRevisions,
+            inReviewRevisions: context.inReviewRevisions,
             parentShortID: context.parentShortID,
             terminalTooltip: context.terminalTooltip,
             deferredScopeItems: context.deferredScopeItems,
@@ -470,7 +473,7 @@ struct WorkCardSnapshot: Equatable {
             hasReviewRow: task.prURL != nil && reviewRequiredState != nil,
             hasRevisionParentPRRow: hasRevisionParentPRRow,
             hasStandaloneShortID: !prURLNonEmpty && task.shortID != nil,
-            hasDoneRevisions: !context.doneRevisions.isEmpty,
+            hasInReviewRevisions: !context.inReviewRevisions.isEmpty,
             showsBlockedChrome: !isResolvingConflicts
                 && !isRemediatingCI
                 && task.status == "blocked"
@@ -530,7 +533,12 @@ enum WorkCardLiveStatus {
         if liveState?.hungSince != nil { return "Hung — inspect or restart worker" }
         if isResolvingConflicts { return nil }
         if isRemediatingCI { return nil }
-        if isAIReviewing { return nil }
+        // A card held for AI review has no worker of its own to describe (a
+        // revision's reviewers are bound to the PR's chain root), so say what
+        // the engine reports it is waiting on rather than leaving a bare dot.
+        if isAIReviewing {
+            return liveState == nil ? AgentActivityState.aiReviewCaption(stage: task.aiReviewStage) : nil
+        }
         // Transient-recovery banner wins outright — a worker being
         // auto-resumed after a Claude API error looks idle to every
         // other signal, so without this the card would silently show

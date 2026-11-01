@@ -180,17 +180,16 @@ struct WorkTask: Identifiable, Hashable {
     /// the kanban — the purple wand icon distinguishes them from human-filed
     /// work so the user can still review and merge their PRs.
     var sourceAutomationId: String? = nil
-    /// `true` while an independent `pr_review` reviewer execution is running
-    /// for this task. The task is held in the Doing column until the reviewer
-    /// finalises (or a timeout forces the advance). Surfaces as a
-    /// "Reviewing (AI)" badge on the card so the user can see the hold is
-    /// intentional. Mirrors `Task.ai_reviewing` on the wire; `false` when
-    /// absent (older engines / tasks not undergoing an AI review pass).
+    /// Engine-resolved review activity, including a held revision's started
+    /// batch across reviewer re-admission, consolidation and verdict apply.
+    /// First admission to the review pool remains queued.
     var aiReviewing: Bool = false
-    /// Engine-reported stage of the running AI review (`"reviewers"` or
-    /// `"consolidation"`). Mirrors `Task.ai_review_stage`; only set while
+    /// Engine-reported stage of the AI review cycle (`"reviewers"`,
+    /// `"consolidation"` or `"applying"`). Mirrors `Task.ai_review_stage`; only set while
     /// `aiReviewing` is true.
     var aiReviewStage: String? = nil
+    /// Engine-resolved parent-card rollup, including review-phase blocked revisions.
+    var boardFoldedRevision: Bool = false
     /// Engine-resolved review for the current PR head. `not_reviewed`
     /// explicitly marks missing review evidence; `reviewed_clean_pending`
     /// means AI passed but CI, mergeability, or revisions prevent readiness.
@@ -570,6 +569,12 @@ extension WorkTask {
         default:
             return .backlog
         }
+    }
+
+    /// The engine resolves whether this revision is represented on its parent.
+    /// Board membership consumes the projection without inferring it from status.
+    var isFoldedRevision: Bool {
+        boardFoldedRevision
     }
 
     /// `true` when this task is blocked for a review-phase reason —

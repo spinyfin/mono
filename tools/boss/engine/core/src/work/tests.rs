@@ -526,6 +526,7 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
         review_cycle: 0,
         last_reviewed_sha: None,
         ai_reviewing: false,
+        board_folded_revision: false,
         ai_review_stage: None,
         ai_review_state: None,
         ai_review_badge: None,
@@ -580,6 +581,7 @@ mod review_batches_tests;
 mod review_guide_state_tests;
 mod review_verdict_apply_tests;
 mod review_verdicts_tests;
+mod revision_ai_review_tests;
 mod revision_recovery;
 mod revision_sequencing;
 mod semantic_progress_tests;
@@ -623,7 +625,6 @@ mod board_runtime_cache_tests;
 mod work_tree_scale_tests;
 
 mod board_patch_tests;
-mod revision_review_card_tests;
 
 mod design_doc_contention_tests;
 

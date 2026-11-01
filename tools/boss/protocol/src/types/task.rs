@@ -1106,22 +1106,23 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_automation_id: Option<String>,
 
-    /// `true` while an independent `pr_review` reviewer execution is
-    /// running for this task. The task is held in the Doing column
-    /// (`status = "active"`) until the reviewer finalises (or a timeout
-    /// forces the advance). Surfaces as a "Reviewing (AI)" badge on the
-    /// kanban card so the user can tell the hold is intentional.
-    ///
-    /// This is a derived projection set by the engine's `get_work_tree`
-    /// path (not a stored DB column). It is always `false` for tasks
-    /// not currently undergoing an AI review pass.
+    /// True while a reviewer is running for this task, or a held revision's
+    /// started review batch is awaiting reviewers, consolidation or verdict apply.
+    /// First admission to the review pool remains queued. Derived by the engine
+    /// together with Doing membership so the card explains the entire hold.
     #[serde(default, skip_serializing_if = "is_false")]
     #[builder(default)]
     pub ai_reviewing: bool,
 
-    /// Which stage of the running AI review this is: `"reviewers"` (the
+    /// The revision is represented by its parent card and has no standalone board card.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[builder(default)]
+    pub board_folded_revision: bool,
+
+    /// Which stage of the AI review cycle this is: `"reviewers"` (the
     /// parallel reviewers) or `"consolidation"` (the agent merging their
-    /// findings into one review), per [`crate::ReviewStage::as_str`]. Set
+    /// findings into one review), or `"applying"` (verdict application), using
+    /// [`crate::ReviewStage::as_str`]. Set
     /// only while `ai_reviewing` is true; a derived projection, not a stored
     /// column. Clients render it and never infer it themselves.
     #[serde(default, skip_serializing_if = "Option::is_none")]

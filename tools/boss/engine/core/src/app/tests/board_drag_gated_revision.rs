@@ -445,94 +445,83 @@ async fn blocked_chore_and_project_task_with_satisfied_prerequisite_dispatch() {
     }
 }
 
-/// A delivered hold is reordered in its displayed lane, including while its
-/// owner is blocked; neither a drop nor its reply may lift the durable hold.
 #[tokio::test]
-async fn held_review_revision_reorder_preserves_hold_and_blocked_reply() {
+async fn folded_revision_drop_is_refused_and_preserves_status() {
     let (state, _dir) = test_server_state_with_fakes();
-    let db = &state.work_db;
-    let product = create_test_product_with_repo(db, "HeldReview", Some("https://github.com/example/repo"));
-    let root = create_test_chore_manual(db, &product.id, "Review owner");
-    let pr = "https://github.com/example/repo/pull/1";
-    db.update_work_item(
-        &root.id,
-        WorkItemPatch::builder().status("in_review").pr_url(pr).build(),
-    )
-    .unwrap();
-    let revision = create_manual_revision(&state, &root.id, "Delivered revision");
-    let execution = db
-        .create_execution(
-            boss_protocol::CreateExecutionInput::builder()
-                .work_item_id(&revision.id)
-                .kind(ExecutionKind::RevisionImplementation)
-                .status(boss_protocol::ExecutionStatus::Ready)
+    let (_, revision, _) = seed_ci_fix_behind_in_review_revision(&state);
+    let sink = make_session_sink();
+    handle_move_work_item_on_board(dispatch(&state, &sink, "folded-drop"), drop_on_doing(&revision.id)).await;
+    match sole_response(&sink).await {
+        FrontendEvent::WorkError { message } => assert!(message.contains("no board position"), "{message}"),
+        other => panic!("expected folded-card refusal, got {other:?}"),
+    }
+    assert_eq!(task_row(&state, &revision.id).status, TaskStatus::InReview);
+}
+
+#[tokio::test]
+async fn held_active_revision_reorder_preserves_review_hold() {
+    let (state, _dir) = test_server_state_with_fakes();
+    let (root, _, revision) = seed_ci_fix_behind_in_review_revision(&state);
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'active', blocked_reason = NULL, pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![revision.id, root.pr_url],
+        )
+        .unwrap();
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed' WHERE work_item_id = ?1",
+            [&revision.id],
+        )
+        .unwrap();
+    let before = task_row(&state, &revision.id);
+    let executions = state.work_db.list_executions(Some(&revision.id)).unwrap();
+    let sink = make_session_sink();
+    handle_move_work_item_on_board(dispatch(&state, &sink, "held-reorder"), drop_on_doing(&revision.id)).await;
+    assert!(matches!(
+        sole_response(&sink).await,
+        FrontendEvent::WorkItemUpdated { .. }
+    ));
+    let after = task_row(&state, &revision.id);
+    assert_eq!(after.status, TaskStatus::Active);
+    assert_eq!(after.pr_url, before.pr_url);
+    assert_eq!(
+        state.work_db.list_executions(Some(&revision.id)).unwrap().len(),
+        executions.len()
+    );
+}
+
+#[tokio::test]
+async fn folded_ci_failure_revision_drop_is_refused_and_preserves_block() {
+    let (state, _dir) = test_server_state_with_fakes();
+    let (_, revision, _) = seed_ci_fix_behind_in_review_revision(&state);
+    state
+        .work_db
+        .update_work_item(
+            &revision.id,
+            WorkItemPatch::builder()
+                .status("blocked")
+                .blocked_reason("ci_failure")
                 .build(),
         )
         .unwrap();
-    db.start_execution_run(
-        &execution.id,
-        "held-review-run",
-        "repo",
-        "lease",
-        "workspace",
-        "/tmp/held-review",
+    let sink = make_session_sink();
+    handle_move_work_item_on_board(
+        dispatch(&state, &sink, "folded-blocked-drop"),
+        drop_on_doing(&revision.id),
     )
-    .unwrap();
-    db.record_worker_pr_completion(
-        &execution.id,
-        pr,
-        None,
-        None,
-        crate::work::WorkerPrCompletionTarget::PendingReview,
-        None,
-    )
-    .unwrap()
-    .unwrap();
-    for blocked in [false, true] {
-        if blocked {
-            db.update_work_item(
-                &root.id,
-                WorkItemPatch::builder()
-                    .status("blocked")
-                    .blocked_reason("merge_conflict")
-                    .blocked_detail("conflicts in a.rs")
-                    .build(),
-            )
-            .unwrap();
-        }
-        let sink = make_session_sink();
-        handle_move_work_item_on_board(
-            dispatch(&state, &sink, "held-reorder"),
-            FrontendRequest::MoveWorkItemOnBoard {
-                id: revision.id.clone(),
-                target: BoardDropTarget::new(BoardColumn::Review, None),
-                bypass_dispatch_pause: false,
-                observed_pause_since_epoch_s: None,
-            },
-        )
-        .await;
-        let FrontendEvent::WorkItemUpdated {
-            item: WorkItem::Task(card),
-        } = sole_response(&sink).await
-        else {
-            panic!("expected projected revision reply")
-        };
-        assert_eq!(
-            card.status,
-            if blocked {
-                TaskStatus::Blocked
-            } else {
-                TaskStatus::InReview
-            }
-        );
-        assert_eq!(
-            card.blocked_reason.as_deref(),
-            if blocked { Some("merge_conflict") } else { None }
-        );
-        assert_eq!(
-            card.blocked_detail.as_deref(),
-            if blocked { Some("conflicts in a.rs") } else { None }
-        );
-        assert_eq!(task_row(&state, &revision.id).status, TaskStatus::Active);
+    .await;
+    match sole_response(&sink).await {
+        FrontendEvent::WorkError { message } => assert!(message.contains("no board position"), "{message}"),
+        other => panic!("expected folded-card refusal, got {other:?}"),
     }
+    let after = task_row(&state, &revision.id);
+    assert_eq!(after.status, TaskStatus::Blocked);
+    assert_eq!(after.blocked_reason.as_deref(), Some("ci_failure"));
 }

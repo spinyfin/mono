@@ -72,6 +72,7 @@ public enum AgentExecutionKind {
 /// app only maps it to text.
 public enum AgentReviewStage {
     public static let consolidation = "consolidation"
+    public static let applying = "applying"
 }
 
 /// Project attribution. Work with no project is `unfiled`; it is never

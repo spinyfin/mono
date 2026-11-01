@@ -257,12 +257,13 @@ impl ReviewBatchMemberRole {
 
 /// Which stage of an AI review a `pr_review` execution is in. Several
 /// reviewers run in parallel on the PR head, then one consolidating agent
-/// merges their findings into a single review.
+/// merges their findings into a single review before its verdict is applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewStage {
     Reviewers,
     Consolidation,
+    Applying,
 }
 
 impl ReviewStage {
@@ -270,6 +271,7 @@ impl ReviewStage {
         match self {
             Self::Reviewers => "reviewers",
             Self::Consolidation => "consolidation",
+            Self::Applying => "applying",
         }
     }
 }
@@ -287,6 +289,7 @@ impl std::str::FromStr for ReviewStage {
         match value {
             "reviewers" => Ok(Self::Reviewers),
             "consolidation" => Ok(Self::Consolidation),
+            "applying" => Ok(Self::Applying),
             _ => Err(format!("unknown review stage: {value}")),
         }
     }
@@ -419,6 +422,8 @@ mod tests {
         assert_eq!("grok_reviewer".parse(), Ok(ReviewBatchMemberRole::GrokReviewer));
         assert_eq!("reported".parse(), Ok(ReviewBatchMemberStatus::Reported));
         assert_eq!("consolidation".parse(), Ok(ReviewStage::Consolidation));
+        assert_eq!("applying".parse(), Ok(ReviewStage::Applying));
+        assert_eq!(ReviewStage::Applying.as_str(), "applying");
     }
 
     #[test]

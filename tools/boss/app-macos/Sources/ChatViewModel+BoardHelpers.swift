@@ -5,7 +5,7 @@ import Foundation
 enum RevealCardResult: Equatable {
     /// A host card resolves to this id — either the requested
     /// item's own card, or (for a revision rolled up into its parent
-    /// because it reached `done`) the parent's card. This is
+    /// by the engine projection) the parent's card. This is
     /// resolution only, not evidence that a view scrolled successfully.
     case revealed(cardID: String)
     /// The id isn't loaded locally yet — the common cross-product case,
@@ -23,18 +23,8 @@ enum RevealCardResult: Equatable {
 extension ChatViewModel {
     // MARK: Revisions
 
-    /// PR actions on a revision use the same owner as the engine's review projection.
-    func reviewOwner(for task: WorkTask) -> WorkTask {
-        var owner = task
-        var visited: Set<String> = []
-        while owner.kind == "revision", visited.insert(owner.id).inserted,
-              let parentID = owner.parentTaskId, let parent = workTask(withID: parentID) {
-            owner = parent
-        }
-        return owner
-    }
-
-    /// Review revisions host their own card; completed revisions reveal the parent rollup.
+    /// Resolves the card hosting an item. Engine-folded revisions, including
+    /// review-phase blocked revisions, reveal their parent's inline rollup.
     func revealCardTarget(for taskID: String) -> RevealCardResult {
         guard let item = task(withID: taskID) else {
             return .deferred
@@ -42,7 +32,7 @@ extension ChatViewModel {
         guard item.deletedAt == nil else {
             return .unreachable(reason: "\(revealLabel(for: item)) is deleted")
         }
-        guard item.kind == "revision", item.status == "done" else {
+        guard item.isFoldedRevision else {
             return .revealed(cardID: item.id)
         }
         guard let parentID = item.parentTaskId, let parent = task(withID: parentID) else {
@@ -63,7 +53,19 @@ extension ChatViewModel {
     }
 
 
-    /// Completed revisions grouped by parent, cached once per update.
+    /// Engine-folded review and review-blocked revisions for parentID.
+    /// O(1) per card — reads the cache built by `rebuildRevisionCache()`,
+    /// which groups every project- and product-level revision by parent id
+    /// and status in a single pass. Called once per visible card on every
+    /// kanban render, so this used to be an O(total tasks) scan per card;
+    /// see `cachedInReviewRevisionsByParentID`.
+    func inReviewRevisions(forParentTaskID parentID: String) -> [WorkTask] {
+        if cachedInReviewRevisionsByParentID == nil { rebuildRevisionCache() }
+        return cachedInReviewRevisionsByParentID?[parentID] ?? []
+    }
+
+    /// `kind == "revision"` tasks for parentID with status `"done"`. O(1)
+    /// per card; see `inReviewRevisions(forParentTaskID:)`.
     func doneRevisions(forParentTaskID parentID: String) -> [WorkTask] {
         if cachedDoneRevisionsByParentID == nil { rebuildRevisionCache() }
         return cachedDoneRevisionsByParentID?[parentID] ?? []
@@ -146,7 +148,8 @@ extension ChatViewModel {
     }
 
     /// True when an incremental task update must drop the revision rollup
-    /// caches (`cachedDoneRevisionsByParentID`). Rollups store full `WorkTask`
+    /// caches (`cachedInReviewRevisionsByParentID` /
+    /// `cachedDoneRevisionsByParentID`). Rollups store full `WorkTask`
     /// snapshots, so any field change on a revision row (name, PR URL,
     /// status, parent, seq, …) — or a kind flip into/out of revision —
     /// must invalidate them. Non-revision same-bucket edits leave the
@@ -158,25 +161,36 @@ extension ChatViewModel {
         return wasRevision || isRevision
     }
 
-    /// Groups done revisions by parent in one pass for card footers.
+    /// Groups every project- and product-level revision task by parent id
+    /// using engine folding membership, separating completed rows from review rows
+    /// in one O(total revisions) pass. Populates
+    /// `cachedInReviewRevisionsByParentID` / `cachedDoneRevisionsByParentID`.
+    /// Mirrors `rebuildPrereqCache` in ChatViewModel+Dependencies.swift —
+    /// same buckets as the `revisions(...)` scan above with
+    /// `includeChoresAndProductTasks: false` (chores/product-level tasks
+    /// aren't revision parents, so they're excluded here too).
     private func rebuildRevisionCache() {
+        var inReview: [String: [WorkTask]] = [:]
         var done: [String: [WorkTask]] = [:]
         func collect(_ tasks: [WorkTask]) {
             for task in tasks {
-                guard task.kind == "revision", let parentID = task.parentTaskId else { continue }
-                switch task.status {
-                case "done":
+                guard task.isFoldedRevision, let parentID = task.parentTaskId else { continue }
+                if task.status == "done" {
                     done[parentID, default: []].append(task)
-                default:
-                    break
+                } else {
+                    inReview[parentID, default: []].append(task)
                 }
             }
         }
         for tasks in tasksByProjectID.values { collect(tasks) }
         for revisions in productLevelRevisionsByProductID.values { collect(revisions) }
+        for key in inReview.keys {
+            inReview[key]?.sort { ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0) }
+        }
         for key in done.keys {
             done[key]?.sort { ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0) }
         }
+        cachedInReviewRevisionsByParentID = inReview
         cachedDoneRevisionsByParentID = done
     }
 
@@ -446,8 +460,11 @@ extension ChatViewModel {
         // falls through to the per-task `docLinkState`.
         let docPresentation = workItemDocPresentation(for: task)
 
-        // Only done revisions roll up; delivered revisions have their own cards.
-        let doneRevisions: [WorkCardRevisionRollup] = doneRevisions(forParentTaskID: task.id)
+        // Engine-folded revisions render inline wherever their parent's card lands,
+        // including review-phase blocks that have no standalone card.
+        let inReviewRevisions: [WorkCardRevisionRollup] = (
+            inReviewRevisions(forParentTaskID: task.id) + doneRevisions(forParentTaskID: task.id)
+        )
         .sorted { ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0) }
         .map(WorkCardRevisionRollup.init(revision:))
 
@@ -499,7 +516,7 @@ extension ChatViewModel {
                 designDocPresentation: docPresentation,
                 externalRefLink: ExternalRefLinkPresentation.forTask(task),
                 ambiguousRepoNames: ambiguousVisibleRepoNames,
-                doneRevisions: doneRevisions,
+                inReviewRevisions: inReviewRevisions,
                 parentShortID: parentShortID,
                 deferredScopeItems: deferredScopeItems,
                 deferredScopeActionInFlightIDs: deferredScopeActionInFlightIDs,

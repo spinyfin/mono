@@ -634,7 +634,11 @@ fn worker_tier_gate_handoff_write_is_audited() {
         let pid = child.id() as libc::pid_t;
         let started = std::time::Instant::now();
         loop {
-            if boss_engine_utils::process_args::command(pid as u32).is_some() {
+            // A freshly forked child can still expose the test runner's argv
+            // before exec installs the shell fixture's command line.
+            if boss_engine_utils::process_args::command(pid as u32)
+                .is_some_and(|argv| argv.contains(&format!("--authorization {credential}")))
+            {
                 break;
             }
             assert!(
