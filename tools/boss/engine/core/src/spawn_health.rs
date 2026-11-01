@@ -93,14 +93,14 @@ use std::sync::{Arc, Mutex};
 use boss_protocol::{CreateAttentionItemInput, WorkExecution};
 use serde::Serialize;
 
-use crate::app::handler_helpers::{
-    METADATA_KEY_DISPATCH_PAUSE_ORIGIN, METADATA_KEY_DISPATCH_PAUSE_REASON, METADATA_KEY_DISPATCH_PAUSE_SCOPE,
-    METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE,
-};
 use crate::config::DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER;
 use crate::coordinator::{DispatchAdmission, DispatchPauseOrigin, ExecutionCoordinator};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::work::WorkDb;
+use boss_execution_contracts::{
+    METADATA_KEY_DISPATCH_PAUSE_ORIGIN, METADATA_KEY_DISPATCH_PAUSE_REASON, METADATA_KEY_DISPATCH_PAUSE_SCOPE,
+    METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE,
+};
 
 /// Number of **distinct** work items whose spawn must fail inside the window
 /// before the breaker trips. Set above the noise of a single flaky spawn but

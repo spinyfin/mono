@@ -1,0 +1,18 @@
+[package]
+name = "boss-execution-contracts"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+boss-engine-effort = { path = "../effort" }
+boss-engine-recovery = { path = "../recovery" }
+boss-engine-storage-values = { path = "../storage-values" }
+boss-engine-structured-output = { path = "../structured-output" }
+boss-host-execution = { path = "../host-execution" }
+boss-protocol = { path = "../../protocol" }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "macros", "rt-multi-thread"] }
+tracing = { workspace = true }

@@ -10,21 +10,15 @@
 //! - [`worker_spawn`] — worker-spawn composition ([`ComposedWorkerSpawn`],
 //!   [`compose_worker_spawn`], PR review/diff fetch).
 //! - [`prompt`] — worker prompt composition (the directive/fragment family).
-//! - [`work_item`] — [`WorkItem`] accessor helpers and PR-URL extraction.
+//! - [`work_item`] — [`boss_protocol::WorkItem`] accessor helpers and PR-URL extraction.
 //!
-//! This module owns the shared run-outcome vocabulary and the
-//! [`ExecutionRunner`] trait, and re-exports the items other engine modules
+//! This module re-exports the shared run-outcome vocabulary and the
+//! [`ExecutionRunner`] trait from execution contracts, plus the items other engine modules
 //! reach as `crate::runner::*`.
 
-use std::path::{Path, PathBuf};
-
-use anyhow::Result;
-use async_trait::async_trait;
+use std::path::PathBuf;
 
 use crate::config::RuntimeConfig;
-use crate::effort::SpawnConfig;
-use crate::work::{WorkExecution, WorkItem};
-use boss_protocol::ExecutionStatus;
 
 mod answer_agent_prompt;
 pub(crate) mod pane_spawn;
@@ -42,130 +36,7 @@ pub(crate) use prompt::designated_output_kind;
 pub(crate) use work_item::{task_bound_pr_url, work_item_name, work_item_task_kind};
 pub(crate) use worker_spawn::{ComposedWorkerSpawn, REVIEW_GUIDE_DRIVER, WorkerSpawnOpts, compose_worker_spawn};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunAttention {
-    pub kind: String,
-    pub title: String,
-    pub body_markdown: String,
-}
-
-/// What a worker is waiting for after a run ends. Drives the lease
-/// retain/release decision in the coordinator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunWaitState {
-    /// Run finished cleanly with no further work expected (`completed` or
-    /// equivalent terminal status). Workspace is released.
-    Terminal,
-    /// Worker is blocked on an upstream dependency. Workspace is released
-    /// and re-leased when the work becomes ready again.
-    WaitingDependency,
-    /// Worker is awaiting human input/redirect. Workspace is retained so
-    /// the next run can continue in-place.
-    ///
-    /// **Not** the post-spawn outcome of a pane-hosted run — that is
-    /// [`Self::WorkerPaneAlive`]. A runner may only return this when it has
-    /// positive evidence the worker is blocked on a person; a runner that
-    /// merely handed off to a live agent has not.
-    ///
-    /// No runner currently constructs this — `PaneSpawnRunner` and the
-    /// remote host adapter both return [`Self::WorkerPaneAlive`], and the
-    /// only source of positive wait-on-a-person evidence today is the
-    /// driver's own hook stream, mirrored onto the row by
-    /// `crate::awaiting_input_status` rather than returned from a runner.
-    /// Retained for a runner that can observe a genuine block directly
-    /// (out-of-band from the hook stream) rather than inferring it.
-    WaitingHuman,
-    /// Worker is awaiting human review of an open PR. Workspace retained.
-    WaitingReview,
-    /// Worker is awaiting merge of an approved PR. Workspace retained.
-    WaitingMerge,
-    /// The execution was cancelled (kanban drag to Backlog, force-stop)
-    /// *during* its spawn window — after the worker pane came up but
-    /// before the run could be recorded. The runner has already reaped
-    /// the just-spawned pane; the coordinator must release the cube
-    /// lease the cancel path deliberately left held and skip the normal
-    /// completion recording (the row is already terminal). See
-    /// [`PaneSpawnRunner::run_execution`] and the mid-spawn-cancel
-    /// collision this closes.
-    CancelledDuringSpawn,
-    /// An agent pane was successfully spawned. The pane is alive and its
-    /// agent is actively working; the engine has handed the turn loop off
-    /// but nothing is blocked on a person. The execution stays in
-    /// `running` until the agent's own lifecycle concludes it — a Stop
-    /// hook driving `on_stop`'s completion machinery for a worker, or
-    /// `finalize_pr_review_pass` → `record_worker_pr_completion` for a
-    /// reviewer. Workspace is retained so the pane can continue.
-    ///
-    /// This is the outcome of every successful pane spawn, whatever the
-    /// execution kind: `waiting_human` would be semantically wrong for any
-    /// of them — nobody is waiting for a person while the agent is working.
-    ///
-    /// Using `running` is also what keeps the "AI reviewing" badge visible
-    /// on kanban cards for the duration of a review — the badge queries
-    /// `pr_review` executions in `running` status.
-    WorkerPaneAlive,
-}
-
-impl RunWaitState {
-    pub fn execution_status(self) -> ExecutionStatus {
-        match self {
-            RunWaitState::Terminal => ExecutionStatus::Completed,
-            RunWaitState::WaitingDependency => ExecutionStatus::WaitingDependency,
-            RunWaitState::WaitingHuman => ExecutionStatus::WaitingHuman,
-            RunWaitState::WaitingReview => ExecutionStatus::WaitingReview,
-            RunWaitState::WaitingMerge => ExecutionStatus::WaitingMerge,
-            // The row is already `cancelled`; the coordinator never
-            // drives a status transition for this variant. Report the
-            // terminal status for completeness.
-            RunWaitState::CancelledDuringSpawn => ExecutionStatus::Cancelled,
-            // Agent pane is alive and working; execution stays `running`.
-            RunWaitState::WorkerPaneAlive => ExecutionStatus::Running,
-        }
-    }
-
-    pub fn release_workspace(self) -> bool {
-        matches!(
-            self,
-            RunWaitState::Terminal | RunWaitState::WaitingDependency | RunWaitState::CancelledDuringSpawn
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunOutcome {
-    pub wait_state: RunWaitState,
-    pub result_summary: Option<String>,
-    pub attention: Option<RunAttention>,
-    /// Pane slot the worker was actually allocated into, if this run
-    /// hosts a tmux pane. The coordinator stamps this onto the
-    /// run record's `agent_id` (as `worker-{slot_id}`) so `bossctl
-    /// agents list` shows one entry per active pane instead of
-    /// collapsing every run into the worker-pool placeholder. `None`
-    /// means the runner doesn't have a pane (e.g., a test fake);
-    /// the coordinator leaves agent_id alone.
-    pub slot_id: Option<u8>,
-    /// Resolved per-execution effort + model knobs the runner used
-    /// to construct the worker's `claude` invocation. The coordinator
-    /// surfaces this on the `pane_spawned` dispatch event so
-    /// `bossctl dispatch diagnose <exec-id>` shows what model and
-    /// effort value the worker actually launched with — design §Q2:
-    /// "surfaces the chosen model, effort value, and level on the
-    /// dispatch instrumentation stream." `None` for fake runners that
-    /// don't go through the spawn-config resolver.
-    pub spawn_config: Option<SpawnConfig>,
-}
-
-#[async_trait]
-pub trait ExecutionRunner: Send + Sync {
-    async fn run_execution(
-        &self,
-        worker_id: &str,
-        execution: &WorkExecution,
-        work_item: &WorkItem,
-        workspace_path: &Path,
-        cube_change_id: Option<&str>,
-    ) -> Result<RunOutcome>;
-}
+pub use boss_execution_contracts::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
 
 /// Absolute path of the events socket this engine bound — where worker hook
 /// shims connect, and the target of each remote run's reverse `ssh -R`
