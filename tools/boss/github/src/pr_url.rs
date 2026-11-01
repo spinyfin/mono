@@ -221,3 +221,145 @@ mod tests {
         assert_eq!(pr_number_from_url("not-a-url"), None);
     }
 }
+
+/// Well-known placeholder owner/repo slugs used in tests and documentation
+/// (compared case-insensitively). These are rejected as a belt-and-suspenders
+/// check even before the product-repo gate runs.
+static PLACEHOLDER_SLUGS: &[&str] = &["foo/bar", "octocat/hello-world", "someuser/somerepo", "example/example"];
+
+/// Parse `product_repo_remote_url` (SSH `git@github.com:owner/repo.git` or
+/// HTTPS `https://github.com/owner/repo`) into a lowercase `owner/repo` slug.
+/// Returns `None` if the URL is not a recognisable github.com remote.
+pub fn parse_product_slug(repo_remote_url: &str) -> Option<String> {
+    let (owner, repo) = git_utils::repo_slug::parse_github_owner_repo(repo_remote_url).ok()?;
+    Some(format!("{}/{}", owner.to_lowercase(), repo.to_lowercase()))
+}
+
+/// Validate that `pr_url` belongs to the product identified by
+/// `product_repo_remote_url`. Returns `Ok(())` when the URL is a
+/// legitimate product PR, or `Err(reason)` explaining why it was
+/// rejected.
+///
+/// Two gates run in order:
+/// 1. **Placeholder reject** — slugs from `PLACEHOLDER_SLUGS` are
+///    dropped immediately with an informative reason. These are test
+///    fixtures that should never appear in real worker output.
+/// 2. **Repo-remote-url gate** — the URL's `owner/repo` must
+///    case-insensitively match the parsed slug of
+///    `product_repo_remote_url`. A worker operating on the product's
+///    cube workspace can only legitimately emit a PR URL for that repo.
+pub fn validate_pr_url(pr_url: &str, product_repo_remote_url: &str) -> Result<(), String> {
+    let pr_slug = repo_from_pr_url_lenient(pr_url)
+        .map(|slug| slug.to_lowercase())
+        .ok_or_else(|| format!("URL does not contain a recognisable owner/repo slug: {pr_url}"))?;
+
+    if PLACEHOLDER_SLUGS.iter().any(|p| pr_slug == *p) {
+        return Err(format!("owner/repo `{pr_slug}` is a well-known test placeholder"));
+    }
+
+    let product_slug = parse_product_slug(product_repo_remote_url)
+        .ok_or_else(|| format!("could not parse product repo slug from `{product_repo_remote_url}`"))?;
+
+    if pr_slug != product_slug {
+        return Err(format!(
+            "URL repo `{pr_slug}` does not match product repo `{product_slug}`"
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod product_gate_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_every_placeholder_before_the_product_gate() {
+        for slug in PLACEHOLDER_SLUGS {
+            let url = format!("https://github.com/{slug}/pull/42");
+            let remote = format!("git@github.com:{slug}.git");
+            assert!(validate_pr_url(&url, &remote).unwrap_err().contains("placeholder"));
+        }
+    }
+
+    #[test]
+    fn matches_product_case_insensitively_and_rejects_other_repos() {
+        assert_eq!(
+            validate_pr_url(
+                "https://github.com/SpinYFin/Mono/pull/99",
+                "git@github.com:spinyfin/mono.git"
+            ),
+            Ok(())
+        );
+        assert!(
+            validate_pr_url(
+                "https://github.com/another/repo/pull/1",
+                "git@github.com:spinyfin/mono.git"
+            )
+            .unwrap_err()
+            .contains("does not match")
+        );
+        assert!(
+            validate_pr_url("not-a-url", "git@github.com:spinyfin/mono.git")
+                .unwrap_err()
+                .contains("recognisable")
+        );
+        assert!(
+            validate_pr_url("https://github.com/spinyfin/mono/pull/1", "not-a-remote")
+                .unwrap_err()
+                .contains("could not parse")
+        );
+    }
+
+    #[test]
+    fn parses_github_remotes() {
+        for remote in [
+            "git@github.com:SpinYFin/Mono.git",
+            "https://github.com/spinyfin/mono.git",
+            "https://github.com/spinyfin/mono",
+        ] {
+            assert_eq!(parse_product_slug(remote).as_deref(), Some("spinyfin/mono"));
+        }
+        assert_eq!(parse_product_slug("https://gitlab.com/foo/bar"), None);
+    }
+
+    #[test]
+    fn validate_rejects_url_for_wrong_repo() {
+        // A worker running tests that mention another GitHub repo's PR URL.
+        let result = validate_pr_url(
+            "https://github.com/some-org/other-repo/pull/10",
+            "git@github.com:spinyfin/mono.git",
+        );
+        assert!(result.is_err());
+        let reason = result.unwrap_err();
+        assert!(reason.contains("does not match"), "got: {reason}");
+    }
+
+    #[test]
+    fn parse_product_slug_handles_ssh_and_https() {
+        assert_eq!(
+            parse_product_slug("git@github.com:spinyfin/mono.git"),
+            Some("spinyfin/mono".to_owned()),
+        );
+        assert_eq!(
+            parse_product_slug("https://github.com/spinyfin/mono.git"),
+            Some("spinyfin/mono".to_owned()),
+        );
+        assert_eq!(
+            parse_product_slug("https://github.com/spinyfin/mono"),
+            Some("spinyfin/mono".to_owned()),
+        );
+        assert_eq!(parse_product_slug("https://gitlab.com/foo/bar"), None);
+    }
+
+    #[test]
+    fn validate_is_case_insensitive_for_slug_matching() {
+        // GitHub names are case-insensitive; SpinYFin/Mono must match
+        // spinyfin/mono from the product's repo_remote_url.
+        let result = validate_pr_url(
+            "https://github.com/SpinYFin/Mono/pull/99",
+            "git@github.com:spinyfin/mono.git",
+        );
+        assert_eq!(result, Ok(()));
+    }
+}

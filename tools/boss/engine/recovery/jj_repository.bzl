@@ -15,6 +15,6 @@ def _jj_test_repository_impl(ctx):
         url = "https://github.com/jj-vcs/jj/releases/download/v0.26.0/jj-v0.26.0-" + platform + ".tar.gz",
         sha256 = _ARCHIVES[platform],
     )
-    ctx.file("BUILD.bazel", 'exports_files(["jj"], visibility = ["@@//tools/boss/engine/recovery:__pkg__", "@@//tools/boss/engine/core:__pkg__", "@@//tools/cube:__pkg__"])\n')
+    ctx.file("BUILD.bazel", 'exports_files(["jj"], visibility = ["@@//tools/boss/engine/recovery:__pkg__", "@@//tools/boss/engine/core:__pkg__", "@@//tools/boss/engine/work-db:__pkg__", "@@//tools/cube:__pkg__"])\n')
 
 jj_test_repository = repository_rule(implementation = _jj_test_repository_impl)

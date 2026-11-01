@@ -1,0 +1,774 @@
+//! `answer_agent_runs` persistence — one row per ephemeral, read-only
+//! "mini-coordinator" answer-agent run against a `question`-classified doc
+//! comment (P3a of `comment-triggered-document-revisions.md`).
+//!
+//! Deliberately parallels the `magic_wand_dispatches` CRUD in
+//! [`super::comments`]: a shared column list that must match
+//! [`map_answer_agent_run`], an insert that re-selects the created row, and a
+//! guarded completion transition (`running` → `replied`/`failed`). The table
+//! is comment-keyed with a per-run row, differing from magic-wand only in the
+//! `thread_turn` / `workspace_lease_id` / `reply_body` columns and the
+//! distinct `answer_agent` capability profile.
+
+use super::*;
+
+/// The apology entry standing in for the answer that never arrived. Shared by
+/// [`WorkDb::recover_unanswered_comment`]'s two callers (`finalize_answer_agent`
+/// and `stranded_answering_sweep::recover`) so the wording can't drift between
+/// them: from the operator's side these are the same event, and two different
+/// wordings for it would read as two different failures.
+pub const ANSWER_AGENT_NO_REPLY_BODY: &str = "I wasn't able to finish answering this question — the session ended before \
+     posting a reply. Please try again, or answer directly.";
+
+/// Column list for every `answer_agent_runs` SELECT. Order must match
+/// [`map_answer_agent_run`]. `pub` so callers that already hold a
+/// connection (e.g. [`crate::answer_agent_runs::latest_answer_agent_run_for_comment_on`])
+/// can build the same SELECT without duplicating the column list.
+pub(crate) fn answer_agent_run_columns() -> &'static str {
+    "id, comment_id, artifact_kind, artifact_id, doc_version, thread_turn, \
+     status, execution_id, workspace_lease_id, reply_body, error_kind, created_at, completed_at, \
+     workspace_positioned"
+}
+
+/// The most recent answer-agent run for a comment (by `created_at`, then
+/// `id` as a stable tiebreak), on an already-open connection. Shared by
+/// [`WorkDb::latest_answer_agent_run_for_comment`] and by
+/// `revise_doc::push_comment_directive_block`, which holds the single pooled connection
+/// inside an Immediate transaction and cannot call back through
+/// `WorkDb::connect`.
+pub(crate) fn latest_answer_agent_run_for_comment_on(
+    conn: &Connection,
+    comment_id: &str,
+) -> Result<Option<AnswerAgentRun>> {
+    let cols = answer_agent_run_columns();
+    let sql = format!(
+        "SELECT {cols} FROM answer_agent_runs WHERE comment_id = ?1 \
+         ORDER BY created_at DESC, id DESC LIMIT 1"
+    );
+    conn.query_row(&sql, [comment_id], map_answer_agent_run)
+        .optional()
+        .map_err(Into::into)
+}
+
+#[work_db_boundary::instrument]
+impl WorkDb {
+    /// Insert a `running` answer-agent run row and return it. `thread_turn` is
+    /// `0` for the first answer on a comment and `1+` for re-entered follow-ups.
+    /// `workspace_lease_id` is `None` at creation and stamped later if/when the
+    /// run leases a workspace to read code.
+    pub fn create_answer_agent_run(
+        &self,
+        comment_id: &str,
+        artifact_kind: &str,
+        artifact_id: &str,
+        doc_version: &str,
+        thread_turn: i64,
+    ) -> Result<AnswerAgentRun> {
+        let conn = self.connect()?;
+        let id = next_id("aar");
+        let now = now_string();
+        conn.execute(
+            "INSERT INTO answer_agent_runs \
+             (id, comment_id, artifact_kind, artifact_id, doc_version, thread_turn, \
+              status, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                id,
+                comment_id,
+                artifact_kind,
+                artifact_id,
+                doc_version,
+                thread_turn,
+                ANSWER_AGENT_RUN_STATUS_RUNNING,
+                now,
+            ],
+        )?;
+        let cols = answer_agent_run_columns();
+        let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE id = ?1");
+        conn.query_row(&sql, [&id], map_answer_agent_run).map_err(Into::into)
+    }
+
+    /// Record the workspace lease a run acquired to check out code for reading.
+    /// Idempotent-friendly: only updates a `running` row (a completed run never
+    /// gains a lease). Returns the updated row.
+    pub fn set_answer_agent_run_lease(&self, run_id: &str, workspace_lease_id: &str) -> Result<AnswerAgentRun> {
+        let conn = self.connect()?;
+        let n = conn.execute(
+            "UPDATE answer_agent_runs SET workspace_lease_id = ?2 \
+             WHERE id = ?1 AND status = 'running'",
+            params![run_id, workspace_lease_id],
+        )?;
+        if n == 0 {
+            bail!("answer-agent run {run_id} not found or already in a terminal state (expected running)");
+        }
+        let cols = answer_agent_run_columns();
+        let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE id = ?1");
+        conn.query_row(&sql, [run_id], map_answer_agent_run).map_err(Into::into)
+    }
+
+    /// Bind a newly-created `answer_agent` execution to its tracking run.
+    /// The association is established before dispatch can pick the execution
+    /// up, so operators can follow a queued question directly into dispatch
+    /// diagnostics.
+    pub fn bind_answer_agent_run_execution(&self, run_id: &str, execution_id: &str) -> Result<AnswerAgentRun> {
+        let conn = self.connect()?;
+        let n = conn.execute(
+            "UPDATE answer_agent_runs SET execution_id = ?2 \
+             WHERE id = ?1 AND status = 'running' \
+               AND (execution_id IS NULL OR execution_id = ?2)",
+            params![run_id, execution_id],
+        )?;
+        if n == 0 {
+            bail!("answer-agent run {run_id} not found, terminal, or bound to another execution");
+        }
+        let cols = answer_agent_run_columns();
+        let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE id = ?1");
+        conn.query_row(&sql, [run_id], map_answer_agent_run).map_err(Into::into)
+    }
+
+    /// Stamp the workspace lease on the run bound to an execution, and clear
+    /// `workspace_positioned` so a stale positioning stamp from an earlier
+    /// lease on this run never carries over to the new one: a fresh lease
+    /// starts unpositioned until the coordinator's goto attempt (or its
+    /// absence) stamps `workspace_positioned` again for this lease.
+    /// Returning `None` is expected for non-answer-agent executions and lets
+    /// the coordinator share its ordinary lease path without guessing by
+    /// comment.
+    pub fn set_answer_agent_execution_lease(
+        &self,
+        execution_id: &str,
+        workspace_lease_id: &str,
+    ) -> Result<Option<AnswerAgentRun>> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE answer_agent_runs SET workspace_lease_id = ?2, workspace_positioned = NULL \
+             WHERE execution_id = ?1 AND status = 'running'",
+            params![execution_id, workspace_lease_id],
+        )?;
+        let cols = answer_agent_run_columns();
+        let sql =
+            format!("SELECT {cols} FROM answer_agent_runs WHERE execution_id = ?1 AND status = 'running' LIMIT 1");
+        conn.query_row(&sql, [execution_id], map_answer_agent_run)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Stamp whether `cube workspace goto --pr` actually positioned this
+    /// run's leased checkout on the PR head — `true` on success, `false`
+    /// when goto was attempted and failed (the coordinator fell back to a
+    /// fresh `cube change create` checkout). Called from the coordinator's
+    /// dispatch path right after the goto attempt, alongside
+    /// [`Self::set_answer_agent_execution_lease`]. Returning `None` is
+    /// expected for non-answer-agent executions.
+    pub fn set_answer_agent_run_positioning(
+        &self,
+        execution_id: &str,
+        positioned: bool,
+    ) -> Result<Option<AnswerAgentRun>> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE answer_agent_runs SET workspace_positioned = ?2 \
+             WHERE execution_id = ?1 AND status = 'running'",
+            params![execution_id, positioned],
+        )?;
+        let cols = answer_agent_run_columns();
+        let sql =
+            format!("SELECT {cols} FROM answer_agent_runs WHERE execution_id = ?1 AND status = 'running' LIMIT 1");
+        conn.query_row(&sql, [execution_id], map_answer_agent_run)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// The run bound to an execution, regardless of status — unlike
+    /// [`Self::set_answer_agent_execution_lease`]'s read-back, this is used
+    /// by prompt composition, which may run after the run has already
+    /// reached a terminal status in a resume/redispatch.
+    pub fn get_answer_agent_run_by_execution(&self, execution_id: &str) -> Result<Option<AnswerAgentRun>> {
+        let conn = self.connect()?;
+        let cols = answer_agent_run_columns();
+        let sql = format!(
+            "SELECT {cols} FROM answer_agent_runs WHERE execution_id = ?1 \
+             ORDER BY created_at DESC, id DESC LIMIT 1"
+        );
+        conn.query_row(&sql, [execution_id], map_answer_agent_run)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Transition a run from `running` to a terminal `replied` (with the reply
+    /// body) or `failed` (with an `error_kind`). Guarded on `status='running'`
+    /// so a duplicate completion callback is a no-op error, not a double
+    /// transition (design § "Reconciliation idempotency"). Returns the updated
+    /// row.
+    pub fn complete_answer_agent_run(
+        &self,
+        run_id: &str,
+        status: &str,
+        reply_body: Option<&str>,
+        error_kind: Option<&str>,
+    ) -> Result<AnswerAgentRun> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let n = conn.execute(
+            "UPDATE answer_agent_runs \
+             SET status = ?2, reply_body = ?3, error_kind = ?4, completed_at = ?5 \
+             WHERE id = ?1 AND status = 'running'",
+            params![run_id, status, reply_body, error_kind, now],
+        )?;
+        if n == 0 {
+            bail!("answer-agent run {run_id} not found or already in a terminal state (expected running)");
+        }
+        let cols = answer_agent_run_columns();
+        let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE id = ?1");
+        conn.query_row(&sql, [run_id], map_answer_agent_run).map_err(Into::into)
+    }
+
+    /// Stand a comment's in-flight answer-agent run down because the operator
+    /// reclassified the comment away from `question`
+    /// (`handle_comments_set_intent`). Completes the `running` row as the
+    /// terminal [`ANSWER_AGENT_RUN_STATUS_SUPERSEDED`] with no `reply_body`,
+    /// returning the row it stood down (`None` when there was no live run —
+    /// the agent already replied, or never started).
+    ///
+    /// Being no longer `running` is what makes the stand-down stick against a
+    /// late reply: [`Self::running_answer_agent_run_for_comment`] stops
+    /// matching, so `CommentsPostAnswer` rejects the agent's reply instead of
+    /// posting a thread entry and dragging the comment back to `answered`, and
+    /// `finalize_answer_agent` takes its already-completed branch instead of
+    /// re-transitioning the comment. Carrying no `reply_body` is what keeps a
+    /// retracted question's answer out of `compose_doc_comment_directive`.
+    ///
+    /// Distinct from a `failed` completion on purpose: nothing went wrong, and
+    /// `CommentWithThread::answer_agent_failed` (which keys on the latest run
+    /// being `failed`) must not light up a failure state in the sidebar for a
+    /// run the operator themself retracted.
+    pub fn stand_down_answer_agent_run(&self, comment_id: &str) -> Result<Option<AnswerAgentRun>> {
+        let Some(run) = self.running_answer_agent_run_for_comment(comment_id)? else {
+            return Ok(None);
+        };
+        self.complete_answer_agent_run(&run.id, ANSWER_AGENT_RUN_STATUS_SUPERSEDED, None, Some("reclassified"))
+            .map(Some)
+    }
+
+    /// The comment's bound `answer_agent` execution while it is still
+    /// non-terminal (`ready` before dispatch, `running`/`waiting_human` after).
+    /// `None` once the execution reached a terminal status, or when the comment
+    /// never had one.
+    ///
+    /// Used by the stand-down path to cancel and release a run the operator
+    /// retracted, and by `boss_engine::stranded_answering_sweep` to tell "the agent
+    /// is genuinely still working" from "the agent is gone and nothing will
+    /// ever move this comment". `get_live_execution_for_work_item` is not a
+    /// substitute: it deliberately matches only `running`/`waiting_human`, so
+    /// it misses a `ready` execution the coordinator has not dispatched yet —
+    /// precisely the window in which a reclassification is most likely.
+    pub fn live_answer_agent_execution_for_comment(&self, comment_id: &str) -> Result<Option<WorkExecution>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM work_executions
+             WHERE work_item_id = ?1 AND kind = ?2
+             ORDER BY created_at DESC, id DESC",
+        )?;
+        let ids: Vec<String> = collect_rows(
+            stmt.query_map(params![comment_id, boss_protocol::EXECUTION_KIND_ANSWER_AGENT], |row| {
+                row.get(0)
+            })?,
+        )?;
+        for id in ids {
+            if let Some(execution) = query_execution(&conn, &id)?
+                && !execution.status.is_terminal()
+            {
+                return Ok(Some(execution));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Every non-terminal `answer_agent` execution, oldest first.
+    ///
+    /// The execution-centric counterpart of
+    /// [`Self::live_answer_agent_execution_for_comment`], and the candidate set
+    /// `boss_engine::answer_agent_completion_sweep` scans: that sweep asks "is this
+    /// live execution's answer already delivered?", which is a question about
+    /// executions, not about comments. Cheap by construction — an engine has at
+    /// most a handful of live executions at a time, capped by the worker pools.
+    pub fn list_live_answer_agent_executions(&self) -> Result<Vec<WorkExecution>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM work_executions
+             WHERE kind = ?1 AND status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let ids: Vec<String> =
+            collect_rows(stmt.query_map(params![boss_protocol::EXECUTION_KIND_ANSWER_AGENT], |row| row.get(0))?)?;
+        let mut executions = Vec::with_capacity(ids.len());
+        for id in ids {
+            // Re-read through the shared mapper (rather than trusting the
+            // status string in the filter above) so terminality is judged by
+            // `ExecutionStatus::is_terminal`, the one definition every other
+            // reaper uses.
+            if let Some(execution) = query_execution(&conn, &id)?
+                && !execution.status.is_terminal()
+            {
+                executions.push(execution);
+            }
+        }
+        Ok(executions)
+    }
+
+    /// Fetch an answer-agent run by id.
+    pub fn get_answer_agent_run(&self, run_id: &str) -> Result<Option<AnswerAgentRun>> {
+        let conn = self.connect()?;
+        let cols = answer_agent_run_columns();
+        let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE id = ?1");
+        conn.query_row(&sql, [run_id], map_answer_agent_run)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Every answer-agent run for a comment, oldest first — the full history
+    /// [`Self::latest_answer_agent_run_for_comment`] and
+    /// [`Self::running_answer_agent_run_for_comment`] only sample a single row
+    /// of. Backs `boss comment show` / `boss comment runs` (and the bossctl
+    /// direct-DB twins), which otherwise had no way to answer "how many
+    /// answer-agent runs has this comment had, and how did each end" without
+    /// raw SQL against `answer_agent_runs`.
+    pub fn list_answer_agent_runs_for_comment(&self, comment_id: &str) -> Result<Vec<AnswerAgentRun>> {
+        let conn = self.connect()?;
+        let cols = answer_agent_run_columns();
+        let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE comment_id = ?1 ORDER BY created_at ASC, id ASC");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([comment_id], map_answer_agent_run)?;
+        collect_rows(rows)
+    }
+
+    /// The most recent answer-agent run for a comment (by `created_at`, then
+    /// `id` as a stable tiebreak). Drives the bridging path — when a follow-up
+    /// reclassifies to `revision`, the latest run's
+    /// `reply_body` (if any) is appended to the revision directive — and the
+    /// per-comment concurrency guard (at most one live run per comment).
+    pub fn latest_answer_agent_run_for_comment(&self, comment_id: &str) -> Result<Option<AnswerAgentRun>> {
+        let conn = self.connect()?;
+        latest_answer_agent_run_for_comment_on(&conn, comment_id)
+    }
+
+    /// Create a `ready` `answer_agent` work_execution bound to a comment
+    /// (P3b of `comment-triggered-document-revisions.md`).
+    ///
+    /// An answer-agent execution's `work_item_id` is the `work_comments.id`,
+    /// not a task — so, exactly like
+    /// [`Self::create_automation_triage_execution`], it cannot go through
+    /// the task-centric `insert_execution` resolvers. We insert the row
+    /// directly. This choice also gives the per-comment concurrency guard
+    /// the design requires "for free": `get_live_execution_for_work_item`
+    /// (keyed on `work_item_id`) already refuses a second live execution for
+    /// the same `work_item_id`, so at most one answer-agent execution can be
+    /// live per comment at a time. Downstream: the dispatcher routes it to
+    /// the main pool (its `work_item_id` never resolves via
+    /// `source_automation_id_for_work_item`, so it falls through to
+    /// `worker_pool`), the coordinator resolves a synthetic work item from
+    /// the comment for the task-centric spawn plumbing, the runner renders
+    /// the answer-agent prompt, and the completion handler branches on
+    /// `kind` to finalise the run instead of doing PR detection. The row
+    /// starts `ready` so the coordinator's normal drain picks it up.
+    pub fn create_answer_agent_execution(&self, comment_id: &str, repo_remote_url: &str) -> Result<WorkExecution> {
+        let conn = self.connect()?;
+        let id = next_id("exec");
+        let now = now_string();
+        let branch_naming_json = serde_json::to_string(&boss_protocol::BranchNaming::default()).unwrap_or_default();
+        // Column list mirrors `create_automation_triage_execution` /
+        // `insert_execution`; every column it omits has a schema DEFAULT
+        // (pre_start_failure_count=0, dispatch_not_before=NULL,
+        // transient_failure_count=0, host_id='local', …).
+        conn.execute(
+            "INSERT INTO work_executions (
+                id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                created_at, started_at, finished_at, prefer_is_soft, pr_url, worker_branch_prefix,
+                allow_dirty, branch_naming
+             ) VALUES (?1, ?2, ?3, 'ready', ?4, NULL, NULL, NULL, NULL, 0, NULL, ?5, NULL, NULL, 0, NULL, NULL, 0, ?6)",
+            params![
+                id,
+                comment_id,
+                boss_protocol::EXECUTION_KIND_ANSWER_AGENT,
+                repo_remote_url,
+                now,
+                branch_naming_json,
+            ],
+        )?;
+        query_execution(&conn, &id)?.with_context(|| format!("missing answer-agent execution after insert: {id}"))
+    }
+
+    /// The comment's currently-`running` answer-agent run, if any. Used by
+    /// `CommentsPostAnswer` (P3b) to resolve "the run this reply belongs to"
+    /// once the caller's `BOSS_RUN_ID` has been resolved to a comment via its
+    /// bound `work_executions` row, and by `finalize_answer_agent` to detect
+    /// a Stop that arrived without a reply ever having been posted. At most
+    /// one row can match by construction: a fresh run is only ever created
+    /// once the prior run for the same comment has left `running`.
+    pub fn running_answer_agent_run_for_comment(&self, comment_id: &str) -> Result<Option<AnswerAgentRun>> {
+        let conn = self.connect()?;
+        let cols = answer_agent_run_columns();
+        let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE comment_id = ?1 AND status = ?2 LIMIT 1");
+        conn.query_row(
+            &sql,
+            params![comment_id, ANSWER_AGENT_RUN_STATUS_RUNNING],
+            map_answer_agent_run,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Recover a comment stuck `answering` whose answer-agent run ended
+    /// without ever posting a reply: mark `run_id` (if still `running`)
+    /// `failed` with `error_kind`, post the no-reply apology thread entry, and
+    /// transition the comment out of `answering`
+    /// ([`Self::transition_comment_to_answer_failed`] folds a reclassified
+    /// comment straight into `active` instead of `answer_failed`). Shared by
+    /// `CompletionHandler::finalize_answer_agent` (Stop fired, run still
+    /// `running`) and `stranded_answering_sweep::recover` (Stop never fired at
+    /// all) — the two paths differ only in `error_kind` and whether `run_id`
+    /// is still around to mark `failed`.
+    ///
+    /// Deliberately lands on `answer_failed`, never `answered`: no reply ever
+    /// existed for this run, so the apology thread entry standing in for it
+    /// must not read as a real answer to an operator glancing at the
+    /// sidebar. [`Self::transition_comment_to_answered`] is reserved for the
+    /// two callers with a genuine reply in hand.
+    ///
+    /// `finalize_answer_agent` and the stranded-answering sweep's event path
+    /// run on independently spawned connection tasks (Stop and SessionEnd),
+    /// so both can read the same `running` run and race into this function
+    /// for the same comment. `complete_answer_agent_run`'s `WHERE status =
+    /// 'running'` guard means only one of them actually transitions the run
+    /// — the other's call returns an error because the row is already
+    /// terminal. The apology thread entry is posted only by whichever call
+    /// won that transition (or when there was no run row to race over at
+    /// all, i.e. `run_id` is `None`), so a losing racer never double-posts
+    /// an apology the winner already recorded.
+    pub fn recover_unanswered_comment(
+        &self,
+        comment_id: &str,
+        run_id: Option<&str>,
+        error_kind: &str,
+    ) -> Result<WorkComment> {
+        let won_transition = match run_id {
+            Some(run_id) => {
+                match self.complete_answer_agent_run(run_id, ANSWER_AGENT_RUN_STATUS_FAILED, None, Some(error_kind)) {
+                    Ok(_) => true,
+                    Err(err) => {
+                        tracing::warn!(
+                            comment_id,
+                            run_id,
+                            ?err,
+                            "failed to mark the stranded run 'failed' — a concurrent recovery already \
+                         completed it; skipping the apology entry to avoid a duplicate",
+                        );
+                        false
+                    }
+                }
+            }
+            None => true,
+        };
+
+        if won_transition
+            && let Err(err) = self.create_comment_thread_entry(
+                comment_id,
+                THREAD_ENTRY_KIND_ANSWER,
+                THREAD_ENTRY_AUTHOR_ENGINE,
+                ANSWER_AGENT_NO_REPLY_BODY,
+                None,
+                run_id,
+            )
+        {
+            tracing::warn!(comment_id, ?err, "failed to post the no-reply-posted thread entry");
+        }
+
+        self.transition_comment_to_answer_failed(comment_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::WorkDb;
+    use boss_protocol::{CommentAnchor, CreateCommentInput};
+    use std::path::PathBuf;
+
+    fn mem_db() -> WorkDb {
+        WorkDb::open(PathBuf::from(":memory:")).unwrap()
+    }
+
+    /// Create a real `work_comments` row so the `answer_agent_runs.comment_id`
+    /// foreign key (enforced under `PRAGMA foreign_keys = ON`) is satisfiable.
+    fn make_comment(db: &WorkDb, artifact_id: &str) -> String {
+        db.create_comment(CreateCommentInput {
+            artifact_kind: "work_item".to_owned(),
+            artifact_id: artifact_id.to_owned(),
+            doc_version: "v0".to_owned(),
+            anchor: CommentAnchor {
+                exact: "alpha".to_owned(),
+                prefix: String::new(),
+                suffix: String::new(),
+            },
+            body: "why does this retry three times?".to_owned(),
+            author: "operator".to_owned(),
+            plain_text_projection_version: 0,
+        })
+        .unwrap()
+        .id
+    }
+
+    #[test]
+    fn create_and_fetch() {
+        let db = mem_db();
+        let comment = make_comment(&db, "t1");
+        let run = db
+            .create_answer_agent_run(&comment, "work_item", "t1", "v0", 0)
+            .unwrap();
+        assert_eq!(run.comment_id, comment);
+        assert_eq!(run.artifact_kind, "work_item");
+        assert_eq!(run.artifact_id, "t1");
+        assert_eq!(run.doc_version, "v0");
+        assert_eq!(run.thread_turn, 0);
+        assert_eq!(run.status, "running");
+        assert!(run.execution_id.is_none());
+        assert!(run.workspace_lease_id.is_none());
+        assert!(run.reply_body.is_none());
+        assert!(run.error_kind.is_none());
+        assert!(run.completed_at.is_none());
+
+        let fetched = db.get_answer_agent_run(&run.id).unwrap().unwrap();
+        assert_eq!(fetched.id, run.id);
+        assert_eq!(fetched.status, "running");
+    }
+
+    #[test]
+    fn complete_replied() {
+        let db = mem_db();
+        let comment = make_comment(&db, "t1");
+        let run = db
+            .create_answer_agent_run(&comment, "work_item", "t1", "v0", 0)
+            .unwrap();
+        let done = db
+            .complete_answer_agent_run(
+                &run.id,
+                "replied",
+                Some("The retry backoff is exponential because…"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(done.status, "replied");
+        assert_eq!(
+            done.reply_body.as_deref(),
+            Some("The retry backoff is exponential because…")
+        );
+        assert!(done.error_kind.is_none());
+        assert!(done.completed_at.is_some());
+    }
+
+    #[test]
+    fn complete_failed() {
+        let db = mem_db();
+        let comment = make_comment(&db, "t1");
+        let run = db
+            .create_answer_agent_run(&comment, "work_item", "t1", "v0", 0)
+            .unwrap();
+        let done = db
+            .complete_answer_agent_run(&run.id, "failed", None, Some("api_error"))
+            .unwrap();
+        assert_eq!(done.status, "failed");
+        assert!(done.reply_body.is_none());
+        assert_eq!(done.error_kind.as_deref(), Some("api_error"));
+        assert!(done.completed_at.is_some());
+    }
+
+    #[test]
+    fn complete_is_idempotency_guarded() {
+        let db = mem_db();
+        let comment = make_comment(&db, "t1");
+        let run = db
+            .create_answer_agent_run(&comment, "work_item", "t1", "v0", 0)
+            .unwrap();
+        db.complete_answer_agent_run(&run.id, "replied", Some("first"), None)
+            .unwrap();
+        // A duplicate completion callback finds the row terminal, so it's a
+        // no-op error rather than silently re-writing the reply.
+        assert!(
+            db.complete_answer_agent_run(&run.id, "replied", Some("second"), None)
+                .is_err()
+        );
+        let reloaded = db.get_answer_agent_run(&run.id).unwrap().unwrap();
+        assert_eq!(reloaded.reply_body.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn set_lease_only_while_running() {
+        let db = mem_db();
+        let comment = make_comment(&db, "t1");
+        let run = db
+            .create_answer_agent_run(&comment, "work_item", "t1", "v0", 0)
+            .unwrap();
+        let leased = db.set_answer_agent_run_lease(&run.id, "lease-123").unwrap();
+        assert_eq!(leased.workspace_lease_id.as_deref(), Some("lease-123"));
+
+        db.complete_answer_agent_run(&run.id, "replied", Some("done"), None)
+            .unwrap();
+        // A completed run never gains a lease.
+        assert!(db.set_answer_agent_run_lease(&run.id, "lease-456").is_err());
+    }
+
+    #[test]
+    fn binds_execution_then_stamps_its_workspace_lease() {
+        let db = mem_db();
+        let comment = make_comment(&db, "t1");
+        let run = db
+            .create_answer_agent_run(&comment, "work_item", "t1", "v0", 0)
+            .unwrap();
+        let execution = db
+            .create_answer_agent_execution(&comment, "https://example.test/repo.git")
+            .unwrap();
+
+        let bound = db.bind_answer_agent_run_execution(&run.id, &execution.id).unwrap();
+        assert_eq!(bound.execution_id.as_deref(), Some(execution.id.as_str()));
+
+        let leased = db
+            .set_answer_agent_execution_lease(&execution.id, "lease-123")
+            .unwrap()
+            .expect("bound run should be found through the execution");
+        assert_eq!(leased.workspace_lease_id.as_deref(), Some("lease-123"));
+        assert_eq!(leased.execution_id.as_deref(), Some(execution.id.as_str()));
+    }
+
+    #[test]
+    fn re_leasing_clears_stale_positioning_stamp() {
+        let db = mem_db();
+        let comment = make_comment(&db, "t1");
+        let run = db
+            .create_answer_agent_run(&comment, "work_item", "t1", "v0", 0)
+            .unwrap();
+        let execution = db
+            .create_answer_agent_execution(&comment, "https://example.test/repo.git")
+            .unwrap();
+        db.bind_answer_agent_run_execution(&run.id, &execution.id).unwrap();
+        db.set_answer_agent_execution_lease(&execution.id, "lease-123").unwrap();
+
+        let positioned = db
+            .set_answer_agent_run_positioning(&execution.id, true)
+            .unwrap()
+            .expect("bound run should be found through the execution");
+        assert_eq!(positioned.workspace_positioned, Some(true));
+
+        // A retried dispatch takes a new lease on the same run without a
+        // fresh goto attempt (e.g. because the PR is no longer open); the
+        // earlier lease's `true` stamp must not carry over.
+        let re_leased = db
+            .set_answer_agent_execution_lease(&execution.id, "lease-456")
+            .unwrap()
+            .expect("bound run should be found through the execution");
+        assert_eq!(re_leased.workspace_lease_id.as_deref(), Some("lease-456"));
+        assert_eq!(re_leased.workspace_positioned, None);
+    }
+
+    #[test]
+    fn latest_run_orders_by_created_then_id() {
+        let db = mem_db();
+        let comment = make_comment(&db, "t1");
+        let first = db
+            .create_answer_agent_run(&comment, "work_item", "t1", "v0", 0)
+            .unwrap();
+        let second = db
+            .create_answer_agent_run(&comment, "work_item", "t1", "v1", 1)
+            .unwrap();
+        let latest = db.latest_answer_agent_run_for_comment(&comment).unwrap().unwrap();
+        // `next_id` is monotonic, so the second insert wins even at equal
+        // epoch-second `created_at`.
+        assert_eq!(latest.id, second.id);
+        assert_ne!(latest.id, first.id);
+        assert_eq!(latest.thread_turn, 1);
+
+        // A comment with no runs returns None.
+        let other = make_comment(&db, "t2");
+        assert!(db.latest_answer_agent_run_for_comment(&other).unwrap().is_none());
+    }
+
+    #[test]
+    fn running_run_lookup_finds_only_the_running_row() {
+        let db = mem_db();
+        let comment = make_comment(&db, "t1");
+        assert!(db.running_answer_agent_run_for_comment(&comment).unwrap().is_none());
+
+        let run = db
+            .create_answer_agent_run(&comment, "work_item", "t1", "v0", 0)
+            .unwrap();
+        let running = db.running_answer_agent_run_for_comment(&comment).unwrap().unwrap();
+        assert_eq!(running.id, run.id);
+
+        db.complete_answer_agent_run(&run.id, "replied", Some("done"), None)
+            .unwrap();
+        assert!(db.running_answer_agent_run_for_comment(&comment).unwrap().is_none());
+    }
+
+    #[test]
+    fn list_all_runs_for_comment_returns_full_history_oldest_first() {
+        let db = mem_db();
+        let comment = make_comment(&db, "t1");
+        assert!(db.list_answer_agent_runs_for_comment(&comment).unwrap().is_empty());
+
+        let first = db
+            .create_answer_agent_run(&comment, "work_item", "t1", "v0", 0)
+            .unwrap();
+        db.complete_answer_agent_run(&first.id, "failed", None, Some("api_error"))
+            .unwrap();
+        let second = db
+            .create_answer_agent_run(&comment, "work_item", "t1", "v1", 1)
+            .unwrap();
+        db.complete_answer_agent_run(&second.id, "replied", Some("done"), None)
+            .unwrap();
+
+        let all = db.list_answer_agent_runs_for_comment(&comment).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].id, first.id);
+        assert_eq!(all[0].status, "failed");
+        assert_eq!(all[1].id, second.id);
+        assert_eq!(all[1].status, "replied");
+
+        // A different comment's history is isolated.
+        let other = make_comment(&db, "t2");
+        assert!(db.list_answer_agent_runs_for_comment(&other).unwrap().is_empty());
+    }
+
+    /// Two concurrent recoveries of the same stranded comment — e.g.
+    /// `finalize_answer_agent`'s Stop-triggered recovery racing
+    /// `stranded_answering_sweep::reconcile_on_event`'s SessionEnd-triggered
+    /// recovery — both read the same `running` run id before either commits.
+    /// Only the winner's `complete_answer_agent_run` call actually
+    /// transitions the row; the loser must not also post the apology thread
+    /// entry, or the thread ends up with two.
+    #[test]
+    fn recover_unanswered_comment_posts_the_apology_only_once_under_a_race() {
+        let db = mem_db();
+        let comment = make_comment(&db, "t1");
+        db.transition_comment_to_answering(&comment).unwrap();
+        let run = db
+            .create_answer_agent_run(&comment, "work_item", "t1", "v0", 0)
+            .unwrap();
+
+        // Both racers observed the same `running` run id before either
+        // committed its completion.
+        let winner = db.recover_unanswered_comment(&comment, Some(&run.id), "stranded_no_stop");
+        assert!(winner.is_ok());
+
+        // The loser's transition attempt on the run fails (already
+        // terminal) and its comment transition attempt also fails (the
+        // winner already moved it out of `answering`) — both are expected,
+        // benign no-ops, not a second apology.
+        let _ = db.recover_unanswered_comment(&comment, Some(&run.id), "no_reply_posted");
+
+        let entries = db.list_comment_thread_entries(&comment).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "a losing racer must not post a duplicate apology entry"
+        );
+    }
+}

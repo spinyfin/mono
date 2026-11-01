@@ -19,6 +19,7 @@ rust_library(
         "//tools/boss/engine/metrics:__pkg__",
         "//tools/boss/engine/pr-review-sources:__pkg__",
         "//tools/boss/engine/timer-wheel:__pkg__",
+        "//tools/boss/engine/work-db:__pkg__",
         "//tools/boss/github_tracker:__pkg__",
     ],
     deps = all_crate_deps(normal = True),

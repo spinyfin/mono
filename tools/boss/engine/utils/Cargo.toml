@@ -5,6 +5,7 @@ edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
+fastrand = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
 libc = { workspace = true }

@@ -12,6 +12,7 @@ rust_library(
     visibility = [
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/timer-wheel:__pkg__",
+        "//tools/boss/engine/work-db:__pkg__",
     ],
     deps = [
         "//tools/boss/engine/metrics-registry:metrics_registry",

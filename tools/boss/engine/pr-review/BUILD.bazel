@@ -14,6 +14,7 @@ rust_library(
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/driver:__pkg__",
         "//tools/boss/engine/proposal-validation:__pkg__",
+        "//tools/boss/engine/work-db:__pkg__",
     ],
     deps = [
         "//tools/boss/engine/pr-template",

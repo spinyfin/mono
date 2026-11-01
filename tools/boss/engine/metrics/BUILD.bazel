@@ -12,10 +12,33 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/work-db:__pkg__",
     ],
     deps = [
+        "//tools/boss/engine/day-rotated-log",
         "//tools/boss/engine/metrics-registry:metrics_registry",
         "//tools/boss/engine/task-scope",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_library(
+    name = "metrics_test_support",
+    testonly = True,
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = ["test-support"],
+    crate_name = "boss_metrics",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = [
+        "//tools/boss/engine/work-db:__pkg__",
+    ],
+    deps = [
+        "//tools/boss/engine/day-rotated-log",
+        "//tools/boss/engine/metrics-registry:metrics_registry",
+        "//tools/boss/engine/task-scope",
+        "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
 )
 
@@ -29,8 +52,10 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//tools/boss/engine/day-rotated-log",
         "//tools/boss/engine/metrics-registry:metrics_registry",
         "//tools/boss/engine/task-scope",
+        "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,

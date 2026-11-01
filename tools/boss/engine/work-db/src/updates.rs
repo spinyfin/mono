@@ -1,0 +1,812 @@
+use super::*;
+use unicode_segmentation::UnicodeSegmentation;
+
+/// Max length of `blocked_reason`, in grapheme clusters (not bytes, not
+/// `char`s — `🚧 Future` must cost 9, not more). The pill title-cases and
+/// hard-truncates at one line; anything longer belongs in `blocked_detail`
+/// instead, which is unlimited and rendered verbatim as a tooltip.
+///
+/// Measured against the kanban card's blocked pill at its default board
+/// column width: the reported bad input (`FUTURE — deferred scope per
+/// design doc; requires explicit operator approval to start`, 84
+/// graphemes) visibly truncates after 44 characters
+/// (`Future — Deferred Scope Per Design Doc; Requ…`). 40 sits just below
+/// that measured fit point — leaving a small margin for strings with
+/// wider average character width than the measured sample — while
+/// staying comfortably above every real label in use today (the longest
+/// built-in discriminator is `ci_failure_exhausted` at 20 graphemes, and
+/// the example custom tag `🚧 Future` is 8).
+pub const BLOCKED_REASON_MAX_GRAPHEMES: usize = 40;
+
+/// Reject a `blocked_reason` patch value that would render as a
+/// truncated, unrecoverable pill. Validates the incoming value only —
+/// never the value already stored on a row, so updating an unrelated
+/// field on a row with a pre-existing over-long `blocked_reason` (from
+/// before this limit existed) still succeeds.
+fn validate_blocked_reason_length(reason: &str) -> Result<()> {
+    let len = reason.graphemes(true).count();
+    if len > BLOCKED_REASON_MAX_GRAPHEMES {
+        bail!(
+            "blocked_reason is too long ({len} graphemes, max {BLOCKED_REASON_MAX_GRAPHEMES}): \
+             it renders as a short pill label and truncates anything longer. \
+             Put the full explanation in --blocked-detail instead — it has no length limit \
+             and renders verbatim as a tooltip on the pill."
+        );
+    }
+    Ok(())
+}
+
+/// Count every live task under a project, using the canonical terminal
+/// vocabulary shared by [`TaskStatus::is_terminal`]. Status provenance uses
+/// both numbers so a deliberate completion with open work says so explicitly
+/// instead of looking like an automatic certification.
+fn project_task_completion_counts(conn: &Connection, project_id: &str) -> Result<(i64, i64)> {
+    conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(CASE
+                    WHEN status IN ('done', 'archived') THEN 0
+                    ELSE 1
+                END), 0)
+         FROM tasks
+         WHERE project_id = ?1 AND deleted_at IS NULL",
+        [project_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .map_err(Into::into)
+}
+
+fn explicit_project_status_basis(
+    conn: &Connection,
+    project_id: &str,
+    actor: &str,
+    previous: ProjectStatus,
+    next: ProjectStatus,
+) -> Result<String> {
+    if next != ProjectStatus::Done {
+        return Ok(format!(
+            "status transition requested by {actor}: {} to {}",
+            previous.as_str(),
+            next.as_str()
+        ));
+    }
+
+    let (total, open) = project_task_completion_counts(conn, project_id)?;
+    let terminal = total - open;
+    if open == 0 {
+        Ok(format!(
+            "completion requested by {actor} after all {total} live task(s) reached a terminal status"
+        ))
+    } else {
+        Ok(format!(
+            "completion override requested by {actor} with {open} open and {terminal} terminal live task(s)"
+        ))
+    }
+}
+
+/// Chores and project tasks change kind with membership. Follow-ups keep
+/// their kind and origin provenance independently of project membership.
+/// Design seeds belong to their project, investigations remain project-less,
+/// and revisions inherit membership from their parent chain. The legacy
+/// generic task kind has no defined reassignment semantics.
+fn is_movable_project_membership_kind(kind: &TaskKind) -> bool {
+    matches!(kind, TaskKind::Chore | TaskKind::ProjectTask | TaskKind::Followup)
+}
+
+/// Stamp mechanism / time / reason when `update_task` first moves a row
+/// to `archived`. Human archives stay `manual_status_change` with an
+/// optional reason. Automated actors (`boss`, `engine`, `boothby`, `progression`) must
+/// record a non-empty reason — never a constant placeholder and never a
+/// blanket `None` that would wipe a caller-supplied value.
+fn apply_archive_transition_provenance(db: &WorkDb, task: &mut Task, actor: &str) -> Result<()> {
+    task.archived_at = Some(task.updated_at.clone());
+    if actor == LAST_STATUS_ACTOR_HUMAN {
+        task.archived_by = Some(ARCHIVE_MECHANISM_MANUAL_STATUS_CHANGE.to_owned());
+        return Ok(());
+    }
+    if actor == LAST_STATUS_ACTOR_BOOTHBY {
+        let context = db.armed_boothby_action()?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot archive {} as boothby without an armed action context (verb + rationale)",
+                task.id
+            )
+        })?;
+        let verb = context.verb.trim();
+        if verb.is_empty() {
+            bail!("cannot archive {} as boothby: armed verb is empty", task.id);
+        }
+        task.archived_by = Some(verb.to_owned());
+        if task.archived_reason.as_deref().is_none_or(|s| s.trim().is_empty()) {
+            let rationale = context.rationale.trim();
+            if rationale.is_empty() {
+                bail!(
+                    "cannot archive {} as boothby without a rationale or archived_reason",
+                    task.id
+                );
+            }
+            task.archived_reason = Some(rationale.to_owned());
+        }
+        return Ok(());
+    }
+
+    if task.archived_reason.as_deref().is_none_or(|s| s.trim().is_empty()) {
+        bail!(
+            "cannot archive {} as actor `{actor}` without an archived_reason; \
+             automated archives must record the condition that was met \
+             (pass --archived-reason)",
+            task.id
+        );
+    }
+    task.archived_by = Some(if actor == boss_protocol::LAST_STATUS_ACTOR_BOSS {
+        ARCHIVE_MECHANISM_BOSS_STATUS_CHANGE.to_owned()
+    } else if actor == boss_protocol::LAST_STATUS_ACTOR_ENGINE {
+        ARCHIVE_MECHANISM_ENGINE_STATUS_CHANGE.to_owned()
+    } else {
+        format!("{actor}_status_change")
+    });
+    Ok(())
+}
+
+/// Normalize and validate a free-form tag list for a leaf work item.
+/// Trims whitespace, drops empty strings, de-duplicates (first wins),
+/// and enforces [`boss_protocol::WORK_ITEM_TAG_MAX_LEN`] /
+/// [`boss_protocol::WORK_ITEM_TAG_MAX_COUNT`]. Length is measured in
+/// Unicode scalar values (Rust `char`s), matching the Swift UI chip
+/// truncation so a tag that survives the write path still fits the card.
+pub(crate) fn normalize_and_validate_tags(input: &[String]) -> Result<Vec<String>> {
+    use boss_protocol::{WORK_ITEM_TAG_MAX_COUNT, WORK_ITEM_TAG_MAX_LEN};
+    let mut out: Vec<String> = Vec::new();
+    for raw in input {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let len = trimmed.chars().count();
+        if len > WORK_ITEM_TAG_MAX_LEN {
+            bail!(
+                "tag is too long ({len} chars, max {WORK_ITEM_TAG_MAX_LEN}): `{trimmed}`. \
+                 Keep tags short so kanban chips stay readable."
+            );
+        }
+        if out.iter().any(|existing| existing == trimmed) {
+            continue;
+        }
+        out.push(trimmed.to_owned());
+    }
+    if out.len() > WORK_ITEM_TAG_MAX_COUNT {
+        bail!(
+            "too many tags ({}, max {WORK_ITEM_TAG_MAX_COUNT}). \
+             Remove some tags before adding more.",
+            out.len()
+        );
+    }
+    Ok(out)
+}
+
+/// Apply set / add / remove tag patch fields onto the current list.
+/// Order: replace (if `set` is `Some`) → append adds → drop removes.
+/// Final list is re-validated for length/count caps.
+pub(crate) fn apply_tag_patch(
+    current: &[String],
+    set: Option<Vec<String>>,
+    add: Option<Vec<String>>,
+    remove: Option<Vec<String>>,
+) -> Result<Vec<String>> {
+    let mut tags = if let Some(set) = set {
+        normalize_and_validate_tags(&set)?
+    } else {
+        current.to_vec()
+    };
+    if let Some(add) = add {
+        let mut combined = tags;
+        combined.extend(add);
+        tags = normalize_and_validate_tags(&combined)?;
+    }
+    if let Some(remove) = remove {
+        let remove_set: Vec<String> = remove
+            .into_iter()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        tags.retain(|t| !remove_set.iter().any(|r| r == t));
+    }
+    Ok(tags)
+}
+
+#[work_db_boundary::instrument]
+impl WorkDb {
+    pub fn update_product(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut product = query_product(&tx, id).require("product", id)?;
+        let previous_status = product.status.clone();
+        let status_changed = patch.status.is_some();
+
+        apply_text_patch(&mut product.name, patch.name);
+        if let Some(description) = patch.description.as_deref() {
+            super::description_guard::validate_description_update(
+                &product.description,
+                description,
+                patch.force_shrink,
+            )?;
+        }
+        apply_text_patch(&mut product.description, patch.description);
+        apply_repo_remote_url_patch(&mut product.repo_remote_url, patch.repo_remote_url);
+        apply_repo_remote_url_patch(&mut product.design_repo, patch.design_repo);
+        apply_repo_remote_url_patch(&mut product.docs_repo, patch.docs_repo);
+        apply_text_patch(&mut product.status, patch.status);
+        apply_optional_string_patch(&mut product.default_model, patch.default_model);
+        apply_optional_string_patch(&mut product.default_driver, patch.default_driver);
+        apply_optional_string_patch(&mut product.dispatch_preamble, patch.dispatch_preamble);
+        apply_optional_string_patch(&mut product.design_guidance, patch.design_guidance);
+        apply_optional_string_patch(&mut product.worker_branch_prefix, patch.worker_branch_prefix);
+        // Re-canonicalise so a patched (or pre-existing) prefix always
+        // carries its trailing `/`; idempotent on already-canonical
+        // values and on `None`.
+        product.worker_branch_prefix = canonicalize_worker_branch_prefix(product.worker_branch_prefix.take());
+        product.slug = unique_product_slug_for_update(&tx, id, &slugify(&product.name))?;
+        product.updated_at = now_string();
+        if status_changed && product.status != previous_status {
+            product.last_status_actor = Some(actor.to_owned());
+            product.status_basis = Some(format!(
+                "status transition requested by {actor}: {previous_status} to {}",
+                product.status
+            ));
+        }
+
+        tx.execute(
+            "UPDATE products
+             SET name = ?2, slug = ?3, description = ?4, repo_remote_url = ?5, status = ?6, updated_at = ?7, default_model = ?8, dispatch_preamble = ?9, design_repo = ?10, worker_branch_prefix = ?11, docs_repo = ?12, default_driver = ?13, design_guidance = ?14, last_status_actor = ?15, status_basis = ?16
+             WHERE id = ?1",
+            params![
+                product.id,
+                product.name,
+                product.slug,
+                product.description,
+                product.repo_remote_url,
+                product.status,
+                product.updated_at,
+                product.default_model,
+                product.dispatch_preamble,
+                product.design_repo,
+                product.worker_branch_prefix,
+                product.docs_repo,
+                product.default_driver,
+                product.design_guidance,
+                product.last_status_actor,
+                product.status_basis,
+            ],
+        )?;
+
+        let updated = query_product(&tx, id).require("product", id)?;
+        tx.commit()?;
+        Ok(WorkItem::Product(updated))
+    }
+
+    #[tracing::instrument(name = "project_transaction", level = "debug", skip_all)]
+    pub(crate) fn update_project(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
+        let mut conn = self.connect()?;
+        tracing::debug!(target: "work_write_timing", boundary = "transaction_begin");
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut project = query_project(&tx, id).require("project", id)?;
+        // Pre-image for the Boothby audit trail. Cloned unconditionally
+        // rather than behind the actor gate: `project` is mutated in place
+        // by the patch application below, so by the time the gate is
+        // consulted the original is gone. One clone of a small struct on a
+        // path that already does several SQL round-trips.
+        let before = project.clone();
+        let previous_status = project.status;
+        let status_changed = patch.status.is_some();
+
+        apply_text_patch(&mut project.name, patch.name);
+        if let Some(description) = patch.description.as_deref() {
+            super::description_guard::validate_description_update(
+                &project.description,
+                description,
+                patch.force_shrink,
+            )?;
+        }
+        apply_text_patch(&mut project.description, patch.description);
+        apply_text_patch(&mut project.goal, patch.goal);
+        if let Some(status_str) = patch.status {
+            project.status = status_str.parse::<ProjectStatus>().map_err(|e| anyhow::anyhow!(e))?;
+        }
+        apply_text_patch(&mut project.priority, patch.priority);
+        project.slug = unique_project_slug_for_update(&tx, &project.product_id, id, &slugify(&project.name))?;
+        project.updated_at = now_string();
+
+        if status_changed {
+            refuse_manual_move_off_blocked_while_gated(&tx, id, previous_status.as_str(), project.status.as_str())?;
+        }
+        let actual_status_change = status_changed && previous_status != project.status;
+        if actual_status_change
+            && project.status == ProjectStatus::Done
+            && actor == boss_protocol::LAST_STATUS_ACTOR_ENGINE
+        {
+            bail!(
+                "engine-originated project completion is not allowed: only an explicit operator or audited agent action may mark a project done"
+            );
+        }
+        let status_basis = if actual_status_change {
+            Some(explicit_project_status_basis(
+                &tx,
+                id,
+                actor,
+                previous_status,
+                project.status,
+            )?)
+        } else {
+            None
+        };
+        let actor_stamp = if actual_status_change { actor } else { "" };
+
+        tx.execute(
+            "UPDATE projects
+             SET name = ?2, slug = ?3, description = ?4, goal = ?5, status = ?6, priority = ?7, updated_at = ?8,
+                 last_status_actor = CASE WHEN ?9 = '' THEN last_status_actor ELSE ?9 END,
+                 status_basis = CASE WHEN ?9 = '' THEN status_basis ELSE ?10 END
+             WHERE id = ?1",
+            params![
+                project.id,
+                project.name,
+                project.slug,
+                project.description,
+                project.goal,
+                project.status.as_str(),
+                project.priority,
+                project.updated_at,
+                actor_stamp,
+                status_basis,
+            ],
+        )?;
+
+        let mut pending = PendingEvents::new();
+        if actual_status_change {
+            cascade_dependents_after_prereq_status_change(
+                &mut pending,
+                &tx,
+                id,
+                project.status.as_str(),
+                &project.updated_at,
+            )?;
+            record_project_status_audit(
+                &tx,
+                id,
+                previous_status,
+                project.status,
+                actor,
+                status_basis.as_deref().expect("status transition basis"),
+                &project.updated_at,
+            )?;
+        }
+
+        let updated = query_project(&tx, id).require("project", id)?;
+        // Audit inside `tx`: the action row and the write it describes
+        // commit together or not at all. Inert unless `actor` is Boothby.
+        boothby::capture_project_update(&tx, self, actor, &before, &updated, &project.updated_at)?;
+        commit_and_publish(tx, pending, self.event_bus())?;
+        Ok(WorkItem::Project(updated))
+    }
+
+    pub fn update_task(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
+        // Fail fast, before opening a transaction: validate the incoming
+        // value only (never a value already sitting in a row from before
+        // this limit existed — see `validate_blocked_reason_length`).
+        if let Some(reason) = patch.blocked_reason.as_deref() {
+            validate_blocked_reason_length(reason)?;
+        }
+        let blocked_detail_patch_requests_set = patch.blocked_detail.as_deref().is_some_and(|s| !s.is_empty());
+        let archived_reason_patch_requests_set = patch.archived_reason.as_deref().is_some_and(|s| !s.is_empty());
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut pending = PendingEvents::new();
+        let mut task = query_task(&tx, id).require("task", id)?;
+        let previous_status = task.status.clone();
+        // Check this before the generic tombstone bail below: an
+        // archived-and-tombstoned moot revision (see
+        // `block_pending_revisions_on_parent_close`) is also a deleted
+        // task, so without this ordering every attempt to reopen one would
+        // surface the generic "cannot update a deleted task" message
+        // instead of the specific, actionable explanation.
+        if let Some(status_str) = patch.status.as_deref() {
+            let requested_status = status_str.parse::<TaskStatus>().map_err(|e| anyhow::anyhow!(e))?;
+            refuse_manual_move_off_archived_moot_revision(&tx, id, &task.kind, &previous_status, &requested_status)?;
+        }
+        if task.deleted_at.is_some() {
+            bail!("cannot update a deleted task: {id}");
+        }
+        if patch.project_id.is_some() && !is_movable_project_membership_kind(&task.kind) {
+            bail!(
+                "cannot move {id}: kind `{}` has its own project-membership semantics \
+                 and cannot be reassigned between projects or the no-project state \
+                 (only `chore`, `project_task`, and `followup` rows are movable)",
+                task.kind
+            );
+        }
+        // Pre-image for the Boothby audit trail — see the note in
+        // `update_project`. Taken after the two refusal checks above so a
+        // rejected patch never reaches the audit path at all.
+        let before = task.clone();
+        let previous_blocked_reason = task.blocked_reason.clone();
+        let status_changed = patch.status.is_some();
+
+        apply_text_patch(&mut task.name, patch.name);
+        if let Some(description) = patch.description.as_deref() {
+            super::description_guard::validate_description_update(&task.description, description, patch.force_shrink)?;
+        }
+        apply_text_patch(&mut task.description, patch.description);
+        if let Some(status_str) = patch.status {
+            task.status = status_str.parse::<TaskStatus>().map_err(|e| anyhow::anyhow!(e))?;
+        }
+        apply_optional_patch(&mut task.pr_url, patch.pr_url);
+        // Reject non-empty repo override when the product has its own repo.
+        if let Some(ref repo_patch) = patch.repo_remote_url
+            && !repo_patch.trim().is_empty()
+        {
+            let product = query_product(&tx, &task.product_id)?
+                .with_context(|| format!("orphan task {id}: parent product {} missing", task.product_id))?;
+            if let Some(product_repo) = product.repo_remote_url.as_deref() {
+                bail!(
+                    "cannot set per-task repo override on product `{}`: \
+                         product has its own repo (`{}`). \
+                         Clear the product's repo first, or omit --repo to inherit.",
+                    product.slug,
+                    product_repo,
+                );
+            }
+        }
+        apply_repo_remote_url_patch(&mut task.repo_remote_url, patch.repo_remote_url);
+        if let Some(priority_patch) = patch.priority {
+            let requested = normalize_priority(Some(&priority_patch))?;
+            // `critical` is the human owner's escape hatch: a raise to it
+            // is accepted only from the human caller tier — see
+            // `critical_priority`. Lowering is an ordinary change.
+            super::critical_priority::authorize_priority_write(&requested, Some(&task.priority), actor)?;
+            if super::critical_priority::is_critical(&requested)
+                && !super::critical_priority::is_critical(&task.priority)
+            {
+                task.critical_set_by = Some(actor.to_owned());
+                task.critical_set_at = Some(now_string());
+            }
+            task.priority = requested;
+        }
+        // Critical provenance documents the row's *current* level only.
+        if !super::critical_priority::is_critical(&task.priority) {
+            task.critical_set_by = None;
+            task.critical_set_at = None;
+        }
+        let effort_level_patched = patch.effort_level.is_some();
+        let effort_provenance_patched = patch.effort_matched_rule.is_some() || patch.effort_reasons.is_some();
+        if let Some(effort_patch) = patch.effort_level {
+            // Empty string clears the column; anything else must
+            // parse as one of the five allowed levels. Invalid
+            // values reject the whole patch — no half-updates.
+            let trimmed = effort_patch.trim();
+            task.effort_level = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.parse::<EffortLevel>().map_err(|e| anyhow::anyhow!(e))?)
+            };
+        }
+        if let Some(reasoning_patch) = patch.reasoning {
+            // Same contract as `effort_level` above: empty string clears the
+            // column (back to the dispatcher's legacy path), anything else
+            // must parse, and an invalid value rejects the whole patch rather
+            // than half-applying it.
+            let trimmed = reasoning_patch.trim();
+            task.reasoning = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.parse::<ReasoningMode>().map_err(|e| anyhow::anyhow!(e))?)
+            };
+        }
+        // Effort provenance: explicit patch values win. When `effort_level`
+        // is changed without also supplying provenance, clear both columns
+        // so a hand-set level is detectable by the absence of
+        // `effort_matched_rule` (and so a clear of effort_level does not
+        // leave orphan provenance behind).
+        if effort_level_patched && !effort_provenance_patched {
+            task.effort_matched_rule = None;
+            task.effort_reasons = None;
+        }
+        apply_optional_string_patch(&mut task.effort_matched_rule, patch.effort_matched_rule);
+        apply_optional_string_patch(&mut task.effort_reasons, patch.effort_reasons);
+        if task.effort_level.is_none() {
+            // Provenance cannot outlive its level — same invariant as
+            // blocked_detail / blocked_reason.
+            task.effort_matched_rule = None;
+            task.effort_reasons = None;
+        }
+        apply_optional_string_patch(&mut task.model_override, patch.model_override);
+        apply_optional_string_patch(&mut task.driver, patch.driver);
+        apply_optional_string_patch(&mut task.blocked_reason, patch.blocked_reason);
+        apply_optional_string_patch(&mut task.blocked_detail, patch.blocked_detail);
+        apply_optional_string_patch(&mut task.archived_reason, patch.archived_reason);
+        if let Some(autostart) = patch.autostart {
+            task.autostart = autostart;
+        }
+        // Approving (`--deferred false`) pulls a future-scope item into
+        // scope so the reconciler/cascade can mint a `ready` execution for
+        // it again; `--deferred true` re-parks it. `task.deferred` was
+        // loaded from the row by `query_task`, so writing it back below
+        // never clobbers an unrelated update.
+        if let Some(deferred) = patch.deferred {
+            task.deferred = deferred;
+        }
+        if let Some(human_driven) = patch.human_driven {
+            task.human_driven = human_driven;
+            // Marking a row human-driven permanently parks auto-dispatch.
+            if human_driven {
+                task.autostart = false;
+            }
+        }
+        if let Some(design_reasoning_effort_xhigh) = patch.design_reasoning_effort_xhigh {
+            if design_reasoning_effort_xhigh && task.kind != TaskKind::Design {
+                bail!(
+                    "design reasoning effort xhigh is only valid for kind=design; {} is kind={}",
+                    task.id,
+                    task.kind
+                );
+            }
+            if task.kind == TaskKind::Design {
+                task.design_reasoning_effort_xhigh = design_reasoning_effort_xhigh;
+            }
+        }
+        if let Some(summary) = patch.completion_summary {
+            // Empty string clears; non-empty stores the human close summary.
+            let trimmed = summary.trim();
+            task.completion_summary = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            };
+        }
+        if patch.tags.is_some() || patch.add_tags.is_some() || patch.remove_tags.is_some() {
+            task.tags = apply_tag_patch(
+                &task.tags,
+                patch.tags.clone(),
+                patch.add_tags.clone(),
+                patch.remove_tags.clone(),
+            )?;
+        }
+        if let Some(ordinal) = patch.ordinal {
+            task.ordinal = Some(ordinal);
+        }
+        // A project move allocates an ordinal in the destination (or clears
+        // it outside projects), overriding any explicit patch.ordinal above.
+        // Only chores/project tasks change kind; follow-up identity and
+        // origin/review provenance are independent of membership.
+        // Whether to cascade the (possibly unchanged) project assignment onto
+        // this task's revision chain after the write below. Set whenever a
+        // `project_id` patch is present at all — including a no-op
+        // re-application of the current value — so re-running `--set-project`
+        // with the project a task already has is the repair path for any
+        // revision that drifted out of sync before this cascade existed (see
+        // `cascade_project_id_to_revisions`). A short-circuit here would make
+        // that repair path unreachable.
+        let mut cascade_project_to_revisions = false;
+        if let Some(ref project_patch) = patch.project_id {
+            let trimmed = project_patch.trim();
+            let target_project_id = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            };
+            if let Some(target) = target_project_id.as_deref() {
+                ensure_project_belongs_to_product(&tx, target, &task.product_id)
+                    .with_context(|| format!("cannot move {id} into project {target}"))?;
+            }
+            if target_project_id != task.project_id {
+                task.ordinal = match target_project_id.as_deref() {
+                    Some(target) => Some(next_task_ordinal(&tx, target)?),
+                    None => None,
+                };
+                if task.kind != TaskKind::Followup {
+                    task.kind = if target_project_id.is_some() {
+                        TaskKind::ProjectTask
+                    } else {
+                        TaskKind::Chore
+                    };
+                }
+                task.project_id = target_project_id;
+            }
+            cascade_project_to_revisions = true;
+        }
+        task.updated_at = now_string();
+
+        // Invariant: blocked_reason and blocked_attempt_id must be NULL for any
+        // non-blocked status. Enforce this here so every write path honours it,
+        // not just the engine's targeted CI/conflict-resolution helpers.
+        if task.status != TaskStatus::Blocked {
+            task.blocked_reason = None;
+            task.blocked_attempt_id = None;
+        }
+        // Archival provenance only documents the row's current archived
+        // status, so it must not linger after any reopening transition.
+        if task.status != TaskStatus::Archived {
+            // Reject rather than silently drop: a non-empty archived_reason
+            // on a row that is not (and is not becoming) archived is the
+            // same shape as a blocked_detail with no blocked_reason — very
+            // likely the caller forgetting --status archived / --to archived.
+            if archived_reason_patch_requests_set {
+                bail!(
+                    "cannot set archived_reason on {id}: the row is not moving to archived; \
+                     pass --archived-reason only with --status archived or --to archived"
+                );
+            }
+            task.archived_by = None;
+            task.archived_at = None;
+            task.archived_reason = None;
+        }
+        // Invariant: blocked_detail cannot outlive blocked_reason — a
+        // detail with nothing to explain is meaningless. Clear it
+        // whenever the row ends up with no reason, whether that's because
+        // this patch cleared blocked_reason directly or because it moved
+        // the status off `blocked` (which already nulled blocked_reason
+        // above).
+        if task.blocked_reason.is_none() {
+            task.blocked_detail = None;
+        }
+        // Reject rather than silently drop: if this patch explicitly asked
+        // to set a non-empty blocked_detail but the row has no
+        // blocked_reason to attach it to (the clear above just fired),
+        // that's very likely the caller forgetting --blocked-reason, not
+        // an intentional no-op.
+        if blocked_detail_patch_requests_set && task.blocked_reason.is_none() {
+            bail!(
+                "cannot set blocked_detail without a blocked_reason on {id}: \
+                 pass --blocked-reason alongside --blocked-detail (or update a task \
+                 that already has a blocked_reason set)"
+            );
+        }
+
+        if status_changed {
+            refuse_manual_move_off_blocked_while_gated(&tx, id, previous_status.as_str(), task.status.as_str())?;
+        }
+        // Human-driven close ritual: moving to `done` requires a non-empty
+        // completion_summary (supplied by `boss task complete --summary`).
+        // Archival remains an ordinary escape and does not require a summary.
+        if status_changed && task.status == TaskStatus::Done && task.human_driven {
+            let summary_ok = task.completion_summary.as_deref().is_some_and(|s| !s.trim().is_empty());
+            if !summary_ok {
+                bail!(
+                    "human-driven work item {id} cannot move to done without a completion summary; \
+                     use `boss task complete {id} --summary \"…\"`. \
+                     Agents must not close human-driven rows."
+                );
+            }
+        }
+        // Leaving a terminal status clears the close summary so a reopened
+        // human-driven row does not carry a stale outcome.
+        if status_changed && !task.status.is_terminal() {
+            task.completion_summary = None;
+        }
+        let actor_stamp = if status_changed && previous_status != task.status {
+            actor
+        } else {
+            ""
+        };
+        if status_changed && previous_status != task.status && task.status == TaskStatus::Archived {
+            apply_archive_transition_provenance(self, &mut task, actor)?;
+        }
+
+        let effort_level_value = task.effort_level.map(|level| level.as_str().to_owned());
+        let reasoning_value = task.reasoning.map(|mode| mode.as_str().to_owned());
+        let tags_value = encode_task_tags(&task.tags);
+
+        crate::task_status_audit::execute(
+            &tx,
+            "update_task",
+            actor,
+            "UPDATE tasks
+             SET name = ?2, description = ?3, status = ?4, ordinal = ?5, pr_url = ?6, updated_at = ?7,
+                 priority = ?9, repo_remote_url = ?10,
+                 effort_level = ?11, model_override = ?12, autostart = ?13,
+                 blocked_reason = ?14, blocked_attempt_id = ?15, driver = ?16,
+                 archived_reason = ?17, blocked_detail = ?18, deferred = ?19,
+                 reasoning = ?20, tags = ?21, human_driven = ?22, completion_summary = ?23,
+                 effort_matched_rule = ?24, effort_reasons = ?25, project_id = ?26, kind = ?27,
+                 archived_by = ?28, archived_at = ?29, design_reasoning_effort_xhigh = ?30,
+                 critical_set_by = ?31, critical_set_at = ?32,
+                 last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END,
+                 completed_at = CASE
+                     WHEN ?4 IN ('done', 'archived') THEN COALESCE(completed_at, ?7)
+                     ELSE NULL
+                 END
+             WHERE id = ?1",
+            params![
+                task.id,
+                task.name,
+                task.description,
+                task.status.as_str(),
+                task.ordinal,
+                task.pr_url,
+                task.updated_at,
+                actor_stamp,
+                task.priority,
+                task.repo_remote_url,
+                effort_level_value,
+                task.model_override,
+                task.autostart as i64,
+                task.blocked_reason,
+                task.blocked_attempt_id,
+                task.driver,
+                task.archived_reason,
+                task.blocked_detail,
+                task.deferred as i64,
+                reasoning_value,
+                tags_value,
+                task.human_driven as i64,
+                task.completion_summary,
+                task.effort_matched_rule,
+                task.effort_reasons,
+                task.project_id,
+                task.kind.as_str(),
+                task.archived_by,
+                task.archived_at,
+                task.design_reasoning_effort_xhigh as i64,
+                task.critical_set_by,
+                task.critical_set_at,
+            ],
+        )?;
+
+        if cascade_project_to_revisions {
+            cascade_project_id_to_revisions(&tx, id, task.project_id.as_deref(), &task.updated_at)?;
+        }
+
+        // Re-classifying an item as deferred pulls it out of the dispatch
+        // pool immediately: abandon any not-yet-live execution so a row that
+        // was already queued (`ready` / `waiting_dependency`) can't dispatch
+        // before the reconcile gate next runs. A live worker
+        // (`running` / `waiting_human`) is left alone — it self-retires. The
+        // reconcile guard (`work_item_is_deferred`) then keeps it parked.
+        if patch.deferred == Some(true) {
+            abandon_pending_executions(&mut pending, &tx, id, &task.updated_at)?;
+        }
+
+        if status_changed && previous_status != task.status {
+            cascade_dependents_after_prereq_status_change(
+                &mut pending,
+                &tx,
+                id,
+                task.status.as_str(),
+                &task.updated_at,
+            )?;
+        }
+
+        // Manual-override suppression for `blocked: ci_failure` /
+        // `ci_failure_exhausted` (design §Q5 / Phase 12 #38). A human
+        // pulling a chore out of the CI-failure column is a signal that
+        // the engine should keep its hands off the current head sha —
+        // otherwise the very next probe re-observes the failure and
+        // immediately re-flips the row. We honour the override by:
+        //   1) inserting a `ci_failure_suppressions` row keyed on the
+        //      head_sha of the most recent CI attempt (a fresh push
+        //      changes the key and naturally invalidates suppression),
+        //   2) resetting `ci_attempts_used` so a future probe (on a
+        //      new head) starts with a fresh budget — mirrors the
+        //      `boss engine ci retry` reset rule.
+        if status_changed
+            && previous_status == TaskStatus::Blocked
+            && task.status != TaskStatus::Blocked
+            && matches!(
+                previous_blocked_reason.as_deref(),
+                Some("ci_failure") | Some("ci_failure_exhausted")
+            )
+        {
+            record_ci_failure_suppression_in_tx(&tx, id, &task.updated_at)?;
+        }
+
+        let mut updated = query_task(&tx, id).require("task", id)?;
+        // Same single-item projection `get_work_item` runs, so SetStatus's
+        // WorkItemUpdated does not flicker derived flags to mapper zeros
+        // for the 150 ms until the invalidation refetch lands.
+        project_for_work_item_updated(&tx, &mut updated, "update_task");
+        // Audit inside `tx`: the action row and the write it describes
+        // commit together or not at all. Inert unless `actor` is Boothby.
+        // Derived fields are not part of `task_image`, so projecting
+        // before capture does not journal a no-op as a mutation.
+        boothby::capture_task_update(&tx, self, actor, &before, &updated, &task.updated_at)?;
+        commit_and_publish(tx, pending, self.event_bus())?;
+        Ok(task_to_item(updated))
+    }
+}

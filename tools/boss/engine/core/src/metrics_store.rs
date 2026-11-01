@@ -1,35 +1,12 @@
-//! `WorkDb` as the engine's durable [`MetricsStore`].
+//! Persistence tests for `WorkDb` as the engine's durable [`MetricsStore`].
 //!
-//! The metrics framework ([`boss_metrics`]) persists through the
-//! [`MetricsStore`] trait rather than against a concrete database,
-//! which is what lets it live in its own crate. This adapter is the
-//! engine's side of that boundary: it forwards to the inherent
-//! `WorkDb::metrics_*` methods, which own the actual SQL against the
-//! `metrics_counter` / `metrics_gauge` tables in `state.db` (see
-//! `work/metrics_db.rs`).
+//! The trait implementation lives with storage (`boss_work_db`) so the
+//! metrics crate and `WorkDb` stay independent of engine core.
 
-use anyhow::Result;
-use boss_metrics::{MetricsCounterRow, MetricsGaugeRow, MetricsStore};
-
+#[cfg(test)]
 use crate::work::WorkDb;
-
-impl MetricsStore for WorkDb {
-    fn metrics_load_all(&self) -> Result<(Vec<MetricsCounterRow>, Vec<MetricsGaugeRow>)> {
-        WorkDb::metrics_load_all(self)
-    }
-
-    fn metrics_flush(&self, counters: &[MetricsCounterRow], gauges: &[MetricsGaugeRow]) -> Result<()> {
-        WorkDb::metrics_flush(self, counters, gauges)
-    }
-
-    fn metrics_reset_one(&self, name: &str, now_ms: i64) -> Result<(bool, bool)> {
-        WorkDb::metrics_reset_one(self, name, now_ms)
-    }
-
-    fn metrics_reset_all(&self, now_ms: i64) -> Result<(usize, usize)> {
-        WorkDb::metrics_reset_all(self, now_ms)
-    }
-}
+#[cfg(test)]
+use boss_metrics::MetricsStore;
 
 /// Round-trip coverage for the real sqlite-backed store. The
 /// framework's own logic is unit-tested against an in-memory fake

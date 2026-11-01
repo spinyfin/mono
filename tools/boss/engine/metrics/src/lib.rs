@@ -22,9 +22,9 @@
 //! metric doesn't rebuild `boss-engine`, the largest Rust target in
 //! the repo. This crate re-exports that vocabulary and adds the flush
 //! / rehydrate machinery on top. The persistence layer talks to
-//! storage through the [`MetricsStore`] trait, which `boss_engine`'s
+//! storage through the [`MetricsStore`] trait, which `boss_work_db`'s
 //! `WorkDb` implements. That keeps the dependency edge one-directional
-//! (`boss_engine` -> `boss_metrics` -> `boss_engine_metrics_registry`).
+//! (`boss_engine` -> `boss_work_db` -> `boss_metrics` -> `boss_engine_metrics_registry`).
 //!
 //! Registering the engine's own handles is the engine's job: see
 //! `boss_engine::metrics_init::init_all`, which must name every
@@ -32,9 +32,13 @@
 
 pub mod persistence;
 pub mod store;
+pub mod sweep;
 
 pub use boss_engine_metrics_registry::{
     CounterHandle, CounterSnapshot, GaugeHandle, GaugeSnapshot, Registry, now_ms, register_counter, register_gauge,
 };
 pub use persistence::{FLUSH_INTERVAL, flush_all, seed_from_db, spawn_flush_task};
 pub use store::{MetricsCounterRow, MetricsGaugeRow, MetricsStore};
+
+pub mod population_progress;
+pub mod population_timing;

@@ -1,0 +1,2782 @@
+use super::*;
+use boss_protocol::{
+    DispatchAdmissionEntryPoint, OperatorAnswer, OperatorAnswerType, OperatorQuestion, OperatorQuestionError,
+    OperatorQuestionRecord, OperatorQuestionStatus, OperatorQuestionView,
+};
+
+/// The `blocked_reason` value the incident-002 postmortem tripwire stamps on
+/// a cycle root it halts pending explicit operator sign-off (see
+/// `WorkerPrCompletionTarget::BlockedDeletionSignoff` below and
+/// `conflict_ladder.rs`). Shared with `review_verdict_apply.rs` so the async
+/// verdict-apply path recognises and preserves the same hold instead of
+/// silently clearing it.
+pub const DELETION_SIGNOFF_BLOCKED_REASON: &str = "deletion_signoff";
+
+/// Why a worker-failure status write happened.
+///
+/// The shipped `blocked_reason` trigger records a new `worker_failed`
+/// observation for every variant, even when the displayed reason is
+/// unchanged; its repeat-observation list is generated from [`Self::ALL`].
+/// [`Self::OperatorNo`] remains the historical basis for a declined answer
+/// that parked the task; live No answers now redispatch.
+/// A delivery whose conflict resolution cannot be verified is recorded as
+/// [`Self::DeliveredWithoutPr`]: the worker declared delivery that the engine
+/// could not confirm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerFailureBasis {
+    NudgeBreaker,
+    DeclaredBlocked,
+    DeliveredWithoutPr,
+    ForeignPrBinding,
+    OperatorNo,
+}
+
+macro_rules! worker_failure_basis_variants {
+    ($($variant:ident => $str:literal),+ $(,)?) => {
+        impl WorkerFailureBasis {
+            /// Every basis, sharing the exhaustive string mapping.
+            pub const ALL: &'static [WorkerFailureBasis] = &[$(WorkerFailureBasis::$variant),+];
+            pub fn as_str(self) -> &'static str {
+                match self { $(Self::$variant => $str),+ }
+            }
+        }
+    };
+}
+
+worker_failure_basis_variants! {
+    NudgeBreaker => "nudge_breaker",
+    DeclaredBlocked => "declared_blocked",
+    DeliveredWithoutPr => "delivered_without_pr",
+    ForeignPrBinding => "foreign_pr_binding",
+    OperatorNo => "operator_no",
+}
+
+/// A task held in PendingReview with no live pre-merge batch, waiting for
+/// weighted admission to retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredReviewAdmissionCandidate {
+    pub task_id: String,
+    pub product_id: String,
+    pub pr_url: String,
+    pub repo_remote_url: String,
+    pub cycle_root_id: String,
+}
+
+/// The `tasks` columns a `boss pr status --refresh` observation can move, in
+/// one comparable value, so [`WorkDb::set_pr_status_observation`] can report
+/// whether it changed anything.
+#[derive(Debug, PartialEq, Eq)]
+struct PrObservationColumns {
+    pr_url: Option<String>,
+    pr_mergeable_state: Option<String>,
+    pr_merge_state_status: Option<String>,
+    pr_head_sha: Option<String>,
+    ci_required_state: Option<String>,
+}
+
+/// `None` when the row is absent or deleted.
+fn read_pr_observation_columns(conn: &Connection, work_item_id: &str) -> Result<Option<PrObservationColumns>> {
+    conn.query_row(
+        "SELECT pr_mergeable_state, pr_merge_state_status, pr_head_sha, ci_required_state, pr_url
+         FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+        params![work_item_id],
+        |row| {
+            Ok(PrObservationColumns {
+                pr_url: row.get(4)?,
+                pr_mergeable_state: row.get(0)?,
+                pr_merge_state_status: row.get(1)?,
+                pr_head_sha: row.get(2)?,
+                ci_required_state: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(anyhow::Error::from)
+}
+
+/// GitHub's UNKNOWN means recomputation, not a new mergeability verdict.
+/// Share this rule with on-demand refreshes so either writer preserves facts.
+fn retain_known_poll_value<'a>(prior: Option<&'a str>, incoming: &'a str) -> &'a str {
+    if incoming.eq_ignore_ascii_case("unknown")
+        && let Some(known) = prior.filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("unknown"))
+    {
+        return known;
+    }
+    incoming
+}
+
+#[work_db_boundary::instrument]
+impl WorkDb {
+    /// Record that a worker produced a PR for `execution_id`. In a single
+    /// transaction:
+    ///   - the linked task/chore moves to the column dictated by
+    ///     `target` (`in_review` for an open PR, `done` for a PR that
+    ///     was already merged at Stop time) and gets `pr_url`
+    ///     populated. If the task is already past the target column
+    ///     (`done`, `archived`), its status is left alone — the
+    ///     `pr_url` update still applies.
+    ///   - the execution transitions from `waiting_human` (or `running`)
+    ///     to `completed`, the cube workspace lease columns are
+    ///     cleared, `finished_at` is stamped,
+    ///   - the run summary is updated if a fresh summary is provided
+    ///     and the run hasn't already captured one.
+    ///
+    /// Returns `Ok(None)` if the execution has already been finalised
+    /// (terminal status), making this safe to call from a hook handler
+    /// that may fire repeatedly.
+    ///
+    /// `review_verdict`, when `Some`, is inserted into `pr_review_verdicts`
+    /// inside the SAME transaction as the writes below — see
+    /// [`crate::ReviewVerdictInput`]'s docs. Every non-`pr_review`
+    /// caller passes `None`.
+    pub fn record_worker_pr_completion(
+        &self,
+        execution_id: &str,
+        pr_url: &str,
+        pr_head_after: Option<&str>,
+        result_summary: Option<&str>,
+        target: WorkerPrCompletionTarget,
+        review_verdict: Option<ReviewVerdictInput>,
+    ) -> Result<Option<WorkerPrCompletion>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        if execution.status.is_terminal() {
+            return Ok(None);
+        }
+        if !execution.status.is_live() {
+            bail!(
+                "execution {execution_id} cannot complete from worker PR signal in status `{}`",
+                execution.status
+            );
+        }
+
+        let original_lease_id = execution.cube_lease_id.clone();
+        let original_workspace_id = execution.cube_workspace_id.clone();
+
+        let work_item_id = execution.work_item_id.clone();
+        let task =
+            query_task(&tx, &work_item_id)?.with_context(|| format!("unknown task for execution: {work_item_id}"))?;
+        if task.deleted_at.is_some() {
+            bail!("cannot complete a deleted task: {work_item_id}");
+        }
+
+        let now = now_string();
+        // Compute the new status. The chore can only advance — if it
+        // is already past the target column (`done` / `archived`), we
+        // keep the existing status. `PendingReview` holds the task in
+        // its current status so the reviewer pass runs before human Review.
+        let new_status = match target {
+            _ if task.status == TaskStatus::Done || task.status == TaskStatus::Archived => task.status.clone(),
+            WorkerPrCompletionTarget::InReview if task.status == TaskStatus::InReview => task.status.clone(),
+            WorkerPrCompletionTarget::InReview => TaskStatus::InReview,
+            WorkerPrCompletionTarget::Done => TaskStatus::Done,
+            // Hold the task in its current status while the automated reviewer runs.
+            WorkerPrCompletionTarget::PendingReview => task.status.clone(),
+            // Halt in `blocked` pending operator sign-off.
+            WorkerPrCompletionTarget::BlockedDeletionSignoff => TaskStatus::Blocked,
+        };
+        // Revision tasks do not own a PR — their `pr_url` must stay NULL
+        // (the chain root's `pr_url` is the source of truth), *except* for
+        // `PendingReview` / `BlockedDeletionSignoff` where we must stamp it so
+        // the reviewer / signing-off operator can find it.
+        let pr_url_for_task: Option<&str> = match target {
+            WorkerPrCompletionTarget::PendingReview | WorkerPrCompletionTarget::BlockedDeletionSignoff => Some(pr_url),
+            _ if task.kind == TaskKind::Revision => task.pr_url.as_deref(),
+            _ => Some(pr_url),
+        };
+        // Deletion-signoff halt stamps `blocked_reason` instead of clearing it;
+        // no attempt id (there is no auto-clearing signal — a human moves the
+        // task out of `blocked`). Every other target clears the blocked columns.
+        let blocked_reason_for_task: Option<&str> = match target {
+            WorkerPrCompletionTarget::BlockedDeletionSignoff => Some(DELETION_SIGNOFF_BLOCKED_REASON),
+            _ => None,
+        };
+        crate::task_status_audit::execute(
+            &tx,
+            "record_worker_pr_completion",
+            "engine",
+            "UPDATE tasks
+             SET status             = ?2,
+                 pr_url             = ?3,
+                 updated_at         = ?4,
+                 last_status_actor  = 'engine',
+                 blocked_reason     = ?5,
+                 blocked_attempt_id = NULL,
+                 completed_at       = COALESCE(completed_at, CASE WHEN ?2 IN ('done','archived') THEN ?4 END)
+             WHERE id = ?1",
+            params![
+                task.id,
+                new_status.as_str(),
+                pr_url_for_task,
+                now,
+                blocked_reason_for_task
+            ],
+        )?;
+
+        // A worker that finds its PR already merged lands here with `Done`;
+        // the merge poller never sees these tasks again.
+        if matches!(target, WorkerPrCompletionTarget::Done) {
+            driver_allocation::sol_selection::record_merge(&tx, &task.id, &now)?;
+        }
+
+        let mut pending = PendingEvents::new();
+        if new_status != task.status {
+            cascade_dependents_after_prereq_status_change(&mut pending, &tx, &task.id, new_status.as_str(), &now)?;
+        }
+
+        // Comment-intent-classification design §"Reconciliation": a
+        // revision's claimed comments are addressed the moment its commit
+        // is verified on the chain root's PR branch (this is that
+        // detection point), not when the chain root's PR eventually merges
+        // — the reviewer's re-read of the updated doc happens here, not at
+        // merge time. Guarded on `status = 'in_revision'` inside
+        // `reconcile_comments_for_task`, so this is a no-op on a re-fire
+        // (e.g. `target` already `InReview` and this call just re-affirms
+        // it). `flip_in_review_revisions_to_done`'s merge-time reconcile
+        // becomes a no-op backstop for rows already resolved here.
+        if new_status == TaskStatus::InReview && task.kind == TaskKind::Revision {
+            comments::reconcile_comments_for_task(&tx, &task.id, comments::CommentReconcileOutcome::Resolved, &now)?;
+        }
+
+        tx.execute(
+            "UPDATE work_executions
+             SET status = 'completed',
+                 finished_at = ?2,
+                 pr_url = ?3,
+                 pr_head_after = ?4
+             WHERE id = ?1",
+            params![execution_id, now, pr_url, pr_head_after],
+        )?;
+
+        // Update the most-recent run for this execution: if a summary is
+        // provided and the run's existing summary is empty, capture it.
+        // The run is typically already `completed` because the
+        // PaneSpawnRunner records completion immediately on spawn.
+        if let Some(summary) = result_summary {
+            let trimmed = summary.trim();
+            if !trimmed.is_empty() {
+                tx.execute(
+                    "UPDATE work_runs
+                     SET result_summary = COALESCE(NULLIF(result_summary, ''), ?2)
+                     WHERE execution_id = ?1
+                       AND id = (
+                           SELECT id FROM work_runs
+                           WHERE execution_id = ?1
+                           ORDER BY created_at DESC, id DESC
+                           LIMIT 1
+                       )",
+                    params![execution_id, trimmed],
+                )?;
+            }
+        }
+
+        // Written in the same transaction as the writes above: a `pr_review`
+        // pass can never reach `completed` without this row committing
+        // alongside it, and this row can never exist for a pass that didn't.
+        if let Some(verdict) = review_verdict.as_ref() {
+            Self::insert_review_verdict_in_tx(&tx, execution_id, &work_item_id, verdict)?;
+        }
+
+        let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        let updated_task = query_task(&tx, &work_item_id).require("task", &work_item_id)?;
+        stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
+        Ok(Some(WorkerPrCompletion {
+            execution: updated_execution,
+            work_item: task_to_item(updated_task),
+            released_lease_id: original_lease_id,
+            released_workspace_id: original_workspace_id,
+            filed_attention_item: None,
+        }))
+    }
+
+    /// Record that a primary-implementation worker (`chore_implementation`
+    /// / `task_implementation`) verified its assigned work is **already
+    /// done** — the change is already present on `main`, the working-copy
+    /// diff is empty, and there is genuinely nothing to commit, push, or
+    /// open a PR for. This is the sanctioned no-op terminal (the
+    /// worker's `boss propose done --outcome no-changes-needed` declaration).
+    /// In a single transaction:
+    ///   - the linked task/chore moves to `done`, unless already terminal.
+    ///     A nonterminal PR owner instead stays in `in_review` with a
+    ///     contradiction attention; revisions do not own their stamped PR;
+    ///   - the execution transitions from `waiting_human` (or `running`)
+    ///     to `completed`, the cube workspace lease columns are cleared,
+    ///     and `finished_at` is stamped;
+    ///   - the most-recent run captures `detail` as its result summary if
+    ///     it does not already have one.
+    ///
+    /// Mirrors [`Self::record_worker_pr_completion`] — including the
+    /// dependent-cascade on a real status change and the returned
+    /// lease/workspace ids for out-of-band cube release — but preserves any existing
+    /// `pr_url` without fabricating a new one.
+    ///
+    /// Returns `Ok(None)` if the execution has already been finalised
+    /// (terminal status), making this safe to call from a hook handler
+    /// that may fire repeatedly.
+    ///
+    /// `attention`, when given, is filed as an execution-scoped attention
+    /// item in this SAME transaction as the terminal transition below —
+    /// both commit together or neither does. This is what keeps a
+    /// human-visible "this was closed and its slot released" record from
+    /// ever being written for a completion that didn't actually happen: if
+    /// the attention insert fails (e.g. a store-level guard rejects it),
+    /// the whole transaction rolls back and the execution is left live,
+    /// exactly as if this call had never been made. The caller reads the
+    /// filed item back from [`WorkerPrCompletion::filed_attention_item`].
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn record_worker_no_op_completion(
+        &self,
+        execution_id: &str,
+        detail: &str,
+        attention: Option<CreateAttentionItemInput>,
+    ) -> Result<Option<WorkerPrCompletion>> {
+        self.record_worker_no_op_completion_inner(execution_id, detail, attention, None)
+    }
+
+    /// Complete only while this exact proposal remains the applied no-op
+    /// declaration. The authorization check and terminal write share one
+    /// transaction, so a cleared or superseded declaration cannot close a run.
+    pub fn record_declared_worker_no_op_completion(
+        &self,
+        execution_id: &str,
+        declaration_id: &str,
+        detail: &str,
+        attention: Option<CreateAttentionItemInput>,
+    ) -> Result<Option<WorkerPrCompletion>> {
+        self.record_worker_no_op_completion_inner(execution_id, detail, attention, Some(declaration_id))
+    }
+
+    fn record_worker_no_op_completion_inner(
+        &self,
+        execution_id: &str,
+        detail: &str,
+        attention: Option<CreateAttentionItemInput>,
+        declaration_id: Option<&str>,
+    ) -> Result<Option<WorkerPrCompletion>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(declaration_id) = declaration_id {
+            let authorized: bool = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM worker_proposals p JOIN work_executions e ON e.id = p.execution_id
+                    WHERE p.id = ?1 AND e.id = ?2 AND p.kind = 'run_done' AND p.state = 'applied'
+                      AND e.run_done_outcome = 'no_changes_needed'
+                )",
+                params![declaration_id, execution_id],
+                |row| row.get(0),
+            )?;
+            if !authorized {
+                return Ok(None);
+            }
+        }
+        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        if execution.status.is_terminal() {
+            return Ok(None);
+        }
+        if !execution.status.is_live() {
+            bail!(
+                "execution {execution_id} cannot complete from worker no-op signal in status `{}`",
+                execution.status
+            );
+        }
+
+        let original_lease_id = execution.cube_lease_id.clone();
+        let original_workspace_id = execution.cube_workspace_id.clone();
+
+        let work_item_id = execution.work_item_id.clone();
+        let task =
+            query_task(&tx, &work_item_id)?.with_context(|| format!("unknown task for execution: {work_item_id}"))?;
+        if task.deleted_at.is_some() {
+            bail!("cannot complete a deleted task: {work_item_id}");
+        }
+
+        let now = now_string();
+        // A no-op completion closes the task as done. If it is already
+        // terminal (done / archived), leave the status alone.
+        // `pr_url` is left untouched — a no-op produced none, and the
+        // worker correctly refused to fabricate one.
+        // Finishing a run without new changes is not evidence that its
+        // existing PR merged. Keep the owner visible and report the
+        // contradiction in the same transaction as the run's completion.
+        let contradiction = task
+            .pr_url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+            .filter(|_| task.kind != TaskKind::Revision && !task.status.is_terminal());
+        let attention = if let Some(pr_url) = contradiction {
+            Some(CreateAttentionItemInput {
+                kind: boss_engine_storage_values::attention_kinds::COMPLETION_WITH_BOUND_PR_ATTENTION_KIND.into(),
+                title: "Completion refused: work still has a bound PR".into(),
+                body_markdown: format!(
+                    "The worker declared no changes needed, but this work item owns {pr_url}. \
+                     This completion has no merge evidence. The run has ended, but the work item \
+                     remains in review. Inspect the PR before closing the work item."
+                ),
+                ..Default::default()
+            })
+        } else if task.kind == TaskKind::Revision && task.created_via.starts_with(CREATED_VIA_GUIDE_COMMENT_PREFIX) {
+            super::guide_feedback::no_op_attention_on(&tx, &task.id)?
+        } else {
+            attention
+        };
+        let new_status = if task.status.is_terminal() {
+            task.status.clone()
+        } else if contradiction.is_some() {
+            TaskStatus::InReview
+        } else {
+            TaskStatus::Done
+        };
+        crate::task_status_audit::execute(
+            &tx,
+            "record_worker_no_op_completion_inner",
+            "engine",
+            "UPDATE tasks
+             SET status             = ?2,
+                 updated_at         = ?3,
+                 last_status_actor  = 'engine',
+                 blocked_reason     = NULL,
+                 blocked_attempt_id = NULL,
+                 completed_at       = COALESCE(completed_at, CASE WHEN ?2 IN ('done','archived') THEN ?3 END)
+             WHERE id = ?1",
+            params![task.id, new_status.as_str(), now],
+        )?;
+
+        let mut pending = PendingEvents::new();
+        if new_status != task.status {
+            cascade_dependents_after_prereq_status_change(&mut pending, &tx, &task.id, new_status.as_str(), &now)?;
+        }
+
+        // Mirror `record_worker_pr_completion`: a revision's claimed comments
+        // must reconcile when the run ends with no new commit. Guide comments
+        // resolve only when a disposition was recorded (the guide-aware
+        // predicate); document comments still resolve on completion. Without
+        // this, a no-code guide batch stays `in_revision` until the parent PR
+        // merges — or reopens if the PR closes unmerged.
+        if task.kind == TaskKind::Revision {
+            comments::reconcile_comments_for_task(&tx, &task.id, comments::CommentReconcileOutcome::Resolved, &now)?;
+        }
+
+        tx.execute(
+            "UPDATE work_executions
+             SET status = 'completed',
+                 finished_at = ?2
+             WHERE id = ?1",
+            params![execution_id, now],
+        )?;
+
+        // Capture the no-op explanation as the run summary if the run
+        // hasn't already recorded one.
+        let detail = if contradiction.is_some() {
+            "No-op completion refused: the work item has a bound PR without merge evidence; retained in review with attention."
+        } else {
+            detail
+        };
+        let trimmed = detail.trim();
+        if !trimmed.is_empty() {
+            tx.execute(
+                "UPDATE work_runs
+                 SET result_summary = COALESCE(NULLIF(result_summary, ''), ?2)
+                 WHERE execution_id = ?1
+                   AND id = (
+                       SELECT id FROM work_runs
+                       WHERE execution_id = ?1
+                       ORDER BY created_at DESC, id DESC
+                       LIMIT 1
+                   )",
+                params![execution_id, trimmed],
+            )?;
+        }
+
+        let filed_attention_item = attention
+            .map(|input| {
+                super::workitems::insert_attention_item_row(
+                    &tx,
+                    &CreateAttentionItemInput {
+                        execution_id: Some(execution_id.to_owned()),
+                        work_item_id: None,
+                        ..input
+                    },
+                )
+            })
+            .transpose()?;
+
+        let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        let updated_task = query_task(&tx, &work_item_id).require("task", &work_item_id)?;
+        stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
+        Ok(Some(WorkerPrCompletion {
+            execution: updated_execution,
+            work_item: task_to_item(updated_task),
+            released_lease_id: original_lease_id,
+            released_workspace_id: original_workspace_id,
+            filed_attention_item,
+        }))
+    }
+
+    /// Fail an unsuccessful worker and, when the linked task is still in a
+    /// status this path owns (`active` / `todo`), move it out of automatic
+    /// dispatch in the same transaction, before publishing ExecutionTerminal.
+    /// Helper executions (`ci_remediation`, `conflict_resolution`,
+    /// `revision_implementation`) share the parent task's `work_item_id`; a
+    /// parent already in `in_review` or a domain-owned blocked reason
+    /// (`ci_failure`, `merge_conflict`, …) is left in that recovery state so
+    /// the merge poller and CI/conflict sweeps still see it. The failure
+    /// diagnostic is folded into `blocked_detail` when a blocked reason
+    /// already exists. Resources are released even for a deleted task. A
+    /// repeated call is a no-op. Explicit retries retain workspace recovery.
+    pub fn record_worker_failure_with_basis(
+        &self,
+        execution_id: &str,
+        detail: &str,
+        basis: WorkerFailureBasis,
+    ) -> Result<Option<WorkerFailureCompletion>> {
+        self.record_worker_failure_or_question(execution_id, detail, None, basis)
+    }
+
+    /// Test-only shorthand recording [`WorkerFailureBasis::DeclaredBlocked`];
+    /// production callers must name the producing basis.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn record_worker_failure(&self, execution_id: &str, detail: &str) -> Result<Option<WorkerFailureCompletion>> {
+        self.record_worker_failure_with_basis(execution_id, detail, WorkerFailureBasis::DeclaredBlocked)
+    }
+
+    pub fn record_worker_awaiting_operator_answer(
+        &self,
+        execution_id: &str,
+        detail: &str,
+        question: &boss_protocol::OperatorQuestion,
+    ) -> Result<Option<WorkerFailureCompletion>> {
+        self.record_worker_failure_or_question(
+            execution_id,
+            detail,
+            Some(question),
+            WorkerFailureBasis::DeclaredBlocked,
+        )
+    }
+
+    fn record_worker_failure_or_question(
+        &self,
+        execution_id: &str,
+        detail: &str,
+        question: Option<&boss_protocol::OperatorQuestion>,
+        basis: WorkerFailureBasis,
+    ) -> Result<Option<WorkerFailureCompletion>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        if execution.status.is_terminal() {
+            return Ok(None);
+        }
+        if !execution.status.is_live() {
+            bail!(
+                "execution {execution_id} cannot fail from status `{}`",
+                execution.status
+            );
+        }
+
+        let deliberately_blocked: bool = tx.query_row(
+            "SELECT COALESCE(run_done_outcome = 'blocked', 0) FROM work_executions WHERE id = ?1",
+            [execution_id],
+            |row| row.get(0),
+        )?;
+        if deliberately_blocked {
+            exec_tail::preserve_execution_workspace_preference(&tx, execution_id)?;
+        }
+
+        let original_lease_id = execution.cube_lease_id.clone();
+        let original_workspace_id = execution.cube_workspace_id.clone();
+
+        let work_item_id = execution.work_item_id.clone();
+
+        let now = now_string();
+        let mut diagnostic = detail.trim().to_owned();
+        // Include the declaration and companion blocker in the readable failure.
+        let mut stmt = tx.prepare(
+            "SELECT payload_json FROM worker_proposals
+             WHERE execution_id = ?1 AND kind IN ('run_done', 'blocked') AND state = 'applied'
+             ORDER BY created_at, id",
+        )?;
+        for payload in stmt.query_map([execution_id], |row| row.get::<_, String>(0))? {
+            let payload: serde_json::Value = serde_json::from_str(&payload?)?;
+            for field in ["summary", "reason"] {
+                if let Some(text) = payload.get(field).and_then(|value| value.as_str()) {
+                    diagnostic.push_str("\n\n");
+                    diagnostic.push_str(text);
+                }
+            }
+        }
+        drop(stmt);
+        if let Some(question) = question {
+            diagnostic.push_str(&format!("\n\n{}\n\n{}", question.text, question.explanation));
+        }
+        let trimmed = diagnostic.trim();
+        tx.execute(
+            "UPDATE work_executions
+             SET status = 'failed',
+                 finished_at = ?2
+             WHERE id = ?1",
+            params![execution_id, now],
+        )?;
+
+        // Terminal-failure takeover applies only to rows this path owns
+        // (`active` / `todo`). Helper executions share the parent
+        // `work_item_id`; stomping `in_review` or a domain-owned
+        // `blocked_reason` drops the parent out of the merge poller and
+        // CI/conflict recovery sweeps. Those rows keep status/reason/pr_url;
+        // the diagnostic is folded into `blocked_detail` when a reason
+        // already exists (blocked_detail cannot outlive blocked_reason).
+        // Kind-agnostic: a chore or followup parks on a question exactly like
+        // a task does. The question card is what makes the decision answerable,
+        // so folding the question into a `worker_failed` detail would leave
+        // the row looking failed when it is waiting on a human.
+        let mut question_attention = None;
+        let fallback_question = if let Some(question) = question {
+            let has_open_question = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM operator_questions WHERE execution_id = ?1 AND status = 'open')",
+                [execution_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            (!has_open_question).then_some(question)
+        } else {
+            None
+        };
+        match (
+            query_task(&tx, &work_item_id)?.filter(|task| task.deleted_at.is_none()),
+            fallback_question,
+        ) {
+            (Some(task), Some(question)) => {
+                question_attention = Some(super::attentions::worker_questions::create_in_tx(
+                    &tx,
+                    &task,
+                    execution_id,
+                    question,
+                )?);
+            }
+            (Some(task), _) if matches!(task.status, TaskStatus::Active | TaskStatus::Todo) => {
+                crate::task_status_audit::execute(
+                    &tx,
+                    basis.as_str(),
+                    "engine",
+                    "UPDATE tasks
+                     SET status = 'blocked', blocked_reason = ?4, blocked_detail = ?2,
+                         autostart = 0, last_status_actor = 'engine', updated_at = ?3
+                     WHERE id = ?1 AND deleted_at IS NULL AND status IN ('active', 'todo')",
+                    params![
+                        work_item_id,
+                        question.map_or(trimmed, |q| q.text.as_str()),
+                        now,
+                        if question.is_some() {
+                            "awaiting_operator_answer"
+                        } else {
+                            "worker_failed"
+                        }
+                    ],
+                )?;
+            }
+            (Some(task), _)
+                if task.status == TaskStatus::Blocked
+                    && task.blocked_reason.is_some()
+                    && (!trimmed.is_empty() || task.blocked_reason.as_deref() == Some("worker_failed")) =>
+            {
+                let folded = match task.blocked_detail.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(existing) if trimmed.is_empty() => existing.to_owned(),
+                    Some(existing) => format!("{existing}\n\n{trimmed}"),
+                    None => trimmed.to_owned(),
+                };
+                crate::task_status_audit::execute(
+                    &tx,
+                    basis.as_str(),
+                    "engine",
+                    "UPDATE tasks
+                     SET blocked_detail = ?2, updated_at = ?3, blocked_reason = ?4
+                     WHERE id = ?1 AND deleted_at IS NULL AND status = 'blocked' AND blocked_reason IS NOT NULL",
+                    params![work_item_id, folded, now, task.blocked_reason.as_deref()],
+                )?;
+            }
+            _ => {}
+        }
+
+        if question.is_some()
+            && !query_task(&tx, &work_item_id)?.is_some_and(|task| {
+                task.deleted_at.is_none() && task.blocked_reason.as_deref() == Some("awaiting_operator_answer")
+            })
+        {
+            super::pr_flow::withdraw_questions(&tx, &work_item_id, "task_not_parkable")?;
+        }
+
+        // Preserve the attributable failure in the latest run history.
+        if !trimmed.is_empty() {
+            tx.execute(
+                "UPDATE work_runs
+                 SET status = 'failed', error_text = ?2, result_summary = ?2, finished_at = COALESCE(finished_at, ?3)
+                 WHERE execution_id = ?1
+                   AND id = (
+                       SELECT id FROM work_runs
+                       WHERE execution_id = ?1
+                       ORDER BY created_at DESC, id DESC
+                       LIMIT 1
+                   )",
+                params![execution_id, trimmed, now],
+            )?;
+        }
+
+        let task = query_task(&tx, &work_item_id)?;
+        let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        let mut pending = PendingEvents::new();
+        stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
+        // A same-chain later revision may already be `blocked: dependency`
+        // on this row. Once the writer is a dead halt with no live
+        // execution, `gating_prereqs_for` no longer treats it as a gate;
+        // re-evaluate dependents in this transaction so they do not wait
+        // for the dep-unblock sweep.
+        if task
+            .as_ref()
+            .is_some_and(|t| t.status == TaskStatus::Blocked && t.blocked_reason.as_deref() == Some("worker_failed"))
+        {
+            cascade_dependents_after_prereq_status_change(&mut pending, &tx, &work_item_id, "blocked", &now)?;
+        }
+        commit_and_publish(tx, pending, &self.event_bus)?;
+        Ok(Some(WorkerFailureCompletion {
+            question_attention,
+            execution: updated_execution,
+            work_item: task.map(task_to_item),
+            released_lease_id: original_lease_id,
+            released_workspace_id: original_workspace_id,
+        }))
+    }
+
+    /// Chores and project_tasks currently in `in_review` whose
+    /// `pr_url` is set. The merge poller iterates this list, asks
+    /// GitHub whether each PR is merged, and calls
+    /// [`Self::mark_chore_pr_merged`] for the ones that are. Both
+    /// kinds share the `pr_url` / `status='in_review'` shape, so the
+    /// poller treats them identically; `kind = 'task'` is excluded
+    /// deliberately because non-project tasks don't share the
+    /// PR-on-merge lifecycle yet.
+    pub fn list_chores_pending_merge_check(&self) -> Result<Vec<PendingMergeCheck>> {
+        self.query_pending_merge_checks("t.status = 'in_review'")
+    }
+
+    /// Executions whose bound chore is still `active` with no `pr_url`,
+    /// whose execution row is `waiting_human` (i.e., the worker spawned,
+    /// hit a Stop boundary, and is now idle), and that have a recorded
+    /// `workspace_path` for PR detection.
+    ///
+    /// This is the fallback set for the merge poller's PR-open recheck:
+    /// the on-Stop hook is the primary detection path but it can miss
+    /// (transient `gh api` failure, GitHub's
+    /// `commits/{sha}/pulls` index lagging a fresh `gh pr create`, or
+    /// a Stop event that never reached the engine). Without this list
+    /// the chore is stuck in `active` forever because the merge poller's
+    /// other query (`list_chores_pending_merge_check`) only sees rows
+    /// already in `in_review`.
+    ///
+    /// `CHORE_LIKE_KINDS_SQL` matches the same kinds the in-review poller
+    /// watches; `task` is excluded for the same reason (non-project tasks
+    /// don't share the PR lifecycle). `revision` is also included because
+    /// its on-Stop hook stamps the parent pr_url, not its own.
+    ///
+    /// The status filter is both live statuses, not `waiting_human` alone: a
+    /// working worker stores `running`, and this sweep — the recovery path
+    /// for a *missed* PR-open — must match it, not just a genuinely-parked
+    /// one. `pr_review` is excluded explicitly for the same reason the
+    /// Stop-path gate excludes it: a reviewer never opens a PR of its own.
+    /// Mirrors `boss_engine::completion::worker_owns_turn_loop`, which is the
+    /// gate the candidates then have to pass anyway.
+    pub fn list_executions_pending_pr_detection(&self) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT we.id
+             FROM work_executions we
+             JOIN tasks t ON t.id = we.work_item_id
+             WHERE we.status IN ('running', 'waiting_human')
+               AND we.kind != 'pr_review'
+               AND we.workspace_path IS NOT NULL
+               AND we.workspace_path != ''
+               AND t.deleted_at IS NULL
+               AND t.kind IN ({CHORE_LIKE_KINDS_SQL}, 'revision')
+               AND t.status = 'active'
+               AND (t.pr_url IS NULL OR t.pr_url = '')
+             ORDER BY we.created_at ASC",
+        ))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        collect_rows(rows)
+    }
+
+    /// Return recently-terminal executions whose task is still `active`
+    /// with no `pr_url`. These are candidates for the merge poller's
+    /// late-PR-detection sweep (Bug B): when a double-spawn race causes
+    /// exec_A to be abandoned before the real worker pushes its PR, the
+    /// on-Stop hook returns `AlreadyTerminal` and the normal
+    /// `list_executions_pending_pr_detection` query (which only watches
+    /// `waiting_human`) never picks the chore back up. This query fills
+    /// that gap by watching terminal executions that finished within the
+    /// last `lookback_secs` seconds.
+    ///
+    /// Only executions with `workspace_path` set are returned — the
+    /// absence of a workspace_path means the execution never reached the
+    /// pane-spawn stage and therefore never pushed a branch the detector
+    /// could find. Status `'cancelled'` and `'orphaned'` are excluded
+    /// because those arise from human or engine actions that pre-date
+    /// the pane-spawn lifecycle this sweep covers.
+    pub fn list_recently_terminal_executions_pending_pr_detection(
+        &self,
+        lookback_secs: u64,
+    ) -> Result<Vec<LatePrCandidate>> {
+        let conn = self.connect()?;
+        let cutoff = (boss_engine_utils::epoch_time::now_epoch_secs() as u64)
+            .saturating_sub(lookback_secs)
+            .to_string();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT we.id, we.work_item_id, we.repo_remote_url, we.branch_naming, we.worker_branch_prefix
+             FROM work_executions we
+             JOIN tasks t ON t.id = we.work_item_id
+             WHERE we.status IN ('abandoned', 'completed', 'failed')
+               AND we.workspace_path IS NOT NULL
+               AND we.workspace_path != ''
+               AND we.finished_at IS NOT NULL
+               AND CAST(we.finished_at AS INTEGER) >= ?1
+               AND t.deleted_at IS NULL
+               AND t.kind IN ({CHORE_LIKE_KINDS_SQL})
+               AND t.status = 'active'
+               AND (t.pr_url IS NULL OR t.pr_url = '')
+             ORDER BY we.finished_at DESC, we.id DESC",
+        ))?;
+        let rows = stmt.query_map([cutoff], |row| {
+            let branch_naming: BranchNaming = deserialize_json_or_default(row.get::<_, Option<String>>(3)?.as_deref());
+            Ok(LatePrCandidate {
+                execution_id: row.get(0)?,
+                work_item_id: row.get(1)?,
+                repo_remote_url: row.get(2)?,
+                branch_naming,
+                worker_branch_prefix: row.get::<_, Option<String>>(4)?.filter(|s| !s.is_empty()),
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Tasks that are held in `active` (Doing) pending their latest AI
+    /// reviewer pass, where that latest pass has either finished (terminal
+    /// `pr_review` execution) or timed out (non-terminal `pr_review`
+    /// execution older than `stale_secs` seconds).
+    ///
+    /// These are the candidates for the merge poller's reviewer-fallback
+    /// sweep. A pass with a durable result may release the hold and advance;
+    /// a pass without one stays in Doing while recovery re-fires the review.
+    ///
+    /// Historical terminal attempts are deliberately ignored once a newer
+    /// pass exists. Otherwise a failed attempt keeps matching during its
+    /// replacement pass and can make the fallback treat an actively-reviewed
+    /// row as stalled.
+    ///
+    /// Returns `(task_id, product_id, pr_url, review_result_written)` tuples.
+    /// The final value is true when the latest pass durably recorded a
+    /// `ReviewResult` — including `dropped_duplicate_head`, which produced a
+    /// result then deferred to an earlier covering pass. A `gave_up` ledger
+    /// row does not count.
+    pub fn list_tasks_with_stalled_reviewer(&self, stale_secs: u64) -> Result<Vec<(String, String, String, bool)>> {
+        let conn = self.connect()?;
+        let cutoff = (boss_engine_utils::epoch_time::now_epoch_secs() as u64)
+            .saturating_sub(stale_secs)
+            .to_string();
+        // Tasks in `active` with a `pr_url` whose latest `pr_review` execution
+        // is either:
+        //   1. Terminal (reviewer finished — should have advanced the task via
+        //      finalize_pr_review_pass but didn't, e.g. Stop hook was missed).
+        //   2. Non-terminal but created before the stale cutoff (timeout).
+        let review_result_outcomes = super::review_verdicts::review_result_gate_outcomes_sql();
+        let sql = format!(
+            "SELECT t.id, t.product_id, t.pr_url,
+                    EXISTS (
+                      SELECT 1
+                      FROM pr_review_verdicts rv
+                      WHERE rv.execution_id = we.id
+                        AND rv.gate_outcome IN ({review_result_outcomes})
+                    ) AS review_result_written
+             FROM tasks t
+             JOIN work_executions we ON we.id = (
+               SELECT latest.id
+               FROM work_executions latest
+               WHERE latest.work_item_id = t.id
+                 AND latest.kind = 'pr_review'
+               ORDER BY latest.created_at DESC, latest.id DESC
+               LIMIT 1
+             )
+             WHERE t.status = 'active'
+               AND t.pr_url IS NOT NULL
+               AND t.pr_url != ''
+               AND t.deleted_at IS NULL
+               AND (
+                 -- Reviewer finished but task was not advanced (missed Stop hook)
+                 we.status IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')
+                 OR
+                 -- Reviewer still running but has been running too long (timeout)
+                 (we.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')
+                  AND we.created_at < ?1)
+               )
+             ORDER BY t.updated_at ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([cutoff], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Tasks held in `active` (PendingReview) with a bound PR that have no
+    /// live pre-merge batch and no non-terminal `pr_review` execution on
+    /// their review-cycle root.
+    ///
+    /// This is the durable recovery set for [`super::ReviewBatchDispatch::AdmissionDeferred`]
+    /// and [`super::ReviewBatchDispatch::AlreadyReviewed`]: both write no
+    /// batch and no member rows, so neither `list_executions_pending_pr_detection`
+    /// (waiting_human producers) nor [`Self::list_tasks_with_stalled_reviewer`]
+    /// (INNER JOIN on a `pr_review` execution) can see them. Includes
+    /// first-time producers with zero reviews and tasks whose previous
+    /// cycle's terminal `pr_review` must not be treated as covering a new
+    /// head.
+    ///
+    /// A task qualifies immediately once an open
+    /// `pr_review_admission_deferred` attention item marks it as an actual
+    /// deferral (the deferral paths file exactly that marker). Absent that
+    /// marker — e.g. an `AlreadyReviewed` hold, which files none — a task
+    /// only qualifies once its `updated_at` is older than
+    /// [`super::REVIEW_BATCH_STALE_SECS`], so a task merely waiting on a pool
+    /// slot or between orphan-sweep passes does not cost a `gh pr view` on
+    /// every full sweep before it has had a chance to resolve on its own.
+    ///
+    /// A task — `active` OR already `in_review` — also qualifies immediately
+    /// when its cycle root's newest pre-merge batch left the current head
+    /// needing a review that nothing else will schedule
+    /// ([`super::review_batches::pre_merge_review_needs_readmission_sql`]):
+    /// the batch was reaped or died without a consolidated verdict (the
+    /// re-admission mints the next generation, bounded by
+    /// [`super::MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS`]), or its verdict
+    /// landed `stale_head` after a later push moved the PR on. The root is
+    /// typically `in_review` by then (an earlier verdict advanced it), which
+    /// is exactly why this arm cannot be gated on `active`; it applies to the
+    /// cycle root itself only, so a root and its revisions yield one
+    /// candidate per cycle; it is self-limiting (keyed on the newest batch, which the re-admission
+    /// replaces), so it needs neither marker nor inertia cutoff.
+    pub fn list_tasks_awaiting_pre_merge_review_admission(&self) -> Result<Vec<DeferredReviewAdmissionCandidate>> {
+        let conn = self.connect()?;
+        let inertia_cutoff = (boss_engine_utils::epoch_time::now_epoch_secs() as u64)
+            .saturating_sub(super::REVIEW_BATCH_STALE_SECS)
+            .to_string();
+        // Shared with `list_orphan_active_candidates`: same walk, same
+        // `CYCLE_ROOT_WALK_SQL_DEPTH_BOUND` (`MAX_CHAIN_DEPTH - 1`). The
+        // previous inlined copy used `depth < 64`, which could emit depth 64
+        // and overshoot [`super::chain_root`]. The seed admits every
+        // `in_review` PR task because the readmission arm below needs the
+        // walked cycle root, which the seed filter cannot see yet; the
+        // outer WHERE narrows `in_review` rows to the marker and
+        // readmission arms.
+        let walk = super::cycle_root_walk_cte(
+            "t.status IN ('active', 'in_review')
+                 AND t.pr_url IS NOT NULL
+                 AND t.pr_url != ''
+                 AND t.deleted_at IS NULL",
+        );
+        let needs_readmission = super::review_batches::pre_merge_review_needs_readmission_sql("roots.cycle_root_id");
+        let sql = format!(
+            "{walk}
+             SELECT t.id, t.product_id, t.pr_url,
+                    COALESCE(
+                      NULLIF(p.repo_remote_url, ''),
+                      (
+                        SELECT we.repo_remote_url
+                        FROM work_executions we
+                        WHERE we.work_item_id = t.id
+                          AND we.repo_remote_url IS NOT NULL
+                          AND we.repo_remote_url != ''
+                        ORDER BY we.created_at DESC, we.id DESC
+                        LIMIT 1
+                      ),
+                      ''
+                    ) AS repo_remote_url,
+                    roots.cycle_root_id
+             FROM tasks t
+             JOIN products p ON p.id = t.product_id
+             JOIN roots ON roots.task_id = t.id
+             WHERE (
+                     t.status = 'active'
+                     OR EXISTS (
+                       SELECT 1 FROM work_attention_items ai
+                       WHERE ai.work_item_id = t.id
+                         AND ai.kind = 'pr_review_admission_deferred'
+                         AND ai.status = 'open'
+                     )
+                     OR ({needs_readmission} AND t.id = roots.cycle_root_id)
+                   )
+               AND NOT EXISTS (
+                     SELECT 1 FROM pr_review_batches b
+                     WHERE b.cycle_root_id = roots.cycle_root_id
+                       AND b.phase = 'pre_merge'
+                       AND b.status NOT IN ('completed', 'failed')
+                   )
+               AND NOT EXISTS (
+                     SELECT 1 FROM work_executions we
+                     WHERE we.work_item_id IN (t.id, roots.cycle_root_id)
+                       AND we.kind = 'pr_review'
+                       AND we.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')
+                   )
+               AND NOT EXISTS (
+                     SELECT 1 FROM work_executions we
+                     WHERE we.work_item_id = t.id
+                       AND we.status IN ('running', 'waiting_human')
+                       AND we.kind != 'pr_review'
+                   )
+               AND (
+                     EXISTS (
+                       SELECT 1 FROM work_attention_items ai
+                       WHERE ai.work_item_id = t.id
+                         AND ai.kind = 'pr_review_admission_deferred'
+                         AND ai.status = 'open'
+                     )
+                     OR t.updated_at < ?1
+                     OR ({needs_readmission} AND t.id = roots.cycle_root_id)
+                   )
+             ORDER BY t.updated_at ASC",
+            walk = walk,
+            needs_readmission = needs_readmission,
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([inertia_cutoff], |row| {
+            Ok(DeferredReviewAdmissionCandidate {
+                task_id: row.get(0)?,
+                product_id: row.get(1)?,
+                pr_url: row.get(2)?,
+                repo_remote_url: row.get(3)?,
+                cycle_root_id: row.get(4)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Advance a task from `active` to `in_review` as the reviewer-fallback,
+    /// but only after its latest reviewer pass durably recorded a real
+    /// `ReviewResult`. Idempotent: no-ops if the task is already past
+    /// `active`, the latest pass has no result, or a non-review worker is
+    /// live. Returns `true` if the task was updated.
+    ///
+    /// Single-live-worker guard: the reviewer-fallback is only correct when
+    /// the worker holding the task in `active` is actually the AI reviewer.
+    /// A `pr_review` execution can be terminal/timed-out (which surfaces the
+    /// task as a fallback candidate) while a DIFFERENT live execution — a
+    /// `chore_implementation`/`task_implementation`/`ci_remediation` resume
+    /// — is actively working the task. Advancing the lane then would strand
+    /// the implementation worker in the Review column with no Doing card.
+    /// So we refuse to advance while ANY live (`running`/`waiting_human`)
+    /// non-`pr_review` execution exists on the task: the `NOT EXISTS` clause
+    /// makes the update a no-op in that case.
+    pub fn advance_pending_review_task_to_in_review(&self, work_item_id: &str) -> Result<bool> {
+        self.advance_pending_review_task_to_in_review_with_verdict_source(work_item_id, work_item_id)
+    }
+
+    /// Same as [`Self::advance_pending_review_task_to_in_review`], but looks
+    /// for the informative `pr_review_verdicts` row under `verdict_source_id`
+    /// rather than `work_item_id`. For a revision task, batch leaf executions
+    /// (and their verdicts) are created against the review-cycle root
+    /// (`review_cycle_root_id`), not the task row itself — pass that root as
+    /// `verdict_source_id` so a verdict recorded there still admits the
+    /// advance. `work_item_id` and `verdict_source_id` are identical for a
+    /// legacy single-reviewer verdict (a non-revision task is its own cycle
+    /// root), which is exactly what the single-argument wrapper above
+    /// preserves.
+    /// Release a `PendingReview` hold with no verdict-existence requirement:
+    /// for the declared-delivery completion path
+    /// (`completion::run_done_declaration::maybe_enqueue_declared_delivery_reviewer`),
+    /// which decides NOT to enqueue a reviewer for reasons other than an
+    /// already-recorded verdict — a first delivery (`review_cycle == 0`, no
+    /// `pr_review_verdicts` row can exist yet) or a legacy-reviewer-creation
+    /// failure. The decision not to review is itself the justification;
+    /// requiring a verdict row here (as
+    /// [`Self::advance_pending_review_task_to_in_review_with_verdict_source`]
+    /// does) makes the UPDATE match zero rows and strands the task in
+    /// `active` forever, since the producing execution is already terminal
+    /// by the time this runs. Keeps the same terminal-task and live-worker
+    /// guards as the verdict-gated variants — only the verdict `EXISTS`
+    /// clause is dropped.
+    pub fn advance_held_pending_review_task_to_in_review(&self, work_item_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let now = now_string();
+        Self::advance_held_pending_review_task_to_in_review_in_tx(&conn, work_item_id, &now)
+    }
+
+    pub fn advance_held_pending_review_task_to_in_review_in_tx(
+        conn: &Connection,
+        work_item_id: &str,
+        now: &str,
+    ) -> Result<bool> {
+        let rows_changed = crate::task_status_audit::execute(
+            conn,
+            "advance_held_pending_review_task_to_in_review_in_tx",
+            "engine",
+            "UPDATE tasks
+             SET status            = 'in_review',
+                 updated_at        = ?2,
+                 last_status_actor = 'engine'
+             WHERE id = ?1
+               AND status = 'active'
+               AND pr_url IS NOT NULL
+               AND pr_url != ''
+               AND deleted_at IS NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM work_executions we
+                 WHERE we.work_item_id = ?1
+                   AND we.status IN ('running', 'waiting_human')
+                   AND we.kind != 'pr_review'
+               )",
+            params![work_item_id, now],
+        )?;
+        Ok(rows_changed > 0)
+    }
+
+    pub fn advance_pending_review_task_to_in_review_with_verdict_source(
+        &self,
+        work_item_id: &str,
+        verdict_source_id: &str,
+    ) -> Result<bool> {
+        let conn = self.connect()?;
+        let now = now_string();
+        Self::advance_pending_review_task_to_in_review_with_verdict_source_in_tx(
+            &conn,
+            work_item_id,
+            verdict_source_id,
+            &now,
+        )
+    }
+
+    /// Transaction-scoped body of
+    /// [`Self::advance_pending_review_task_to_in_review_with_verdict_source`],
+    /// factored out so [`super::review_verdict_apply`] can advance a held
+    /// revision in the same transaction as the cycle-root advance and the
+    /// verdict write it depends on, rather than in a separate connection
+    /// after `commit_applied_review_verdict`'s transaction has already
+    /// committed (which would let a crash between the two land the verdict
+    /// without ever releasing the revision's hold). `conn` may be a plain
+    /// [`Connection`] (the public wrapper above) or a `Transaction` — both
+    /// implement the same `execute` surface.
+    pub(crate) fn advance_pending_review_task_to_in_review_with_verdict_source_in_tx(
+        conn: &Connection,
+        work_item_id: &str,
+        verdict_source_id: &str,
+        now: &str,
+    ) -> Result<bool> {
+        let review_result_outcomes = super::review_verdicts::review_result_gate_outcomes_sql();
+        let rows_changed = crate::task_status_audit::execute(
+            conn,
+            "advance_pending_review_task_to_in_review_with_verdict_source",
+            "engine",
+            &format!(
+                "UPDATE tasks
+             SET status            = 'in_review',
+                 updated_at        = ?2,
+                 last_status_actor = 'engine'
+             WHERE id = ?1
+               AND status = 'active'
+               AND pr_url IS NOT NULL
+               AND pr_url != ''
+               AND deleted_at IS NULL
+               AND EXISTS (
+                 SELECT 1
+                 FROM work_executions latest
+                 JOIN pr_review_verdicts rv ON rv.execution_id = latest.id
+                 WHERE latest.id = (
+                   SELECT newest.id
+                   FROM work_executions newest
+                   WHERE newest.work_item_id = ?3
+                     AND newest.kind = 'pr_review'
+                   ORDER BY newest.created_at DESC, newest.id DESC
+                   LIMIT 1
+                 )
+                   AND rv.gate_outcome IN ({review_result_outcomes})
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM work_executions we
+                 WHERE we.work_item_id = ?1
+                   AND we.status IN ('running', 'waiting_human')
+                   AND we.kind != 'pr_review'
+               )"
+            ),
+            params![work_item_id, now, verdict_source_id],
+        )?;
+        Ok(rows_changed > 0)
+    }
+
+    /// Transition a task from `active` to `in_review` by binding a
+    /// late-detected PR URL. Called by the merge poller's late-PR sweep
+    /// when the PR was pushed after the original execution became
+    /// terminal (double-spawn race). Unlike `record_worker_pr_completion`
+    /// this function does not gate on execution status — the execution is
+    /// already terminal; we only need to advance the task.
+    ///
+    /// Returns `Ok(true)` if the task was updated, `Ok(false)` if it was
+    /// already past `active` (idempotent for concurrent sweeps).
+    pub fn bind_pr_to_active_task_from_terminal_execution(&self, work_item_id: &str, pr_url: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let rows_changed = crate::task_status_audit::execute(
+            &conn,
+            "bind_pr_to_active_task_from_terminal_execution",
+            "engine",
+            "UPDATE tasks
+             SET status            = 'in_review',
+                 pr_url            = ?2,
+                 updated_at        = ?3,
+                 last_status_actor = 'engine',
+                 blocked_reason    = NULL,
+                 blocked_attempt_id = NULL
+             WHERE id = ?1
+               AND deleted_at IS NULL
+               AND status = 'active'
+               AND (pr_url IS NULL OR pr_url = '')",
+            params![work_item_id, pr_url, now],
+        )?;
+        Ok(rows_changed > 0)
+    }
+
+    /// Return terminated/abandoned executions whose engine-supplied branch
+    /// may have been pushed with no PR ever bound — the candidate set for
+    /// `boss_engine::abandoned_branch_pr_sweep`.
+    ///
+    /// Unlike [`Self::list_recently_terminal_executions_pending_pr_detection`]
+    /// this does **not** gate on `t.status = 'active'`. That gate is exactly
+    /// the gap behind the 2026-07-24 GitHub PR-creation-outage incident: a
+    /// terminated worker's execution can leave the task in `todo` (auto-demote
+    /// / churn-guard / plain fallback), not just `active`, and an
+    /// `active`-only query then treats it as indistinguishable from work
+    /// that never started. This detects the state directly off the
+    /// execution row — terminal, workspace-backed (a pane actually spawned
+    /// and could have pushed), no `pr_url` bound anywhere — independent of
+    /// whatever kanban status the task fell back to.
+    ///
+    /// `grace_secs` excludes executions that finished too recently: a
+    /// worker that just terminated may not have reached PR creation yet, and
+    /// the normal on-Stop / merge-poller paths are still the first line of
+    /// detection. `max_lookback_secs` bounds the scan on the old end — this
+    /// sweep runs frequently and retries indefinitely (see that module), so
+    /// once a row is older than the lookback it has already been through
+    /// many passes; the bound exists to keep the query cheap as the table
+    /// grows, not to give up on any specific row (a still-unresolved row
+    /// this old already has an open attention item from an earlier pass).
+    ///
+    /// Excludes `cancelled` executions (explicit human/engine cancel — no
+    /// business auto-recovering a PR for abandoned-on-purpose work) and
+    /// `t.status IN ('done', 'archived')` (an explicit close
+    /// decision the auto-heal path must never overwrite). `workspace_path
+    /// IS NOT NULL` mirrors the late-PR query: the absence of a workspace
+    /// path means the execution never reached pane-spawn and therefore never
+    /// pushed anything.
+    ///
+    /// Single-live-worker guard: excludes any work item that currently has a
+    /// LIVE execution (any non-terminal [`ExecutionStatus`]). A terminated
+    /// execution's task commonly falls back to `todo` — the dispatchable
+    /// backlog status the reconcile sweep re-enqueues for autostart chores —
+    /// so a live execution frequently exists on the same work item shortly
+    /// after the terminal one that pushed the abandoned branch. Without this
+    /// guard the sweep would open a PR from the dead run's stale branch and
+    /// flip the task to `in_review` out from under the still-running worker
+    /// — the same race [`Self::advance_pending_review_task_to_in_review`]
+    /// guards against with an equivalent `NOT EXISTS` clause.
+    pub fn list_abandoned_pushed_branch_candidates(
+        &self,
+        grace_secs: i64,
+        max_lookback_secs: i64,
+    ) -> Result<Vec<LatePrCandidate>> {
+        let conn = self.connect()?;
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let grace_cutoff = (now - grace_secs).to_string();
+        let lookback_cutoff = (now - max_lookback_secs).to_string();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT we.id, we.work_item_id, we.repo_remote_url, we.branch_naming, we.worker_branch_prefix
+             FROM work_executions we
+             JOIN tasks t ON t.id = we.work_item_id
+             WHERE we.status IN ('orphaned', 'abandoned', 'failed', 'completed')
+               AND we.workspace_path IS NOT NULL
+               AND we.workspace_path != ''
+               AND (we.pr_url IS NULL OR we.pr_url = '')
+               AND we.finished_at IS NOT NULL
+               AND CAST(we.finished_at AS INTEGER) <= ?1
+               AND CAST(we.finished_at AS INTEGER) >= ?2
+               AND t.deleted_at IS NULL
+               AND t.kind IN ({CHORE_LIKE_KINDS_SQL})
+               AND t.status NOT IN ('done', 'archived')
+               AND (t.pr_url IS NULL OR t.pr_url = '')
+               AND NOT EXISTS (
+                 SELECT 1 FROM work_executions live
+                 WHERE live.work_item_id = we.work_item_id
+                   AND live.status IN (
+                     'queued', 'ready', 'waiting_dependency', 'claimed', 'running',
+                     'waiting_human', 'waiting_review', 'waiting_merge'
+                   )
+               )
+             ORDER BY we.finished_at ASC, we.id ASC",
+        ))?;
+        let rows = stmt.query_map(params![grace_cutoff, lookback_cutoff], |row| {
+            let branch_naming: BranchNaming = deserialize_json_or_default(row.get::<_, Option<String>>(3)?.as_deref());
+            Ok(LatePrCandidate {
+                execution_id: row.get(0)?,
+                work_item_id: row.get(1)?,
+                repo_remote_url: row.get(2)?,
+                branch_naming,
+                worker_branch_prefix: row.get::<_, Option<String>>(4)?.filter(|s| !s.is_empty()),
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Bind a PR to a task from a terminal execution regardless of the
+    /// task's current kanban status, so long as it isn't already closed.
+    ///
+    /// Like [`Self::bind_pr_to_active_task_from_terminal_execution`] but
+    /// relaxes the `status = 'active'` gate to `status NOT IN ('done',
+    /// 'archived')` — `boss_engine::abandoned_branch_pr_sweep`
+    /// detects state directly off the execution row and must be able to
+    /// recover a work item regardless of whether it fell back to `todo`,
+    /// stayed `active`, or is sitting `blocked`. Refuses only an explicit
+    /// close decision (`done`/`archived`), which the auto-heal
+    /// path must never overwrite.
+    ///
+    /// Returns `Ok(true)` if the task was updated, `Ok(false)` if it was
+    /// already closed, already carried a `pr_url`, or a live execution has
+    /// appeared on the work item since the candidate query ran (idempotent
+    /// for concurrent sweeps, and a no-op guard against the same
+    /// single-live-worker race the candidate query itself excludes — see
+    /// [`Self::list_abandoned_pushed_branch_candidates`]).
+    pub fn bind_pr_to_task_from_terminal_execution(&self, work_item_id: &str, pr_url: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let rows_changed = crate::task_status_audit::execute(
+            &conn,
+            "bind_pr_to_task_from_terminal_execution",
+            "engine",
+            "UPDATE tasks
+             SET status            = 'in_review',
+                 pr_url            = ?2,
+                 updated_at        = ?3,
+                 last_status_actor = 'engine',
+                 blocked_reason    = NULL,
+                 blocked_attempt_id = NULL
+             WHERE id = ?1
+               AND deleted_at IS NULL
+               AND status NOT IN ('done', 'archived')
+               AND (pr_url IS NULL OR pr_url = '')
+               AND NOT EXISTS (
+                 SELECT 1 FROM work_executions live
+                 WHERE live.work_item_id = ?1
+                   AND live.status IN (
+                     'queued', 'ready', 'waiting_dependency', 'claimed', 'running',
+                     'waiting_human', 'waiting_review', 'waiting_merge'
+                   )
+               )",
+            params![work_item_id, pr_url, now],
+        )?;
+        Ok(rows_changed > 0)
+    }
+
+    /// Move the chore or project_task identified by `work_item_id`
+    /// from `in_review` to `done`, recording `pr_url` (no-op if it
+    /// was already set to the same value). Returns the updated task
+    /// if a transition happened; `Ok(None)` if the row was already
+    /// past `in_review` (idempotent for late-arriving merge events).
+    /// Callers are expected to pre-filter on `kind` via
+    /// [`Self::list_chores_pending_merge_check`]; this function
+    /// itself does not gate on kind so that the SQL filter remains
+    /// the single source of truth for what's mergeable.
+    pub fn mark_chore_pr_merged(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut pending = PendingEvents::new();
+        let Some(task) = query_task(&tx, work_item_id)? else {
+            return Ok(None);
+        };
+        if task.deleted_at.is_some() {
+            return Ok(None);
+        }
+        driver_allocation::sol_selection::record_merge(&tx, work_item_id, &now_string())?;
+        if task.status == TaskStatus::Done || task.status == TaskStatus::Archived {
+            // Already terminal — no status transition, but a task that
+            // reached done/archived via a path that predates (or missed)
+            // clearing merge_queue_state would otherwise sit forever in
+            // `list_queued_merge_queue_members`'s membership set and
+            // inflate every live card's renumbered position. Clear it here
+            // too so a late-arriving merge-poller observation of an
+            // already-terminal task self-heals the orphan.
+            tx.execute(
+                "UPDATE tasks
+                 SET merge_queue_state  = NULL,
+                     merge_queue_detail = NULL
+                 WHERE id = ?1
+                   AND merge_queue_state IS NOT NULL",
+                params![task.id],
+            )?;
+            tx.commit()?;
+            return Ok(None);
+        }
+        // Human-driven rows close only via the human complete ritual —
+        // never by merge-poller observation of a bound PR.
+        if task.human_driven {
+            tracing::info!(
+                work_item_id = %task.id,
+                %pr_url,
+                "mark_chore_pr_merged: skipping human-driven row — only `boss task complete --summary` closes it",
+            );
+            return Ok(None);
+        }
+        let now = now_string();
+        // Clearing blocked_reason / blocked_attempt_id is load-bearing
+        // for the case where the merge poller observes a force-merge
+        // (branch-protection override) of a PR currently in
+        // `blocked: merge_conflict`. The new state must be coherent —
+        // `done` rows never carry a blocked reason.
+        // Clearing merge_queue_state / merge_queue_detail here is load-bearing:
+        // update_pr_poll_state (the merge poller's dequeue writer) is only
+        // invoked for `Open` PRs, so a just-merged PR would otherwise keep
+        // whatever queue state it carried at merge time forever. A stale
+        // `merge_queue_state` on a `done` row makes the client's
+        // `isInMergingSection` (see `Models.swift`) misroute the task into
+        // the kanban's "Merging" section instead of the normal Done/recency
+        // buckets.
+        crate::task_status_audit::execute(
+            &tx,
+            "mark_chore_pr_merged",
+            "engine",
+            "UPDATE tasks
+             SET status             = 'done',
+                 pr_url             = ?2,
+                 updated_at         = ?3,
+                 last_status_actor  = 'engine',
+                 blocked_reason     = NULL,
+                 blocked_attempt_id = NULL,
+                 merge_queue_state  = NULL,
+                 merge_queue_detail = NULL,
+                 completed_at       = COALESCE(completed_at, ?3)
+             WHERE id = ?1",
+            params![task.id, pr_url, now],
+        )?;
+        cascade_dependents_after_prereq_status_change(&mut pending, &tx, &task.id, "done", &now)?;
+        // merge_order sequencing (direction 2): order the pair. Any in-flight
+        // merge_order sibling of this just-merged task is now the "later" side
+        // and owes a preserving forward-port when its base moves. This never
+        // gates dispatch — it only records the ordering for the log; the
+        // durable contract is the merge_order edge + this task's `done` status,
+        // which the forward-port brief and the both-parents deletion tripwire
+        // consume.
+        record_merge_order_on_merge(&tx, &task.id)?;
+        // OQ7: when a chain root reaches `done`, flip any `in_review`
+        // revisions on it to `done` as well.  A revision's deliverable
+        // (the commit) rode the parent PR to its terminal state.
+        flip_in_review_revisions_to_done(&tx, &task.id, &now)?;
+        // Invalidation: any revision still in a pre-dispatch state
+        // (todo / active / waiting_dependency / blocked-for-another-reason)
+        // can never push to the merged PR.  Block them now so the
+        // scheduler stops dispatching them and the kanban shows why.
+        block_pending_revisions_on_parent_close(&mut pending, &tx, &task.id, &now)?;
+        // Comment-intent-classification design §"Reconciliation" (task
+        // 2c): resolve any comments whose `[Revise]` batch was dispatched
+        // directly to this task (the plain-chore vehicle of the
+        // revision-vs-chore decision table — a revision's comments are
+        // reconciled inside `flip_in_review_revisions_to_done` above,
+        // since `revise_task_id` there points at the revision, not the
+        // chain root).
+        comments::reconcile_comments_for_task(&tx, &task.id, comments::CommentReconcileOutcome::Resolved, &now)?;
+        let updated =
+            query_task(&tx, work_item_id)?.with_context(|| format!("unknown task after update: {work_item_id}"))?;
+        commit_and_publish(tx, pending, self.event_bus())?;
+        Ok(Some(updated))
+    }
+
+    /// Move the chore or project_task identified by `work_item_id`
+    /// from `in_review` to `done` because its bound PR was **closed
+    /// without merging** — the on-close counterpart to
+    /// [`Self::mark_chore_pr_merged`] (`chore-lifecycle-pr-closed-unmerged.md`).
+    /// Returns the updated task if a transition happened; `Ok(None)` if the
+    /// row was already past `in_review` (idempotent for late-arriving close
+    /// events, and safe if a concurrent sweep already retired it).
+    ///
+    /// `done` is the only terminal status the current enum offers — there is
+    /// no `abandoned`/`cancelled` state to distinguish "shipped" from
+    /// "closed unmerged" at the status level (open question, out of scope
+    /// here). Callers are expected to pre-filter on `kind` and `status =
+    /// in_review` the same way [`Self::list_chores_pending_merge_check`]
+    /// does for the merge path; this function itself only refuses rows
+    /// already past `in_review`.
+    ///
+    /// Mirrors `mark_chore_pr_merged`'s terminal-transition side effects
+    /// (dependent cascade, revision flip/block) since the row's resulting
+    /// status is identical — but deliberately does **not** call
+    /// `comments::reconcile_comments_for_task` with `Resolved`: the
+    /// close-unmerged comment story is "reopen anything still `in_revision`"
+    /// ([`Self::reopen_comments_for_closed_unmerged_pr`], called separately
+    /// by the merge poller), which this function must not immediately
+    /// undo by re-resolving those same comments.
+    pub fn mark_chore_pr_closed_unmerged(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut pending = PendingEvents::new();
+        let Some(task) = query_task(&tx, work_item_id)? else {
+            return Ok(None);
+        };
+        if task.deleted_at.is_some() {
+            return Ok(None);
+        }
+        if task.status == TaskStatus::Done || task.status == TaskStatus::Archived {
+            return Ok(None);
+        }
+        // Human-driven rows close only via the human complete ritual —
+        // never by merge-poller observation of a closed-unmerged PR.
+        // Same early-return contract as `mark_chore_pr_merged`.
+        if task.human_driven {
+            tracing::info!(
+                work_item_id = %task.id,
+                %pr_url,
+                "mark_chore_pr_closed_unmerged: skipping human-driven row — only `boss task complete --summary` closes it",
+            );
+            return Ok(None);
+        }
+        let now = now_string();
+        // `merge_queue_state` / `merge_queue_detail` are cleared for exactly
+        // the reason the merged twin above clears them, and the omission here
+        // was a real gap: `update_pr_poll_state` only runs for `Open` PRs, so
+        // a PR that closes unmerged while enqueued keeps whatever queue state
+        // it carried at close time forever. For a `trunk_queue` product that
+        // is permanent — `preserve_merge_queue_state` deliberately stops the
+        // GitHub sweep from recomputing these columns, so nothing else would
+        // ever correct them — leaving a `done` row that the client's
+        // `isInMergingSection` (see `Models.swift`) still routes into the
+        // kanban's "Merging" section.
+        crate::task_status_audit::execute(
+            &tx,
+            "mark_chore_pr_closed_unmerged",
+            "engine",
+            "UPDATE tasks
+             SET status             = 'done',
+                 updated_at         = ?3,
+                 last_status_actor  = 'engine',
+                 blocked_reason     = NULL,
+                 blocked_attempt_id = NULL,
+                 merge_queue_state  = NULL,
+                 merge_queue_detail = NULL,
+                 completed_at       = COALESCE(completed_at, ?3)
+             WHERE id = ?1
+               AND pr_url = ?2",
+            params![task.id, pr_url, now],
+        )?;
+        cascade_dependents_after_prereq_status_change(&mut pending, &tx, &task.id, "done", &now)?;
+        flip_in_review_revisions_to_done(&tx, &task.id, &now)?;
+        block_pending_revisions_on_parent_close(&mut pending, &tx, &task.id, &now)?;
+        let updated =
+            query_task(&tx, work_item_id)?.with_context(|| format!("unknown task after update: {work_item_id}"))?;
+        commit_and_publish(tx, pending, self.event_bus())?;
+        Ok(Some(updated))
+    }
+
+    /// Reopen every `in_revision` comment addressed by `work_item_id`'s PR
+    /// closing without merging — the "reopen on abandon" half of
+    /// comment-intent-classification design §"Reconciliation" (task 2c).
+    ///
+    /// `chore-lifecycle-pr-closed-unmerged` (the design this reconciliation
+    /// soft-depends on) is not yet implemented, so there is no `abandoned`
+    /// task status to key off of; this is the minimal comment-only hook the
+    /// design's Risks section calls out as an accepted interim mitigation —
+    /// it reopens comments without changing any task's own status, matching
+    /// the merge poller's existing "leave the row in place" behaviour for a
+    /// `ClosedUnmerged` PR.
+    ///
+    /// Reconciles two cases, mirroring the resolve-side fan-out in
+    /// [`Self::mark_chore_pr_merged`] / [`flip_in_review_revisions_to_done`]:
+    ///   - `revise_task_id = work_item_id` directly — the plain-chore
+    ///     vehicle, whose own PR is exactly the one that just closed.
+    ///   - `revise_task_id` = a revision in `work_item_id`'s chain — the
+    ///     PR-open vehicle, whose commit rides the chain root's PR, so the
+    ///     chain root's close-unmerged event is the only terminal signal a
+    ///     revision-owned comment ever gets today.
+    ///
+    /// Returns the number of comment rows reopened (tests / logging).
+    pub fn reopen_comments_for_closed_unmerged_pr(&self, work_item_id: &str) -> Result<usize> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = now_string();
+        // The direct/plain-chore vehicle's own comments only ever resolve on
+        // a genuine merge, so a late/duplicate close-unmerged sweep here
+        // must never undo that (`include_resolved: false`).
+        let mut affected = comments::reconcile_comments_for_task(
+            &tx,
+            work_item_id,
+            comments::CommentReconcileOutcome::Reopened {
+                include_resolved: false,
+            },
+            &now,
+        )?;
+        for rev_id in collect_chain_revision_ids(&tx, work_item_id)? {
+            // A revision's comments may already be `resolved` (its commit
+            // landed and reached `in_review` before the chain root's PR
+            // itself resolved) — that resolve must be undone here too, since
+            // the commit that produced it never merged either.
+            affected += comments::reconcile_comments_for_task(
+                &tx,
+                &rev_id,
+                comments::CommentReconcileOutcome::Reopened { include_resolved: true },
+                &now,
+            )?;
+        }
+        tx.commit()?;
+        Ok(affected)
+    }
+
+    /// Update the PR poll-state columns for a single task row after a
+    /// successful merge-poller probe. Stores the CI and review state strings
+    /// (and optional JSON-encoded detail blobs) plus the current timestamp.
+    ///
+    /// Returns a [`PrPollStateOutcome`] carrying `changed` (the CI, review, or
+    /// merge-queue state actually moved, so the caller should emit a change
+    /// event) and `prior_ci_state` (the `ci_required_state` value stored
+    /// *before* this update). `changed` is `false` when the probe confirmed
+    /// the same state as before, or when the row was deleted / not found.
+    /// Errors propagate from the underlying DB operations.
+    ///
+    /// The UPDATE is guarded by a `WHERE` clause that skips rows whose
+    /// `ci_required_state` AND `review_required_state` are already set to
+    /// the incoming values, so `changes() == 0` reliably means "nothing
+    /// changed" — the caller does not need to issue a separate read.
+    ///
+    /// `prior_ci_state` is read in the same connection just before the UPDATE
+    /// so the caller can detect a `fail → success` transition (CI recovered at
+    /// the current head) and broadcast a `CiFailureCleared` event, reconciling
+    /// a stale "ci failing" badge away during the poll we already do. Per-task
+    /// poll writes are serialised by the sweep loop, so the read-then-write is
+    /// race-free in practice.
+    ///
+    /// `input.preserve_merge_queue_state` leaves `merge_queue_state` /
+    /// `merge_queue_detail` untouched regardless of `input.merge_queue_state`
+    /// / `input.merge_queue_detail`. The merge poller uses it for a
+    /// `trunk_queue`-mechanism task (whose columns are owned by Trunk) and
+    /// for the empty first GitHub observation of a per-row native merge
+    /// intent. Neither case is evidence that the requested merge departed.
+    ///
+    /// UNKNOWN mergeability / merge-state status means GitHub is computing.
+    /// Retain each last known value before comparing the row, so a transient
+    /// observation neither moves Review cards nor publishes an invalidation.
+    pub fn update_task_pr_poll_state(&self, work_item_id: &str, input: PrPollStateInput) -> Result<PrPollStateOutcome> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = now_string();
+        let before = read_pr_observation_columns(&tx, work_item_id)?;
+        if before.is_some() {
+            driver_allocation::sol_selection::observe_ci(
+                &tx,
+                work_item_id,
+                input.pr_head_sha,
+                input.ci_required_state,
+            )?;
+        }
+        let prior_ci_state = before.as_ref().and_then(|row| row.ci_required_state.clone());
+        let prior_mergeable = before.as_ref().and_then(|row| row.pr_mergeable_state.as_deref());
+        let prior_merge_status = before.as_ref().and_then(|row| row.pr_merge_state_status.as_deref());
+        let mergeable = retain_known_poll_value(prior_mergeable, input.pr_mergeable_state);
+        let merge_status = input
+            .pr_merge_state_status
+            .map(|value| retain_known_poll_value(prior_merge_status, value))
+            .or(prior_merge_status);
+        let prior_merge_queue_state: Option<String> = tx
+            .query_row(
+                "SELECT merge_queue_state FROM tasks
+                 WHERE id = ?1 AND deleted_at IS NULL",
+                params![work_item_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        // Always stamp the poll timestamp so operators can observe that sweeps
+        // are running even when CI/review/merge-queue state is unchanged (e.g. a
+        // PR that stays CONFLICTING for an extended period). Without this,
+        // pr_state_polled_at freezes the moment the state stabilises, making it
+        // impossible to distinguish a frozen poller from an actively-polling one.
+        // `pr_status_observed_at` is stamped alongside it here (the poller
+        // side of that column's two writers — see
+        // `set_pr_status_observation` for the worker-refresh side); unlike
+        // `pr_state_polled_at`, it is not exclusively a poller liveness
+        // signal, so a worker refresh is allowed to advance it too.
+        tx.execute(
+            "UPDATE tasks SET pr_state_polled_at = ?2, pr_status_observed_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+            params![work_item_id, now],
+        )?;
+        // Only write state columns (and count as changed) when CI, review,
+        // merge-queue state, or merge-queue detail (position/enqueued-at,
+        // which ticks every sweep while queued) differs from what's already
+        // stored. COALESCE treats NULL as distinct from any non-empty string,
+        // so the first probe after migration always fires the event.
+        //
+        // `preserve` (`?8`) short-circuits both the merge-queue SET clauses
+        // (via CASE, so the stored value passes through unchanged) and the
+        // merge-queue arms of the changed-check, so a preserved row's
+        // `changed` outcome reflects only CI/review movement.
+        let preserve = input.preserve_merge_queue_state;
+        let changed = tx.execute(
+            "UPDATE tasks
+             SET ci_required_state      = ?2,
+                 review_required_state  = ?3,
+                 ci_required_detail     = ?4,
+                 review_required_detail = ?5,
+                 merge_queue_state      = CASE WHEN ?8 THEN merge_queue_state ELSE ?6 END,
+                 merge_queue_detail     = CASE WHEN ?8 THEN merge_queue_detail ELSE ?7 END,
+                 pr_mergeable_state     = ?9,
+                 pr_merge_state_status  = ?10,
+                 pr_head_sha            = ?11,
+                 pr_updated_at          = COALESCE(?12, pr_updated_at)
+             WHERE id = ?1
+               AND deleted_at IS NULL
+               AND (COALESCE(ci_required_state, '') != ?2
+                    OR COALESCE(review_required_state, '') != ?3
+                    OR (NOT ?8 AND (COALESCE(merge_queue_state, '') != COALESCE(?6, '')
+                                    OR COALESCE(merge_queue_detail, '') != COALESCE(?7, '')))
+                    OR COALESCE(pr_mergeable_state, '') != ?9
+                    OR COALESCE(pr_merge_state_status, '') != COALESCE(?10, '')
+                    OR COALESCE(pr_head_sha, '') != COALESCE(?11, '')
+                    OR COALESCE(pr_updated_at, '') != COALESCE(?12, pr_updated_at, ''))",
+            params![
+                work_item_id,
+                input.ci_required_state,
+                input.review_required_state,
+                input.ci_required_detail,
+                input.review_required_detail,
+                input.merge_queue_state,
+                input.merge_queue_detail,
+                preserve,
+                mergeable,
+                merge_status,
+                input.pr_head_sha,
+                input.pr_updated_at,
+            ],
+        )?;
+        tx.commit()?;
+        if changed > 0
+            && (prior_ci_state.as_deref() != Some(input.ci_required_state)
+                || prior_mergeable != Some(mergeable)
+                || prior_merge_status != merge_status)
+        {
+            tracing::info!(
+                work_item_id,
+                pr_url = ?before.as_ref().and_then(|row| row.pr_url.as_deref()),
+                caller = input.caller,
+                old_ci_required_state = ?prior_ci_state,
+                new_ci_required_state = input.ci_required_state,
+                old_pr_mergeable_state = ?prior_mergeable,
+                new_pr_mergeable_state = mergeable,
+                old_pr_merge_state_status = ?prior_merge_status,
+                new_pr_merge_state_status = ?merge_status,
+                "PR poll state changed",
+            );
+        }
+        Ok(PrPollStateOutcome {
+            changed: changed > 0,
+            prior_ci_state,
+            prior_merge_queue_state,
+        })
+    }
+
+    /// The PR-status snapshot backing `boss pr status` (`app::pr_status`):
+    /// exactly the columns the merge poller already wrote for this task's
+    /// PR, as of its last probe — no GitHub call. Returns `Ok(None)` only
+    /// when the row itself is gone (deleted); a task with no PR yet, or one
+    /// the poller hasn't probed, comes back with every field `None` except
+    /// `pr_url` if set.
+    pub fn get_pr_status_snapshot(&self, work_item_id: &str) -> Result<Option<PrStatusSnapshot>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT pr_url, pr_mergeable_state, pr_merge_state_status, pr_head_sha, pr_status_observed_at
+             FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+            params![work_item_id],
+            |row| {
+                Ok(PrStatusSnapshot {
+                    pr_url: row.get(0)?,
+                    mergeable: row.get(1)?,
+                    merge_state_status: row.get(2)?,
+                    head_sha: row.get(3)?,
+                    observed_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .context("reading pr status snapshot")
+    }
+
+    /// Persist a fresh `boss pr status --refresh` observation directly from
+    /// a live `MergeProbe::probe` result, bypassing the CI/review/merge-queue
+    /// bookkeeping [`Self::update_task_pr_poll_state`] otherwise couples to
+    /// the same write — a refresh is a single bounded on-demand mergeability
+    /// check, not a full sweep pass. Always writes `pr_mergeable_state` and
+    /// `pr_status_observed_at` (no changed-guard): a caller that paid for a
+    /// live `gh` round trip wants the row to reflect it unconditionally.
+    /// `merge_state_status` / `head_sha` are `COALESCE`d against the stored
+    /// value instead of overwritten outright — the probe that reaches this
+    /// call is always `Open` (callers must gate on `PrLifecycleState::Open`
+    /// before calling), but GitHub can still omit either individual field on
+    /// a given response, and a missing field must not blank a previously
+    /// known-good one.
+    ///
+    /// Deliberately does NOT touch `pr_state_polled_at` — that column stays
+    /// the merge poller's own liveness diagnostic (see
+    /// `update_task_pr_poll_state`'s doc comment); a worker refresh advancing
+    /// it would make a wedged poller look alive. `pr_status_observed_at` is
+    /// the shared "last observed by anyone" timestamp both writers stamp.
+    ///
+    /// Returns `true` when the write moved any column the board's Review
+    /// classification reads (`pr_mergeable_state`, `ci_required_state`) or
+    /// the merge poller's changed-guard compares against
+    /// (`pr_merge_state_status`, `pr_head_sha`). The caller must then publish
+    /// a work invalidation itself: nothing else will. The merge poller's next
+    /// sweep diffs its probe against the row this call just wrote, so a
+    /// refresh that already stored what the sweep would have stored makes
+    /// that sweep report "unchanged" and publish nothing — the board would
+    /// keep showing the card where the last published state put it until the
+    /// next product-topic invalidation triggers a tree refetch (for example
+    /// under Pending with `pr_mergeable_state = "unknown"`) while the engine
+    /// itself classifies the row as Ready.
+    pub fn set_pr_status_observation(
+        &self,
+        work_item_id: &str,
+        mergeable_state: &str,
+        merge_state_status: Option<&str>,
+        head_sha: Option<&str>,
+        observed_at: &str,
+    ) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let before = read_pr_observation_columns(&tx, work_item_id)?;
+        let mergeable_state = retain_known_poll_value(
+            before.as_ref().and_then(|row| row.pr_mergeable_state.as_deref()),
+            mergeable_state,
+        );
+        let merge_state_status = merge_state_status.map(|value| {
+            retain_known_poll_value(
+                before.as_ref().and_then(|row| row.pr_merge_state_status.as_deref()),
+                value,
+            )
+        });
+        tx.execute(
+            "UPDATE tasks
+             SET pr_mergeable_state    = ?2,
+                 pr_merge_state_status = COALESCE(?3, pr_merge_state_status),
+                 -- CI is only polled in full sweeps, so a snapshot recorded for
+                 -- the previous head says nothing about a new one: drop it
+                 -- until the next poll reports CI for the new head.
+                 ci_required_state     = CASE WHEN ?4 IS NOT NULL AND ?4 != COALESCE(pr_head_sha, '')
+                                              THEN NULL ELSE ci_required_state END,
+                 pr_head_sha           = COALESCE(?4, pr_head_sha),
+                 pr_status_observed_at = ?5
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![work_item_id, mergeable_state, merge_state_status, head_sha, observed_at],
+        )?;
+        let after = read_pr_observation_columns(&tx, work_item_id)?;
+        tx.commit()?;
+        Ok(before != after)
+    }
+
+    /// Write the Merging-UI columns for `work_item_id` directly — the
+    /// Trunk-owned counterpart to [`Self::update_task_pr_poll_state`],
+    /// whose `preserve_merge_queue_state` gate deliberately keeps the
+    /// GitHub probe off these two columns for a `trunk_queue` product.
+    ///
+    /// Two callers: `app::review::handle_trunk_queue_merge`'s optimistic
+    /// write right after a successful `submitPullRequest`, and the Trunk
+    /// queue poller on every observation (including the `NULL, NULL`
+    /// Review snap-back when an entry leaves the queue).
+    ///
+    /// Returns whether the stored pair actually moved. The poller re-derives
+    /// identical JSON on most sweeps, and the macOS app is push-only — so
+    /// without this the poller would either publish a `work_item_changed`
+    /// per PR per 15 s regardless of news, or have to re-read the row
+    /// itself to tell. Does not stamp `updated_at`, consistent with
+    /// `update_task_pr_poll_state` also leaving it alone.
+    pub fn set_task_merge_queue_state(
+        &self,
+        work_item_id: &str,
+        merge_queue_state: Option<&str>,
+        merge_queue_detail: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.connect()?;
+        // `IS NOT` (not `<>`) so a NULL on either side compares as a value:
+        // `NULL <> 'queued'` is NULL, i.e. not true, which would silently
+        // swallow the very first write and the snap-back back to NULL.
+        let changed = conn.execute(
+            "UPDATE tasks SET merge_queue_state = ?2, merge_queue_detail = ?3 \
+             WHERE id = ?1 AND deleted_at IS NULL \
+               AND (merge_queue_state IS NOT ?2 OR merge_queue_detail IS NOT ?3)",
+            params![work_item_id, merge_queue_state, merge_queue_detail],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// The currently stored `merge_queue_detail` blob for `work_item_id`,
+    /// if any.
+    ///
+    /// Used by the Trunk queue poller to seed a fresh write's
+    /// `section_order` from the value the last renumbering pass settled
+    /// on, rather than a provisional one derived fresh from this probe's
+    /// raw queue position — which, whenever the real Trunk queue has any
+    /// non-Boss-tracked member ahead of a tracked one, differs from the
+    /// renumbered value and would otherwise be immediately overwritten
+    /// (and republished) again every single pass.
+    pub fn get_task_merge_queue_detail(&self, work_item_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let detail = conn
+            .query_row(
+                "SELECT merge_queue_detail FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+                params![work_item_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(detail)
+    }
+}
+
+/// Argument bundle for [`WorkDb::update_task_pr_poll_state`] — grouped to
+/// keep the method under clippy's `too_many_arguments` threshold rather than
+/// passing six positional `Option<&str>`/`&str` params.
+#[derive(Debug, Clone, Copy, Default, bon::Builder)]
+#[builder(on(String, into))]
+pub struct PrPollStateInput<'a> {
+    /// Origin of the observation, included in per-row state transition logs.
+    #[builder(default = "unspecified")]
+    pub caller: &'a str,
+    pub ci_required_state: &'a str,
+    pub review_required_state: &'a str,
+    pub ci_required_detail: Option<&'a str>,
+    pub review_required_detail: Option<&'a str>,
+    pub merge_queue_state: Option<&'a str>,
+    pub merge_queue_detail: Option<&'a str>,
+    /// Raw GitHub mergeability (`"mergeable"` / `"conflicting"` / `"unknown"`)
+    /// for this probe, independent of CI/review/merge-queue state — see
+    /// `Task::pr_mergeable_state`. Defaults to `""` via `#[derive(Default)]`,
+    /// matching the `ci_required_state`/`review_required_state` convention of
+    /// treating an empty string as "not yet probed" at the DB layer (the
+    /// protocol layer instead normalizes empty to `None`, per `map_task`).
+    pub pr_mergeable_state: &'a str,
+    /// GitHub's raw `mergeStateStatus` for this probe (`"CLEAN"`,
+    /// `"DIRTY"`, `"BLOCKED"`, `"BEHIND"`, `"UNSTABLE"`, `"UNKNOWN"`) — see
+    /// `tasks.pr_merge_state_status`'s migration doc for the stored column.
+    /// `None` when the probe didn't carry one (rare). Missing / UNKNOWN
+    /// observations retain a known value. Backs `boss pr status`.
+    pub pr_merge_state_status: Option<&'a str>,
+    /// The PR's `headRefOid` at probe time. `None` when GitHub didn't
+    /// report one. Backs `boss pr status`'s `head_sha` field with the
+    /// current observed head, distinct from
+    /// `WorkExecution::pr_head_before` (the snapshot at a specific
+    /// execution's run start).
+    pub pr_head_sha: Option<&'a str>,
+    /// GitHub's `updatedAt` for the PR at probe time (RFC 3339). `None` when
+    /// GitHub didn't report one; the stored value is then kept. Backs
+    /// `Task::pr_updated_at`, the Review column's Pending-section recency key.
+    pub pr_updated_at: Option<&'a str>,
+    /// When `true`, `merge_queue_state`/`merge_queue_detail` are left
+    /// untouched regardless of the values above. Used for Trunk-owned rows
+    /// and a GitHub-native intent's empty first observation; both have a
+    /// separate authoritative owner for their next lane transition. Defaults
+    /// to `false` (the pre-existing behaviour) via `#[derive(Default)]`.
+    pub preserve_merge_queue_state: bool,
+}
+
+/// Result of [`WorkDb::get_pr_status_snapshot`] — the columns the merge
+/// poller (or a `boss pr status --refresh` call) last observed for a task's
+/// PR. Every field beyond `pr_url` is `None` until at least one probe has
+/// run. `app::pr_status` maps this into the wire-level `PrStatusView`.
+#[derive(Debug, Clone, Default)]
+pub struct PrStatusSnapshot {
+    pub pr_url: Option<String>,
+    pub mergeable: Option<String>,
+    pub merge_state_status: Option<String>,
+    pub head_sha: Option<String>,
+    pub observed_at: Option<String>,
+}
+
+/// Outcome of [`WorkDb::update_task_pr_poll_state`].
+#[derive(Debug, Clone)]
+pub struct PrPollStateOutcome {
+    /// `true` when the CI, review, or merge-queue state actually changed
+    /// (so the caller should emit a `pr_poll_state_updated` event).
+    pub changed: bool,
+    /// The `ci_required_state` value stored *before* this update, or `None`
+    /// when the column was NULL / the row was absent. Lets the caller detect
+    /// a `fail → success` transition and clear a stale "ci failing" badge.
+    pub prior_ci_state: Option<String>,
+    /// The `merge_queue_state` value stored *before* this update, or `None`
+    /// when the column was NULL / the row was absent. Lets the caller detect
+    /// merge-queue entry/exit (`_ → "queued"` or `"queued" → _`) and trigger
+    /// a whole-queue renumbering pass (`merge_poller::renumber_merge_queue`)
+    /// rather than patching only this row.
+    pub prior_merge_queue_state: Option<String>,
+}
+
+/// One row from [`WorkDb::list_queued_merge_queue_members`]: a task
+/// currently sitting in GitHub's merge queue, keyed with its raw
+/// `merge_queue_detail` JSON blob so the caller can re-derive a canonical
+/// ordering across every member.
+#[derive(Debug, Clone)]
+pub struct QueuedMergeQueueMember {
+    pub task_id: String,
+    pub merge_queue_detail: Option<String>,
+}
+
+#[work_db_boundary::instrument]
+impl WorkDb {
+    /// Every task in `product_id` currently in GitHub's merge queue
+    /// (`merge_queue_state = 'queued'`). Used by the merge poller's
+    /// whole-queue renumbering pass (`merge_poller::renumber_merge_queue`)
+    /// to recompute every member's displayed position whenever any one of
+    /// them enters, exits, fails, or reorders — rather than leaving
+    /// siblings with a stale (possibly now-duplicate or now-missing)
+    /// position until their own next individual probe.
+    pub fn list_queued_merge_queue_members(&self, product_id: &str) -> Result<Vec<QueuedMergeQueueMember>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, merge_queue_detail
+             FROM tasks
+             WHERE product_id = ?1
+               AND merge_queue_state = 'queued'
+               AND status NOT IN ('done', 'archived')
+               AND deleted_at IS NULL",
+        )?;
+        let rows = stmt.query_map(params![product_id], |row| {
+            Ok(QueuedMergeQueueMember {
+                task_id: row.get(0)?,
+                merge_queue_detail: row.get(1)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Overwrite `merge_queue_detail` for one task after a whole-queue
+    /// renumbering pass recomputed its canonical position. Guarded by
+    /// `merge_queue_state = 'queued'` so a row that exited the queue
+    /// between [`list_queued_merge_queue_members`](Self::list_queued_merge_queue_members)'s
+    /// read and this write is left untouched — it will simply no longer
+    /// appear in the next renumbering pass's member list either. Returns
+    /// `true` when a row was actually updated (so the caller knows to emit
+    /// a change event), `false` when the stored value already matched or
+    /// the row is no longer a live queue member.
+    pub fn update_task_merge_queue_detail(&self, task_id: &str, merge_queue_detail: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let changed = conn.execute(
+            "UPDATE tasks
+             SET merge_queue_detail = ?2
+             WHERE id = ?1
+               AND deleted_at IS NULL
+               AND merge_queue_state = 'queued'
+               AND COALESCE(merge_queue_detail, '') != ?2",
+            params![task_id, merge_queue_detail],
+        )?;
+        Ok(changed > 0)
+    }
+}
+
+#[work_db_boundary::instrument]
+impl WorkDb {
+    /// Return `(review_cycle, last_reviewed_sha)` for `task_id`.
+    ///
+    /// `review_cycle` is the number of `pr_review` passes that have completed
+    /// for this task's PR. `last_reviewed_sha` is the PR HEAD SHA recorded at
+    /// the end of the most recent pass, or `None` if no pass has completed yet.
+    ///
+    /// Used by the cycle-bound check in `boss_engine::completion::WorkerCompletionHandler`
+    /// before enqueuing a new `pr_review` execution.
+    pub fn get_task_review_cycle_state(&self, task_id: &str) -> Result<(i64, Option<String>)> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT review_cycle, last_reviewed_sha FROM tasks WHERE id = ?1",
+            [task_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .with_context(|| format!("unknown task: {task_id}"))
+    }
+
+    /// Atomically increment `review_cycle` by 1 and set `last_reviewed_sha`.
+    ///
+    /// Called from `boss_engine::completion::WorkerCompletionHandler::finalize_pr_review_pass`
+    /// after a `pr_review` execution completes, regardless of whether a
+    /// revision was warranted. A missing or empty `last_reviewed_sha` records
+    /// `NULL` (the reviewer could not determine the HEAD SHA).
+    /// The cycle state is shared by a task and its revisions.
+    pub fn increment_task_review_cycle(&self, task_id: &str, last_reviewed_sha: Option<&str>) -> Result<()> {
+        let conn = self.connect()?;
+        let rows = conn.execute(
+            "UPDATE tasks
+             SET review_cycle      = review_cycle + 1,
+                 last_reviewed_sha = ?2,
+                 updated_at        = ?3
+             WHERE id = ?1
+               AND deleted_at IS NULL",
+            params![task_id, last_reviewed_sha.filter(|s| !s.is_empty()), now_string(),],
+        )?;
+        if rows == 0 {
+            bail!("unknown or deleted task: {task_id}");
+        }
+        Ok(())
+    }
+
+    /// Resolve the task id whose `review_cycle` / `last_reviewed_sha`
+    /// columns should record a completed reviewer pass triggered by
+    /// `task_id`'s completion.
+    ///
+    /// For a `revision` task, walks to the chain root (the task that owns
+    /// the PR the revision pushes commits onto) and returns *its* id
+    /// instead. Each revision is a brand-new task row, so tracking cycle
+    /// state on the revision itself would silently reset the cycle-bound
+    /// (`max_review_cycles`) and no-op-skip gates to zero on every single
+    /// revision — defeating both once revisions can trigger reviews of
+    /// their own. Bookkeeping instead accumulates on one persistent row
+    /// across the whole chain, mirroring how the chain root is already the
+    /// source of truth for `pr_url` (see [`Self::get_revision_chain_root_pr_url`]).
+    ///
+    /// Returns `task_id` unchanged for a non-revision task, or when the
+    /// chain root can't be resolved (broken parent link — fails open so a
+    /// data anomaly degrades to "count from zero" rather than an error).
+    pub fn review_cycle_root_id(&self, task_id: &str) -> String {
+        let Ok(conn) = self.connect() else {
+            return task_id.to_owned();
+        };
+        match query_task(&conn, task_id) {
+            Ok(Some(t)) if t.kind == TaskKind::Revision => get_chain_root_task(&conn, task_id)
+                .ok()
+                .flatten()
+                .map(|root| root.id)
+                .unwrap_or_else(|| task_id.to_owned()),
+            _ => task_id.to_owned(),
+        }
+    }
+}
+
+pub(super) const OPERATOR_QUESTION_STUCK_CLASSIFICATION_MIGRATION_ID: &str =
+    "20261029_1807_operator_question_stuck_classification";
+
+/// Records which stuck state a question was filed in, so the stuck report can
+/// count questions by kind long after the item has moved on. Rows filed before
+/// this column existed read as `unknown_legacy`.
+pub(super) fn migrate_operator_question_stuck_classification(conn: &Connection) -> Result<()> {
+    if !super::schema_init::table_has_column(conn, "operator_questions", "stuck_classification")? {
+        conn.execute_batch(
+            "ALTER TABLE operator_questions ADD COLUMN stuck_classification TEXT NOT NULL DEFAULT 'unknown_legacy'",
+        )?;
+    }
+    Ok(())
+}
+
+// Durable questions attached to blocked completion declarations.
+pub(super) fn migrate_operator_questions(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS operator_questions (
+            id TEXT PRIMARY KEY,
+            work_item_id TEXT NOT NULL,
+            execution_id TEXT NOT NULL,
+            proposal_id TEXT NOT NULL,
+            question_json TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('open', 'answered', 'withdrawn')),
+            answer_json TEXT,
+            answered_by TEXT,
+            answered_at TEXT,
+            withdrawn_reason TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS operator_questions_one_open_per_item
+            ON operator_questions(work_item_id) WHERE status = 'open';
+        CREATE INDEX IF NOT EXISTS operator_questions_by_item
+            ON operator_questions(work_item_id, created_at);
+        DROP VIEW IF EXISTS open_operator_questions;
+        CREATE VIEW open_operator_questions AS
+            SELECT work_item_id, json_patch(question_json,
+                json_object('id', id, 'asked_at', created_at, 'execution_id', execution_id,
+                    'run_summary', (SELECT json_extract(payload_json, '$.summary') FROM worker_proposals
+                        WHERE worker_proposals.id = operator_questions.proposal_id))) AS view_json
+            FROM operator_questions WHERE status = 'open';
+        CREATE TRIGGER IF NOT EXISTS operator_questions_task_override
+        AFTER UPDATE OF status, blocked_reason, deleted_at ON tasks
+        WHEN NEW.deleted_at IS NOT OLD.deleted_at
+          OR NEW.status IS NOT OLD.status
+          OR NEW.blocked_reason IS NOT OLD.blocked_reason
+        BEGIN
+            UPDATE operator_questions
+            SET status = 'withdrawn', withdrawn_reason = CASE
+                WHEN NEW.deleted_at IS NOT NULL THEN 'task_deleted'
+                WHEN NEW.status != 'blocked' THEN 'status_edited'
+                ELSE 'reason_edited' END
+            WHERE work_item_id = NEW.id AND status = 'open'
+              AND (NEW.deleted_at IS NOT NULL
+                OR (NEW.status IS NOT OLD.status AND NEW.status != 'blocked')
+                OR (NEW.blocked_reason IS NOT OLD.blocked_reason
+                    AND NEW.blocked_reason IS NOT 'awaiting_operator_answer'));
+        END;",
+    )?;
+    Ok(())
+}
+
+pub(super) fn withdraw_questions(conn: &Connection, work_item_id: &str, reason: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE operator_questions SET status = 'withdrawn', withdrawn_reason = ?2
+         WHERE work_item_id = ?1 AND status = 'open'",
+        params![work_item_id, reason],
+    )?;
+    Ok(())
+}
+
+/// Insert a question without host observations in storage-only tests.
+#[cfg(any(test, feature = "test-support"))]
+pub fn insert_question(
+    conn: &Connection,
+    execution_id: &str,
+    proposal_id: &str,
+    question: &OperatorQuestion,
+) -> Result<()> {
+    insert_question_with_liveness(conn, execution_id, proposal_id, question, None)
+}
+
+/// Persist the pre-transaction observation, rechecking durable eligibility.
+pub(super) fn insert_question_with_liveness(
+    conn: &Connection,
+    execution_id: &str,
+    proposal_id: &str,
+    question: &OperatorQuestion,
+    worker: Option<&super::stuck_report::QuestionWorkerObservation>,
+) -> Result<()> {
+    let execution = query_execution(conn, execution_id).require("execution", execution_id)?;
+    // Every work-item kind that can run a worker gets a question row: a
+    // chore or followup that stops on a human decision is waiting on that
+    // decision exactly like a task is, and the kanban card is the only
+    // surface where this decision can be answered. The row is `open` only when
+    // the item can actually park on it (see `record_worker_failure_or_question`).
+    let Some(task) = query_task(conn, &execution.work_item_id)? else {
+        return Ok(());
+    };
+    let parkable = task.deleted_at.is_none() && matches!(task.status, TaskStatus::Active | TaskStatus::Todo);
+    let stuck_classification = if task.blocked_reason.is_some() || task.dispatch_failed_reason.is_some() {
+        let durable = super::stuck_report::classification(conn, &task, None)?;
+        if let Some(worker) = worker
+            && worker.still_eligible(conn, &task, &durable)?
+        {
+            "S15_orphan_live_pid".to_owned()
+        } else {
+            durable
+        }
+    } else {
+        "S8_operator_question".to_owned()
+    };
+    conn.execute(
+        "INSERT INTO operator_questions
+         (id, work_item_id, execution_id, proposal_id, question_json, status, withdrawn_reason, created_at, stuck_classification)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            next_id("oq"),
+            task.id,
+            execution_id,
+            proposal_id,
+            serde_json::to_string(question)?,
+            if parkable { "open" } else { "withdrawn" },
+            if parkable { None } else { Some("task_not_parkable") },
+            now_string(),
+            stuck_classification
+        ],
+    )?;
+    Ok(())
+}
+
+pub(super) fn map_question(row: &Row<'_>) -> rusqlite::Result<OperatorQuestionRecord> {
+    let json: String = row.get("question_json")?;
+    let question: OperatorQuestion = serde_json::from_str(&json)
+        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err)))?;
+    let answer: Option<String> = row.get("answer_json")?;
+    let answer = answer
+        .map(|json| serde_json::from_str(&json))
+        .transpose()
+        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(err)))?;
+    let status: String = row.get("status")?;
+    Ok(OperatorQuestionRecord::builder()
+        .question(
+            OperatorQuestionView::builder()
+                .id(row.get::<_, String>("id")?)
+                .text(question.text)
+                .answer_type(question.answer_type)
+                .explanation(question.explanation)
+                .asked_at(row.get::<_, String>("created_at")?)
+                .execution_id(row.get::<_, String>("execution_id")?)
+                .maybe_run_summary(row.get::<_, Option<String>>("run_summary")?)
+                .build(),
+        )
+        .work_item_id(row.get::<_, String>("work_item_id")?)
+        .status(match status.as_str() {
+            "open" => OperatorQuestionStatus::Open,
+            "answered" => OperatorQuestionStatus::Answered,
+            _ => OperatorQuestionStatus::Withdrawn,
+        })
+        .maybe_answer(answer)
+        .maybe_answered_by(row.get::<_, Option<String>>("answered_by")?)
+        .maybe_answered_at(row.get::<_, Option<String>>("answered_at")?)
+        .maybe_withdrawn_reason(row.get::<_, Option<String>>("withdrawn_reason")?)
+        .build())
+}
+
+/// The one select `map_question` reads: every `operator_questions` column
+/// plus the declaring run's summary. Append a `WHERE` clause.
+pub(super) const OPERATOR_QUESTION_RECORD_SELECT: &str = "SELECT *, (SELECT json_extract(payload_json, '$.summary') \
+     FROM worker_proposals WHERE worker_proposals.id = operator_questions.proposal_id) AS run_summary \
+     FROM operator_questions";
+
+#[work_db_boundary::instrument]
+impl WorkDb {
+    pub fn list_operator_questions(&self, work_item_id: &str) -> Result<Vec<OperatorQuestionRecord>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(&format!(
+            "{OPERATOR_QUESTION_RECORD_SELECT} WHERE work_item_id = ?1 ORDER BY created_at, id"
+        ))?;
+        collect_rows(stmt.query_map([work_item_id], map_question)?)
+    }
+
+    pub fn execution_operator_question(&self, execution_id: &str) -> Result<Option<OperatorQuestion>> {
+        let conn = self.connect()?;
+        let payload: Option<String> = conn
+            .query_row(
+                "SELECT payload_json FROM worker_proposals
+             WHERE execution_id = ?1 AND kind = 'run_done' AND state = 'applied'
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+                [execution_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        payload
+            .map(|json| {
+                serde_json::from_str::<boss_protocol::RunDoneProposalPayload>(&json).map(|payload| payload.question)
+            })
+            .transpose()
+            .map(Option::flatten)
+            .map_err(Into::into)
+    }
+
+    /// The selector is a question id or a canonical task id (RPC resolves short ids).
+    ///
+    /// `minted_execution` is true only when this call minted a ready execution
+    /// (a first Yes on a plain question, or a first choice on a multiple-choice
+    /// question); the caller must then kick the
+    /// scheduler, since the transaction stages no dispatch wakeup of its own.
+    /// It is false for No answers, for idempotent repeats, and for a
+    /// prerequisite approval (the task is parked behind its prerequisite; the
+    /// dependency cascade dispatches it later).
+    ///
+    /// Immediate, so two racing answers serialize on the write lock instead of
+    /// failing at the read-to-write upgrade: the loser then reads the winner's
+    /// `answered` row and is an idempotent repeat (or a `Conflict`).
+    pub fn answer_operator_question(&self, id: &str, answer: OperatorAnswer) -> Result<OperatorAnswerOutcome> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let question = tx
+            .query_row(
+                &format!(
+                    "{OPERATOR_QUESTION_RECORD_SELECT} WHERE id = ?1 OR work_item_id = ?1
+                     ORDER BY (status = 'open') DESC, created_at DESC, id DESC LIMIT 1"
+                ),
+                [id],
+                map_question,
+            )
+            .optional()?
+            .ok_or(OperatorQuestionError::NotFound)?;
+        let task = query_task(&tx, &question.work_item_id)?
+            .filter(|task| task.deleted_at.is_none())
+            .ok_or(OperatorQuestionError::NotFound)?;
+        if question.status != OperatorQuestionStatus::Open {
+            if question.status == OperatorQuestionStatus::Answered && question.answer.as_ref() == Some(&answer) {
+                let mut unchanged = task;
+                project_for_work_item_updated(&tx, &mut unchanged, "answer_operator_question");
+                return Ok(OperatorAnswerOutcome::unchanged(task_to_item(unchanged)));
+            }
+            return Err(OperatorQuestionError::Conflict {
+                state: match question.status {
+                    OperatorQuestionStatus::Answered => "answered",
+                    _ => "withdrawn",
+                }
+                .into(),
+                answer: question.answer,
+            }
+            .into());
+        }
+        if task.status != TaskStatus::Blocked || task.blocked_reason.as_deref() != Some("awaiting_operator_answer") {
+            return Err(OperatorQuestionError::Conflict {
+                state: task.status.to_string(),
+                answer: None,
+            }
+            .into());
+        }
+        question
+            .question
+            .answer_type
+            .check_answer(&answer)
+            .map_err(|message| OperatorQuestionError::ValidationFailed { message })?;
+        let now = now_string();
+        let answered_at = chrono::DateTime::from_timestamp(now.parse::<i64>()?, 0)
+            .context("answer timestamp is outside the supported range")?;
+        let changed = tx.execute(
+            "UPDATE operator_questions SET status = 'answered', answer_json = ?2,
+             answered_by = 'human', answered_at = ?3 WHERE id = ?1 AND status = 'open'",
+            params![question.question.id, serde_json::to_string(&answer)?, now],
+        )?;
+        anyhow::ensure!(changed == 1, "question transition lost inside its transaction");
+        let mut pending = PendingEvents::new();
+        let mut minted_execution = false;
+        let mut prerequisite_work_item_id = None;
+        match (answer, &question.question.answer_type) {
+            (OperatorAnswer::YesNo { value: true }, OperatorAnswerType::CreatePrerequisiteTask { name, brief, .. }) => {
+                let linked = super::prerequisite_question::approve_in_tx(
+                    &mut pending,
+                    &tx,
+                    &task,
+                    &question.question,
+                    (name, brief),
+                    answered_at,
+                    &now,
+                )?;
+                prerequisite_work_item_id = Some(linked.id);
+            }
+            (OperatorAnswer::YesNo { value: true }, OperatorAnswerType::YesNo) => {
+                let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
+                let block = authorization_block(&question.question, &timestamp);
+                restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
+                minted_execution = true;
+            }
+            (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. }) => {
+                let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
+                let block = choice_block(&question.question, &value, &timestamp);
+                restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
+                minted_execution = true;
+            }
+            (
+                OperatorAnswer::YesNo { value: false },
+                OperatorAnswerType::CreatePrerequisiteTask {
+                    file_count_bypass: Some(spec),
+                    ..
+                },
+            ) => {
+                let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
+                let block = file_count_bypass_authorization_block(&question.question, *spec, &timestamp);
+                restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
+                minted_execution = true;
+            }
+            (OperatorAnswer::YesNo { value: false }, _) => {
+                let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
+                let block = declined_block(&question.question, &timestamp);
+                restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
+                minted_execution = true;
+            }
+            // `check_answer` above refuses every other pairing.
+            (answer, answer_type) => anyhow::bail!("unhandled operator answer {answer:?} for {answer_type:?}"),
+        }
+
+        let mut updated = query_task(&tx, &task.id).require("task", &task.id)?;
+        project_for_work_item_updated(&tx, &mut updated, "answer_operator_question");
+        commit_and_publish(tx, pending, &self.event_bus)?;
+        Ok(OperatorAnswerOutcome {
+            item: task_to_item(updated),
+            minted_execution,
+            prerequisite_work_item_id,
+        })
+    }
+}
+
+/// What [`WorkDb::answer_operator_question`] did, for the RPC layer.
+#[derive(Debug)]
+pub struct OperatorAnswerOutcome {
+    /// The answered task as it stands after the answer.
+    pub item: WorkItem,
+    /// See [`WorkDb::answer_operator_question`].
+    pub minted_execution: bool,
+    /// The prerequisite task a Yes created or linked, so the RPC layer can
+    /// invalidate it alongside the answered task.
+    pub prerequisite_work_item_id: Option<String>,
+}
+
+impl OperatorAnswerOutcome {
+    fn unchanged(item: WorkItem) -> Self {
+        Self {
+            item,
+            minted_execution: false,
+            prerequisite_work_item_id: None,
+        }
+    }
+}
+
+/// Move the answered task back to Todo with `block` appended to its brief and
+/// mint the ready execution that carries the answer to the next worker.
+fn restart_after_answer(
+    pending: &mut PendingEvents,
+    tx: &rusqlite::Transaction<'_>,
+    task: &Task,
+    question: &OperatorQuestionView,
+    block: &str,
+    now: &str,
+) -> Result<()> {
+    let description = format!("{}{block}", task.description);
+    super::description_guard::validate_description_update(&task.description, &description, false)?;
+    crate::task_status_audit::execute(
+        tx,
+        "restart_after_answer",
+        "human",
+        "UPDATE tasks SET description = ?2, status = 'todo', blocked_reason = NULL,
+         blocked_detail = NULL, autostart = 1, last_status_actor = 'human', updated_at = ?3 WHERE id = ?1",
+        params![task.id, description, now],
+    )?;
+    let asking = query_execution(tx, &question.execution_id).require("execution", &question.execution_id)?;
+    request_execution_in_tx_with_live_check(
+        pending,
+        tx,
+        RequestExecutionInput::builder()
+            .work_item_id(&task.id)
+            .maybe_preferred_workspace_id(asking.preferred_workspace_id)
+            .entry_point(DispatchAdmissionEntryPoint::OperatorAnswer)
+            .explicit_start(true)
+            .build(),
+        // Match request_execution's conservative behavior when
+        // no live-worker oracle is supplied.
+        |_| true,
+    )?;
+    Ok(())
+}
+
+/// No on a plain yes-no or ordinary prerequisite question: record the
+/// declined path and grant nothing, matching [`choice_block`].
+fn declined_block(question: &OperatorQuestionView, timestamp: &str) -> String {
+    let mut lines = format!(
+        "\n\n---\n\n## Recorded answer ({timestamp})\n\n\
+- **Question the previous worker asked:** {}\n\
+- **Answer:** No\n",
+        question.text
+    );
+    if let Some(no_path) = boss_protocol::explanation_no_section(&question.explanation) {
+        lines.push_str(&format!("- **The worker's No path:** {no_path}\n"));
+    }
+    lines.push_str(&format!(
+        "- **The worker's explanation:** {}\n\
+- **Asked by run:** `{}`\n\n\
+The repo owner recorded this decline on the kanban. Proceed with the declined path named above. It grants no authorization: it does not authorize bypassing any check or exceeding any limit.\n",
+        question.explanation, question.execution_id
+    ));
+    lines
+}
+
+/// The brief addendum for a multiple-choice answer: the chosen option,
+/// verbatim. Unlike [`authorization_block`] it grants nothing beyond
+/// the decision itself.
+fn choice_block(question: &OperatorQuestionView, choice: &str, timestamp: &str) -> String {
+    format!(
+        "\n\n---\n\n## Recorded answer ({timestamp})\n\n\
+- **Question the previous worker asked:** {}\n\
+- **Options offered:** {}\n\
+- **Operator chose:** {choice}\n\
+- **The worker's explanation:** {}\n\
+- **Asked by run:** `{}`\n\n\
+The operator recorded this choice on the kanban. Proceed with the chosen option. It decides exactly the question above and nothing broader: it does not authorize bypassing any check or exceeding any limit.\n",
+        question.text,
+        match &question.answer_type {
+            OperatorAnswerType::MultipleChoice { choices } => choices.join(" / "),
+            _ => String::new(),
+        },
+        question.explanation,
+        question.execution_id
+    )
+}
+
+fn authorization_block(question: &OperatorQuestionView, timestamp: &str) -> String {
+    format!(
+        "\n\n---\n\n## Repo owner approval ({timestamp})\n\n\
+- **Question the previous worker asked:** {}\n\
+- **Answer:** Yes\n\
+- **The worker's explanation:** {}\n\
+- **Asked by run:** `{}`\n\n\
+The repo owner recorded this answer. It is explicit, human-granted approval for exactly what the question asks and nothing broader. Treat it as the authorization the worker rules require before relaxing a check or exceeding a limit for this task; state in the PR body that this was approved by the repo owner on the date above. It does not authorize bypassing any other check, and it does not change what the repository's checks enforce.\n",
+        question.text, question.explanation, question.execution_id
+    )
+}
+
+/// No on a split-vs-file-count-bypass question: keep this change in one PR,
+/// recording the approved file count separately from the free-form bypass reason.
+pub(super) fn file_count_bypass_authorization_block(
+    question: &OperatorQuestionView,
+    spec: boss_protocol::FileCountBypassSpec,
+    timestamp: &str,
+) -> String {
+    format!(
+        "\n\n---\n\n## Repo owner approval ({timestamp})\n\n\
+- **Question the previous worker asked:** {}\n\
+- **Answer:** No — keep this change in one PR\n\
+- **Authorized exception:** change/file-count for this PR only, up to {} files (repository limit {})\n\
+- **The worker's explanation:** {}\n\
+- **Asked by run:** `{}`\n\n\
+The repo owner recorded this answer. It is explicit, human-granted approval to finish this change as a single PR by declaring `BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered No by the repo owner on {timestamp}; one-PR exception for this PR only` in the commit description. Checkleft does not enforce the approved count. Before pushing, compare the non-deleted file count from `jj diff --stat` against the PR base with the approved bound above and ask again if it is over. It does not authorize bypassing any other check, raising any other limit, or using the exception on a different PR. State in the PR body that this file-count exception was approved by the repo owner on the date above.\n",
+        question.text, spec.files, spec.limit, question.explanation, question.execution_id
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test_support::*;
+    use boss_protocol::WorkItem;
+
+    #[test]
+    fn approval_text_avoids_internal_vocabulary() {
+        let question = boss_protocol::OperatorQuestionView::builder()
+            .id("question-1")
+            .text("Include the additional files?")
+            .answer_type(boss_protocol::OperatorAnswerType::YesNo)
+            .explanation("The fix requires both files.")
+            .asked_at("2026-10-23")
+            .execution_id("exec_example")
+            .build();
+        let text = super::authorization_block(&question, "2026-10-23");
+        crate::prose_vocabulary::assert_no_forbidden_prose("recorded approval", &text);
+        assert!(text.contains("## Repo owner approval (2026-10-23)"));
+    }
+
+    #[test]
+    fn file_count_bypass_approval_text_is_scoped_and_avoids_internal_vocabulary() {
+        let question = boss_protocol::OperatorQuestionView::builder()
+            .id("question-1")
+            .text("Split this 48-file change (limit 30) by landing 'Extract the first PR' first, or keep it in one PR?")
+            .answer_type(boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
+                name: "Extract the first PR".into(),
+                brief: "Land the first capability as its own PR.".into(),
+                file_count_bypass: Some(boss_protocol::FileCountBypassSpec { files: 48, limit: 30 }),
+            })
+            .explanation("The change is 48 files against a limit of 30.")
+            .asked_at("2026-10-23")
+            .execution_id("exec_example")
+            .build();
+        let text = super::file_count_bypass_authorization_block(
+            &question,
+            boss_protocol::FileCountBypassSpec { files: 48, limit: 30 },
+            "2026-10-23",
+        );
+        crate::prose_vocabulary::assert_no_forbidden_prose("file-count bypass approval", &text);
+        assert!(text.contains("## Repo owner approval (2026-10-23)"));
+        assert!(text.contains("change/file-count for this PR only, up to 48 files (repository limit 30)"));
+        assert!(text.contains("Checkleft does not enforce the approved count"));
+        assert!(text.contains("ask again if it is over"));
+        assert!(text.contains("BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered No by the repo owner on 2026-10-23; one-PR exception for this PR only"));
+        assert!(text.contains("It does not authorize bypassing any other check"));
+    }
+
+    #[test]
+    fn declined_answer_text_grants_no_authorization() {
+        let question = boss_protocol::OperatorQuestionView::builder()
+            .id("question-1")
+            .text("Ship the smaller retry change?")
+            .answer_type(boss_protocol::OperatorAnswerType::YesNo)
+            .explanation(
+                "Context:\nRetries fail open.\nYes:\nKeep the extra telemetry.\nNo:\nShip the smaller retry change instead.\nRecommendation:\nNo, to finish sooner.",
+            )
+            .asked_at("2026-10-23")
+            .execution_id("exec_example")
+            .build();
+        let text = super::declined_block(&question, "2026-10-23");
+        crate::prose_vocabulary::assert_no_forbidden_prose("declined answer", &text);
+        assert!(text.contains("## Recorded answer (2026-10-23)"));
+        assert!(text.contains("- **Answer:** No\n"));
+        assert!(text.contains("- **The worker's No path:** Ship the smaller retry change instead.\n"));
+        assert!(text.contains("It grants no authorization"));
+        assert!(text.contains("does not authorize bypassing any check"));
+    }
+
+    /// A task whose `review_cycle` is a known non-zero value must serialise
+    /// that real value through every mapper path, not the hardcoded `0`
+    /// `map_task` used to return regardless of the stored column. Exercises
+    /// both `get_work_item` (the `boss task show --json` path, via
+    /// `map_task_with_parent_provenance_and_archived_reason`) and the plain
+    /// `map_task` base reached by `list_tasks_for_product`.
+    #[test]
+    fn review_cycle_and_last_reviewed_sha_survive_through_task_show() {
+        let (_tmp, db) = open_db();
+        let product = create_test_product(&db);
+        let task = create_test_chore(&db, product.id.clone(), "review cycle task");
+
+        db.increment_task_review_cycle(&task.id, Some("deadbeef")).unwrap();
+        db.increment_task_review_cycle(&task.id, Some("cafef00d")).unwrap();
+
+        let item = db.get_work_item(&task.id).unwrap();
+        let WorkItem::Chore(shown) = item else {
+            panic!("expected a chore, got {item:?}");
+        };
+        assert_eq!(shown.review_cycle, 2);
+        assert_eq!(shown.last_reviewed_sha.as_deref(), Some("cafef00d"));
+
+        let listed = db.list_tasks(&product.id, None, None, false).unwrap();
+        let listed_task = listed.iter().find(|t| t.id == task.id).unwrap();
+        assert_eq!(listed_task.review_cycle, 2);
+        assert_eq!(listed_task.last_reviewed_sha.as_deref(), Some("cafef00d"));
+    }
+}
+
+#[cfg(test)]
+mod operator_question_tests {
+    use super::*;
+
+    #[test]
+    fn migration_survives_reopen_and_enforces_one_open_question() {
+        let (dir, db) = crate::test_support::open_db();
+        let conn = db.connect().unwrap();
+        let trigger_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                 WHERE type = 'trigger' AND name = 'operator_questions_task_override')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(trigger_exists, "fresh schema must retain the task override trigger");
+        for id in ["oq_first", "oq_second"] {
+            let result = conn.execute(
+                "INSERT INTO operator_questions
+                 (id, work_item_id, execution_id, proposal_id, question_json, status, created_at)
+                 VALUES (?1, 'task_example', 'exec_example', 'prop_example', '{}', 'open', '1')",
+                [id],
+            );
+            if id == "oq_first" {
+                result.unwrap();
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("operator_questions.work_item_id")
+                );
+            }
+        }
+        withdraw_questions(&conn, "task_example", "status_edited").unwrap();
+        conn.execute(
+            "INSERT INTO operator_questions
+             (id, work_item_id, execution_id, proposal_id, question_json, status, created_at)
+             VALUES ('oq_second', 'task_example', 'exec_example', 'prop_example', '{}', 'open', '2')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        drop(db);
+        let reopened = WorkDb::open(dir.path().join("state.db")).unwrap();
+        let conn = reopened.connect().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM operator_questions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN
+             ('operator_questions_one_open_per_item', 'operator_questions_by_item')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 2);
+    }
+}

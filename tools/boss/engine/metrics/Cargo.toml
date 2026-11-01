@@ -4,9 +4,20 @@ version.workspace = true
 edition.workspace = true
 workspace = "../../../.."
 
+[features]
+test-support = []
+
 [dependencies]
 boss-task-scope = { path = "../task-scope" }
 anyhow = { workspace = true }
+bon = { workspace = true }
 boss-engine-metrics-registry = { path = "../metrics-registry" }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
+boss-engine-day-rotated-log = { path = "../day-rotated-log" }
+boss-protocol = { path = "../../protocol" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

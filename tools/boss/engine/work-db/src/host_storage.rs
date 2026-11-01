@@ -1,0 +1,1300 @@
+//! Host registry storage: the `hosts`, `host_capabilities` and
+//! `work_capability_requirements` SQL behind `WorkDb`, plus the `local` host
+//! seed run by schema setup.
+//!
+//! This module only reads and writes the database. Anything that observes the
+//! machine (capability discovery, process probes) lives in the host services
+//! (`boss_engine::host_registry`) and hands its observation in, so storage never
+//! spawns a process.
+
+use std::collections::{BTreeSet, HashMap};
+
+use anyhow::{Context, Result, bail};
+use boss_event_bus::Event;
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+
+use super::WorkDb;
+
+// ── Public types ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
+pub struct Host {
+    pub id: String,
+    pub ssh_target: Option<String>,
+    pub pool_size: i64,
+    pub enabled: bool,
+    /// Epoch-seconds string of the most recent contact *attempt* with
+    /// this host (success or failure) — either a dispatch-time cube
+    /// invocation or the registration-time wrapper push. `None` when
+    /// the host has never been contacted.
+    pub last_seen_at: Option<String>,
+    pub last_error_text: Option<String>,
+    /// Consecutive dispatch-time cube invocations that have failed on
+    /// this host, reset to 0 on any success. See
+    /// [`HOST_HEALTH_FAILURE_THRESHOLD`] / [`WorkDb::record_host_dispatch_failure`].
+    pub consecutive_failures: i64,
+    pub created_at: String,
+}
+
+/// Number of consecutive dispatch-time cube invocation failures on a
+/// host before it is auto-disabled. Chosen to match the design's
+/// documented heartbeat threshold ("after three consecutive failures,
+/// marks the host `unhealthy`") — see
+/// `docs/designs/distributed-agent-execution-register-and-dispatch-to-remote-ssh-hosts.md`.
+/// A broken host (e.g. `cube` missing from the remote's non-interactive
+/// `PATH`) fails every single dispatch, so this threshold trips within
+/// one pre-start retry cycle rather than retrying forever while local
+/// capacity idles.
+pub const HOST_HEALTH_FAILURE_THRESHOLD: i64 = 3;
+
+/// Outcome of [`WorkDb::record_host_dispatch_failure`] — distinguishes
+/// "still under threshold" from "just tripped the breaker" so the
+/// caller can log/alert only on the transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostHealthOutcome {
+    Degraded { consecutive_failures: i64 },
+    AutoDisabled { consecutive_failures: i64 },
+}
+
+#[derive(Debug, Clone)]
+pub struct HostCapability {
+    pub host_id: String,
+    pub capability: String,
+    pub source: String,
+}
+
+// ── Runtime initialization (called from WorkDb::init) ──────────────────────────────
+
+/// Ensure the `local` host row exists. Idempotent — the `INSERT OR IGNORE`
+/// is a no-op on subsequent engine starts.
+pub(super) fn ensure_local_host(conn: &Connection) -> Result<()> {
+    let now = now_epoch_string();
+    conn.execute(
+        "INSERT OR IGNORE INTO hosts (id, ssh_target, pool_size, enabled, created_at)
+         VALUES ('local', NULL, 1, 1, ?1)",
+        params![now],
+    )?;
+    Ok(())
+}
+
+#[work_db_boundary::instrument]
+impl WorkDb {
+    /// Delete every `auto`-sourced capability row for the `local` host,
+    /// leaving operator `--tag` rows alone. Startup calls this *before* the
+    /// background probe runs so a driver that was uninstalled (or a `gh`
+    /// login that lapsed) since the previous boot can never look available
+    /// on the strength of a stale row: until the probe writes fresh rows,
+    /// the host carries no `drivers-probed=true` and driver-constrained
+    /// selection reports `DriverProbeNotRun` rather than a match.
+    pub fn clear_local_host_auto_capabilities(&self) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "DELETE FROM host_capabilities WHERE host_id = 'local' AND source = 'auto'",
+            [],
+        )?;
+        Ok(())
+    }
+}
+
+/// Replace every `auto`-sourced capability row for `host_id` with `caps`.
+/// User-tagged rows (`source = 'user'`) are left untouched, so an operator
+/// `--tag` always survives a re-probe.
+///
+/// Deliberately takes the host id rather than hard-coding `'local'`: the
+/// local-only spelling of this write is why a remote host could never hold
+/// an auto-discovered capability. See `boss_engine::host_capability_probe`.
+fn replace_auto_capabilities(conn: &Connection, host_id: &str, caps: &[String]) -> Result<()> {
+    conn.execute(
+        "DELETE FROM host_capabilities WHERE host_id = ?1 AND source = 'auto'",
+        params![host_id],
+    )?;
+    for capability in caps {
+        conn.execute(
+            "INSERT OR IGNORE INTO host_capabilities (host_id, capability, source)
+             VALUES (?1, ?2, 'auto')",
+            params![host_id, capability],
+        )?;
+    }
+    Ok(())
+}
+
+// ── WorkDb impl: host CRUD ────────────────────────────────────────────────────
+
+#[work_db_boundary::instrument]
+impl WorkDb {
+    pub fn list_hosts(&self) -> Result<Vec<Host>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, ssh_target, pool_size, enabled, last_seen_at, last_error_text, consecutive_failures, created_at
+             FROM hosts
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([], map_host)?;
+        collect_rows(rows)
+    }
+
+    pub fn get_host(&self, id: &str) -> Result<Option<Host>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT id, ssh_target, pool_size, enabled, last_seen_at, last_error_text, consecutive_failures, created_at
+             FROM hosts WHERE id = ?1",
+            params![id],
+            map_host,
+        )
+        .optional()
+        .context("get_host query")
+    }
+
+    /// Insert a new non-local host. Returns an error if the id is `"local"` or
+    /// already exists. User-provided `tags` are stored with `source = 'user'`.
+    pub fn add_host(&self, id: &str, ssh_target: &str, pool_size: i64, tags: &[String]) -> Result<Host> {
+        if id == "local" {
+            bail!("'local' is a reserved host id; use `bossctl hosts list` to see it");
+        }
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        if tx.query_row("SELECT COUNT(*) FROM hosts WHERE id = ?1", params![id], |r| {
+            r.get::<_, i64>(0)
+        })? > 0
+        {
+            bail!(
+                "host '{}' already exists; use `bossctl hosts show {}` to inspect it",
+                id,
+                id
+            );
+        }
+
+        let now = now_epoch_string();
+        tx.execute(
+            "INSERT INTO hosts (id, ssh_target, pool_size, enabled, created_at)
+             VALUES (?1, ?2, ?3, 1, ?4)",
+            params![id, ssh_target, pool_size, now],
+        )?;
+
+        for tag in tags {
+            tx.execute(
+                "INSERT OR REPLACE INTO host_capabilities (host_id, capability, source)
+                 VALUES (?1, ?2, 'user')",
+                params![id, tag],
+            )?;
+        }
+
+        let host = tx
+            .query_row(
+                "SELECT id, ssh_target, pool_size, enabled, last_seen_at, last_error_text, consecutive_failures, created_at
+                 FROM hosts WHERE id = ?1",
+                params![id],
+                map_host,
+            )
+            .context("add_host: re-query after insert")?;
+
+        tx.commit()?;
+        Ok(host)
+    }
+
+    pub fn set_host_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        let conn = self.connect()?;
+        let was_enabled: Option<bool> = conn
+            .query_row("SELECT enabled FROM hosts WHERE id = ?1", params![id], |row| row.get(0))
+            .optional()?;
+        let n = conn.execute(
+            "UPDATE hosts SET enabled = ?1 WHERE id = ?2",
+            params![enabled as i64, id],
+        )?;
+        if n == 0 {
+            bail!("host '{}' not found", id);
+        }
+        // Publish only on a genuine true → false transition — an explicit
+        // re-disable of an already-disabled host (or an enable call) is not
+        // a new "host disabled" fact and must not re-fire the event, so
+        // future idempotent subscribers (e.g. `host_reconcile`) don't
+        // re-terminalize executions that were already handled.
+        if !enabled && was_enabled == Some(true) {
+            self.event_bus().publish(Event::HostDisabled { host_id: id.to_owned() });
+        }
+        Ok(())
+    }
+
+    /// Record a human-readable error description on the host row.
+    /// Called when an eager wrapper push fails at registration time so the
+    /// UI can surface the cause without the user needing to check logs.
+    pub fn set_host_last_error(&self, id: &str, text: Option<&str>) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute("UPDATE hosts SET last_error_text = ?1 WHERE id = ?2", params![text, id])?;
+        Ok(())
+    }
+
+    /// Record a dispatch-time cube invocation failure against `id`'s
+    /// health counter (the circuit breaker guarding against exactly the
+    /// anaplian incident: a registered-but-broken host — e.g. `cube`
+    /// missing from the remote's non-interactive `PATH` — that the
+    /// dispatcher would otherwise retry forever while healthy local
+    /// capacity idles). Bumps `consecutive_failures`, and stamps
+    /// `last_seen_at`/`last_error_text` so the failure is visible even
+    /// though no periodic heartbeat exists yet. Once the count reaches
+    /// [`HOST_HEALTH_FAILURE_THRESHOLD`] the host is auto-disabled —
+    /// `boss_engine::host_scheduling::select_host` already excludes disabled
+    /// hosts, so the very next dispatch attempt for any queued execution
+    /// naturally falls back to a different (e.g. `local`) host instead of
+    /// re-selecting the broken one.
+    pub fn record_host_dispatch_failure(&self, id: &str, error_text: &str) -> Result<HostHealthOutcome> {
+        let conn = self.connect()?;
+        let now = now_epoch_string();
+        let n = conn.execute(
+            "UPDATE hosts SET consecutive_failures = consecutive_failures + 1,
+                 last_seen_at = ?1, last_error_text = ?2
+             WHERE id = ?3",
+            params![now, error_text, id],
+        )?;
+        if n == 0 {
+            bail!("host '{}' not found", id);
+        }
+        let failures: i64 = conn.query_row(
+            "SELECT consecutive_failures FROM hosts WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        if failures >= HOST_HEALTH_FAILURE_THRESHOLD {
+            let reason =
+                format!("auto-disabled after {failures} consecutive dispatch failures; last error: {error_text}");
+            let was_enabled: Option<bool> = conn
+                .query_row("SELECT enabled FROM hosts WHERE id = ?1", params![id], |row| row.get(0))
+                .optional()?;
+            conn.execute(
+                "UPDATE hosts SET enabled = 0, last_error_text = ?1 WHERE id = ?2",
+                params![reason, id],
+            )?;
+            // Same true → false transition guard as `set_host_enabled`: a
+            // host already sitting disabled that keeps failing (or that a
+            // human explicitly disabled) must not re-publish on every
+            // subsequent failed dispatch attempt.
+            if was_enabled == Some(true) {
+                self.event_bus().publish(Event::HostDisabled { host_id: id.to_owned() });
+            }
+            return Ok(HostHealthOutcome::AutoDisabled {
+                consecutive_failures: failures,
+            });
+        }
+        Ok(HostHealthOutcome::Degraded {
+            consecutive_failures: failures,
+        })
+    }
+
+    /// Record a successful contact with `id`: a dispatch-time cube
+    /// invocation, or a successful registration / `hosts probe` provision.
+    /// Clears `last_error_text` (a healthy host shouldn't show a stale
+    /// error), stamps `last_seen_at`, and resets `consecutive_failures`.
+    /// Does not touch `enabled` — re-enabling a host the operator (or a
+    /// prior auto-disable) turned off is an explicit `set_host_enabled`
+    /// action, not an implicit side-effect of one successful call.
+    pub fn record_host_contact_success(&self, id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let now = now_epoch_string();
+        conn.execute(
+            "UPDATE hosts SET consecutive_failures = 0, last_seen_at = ?1, last_error_text = NULL
+             WHERE id = ?2",
+            params![now, id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a host. Fails if live executions reference it (by convention;
+    /// Phase 1 has no dispatch so the check is always trivially true).
+    pub fn remove_host(&self, id: &str) -> Result<()> {
+        if id == "local" {
+            bail!("the 'local' host cannot be removed");
+        }
+        let conn = self.connect()?;
+        let n = conn.execute("DELETE FROM hosts WHERE id = ?1", params![id])?;
+        if n == 0 {
+            bail!("host '{}' not found", id);
+        }
+        Ok(())
+    }
+
+    pub fn list_host_capabilities(&self, host_id: &str) -> Result<Vec<HostCapability>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT host_id, capability, source
+             FROM host_capabilities
+             WHERE host_id = ?1
+             ORDER BY source ASC, capability ASC",
+        )?;
+        let rows = stmt.query_map(params![host_id], |row| {
+            Ok(HostCapability {
+                host_id: row.get(0)?,
+                capability: row.get(1)?,
+                source: row.get(2)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Replace every `auto`-sourced capability on `host_id` with `caps`,
+    /// leaving user-tagged rows alone. This is how a remote host's
+    /// discovered capabilities (`boss_engine::host_capability_probe`) reach the
+    /// registry, and it is idempotent — re-probing a host converges rather
+    /// than accumulating stale rows.
+    pub fn replace_auto_host_capabilities(&self, host_id: &str, caps: &[String]) -> Result<()> {
+        let conn = self.connect()?;
+        if conn.query_row("SELECT COUNT(*) FROM hosts WHERE id = ?1", params![host_id], |r| {
+            r.get::<_, i64>(0)
+        })? == 0
+        {
+            bail!("host '{}' not found", host_id);
+        }
+        replace_auto_capabilities(&conn, host_id, caps)
+    }
+
+    /// Add a user-tagged capability to a host. Overwrites the row if
+    /// a capability with the same key already exists (regardless of prior source).
+    pub fn add_user_host_capability(&self, host_id: &str, capability: &str) -> Result<()> {
+        let conn = self.connect()?;
+        if conn.query_row("SELECT COUNT(*) FROM hosts WHERE id = ?1", params![host_id], |r| {
+            r.get::<_, i64>(0)
+        })? == 0
+        {
+            bail!("host '{}' not found", host_id);
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO host_capabilities (host_id, capability, source)
+             VALUES (?1, ?2, 'user')",
+            params![host_id, capability],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a capability from a host. Only removes user-tagged capabilities;
+    /// auto-discovered capabilities are managed by the engine heartbeat.
+    /// Fails if the capability is not present.
+    pub fn remove_user_host_capability(&self, host_id: &str, capability: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let n = conn.execute(
+            "DELETE FROM host_capabilities
+             WHERE host_id = ?1 AND capability = ?2 AND source = 'user'",
+            params![host_id, capability],
+        )?;
+        if n == 0 {
+            // Check if it exists but is auto to give a better error.
+            let auto_exists: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM host_capabilities
+                 WHERE host_id = ?1 AND capability = ?2",
+                params![host_id, capability],
+                |r| r.get(0),
+            )?;
+            if auto_exists > 0 {
+                bail!(
+                    "capability '{}' on host '{}' is auto-discovered and cannot be removed manually; \
+                     it will be refreshed on the next engine startup",
+                    capability,
+                    host_id,
+                );
+            }
+            bail!("capability '{}' not found on host '{}'", capability, host_id);
+        }
+        Ok(())
+    }
+
+    // ── Host-scheduling reads (consumed by the coordinator dispatch loop) ──────
+
+    /// Read an execution's `pinned_host_id` (the design's "pin escape
+    /// hatch"). `None` when unpinned or on rows that predate the column.
+    pub fn execution_pinned_host(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT pinned_host_id FROM work_executions WHERE id = ?1",
+            params![execution_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .context("execution_pinned_host query")
+        .map(Option::flatten)
+    }
+
+    /// Pin an execution to a specific host (or clear the pin with
+    /// `None`). When set, `boss_engine::host_scheduling::select_host` bypasses
+    /// the capability filter and routes the execution only to that host.
+    pub fn set_execution_pinned_host(&self, execution_id: &str, host_id: Option<&str>) -> Result<()> {
+        let conn = self.connect()?;
+        let affected = conn.execute(
+            "UPDATE work_executions SET pinned_host_id = ?2 WHERE id = ?1",
+            params![execution_id, host_id],
+        )?;
+        if affected == 0 {
+            bail!("unknown execution: {execution_id}");
+        }
+        Ok(())
+    }
+
+    /// The host a `work_runs` row was attributed to. Used by tests and
+    /// (later) the host-badge surface to confirm where a run executed.
+    pub fn run_host(&self, run_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        conn.query_row("SELECT host_id FROM work_runs WHERE id = ?1", params![run_id], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()
+        .context("run_host query")
+    }
+
+    /// Count live worker runs grouped by host. Feeds the free-slots gate
+    /// in `boss_engine::host_scheduling::select_host`. Only `active` runs are
+    /// counted — terminal runs have already freed their slot. The local
+    /// host is *not* gated by this count (the worker pool bounds local
+    /// concurrency), so the coordinator overrides its slot to free.
+    pub fn active_runs_per_host(&self) -> Result<HashMap<String, i64>> {
+        let conn = self.connect()?;
+        let mut stmt =
+            conn.prepare("SELECT host_id, COUNT(*) FROM work_runs WHERE status = 'active' GROUP BY host_id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (host_id, count) = row?;
+            out.insert(host_id, count);
+        }
+        Ok(out)
+    }
+
+    /// Union of required capabilities recorded against any of the given
+    /// subject ids (a chore plus its product / project). Subject ids are
+    /// globally unique across kinds, so the lookup matches on id alone.
+    /// Empty when nothing has been tagged — the common case today, which
+    /// leaves every enabled host capability-eligible.
+    pub fn required_capabilities_for_subject_ids(&self, subject_ids: &[&str]) -> Result<BTreeSet<String>> {
+        if subject_ids.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let conn = self.connect()?;
+        let placeholders = vec!["?"; subject_ids.len()].join(", ");
+        let sql = format!(
+            "SELECT DISTINCT capability FROM work_capability_requirements
+             WHERE subject_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(subject_ids.iter()), |r| r.get::<_, String>(0))?;
+        let mut out = BTreeSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    }
+}
+
+// ── Row mappers ───────────────────────────────────────────────────────────────
+
+fn map_host(row: &rusqlite::Row<'_>) -> rusqlite::Result<Host> {
+    Ok(Host {
+        id: row.get(0)?,
+        ssh_target: row.get(1)?,
+        pool_size: row.get(2)?,
+        enabled: row.get::<_, i64>(3)? != 0,
+        last_seen_at: row.get(4)?,
+        last_error_text: row.get(5)?,
+        consecutive_failures: row.get(6)?,
+        created_at: row.get(7)?,
+    })
+}
+
+fn collect_rows<T>(rows: impl Iterator<Item = rusqlite::Result<T>>) -> Result<Vec<T>> {
+    rows.collect::<rusqlite::Result<Vec<T>>>()
+        .context("host_registry row collection")
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+
+fn now_epoch_string() -> String {
+    boss_engine_utils::epoch_time::now_epoch_secs().to_string()
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+//
+// Behavioral coverage for the `WorkDb` host-registry methods. Everything
+// runs against a fresh `:memory:` database, which `WorkDb::open` seeds with
+// the baseline plus `ensure_local_host` only; local auto-capabilities
+// are written by the startup probe (`boss_engine::host_registry`), so tests that
+// need them seed them via `insert_host_capability`.
+// Assertions go through the public methods (returned values, `Host` /
+// `HostCapability` fields, error outcomes, post-state read back). Raw
+// connections are used only to plant fixture rows in tables that have no
+// public insert path on `WorkDb` (`work_executions`, `work_runs`,
+// `work_capability_requirements`) and to control `created_at` for the
+// ordering test.
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    use boss_event_bus::{EventKind, TopicFilter};
+
+    use super::*;
+    use crate::test_support::insert_host_capability;
+
+    fn open_db() -> WorkDb {
+        WorkDb::open(PathBuf::from(":memory:")).expect("open in-memory work db")
+    }
+
+    /// Plant a minimal `work_executions` row (no public insert method is a
+    /// good fit for these focused host-registry tests).
+    fn insert_execution(db: &WorkDb, id: &str) {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "INSERT INTO work_executions
+                 (id, work_item_id, kind, status, repo_remote_url, created_at)
+             VALUES (?1, 'wi-1', 'chore_implementation', 'queued',
+                     'https://github.com/test/repo', '100')",
+            params![id],
+        )
+        .unwrap();
+    }
+
+    /// Plant a `work_runs` row attributed to `host_id` with the given status.
+    fn insert_run(db: &WorkDb, id: &str, execution_id: &str, host_id: &str, status: &str) {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "INSERT INTO work_runs
+                 (id, execution_id, agent_id, status, created_at, host_id)
+             VALUES (?1, ?2, 'agent-1', ?4, '100', ?3)",
+            params![id, execution_id, host_id, status],
+        )
+        .unwrap();
+    }
+
+    /// Plant a `work_capability_requirements` row keyed on `subject_id`.
+    fn insert_requirement(db: &WorkDb, subject_id: &str, capability: &str) {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "INSERT INTO work_capability_requirements (subject_kind, subject_id, capability)
+             VALUES ('chore', ?1, ?2)",
+            params![subject_id, capability],
+        )
+        .unwrap();
+    }
+
+    // ── add_host ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn add_host_rejects_reserved_local_id() {
+        let db = open_db();
+        let err = db.add_host("local", "user@x", 2, &[]).unwrap_err();
+        assert!(err.to_string().contains("reserved"), "got: {err}");
+    }
+
+    #[test]
+    fn add_host_rejects_duplicate_id() {
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
+        let err = db.add_host("zakalwe", "user@z", 2, &[]).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "got: {err}");
+    }
+
+    #[test]
+    fn add_host_persists_fields_and_user_tags() {
+        let db = open_db();
+        let host = db
+            .add_host(
+                "zakalwe",
+                "user@zakalwe:22",
+                4,
+                &["os=macos".to_owned(), "xcode=15".to_owned()],
+            )
+            .unwrap();
+
+        // Returned Host reflects the inserted row.
+        assert_eq!(host.id, "zakalwe");
+        assert_eq!(host.ssh_target.as_deref(), Some("user@zakalwe:22"));
+        assert_eq!(host.pool_size, 4);
+        assert!(host.enabled);
+
+        // Read back through the public getter.
+        let fetched = db.get_host("zakalwe").unwrap().expect("host present");
+        assert_eq!(fetched.ssh_target.as_deref(), Some("user@zakalwe:22"));
+        assert_eq!(fetched.pool_size, 4);
+
+        // Each provided tag is stored with source = 'user'.
+        let caps = db.list_host_capabilities("zakalwe").unwrap();
+        assert_eq!(caps.len(), 2);
+        assert!(caps.iter().all(|c| c.source == "user"));
+        let names: BTreeSet<&str> = caps.iter().map(|c| c.capability.as_str()).collect();
+        assert!(names.contains("os=macos"));
+        assert!(names.contains("xcode=15"));
+    }
+
+    // ── remove_host ───────────────────────────────────────────────────────
+
+    #[test]
+    fn remove_host_rejects_local() {
+        let db = open_db();
+        let err = db.remove_host("local").unwrap_err();
+        assert!(err.to_string().contains("cannot be removed"), "got: {err}");
+    }
+
+    #[test]
+    fn remove_host_errors_on_missing() {
+        let db = open_db();
+        let err = db.remove_host("ghost").unwrap_err();
+        assert!(err.to_string().contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn remove_host_deletes_host_and_cascades_capabilities() {
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &["os=macos".to_owned()]).unwrap();
+        assert!(db.get_host("zakalwe").unwrap().is_some());
+        assert_eq!(db.list_host_capabilities("zakalwe").unwrap().len(), 1);
+
+        db.remove_host("zakalwe").unwrap();
+
+        assert!(db.get_host("zakalwe").unwrap().is_none());
+        // ON DELETE CASCADE drops the capability rows too.
+        assert!(db.list_host_capabilities("zakalwe").unwrap().is_empty());
+    }
+
+    // ── set_host_enabled ──────────────────────────────────────────────────
+
+    #[test]
+    fn set_host_enabled_errors_on_unknown() {
+        let db = open_db();
+        let err = db.set_host_enabled("ghost", false).unwrap_err();
+        assert!(err.to_string().contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn set_host_enabled_toggles_state() {
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
+        assert!(db.get_host("zakalwe").unwrap().unwrap().enabled);
+
+        db.set_host_enabled("zakalwe", false).unwrap();
+        assert!(!db.get_host("zakalwe").unwrap().unwrap().enabled);
+
+        db.set_host_enabled("zakalwe", true).unwrap();
+        assert!(db.get_host("zakalwe").unwrap().unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn set_host_enabled_publishes_host_disabled_on_true_to_false() {
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
+        let mut sub = db.event_bus().subscribe(TopicFilter::kind(EventKind::HostDisabled));
+
+        db.set_host_enabled("zakalwe", false).unwrap();
+
+        let event = sub.recv().await.expect("HostDisabled published on disable");
+        assert_eq!(
+            event,
+            Event::HostDisabled {
+                host_id: "zakalwe".to_owned()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn set_host_enabled_does_not_republish_when_already_disabled() {
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
+        db.set_host_enabled("zakalwe", false).unwrap();
+
+        let mut sub = db.event_bus().subscribe(TopicFilter::kind(EventKind::HostDisabled));
+        db.set_host_enabled("zakalwe", false).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv())
+            .await
+            .expect_err("re-disabling an already-disabled host must not republish");
+    }
+
+    #[tokio::test]
+    async fn set_host_enabled_does_not_publish_on_enable() {
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
+        db.set_host_enabled("zakalwe", false).unwrap();
+
+        let mut sub = db.event_bus().subscribe(TopicFilter::kind(EventKind::HostDisabled));
+        db.set_host_enabled("zakalwe", true).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv())
+            .await
+            .expect_err("re-enabling a host must not publish HostDisabled");
+    }
+
+    // ── record_host_dispatch_failure / _success ─────────────────────────────
+
+    #[test]
+    fn record_host_dispatch_failure_errors_on_unknown_host() {
+        let db = open_db();
+        let err = db.record_host_dispatch_failure("ghost", "boom").unwrap_err();
+        assert!(err.to_string().contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn record_host_dispatch_failure_degrades_below_threshold() {
+        let db = open_db();
+        db.add_host("anaplian", "user@a", 3, &[]).unwrap();
+
+        let outcome = db
+            .record_host_dispatch_failure("anaplian", "command not found: cube")
+            .unwrap();
+        assert_eq!(
+            outcome,
+            HostHealthOutcome::Degraded {
+                consecutive_failures: 1
+            }
+        );
+
+        let host = db.get_host("anaplian").unwrap().unwrap();
+        assert!(host.enabled, "host must stay enabled below the failure threshold");
+        assert_eq!(host.consecutive_failures, 1);
+        assert_eq!(host.last_error_text.as_deref(), Some("command not found: cube"));
+        assert!(
+            host.last_seen_at.is_some(),
+            "last_seen_at must be stamped on a failed attempt"
+        );
+    }
+
+    /// The exact regression this breaker exists for: a host that fails
+    /// every single dispatch (the anaplian incident — `cube` missing from
+    /// the remote's non-interactive PATH) must auto-disable at the
+    /// threshold instead of being retried forever while local capacity
+    /// idles. Once disabled, `host_scheduling::select_host` already
+    /// excludes it via the existing `enabled` gate.
+    #[test]
+    fn record_host_dispatch_failure_auto_disables_at_threshold() {
+        let db = open_db();
+        db.add_host("anaplian", "user@a", 3, &[]).unwrap();
+
+        for n in 1..HOST_HEALTH_FAILURE_THRESHOLD {
+            let outcome = db
+                .record_host_dispatch_failure("anaplian", "ssh cube command failed: command not found: cube")
+                .unwrap();
+            assert_eq!(
+                outcome,
+                HostHealthOutcome::Degraded {
+                    consecutive_failures: n
+                }
+            );
+            assert!(
+                db.get_host("anaplian").unwrap().unwrap().enabled,
+                "attempt {n} must not disable yet"
+            );
+        }
+
+        let tripping = db
+            .record_host_dispatch_failure("anaplian", "ssh cube command failed: command not found: cube")
+            .unwrap();
+        assert_eq!(
+            tripping,
+            HostHealthOutcome::AutoDisabled {
+                consecutive_failures: HOST_HEALTH_FAILURE_THRESHOLD
+            }
+        );
+
+        let host = db.get_host("anaplian").unwrap().unwrap();
+        assert!(
+            !host.enabled,
+            "host must be auto-disabled once the threshold is reached"
+        );
+        assert!(
+            host.last_error_text.as_deref().unwrap().contains("auto-disabled"),
+            "got: {:?}",
+            host.last_error_text
+        );
+        assert!(
+            host.last_error_text
+                .as_deref()
+                .unwrap()
+                .contains("command not found: cube")
+        );
+    }
+
+    #[tokio::test]
+    async fn record_host_dispatch_failure_publishes_host_disabled_once_at_threshold() {
+        let db = open_db();
+        db.add_host("anaplian", "user@a", 3, &[]).unwrap();
+        let mut sub = db.event_bus().subscribe(TopicFilter::kind(EventKind::HostDisabled));
+
+        for _ in 1..HOST_HEALTH_FAILURE_THRESHOLD {
+            db.record_host_dispatch_failure("anaplian", "boom").unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv())
+            .await
+            .expect_err("no HostDisabled before the threshold trips");
+
+        db.record_host_dispatch_failure("anaplian", "boom").unwrap();
+        let event = sub.recv().await.expect("HostDisabled published once the breaker trips");
+        assert_eq!(
+            event,
+            Event::HostDisabled {
+                host_id: "anaplian".to_owned()
+            }
+        );
+
+        // A further failure against an already-disabled host must not
+        // republish.
+        db.record_host_dispatch_failure("anaplian", "boom again").unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv())
+            .await
+            .expect_err("no repeat HostDisabled while already disabled");
+    }
+
+    #[test]
+    fn record_host_contact_success_resets_counter_and_clears_error() {
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
+        db.record_host_dispatch_failure("zakalwe", "transient blip").unwrap();
+        assert_eq!(db.get_host("zakalwe").unwrap().unwrap().consecutive_failures, 1);
+
+        db.record_host_contact_success("zakalwe").unwrap();
+
+        let host = db.get_host("zakalwe").unwrap().unwrap();
+        assert_eq!(host.consecutive_failures, 0);
+        assert!(host.last_error_text.is_none());
+        assert!(host.last_seen_at.is_some());
+    }
+
+    /// Registration / `hosts probe` success leaves the row the operator
+    /// reads next fully healthy: it clears `last_error_text`, stamps
+    /// `last_seen_at`, and resets the failure counter.
+    #[test]
+    fn record_host_contact_success_heals_row_after_stale_failure() {
+        let db = open_db();
+        db.add_host("anaplian", "user@a", 3, &[]).unwrap();
+        db.record_host_dispatch_failure("anaplian", "opening ssh control master: could not resolve hostname")
+            .unwrap();
+        let before = db.get_host("anaplian").unwrap().unwrap();
+        assert_eq!(
+            before.last_error_text.as_deref(),
+            Some("opening ssh control master: could not resolve hostname")
+        );
+        assert!(before.last_seen_at.is_some());
+        assert_eq!(before.consecutive_failures, 1);
+
+        db.record_host_contact_success("anaplian").unwrap();
+
+        let after = db.get_host("anaplian").unwrap().unwrap();
+        assert_eq!(after.last_error_text, None, "success must clear last_error_text");
+        assert_eq!(after.consecutive_failures, 0);
+        assert!(
+            after.last_seen_at.is_some(),
+            "success must stamp last_seen_at (not merely leave a prior failure's stamp uncleared)"
+        );
+    }
+
+    /// Clearing only the error column is not a successful-contact write:
+    /// `last_seen_at` stays put, unlike
+    /// [`WorkDb::record_host_contact_success`].
+    #[test]
+    fn set_host_last_error_none_does_not_stamp_last_seen() {
+        let db = open_db();
+        db.add_host("anaplian", "user@a", 3, &[]).unwrap();
+        db.set_host_last_error("anaplian", Some("prior failure")).unwrap();
+        let host = db.get_host("anaplian").unwrap().unwrap();
+        assert!(host.last_seen_at.is_none());
+
+        db.set_host_last_error("anaplian", None).unwrap();
+        let host = db.get_host("anaplian").unwrap().unwrap();
+        assert_eq!(host.last_error_text, None);
+        assert!(
+            host.last_seen_at.is_none(),
+            "clearing last_error alone must not invent a last_seen stamp"
+        );
+    }
+
+    #[test]
+    fn record_host_contact_success_does_not_re_enable_a_disabled_host() {
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
+        db.set_host_enabled("zakalwe", false).unwrap();
+
+        db.record_host_contact_success("zakalwe").unwrap();
+
+        assert!(
+            !db.get_host("zakalwe").unwrap().unwrap().enabled,
+            "a successful call must not implicitly re-enable a host the operator disabled"
+        );
+    }
+
+    // ── get_host / list_hosts ───────────────────────────────────────────────
+
+    #[test]
+    fn get_host_returns_none_for_missing() {
+        let db = open_db();
+        assert!(db.get_host("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn local_host_present_after_open() {
+        let db = open_db();
+        let local = db.get_host("local").unwrap().expect("local host seeded on open");
+        assert_eq!(local.id, "local");
+        assert!(local.enabled);
+        assert!(db.list_hosts().unwrap().iter().any(|h| h.id == "local"));
+    }
+
+    #[test]
+    fn list_hosts_orders_by_created_at_then_id() {
+        let db = open_db();
+        db.add_host("bravo", "user@b", 1, &[]).unwrap();
+        db.add_host("alpha", "user@a", 1, &[]).unwrap();
+        db.add_host("charlie", "user@c", 1, &[]).unwrap();
+
+        // Force deterministic created_at values: wall-clock granularity is
+        // too coarse to control ordering otherwise. `alpha` and `charlie`
+        // share a created_at to exercise the secondary id ASC tiebreak.
+        {
+            let conn = db.connect().unwrap();
+            conn.execute("UPDATE hosts SET created_at = '10' WHERE id = 'local'", [])
+                .unwrap();
+            conn.execute("UPDATE hosts SET created_at = '20' WHERE id = 'alpha'", [])
+                .unwrap();
+            conn.execute("UPDATE hosts SET created_at = '20' WHERE id = 'charlie'", [])
+                .unwrap();
+            conn.execute("UPDATE hosts SET created_at = '30' WHERE id = 'bravo'", [])
+                .unwrap();
+        }
+
+        let ids: Vec<String> = db.list_hosts().unwrap().into_iter().map(|h| h.id).collect();
+        assert_eq!(ids, vec!["local", "alpha", "charlie", "bravo"]);
+    }
+
+    // ── add_user_host_capability ────────────────────────────────────────────
+
+    #[test]
+    fn add_user_capability_errors_when_host_missing() {
+        let db = open_db();
+        let err = db.add_user_host_capability("ghost", "os=macos").unwrap_err();
+        assert!(err.to_string().contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn add_user_capability_replaces_auto_source_with_user() {
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
+        insert_host_capability(&db, "zakalwe", "os=macos", "auto");
+
+        db.add_user_host_capability("zakalwe", "os=macos").unwrap();
+
+        // INSERT OR REPLACE overwrites the single row and flips its source.
+        let matching: Vec<_> = db
+            .list_host_capabilities("zakalwe")
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.capability == "os=macos")
+            .collect();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].source, "user");
+    }
+
+    // ── remove_user_host_capability ─────────────────────────────────────────
+
+    #[test]
+    fn remove_user_capability_removes_user_sourced() {
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &["os=macos".to_owned()]).unwrap();
+
+        db.remove_user_host_capability("zakalwe", "os=macos").unwrap();
+
+        assert!(
+            db.list_host_capabilities("zakalwe")
+                .unwrap()
+                .iter()
+                .all(|c| c.capability != "os=macos")
+        );
+    }
+
+    #[test]
+    fn remove_user_capability_rejects_auto_sourced() {
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
+        insert_host_capability(&db, "zakalwe", "arch=arm64", "auto");
+
+        let err = db.remove_user_host_capability("zakalwe", "arch=arm64").unwrap_err();
+        assert!(err.to_string().contains("auto-discovered"), "got: {err}");
+
+        // The auto row is left in place.
+        assert!(
+            db.list_host_capabilities("zakalwe")
+                .unwrap()
+                .iter()
+                .any(|c| c.capability == "arch=arm64")
+        );
+    }
+
+    #[test]
+    fn remove_user_capability_not_found_when_absent() {
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
+
+        let err = db.remove_user_host_capability("zakalwe", "nope=1").unwrap_err();
+        let msg = err.to_string();
+        // Distinct from the auto-discovered branch.
+        assert!(msg.contains("not found"), "got: {msg}");
+        assert!(!msg.contains("auto-discovered"), "got: {msg}");
+    }
+
+    // ── list_host_capabilities ──────────────────────────────────────────────
+
+    #[test]
+    fn list_host_capabilities_orders_by_source_then_capability() {
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
+        insert_host_capability(&db, "zakalwe", "zzz", "user");
+        insert_host_capability(&db, "zakalwe", "os=linux", "auto");
+        insert_host_capability(&db, "zakalwe", "arch=x86", "auto");
+        insert_host_capability(&db, "zakalwe", "aaa", "user");
+
+        let ordered: Vec<(String, String)> = db
+            .list_host_capabilities("zakalwe")
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.source, c.capability))
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![
+                ("auto".to_owned(), "arch=x86".to_owned()),
+                ("auto".to_owned(), "os=linux".to_owned()),
+                ("user".to_owned(), "aaa".to_owned()),
+                ("user".to_owned(), "zzz".to_owned()),
+            ]
+        );
+    }
+
+    // ── replace_auto_host_capabilities ──────────────────────────────────────
+
+    /// `(source, capability)` pairs on a host, in `list_host_capabilities`
+    /// order.
+    fn cap_pairs(db: &WorkDb, host_id: &str) -> Vec<(String, String)> {
+        db.list_host_capabilities(host_id)
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.source, c.capability))
+            .collect()
+    }
+
+    #[test]
+    fn schema_init_seeds_the_local_host_row_but_never_probes_its_capabilities() {
+        // Schema init must not perform host I/O, network calls, or
+        // subprocess execution. The local host row is data the schema
+        // needs; its capability rows come from the startup probe (see
+        // `crate::host_registry::refresh_local_host_auto_capabilities`), never from
+        // `init()`. This is the regression guard for the probe having
+        // lived inside the migration chain, where it spawned three login
+        // shells and a `gh auth status` on every boot.
+        let db = open_db();
+        assert!(db.get_host("local").unwrap().is_some(), "local host row must exist");
+        assert_eq!(cap_pairs(&db, "local"), Vec::<(String, String)>::new());
+    }
+
+    #[test]
+    fn clear_local_host_auto_capabilities_drops_auto_rows_and_keeps_operator_tags() {
+        let db = open_db();
+        // What a previous boot's probe left behind, plus an operator tag.
+        db.replace_auto_host_capabilities(
+            "local",
+            &[
+                "os=macos".to_owned(),
+                "driver=grok".to_owned(),
+                "drivers-probed=true".to_owned(),
+            ],
+        )
+        .unwrap();
+        db.add_user_host_capability("local", "role=builder").unwrap();
+
+        db.clear_local_host_auto_capabilities().unwrap();
+
+        // Every `auto` row is gone (so a driver uninstalled since the last
+        // boot cannot look available), and the operator tag survives.
+        assert_eq!(
+            cap_pairs(&db, "local"),
+            vec![("user".to_owned(), "role=builder".to_owned())]
+        );
+        // Other hosts are untouched.
+        db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
+        db.replace_auto_host_capabilities("zakalwe", &["os=linux".to_owned()])
+            .unwrap();
+        db.clear_local_host_auto_capabilities().unwrap();
+        assert_eq!(
+            cap_pairs(&db, "zakalwe"),
+            vec![("auto".to_owned(), "os=linux".to_owned())]
+        );
+    }
+
+    #[test]
+    fn replace_auto_host_capabilities_writes_auto_rows_for_a_remote_host() {
+        // The gap behind the anaplian `caps=0` report: the only writer of
+        // `auto` rows hard-coded `host_id = 'local'`, so a remote host had
+        // no path to an auto-discovered capability at all.
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
+
+        db.replace_auto_host_capabilities("zakalwe", &["os=macos".to_owned(), "arch=arm64".to_owned()])
+            .unwrap();
+
+        assert_eq!(
+            cap_pairs(&db, "zakalwe"),
+            vec![
+                ("auto".to_owned(), "arch=arm64".to_owned()),
+                ("auto".to_owned(), "os=macos".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn replace_auto_host_capabilities_converges_rather_than_accumulating() {
+        // Re-probing a host whose `gh` credentials expired must leave one
+        // `gh-authed=` row, not both answers.
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
+        db.replace_auto_host_capabilities("zakalwe", &["gh-authed=true".to_owned()])
+            .unwrap();
+
+        db.replace_auto_host_capabilities("zakalwe", &["gh-authed=false".to_owned()])
+            .unwrap();
+
+        assert_eq!(
+            cap_pairs(&db, "zakalwe"),
+            vec![("auto".to_owned(), "gh-authed=false".to_owned())]
+        );
+    }
+
+    #[test]
+    fn replace_auto_host_capabilities_leaves_operator_tags_alone() {
+        // An operator `--tag` is a deliberate statement about the host and
+        // must survive any number of re-probes.
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &["role=builder".to_owned()])
+            .unwrap();
+
+        db.replace_auto_host_capabilities("zakalwe", &["os=macos".to_owned()])
+            .unwrap();
+
+        assert_eq!(
+            cap_pairs(&db, "zakalwe"),
+            vec![
+                ("auto".to_owned(), "os=macos".to_owned()),
+                ("user".to_owned(), "role=builder".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn replace_auto_host_capabilities_preserves_a_colliding_operator_tag() {
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &["os=macos".to_owned()]).unwrap();
+
+        db.replace_auto_host_capabilities("zakalwe", &["os=macos".to_owned()])
+            .unwrap();
+
+        assert_eq!(
+            cap_pairs(&db, "zakalwe"),
+            vec![("user".to_owned(), "os=macos".to_owned())]
+        );
+    }
+
+    #[test]
+    fn replace_auto_host_capabilities_rejects_an_unknown_host() {
+        // The `host_capabilities` FK would reject the insert anyway, but an
+        // empty `caps` slice performs no insert at all — without this check
+        // that call would silently succeed against a host that isn't there.
+        let db = open_db();
+        let err = db.replace_auto_host_capabilities("ghost", &[]).unwrap_err();
+        assert!(err.to_string().contains("host 'ghost' not found"), "got: {err}");
+    }
+
+    // ── set_execution_pinned_host / execution_pinned_host ───────────────────
+
+    #[test]
+    fn pinned_host_round_trips_and_clears() {
+        let db = open_db();
+        insert_execution(&db, "exec-1");
+
+        // Unpinned to start.
+        assert!(db.execution_pinned_host("exec-1").unwrap().is_none());
+
+        db.set_execution_pinned_host("exec-1", Some("zakalwe")).unwrap();
+        assert_eq!(db.execution_pinned_host("exec-1").unwrap().as_deref(), Some("zakalwe"));
+
+        // Clearing with None resets to None.
+        db.set_execution_pinned_host("exec-1", None).unwrap();
+        assert!(db.execution_pinned_host("exec-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn set_execution_pinned_host_errors_on_unknown_execution() {
+        let db = open_db();
+        let err = db.set_execution_pinned_host("nope", Some("zakalwe")).unwrap_err();
+        assert!(err.to_string().contains("unknown execution"), "got: {err}");
+    }
+
+    // ── run_host / active_runs_per_host ──────────────────────────────────────
+
+    #[test]
+    fn active_runs_per_host_counts_only_active_grouped_by_host() {
+        let db = open_db();
+        insert_execution(&db, "exec-1");
+        insert_run(&db, "run-1", "exec-1", "zakalwe", "active");
+        insert_run(&db, "run-2", "exec-1", "zakalwe", "active");
+        insert_run(&db, "run-3", "exec-1", "local", "active");
+        // Terminal runs must not be counted.
+        insert_run(&db, "run-4", "exec-1", "zakalwe", "finished");
+        insert_run(&db, "run-5", "exec-1", "local", "failed");
+
+        let counts = db.active_runs_per_host().unwrap();
+        assert_eq!(counts.get("zakalwe").copied(), Some(2));
+        assert_eq!(counts.get("local").copied(), Some(1));
+    }
+
+    #[test]
+    fn run_host_returns_attributed_host() {
+        let db = open_db();
+        insert_execution(&db, "exec-1");
+        insert_run(&db, "run-1", "exec-1", "zakalwe", "active");
+
+        assert_eq!(db.run_host("run-1").unwrap().as_deref(), Some("zakalwe"));
+        assert!(db.run_host("missing").unwrap().is_none());
+    }
+
+    // ── required_capabilities_for_subject_ids ────────────────────────────────
+
+    #[test]
+    fn required_capabilities_empty_for_empty_input() {
+        let db = open_db();
+        assert!(db.required_capabilities_for_subject_ids(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn required_capabilities_distinct_union_across_subjects() {
+        let db = open_db();
+        insert_requirement(&db, "chore-1", "os=macos");
+        insert_requirement(&db, "chore-1", "xcode=15");
+        // Duplicate capability under a different subject id collapses to one.
+        insert_requirement(&db, "product-1", "os=macos");
+        insert_requirement(&db, "product-1", "gpu=true");
+
+        let caps = db
+            .required_capabilities_for_subject_ids(&["chore-1", "product-1"])
+            .unwrap();
+        let expected: BTreeSet<String> = ["os=macos", "xcode=15", "gpu=true"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(caps, expected);
+    }
+
+    // ── ensure_local_host ────────────────────────────────────────────────────
+
+    #[test]
+    fn ensure_local_host_is_idempotent() {
+        let db = open_db();
+        {
+            let conn = db.connect().unwrap();
+            // `local` already exists from open(); re-running must not error or dup.
+            ensure_local_host(&conn).unwrap();
+            ensure_local_host(&conn).unwrap();
+        }
+
+        let locals = db.list_hosts().unwrap().into_iter().filter(|h| h.id == "local").count();
+        assert_eq!(locals, 1);
+    }
+}
