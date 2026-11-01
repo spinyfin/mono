@@ -135,8 +135,8 @@ async fn clean_verdict_advances_the_origin_to_review_without_a_revision() {
         "{error:#}"
     );
     assert_eq!(
-        db.worker_proposal(&outcome.proposal.id).unwrap().unwrap().state,
-        ProposalState::Proposed
+        db.get_worker_proposal(&outcome.proposal.id).unwrap().state,
+        boss_protocol::ProposalState::Proposed
     );
 
     // The supervisor has stopped before asynchronous application. Neither
