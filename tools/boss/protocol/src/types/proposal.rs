@@ -697,6 +697,28 @@ pub struct ReviewGuideProposalPayload {
     pub body_markdown: String,
 }
 
+/// Body of a labelled `No:` section, stopping at `Recommendation:`.
+pub fn explanation_no_section(explanation: &str) -> Option<String> {
+    let mut in_no = false;
+    let mut body = Vec::new();
+    for line in explanation.lines() {
+        let trimmed = line.trim();
+        if !in_no {
+            if trimmed == "No:" {
+                in_no = true;
+            }
+            continue;
+        }
+        if trimmed == "Recommendation:" {
+            break;
+        }
+        if !trimmed.is_empty() {
+            body.push(trimmed);
+        }
+    }
+    if body.is_empty() { None } else { Some(body.join(" ")) }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OperatorQuestion {
@@ -1123,5 +1145,19 @@ mod tests {
         assert!(super::FileCountBypassSpec { files: 48, limit: 0 }.validate().is_err());
         assert!(super::FileCountBypassSpec { files: 30, limit: 30 }.validate().is_err());
         assert!(super::FileCountBypassSpec { files: 29, limit: 30 }.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod explanation_tests {
+    #[test]
+    fn no_section_stops_before_details() {
+        assert_eq!(
+            super::explanation_no_section(
+                "Context:\nContext\nYes:\nYes\nNo:\n  Ship the smaller change.\n\n Keep the rest.\nRecommendation:\nYes\nDetails:\nNo:\nStay blocked."
+            ),
+            Some("Ship the smaller change. Keep the rest.".into())
+        );
+        assert_eq!(super::explanation_no_section("Context:\nNo answer section"), None);
     }
 }

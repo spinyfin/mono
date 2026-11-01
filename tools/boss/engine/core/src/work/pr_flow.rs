@@ -2555,7 +2555,7 @@ fn declined_block(question: &OperatorQuestionView, timestamp: &str) -> String {
 - **Answer:** No\n",
         question.text
     );
-    if let Some(no_path) = explanation_no_path(&question.explanation) {
+    if let Some(no_path) = boss_protocol::explanation_no_section(&question.explanation) {
         lines.push_str(&format!("- **The worker's No path:** {no_path}\n"));
     }
     lines.push_str(&format!(
@@ -2565,28 +2565,6 @@ The repo owner recorded this decline on the kanban. Proceed with the declined pa
         question.explanation, question.execution_id
     ));
     lines
-}
-
-/// Body of a labelled `No:` section, stopping at `Recommendation:`.
-fn explanation_no_path(explanation: &str) -> Option<String> {
-    let mut in_no = false;
-    let mut body = Vec::new();
-    for line in explanation.lines() {
-        let trimmed = line.trim();
-        if !in_no {
-            if trimmed == "No:" {
-                in_no = true;
-            }
-            continue;
-        }
-        if trimmed == "Recommendation:" {
-            break;
-        }
-        if !trimmed.is_empty() {
-            body.push(trimmed);
-        }
-    }
-    if body.is_empty() { None } else { Some(body.join(" ")) }
 }
 
 /// The brief addendum for a multiple-choice answer: the chosen option,

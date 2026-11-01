@@ -43,46 +43,15 @@ const REMAIN_BLOCKED_PHRASES: &[&str] = &[
     "leave the task blocked",
     "a different approach would be needed",
 ];
-const STAY_WORDS: &[&str] = &[
-    "stay",
-    "stays",
-    "staying",
-    "remain",
-    "remains",
-    "remaining",
-    "leave",
-    "leaves",
-    "left",
-];
+const STAY_WORDS: &[&str] = &["stay", "stays", "staying", "remain", "remains", "leave", "leaves"];
 const BLOCKED_WORDS: &[&str] = &["blocked", "parked"];
 
 fn no_section_names_remain_blocked(raw: &str) -> bool {
-    remain_blocked_language(&no_section_body(raw))
-}
-
-/// Collect the No section only, stopping at Recommendation. Later `No:` lines
-/// (including inside Details) never re-enter the scan.
-fn no_section_body(raw: &str) -> String {
-    let mut in_no = false;
-    let mut body = String::new();
-    for line in raw.lines().map(str::trim) {
-        if !in_no {
-            if line == "No:" {
-                in_no = true;
-            }
-            continue;
-        }
-        if line == "Recommendation:" {
-            break;
-        }
-        if !line.is_empty() {
-            if !body.is_empty() {
-                body.push(' ');
-            }
-            body.push_str(&line.to_ascii_lowercase());
-        }
-    }
-    body
+    remain_blocked_language(
+        &boss_protocol::explanation_no_section(raw)
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+    )
 }
 
 fn remain_blocked_language(body: &str) -> bool {
@@ -235,6 +204,12 @@ pub(super) mod tests {
                 validate_for(&text, false).unwrap_err().contains("remain blocked"),
                 "{no}"
             );
+        }
+        for no in [
+            "Ship the 12 remaining files; the blocked job is fixed separately.",
+            "Ship the files left; the blocked job is fixed separately.",
+        ] {
+            assert!(validate_for(&VALID.replace("Ship the smaller change instead.", no), false).is_ok());
         }
         let details_no = format!("{VALID}\nDetails:\nEvidence\nNo:\nWork stays blocked.\nverbatim");
         assert!(

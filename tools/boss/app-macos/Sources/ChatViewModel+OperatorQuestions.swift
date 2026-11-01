@@ -4,8 +4,8 @@ extension ChatViewModel {
     // MARK: Operator questions (Doing ▸ Queued)
 
     /// Answer the question a blocked worker asked on `task`'s card — the
-    /// card's Yes / No buttons. Yes re-authorizes and restarts the task, No
-    /// parks it in Backlog; either way the engine replies with
+    /// card's Yes / No buttons. Both answers record the chosen path and restart
+    /// the task; the engine replies with
     /// `work_item_updated`, which moves the card, so nothing is applied
     /// optimistically here.
     ///

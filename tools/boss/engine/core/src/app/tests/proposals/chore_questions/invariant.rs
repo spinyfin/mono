@@ -314,7 +314,34 @@ async fn exercise(kind: &TaskKind, status: &TaskStatus, payload: Value, answer: 
 /// file-count authorization on the successor that continues the same PR.
 #[tokio::test]
 async fn file_count_no_on_in_review_source_records_bypass_on_successor() {
+    file_count_successor(crate::work::PrOpenState::Open, true, true).await;
+}
+
+#[tokio::test]
+async fn file_count_no_after_pr_finished_requires_fresh_approval() {
+    for pr_state in [
+        crate::work::PrOpenState::Merged,
+        crate::work::PrOpenState::ClosedUnmerged,
+    ] {
+        file_count_successor(pr_state, true, false).await;
+    }
+}
+
+#[tokio::test]
+async fn file_count_no_before_first_pr_retains_approval() {
+    file_count_successor(crate::work::PrOpenState::Open, false, true).await;
+}
+
+async fn file_count_successor(pr_state: crate::work::PrOpenState, has_pr: bool, authorized: bool) {
     let (state, _dir, execution, task) = fixture(&TaskKind::ProjectTask, &TaskStatus::InReview, false);
+    if !has_pr {
+        state
+            .work_db
+            .connect()
+            .unwrap()
+            .execute("UPDATE tasks SET pr_url = NULL WHERE id = ?1", [&task])
+            .unwrap();
+    }
     submitted(
         call_with_peer(
             &state,
@@ -348,7 +375,7 @@ async fn file_count_no_on_in_review_source_records_bypass_on_successor() {
             &group.id,
             false,
             &Default::default(),
-            &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
+            &crate::work::StaticPrStateChecker(pr_state),
         )
         .unwrap();
     assert_eq!(result.produced_work_item_ids.len(), 1);
@@ -361,7 +388,15 @@ async fn file_count_no_on_in_review_source_records_bypass_on_successor() {
             Ok((row.get(0)?, row.get(1)?))
         })
         .unwrap();
-    assert_eq!(produced_kind, "revision");
+    assert_eq!(produced_kind, if has_pr && authorized { "revision" } else { "design" });
+    if !authorized {
+        assert!(description.contains("**Answer:** no"));
+        assert!(description.contains("grants no authorization for a new PR"));
+        assert!(description.contains("requires fresh approval"));
+        assert!(!description.contains("Repo owner approval"));
+        assert!(!description.contains("BYPASS_CHANGE_FILE_COUNT="));
+        return;
+    }
     assert!(description.contains("**Answer:** no"));
     assert!(description.contains("Repo owner approval"));
     assert!(description.contains("No — keep this change in one PR"));

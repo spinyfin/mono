@@ -4,6 +4,13 @@ use boss_protocol::{
     FileCountBypassSpec, OperatorAnswerType, OperatorQuestion, OperatorQuestionRecord, OperatorQuestionView,
 };
 
+/// Whether a successor continues the PR covered by the original question.
+pub(super) enum QuestionSuccessor {
+    Revision,
+    NoPr,
+    FinishedPr,
+}
+
 pub(crate) fn create_in_tx(
     conn: &Connection,
     task: &Task,
@@ -138,6 +145,7 @@ pub(super) fn apply_prerequisite_in_tx(
     group: &AttentionGroup,
     members: &[Attention],
     produced_ids: &[String],
+    successor: QuestionSuccessor,
 ) -> Result<()> {
     let answered_yes = members
         .iter()
@@ -177,7 +185,15 @@ pub(super) fn apply_prerequisite_in_tx(
     let answered_at = chrono::DateTime::from_timestamp(now.parse::<i64>()?, 0)
         .context("answer timestamp is outside the supported range")?;
     let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
-    let block = super::super::pr_flow::file_count_bypass_authorization_block(&question, spec, &timestamp);
+    let block = match successor {
+        QuestionSuccessor::Revision | QuestionSuccessor::NoPr => {
+            super::super::pr_flow::file_count_bypass_authorization_block(&question, spec, &timestamp)
+        }
+        QuestionSuccessor::FinishedPr => format!(
+            "\n\n## Recorded answer ({timestamp})\n\nThe operator answered No to: {}\n\nThe original PR has merged or closed. This answer is context only and grants no authorization for a new PR; exceeding the file-count limit requires fresh approval.\n",
+            question.text
+        ),
+    };
     for id in produced_ids {
         let task = query_task(conn, id).require("task", id)?;
         let description = format!("{}{block}", task.description);
