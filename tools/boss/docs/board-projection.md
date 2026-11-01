@@ -17,7 +17,7 @@ Bounds are explicit:
 - At most four products are retained with least-recently-used eviction, each with at most 16,384 cards and 32 MiB of encoded content. After a snapshot, a conservative byte total is adjusted from the replaced cards, runtimes and dependency list; the retention guard does not serialize the whole board on each update. Parity sequences verify this total against actual encoding (at most six bytes of comma-count slack). Oversized boards are returned intact through full reads and are not retained. These are retention bounds, not a claim that Rust heap usage equals encoded size. In-flight responses and existing per-session wire caches have their own lifetimes.
 - Changes to product/project metadata, ideas, dependencies, product alerts, planner summaries recover from a complete snapshot. They can affect non-card collections or relationships beyond an individual family. Review membership and projected guide columns journal only their owning card families; review status bookkeeping does not invalidate boards. Only the review-verdict watermark is observed in the engine metadata table; unrelated scheduler metadata does not force a snapshot.
 
-New projection inputs must be added to the journal coverage or the full-snapshot class. The input table list lives beside the migration in `work/board_projection_schema.rs`. No call site may substitute a best-effort invalidation ID for that coverage.
+New projection inputs must be added to the journal coverage or the full-snapshot class. The input table list lives beside the migration in `tools/boss/engine/work-db/src/board_projection_schema.rs`. No call site may substitute a best-effort invalidation ID for that coverage.
 
 ## Validation and measurement
 

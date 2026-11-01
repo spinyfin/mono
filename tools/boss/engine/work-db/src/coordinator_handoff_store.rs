@@ -45,3 +45,26 @@ impl WorkDb {
         Ok(handoff)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    const NOW: i64 = 1_756_800_000;
+
+    #[test]
+    fn state_distinguishes_missing_present_and_unreadable() {
+        let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+        assert_eq!(db.coordinator_handoff_state(), HandoffState::Missing);
+
+        let written = db.set_coordinator_handoff("- fact", "token-a", NOW).unwrap();
+        assert_eq!(db.coordinator_handoff_state(), HandoffState::Present(written));
+
+        db.set_metadata(HANDOFF_METADATA_KEY, "{not json").unwrap();
+        match db.coordinator_handoff_state() {
+            HandoffState::Unreadable(reason) => assert!(reason.contains("not valid JSON"), "got: {reason}"),
+            other => panic!("corrupt value must read as Unreadable, got {other:?}"),
+        }
+    }
+}

@@ -30,6 +30,8 @@
 //! prefix — not a substring scan — so prose that merely mentions the
 //! protocol never trips it.
 
+use boss_engine_utils::quoted_field::extract_quoted;
+
 /// `[deferred-scope]` marker prefix.
 pub const DEFERRED_SCOPE_MARKER: &str = "[deferred-scope]";
 
@@ -58,14 +60,6 @@ impl DeferredScopeItem {
 /// beginning with [`DEFERRED_SCOPE_MARKER`]. Returns one [`DeferredScopeItem`]
 /// per matching line, in document order — a worker deferring several distinct
 /// pieces of scope emits one line each, and all are reported.
-fn extract_quoted<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    let needle = format!("{key}=\"");
-    let idx = text.find(&needle)?;
-    let rest = &text[idx + needle.len()..];
-    let end = rest.find('"')?;
-    Some(&rest[..end])
-}
-
 pub fn detect_deferred_scope_items(text: &str) -> Vec<DeferredScopeItem> {
     text.lines()
         .filter_map(|raw| {

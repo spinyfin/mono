@@ -51,6 +51,6 @@ Hook prompts were rejected as an authorization source: `UserPromptSubmit` has se
 
 ## Where it lives
 
-- Write rule and provenance: `tools/boss/engine/core/src/work/critical_priority.rs`; create/update entry points in `insert_helpers.rs`, `create_entities.rs`, `updates.rs`; the worker-pane refusal in `app/work_items.rs` (`resolve_write_actor`).
-- Ordering: `WorkDb::list_ready_executions` (`work/executions_runs.rs`).
+- Write rule and provenance: `tools/boss/engine/work-db/src/critical_priority.rs`; create/update entry points in `insert_helpers.rs`, `create_entities.rs`, `updates.rs`; the worker-pane refusal in `app/work_items.rs` (`resolve_write_actor`).
+- Ordering: `WorkDb::list_ready_executions` (`tools/boss/engine/work-db/src/executions_runs.rs`).
 - Cap and pause gates: `drain_ready_queue` in `coordinator/scheduler.rs`; the chokepoint arm `DispatchAdmission::Critical` in `coordinator/config.rs`.

@@ -6,7 +6,8 @@ use boss_protocol::CoordinatorHandoffView;
 
 use super::*;
 use crate::app::coordinator_handoff;
-use crate::coordinator_handoff::{HANDOFF_METADATA_KEY, MAX_HANDOFF_BYTES};
+use crate::coordinator_handoff::MAX_HANDOFF_BYTES;
+use crate::work::HANDOFF_METADATA_KEY;
 
 fn server_state() -> (Arc<ServerState>, tempfile::TempDir) {
     let temp = tempfile::tempdir().unwrap();

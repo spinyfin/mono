@@ -184,7 +184,7 @@ The restart-during-spawn shape — a guide run spawned seconds before an
 engine restart, orphaned by the restarted engine's recovery probe, re-adopted
 on the worker's next hook, and submitting its guide minutes later — is
 covered by `restart_during_spawn_reopens_the_attempt_with_the_readopted_execution_and_publishes_the_guide`
-in `engine/core/src/work/review_guide_jobs_tests.rs`.
+in `tools/boss/engine/work-db/src/review_guide_jobs_tests.rs`.
 
 ## Automatic workspace patch backup
 
