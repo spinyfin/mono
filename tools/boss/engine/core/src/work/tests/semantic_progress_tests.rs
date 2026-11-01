@@ -3,7 +3,7 @@
 
 use super::*;
 
-use crate::semantic_progress::SemanticToolCondition;
+use boss_engine_storage_values::SemanticToolCondition;
 use boss_protocol::WorkerEvent;
 
 fn started_execution(db: &WorkDb) -> String {

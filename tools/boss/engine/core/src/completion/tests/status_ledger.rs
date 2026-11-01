@@ -1414,7 +1414,8 @@ fn review_verdict_apply_records_cycle_root_advance() {
             [&root.id],
         )
         .unwrap();
-    db.apply_review_verdict_proposal(
+    crate::test_support::apply_review_verdict(
+        &db,
         &outcome.proposal.id,
         &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
     )
@@ -1555,7 +1556,8 @@ fn review_verdict_apply_records_deletion_signoff_hold() {
             self.deletions.clone()
         }
     }
-    db.apply_review_verdict_proposal(
+    crate::test_support::apply_review_verdict(
+        &db,
         &outcome.proposal.id,
         &DeletingPrChecker {
             inner: FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),

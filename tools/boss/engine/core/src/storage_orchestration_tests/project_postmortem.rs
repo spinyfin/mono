@@ -1,5 +1,8 @@
-use super::*;
+use boss_protocol::{CreateProjectInput, CreateTaskInput, Project, Task};
+
+use super::{now_string, raw};
 use crate::test_support::{create_test_product_named, open_db};
+use crate::work::{ClaimPlannerRunInput, SetProjectDesignDocInput, WorkDb, WorkItemPatch};
 
 fn empty_project(db: &WorkDb) -> Project {
     let product = create_test_product_named(db, "Postmortems");
@@ -18,7 +21,7 @@ fn empty_project(db: &WorkDb) -> Project {
         ..Default::default()
     })
     .unwrap();
-    query_project(&db.connect().unwrap(), &project.id).unwrap().unwrap()
+    db.get_project(&project.id).unwrap()
 }
 
 /// A project with one completed implementation task. The completion signal
@@ -44,10 +47,7 @@ fn project(db: &WorkDb) -> Project {
         },
     )
     .unwrap();
-    db.connect()
-        .unwrap()
-        .execute("DELETE FROM project_postmortem_signals", [])
-        .unwrap();
+    raw(db).execute("DELETE FROM project_postmortem_signals", []).unwrap();
     p
 }
 
@@ -77,26 +77,17 @@ async fn assert_scheduled_once(db: &WorkDb, project: &Project) {
         0
     );
     assert!(!db.start_project_postmortem(&project.id).unwrap().1);
-    let count: i64 = db
-        .connect()
+    let postmortems: Vec<_> = db
+        .list_tasks(&project.product_id, Some(&project.id), None, true)
         .unwrap()
-        .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE project_id = ?1 AND kind = 'design_postmortem'",
-            [&project.id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(count, 1);
-    let executions: i64 = db
-        .connect()
-        .unwrap()
-        .query_row(
-            "SELECT COUNT(*) FROM work_executions e JOIN tasks t ON t.id = e.work_item_id
-         WHERE t.project_id = ?1 AND t.kind = 'design_postmortem'",
-            [&project.id],
-            |row| row.get(0),
-        )
-        .unwrap();
+        .into_iter()
+        .filter(|task| task.kind == boss_protocol::TaskKind::DesignPostmortem)
+        .collect();
+    assert_eq!(postmortems.len(), 1);
+    let executions: usize = postmortems
+        .iter()
+        .map(|task| db.list_executions(Some(&task.id)).unwrap().len())
+        .sum();
     assert_eq!(executions, 1, "completion must also enqueue the postmortem execution");
 }
 

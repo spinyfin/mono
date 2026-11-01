@@ -40,7 +40,7 @@ pub trait PrStateChecker: Send + Sync {
     }
 
     /// Hermetic compare response used only by the review-service test fixtures.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn merged_parent_deletions(
         &self,
         _repo_slug: &str,
@@ -208,7 +208,7 @@ impl PrStateChecker for StaticPrStateChecker {
 }
 
 /// Test double: returns a preset state for known PR URLs.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone)]
 pub struct FakePrStateChecker {
     pub states: std::collections::HashMap<String, PrOpenState>,
@@ -216,7 +216,7 @@ pub struct FakePrStateChecker {
     pub head_sha: Option<String>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl FakePrStateChecker {
     pub fn always(state: PrOpenState) -> Self {
         Self {
@@ -235,7 +235,7 @@ impl FakePrStateChecker {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl PrStateChecker for FakePrStateChecker {
     fn check(&self, pr_url: &str) -> Result<PrOpenState> {
         Ok(self.states.get(pr_url).cloned().unwrap_or(self.default.clone()))

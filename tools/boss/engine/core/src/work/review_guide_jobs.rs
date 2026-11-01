@@ -193,11 +193,18 @@ struct FailureProvenance<'a> {
 
 #[work_db_boundary::instrument]
 impl WorkDb {
+    /// Read an attempt, including its durable failure and recovery state.
+    pub fn get_pr_review_guide_attempt(&self, attempt_id: &str) -> Result<Option<PrReviewGuideAttempt>> {
+        let conn = self.connect()?;
+        query_pr_review_guide_attempt(&conn, attempt_id)
+    }
+
     /// Admit a request for the selected comparison, reusing a live request
     /// for that comparison or atomically replacing an obsolete request.
     /// The durable queued attempt can be dispatched by enqueue or reconcile.
-    #[cfg(test)]
-    pub(crate) fn create_pr_review_guide_attempt(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn create_pr_review_guide_attempt(
         &self,
         series_id: &str,
         comparison_id: &str,
@@ -207,7 +214,7 @@ impl WorkDb {
             .map(|(attempt, _)| attempt)
     }
 
-    pub(crate) fn create_automatic_pr_review_guide_attempt(
+    pub fn create_automatic_pr_review_guide_attempt(
         &self,
         series_id: &str,
         comparison_id: &str,
@@ -359,8 +366,9 @@ impl WorkDb {
     /// `get_live_execution_for_work_item`-style per-comparison dedup and the
     /// generic execution machinery both work for free. Every omitted column
     /// carries its schema default.
-    #[cfg(test)]
-    pub(crate) fn create_pr_review_guide_execution(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn create_pr_review_guide_execution(
         &self,
         comparison_id: &str,
         repo_remote_url: &str,
@@ -394,8 +402,9 @@ impl WorkDb {
     /// current desired comparison. A stale bind (series already moved on)
     /// still records the execution on the attempt but leaves card lifecycle
     /// untouched.
-    #[cfg(test)]
-    pub(crate) fn bind_pr_review_guide_attempt_execution(&self, attempt_id: &str, execution_id: &str) -> Result<()> {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn bind_pr_review_guide_attempt_execution(&self, attempt_id: &str, execution_id: &str) -> Result<()> {
         let now = now_string();
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -589,7 +598,7 @@ impl WorkDb {
     /// Create the `work_executions` row for a queued attempt and bind it.
     /// Idempotent: an already-bound or already-terminal attempt is returned
     /// unchanged. The root task must resolve to a repository (override or product).
-    pub(crate) fn dispatch_pr_review_guide_attempt(
+    pub fn dispatch_pr_review_guide_attempt(
         &self,
         attempt_id: &str,
         root_task_id: &str,
@@ -676,7 +685,7 @@ impl WorkDb {
     ///
     /// Every action is logged with the attempt id, execution id and reason.
     /// Returns the number of attempts finished or dispatched.
-    pub(crate) fn reconcile_pr_review_guide_attempts_with_live_runs(
+    pub fn reconcile_pr_review_guide_attempts_with_live_runs(
         &self,
         known_live_execution_ids: &HashSet<String>,
         execution_is_alive: &dyn Fn(&str) -> bool,
@@ -1555,7 +1564,7 @@ pub(in crate::work) mod guide_updates {
         /// True when the comparison already has live work or its guide is the one
         /// currently readable. A historical version for a head the PR has since
         /// left (A -> B -> A) does not count: the card would keep opening B.
-        pub(crate) fn review_guide_comparison_has_attempt(&self, comparison: &str) -> Result<bool> {
+        pub fn review_guide_comparison_has_attempt(&self, comparison: &str) -> Result<bool> {
             Ok(self.connect()?.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pr_review_guide_attempts
                  WHERE comparison_id = ?1 AND status IN ('queued', 'running'))
@@ -1568,7 +1577,7 @@ pub(in crate::work) mod guide_updates {
         }
 
         /// The old head and original Markdown are immutable and bound to this attempt.
-        pub(crate) fn review_guide_update_context(&self, execution: &str) -> Result<Option<(String, String)>> {
+        pub fn review_guide_update_context(&self, execution: &str) -> Result<Option<(String, String)>> {
             let conn = self.connect()?;
             let context = conn
                 .query_row(
@@ -1596,13 +1605,7 @@ pub(in crate::work) mod guide_updates {
         /// A revision pushed `child` on top of `parent`, so `child` contains
         /// `parent`. A force-push never records an edge, which is what keeps a
         /// replaced head from counting as contained.
-        pub(crate) fn record_review_guide_head_ancestry(
-            &self,
-            root: &str,
-            pr: &str,
-            parent: &str,
-            child: &str,
-        ) -> Result<()> {
+        pub fn record_review_guide_head_ancestry(&self, root: &str, pr: &str, parent: &str, child: &str) -> Result<()> {
             self.connect()?.execute(
                 "INSERT OR IGNORE INTO pr_review_guide_head_ancestry
                  (root_task_id, pr_url, parent_sha, child_sha) VALUES (?1, ?2, ?3, ?4)",
@@ -1611,7 +1614,7 @@ pub(in crate::work) mod guide_updates {
             Ok(())
         }
 
-        pub(crate) fn record_review_guide_revision_head(
+        pub fn record_review_guide_revision_head(
             &self,
             root: &str,
             pr: &str,

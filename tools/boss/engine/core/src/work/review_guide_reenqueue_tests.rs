@@ -277,31 +277,6 @@ fn a_reenqueued_attempt_that_fails_again_is_not_retried_on_the_same_build() {
 }
 
 #[test]
-fn spawn_failures_record_whether_they_were_before_start_and_on_which_build() {
-    let (_dir, db) = open_db();
-    let (_root, series_id, comparison_id) = seeded_open_pr(&db);
-
-    let pre_start = db
-        .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
-        .unwrap();
-    db.fail_pr_review_guide_attempt_pre_start(&pre_start.id, "refused")
-        .unwrap();
-    let recorded = attempt_for(&db, &pre_start.id);
-    assert!(recorded.failed_pre_start);
-    assert_eq!(
-        recorded.failed_by_build.as_deref(),
-        Some(crate::build_info::build_identity())
-    );
-
-    let post_start = db
-        .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
-        .unwrap();
-    db.fail_pr_review_guide_attempt(&post_start.id, "ran and gave up")
-        .unwrap();
-    assert!(!attempt_for(&db, &post_start.id).failed_pre_start);
-}
-
-#[test]
 fn permanent_pre_start_execution_failure_marks_the_attempt_pre_start() {
     let (_dir, db) = open_db();
     let (root, _series_id, _comparison_id) = seeded_open_pr(&db);

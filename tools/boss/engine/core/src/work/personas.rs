@@ -96,7 +96,7 @@ pub(super) fn allocate(conn: &Connection, run_id: &str) -> Result<bool> {
 #[work_db_boundary::instrument]
 impl WorkDb {
     /// Apply the authoritative startup death verdict before dispatch reconciliation.
-    pub(crate) fn reap_startup_dead_execution(
+    pub fn reap_startup_dead_execution(
         &self,
         execution_id: &str,
         verdict: &boss_engine_storage_values::RunReconcileVerdict,

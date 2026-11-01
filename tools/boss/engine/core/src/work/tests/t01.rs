@@ -720,7 +720,7 @@ fn execution_honors_product_worker_branch_prefix() {
     // No editorial_rules configured → branch_naming defaults to
     // BossExecPrefix, under which the frozen prefix replaces `boss/`.
     assert_eq!(execution.branch_naming, BranchNaming::BossExecPrefix);
-    let branch = crate::completion::expected_branch_name(
+    let branch = boss_engine_storage_values::branch_identity::expected_branch_name(
         &execution.id,
         &execution.branch_naming,
         execution.worker_branch_prefix.as_deref(),
@@ -738,7 +738,7 @@ fn execution_without_product_prefix_defaults_to_boss() {
     // No override frozen onto the execution → default BossExecPrefix shape.
     assert_eq!(execution.worker_branch_prefix, None);
     assert_eq!(execution.branch_naming, BranchNaming::BossExecPrefix);
-    let branch = crate::completion::expected_branch_name(
+    let branch = boss_engine_storage_values::branch_identity::expected_branch_name(
         &execution.id,
         &execution.branch_naming,
         execution.worker_branch_prefix.as_deref(),
@@ -1564,7 +1564,7 @@ fn cost_snapshot_prefers_agent_session_over_prestart_failure_sibling() {
     let wrote = db
         .set_run_cost_snapshot(
             &execution.id,
-            crate::run_cost::RunCostSnapshot::builder()
+            boss_engine_storage_values::RunCostSnapshot::builder()
                 .model("claude-opus-4-5")
                 .output_tokens(42)
                 .input_tokens(100)

@@ -954,8 +954,8 @@ fn explicit_start_resolves_execution_scoped_park_attention_synchronously() {
     let db = WorkDb::open(temp_db_path("park-explicit-attention")).unwrap();
     let (chore_id, execution_id) = unparked_active_chore(&db, "explicit-attention");
     for kind in [
-        crate::completion::RUN_DONE_BLOCKED_ATTENTION_KIND,
-        crate::completion::NUDGE_BREAKER_ATTENTION_KIND,
+        boss_engine_storage_values::attention_kinds::RUN_DONE_BLOCKED_ATTENTION_KIND,
+        boss_engine_storage_values::attention_kinds::NUDGE_BREAKER_ATTENTION_KIND,
     ] {
         db.create_attention_item(boss_protocol::CreateAttentionItemInput {
             execution_id: Some(execution_id.clone()),

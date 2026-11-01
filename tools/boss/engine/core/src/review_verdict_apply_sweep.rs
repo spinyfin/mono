@@ -128,28 +128,6 @@ pub(crate) fn apply_pending_review_verdicts(
     Ok(stats)
 }
 
-// Test fixtures exercise the same service with their hermetic compare responses.
-#[cfg(test)]
-impl WorkDb {
-    pub(crate) fn apply_review_verdict_proposal(
-        &self,
-        proposal_id: &str,
-        checker: &dyn PrStateChecker,
-    ) -> anyhow::Result<Option<String>> {
-        apply_review_verdict_proposal(self, proposal_id, checker, &|input| {
-            checker.merged_parent_deletions(&input.repo_slug, &input.head_before, &input.base_sha, &input.head_after)
-        })
-    }
-    pub(crate) fn apply_pending_review_verdicts(
-        &self,
-        checker: &dyn PrStateChecker,
-    ) -> anyhow::Result<ReviewVerdictApplyStats> {
-        apply_pending_review_verdicts(self, checker, &|input| {
-            checker.merged_parent_deletions(&input.repo_slug, &input.head_before, &input.base_sha, &input.head_after)
-        })
-    }
-}
-
 /// Cadence for the crash-recovery pass. Fresh submissions are applied
 /// immediately from the proposal handler; this interval only covers
 /// engine restarts and a failed first attempt.

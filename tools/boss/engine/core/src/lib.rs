@@ -202,6 +202,8 @@ pub mod startup_timing;
 pub mod stdout_progress;
 pub mod stranded_answering_sweep;
 pub use boss_engine_structured_output as structured_output;
+#[cfg(test)]
+mod storage_orchestration_tests;
 pub mod supersession_scan;
 pub(crate) mod sweep_loop;
 pub mod sweep_metrics;

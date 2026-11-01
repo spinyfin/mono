@@ -79,39 +79,3 @@ fn task_from_item(item: WorkItem) -> Task {
         _ => panic!("expected task"),
     }
 }
-
-#[tokio::test]
-async fn committed_dependency_change_reaches_board_publisher() {
-    let db = WorkDb::open(temp_db_path("dependency-board-bridge")).unwrap();
-    let product = create_test_product(&db);
-    let prerequisite = create_test_chore(&db, product.id.clone(), "Prerequisite");
-    let dependent = create_test_chore(&db, product.id.clone(), "Dependent");
-    let publisher = std::sync::Arc::new(crate::test_support::RecordingPublisher::default());
-    let bridge = crate::board_notification_bridge::spawn_notifications(db.event_bus().clone(), publisher.clone());
-    db.add_dependency(AddDependencyInput {
-        dependent: dependent.id.clone(),
-        prerequisite: prerequisite.id,
-        relation: None,
-    })
-    .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            if !publisher.events.lock().await.is_empty() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(
-        *publisher.events.lock().await,
-        vec![(product.id, dependent.id.clone(), "work_item_changed".into())]
-    );
-    assert_eq!(
-        task_from_item(db.get_work_item(&dependent.id).unwrap()).status,
-        TaskStatus::Blocked
-    );
-    bridge.abort();
-    let _ = bridge.await;
-}

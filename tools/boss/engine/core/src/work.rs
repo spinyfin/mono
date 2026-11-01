@@ -720,8 +720,6 @@ mod github_merge_intents;
 pub(crate) mod personas;
 mod progression_scope;
 mod project_postmortem;
-#[cfg(test)]
-mod project_postmortem_tests;
 mod queued_wait;
 #[cfg(test)]
 mod read_only_tests;
@@ -831,9 +829,10 @@ pub(crate) use review_guide_jobs::{
     PrReviewGuideAttempt, PrReviewGuideVersion, PublishReviewGuideOutcome, RetryReviewGuideOutcome,
     ReviewGuideReenqueueReport, to_wire_review_guide_summary,
 };
-pub(crate) use review_guide_sources::{
-    PrReviewGuideSourceCapture, PrSourceCapturePersistOutcome, PrSourceCaptureTrigger,
-};
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
+pub use review_guide_sources::{PrReviewGuideSourceCapture, PrSourceCapturePersistOutcome, PrSourceCaptureTrigger};
 // Only the unit-test suite (and the resolver itself) call this directly;
 // production attach sites go through `attach_task_doc_link_state`.
 pub use pr_binding::{BLOCKED_REASON_PR_BINDING_UNRESOLVED, PrBindingRepairCandidate, PrBindingSuspicion};
@@ -853,8 +852,10 @@ pub use review_batches::{
     RetryDeadReviewBatchMember, ReviewBatchCreateInput, ReviewBatchDispatch, ReviewBatchMemberCreateInput,
     ReviewBatchQuorumOutcome,
 };
+pub use review_findings_followup::ReviewFindingsFollowupInsert;
 pub(crate) use review_findings_followup::*;
 pub(crate) use review_section::*;
+pub use review_verdict_apply::ReviewVerdictApplyStats;
 pub(crate) use review_verdict_apply::*;
 pub(crate) use revision_helpers::*;
 pub(crate) use task_targets::*;
@@ -916,7 +917,8 @@ pub use planner_runs::RunningPlannerRun;
 pub use pr_flow::PrPollStateInput;
 pub use pr_flow::PrStatusSnapshot;
 pub use pr_flow::QueuedMergeQueueMember;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
 pub use pr_state::FakePrStateChecker;
 pub use pr_state::GhPrStateChecker;
 pub use pr_state::PrInspect;

@@ -226,7 +226,7 @@ fn ai_review_state_ignores_a_stale_open_pr_review_died_attention() {
     db.create_attention_item(CreateAttentionItemInput {
         execution_id: None,
         work_item_id: Some(chore_id.clone()),
-        kind: crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND.to_owned(),
+        kind: boss_engine_storage_values::attention_kinds::PR_REVIEW_DIED_ATTENTION_KIND.to_owned(),
         status: None,
         title: "Automated review died without findings — auto-refired".to_owned(),
         body_markdown: "test".to_owned(),

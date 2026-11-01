@@ -64,7 +64,8 @@ fn cost_row_mapping_preserves_every_owned_field_and_null() {
             map_cost_run_record,
         )
         .unwrap();
-    let builder: crate::cost_report::CostRunRecordBuilder = crate::cost_report::CostRunRecord::builder();
+    let builder: boss_engine_storage_values::CostRunRecordBuilder =
+        boss_engine_storage_values::CostRunRecord::builder();
     let expected = builder
         .run_id("run-a")
         .execution_id("exec-a")
@@ -160,8 +161,8 @@ impl WorkDb {
 mod sol_report_db {
     //! Fetch complete PR families in a consistent snapshot for the Sol comparison.
     use super::{COST_RECORD_COLUMNS, map_cost_run_record};
-    use crate::cost_report::sol::SolPrRecord;
     use crate::work::*;
+    use boss_engine_storage_values::SolPrRecord;
 
     #[work_db_boundary::instrument]
     impl WorkDb {
@@ -287,115 +288,6 @@ mod sol_report_db {
                 params![run.id, model, tokens, time.to_string()],
             )
             .unwrap();
-        }
-
-        #[test]
-        fn report_joins_revisions_retries_and_findings_once_and_observes_only_first_ci() {
-            let (_dir, db) = open_db();
-            let product = create_product(&db);
-            let task = create_test_chore(&db, &product, "root");
-            let first = create_ready_chore_execution(&db, &task.id);
-            db.set_codex_sol_percentage(100).unwrap();
-            db.connect()
-                .unwrap()
-                .execute("UPDATE tasks SET pr_head_sha='stale' WHERE id=?1", [&task.id])
-                .unwrap();
-            assert_eq!(
-                db.select_codex_sol_model(&first.id, true, ASTRA_MODEL).unwrap(),
-                SOL_MODEL
-            );
-            measured_run(&db, &first, SOL_MODEL, 100, 10);
-            let historical = create_ready_chore_execution(&db, &task.id);
-            db.record_execution_launch_config(&historical.id, "codex", ASTRA_MODEL, None)
-                .unwrap();
-            let conn = db.connect().unwrap();
-            conn.execute(
-                "UPDATE work_executions SET created_at='5',started_at='5',status='completed' WHERE id=?1",
-                [&historical.id],
-            )
-            .unwrap();
-            conn.execute(
-                "UPDATE tasks SET pr_url='https://github.com/org/repo/pull/1',status='in_review' WHERE id=?1",
-                [&task.id],
-            )
-            .unwrap();
-            // A stale poll from before enrollment must not enter the experiment.
-            driver_allocation::sol_selection::observe_ci(&conn, &task.id, Some("stale"), "success").unwrap();
-            driver_allocation::sol_selection::observe_ci(&conn, &task.id, Some("first"), "in_progress").unwrap();
-            driver_allocation::sol_selection::observe_ci(&conn, &task.id, Some("first"), "fail").unwrap();
-            driver_allocation::sol_selection::observe_ci(&conn, &task.id, Some("first"), "success").unwrap();
-            conn.execute("UPDATE work_executions SET status='failed' WHERE id=?1", [&first.id])
-                .unwrap();
-            drop(conn);
-            let retry = create_ready_chore_execution(&db, &task.id);
-            assert_eq!(
-                db.select_codex_sol_model(&retry.id, true, ASTRA_MODEL).unwrap(),
-                ASTRA_MODEL
-            );
-            measured_run(&db, &retry, ASTRA_MODEL, 200, 20);
-            // Queue creation order and random execution IDs must not move a
-            // PR to the retry's arm when both launches have the same second.
-            db.connect()
-                .unwrap()
-                .execute(
-                    "UPDATE work_executions SET created_at='1',started_at='10' WHERE id=?1",
-                    [&retry.id],
-                )
-                .unwrap();
-            let revision = create_test_chore(&db, &product, "revision");
-            db.connect()
-                .unwrap()
-                .execute(
-                    "UPDATE tasks SET kind='revision',parent_task_id=?2 WHERE id=?1",
-                    params![revision.id, task.id],
-                )
-                .unwrap();
-            let revision_execution = create_ready_chore_execution(&db, &revision.id);
-            db.select_codex_sol_model(&revision_execution.id, true, ASTRA_MODEL)
-                .unwrap();
-            measured_run(&db, &revision_execution, SOL_MODEL, 300, 30);
-            for (id, findings, outcome) in [
-                (
-                    "verdict",
-                    3,
-                    review_verdicts::REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS,
-                ),
-                (
-                    "duplicate",
-                    5,
-                    review_verdicts::REVIEW_GATE_OUTCOME_DROPPED_DUPLICATE_HEAD,
-                ),
-                ("stale", 4, review_verdicts::REVIEW_GATE_OUTCOME_STALE_HEAD),
-            ] {
-                db.connect()
-                    .unwrap()
-                    .execute(
-                        "INSERT INTO pr_review_verdicts(id,execution_id,work_item_id,findings_count,gate_outcome,created_at)
-                        VALUES (?1,?2,?3,?4,?5,'25')",
-                        params![id, retry.id, task.id, findings, outcome],
-                    )
-                    .unwrap();
-            }
-            db.mark_chore_pr_merged(&task.id, "https://github.com/org/repo/pull/1")
-                .unwrap();
-            db.connect()
-                .unwrap()
-                .execute(
-                    "UPDATE sol_pr_outcomes SET merged_at='40' WHERE work_item_id=?1",
-                    [&task.id],
-                )
-                .unwrap();
-            let records = db.sol_comparison_records().unwrap();
-            assert_eq!(records.len(), 1);
-            let report = crate::cost_report::sol::build_sol_report(&records);
-            let sol = &report.arms[0];
-            assert_eq!(sol.prs, 1);
-            assert_eq!(sol.first_attempt_ci_passes, 0);
-            assert_eq!(sol.ci_observed_prs, 1);
-            assert_eq!(sol.revisions_before_merge, 1);
-            assert_eq!(sol.review_findings, 3);
-            assert_eq!(sol.tokens_per_merged_pr, Some(600.0));
-            assert_eq!(report.arms[1].prs, 0);
         }
 
         #[test]

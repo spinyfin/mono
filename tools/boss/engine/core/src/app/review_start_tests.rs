@@ -355,7 +355,7 @@ async fn explicit_generation_two_verdict_materialises_findings_instead_of_droppi
     );
 
     let proposal_id = stage_high_severity_supervisor_verdict(db, &id, &second, "head");
-    let stats = db.apply_pending_review_verdicts(&OpenPr).unwrap();
+    let stats = crate::test_support::apply_pending_review_verdicts(db, &OpenPr).unwrap();
     assert_eq!(stats.applied, 1);
     assert_eq!(
         stats.created_work, 1,
@@ -374,7 +374,7 @@ async fn explicit_generation_two_verdict_materialises_findings_instead_of_droppi
 
     // Replaying the identical applied proposal must not duplicate the
     // revision it already materialised.
-    db.apply_review_verdict_proposal(&proposal_id, &OpenPr).unwrap();
+    crate::test_support::apply_review_verdict(db, &proposal_id, &OpenPr).unwrap();
     let verdict_after_replay = db.latest_review_verdict(&id).unwrap().unwrap();
     assert_eq!(
         verdict_after_replay.revision_task_id.as_deref(),
