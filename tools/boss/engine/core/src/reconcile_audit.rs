@@ -96,10 +96,9 @@ pub(crate) fn strip_engine_audit_lines(description: &str) -> String {
 
 /// Append `line` verbatim to `work_item_id`'s description. Shared by
 /// [`append_reconcile_audit`] and [`crate::completion::WorkerCompletionHandler::record_deferred_scope_item`]
-/// (the `[deferred-scope]` audit trail) — both need the identical
-/// get -> extract-description -> format -> update sequence, differing only
-/// in the line they format. The sequence itself is
-/// [`WorkDb::append_work_item_description_line`]: storage owns the update so
+/// (the `[deferred-scope]` audit trail) — both use the same atomic append,
+/// differing only in the line they format.
+/// [`WorkDb::append_work_item_description_line`] owns the update so
 /// the proposal path can append its post-commit line without calling back
 /// into engine core.
 pub(crate) fn append_description_line(work_db: &WorkDb, work_item_id: &str, line: &str) -> anyhow::Result<()> {
