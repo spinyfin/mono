@@ -274,18 +274,34 @@ final class RevisionKanbanTests: XCTestCase {
     }
 
     func testFoldedProjectionControlsBoardMembershipIncludingBlockedRevisions() {
-        let model = makeModel()
-        var revision = makeRevision(status: "blocked", seq: 1)
-        revision.blockedReason = "ci_failure"
-        revision.boardFoldedRevision = true
-        model.tasksByProjectID = ["proj_1": [revision]]
-        for column in [WorkBoardColumnKey.backlog, .doing, .review, .done] {
-            XCTAssertFalse(model.workItems(in: column).contains { $0.id == revision.id })
+        for reason in ["merge_conflict", "ci_failure", "ci_failure_exhausted", "review_feedback"] {
+            assertFoldedBlockedRevision(reason: reason)
         }
+    }
+
+    private func assertFoldedBlockedRevision(reason: String) {
+        let model = makeModel()
+        let parent = makeParent(status: "in_review")
+        var revision = makeRevision(status: "blocked", seq: 2, parentID: parent.id)
+        revision.blockedReason = reason
+        revision.boardFoldedRevision = true
+        let reviewing = makeRevision(status: "in_review", seq: 1, parentID: parent.id)
+        let done = makeRevision(status: "done", seq: 3, parentID: parent.id)
+        model.tasksByProjectID = ["proj_1": [parent, revision, done, reviewing]]
+        for column in [WorkBoardColumnKey.backlog, .doing, .review, .done] {
+            XCTAssertFalse(model.workItems(in: column).contains { $0.id == revision.id }, reason)
+        }
+        XCTAssertEqual(model.inReviewRevisions(forParentTaskID: parent.id).map(\.id),
+                       [reviewing.id, revision.id], reason)
+        XCTAssertEqual(model.doneRevisions(forParentTaskID: parent.id).map(\.id), [done.id], reason)
+        XCTAssertEqual(WorkCardRevisionRollup(revision: revision).blockedReason, reason)
+        XCTAssertEqual(model.revealCardTarget(for: revision.id), .revealed(cardID: parent.id), reason)
         revision.boardFoldedRevision = false
-        model.tasksByProjectID = ["proj_1": [revision]]
+        model.applyIncrementalTaskUpdate(revision, isChore: false)
         XCTAssertTrue(model.workItems(in: .review).contains { $0.id == revision.id },
                       "the engine projection, rather than a client status predicate, owns folding")
+        XCTAssertEqual(model.inReviewRevisions(forParentTaskID: parent.id).map(\.id), [reviewing.id])
+        XCTAssertEqual(model.revealCardTarget(for: revision.id), .revealed(cardID: revision.id))
     }
 
     func testRevisionInDoingIsNotFolded() {
