@@ -22,20 +22,11 @@ use crate::cost_pricing;
 
 pub mod sol {
     //! PR-family aggregation. Retried and revised work stays in its enrollment arm.
-    use super::{Accumulator, CostRunRecord};
+    use super::Accumulator;
     use boss_protocol::{SolArmReport, SolComparisonReport};
     use std::collections::BTreeSet;
 
-    #[derive(Debug, bon::Builder)]
-    #[builder(on(String, into))]
-    pub struct SolPrRecord {
-        pub arm: String,
-        pub merged: bool,
-        pub revisions: u64,
-        pub findings: u64,
-        pub runs: Vec<CostRunRecord>,
-        pub first_ci: Option<bool>,
-    }
+    pub use boss_engine_storage_values::SolPrRecord;
 
     pub fn build_sol_report(prs: &[SolPrRecord]) -> SolComparisonReport {
         let arms = ["sol", "astra"]
@@ -97,6 +88,7 @@ pub mod sol {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use boss_engine_storage_values::CostRunRecord;
 
         fn run(model: &str, tokens: Option<i64>) -> CostRunRecord {
             CostRunRecord::builder()

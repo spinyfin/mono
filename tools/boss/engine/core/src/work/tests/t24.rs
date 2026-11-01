@@ -19,7 +19,7 @@ fn file_deferred_scope_attention(db: &WorkDb, execution_id: &str, marker_line: &
     db.create_attention_item(CreateAttentionItemInput {
         execution_id: Some(execution_id.to_owned()),
         work_item_id: None,
-        kind: crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND.to_owned(),
+        kind: boss_engine_storage_values::attention_kinds::DEFERRED_SCOPE_ATTENTION_KIND.to_owned(),
         status: None,
         title: "Worker deferred scope".to_owned(),
         body_markdown: deferred_scope_body(marker_line),

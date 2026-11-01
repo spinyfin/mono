@@ -3,6 +3,9 @@ name = "boss-engine"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+test-support = []
+
 [dependencies]
 boss-engine-storage-values = { path = "../storage-values" }
 boss-board-projection = { path = "../board-projection" }

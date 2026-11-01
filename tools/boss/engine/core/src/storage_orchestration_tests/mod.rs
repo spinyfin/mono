@@ -22,8 +22,10 @@ use crate::work::{ReviewBatchCreateInput, SubmitWorkerProposalInput, SubmitWorke
 
 mod automation_triage_context;
 mod board_notification_bridge;
+mod cost_report;
 mod persona_live_state;
 mod project_postmortem;
+mod queue_ci_evidence;
 mod review_guide_jobs;
 mod review_guide_source_capture;
 mod review_stage_metadata;
@@ -93,28 +95,17 @@ fn insert_revision_row(db: &WorkDb, product_id: &str, parent_task_id: &str) -> S
 
 /// `(id, status)` of every execution bound to `work_item_id`, oldest first.
 fn executions_for(db: &WorkDb, work_item_id: &str) -> Vec<(String, String)> {
-    let conn = raw(db);
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, status FROM work_executions
-             WHERE work_item_id = ?1 ORDER BY created_at ASC, id ASC",
-        )
-        .unwrap();
-    let rows = stmt
-        .query_map(params![work_item_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })
-        .unwrap();
-    rows.map(Result::unwrap).collect()
+    let mut executions = db.list_executions(Some(work_item_id)).unwrap();
+    executions.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+    executions.into_iter().map(|e| (e.id, e.status.to_string())).collect()
 }
 
 /// The stored status of `task_id`.
 fn task_status(db: &WorkDb, task_id: &str) -> String {
-    raw(db)
-        .query_row("SELECT status FROM tasks WHERE id = ?1", params![task_id], |r| {
-            r.get::<_, String>(0)
-        })
-        .unwrap()
+    match db.get_work_item(task_id).unwrap() {
+        boss_protocol::WorkItem::Task(task) | boss_protocol::WorkItem::Chore(task) => task.status.to_string(),
+        item => panic!("expected a task, got {item:?}"),
+    }
 }
 
 /// Put an open-PR review cycle root in `in_review` on [`PR_URL`].

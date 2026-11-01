@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use boss_protocol::{RequestExecutionInput, WorkExecution, WorkRun};
 
-use super::raw;
 use crate::live_worker_state::{LiveSpawnRouting, LiveWorkerStateRegistry, ReadoptionEvidence};
 use crate::test_support::{create_test_chore_manual, create_test_product, open_db};
 use crate::work::WorkDb;
@@ -117,10 +116,16 @@ fn spawn_registration_does_not_hold_registry_lock_while_waiting_for_db() {
     let db = Arc::new(db);
     let states = Arc::new(LiveWorkerStateRegistry::with_work_db(db.clone()));
     let (execution, _) = start(&db, "local");
-    // Hold the shared connection the way a dispatch transaction does. No
-    // public `WorkDb` operation holds it across a caller-supplied wait, so
-    // this one test still takes the crate-private guard.
-    let conn = db.connect().unwrap();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder_db = db.clone();
+    let holder = std::thread::spawn(move || {
+        crate::work::test_support::with_connection_held(&holder_db, || {
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+    });
+    held_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
     let (boundary_tx, boundary_rx) = std::sync::mpsc::channel();
     *states.test_hooks.persona_boundary.lock().unwrap() = Some(Box::new(move || {
         let _ = boundary_tx.send(());
@@ -139,7 +144,8 @@ fn spawn_registration_does_not_hold_registry_lock_while_waiting_for_db() {
         })
     };
     let result = rx.recv_timeout(std::time::Duration::from_secs(5));
-    drop(conn);
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
     probe.join().unwrap();
     spawner.join().unwrap();
     assert!(boundary.is_ok(), "spawner never reached the persona DB boundary");
@@ -194,13 +200,7 @@ fn same_run_readoption_waits_for_removed_entry_persona_release() {
     readopter.join().unwrap();
     assert!(removed.is_ok() && waiting.is_ok() && absent);
     assert_eq!(states.get(8).unwrap().name, "Riker");
-    let active: bool = raw(&db)
-        .query_row(
-            "SELECT persona_lease_active FROM work_runs WHERE id = ?1",
-            [&run.id],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let active = crate::work::test_support::persona_lease_active(&db, &run.id);
     assert!(active, "surviving registry entry must retain its persona lease");
     let (_, next) = start(&db, "local");
     assert_eq!(next.persona.as_deref(), Some("Data"));

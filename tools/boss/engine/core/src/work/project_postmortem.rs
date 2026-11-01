@@ -35,7 +35,7 @@ pub(crate) fn migrate_project_postmortem_signals(conn: &Connection) -> Result<()
 
 #[work_db_boundary::instrument]
 impl WorkDb {
-    pub(crate) fn has_project_postmortem_signal(&self, project_id: &str) -> Result<bool> {
+    pub fn has_project_postmortem_signal(&self, project_id: &str) -> Result<bool> {
         Ok(self.connect()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM project_postmortem_signals WHERE project_id = ?1)",
             [project_id],

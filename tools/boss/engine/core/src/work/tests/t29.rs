@@ -63,8 +63,8 @@ fn status_of(db: &WorkDb, attention_id: &str) -> String {
     db.get_attention_item(attention_id).unwrap().status
 }
 
-const ESCALATION: &str = crate::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND;
-const BLOCKED: &str = crate::worker_escalation::WORKER_BLOCKED_ATTENTION_KIND;
+const ESCALATION: &str = boss_engine_storage_values::attention_kinds::WORKER_ESCALATION_ATTENTION_KIND;
+const BLOCKED: &str = boss_engine_storage_values::attention_kinds::WORKER_BLOCKED_ATTENTION_KIND;
 
 // ── upsert_work_item_attention ─────────────────────────────────────────────
 
@@ -210,7 +210,11 @@ fn resolve_worker_signal_attentions_leaves_other_kinds_untouched() {
     let (db, product, _chore) = chore_fixture("resolve-signals-kinds");
     let execution = seed_execution_for_chore(&db, &product, "kinds");
     let escalation = open_execution_attention(&db, &execution, ESCALATION);
-    let deferred = open_execution_attention(&db, &execution, crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND);
+    let deferred = open_execution_attention(
+        &db,
+        &execution,
+        boss_engine_storage_values::attention_kinds::DEFERRED_SCOPE_ATTENTION_KIND,
+    );
 
     let resolved = db.resolve_worker_signal_attentions_for_execution(&execution).unwrap();
 

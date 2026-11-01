@@ -77,13 +77,12 @@ fn pr_review_revision_creates_followup_with_correct_kind_and_provenance() {
         format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_test_123")
     );
 
-    let materialisation_count: i64 = raw(&db)
-        .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE created_via = ?1",
-            params![followup.created_via],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let materialisation_count = db
+        .list_tasks(&product_id, None, None, true)
+        .unwrap()
+        .iter()
+        .filter(|task| task.created_via == followup.created_via)
+        .count();
     assert_eq!(
         materialisation_count, 1,
         "revision creation and parent-close conversion must share one execution-keyed row"

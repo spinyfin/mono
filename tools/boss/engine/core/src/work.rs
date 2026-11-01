@@ -829,11 +829,10 @@ pub(crate) use review_guide_jobs::{
     PrReviewGuideAttempt, PrReviewGuideVersion, PublishReviewGuideOutcome, RetryReviewGuideOutcome,
     ReviewGuideReenqueueReport, to_wire_review_guide_summary,
 };
-#[cfg(test)]
-pub(crate) use review_guide_sources::set_before_packet_read_hook;
-pub(crate) use review_guide_sources::{
-    PrReviewGuideSourceCapture, PrSourceCapturePersistOutcome, PrSourceCaptureTrigger,
-};
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
+pub use review_guide_sources::{PrReviewGuideSourceCapture, PrSourceCapturePersistOutcome, PrSourceCaptureTrigger};
 // Only the unit-test suite (and the resolver itself) call this directly;
 // production attach sites go through `attach_task_doc_link_state`.
 pub use pr_binding::{BLOCKED_REASON_PR_BINDING_UNRESOLVED, PrBindingRepairCandidate, PrBindingSuspicion};
@@ -916,7 +915,8 @@ pub use planner_runs::RunningPlannerRun;
 pub use pr_flow::PrPollStateInput;
 pub use pr_flow::PrStatusSnapshot;
 pub use pr_flow::QueuedMergeQueueMember;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
 pub use pr_state::FakePrStateChecker;
 pub use pr_state::GhPrStateChecker;
 pub use pr_state::PrInspect;

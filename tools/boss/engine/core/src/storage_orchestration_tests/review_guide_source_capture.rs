@@ -7,7 +7,6 @@ use std::fs;
 
 use boss_pr_review_sources::{ChangeKind, PinnedSource, SourceFile, SourcePacket};
 
-use super::raw;
 use crate::test_support::{create_active_chore, create_product, open_db};
 use crate::work::{PrSourceCapturePersistOutcome, PrSourceCaptureTrigger, WorkDb};
 
@@ -66,13 +65,7 @@ fn assert_recollects(db: &WorkDb, root: &str, packet: &SourcePacket) {
     let claim = crate::review_guide_capture::prepare_capture(db, root, &packet.canonical_pr_url, &endpoints, 3, false)
         .unwrap()
         .expect("invalid artifact must permit recollection");
-    let error: Option<String> = raw(db)
-        .query_row(
-            "SELECT last_capture_error FROM pr_review_guide_source_series WHERE canonical_pr_url = ?1",
-            [&packet.canonical_pr_url],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let error = crate::work::test_support::source_capture_error(db, &packet.canonical_pr_url);
     assert!(error.is_some(), "artifact failure remains visible until recovery");
     db.persist_pr_review_guide_source_capture(root, 3, PrSourceCaptureTrigger::Poller, packet)
         .unwrap();
@@ -146,7 +139,7 @@ fn blocked_artifact_validation_allows_unrelated_claim_and_database_write() {
     let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         let reader = scope.spawn(|| {
-            crate::work::set_before_packet_read_hook(Box::new(move || {
+            crate::work::test_support::set_before_packet_read_hook(Box::new(move || {
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
             }));

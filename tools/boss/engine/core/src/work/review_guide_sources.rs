@@ -78,7 +78,7 @@ impl WorkDb {
     /// Allocate the global observation order before starting an asynchronous
     /// source read. The returned sequence, rather than a response timestamp,
     /// fences delayed GitHub responses from replacing a newer observation.
-    pub(crate) fn allocate_pr_review_guide_source_observation_sequence(&self) -> Result<i64> {
+    pub fn allocate_pr_review_guide_source_observation_sequence(&self) -> Result<i64> {
         let conn = self.connect()?;
         // Seed the singleton on first use. Subsequent allocations preserve
         // the sequence persisted by earlier engine versions.
@@ -836,7 +836,7 @@ fn map_capture(row: &Row<'_>, artifact_root: &Path) -> rusqlite::Result<PrReview
     Ok(metadata.with_packet(packet))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     pub(super) static BEFORE_PACKET_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
@@ -844,8 +844,8 @@ thread_local! {
 /// Install a one-shot hook that runs inside the next packet-artifact read on
 /// this thread, so a test outside storage can hold an artifact validation open
 /// while it drives other work.
-#[cfg(test)]
-pub(crate) fn set_before_packet_read_hook(hook: Box<dyn FnOnce()>) {
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn set_before_packet_read_hook(hook: Box<dyn FnOnce()>) {
     BEFORE_PACKET_READ.with(|slot| *slot.borrow_mut() = Some(hook));
 }
 
@@ -854,7 +854,7 @@ pub(super) fn load_packet(
     packet_path: Option<&str>,
     expected_hash: &str,
 ) -> Result<SourcePacket> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     BEFORE_PACKET_READ.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
             hook();

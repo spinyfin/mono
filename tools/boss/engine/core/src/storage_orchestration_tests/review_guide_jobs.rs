@@ -30,13 +30,7 @@ fn seeded_series(db: &WorkDb) -> (String, String, String) {
 }
 
 fn attempt_status(db: &WorkDb, attempt_id: &str) -> String {
-    raw(db)
-        .query_row(
-            "SELECT status FROM pr_review_guide_attempts WHERE id = ?1",
-            [attempt_id],
-            |row| row.get(0),
-        )
-        .unwrap()
+    db.get_pr_review_guide_attempt(attempt_id).unwrap().unwrap().status
 }
 
 /// A bound attempt whose execution has started a run with a live tmux shell
@@ -114,32 +108,25 @@ fn store_refused_guide_submission(db: &WorkDb, execution_id: &str, comparison_id
 }
 
 fn proposal_state(db: &WorkDb, proposal_id: &str) -> (String, Option<String>) {
-    raw(db)
-        .query_row(
-            "SELECT state, applied_ref FROM worker_proposals WHERE id = ?1",
-            [proposal_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap()
+    let proposal = db.get_worker_proposal(proposal_id).unwrap();
+    (proposal.state.as_str().to_owned(), proposal.applied_ref)
 }
 
 fn review_guide_version_count(db: &WorkDb) -> i64 {
-    raw(db)
-        .query_row("SELECT COUNT(*) FROM pr_review_guide_versions", [], |row| row.get(0))
-        .unwrap()
+    crate::work::test_support::review_guide_version_count(db)
 }
 
 fn attempt_recovery_snapshot(
     db: &WorkDb,
     attempt_id: &str,
 ) -> (String, Option<String>, Option<String>, Option<String>) {
-    raw(db)
-        .query_row(
-            "SELECT status, error, finished_at, failed_by_build FROM pr_review_guide_attempts WHERE id = ?1",
-            [attempt_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .unwrap()
+    let attempt = db.get_pr_review_guide_attempt(attempt_id).unwrap().unwrap();
+    (
+        attempt.status,
+        attempt.error,
+        attempt.finished_at,
+        attempt.failed_by_build,
+    )
 }
 
 #[tokio::test]
@@ -465,13 +452,11 @@ fn startup_recovery_rolls_back_when_publish_is_fenced_as_superseded() {
     .unwrap();
     let proposal_id = store_refused_guide_submission(&db, &execution_id, &comparison_id, RESTART_GUIDE);
     let attempt_before = attempt_recovery_snapshot(&db, &attempt_id);
-    let epoch_before: i64 = raw(&db)
-        .query_row(
-            "SELECT request_epoch FROM pr_review_guide_source_series WHERE id = ?1",
-            [&series_id],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let epoch_before = db
+        .get_pr_review_guide_summary_for_root(&root)
+        .unwrap()
+        .unwrap()
+        .request_epoch;
 
     raw(&db)
         .execute_batch(
@@ -493,13 +478,11 @@ fn startup_recovery_rolls_back_when_publish_is_fenced_as_superseded() {
     );
     assert_eq!(proposal_state(&db, &proposal_id), ("rejected".to_owned(), None));
     assert_eq!(attempt_recovery_snapshot(&db, &attempt_id), attempt_before);
-    let epoch_after: i64 = raw(&db)
-        .query_row(
-            "SELECT request_epoch FROM pr_review_guide_source_series WHERE id = ?1",
-            [&series_id],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let epoch_after = db
+        .get_pr_review_guide_summary_for_root(&root)
+        .unwrap()
+        .unwrap()
+        .request_epoch;
     assert_eq!(epoch_after, epoch_before);
     let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
     assert_eq!(summary.lifecycle, "failed");
@@ -546,13 +529,8 @@ fn seeded_open_pr(db: &WorkDb) -> (String, String, String) {
 /// What the attempt row recorded about its failure: whether it was before
 /// start, and on which build.
 fn failure_columns(db: &WorkDb, attempt_id: &str) -> (bool, Option<String>) {
-    raw(db)
-        .query_row(
-            "SELECT failed_pre_start, failed_by_build FROM pr_review_guide_attempts WHERE id = ?1",
-            [attempt_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap()
+    let attempt = db.get_pr_review_guide_attempt(attempt_id).unwrap().unwrap();
+    (attempt.failed_pre_start, attempt.failed_by_build)
 }
 
 #[test]

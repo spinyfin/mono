@@ -77,22 +77,17 @@ async fn assert_scheduled_once(db: &WorkDb, project: &Project) {
         0
     );
     assert!(!db.start_project_postmortem(&project.id).unwrap().1);
-    let count: i64 = raw(db)
-        .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE project_id = ?1 AND kind = 'design_postmortem'",
-            [&project.id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(count, 1);
-    let executions: i64 = raw(db)
-        .query_row(
-            "SELECT COUNT(*) FROM work_executions e JOIN tasks t ON t.id = e.work_item_id
-         WHERE t.project_id = ?1 AND t.kind = 'design_postmortem'",
-            [&project.id],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let postmortems: Vec<_> = db
+        .list_tasks(&project.product_id, Some(&project.id), None, true)
+        .unwrap()
+        .into_iter()
+        .filter(|task| task.kind == boss_protocol::TaskKind::DesignPostmortem)
+        .collect();
+    assert_eq!(postmortems.len(), 1);
+    let executions: usize = postmortems
+        .iter()
+        .map(|task| db.list_executions(Some(&task.id)).unwrap().len())
+        .sum();
     assert_eq!(executions, 1, "completion must also enqueue the postmortem execution");
 }
 

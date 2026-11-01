@@ -227,12 +227,13 @@ impl WorkDb {
     /// pinned workspace, which spawns `git` and so happens above storage; use
     /// [`Self::submit_worker_proposal_with_guide`] for that kind. Submitting
     /// one here is an error and stores nothing.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
     pub fn submit_worker_proposal(
         &self,
         input: SubmitWorkerProposalInput<'_>,
     ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
-        self.submit_worker_proposal_with_guide(input, None)
+        self.submit_worker_proposal_with_liveness(input, &|_| false)
     }
 
     /// Submit a non-guide proposal with an injected worker-liveness observation.
@@ -562,7 +563,7 @@ impl WorkDb {
     /// (not the whole work item — see [`Self::list_worker_proposals_for_work_item`]
     /// for that), newest first.
     ///
-    /// Used by [`crate::completion::WorkerCompletionHandler::execution_has_worker_signal_proposal`]
+    /// Used by [`boss_engine_storage_values::attention_kinds::WorkerCompletionHandler::execution_has_worker_signal_proposal`]
     /// to compare a legacy marker's content against what was actually
     /// proposed, rather than skipping on kind alone.
     pub fn list_worker_proposals_for_execution(
@@ -1113,7 +1114,10 @@ mod tests {
 
         let items = db.list_attention_items(&execution_id).unwrap();
         let item = items.iter().find(|i| i.id == applied_ref).unwrap();
-        assert_eq!(item.kind, crate::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND);
+        assert_eq!(
+            item.kind,
+            boss_engine_storage_values::attention_kinds::WORKER_ESCALATION_ATTENTION_KIND
+        );
         assert_eq!(item.status, "open");
         assert!(item.body_markdown.contains("multi-subsystem race"));
         assert!(item.body_markdown.contains("large"));
@@ -1142,7 +1146,10 @@ mod tests {
 
         let items = db.list_attention_items(&execution_id).unwrap();
         let item = items.iter().find(|i| i.id == applied_ref).unwrap();
-        assert_eq!(item.kind, crate::worker_escalation::WORKER_BLOCKED_ATTENTION_KIND);
+        assert_eq!(
+            item.kind,
+            boss_engine_storage_values::attention_kinds::WORKER_BLOCKED_ATTENTION_KIND
+        );
         assert_eq!(item.status, "open");
         assert!(item.body_markdown.contains("bazel E0583"));
     }
@@ -1172,7 +1179,10 @@ mod tests {
 
         let items = db.list_attention_items(&execution_id).unwrap();
         let item = items.iter().find(|i| i.id == applied_ref).unwrap();
-        assert_eq!(item.kind, crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND);
+        assert_eq!(
+            item.kind,
+            boss_engine_storage_values::attention_kinds::DEFERRED_SCOPE_ATTENTION_KIND
+        );
         assert!(item.body_markdown.contains("third data source wiring"));
         assert!(item.body_markdown.contains("needs a new ingestion pipeline"));
 
@@ -2181,7 +2191,7 @@ mod tests {
         let (_dir, db) = open_db();
         let (execution_id, chore_id) = execution_for_new_chore(&db, "Cleanup");
         let execution = db.get_execution(&execution_id).unwrap();
-        let expected_branch = crate::completion::expected_branch_name(
+        let expected_branch = boss_engine_storage_values::branch_identity::expected_branch_name(
             &execution_id,
             &execution.branch_naming,
             execution.worker_branch_prefix.as_deref(),

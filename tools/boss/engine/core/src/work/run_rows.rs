@@ -760,11 +760,12 @@ impl WorkDb {
     /// them in the preceding intent write) and passes them straight through
     /// `persist_tmux_identity_after_observation` instead — see
     /// [`crate::spawn_flow::TmuxSpawnStore::record_tmux_session_created`].
-    /// Kept `#[cfg(test)]` rather than deleted because a broad set of tests
+    /// Available through `test-support` because a broad set of tests
     /// across this crate legitimately don't care about the session name/
     /// label and would otherwise have to invent placeholder values just to
     /// call the five-argument form.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
     pub fn record_tmux_session_created_for_execution(
         &self,
         execution_id: &str,

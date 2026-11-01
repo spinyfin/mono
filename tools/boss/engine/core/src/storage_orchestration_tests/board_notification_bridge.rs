@@ -1,4 +1,3 @@
-use crate::work::ReviewVerdictObservation;
 //! The board notification bridge, driven by committed `WorkDb` changes: a
 //! committed dependency edge reaches the board publisher, and a clean review
 //! verdict invalidates the card it advances.
@@ -123,17 +122,12 @@ async fn clean_verdict_advances_the_origin_to_review_without_a_revision() {
         .unwrap()
         .unwrap();
 
-    let error = db
-        .apply_observed_review_verdict_proposal(
-            &outcome.proposal.id,
-            &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
-            ReviewVerdictObservation {
-                inputs: db.review_verdict_comparison(&outcome.proposal.id).unwrap(),
-                freshness: None,
-                deletions: Some(vec![]),
-            },
-        )
-        .unwrap_err();
+    let error = crate::work::test_support::apply_review_verdict_without_freshness(
+        &db,
+        &outcome.proposal.id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap_err();
     assert!(
         error
             .to_string()
@@ -197,12 +191,9 @@ async fn clean_verdict_advances_the_origin_to_review_without_a_revision() {
         db.review_batch(&batch.id).unwrap().unwrap().status,
         ReviewBatchStatus::Completed
     );
-    let revision_count: i64 = raw(&db)
-        .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE parent_task_id = ?1 AND kind = 'revision'",
-            rusqlite::params![cycle_root.id],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let revision_count = db
+        .list_revisions(&product_id, None, true, Some(&cycle_root.id))
+        .unwrap()
+        .len();
     assert_eq!(revision_count, 0, "clean verdict must not mint a revision");
 }

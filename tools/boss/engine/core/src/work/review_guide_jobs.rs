@@ -193,11 +193,18 @@ struct FailureProvenance<'a> {
 
 #[work_db_boundary::instrument]
 impl WorkDb {
+    /// Read an attempt, including its durable failure and recovery state.
+    pub fn get_pr_review_guide_attempt(&self, attempt_id: &str) -> Result<Option<PrReviewGuideAttempt>> {
+        let conn = self.connect()?;
+        query_pr_review_guide_attempt(&conn, attempt_id)
+    }
+
     /// Admit a request for the selected comparison, reusing a live request
     /// for that comparison or atomically replacing an obsolete request.
     /// The durable queued attempt can be dispatched by enqueue or reconcile.
-    #[cfg(test)]
-    pub(crate) fn create_pr_review_guide_attempt(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn create_pr_review_guide_attempt(
         &self,
         series_id: &str,
         comparison_id: &str,
@@ -359,8 +366,9 @@ impl WorkDb {
     /// `get_live_execution_for_work_item`-style per-comparison dedup and the
     /// generic execution machinery both work for free. Every omitted column
     /// carries its schema default.
-    #[cfg(test)]
-    pub(crate) fn create_pr_review_guide_execution(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn create_pr_review_guide_execution(
         &self,
         comparison_id: &str,
         repo_remote_url: &str,
@@ -394,8 +402,9 @@ impl WorkDb {
     /// current desired comparison. A stale bind (series already moved on)
     /// still records the execution on the attempt but leaves card lifecycle
     /// untouched.
-    #[cfg(test)]
-    pub(crate) fn bind_pr_review_guide_attempt_execution(&self, attempt_id: &str, execution_id: &str) -> Result<()> {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn bind_pr_review_guide_attempt_execution(&self, attempt_id: &str, execution_id: &str) -> Result<()> {
         let now = now_string();
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -676,7 +685,7 @@ impl WorkDb {
     ///
     /// Every action is logged with the attempt id, execution id and reason.
     /// Returns the number of attempts finished or dispatched.
-    pub(crate) fn reconcile_pr_review_guide_attempts_with_live_runs(
+    pub fn reconcile_pr_review_guide_attempts_with_live_runs(
         &self,
         known_live_execution_ids: &HashSet<String>,
         execution_is_alive: &dyn Fn(&str) -> bool,

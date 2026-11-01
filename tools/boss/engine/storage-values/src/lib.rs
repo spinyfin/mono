@@ -151,3 +151,15 @@ impl HandoffState {
 
 #[cfg(test)]
 mod tests;
+
+/// Stored measurements for one enrolled PR family.
+#[derive(Debug, bon::Builder)]
+#[builder(on(String, into))]
+pub struct SolPrRecord {
+    pub arm: String,
+    pub merged: bool,
+    pub revisions: u64,
+    pub findings: u64,
+    pub runs: Vec<CostRunRecord>,
+    pub first_ci: Option<bool>,
+}

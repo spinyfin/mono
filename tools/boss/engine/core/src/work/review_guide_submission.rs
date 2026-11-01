@@ -142,7 +142,7 @@ impl WorkDb {
         load_for_validation(self, execution_id, payload_json)
     }
 
-    pub(crate) fn submitted_review_guide(&self, execution_id: &str, attempt_id: &str) -> Result<Option<String>> {
+    pub fn submitted_review_guide(&self, execution_id: &str, attempt_id: &str) -> Result<Option<String>> {
         let proposals =
             self.list_worker_proposals_for_execution(execution_id, boss_protocol::ProposalKind::ReviewGuide)?;
         proposals

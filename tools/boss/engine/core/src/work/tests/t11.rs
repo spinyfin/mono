@@ -34,7 +34,7 @@ fn seed_investigation_with_execution(db: &WorkDb) -> (Task, WorkExecution) {
 }
 
 fn execution_branch(execution: &WorkExecution) -> String {
-    crate::completion::expected_branch_name(
+    boss_engine_storage_values::branch_identity::expected_branch_name(
         &execution.id,
         &execution.branch_naming,
         execution.worker_branch_prefix.as_deref(),
