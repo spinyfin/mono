@@ -1082,7 +1082,7 @@ fn rearm_blocked_merge_conflict_signal_true_and_arms() {
 }
 
 /// A previously-cleared signal row is re-armed (its `cleared_at` reset to
-/// NULL) rather than duplicated — the T230 premature-clear recovery.
+/// NULL) rather than duplicated — recovering from a premature clear.
 #[test]
 fn rearm_blocked_merge_conflict_signal_rearms_a_cleared_row() {
     let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
@@ -1183,7 +1183,7 @@ fn rearm_blocked_ci_failure_signal_false_on_wrong_state() {
 // ── retarget_blocked_ci_failure_to_merge_conflict ───────────────────────
 //
 // Coverage for `WorkDb::retarget_blocked_ci_failure_to_merge_conflict` — the
-// foreign-bucket takeover (T2381/PR#1861) that re-buckets a chore currently
+// foreign-bucket takeover (mono#1861) that re-buckets a chore currently
 // `blocked: ci_failure` / `ci_failure_exhausted` into `blocked:
 // merge_conflict`, clearing the CI-family signals and arming a
 // merge_conflict signal. Unlike its siblings this path overwrites *another*

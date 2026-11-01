@@ -1,6 +1,8 @@
 use super::*;
 
-pub fn collect_rows<T>(rows: rusqlite::MappedRows<'_, impl FnMut(&Row<'_>) -> rusqlite::Result<T>>) -> Result<Vec<T>> {
+pub(crate) fn collect_rows<T>(
+    rows: rusqlite::MappedRows<'_, impl FnMut(&Row<'_>) -> rusqlite::Result<T>>,
+) -> Result<Vec<T>> {
     let mut values = Vec::new();
     for row in rows {
         values.push(row?);
@@ -33,7 +35,7 @@ where
 /// chain shared by the `map_*` mappers and a few ad-hoc row readers.
 /// Note `serde_json::Value::default()` is `Value::Null`, so this covers
 /// the `Value` call sites that previously wrote `unwrap_or(Value::Null)`.
-pub fn deserialize_json_or_default<T: serde::de::DeserializeOwned + Default>(json: Option<&str>) -> T {
+pub(crate) fn deserialize_json_or_default<T: serde::de::DeserializeOwned + Default>(json: Option<&str>) -> T {
     json.and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default()
 }
 
@@ -70,7 +72,7 @@ pub fn map_product(row: &Row<'_>) -> rusqlite::Result<Product> {
     })
 }
 
-pub fn map_project(row: &Row<'_>) -> rusqlite::Result<Project> {
+pub(crate) fn map_project(row: &Row<'_>) -> rusqlite::Result<Project> {
     let status_raw: String = row.get(6)?;
     Ok(Project {
         id: row.get(0)?,
@@ -102,7 +104,7 @@ pub fn map_project(row: &Row<'_>) -> rusqlite::Result<Project> {
 /// A corrupt `anchor_json` degrades to an empty anchor (the comment still
 /// lists; it simply orphans on the next resolve) rather than failing the
 /// whole list query.
-pub fn map_comment(row: &Row<'_>) -> rusqlite::Result<WorkComment> {
+pub(crate) fn map_comment(row: &Row<'_>) -> rusqlite::Result<WorkComment> {
     let anchor_json: String = row.get(4)?;
     let anchor: CommentAnchor = serde_json::from_str(&anchor_json).unwrap_or_default();
     let guide_context = row
@@ -145,7 +147,7 @@ pub fn map_comment(row: &Row<'_>) -> rusqlite::Result<WorkComment> {
 /// `id, comment_id, artifact_kind, artifact_id, doc_version, thread_turn,
 ///  status, execution_id, workspace_lease_id, reply_body, error_kind, created_at,
 ///  completed_at`.
-pub fn map_answer_agent_run(row: &Row<'_>) -> rusqlite::Result<AnswerAgentRun> {
+pub(crate) fn map_answer_agent_run(row: &Row<'_>) -> rusqlite::Result<AnswerAgentRun> {
     Ok(AnswerAgentRun {
         id: row.get(0)?,
         comment_id: row.get(1)?,
@@ -168,7 +170,7 @@ pub fn map_answer_agent_run(row: &Row<'_>) -> rusqlite::Result<AnswerAgentRun> {
 /// in `work/comment_thread_entries.rs`:
 /// `id, comment_id, entry_kind, author, body, revise_task_id,
 ///  answer_agent_run_id, created_at`.
-pub fn map_comment_thread_entry(row: &Row<'_>) -> rusqlite::Result<CommentThreadEntry> {
+pub(crate) fn map_comment_thread_entry(row: &Row<'_>) -> rusqlite::Result<CommentThreadEntry> {
     Ok(CommentThreadEntry {
         id: row.get(0)?,
         comment_id: row.get(1)?,
@@ -183,7 +185,7 @@ pub fn map_comment_thread_entry(row: &Row<'_>) -> rusqlite::Result<CommentThread
 
 /// Maps a task row whose SELECT includes the `operator_question` column; a
 /// SELECT that omits it is an error rather than a silent `None`.
-pub fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
+pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let effort_raw: Option<String> = row.get(19)?;
     let effort_level = match effort_raw.as_deref() {
         None | Some("") => None,
@@ -378,7 +380,7 @@ pub fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
 /// already returned by `task show`. Without `parent_task_id`, client-side
 /// filters like `select(.parent_task_id == …)` silently return empty
 /// (false negative for "has children?") because serde skips `None`.
-pub fn map_task_with_tags(row: &Row<'_>) -> rusqlite::Result<Task> {
+pub(crate) fn map_task_with_tags(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task(row)?;
     task.parent_task_id = row.get::<_, Option<String>>(36)?.filter(|s| !s.is_empty());
     task.tags = decode_task_tags(row.get::<_, Option<String>>(37)?)?;
@@ -388,7 +390,7 @@ pub fn map_task_with_tags(row: &Row<'_>) -> rusqlite::Result<Task> {
 /// Decode the JSON array stored in `tasks.tags`. Empty/NULL/`[]` → empty
 /// vec. Corrupt JSON is treated as a row-level conversion error rather
 /// than silently dropped, matching other JSON text columns.
-pub fn decode_task_tags(raw: Option<String>) -> rusqlite::Result<Vec<String>> {
+pub(crate) fn decode_task_tags(raw: Option<String>) -> rusqlite::Result<Vec<String>> {
     let Some(raw) = raw.filter(|s| !s.is_empty()) else {
         return Ok(Vec::new());
     };
@@ -401,7 +403,7 @@ pub fn decode_task_tags(raw: Option<String>) -> rusqlite::Result<Vec<String>> {
 
 /// Encode tags for storage in `tasks.tags`. Always a JSON array (never
 /// NULL) so the column's NOT NULL DEFAULT stays honest.
-pub fn encode_task_tags(tags: &[String]) -> String {
+pub(crate) fn encode_task_tags(tags: &[String]) -> String {
     serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_owned())
 }
 
@@ -410,7 +412,7 @@ pub fn encode_task_tags(tags: &[String]) -> String {
 /// follow the `reasoning` column at 33). Used by
 /// `list_tasks_for_automation` so produced tasks carry their provenance
 /// on the wire.
-pub fn map_task_with_source_automation_id(row: &Row<'_>) -> rusqlite::Result<Task> {
+pub(crate) fn map_task_with_source_automation_id(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task(row)?;
     task.source_automation_id = row.get::<_, Option<String>>(36)?.filter(|s| !s.is_empty());
     Ok(task)
@@ -421,7 +423,7 @@ pub fn map_task_with_source_automation_id(row: &Row<'_>) -> rusqlite::Result<Tas
 /// at 34-35). Used by `query_task` / `get_work_item_by_short_id`; the
 /// wider [`map_task_with_external_ref_and_parent`] reads `parent_task_id`
 /// from index 41 instead (after the external-ref columns at 36-40).
-pub fn map_task_with_parent(row: &Row<'_>) -> rusqlite::Result<Task> {
+pub(crate) fn map_task_with_parent(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task(row)?;
     task.parent_task_id = row.get::<_, Option<String>>(36)?.filter(|s| !s.is_empty());
     Ok(task)
@@ -432,7 +434,7 @@ pub fn map_task_with_parent(row: &Row<'_>) -> rusqlite::Result<Task> {
 /// (index 39). Used by `query_task`, `get_work_item_by_short_id`, and
 /// the list-path mappers that append further trailing columns after
 /// these provenance fields.
-pub fn map_task_with_parent_and_provenance(row: &Row<'_>) -> rusqlite::Result<Task> {
+pub(crate) fn map_task_with_parent_and_provenance(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_parent(row)?;
     task.origin_task_short_id = row.get(37)?;
     task.origin_pr_number = row.get(38)?;
@@ -446,7 +448,7 @@ pub fn map_task_with_parent_and_provenance(row: &Row<'_>) -> rusqlite::Result<Ta
 /// `task show` / `chore show`. Distinct from the wider
 /// [`map_task_with_parent_provenance_and_archived_reason`] path (tags at
 /// index 47 after archived/dispatch columns).
-pub fn map_task_with_parent_provenance_and_tags(row: &Row<'_>) -> rusqlite::Result<Task> {
+pub(crate) fn map_task_with_parent_provenance_and_tags(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_parent_and_provenance(row)?;
     task.tags = decode_task_tags(row.get::<_, Option<String>>(40)?)?;
     Ok(task)
@@ -466,7 +468,7 @@ pub fn map_task_with_parent_provenance_and_tags(row: &Row<'_>) -> rusqlite::Resu
 /// classification, free-form kanban tags, any human close summary,
 /// effort-classification provenance, the bound tracker issue, and
 /// automation provenance.
-pub fn map_task_with_parent_provenance_and_archived_reason(row: &Row<'_>) -> rusqlite::Result<Task> {
+pub(crate) fn map_task_with_parent_provenance_and_archived_reason(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_parent_and_provenance(row)?;
     task.archived_by = row.get::<_, Option<String>>(40)?.filter(|s| !s.is_empty());
     task.archived_at = row.get::<_, Option<String>>(41)?.filter(|s| !s.is_empty());
@@ -516,7 +518,7 @@ fn populate_external_ref_from_row(task: &mut Task, row: &Row<'_>, kind_idx: usiz
 /// canonical_id encodes `"owner/repo#number"`, which maps to
 /// `https://github.com/owner/repo/issues/number`. Returns an empty
 /// string for unknown trackers so callers can still surface the ref.
-pub fn derive_external_ref_web_url(kind: &str, canonical_id: &str) -> String {
+pub(crate) fn derive_external_ref_web_url(kind: &str, canonical_id: &str) -> String {
     if kind == "github"
         && let Some((repo, number)) = canonical_id.rsplit_once('#')
     {
@@ -530,7 +532,7 @@ pub fn derive_external_ref_web_url(kind: &str, canonical_id: &str) -> String {
 /// explicitly includes those columns (e.g. `get_work_tree`, `find_by_external_ref`).
 /// (Column 33 is `reasoning`, and 34-35 are `review_cycle`/`last_reviewed_sha`,
 /// all part of the base SELECT.)
-pub fn map_task_with_external_ref(row: &Row<'_>) -> rusqlite::Result<Task> {
+pub(crate) fn map_task_with_external_ref(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task(row)?;
     populate_external_ref_from_row(&mut task, row, 36)?;
     Ok(task)
@@ -539,7 +541,7 @@ pub fn map_task_with_external_ref(row: &Row<'_>) -> rusqlite::Result<Task> {
 /// Like [`map_task_with_external_ref`] but also reads column 41 carrying
 /// `parent_task_id`. Used in `get_work_tree` where the SELECT explicitly
 /// includes the external-ref columns (36-40) followed by `parent_task_id`.
-pub fn map_task_with_external_ref_and_parent(row: &Row<'_>) -> rusqlite::Result<Task> {
+pub(crate) fn map_task_with_external_ref_and_parent(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_external_ref(row)?;
     task.parent_task_id = row.get::<_, Option<String>>(41)?.filter(|s| !s.is_empty());
     Ok(task)
@@ -549,7 +551,7 @@ pub fn map_task_with_external_ref_and_parent(row: &Row<'_>) -> rusqlite::Result<
 /// carrying `source_automation_id`. Used in `get_work_tree` so automation-
 /// produced tasks carry their provenance to the client (icon display + kanban
 /// filtering both key off this field).
-pub fn map_task_with_external_ref_parent_and_source_automation_id(row: &Row<'_>) -> rusqlite::Result<Task> {
+pub(crate) fn map_task_with_external_ref_parent_and_source_automation_id(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_external_ref_and_parent(row)?;
     task.source_automation_id = row.get::<_, Option<String>>(42)?.filter(|s| !s.is_empty());
     Ok(task)
@@ -564,7 +566,7 @@ pub fn map_task_with_external_ref_parent_and_source_automation_id(row: &Row<'_>)
 /// `completion_summary` (index 53), `effort_matched_rule` (index 54), and
 /// `effort_reasons` (index 55). Used by `get_work_tree` for both
 /// task and chore queries, which append these columns at the end.
-pub fn map_task_with_external_ref_parent_source_and_provenance(row: &Row<'_>) -> rusqlite::Result<Task> {
+pub(crate) fn map_task_with_external_ref_parent_source_and_provenance(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_external_ref_parent_and_source_automation_id(row)?;
     task.origin_task_short_id = row.get(43)?;
     task.origin_pr_number = row.get(44)?;
@@ -582,7 +584,7 @@ pub fn map_task_with_external_ref_parent_source_and_provenance(row: &Row<'_>) ->
     Ok(task)
 }
 
-pub fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
+pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
     let branch_naming: BranchNaming = deserialize_json_or_default(row.get::<_, Option<String>>(22)?.as_deref());
     let kind_raw: String = row.get(2)?;
     let kind = parse_text_column::<ExecutionKind>(2, &kind_raw)?;
@@ -630,7 +632,7 @@ pub fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
     })
 }
 
-pub fn map_run(row: &Row<'_>) -> rusqlite::Result<WorkRun> {
+pub(crate) fn map_run(row: &Row<'_>) -> rusqlite::Result<WorkRun> {
     Ok(WorkRun {
         persona: row.get(11)?,
         id: row.get(0)?,
@@ -647,7 +649,7 @@ pub fn map_run(row: &Row<'_>) -> rusqlite::Result<WorkRun> {
     })
 }
 
-pub fn map_attention_item(row: &Row<'_>) -> rusqlite::Result<WorkAttentionItem> {
+pub(crate) fn map_attention_item(row: &Row<'_>) -> rusqlite::Result<WorkAttentionItem> {
     Ok(WorkAttentionItem {
         id: row.get(0)?,
         execution_id: row.get(1)?,
@@ -662,7 +664,7 @@ pub fn map_attention_item(row: &Row<'_>) -> rusqlite::Result<WorkAttentionItem> 
     })
 }
 
-pub fn map_effort_escalation(row: &Row<'_>) -> rusqlite::Result<boss_protocol::EffortEscalation> {
+pub(crate) fn map_effort_escalation(row: &Row<'_>) -> rusqlite::Result<boss_protocol::EffortEscalation> {
     let id: String = row.get(0)?;
     let product_id: String = row.get(1)?;
     let work_item_id: String = row.get(2)?;
@@ -691,7 +693,7 @@ pub fn map_effort_escalation(row: &Row<'_>) -> rusqlite::Result<boss_protocol::E
     })
 }
 
-pub fn map_conflict_resolution(row: &Row<'_>) -> rusqlite::Result<ConflictResolution> {
+pub(crate) fn map_conflict_resolution(row: &Row<'_>) -> rusqlite::Result<ConflictResolution> {
     Ok(ConflictResolution {
         id: row.get(0)?,
         product_id: row.get(1)?,
@@ -731,7 +733,7 @@ pub const CONFLICT_RESOLUTION_COLUMNS: &str =
                 created_at, started_at, finished_at, revision_task_id,
                 event_source, conflict_class, resolved_by_rung, mechanical_rung_in_flight";
 
-pub fn query_conflict_resolution(conn: &Connection, id: &str) -> Result<Option<ConflictResolution>> {
+pub(crate) fn query_conflict_resolution(conn: &Connection, id: &str) -> Result<Option<ConflictResolution>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {CONFLICT_RESOLUTION_COLUMNS}
          FROM conflict_resolutions
@@ -850,7 +852,7 @@ impl CiInFlightObservation {
     }
 }
 
-pub fn map_ci_remediation(row: &Row<'_>) -> rusqlite::Result<CiRemediation> {
+pub(crate) fn map_ci_remediation(row: &Row<'_>) -> rusqlite::Result<CiRemediation> {
     Ok(CiRemediation {
         id: row.get(0)?,
         product_id: row.get(1)?,
@@ -892,7 +894,7 @@ pub fn map_ci_remediation(row: &Row<'_>) -> rusqlite::Result<CiRemediation> {
 ///  produced_artifact_kind(15), produced_artifact_ref(16),
 ///  created_at(17), actioned_at(18), dismissed_at(19)`.
 #[allow(dead_code)] // prepared for attention-group query handlers (app.rs stubs)
-pub fn map_attention_group(row: &Row<'_>) -> rusqlite::Result<AttentionGroup> {
+pub(crate) fn map_attention_group(row: &Row<'_>) -> rusqlite::Result<AttentionGroup> {
     Ok(AttentionGroup {
         id: row.get(0)?,
         product_id: row.get(1)?,
@@ -927,7 +929,7 @@ pub fn map_attention_group(row: &Row<'_>) -> rusqlite::Result<AttentionGroup> {
 ///  proposed_work_kind(14), rationale(15), confidence_source(16),
 ///  score(17), linked_work_item_id(18), source_proposal_id(19)`.
 #[allow(dead_code)] // prepared for attention query handlers (app.rs stubs)
-pub fn map_attention(row: &Row<'_>) -> rusqlite::Result<Attention> {
+pub(crate) fn map_attention(row: &Row<'_>) -> rusqlite::Result<Attention> {
     Ok(Attention {
         id: row.get(0)?,
         group_id: row.get(1)?,
@@ -952,7 +954,7 @@ pub fn map_attention(row: &Row<'_>) -> rusqlite::Result<Attention> {
     })
 }
 
-pub fn query_ci_remediation(conn: &Connection, id: &str) -> Result<Option<CiRemediation>> {
+pub(crate) fn query_ci_remediation(conn: &Connection, id: &str) -> Result<Option<CiRemediation>> {
     let mut stmt = conn.prepare(
         "SELECT id, product_id, work_item_id, pr_url, pr_number,
                 head_branch, head_sha_at_trigger, head_sha_after,
@@ -978,7 +980,7 @@ pub fn query_ci_remediation(conn: &Connection, id: &str) -> Result<Option<CiReme
 /// commit-on-both-paths semantics — in exactly one place across the ~14
 /// call sites, differing only in the `query` passed
 /// (`query_conflict_resolution` vs `query_ci_remediation`).
-pub fn finish_attempt_update<T>(
+pub(crate) fn finish_attempt_update<T>(
     tx: rusqlite::Transaction<'_>,
     rows: usize,
     attempt_id: &str,
@@ -999,7 +1001,10 @@ pub fn finish_attempt_update<T>(
 /// The body does NOT contain the `"kind"` field — the discriminator is
 /// stored separately for cheap index filtering. We inject it back before
 /// deserialising.
-pub fn automation_trigger_from_db(kind: &str, config_json: &str) -> anyhow::Result<boss_protocol::AutomationTrigger> {
+pub(crate) fn automation_trigger_from_db(
+    kind: &str,
+    config_json: &str,
+) -> anyhow::Result<boss_protocol::AutomationTrigger> {
     let mut config: serde_json::Map<String, serde_json::Value> = serde_json::from_str(config_json)
         .with_context(|| format!("failed to parse trigger_config JSON: {config_json}"))?;
     config.insert("kind".to_owned(), serde_json::Value::String(kind.to_owned()));
@@ -1011,7 +1016,7 @@ pub fn automation_trigger_from_db(kind: &str, config_json: &str) -> anyhow::Resu
 /// Split an [`AutomationTrigger`] into `(trigger_kind, trigger_config_json)`
 /// for DB storage. The `"kind"` field is removed from the config body so the
 /// discriminator can be stored separately without duplication.
-pub fn automation_trigger_to_db(trigger: &boss_protocol::AutomationTrigger) -> anyhow::Result<(String, String)> {
+pub(crate) fn automation_trigger_to_db(trigger: &boss_protocol::AutomationTrigger) -> anyhow::Result<(String, String)> {
     let tagged = serde_json::to_value(trigger).context("failed to serialise AutomationTrigger")?;
     let mut map = match tagged {
         serde_json::Value::Object(m) => m,
@@ -1031,7 +1036,7 @@ pub fn automation_trigger_to_db(trigger: &boss_protocol::AutomationTrigger) -> a
 /// 8  open_task_limit, 9 catch_up_window_secs, 10 enabled,
 /// 11 created_via, 12 created_at, 13 updated_at,
 /// 14 last_fired_at, 15 last_outcome, 16 next_due_at
-pub fn map_automation(row: &Row<'_>) -> rusqlite::Result<boss_protocol::Automation> {
+pub(crate) fn map_automation(row: &Row<'_>) -> rusqlite::Result<boss_protocol::Automation> {
     let trigger_kind: String = row.get(5)?;
     let trigger_config: String = row.get(6)?;
     let trigger = automation_trigger_from_db(&trigger_kind, &trigger_config).map_err(|e| {
@@ -1065,7 +1070,7 @@ pub fn map_automation(row: &Row<'_>) -> rusqlite::Result<boss_protocol::Automati
 /// 0 id, 1 automation_id, 2 scheduled_for, 3 started_at, 4 finished_at,
 /// 5 triage_execution_id, 6 outcome, 7 produced_task_id, 8 detail,
 /// 9 first_attempted_at
-pub fn map_automation_run(row: &Row<'_>) -> rusqlite::Result<boss_protocol::AutomationRun> {
+pub(crate) fn map_automation_run(row: &Row<'_>) -> rusqlite::Result<boss_protocol::AutomationRun> {
     Ok(boss_protocol::AutomationRun {
         id: row.get(0)?,
         automation_id: row.get(1)?,

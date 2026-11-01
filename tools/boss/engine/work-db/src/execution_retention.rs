@@ -54,7 +54,7 @@
 //! execution just leaves that column dangling; the automation's run
 //! history stays intact and readable.
 //!
-//! This runs on a recurring schedule ([`crate::execution_retention_sweep`],
+//! This runs on a recurring schedule (`boss_engine::execution_retention_sweep`,
 //! which also performs the one-time backlog cleanup on first boot after
 //! this ships — the sweep fires immediately on spawn) and is available as
 //! an on-demand operator verb (`bossctl executions prune`) for manual

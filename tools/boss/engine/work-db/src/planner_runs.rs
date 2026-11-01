@@ -79,7 +79,10 @@ fn map_planner_run(row: &Row<'_>) -> rusqlite::Result<PlannerRun> {
 /// caller's connection so `get_work_tree` reads it in the same transaction as
 /// the rest of the tree. "Latest" uses the same `created_at DESC, id DESC`
 /// order as [`WorkDb::list_planner_runs_for_project`].
-pub fn latest_settled_planner_run_summaries(conn: &Connection, product_id: &str) -> Result<Vec<PlannerRunSummary>> {
+pub(crate) fn latest_settled_planner_run_summaries(
+    conn: &Connection,
+    product_id: &str,
+) -> Result<Vec<PlannerRunSummary>> {
     let mut stmt = conn.prepare(
         "SELECT pr.id, pr.project_id, pr.outcome, pr.created_at, pr.updated_at
          FROM planner_runs pr

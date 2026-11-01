@@ -2024,7 +2024,7 @@ fn ai_reviewing_badge_only_shows_while_reviewer_running() {
     let product = create_test_product(&db);
     let chore = create_test_chore_manual(&db, product.id.clone(), "Has PR under review");
 
-    // Simulate the P992 `PendingReview` hold: the implementation finished and
+    // Simulate the `PendingReview` hold: the implementation finished and
     // opened a PR, but the card is held in Doing (`active`) with the PR stamped
     // while the reviewer pass runs. This is the only state the badge keys on.
     {
@@ -2108,7 +2108,7 @@ fn ai_reviewing_badge_only_shows_while_reviewer_running() {
     let _ = std::fs::remove_file(path);
 }
 
-/// Regression for T1647: the "AI reviewing" badge (`ai_reviewing`) must
+/// Review badge regression: the "AI reviewing" badge (`ai_reviewing`) must
 /// remain visible after `finish_execution_run(Running)` — the post-spawn
 /// state `PaneSpawnRunner` now writes for `pr_review` executions via
 /// `RunWaitState::WorkerPaneAlive`. Before the fix, `PaneSpawnRunner`

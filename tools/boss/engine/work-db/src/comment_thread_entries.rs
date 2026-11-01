@@ -19,7 +19,7 @@ use super::*;
 /// hold a connection (e.g.
 /// [`crate::comment_thread_entries::list_comment_thread_entries_on`]) can build the
 /// same SELECT without duplicating the column list.
-pub fn comment_thread_entry_columns() -> &'static str {
+pub(crate) fn comment_thread_entry_columns() -> &'static str {
     "id, comment_id, entry_kind, author, body, revise_task_id, answer_agent_run_id, created_at"
 }
 
@@ -30,7 +30,7 @@ pub fn comment_thread_entry_columns() -> &'static str {
 /// prompt) goes through this same filter and column list, so a caller that
 /// already holds WorkDb's single pooled connection (an Immediate transaction)
 /// gets the identical query instead of a hand-rolled copy.
-pub fn list_comment_thread_entries_on(conn: &Connection, comment_id: &str) -> Result<Vec<CommentThreadEntry>> {
+pub(crate) fn list_comment_thread_entries_on(conn: &Connection, comment_id: &str) -> Result<Vec<CommentThreadEntry>> {
     let cols = comment_thread_entry_columns();
     let sql = format!(
         "SELECT {cols} FROM comment_thread_entries \

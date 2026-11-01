@@ -16,7 +16,7 @@ pub enum WorkerPrCompletionTarget {
     /// reviewer pass drives the subsequent `active → in_review`
     /// transition once the review pass resolves (or the timeout fires).
     PendingReview,
-    /// incident-002 P2: the both-parents deletion tripwire fired — this PR
+    /// Deletion recovery: the both-parents deletion tripwire fired — this PR
     /// resolves a merge/forward-port that removed a surface a merged parent
     /// added. Halt auto-progression: the task lands in `blocked` with
     /// `blocked_reason = 'deletion_signoff'` and `pr_url` stamped, pending an
@@ -43,10 +43,10 @@ pub enum SetRunTranscriptPathOutcome {
 /// One detached remote run returned by
 /// [`WorkDb::list_live_remote_runs`]: the latest `work_runs` row on a
 /// non-local host whose execution is still non-terminal. The engine's
-/// startup reattach pass (see [`crate::remote_reattach`])
+/// startup reattach pass (see `boss_engine::remote_reattach`)
 /// re-establishes the reverse events-socket forward for each of these
 /// so the still-running worker's hook stream reaches the new engine,
-/// and [`crate::remote_lease_reconcile`] probes each one's worker pid.
+/// and `boss_engine::remote_lease_reconcile` probes each one's worker pid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteRunHandle {
     /// `work_runs.id` (`run_*`).
@@ -199,7 +199,7 @@ pub struct TmuxPaneObservationWrite {
 /// `bossctl hosts disable` or the dispatch-health circuit breaker) or
 /// removed from the registry entirely. Returned by
 /// [`WorkDb::list_nonterminal_executions_on_offline_hosts`] and consumed
-/// by the host-reconcile sweep ([`crate::host_reconcile`]), which
+/// by the host-reconcile sweep (`boss_engine::host_reconcile`), which
 /// terminalizes the execution, releases its cube lease, and lets the
 /// existing orphan→redispatch machinery re-place the work item on a
 /// still-eligible host. `host_id` is never `'local'` (a local run is
@@ -353,7 +353,7 @@ pub struct StrandedCiRemediationAttempt {
 }
 
 /// One task an automation is already tracking, as shown to its triage
-/// agent in [`crate::automation_triage::render_triage_preamble`].
+/// agent in `boss_engine::automation_triage::render_triage_preamble`.
 ///
 /// Deliberately minimal: the agent needs to recognise "I was about to
 /// file this" and cite the existing row, nothing more. Full task bodies

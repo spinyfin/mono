@@ -11,12 +11,12 @@
 //! operator happened to notice weeks later.
 //!
 //! This module gives deferred scope a first-class, parseable channel,
-//! mirroring [`crate::worker_escalation`]'s `[effort-escalation]`/`[blocked]`
+//! mirroring `boss_engine::worker_escalation`'s `[effort-escalation]`/`[blocked]`
 //! marker protocol: a worker that deliberately delivers less than the brief
 //! asks emits one `[deferred-scope]` line per deferred item on its Stop
 //! boundary (see
-//! [`crate::runner::prompt::deferred_scope_directive`] for the prompt text taught to
-//! workers). [`crate::completion::WorkerCompletionHandler::detect_and_record_deferred_scope`]
+//! `boss_engine::runner::prompt::deferred_scope_directive` for the prompt text taught to
+//! workers). `boss_engine::completion::WorkerCompletionHandler::detect_and_record_deferred_scope`
 //! detects it at the same Stop-boundary surface `[effort-escalation]`/
 //! `[blocked]` travel on, appends a durable audit line to the work item's
 //! description, and files a coordinator-visible attention item — so a
@@ -24,7 +24,7 @@
 //! silently vanishing.
 //!
 //! Detection is best-effort and permissive, matching
-//! [`crate::worker_escalation`]'s discipline: a marker missing a required
+//! `boss_engine::worker_escalation`'s discipline: a marker missing a required
 //! field is still reported (with a parse warning) rather than dropped, and
 //! matching requires a line whose trimmed content STARTS WITH the marker
 //! prefix — not a substring scan — so prose that merely mentions the
@@ -99,7 +99,7 @@ fn validate_deferred_scope_fields(rest: &str) -> Option<String> {
 
 /// Render the `[deferred-scope]` audit line appended to a work item's
 /// description by
-/// [`crate::completion::WorkerCompletionHandler::record_deferred_scope_item`].
+/// `boss_engine::completion::WorkerCompletionHandler::record_deferred_scope_item`.
 /// `epoch` is unix seconds. `item.marker_line`'s own `[deferred-scope]`
 /// prefix is stripped before formatting so the resulting line carries the
 /// tag exactly once (e.g.
@@ -108,7 +108,7 @@ fn validate_deferred_scope_fields(rest: &str) -> Option<String> {
 /// audit lines on work item descriptions.
 /// Extract `(summary, reason)` from a `[deferred-scope]` marker line's
 /// quoted fields, e.g. for prefilling the followup task created by
-/// [`crate::app::attentions::handle_create_task_from_deferred_scope_attention`].
+/// `boss_engine::app::attentions::handle_create_task_from_deferred_scope_attention`.
 /// `None` for a field that's missing or malformed — mirrors
 /// [`validate_deferred_scope_fields`]'s leniency: a malformed marker still
 /// yields whatever DID parse instead of nothing. Accepts the line with or

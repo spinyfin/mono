@@ -1,6 +1,6 @@
 use super::*;
 
-pub fn slugify(name: &str) -> String {
+pub(crate) fn slugify(name: &str) -> String {
     let mut slug = String::new();
     let mut last_was_dash = false;
 
@@ -72,7 +72,7 @@ impl ShortIdCandidate {
 /// do not (`create-revision`, `bossctl dispatch diagnose`, `work
 /// executions`, `review show`): `slug/n` and the primary `task_…` /
 /// `proj_…` id work everywhere.
-pub fn format_short_id_ambiguous(input: &str, candidates: &[ShortIdCandidate]) -> String {
+pub(crate) fn format_short_id_ambiguous(input: &str, candidates: &[ShortIdCandidate]) -> String {
     let mut lines = vec![format!(
         "could not resolve id {input}: {} across {} products; \
          pass --product <slug>, use the product-scoped `slug/n` form, \
@@ -98,7 +98,7 @@ pub fn format_short_id_ambiguous(input: &str, candidates: &[ShortIdCandidate]) -
 /// - `Err` when the short id matches more than one product — the error
 ///   message lists every candidate (long id, product, name, status).
 ///   Never silently picks one.
-pub fn resolve_friendly_work_item_id(conn: &Connection, id: &str) -> Result<Option<String>> {
+pub(crate) fn resolve_friendly_work_item_id(conn: &Connection, id: &str) -> Result<Option<String>> {
     resolve_friendly_work_item_id_inner(conn, id, false)
 }
 
@@ -107,7 +107,7 @@ pub fn resolve_friendly_work_item_id(conn: &Connection, id: &str) -> Result<Opti
 /// task row carries a `deleted_at` tombstone. Only `restore` needs
 /// this — every other resolution path wants the live-only view and
 /// calls through the plain wrapper above.
-pub fn resolve_friendly_work_item_id_inner(
+pub(crate) fn resolve_friendly_work_item_id_inner(
     conn: &Connection,
     id: &str,
     include_deleted: bool,
@@ -248,7 +248,7 @@ pub fn classify_id(id: &str) -> Result<ItemKind> {
 /// `prod_`). Used by the shared resolver so verifying a primary id does
 /// not pay for a full row read + doc-link attach (GetWorkItem fetches
 /// once after resolve).
-pub fn typed_work_item_exists(conn: &Connection, id: &str) -> Result<bool> {
+pub(crate) fn typed_work_item_exists(conn: &Connection, id: &str) -> Result<bool> {
     match classify_id(id)? {
         ItemKind::Task => Ok(conn
             .query_row(
@@ -288,7 +288,7 @@ pub fn typed_work_item_exists(conn: &Connection, id: &str) -> Result<bool> {
 /// as existing. Used by resolvers that must see archived work items
 /// (restore, the dependency verbs) so a typo'd id is still reported as
 /// "no matching work item" instead of a silent no-op downstream.
-pub fn typed_work_item_exists_including_deleted(conn: &Connection, id: &str) -> Result<bool> {
+pub(crate) fn typed_work_item_exists_including_deleted(conn: &Connection, id: &str) -> Result<bool> {
     match classify_id(id)? {
         ItemKind::Task => Ok(conn
             .query_row("SELECT 1 FROM tasks WHERE id = ?1", params![id], |_| Ok(()))
@@ -326,7 +326,7 @@ pub fn typed_work_item_exists_including_deleted(conn: &Connection, id: &str) -> 
 /// `kind = "unknown"` with empty name and `status = "missing"` —
 /// the human renderer surfaces it instead of dropping the row, so
 /// the user can spot dangling edges and clean them up.
-pub fn resolve_dependency_edge(conn: &Connection, peer_id: &str, relation: &str) -> Result<DependencyEdge> {
+pub(crate) fn resolve_dependency_edge(conn: &Connection, peer_id: &str, relation: &str) -> Result<DependencyEdge> {
     if peer_id.starts_with("proj_") {
         if let Some(project) = query_project(conn, peer_id)? {
             return Ok(DependencyEdge {
@@ -380,7 +380,7 @@ pub fn resolve_dependency_edge(conn: &Connection, peer_id: &str, relation: &str)
 /// [`compute_gated_work_item_ids`]). `PrerequisitesOf` and
 /// `DependentsOf` need only the edge listing for the named row, so
 /// they walk the existing dep helpers directly.
-pub fn apply_dep_filter<T, F, G>(
+pub(crate) fn apply_dep_filter<T, F, G>(
     conn: &Connection,
     filter: &DependencyFilter,
     id_of: F,
@@ -827,15 +827,15 @@ pub fn cascade_dependents_after_prereq_status_change(
 /// just-merged item. Those siblings become the "later" PRs of their pairing
 /// and, when they next forward-port onto the moved base, must do so
 /// preservingly — the forward-port brief stamps a sibling-specific
-/// preservation clause (see [`crate::runner`]) and the both-parents deletion
-/// tripwire ([`crate::merge_parent_deletion`]) verifies it.
+/// preservation clause (see `boss_engine::runner`) and the both-parents deletion
+/// tripwire (`boss_engine::merge_parent_deletion`) verifies it.
 ///
 /// This is observability-only (no status change, never gates dispatch): the
 /// durable "contract" is the `merge_order` edge itself plus the merged
 /// sibling's `done` status. Emitting the ordering decision at merge time
 /// makes it visible after the fact in the engine log. Returns the count of
 /// in-flight siblings that now owe a preserving forward-port.
-pub fn record_merge_order_on_merge(conn: &Connection, merged_id: &str) -> Result<usize> {
+pub(crate) fn record_merge_order_on_merge(conn: &Connection, merged_id: &str) -> Result<usize> {
     let mut later_count = 0usize;
     for sibling in deps::merge_order_siblings(conn, merged_id)? {
         let status = deps::lookup_work_item_status(conn, &sibling.sibling_id)?;
@@ -867,7 +867,7 @@ pub fn record_merge_order_on_merge(conn: &Connection, merged_id: &str) -> Result
 /// the writer by table means the *type* passed in is constrained to
 /// the target table's vocabulary at the call site, not just validated
 /// after the fact.
-pub fn write_engine_project_status(
+pub(crate) fn write_engine_project_status(
     conn: &Connection,
     project_id: &str,
     new_status: ProjectStatus,
@@ -911,7 +911,7 @@ pub fn write_engine_project_status(
 /// Task-table counterpart of [`write_engine_project_status`]. See that
 /// function's doc comment for why this is split by table and typed by
 /// [`TaskStatus`] rather than a bare `&str`.
-pub fn write_engine_task_status(
+pub(crate) fn write_engine_task_status(
     conn: &Connection,
     task_id: &str,
     new_status: TaskStatus,
@@ -938,7 +938,7 @@ pub fn write_engine_task_status(
 ///
 /// Manual moves *into* `blocked`, and any move when no edges gate
 /// the row, are allowed.
-pub fn refuse_manual_move_off_blocked_while_gated(
+pub(crate) fn refuse_manual_move_off_blocked_while_gated(
     conn: &Connection,
     work_item_id: &str,
     previous_status: &str,
@@ -955,7 +955,7 @@ pub fn refuse_manual_move_off_blocked_while_gated(
     bail!("cannot move {work_item_id} to {new_status}: gated by [{names}] (use `boss <kind> depend rm` to remove)");
 }
 
-pub fn lookup_blocked_reason(conn: &Connection, work_item_id: &str) -> Result<Option<String>> {
+pub(crate) fn lookup_blocked_reason(conn: &Connection, work_item_id: &str) -> Result<Option<String>> {
     if work_item_id.starts_with("task_") {
         return conn
             .query_row(
@@ -970,7 +970,7 @@ pub fn lookup_blocked_reason(conn: &Connection, work_item_id: &str) -> Result<Op
     Ok(None)
 }
 
-pub fn lookup_last_status_actor(conn: &Connection, work_item_id: &str) -> Result<Option<String>> {
+pub(crate) fn lookup_last_status_actor(conn: &Connection, work_item_id: &str) -> Result<Option<String>> {
     if work_item_id.starts_with("proj_") {
         return conn
             .query_row(

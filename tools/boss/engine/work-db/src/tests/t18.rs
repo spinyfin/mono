@@ -348,7 +348,7 @@ fn auto_pr_maintenance_reflects_explicit_toggle() {
     );
 }
 
-// ── record_producer_side_conflict (Layer 0 / T1 telemetry) ─────────────
+// ── record_producer_side_conflict (Layer 0 telemetry) ─────────────
 
 /// Create an execution row for `work_item_id`, optionally with a
 /// `pr_url` already bound, so `record_producer_side_conflict` has an
@@ -537,7 +537,7 @@ fn mark_succeeded_stamps_full_worker_rung() {
     assert_eq!(succeeded.resolved_by_rung, Some(3));
 }
 
-// ── record_speculative_conflict_prediction (Layer 4 / T10 telemetry) ───
+// ── record_speculative_conflict_prediction (Layer 4 telemetry) ───
 
 /// The speculative sweep's predicted-conflict row is inserted already
 /// terminal, tagged with its own `event_source`/`status` so it can never

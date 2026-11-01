@@ -94,7 +94,7 @@ impl WorkDb {
 /// starting from direct children of `root_id`.  Depth is capped at 64 by
 /// the CTE's `UNION ALL` termination condition (no infinite loop in
 /// well-formed data; the engine never creates cycles).
-pub fn find_latest_active_revision_in_chain(conn: &Connection, root_id: &str) -> Result<Option<String>> {
+pub(crate) fn find_latest_active_revision_in_chain(conn: &Connection, root_id: &str) -> Result<Option<String>> {
     let live = live_chain_writer_sql("t");
     let live_successor = live_chain_writer_sql("next");
     let id: Option<String> = conn
@@ -150,7 +150,7 @@ pub fn find_latest_active_revision_in_chain(conn: &Connection, root_id: &str) ->
 /// 3. If chain root `status == "done"` → [`RevisionGateError::Merged`] (PR merged = task done).
 /// 4. Otherwise call `pr_checker.check(pr_url)` for the live state:
 ///    `Merged` → merged error; `ClosedUnmerged` → closed error; `Open` → insert.
-pub fn assert_parent_revisable_and_insert_as_actor(
+pub(crate) fn assert_parent_revisable_and_insert_as_actor(
     pending: &mut PendingEvents,
     conn: &Connection,
     input: CreateRevisionInput,
@@ -302,7 +302,7 @@ pub fn assert_parent_revisable_and_insert_as_actor(
 /// short id, or bare primary id) to the primary `tasks.id`. For now only
 /// full ids are supported; short-id resolution requires the product scope
 /// which the engine RPC can carry. Extended when needed.
-pub fn resolve_task_id_from_selector(conn: &Connection, selector: &str) -> Result<String> {
+pub(crate) fn resolve_task_id_from_selector(conn: &Connection, selector: &str) -> Result<String> {
     let trimmed = selector.trim();
     // Full typed id
     if trimmed.starts_with("task_") {
@@ -337,7 +337,7 @@ pub fn resolve_task_id_from_selector(conn: &Connection, selector: &str) -> Resul
 ///    `revision_parent_pr_url` from the chain root's `pr_url`.
 ///
 /// Capped at a chain depth of 20 to protect against cycles in corrupt data.
-pub fn attach_revision_projections(mut tasks: Vec<Task>, chores: &[Task]) -> Vec<Task> {
+pub(crate) fn attach_revision_projections(mut tasks: Vec<Task>, chores: &[Task]) -> Vec<Task> {
     // Compact lookup: id → (kind, parent_task_id, pr_url)
     type Entry = (TaskKind, Option<String>, Option<String>);
     let mut lookup: std::collections::HashMap<String, Entry> = std::collections::HashMap::new();
@@ -437,7 +437,7 @@ pub fn attach_revision_projections(mut tasks: Vec<Task>, chores: &[Task]) -> Vec
 /// Also sets `in_revision_blocked_only` when every counted revision for a
 /// root is `blocked`, so the card can show the badge as blocked rather than
 /// as running work.
-pub fn attach_in_progress_revision_flag(tasks: &mut [Task], chores: &mut [Task]) {
+pub(crate) fn attach_in_progress_revision_flag(tasks: &mut [Task], chores: &mut [Task]) {
     // Build a compact lookup: id → (kind, parent_task_id) for chain walking.
     let mut lookup: std::collections::HashMap<String, (TaskKind, Option<String>)> = std::collections::HashMap::new();
     for t in tasks.iter().chain(chores.iter()) {
@@ -516,7 +516,7 @@ pub fn attach_in_progress_revision_flag(tasks: &mut [Task], chores: &mut [Task])
 /// ready. A still-running (`"in_progress"`) or not-yet-polled (`None`/
 /// `"unknown"`) CI state is treated as NOT ready — there's nothing to
 /// merge yet.
-pub fn attach_ready_for_review_flag(tasks: &mut [Task], chores: &mut [Task]) {
+pub(crate) fn attach_ready_for_review_flag(tasks: &mut [Task], chores: &mut [Task]) {
     for task in tasks.iter_mut().chain(chores.iter_mut()) {
         task.ready_for_review = task.status == TaskStatus::InReview
             && task.pr_url.is_some()
@@ -602,7 +602,11 @@ fn review_execution_target_ids_with(
 /// Attach live reviewer stages and the shared held-revision review-cycle stage.
 /// A held revision keeps its caption across consolidation, apply and re-admission
 /// waits after the cycle starts; first admission to a review pool remains queued.
-pub fn attach_ai_reviewing_flag(conn: &Connection, tasks: &mut [Task], chores: &mut [Task]) -> rusqlite::Result<()> {
+pub(crate) fn attach_ai_reviewing_flag(
+    conn: &Connection,
+    tasks: &mut [Task],
+    chores: &mut [Task],
+) -> rusqlite::Result<()> {
     // Collect the target ids for every row that can possibly show the
     // badge: a non-revision row in `active`/`in_review` with a `pr_url`
     // targets itself; a revision held `active` targets itself and its review cycle root,
@@ -725,7 +729,11 @@ pub fn attach_ai_reviewing_flag(conn: &Connection, tasks: &mut [Task], chores: &
 /// unreachable from the board. A revision's own row reflects only its own
 /// attachments: revisions never have revisions of their own to roll up
 /// (`insert_revision_in_tx` always parents directly to the chain root).
-pub fn attach_has_attachments_flag(conn: &Connection, tasks: &mut [Task], chores: &mut [Task]) -> rusqlite::Result<()> {
+pub(crate) fn attach_has_attachments_flag(
+    conn: &Connection,
+    tasks: &mut [Task],
+    chores: &mut [Task],
+) -> rusqlite::Result<()> {
     let candidate_ids: std::collections::HashSet<&str> =
         tasks.iter().chain(chores.iter()).map(|t| t.id.as_str()).collect();
     if candidate_ids.is_empty() {
@@ -751,7 +759,7 @@ pub fn attach_has_attachments_flag(conn: &Connection, tasks: &mut [Task], chores
 /// Like [`attach_has_attachments_flag`], but queries only the supplied
 /// candidate rows. This is for single-row projections, whose revision-chain
 /// slices are small enough that keyed lookups beat a board-wide index scan.
-pub fn attach_has_attachments_flag_for_ids(
+pub(crate) fn attach_has_attachments_flag_for_ids(
     conn: &Connection,
     tasks: &mut [Task],
     chores: &mut [Task],
@@ -848,7 +856,11 @@ pub struct ReviewAttachTimings {
 /// Uncached: every owner is recomputed from the database (single-item
 /// projections, runtime patches, tests). The board assembly passes its
 /// [`BoardReviewCache`] through [`attach_ai_review_state_with`] instead.
-pub fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chores: &mut [Task]) -> Result<ReviewAttachStats> {
+pub(crate) fn attach_ai_review_state(
+    conn: &Connection,
+    tasks: &mut [Task],
+    chores: &mut [Task],
+) -> Result<ReviewAttachStats> {
     attach_ai_review_state_with(conn, tasks, chores, None).map(|(stats, _)| stats)
 }
 
@@ -871,7 +883,7 @@ pub fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chores: &mu
 ///    the queries read one `tasks` row per family rather than per card.
 /// 3. Running and queued reviews are read per pass from live executions and
 ///    layered on top, so no cached value depends on execution liveness.
-pub fn attach_ai_review_state_with(
+pub(crate) fn attach_ai_review_state_with(
     conn: &Connection,
     tasks: &mut [Task],
     chores: &mut [Task],
@@ -1245,7 +1257,7 @@ impl BoardChains {
 /// (the affordance lives on the root's card, not a revision's). One scan of
 /// the series table intersected with the board in memory (see
 /// [`query_review_guide_card_states`]).
-pub fn attach_review_guide_state(conn: &Connection, tasks: &mut [Task], chores: &mut [Task]) -> Result<()> {
+pub(crate) fn attach_review_guide_state(conn: &Connection, tasks: &mut [Task], chores: &mut [Task]) -> Result<()> {
     let roots: HashMap<&str, &str> = tasks
         .iter()
         .chain(chores.iter())
@@ -1316,7 +1328,7 @@ fn map_review_guide_card_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Review
 
 /// Constant SQL text for [`query_review_guide_card_states`]: root ids arrive
 /// as a JSON array bound to `?1`.
-pub fn review_guide_card_states_sql() -> String {
+pub(crate) fn review_guide_card_states_sql() -> String {
     format!(
         "SELECT s.root_task_id, s.guide_lifecycle, s.readable_version_id,
                 s.selected_comparison_id, v.comparison_id,
@@ -1394,7 +1406,7 @@ fn query_review_guide_card_states(
 /// are in `get_work_tree` — a side-query failure must not take down
 /// `GetWorkItem`. Chain loading errors (BFS / point reads) propagate:
 /// those are the same class of failure as the row read itself.
-pub fn attach_task_derived_projections(conn: &Connection, task: &mut Task, caller: &str) -> Result<()> {
+pub(crate) fn attach_task_derived_projections(conn: &Connection, task: &mut Task, caller: &str) -> Result<()> {
     attach_task_derived_projections_labeled(conn, task, caller).1
 }
 
@@ -1423,7 +1435,7 @@ fn attach_task_derived_projections_labeled(
 }
 
 #[cfg(test)]
-pub fn attach_task_derived_projections_for_test(
+pub(crate) fn attach_task_derived_projections_for_test(
     conn: &Connection,
     task: &mut Task,
     caller: &str,
@@ -1435,7 +1447,7 @@ pub fn attach_task_derived_projections_for_test(
 
 /// Records one single-item derivation, including the loaded chain's size
 /// and the review stage's actual card and SQL statement counts.
-pub fn attach_task_derived_projections_traced(
+pub(crate) fn attach_task_derived_projections_traced(
     conn: &Connection,
     task: &mut Task,
     trace: &mut boss_metrics::population_timing::PopulationTrace,
@@ -1583,7 +1595,7 @@ fn default_revision_effort_level(root_kind: &TaskKind) -> &'static str {
 /// nearest word boundary below 120 and an ellipsis is appended. The full
 /// description is stored separately in `tasks.description`; the `name`
 /// column is just the compact card title.
-pub fn revision_name_from_description(description: &str) -> String {
+pub(crate) fn revision_name_from_description(description: &str) -> String {
     for line in description.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -1793,7 +1805,7 @@ pub fn insert_design_task_for_project_in_tx(
 /// stored verbatim but logged so we can spot undocumented sources
 /// sneaking in. `id_for_log` and `kind_for_log` exist only to make
 /// the warning useful — they don't affect the stored value.
-pub fn canonicalize_created_via(raw: Option<&str>, id_for_log: &str, kind_for_log: &str) -> String {
+pub(crate) fn canonicalize_created_via(raw: Option<&str>, id_for_log: &str, kind_for_log: &str) -> String {
     let value = raw
         .map(str::trim)
         .filter(|s| !s.is_empty())

@@ -35,7 +35,7 @@ const AUTOMATION_SELECT: &str = "
            last_fired_at, last_outcome, next_due_at
     FROM automations";
 
-pub fn query_automation(conn: &Connection, id: &str) -> Result<Option<boss_protocol::Automation>> {
+pub(crate) fn query_automation(conn: &Connection, id: &str) -> Result<Option<boss_protocol::Automation>> {
     let sql = format!("{AUTOMATION_SELECT} WHERE id = ?1");
     conn.query_row(&sql, [id], map_automation)
         .optional()
@@ -281,7 +281,7 @@ impl WorkDb {
     /// unbounded ordering behaviour.
     ///
     /// This is the primary decision-derivation path for a triage run's
-    /// finalization (see [`crate::completion::WorkerCompletionHandler::finalize_automation_triage`]):
+    /// finalization (see `boss_engine::completion::WorkerCompletionHandler::finalize_automation_triage`):
     /// the decision marker the triage agent is asked to emit is, in practice,
     /// almost never present in the transcript (a measurement of 67 recent
     /// `produced_task` finalizations found none with a valid marker), so
@@ -635,7 +635,7 @@ impl WorkDb {
     /// 1 Hz for as long as the blocker lasts (the paused-scheduler defect: ~0.96
     /// passes/s and ~2.4 `automation_runs` write transactions/s, sustained for
     /// the whole pause). The scheduler paces those cases explicitly instead, via
-    /// [`crate::automation_scheduler::AutomationSchedulerPass::wake_hint`].
+    /// `boss_engine::automation_scheduler::AutomationSchedulerPass::wake_hint`.
     pub fn list_min_future_next_due_at_for_scheduler(&self, now_epoch: i64) -> Result<(Option<i64>, bool)> {
         let conn = self.connect()?;
         let min_next_due: Option<i64> = conn.query_row(
@@ -850,6 +850,7 @@ impl WorkDb {
     /// Stamp a task's `source_automation_id` (and status) directly. Used by
     /// scheduler tests to drive the open-task-limit gate without the
     /// `boss task create --automation` path (Maint task 6).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn stamp_task_source_automation_for_test(
         &self,
         task_id: &str,

@@ -1,0 +1,26 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "prose-vocabulary",
+    testonly = True,
+    srcs = ["src/lib.rs"],
+    crate_name = "boss_prose_vocabulary",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    visibility = [
+        "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/work-db:__pkg__",
+    ],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "prose_vocabulary_test",
+    size = "small",
+    crate = ":prose-vocabulary",
+    edition = "2024",
+    deps = all_crate_deps(normal = True),
+)

@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 workspace = "../../../.."
 
+[features]
+test-support = []
+
 [dependencies]
 boss-task-scope = { path = "../task-scope" }
 anyhow = { workspace = true }

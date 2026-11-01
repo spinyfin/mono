@@ -4,7 +4,7 @@
 //!
 //! - the post-hoc interception dispatch on the `PostToolUse` boundary
 //!   (`dispatch_post_hoc_interception_on_post_tool_use`), and
-//! - [`crate::events_socket::handle_connection`], which resolves the driver
+//! - `boss_engine::events_socket::handle_connection`, which resolves the driver
 //!   for EVERY inbound hook connection before it can decode the payload.
 //!   A run this returns `None` for has its whole hook event rejected with
 //!   `SocketError::UnresolvedDriver` — including the driver turn boundary

@@ -1243,7 +1243,7 @@ mod tests {
         assert!(task.description.contains("beta"));
     }
 
-    // --- T2265: a manually-reclassified answered question re-enters the
+    // --- A manually-reclassified answered question re-enters the
     // revise pool with its full thread ---
 
     #[test]
@@ -1263,7 +1263,7 @@ mod tests {
 
         // A comment auto-classified `question`, answered by the answer
         // agent, then manually reclassified to `revision` by the user
-        // via the sidebar intent badge — the exact repro from T2265's
+        // via the sidebar intent badge — reproducing the
         // design doc (PR spinyfin/mono#1791): the answer agent has already
         // finished (status = 'answered'), so there is no bucket-2 bridge in
         // play here, just a direct manual override.

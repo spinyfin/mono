@@ -495,6 +495,7 @@ impl PopulationTrace {
     /// `(duration_ms, rows, db_queries)` for the first recorded segment named
     /// `name`. Storage tests assert the N+1 fan-out captured by
     /// `get_work_tree_instrumented` without a disk round-trip.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn segment_counts(&self, name: &str) -> Option<(f64, Option<i64>, Option<i64>)> {
         self.segments
             .iter()
@@ -502,6 +503,7 @@ impl PopulationTrace {
             .map(|s| (s.duration_ms, s.rows, s.db_queries))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn segment_review_counts(&self, name: &str) -> Option<(Option<i64>, Option<i64>, Option<i64>)> {
         self.segments
             .iter()
@@ -509,6 +511,7 @@ impl PopulationTrace {
             .map(|s| (s.cache_hits, s.cache_misses, s.owners))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn request_id(&self) -> &str {
         &self.ctx.request_id
     }

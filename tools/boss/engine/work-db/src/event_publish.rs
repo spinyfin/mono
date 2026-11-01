@@ -23,7 +23,7 @@
 //! **Publish-after-commit is the default for every producer.** The one
 //! documented exception is the dependency-unblock cascade
 //! (`cascade_dependents_after_prereq_status_change`, see
-//! [`crate::dep_unblock_sweep`]), which legitimately acts *inside* the
+//! `boss_engine::dep_unblock_sweep`), which legitimately acts *inside* the
 //! transaction it's part of; that path should additionally stage a
 //! post-commit `DependencyPrereqsSatisfied` event here for other bus
 //! subscribers rather than publish in-txn itself.

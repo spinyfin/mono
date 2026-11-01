@@ -136,6 +136,7 @@ impl WorkDb {
         Ok(true)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn clear_coordinator_handoff_authorization(&self) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(

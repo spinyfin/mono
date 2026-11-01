@@ -79,7 +79,7 @@ pub const REVIEW_RESULT_GATE_OUTCOMES: [&str; 5] = [
 
 /// SQL list literal for [`REVIEW_RESULT_GATE_OUTCOMES`]. Engine-owned
 /// constants, safe to interpolate.
-pub fn review_result_gate_outcomes_sql() -> String {
+pub(crate) fn review_result_gate_outcomes_sql() -> String {
     REVIEW_RESULT_GATE_OUTCOMES
         .iter()
         .map(|outcome| format!("'{outcome}'"))
@@ -103,7 +103,7 @@ pub const PR_REVIEW_VERDICTS_SINCE_METADATA_KEY: &str = "pr_review_verdicts_sinc
 /// an earlier informative pass covers the head. Treating it as dead would
 /// yank the card back to Doing, re-review the same SHA, drop as a
 /// duplicate again, and loop until the churn guard parks it.
-pub fn unproductive_completed_pr_review_sql() -> String {
+pub(crate) fn unproductive_completed_pr_review_sql() -> String {
     format!(
         "(we.status = 'completed' AND (
             EXISTS (
@@ -127,7 +127,7 @@ pub fn unproductive_completed_pr_review_sql() -> String {
     )
 }
 
-/// What [`crate::completion::WorkerCompletionHandler::finalize_pr_review_pass`]
+/// What `boss_engine::completion::WorkerCompletionHandler::finalize_pr_review_pass`
 /// knows about a completed reviewer pass at the moment it calls
 /// [`WorkDb::record_worker_pr_completion`]. Written into `pr_review_verdicts`
 /// in the SAME transaction as that call so a `pr_review` pass can never reach
@@ -255,7 +255,7 @@ impl WorkDb {
     /// Insert the durable per-batch review verdict row for a supervisor
     /// proposal. `batch_id` / `proposal_id` uniqueness makes reapply a no-op
     /// even when the origin PR changed state between attempts.
-    pub fn insert_batch_review_verdict_in_tx(
+    pub(crate) fn insert_batch_review_verdict_in_tx(
         conn: &Connection,
         execution_id: &str,
         work_item_id: &str,

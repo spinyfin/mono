@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-test-support = []
+test-support = ["boss-work-db/test-support"]
 
 [dependencies]
 boss-engine-storage-values = { path = "../storage-values" }
@@ -94,6 +94,8 @@ toml = { workspace = true }
 unicode-segmentation = { workspace = true }
 
 [dev-dependencies]
+boss-work-db = { path = "../work-db", features = ["test-support"] }
+boss-prose-vocabulary = { path = "../prose-vocabulary" }
 boss-client = { path = "../../client" }
 boss-engine-test-git = { path = "../test-git" }
 tempfile = { workspace = true }

@@ -97,7 +97,7 @@ fn product_task_execution_with_prefix(db: &WorkDb, worker_branch_prefix: Option<
     (product, execution)
 }
 
-// ── T8 WorkDb external-ref method tests ─────────────────────────────────
+// ── WorkDb external-ref method tests ─────────────────────────────────
 
 /// Helper: create a product and a chore in a fresh in-memory db.
 /// Returns `(db, product_id, chore_id)`.

@@ -26,7 +26,7 @@ pub const DUPLICATE_GATE_TOKEN_OVERLAP_THRESHOLD: f64 = 0.3;
 /// sensitive, no canonicalization) — the gate only needs to catch the
 /// exact-path-repeated case the incident demonstrated, not fuzzy path
 /// matching.
-pub fn normalize_target_file(raw: &str) -> String {
+pub(crate) fn normalize_target_file(raw: &str) -> String {
     raw.trim().trim_start_matches("./").to_owned()
 }
 
@@ -55,7 +55,7 @@ fn token_overlap_ratio(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
 /// Insert `task_targets` rows for a freshly created task. Blank entries
 /// (after trimming) are dropped rather than stored — an agent-supplied
 /// `--target-file ""` declares nothing.
-pub fn insert_task_targets_in_tx(
+pub(crate) fn insert_task_targets_in_tx(
     conn: &Connection,
     task_id: &str,
     target_files: &[String],
@@ -89,7 +89,7 @@ pub fn insert_task_targets_in_tx(
 
 /// Declared target files for `task_id`, normalized. Empty when the task
 /// declared none.
-pub fn declared_target_files_in_tx(conn: &Connection, task_id: &str) -> Result<HashSet<String>> {
+pub(crate) fn declared_target_files_in_tx(conn: &Connection, task_id: &str) -> Result<HashSet<String>> {
     let mut stmt = conn.prepare("SELECT value FROM task_targets WHERE task_id = ?1 AND kind = 'file'")?;
     let rows = stmt.query_map([task_id], |row| row.get::<_, String>(0))?;
     let mut set = HashSet::new();
@@ -117,7 +117,7 @@ pub struct DuplicateGateBlocker {
 /// Returns `Ok(None)` immediately when `candidate_files` is empty — an
 /// undeclared candidate has nothing structural to compare against and is
 /// never gated (high precision only).
-pub fn find_duplicate_gate_blocker(
+pub(crate) fn find_duplicate_gate_blocker(
     conn: &Connection,
     product_id: &str,
     candidate_name: &str,

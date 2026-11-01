@@ -63,7 +63,7 @@ impl WorkDb {
     ///
     /// Accepts a friendly short id or a primary `task_…` id. The single
     /// dispatch path shared by the dead-review auto-recovery sweep
-    /// ([`crate::pr_review_recovery`]) and the operator-facing `bossctl
+    /// (`boss_engine::pr_review_recovery`) and the operator-facing `bossctl
     /// review start --pr <n>` verb — see
     /// [`dispatch_helpers::request_pr_review_in_tx`] for the full refusal
     /// conditions and idempotency contract.
@@ -380,13 +380,13 @@ impl WorkDb {
     /// item", so it is cleared by the first execution that actually starts
     /// a run — `start_execution_run_on_host`, in the same transaction that
     /// flips the execution to `running`, with
-    /// [`crate::attention_reconcile_sweep`] as the periodic backstop. The
+    /// `boss_engine::attention_reconcile_sweep` as the periodic backstop. The
     /// clear in [`Self::request_execution_with_live_check`] referenced above
     /// is now the *earliest* of those, not the only one: relying on it alone
     /// meant an item that resumed by any other path (the reconciler minting
     /// an execution, a `pr_review` / `revision_implementation` /
     /// `ci_remediation` dispatched by the review pipeline) kept showing a
-    /// long-dead failure forever. See [`crate::attention_lifecycle`].
+    /// long-dead failure forever. See `boss_engine::attention_lifecycle`.
     ///
     /// Guarded on `status IN ('todo', 'active')` so a concurrent move to
     /// `done`/`archived`/`blocked`/`in_review` is never stomped — this
@@ -427,7 +427,7 @@ impl WorkDb {
     /// [`Self::bounce_dispatch_failed_to_backlog`] (a pre-spawn dispatch
     /// failure exhausted its immediate retries), still schedulable, and
     /// whose `dispatch_failed_at` is older than `min_age_secs` — the
-    /// candidate set for [`crate::dispatch_failure_recovery_sweep`].
+    /// candidate set for `boss_engine::dispatch_failure_recovery_sweep`.
     /// Mirrors [`Self::list_orphan_active_candidates`]'s shape for the
     /// pre-spawn side of the reconciliation story.
     pub fn list_dispatch_failed_recovery_candidates(&self, min_age_secs: i64) -> Result<Vec<String>> {
@@ -454,7 +454,7 @@ impl WorkDb {
 
     /// Current `tasks.dispatch_failed_reason` for `work_item_id`, if any.
     ///
-    /// [`crate::dispatch_failure_recovery_sweep`] uses this to tell a row
+    /// `boss_engine::dispatch_failure_recovery_sweep` uses this to tell a row
     /// parked by [`Self::bounce_churn_guard_parked_to_backlog`]
     /// (`reason = `[`crate::CHURN_GUARD_DISPATCH_FAILED_REASON`]`)
     /// apart from an ordinary pre-spawn dispatch failure, so it can apply
@@ -512,7 +512,7 @@ impl WorkDb {
 
     /// Atomic combination of [`Self::reenable_autostart_after_dispatch_failure_in_tx`]
     /// and [`Self::request_execution_with_live_check`], used by
-    /// [`crate::dispatch_failure_recovery_sweep`] to give a work item
+    /// `boss_engine::dispatch_failure_recovery_sweep` to give a work item
     /// bounced by [`Self::bounce_dispatch_failed_to_backlog`] another
     /// shot after its cooldown elapses.
     ///
@@ -841,7 +841,7 @@ impl WorkDb {
     /// implementation kinds), so if this sweep redispatched a dead-review
     /// item it would wrongly spawn a fresh implementer on top of an
     /// already-open PR instead of re-running the reviewer. Those items are
-    /// handled exclusively by [`crate::pr_review_recovery`], which creates
+    /// handled exclusively by `boss_engine::pr_review_recovery`, which creates
     /// the correct `pr_review` execution kind.
     ///
     /// Also excludes a task **deliberately held** `active` pending an
@@ -971,7 +971,7 @@ impl WorkDb {
     /// whose latest **`pr_review`** execution either died before finalizing
     /// or completed without an informative verdict — see
     /// [`DeadPrReviewCandidate`]. Used by
-    /// [`crate::pr_review_recovery`]'s sweep to auto-refire the review
+    /// `boss_engine::pr_review_recovery`'s sweep to auto-refire the review
     /// pipeline for a PR whose reviewer died mid-run (host failure,
     /// cube-lease reap, crash) so the PR is never silently left unreviewed.
     ///
@@ -1039,7 +1039,7 @@ impl WorkDb {
     /// item that keeps dying.
     ///
     /// `kind = Some(ExecutionKind::PrReview)` is what
-    /// [`crate::pr_review_recovery`]'s churn guard passes instead of
+    /// `boss_engine::pr_review_recovery`'s churn guard passes instead of
     /// `None`: a work item routinely accumulates terminal
     /// `chore_implementation`/`revision_implementation` retries in the same
     /// trailing window a review is dispatched in (they happen back-to-back
@@ -1341,7 +1341,7 @@ impl WorkDb {
     ///
     /// Used by the completion handler to ignore Stop events that leaked
     /// from a stale `boss-event` hook registration left in a re-leased
-    /// workspace (see [`crate::worker_setup::purge_leaked_worker_hooks`]).
+    /// workspace (see `boss_engine::worker_setup::purge_leaked_worker_hooks`).
     /// Without this guard a stale Stop could mis-attribute completion to
     /// the wrong run or release the live run's re-leased workspace. The
     /// newest execution is never its own predecessor, so its own Stop
@@ -1480,7 +1480,7 @@ impl WorkDb {
     /// work item X qualifies iff:
     ///
     ///   - `stagger_secs > 0` (opt-in; the config loader clamps it to
-    ///     [`crate::config::MAX_MERGE_ORDER_STAGGER_SECS`]), and
+    ///     `boss_engine::config::MAX_MERGE_ORDER_STAGGER_SECS`), and
     ///   - X is the **later** side of a `merge_order` pairing (the `dependent`
     ///     end of the edge — the canonical "second" task; we only ever stagger
     ///     one deterministic member of a pair, never both), and
@@ -1559,7 +1559,7 @@ impl WorkDb {
     /// members (see [`chain_member_ids_on`] for the tombstone rationale).
     ///
     /// Exposed for the in-flight dispatch registry
-    /// ([`crate::dispatch_inflight`]), which must answer "is this chain
+    /// (`boss_engine::dispatch_inflight`), which must answer "is this chain
     /// already being dispatched" against reservations held in memory rather
     /// than rows in `work_executions`. Dispatch liveness is only visible in
     /// the DB once `start_execution_run_on_host` commits, so the registry —

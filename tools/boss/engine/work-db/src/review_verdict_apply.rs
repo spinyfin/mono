@@ -865,6 +865,7 @@ impl WorkDb {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn test_tombstone_orphaned_remediation(&self, task_id: &str) -> Result<()> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;

@@ -753,7 +753,7 @@ fn task_runtime_follows_live_execution_not_newer_terminal() {
     let _ = std::fs::remove_file(path);
 }
 
-/// Companion to the R693 case for the all-terminal shape (exec_89 / T500):
+/// Companion coverage for the all-terminal execution shape:
 /// when there is NO live execution and the newest row is an `abandoned`
 /// redundant/superseded duplicate, `query_task_runtime` must fall back to the
 /// most recent non-abandoned execution. Otherwise a successfully COMPLETED
@@ -764,7 +764,7 @@ fn task_runtime_prefers_completed_over_abandoned_duplicate() {
     let path = temp_db_path("runtime-prefers-completed-over-abandoned");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = create_test_chore(&db, product.id.clone(), "T500-shaped");
+    let chore = create_test_chore(&db, product.id.clone(), "all-terminal executions");
 
     // The execution that actually did the work and completed.
     let completed = db
@@ -1265,7 +1265,7 @@ fn no_autostart_direct_to_in_review_suppresses_dispatch() {
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
     // Step 1: create with --no-autostart (autostart=false)
-    let chore = create_test_chore_manual(&db, product.id.clone(), "Design doc T708");
+    let chore = create_test_chore_manual(&db, product.id.clone(), "Design doc without an execution");
     assert!(!chore.autostart);
 
     // Reconcile right after create — no execution (autostart=false + todo).
@@ -1305,7 +1305,7 @@ fn no_autostart_direct_to_in_review_suppresses_dispatch() {
     );
     assert!(
         db.list_executions(Some(&chore.id)).unwrap().is_empty(),
-        "no execution row must exist at all for T708-shaped chore",
+        "no execution row must exist at all for design-doc chore",
     );
 }
 

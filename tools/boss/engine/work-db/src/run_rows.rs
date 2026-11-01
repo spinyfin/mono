@@ -577,7 +577,7 @@ impl WorkDb {
     /// `execution_id`, or `None` when the execution has no run yet.
     ///
     /// This is the *spawned worker's* id, not the reviewed/automated row's
-    /// own `driver` column — [`crate::driver_transcript::driver_for_execution`]
+    /// own `driver` column — `boss_engine::driver_transcript::driver_for_execution`
     /// uses it to detect a pool-dispatched run (review/automation pool
     /// workers always run [`boss_engine_storage_values::pool_policy::pool_dispatch_policy_for_worker_id`]'s
     /// fixed driver, overriding whatever `tasks.driver` the row carries,
@@ -678,8 +678,8 @@ impl WorkDb {
     /// Persist the real OS shell pid of a *local* worker pane onto the
     /// agent-session `work_runs` row for `execution_id`, so the pid is
     /// durable across an engine restart (the in-memory
-    /// [`crate::live_worker_state::LiveWorkerStateRegistry`] is empty on
-    /// boot). [`crate::dead_pane_sweep`] then probes this pid with
+    /// `boss_engine::live_worker_state::LiveWorkerStateRegistry` is empty on
+    /// boot). `boss_engine::dead_pane_sweep` then probes this pid with
     /// `kill(pid, 0)` to detect a pane that died with its host app while the
     /// execution row is still `waiting_human`.
     ///
@@ -759,12 +759,13 @@ impl WorkDb {
     /// session creation (`spawn_flow::start_tmux_worker` already recorded
     /// them in the preceding intent write) and passes them straight through
     /// `persist_tmux_identity_after_observation` instead — see
-    /// [`crate::spawn_flow::TmuxSpawnStore::record_tmux_session_created`].
+    /// `boss_engine::spawn_flow::TmuxSpawnStore::record_tmux_session_created`.
     /// Available through `test-support` because a broad set of tests
     /// across this crate legitimately don't care about the session name/
     /// label and would otherwise have to invent placeholder values just to
     /// call the five-argument form.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn record_tmux_session_created_for_execution(
         &self,
         execution_id: &str,
@@ -891,7 +892,7 @@ impl WorkDb {
     /// The shell pid of the **latest** `work_runs` row for `execution_id`,
     /// returned only when that latest run ran locally and recorded a pid;
     /// `None` when the latest run ran on a remote host, has no pid yet, or no
-    /// run exists. Used by [`crate::dead_pane_sweep`] to probe pane liveness
+    /// run exists. Used by `boss_engine::dead_pane_sweep` to probe pane liveness
     /// after a restart.
     ///
     /// Deliberately keys on the *latest* run's id (via subquery), NOT "the
@@ -961,7 +962,7 @@ impl WorkDb {
     /// is the pid-reuse bound that
     /// [`Self::latest_local_worker_process_for_work_item`] already applies, so
     /// the destructive caller
-    /// ([`crate::app::ServerState::release_worker_pane`]'s durable-pid reap)
+    /// (`boss_engine::app::ServerState::release_worker_pane`'s durable-pid reap)
     /// cannot act on a pid this table can no longer vouch for.
     ///
     /// The bound is on `COALESCE(finished_at, created_at)` rather than
@@ -1005,7 +1006,7 @@ impl WorkDb {
     /// [`Self::latest_local_shell_pid_for_execution`], and it exists for the
     /// one question that helper cannot answer: *before I dispatch a second
     /// worker onto this row, is the previous one still running?* The
-    /// re-dispatchers ([`crate::orphan_sweep`]) reach that decision point
+    /// re-dispatchers (`boss_engine::orphan_sweep`) reach that decision point
     /// holding only a `work_item_id` — the execution they would be duplicating
     /// is already terminal, so no "live execution" lookup finds it, and the
     /// in-memory `LiveWorkerStateRegistry` entry that used to hold its pid was
@@ -1046,10 +1047,10 @@ impl WorkDb {
     /// carries its hook stream rides the engine's `ControlMaster` and
     /// dies with the old engine process. On startup the engine queries
     /// this set and re-establishes each forward (see
-    /// [`crate::remote_reattach`]) so the still-running worker's events
+    /// `boss_engine::remote_reattach`) so the still-running worker's events
     /// — and its eventual `Stop` / PR-URL completion — reach the engine
     /// again. The same set is the candidate list for
-    /// [`crate::remote_lease_reconcile`], which probes each worker pid
+    /// `boss_engine::remote_lease_reconcile`, which probes each worker pid
     /// over SSH and reaps the ones that are provably gone.
     ///
     /// **Liveness is judged on the EXECUTION, never on `work_runs.status`.**
@@ -1257,7 +1258,7 @@ impl WorkDb {
     /// token matched none of those candidates: the token is durable and
     /// unique (`work_runs_tmux_spawn_token_idx`), so a miss there means either
     /// the execution behind it has since gone terminal — in which case the
-    /// caller hands the session off to [`crate::worker_readoption`] instead of
+    /// caller hands the session off to `boss_engine::worker_readoption` instead of
     /// leaving a live worker untracked — or the token is unknown to this DB
     /// at all, which the caller treats as out of scope (a leaked session for
     /// a separate sweep to reap).
@@ -1273,7 +1274,7 @@ impl WorkDb {
     }
 
     /// The tmux session identity durably recorded for `execution_id` — the
-    /// read [`crate::app::ServerState::reap_tmux_worker`] starts every tmux
+    /// read `boss_engine::app::ServerState::reap_tmux_worker` starts every tmux
     /// teardown from. Targets the same row
     /// [`Self::record_tmux_spawn_intent_for_execution`] /
     /// [`Self::persist_tmux_identity_after_observation`] wrote.
@@ -1484,6 +1485,7 @@ impl WorkDb {
     /// yet, leaving the column NULL after the row was later
     /// inserted. The cache fallback (this PR) is what allows a
     /// subsequent hook to finally win.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn force_updated_at_for_test(&self, work_item_id: &str, epoch_secs: i64) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
@@ -1500,6 +1502,7 @@ impl WorkDb {
     /// real wall-clock time (two DB writes in the same in-process test can
     /// easily land in the same second); this lets a test establish a
     /// deterministic ordering directly instead.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn force_completed_at_for_test(&self, work_item_id: &str, epoch_secs: i64) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
@@ -1511,9 +1514,10 @@ impl WorkDb {
 
     /// Inserts a terminal `work_executions` row with the given `kind` and
     /// `status` — used to build up churn-guard fixtures. Callers testing
-    /// the kind-scoped guard (e.g. [`crate::pr_review_recovery`]) pass
+    /// the kind-scoped guard (e.g. `boss_engine::pr_review_recovery`) pass
     /// `kind = "pr_review"`; callers testing the unscoped guard pass
     /// whatever kind, typically `"chore_implementation"`.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn insert_terminal_execution_for_test(
         &self,
         work_item_id: &str,
@@ -1539,6 +1543,7 @@ impl WorkDb {
     /// window draining (a real re-check would just wait for wall-clock time
     /// to pass) by moving previously-recent terminal executions outside the
     /// window deterministically.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn backdate_terminal_executions_for_test(&self, work_item_id: &str, created_at_epoch: i64) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
@@ -1554,6 +1559,7 @@ impl WorkDb {
     /// Mark a task `done` without running `cascade_dependents_after_prereq_status_change`.
     /// Used in tests that need to simulate the engine being offline when a
     /// prereq transitions, so the sweeper can be exercised as the recovery path.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn mark_task_done_for_test_no_cascade(&self, task_id: &str) -> Result<()> {
         let conn = self.connect()?;
         let now = now_string();
@@ -1569,6 +1575,7 @@ impl WorkDb {
     /// Overwrite `last_status_actor` for a task without touching any other
     /// column. Used in tests to simulate a concurrent update that reset the
     /// actor (the scenario that previously caused the cascade to skip an item).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn force_last_status_actor_for_test(&self, task_id: &str, actor: &str) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
@@ -1578,6 +1585,7 @@ impl WorkDb {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn force_execution_status_for_test(&self, work_item_id: &str, status: ExecutionStatus) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
@@ -1587,6 +1595,7 @@ impl WorkDb {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn force_task_status_for_test(&self, task_id: &str, status: &str) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
@@ -1596,6 +1605,7 @@ impl WorkDb {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn force_started_at_for_test(&self, execution_id: &str, epoch_secs: i64) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
@@ -1611,6 +1621,7 @@ impl WorkDb {
     /// `start_execution_run`'s `COALESCE`). Lets a test model a resumed
     /// execution whose first-ever `started_at` is ancient while its current
     /// run is fresh, or vice versa.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn force_latest_run_started_at_for_test(&self, execution_id: &str, epoch_secs: i64) -> Result<()> {
         let conn = self.connect()?;
         let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
@@ -1623,6 +1634,7 @@ impl WorkDb {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn force_transient_failure_count_for_test(&self, execution_id: &str, count: i64) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
@@ -1636,6 +1648,7 @@ impl WorkDb {
     /// verify that the detector reconstructs the correct branch name from
     /// the snapshotted strategy without needing to re-create the full
     /// product/editorial-rules fixture.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn force_branch_naming_for_test(&self, execution_id: &str, naming: &BranchNaming) -> Result<()> {
         let json = serde_json::to_string(naming)
             .with_context(|| format!("failed to serialise BranchNaming for {execution_id}"))?;
@@ -1647,6 +1660,7 @@ impl WorkDb {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn clear_run_transcript_path_for_test(&self, run_id: &str) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
@@ -1696,7 +1710,7 @@ impl WorkDb {
 /// path/cost writes that belong to the real session row, and so the
 /// live-status resolver does not report NULL/wrong-host when only a failed
 /// sibling is newer than a path-bearing session.
-pub fn resolve_run_id_for_execution_hooks(conn: &Connection, execution_id: &str) -> Result<Option<String>> {
+pub(crate) fn resolve_run_id_for_execution_hooks(conn: &Connection, execution_id: &str) -> Result<Option<String>> {
     conn.query_row(
         "SELECT id FROM work_runs
          WHERE execution_id = ?1

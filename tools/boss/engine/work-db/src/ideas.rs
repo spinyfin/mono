@@ -39,7 +39,7 @@ fn query_idea(conn: &Connection, id: &str) -> Result<Option<Idea>> {
 /// worktree fetch and `work.product.<id>` invalidation topic every other
 /// product-scoped entity uses), which already holds the shared connection
 /// guard and cannot re-enter `self.connect()` to call the public method.
-pub fn list_ideas_in_tx(conn: &Connection, product_id: &str, status: Option<IdeaStatus>) -> Result<Vec<Idea>> {
+pub(crate) fn list_ideas_in_tx(conn: &Connection, product_id: &str, status: Option<IdeaStatus>) -> Result<Vec<Idea>> {
     let mut sql = format!("SELECT {IDEA_COLUMNS} FROM ideas WHERE product_id = ?1");
     if status.is_some() {
         sql.push_str(" AND status = ?2");

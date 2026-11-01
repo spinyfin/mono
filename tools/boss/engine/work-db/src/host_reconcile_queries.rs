@@ -1,4 +1,4 @@
-//! `WorkDb` reads for the host-reconcile sweep ([`crate::host_reconcile`]):
+//! `WorkDb` reads for the host-reconcile sweep (`boss_engine::host_reconcile`):
 //! find the executions bound to a host that has gone offline, and answer
 //! whether a single execution's bound host is offline (the heartbeat
 //! auto-reap's positive-evidence signal). Kept in their own submodule so
@@ -13,7 +13,7 @@ impl WorkDb {
     /// `bossctl hosts disable` or the dispatch-health circuit breaker in
     /// [`WorkDb::record_host_dispatch_failure`]) or removed from the
     /// registry. This is the candidate set for the host-reconcile sweep
-    /// ([`crate::host_reconcile`]), which terminalizes each one and lets
+    /// (`boss_engine::host_reconcile`), which terminalizes each one and lets
     /// the orphan→redispatch machinery re-place its work item on a
     /// still-eligible host — the gap the 2026-07-03 anaplian incident
     /// exposed (disabling the host left its in-flight executions stuck,

@@ -4,9 +4,10 @@
 //! Periodic singleton sweeps also report the interval between pass starts.
 //! Concurrent tails and rebase operations do not have a shared cadence.
 
+#[cfg(test)]
 use std::time::Instant;
 
-use crate::metrics::{CounterHandle, GaugeHandle, Registry};
+use crate::metrics::Registry;
 pub(crate) use crate::work::sweep_handles::AGENT_JSONL_STREAM_ROOT_REVALIDATIONS;
 use crate::work::sweep_handles::{
     AGENT_JSONL_STREAM_ITEMS_PER_PASS, AGENT_JSONL_STREAM_PASS_DURATION_MS, AGENT_JSONL_STREAM_PASSES,
@@ -15,6 +16,7 @@ use crate::work::sweep_handles::{
     ENVELOPE_WATCH_TICK_INTERVAL_MS, TERMINAL_WORK_SWEEP_ITEMS_PER_PASS, TERMINAL_WORK_SWEEP_PASS_DURATION_MS,
     TERMINAL_WORK_SWEEP_PASSES, TERMINAL_WORK_SWEEP_TICK_INTERVAL_MS,
 };
+pub(crate) use boss_metrics::sweep::{PassTimer, SweepTicker};
 pub(crate) static DEAD_PANE_TERMINAL: SweepTicker = SweepTicker::new(
     &DEAD_PANE_TERMINAL_PASS_DURATION_MS,
     &DEAD_PANE_TERMINAL_ITEMS_PER_PASS,
@@ -31,80 +33,10 @@ pub fn register_metrics(registry: &Registry) {
         &TERMINAL_WORK_SWEEP,
         &AGENT_JSONL_STREAM,
     ] {
-        registry.register_gauge(ticker.pass_duration_ms);
-        registry.register_gauge(ticker.items_per_pass);
-        if let Some(interval) = ticker.tick_interval_ms {
-            registry.register_gauge(interval);
-        }
-        registry.register_counter(ticker.passes);
+        ticker.register(registry);
     }
     registry.register_counter(&AGENT_JSONL_STREAM_ROOT_REVALIDATIONS);
     crate::work::execution_bookmark_metrics::register_metrics(registry);
-}
-
-/// Handles published by one sweep. Cadence state is owned by its loop; a
-/// pass is bracketed by [`SweepTicker::begin`] / [`PassTimer::finish`].
-pub(crate) struct SweepTicker {
-    pass_duration_ms: &'static GaugeHandle,
-    items_per_pass: &'static GaugeHandle,
-    tick_interval_ms: Option<&'static GaugeHandle>,
-    passes: &'static CounterHandle,
-}
-
-impl SweepTicker {
-    /// Cadence belongs to one running loop, separate from phase timing.
-    pub(crate) fn record_tick(&self, registry: &Registry, previous: &mut Option<Instant>) {
-        let now = Instant::now();
-        if let (Some(last), Some(interval)) = (previous.replace(now), self.tick_interval_ms) {
-            interval.set(registry, saturating_ms(now.duration_since(last)));
-        }
-    }
-
-    const fn new(
-        pass_duration_ms: &'static GaugeHandle,
-        items_per_pass: &'static GaugeHandle,
-        tick_interval_ms: Option<&'static GaugeHandle>,
-        passes: &'static CounterHandle,
-    ) -> Self {
-        Self {
-            pass_duration_ms,
-            items_per_pass,
-            tick_interval_ms,
-            passes,
-        }
-    }
-
-    /// Start timing the measured phase of a pass.
-    pub(crate) fn begin(&'static self) -> PassTimer {
-        let now = Instant::now();
-        PassTimer {
-            ticker: self,
-            started: now,
-        }
-    }
-}
-
-/// An in-flight pass of one sweep; see [`SweepTicker::begin`].
-pub(crate) struct PassTimer {
-    ticker: &'static SweepTicker,
-    started: Instant,
-}
-
-impl PassTimer {
-    /// Record the pass's duration and how many items it touched.
-    pub(crate) fn finish(self, registry: &Registry, items: usize) {
-        self.ticker
-            .pass_duration_ms
-            .set(registry, saturating_ms(self.started.elapsed()));
-        self.ticker
-            .items_per_pass
-            .set(registry, i64::try_from(items).unwrap_or(i64::MAX));
-        self.ticker.passes.inc(registry);
-    }
-}
-
-fn saturating_ms(duration: std::time::Duration) -> i64 {
-    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
 pub(crate) static ENVELOPE_WATCH: SweepTicker = SweepTicker::new(

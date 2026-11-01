@@ -5,7 +5,7 @@ use super::*;
 /// already have a `TaskKind` in hand (no DB round trip needed) — notably
 /// [`task_kind_excluded_from_ai_review`] — share this one mapping instead of
 /// hand-rolling a second copy of the kind list that could drift from it.
-pub fn execution_kind_for_task_kind(kind: &TaskKind) -> ExecutionKind {
+pub(crate) fn execution_kind_for_task_kind(kind: &TaskKind) -> ExecutionKind {
     match kind {
         TaskKind::Chore | TaskKind::Followup => ExecutionKind::ChoreImplementation,
         // Reuses `ProjectDesign`: a postmortem's deliverable is a doc PR
@@ -54,7 +54,7 @@ pub fn execution_kind_for_work_item(conn: &Connection, work_item_id: &str) -> Re
 /// the reviewer finalises.
 ///
 /// `RevisionImplementation` is handled separately, at the call site in
-/// [`crate::completion::WorkerCompletionHandler::finalize_pr_transition`]:
+/// `boss_engine::completion::WorkerCompletionHandler::finalize_pr_transition`:
 /// every revision kind (reviewer-spawned, CI-fix, conflict-resolution, and
 /// human/operator-initiated) that pushes new commits to its parent PR
 /// re-triggers a reviewer pass, gated only by the
@@ -95,7 +95,7 @@ pub fn should_enqueue_reviewer_for_primary(kind: &ExecutionKind) -> bool {
 /// (`producing.kind == ExecutionKind::RevisionImplementation`), independent
 /// of whether the chain root's kind is reviewable — so the primary-kind
 /// exclusion list does not apply to revision rows at all.
-pub fn task_kind_excluded_from_ai_review(kind: &TaskKind) -> bool {
+pub(crate) fn task_kind_excluded_from_ai_review(kind: &TaskKind) -> bool {
     if *kind == TaskKind::Revision {
         return false;
     }
@@ -117,7 +117,7 @@ pub fn task_kind_excluded_from_ai_review(kind: &TaskKind) -> bool {
 /// helper can see. Per the event-bus design's "events are hints, not
 /// commands" contract, a future `pool_claim_sweep` subscriber re-reads the
 /// live pool state itself rather than trusting this field for correctness.
-pub fn stage_execution_terminal(
+pub(crate) fn stage_execution_terminal(
     pending: &mut PendingEvents,
     conn: &Connection,
     execution_id: &str,
@@ -144,7 +144,7 @@ pub fn stage_execution_terminal(
 /// transition (`queued`/`ready`/`waiting_dependency`) so subscribers stop
 /// seeing the stale status. Published only after the caller's transaction
 /// commits.
-pub fn stage_execution_status_changed(pending: &mut PendingEvents, execution: &WorkExecution) {
+pub(crate) fn stage_execution_status_changed(pending: &mut PendingEvents, execution: &WorkExecution) {
     pending.push(Event::ExecutionStatusChanged {
         execution_id: execution.id.clone(),
         task_id: execution.work_item_id.clone(),
@@ -158,7 +158,12 @@ pub fn stage_execution_status_changed(pending: &mut PendingEvents, execution: &W
 /// so there is no commit to gate the publish on. Same field resolution as
 /// [`stage_execution_terminal`]; callers must invoke this only *after* the
 /// write that made the transition already succeeded.
-pub fn publish_execution_terminal(bus: &EventBus, conn: &Connection, execution_id: &str, task_id: &str) -> Result<()> {
+pub(crate) fn publish_execution_terminal(
+    bus: &EventBus,
+    conn: &Connection,
+    execution_id: &str,
+    task_id: &str,
+) -> Result<()> {
     let mut pending = PendingEvents::new();
     stage_execution_terminal(&mut pending, conn, execution_id, task_id)?;
     for event in pending.into_events() {
@@ -209,7 +214,7 @@ pub fn demote_active_if_latest_execution(
     Ok(affected > 0)
 }
 
-pub fn update_execution_status(
+pub(crate) fn update_execution_status(
     conn: &Connection,
     execution_id: &str,
     status: ExecutionStatus,
@@ -297,7 +302,7 @@ pub fn task_accepts_execution(task: &Task) -> bool {
 /// It is deliberately NOT wired into [`task_accepts_execution`] — the
 /// dependency auto-unblock cascade bypasses that gate and calls the
 /// reconcile helpers directly, so the check belongs at the mint point.
-pub fn work_item_is_deferred(conn: &Connection, work_item_id: &str) -> Result<bool> {
+pub(crate) fn work_item_is_deferred(conn: &Connection, work_item_id: &str) -> Result<bool> {
     if !work_item_id.starts_with("task_") {
         return Ok(false);
     }
@@ -316,7 +321,7 @@ pub fn work_item_is_deferred(conn: &Connection, work_item_id: &str) -> Result<bo
 /// engine must never mint a `ready` execution for them and never auto-
 /// complete them — only an explicit human close with a summary does.
 /// Reads the column directly (same rationale as [`work_item_is_deferred`]).
-pub fn work_item_is_human_driven(conn: &Connection, work_item_id: &str) -> Result<bool> {
+pub(crate) fn work_item_is_human_driven(conn: &Connection, work_item_id: &str) -> Result<bool> {
     if !work_item_id.starts_with("task_") {
         return Ok(false);
     }
@@ -330,7 +335,7 @@ pub fn work_item_is_human_driven(conn: &Connection, work_item_id: &str) -> Resul
     Ok(human_driven.unwrap_or(0) != 0)
 }
 
-pub fn product_id_for_work_item(conn: &Connection, work_item_id: &str) -> Result<String> {
+pub(crate) fn product_id_for_work_item(conn: &Connection, work_item_id: &str) -> Result<String> {
     match classify_id(work_item_id)? {
         ItemKind::Product => query_product(conn, work_item_id)?
             .map(|product| product.id)
@@ -363,7 +368,7 @@ pub fn product_id_for_work_item(conn: &Connection, work_item_id: &str) -> Result
 /// the same transaction it raises their `revision_archived` attention
 /// item) — callers that only need to validate the id and are not about to
 /// mutate or dispatch against the row should use this instead.
-pub fn product_id_for_work_item_including_deleted(conn: &Connection, work_item_id: &str) -> Result<String> {
+pub(crate) fn product_id_for_work_item_including_deleted(conn: &Connection, work_item_id: &str) -> Result<String> {
     match classify_id(work_item_id)? {
         ItemKind::Product => query_product(conn, work_item_id)?
             .map(|product| product.id)
@@ -457,7 +462,7 @@ pub fn resolve_repo_for_work_item(conn: &Connection, work_item_id: &str) -> Resu
     Ok(product.repo_remote_url)
 }
 
-pub fn resolve_execution_repo_remote_url(
+pub(crate) fn resolve_execution_repo_remote_url(
     conn: &Connection,
     work_item_id: &str,
     explicit_repo_remote_url: Option<String>,
@@ -492,7 +497,7 @@ impl WorkDb {
     }
 }
 
-pub fn next_task_ordinal(conn: &Connection, project_id: &str) -> Result<i64> {
+pub(crate) fn next_task_ordinal(conn: &Connection, project_id: &str) -> Result<i64> {
     let current = conn.query_row(
         "SELECT COALESCE(MAX(ordinal), 0) FROM tasks
              WHERE project_id = ?1 AND deleted_at IS NULL",
@@ -502,7 +507,7 @@ pub fn next_task_ordinal(conn: &Connection, project_id: &str) -> Result<i64> {
     Ok(current + 1)
 }
 
-pub fn unique_product_slug(conn: &Connection, base_slug: &str) -> Result<String> {
+pub(crate) fn unique_product_slug(conn: &Connection, base_slug: &str) -> Result<String> {
     let base_slug = default_slug(base_slug);
     let mut candidate = base_slug.clone();
     let mut suffix = 2;
@@ -517,7 +522,7 @@ pub fn unique_product_slug(conn: &Connection, base_slug: &str) -> Result<String>
     Ok(candidate)
 }
 
-pub fn unique_product_slug_for_update(conn: &Connection, id: &str, base_slug: &str) -> Result<String> {
+pub(crate) fn unique_product_slug_for_update(conn: &Connection, id: &str, base_slug: &str) -> Result<String> {
     let base_slug = default_slug(base_slug);
     let mut candidate = base_slug.clone();
     let mut suffix = 2;
@@ -532,7 +537,7 @@ pub fn unique_product_slug_for_update(conn: &Connection, id: &str, base_slug: &s
     Ok(candidate)
 }
 
-pub fn unique_project_slug(conn: &Connection, product_id: &str, base_slug: &str) -> Result<String> {
+pub(crate) fn unique_project_slug(conn: &Connection, product_id: &str, base_slug: &str) -> Result<String> {
     let base_slug = default_slug(base_slug);
     let mut candidate = base_slug.clone();
     let mut suffix = 2;
@@ -547,7 +552,7 @@ pub fn unique_project_slug(conn: &Connection, product_id: &str, base_slug: &str)
     Ok(candidate)
 }
 
-pub fn unique_project_slug_for_update(
+pub(crate) fn unique_project_slug_for_update(
     conn: &Connection,
     product_id: &str,
     id: &str,
@@ -567,7 +572,7 @@ pub fn unique_project_slug_for_update(
     Ok(candidate)
 }
 
-pub fn default_slug(base_slug: &str) -> String {
+pub(crate) fn default_slug(base_slug: &str) -> String {
     if base_slug.is_empty() {
         "item".to_owned()
     } else {

@@ -71,7 +71,7 @@ const ATTENTION_WORK_ITEM: &str = "COALESCE(
 ///
 /// Deliberately **not** `created_at`. Every filer deduplicates a re-raise
 /// onto the already-`open` row rather than inserting a second one (see
-/// [`crate::reraise_open_work_item_attention`]), which is the right UI
+/// `boss_engine::reraise_open_work_item_attention`), which is the right UI
 /// behaviour but freezes `created_at` at the *first* occurrence. Comparing
 /// evidence against that would clear a live signal with pre-occurrence proof:
 /// the pane dies (t0); the orphan sweep redispatches and a run starts (t1);

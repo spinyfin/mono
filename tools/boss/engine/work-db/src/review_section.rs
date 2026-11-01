@@ -97,7 +97,7 @@ pub fn classify_review_section(task: &Task) -> Option<ReviewSection> {
 
 /// Set `review_section` on every task and chore. Called by `get_work_tree`
 /// and by the single-row projection path after the attaches it reads.
-pub fn attach_review_section(tasks: &mut [Task], chores: &mut [Task]) {
+pub(crate) fn attach_review_section(tasks: &mut [Task], chores: &mut [Task]) {
     for task in tasks.iter_mut().chain(chores.iter_mut()) {
         task.review_section = classify_review_section(task);
     }

@@ -34,7 +34,7 @@ pub struct ReviewFindingsFollowupPlan {
 
 /// Derive follow-up kind, origin provenance, and rewritten description from
 /// the chain root and the revision-style instructions.
-pub fn plan_review_findings_followup(
+pub(crate) fn plan_review_findings_followup(
     conn: &Connection,
     chain_root_id: &str,
     description: &str,
@@ -82,7 +82,7 @@ pub fn plan_review_findings_followup(
 /// `commit_applied_review_verdict`, so a crash between those two leaves the
 /// proposal `proposed` for retry with the follow-up already on disk. Exact
 /// match on the new key would miss that row and mint a duplicate.
-pub fn existing_review_findings_work_item(conn: &Connection, created_via: &str) -> Result<Option<Task>> {
+pub(crate) fn existing_review_findings_work_item(conn: &Connection, created_via: &str) -> Result<Option<Task>> {
     if !created_via.starts_with(CREATED_VIA_PR_REVIEW_PREFIX) {
         return Ok(None);
     }
@@ -196,7 +196,7 @@ pub struct ReviewFindingsFollowupInsert {
 /// Insert a new review-findings follow-up (or return the existing one keyed
 /// on `created_via`). Used when the origin PR is already merged at apply
 /// time, so no revision row is ever created.
-pub fn insert_review_findings_followup(conn: &Connection, input: ReviewFindingsFollowupInsert) -> Result<Task> {
+pub(crate) fn insert_review_findings_followup(conn: &Connection, input: ReviewFindingsFollowupInsert) -> Result<Task> {
     if let Some(existing) = existing_review_findings_work_item(conn, &input.created_via)? {
         tracing::warn!(
             created_via = input.created_via.as_str(),

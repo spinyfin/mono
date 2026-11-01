@@ -659,6 +659,7 @@ impl WorkDb {
     /// [`Self::gc_unreferenced_pr_review_guide_source_artifacts_with`] with no
     /// process observation: no other process's staging file is provably
     /// orphaned, so none is removed. Production sweeps supply an observer.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn gc_unreferenced_pr_review_guide_source_artifacts(&self) -> Result<()> {
         self.gc_unreferenced_pr_review_guide_source_artifacts_with(&|_| false)
     }
@@ -835,6 +836,7 @@ fn map_capture(row: &Row<'_>, artifact_root: &Path) -> rusqlite::Result<PrReview
     Ok(metadata.with_packet(packet))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     pub(super) static BEFORE_PACKET_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
@@ -842,6 +844,7 @@ thread_local! {
 /// Install a one-shot hook that runs inside the next packet-artifact read on
 /// this thread, so a test outside storage can hold an artifact validation open
 /// while it drives other work.
+#[cfg(any(test, feature = "test-support"))]
 pub(super) fn set_before_packet_read_hook(hook: Box<dyn FnOnce()>) {
     BEFORE_PACKET_READ.with(|slot| *slot.borrow_mut() = Some(hook));
 }
@@ -851,6 +854,7 @@ pub(super) fn load_packet(
     packet_path: Option<&str>,
     expected_hash: &str,
 ) -> Result<SourcePacket> {
+    #[cfg(any(test, feature = "test-support"))]
     BEFORE_PACKET_READ.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
             hook();

@@ -159,7 +159,7 @@ pub fn work_item_is_deliberately_parked(conn: &Connection, work_item_id: &str) -
 }
 
 /// Explicit dispatch acknowledges parks on prior executions in the same transaction.
-pub fn resolve_deliberate_park_attention(conn: &Connection, work_item_id: &str) -> Result<()> {
+pub(crate) fn resolve_deliberate_park_attention(conn: &Connection, work_item_id: &str) -> Result<()> {
     for kind in DELIBERATE_PARK_ATTENTION_KINDS {
         conn.execute(
             "UPDATE work_attention_items SET status = 'resolved', resolved_at = ?1
@@ -174,7 +174,7 @@ pub fn resolve_deliberate_park_attention(conn: &Connection, work_item_id: &str) 
 /// A delivered primary PR belongs to review/merge handling, even while
 /// deferred review admission leaves its owner in `active`.
 /// Revisions intentionally resume their parent's PR and are not owners.
-pub fn primary_pr_awaits_review(conn: &Connection, work_item_id: &str) -> Result<bool> {
+pub(crate) fn primary_pr_awaits_review(conn: &Connection, work_item_id: &str) -> Result<bool> {
     Ok(query_task(conn, work_item_id)?.is_some_and(|task| {
         task.kind != TaskKind::Revision && task.pr_url.as_deref().is_some_and(|url| !url.trim().is_empty())
     }))
@@ -183,7 +183,7 @@ pub fn primary_pr_awaits_review(conn: &Connection, work_item_id: &str) -> Result
 /// Completed revision work belongs to completion/review handling. A review
 /// execution (including one on the chain root) must not hide that completion.
 /// Explicit starts create a newer implementation and remain allowed.
-pub fn revision_implementation_completed(conn: &Connection, work_item_id: &str) -> Result<bool> {
+pub(crate) fn revision_implementation_completed(conn: &Connection, work_item_id: &str) -> Result<bool> {
     let status: Option<String> = conn
         .query_row(
             "SELECT e.status FROM work_executions e JOIN tasks t ON t.id = e.work_item_id

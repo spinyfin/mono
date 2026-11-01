@@ -10,7 +10,7 @@
 //! - [`WorkDb::list_pr_binding_repair_candidates`] — rows whose stored
 //!   binding is structurally suspect (bound to their own origin PR, sharing a
 //!   PR with another work item, or carrying a doc pointer on a branch that is
-//!   not their execution's). [`crate::pr_binding_repair_sweep`] confirms each
+//!   not their execution's). `boss_engine::pr_binding_repair_sweep` confirms each
 //!   against GitHub and repairs it by mechanism.
 //! - [`WorkDb::rebind_task_pr_from_execution_branch`] /
 //!   [`WorkDb::mark_task_pr_binding_unresolved`] — the two repair writes:
@@ -90,7 +90,7 @@ const NON_PRIMARY_EXECUTION_KINDS_SQL: &str = "'pr_review', 'pr_review_guide', '
 /// Connection-level form of [`WorkDb::other_work_item_bound_to_pr`], so a
 /// caller already inside a transaction (`Transaction` derefs to
 /// `Connection`) applies the same holder policy.
-pub fn query_other_work_item_bound_to_pr(
+pub(crate) fn query_other_work_item_bound_to_pr(
     conn: &rusqlite::Connection,
     pr_url: &str,
     work_item_id: &str,

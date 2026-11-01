@@ -159,7 +159,7 @@ impl WorkDb {
     /// ever use, with every per-connection PRAGMA/behavior setting applied
     /// once up front. `WorkDb::connect()` just locks this connection's
     /// mutex — see the docs on `WorkDb::conn`.
-    pub fn open_raw_connection(path: &Path, memory: Option<&InMemoryAnchor>) -> Result<Connection> {
+    pub(crate) fn open_raw_connection(path: &Path, memory: Option<&InMemoryAnchor>) -> Result<Connection> {
         let mut conn = if let Some(mem) = memory {
             // For in-memory databases, connect via the named shared-cache URI.
             Connection::open_with_flags(
@@ -505,7 +505,7 @@ mod tests {
 
 /// Whether `table` currently has a column named `column`. Used by the
 /// idempotent schema-46 migration in `init` and by migration tests.
-pub fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+pub(crate) fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
     for row in rows {
@@ -543,7 +543,7 @@ pub fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
 }
 
 #[cfg(test)]
-pub fn assert_all_migrations_applied(conn: &Connection) {
+pub(crate) fn assert_all_migrations_applied(conn: &Connection) {
     let expected = registry::all().into_iter().map(|m| m.id).collect();
     assert_eq!(migrations::applied(conn).unwrap(), expected);
     let legacy: bool = conn

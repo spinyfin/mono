@@ -1,0 +1,8 @@
+[package]
+name = "boss-prose-vocabulary"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+regex = { workspace = true }

@@ -385,7 +385,10 @@ fn recompute_group_state(conn: &Connection, group_id: &str) -> Result<()> {
 /// automation pre-file dedup gate, which files a suppression attention item
 /// in the same `Immediate` transaction as the create-path gate check it
 /// lost to — see `WorkDb::create_automation_task`).
-pub fn create_attention_in_tx(conn: &Connection, input: CreateAttentionInput) -> Result<(Attention, AttentionGroup)> {
+pub(crate) fn create_attention_in_tx(
+    conn: &Connection,
+    input: CreateAttentionInput,
+) -> Result<(Attention, AttentionGroup)> {
     let group = resolve_or_create_group(conn, &input)?;
     if group.kind != input.kind {
         bail!(
@@ -1469,7 +1472,7 @@ impl WorkDb {
 
     /// Transaction-aware variant of [`Self::retire_group_if_empty`] for use
     /// inside an existing transaction.
-    pub fn retire_group_if_empty_in_tx(&self, conn: &Connection, group_id: &str) -> Result<bool> {
+    pub(crate) fn retire_group_if_empty_in_tx(&self, conn: &Connection, group_id: &str) -> Result<bool> {
         let group = match query_attention_group(conn, group_id)? {
             Some(g) => g,
             None => return Ok(false),

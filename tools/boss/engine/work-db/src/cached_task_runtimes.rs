@@ -8,7 +8,7 @@ use super::*;
 /// only misses (changed, expired, never seen, or consulting other items) run
 /// the point queries. The returned statement count covers the misses plus the
 /// one epoch query, which keeps the population trace honest about what ran.
-pub fn collect_task_runtimes_cached(
+pub(crate) fn collect_task_runtimes_cached(
     conn: &Connection,
     product_id: &str,
     tasks: &[Task],

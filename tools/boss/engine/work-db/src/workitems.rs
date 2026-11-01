@@ -276,7 +276,7 @@ impl WorkDb {
     }
 
     /// File (idempotently) the operator-visible attention item raised when
-    /// [`crate::orphan_sweep`] or [`crate::pr_review_recovery`] trips the
+    /// `boss_engine::orphan_sweep` or `boss_engine::pr_review_recovery` trips the
     /// shared churn guard and parks a work item instead of auto-redispatching
     /// it — see [`boss_engine_storage_values::attention_kinds::CHURN_GUARD_PARKED_ATTENTION_KIND`]. Reuses
     /// [`Self::upsert_external_tracker_attention`] so repeated trips across
@@ -381,7 +381,7 @@ impl WorkDb {
 
     /// Bounce an `active` work item to Backlog when the churn guard trips —
     /// the replacement for [`Self::file_churn_guard_parked_attention`] on
-    /// [`crate::orphan_sweep`]'s path (an `active` task with no live
+    /// `boss_engine::orphan_sweep`'s path (an `active` task with no live
     /// execution). Reuses the same `dispatch_failed_reason` /
     /// `dispatch_failed_error` / `dispatch_failed_at` representation a
     /// pre-spawn dispatch failure uses
@@ -392,7 +392,7 @@ impl WorkDb {
     /// `work_attention_items` — see
     /// `docs/designs/dispatch-halt-state-vs-attention-items.md` for why.
     ///
-    /// [`crate::pr_review_recovery`] keeps filing the attention-item form
+    /// `boss_engine::pr_review_recovery` keeps filing the attention-item form
     /// via [`Self::file_churn_guard_parked_attention`]: its target task
     /// stays `in_review`, and `bounce_dispatch_failed_to_backlog` only
     /// applies to `todo`/`active` rows — Backlog is not a meaningful
@@ -437,7 +437,7 @@ impl WorkDb {
         }
     }
 
-    /// Bounce an `active` work item to Backlog when [`crate::orphan_sweep`]
+    /// Bounce an `active` work item to Backlog when `boss_engine::orphan_sweep`
     /// finds its run ended in a deliberate engine park — a `boss propose done
     /// --outcome blocked` declaration, or the auto-nudge breaker giving up —
     /// whose attention item is still open. The board must show the halt
@@ -447,7 +447,7 @@ impl WorkDb {
     /// / Backlog-status representation [`Self::bounce_churn_guard_parked_to_backlog`]
     /// established, under [`DELIBERATE_PARK_DISPATCH_FAILED_REASON`] instead of
     /// [`CHURN_GUARD_DISPATCH_FAILED_REASON`] so
-    /// [`crate::dispatch_failure_recovery_sweep`] can tell the two apart and
+    /// `boss_engine::dispatch_failure_recovery_sweep` can tell the two apart and
     /// never auto-retries this one — a deliberate park is a human decision,
     /// cleared only by an explicit `bossctl work start` / kanban drag-to-Doing
     /// (which starts a fresh run and clears the stamp the same way it clears
@@ -548,9 +548,9 @@ impl WorkDb {
     }
 
     /// File (idempotently) the operator-visible attention item raised when
-    /// [`crate::dispatch_stall_escalation`] finds a dispatch timeline stuck
+    /// `boss_engine::dispatch_stall_escalation` finds a dispatch timeline stuck
     /// in one stage past
-    /// [`crate::dispatch_stall_escalation::PERSISTENT_STALL_THRESHOLD`] —
+    /// `boss_engine::dispatch_stall_escalation::PERSISTENT_STALL_THRESHOLD` —
     /// see [`boss_engine_storage_values::attention_kinds::DISPATCH_STAGE_STALLED_ATTENTION_KIND`]. Reuses
     /// [`Self::upsert_external_tracker_attention`] so repeated sweep ticks
     /// refresh the same row's elapsed-time text instead of piling up
@@ -582,7 +582,7 @@ impl WorkDb {
     /// Decide whether a persistently-stalled execution the dispatch-stall
     /// escalation sweep detected should be escalated onto the work-item
     /// attention surface — the terminal/liveness/id-kind gate the file-scan
-    /// detector ([`crate::dispatch_reader::persistently_stalled`])
+    /// detector (`boss_engine::dispatch_reader::persistently_stalled`)
     /// deliberately cannot apply (it is DB-free so it works when the engine
     /// RPC is wedged). Consults the execution's authoritative `work_item_id`
     /// and `status` from `work_executions` rather than trusting the mirror
@@ -624,7 +624,7 @@ impl WorkDb {
     /// (`bossctl probe` / `FrontendRequest::ProbeRun`) — issuing a probe IS
     /// the coordinator's documented ack gesture for both markers (e.g.
     /// `[effort-escalation-ack] … next_dispatch=true`), so resolving here
-    /// resumes [`crate::completion::WorkerCompletionHandler`]'s suppressed
+    /// resumes `boss_engine::completion::WorkerCompletionHandler`'s suppressed
     /// "produce a PR" auto-nudge on the run's next Stop without a separate
     /// resolve RPC. See `crate::worker_escalation` for the marker contract.
     pub fn resolve_worker_signal_attentions_for_execution(&self, execution_id: &str) -> Result<usize> {
@@ -1087,7 +1087,7 @@ impl WorkDb {
 
     /// Body of [`get_work_tree`] with per-segment wall-clock instrumentation
     /// threaded through `trace`. The production `handle_get_work_tree` path
-    /// passes an enabled trace (see [`crate::population_timing`]); every
+    /// passes an enabled trace (see `boss_engine::population_timing`); every
     /// other caller goes through the wrapper above with a disabled trace, so
     /// the timing is genuinely free off the RPC path.
     pub fn get_work_tree_instrumented(&self, product_id: &str, trace: &mut PopulationTrace) -> Result<WorkTree> {
@@ -1096,7 +1096,7 @@ impl WorkDb {
 
     /// [`get_work_tree`] evaluating every wall-clock-dependent projection at
     /// the caller's `now` (epoch seconds) instead of reading the clock.
-    pub fn get_work_tree_at(&self, product_id: &str, now: i64) -> Result<WorkTree> {
+    pub(crate) fn get_work_tree_at(&self, product_id: &str, now: i64) -> Result<WorkTree> {
         let mut trace = PopulationTrace::disabled();
         self.assemble_work_tree(product_id, &mut trace, None, now)
     }
@@ -1105,7 +1105,7 @@ impl WorkDb {
     /// per-owner review projections from `caches` instead of rebuilding
     /// them from point queries. Returns exactly the tree the uncached path
     /// would for the same snapshot.
-    pub fn get_work_tree_cached(
+    pub(crate) fn get_work_tree_cached(
         &self,
         product_id: &str,
         trace: &mut PopulationTrace,
@@ -1120,7 +1120,7 @@ impl WorkDb {
     }
 
     /// [`get_work_tree_cached`] evaluated at the caller's `now`.
-    pub fn get_work_tree_cached_at(
+    pub(crate) fn get_work_tree_cached_at(
         &self,
         product_id: &str,
         trace: &mut PopulationTrace,

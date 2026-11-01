@@ -65,8 +65,8 @@ impl WorkDb {
 
     /// Set (or clear) a product's `merge_mechanism`. `mechanism = None` or
     /// `Some("")` clears the column (resolves to
-    /// [`crate::merge_mechanism::MergeMechanism::Direct`]). Any other value
-    /// is validated via [`crate::merge_mechanism_parse::parse`]
+    /// `boss_engine::merge_mechanism::MergeMechanism::Direct`). Any other value
+    /// is validated via [`boss_engine_storage_values::merge_mechanism::MergeMechanism::parse`]
     /// before the write — this is the CLI-reachable write path, so an
     /// invalid value must fail loudly here rather than persisting and only
     /// surfacing later at every parse call site.
@@ -75,7 +75,7 @@ impl WorkDb {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let _ = query_product(&tx, product_id).require("product", product_id)?;
         let stored = mechanism.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
-        crate::merge_mechanism_parse::parse(stored.as_deref())?;
+        boss_engine_storage_values::merge_mechanism::MergeMechanism::parse(stored.as_deref())?;
         let now = now_string();
         tx.execute(
             "UPDATE products SET merge_mechanism = ?2, updated_at = ?3 WHERE id = ?1",
@@ -723,7 +723,7 @@ impl WorkDb {
     /// (`git@github.com:owner/repo.git`), or an HTTPS remote
     /// (`https://github.com/owner/repo`) — not just the exact string
     /// persisted at comment-creation time (always the full git remote
-    /// URL; see [`crate::design_detector`]). Compares canonicalized forms
+    /// URL; see `boss_engine::design_detector`). Compares canonicalized forms
     /// at lookup time rather than rewriting stored keys.
     ///
     /// Falls back to `artifact_id` unchanged when it isn't a `pr_doc` key,
@@ -787,7 +787,7 @@ impl WorkDb {
     ///
     /// - **Project-design tasks** (`kind='design'`, `project_id IS NOT NULL`):
     ///   the associated project's `design_doc_branch` is `NULL`. The caller
-    ///   should invoke [`crate::design_detector::on_design_pr_detected`] with
+    ///   should invoke `boss_engine::design_detector::on_design_pr_detected` with
     ///   `project_id = Some(...)`. This is the *project-level* design-doc
     ///   pointer, a separate concept from the per-task `doc_*` columns.
     ///
@@ -795,7 +795,7 @@ impl WorkDb {
     ///   `doc_branch` is `NULL`, or it is a design/investigation with no
     ///   pointer yet. The latter preserves startup retry after a detector
     ///   scan fails before it can persist the discovered pointer. The caller
-    ///   should invoke [`crate::design_detector::on_task_doc_pr_detected`].
+    ///   should invoke `boss_engine::design_detector::on_task_doc_pr_detected`.
     ///   `project_id` is returned as `NULL` on this arm so the backfill
     ///   dispatcher routes to the per-task detector rather than the project
     ///   one.
@@ -1067,7 +1067,7 @@ pub fn parse_pr_doc_artifact_id(artifact_id: &str) -> Option<(String, String, St
 /// which of the three shapes each is spelled in: a bare `owner/repo` slug,
 /// an SSH remote (`git@github.com:owner/repo.git`), or an HTTPS remote
 /// (`https://github.com/owner/repo`). `pr_doc` artifact ids always store
-/// the full remote URL (see [`crate::design_detector`]), but a slug is what
+/// the full remote URL (see `boss_engine::design_detector`), but a slug is what
 /// every other surface (`gh`, PR links, chat) shows a human, so lookups
 /// need to accept either.
 fn repo_component_matches(a: &str, b: &str) -> bool {

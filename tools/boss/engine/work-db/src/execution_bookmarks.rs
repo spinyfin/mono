@@ -297,6 +297,7 @@ impl WorkDb {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn execution_bookmark_retired_reason(&self, execution_id: &str) -> Result<Option<String>> {
         Ok(self
             .connect()?
@@ -521,6 +522,7 @@ impl WorkDb {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn execution_bookmark_prune_outcome(&self, execution_id: &str) -> Result<Option<String>> {
         Ok(self
             .connect()?

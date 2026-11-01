@@ -1,7 +1,7 @@
 //! Last-known-good coordinator guidance, one entry per product.
 //!
 //! `BOSS_COORDINATOR.md` is read from GitHub (see
-//! [`crate::coordinator_guidance`]); when that read fails the engine falls
+//! `boss_engine::coordinator_guidance`); when that read fails the engine falls
 //! back to what the last successful read saw rather than leaving the
 //! coordinator with no product rules. The entry lives in the engine's own
 //! state DB, in the `metadata` key-value table (the same home as the

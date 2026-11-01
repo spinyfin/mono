@@ -107,7 +107,7 @@ impl WorkDb {
     /// The workspace lease columns (`cube_lease_id`,
     /// `cube_workspace_id`, `workspace_path`) are intentionally left
     /// intact. Resume reads preserved work from `boss-recovery/<execution>`
-    /// bookmarks, not this working copy; [`crate::workspace_lease_release`]
+    /// bookmarks, not this working copy; `boss_engine::workspace_lease_release`
     /// releases the lease once the bookmark is confirmed and no process
     /// still has its cwd inside the workspace. If those gates fail the
     /// columns stay so a later pass can retry; cube's TTL is the backstop.
@@ -224,7 +224,7 @@ impl WorkDb {
     ///
     /// `orphaned` and `abandoned` are not decisions — they are **guesses**.
     /// Every site that writes them ([`Self::mark_execution_orphaned`],
-    /// [`crate::spawn_ack_sweep`], [`crate::dead_pid_sweep`], the orphan
+    /// `boss_engine::spawn_ack_sweep`, `boss_engine::dead_pid_sweep`, the orphan
     /// sweep's `request_execution_with_live_check`) is inferring "the worker
     /// must be gone" from the absence of a signal: no ack, no pid, no pool
     /// claim, no hook. Absence of a signal is exactly what a degraded network
@@ -464,7 +464,7 @@ impl WorkDb {
     ///      `false` for an ordinary first dispatch) would let cube's
     ///      normal clean-reset silently discard that work even on a
     ///      successful same-workspace lease. Forcing it `true` also
-    ///      hardens [`crate::coordinator`]'s `lease_workspace_with_fallback`:
+    ///      hardens `boss_engine::coordinator`'s `lease_workspace_with_fallback`:
     ///      a failed lease on the preferred workspace becomes a hard
     ///      failure instead of a silent fallback to a different, clean
     ///      workspace.
@@ -577,7 +577,7 @@ impl WorkDb {
     ///
     /// Filing runs [`warn_if_lifecycle_undeclared`]: a signal the engine can
     /// raise but has not declared a way to lower is the defect
-    /// [`crate::attention_lifecycle`] exists to prevent, so an unregistered
+    /// `boss_engine::attention_lifecycle` exists to prevent, so an unregistered
     /// kind is surfaced in the trace rather than passing silently.
     ///
     /// Deduping onto the open row stamps its `last_raised_at`
@@ -925,7 +925,7 @@ impl WorkDb {
 
     /// Return every non-terminal `work_executions` row that recorded a
     /// `workspace_path` — the candidate set for the lost-workspace
-    /// reconciler ([`crate::lost_workspace_sweep`]).
+    /// reconciler (`boss_engine::lost_workspace_sweep`).
     ///
     /// A worker parked in `running` / `waiting_human` keeps a live cube
     /// workspace checkout at `workspace_path` for the lifetime of its pane;
@@ -956,7 +956,7 @@ impl WorkDb {
 
     /// Return every non-terminal `work_executions` row whose latest local
     /// `work_runs` row recorded a positive `shell_pid` — the candidate set
-    /// for the pane-death reconciler ([`crate::dead_pane_sweep`]).
+    /// for the pane-death reconciler (`boss_engine::dead_pane_sweep`).
     ///
     /// Distinct from [`Self::list_non_terminal_executions_with_workspace`]:
     /// that query stats `workspace_path`, which the idle-park path NULLs in
@@ -1862,7 +1862,7 @@ impl WorkDb {
     /// `None` — no `work_runs` row was written.
     ///
     /// Lease columns are left as they stand. Dispatch persists the lease on
-    /// acquire and releases it through [`crate::workspace_lease_release`];
+    /// acquire and releases it through `boss_engine::workspace_lease_release`;
     /// clearing here would hide a cube-release failure from the leftover
     /// sweep.
     pub fn record_pre_start_failure(

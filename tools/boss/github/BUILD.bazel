@@ -22,6 +22,7 @@ rust_library(
         "//tools/boss:__subpackages__",
     ],
     deps = [
+        "//lib/rust/git_utils",
         "//tools/boss/command-runner",
         "//tools/boss/gh_telemetry",
     ] + all_crate_deps(normal = True),
@@ -42,6 +43,7 @@ rust_test(
         "BOSS_SHAKE_PRIVATE_KEY_PEM": "$(BOSS_SHAKE_PRIVATE_KEY_PEM)",
     },
     deps = [
+        "//lib/rust/git_utils",
         "//tools/boss/command-runner",
         "//tools/boss/gh_telemetry",
     ] + all_crate_deps(

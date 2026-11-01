@@ -326,6 +326,7 @@ impl WorkDb {
     /// exactly as if this call had never been made. The caller reads the
     /// filed item back from [`WorkerPrCompletion::filed_attention_item`].
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn record_worker_no_op_completion(
         &self,
         execution_id: &str,
@@ -537,6 +538,7 @@ impl WorkDb {
 
     /// Test-only shorthand recording [`WorkerFailureBasis::DeclaredBlocked`];
     /// production callers must name the producing basis.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn record_worker_failure(&self, execution_id: &str, detail: &str) -> Result<Option<WorkerFailureCompletion>> {
         self.record_worker_failure_with_basis(execution_id, detail, WorkerFailureBasis::DeclaredBlocked)
     }
@@ -782,7 +784,7 @@ impl WorkDb {
     /// for a *missed* PR-open — must match it, not just a genuinely-parked
     /// one. `pr_review` is excluded explicitly for the same reason the
     /// Stop-path gate excludes it: a reviewer never opens a PR of its own.
-    /// Mirrors [`crate::completion::worker_owns_turn_loop`], which is the
+    /// Mirrors `boss_engine::completion::worker_owns_turn_loop`, which is the
     /// gate the candidates then have to pass anyway.
     pub fn list_executions_pending_pr_detection(&self) -> Result<Vec<String>> {
         let conn = self.connect()?;
@@ -1163,7 +1165,7 @@ impl WorkDb {
     /// without ever releasing the revision's hold). `conn` may be a plain
     /// [`Connection`] (the public wrapper above) or a `Transaction` — both
     /// implement the same `execute` surface.
-    pub fn advance_pending_review_task_to_in_review_with_verdict_source_in_tx(
+    pub(crate) fn advance_pending_review_task_to_in_review_with_verdict_source_in_tx(
         conn: &Connection,
         work_item_id: &str,
         verdict_source_id: &str,
@@ -1244,7 +1246,7 @@ impl WorkDb {
 
     /// Return terminated/abandoned executions whose engine-supplied branch
     /// may have been pushed with no PR ever bound — the candidate set for
-    /// [`crate::abandoned_branch_pr_sweep`].
+    /// `boss_engine::abandoned_branch_pr_sweep`.
     ///
     /// Unlike [`Self::list_recently_terminal_executions_pending_pr_detection`]
     /// this does **not** gate on `t.status = 'active'`. That gate is exactly
@@ -1337,7 +1339,7 @@ impl WorkDb {
     ///
     /// Like [`Self::bind_pr_to_active_task_from_terminal_execution`] but
     /// relaxes the `status = 'active'` gate to `status NOT IN ('done',
-    /// 'archived')` — [`crate::abandoned_branch_pr_sweep`]
+    /// 'archived')` — `boss_engine::abandoned_branch_pr_sweep`
     /// detects state directly off the execution row and must be able to
     /// recover a work item regardless of whether it fell back to `todo`,
     /// stayed `active`, or is sitting `blocked`. Refuses only an explicit
@@ -2086,7 +2088,7 @@ impl WorkDb {
     /// for this task's PR. `last_reviewed_sha` is the PR HEAD SHA recorded at
     /// the end of the most recent pass, or `None` if no pass has completed yet.
     ///
-    /// Used by the cycle-bound check in [`crate::completion::WorkerCompletionHandler`]
+    /// Used by the cycle-bound check in `boss_engine::completion::WorkerCompletionHandler`
     /// before enqueuing a new `pr_review` execution.
     pub fn get_task_review_cycle_state(&self, task_id: &str) -> Result<(i64, Option<String>)> {
         let conn = self.connect()?;
@@ -2100,7 +2102,7 @@ impl WorkDb {
 
     /// Atomically increment `review_cycle` by 1 and set `last_reviewed_sha`.
     ///
-    /// Called from [`crate::completion::WorkerCompletionHandler::finalize_pr_review_pass`]
+    /// Called from `boss_engine::completion::WorkerCompletionHandler::finalize_pr_review_pass`
     /// after a `pr_review` execution completes, regardless of whether a
     /// revision was warranted. A missing or empty `last_reviewed_sha` records
     /// `NULL` (the reviewer could not determine the HEAD SHA).
@@ -2227,6 +2229,7 @@ pub(super) fn withdraw_questions(conn: &Connection, work_item_id: &str, reason: 
 }
 
 /// Insert a question without host observations in storage-only tests.
+#[cfg(any(test, feature = "test-support"))]
 pub fn insert_question(
     conn: &Connection,
     execution_id: &str,

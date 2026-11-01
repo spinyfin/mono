@@ -232,7 +232,7 @@ fn record_worker_pr_completion_done_sets_completed_at() {
     );
 }
 
-/// incident-002 P2: the `BlockedDeletionSignoff` target must hold the task in
+/// Deletion recovery: the `BlockedDeletionSignoff` target must hold the task in
 /// `blocked` with `blocked_reason='deletion_signoff'` and stamp `pr_url`, so a
 /// merge resolution that removed a merged-parent surface cannot auto-progress
 /// to human Review until an operator signs off. No auto-clearing signal is

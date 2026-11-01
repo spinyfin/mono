@@ -382,7 +382,7 @@ impl WorkDb {
         }
     }
 
-    // ── External-ref methods (T8) ────────────────────────────────────────────
+    // ── External-ref methods ────────────────────────────────────────────
     // Design: tools/boss/docs/designs/external-issue-tracker-sync-github-projects.md
     // §"Design Question 4" and §"Lookup methods on WorkDb".
 

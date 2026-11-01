@@ -152,7 +152,7 @@ fn apply_archive_transition_provenance(db: &WorkDb, task: &mut Task, actor: &str
 /// [`boss_protocol::WORK_ITEM_TAG_MAX_COUNT`]. Length is measured in
 /// Unicode scalar values (Rust `char`s), matching the Swift UI chip
 /// truncation so a tag that survives the write path still fits the card.
-pub fn normalize_and_validate_tags(input: &[String]) -> Result<Vec<String>> {
+pub(crate) fn normalize_and_validate_tags(input: &[String]) -> Result<Vec<String>> {
     use boss_protocol::{WORK_ITEM_TAG_MAX_COUNT, WORK_ITEM_TAG_MAX_LEN};
     let mut out: Vec<String> = Vec::new();
     for raw in input {
@@ -185,7 +185,7 @@ pub fn normalize_and_validate_tags(input: &[String]) -> Result<Vec<String>> {
 /// Apply set / add / remove tag patch fields onto the current list.
 /// Order: replace (if `set` is `Some`) → append adds → drop removes.
 /// Final list is re-validated for length/count caps.
-pub fn apply_tag_patch(
+pub(crate) fn apply_tag_patch(
     current: &[String],
     set: Option<Vec<String>>,
     add: Option<Vec<String>>,
@@ -283,7 +283,7 @@ impl WorkDb {
     }
 
     #[tracing::instrument(name = "project_transaction", level = "debug", skip_all)]
-    pub fn update_project(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
+    pub(crate) fn update_project(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
         let mut conn = self.connect()?;
         tracing::debug!(target: "work_write_timing", boundary = "transaction_begin");
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;

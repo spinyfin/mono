@@ -60,7 +60,11 @@ fn conflict_fix_in_flight(conn: &Connection, task_id: &str) -> Result<bool> {
 
 /// Same-chain prerequisites of a conflict fix represent writer exclusion.
 /// Explicit prerequisites outside this PR retain ordinary completion semantics.
-pub fn conflict_writer_gate(conn: &Connection, dependent_id: &str, prerequisite_id: &str) -> Result<Option<bool>> {
+pub(crate) fn conflict_writer_gate(
+    conn: &Connection,
+    dependent_id: &str,
+    prerequisite_id: &str,
+) -> Result<Option<bool>> {
     // Recovery keeps attention provenance rather than impersonating a conflict
     // resolution attempt. Its inherited edges use the asking revision's order.
     let source = query_task(conn, dependent_id)?.and_then(|task| {
@@ -91,7 +95,7 @@ pub fn conflict_writer_gate(conn: &Connection, dependent_id: &str, prerequisite_
 /// `in_review` revision would otherwise run ahead of the fix. A revision with
 /// a live writer is never gated, so this cannot cycle with the writer
 /// exclusion edge from the conflict fix to that writer.
-pub fn queued_behind_conflict_fixes(conn: &Connection, work_item_id: &str) -> Result<Vec<String>> {
+pub(crate) fn queued_behind_conflict_fixes(conn: &Connection, work_item_id: &str) -> Result<Vec<String>> {
     let Some(task) = query_task(conn, work_item_id)? else {
         return Ok(Vec::new());
     };
@@ -178,7 +182,7 @@ pub(super) fn prioritize_conflict_revision(
 /// a restarted `in_review` revision or a released/retried `active` writer is
 /// parked behind a conflict fix while keeping its task status, so it needs its
 /// own wake-up. `task_ids` limits the scan; `None` scans every task.
-pub fn promote_waiting_writers(
+pub(crate) fn promote_waiting_writers(
     pending: &mut PendingEvents,
     conn: &Connection,
     task_ids: Option<&[String]>,
@@ -214,7 +218,11 @@ pub fn promote_waiting_writers(
 
 /// Cascade hook: when a conflict fix changes state, wake the same-chain
 /// writers that were parked behind it.
-pub fn wake_writers_after_conflict_change(pending: &mut PendingEvents, conn: &Connection, task_id: &str) -> Result<()> {
+pub(crate) fn wake_writers_after_conflict_change(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    task_id: &str,
+) -> Result<()> {
     if !is_conflict_revision(conn, task_id)? {
         return Ok(());
     }

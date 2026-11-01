@@ -26,7 +26,7 @@ impl<T> RequireRow<T> for Result<Option<T>> {
 /// `unique_*_slug` uniqueness loops in this module would otherwise repeat
 /// at every site. `sql` must be a single `SELECT EXISTS(...)` expression
 /// yielding one `i64` column.
-pub fn row_exists(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Result<bool> {
+pub(crate) fn row_exists(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Result<bool> {
     let exists: i64 = conn.query_row(sql, params, |row| row.get(0))?;
     Ok(exists != 0)
 }
@@ -36,7 +36,7 @@ pub fn row_exists(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql])
 /// default `boss/`) when the product carries no override. The stored
 /// value is already canonicalised (trailing `/`) at product write
 /// time, so it is returned verbatim.
-pub fn resolve_execution_worker_branch_prefix(conn: &Connection, work_item_id: &str) -> Result<Option<String>> {
+pub(crate) fn resolve_execution_worker_branch_prefix(conn: &Connection, work_item_id: &str) -> Result<Option<String>> {
     let product_id = product_id_for_work_item(conn, work_item_id)?;
     let prefix: Option<String> = conn
         .query_row(
@@ -56,7 +56,7 @@ pub fn resolve_execution_worker_branch_prefix(conn: &Connection, work_item_id: &
 /// rules configured or the JSON does not contain a `branch_naming` key.
 /// The resolved value is snapshotted onto the execution row at spawn so
 /// it remains stable even if the product rule changes later.
-pub fn resolve_execution_branch_naming(conn: &Connection, work_item_id: &str) -> Result<BranchNaming> {
+pub(crate) fn resolve_execution_branch_naming(conn: &Connection, work_item_id: &str) -> Result<BranchNaming> {
     let product_id = product_id_for_work_item(conn, work_item_id)?;
     let rules_json: Option<String> = conn
         .query_row(
@@ -111,7 +111,7 @@ pub fn query_task(conn: &Connection, id: &str) -> Result<Option<Task>> {
     .map_err(Into::into)
 }
 
-pub fn query_execution(conn: &Connection, id: &str) -> Result<Option<WorkExecution>> {
+pub(crate) fn query_execution(conn: &Connection, id: &str) -> Result<Option<WorkExecution>> {
     conn.query_row(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
@@ -128,7 +128,7 @@ pub fn query_execution(conn: &Connection, id: &str) -> Result<Option<WorkExecuti
     .map_err(Into::into)
 }
 
-pub fn query_run(conn: &Connection, id: &str) -> Result<Option<WorkRun>> {
+pub(crate) fn query_run(conn: &Connection, id: &str) -> Result<Option<WorkRun>> {
     conn.query_row(
         "SELECT id, execution_id, agent_id, status, error_text, result_summary, transcript_path,
                 artifacts_path, created_at, started_at, finished_at, persona
@@ -141,7 +141,7 @@ pub fn query_run(conn: &Connection, id: &str) -> Result<Option<WorkRun>> {
     .map_err(Into::into)
 }
 
-pub fn query_attention_item(conn: &Connection, id: &str) -> Result<Option<WorkAttentionItem>> {
+pub(crate) fn query_attention_item(conn: &Connection, id: &str) -> Result<Option<WorkAttentionItem>> {
     conn.query_row(
         "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at, converted_task_id
          FROM work_attention_items
@@ -153,7 +153,7 @@ pub fn query_attention_item(conn: &Connection, id: &str) -> Result<Option<WorkAt
     .map_err(Into::into)
 }
 
-pub fn list_projects_for_product(conn: &Connection, product_id: &str) -> Result<Vec<Project>> {
+pub(crate) fn list_projects_for_product(conn: &Connection, product_id: &str) -> Result<Vec<Project>> {
     let mut stmt = conn.prepare(
         "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor,
                 design_doc_repo_remote_url, design_doc_branch, design_doc_path, short_id, status_basis
@@ -165,7 +165,7 @@ pub fn list_projects_for_product(conn: &Connection, product_id: &str) -> Result<
     collect_rows(rows)
 }
 
-pub fn list_tasks_for_product(conn: &Connection, product_id: &str) -> Result<Vec<Task>> {
+pub(crate) fn list_tasks_for_product(conn: &Connection, product_id: &str) -> Result<Vec<Task>> {
     let mut stmt = conn.prepare(
         "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
          FROM tasks
@@ -176,7 +176,7 @@ pub fn list_tasks_for_product(conn: &Connection, product_id: &str) -> Result<Vec
     collect_rows(rows)
 }
 
-pub fn ensure_product_exists(conn: &Connection, product_id: &str) -> Result<()> {
+pub(crate) fn ensure_product_exists(conn: &Connection, product_id: &str) -> Result<()> {
     if !row_exists(
         conn,
         "SELECT EXISTS(SELECT 1 FROM products WHERE id = ?1)",
@@ -187,7 +187,7 @@ pub fn ensure_product_exists(conn: &Connection, product_id: &str) -> Result<()> 
     Ok(())
 }
 
-pub fn ensure_project_exists(conn: &Connection, project_id: &str) -> Result<()> {
+pub(crate) fn ensure_project_exists(conn: &Connection, project_id: &str) -> Result<()> {
     if !row_exists(
         conn,
         "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
@@ -198,7 +198,7 @@ pub fn ensure_project_exists(conn: &Connection, project_id: &str) -> Result<()> 
     Ok(())
 }
 
-pub fn ensure_project_belongs_to_product(conn: &Connection, project_id: &str, product_id: &str) -> Result<()> {
+pub(crate) fn ensure_project_belongs_to_product(conn: &Connection, project_id: &str, product_id: &str) -> Result<()> {
     if !row_exists(
         conn,
         "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1 AND product_id = ?2)",

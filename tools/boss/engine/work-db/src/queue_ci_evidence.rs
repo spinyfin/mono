@@ -52,6 +52,7 @@ struct JobNeeds {
     bazel: bool,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(super) fn is_lint_check(name: &str) -> bool {
     job_needs(name).lint
 }
@@ -182,7 +183,11 @@ fn names_no_build_reason(text: &str) -> bool {
 /// attempts always need full evidence. A Trunk eviction with an empty capture
 /// may have no build to verify: evidence, when supplied, is fully validated;
 /// without it the give-up must name a [`NO_BUILD_REASONS`] reason.
-pub fn validate_give_up(attempt: &CiRemediation, evidence: Option<&QueueCiEvidence>, reason: &str) -> Result<()> {
+pub(crate) fn validate_give_up(
+    attempt: &CiRemediation,
+    evidence: Option<&QueueCiEvidence>,
+    reason: &str,
+) -> Result<()> {
     if is_trunk_empty_capture(attempt) {
         return match evidence {
             Some(evidence) => validate_evidence(attempt, evidence),
@@ -309,7 +314,7 @@ pub struct QueueCiAuditInput {
     pub delivered: bool,
 }
 
-pub fn attempt_for_execution(conn: &Connection, execution_id: &str) -> Result<Option<CiRemediation>> {
+pub(crate) fn attempt_for_execution(conn: &Connection, execution_id: &str) -> Result<Option<CiRemediation>> {
     // Include terminal attempts: calling mark-failed first must not remove the
     // declaration gate. Legacy remediation executions bind through worker_id.
     let id: Option<String> = conn
@@ -359,7 +364,11 @@ fn requeue_receipt_present(evidence: &QueueCiEvidence, attempt: &CiRemediation) 
             .is_some_and(|t| receipt_time_plausible(t, attempt.created_at.trim().parse().ok(), epoch_now()))
 }
 
-pub fn validate_declaration(conn: &Connection, execution_id: &str, payload: &RunDoneProposalPayload) -> Result<()> {
+pub(crate) fn validate_declaration(
+    conn: &Connection,
+    execution_id: &str,
+    payload: &RunDoneProposalPayload,
+) -> Result<()> {
     let Some(attempt) = attempt_for_execution(conn, execution_id)? else {
         return Ok(());
     };
@@ -402,7 +411,7 @@ pub fn validate_declaration(conn: &Connection, execution_id: &str, payload: &Run
 /// The applied proposal retains the receipt and full verification evidence.
 /// Archive the head dedup key by queue SHA so the same failure remains deduped,
 /// but a later construction at the same PR head can consume the next budget slot.
-pub fn record_delivery(conn: &Connection, execution_id: &str, payload: &RunDoneProposalPayload) -> Result<()> {
+pub(crate) fn record_delivery(conn: &Connection, execution_id: &str, payload: &RunDoneProposalPayload) -> Result<()> {
     let Some(attempt) = attempt_for_execution(conn, execution_id)? else {
         return Ok(());
     };

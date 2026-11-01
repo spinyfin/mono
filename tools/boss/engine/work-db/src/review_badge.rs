@@ -468,7 +468,7 @@ fn informative_gate_outcomes_sql() -> String {
 
 /// Production SQL for [`fetch_current_heads`]. Exposed so the query-plan test
 /// can `EXPLAIN` the same statement the board runs.
-pub fn current_heads_sql(placeholders: &str, key: ReviewKey) -> String {
+pub(crate) fn current_heads_sql(placeholders: &str, key: ReviewKey) -> String {
     let outcomes = informative_gate_outcomes_sql();
     let family = review_family_cte(placeholders, key);
     format!(
@@ -501,7 +501,7 @@ pub fn current_heads_sql(placeholders: &str, key: ReviewKey) -> String {
 
 /// Production SQL for [`fetch_badge_histories`]. Exposed so the query-plan test
 /// can `EXPLAIN` the same statement the board runs.
-pub fn badge_histories_sql(placeholders: &str, key: ReviewKey) -> String {
+pub(crate) fn badge_histories_sql(placeholders: &str, key: ReviewKey) -> String {
     let outcomes = informative_gate_outcomes_sql();
     let family = review_family_cte(placeholders, key);
     format!(

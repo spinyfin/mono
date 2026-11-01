@@ -1,6 +1,6 @@
 //! Query layer behind `boss cost` — projects `work_runs` rows (joined
 //! against their owning execution and task) into [`boss_engine_storage_values::CostRunRecord`].
-//! All grouping, ranking, and pricing stays in [`crate::cost_report`];
+//! All grouping, ranking, and pricing stays in `boss_engine::cost_report`;
 //! this file's only job is the flat row fetch.
 
 use super::*;

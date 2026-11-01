@@ -2,7 +2,7 @@
 //! comments-in-markdown-viewer feature (Phase 2). Design:
 //! `tools/boss/docs/designs/comments-in-markdown-viewer.md`.
 //!
-//! The pure `TextQuoteSelector` resolver lives in [`crate::comments_anchor`];
+//! The pure `TextQuoteSelector` resolver lives in `boss_engine::comments_anchor`;
 //! this module wires it to the database — persisting fuzzy re-anchors and
 //! orphan flips on resolve, and re-keying work-item comments to a `pr_doc:*`
 //! artifact when a design doc graduates to a PR.
@@ -103,7 +103,7 @@ pub fn revisable_comment_predicate() -> String {
 /// from a batch. Drives `ReviseDocOutcome::Created`'s `excluded_comment_ids`
 /// so the operator is told what the batch left behind instead of seeing an
 /// unqualified success.
-pub fn excluded_revisable_comment_predicate() -> String {
+pub(crate) fn excluded_revisable_comment_predicate() -> String {
     format!(
         "status NOT IN ('{COMMENT_STATUS_ACTIVE}', '{COMMENT_STATUS_RESOLVED}', '{COMMENT_STATUS_DISMISSED}') \
          AND intent = '{INTENT_REVISION}'"
@@ -447,7 +447,7 @@ impl WorkDb {
     /// reply — a Stop hook that arrived with the run still `running`
     /// (`finalize_answer_agent`'s no-reply-posted path, via
     /// [`Self::recover_unanswered_comment`]) or a Stop that never arrived at
-    /// all ([`crate::stranded_answering_sweep`], same shared path). Terminal
+    /// all (`boss_engine::stranded_answering_sweep`, same shared path). Terminal
     /// and deliberately distinct from [`Self::transition_comment_to_answered`]:
     /// the apology thread entry standing in for the missing answer must never
     /// let the comment read as `answered` to an operator glancing at the
@@ -771,7 +771,7 @@ impl WorkDb {
     }
 
     /// Every comment currently sitting `answering`, oldest first — the
-    /// candidate set for [`crate::stranded_answering_sweep`].
+    /// candidate set for `boss_engine::stranded_answering_sweep`.
     ///
     /// `answering` is only ever meant to be transient: the answer agent runs,
     /// its Stop hook fires, and `finalize_answer_agent` moves the comment on.
@@ -1024,12 +1024,12 @@ fn extract_anchor(plain_text: &str, start: usize, length: usize) -> CommentAncho
     }
 }
 
-pub fn query_comment(conn: &Connection, id: &str) -> Result<Option<WorkComment>> {
+pub(crate) fn query_comment(conn: &Connection, id: &str) -> Result<Option<WorkComment>> {
     let sql = format!("SELECT {COMMENT_COLUMNS} FROM work_comments WHERE id = ?1");
     conn.query_row(&sql, [id], map_comment).optional().map_err(Into::into)
 }
 
-pub fn query_comments(
+pub(crate) fn query_comments(
     conn: &Connection,
     artifact_kind: &str,
     artifact_id: &str,
@@ -1050,7 +1050,7 @@ pub fn query_comments(
     collect_rows(rows)
 }
 
-pub fn query_all_comments(conn: &Connection, include_resolved: bool) -> Result<Vec<WorkComment>> {
+pub(crate) fn query_all_comments(conn: &Connection, include_resolved: bool) -> Result<Vec<WorkComment>> {
     let filter = if include_resolved {
         ""
     } else {
@@ -1104,7 +1104,7 @@ pub fn query_revisable_comments(
 /// sidebar already hides. Reported as `ReviseDocOutcome::Created`'s
 /// `excluded_comment_ids` so `[Revise]` never returns an unqualified success
 /// while quietly dropping comments the operator can see marked revisable.
-pub fn query_excluded_revisable_comment_ids(
+pub(crate) fn query_excluded_revisable_comment_ids(
     conn: &Connection,
     artifact_kind: &str,
     artifact_id: &str,
@@ -1183,7 +1183,7 @@ pub enum CommentReconcileOutcome {
 /// calling this on a task that never claimed any comments — or re-firing on
 /// an already-reconciled task — is a no-op. Returns the number of comment
 /// rows changed (tests / logging).
-pub fn reconcile_comments_for_task(
+pub(crate) fn reconcile_comments_for_task(
     conn: &Connection,
     task_id: &str,
     outcome: CommentReconcileOutcome,
@@ -1693,7 +1693,7 @@ mod tests {
     }
 
     // --- Reclassified answered/awaiting_followup comments re-enter the
-    // revise pool (T2265: intent override never reset status) ---
+    // revise pool (intent override never reset status) ---
 
     #[test]
     fn override_comment_intent_resets_answered_status_to_active_for_revisable_intent() {

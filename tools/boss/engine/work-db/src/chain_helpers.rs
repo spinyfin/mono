@@ -62,7 +62,7 @@ pub const CYCLE_ROOT_WALK_SQL_DEPTH_BOUND: usize = MAX_CHAIN_DEPTH - 1;
 ///
 /// The fragment defines `walk` and `roots` (`roots.task_id`,
 /// `roots.cycle_root_id`). Callers append their `SELECT`.
-pub fn cycle_root_walk_cte(base_filter_sql: &str) -> String {
+pub(crate) fn cycle_root_walk_cte(base_filter_sql: &str) -> String {
     format!(
         "WITH RECURSIVE walk(task_id, current_id, kind, parent_task_id, depth) AS (
              SELECT t.id, t.id, t.kind, t.parent_task_id, 0
@@ -221,7 +221,10 @@ pub fn collect_chain_revision_ids(conn: &Connection, chain_root_id: &str) -> Res
 /// of a WIP revision's in-flight execution right after that revision was
 /// just archived. Using the tombstone-filtered walk there would silently
 /// stop finding the row and leak the lease.
-pub fn collect_chain_revision_ids_including_deleted(conn: &Connection, chain_root_id: &str) -> Result<Vec<String>> {
+pub(crate) fn collect_chain_revision_ids_including_deleted(
+    conn: &Connection,
+    chain_root_id: &str,
+) -> Result<Vec<String>> {
     let mut ids = Vec::new();
     let mut frontier = vec![chain_root_id.to_owned()];
     for _ in 0..64 {
@@ -256,7 +259,7 @@ pub fn collect_chain_revision_ids_including_deleted(conn: &Connection, chain_roo
 /// alone; it self-retires when its worker stops.
 ///
 /// Returns the number of execution rows abandoned.
-pub fn abandon_pending_executions(
+pub(crate) fn abandon_pending_executions(
     pending: &mut PendingEvents,
     conn: &Connection,
     work_item_id: &str,
@@ -690,7 +693,7 @@ pub fn record_revision_archived_attention(
 /// Must run in the same transaction as the parent's own `project_id` write:
 /// a cascade that only partially lands would recreate exactly the
 /// divergence this closes.
-pub fn cascade_project_id_to_revisions(
+pub(crate) fn cascade_project_id_to_revisions(
     conn: &Connection,
     root_id: &str,
     project_id: Option<&str>,
@@ -723,7 +726,7 @@ pub fn cascade_project_id_to_revisions(
 /// any path other than the chain-root reconciler) do not have this
 /// "the engine will re-decide the status on the next tick" property, so a
 /// manual reopen of those rows sticks and must not be blocked here.
-pub fn refuse_manual_move_off_archived_moot_revision(
+pub(crate) fn refuse_manual_move_off_archived_moot_revision(
     conn: &Connection,
     task_id: &str,
     kind: &TaskKind,

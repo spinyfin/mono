@@ -48,7 +48,7 @@ pub struct TrunkMergeIntent {
     pub submit_count: i64,
     pub created_at: String,
     /// The PR head sha whose Trunk merge-queue check
-    /// [`crate::trunk_queue_adopt`] observed when it adopted a queue
+    /// `boss_engine::trunk_queue_adopt` observed when it adopted a queue
     /// episode Boss did not submit. `None` for every intent created by the
     /// merge verb, so this doubles as the "who started this episode?"
     /// provenance marker.
@@ -72,11 +72,11 @@ pub struct TrunkMergeIntentInsertInput {
     pub pr_number: i64,
     pub repo: String,
     pub target_branch: String,
-    /// Set only by [`crate::trunk_queue_adopt`], to the PR head sha
+    /// Set only by `boss_engine::trunk_queue_adopt`, to the PR head sha
     /// carrying the failed Trunk merge-queue check. Left unset by the merge
     /// verb — see [`TrunkMergeIntent::adopted_at_head_sha`].
     pub adopted_at_head_sha: Option<String>,
-    /// Set only by [`crate::trunk_queue_adopt`], to that check run's
+    /// Set only by `boss_engine::trunk_queue_adopt`, to that check run's
     /// `completedAt` — see [`TrunkMergeIntent::adopted_at_check_completed_at`].
     pub adopted_at_check_completed_at: Option<String>,
 }
@@ -184,7 +184,7 @@ impl WorkDb {
     /// filters them out before deciding which queues to probe.
     ///
     /// This list is the Trunk queue poller's *entire* candidate set, which
-    /// is why [`crate::trunk_queue_adopt`] exists: while the merge verb was
+    /// is why `boss_engine::trunk_queue_adopt` exists: while the merge verb was
     /// the only writer of this table, an episode a human started through
     /// Trunk's own affordance was enumerated by nobody and its eviction was
     /// remediated by nobody. Adopted rows join this list on equal terms.

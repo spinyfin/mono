@@ -11,7 +11,7 @@ use super::*;
 /// `design_task_description` seeds the auto-minted design task's
 /// `description` column (normally `''`; idea graduation passes the idea's
 /// markdown body there instead).
-pub fn create_project_in_tx(
+pub(crate) fn create_project_in_tx(
     conn: &Connection,
     input: CreateProjectInput,
     design_task_description: &str,
@@ -181,7 +181,7 @@ impl WorkDb {
         // Reject an invalid merge_mechanism at the single write path rather
         // than letting it persist silently and only explode later at every
         // MergeMechanism::parse call site.
-        crate::merge_mechanism_parse::parse(input.merge_mechanism.as_deref())?;
+        boss_engine_storage_values::merge_mechanism::MergeMechanism::parse(input.merge_mechanism.as_deref())?;
 
         tx.execute(
             "INSERT INTO products (id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, design_repo, docs_repo, worker_branch_prefix, merge_mechanism)

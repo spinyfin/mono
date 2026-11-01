@@ -625,6 +625,7 @@ dependencies = [
  "boss-metrics",
  "boss-pr-review",
  "boss-pr-template",
+ "boss-prose-vocabulary",
  "boss-protocol",
  "boss-review-guide",
  "boss-single-flight",
@@ -987,6 +988,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "chrono-tz",
+ "fastrand 2.4.1",
  "libc",
  "tempfile",
 ]
@@ -1059,6 +1061,7 @@ dependencies = [
  "bon",
  "boss-command-runner",
  "boss-gh-telemetry",
+ "git-utils",
  "jsonwebtoken",
  "reqwest",
  "rustls",
@@ -1217,6 +1220,13 @@ name = "boss-pr-template"
 version = "0.1.0"
 dependencies = [
  "tempfile",
+]
+
+[[package]]
+name = "boss-prose-vocabulary"
+version = "0.1.0"
+dependencies = [
+ "regex",
 ]
 
 [[package]]
@@ -1473,6 +1483,7 @@ dependencies = [
  "boss-metrics",
  "boss-pr-review",
  "boss-pr-review-sources",
+ "boss-prose-vocabulary",
  "boss-protocol",
  "boss-review-guide",
  "boss-task-scope",

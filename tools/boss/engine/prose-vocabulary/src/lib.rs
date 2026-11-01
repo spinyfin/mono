@@ -1,4 +1,3 @@
-#![cfg(test)]
 //! Test-only scanner for engine-internal vocabulary in worker-bound text.
 //!
 //! Workers echo whatever nouns the surrounding prompt uses into PR titles and

@@ -44,7 +44,7 @@ fn allocate_next_short_id(conn: &Connection, table: &str, product_id: &str) -> R
 /// See `tools/boss/docs/designs/friendly-numeric-ids-for-work-items.md`
 /// (Q3) for the reasoning behind the per-product scope and the
 /// in-transaction read-modify-write pattern.
-pub fn allocate_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
+pub(crate) fn allocate_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
     allocate_next_short_id(conn, "short_id_sequences", product_id)
 }
 
@@ -52,7 +52,7 @@ pub fn allocate_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
 /// Reads and advances `automation_short_id_sequences` for `product_id`.
 /// Must be called inside the same transaction as the `automations` row insert.
 /// See `tools/boss/docs/designs/maintenance-tasks.md` §"Short-id namespace".
-pub fn allocate_automation_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
+pub(crate) fn allocate_automation_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
     allocate_next_short_id(conn, "automation_short_id_sequences", product_id)
 }
 
@@ -63,7 +63,7 @@ pub fn allocate_automation_short_id(conn: &Connection, product_id: &str) -> Resu
 /// per-product counter (rather than sharing the tasks/projects sequence)
 /// so the first group in a busy product is `A1`, not `A<large>`.
 /// See `tools/boss/docs/designs/attentions.md` §"Schema and wire summary".
-pub fn allocate_attention_group_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
+pub(crate) fn allocate_attention_group_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
     allocate_next_short_id(conn, "attention_group_short_id_sequences", product_id)
 }
 
@@ -71,7 +71,7 @@ pub fn allocate_attention_group_short_id(conn: &Connection, product_id: &str) ->
 /// namespace. Reads and advances `decision_short_id_sequences` for
 /// `product_id`. Must be called inside the same transaction as the
 /// `product_decisions` row insert.
-pub fn allocate_decision_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
+pub(crate) fn allocate_decision_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
     allocate_next_short_id(conn, "decision_short_id_sequences", product_id)
 }
 
@@ -80,7 +80,7 @@ pub fn allocate_decision_short_id(conn: &Connection, product_id: &str) -> Result
 /// inside the same transaction as the `ideas` row insert (own dense
 /// per-product counter, not the shared `short_id_sequences` tasks/chores/
 /// projects use).
-pub fn allocate_idea_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
+pub(crate) fn allocate_idea_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
     allocate_next_short_id(conn, "idea_short_id_sequences", product_id)
 }
 
@@ -89,7 +89,7 @@ pub fn allocate_idea_short_id(conn: &Connection, product_id: &str) -> Result<i64
 /// Exactly one of the two must be set; both-set or neither-set is a
 /// caller bug. Also confirms the referenced row actually exists so
 /// the CHECK constraint and FK don't blow up on insert.
-pub fn attention_target_from_input(
+pub(crate) fn attention_target_from_input(
     conn: &Connection,
     input: &CreateAttentionItemInput,
 ) -> Result<(Option<String>, Option<String>)> {
@@ -195,7 +195,7 @@ pub fn ensure_dispatch_repo_resolvable(conn: &mut Connection, work_item_id: &str
 /// The exact message text both the attention item and the
 /// `request_execution` bail path use. Single source so the two
 /// surfaces never drift, per the design doc's R1 mitigation.
-pub fn repo_unresolved_attention_body(work_item_id: &str, kind_label: &str) -> String {
+pub(crate) fn repo_unresolved_attention_body(work_item_id: &str, kind_label: &str) -> String {
     format!(
         "work item {work_item_id} has no repo resolution; set one with `boss {kind_label} update --repo <url>` or set a product default."
     )
@@ -205,7 +205,7 @@ pub fn repo_unresolved_attention_body(work_item_id: &str, kind_label: &str) -> S
 /// `repo_unresolved` message. Tasks under a project use `task`;
 /// project-less rows are `chore`. Projects don't dispatch directly,
 /// so the message there falls back to the safe generic.
-pub fn repo_unresolved_kind_label(conn: &Connection, work_item_id: &str) -> Result<&'static str> {
+pub(crate) fn repo_unresolved_kind_label(conn: &Connection, work_item_id: &str) -> Result<&'static str> {
     Ok(match classify_id(work_item_id)? {
         ItemKind::Task => {
             let task = query_task(conn, work_item_id)?
@@ -228,7 +228,7 @@ pub fn repo_unresolved_kind_label(conn: &Connection, work_item_id: &str) -> Resu
     })
 }
 
-pub fn ensure_execution_exists(conn: &Connection, execution_id: &str) -> Result<()> {
+pub(crate) fn ensure_execution_exists(conn: &Connection, execution_id: &str) -> Result<()> {
     if !row_exists(
         conn,
         "SELECT EXISTS(SELECT 1 FROM work_executions WHERE id = ?1)",
@@ -244,7 +244,7 @@ pub fn ensure_execution_exists(conn: &Connection, execution_id: &str) -> Result<
 /// `projects` so cross-product or stale-by-deletion edges never leak
 /// into a kanban payload. Sorted to match `prerequisites_of` /
 /// `dependents_of` so consumers see a stable order.
-pub fn collect_product_dependencies(conn: &Connection, product_id: &str) -> Result<Vec<WorkItemDependency>> {
+pub(crate) fn collect_product_dependencies(conn: &Connection, product_id: &str) -> Result<Vec<WorkItemDependency>> {
     let mut stmt = conn.prepare(
         "SELECT d.dependent_id, d.prerequisite_id, d.relation, d.created_at
          FROM work_item_dependencies d
@@ -275,9 +275,9 @@ pub fn collect_product_dependencies(conn: &Connection, product_id: &str) -> Resu
 /// Hydrate the per-item runtime for every task and chore. This is the
 /// primary N+1 on the `get_work_tree` path: one call per work item, each
 /// running 1-4 point queries. Returns the runtimes alongside the total
-/// number of SQL statements executed, so [`crate::population_timing`] can
+/// number of SQL statements executed, so `boss_engine::population_timing` can
 /// attribute the per-row subquery fan-out.
-pub fn collect_task_runtimes(
+pub(crate) fn collect_task_runtimes(
     conn: &Connection,
     tasks: &[Task],
     chores: &[Task],
@@ -296,7 +296,7 @@ pub fn collect_task_runtimes(
 /// whether a live-execution fallback, a non-abandoned-execution fallback for
 /// an all-abandoned work item, and a latest-run lookup are needed) so N+1
 /// callers can report an accurate aggregate subquery count.
-pub fn query_task_runtime(conn: &Connection, work_item_id: &str, queries: &mut u64) -> Result<TaskRuntime> {
+pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str, queries: &mut u64) -> Result<TaskRuntime> {
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
     Ok(compute_task_runtime(conn, work_item_id, queries, now)?.runtime)
 }
@@ -330,7 +330,7 @@ pub struct ComputedRuntime {
 /// will serve it stale; `every_runtime_input_write_invalidates_exactly_its_item`
 /// in `work/tests/board_runtime_cache_tests.rs` is the net that catches a
 /// missed one, so a new runtime input needs a step added there.
-pub fn compute_task_runtime(
+pub(crate) fn compute_task_runtime(
     conn: &Connection,
     work_item_id: &str,
     queries: &mut u64,
@@ -450,7 +450,7 @@ fn dispatch_retry_at_for_execution(execution: &WorkExecution, now_secs: i64) -> 
     }
 }
 
-pub fn query_latest_run(conn: &Connection, execution_id: &str) -> Result<Option<(String, String)>> {
+pub(crate) fn query_latest_run(conn: &Connection, execution_id: &str) -> Result<Option<(String, String)>> {
     conn.query_row(
         "SELECT id, status
          FROM work_runs
@@ -464,7 +464,10 @@ pub fn query_latest_run(conn: &Connection, execution_id: &str) -> Result<Option<
     .map_err(Into::into)
 }
 
-pub fn query_latest_execution_for_work_item(conn: &Connection, work_item_id: &str) -> Result<Option<WorkExecution>> {
+pub(crate) fn query_latest_execution_for_work_item(
+    conn: &Connection,
+    work_item_id: &str,
+) -> Result<Option<WorkExecution>> {
     conn.query_row(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
@@ -491,7 +494,10 @@ pub fn query_latest_execution_for_work_item(conn: &Connection, work_item_id: &st
 /// answer "is this work item already being worked?" must key off this,
 /// not the latest row. Mirrors the status set of the method
 /// [`WorkDb::get_live_execution_for_work_item`].
-pub fn query_live_execution_for_work_item(conn: &Connection, work_item_id: &str) -> Result<Option<WorkExecution>> {
+pub(crate) fn query_live_execution_for_work_item(
+    conn: &Connection,
+    work_item_id: &str,
+) -> Result<Option<WorkExecution>> {
     conn.query_row(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
@@ -518,7 +524,7 @@ pub fn query_live_execution_for_work_item(conn: &Connection, work_item_id: &str)
 /// render as `abandoned`/"broken" in `agents status`). Returns `None` only
 /// when every execution for the work item is abandoned (or there are none),
 /// in which case the caller keeps the latest row.
-pub fn query_last_non_abandoned_execution_for_work_item(
+pub(crate) fn query_last_non_abandoned_execution_for_work_item(
     conn: &Connection,
     work_item_id: &str,
 ) -> Result<Option<WorkExecution>> {
@@ -684,7 +690,7 @@ pub fn reconcile_work_item_execution(
 /// Look up the chain root's task for a revision (the first non-revision
 /// ancestor) and return it. Returns `None` if the chain root can't be
 /// resolved (broken parent link or missing task).
-pub fn get_chain_root_task(conn: &Connection, revision_id: &str) -> Result<Option<Task>> {
+pub(crate) fn get_chain_root_task(conn: &Connection, revision_id: &str) -> Result<Option<Task>> {
     let root_id = chain_root(conn, revision_id)?;
     if root_id == revision_id {
         // chain_root didn't walk anywhere — either the task itself is the
@@ -698,7 +704,7 @@ pub fn get_chain_root_task(conn: &Connection, revision_id: &str) -> Result<Optio
 /// Return the `cube_workspace_id` from the most recent non-failed
 /// execution of `chain_root_id`. Used as the soft preferred workspace
 /// for revision dispatch — warmth only, never a hard requirement.
-pub fn preferred_workspace_for_chain_root(conn: &Connection, chain_root_id: &str) -> Result<Option<String>> {
+pub(crate) fn preferred_workspace_for_chain_root(conn: &Connection, chain_root_id: &str) -> Result<Option<String>> {
     conn.query_row(
         "SELECT cube_workspace_id
          FROM work_executions
@@ -722,7 +728,7 @@ pub fn preferred_workspace_for_chain_root(conn: &Connection, chain_root_id: &str
 /// human/reviewer-filed revision or an empty attempt id. The table name is
 /// selected from this fixed prefix→table map (never from caller data), so
 /// queries formatted with it are not an injection surface.
-pub fn spawning_attempt_ref(task: &Task) -> Option<(&'static str, &str)> {
+pub(crate) fn spawning_attempt_ref(task: &Task) -> Option<(&'static str, &str)> {
     let created_via = task.created_via.as_str();
     let (table, attempt_id) = created_via
         .strip_prefix(CREATED_VIA_MERGE_CONFLICT_PREFIX)
@@ -780,7 +786,7 @@ impl RetiredSpawningAttempt {
 /// signal that the revision's fix vehicle is spent and must stop being
 /// re-dispatched — until an explicit start re-opens it via
 /// [`reopen_retired_spawning_attempt`].
-pub fn retired_spawning_attempt(conn: &Connection, task: &Task) -> Result<Option<RetiredSpawningAttempt>> {
+pub(crate) fn retired_spawning_attempt(conn: &Connection, task: &Task) -> Result<Option<RetiredSpawningAttempt>> {
     let Some((table, attempt_id)) = spawning_attempt_ref(task) else {
         return Ok(None);
     };
@@ -823,7 +829,10 @@ pub const BLOCKED_REASON_SPAWNING_ATTEMPT_RETIRED: &str = "spawning_attempt_reti
 /// (trigger SHA, failed checks, budget accounting) and the revision's
 /// `created_via` link are preserved, so this is a resume of the same
 /// attempt, not a new one.
-pub fn reopen_retired_spawning_attempt(conn: &Connection, task: &Task) -> Result<Option<RetiredSpawningAttempt>> {
+pub(crate) fn reopen_retired_spawning_attempt(
+    conn: &Connection,
+    task: &Task,
+) -> Result<Option<RetiredSpawningAttempt>> {
     let Some(retired) = retired_spawning_attempt(conn, task)? else {
         return Ok(None);
     };
@@ -845,7 +854,7 @@ pub fn reopen_retired_spawning_attempt(conn: &Connection, task: &Task) -> Result
 /// The `blocked_detail` the revision reconciler writes when it settles an
 /// engine-spawned revision to [`BLOCKED_REASON_SPAWNING_ATTEMPT_RETIRED`]:
 /// what ended, and exactly how to resume it.
-pub fn spawning_attempt_retired_blocked_detail(attempt: &RetiredSpawningAttempt) -> String {
+pub(crate) fn spawning_attempt_retired_blocked_detail(attempt: &RetiredSpawningAttempt) -> String {
     format!(
         "The engine's {} attempt that spawned this revision ended ({}) before a fix landed, so the \
          engine will not dispatch it on its own. Start it explicitly — drag the card to Doing, run \
@@ -1249,7 +1258,7 @@ pub enum StatusIneligibility {
 /// against whatever row shape their own query already fetched. `None`
 /// means the status itself does not block dispatch (the caller still
 /// owes its own human-driven / gating / repo-resolution checks).
-pub fn status_ineligibility(
+pub(crate) fn status_ineligibility(
     status: &TaskStatus,
     archived_reason: Option<&str>,
     deleted: bool,
@@ -1841,7 +1850,7 @@ pub fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
 /// Re-fire the automated review pipeline for `work_item_id` by enqueuing a
 /// fresh `pr_review` execution. Shared by two callers:
 ///
-/// - [`crate::pr_review_recovery`]'s dead-review sweep, which calls this
+/// - `boss_engine::pr_review_recovery`'s dead-review sweep, which calls this
 ///   when a prior `pr_review` execution died (host failure, cube-lease
 ///   reap, crash) without ever reaching `finalize_pr_review_pass` — a
 ///   review that silently vanished must not leave the PR unreviewed.
@@ -1869,7 +1878,7 @@ pub fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
 /// Idempotent when a non-terminal `pr_review` execution (`ready` /
 /// `waiting_dependency`) is already the item's latest execution: returns
 /// that row instead of creating a duplicate.
-pub fn request_pr_review_in_tx(
+pub(crate) fn request_pr_review_in_tx(
     conn: &Connection,
     work_item_id: &str,
     pr_checker: &dyn PrStateChecker,
@@ -1957,7 +1966,7 @@ pub fn request_pr_review_in_tx(
 /// the subsequent insert inside the same `Immediate` transaction — sqlite
 /// then serialises concurrent callers on the write lock, closing the
 /// check-then-insert race instead of merely narrowing it.
-pub fn existing_nonterminal_pr_review_execution(
+pub(crate) fn existing_nonterminal_pr_review_execution(
     conn: &Connection,
     work_item_id: &str,
 ) -> Result<Option<WorkExecution>> {

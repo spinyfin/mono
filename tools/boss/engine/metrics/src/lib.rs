@@ -32,6 +32,7 @@
 
 pub mod persistence;
 pub mod store;
+pub mod sweep;
 
 pub use boss_engine_metrics_registry::{
     CounterHandle, CounterSnapshot, GaugeHandle, GaugeSnapshot, Registry, now_ms, register_counter, register_gauge,

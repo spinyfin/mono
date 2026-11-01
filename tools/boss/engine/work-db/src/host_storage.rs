@@ -4,7 +4,7 @@
 //!
 //! This module only reads and writes the database. Anything that observes the
 //! machine (capability discovery, process probes) lives in the host services
-//! ([`crate::host_registry`]) and hands its observation in, so storage never
+//! (`boss_engine::host_registry`) and hands its observation in, so storage never
 //! spawns a process.
 
 use std::collections::{BTreeSet, HashMap};
@@ -103,7 +103,7 @@ impl WorkDb {
 ///
 /// Deliberately takes the host id rather than hard-coding `'local'`: the
 /// local-only spelling of this write is why a remote host could never hold
-/// an auto-discovered capability. See [`crate::host_capability_probe`].
+/// an auto-discovered capability. See `boss_engine::host_capability_probe`.
 fn replace_auto_capabilities(conn: &Connection, host_id: &str, caps: &[String]) -> Result<()> {
     conn.execute(
         "DELETE FROM host_capabilities WHERE host_id = ?1 AND source = 'auto'",
@@ -235,7 +235,7 @@ impl WorkDb {
     /// `last_seen_at`/`last_error_text` so the failure is visible even
     /// though no periodic heartbeat exists yet. Once the count reaches
     /// [`HOST_HEALTH_FAILURE_THRESHOLD`] the host is auto-disabled —
-    /// [`crate::host_scheduling::select_host`] already excludes disabled
+    /// `boss_engine::host_scheduling::select_host` already excludes disabled
     /// hosts, so the very next dispatch attempt for any queued execution
     /// naturally falls back to a different (e.g. `local`) host instead of
     /// re-selecting the broken one.
@@ -334,7 +334,7 @@ impl WorkDb {
 
     /// Replace every `auto`-sourced capability on `host_id` with `caps`,
     /// leaving user-tagged rows alone. This is how a remote host's
-    /// discovered capabilities ([`crate::host_capability_probe`]) reach the
+    /// discovered capabilities (`boss_engine::host_capability_probe`) reach the
     /// registry, and it is idempotent — re-probing a host converges rather
     /// than accumulating stale rows.
     pub fn replace_auto_host_capabilities(&self, host_id: &str, caps: &[String]) -> Result<()> {
@@ -414,7 +414,7 @@ impl WorkDb {
     }
 
     /// Pin an execution to a specific host (or clear the pin with
-    /// `None`). When set, [`crate::host_scheduling::select_host`] bypasses
+    /// `None`). When set, `boss_engine::host_scheduling::select_host` bypasses
     /// the capability filter and routes the execution only to that host.
     pub fn set_execution_pinned_host(&self, execution_id: &str, host_id: Option<&str>) -> Result<()> {
         let conn = self.connect()?;
@@ -440,7 +440,7 @@ impl WorkDb {
     }
 
     /// Count live worker runs grouped by host. Feeds the free-slots gate
-    /// in [`crate::host_scheduling::select_host`]. Only `active` runs are
+    /// in `boss_engine::host_scheduling::select_host`. Only `active` runs are
     /// counted — terminal runs have already freed their slot. The local
     /// host is *not* gated by this count (the worker pool bounds local
     /// concurrency), so the coordinator overrides its slot to free.
@@ -513,7 +513,7 @@ fn now_epoch_string() -> String {
 // Behavioral coverage for the `WorkDb` host-registry methods. Everything
 // runs against a fresh `:memory:` database, which `WorkDb::open` seeds with
 // the baseline plus `ensure_local_host` only; local auto-capabilities
-// are written by the startup probe ([`crate::host_registry`]), so tests that
+// are written by the startup probe (`boss_engine::host_registry`), so tests that
 // need them seed them via `insert_host_capability`.
 // Assertions go through the public methods (returned values, `Host` /
 // `HostCapability` fields, error outcomes, post-state read back). Raw

@@ -79,7 +79,7 @@ impl LockStats {
     }
 
     /// One lock acquisition whose wait or hold crossed the logging threshold.
-    pub fn record_timing(&self, caller: &std::panic::Location<'_>, held: Duration) {
+    pub(crate) fn record_timing(&self, caller: &std::panic::Location<'_>, held: Duration) {
         let caller = caller.to_string();
         let mut window = self.window();
         window.events += 1;
@@ -91,12 +91,12 @@ impl LockStats {
         entry.1 += held;
     }
 
-    pub fn record_busy(&self) {
+    pub(crate) fn record_busy(&self) {
         self.busy.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Drain the window; `None` when the interval saw no events at all.
-    pub fn take_summary(&self) -> Option<Summary> {
+    pub(crate) fn take_summary(&self) -> Option<Summary> {
         let window = std::mem::take(&mut *self.window());
         let busy = self.busy.swap(0, Ordering::Relaxed);
         if window.events == 0 && busy == 0 {
@@ -172,12 +172,12 @@ const SQLITE_BUSY: i32 = rusqlite::ffi::SQLITE_BUSY;
 /// True when `extended_code` is `SQLITE_BUSY` or any extended code built on it
 /// (`SQLITE_BUSY_SNAPSHOT`, `SQLITE_BUSY_RECOVERY`, ...). The primary code is
 /// the low byte.
-pub fn is_busy_code(extended_code: i32) -> bool {
+pub(crate) fn is_busy_code(extended_code: i32) -> bool {
     extended_code & 0xff == SQLITE_BUSY
 }
 
 /// Classify a returned rusqlite error by its primary result code.
-pub fn is_busy_error(error: &rusqlite::Error) -> bool {
+pub(crate) fn is_busy_error(error: &rusqlite::Error) -> bool {
     match error {
         rusqlite::Error::SqliteFailure(err, _) => is_busy_code(err.extended_code),
         _ => false,

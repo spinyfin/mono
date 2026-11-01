@@ -1,7 +1,7 @@
 //! Durable completion signals and the shared, serialized scheduling decision.
 use super::*;
 
-pub fn migrate_project_postmortem_signals(conn: &Connection) -> Result<()> {
+pub(crate) fn migrate_project_postmortem_signals(conn: &Connection) -> Result<()> {
     // Signals are written in the mutation's transaction, including direct SQL
     // writers (merge reconciliation and cascade deletion). No historical rows
     // are seeded: installing this feature must not backfill old projects.

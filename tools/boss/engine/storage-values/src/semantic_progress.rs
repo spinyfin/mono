@@ -1,3 +1,5 @@
+use boss_protocol::WorkerEvent;
+
 /// What the engine knows about whether a tool is in flight on a run.
 ///
 /// Stored as a TEXT column (`in_flight` / `yielded` / `idle` / `unknown`). Unrecognised
@@ -104,10 +106,16 @@ pub struct SemanticProgressCheckpoint {
     pub turn_condition: SemanticTurnCondition,
 }
 
-use boss_protocol::WorkerEvent;
-
 /// What tool-state `event` establishes on its own, independent of any prior
-/// condition — `None` for an event that carries no tool-state signal.
+/// condition — `None` for an event that carries no tool-state signal
+/// (`SessionStart`, `SessionEnd`, `Notification`), and the established
+/// condition otherwise.
+///
+/// Split out from `boss_engine::semantic_progress::next_tool_condition` so a per-event writer can decide
+/// whether it needs to touch the stored condition at all *without* reading
+/// the previous value back first: a `None` here means "leave the column
+/// alone," which a caller can express directly in SQL instead of resolving
+/// `previous` just to hand it back unchanged.
 pub fn tool_condition_signal(event: &WorkerEvent) -> Option<SemanticToolCondition> {
     match event {
         WorkerEvent::ToolPoll { awaiting_model, .. } => Some(if *awaiting_model {
@@ -127,7 +135,20 @@ pub fn tool_condition_signal(event: &WorkerEvent) -> Option<SemanticToolConditio
 }
 
 /// What turn-state `event` establishes on its own — `None` for an event
-/// that carries no turn-state signal.
+/// that carries no turn-state signal, and the established condition
+/// otherwise.
+///
+/// The three turn-activity events and `Stop` are exactly the events
+/// `apply_event` in `live_worker_state.rs` reduces to `Working` and
+/// `Idle`/`WaitingForInput` respectively, so these are the driver's own
+/// turn signals, never a timer or an inference from silence. The stored
+/// column is not written from this function directly: it is persisted from
+/// the reducer's post-apply state, which also honours ingress ordering and
+/// ignores subagent tool hooks. `SessionStart` (including a resume) does
+/// not open a turn, `SessionEnd` does not close one (a `SessionEnd` with an
+/// unbalanced tool is evidence the session did *not* end — see the
+/// reducer), and `Notification` is not a turn signal for the same reason it
+/// is not a tool signal above.
 pub fn turn_condition_signal(event: &WorkerEvent) -> Option<SemanticTurnCondition> {
     match event {
         WorkerEvent::PreToolUse { .. } | WorkerEvent::PostToolUse { .. } | WorkerEvent::UserPromptSubmit { .. } => {

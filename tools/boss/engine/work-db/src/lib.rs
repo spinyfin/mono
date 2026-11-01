@@ -73,7 +73,7 @@ pub fn live_chain_writer_sql(alias: &str) -> String {
 }
 
 /// True when `task_id` is a live writer per [`live_chain_writer_sql`].
-pub fn is_live_chain_writer(conn: &Connection, task_id: &str) -> Result<bool> {
+pub(crate) fn is_live_chain_writer(conn: &Connection, task_id: &str) -> Result<bool> {
     let live = live_chain_writer_sql("t");
     Ok(conn.query_row(
         &format!(
@@ -168,9 +168,9 @@ pub use boss_engine_storage_values::attention_kinds::LOCKFILE_REGENERATION_FAILE
 
 /// `tasks.dispatch_failed_reason` value stamped by
 /// [`crate::WorkDb::bounce_churn_guard_parked_to_backlog`] when
-/// [`crate::orphan_sweep`] trips the churn guard on an `active` work item.
+/// `boss_engine::orphan_sweep` trips the churn guard on an `active` work item.
 /// Distinct from [`CHURN_GUARD_PARKED_ATTENTION_KIND`]: that kind remains
-/// in use by [`crate::pr_review_recovery`] (whose target task stays
+/// in use by `boss_engine::pr_review_recovery` (whose target task stays
 /// `in_review`, so it cannot bounce to Backlog), but the `active`-task case
 /// now goes through the same `dispatch_failed_reason` representation a
 /// pre-spawn dispatch failure uses, so the kanban board reflects the park
@@ -180,7 +180,7 @@ pub const CHURN_GUARD_DISPATCH_FAILED_REASON: &str = "churn_guard";
 
 /// `tasks.dispatch_failed_reason` value stamped by
 /// [`crate::WorkDb::bounce_deliberate_park_to_backlog`] when
-/// [`crate::orphan_sweep`] finds an `active` work item whose run ended in a
+/// `boss_engine::orphan_sweep` finds an `active` work item whose run ended in a
 /// deliberate engine park (`run_done_declared_blocked` / `nudge_breaker_tripped`
 /// — see `DELIBERATE_PARK_ATTENTION_KINDS` in that module) with its attention
 /// item still open. The board reads the typed halt fields independently
@@ -190,7 +190,7 @@ pub const CHURN_GUARD_DISPATCH_FAILED_REASON: &str = "churn_guard";
 /// / Backlog-status representation [`CHURN_GUARD_DISPATCH_FAILED_REASON`]
 /// established, under its own reason, for one deliberate purpose: a park is a
 /// human decision, not a transient dispatch failure, so
-/// [`crate::dispatch_failure_recovery_sweep`] must NEVER treat a row carrying
+/// `boss_engine::dispatch_failure_recovery_sweep` must NEVER treat a row carrying
 /// this reason as eligible for its own automatic retry the way it does for
 /// [`CHURN_GUARD_DISPATCH_FAILED_REASON`] — only an explicit `bossctl work
 /// start` (or kanban drag-to-Doing) may clear a deliberate park, exactly the
@@ -280,7 +280,7 @@ pub use boss_engine_storage_values::attention_kinds::DISPATCH_STAGE_STALLED_ATTE
 /// stalled execution the escalation sweep detected should actually be
 /// escalated onto the work-item attention surface, and if not, why.
 ///
-/// The sweep's detector ([`crate::dispatch_reader::persistently_stalled`])
+/// The sweep's detector (`boss_engine::dispatch_reader::persistently_stalled`)
 /// is a pure scan of the per-execution `dispatch.jsonl` mirrors with no
 /// view of the DB — deliberately, so it still works when the engine RPC is
 /// wedged. That blind spot is exactly why it over-reports: a mirror can
@@ -321,7 +321,7 @@ pub use boss_engine_storage_values::attention_kinds::ATTENTION_KIND_RECOVERY_PER
 /// Cooldown after a pre-spawn dispatch failure exhausts
 /// `PRE_START_RETRY_DELAYS` and `bounce_dispatch_failed_to_backlog` parks
 /// the work item in Backlog (`autostart = 0`, `dispatch_failed_reason`
-/// set) before [`crate::dispatch_failure_recovery_sweep`] gives it
+/// set) before `boss_engine::dispatch_failure_recovery_sweep` gives it
 /// another shot. Long relative to the ~65s in-process retry window —
 /// the point of the bounce was to stop hammering a broken host/repo
 /// immediately, so the recovery sweep's cadence is "try again later, in
@@ -566,9 +566,9 @@ pub struct DeadPrReviewCandidate {
 /// `pr_url` the design detector can scan.
 ///
 /// - `project_id = Some(id)` → project-level design-doc path; call
-///   [`crate::design_detector::on_design_pr_detected`].
+///   `boss_engine::design_detector::on_design_pr_detected`.
 /// - `project_id = None` → per-task `doc_*` path (any kind); call
-///   [`crate::design_detector::on_task_doc_pr_detected`].
+///   `boss_engine::design_detector::on_task_doc_pr_detected`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocBranchBackfillCandidate {
     pub task_id: String,
@@ -635,9 +635,8 @@ pub struct WorkDb {
     event_bus: Arc<EventBus>,
     persona_metrics: Arc<boss_metrics::Registry>,
     /// Produces coordinator handoff write ids and tmux spawn authorizations.
-    /// Production injects `engine_control::generate_token` at the engine open
-    /// site; tests keep the default 64-hex generator so `WorkDb::open` call
-    /// sites stay unchanged.
+    /// Defaults to the shared utility generator; callers can inject a fixture
+    /// or an alternate generator at the open boundary.
     #[builder(default = default_token_generator())]
     token_generator: Arc<dyn Fn() -> String + Send + Sync>,
 }
@@ -658,19 +657,7 @@ impl Clone for WorkDb {
 }
 
 fn default_token_generator() -> Arc<dyn Fn() -> String + Send + Sync> {
-    Arc::new(generate_storage_token)
-}
-
-/// 32-byte hex token matching `engine_control::generate_token`.
-fn generate_storage_token() -> String {
-    let mut rng = fastrand::Rng::new();
-    let mut bytes = [0u8; 32];
-    for chunk in bytes.chunks_mut(8) {
-        let word = rng.u64(..);
-        let word_bytes = word.to_le_bytes();
-        chunk.copy_from_slice(&word_bytes[..chunk.len()]);
-    }
-    bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    Arc::new(boss_engine_utils::token::generate_token)
 }
 
 impl WorkDb {
@@ -745,13 +732,11 @@ mod executions_runs;
 mod feedback_target;
 mod github_api_usage_db;
 mod github_merge_intents;
-mod merge_mechanism_parse;
 pub mod personas;
-mod pr_url_validate;
 mod progression_scope;
 mod project_postmortem;
 #[cfg(test)]
-mod prose_vocabulary;
+use boss_prose_vocabulary as prose_vocabulary;
 mod queued_wait;
 #[cfg(test)]
 mod read_only_tests;
@@ -830,16 +815,14 @@ pub use attention_filing::reraise_open_work_item_attention;
 pub use coordinator_guidance_cache::CachedGuidance;
 pub use coordinator_handoff_store::HANDOFF_METADATA_KEY;
 pub use coordinator_tmux::CoordinatorTmuxRecord;
-// pub, not pub: no consumer outside boss-engine-core exists, and the
-// intra-doc links to it from the crate-public `attention_lifecycle` module
-// (rustdoc's `private_intra_doc_links` warns on those, not `broken_intra_doc_links`
-// on a pub target) are formatted as plain code rather than doc links.
+// Exported for core's attention_lifecycle; its references to this helper
+// use plain code spans rather than intra-doc links.
 pub use attention_filing::warn_if_lifecycle_undeclared;
 pub use attention_reconcile::AttentionReconcileOutcome;
 use attentions::create_attention_in_tx;
 pub use audit_misc::*;
 use board_notifications::stage_task_board_change;
-pub use cached_task_runtimes::*;
+use cached_task_runtimes::*;
 pub use chain_helpers::*;
 use create_entities::create_project_in_tx;
 pub use dep_helpers::*;
@@ -851,8 +834,8 @@ pub use exec_tail::content_checksum;
 use ideas::list_ideas_in_tx;
 pub use insert_helpers::*;
 pub use sweep_reads::{TaskWaitLabel, TerminalExecutionRef};
-// Private on purpose: only the list-read submodules under `work` build
-// these queries, so it stays visible to `work` and its children only.
+// Private on purpose: only the list-read submodules in this crate build
+// these queries.
 use list_filter::ListFilterQuery;
 pub use mappers::*;
 pub use pr_state::stored_pr_number;
@@ -864,6 +847,7 @@ pub use review_guide_jobs::{
     PrReviewGuideAttempt, PrReviewGuideVersion, PublishReviewGuideOutcome, RetryReviewGuideOutcome,
     ReviewGuideReenqueueReport, to_wire_review_guide_summary,
 };
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod test_support;
 pub use review_guide_sources::{PrReviewGuideSourceCapture, PrSourceCapturePersistOutcome, PrSourceCaptureTrigger};
@@ -873,6 +857,7 @@ pub use pr_binding::{BLOCKED_REASON_PR_BINDING_UNRESOLVED, PrBindingRepairCandid
 pub use pr_flow::DeferredReviewAdmissionCandidate;
 pub use pr_flow::OperatorAnswerOutcome;
 pub use pr_flow::WorkerFailureBasis;
+#[cfg(any(test, feature = "test-support"))]
 pub use pr_flow::insert_question;
 #[cfg(test)]
 pub use products_design::resolve_task_doc_pointer;
@@ -950,6 +935,7 @@ pub use planner_runs::RunningPlannerRun;
 pub use pr_flow::PrPollStateInput;
 pub use pr_flow::PrStatusSnapshot;
 pub use pr_flow::QueuedMergeQueueMember;
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub use pr_state::FakePrStateChecker;
 pub use pr_state::GhPrStateChecker;

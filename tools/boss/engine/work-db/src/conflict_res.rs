@@ -673,7 +673,7 @@ impl WorkDb {
     /// lease/workspace it stamped) once a mechanical rung has concluded —
     /// whether it retired the attempt, halted it for sign-off, or fell
     /// through to a worker. Called unconditionally by
-    /// [`crate::conflict_ladder::try_mechanical_rungs`] right before it
+    /// `boss_engine::conflict_ladder::try_mechanical_rungs` right before it
     /// releases the leased workspace, so a row only ever carries a
     /// non-`NULL` `mechanical_rung_in_flight` while a rung is genuinely
     /// executing. Nulling the lease/workspace here is safe: the mechanical

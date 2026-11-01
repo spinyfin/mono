@@ -109,7 +109,7 @@ pub fn inherited_priority(source: &str) -> String {
 /// Record who raised `task_id` to critical and when. Used by the create
 /// path after the row is inserted; the update path writes the same two
 /// columns in its single `UPDATE`.
-pub fn stamp_create_provenance(conn: &Connection, task_id: &str, actor: &str, now: &str) -> Result<()> {
+pub(crate) fn stamp_create_provenance(conn: &Connection, task_id: &str, actor: &str, now: &str) -> Result<()> {
     conn.execute(
         "UPDATE tasks SET critical_set_by = ?2, critical_set_at = ?3 WHERE id = ?1",
         params![task_id, actor, now],

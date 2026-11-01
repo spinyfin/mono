@@ -281,7 +281,7 @@ fn mark_chore_pr_merged_retires_moot_ci_fix_revision() {
         "no new chore must be created for a moot CI-fix revision; chores: {chores:?}",
     );
 
-    // Regression (operator report: T2111 — "Fix failing CI" on an
+    // Regression ("Fix failing CI" on an
     // already-merged PR lingering on the kanban): the archived CI-fix
     // revision must vanish from get_work_tree, not just flip status.
     let tree = db.get_work_tree(&product_id).unwrap();
@@ -578,7 +578,7 @@ fn list_active_revision_executions_for_chain_finds_execution_after_revision_arch
 
 // ── Revision dispatch via request_execution ───────────────────────────
 
-/// Regression: T701-style bug where `request_execution` (used by the
+/// Regression: dependency deadlock where `request_execution` (used by the
 /// orphan sweep and kanban drag) produced `task_implementation` for
 /// `kind=revision` tasks instead of `revision_implementation`.
 ///
@@ -688,7 +688,7 @@ fn request_execution_redispatch_of_revision_preserves_revision_kind_and_pr_url()
 
 // ── Conflict-resolution revision: stop re-dispatch once the attempt retires ──
 
-/// Regression (T906 / PR #970): a merge-conflict revision must stop being
+/// Regression (mono#970): a merge-conflict revision must stop being
 /// re-dispatched once its `conflict_resolutions` attempt has retired
 /// (`succeeded`), even though the chore PR is still open + `in_review`.
 ///
@@ -1361,7 +1361,7 @@ fn redispatching_in_review_base_with_no_revision_stays_in_review() {
 
 // ── Transcript-path recording for conflict-resolution revision executions ──
 
-/// Regression guard for the T1291 incident: a conflict-resolution revision
+/// Conflicting-revision regression guard: a conflict-resolution revision
 /// execution that IS dispatched (while the `conflict_resolutions` attempt is
 /// still active) must record `transcript_path` in `work_runs` when the
 /// worker fires a hook with the path.
@@ -1655,7 +1655,7 @@ fn make_active_chore_with_pr(db: &WorkDb, product_id: &str, pr_url: &str) -> Str
 }
 
 /// The reviewer-fallback must NOT advance active→in_review while a live
-/// IMPLEMENTATION execution is working the task (T1577 incident): doing so
+/// IMPLEMENTATION execution is working the task (concurrent implementation): doing so
 /// strands the implementation worker in the Review lane with no Doing card.
 #[test]
 fn reviewer_fallback_refuses_while_impl_exec_live() {
@@ -2011,10 +2011,10 @@ fn get_work_tree_instrumented_reports_task_runtime_nplus1() {
     assert_eq!(plain.chores.len(), N);
 }
 
-// ── T1503/T1496 regression: revision rows must not jump to in_review ─────────
+// ── Execution-status regression: revision rows must not jump to in_review ─────────
 // while their execution is live.
 
-/// Regression (T1503/T1496): `reconcile_revision_execution` must NOT create a
+/// Execution-status regression: `reconcile_revision_execution` must NOT create a
 /// duplicate `ready` execution when the revision task already has a live
 /// (`running` or `waiting_human`) execution. Before the fix the `_ =>` arm
 /// fired for every reconcile tick while the execution was `waiting_human`
@@ -2119,7 +2119,7 @@ fn reconcile_does_not_create_duplicate_execution_for_running_revision() {
     assert_eq!(task_status(&db, &revision_id), "active");
 }
 
-/// Regression (exec_89 / T500): the "no duplicate" guard must ALSO fire when
+/// All-terminal execution regression: the "no duplicate" guard must ALSO fire when
 /// the task's latest live execution is a DIFFERENT kind — e.g. a `pr_review`
 /// reviewing the revision's contribution to the parent PR. Before the
 /// cross-kind guard none of the `RevisionImplementation`-keyed match arms
@@ -2306,7 +2306,7 @@ fn create_revision_of_revision_of_design_task_still_defaults_to_large() {
 
 #[test]
 fn create_revision_explicit_effort_overrides_design_family_default() {
-    // T289's regression: an explicit --effort must always win over the
+    // Effort-precedence regression: an explicit --effort must always win over the
     // design-family default, on either side (up or down).
     let db = WorkDb::open(temp_db_path("explicit-overrides-default")).unwrap();
     let product_id = make_revision_product(&db, "explicit-overrides-default");

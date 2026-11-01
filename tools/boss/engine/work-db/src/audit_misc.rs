@@ -21,7 +21,7 @@ pub use boss_engine_storage_values::ProjectPropertyAuditEntry;
 /// branch-only edit that matched the existing branch). Runs inside
 /// the caller's transaction so the audit row commits with the
 /// underlying write.
-pub fn record_design_doc_audit(
+pub(crate) fn record_design_doc_audit(
     conn: &Connection,
     project_id: &str,
     before: &Project,
@@ -56,7 +56,7 @@ pub fn record_design_doc_audit(
 /// Record one append-only project status transition in the existing general
 /// project-property audit ledger. The caller owns the transaction that also
 /// updates `projects`, so provenance and state cannot commit independently.
-pub fn record_project_status_audit(
+pub(crate) fn record_project_status_audit(
     conn: &Connection,
     project_id: &str,
     old_status: ProjectStatus,
@@ -95,7 +95,7 @@ pub fn now_string() -> String {
     boss_engine_utils::epoch_time::now_epoch_secs().to_string()
 }
 
-pub fn normalize_optional_text(value: Option<String>) -> Option<String> {
+pub(crate) fn normalize_optional_text(value: Option<String>) -> Option<String> {
     value.and_then(|text| {
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -132,7 +132,7 @@ pub fn canonicalize_worker_branch_prefix(value: Option<String>) -> Option<String
 /// canonical form. Callers that want to *clear* the pointer should
 /// use `unset = true` on `SetProjectDesignDocInput` instead of
 /// passing an empty string here.
-pub fn validate_design_doc_path(path: &str) -> Result<String> {
+pub(crate) fn validate_design_doc_path(path: &str) -> Result<String> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         bail!("design_doc_path may not be empty (use `unset = true` to clear the pointer)");
@@ -182,7 +182,7 @@ pub fn canonicalize_repo_remote_url(value: Option<String>) -> Option<String> {
 /// owns the repo. Errors when the caller violates the invariant:
 ///   - product has a repo AND caller supplied a non-empty override
 ///   - product has no repo AND caller supplied no repo
-pub fn enforce_task_repo_invariant(product: &Product, input_repo: Option<String>) -> Result<Option<String>> {
+pub(crate) fn enforce_task_repo_invariant(product: &Product, input_repo: Option<String>) -> Result<Option<String>> {
     let canonicalized = canonicalize_repo_remote_url(input_repo);
     if let Some(product_repo) = product.repo_remote_url.as_deref() {
         if canonicalized.is_some() {
@@ -209,7 +209,7 @@ pub fn enforce_task_repo_invariant(product: &Product, input_repo: Option<String>
 
 /// Thin wrapper kept for the design-doc call sites until they migrate
 /// to [`canonicalize_repo_remote_url`] directly.
-pub fn canonicalize_design_doc_repo_remote_url(value: Option<String>) -> Option<String> {
+pub(crate) fn canonicalize_design_doc_repo_remote_url(value: Option<String>) -> Option<String> {
     canonicalize_repo_remote_url(value)
 }
 
@@ -220,7 +220,7 @@ pub fn canonicalize_design_doc_repo_remote_url(value: Option<String>) -> Option<
 /// always gets *something* to render — the resolver itself doesn't
 /// fail the whole request just because the URL formatter can't pull
 /// `owner/repo` out of the remote.
-pub fn render_design_doc_web_url(repo_remote_url: &str, branch: &str, path: &str) -> String {
+pub(crate) fn render_design_doc_web_url(repo_remote_url: &str, branch: &str, path: &str) -> String {
     match git_utils::repo_slug::parse_github_slug(repo_remote_url) {
         Some(slug) => format!("https://github.com/{slug}/blob/{branch}/{path}"),
         None => format!("{repo_remote_url}/blob/{branch}/{path}"),
@@ -245,7 +245,7 @@ pub fn render_design_doc_web_url(repo_remote_url: &str, branch: &str, path: &str
 /// (e.g. an enterprise mirror or non-GitHub host) so callers know the
 /// raw-content fast path is unavailable and should fall back to the
 /// web URL.
-pub fn render_design_doc_raw_content_url(repo_remote_url: &str, branch: &str, path: &str) -> Option<String> {
+pub(crate) fn render_design_doc_raw_content_url(repo_remote_url: &str, branch: &str, path: &str) -> Option<String> {
     // Percent-encode only `/` in branch names. Other characters legal in
     // Git branch names (alphanumeric, `-`, `_`, `.`) are safe in a URL
     // path segment without encoding.
@@ -260,7 +260,7 @@ pub fn render_design_doc_raw_content_url(repo_remote_url: &str, branch: &str, pa
 /// `None` when no product matches. `NULL` `repo_remote_url` rows are
 /// excluded so a freshly-created product without a URL doesn't
 /// silently match the project's pointer.
-pub fn find_product_by_repo_remote_url(conn: &Connection, repo_remote_url: &str) -> Result<Option<String>> {
+pub(crate) fn find_product_by_repo_remote_url(conn: &Connection, repo_remote_url: &str) -> Result<Option<String>> {
     conn.query_row(
         "SELECT id FROM products
          WHERE repo_remote_url IS NOT NULL AND repo_remote_url = ?1
@@ -273,7 +273,7 @@ pub fn find_product_by_repo_remote_url(conn: &Connection, repo_remote_url: &str)
     .map_err(Into::into)
 }
 
-pub fn apply_text_patch(target: &mut String, patch: Option<String>) {
+pub(crate) fn apply_text_patch(target: &mut String, patch: Option<String>) {
     if let Some(value) = patch {
         *target = value;
     }
@@ -291,7 +291,7 @@ pub fn apply_repo_remote_url_patch(target: &mut Option<String>, patch: Option<St
     }
 }
 
-pub fn apply_optional_patch(target: &mut Option<String>, patch: Option<String>) {
+pub(crate) fn apply_optional_patch(target: &mut Option<String>, patch: Option<String>) {
     if let Some(value) = patch {
         *target = normalize_optional_text(Some(value));
     }
@@ -303,7 +303,7 @@ pub fn apply_optional_patch(target: &mut Option<String>, patch: Option<String>) 
 /// and `Some(slug)` stores the slug after a trim. Slugs are
 /// deliberately not validated — claude is the source of truth on
 /// what `--model` accepts (design §Q3).
-pub fn apply_optional_string_patch(target: &mut Option<String>, patch: Option<String>) {
+pub(crate) fn apply_optional_string_patch(target: &mut Option<String>, patch: Option<String>) {
     if patch.is_some() {
         *target = normalize_optional_text(patch);
     }
@@ -311,7 +311,7 @@ pub fn apply_optional_string_patch(target: &mut Option<String>, patch: Option<St
 
 /// Chores, and followups not (yet) moved into a project, are chore-side
 /// rows; a followup with a `project_id` is a project member.
-pub fn is_chore_like(task: &Task) -> bool {
+pub(crate) fn is_chore_like(task: &Task) -> bool {
     task.kind == TaskKind::Chore || (task.kind == TaskKind::Followup && task.project_id.is_none())
 }
 

@@ -4,8 +4,8 @@
 //! ("Apply pipeline: auto-apply kinds") built a policy table plus
 //! synchronous appliers for `attention`, `effort_escalation`, `blocked`, and
 //! `deferred_scope` — each writing the same `work_attention_items` rows
-//! today's marker detectors write ([`crate::completion::WorkerCompletionHandler::file_worker_signal_attention`],
-//! [`crate::completion::WorkerCompletionHandler::record_deferred_scope_item`]),
+//! today's marker detectors write (`boss_engine::completion::WorkerCompletionHandler::file_worker_signal_attention`,
+//! `boss_engine::completion::WorkerCompletionHandler::record_deferred_scope_item`),
 //! so a submitted proposal and its effect are the same event.
 //!
 //! Implementation task 6 ("Apply pipeline: gated `followup_task` + verified
@@ -553,10 +553,10 @@ fn apply_attention(tx: &Transaction<'_>, execution_id: &str, payload_json: &str)
 
 /// `effort_escalation` proposals auto-apply the same as the legacy
 /// `[effort-escalation]` marker path
-/// ([`crate::completion::WorkerCompletionHandler::file_worker_signal_attention`]):
+/// (`boss_engine::completion::WorkerCompletionHandler::file_worker_signal_attention`):
 /// a `worker_escalation`-kind attention item. Filing that (unresolved) row
 /// is the entire "auto-nudge pause" mechanism —
-/// [`crate::completion::WorkerCompletionHandler::unresolved_worker_signal_reason`]
+/// `boss_engine::completion::WorkerCompletionHandler::unresolved_worker_signal_reason`
 /// re-derives the pause reactively from `work_attention_items`, so there is
 /// no separate pause flag to set here.
 fn apply_effort_escalation(tx: &Transaction<'_>, execution_id: &str, payload_json: &str) -> Result<ApplyOutcome> {
@@ -606,7 +606,7 @@ fn apply_blocked(tx: &Transaction<'_>, execution_id: &str, payload_json: &str) -
 }
 
 /// Persist the wait proposal as applied. The time-bounded hold itself lives
-/// in [`crate::wait_registry::WaitRegistry`], which the submit handler
+/// in `boss_engine::wait_registry::WaitRegistry`, which the submit handler
 /// updates after attribution — the proposal row is the durable audit.
 fn apply_wait(payload_json: &str) -> Result<ApplyOutcome> {
     let _: WaitProposalPayload =
@@ -619,7 +619,7 @@ fn apply_wait(payload_json: &str) -> Result<ApplyOutcome> {
 }
 
 /// `deferred_scope` proposals auto-apply the same two effects
-/// [`crate::completion::WorkerCompletionHandler::record_deferred_scope_item`]
+/// `boss_engine::completion::WorkerCompletionHandler::record_deferred_scope_item`
 /// writes for the legacy `[deferred-scope]` marker: a `deferred_scope`-kind
 /// attention item (in-transaction, atomic with the proposal row) carrying
 /// the verbatim `[deferred-scope] summary="…" reason="…"` marker line —
@@ -724,7 +724,7 @@ pub fn stage_followup_task_in_transaction(
 }
 
 /// `automation_outcome` auto-applies with a provenance check mirroring the
-/// legacy marker path's ([`crate::completion::WorkerCompletionHandler::finalize_automation_triage`],
+/// legacy marker path's (`boss_engine::completion::WorkerCompletionHandler::finalize_automation_triage`,
 /// `completion.rs:2414`): a `produced_task` outcome is only accepted when
 /// the named task exists and carries a matching `source_automation_id` — the
 /// same check that stops a triage worker from claiming credit for an
@@ -843,7 +843,7 @@ fn supersede_prior_automation_outcomes(tx: &Transaction<'_>, execution_id: &str,
 
 /// `pr_created` auto-applies with verification mirroring the legacy
 /// hook-observed path: URL shape + product-repo slug
-/// ([`crate::pr_url_validate::validate_pr_url`], `pr_url_capture.rs:86`) and,
+/// ([`boss_github::pr_url::validate_pr_url`]) and,
 /// when the worker supplied a `branch`, a branch-name match against the
 /// execution ([`boss_engine_storage_values::branch_identity::expected_branch_name`] /
 /// [`boss_engine_storage_values::branch_identity::branches_identify_same_work_item`] — the same
@@ -894,7 +894,7 @@ fn apply_pr_created(tx: &Transaction<'_>, execution_id: &str, payload_json: &str
         )));
     };
 
-    if let Err(reason) = crate::pr_url_validate::validate_pr_url(&payload.pr_url, repo_remote_url) {
+    if let Err(reason) = boss_github::pr_url::validate_pr_url(&payload.pr_url, repo_remote_url) {
         return Ok(ApplyDecision::Rejected(reason));
     }
 

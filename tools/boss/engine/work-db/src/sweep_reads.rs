@@ -150,7 +150,7 @@ impl WorkDb {
     /// task: <id>`) when no visible row exists, matching the error
     /// [`Self::get_work_item`] returned on the same input so callers that
     /// follow up with [`Self::work_item_row_missing`] keep working.
-    pub fn task_closed_state(&self, id: &str) -> Result<bool> {
+    pub(crate) fn task_closed_state(&self, id: &str) -> Result<bool> {
         self.task_closed_states(std::slice::from_ref(&id.to_owned()))?
             .remove(id)
             .with_context(|| format!("unknown task: {id}"))

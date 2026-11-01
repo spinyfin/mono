@@ -32,7 +32,7 @@ impl WorkDb {
     /// inserts the revision in one transaction so a losing concurrent claim
     /// creates no spare task. Closed/merged/missing PRs return `PrClosed`
     /// with no chore fallback.
-    pub fn revise_guide_pr(
+    pub(crate) fn revise_guide_pr(
         &self,
         input: ReviseDocInput,
         pr_checker: &dyn PrStateChecker,
@@ -336,7 +336,7 @@ pub(super) fn no_op_attention_on(conn: &Connection, task_id: &str) -> Result<Opt
 /// Resolve-side of guide-aware reconciliation: document comments still
 /// resolve on task completion; guide comments resolve only when a
 /// disposition was recorded. Missing dispositions stay `in_revision`.
-pub fn resolve_guide_aware_comments(conn: &Connection, task_id: &str, now: &str) -> Result<usize> {
+pub(crate) fn resolve_guide_aware_comments(conn: &Connection, task_id: &str, now: &str) -> Result<usize> {
     conn.execute(
         &format!(
             "UPDATE work_comments

@@ -228,6 +228,7 @@ impl WorkDb {
     /// [`Self::submit_worker_proposal_with_guide`] for that kind. Submitting
     /// one here is an error and stores nothing.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn submit_worker_proposal(
         &self,
         input: SubmitWorkerProposalInput<'_>,
@@ -253,7 +254,7 @@ impl WorkDb {
     /// the attempt-state checks, so an attempt-state refusal takes precedence over
     /// a validation failure.
     #[cfg(test)]
-    pub fn submit_worker_proposal_with_guide(
+    pub(crate) fn submit_worker_proposal_with_guide(
         &self,
         input: SubmitWorkerProposalInput<'_>,
         guide: Option<&Result<super::review_guide_submission::PreparedGuide>>,
@@ -638,7 +639,7 @@ impl WorkDb {
 
     /// Expire undecided (`state = 'proposed'`) proposals of an in-flight-only
     /// kind whose owning execution has reached a terminal status. Called by
-    /// the periodic [`crate::proposal_expiry_sweep`]. Returns the number of
+    /// the periodic `boss_engine::proposal_expiry_sweep`. Returns the number of
     /// rows expired.
     ///
     /// [`IN_FLIGHT_ONLY_PROPOSAL_KINDS`] is exactly `effort_escalation` and
@@ -726,7 +727,7 @@ fn count_proposals_in_tx(conn: &Connection, execution_id: &str, kind: ProposalKi
 /// A member with no `source_proposal_id` (created by any path other than
 /// `boss propose followup-task` — a detector, a manifest, the plain
 /// `CreateAttention` RPC) is a no-op: there is no proposal row to update.
-pub fn mark_followup_proposal_decided_in_tx(
+pub(crate) fn mark_followup_proposal_decided_in_tx(
     conn: &Connection,
     source_proposal_id: Option<&str>,
     applied_ref: Option<&str>,

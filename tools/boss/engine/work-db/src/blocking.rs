@@ -701,7 +701,7 @@ impl WorkDb {
     /// parent task's `status` column. Called when an engine-triggered CI-fix
     /// revision is in flight and the parent should stay `in_review` — the
     /// #1007 parent-state model, now shared with the conflict path via
-    /// [`crate::blocking_signal::SignalKind`].
+    /// `boss_engine::blocking_signal::SignalKind`.
     ///
     /// The active signal ensures `maybe_clear_blocked` dispatches
     /// `ci_watch::on_ci_resolved` when the PR's checks later go green, even
@@ -1491,7 +1491,7 @@ impl WorkDb {
     /// stopped, and treating it as a writer would strand the next
     /// CI-fix behind a row that never runs again.
     ///
-    /// Used by [`crate::ci_watch::on_ci_failure_detected`] as a
+    /// Used by `boss_engine::ci_watch::on_ci_failure_detected` as a
     /// secondary pre-flight gate: after the primary gate (based on
     /// the `ci_remediations` status column) passes, this check
     /// prevents a new CI-fix revision from spawning while a prior

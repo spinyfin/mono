@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 workspace = "../../../.."
 
+[features]
+test-support = []
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -45,6 +48,8 @@ tracing = { workspace = true }
 unicode-segmentation = { workspace = true }
 
 [dev-dependencies]
+boss-metrics = { path = "../metrics", features = ["test-support"] }
+boss-prose-vocabulary = { path = "../prose-vocabulary" }
 libc = "0.2"
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }

@@ -20,7 +20,7 @@ pub fn stored_pr_number(pr_url: &str) -> Option<i64> {
 /// Injected into `create_revision` so the gate can distinguish "open"
 /// from "closed without merging" without hardcoding a `gh` call, which
 /// would make unit tests depend on GitHub access. Production wires in
-/// [`GhPrStateChecker`]; tests pass [`FakePrStateChecker`].
+/// [`GhPrStateChecker`]; tests pass `FakePrStateChecker`.
 pub trait PrStateChecker: Send + Sync {
     /// Return the live lifecycle state of the given PR URL.
     fn check(&self, pr_url: &str) -> Result<PrOpenState>;
@@ -40,6 +40,7 @@ pub trait PrStateChecker: Send + Sync {
     }
 
     /// Hermetic compare response used only by the review-service test fixtures.
+    #[cfg(any(test, feature = "test-support"))]
     fn merged_parent_deletions(
         &self,
         _repo_slug: &str,
@@ -71,9 +72,9 @@ pub enum PrOpenState {
 ///
 /// This is the single source of truth for the merged / closed-unmerged /
 /// open tri-state. Both the merge poller
-/// ([`crate::merge_poller::classify_state`]) and the revision gate
+/// (`boss_engine::merge_poller::classify_state`) and the revision gate
 /// ([`map_gh_state`]) map from this shared classification into their own
-/// richer enums ([`crate::merge_poller::PrLifecycleState`] /
+/// richer enums (`boss_engine::merge_poller::PrLifecycleState` /
 /// [`PrOpenState`]), so the (state, mergedAt) decision lives in exactly
 /// one place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,12 +209,14 @@ impl PrStateChecker for StaticPrStateChecker {
 
 /// Test double: returns a preset state for known PR URLs.
 #[derive(Clone)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct FakePrStateChecker {
     pub states: std::collections::HashMap<String, PrOpenState>,
     pub default: PrOpenState,
     pub head_sha: Option<String>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl FakePrStateChecker {
     pub fn always(state: PrOpenState) -> Self {
         Self {
@@ -232,6 +235,7 @@ impl FakePrStateChecker {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl PrStateChecker for FakePrStateChecker {
     fn check(&self, pr_url: &str) -> Result<PrOpenState> {
         Ok(self.states.get(pr_url).cloned().unwrap_or(self.default.clone()))

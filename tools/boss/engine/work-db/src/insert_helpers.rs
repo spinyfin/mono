@@ -32,7 +32,7 @@ pub fn merge_queue_rebounce_pr_head(discriminator: &str) -> &str {
 /// head sha — the suppression has expired by then) starts with a
 /// fresh budget; mirrors the manual `boss engine ci retry` reset rule.
 /// The reset happens on both paths, including the no-attempt one.
-pub fn record_ci_failure_suppression_in_tx(conn: &Connection, work_item_id: &str, now: &str) -> Result<()> {
+pub(crate) fn record_ci_failure_suppression_in_tx(conn: &Connection, work_item_id: &str, now: &str) -> Result<()> {
     // The most recent `ci_remediations` row carries the head sha the
     // engine was reacting to. Prefer the latest attempt regardless of
     // status — the user may be moving off `ci_failure_exhausted`, in
@@ -89,7 +89,7 @@ pub fn record_ci_failure_suppression_in_tx(conn: &Connection, work_item_id: &str
 /// `'dependency'` (which has no attempt table) and for the
 /// `'ci_failure_exhausted'` signal (which is the *absence* of an
 /// engine-managed attempt — the engine has stopped trying).
-pub fn upsert_task_blocked_signal(
+pub(crate) fn upsert_task_blocked_signal(
     conn: &Connection,
     work_item_id: &str,
     reason: &str,
@@ -227,7 +227,7 @@ pub fn insert_task_in_tx_as_actor(conn: &Connection, input: CreateTaskInput, act
 /// resolves short selectors to canonical work-item IDs before sending. A freshly
 /// created row can't have a live worker, so the cancelled-execution
 /// channel of [`add_dependency_edge_in_tx`] is always empty here.
-pub fn apply_create_time_dependencies(
+pub(crate) fn apply_create_time_dependencies(
     conn: &Connection,
     dependent_id: &str,
     prerequisite_ids: &[String],
@@ -269,16 +269,16 @@ pub fn apply_create_time_dependencies(
 }
 
 /// Engine-internal create — see [`insert_task_in_tx`] for the actor rule.
-pub fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> Result<Task> {
+pub(crate) fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> Result<Task> {
     insert_chore_with_project_in_tx(conn, input, None)
 }
 
-pub fn insert_chore_in_tx_as_actor(conn: &Connection, input: CreateChoreInput, actor: &str) -> Result<Task> {
+pub(crate) fn insert_chore_in_tx_as_actor(conn: &Connection, input: CreateChoreInput, actor: &str) -> Result<Task> {
     insert_chore_with_project_in_tx_as_actor(conn, input, None, actor)
 }
 
 /// Review follow-ups may inherit project membership at creation time.
-pub fn insert_chore_with_project_in_tx(
+pub(crate) fn insert_chore_with_project_in_tx(
     conn: &Connection,
     input: CreateChoreInput,
     project_id: Option<&str>,
@@ -581,7 +581,7 @@ mod tests {
         );
     }
 
-    /// Legacy rows predating the short-id column report `T0` rather
+    /// Legacy rows predating the short-id column report a zero short id rather
     /// than failing the insert path with a NULL decode error.
     #[test]
     fn existing_short_id_falls_back_to_zero_when_null() {

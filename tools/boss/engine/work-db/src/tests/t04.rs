@@ -556,7 +556,7 @@ fn import_chore_with_external_ref_is_atomic_and_findable() {
 }
 
 /// get_work_tree populates external_ref on chores so the kanban card
-/// can render the upstream-link affordance (T503 follow-up / T588).
+/// can render the upstream-link affordance (including follow-up work).
 #[test]
 fn get_work_tree_includes_external_ref_on_chores() {
     let (db, product_id, chore_id) = setup_product_and_chore();
@@ -1477,7 +1477,7 @@ fn resolve_project_design_doc_surfaces_broken_when_no_repo() {
     let _ = std::fs::remove_file(path);
 }
 
-/// Regression for the P844/T845 bug: a design doc that lives under a
+/// Document-path regression: a design doc that lives under a
 /// non-boss product directory (e.g. `tools/checkleft/docs/designs/`) must
 /// resolve to the PR head branch while the PR is still open, not to "main".
 ///
@@ -1546,7 +1546,7 @@ fn resolve_project_design_doc_returns_pr_head_branch_for_non_boss_product_path()
 }
 
 /// Fresh init and migration both land the editorial-controls schema
-/// (P576 chore #1): `products.editorial_rules`, `work_executions.branch_naming`,
+/// (product defaults): `products.editorial_rules`, `work_executions.branch_naming`,
 /// and the `editorial_actions` table + index. Existing rows must read
 /// back as NULL (all-defaults, no behaviour change).
 #[test]

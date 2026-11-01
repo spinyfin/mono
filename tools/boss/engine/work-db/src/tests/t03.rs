@@ -970,7 +970,7 @@ fn mark_chore_pr_merged_clears_stale_merge_queue_state() {
     let _ = std::fs::remove_file(path);
 }
 
-/// T701-class deadlock: a `kind = 'revision'` task gated on its parent
+/// Dependency deadlock: a `kind = 'revision'` task gated on its parent
 /// via a `blocks` edge must unblock as soon as the parent reaches
 /// `in_review` (PR open). Previously the cascade bailed out on
 /// `in_review` (only `done` was considered satisfying) so the revision
@@ -1539,10 +1539,10 @@ fn redispatch_preserves_investigation_execution_kind() {
     let _ = std::fs::remove_file(path);
 }
 
-/// RECURRING REGRESSION LOCK (T756 / T926 / T928 / T1205 / T1310): an
+/// Derived document-link regression: an
 /// investigation task whose worker has opened its doc PR must expose a
-/// doc link on the kanban card. Post-T928 the card derives that link
-/// *live* from the task's `pr_url` (T926's stored doc-pointer was ripped
+/// doc link on the kanban card. The card derives that link
+/// *live* from the task's `pr_url` (the stored doc-pointer was ripped
 /// out — `investigation_detector.rs` and the `doc_url` / `investigation_doc_*`
 /// columns are gone), so the single load-bearing invariant is:
 ///
@@ -1619,7 +1619,7 @@ fn investigation_open_pr_exposes_derived_doc_link_in_work_tree() {
     // receives. The existing assertion above checks the Rust struct; this
     // checks the wire path so a serde annotation that silently drops pr_url
     // (e.g. a mistaken skip_serializing_if) would also fail here. This is the
-    // T1310 gap-hunt addition: if this passes but the live card shows no link,
+    // Card projection check: if this passes but the live card shows no link,
     // the gap is in the app's IPC reception (parseTask) or render path.
     let tasks_json = serde_json::to_value(&tree.tasks).expect("work tree tasks must be JSON-serializable");
     let inv_json = tasks_json
@@ -1639,9 +1639,9 @@ fn investigation_open_pr_exposes_derived_doc_link_in_work_tree() {
     let _ = std::fs::remove_file(path);
 }
 
-/// Recurrence lock, redispatch variant (the T1205 / #1257 path): an
+/// Document-link redispatch regression (mono#1257): an
 /// investigation that was dispatched, abandoned, then redispatched must
-/// STILL expose a derived doc link once its PR opens. T1205 fixed the
+/// STILL expose a derived doc link once its PR opens. The redispatch fix restored the
 /// execution kind on redispatch, but only asserted the kind — not that a
 /// doc link ultimately materialises. This drives the abandon-and-redispatch
 /// path all the way through PR completion and pins the end result, so a
@@ -1790,7 +1790,7 @@ fn cold_path_pr_detection_covers_investigations() {
 /// `doc_link_state` on the card — parity with how design cards carry the
 /// project's resolved design-doc state. This is the load-bearing wire that
 /// makes the Review-lane doc-link icon render for project-less
-/// investigations (the T1705 bug). The gh PR scan that populates the
+/// investigations. The gh PR scan that populates the
 /// columns is covered by `design_detector`'s parse tests; here we write the
 /// pointer directly and assert the delivery + JSON wire shape.
 #[test]

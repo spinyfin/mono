@@ -203,6 +203,7 @@ impl WorkDb {
     /// for that comparison or atomically replacing an obsolete request.
     /// The durable queued attempt can be dispatched by enqueue or reconcile.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn create_pr_review_guide_attempt(
         &self,
         series_id: &str,
@@ -366,6 +367,7 @@ impl WorkDb {
     /// generic execution machinery both work for free. Every omitted column
     /// carries its schema default.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn create_pr_review_guide_execution(
         &self,
         comparison_id: &str,
@@ -379,6 +381,7 @@ impl WorkDb {
     /// Used to enforce "at most one active attempt per series": a duplicate
     /// observation of the same comparison is a no-op, and a newer comparison
     /// must cancel these before admitting a replacement.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn live_pr_review_guide_attempts_for_series(&self, series_id: &str) -> Result<Vec<PrReviewGuideAttempt>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(&format!(
@@ -397,6 +400,7 @@ impl WorkDb {
     /// still records the execution on the attempt but leaves card lifecycle
     /// untouched.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn bind_pr_review_guide_attempt_execution(&self, attempt_id: &str, execution_id: &str) -> Result<()> {
         let now = now_string();
         let mut conn = self.connect()?;
@@ -487,7 +491,7 @@ impl WorkDb {
 
     /// [`Self::fail_pr_review_guide_attempt`] with the failing build named by
     /// the caller instead of the injected identity.
-    pub fn fail_pr_review_guide_attempt_at(
+    pub(crate) fn fail_pr_review_guide_attempt_at(
         &self,
         attempt_id: &str,
         error: &str,
@@ -661,7 +665,7 @@ impl WorkDb {
     ///   is finished with a classified reason — **unless** that status is
     ///   `orphaned` and the worker is still live. `orphaned` is a death the
     ///   engine *inferred* from missing signal, never a decision (see
-    ///   [`crate::worker_readoption::classify_contradiction`]); an orphaned
+    ///   `boss_engine::worker_readoption::classify_contradiction`); an orphaned
     ///   row with a live process is exactly the contradiction re-adoption
     ///   resolves by putting the execution back to `running`, and an attempt
     ///   closed in the meantime would leave that re-adopted run with nothing
@@ -1503,7 +1507,7 @@ pub mod guide_updates {
     /// root is resolved from the attempt's series, so an attempt admitted before
     /// completion attribution arrives is held too. Parked (todo/blocked)
     /// revisions are not writing and never hold an update.
-    pub fn chain_has_active_writer(conn: &Connection, attempt: &str) -> Result<bool> {
+    pub(crate) fn chain_has_active_writer(conn: &Connection, attempt: &str) -> Result<bool> {
         let root: Option<String> = conn
             .query_row(
                 "SELECT s.root_task_id FROM pr_review_guide_attempts a

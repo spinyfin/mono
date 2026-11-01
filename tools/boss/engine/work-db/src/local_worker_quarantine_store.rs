@@ -3,7 +3,7 @@
 //! readers dispatch admission runs inside its own transaction.
 //!
 //! Deciding *who* to quarantine needs process and kernel observations, so the
-//! scan lives with the host services in [`crate::local_worker_quarantine`];
+//! scan lives with the host services in `boss_engine::local_worker_quarantine`;
 //! it hands its verdict in through [`WorkDb::write_local_worker_quarantine`].
 
 use std::collections::BTreeMap;

@@ -29,7 +29,7 @@ fn insert_attempt(db: &WorkDb, product_id: &str, work_item_id: &str, base_sha: &
     .expect("insert must produce a pending attempt")
 }
 
-// Behavioural coverage for `WorkDb::conflict_hotspots` (Layer 0 / T5),
+// Behavioural coverage for `WorkDb::conflict_hotspots` (Layer 0),
 // the aggregation query behind `boss engine conflicts hotspots`:
 //
 // * per-file conflict frequency, deduped within a single event so a

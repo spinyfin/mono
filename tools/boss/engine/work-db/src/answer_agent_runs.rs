@@ -24,7 +24,7 @@ pub const ANSWER_AGENT_NO_REPLY_BODY: &str = "I wasn't able to finish answering 
 /// [`map_answer_agent_run`]. `pub` so callers that already hold a
 /// connection (e.g. [`crate::answer_agent_runs::latest_answer_agent_run_for_comment_on`])
 /// can build the same SELECT without duplicating the column list.
-pub fn answer_agent_run_columns() -> &'static str {
+pub(crate) fn answer_agent_run_columns() -> &'static str {
     "id, comment_id, artifact_kind, artifact_id, doc_version, thread_turn, \
      status, execution_id, workspace_lease_id, reply_body, error_kind, created_at, completed_at, \
      workspace_positioned"
@@ -36,7 +36,10 @@ pub fn answer_agent_run_columns() -> &'static str {
 /// `revise_doc::push_comment_directive_block`, which holds the single pooled connection
 /// inside an Immediate transaction and cannot call back through
 /// `WorkDb::connect`.
-pub fn latest_answer_agent_run_for_comment_on(conn: &Connection, comment_id: &str) -> Result<Option<AnswerAgentRun>> {
+pub(crate) fn latest_answer_agent_run_for_comment_on(
+    conn: &Connection,
+    comment_id: &str,
+) -> Result<Option<AnswerAgentRun>> {
     let cols = answer_agent_run_columns();
     let sql = format!(
         "SELECT {cols} FROM answer_agent_runs WHERE comment_id = ?1 \
@@ -253,7 +256,7 @@ impl WorkDb {
     /// never had one.
     ///
     /// Used by the stand-down path to cancel and release a run the operator
-    /// retracted, and by [`crate::stranded_answering_sweep`] to tell "the agent
+    /// retracted, and by `boss_engine::stranded_answering_sweep` to tell "the agent
     /// is genuinely still working" from "the agent is gone and nothing will
     /// ever move this comment". `get_live_execution_for_work_item` is not a
     /// substitute: it deliberately matches only `running`/`waiting_human`, so
@@ -285,7 +288,7 @@ impl WorkDb {
     ///
     /// The execution-centric counterpart of
     /// [`Self::live_answer_agent_execution_for_comment`], and the candidate set
-    /// [`crate::answer_agent_completion_sweep`] scans: that sweep asks "is this
+    /// `boss_engine::answer_agent_completion_sweep` scans: that sweep asks "is this
     /// live execution's answer already delivered?", which is a question about
     /// executions, not about comments. Cheap by construction — an engine has at
     /// most a handful of live executions at a time, capped by the worker pools.

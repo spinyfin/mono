@@ -29,7 +29,7 @@ pub const RELATION_BLOCKS: &str = "blocks";
 /// and [`gating_prereqs_for`], both of which pass `Some(RELATION_BLOCKS)`).
 /// Its purpose is merge sequencing: the later PR of the pair forward-ports
 /// preservingly (see the merge-conflict-reduction design, Layer 3 /
-/// direction 2, and incident-002 postmortem P5).
+/// direction 2, and deletion-recovery postmortem).
 pub const RELATION_MERGE_ORDER: &str = "merge_order";
 
 /// Result of `insert_edge` — `Inserted` if a new row was added,

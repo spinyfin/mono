@@ -108,7 +108,7 @@ impl WorkDb {
         Ok(BoothbyActionGuard { db: self, previous })
     }
 
-    pub fn armed_boothby_action(&self) -> Result<Option<BoothbyActionContext>> {
+    pub(crate) fn armed_boothby_action(&self) -> Result<Option<BoothbyActionContext>> {
         Ok(self
             .boothby_action
             .lock()
@@ -119,7 +119,7 @@ impl WorkDb {
 
 /// `true` when this mutation is Boothby's. The single gate that keeps the
 /// journal inert for every other actor.
-pub fn is_boothby_actor(actor: &str) -> bool {
+pub(crate) fn is_boothby_actor(actor: &str) -> bool {
     actor == LAST_STATUS_ACTOR_BOOTHBY
 }
 
@@ -136,7 +136,7 @@ pub fn is_boothby_actor(actor: &str) -> bool {
 /// otherwise the row would stay stamped `boothby` forever and the
 /// dep-unblock rule ([`StatusActor::is_engine_cascade`]) would keep reading
 /// it as a deliberate Boothby decision that no longer exists.
-pub fn task_image(task: &Task) -> ColumnImage {
+pub(crate) fn task_image(task: &Task) -> ColumnImage {
     ColumnImage::from([
         ("archived_at", task.archived_at.clone()),
         ("archived_by", task.archived_by.clone()),
@@ -163,7 +163,7 @@ pub fn task_image(task: &Task) -> ColumnImage {
 /// The columns of `projects` that a journalled Boothby mutation can move.
 /// Same `updated_at` exclusion and `last_status_actor` inclusion rules as
 /// [`task_image`].
-pub fn project_image(project: &Project) -> ColumnImage {
+pub(crate) fn project_image(project: &Project) -> ColumnImage {
     ColumnImage::from([
         ("description", Some(project.description.clone())),
         ("goal", Some(project.goal.clone())),
@@ -178,7 +178,7 @@ pub fn project_image(project: &Project) -> ColumnImage {
 
 /// The columns of `attention_groups` that a journalled Boothby mutation can
 /// move. Boothby merges and dismisses attention groups; both land here.
-pub fn attention_group_image(group: &AttentionGroup) -> ColumnImage {
+pub(crate) fn attention_group_image(group: &AttentionGroup) -> ColumnImage {
     ColumnImage::from([
         ("actioned_at", group.actioned_at.clone()),
         ("dismissed_at", group.dismissed_at.clone()),
@@ -189,7 +189,7 @@ pub fn attention_group_image(group: &AttentionGroup) -> ColumnImage {
 /// The columns of `attentions` that a journalled Boothby mutation can move.
 /// Covers member-level dismissal ([`BOOTHBY_TARGET_ATTENTION_ITEM`]) — the
 /// group-level path uses [`attention_group_image`] instead.
-pub fn attention_image(attention: &Attention) -> ColumnImage {
+pub(crate) fn attention_image(attention: &Attention) -> ColumnImage {
     ColumnImage::from([
         ("answer", attention.answer.clone()),
         ("answer_state", Some(attention.answer_state.clone())),
@@ -343,7 +343,7 @@ fn record_action_in_tx(
 }
 
 /// Journal a `tasks` mutation iff `actor` is Boothby. Inert otherwise.
-pub fn capture_task_update(
+pub(crate) fn capture_task_update(
     conn: &Connection,
     db: &WorkDb,
     actor: &str,
@@ -367,7 +367,7 @@ pub fn capture_task_update(
 }
 
 /// Journal a `projects` mutation iff `actor` is Boothby. Inert otherwise.
-pub fn capture_project_update(
+pub(crate) fn capture_project_update(
     conn: &Connection,
     db: &WorkDb,
     actor: &str,
@@ -392,7 +392,7 @@ pub fn capture_project_update(
 
 /// Journal an `attention_groups` mutation iff `actor` is Boothby. Inert
 /// otherwise.
-pub fn capture_attention_group_update(
+pub(crate) fn capture_attention_group_update(
     conn: &Connection,
     db: &WorkDb,
     actor: &str,
@@ -421,7 +421,7 @@ pub fn capture_attention_group_update(
 /// mutates the member row (and, via `recompute_group_state`, potentially the
 /// owning group's `state` as a side effect that this journal does not
 /// separately capture).
-pub fn capture_attention_member_update(
+pub(crate) fn capture_attention_member_update(
     conn: &Connection,
     db: &WorkDb,
     actor: &str,

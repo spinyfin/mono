@@ -78,7 +78,7 @@
 //!
 //! [`WorkDb::get_execution_driver_decision`] is the read side both real
 //! dispatch paths ([`crate::driver_lookup`]'s events-socket resolver
-//! and [`crate::runner::worker_spawn`]'s spawn-config resolver) consult, so
+//! and `boss_engine::runner::worker_spawn`'s spawn-config resolver) consult, so
 //! an allocated row is actually routed to its driver rather than the
 //! recorded decision being an inert audit trail.
 
@@ -245,7 +245,7 @@ fn hash_bucket(work_item_id: &str) -> u8 {
 /// nearby valid-looking split. Failing the read outright would wedge every
 /// subsequent execution insert, which is a far worse outcome than routing to
 /// the default driver with a loud log line.
-pub fn load_driver_traffic_split_conn(conn: &Connection) -> Result<DriverTrafficSplit> {
+pub(crate) fn load_driver_traffic_split_conn(conn: &Connection) -> Result<DriverTrafficSplit> {
     let raw: Option<String> = conn
         .query_row(
             "SELECT value FROM metadata WHERE key = ?1",
@@ -317,7 +317,10 @@ impl WorkDb {
 /// `WorkDb::get_execution_driver_decision`, but reusing an already-open
 /// `Connection` (see `load_driver_traffic_split_conn`'s doc for why this
 /// split exists).
-pub fn get_execution_driver_decision_conn(conn: &Connection, execution_id: &str) -> Result<Option<DriverDecision>> {
+pub(crate) fn get_execution_driver_decision_conn(
+    conn: &Connection,
+    execution_id: &str,
+) -> Result<Option<DriverDecision>> {
     conn.query_row(
         "SELECT driver, reason, split_at_decision
            FROM execution_driver_decisions
@@ -386,7 +389,7 @@ pub fn driver_clears_dispatch_gate(driver_slug: &str, task_kind: &TaskKind, exec
 /// mirroring the substitution [`boss_engine_effort::resolve_spawn_config_in`]
 /// applies at spawn time for a `TrafficAllocation`/`EngineDefault`-sourced
 /// driver.
-pub fn driver_has_design_investigation_model(driver_slug: &str) -> bool {
+pub(crate) fn driver_has_design_investigation_model(driver_slug: &str) -> bool {
     let registry = boss_engine_driver::DriverRegistry::default();
     registry
         .get(driver_slug)
@@ -591,7 +594,7 @@ fn allocate_among(
 /// `work_executions` row is inserted, in the same transaction — this is
 /// the durable, queryable record the task requires ("how much went to each
 /// driver", "did one driver's rows fail more"), not just a log line.
-pub fn record_execution_driver_decision(
+pub(crate) fn record_execution_driver_decision(
     conn: &Connection,
     execution_id: &str,
     work_item_id: &str,
@@ -639,7 +642,7 @@ pub(super) mod sol_selection {
     /// be told apart from the former 50% default being stepped away from and
     /// back, so a stored 50 moves to 100. Any other stored value was
     /// deliberately chosen and is kept.
-    pub fn migrate_default_full_share(conn: &Connection) -> Result<()> {
+    pub(crate) fn migrate_default_full_share(conn: &Connection) -> Result<()> {
         conn.execute(
             "UPDATE metadata SET value='100' WHERE key='codex_sol_percentage' AND value='50'",
             [],
@@ -799,7 +802,7 @@ pub(super) mod sol_selection {
     /// Idempotently stamp the family's merge time; a no-op for families that
     /// never enrolled. Shared by the merge poller and the worker-completion
     /// path that finds its PR already merged.
-    pub fn record_merge(conn: &Connection, work_item_id: &str, now: &str) -> Result<()> {
+    pub(crate) fn record_merge(conn: &Connection, work_item_id: &str, now: &str) -> Result<()> {
         let root = crate::chain_helpers::chain_root(conn, work_item_id)?;
         conn.execute(
             "UPDATE sol_pr_outcomes SET merged_at=COALESCE(merged_at,?2) WHERE work_item_id=?1",
@@ -828,7 +831,7 @@ pub(super) mod sol_selection {
     /// into a success, and the head that existed at enrollment never counts.
     /// Families that never enrolled have no outcome row, so this is two cheap
     /// primary-key updates for them.
-    pub fn observe_ci(conn: &Connection, item: &str, head: Option<&str>, state: &str) -> Result<()> {
+    pub(crate) fn observe_ci(conn: &Connection, item: &str, head: Option<&str>, state: &str) -> Result<()> {
         let Some(head) = head else { return Ok(()) };
         let root = crate::chain_helpers::chain_root(conn, item)?;
         conn.execute(
@@ -846,7 +849,7 @@ pub(super) mod sol_selection {
     }
 
     /// Reuse the indexed review-family walk, including tombstoned revisions.
-    pub fn family_cte() -> String {
+    pub(crate) fn family_cte() -> String {
         format!(
             "{}, roots AS (SELECT DISTINCT id AS task_id,root AS cycle_root_id FROM family)",
             review_badge::review_family_cte("?1", review_badge::ReviewKey::Owner)

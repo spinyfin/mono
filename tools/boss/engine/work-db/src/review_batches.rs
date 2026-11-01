@@ -158,7 +158,7 @@ fn failed_batch_is_automatically_remintable_in(conn: &rusqlite::Connection, batc
 /// batch exists in any status, and never re-fires once the cap is reached —
 /// the condition is self-limiting, so a candidate query may splice it with
 /// no inertia cutoff and no attention marker.
-pub fn pre_merge_review_needs_readmission_sql(cycle_root_expr: &str) -> String {
+pub(crate) fn pre_merge_review_needs_readmission_sql(cycle_root_expr: &str) -> String {
     format!(
         "EXISTS (
             SELECT 1 FROM pr_review_batches newest
@@ -1087,7 +1087,7 @@ fn file_reported_live_review_batch_member_attentions(conn: &mut Connection) -> R
 ///
 /// Must be called inside an already-open transaction — see
 /// [`WorkDb::try_advance_review_batch_quorum`] for the standalone wrapper.
-pub fn try_advance_review_batch_quorum_in_tx(
+pub(crate) fn try_advance_review_batch_quorum_in_tx(
     tx: &Transaction<'_>,
     batch_id: &str,
     registry: &boss_engine_driver::DriverRegistry,
