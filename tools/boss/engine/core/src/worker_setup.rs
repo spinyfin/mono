@@ -1821,7 +1821,8 @@ if __name__ == "__main__":
 ///
 /// The checkleft invocation is resolved from (in order): `BOSS_CHECKLEFT_BIN`
 /// (an override used by tests, used as-is); `repobin exec checkleft` via a
-/// `repobin` binary found at `<repo-root>/bin/repobin` or on `PATH`, but
+/// `repobin` binary found at `$BOSS_BIN_DIR/repobin` (the Boss-bundled copy),
+/// `<repo-root>/bin/repobin` or on `PATH`, in that order, but
 /// only once a cheap `repobin exec checkleft --version` probe confirms the
 /// dispatch actually works (see `probe_repobin_checkleft` below);
 /// `<repo-root>/bin/checkleft` (a repobin-installed tool symlink); then a
@@ -1969,6 +1970,14 @@ def find_repo_root(start):
 
 
 def resolve_repobin(root):
+    # The repobin that ships with Boss comes first, by absolute path: a bare
+    # PATH search finds whichever repobin the user's dotfiles put first, which
+    # can be a stale or differently-pinned copy of the bundled one.
+    bundle_dir = os.environ.get("BOSS_BIN_DIR", "").strip()
+    if bundle_dir:
+        bundled = os.path.join(bundle_dir, "repobin")
+        if os.path.isfile(bundled) and os.access(bundled, os.X_OK):
+            return bundled
     candidate = os.path.join(root, "bin", "repobin")
     if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
         return candidate

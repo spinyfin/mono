@@ -183,14 +183,7 @@ fn run_worker_preflight_with(
 ) -> anyhow::Result<()> {
     assert_grok_oauth_with_reprobe(runner, workspace, environment)?;
 
-    let workspace_arg = workspace.display().to_string();
-    let cube = runner.run(
-        "cube",
-        &["--json", "workspace", "status", "--workspace", &workspace_arg],
-        workspace,
-        environment,
-    )?;
-    assert_cube_workspace(&cube, workspace)?;
+    probe_cube_workspace(runner, workspace, environment)?;
 
     let gh = runner.run(
         "gh",
@@ -209,6 +202,29 @@ fn run_worker_preflight_with(
     assert_session_store_writable(runner, workspace, environment)?;
 
     Ok(())
+}
+
+/// Prove the Boss-bundled `cube` can see the leased workspace.
+///
+/// `cube` is run by the absolute path of the binary that ships with the engine
+/// ([`GrokProcessEnvironment::bundled_cube`]), never by bare name: the engine's
+/// own `PATH` can put the user's repobin shim ahead of the bundle, and that
+/// shim builds the CLI from source with Bazel. When the bundled binary is
+/// missing, or genuinely cannot do the job, this still fails loudly.
+fn probe_cube_workspace(
+    runner: &dyn PreflightRunner,
+    workspace: &Path,
+    environment: &GrokProcessEnvironment,
+) -> anyhow::Result<()> {
+    let cube_program = environment.bundled_cube()?.to_string_lossy().into_owned();
+    let workspace_arg = workspace.display().to_string();
+    let cube = runner.run(
+        &cube_program,
+        &["--json", "workspace", "status", "--workspace", &workspace_arg],
+        workspace,
+        environment,
+    )?;
+    assert_cube_workspace(&cube, workspace)
 }
 
 /// Absolute path of the probe file, under the sessions directory itself so
@@ -432,8 +448,126 @@ mod tests {
         run_worker_preflight_with(&runner, workspace, &environment()).unwrap();
         assert_eq!(
             runner.programs.into_inner(),
-            ["grok", "cube", "gh", "jj", "jj", "/usr/bin/touch"]
+            ["grok", "/bundle/bin/cube", "gh", "jj", "jj", "/usr/bin/touch"]
         );
+    }
+
+    /// With no bundled `cube`, the preflight must fail loudly and name the
+    /// problem — before it runs anything, and without substituting a `PATH`
+    /// lookup of the bare name.
+    #[test]
+    fn a_missing_bundled_cube_fails_the_preflight_without_a_path_fallback() {
+        let runner = FakeRunner::new(vec![success("You are logged in with grok.com.\n")]);
+        let environment = environment().with_bundled_cube(None);
+
+        let error = run_worker_preflight_with(&runner, Path::new("/workspace"), &environment)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Boss-bundled `cube` could not be located"), "{error}");
+        assert!(error.contains("refusing a PATH lookup"), "{error}");
+        assert_eq!(
+            runner.programs.into_inner(),
+            ["grok"],
+            "nothing past the OAuth probe may run, and no bare `cube` may be tried"
+        );
+    }
+
+    /// Runs real processes the way the engine does, but with a `PATH` whose
+    /// first entry holds a decoy `cube` — the shape of `~/bin/cube`, the repobin
+    /// shim that wins a bare-name lookup on a developer machine.
+    struct DecoyPathRunner {
+        decoy_dir: PathBuf,
+    }
+
+    impl PreflightRunner for DecoyPathRunner {
+        fn run(
+            &self,
+            program: &str,
+            args: &[&str],
+            workspace: &Path,
+            _environment: &GrokProcessEnvironment,
+        ) -> anyhow::Result<PreflightOutput> {
+            let output = Command::new(program)
+                .args(args)
+                .current_dir(workspace)
+                .env("PATH", format!("{}:/usr/bin:/bin", self.decoy_dir.display()))
+                .output()?;
+            Ok(PreflightOutput {
+                success: output.status.success(),
+                status: output.status.to_string(),
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Regression: the cube probe ran a bare `cube`, so a repobin shim earlier on
+    /// the engine's `PATH` tried to build `//tools/cube:cube` from source and
+    /// killed the run before the pane started. The decoy here records that it ran
+    /// and fails; the bundled copy answers properly.
+    #[cfg(unix)]
+    #[test]
+    fn the_cube_probe_runs_the_bundled_binary_not_a_decoy_earlier_on_path() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let decoy_dir = root.path().join("home-bin");
+        let marker = root.path().join("decoy-ran");
+        write_script(
+            &decoy_dir.join("cube"),
+            &format!(
+                "#!/bin/sh\ntouch '{}'\necho 'repobin: building //tools/cube:cube' >&2\nexit 1\n",
+                marker.display()
+            ),
+        );
+        let bundled = root.path().join("Boss.app/Contents/Resources/bin/cube");
+        write_script(
+            &bundled,
+            &format!(
+                "#!/bin/sh\nprintf '%s' '{{\"workspace\":{{\"workspace_path\":\"{}\"}}}}'\n",
+                workspace.display()
+            ),
+        );
+
+        let environment = environment().with_bundled_cube(Some(bundled));
+        let runner = DecoyPathRunner { decoy_dir };
+        probe_cube_workspace(&runner, &workspace, &environment).unwrap();
+        assert!(!marker.exists(), "the decoy `cube` on PATH must never be executed");
+    }
+
+    /// The probe must keep failing when the bundled `cube` itself cannot do its
+    /// job — a decoy must not mask that either.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_bundled_cube_still_fails_the_probe_loudly() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let decoy_dir = root.path().join("home-bin");
+        write_script(
+            &decoy_dir.join("cube"),
+            &format!(
+                "#!/bin/sh\nprintf '%s' '{{\"workspace\":{{\"workspace_path\":\"{}\"}}}}'\n",
+                workspace.display()
+            ),
+        );
+        let bundled = root.path().join("bundle/cube");
+        write_script(&bundled, "#!/bin/sh\necho 'bundled cube is broken' >&2\nexit 7\n");
+
+        let environment = environment().with_bundled_cube(Some(bundled));
+        let error = probe_cube_workspace(&DecoyPathRunner { decoy_dir }, &workspace, &environment)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Cube workspace access command exited"), "{error}");
+        assert!(error.contains("bundled cube is broken"), "{error}");
     }
 
     /// The failure this check exists for: the session store is unwritable

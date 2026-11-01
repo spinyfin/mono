@@ -39,6 +39,7 @@ rust_library(
         "//tools/boss/engine/structured-output",
         "//tools/boss/engine/transient-error",
         "//tools/boss/engine/utils",
+        "//tools/boss/engine/worker-bin",
         "//tools/boss/log-files",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
@@ -80,6 +81,7 @@ rust_test(
         "//tools/boss/engine/structured-output",
         "//tools/boss/engine/transient-error",
         "//tools/boss/engine/utils",
+        "//tools/boss/engine/worker-bin",
         "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,

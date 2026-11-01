@@ -123,9 +123,9 @@ pub const DEFAULT_ENABLE_DISPATCH_READY_BUS: bool = false;
 /// higher tier — no code change required.
 pub const DEFAULT_COORDINATOR_MODEL: &str = "opus";
 
-// Bare name used as the PATH fallback. In installed Boss.app the engine
-// resolves cube from the bundle first (see resolve_cube_command); this
-// constant is only reached in dev mode or when the bundle copy is absent.
+// Bare name used only when no bundled `cube` can be located at all (see
+// `resolve_cube_command`): an unbundled test or ad-hoc process, never an
+// installed Boss.app or a `bazel run` engine, which both carry a `cube`.
 const DEFAULT_CUBE_COMMAND: &str = "cube";
 
 #[derive(Debug, Clone)]
@@ -570,28 +570,30 @@ impl RuntimeConfig {
     }
 }
 
-/// Returns the cube command to use, preferring a bundle-relative binary when
-/// the engine itself was launched from a bundle (installed Boss.app).
+/// Returns the cube command the engine itself runs.
 ///
-/// Resolution order:
-///   1. `<engine_exe_dir>/cube` — present in the bundle; used by installed
-///      Boss.app so the engine never depends on the GUI launchd PATH.
-///   2. `"cube"` — bare name resolved from PATH at exec time; used in dev
-///      mode where the engine runs via `bazel run` outside a bundle.
+/// Resolved by absolute path through the same bundled-binary lookup the
+/// worker `cube` launcher uses
+/// ([`boss_engine_worker_bin::resolve_cube_cli_from_process`]): `CUBE_CLI_BIN`,
+/// `$BOSS_BIN_DIR/cube`, the engine's runfiles, `bazel-bin`, then the engine's
+/// sibling directory. Build-from-source repobin shims are skipped, and `PATH` is
+/// never searched, so the user's `~/bin/cube` cannot win over the bundle.
 ///
-/// Workers run inside Ghostty terminal panes which inherit the user's shell
-/// PATH, so they continue to resolve cube (and jj, gh, claude, etc.) from
-/// PATH naturally. This bundle-relative lookup is engine-only.
+/// The bare name `cube` is returned only when none of those exist (an
+/// unbundled test or ad-hoc process). That is logged at error level because it
+/// is the one remaining `PATH` lookup; `BOSS_CUBE_CMD` overrides all of this.
 fn resolve_cube_command() -> String {
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let candidate = dir.join(DEFAULT_CUBE_COMMAND);
-        if candidate.is_file() {
-            return candidate.to_string_lossy().into_owned();
+    match boss_engine_worker_bin::resolve_cube_cli_from_process() {
+        Some(path) => path.to_string_lossy().into_owned(),
+        None => {
+            tracing::error!(
+                "no bundled `cube` found (checked CUBE_CLI_BIN, BOSS_BIN_DIR, the engine's runfiles, \
+                 bazel-bin and its sibling directory); falling back to a PATH lookup of `cube`, which \
+                 may resolve to a build-from-source shim. Set BOSS_CUBE_CMD or CUBE_CLI_BIN."
+            );
+            DEFAULT_CUBE_COMMAND.to_owned()
         }
     }
-    DEFAULT_CUBE_COMMAND.to_owned()
 }
 
 /// Logs how cube was resolved and warns if the bare name cannot be found on PATH.

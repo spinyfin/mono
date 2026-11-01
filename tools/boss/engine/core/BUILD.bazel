@@ -172,9 +172,15 @@ rust_binary(
     # launcher at, and the worker's bare `boss pr status` falls through
     # to whatever the user's dotfiles put on PATH — typically a repobin
     # shim that builds the CLI from source on every cold cache.
+    #
+    # `cube` rides along for the same reason: the engine's own cube client,
+    # the Grok capability preflight and every worker's `cube` launcher resolve
+    # it by absolute path (never PATH). Without this dep a `bazel run` engine
+    # has no `cube` of its own and would fall back to a PATH lookup.
     data = [
         "//tools/boss/cli:boss",
         "//tools/boss/event-shim:boss-event",
+        "//tools/cube",
         "//tools/repobin",
     ],
     edition = "2024",

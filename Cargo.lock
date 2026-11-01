@@ -788,6 +788,7 @@ dependencies = [
  "boss-engine-structured-output",
  "boss-engine-transient-error",
  "boss-engine-utils",
+ "boss-engine-worker-bin",
  "boss-log-files",
  "boss-pr-review",
  "boss-protocol",
