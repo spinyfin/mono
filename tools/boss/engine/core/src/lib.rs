@@ -64,6 +64,7 @@ pub use boss_host_execution::cube_op_budget;
 pub mod database_backup;
 pub mod dead_pane_sweep;
 pub mod dead_pid_sweep;
+pub mod dedup;
 pub mod deferred_scope;
 pub mod dep_unblock_sweep;
 pub mod design_detector;
@@ -201,6 +202,7 @@ pub mod startup_pane_reconcile;
 pub mod startup_timing;
 pub mod stdout_progress;
 pub mod stranded_answering_sweep;
+pub mod structured_call;
 pub use boss_engine_structured_output as structured_output;
 #[cfg(test)]
 mod storage_orchestration_tests;
