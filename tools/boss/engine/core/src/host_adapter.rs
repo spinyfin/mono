@@ -132,9 +132,9 @@ fn remote_driver_config_paths(workspace: &str, descriptor: &crate::driver::Drive
     (directory, gitignore)
 }
 
-use boss_host_execution::ClosedRecoveryPr;
+use boss_host_execution::recovery_pr::ClosedRecoveryPr;
 #[cfg(test)]
-pub(crate) use boss_host_execution::closed_recovery_pr_error;
+pub(crate) use boss_host_execution::recovery_pr::closed_recovery_pr_error;
 
 mod pr_anchor;
 

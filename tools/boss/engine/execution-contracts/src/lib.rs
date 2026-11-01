@@ -12,7 +12,7 @@ use boss_engine_recovery::execution_bookmark::{self, ExecutionBookmark};
 use boss_engine_storage_values::Host;
 use boss_engine_storage_values::pool_policy::{AUTOMATION_WORKER_ID_PREFIX, REVIEW_WORKER_ID_PREFIX};
 use boss_engine_structured_output::StructuredOutputKind;
-use boss_host_execution::fetch_recovery_pr_base;
+use boss_host_execution::recovery_pr::fetch_recovery_pr_base;
 pub use boss_host_execution::types::{
     CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
 };
@@ -312,8 +312,8 @@ pub const MAX_WORKER_POOL_SIZE: usize = WORKER_PAGE_SIZE * WORKER_PAGE_COUNT;
 
 /// Hard cap on the automation worker pool. The runtime config can request a
 /// smaller pool via `BOSS_AUTOMATION_POOL_SIZE`, but values above this are
-/// clamped. Raised from 6 to 8 per operator request (2026-07-15): automation
-/// demand regularly exceeds the pool.
+/// clamped. Sized at 8 because automation demand regularly exceeds a smaller
+/// pool.
 pub const MAX_AUTOMATION_POOL_SIZE: usize = 8;
 
 pub use boss_engine_storage_values::pool_policy::{DEFAULT_REVIEW_POOL_SIZE, MAX_REVIEW_POOL_SIZE};
@@ -1013,12 +1013,14 @@ impl WorkerPool {
 
     /// Claim a slot and mark it working. Test helper for filling the
     /// interactive cap with live workers rather than lease-pending claims.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn claim_working(&self, execution_id: &str, preferred_workspace_id: Option<&str>) -> Option<String> {
         let worker_id = self.claim_worker(execution_id, preferred_workspace_id).await?;
         self.mark_working(&worker_id).await;
         Some(worker_id)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn idle_count(&self) -> usize {
         let inner = self.inner.lock().await;
         inner
@@ -1028,6 +1030,7 @@ impl WorkerPool {
             .count()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn worker_affinity(&self, worker_id: &str) -> Option<String> {
         let inner = self.inner.lock().await;
         inner

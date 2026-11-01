@@ -95,6 +95,7 @@ toml = { workspace = true }
 unicode-segmentation = { workspace = true }
 
 [dev-dependencies]
+boss-execution-contracts = { path = "../execution-contracts", features = ["test-support"] }
 boss-work-db = { path = "../work-db", features = ["test-support"] }
 boss-prose-vocabulary = { path = "../prose-vocabulary" }
 boss-client = { path = "../../client" }
