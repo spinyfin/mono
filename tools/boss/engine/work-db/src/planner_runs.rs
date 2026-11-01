@@ -1,0 +1,1027 @@
+use super::*;
+use boss_protocol::{
+    PLANNER_OUTCOME_APPLIED, PLANNER_OUTCOME_PLANNER_FAILED, PLANNER_OUTCOME_RUNNING, PLANNER_OUTCOME_STAGED,
+    PlannerRun, PlannerRunSummary,
+};
+
+/// Audit summary recorded when an engine restart interrupts a Planner run.
+pub const PLANNER_RUN_ENGINE_RESTART_SUMMARY: &str = "engine restart interrupted the planner run";
+
+// ---- input types ----
+
+/// One row read by [`WorkDb::list_running_planner_runs_older_than`]: a
+/// `planner_runs` row still `outcome = 'running'`, joined to its
+/// project's name. Feeds `crate::background_work`'s toolbar snapshot —
+/// see the design's "Background task visibility" phase text
+/// (`Planning <project>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningPlannerRun {
+    pub id: String,
+    pub project_id: String,
+    pub product_id: String,
+    pub project_name: String,
+    pub created_at: String,
+}
+
+/// Input for creating a new `planner_runs` row via
+/// [`WorkDb::claim_planner_run`].
+pub struct ClaimPlannerRunInput<'a> {
+    pub project_id: &'a str,
+    pub product_id: &'a str,
+    /// Set when the trigger is a design-PR merge. `None` for
+    /// operator-initiated runs.
+    pub design_task_id: Option<&'a str>,
+    /// `"merge_trigger"` | `"operator"` | `"replan"`.
+    pub caller: &'a str,
+}
+
+/// Patch applied by [`WorkDb::update_planner_run`]. All fields are
+/// optional: only `Some` values overwrite the stored column; `None`
+/// leaves it unchanged. Every call also bumps `updated_at` to now.
+#[derive(Debug, Default, bon::Builder)]
+#[builder(on(String, into))]
+pub struct PlannerRunPatch {
+    pub outcome: Option<String>,
+    pub doc_ref: Option<String>,
+    pub model: Option<String>,
+    pub input_summary: Option<String>,
+    pub raw_output: Option<String>,
+    pub effort_audit: Option<String>,
+    pub notes: Option<String>,
+    pub result_summary: Option<String>,
+}
+
+// ---- mapper ----
+
+fn map_planner_run(row: &Row<'_>) -> rusqlite::Result<PlannerRun> {
+    Ok(PlannerRun {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        product_id: row.get(2)?,
+        design_task_id: row.get(3)?,
+        caller: row.get(4)?,
+        doc_ref: row.get(5)?,
+        model: row.get(6)?,
+        input_summary: row.get(7)?,
+        raw_output: row.get(8)?,
+        effort_audit: row.get(9)?,
+        notes: row.get(10)?,
+        outcome: row.get(11)?,
+        result_summary: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
+    })
+}
+
+/// The latest settled (non-`running`) `planner_runs` row of every project in
+/// `product_id`, as blob-free [`PlannerRunSummary`] values ordered by
+/// `project_id`. One batched statement for the whole product, run on the
+/// caller's connection so `get_work_tree` reads it in the same transaction as
+/// the rest of the tree. "Latest" uses the same `created_at DESC, id DESC`
+/// order as [`WorkDb::list_planner_runs_for_project`].
+pub fn latest_settled_planner_run_summaries(conn: &Connection, product_id: &str) -> Result<Vec<PlannerRunSummary>> {
+    let mut stmt = conn.prepare(
+        "SELECT pr.id, pr.project_id, pr.outcome, pr.created_at, pr.updated_at
+         FROM planner_runs pr
+         WHERE pr.product_id = ?1
+           AND pr.outcome != ?2
+           AND pr.id = (
+               SELECT latest.id FROM planner_runs latest
+               WHERE latest.project_id = pr.project_id
+                 AND latest.outcome != ?2
+               ORDER BY latest.created_at DESC, latest.id DESC
+               LIMIT 1
+           )
+         ORDER BY pr.project_id",
+    )?;
+    let rows = stmt.query_map(params![product_id, PLANNER_OUTCOME_RUNNING], |row| {
+        Ok(PlannerRunSummary {
+            run_id: row.get(0)?,
+            project_id: row.get(1)?,
+            outcome: row.get(2)?,
+            created_at: row.get(3)?,
+            updated_at: row.get(4)?,
+        })
+    })?;
+    rows.map(|r| r.map_err(Into::into)).collect()
+}
+
+const SELECT_PLANNER_RUN: &str = "SELECT id, project_id, product_id, design_task_id, caller,
+            doc_ref, model, input_summary, raw_output, effort_audit,
+            notes, outcome, result_summary, created_at, updated_at
+     FROM planner_runs";
+
+// ---- WorkDb accessors ----
+
+#[work_db_boundary::instrument]
+impl WorkDb {
+    /// Mark every Planner run inherited from a previous engine instance as
+    /// failed, releasing each project's idempotency gate for a later retry.
+    ///
+    /// A running Planner lives only in the engine process. Once that process
+    /// restarts, the row cannot have a live owner, so the whole sweep is
+    /// performed in one transaction before the replacement engine serves any
+    /// frontend requests or installs its Populator hook.
+    pub fn recover_running_planner_runs_on_engine_restart(&self) -> Result<Vec<PlannerRun>> {
+        let now = now_string();
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut recovered = {
+            let mut stmt = tx.prepare(&format!("{SELECT_PLANNER_RUN} WHERE outcome = ?1"))?;
+            collect_rows(stmt.query_map(params![PLANNER_OUTCOME_RUNNING], map_planner_run)?)?
+        };
+        tx.execute(
+            "UPDATE planner_runs
+             SET outcome = ?1, result_summary = ?2, updated_at = ?3
+             WHERE outcome = ?4",
+            params![
+                PLANNER_OUTCOME_PLANNER_FAILED,
+                PLANNER_RUN_ENGINE_RESTART_SUMMARY,
+                now,
+                PLANNER_OUTCOME_RUNNING,
+            ],
+        )?;
+        tx.commit()?;
+        for run in &mut recovered {
+            run.outcome = PLANNER_OUTCOME_PLANNER_FAILED.to_owned();
+            run.result_summary = Some(PLANNER_RUN_ENGINE_RESTART_SUMMARY.to_owned());
+            run.updated_at = now.clone();
+        }
+        Ok(recovered)
+    }
+
+    /// Global candidate set for the background-work toolbar badge: every
+    /// `planner_runs` row still `outcome = 'running'` whose `created_at`
+    /// is at least `min_age_secs` old, joined to the owning project's
+    /// name for the phase text. Unlike every other planner accessor,
+    /// this is not scoped to a single project — the badge is a
+    /// cross-project snapshot.
+    ///
+    /// The age filter is the planner source's anti-flicker gate (design
+    /// "Background task visibility" v1): a row younger than the
+    /// threshold is omitted even though it is genuinely live, because
+    /// the common case finishes before a human could act on the badge.
+    /// Ordered `created_at ASC, id ASC` (oldest first), matching
+    /// `crate::background_work`'s stable "known starts oldest first"
+    /// ordering contract.
+    pub fn list_running_planner_runs_older_than(&self, min_age_secs: i64) -> Result<Vec<RunningPlannerRun>> {
+        let now_secs: i64 = now_string().parse().unwrap_or(0);
+        self.list_running_planner_runs_older_than_at(min_age_secs, now_secs)
+    }
+
+    /// [`Self::list_running_planner_runs_older_than`] judged against an
+    /// explicit `now_secs` instead of the live clock, so a test can
+    /// backdate a row and query it against the same instant.
+    pub fn list_running_planner_runs_older_than_at(
+        &self,
+        min_age_secs: i64,
+        now_secs: i64,
+    ) -> Result<Vec<RunningPlannerRun>> {
+        let conn = self.connect()?;
+        let cutoff = now_secs - min_age_secs;
+        let mut stmt = conn.prepare(
+            "SELECT pr.id, pr.project_id, pr.product_id, pr.created_at, p.name
+             FROM planner_runs pr
+             JOIN projects p ON p.id = pr.project_id
+             WHERE pr.outcome = ?1
+               AND CAST(pr.created_at AS INTEGER) <= ?2
+             ORDER BY pr.created_at ASC, pr.id ASC",
+        )?;
+        let rows = stmt.query_map(params![PLANNER_OUTCOME_RUNNING, cutoff], |row| {
+            Ok(RunningPlannerRun {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                product_id: row.get(2)?,
+                created_at: row.get(3)?,
+                project_name: row.get(4)?,
+            })
+        })?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Attempt to claim a planner run for `project_id` by inserting a row
+    /// with `outcome = 'running'`.
+    ///
+    /// Returns `Ok(Some(run))` when the insert succeeds (this invocation owns
+    /// the populate) or `Ok(None)` when the UNIQUE partial index fires —
+    /// indicating a prior `running` / `staged` / `applied` row already exists
+    /// for this project and the caller should skip.
+    ///
+    /// The UNIQUE index `planner_runs_one_per_project` covers only
+    /// `outcome IN ('running','staged','applied')`, so terminal failure rows
+    /// (`planner_failed`, `fetch_failed`, etc.) do **not** block a subsequent
+    /// retry claim.
+    pub fn claim_planner_run(&self, input: ClaimPlannerRunInput<'_>) -> Result<Option<PlannerRun>> {
+        let conn = self.connect()?;
+        let id = next_id("run");
+        let now = now_string();
+        let rows = conn.execute(
+            "INSERT OR IGNORE INTO planner_runs
+                 (id, project_id, product_id, design_task_id, caller,
+                  outcome, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                id,
+                input.project_id,
+                input.product_id,
+                input.design_task_id,
+                input.caller,
+                PLANNER_OUTCOME_RUNNING,
+                now,
+                now,
+            ],
+        )?;
+        if rows == 0 {
+            return Ok(None);
+        }
+        Ok(Some(PlannerRun {
+            id,
+            project_id: input.project_id.to_owned(),
+            product_id: input.product_id.to_owned(),
+            design_task_id: input.design_task_id.map(|s| s.to_owned()),
+            caller: input.caller.to_owned(),
+            doc_ref: None,
+            model: None,
+            input_summary: None,
+            raw_output: None,
+            effort_audit: None,
+            notes: None,
+            outcome: PLANNER_OUTCOME_RUNNING.to_owned(),
+            result_summary: None,
+            created_at: now.clone(),
+            updated_at: now,
+        }))
+    }
+
+    /// Apply a partial update to the `planner_runs` row identified by `id`.
+    ///
+    /// Only `Some` fields in `patch` are written; `None` fields are left
+    /// unchanged. `updated_at` is always bumped to the current epoch second.
+    ///
+    /// Returns `Ok(Some(run))` with the post-update state, or `Ok(None)` if
+    /// no row with `id` exists (stale call after a delete).
+    pub fn update_planner_run(&self, id: &str, patch: PlannerRunPatch) -> Result<Option<PlannerRun>> {
+        let now = now_string();
+        let mut sets: Vec<String> = vec!["updated_at = ?1".to_owned()];
+        // We build the SET list dynamically. Param index 1 is `now`; the `id`
+        // for the WHERE clause will be assigned the next index after all SET
+        // params. We collect the boxed `ToSql` values separately.
+        let mut extra_params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now.clone())];
+
+        macro_rules! push_field {
+            ($field:expr, $col:literal) => {
+                if let Some(val) = $field {
+                    extra_params.push(Box::new(val));
+                    sets.push(format!("{} = ?{}", $col, extra_params.len()));
+                }
+            };
+        }
+
+        push_field!(patch.outcome, "outcome");
+        push_field!(patch.doc_ref, "doc_ref");
+        push_field!(patch.model, "model");
+        push_field!(patch.input_summary, "input_summary");
+        push_field!(patch.raw_output, "raw_output");
+        push_field!(patch.effort_audit, "effort_audit");
+        push_field!(patch.notes, "notes");
+        push_field!(patch.result_summary, "result_summary");
+
+        let id_idx = extra_params.len() + 1;
+        extra_params.push(Box::new(id.to_owned()));
+
+        let sql = format!("UPDATE planner_runs SET {} WHERE id = ?{}", sets.join(", "), id_idx,);
+        let params_refs: Vec<&dyn rusqlite::ToSql> = extra_params.iter().map(|p| p.as_ref()).collect();
+        let changed = {
+            let conn = self.connect()?;
+            conn.execute(&sql, params_refs.as_slice())?
+        };
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.get_planner_run(id)
+    }
+
+    /// Fetch a single `planner_runs` row by primary key.
+    ///
+    /// Returns `Ok(None)` when no row with `id` exists.
+    pub fn get_planner_run(&self, id: &str) -> Result<Option<PlannerRun>> {
+        let conn = self.connect()?;
+        let sql = format!("{SELECT_PLANNER_RUN} WHERE id = ?1");
+        conn.query_row(&sql, params![id], map_planner_run)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Return all `planner_runs` rows for `project_id`, newest first.
+    ///
+    /// Includes all outcomes — callers that only want live rows should filter
+    /// on `outcome IN ('running','staged','applied')`.
+    pub fn list_planner_runs_for_project(&self, project_id: &str) -> Result<Vec<PlannerRun>> {
+        let conn = self.connect()?;
+        let sql = format!(
+            "{SELECT_PLANNER_RUN}
+             WHERE project_id = ?1
+             ORDER BY created_at DESC, id DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![project_id], map_planner_run)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Return the live `planner_runs` row for `project_id` — i.e. the row
+    /// whose `outcome` is one of `'running'`, `'staged'`, or `'applied'`.
+    ///
+    /// At most one such row can exist per the UNIQUE partial index
+    /// `planner_runs_one_per_project`. Returns `Ok(None)` when the project
+    /// has never been successfully populated (or the idempotency gate has
+    /// been cleared for a re-plan).
+    pub fn live_planner_run_for_project(&self, project_id: &str) -> Result<Option<PlannerRun>> {
+        let conn = self.connect()?;
+        let sql = format!(
+            "{SELECT_PLANNER_RUN}
+             WHERE project_id = ?1
+               AND outcome IN (?2, ?3, ?4)
+             LIMIT 1"
+        );
+        conn.query_row(
+            &sql,
+            params![
+                project_id,
+                PLANNER_OUTCOME_RUNNING,
+                PLANNER_OUTCOME_STAGED,
+                PLANNER_OUTCOME_APPLIED,
+            ],
+            map_planner_run,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Delete the `planner_runs` row for `id`.
+    ///
+    /// Used by the undo path (`boss project unpopulate`): removing the row
+    /// also releases the idempotency gate so a corrected re-plan can claim
+    /// the project again. Returns `true` if a row was deleted, `false` if
+    /// the id was unknown.
+    pub fn delete_planner_run(&self, id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let changed = conn.execute("DELETE FROM planner_runs WHERE id = ?1", params![id])?;
+        Ok(changed > 0)
+    }
+
+    /// Return `(id, name, kind)` for every non-deleted task in `project_id`,
+    /// across **all** kinds.
+    ///
+    /// Unlike [`WorkDb::list_tasks`] (which restricts to
+    /// `project_task`/`design`/`investigation`), this counts *any* kind so the
+    /// Populator's pre-seeded refusal honours its "any non-design task under
+    /// the project" contract — a `task`/`revision`/`followup` row attached to
+    /// the project still blocks auto-populate. It also feeds the Planner's
+    /// existing-name dedup hint. Ordered by `created_at` for a stable listing.
+    pub fn list_project_task_briefs(&self, project_id: &str) -> Result<Vec<(String, String, String)>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, kind FROM tasks
+             WHERE project_id = ?1 AND deleted_at IS NULL
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Return the ids of all non-deleted tasks tagged with `planner_run_id` —
+    /// i.e. the batch of tasks the Materializer created for that run.
+    ///
+    /// `tasks.planner_run_id` is a targeted column omitted from the standard
+    /// `map_task` SELECT (like `completed_at`), so this is
+    /// the read side of the Materializer's tag. Ordered by `created_at` for
+    /// a stable, reviewable listing. Used by the undo path
+    /// (`boss project unpopulate --run <id>`) and by Materializer tests.
+    pub fn list_task_ids_for_planner_run(&self, planner_run_id: &str) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM tasks
+             WHERE planner_run_id = ?1 AND deleted_at IS NULL
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![planner_run_id], |row| row.get::<_, String>(0))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+}
+
+// ---- tests ----
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::*;
+
+    fn open() -> WorkDb {
+        WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap()
+    }
+
+    fn product_and_project(db: &WorkDb) -> (String, String) {
+        let product = create_test_product_with_repo(db, "Test", Some("git@github.com:test/test.git"));
+        let project = db
+            .create_project(
+                boss_protocol::CreateProjectInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Alpha")
+                    .goal("build it")
+                    .build(),
+            )
+            .unwrap();
+        (product.id, project.id)
+    }
+
+    #[test]
+    fn claim_succeeds_for_fresh_project() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        let run = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "merge_trigger",
+            })
+            .unwrap();
+        assert!(run.is_some());
+        let run = run.unwrap();
+        assert_eq!(run.outcome, PLANNER_OUTCOME_RUNNING);
+        assert_eq!(run.project_id, project_id);
+        assert_eq!(run.caller, "merge_trigger");
+    }
+
+    #[test]
+    fn claim_returns_none_when_running_row_exists() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        let first = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "merge_trigger",
+            })
+            .unwrap();
+        assert!(first.is_some());
+        let second = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "operator",
+            })
+            .unwrap();
+        assert!(second.is_none(), "second claim must be blocked by idempotency index");
+    }
+
+    #[test]
+    fn claim_returns_none_when_staged_row_exists() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        let run = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "merge_trigger",
+            })
+            .unwrap()
+            .unwrap();
+        // Transition to staged.
+        db.update_planner_run(
+            &run.id,
+            PlannerRunPatch {
+                outcome: Some(PLANNER_OUTCOME_STAGED.to_owned()),
+                ..PlannerRunPatch::default()
+            },
+        )
+        .unwrap();
+        // A second claim must still be blocked.
+        let second = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "operator",
+            })
+            .unwrap();
+        assert!(second.is_none());
+    }
+
+    #[test]
+    fn claim_allowed_after_terminal_failure() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        let run = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "merge_trigger",
+            })
+            .unwrap()
+            .unwrap();
+        // Transition to a terminal failure — no longer covered by the partial
+        // index, so a subsequent claim must succeed.
+        db.update_planner_run(
+            &run.id,
+            PlannerRunPatch {
+                outcome: Some(boss_protocol::PLANNER_OUTCOME_PLANNER_FAILED.to_owned()),
+                ..PlannerRunPatch::default()
+            },
+        )
+        .unwrap();
+        let retry = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "operator",
+            })
+            .unwrap();
+        assert!(retry.is_some(), "retry claim must succeed after terminal failure");
+    }
+
+    #[test]
+    fn restart_recovery_fails_running_rows_preserves_other_outcomes_and_is_idempotent() {
+        let db = open();
+        let (product_id, running_project_id) = product_and_project(&db);
+        let running = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &running_project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "merge_trigger",
+            })
+            .unwrap()
+            .unwrap();
+
+        let (_, staged_project_id) = product_and_project(&db);
+        let staged = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &staged_project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "operator",
+            })
+            .unwrap()
+            .unwrap();
+        db.update_planner_run(
+            &staged.id,
+            PlannerRunPatch::builder().outcome(PLANNER_OUTCOME_STAGED).build(),
+        )
+        .unwrap();
+
+        let recovered_runs = db.recover_running_planner_runs_on_engine_restart().unwrap();
+        assert_eq!(recovered_runs.len(), 1);
+        assert_eq!(recovered_runs[0].id, running.id);
+        let recovered = db.get_planner_run(&running.id).unwrap().unwrap();
+        assert_eq!(recovered.outcome, PLANNER_OUTCOME_PLANNER_FAILED);
+        assert_eq!(
+            recovered.result_summary.as_deref(),
+            Some(PLANNER_RUN_ENGINE_RESTART_SUMMARY)
+        );
+        assert_eq!(
+            db.get_planner_run(&staged.id).unwrap().unwrap().outcome,
+            PLANNER_OUTCOME_STAGED,
+            "restart recovery must preserve non-running outcomes"
+        );
+        assert_eq!(
+            db.recover_running_planner_runs_on_engine_restart().unwrap().len(),
+            0,
+            "a second startup sweep must be idempotent"
+        );
+
+        let retry = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &running_project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "operator",
+            })
+            .unwrap();
+        assert!(
+            retry.is_some(),
+            "restart recovery must release the project for a new claim"
+        );
+    }
+
+    #[test]
+    fn update_planner_run_patches_fields() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        let run = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_id,
+                product_id: &product_id,
+                design_task_id: Some("task_abc"),
+                caller: "merge_trigger",
+            })
+            .unwrap()
+            .unwrap();
+        let updated = db
+            .update_planner_run(
+                &run.id,
+                PlannerRunPatch {
+                    outcome: Some(PLANNER_OUTCOME_STAGED.to_owned()),
+                    model: Some("claude-opus-4-5".to_owned()),
+                    result_summary: Some("created 5 tasks, 3 edges".to_owned()),
+                    ..PlannerRunPatch::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.outcome, PLANNER_OUTCOME_STAGED);
+        assert_eq!(updated.model.as_deref(), Some("claude-opus-4-5"));
+        assert_eq!(updated.result_summary.as_deref(), Some("created 5 tasks, 3 edges"));
+        assert_eq!(updated.design_task_id.as_deref(), Some("task_abc"));
+    }
+
+    #[test]
+    fn list_planner_runs_for_project_returns_all() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        // First run: terminal failure.
+        let r1 = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "merge_trigger",
+            })
+            .unwrap()
+            .unwrap();
+        db.update_planner_run(
+            &r1.id,
+            PlannerRunPatch {
+                outcome: Some(boss_protocol::PLANNER_OUTCOME_FETCH_FAILED.to_owned()),
+                ..PlannerRunPatch::default()
+            },
+        )
+        .unwrap();
+        // Second run: staged.
+        let r2 = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "operator",
+            })
+            .unwrap()
+            .unwrap();
+        db.update_planner_run(
+            &r2.id,
+            PlannerRunPatch {
+                outcome: Some(PLANNER_OUTCOME_STAGED.to_owned()),
+                ..PlannerRunPatch::default()
+            },
+        )
+        .unwrap();
+        let runs = db.list_planner_runs_for_project(&project_id).unwrap();
+        assert_eq!(runs.len(), 2, "expected 2 runs for the project");
+    }
+
+    #[test]
+    fn live_planner_run_for_project_returns_staged_row() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        assert!(
+            db.live_planner_run_for_project(&project_id).unwrap().is_none(),
+            "no live run before claim"
+        );
+        let run = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "merge_trigger",
+            })
+            .unwrap()
+            .unwrap();
+        db.update_planner_run(
+            &run.id,
+            PlannerRunPatch {
+                outcome: Some(PLANNER_OUTCOME_STAGED.to_owned()),
+                ..PlannerRunPatch::default()
+            },
+        )
+        .unwrap();
+        let live = db.live_planner_run_for_project(&project_id).unwrap();
+        assert!(live.is_some());
+        assert_eq!(live.unwrap().outcome, PLANNER_OUTCOME_STAGED);
+    }
+
+    #[test]
+    fn delete_planner_run_releases_idempotency_gate() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        let run = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "merge_trigger",
+            })
+            .unwrap()
+            .unwrap();
+        db.update_planner_run(
+            &run.id,
+            PlannerRunPatch {
+                outcome: Some(PLANNER_OUTCOME_STAGED.to_owned()),
+                ..PlannerRunPatch::default()
+            },
+        )
+        .unwrap();
+        // Before delete: a new claim is blocked.
+        let blocked = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "operator",
+            })
+            .unwrap();
+        assert!(blocked.is_none());
+        // Delete the row (undo path).
+        assert!(db.delete_planner_run(&run.id).unwrap());
+        // After delete: a new claim succeeds.
+        let reclaimed = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "operator",
+            })
+            .unwrap();
+        assert!(reclaimed.is_some(), "claim must succeed after undo delete");
+    }
+
+    /// Fixed "now" for the age-gate tests: rows are backdated relative to
+    /// it and queried against it, so the outcome never depends on the
+    /// real clock ticking between the two reads.
+    const NOW_SECS: i64 = 1_700_000_000;
+
+    /// Directly rewrites a `planner_runs` row's `created_at` to
+    /// `NOW_SECS - secs_ago` so age-gate tests can simulate "this run
+    /// started N seconds ago" without sleeping the test. Pure test
+    /// plumbing — production code never touches `created_at` after insert.
+    fn backdate_planner_run(db: &WorkDb, run_id: &str, secs_ago: i64) {
+        let new_ts = (NOW_SECS - secs_ago).to_string();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE planner_runs SET created_at = ?2 WHERE id = ?1",
+            params![run_id, new_ts],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn list_running_planner_runs_older_than_excludes_a_fresh_row() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        db.claim_planner_run(ClaimPlannerRunInput {
+            project_id: &project_id,
+            product_id: &product_id,
+            design_task_id: None,
+            caller: "merge_trigger",
+        })
+        .unwrap();
+        assert!(
+            db.list_running_planner_runs_older_than(15).unwrap().is_empty(),
+            "a just-claimed row must not clear the anti-flicker age gate"
+        );
+    }
+
+    #[test]
+    fn list_running_planner_runs_older_than_includes_rows_at_the_threshold() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        let run = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "merge_trigger",
+            })
+            .unwrap()
+            .unwrap();
+        // Exactly at the threshold: "at least N seconds old" is inclusive.
+        backdate_planner_run(&db, &run.id, 15);
+        let rows = db.list_running_planner_runs_older_than_at(15, NOW_SECS).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, run.id);
+        assert_eq!(rows[0].project_id, project_id);
+        assert_eq!(rows[0].product_id, product_id);
+        assert_eq!(rows[0].project_name, "Alpha");
+    }
+
+    #[test]
+    fn list_running_planner_runs_older_than_excludes_one_second_short_of_the_threshold() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        let run = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "merge_trigger",
+            })
+            .unwrap()
+            .unwrap();
+        backdate_planner_run(&db, &run.id, 14);
+        assert!(
+            db.list_running_planner_runs_older_than_at(15, NOW_SECS)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn list_running_planner_runs_older_than_excludes_non_running_outcomes() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        let run = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "merge_trigger",
+            })
+            .unwrap()
+            .unwrap();
+        backdate_planner_run(&db, &run.id, 999);
+        db.update_planner_run(
+            &run.id,
+            PlannerRunPatch::builder().outcome(PLANNER_OUTCOME_STAGED).build(),
+        )
+        .unwrap();
+        assert!(
+            db.list_running_planner_runs_older_than_at(15, NOW_SECS)
+                .unwrap()
+                .is_empty(),
+            "a staged row is no longer an in-flight background operation"
+        );
+    }
+
+    #[test]
+    fn list_running_planner_runs_older_than_orders_oldest_first_across_projects() {
+        let db = open();
+        let (product_id, project_a) = product_and_project(&db);
+        let project_b = db
+            .create_project(
+                boss_protocol::CreateProjectInput::builder()
+                    .product_id(product_id.clone())
+                    .name("Beta")
+                    .goal("build it too")
+                    .build(),
+            )
+            .unwrap()
+            .id;
+        let newer = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_a,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "merge_trigger",
+            })
+            .unwrap()
+            .unwrap();
+        let older = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_b,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "merge_trigger",
+            })
+            .unwrap()
+            .unwrap();
+        backdate_planner_run(&db, &newer.id, 20);
+        backdate_planner_run(&db, &older.id, 40);
+        let rows = db.list_running_planner_runs_older_than_at(15, NOW_SECS).unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            vec![older.id, newer.id]
+        );
+    }
+
+    // ---- work-tree summary ----
+
+    fn claim(db: &WorkDb, product_id: &str, project_id: &str) -> PlannerRun {
+        db.claim_planner_run(ClaimPlannerRunInput {
+            project_id,
+            product_id,
+            design_task_id: None,
+            caller: "operator",
+        })
+        .unwrap()
+        .expect("claim")
+    }
+
+    fn settle(db: &WorkDb, run_id: &str, outcome: &str) {
+        db.update_planner_run(run_id, PlannerRunPatch::builder().outcome(outcome).build())
+            .unwrap();
+    }
+
+    fn summaries(db: &WorkDb, product_id: &str) -> Vec<PlannerRunSummary> {
+        db.get_work_tree(product_id).unwrap().planner_runs
+    }
+
+    #[test]
+    fn work_tree_summary_is_the_latest_settled_run_per_project_and_follows_transitions() {
+        let db = open();
+        let (product_id, alpha) = product_and_project(&db);
+        let beta = db
+            .create_project(
+                boss_protocol::CreateProjectInput::builder()
+                    .product_id(product_id.clone())
+                    .name("Beta")
+                    .goal("build it too")
+                    .build(),
+            )
+            .unwrap()
+            .id;
+        let untouched = db
+            .create_project(
+                boss_protocol::CreateProjectInput::builder()
+                    .product_id(product_id.clone())
+                    .name("Gamma")
+                    .goal("never planned")
+                    .build(),
+            )
+            .unwrap()
+            .id;
+        assert!(summaries(&db, &product_id).is_empty(), "no runs, no summaries");
+
+        // Alpha: a failed run, then a retry that is still running — the
+        // summary stays on the settled failure; the live run is not in it.
+        let failed = claim(&db, &product_id, &alpha);
+        settle(&db, &failed.id, PLANNER_OUTCOME_PLANNER_FAILED);
+        let retry = claim(&db, &product_id, &alpha);
+        // Beta: only a running run, which has no settled summary yet.
+        let beta_run = claim(&db, &product_id, &beta);
+
+        let tree = summaries(&db, &product_id);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].project_id, alpha);
+        assert_eq!(tree[0].run_id, failed.id);
+        assert_eq!(tree[0].outcome, PLANNER_OUTCOME_PLANNER_FAILED);
+        assert_eq!(tree[0].created_at, failed.created_at);
+
+        // Transition: the retry stages, the summary moves to it.
+        settle(&db, &retry.id, PLANNER_OUTCOME_STAGED);
+        settle(&db, &beta_run.id, PLANNER_OUTCOME_PLANNER_FAILED);
+        let tree = summaries(&db, &product_id);
+        assert_eq!(tree.len(), 2, "alpha and beta, not the never-planned project");
+        let alpha_summary = tree.iter().find(|s| s.project_id == alpha).unwrap();
+        assert_eq!(alpha_summary.run_id, retry.id);
+        assert_eq!(alpha_summary.outcome, PLANNER_OUTCOME_STAGED);
+        assert!(tree.iter().all(|s| s.project_id != untouched));
+
+        // Release flips staged -> applied; undo deletes the row, falling back
+        // to the earlier settled failure.
+        settle(&db, &retry.id, PLANNER_OUTCOME_APPLIED);
+        let tree = summaries(&db, &product_id);
+        let alpha_summary = tree.iter().find(|s| s.project_id == alpha).unwrap();
+        assert_eq!(alpha_summary.outcome, PLANNER_OUTCOME_APPLIED);
+        assert!(db.delete_planner_run(&retry.id).unwrap());
+        let tree = summaries(&db, &product_id);
+        let alpha_summary = tree.iter().find(|s| s.project_id == alpha).unwrap();
+        assert_eq!(alpha_summary.run_id, failed.id);
+    }
+
+    #[test]
+    fn work_tree_summary_is_scoped_to_the_product() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        let (other_product, other_project) = {
+            let product = create_test_product_with_repo(&db, "Other", Some("git@github.com:test/other.git"));
+            let project = db
+                .create_project(
+                    boss_protocol::CreateProjectInput::builder()
+                        .product_id(product.id.clone())
+                        .name("Elsewhere")
+                        .goal("x")
+                        .build(),
+                )
+                .unwrap();
+            (product.id, project.id)
+        };
+        let mine = claim(&db, &product_id, &project_id);
+        settle(&db, &mine.id, PLANNER_OUTCOME_STAGED);
+        let theirs = claim(&db, &other_product, &other_project);
+        settle(&db, &theirs.id, PLANNER_OUTCOME_PLANNER_FAILED);
+
+        let tree = summaries(&db, &product_id);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].run_id, mine.id);
+    }
+}

@@ -1,0 +1,51 @@
+[package]
+name = "boss-work-db"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bon = { workspace = true }
+boss-board-projection = { path = "../board-projection" }
+boss-comment-anchor = { path = "../../comment_anchor" }
+boss-conflict-diagnosis = { path = "../conflict-diagnosis" }
+boss-engine-attachments = { path = "../attachments" }
+boss-engine-automation-dedup = { path = "../automation-dedup" }
+boss-engine-board-gesture = { path = "../board-gesture" }
+boss-engine-driver = { path = "../driver" }
+boss-engine-effort = { path = "../effort" }
+boss-engine-proposal-validation = { path = "../proposal-validation" }
+boss-engine-recovery = { path = "../recovery" }
+boss-engine-storage-values = { path = "../storage-values" }
+boss-engine-utils = { path = "../utils" }
+boss-event-bus = { path = "../event-bus" }
+boss-gh-telemetry = { path = "../../gh_telemetry" }
+boss-github = { path = "../../github" }
+boss-host-execution = { path = "../host-execution" }
+boss-metrics = { path = "../metrics" }
+boss-pr-review = { path = "../pr-review" }
+boss-pr-review-sources = { path = "../pr-review-sources" }
+boss-protocol = { path = "../../protocol" }
+boss-review-guide = { path = "../review-guide" }
+boss-task-scope = { path = "../task-scope" }
+chrono = { workspace = true }
+fastrand = { workspace = true }
+fs4 = { workspace = true }
+git-utils = { path = "../../../../lib/rust/git_utils" }
+regex = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+unicode-segmentation = { workspace = true }
+
+[dev-dependencies]
+libc = "0.2"
+tempfile = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
+tokio = { workspace = true, features = ["test-util"] }

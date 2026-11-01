@@ -7,7 +7,9 @@ rust_proc_macro(
         "src/read_transactions.rs",
     ],
     edition = "2024",
-    visibility = ["//tools/boss/engine/core:__pkg__"],
+    visibility = [
+        "//tools/boss/engine/work-db:__pkg__",
+    ],
     deps = [
         "@@rules_rust++crate+mono_crates__proc-macro2-1.0.106//:proc_macro2",
         "@@rules_rust++crate+mono_crates__quote-1.0.45//:quote",

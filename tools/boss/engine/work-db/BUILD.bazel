@@ -1,0 +1,133 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "work-db",
+    srcs = glob(["src/**/*.rs"]),
+    compile_data = [
+        "//tools/boss/app-macos:work_board_banners_swift",
+    ],
+    crate_name = "boss_work_db",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = ["//tools/boss/engine/work-db-boundary:work_db_boundary"] + all_crate_deps(proc_macro = True),
+    rustc_env = {
+        "BOSS_WORK_BOARD_BANNERS_SWIFT": "$(execpath //tools/boss/app-macos:work_board_banners_swift)",
+    },
+    visibility = [
+        "//tools/boss/bossctl:__pkg__",
+        "//tools/boss/cli:__pkg__",
+        "//tools/boss/engine/core:__pkg__",
+    ],
+    deps = [
+        "//lib/rust/git_utils",
+        "//tools/boss/comment_anchor",
+        "//tools/boss/engine/attachments",
+        "//tools/boss/engine/automation-dedup",
+        "//tools/boss/engine/board-gesture",
+        "//tools/boss/engine/board-projection",
+        "//tools/boss/engine/conflict-diagnosis",
+        "//tools/boss/engine/driver",
+        "//tools/boss/engine/effort",
+        "//tools/boss/engine/event-bus",
+        "//tools/boss/engine/host-execution",
+        "//tools/boss/engine/metrics",
+        "//tools/boss/engine/pr-review",
+        "//tools/boss/engine/pr-review-sources",
+        "//tools/boss/engine/proposal-validation",
+        "//tools/boss/engine/recovery",
+        "//tools/boss/engine/review-guide",
+        "//tools/boss/engine/storage-values",
+        "//tools/boss/engine/task-scope",
+        "//tools/boss/engine/utils",
+        "//tools/boss/gh_telemetry",
+        "//tools/boss/github",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "work_db_test",
+    size = "small",
+    timeout = "moderate",
+    crate = ":work-db",
+    data = [
+        "@jj_test_tools//:jj",
+    ],
+    edition = "2024",
+    env = {
+        "BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)",
+        "HOME": "/tmp",
+    },
+    proc_macro_deps = ["//tools/boss/engine/work-db-boundary:work_db_boundary"] + all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//lib/rust/git_utils",
+        "//tools/boss/comment_anchor",
+        "//tools/boss/engine/attachments",
+        "//tools/boss/engine/automation-dedup",
+        "//tools/boss/engine/board-gesture",
+        "//tools/boss/engine/board-projection",
+        "//tools/boss/engine/conflict-diagnosis",
+        "//tools/boss/engine/driver",
+        "//tools/boss/engine/effort",
+        "//tools/boss/engine/event-bus",
+        "//tools/boss/engine/host-execution",
+        "//tools/boss/engine/metrics",
+        "//tools/boss/engine/pr-review",
+        "//tools/boss/engine/pr-review-sources",
+        "//tools/boss/engine/proposal-validation",
+        "//tools/boss/engine/recovery",
+        "//tools/boss/engine/review-guide",
+        "//tools/boss/engine/storage-values",
+        "//tools/boss/engine/task-scope",
+        "//tools/boss/engine/utils",
+        "//tools/boss/gh_telemetry",
+        "//tools/boss/github",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_library(
+    name = "storage_behavior_fixture",
+    testonly = True,
+    srcs = ["tests/storage_behavior_fixture.rs"],
+    crate_root = "tests/storage_behavior_fixture.rs",
+    edition = "2024",
+    visibility = ["//visibility:private"],
+    deps = [
+        ":work-db",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "storage_behavior_test",
+    size = "small",
+    srcs = ["tests/storage_behavior.rs"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    visibility = ["//visibility:private"],
+    deps = [
+        ":storage_behavior_fixture",
+        ":work-db",
+        "//tools/boss/engine/event-bus",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

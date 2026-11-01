@@ -103,3 +103,41 @@ pub struct SemanticProgressCheckpoint {
     /// unknown, if the event was not a turn-state signal).
     pub turn_condition: SemanticTurnCondition,
 }
+
+use boss_protocol::WorkerEvent;
+
+/// What tool-state `event` establishes on its own, independent of any prior
+/// condition — `None` for an event that carries no tool-state signal.
+pub fn tool_condition_signal(event: &WorkerEvent) -> Option<SemanticToolCondition> {
+    match event {
+        WorkerEvent::ToolPoll { awaiting_model, .. } => Some(if *awaiting_model {
+            SemanticToolCondition::Yielded
+        } else {
+            SemanticToolCondition::InFlight
+        }),
+        WorkerEvent::PreToolUse { .. } => Some(SemanticToolCondition::InFlight),
+        WorkerEvent::PostToolUse { .. } | WorkerEvent::UserPromptSubmit { .. } | WorkerEvent::Stop { .. } => {
+            Some(SemanticToolCondition::Idle)
+        }
+        WorkerEvent::ModelProgress { .. }
+        | WorkerEvent::SessionStart { .. }
+        | WorkerEvent::SessionEnd { .. }
+        | WorkerEvent::Notification { .. } => None,
+    }
+}
+
+/// What turn-state `event` establishes on its own — `None` for an event
+/// that carries no turn-state signal.
+pub fn turn_condition_signal(event: &WorkerEvent) -> Option<SemanticTurnCondition> {
+    match event {
+        WorkerEvent::PreToolUse { .. } | WorkerEvent::PostToolUse { .. } | WorkerEvent::UserPromptSubmit { .. } => {
+            Some(SemanticTurnCondition::InTurn)
+        }
+        WorkerEvent::Stop { .. } => Some(SemanticTurnCondition::Ended),
+        WorkerEvent::ToolPoll { .. }
+        | WorkerEvent::ModelProgress { .. }
+        | WorkerEvent::SessionStart { .. }
+        | WorkerEvent::SessionEnd { .. }
+        | WorkerEvent::Notification { .. } => None,
+    }
+}

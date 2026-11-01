@@ -22,6 +22,7 @@ rust_library(
         "//tools/boss/engine/design-docs:__pkg__",
         "//tools/boss/engine/host-execution:__pkg__",
         "//tools/boss/engine/recovery:__pkg__",
+        "//tools/boss/engine/work-db:__pkg__",
         "//tools/cube:__pkg__",
     ],
     deps = all_crate_deps(normal = True),

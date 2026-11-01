@@ -7,106 +7,14 @@
 use std::time::Instant;
 
 use crate::metrics::{CounterHandle, GaugeHandle, Registry};
-
-crate::register_gauge!(
-    ENVELOPE_WATCH_PASS_DURATION_MS,
-    "envelope_watch.pass_duration_ms",
-    "Wall-clock duration in milliseconds of the most recent envelope-watch sweep pass.",
-);
-crate::register_gauge!(
-    ENVELOPE_WATCH_ITEMS_PER_PASS,
-    "envelope_watch.items_per_pass",
-    "Live worker slots the most recent envelope-watch pass evaluated.",
-);
-crate::register_gauge!(
-    ENVELOPE_WATCH_TICK_INTERVAL_MS,
-    "envelope_watch.tick_interval_ms",
-    "Milliseconds between the starts of the two most recent envelope-watch passes.",
-);
-crate::register_counter!(
-    ENVELOPE_WATCH_PASSES,
-    "envelope_watch.passes",
-    "Total envelope-watch sweep passes since engine start.",
-);
-
-crate::register_gauge!(
-    TERMINAL_WORK_SWEEP_PASS_DURATION_MS,
-    "terminal_work_sweep.pass_duration_ms",
-    "Wall-clock duration in milliseconds of the most recent terminal-work sweep's candidate-gathering phase.",
-);
-crate::register_gauge!(
-    TERMINAL_WORK_SWEEP_ITEMS_PER_PASS,
-    "terminal_work_sweep.items_per_pass",
-    "Live worker slots the most recent terminal-work sweep pass inspected.",
-);
-crate::register_gauge!(
-    TERMINAL_WORK_SWEEP_TICK_INTERVAL_MS,
-    "terminal_work_sweep.tick_interval_ms",
-    "Milliseconds between the starts of the two most recent terminal-work sweep passes.",
-);
-crate::register_counter!(
-    TERMINAL_WORK_SWEEP_PASSES,
-    "terminal_work_sweep.passes",
-    "Total terminal-work sweep passes since engine start.",
-);
-
-crate::register_gauge!(
-    AGENT_JSONL_STREAM_PASS_DURATION_MS,
-    "agent_jsonl_stream.pass_duration_ms",
-    "Wall-clock duration in milliseconds of the most recent agent-JSONL tail poll iteration (any live stream).",
-);
-crate::register_gauge!(
-    AGENT_JSONL_STREAM_ITEMS_PER_PASS,
-    "agent_jsonl_stream.items_per_pass",
-    "JSONL-root revalidations (lstat + canonicalize) the most recent tail poll iteration performed.",
-);
-crate::register_counter!(
-    AGENT_JSONL_STREAM_PASSES,
-    "agent_jsonl_stream.passes",
-    "Total agent-JSONL tail poll iterations across every live stream since engine start.",
-);
-crate::register_counter!(
-    AGENT_JSONL_STREAM_ROOT_REVALIDATIONS,
-    "agent_jsonl_stream.root_revalidations",
-    "Total JSONL-root revalidations (lstat + canonicalize) performed by tail polls since engine start.",
-);
-
-crate::register_gauge!(
-    EXECUTION_BOOKMARK_POINTERS_PASS_DURATION_MS,
-    "execution_bookmark_pointers.pass_duration_ms",
-    "Wall-clock duration in milliseconds of the most recent recovery-pointer snapshot or restore over a PR chain.",
-);
-crate::register_gauge!(
-    EXECUTION_BOOKMARK_POINTERS_ITEMS_PER_PASS,
-    "execution_bookmark_pointers.items_per_pass",
-    "Recovery-bookmark records the most recent pointer snapshot or restore covered.",
-);
-crate::register_counter!(
-    EXECUTION_BOOKMARK_POINTERS_PASSES,
-    "execution_bookmark_pointers.passes",
-    "Total recovery-pointer snapshot and restore passes since engine start.",
-);
-crate::register_counter!(
-    EXECUTION_BOOKMARK_POINTERS_JJ_SPAWNS,
-    "execution_bookmark_pointers.jj_spawns",
-    "Total `jj` child processes spawned by recovery-pointer snapshot and restore passes since engine start.",
-);
-
-crate::register_gauge!(
-    DEAD_PANE_TERMINAL_PASS_DURATION_MS,
-    "dead_pane_terminal.pass_duration_ms",
-    "Wall-clock milliseconds of the most recent terminal execution scan and process probes.",
-);
-crate::register_gauge!(
-    DEAD_PANE_TERMINAL_ITEMS_PER_PASS,
-    "dead_pane_terminal.items_per_pass",
-    "Recent terminal execution rows probed by the most recent scan.",
-);
-crate::register_counter!(
-    DEAD_PANE_TERMINAL_PASSES,
-    "dead_pane_terminal.passes",
-    "Total terminal execution scans since engine start.",
-);
+pub(crate) use crate::work::sweep_handles::AGENT_JSONL_STREAM_ROOT_REVALIDATIONS;
+use crate::work::sweep_handles::{
+    AGENT_JSONL_STREAM_ITEMS_PER_PASS, AGENT_JSONL_STREAM_PASS_DURATION_MS, AGENT_JSONL_STREAM_PASSES,
+    DEAD_PANE_TERMINAL_ITEMS_PER_PASS, DEAD_PANE_TERMINAL_PASS_DURATION_MS, DEAD_PANE_TERMINAL_PASSES,
+    ENVELOPE_WATCH_ITEMS_PER_PASS, ENVELOPE_WATCH_PASS_DURATION_MS, ENVELOPE_WATCH_PASSES,
+    ENVELOPE_WATCH_TICK_INTERVAL_MS, TERMINAL_WORK_SWEEP_ITEMS_PER_PASS, TERMINAL_WORK_SWEEP_PASS_DURATION_MS,
+    TERMINAL_WORK_SWEEP_PASSES, TERMINAL_WORK_SWEEP_TICK_INTERVAL_MS,
+};
 pub(crate) static DEAD_PANE_TERMINAL: SweepTicker = SweepTicker::new(
     &DEAD_PANE_TERMINAL_PASS_DURATION_MS,
     &DEAD_PANE_TERMINAL_ITEMS_PER_PASS,
@@ -122,7 +30,6 @@ pub fn register_metrics(registry: &Registry) {
         &ENVELOPE_WATCH,
         &TERMINAL_WORK_SWEEP,
         &AGENT_JSONL_STREAM,
-        &EXECUTION_BOOKMARK_POINTERS,
     ] {
         registry.register_gauge(ticker.pass_duration_ms);
         registry.register_gauge(ticker.items_per_pass);
@@ -132,7 +39,7 @@ pub fn register_metrics(registry: &Registry) {
         registry.register_counter(ticker.passes);
     }
     registry.register_counter(&AGENT_JSONL_STREAM_ROOT_REVALIDATIONS);
-    registry.register_counter(&EXECUTION_BOOKMARK_POINTERS_JJ_SPAWNS);
+    crate::work::execution_bookmark_metrics::register_metrics(registry);
 }
 
 /// Handles published by one sweep. Cadence state is owned by its loop; a
@@ -217,12 +124,6 @@ pub(crate) static AGENT_JSONL_STREAM: SweepTicker = SweepTicker::new(
     &AGENT_JSONL_STREAM_ITEMS_PER_PASS,
     None,
     &AGENT_JSONL_STREAM_PASSES,
-);
-pub(crate) static EXECUTION_BOOKMARK_POINTERS: SweepTicker = SweepTicker::new(
-    &EXECUTION_BOOKMARK_POINTERS_PASS_DURATION_MS,
-    &EXECUTION_BOOKMARK_POINTERS_ITEMS_PER_PASS,
-    None,
-    &EXECUTION_BOOKMARK_POINTERS_PASSES,
 );
 
 #[cfg(test)]

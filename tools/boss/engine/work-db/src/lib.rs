@@ -1,0 +1,972 @@
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use boss_event_bus::{Event, EventBus};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
+
+use crate::event_publish::{PendingEvents, commit_and_publish};
+
+/// How long sqlite will internally retry on `SQLITE_BUSY` before
+/// surfacing the error to the caller. We funnel concurrent CLI writes
+/// against the same `state.db` (multiple `boss chore bind-pr` etc.
+/// landing in the engine in parallel) — without this the second writer
+/// would fail with "database is locked" even though the first writer
+/// finishes in microseconds. Five seconds is overkill for the in-engine
+/// case (writes are tiny) but cheap when uncontended.
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// SQL fragment for the set of task kinds that behave like chores: they own
+/// their own PR and follow the active → in_review → done lifecycle. Used in
+/// every `kind IN (...)` filter that drives the merge-poller and blocking
+/// sweeps so a new kind only needs to be added here to be wired in everywhere.
+pub const CHORE_LIKE_KINDS_SQL: &str =
+    "'chore', 'project_task', 'design', 'investigation', 'followup', 'design_postmortem'";
+
+/// SQL boolean: `{alias}` is a live writer for the revision chain-tail gate,
+/// [`WorkDb::has_in_flight_ci_fix_revision`], and same-chain revision
+/// gating in [`crate::work_dependencies::gating_prereqs_for`].
+///
+/// Live = `todo` / `active`, or `blocked` for a reason other than a
+/// terminal halt (`worker_failed`, `spawning_attempt_retired_unsuccessfully`),
+/// or those halt reasons while a non-terminal execution is still attached.
+/// A halted revision with no live execution is not a writer: gating a later
+/// revision on it queues forever, and the parent sits in Review ▸ Blocked.
+///
+/// Parent PR CI is not part of this predicate. A dead halt has already
+/// released the branch — there is no live worker to finish — whether the
+/// head is green, red, or unknown. Requiring `ci_required_state = 'success'`
+/// would leave later revisions queued behind a corpse while CI is red, which
+/// is the case that most needs a new writer. A red head still places the
+/// parent in Review ▸ Blocked via `classify_review_section`; that is the
+/// CI failure itself, not this gate.
+///
+/// `alias` is a compile-time table alias from callers (`t`, `next`);
+/// never user input.
+pub fn live_chain_writer_sql(alias: &str) -> String {
+    debug_assert!(
+        alias.chars().all(|c| c.is_ascii_alphabetic()),
+        "live_chain_writer_sql alias must be a SQL identifier, got {alias:?}"
+    );
+    format!(
+        "({alias}.status IN ('todo', 'active')
+          OR (
+              {alias}.status = 'blocked'
+              AND (
+                  COALESCE({alias}.blocked_reason, '') NOT IN (
+                      'worker_failed',
+                      'spawning_attempt_retired_unsuccessfully'
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM work_executions e
+                       WHERE e.work_item_id = {alias}.id
+                         AND e.status NOT IN (
+                             'completed', 'failed', 'abandoned', 'cancelled', 'orphaned'
+                         )
+                  )
+              )
+          ))"
+    )
+}
+
+/// True when `task_id` is a live writer per [`live_chain_writer_sql`].
+pub fn is_live_chain_writer(conn: &Connection, task_id: &str) -> Result<bool> {
+    let live = live_chain_writer_sql("t");
+    Ok(conn.query_row(
+        &format!(
+            "SELECT EXISTS(
+                 SELECT 1 FROM tasks t
+                  WHERE t.id = ?1
+                    AND t.deleted_at IS NULL
+                    AND {live}
+             )"
+        ),
+        [task_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// Error of the single most recent terminal, non-superseded review-guide
+/// attempt (`failed` or `cancelled`). Both the card-state query and the
+/// summary query embed this so the two projections cannot drift. Empty
+/// errors are returned as-is; there is no fallback to an older attempt.
+pub const REVIEW_GUIDE_LATEST_TERMINAL_ERROR_SQL: &str = "CASE WHEN s.guide_lifecycle = 'failed' THEN (
+                    SELECT a.error FROM pr_review_guide_attempts a
+                    WHERE a.series_id = s.id AND a.status IN ('failed', 'cancelled')
+                    ORDER BY a.finished_at DESC, a.id DESC LIMIT 1
+                ) ELSE NULL END";
+
+/// Sliding window for the merge-conflict churn-guard heuristic
+/// (`merge-conflict-handling-in-review.md` Q6 / Phase 6 #16): the
+/// 4th `conflict_resolutions` row for a given work item inside one
+/// hour is created as `abandoned` instead of `pending`.
+pub const CHURN_GUARD_WINDOW_SECS: i64 = 60 * 60;
+/// Trailing-window count at which the next attempt is pre-abandoned.
+/// The first 3 attempts inside `CHURN_GUARD_WINDOW_SECS` go live; the
+/// 4th trips the guard.
+pub const CHURN_GUARD_THRESHOLD: i64 = 3;
+/// `failure_reason` stamped on the pre-abandoned row.
+pub const CHURN_GUARD_REASON: &str = "churn_threshold_exceeded";
+
+/// Sliding window for the orphan-active redispatch churn guard: the
+/// 4th orphan-redispatch for a given work item inside one hour is
+/// skipped and a warning is logged instead.
+pub const ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS: i64 = 60 * 60;
+/// Trailing-window terminal-execution count at which the next
+/// orphan-redispatch is skipped. The first 3 cycles inside the window
+/// go live; the 4th trips the guard.
+pub const ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD: i64 = 3;
+
+/// Time-independent half of the orphan-active redispatch churn guard: the
+/// number of *consecutive* unproductive terminal executions
+/// (`orphaned`/`abandoned`/`failed`/`cancelled`, counted back from the
+/// newest and stopped by the first `completed` run) after which the next
+/// orphan-redispatch is skipped, **regardless of how long the cycle took**.
+///
+/// [`ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS`] alone cannot catch a slow
+/// loop: a redispatch cycle that takes longer than
+/// `WINDOW_SECS / THRESHOLD` ages its own oldest evidence out of the
+/// trailing window before the next failure lands inside it, so the count
+/// never reaches the threshold no matter how many times the row burns a
+/// worker. That is not a tuning problem — a longer window is outrun by a
+/// slower loop — so the guard needs a second half that does not reference
+/// wall-clock time at all. A 40-50 minute cycle (observed 2026-09-13) sat
+/// permanently at two-in-the-window and redispatched indefinitely.
+///
+/// Deliberately the same strike count as the windowed half: the contract
+/// is still "three unproductive runs and the row is parked for a human",
+/// with the window only deciding how *fast* churn also trips it. A
+/// `completed` execution resets the chain, so a row that works, then later
+/// dies once, starts over from zero rather than carrying stale strikes.
+pub const ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD: i64 = 3;
+
+/// Which half of the orphan-redispatch churn guard tripped. Carried into
+/// the park text so the operator reading the bounced card is told which
+/// contract stopped the row, and what will un-stop it — the two halves
+/// clear on different events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChurnTrip {
+    /// [`ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD`] unproductive terminal
+    /// executions inside the trailing
+    /// [`ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS`]: fast churn. Clears on
+    /// its own as the window drains.
+    Window,
+    /// [`ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD`] consecutive
+    /// unproductive terminal executions with no successful run in between,
+    /// however long they took: slow churn, which no trailing window catches.
+    /// Does NOT clear with the passage of time — only a successful run or an
+    /// explicit operator start resets it.
+    Consecutive,
+}
+
+pub use boss_engine_storage_values::attention_kinds::CHURN_GUARD_PARKED_ATTENTION_KIND;
+
+pub use boss_engine_storage_values::attention_kinds::LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND;
+
+/// `tasks.dispatch_failed_reason` value stamped by
+/// [`crate::WorkDb::bounce_churn_guard_parked_to_backlog`] when
+/// [`crate::orphan_sweep`] trips the churn guard on an `active` work item.
+/// Distinct from [`CHURN_GUARD_PARKED_ATTENTION_KIND`]: that kind remains
+/// in use by [`crate::pr_review_recovery`] (whose target task stays
+/// `in_review`, so it cannot bounce to Backlog), but the `active`-task case
+/// now goes through the same `dispatch_failed_reason` representation a
+/// pre-spawn dispatch failure uses, so the kanban board reflects the park
+/// without ever reading `work_attention_items` — see
+/// `docs/designs/dispatch-halt-state-vs-attention-items.md`.
+pub const CHURN_GUARD_DISPATCH_FAILED_REASON: &str = "churn_guard";
+
+/// `tasks.dispatch_failed_reason` value stamped by
+/// [`crate::WorkDb::bounce_deliberate_park_to_backlog`] when
+/// [`crate::orphan_sweep`] finds an `active` work item whose run ended in a
+/// deliberate engine park (`run_done_declared_blocked` / `nudge_breaker_tripped`
+/// — see `DELIBERATE_PARK_ATTENTION_KINDS` in that module) with its attention
+/// item still open. The board reads the typed halt fields independently
+/// of the attention item, so a parked row visibly waits in Backlog (see
+/// `docs/designs/dispatch-halt-state-vs-attention-items.md`). This reuses
+/// the exact `dispatch_failed_reason` / `dispatch_failed_error` / `dispatch_failed_at`
+/// / Backlog-status representation [`CHURN_GUARD_DISPATCH_FAILED_REASON`]
+/// established, under its own reason, for one deliberate purpose: a park is a
+/// human decision, not a transient dispatch failure, so
+/// [`crate::dispatch_failure_recovery_sweep`] must NEVER treat a row carrying
+/// this reason as eligible for its own automatic retry the way it does for
+/// [`CHURN_GUARD_DISPATCH_FAILED_REASON`] — only an explicit `bossctl work
+/// start` (or kanban drag-to-Doing) may clear a deliberate park, exactly the
+/// contract the attention item it is layered over already carries.
+///
+/// A row can be *both* deliberately parked and churn-tripped at once (the
+/// worker declared itself blocked after several unproductive runs). This
+/// reason wins over [`CHURN_GUARD_DISPATCH_FAILED_REASON`] in that case —
+/// see `bounce_deliberate_park_to_backlog`'s `churn_context` parameter — since
+/// the park is the stronger, human-only-clearable condition; the churn detail
+/// is folded into the body text instead so the card names both.
+pub const DELIBERATE_PARK_DISPATCH_FAILED_REASON: &str = "deliberate_park";
+
+/// One-line CLI headline for a `tasks.dispatch_failed_reason` value.
+/// A deliberate park is a wait, not a failure, so it must not share the
+/// "Dispatch failed" prefix every other reason uses. `print_task_details`
+/// (`cli/src/output.rs`) and `bossctl agents status` (`bossctl/src/agents.rs`)
+/// both print this, so a third reason added later cannot regress the same
+/// "failed" mislabel. Mirrors `WorkDispatchFailureBanner.headline` on the
+/// kanban card (colon here, em dash there).
+pub fn dispatch_halt_headline(reason: &str) -> String {
+    if reason == DELIBERATE_PARK_DISPATCH_FAILED_REASON {
+        "Waiting on you: deliberate park".to_owned()
+    } else {
+        format!("Dispatch failed: {reason}")
+    }
+}
+
+/// Verbatim substring [`WorkDb::deliberate_park_text`] writes into the
+/// `dispatch_failed_error` body when a deliberately parked row has ALSO
+/// tripped the churn guard. `tools/boss/app-macos/Sources/WorkBoardBanners.swift`
+/// (`WorkDispatchFailureBanner.reasonLabel`) matches on this exact string to
+/// decide whether to render the combined "deliberate park + churn guard"
+/// headline instead of the plain park one — see the `/// Mirrors` comment
+/// there. The unit test `combined_park_churn_marker_matches_swift_banner`
+/// `include_str!`s that Swift file and asserts this constant appears in it,
+/// so a wording change on either side fails the test instead of silently
+/// dropping the churn half of the card headline. The bounce-path assertion
+/// that the generated body *contains* this constant only proves the churn
+/// branch ran; it does not pin the value.
+pub const DELIBERATE_PARK_CHURN_COMBINED_MARKER: &str = "tripping the churn guard on top of the park";
+
+#[cfg(test)]
+mod combined_park_churn_marker_pin {
+    /// Byte-identity pin: `WorkDispatchFailureBanner.combinedParkChurnMarker`
+    /// in the live Swift source must contain this crate's
+    /// [`super::DELIBERATE_PARK_CHURN_COMBINED_MARKER`] verbatim. A bounce-path
+    /// `contains(CONSTANT)` check cannot do this job — that body is produced
+    /// by interpolating the same constant, so expected and actual move
+    /// together. Reading the Swift file is the same pattern
+    /// `boss_construct_scan` uses for `CHECKS.yaml`.
+    #[test]
+    fn combined_park_churn_marker_matches_swift_banner() {
+        let swift = include_str!(env!("BOSS_WORK_BOARD_BANNERS_SWIFT"));
+        assert!(
+            swift.contains(super::DELIBERATE_PARK_CHURN_COMBINED_MARKER),
+            "WorkBoardBanners.swift must contain DELIBERATE_PARK_CHURN_COMBINED_MARKER \
+             verbatim so reasonLabel can match the engine body; changing the Rust \
+             constant without the Swift literal (or vice versa) silently drops the \
+             churn half of the card headline"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dispatch_halt_headline_tests {
+    #[test]
+    fn does_not_label_a_park_as_failed() {
+        assert_eq!(
+            super::dispatch_halt_headline(super::DELIBERATE_PARK_DISPATCH_FAILED_REASON),
+            "Waiting on you: deliberate park",
+        );
+        assert_eq!(
+            super::dispatch_halt_headline(super::CHURN_GUARD_DISPATCH_FAILED_REASON),
+            "Dispatch failed: churn_guard",
+        );
+        assert_eq!(
+            super::dispatch_halt_headline("spawn_timeout"),
+            "Dispatch failed: spawn_timeout",
+        );
+    }
+}
+
+pub use boss_engine_storage_values::attention_kinds::DISPATCH_STAGE_STALLED_ATTENTION_KIND;
+
+/// Outcome of [`WorkDb::classify_dispatch_stall`] — whether a persistently
+/// stalled execution the escalation sweep detected should actually be
+/// escalated onto the work-item attention surface, and if not, why.
+///
+/// The sweep's detector ([`crate::dispatch_reader::persistently_stalled`])
+/// is a pure scan of the per-execution `dispatch.jsonl` mirrors with no
+/// view of the DB — deliberately, so it still works when the engine RPC is
+/// wedged. That blind spot is exactly why it over-reports: a mirror can
+/// outlive its execution row, describe an already-terminal execution, or
+/// belong to an execution whose `work_item_id` is not a product/project/task
+/// at all. An `automation_triage` execution carries the `automations.id`
+/// (an `auto_…` id) as its `work_item_id`
+/// (`WorkDb::create_automation_triage_execution`), and
+/// [`crate::WorkDb::file_dispatch_stage_stalled_attention`] cannot
+/// target that — `product_id_for_work_item` rejects the id with
+/// `unknown work item id format: auto_…`. Only [`Self::Escalate`] is safe to
+/// file; the other variants are the sweep's cue to skip (and count) the
+/// stall rather than hammer the trace with a per-item failure every 60s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StallEscalation {
+    /// The execution is live (non-terminal) and bound to a real work item.
+    /// Carries the row's authoritative `work_item_id` to file/refresh the
+    /// attention item against.
+    Escalate { work_item_id: String },
+    /// The execution's `work_item_id` is not a product/project/task — e.g.
+    /// an `automation_triage` execution whose id is an `auto_…` automation
+    /// id. Such executions have no kanban card to surface a stall on; their
+    /// stalls remain visible via the `stage_stalled` dispatch event and
+    /// `bossctl dispatch ghost-active --include-stalled`.
+    NotWorkItem,
+    /// The execution row is already terminal
+    /// (`completed`/`failed`/`abandoned`/`cancelled`/`orphaned`) — a dead
+    /// timeline whose mirror simply stopped, not a live stall.
+    Terminal,
+    /// No execution row exists for the mirror's id — retention-swept, or an
+    /// on-disk mirror that outlived its DB row. Nothing live to escalate.
+    Missing,
+}
+
+pub use boss_engine_storage_values::attention_kinds::ATTENTION_KIND_RECOVERY_EXHAUSTED;
+pub use boss_engine_storage_values::attention_kinds::ATTENTION_KIND_RECOVERY_PERMANENT;
+
+/// Cooldown after a pre-spawn dispatch failure exhausts
+/// `PRE_START_RETRY_DELAYS` and `bounce_dispatch_failed_to_backlog` parks
+/// the work item in Backlog (`autostart = 0`, `dispatch_failed_reason`
+/// set) before [`crate::dispatch_failure_recovery_sweep`] gives it
+/// another shot. Long relative to the ~65s in-process retry window —
+/// the point of the bounce was to stop hammering a broken host/repo
+/// immediately, so the recovery sweep's cadence is "try again later, in
+/// case the world changed," not a tighter retry.
+pub const DISPATCH_FAILURE_RECOVERY_MIN_AGE_SECS: i64 = 10 * 60;
+/// Sliding window for the dispatch-failure-recovery churn guard: once a
+/// work item has produced this many terminal executions inside the
+/// window, the recovery sweep stops re-enqueueing it and leaves it
+/// parked for a human. The attention item `record_pre_start_failure`
+/// raised at the original bounce is the escalation; the sweep does not
+/// raise a second one on every skip.
+pub const DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_WINDOW_SECS: i64 = 24 * 60 * 60;
+/// Trailing-window terminal-execution count at which the recovery sweep
+/// stops auto-re-enqueueing a work item.
+pub const DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_THRESHOLD: i64 = 5;
+
+/// Sliding window for the duplicate-create guard: a non-deleted task/chore
+/// in the same product with the same name created within this many seconds
+/// of the attempted insert causes a `DuplicateTaskError` unless
+/// `force_duplicate` is set on the input.
+pub const DUPLICATE_GUARD_WINDOW_SECS: i64 = 60;
+
+/// Phase 12 #40 — sliding window for the CI-retry churn guard. The
+/// engine counts `ci_remediations` created in the last
+/// `CI_CHURN_WINDOW_SECS` for the work item; once the count crosses
+/// [`CI_CHURN_LIMIT`], the next manual `boss engine ci retry`
+/// invocation is rate-limited and requires `--force` to proceed.
+pub const CI_CHURN_WINDOW_SECS: i64 = 60 * 60;
+/// Threshold for [`CI_CHURN_WINDOW_SECS`]. Set well above the default
+/// 3-attempt budget so the natural failure → fix → green cycle never
+/// triggers; the only realistic path to 5 within an hour is repeated
+/// manual retries against a flaky / fundamentally-broken PR.
+pub const CI_CHURN_LIMIT: i64 = 5;
+
+pub use boss_protocol::{
+    ADMISSION_BLOCKER_AUTOSTART_DISABLED, ADMISSION_BLOCKER_CHURN_GUARD_PARKED, ADMISSION_BLOCKER_DELIBERATE_PARKED,
+    ADMISSION_BLOCKER_INELIGIBLE_STATUS, ADMISSION_BLOCKER_INTERACTIVE_CONCURRENCY_CAP,
+    ADMISSION_BLOCKER_UNMET_DEPENDENCY, ANSWER_AGENT_RUN_STATUS_FAILED, ANSWER_AGENT_RUN_STATUS_REPLIED,
+    ANSWER_AGENT_RUN_STATUS_RUNNING, ANSWER_AGENT_RUN_STATUS_SUPERSEDED, AddDependencyInput, AnswerAgentRun, Attention,
+    AttentionGroup, AttentionMerge, Automation, AutomationPatch, AutomationRun, AutomationTrigger,
+    BOOTHBY_REVERSIBILITY_IRREVERSIBLE, BOOTHBY_TARGET_ATTENTION, BOOTHBY_TARGET_ATTENTION_ITEM,
+    BOOTHBY_TARGET_PROJECT, BOOTHBY_TARGET_TASK, BlockedSignal, BoothbyAction, BoothbyCursor, BoothbyFinding,
+    BoothbyPass, BranchNaming, COMMENT_STATUS_ACTIVE, COMMENT_STATUS_ANSWER_FAILED, COMMENT_STATUS_ANSWERED,
+    COMMENT_STATUS_ANSWERING, COMMENT_STATUS_AWAITING_FOLLOWUP, COMMENT_STATUS_DISMISSED, COMMENT_STATUS_IN_REVISION,
+    COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED, CREATED_VIA_ATTENTION, CREATED_VIA_BOOTHBY_PREFIX,
+    CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_DOC_COMMENT_PREFIX, CREATED_VIA_ENGINE_AUTO,
+    CREATED_VIA_GUIDE_COMMENT_PREFIX, CREATED_VIA_IDEA_GRADUATION_PREFIX, CREATED_VIA_MERGE_CONFLICT_PREFIX,
+    CREATED_VIA_PR_REVIEW_POST_MERGE_PREFIX, CREATED_VIA_PR_REVIEW_PREFIX, CREATED_VIA_UNKNOWN, CiBudgetSnapshot,
+    CiRemediation, CommentAnchor, CommentResolution, CommentThreadEntry, CommentWithThread, CommentsBannerState,
+    ConflictClassCount, ConflictFileFrequency, ConflictFilePairFrequency, ConflictHotspotReport, ConflictResolution,
+    CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput,
+    CreateDecisionInput, CreateExecutionInput, CreateIdeaInput, CreateManyChoresInput, CreateManyTasksInput,
+    CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput, Decision,
+    DecisionKind, DecisionStatus, DeferredScopeAttention, DependencyDirection, DependencyEdge, DependencyFilter,
+    DispatchAdmission, DispatchAdmissionBlocker, DispatchPauseSnapshot, DocOwner, DocOwnerPrLifecycle,
+    DriverTrafficSplit, EditorialAction, EditorialRules, EffortLevel, EngineAttemptListEntry, ExecutionKind,
+    ExecutionReconcileResult, ExecutionStatus, FinishExecutionRunInput, FollowupMemberOverride,
+    GuideCommentDisposition, GuideCommentOutcome, INTENT_QUESTION, INTENT_REVISION, Idea, IdeaGraduationKind,
+    IdeaPatch, IdeaStatus, LAST_STATUS_ACTOR_BOOTHBY, LAST_STATUS_ACTOR_HUMAN, ListDependenciesInput, PrWorkItemMatch,
+    Product, Project, ProjectDesignDocState, ProjectStatus, RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY,
+    RESOLVED_WITH_ORPHAN, ReasoningMode, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
+    ResolvedComment, ResolvedDesignDoc, ResolvedDesignDocKind, ReviewBatch, ReviewBatchMember, ReviewBatchMemberRole,
+    ReviewBatchMemberStatus, ReviewBatchPhase, ReviewBatchStatus, ReviewClassification, ReviseDocInput,
+    ReviseDocOutcome, SetProjectDesignDocInput, SetTaskDocPointerInput, StatusActor, THREAD_ENTRY_AUTHOR_ENGINE,
+    THREAD_ENTRY_KIND_ANSWER, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, Task, TaskKind, TaskRuntime, TaskStatus,
+    WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
+    WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree, comment_status_is_closed,
+    is_known_created_via,
+};
+
+/// Outcome of [`WorkDb::claim_execution_for_dispatch`]: the Ready → Claimed
+/// compare-and-swap that keeps `reconcile_product_executions` from rewriting
+/// a row the scheduler has already picked up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchClaimOutcome {
+    /// This caller won the `ready → claimed` CAS.
+    Won,
+    /// The row was already `claimed` (another drain or `force_dispatch` holds it).
+    AlreadyHeld,
+    /// The row is no longer dispatchable — typically the reconciler won and
+    /// moved it to `waiting_dependency`, or it left the ready set some other way.
+    Rejected,
+}
+
+/// Outcome of `WorkDb::record_pre_start_failure`. The coordinator uses
+/// this to decide whether to schedule a delayed kick (retry) or surface
+/// a permanent failure to the operator.
+///
+/// Intermediate [`Self::Retry`] attempts do **not** insert a `work_runs`
+/// row (retry state is on the execution). Only [`Self::PermanentFail`]
+/// inserts a failed bookkeeping run — intermediate failed rows were a
+/// major source of permanent `transcript_path IS NULL` on `work_runs`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PreStartFailureOutcome {
+    /// The execution has been reset to `ready` with a `dispatch_not_before`
+    /// delay. The coordinator should kick the scheduler after `delay`.
+    /// No `work_runs` row was inserted.
+    Retry { delay: Duration },
+    /// All retry attempts exhausted. The execution is now `failed` and a
+    /// single failed `work_runs` row was inserted for operator history.
+    /// The coordinator should surface an attention item.
+    PermanentFail,
+}
+
+/// Returned by `insert_task_in_tx` / `insert_chore_in_tx` when the
+/// duplicate guard fires. Carried as an `anyhow::Error` so `app.rs` can
+/// downcast and send a structured `WorkItemDuplicateBlocked` event.
+#[derive(Debug)]
+pub struct DuplicateTaskError {
+    pub existing_id: String,
+    pub existing_short_id: i64,
+    pub name: String,
+    pub age_secs: i64,
+}
+
+impl std::fmt::Display for DuplicateTaskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "A task/chore named {:?} was created {} seconds ago (id: {}, short_id: T{}); \
+             pass --force-duplicate to create another",
+            self.name, self.age_secs, self.existing_id, self.existing_short_id,
+        )
+    }
+}
+
+impl std::error::Error for DuplicateTaskError {}
+
+/// Returned by [`WorkDb::create_automation_task`] when the dedup gate
+/// finds an open sibling of the same automation already tracking this
+/// finding.
+///
+/// This is not the same condition as [`DuplicateTaskError`], which is the
+/// 60-second same-name guard on human/agent task creation. That guard is
+/// useless against automations: a cron re-fire lands half a day later and
+/// re-words the title, so neither the window nor the exact-name match
+/// applies. See `boss_engine_automation_dedup` for what is compared.
+///
+/// Surfaces to the triage agent as the error text of its
+/// `boss task create --automation` call, which is the only channel that
+/// reaches it — hence the [`Display`](std::fmt::Display) impl spelling out
+/// the marker it should emit instead. A triage agent that got this far
+/// believes it found real work, so telling it merely "rejected" would
+/// leave it retrying or stopping with no marker at all.
+#[derive(Debug)]
+pub struct AutomationDuplicateTaskError {
+    /// Canonical id of the open sibling that already tracks this finding.
+    pub existing_id: String,
+    /// Friendly `T<n>` number of that sibling, for the agent's marker.
+    pub existing_short_id: i64,
+    /// That sibling's title, so the agent can sanity-check the match.
+    pub existing_name: String,
+    /// Which dedup signal fired (`file_target` / `module_target` /
+    /// `normalized_title`).
+    pub matched_on: &'static str,
+    /// The shared value that fired it — a path, a module name, or the
+    /// normalized title.
+    pub match_key: String,
+}
+
+impl std::fmt::Display for AutomationDuplicateTaskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "duplicate suppressed: this automation already has an open task \
+             covering {:?} — T{} {:?} (matched on {}). Do NOT file another. \
+             End your run with the marker: `automation: skip — already tracked as T{}`",
+            self.match_key, self.existing_short_id, self.existing_name, self.matched_on, self.existing_short_id,
+        )
+    }
+}
+
+impl std::error::Error for AutomationDuplicateTaskError {}
+
+/// One row demoted by [`WorkDb::heal_ghost_active_chores`]. Carries the
+/// owning `product_id` so the caller can publish a `work_item_changed`
+/// invalidation on the product's topic — the kanban view subscribes on
+/// product topics, not task ids, so the topic must be the product to
+/// reach it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealedGhostActive {
+    pub work_item_id: String,
+    pub product_id: String,
+}
+
+/// One execution row abandoned by
+/// [`WorkDb::abandon_stranded_executions_on_closed_work_items`] — a
+/// `queued`/`ready`/`waiting_dependency`/`claimed` execution that pointed at a
+/// work item already in a terminal status or soft-deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbandonedStrandedExecution {
+    pub execution_id: String,
+    pub work_item_id: String,
+}
+
+/// One task recovered by
+/// [`WorkDb::reconcile_orphaned_conflict_ladder_attempts`] at engine
+/// startup — a `blocked: merge_conflict` parent whose `blocked_attempt_id`
+/// pointed at a non-terminal `conflict_resolutions` attempt that no live
+/// driver owns (an inline mechanical-rung attempt killed mid-flight by a
+/// restart, or a missing row). The reconciler abandoned the orphaned
+/// attempt, freed its idempotency slot, and flipped the parent back to
+/// `in_review` so the merge poller re-detects the still-open conflict and
+/// re-enters the ladder cleanly. Carries the owning `product_id` so the
+/// caller can publish a `work_item_changed` invalidation on the product
+/// topic, and the `rung`/`attempt_id` the death happened on for the
+/// observability trace line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredConflictLadderAttempt {
+    pub work_item_id: String,
+    pub product_id: String,
+    pub pr_url: String,
+    /// The orphaned attempt id, or `None` when `blocked_attempt_id`
+    /// pointed at a row that no longer exists at all.
+    pub attempt_id: Option<String>,
+    /// The mechanical rung (0/1) the attempt was mid-flight on when it was
+    /// orphaned, when known (`mechanical_rung_in_flight`); `None` for a
+    /// pre-marker orphan or a missing row.
+    pub rung: Option<i64>,
+}
+
+/// One work item returned by
+/// [`WorkDb::list_dead_pr_review_candidates`] — a non-terminal work item
+/// whose latest `pr_review` execution either died before finalizing
+/// (`orphaned`/`abandoned`/`failed`/`cancelled`) or completed without a
+/// durable judgement (`gave_up`, or a missing verdict on a post-verdicts-
+/// table pass). `dropped_duplicate_head` is not this shape: that pass
+/// produced a `ReviewResult` and an earlier informative row already
+/// covers the head. The review died silently — host failure, cube-lease
+/// reap, crash, or a give-up — and the PR it was reviewing may now merge
+/// with no automated review and no visible signal that one is missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadPrReviewCandidate {
+    pub work_item_id: String,
+    pub execution_id: String,
+    pub execution_status: ExecutionStatus,
+}
+
+/// A task returned by
+/// [`WorkDb::list_in_review_tasks_for_doc_branch_backfill`] — an
+/// `in_review` task whose doc-branch pointer is `NULL` and that has a
+/// `pr_url` the design detector can scan.
+///
+/// - `project_id = Some(id)` → project-level design-doc path; call
+///   [`crate::design_detector::on_design_pr_detected`].
+/// - `project_id = None` → per-task `doc_*` path (any kind); call
+///   [`crate::design_detector::on_task_doc_pr_detected`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocBranchBackfillCandidate {
+    pub task_id: String,
+    pub product_id: String,
+    pub project_id: Option<String>,
+    pub pr_url: String,
+}
+
+use crate::work_dependencies::{self as deps, EdgeInsertOutcome, RELATION_BLOCKS};
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_MEM_DB_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Identifies a named shared-cache in-memory SQLite database. Kept for
+/// `is_in_memory()` and error messages; the database itself is kept alive
+/// by `WorkDb::conn` (below) holding the one live connection to it, not by
+/// this struct.
+#[derive(Clone)]
+struct InMemoryAnchor {
+    uri: String,
+}
+
+/// A connection handle borrowed from [`WorkDb::connect`]'s pool. Derefs
+/// transparently to [`Connection`], so existing call sites (`conn.execute`,
+/// `conn.prepare`, `conn.transaction_with_behavior(..)` on a `mut` binding, …) are unaffected
+/// by the switch from "fresh connection per call" to "one shared, cached
+/// connection guarded by a mutex."
+pub type PooledConnection<'a> = connection_wait::ConnectionGuard<'a>;
+
+#[derive(bon::Builder)]
+#[builder(on(String, into), builder_type(vis = "pub(self)"), start_fn(vis = "pub(self)"))]
+pub struct WorkDb {
+    path: PathBuf,
+    engine_build_identity: Option<String>,
+    /// Present only when the database is in-memory (path == ":memory:").
+    memory: Option<InMemoryAnchor>,
+    /// The single connection this `WorkDb` (and every clone of it) uses for
+    /// every operation. Opening a fresh `rusqlite::Connection` used to run
+    /// 3 PRAGMAs and re-parse the entire schema on every `connect()` call —
+    /// 337+ call sites deep, this was most of the SQLite mutex/malloc
+    /// contention seen under parallel test load and adds needless overhead
+    /// to production cold paths too. `Mutex` serializes access the same way
+    /// SQLite's own connection locking already effectively did; `Arc` lets
+    /// `WorkDb::clone` share the one connection across copies (`WorkDb` is
+    /// cloned freely across the engine).
+    conn: Arc<Mutex<Connection>>,
+    /// The Boothby action the executor is currently performing, if any.
+    /// Set by [`WorkDb::arm_boothby_action`] and read by the mutation layer
+    /// when a write arrives with `actor = "boothby"`, which is how the
+    /// executor's `verb` / `rationale` / `reversibility` reach the journal
+    /// without threading them through every mutation signature.
+    ///
+    /// `Arc` so it is shared across clones rather than copied: `WorkDb` is
+    /// cloned freely across the engine, and an arm on one handle must be
+    /// visible to the mutation that runs through another.
+    boothby_action: Arc<Mutex<Option<boothby::BoothbyActionContext>>>,
+    /// The engine event bus this `WorkDb` (and every clone of it) publishes
+    /// state-transition events onto — see `crate::event_publish`. Defaults
+    /// to a private bus with no subscribers when `WorkDb` is opened
+    /// directly; callers that want other subsystems to observe published
+    /// events (e.g. `ServerState`) construct the bus themselves and inject
+    /// it via [`Self::with_event_bus`] so every clone shares the one
+    /// instance subscribers attach to.
+    event_bus: Arc<EventBus>,
+    persona_metrics: Arc<boss_metrics::Registry>,
+    /// Produces coordinator handoff write ids and tmux spawn authorizations.
+    /// Production injects `engine_control::generate_token` at the engine open
+    /// site; tests keep the default 64-hex generator so `WorkDb::open` call
+    /// sites stay unchanged.
+    #[builder(default = default_token_generator())]
+    token_generator: Arc<dyn Fn() -> String + Send + Sync>,
+}
+
+impl Clone for WorkDb {
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            engine_build_identity: self.engine_build_identity.clone(),
+            memory: self.memory.clone(),
+            conn: Arc::clone(&self.conn),
+            boothby_action: Arc::clone(&self.boothby_action),
+            event_bus: Arc::clone(&self.event_bus),
+            persona_metrics: Arc::clone(&self.persona_metrics),
+            token_generator: Arc::clone(&self.token_generator),
+        }
+    }
+}
+
+fn default_token_generator() -> Arc<dyn Fn() -> String + Send + Sync> {
+    Arc::new(generate_storage_token)
+}
+
+/// 32-byte hex token matching `engine_control::generate_token`.
+fn generate_storage_token() -> String {
+    let mut rng = fastrand::Rng::new();
+    let mut bytes = [0u8; 32];
+    for chunk in bytes.chunks_mut(8) {
+        let word = rng.u64(..);
+        let word_bytes = word.to_le_bytes();
+        chunk.copy_from_slice(&word_bytes[..chunk.len()]);
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+}
+
+impl WorkDb {
+    /// Configure provenance for failures recorded by this database handle and its clones.
+    pub fn with_engine_build_identity(mut self, build: &str) -> Self {
+        self.engine_build_identity = Some(build.to_owned());
+        self
+    }
+
+    /// The engine-wide metrics [`Registry`](boss_metrics::Registry) this
+    /// handle (and every clone of it) publishes into — the same registry
+    /// `ServerState` flushes and `bossctl metrics` reads. Sweeps that only
+    /// hold a `&WorkDb` record their per-pass telemetry through this rather
+    /// than threading a second `Arc<Registry>` through every spawn signature.
+    pub fn metrics_registry(&self) -> &boss_metrics::Registry {
+        &self.persona_metrics
+    }
+}
+
+// ---- module tree (see PR description for the split rationale) ----
+
+mod answer_agent_runs;
+mod attachments;
+mod attention_filing;
+mod attention_reconcile;
+mod attentions;
+mod audit_misc;
+mod automations;
+mod blocked_workspace;
+mod blocking;
+pub mod board_caches;
+mod board_notifications;
+mod board_patch;
+pub mod board_projection;
+pub mod board_projection_schema;
+pub mod board_review_cache;
+pub mod board_runtime_cache;
+mod boothby;
+mod cached_task_runtimes;
+mod chain_helpers;
+mod ci_failure_identity;
+mod comment_thread_entries;
+mod comments;
+mod conflict_res;
+mod coordinator_guidance_cache;
+mod coordinator_handoff_store;
+mod coordinator_tmux;
+mod cost_report_db;
+mod create_entities;
+mod critical_priority;
+mod critical_requests;
+mod decisions;
+pub mod deferred_scope;
+mod dep_helpers;
+mod design_postmortem;
+mod dispatch;
+mod dispatch_admission;
+mod dispatch_class;
+mod dispatch_helpers;
+mod driver_allocation;
+mod driver_lookup;
+mod editorial;
+pub mod event_publish;
+mod exec_status_helpers;
+mod exec_tail;
+pub mod execution_bookmark_metrics;
+mod execution_bookmarks;
+mod execution_launch_config;
+mod execution_recovery_rearm;
+mod execution_retention;
+mod executions_runs;
+mod feedback_target;
+mod github_api_usage_db;
+mod github_merge_intents;
+mod merge_mechanism_parse;
+pub mod personas;
+mod pr_url_validate;
+mod progression_scope;
+mod project_postmortem;
+#[cfg(test)]
+mod prose_vocabulary;
+mod queued_wait;
+#[cfg(test)]
+mod read_only_tests;
+mod remediation_state;
+pub mod remote_input_cleanup;
+mod revision_ai_review;
+pub mod sweep_handles;
+pub mod work_dependencies;
+pub use feedback_target::FeedbackTarget;
+mod connection_wait;
+pub mod db_diagnostics;
+mod description_guard;
+mod guide_comments;
+mod guide_feedback;
+mod host_reconcile_queries;
+mod host_storage;
+mod local_worker_quarantine_store;
+pub use host_storage::{HOST_HEALTH_FAILURE_THRESHOLD, Host, HostCapability, HostHealthOutcome};
+pub use local_worker_quarantine_store::LocalWorkerQuarantine;
+mod ideas;
+mod insert_helpers;
+mod list_filter;
+pub mod lock_stats;
+mod mappers;
+mod metrics_db;
+mod output_types;
+mod planner_runs;
+mod pr_binding;
+mod pr_flow;
+mod pr_state;
+mod prerequisite_question;
+mod products_design;
+mod proposal_apply;
+mod proposals;
+mod query_ensure;
+pub mod queue_ci_evidence;
+mod review_badge;
+mod review_batches;
+mod review_findings_followup;
+mod review_guide_context;
+mod review_guide_findings;
+mod review_guide_jobs;
+mod review_guide_recovery;
+pub use review_guide_recovery::OrphanedGuideSubmission;
+mod review_guide_sources;
+mod review_guide_submission;
+mod review_section;
+mod review_verdict_apply;
+mod review_verdicts;
+mod revise_doc;
+mod revision_helpers;
+pub mod revision_sequencing;
+mod run_rows;
+pub use run_rows::REDISPATCH_PID_TRUST_SECS;
+mod schema_init;
+pub use schema_init::table_exists;
+#[cfg(test)]
+use schema_init::table_has_column;
+mod semantic_progress;
+mod stuck_report;
+mod sweep_reads;
+mod task_status_audit;
+mod task_status_backfill;
+mod task_targets;
+#[cfg(test)]
+mod tests;
+mod trunk_merge_intents;
+mod updates;
+mod workitems;
+
+// Private on purpose: only the create-path gate that needs to file an
+// attention item inside its own transaction (`WorkDb::create_automation_task`)
+// reaches for the in-tx variant; every other caller uses the public,
+// tx-owning `WorkDb::create_attention`.
+pub use attention_filing::reraise_open_work_item_attention;
+pub use coordinator_guidance_cache::CachedGuidance;
+pub use coordinator_handoff_store::HANDOFF_METADATA_KEY;
+pub use coordinator_tmux::CoordinatorTmuxRecord;
+// pub, not pub: no consumer outside boss-engine-core exists, and the
+// intra-doc links to it from the crate-public `attention_lifecycle` module
+// (rustdoc's `private_intra_doc_links` warns on those, not `broken_intra_doc_links`
+// on a pub target) are formatted as plain code rather than doc links.
+pub use attention_filing::warn_if_lifecycle_undeclared;
+pub use attention_reconcile::AttentionReconcileOutcome;
+use attentions::create_attention_in_tx;
+pub use audit_misc::*;
+use board_notifications::stage_task_board_change;
+pub use cached_task_runtimes::*;
+pub use chain_helpers::*;
+use create_entities::create_project_in_tx;
+pub use dep_helpers::*;
+pub use dispatch_class::DispatchClass;
+pub use dispatch_helpers::*;
+pub use driver_allocation::*;
+pub use exec_status_helpers::*;
+pub use exec_tail::content_checksum;
+use ideas::list_ideas_in_tx;
+pub use insert_helpers::*;
+pub use sweep_reads::{TaskWaitLabel, TerminalExecutionRef};
+// Private on purpose: only the list-read submodules under `work` build
+// these queries, so it stays visible to `work` and its children only.
+use list_filter::ListFilterQuery;
+pub use mappers::*;
+pub use pr_state::stored_pr_number;
+pub use products_design::{
+    attach_task_doc_link_state, attach_task_doc_link_states, attach_task_doc_link_states_for_groups,
+    parse_pr_doc_artifact_id, project_for_work_item_updated,
+};
+pub use review_guide_jobs::{
+    PrReviewGuideAttempt, PrReviewGuideVersion, PublishReviewGuideOutcome, RetryReviewGuideOutcome,
+    ReviewGuideReenqueueReport, to_wire_review_guide_summary,
+};
+#[doc(hidden)]
+pub mod test_support;
+pub use review_guide_sources::{PrReviewGuideSourceCapture, PrSourceCapturePersistOutcome, PrSourceCaptureTrigger};
+// Only the unit-test suite (and the resolver itself) call this directly;
+// production attach sites go through `attach_task_doc_link_state`.
+pub use pr_binding::{BLOCKED_REASON_PR_BINDING_UNRESOLVED, PrBindingRepairCandidate, PrBindingSuspicion};
+pub use pr_flow::DeferredReviewAdmissionCandidate;
+pub use pr_flow::OperatorAnswerOutcome;
+pub use pr_flow::WorkerFailureBasis;
+pub use pr_flow::insert_question;
+#[cfg(test)]
+pub use products_design::resolve_task_doc_pointer;
+pub use proposal_apply::*;
+pub use query_ensure::*;
+pub use review_batches::{
+    MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS, PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
+    PR_REVIEW_BATCH_STALE_ATTENTION_KIND, PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND,
+    PRE_MERGE_BATCH_RESERVATION_UNITS, REVIEW_BATCH_REPORTED_MEMBER_GRACE_SECS, REVIEW_BATCH_STALE_SECS,
+    RetryDeadReviewBatchMember, ReviewBatchCreateInput, ReviewBatchDispatch, ReviewBatchMemberCreateInput,
+    ReviewBatchQuorumOutcome,
+};
+pub use review_findings_followup::ReviewFindingsFollowupInsert;
+pub use review_findings_followup::*;
+pub use review_section::*;
+pub use review_verdict_apply::ReviewVerdictApplyStats;
+pub use review_verdict_apply::*;
+pub use revision_helpers::*;
+pub use task_targets::*;
+
+pub use attachments::{SubmitAttachmentInput, SubmitAttachmentOutcome, check_attachment_caps};
+pub use attentions::ActionedAttentionGroup;
+pub use audit_misc::AUDIT_ACTOR_DESIGN_DETECTOR;
+pub use audit_misc::AUDIT_ACTOR_HUMAN;
+pub use audit_misc::ProjectPropertyAuditEntry;
+pub use audit_misc::canonicalize_repo_remote_url;
+pub use audit_misc::canonicalize_worker_branch_prefix;
+pub use automations::AutomationFireRecord;
+pub use board_patch::WorkRuntimePatch;
+pub use boothby::{BoothbyActionContext, BoothbyActionGuard};
+pub use exec_tail::ClearedExecutionWorkspace;
+pub use execution_retention::{
+    DEFAULT_RETENTION_KEEP_PER_WORK_ITEM, DEFAULT_RETENTION_MAX_AGE_SECS, ExecutionPruneOutcome,
+    ExecutionRetentionPolicy,
+};
+pub use executions_runs::CancelExecutionOpts;
+pub use github_api_usage_db::{GithubApiCallRow, GithubApiUsageBucket};
+pub use github_merge_intents::{GithubMergeIntent, GithubMergeIntentInsertInput, GithubMergeIntentRecordOutcome};
+pub use mappers::CiInFlightObservation;
+pub use mappers::CiRemediationInsertInput;
+pub use mappers::ConflictResolutionInsertInput;
+pub use mappers::ProducerConflictInsertInput;
+pub use mappers::SpeculativeConflictInsertInput;
+// Metrics vocabulary, owned by the metrics framework rather than by
+// `work`. Re-exported here so the `WorkDb::metrics_*` signatures read
+// the same as every other row type in this module.
+pub use boss_metrics::MetricsCounterRow;
+pub use boss_metrics::MetricsGaugeRow;
+pub use critical_priority::{
+    PRIORITY_CRITICAL, authorize_priority_write, critical_refusal, inherited_priority, is_critical,
+    refuse_worker_critical_raise,
+};
+pub use execution_bookmarks::{PruneCandidate, prune_outcome};
+pub use output_types::AutomationDedupSuppression;
+pub use output_types::AutomationSiblingTask;
+pub use output_types::HostBoundExecution;
+pub use output_types::LatePrCandidate;
+pub use output_types::PendingMergeCheck;
+pub use output_types::RemoteRunHandle;
+pub use output_types::SetRunTranscriptPathOutcome;
+pub use output_types::StoredExternalRef;
+pub use output_types::StrandedCiRemediationAttempt;
+pub use output_types::TmuxIdentity;
+pub use output_types::TmuxPaneObservationKind;
+pub use output_types::TmuxPaneObservationRecord;
+pub use output_types::TmuxPaneObservationWrite;
+pub use output_types::TmuxRunHandle;
+pub use output_types::WorkerFailureCompletion;
+pub use output_types::WorkerPrCompletion;
+pub use output_types::WorkerPrCompletionTarget;
+pub use planner_runs::ClaimPlannerRunInput;
+pub use planner_runs::PLANNER_RUN_ENGINE_RESTART_SUMMARY;
+pub use planner_runs::PlannerRunPatch;
+pub use planner_runs::RunningPlannerRun;
+pub use pr_flow::PrPollStateInput;
+pub use pr_flow::PrStatusSnapshot;
+pub use pr_flow::QueuedMergeQueueMember;
+#[doc(hidden)]
+pub use pr_state::FakePrStateChecker;
+pub use pr_state::GhPrStateChecker;
+pub use pr_state::PrInspect;
+pub use pr_state::PrMergeClass;
+pub use pr_state::PrOpenState;
+pub use pr_state::PrStateChecker;
+pub use pr_state::RevisionGateError;
+pub use pr_state::StaticPrStateChecker;
+pub use pr_state::classify_pr_merge_state;
+pub use proposals::SubmitWorkerProposalInput;
+pub use proposals::SubmitWorkerProposalOutcome;
+pub use review_verdicts::{
+    REVIEW_GATE_OUTCOME_COMPLETED_CLEAN, REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS,
+    REVIEW_GATE_OUTCOME_DROPPED_DUPLICATE_HEAD, REVIEW_GATE_OUTCOME_GAVE_UP,
+    REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED, REVIEW_GATE_OUTCOME_STALE_HEAD, ReviewVerdict, ReviewVerdictInput,
+    is_informative_gate_outcome,
+};
+pub use revision_helpers::normalize_priority;
+pub use trunk_merge_intents::{ActiveTrunkMergeIntent, TrunkMergeIntent, TrunkMergeIntentInsertInput};

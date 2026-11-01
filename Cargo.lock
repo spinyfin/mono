@@ -636,6 +636,7 @@ dependencies = [
  "boss-transcript-tail",
  "boss-trunk-auth",
  "boss-trunk-client",
+ "boss-work-db",
  "chrono",
  "clap",
  "fastrand 2.4.1",
@@ -1171,8 +1172,14 @@ name = "boss-metrics"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bon",
+ "boss-engine-day-rotated-log",
  "boss-engine-metrics-registry",
+ "boss-protocol",
  "boss-task-scope",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -1438,6 +1445,53 @@ dependencies = [
  "tokio",
  "tracing",
  "wiremock",
+]
+
+[[package]]
+name = "boss-work-db"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bon",
+ "boss-board-projection",
+ "boss-comment-anchor",
+ "boss-conflict-diagnosis",
+ "boss-engine-attachments",
+ "boss-engine-automation-dedup",
+ "boss-engine-board-gesture",
+ "boss-engine-driver",
+ "boss-engine-effort",
+ "boss-engine-proposal-validation",
+ "boss-engine-recovery",
+ "boss-engine-storage-values",
+ "boss-engine-utils",
+ "boss-event-bus",
+ "boss-gh-telemetry",
+ "boss-github",
+ "boss-host-execution",
+ "boss-metrics",
+ "boss-pr-review",
+ "boss-pr-review-sources",
+ "boss-protocol",
+ "boss-review-guide",
+ "boss-task-scope",
+ "chrono",
+ "fastrand 2.4.1",
+ "fs4",
+ "git-utils",
+ "libc",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-segmentation",
 ]
 
 [[package]]

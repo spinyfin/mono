@@ -30,6 +30,7 @@ rust_library(
         "//tools/boss/engine/offsite-backup:__pkg__",
         "//tools/boss/engine/structured-output:__pkg__",
         "//tools/boss/engine/transcript-markdown:__pkg__",
+        "//tools/boss/engine/work-db:__pkg__",
         "//tools/boss/github_tracker:__pkg__",
     ],
     deps = all_crate_deps(normal = True),

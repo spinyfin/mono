@@ -1,0 +1,1342 @@
+use super::*;
+
+#[work_db_boundary::instrument]
+impl WorkDb {
+    /// Fetch a single project by id. Used by the runner when it
+    /// composes the worker prompt for a `kind = 'design'` task —
+    /// the design task itself is sparse, so the runner enriches the
+    /// prompt with the parent project's name/goal/description.
+    pub fn get_project(&self, id: &str) -> Result<Project> {
+        let conn = self.connect()?;
+        query_project(&conn, id).require("project", id)
+    }
+
+    /// Fetch a single product row by id. Returns `None` when no row
+    /// matches so the dispatcher can fall through the design's Q3
+    /// precedence (product default → engine default) without
+    /// distinguishing "no product default set" from "the row's
+    /// product id doesn't resolve" — both produce the same engine
+    /// fall-through behaviour for the spawn config resolver.
+    pub fn get_product(&self, id: &str) -> Result<Option<Product>> {
+        let conn = self.connect()?;
+        query_product(&conn, id)
+    }
+
+    /// Set (or clear) a product's `default_model` per the
+    /// effort-and-model-estimation design (PR #370). `model = None`
+    /// or `Some("")` clears the column; any other slug is stored
+    /// verbatim after a trim. The engine deliberately does NOT
+    /// validate the slug — `claude` is the source of truth on what
+    /// `--model` accepts, and a new model must be adoptable without
+    /// an engine release blocking it (design §Q3).
+    pub fn set_product_default_model(&self, product_id: &str, model: Option<&str>) -> Result<Product> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let _ = query_product(&tx, product_id).require("product", product_id)?;
+        let now = now_string();
+        let stored = model.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+        tx.execute(
+            "UPDATE products SET default_model = ?2, updated_at = ?3 WHERE id = ?1",
+            params![product_id, stored, now],
+        )?;
+        let updated = query_product(&tx, product_id).require("product", product_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Set (or clear) a product's `default_driver`. `driver = None` or
+    /// `Some("")` clears the column (resolves to `"claude"` at dispatch).
+    /// Any non-empty value is stored verbatim after a trim. Returns the
+    /// updated product.
+    pub fn set_product_default_driver(&self, product_id: &str, driver: Option<&str>) -> Result<Product> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let _ = query_product(&tx, product_id).require("product", product_id)?;
+        let now = now_string();
+        let stored = driver.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+        tx.execute(
+            "UPDATE products SET default_driver = ?2, updated_at = ?3 WHERE id = ?1",
+            params![product_id, stored, now],
+        )?;
+        let updated = query_product(&tx, product_id).require("product", product_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Set (or clear) a product's `merge_mechanism`. `mechanism = None` or
+    /// `Some("")` clears the column (resolves to
+    /// [`crate::merge_mechanism::MergeMechanism::Direct`]). Any other value
+    /// is validated via [`crate::merge_mechanism_parse::parse`]
+    /// before the write — this is the CLI-reachable write path, so an
+    /// invalid value must fail loudly here rather than persisting and only
+    /// surfacing later at every parse call site.
+    pub fn set_product_merge_mechanism(&self, product_id: &str, mechanism: Option<&str>) -> Result<Product> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let _ = query_product(&tx, product_id).require("product", product_id)?;
+        let stored = mechanism.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+        crate::merge_mechanism_parse::parse(stored.as_deref())?;
+        let now = now_string();
+        tx.execute(
+            "UPDATE products SET merge_mechanism = ?2, updated_at = ?3 WHERE id = ?1",
+            params![product_id, stored, now],
+        )?;
+        let updated = query_product(&tx, product_id).require("product", product_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Bind (or unbind) a product's external tracker columns.
+    ///
+    /// When `unset = true`: clears both `external_tracker_kind` and
+    /// `external_tracker_config` to NULL regardless of any other fields.
+    /// When `unset = false`: both `kind` and `config` must be `Some`;
+    /// the engine stores `config` as its JSON string representation.
+    pub fn set_product_external_tracker(
+        &self,
+        product_id: &str,
+        kind: Option<&str>,
+        config: Option<&serde_json::Value>,
+        unset: bool,
+    ) -> Result<Product> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let _ = query_product(&tx, product_id).require("product", product_id)?;
+        let now = now_string();
+        if unset {
+            tx.execute(
+                "UPDATE products SET external_tracker_kind = NULL, external_tracker_config = NULL, updated_at = ?2 WHERE id = ?1",
+                params![product_id, now],
+            )?;
+        } else {
+            let config_json = config.map(|c| c.to_string());
+            tx.execute(
+                "UPDATE products SET external_tracker_kind = ?2, external_tracker_config = ?3, updated_at = ?4 WHERE id = ?1",
+                params![product_id, kind, config_json, now],
+            )?;
+        }
+        let updated = query_product(&tx, product_id).require("product", product_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Set (or clear) a product's `editorial_rules` JSON blob.
+    ///
+    /// `rules = Some(r)` serialises the blob and stores it. `rules = None`
+    /// clears the column to NULL so all-defaults behaviour resumes.
+    pub fn set_product_editorial_rules(
+        &self,
+        product_id: &str,
+        rules: Option<&boss_protocol::EditorialRules>,
+    ) -> Result<Product> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let _ = query_product(&tx, product_id).require("product", product_id)?;
+        let now = now_string();
+        let rules_json = rules
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("failed to serialize editorial_rules: {e}"))?;
+        tx.execute(
+            "UPDATE products SET editorial_rules = ?2, updated_at = ?3 WHERE id = ?1",
+            params![product_id, rules_json, now],
+        )?;
+        let updated = query_product(&tx, product_id).require("product", product_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Write the project's design-doc pointer columns.
+    ///
+    /// Three input shapes (matching `SetProjectDesignDocInput`):
+    /// - `unset = true` → all three columns are cleared to `NULL`
+    ///   atomically. Any explicit field values supplied alongside are
+    ///   ignored.
+    /// - `design_doc_path = Some(p)` with non-empty `p` → set the
+    ///   pointer. `p` is validated per the design's Q8 rules (no
+    ///   leading `/`, no `..` segments, must end in `.md` /
+    ///   `.markdown`). `design_doc_repo_remote_url` and
+    ///   `design_doc_branch` are best-effort overrides; `None` /
+    ///   blank clears that column so resolution falls back to the
+    ///   product. The repo URL is canonicalised the same way
+    ///   `products.repo_remote_url` is (trim-normalise).
+    /// - `design_doc_path = None` (and `unset = false`) → update only
+    ///   the non-path columns. The existing path stays put. Useful
+    ///   when the user is correcting a typo in just the repo or
+    ///   branch fields.
+    ///
+    /// Last-writer-wins: a fresh call overwrites whatever was there.
+    /// `updated_at` is stamped on every write. `last_status_actor` is
+    /// intentionally untouched — pointer edits are property edits,
+    /// not status transitions (Q10).
+    pub fn set_project_design_doc(&self, input: SetProjectDesignDocInput) -> Result<Project> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let before = query_project(&tx, &input.project_id).require("project", &input.project_id)?;
+        let now = now_string();
+
+        if input.unset {
+            tx.execute(
+                "UPDATE projects
+                 SET design_doc_repo_remote_url = NULL,
+                     design_doc_branch = NULL,
+                     design_doc_path = NULL,
+                     updated_at = ?2
+                 WHERE id = ?1",
+                params![input.project_id, now],
+            )?;
+        } else {
+            let repo = canonicalize_design_doc_repo_remote_url(input.design_doc_repo_remote_url);
+            let branch = normalize_optional_text(input.design_doc_branch);
+
+            match input.design_doc_path {
+                Some(raw_path) => {
+                    let path = validate_design_doc_path(&raw_path)?;
+                    tx.execute(
+                        "UPDATE projects
+                         SET design_doc_repo_remote_url = ?2,
+                             design_doc_branch = ?3,
+                             design_doc_path = ?4,
+                             updated_at = ?5
+                         WHERE id = ?1",
+                        params![input.project_id, repo, branch, path, now],
+                    )?;
+                }
+                None => {
+                    tx.execute(
+                        "UPDATE projects
+                         SET design_doc_repo_remote_url = ?2,
+                             design_doc_branch = ?3,
+                             updated_at = ?4
+                         WHERE id = ?1",
+                        params![input.project_id, repo, branch, now],
+                    )?;
+                }
+            }
+        }
+
+        let updated = query_project(&tx, &input.project_id).require("project", &input.project_id)?;
+        record_design_doc_audit(&tx, &input.project_id, &before, &updated, AUDIT_ACTOR_HUMAN, &now)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Resolve a project's design-doc pointer into the structured
+    /// `ProjectDesignDocState` the UI consumes.
+    ///
+    /// Resolution rules (per design Q2):
+    /// - `design_doc_path` is `NULL` → `NotSet` (UI hides the
+    ///   affordance entirely).
+    /// - Otherwise fall back to the product for any missing
+    ///   `repo_remote_url` / `branch` override. Branch defaults to
+    ///   `"main"` when neither the project nor (a future)
+    ///   `products.docs_branch` supplies one.
+    /// - If no repo can be resolved (project override `NULL` and
+    ///   product's `repo_remote_url` `NULL`) → `Broken` with a
+    ///   human-readable reason.
+    /// - Classify the resolved repo against the project's product:
+    ///   `SameProduct` when it matches, `OtherProduct` when another
+    ///   Boss-tracked product owns the repo, `External` otherwise.
+    ///
+    /// `lookup_repo_workspace_path` is consulted only on the resolved
+    /// path — pass a closure that asks cube for the absolute path of
+    /// a workspace currently leased for the resolved `repo_remote_url`
+    /// (or `None` when no workspace is leased). The macOS open
+    /// dispatcher uses the returned path to fast-path into `$EDITOR` /
+    /// the in-app renderer; when `None`, the affordance falls back to
+    /// the GitHub web URL. In test/CLI contexts where cube isn't
+    /// reachable, `|_| None` is the safe default.
+    pub fn resolve_project_design_doc<F>(
+        &self,
+        project_id: &str,
+        lookup_repo_workspace_path: F,
+    ) -> Result<ResolveProjectDesignDocOutput>
+    where
+        F: FnOnce(&str) -> Option<String>,
+    {
+        let conn = self.connect()?;
+        let project = query_project(&conn, project_id).require("project", project_id)?;
+        let product = query_product(&conn, &project.product_id).require("product", &project.product_id)?;
+
+        let Some(path) = project.design_doc_path.clone() else {
+            return Ok(ResolveProjectDesignDocOutput {
+                project_id: project.id,
+                state: ProjectDesignDocState::NotSet,
+            });
+        };
+
+        let resolved_repo = project
+            .design_doc_repo_remote_url
+            .clone()
+            .or_else(|| product.repo_remote_url.clone());
+        let Some(repo) = resolved_repo else {
+            return Ok(ResolveProjectDesignDocOutput {
+                project_id: project.id,
+                state: ProjectDesignDocState::Broken {
+                    reason: "design_doc_path is set but neither the project's design_doc_repo_remote_url nor the product's repo_remote_url is populated".to_owned(),
+                },
+            });
+        };
+
+        let branch = project.design_doc_branch.clone().unwrap_or_else(|| "main".to_owned());
+
+        let kind = if let Some(product_repo) = product.repo_remote_url.as_deref()
+            && product_repo == repo.as_str()
+        {
+            ResolvedDesignDocKind::SameProduct {
+                product_id: project.product_id.clone(),
+            }
+        } else if let Some(other_product) = find_product_by_repo_remote_url(&conn, &repo)? {
+            ResolvedDesignDocKind::OtherProduct {
+                product_id: other_product,
+            }
+        } else {
+            ResolvedDesignDocKind::External
+        };
+
+        drop(conn);
+        let web_url = render_design_doc_web_url(&repo, &branch, &path);
+        let raw_content_url = render_design_doc_raw_content_url(&repo, &branch, &path);
+        let workspace_path = lookup_repo_workspace_path(&repo);
+
+        Ok(ResolveProjectDesignDocOutput {
+            project_id: project.id,
+            state: ProjectDesignDocState::Resolved {
+                resolved: ResolvedDesignDoc {
+                    repo_remote_url: repo,
+                    branch,
+                    path,
+                    kind,
+                },
+                workspace_path,
+                web_url,
+                raw_content_url,
+            },
+        })
+    }
+
+    /// Sync a `(repo, branch, path)` triple discovered by
+    /// `DesignDetector` into the parent project's pointer columns,
+    /// **iff** the project's `design_doc_path` is currently `NULL`.
+    ///
+    /// This is the one-way auto-populate rule from design Q6: a
+    /// project that already has a hand-set pointer wins; a project
+    /// that has no pointer benefits from the detector's discovery.
+    /// Repo URL is canonicalised on the way in; path is validated
+    /// against the same Q8 rules `set_project_design_doc` enforces,
+    /// so a detector that hands us a garbage path fails fast rather
+    /// than corrupting the column.
+    ///
+    /// Returns `true` if the columns were written, `false` if the
+    /// project already had a pointer set (no-op).
+    ///
+    /// TODO(design-producing-tasks): wire this method into
+    /// `DesignDetector`'s `DOC_REF` stop handler once that detector
+    /// exists. Until then, this is exercised only by integration
+    /// tests with a hand-rolled caller.
+    pub fn sync_project_design_doc_from_detector(
+        &self,
+        project_id: &str,
+        repo_remote_url: Option<&str>,
+        branch: Option<&str>,
+        path: &str,
+    ) -> Result<bool> {
+        let validated_path = validate_design_doc_path(path)?;
+        let repo = canonicalize_design_doc_repo_remote_url(repo_remote_url.map(str::to_owned));
+        let branch = normalize_optional_text(branch.map(str::to_owned));
+
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let before = query_project(&tx, project_id).require("project", project_id)?;
+        if before.design_doc_path.is_some() {
+            return Ok(false);
+        }
+        let now = now_string();
+        tx.execute(
+            "UPDATE projects
+             SET design_doc_repo_remote_url = ?2,
+                 design_doc_branch = ?3,
+                 design_doc_path = ?4,
+                 updated_at = ?5
+             WHERE id = ?1",
+            params![project_id, repo, branch, validated_path, now],
+        )?;
+        let after = query_project(&tx, project_id).require("project", project_id)?;
+        record_design_doc_audit(&tx, project_id, &before, &after, AUDIT_ACTOR_DESIGN_DETECTOR, &now)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Read the append-only audit trail of property edits on
+    /// `project_id`. Returns rows in chronological order (oldest
+    /// first), with a stable secondary sort on row id so two writes
+    /// landing in the same `changed_at` second still serialise.
+    ///
+    /// Records design-doc pointer columns and project status transitions;
+    /// the schema remains general so future project-property provenance can
+    /// ride the same ledger.
+    pub fn list_project_property_audit(&self, project_id: &str) -> Result<Vec<ProjectPropertyAuditEntry>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, property, old_value, new_value, actor, changed_at, basis
+             FROM project_property_audit
+             WHERE project_id = ?1
+             ORDER BY changed_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok(ProjectPropertyAuditEntry {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                property: row.get(2)?,
+                old_value: row.get(3)?,
+                new_value: row.get(4)?,
+                actor: row.get(5)?,
+                changed_at: row.get(6)?,
+                basis: row.get(7)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Surface a `WorkAttentionItem` when an `ApproveDesign` event
+    /// names a design doc whose location disagrees with the parent
+    /// project's already-set pointer.
+    ///
+    /// Behaviour (per design Q6 sync rule 3):
+    /// - Project pointer is `NULL` → no conflict, no item, returns
+    ///   `Ok(None)`. The auto-populate path
+    ///   (`sync_project_design_doc_from_detector`) handles that
+    ///   case before approval.
+    /// - Project pointer matches the approved triple (after
+    ///   resolving `None` overrides against the product / default
+    ///   branch) → no item, returns `Ok(None)`.
+    /// - Project pointer differs → an attention item with kind
+    ///   `design_doc_pointer_conflict` is inserted against
+    ///   `execution_id` and returned.
+    ///
+    /// The helper does NOT overwrite the project's pointer — the
+    /// user's manual value always wins; the attention item asks
+    /// them to choose explicitly.
+    ///
+    /// TODO(design-producing-tasks): wire this method into
+    /// `ApproveDesign`'s state-transition handler once that path
+    /// exists. Until then, this is exercised only by integration
+    /// tests with a hand-rolled caller.
+    pub fn surface_design_doc_conflict_on_approve(
+        &self,
+        project_id: &str,
+        execution_id: &str,
+        approved_repo_remote_url: Option<&str>,
+        approved_branch: Option<&str>,
+        approved_path: &str,
+    ) -> Result<Option<WorkAttentionItem>> {
+        let approved_path = validate_design_doc_path(approved_path)?;
+        let approved_repo = canonicalize_design_doc_repo_remote_url(approved_repo_remote_url.map(str::to_owned));
+        let approved_branch = normalize_optional_text(approved_branch.map(str::to_owned));
+
+        let conn = self.connect()?;
+        let project = query_project(&conn, project_id).require("project", project_id)?;
+        let Some(project_path) = project.design_doc_path.clone() else {
+            return Ok(None);
+        };
+        let product = query_product(&conn, &project.product_id).require("product", &project.product_id)?;
+        drop(conn);
+
+        let project_repo_effective = project
+            .design_doc_repo_remote_url
+            .clone()
+            .or_else(|| product.repo_remote_url.clone());
+        let approved_repo_effective = approved_repo.clone().or_else(|| product.repo_remote_url.clone());
+
+        let project_branch_effective = project.design_doc_branch.clone().unwrap_or_else(|| "main".to_owned());
+        let approved_branch_effective = approved_branch.clone().unwrap_or_else(|| "main".to_owned());
+
+        if project_repo_effective == approved_repo_effective
+            && project_branch_effective == approved_branch_effective
+            && project_path == approved_path
+        {
+            return Ok(None);
+        }
+
+        let title = "Design doc pointer disagrees with approved design".to_owned();
+        let body_markdown = format!(
+            "The project's design-doc pointer (`{project_repo}` `{project_branch}` `{project_path}`) differs from the location of the approved design doc (`{approved_repo}` `{approved_branch}` `{approved_path}`). Update the project pointer with `boss project set-design-doc` or revoke the approval.",
+            project_repo = project_repo_effective.as_deref().unwrap_or("<no repo resolved>"),
+            project_branch = project_branch_effective,
+            project_path = project_path,
+            approved_repo = approved_repo_effective.as_deref().unwrap_or("<no repo resolved>"),
+            approved_branch = approved_branch_effective,
+            approved_path = approved_path,
+        );
+
+        let item = self.create_attention_item(CreateAttentionItemInput {
+            execution_id: Some(execution_id.to_owned()),
+            work_item_id: None,
+            kind: "design_doc_pointer_conflict".to_owned(),
+            status: None,
+            title,
+            body_markdown,
+            resolved_at: None,
+        })?;
+        Ok(Some(item))
+    }
+
+    /// Sync a `(repo, branch, path)` triple discovered by the doc
+    /// detector into a **task's** own `doc_*` pointer columns, **iff**
+    /// the task's `doc_path` is currently `NULL`. The task-level analogue
+    /// of [`Self::sync_project_design_doc_from_detector`]. Independent of
+    /// `kind` — any work item may receive a per-task pointer this way.
+    ///
+    /// One-way auto-populate: a task that already carries a pointer wins;
+    /// a task with no pointer benefits from the detector's discovery. The
+    /// repo URL is canonicalised and the path validated with the same Q8
+    /// rules the project path enforces.
+    ///
+    /// Returns `true` if the columns were written, `false` if the task
+    /// already had a pointer set (no-op).
+    pub fn sync_task_doc_pointer_from_detector(
+        &self,
+        task_id: &str,
+        repo_remote_url: Option<&str>,
+        branch: Option<&str>,
+        path: &str,
+    ) -> Result<bool> {
+        let validated_path = validate_design_doc_path(path)?;
+        let repo = canonicalize_design_doc_repo_remote_url(repo_remote_url.map(str::to_owned));
+        let branch = normalize_optional_text(branch.map(str::to_owned));
+
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing_path: Option<String> = tx
+            .query_row("SELECT doc_path FROM tasks WHERE id = ?1", [task_id], |row| row.get(0))
+            .optional()?
+            .flatten();
+        if existing_path.is_some() {
+            return Ok(false);
+        }
+        let now = now_string();
+        tx.execute(
+            "UPDATE tasks
+             SET doc_repo_remote_url = ?2,
+                 doc_branch = ?3,
+                 doc_path = ?4,
+                 updated_at = ?5
+             WHERE id = ?1",
+            params![task_id, repo, branch, validated_path, now],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Write a task's `doc_*` pointer columns last-writer-wins. The
+    /// task-level analogue of [`Self::set_project_design_doc`]'s write
+    /// path, used by the doc detector to (a) update only `doc_branch`
+    /// while leaving the path intact — `path = None` keeps the existing
+    /// path — or (b) write the full pointer when `path = Some(_)`. As
+    /// with the project path, `repo = None` clears `doc_repo_remote_url`
+    /// so resolution re-inherits the task's product repo, and a `None`
+    /// branch clears `doc_branch` so it re-defaults to `"main"`.
+    ///
+    /// Operator-facing CLI / RPC callers should use
+    /// [`Self::set_task_doc`] instead, which also supports `--unset` and
+    /// returns the updated task row.
+    pub fn set_task_doc_pointer(
+        &self,
+        task_id: &str,
+        repo_remote_url: Option<&str>,
+        branch: Option<&str>,
+        path: Option<&str>,
+    ) -> Result<()> {
+        let repo = canonicalize_design_doc_repo_remote_url(repo_remote_url.map(str::to_owned));
+        let branch = normalize_optional_text(branch.map(str::to_owned));
+        let now = now_string();
+
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        match path {
+            Some(raw_path) => {
+                let validated = validate_design_doc_path(raw_path)?;
+                tx.execute(
+                    "UPDATE tasks
+                     SET doc_repo_remote_url = ?2,
+                         doc_branch = ?3,
+                         doc_path = ?4,
+                         updated_at = ?5
+                     WHERE id = ?1",
+                    params![task_id, repo, branch, validated, now],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "UPDATE tasks
+                     SET doc_repo_remote_url = ?2,
+                         doc_branch = ?3,
+                         updated_at = ?4
+                     WHERE id = ?1",
+                    params![task_id, repo, branch, now],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Set or clear a task's per-task doc pointer — operator-facing
+    /// analogue of [`Self::set_project_design_doc`]. Reuses
+    /// [`Self::set_task_doc_pointer`] for the write path (same
+    /// validation / canonicalisation / column writes the detector
+    /// uses); `unset = true` clears all three columns.
+    ///
+    /// Returns the updated `Task`, with `doc_link_state` resolved from the
+    /// just-written `doc_*` columns so the caller can observe the write
+    /// without a second read. Independent of `kind`.
+    pub fn set_task_doc(&self, input: SetTaskDocPointerInput) -> Result<Task> {
+        let conn = self.connect()?;
+        let _ = query_task(&conn, &input.task_id).require("task", &input.task_id)?;
+        // Drop the connection before the nested write methods open their
+        // own; sqlite's default busy timeout covers the brief gap.
+        drop(conn);
+
+        if input.unset {
+            let now = now_string();
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute(
+                "UPDATE tasks
+                 SET doc_repo_remote_url = NULL,
+                     doc_branch = NULL,
+                     doc_path = NULL,
+                     updated_at = ?2
+                 WHERE id = ?1",
+                params![input.task_id, now],
+            )?;
+            tx.commit()?;
+        } else {
+            // Same write path the detector uses — last-writer-wins, path
+            // validated when Some, repo/branch inheritance when None.
+            self.set_task_doc_pointer(
+                &input.task_id,
+                input.doc_repo_remote_url.as_deref(),
+                input.doc_branch.as_deref(),
+                input.doc_path.as_deref(),
+            )?;
+        }
+
+        let conn = self.connect()?;
+        let mut task = query_task(&conn, &input.task_id).require("task", &input.task_id)?;
+        // Surface the just-written pointer immediately — without this,
+        // `set-doc` echoes only the raw Task columns (none of which carry
+        // doc_path) and the caller has no way to see the write took effect
+        // until a separate `task show`. The same row is the app's
+        // `WorkItemUpdated` payload, so it also needs every derived
+        // projection (`review_section` among them): the app replaces its
+        // cached card with this row as-is.
+        project_for_work_item_updated(&conn, &mut task, "set_task_doc");
+        Ok(task)
+    }
+
+    /// Read a task's stored `doc_path` (the load-bearing pointer field).
+    /// `None` when the task has no row or no pointer set. Used by the doc
+    /// detector to decide between the populate-if-empty and branch-update
+    /// paths on a PR-merged transition.
+    pub fn task_doc_path(&self, task_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let path: Option<String> = conn
+            .query_row("SELECT doc_path FROM tasks WHERE id = ?1", [task_id], |row| row.get(0))
+            .optional()?
+            .flatten();
+        Ok(path)
+    }
+
+    /// Reverse-resolve a `pr_doc:*` comment artifact to the task that owns
+    /// it and that task's current PR lifecycle. This is the missing reverse
+    /// of [`Self::resolve_project_design_doc`] / [`resolve_task_doc_pointer`]
+    /// — those go task → doc, this goes doc → task — and is the one
+    /// authoritative gate for both classifier eligibility (only
+    /// `Design`/`Investigation`-owned docs get classified at all) and the
+    /// directive/larger-change revision-vs-chore routing decision. Design:
+    /// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
+    /// §"The revision-vs-general-task decision".
+    ///
+    /// This kind filter is **not** the per-task doc-pointer gate (that
+    /// gate was deleted: any work item may carry `tasks.doc_*`). It is
+    /// the comment-classifier / `[Revise]`-banner scope, which remains
+    /// Design/Investigation-only by that design.
+    ///
+    /// `None` for any `artifact_kind` other than `"pr_doc"` (per the design,
+    /// `work_item` comments — engine-owned task descriptions — are never
+    /// design/investigation docs and get no comment-driven affordance at
+    /// all), for an artifact id that doesn't parse, or when the matched
+    /// task's `kind` is not `Design`/`Investigation` — the classifier
+    /// scope guard.
+    ///
+    /// Resolution order:
+    /// 1. If `<branch>` is the engine-supplied `expected_branch` of a live
+    ///    execution (`exec_*` under the default `BossExecPrefix` naming),
+    ///    map branch → execution → task directly. This is the exact,
+    ///    unambiguous case, and it can never land on a `kind = 'revision'`
+    ///    task: a revision commits onto its chain root's *existing* PR
+    ///    branch rather than opening its own, so no revision ever owns an
+    ///    `exec_*` branch of its own (see `runner.rs`'s
+    ///    `RevisionImplementation` guard on the "expected branch name"
+    ///    prompt line).
+    /// 2. Otherwise (e.g. `<branch> = "main"` once the doc's PR has merged),
+    ///    match the project's `design_doc_repo_remote_url` /
+    ///    `design_doc_branch` / `design_doc_path` triple to its
+    ///    `kind = 'design'`, `ordinal = 0` task, or else a project-less
+    ///    task's own `doc_repo_remote_url` / `doc_branch` / `doc_path`
+    ///    triple.
+    ///
+    /// Per the design's mitigation for "the reverse resolver is a new trust
+    /// path": an unresolved or ambiguous match returns `None` rather than
+    /// guessing — prefer the exact execution-branch mapping over the path
+    /// match, and never fall back from one to the other.
+    pub fn resolve_doc_owner(&self, artifact_kind: &str, artifact_id: &str) -> Result<Option<DocOwner>> {
+        if artifact_kind != "pr_doc" {
+            return Ok(None);
+        }
+        let Some((repo, branch, path)) = parse_pr_doc_artifact_id(artifact_id) else {
+            return Ok(None);
+        };
+        let conn = self.connect()?;
+
+        let branch_suffix = branch.rsplit('/').next().unwrap_or(branch.as_str());
+        if branch_suffix.starts_with("exec_") {
+            return match query_execution(&conn, branch_suffix)? {
+                Some(execution) => build_doc_owner(&conn, &execution.work_item_id),
+                None => Ok(None),
+            };
+        }
+
+        if let Some(task_id) = find_design_task_by_project_doc_pointer(&conn, &repo, &branch, &path)? {
+            return build_doc_owner(&conn, &task_id);
+        }
+        if let Some(task_id) = find_task_by_doc_pointer(&conn, &repo, &branch, &path)? {
+            return build_doc_owner(&conn, &task_id);
+        }
+        Ok(None)
+    }
+
+    /// Resolve a user-supplied `pr_doc:<repo>:<branch>:<path>` artifact id
+    /// to its stored form, accepting any git remote spelling for the repo
+    /// component — an `owner/repo` slug, an SSH remote
+    /// (`git@github.com:owner/repo.git`), or an HTTPS remote
+    /// (`https://github.com/owner/repo`) — not just the exact string
+    /// persisted at comment-creation time (always the full git remote
+    /// URL; see [`crate::design_detector`]). Compares canonicalized forms
+    /// at lookup time rather than rewriting stored keys.
+    ///
+    /// Falls back to `artifact_id` unchanged when it isn't a `pr_doc` key,
+    /// or when no stored `pr_doc` row's `(branch, path)` and repo are
+    /// equivalent to the ones supplied — the caller's subsequent query then
+    /// legitimately returns zero rows.
+    pub fn resolve_pr_doc_artifact_id(&self, artifact_id: &str) -> Result<String> {
+        let Some((repo, branch, path)) = parse_pr_doc_artifact_id(artifact_id) else {
+            return Ok(artifact_id.to_owned());
+        };
+        for candidate in self.distinct_pr_doc_artifact_ids()? {
+            let Some((cand_repo, cand_branch, cand_path)) = parse_pr_doc_artifact_id(&candidate) else {
+                continue;
+            };
+            if cand_branch == branch && cand_path == path && repo_component_matches(&cand_repo, &repo) {
+                return Ok(candidate);
+            }
+        }
+        Ok(artifact_id.to_owned())
+    }
+
+    /// Find a stored `pr_doc` artifact id sharing `artifact_id`'s
+    /// `(branch, path)` but spelled with a repo component
+    /// [`resolve_pr_doc_artifact_id`] didn't recognise as equivalent —
+    /// e.g. a genuinely different git host, or a spelling outside the
+    /// slug/SSH/HTTPS forms it understands. Used to surface a "did you
+    /// mean" hint instead of a bare zero-rows result. Returns `None` when
+    /// `artifact_id` isn't a `pr_doc` key or no such row exists.
+    pub fn pr_doc_artifact_hint(&self, artifact_id: &str) -> Result<Option<String>> {
+        let Some((repo, branch, path)) = parse_pr_doc_artifact_id(artifact_id) else {
+            return Ok(None);
+        };
+        for candidate in self.distinct_pr_doc_artifact_ids()? {
+            let Some((cand_repo, cand_branch, cand_path)) = parse_pr_doc_artifact_id(&candidate) else {
+                continue;
+            };
+            if cand_branch == branch && cand_path == path && cand_repo != repo {
+                return Ok(Some(candidate));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Every distinct `artifact_id` stored under `artifact_kind = 'pr_doc'`
+    /// in `work_comments`. Backing query for [`Self::resolve_pr_doc_artifact_id`]
+    /// / [`Self::pr_doc_artifact_hint`]; the table is small enough (one row
+    /// per commented-on doc) that scanning it beats trying to express repo
+    /// equivalence in SQL.
+    fn distinct_pr_doc_artifact_ids(&self) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare("SELECT DISTINCT artifact_id FROM work_comments WHERE artifact_kind = 'pr_doc'")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        collect_rows(rows)
+    }
+
+    /// List `in_review` tasks whose doc-branch pointer is `NULL` and whose
+    /// PR is still open (unmerged), so a startup sweep can backfill the
+    /// branch without waiting for the next PR event.
+    ///
+    /// Two candidate shapes are returned:
+    ///
+    /// - **Project-design tasks** (`kind='design'`, `project_id IS NOT NULL`):
+    ///   the associated project's `design_doc_branch` is `NULL`. The caller
+    ///   should invoke [`crate::design_detector::on_design_pr_detected`] with
+    ///   `project_id = Some(...)`. This is the *project-level* design-doc
+    ///   pointer, a separate concept from the per-task `doc_*` columns.
+    ///
+    /// - **Per-task-doc tasks**: a task's `doc_path` is set but
+    ///   `doc_branch` is `NULL`, or it is a design/investigation with no
+    ///   pointer yet. The latter preserves startup retry after a detector
+    ///   scan fails before it can persist the discovered pointer. The caller
+    ///   should invoke [`crate::design_detector::on_task_doc_pr_detected`].
+    ///   `project_id` is returned as `NULL` on this arm so the backfill
+    ///   dispatcher routes to the per-task detector rather than the project
+    ///   one.
+    ///
+    /// Only tasks with a non-null `pr_url` and `deleted_at IS NULL` are
+    /// returned; tasks without a PR cannot be scanned.
+    pub fn list_in_review_tasks_for_doc_branch_backfill(&self) -> Result<Vec<DocBranchBackfillCandidate>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            // Project-level design-doc pointer (separate from per-task
+            // `doc_*`). Kind filter here is the project-design mechanism,
+            // not the deleted per-task-doc kind gate.
+            "SELECT t.id, t.product_id, t.project_id, t.pr_url
+             FROM tasks t
+             JOIN projects p ON t.project_id = p.id
+             WHERE t.kind = 'design'
+               AND t.status = 'in_review'
+               AND t.project_id IS NOT NULL
+               AND t.pr_url IS NOT NULL
+               AND t.deleted_at IS NULL
+               AND p.design_doc_branch IS NULL
+             UNION ALL
+             -- Per-task doc pointer: every in-review work item with an
+             -- existing pointer, plus pointer-less designs/investigations
+             -- so startup can retry detector discovery. A project-design
+             -- task can intentionally appear in both arms because it owns
+             -- independent project and task-level pointers, each needing
+             -- its own detector update.
+             SELECT t.id, t.product_id, NULL, t.pr_url
+             FROM tasks t
+             WHERE t.status = 'in_review'
+               AND t.pr_url IS NOT NULL
+               AND t.deleted_at IS NULL
+               AND (t.doc_path IS NOT NULL OR t.kind IN ('design', 'investigation'))
+               AND t.doc_branch IS NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DocBranchBackfillCandidate {
+                task_id: row.get(0)?,
+                product_id: row.get(1)?,
+                project_id: row.get(2)?,
+                pr_url: row.get(3)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+}
+
+/// Attach everything a `WorkItemUpdated` reply must carry beyond the raw
+/// `tasks` columns: the doc-link state and the derived projections
+/// (`has_in_progress_revision`, `ready_for_review`, `ai_review_state`,
+/// `review_section`, ...). The macOS client applies such a reply by
+/// replacing its cached card wholesale, so a row shipped without these
+/// would blank them on the board until the next full tree refetch — and a
+/// Review card with no `review_section` is reported by the client as a
+/// defect. Projection failures are logged and leave the raw row intact,
+/// matching `update_task`.
+pub fn project_for_work_item_updated(conn: &Connection, task: &mut Task, caller: &str) {
+    let mut doc_pointer_queries = 0u64;
+    attach_task_doc_link_state(conn, task, caller, &mut doc_pointer_queries);
+    if let Err(err) = attach_task_derived_projections(conn, task, caller) {
+        tracing::warn!(
+            ?err,
+            task_id = %task.id,
+            "{caller}: derived projections failed; returning unprojected row"
+        );
+    }
+}
+
+/// Resolve and attach [`Task::doc_link_state`] for a single task from its
+/// `doc_*` columns. Independent of `kind` — any work item may carry a
+/// per-task pointer. Shared by the work-tree loop, list/show read paths,
+/// and `set_task_doc`'s return so a change to the resolution contract
+/// only needs to land once.
+///
+/// Errors are non-fatal: log with `caller` as the message prefix and
+/// leave the field `None` (affordance hidden). The workspace lookup is
+/// always `|_| None`: cube is not consulted on these paths.
+pub fn attach_task_doc_link_state(conn: &Connection, task: &mut Task, caller: &str, queries: &mut u64) {
+    match resolve_task_doc_pointer(conn, &task.id, |_| None, queries) {
+        Ok(state) => task.doc_link_state = state,
+        Err(err) => tracing::warn!(
+            task_id = %task.id,
+            ?err,
+            "{caller}: failed to resolve task doc-link state; leaving affordance hidden"
+        ),
+    }
+}
+
+/// Attach [`Task::doc_link_state`] for items in `tasks` that have a
+/// per-task doc pointer. The one bulk query avoids resolving the absent
+/// pointer for every card returned by list and work-tree paths.
+pub fn attach_task_doc_link_states(
+    conn: &Connection,
+    tasks: &mut [Task],
+    caller: &str,
+    product_id: &str,
+) -> (usize, u64) {
+    attach_task_doc_link_states_for_groups(conn, &mut [tasks], caller, product_id)
+}
+
+/// Resolve doc-link states for several work-tree collections with one
+/// pointer prefilter query for their shared product.
+pub fn attach_task_doc_link_states_for_groups(
+    conn: &Connection,
+    groups: &mut [&mut [Task]],
+    caller: &str,
+    product_id: &str,
+) -> (usize, u64) {
+    if groups.iter().all(|tasks| tasks.is_empty()) {
+        return (0, 0);
+    }
+    let mut queries = 1;
+    let ids_with_pointers = match task_ids_with_doc_pointers(conn, product_id) {
+        Ok(ids) => ids,
+        Err(err) => {
+            tracing::warn!(
+                product_id,
+                ?err,
+                "{caller}: failed to prefilter task doc pointers; resolving all returned items"
+            );
+            let mut n = 0;
+            for tasks in groups {
+                n += tasks.len();
+                for task in tasks.iter_mut() {
+                    attach_task_doc_link_state(conn, task, caller, &mut queries);
+                }
+            }
+            return (n, queries);
+        }
+    };
+    let mut n = 0;
+    for tasks in groups {
+        n += tasks.iter().filter(|task| ids_with_pointers.contains(&task.id)).count();
+        for task in tasks.iter_mut().filter(|task| ids_with_pointers.contains(&task.id)) {
+            attach_task_doc_link_state(conn, task, caller, &mut queries);
+        }
+    }
+    (n, queries)
+}
+
+fn task_ids_with_doc_pointers(conn: &Connection, product_id: &str) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT id FROM tasks WHERE product_id = ?1 AND doc_path IS NOT NULL")?;
+    let rows = stmt.query_map(params![product_id], |row| row.get::<_, String>(0))?;
+    Ok(collect_rows(rows)?.into_iter().collect())
+}
+
+/// Resolve a task's per-task doc pointer (`doc_*` columns) into a
+/// [`ProjectDesignDocState`], the same wire shape the kanban already
+/// renders for project design docs. Returns `Ok(None)` when the task
+/// carries no pointer (`doc_path` is `NULL`), so the caller can leave
+/// the card's affordance hidden.
+///
+/// Mirrors [`WorkDb::resolve_project_design_doc`] but keyed on the
+/// task's own columns with the task's product as the repo/classification
+/// fallback:
+/// - `doc_repo_remote_url` falls back to the product's `repo_remote_url`.
+/// - `doc_branch` defaults to `"main"`.
+/// - the resolved repo is classified `SameProduct` / `OtherProduct` /
+///   `External` against the task's product, exactly like the project path.
+///
+/// `lookup_repo_workspace_path` mirrors the project resolver: pass
+/// `|_| None` in `get_work_tree` (no cube lookup there — the app prefers
+/// the GitHub `raw_content_url` for in-review docs on the PR head branch
+/// anyway).
+///
+/// `queries` is incremented by the number of SQL statements this call
+/// actually executes (1-3, depending on whether the product row and a
+/// cross-product repo lookup are needed) — mirrors
+/// [`crate::dispatch_helpers::query_task_runtime`], so N+1 callers
+/// like `get_work_tree`'s `db.doc_pointers` segment can report an accurate
+/// aggregate statement count.
+pub fn resolve_task_doc_pointer(
+    conn: &Connection,
+    task_id: &str,
+    lookup_repo_workspace_path: impl FnOnce(&str) -> Option<String>,
+    queries: &mut u64,
+) -> Result<Option<ProjectDesignDocState>> {
+    let row = conn
+        .query_row(
+            "SELECT product_id, doc_repo_remote_url, doc_branch, doc_path FROM tasks WHERE id = ?1",
+            [task_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    *queries += 1;
+    let Some((product_id, doc_repo, doc_branch, doc_path)) = row else {
+        return Ok(None);
+    };
+    let Some(path) = doc_path else {
+        return Ok(None);
+    };
+    let product = query_product(conn, &product_id).require("product", &product_id)?;
+    *queries += 1;
+
+    let resolved_repo = doc_repo.or_else(|| product.repo_remote_url.clone());
+    let Some(repo) = resolved_repo else {
+        return Ok(Some(ProjectDesignDocState::Broken {
+            reason: "doc_path is set but neither the task's doc_repo_remote_url nor the product's repo_remote_url is populated".to_owned(),
+        }));
+    };
+
+    let branch = doc_branch.unwrap_or_else(|| "main".to_owned());
+
+    let kind = if let Some(product_repo) = product.repo_remote_url.as_deref()
+        && product_repo == repo.as_str()
+    {
+        ResolvedDesignDocKind::SameProduct {
+            product_id: product_id.clone(),
+        }
+    } else {
+        *queries += 1;
+        if let Some(other_product) = find_product_by_repo_remote_url(conn, &repo)? {
+            ResolvedDesignDocKind::OtherProduct {
+                product_id: other_product,
+            }
+        } else {
+            ResolvedDesignDocKind::External
+        }
+    };
+
+    let web_url = render_design_doc_web_url(&repo, &branch, &path);
+    let raw_content_url = render_design_doc_raw_content_url(&repo, &branch, &path);
+    let workspace_path = lookup_repo_workspace_path(&repo);
+
+    Ok(Some(ProjectDesignDocState::Resolved {
+        resolved: ResolvedDesignDoc {
+            repo_remote_url: repo,
+            branch,
+            path,
+            kind,
+        },
+        workspace_path,
+        web_url,
+        raw_content_url,
+    }))
+}
+
+/// Split a `pr_doc:<repo_remote_url>:<branch>:<path>` artifact id (see
+/// `comments-in-markdown-viewer.md`) into its three components. Repo remote
+/// URLs routinely contain a colon of their own (`git@host:owner/repo.git`,
+/// or the `://` in an `https://` URL), so a naive `split(':')` can't tell
+/// repo from branch. Git ref names cannot contain `:` (git's own
+/// ref-format rule) and `validate_design_doc_path` never admits one either,
+/// so splitting from the right for exactly the last two colon-delimited
+/// fields (path, then branch) leaves everything else — however many colons
+/// it has — as the repo. Returns `None` for anything missing the `pr_doc:`
+/// prefix or a field.
+pub fn parse_pr_doc_artifact_id(artifact_id: &str) -> Option<(String, String, String)> {
+    let rest = artifact_id.strip_prefix("pr_doc:")?;
+    let mut parts = rest.rsplitn(3, ':');
+    let path = parts.next()?;
+    let branch = parts.next()?;
+    let repo = parts.next()?;
+    if repo.is_empty() || branch.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some((repo.to_owned(), branch.to_owned(), path.to_owned()))
+}
+
+/// Returns `true` when `a` and `b` name the same git repo, regardless of
+/// which of the three shapes each is spelled in: a bare `owner/repo` slug,
+/// an SSH remote (`git@github.com:owner/repo.git`), or an HTTPS remote
+/// (`https://github.com/owner/repo`). `pr_doc` artifact ids always store
+/// the full remote URL (see [`crate::design_detector`]), but a slug is what
+/// every other surface (`gh`, PR links, chat) shows a human, so lookups
+/// need to accept either.
+fn repo_component_matches(a: &str, b: &str) -> bool {
+    use git_utils::repo_slug::{is_owner_name_slug, origin_path_matches_slug, origin_urls_equivalent};
+
+    match (is_owner_name_slug(a), is_owner_name_slug(b)) {
+        (true, true) => a.trim().trim_end_matches('/') == b.trim().trim_end_matches('/'),
+        (true, false) => origin_path_matches_slug(b, a),
+        (false, true) => origin_path_matches_slug(a, b),
+        (false, false) => origin_urls_equivalent(a, b),
+    }
+}
+
+/// Build a [`DocOwner`] for `task_id`, applying the scope guard: `None`
+/// unless the task exists, is not soft-deleted, and is `kind ∈ {Design,
+/// Investigation}`.
+fn build_doc_owner(conn: &Connection, task_id: &str) -> Result<Option<DocOwner>> {
+    let Some(task) = query_task(conn, task_id)? else {
+        return Ok(None);
+    };
+    if task.deleted_at.is_some() {
+        return Ok(None);
+    }
+    if !matches!(task.kind, TaskKind::Design | TaskKind::Investigation) {
+        return Ok(None);
+    }
+
+    let chain_root_id = chain_root(conn, &task.id)?;
+    let pr_lifecycle = if task.pr_url.is_none() {
+        DocOwnerPrLifecycle::NoPr
+    } else if task.status == TaskStatus::Done {
+        DocOwnerPrLifecycle::Merged
+    } else {
+        DocOwnerPrLifecycle::Open
+    };
+
+    Ok(Some(DocOwner {
+        task_id: task.id,
+        task_kind: task.kind,
+        chain_root_id,
+        pr_url: task.pr_url,
+        pr_lifecycle,
+    }))
+}
+
+/// Match `projects.design_doc_repo_remote_url` / `design_doc_branch` /
+/// `design_doc_path` against `(repo, branch, path)` and return the id of
+/// that project's `kind = 'design'`, `ordinal = 0` task. Exact column
+/// equality only — no product-repo / `"main"`-branch fallback — mirroring
+/// the design's literal recipe; a project whose pointer columns are `NULL`
+/// (and would resolve only via the forward resolver's fallback) does not
+/// match here.
+fn find_design_task_by_project_doc_pointer(
+    conn: &Connection,
+    repo: &str,
+    branch: &str,
+    path: &str,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT t.id FROM tasks t
+         JOIN projects p ON t.project_id = p.id
+         WHERE p.design_doc_repo_remote_url = ?1
+           AND p.design_doc_branch = ?2
+           AND p.design_doc_path = ?3
+           AND t.kind = 'design'
+           AND t.ordinal = 0
+           AND t.deleted_at IS NULL
+         ORDER BY t.created_at ASC, t.id ASC
+         LIMIT 1",
+        params![repo, branch, path],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Match a project-less task's own `doc_repo_remote_url` / `doc_branch` /
+/// `doc_path` columns against `(repo, branch, path)` — the task-level
+/// analogue of [`find_design_task_by_project_doc_pointer`]. Per-task
+/// pointers are kind-independent, but doc-comment revisions can only be
+/// owned by designs and investigations, so those owners win collisions.
+fn find_task_by_doc_pointer(conn: &Connection, repo: &str, branch: &str, path: &str) -> Result<Option<String>> {
+    let found: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT id, COUNT(*) OVER () FROM tasks
+         WHERE doc_repo_remote_url = ?1
+           AND doc_branch = ?2
+           AND doc_path = ?3
+           AND deleted_at IS NULL
+         ORDER BY (kind IN ('design', 'investigation')) DESC, created_at ASC, id ASC
+         LIMIT 1",
+            params![repo, branch, path],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((task_id, count)) = found {
+        if count > 1 {
+            tracing::warn!(
+                repo,
+                branch,
+                path,
+                matching_tasks = count,
+                selected_task_id = task_id,
+                "multiple tasks share a per-task doc pointer; preferring a revision-capable owner"
+            );
+        }
+        Ok(Some(task_id))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_pr_doc_artifact_id ────────────────────────────────────────────
+
+    #[test]
+    fn parse_pr_doc_artifact_id_splits_https_repo() {
+        let parsed = parse_pr_doc_artifact_id("pr_doc:https://github.com/o/r.git:main:docs/foo.md");
+        assert_eq!(
+            parsed,
+            Some((
+                "https://github.com/o/r.git".to_owned(),
+                "main".to_owned(),
+                "docs/foo.md".to_owned(),
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_pr_doc_artifact_id_splits_ssh_repo_despite_its_own_colon() {
+        // `git@github.com:o/r.git` carries a colon of its own; rsplitn from
+        // the right (path, then branch) must leave the whole repo intact
+        // rather than truncating it at that colon.
+        let parsed = parse_pr_doc_artifact_id("pr_doc:git@github.com:o/r.git:boss/exec_x:doc.md");
+        assert_eq!(
+            parsed,
+            Some((
+                "git@github.com:o/r.git".to_owned(),
+                "boss/exec_x".to_owned(),
+                "doc.md".to_owned(),
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_pr_doc_artifact_id_rejects_missing_prefix() {
+        assert_eq!(parse_pr_doc_artifact_id("work_item:task-123"), None);
+    }
+
+    #[test]
+    fn parse_pr_doc_artifact_id_rejects_missing_fields() {
+        assert_eq!(parse_pr_doc_artifact_id("pr_doc:r:b"), None);
+        assert_eq!(parse_pr_doc_artifact_id("pr_doc:"), None);
+        assert_eq!(parse_pr_doc_artifact_id("pr_doc::b:p.md"), None);
+    }
+
+    // ── repo_component_matches ──────────────────────────────────────────────
+
+    #[test]
+    fn repo_component_matches_slug_against_ssh_and_https() {
+        assert!(repo_component_matches(
+            "spinyfin/mono",
+            "git@github.com:spinyfin/mono.git"
+        ));
+        assert!(repo_component_matches(
+            "git@github.com:spinyfin/mono.git",
+            "spinyfin/mono"
+        ));
+        assert!(repo_component_matches(
+            "spinyfin/mono",
+            "https://github.com/spinyfin/mono"
+        ));
+    }
+
+    #[test]
+    fn repo_component_matches_rejects_different_repos() {
+        assert!(!repo_component_matches(
+            "spinyfin/mono",
+            "git@github.com:other/repo.git"
+        ));
+        assert!(!repo_component_matches("spinyfin/mono", "spinyfin/other"));
+    }
+
+    #[test]
+    fn repo_component_matches_url_forms_ignoring_auth_prefix() {
+        assert!(repo_component_matches(
+            "git@github.com:spinyfin/mono.git",
+            "org-123@github.com:spinyfin/mono.git",
+        ));
+    }
+
+    // ── resolve_pr_doc_artifact_id / pr_doc_artifact_hint ───────────────────
+
+    fn mem_db() -> WorkDb {
+        WorkDb::open(PathBuf::from(":memory:")).unwrap()
+    }
+
+    fn comment_input(artifact_id: &str) -> CreateCommentInput {
+        CreateCommentInput {
+            artifact_kind: "pr_doc".to_owned(),
+            artifact_id: artifact_id.to_owned(),
+            doc_version: "v0".to_owned(),
+            anchor: CommentAnchor {
+                exact: "alpha".to_owned(),
+                prefix: String::new(),
+                suffix: String::new(),
+            },
+            body: "a comment body".to_owned(),
+            author: "user:test@example.com".to_owned(),
+            plain_text_projection_version: 1,
+        }
+    }
+
+    #[test]
+    fn resolve_pr_doc_artifact_id_accepts_slug_for_ssh_stored_key() {
+        let db = mem_db();
+        let stored = "pr_doc:git@github.com:spinyfin/mono.git:boss/exec_x:docs/foo.md";
+        db.create_comment(comment_input(stored)).unwrap();
+
+        let resolved = db
+            .resolve_pr_doc_artifact_id("pr_doc:spinyfin/mono:boss/exec_x:docs/foo.md")
+            .unwrap();
+        assert_eq!(resolved, stored);
+    }
+
+    #[test]
+    fn resolve_pr_doc_artifact_id_falls_back_when_no_row_matches() {
+        let db = mem_db();
+        let queried = "pr_doc:spinyfin/mono:boss/exec_x:docs/foo.md";
+        assert_eq!(db.resolve_pr_doc_artifact_id(queried).unwrap(), queried);
+    }
+
+    #[test]
+    fn resolve_pr_doc_artifact_id_passes_non_pr_doc_ids_through() {
+        let db = mem_db();
+        assert_eq!(
+            db.resolve_pr_doc_artifact_id("work_item:task-1").unwrap(),
+            "work_item:task-1"
+        );
+    }
+
+    #[test]
+    fn pr_doc_artifact_hint_names_the_stored_key_on_a_repo_spelling_mismatch() {
+        let db = mem_db();
+        let stored = "pr_doc:git@github.com:spinyfin/mono.git:boss/exec_x:docs/foo.md";
+        db.create_comment(comment_input(stored)).unwrap();
+
+        // A repo spelling `resolve_pr_doc_artifact_id` can't canonicalize
+        // (not a github.com URL and not a slug) still gets a hint pointing
+        // at the row that shares branch + path.
+        let hint = db
+            .pr_doc_artifact_hint("pr_doc:ssh://git@example.com/spinyfin/mono:boss/exec_x:docs/foo.md")
+            .unwrap();
+        assert_eq!(hint.as_deref(), Some(stored));
+    }
+
+    #[test]
+    fn pr_doc_artifact_hint_is_none_when_nothing_shares_branch_and_path() {
+        let db = mem_db();
+        db.create_comment(comment_input(
+            "pr_doc:git@github.com:spinyfin/mono.git:main:docs/other.md",
+        ))
+        .unwrap();
+        let hint = db
+            .pr_doc_artifact_hint("pr_doc:spinyfin/mono:boss/exec_x:docs/foo.md")
+            .unwrap();
+        assert_eq!(hint, None);
+    }
+}

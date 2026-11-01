@@ -28,6 +28,7 @@ rust_library(
         "//tools/boss/engine/effort:__pkg__",
         "//tools/boss/engine/host-execution:__pkg__",
         "//tools/boss/engine/stdout-progress:__pkg__",
+        "//tools/boss/engine/work-db:__pkg__",
     ],
     deps = [
         "//tools/boss/codex_auth",

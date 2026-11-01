@@ -12,7 +12,10 @@ pub mod pool_policy;
 pub mod postmortem_brief;
 
 mod semantic_progress;
-pub use semantic_progress::{SemanticProgressCheckpoint, SemanticToolCondition, SemanticTurnCondition};
+pub use semantic_progress::{
+    SemanticProgressCheckpoint, SemanticToolCondition, SemanticTurnCondition, tool_condition_signal,
+    turn_condition_signal,
+};
 
 /// One chore as the audit sees it: just enough to run the marker
 /// matcher. The engine layer projects rows out of the `tasks` table

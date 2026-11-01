@@ -27,7 +27,7 @@ pub fn instrument(_args: TokenStream, input: TokenStream) -> TokenStream {
             quote! { (|| #body)() }
         };
         method.block = syn::parse_quote!({
-            crate::work::lock_stats::returned(#result)
+            crate::lock_stats::returned(#result)
         });
     }
     quote!(#implementation).into()

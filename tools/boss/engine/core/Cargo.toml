@@ -8,6 +8,7 @@ test-support = []
 
 [dependencies]
 boss-engine-storage-values = { path = "../storage-values" }
+boss-work-db = { path = "../work-db" }
 boss-board-projection = { path = "../board-projection" }
 boss-host-execution = { path = "../host-execution" }
 boss-task-scope = { path = "../task-scope" }
