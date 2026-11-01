@@ -206,6 +206,8 @@ pub(super) mod tests {
             );
         }
         for no in [
+            "Fix the blocked import here and drop the remaining refactor.",
+            "Fix the blocked import here and drop the files left over.",
             "Ship the 12 remaining files; the blocked job is fixed separately.",
             "Ship the files left; the blocked job is fixed separately.",
         ] {

@@ -942,14 +942,14 @@ fn action_question_group(
                 successor = match err.downcast_ref::<RevisionGateError>() {
                     Some(RevisionGateError::NoPr { .. }) => worker_questions::QuestionSuccessor::NoPr,
                     Some(RevisionGateError::Merged { .. } | RevisionGateError::ClosedUnmerged { .. }) => {
-                        brief = build_qa_brief(group, &answered, false);
-                        if let Some(task) = &source {
-                            brief.push_str(&format!("\n## Original work: {}\n\n{}\n", task.name, task.description));
-                        }
                         worker_questions::QuestionSuccessor::FinishedPr
                     }
                     None => return Err(err),
                 };
+                brief = build_qa_brief(group, &answered, false);
+                if let Some(task) = &source {
+                    brief.push_str(&format!("\n## Original work: {}\n\n{}\n", task.name, task.description));
+                }
             }
         }
     }
@@ -1319,7 +1319,7 @@ impl WorkDb {
             other => bail!("cannot action attention group {} of kind {other:?}", group.id),
         };
 
-        worker_questions::apply_prerequisite_in_tx(
+        worker_questions::apply_typed_answer_in_tx(
             &mut pending,
             &tx,
             &group,

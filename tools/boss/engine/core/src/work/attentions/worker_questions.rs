@@ -136,10 +136,11 @@ pub(super) fn file_count_bypass_no_spec(
         .map(|spec| (record.question, spec)))
 }
 
-/// Apply the original typed prerequisite to the successor, preserving the
-/// source parent's merge/block/terminal lifecycle. This shares the ordinary
-/// question approval's deduplication, dependency and dispatch behavior.
-pub(super) fn apply_prerequisite_in_tx(
+/// Apply a typed answer to the successor: Yes creates or links a prerequisite;
+/// file-count No records authorization only for a revision of the asking PR.
+/// Fresh work retains the answer as history and requires fresh approval.
+/// Preserve the source parent's merge/block/terminal lifecycle.
+pub(super) fn apply_typed_answer_in_tx(
     pending: &mut PendingEvents,
     conn: &Connection,
     group: &AttentionGroup,
@@ -186,11 +187,11 @@ pub(super) fn apply_prerequisite_in_tx(
         .context("answer timestamp is outside the supported range")?;
     let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
     let block = match successor {
-        QuestionSuccessor::Revision | QuestionSuccessor::NoPr => {
+        QuestionSuccessor::Revision => {
             super::super::pr_flow::file_count_bypass_authorization_block(&question, spec, &timestamp)
         }
-        QuestionSuccessor::FinishedPr => format!(
-            "\n\n## Recorded answer ({timestamp})\n\nThe operator answered No to: {}\n\nThe original PR has merged or closed. This answer is context only and grants no authorization for a new PR; exceeding the file-count limit requires fresh approval.\n",
+        QuestionSuccessor::FinishedPr | QuestionSuccessor::NoPr => format!(
+            "\n\n## Recorded answer ({timestamp})\n\nThe operator answered No to: {}\n\nThis successor does not continue an open PR from the original work. This answer is context only and grants no authorization for a new PR; exceeding the file-count limit requires fresh approval.\n",
             question.text
         ),
     };

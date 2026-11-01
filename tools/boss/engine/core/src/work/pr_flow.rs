@@ -2602,7 +2602,7 @@ The repo owner recorded this answer. It is explicit, human-granted approval for 
 }
 
 /// No on a split-vs-file-count-bypass question: keep this change in one PR,
-/// bound to the approved file count, and no other check.
+/// recording the approved file count separately from the free-form bypass reason.
 pub(super) fn file_count_bypass_authorization_block(
     question: &OperatorQuestionView,
     spec: boss_protocol::FileCountBypassSpec,
@@ -2615,8 +2615,8 @@ pub(super) fn file_count_bypass_authorization_block(
 - **Authorized exception:** change/file-count for this PR only, up to {} files (repository limit {})\n\
 - **The worker's explanation:** {}\n\
 - **Asked by run:** `{}`\n\n\
-The repo owner recorded this answer. It is explicit, human-granted approval to finish this change as a single PR by declaring `BYPASS_CHANGE_FILE_COUNT={}:approved by the repo owner` in the commit description. It does not authorize bypassing any other check, raising any other limit, or using the exception on a different PR. State in the PR body that this file-count exception was approved by the repo owner on the date above.\n",
-        question.text, spec.files, spec.limit, question.explanation, question.execution_id, spec.files
+The repo owner recorded this answer. It is explicit, human-granted approval to finish this change as a single PR by declaring `BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered No by the repo owner on {timestamp}; one-PR exception for this PR only` in the commit description. Checkleft does not enforce the approved count. Before pushing, compare the non-deleted file count from `jj diff --stat` against the PR base with the approved bound above and ask again if it is over. It does not authorize bypassing any other check, raising any other limit, or using the exception on a different PR. State in the PR body that this file-count exception was approved by the repo owner on the date above.\n",
+        question.text, spec.files, spec.limit, question.explanation, question.execution_id
     )
 }
 
@@ -2661,8 +2661,10 @@ mod tests {
         );
         crate::prose_vocabulary::assert_no_forbidden_prose("file-count bypass approval", &text);
         assert!(text.contains("## Repo owner approval (2026-10-23)"));
-        assert!(text.contains("change/file-count for this PR only, up to 48 files"));
-        assert!(text.contains("BYPASS_CHANGE_FILE_COUNT=48:approved by the repo owner"));
+        assert!(text.contains("change/file-count for this PR only, up to 48 files (repository limit 30)"));
+        assert!(text.contains("Checkleft does not enforce the approved count"));
+        assert!(text.contains("ask again if it is over"));
+        assert!(text.contains("BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered No by the repo owner on 2026-10-23; one-PR exception for this PR only"));
         assert!(text.contains("It does not authorize bypassing any other check"));
     }
 

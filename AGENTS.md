@@ -104,9 +104,9 @@ Required behavior: fix the real problem — split the oversized file, fix the li
 When `change/file-count` fires on feature work, or the change is heading past the limit (30 files in `CHECKS.yaml`), ask a split-vs-bypass question. Both answers are real paths:
 
 - **Yes** creates a prerequisite for the first coherent capability (a stacked PR along a capability boundary). This task delivers the remainder once that PR has merged.
-- **No** authorizes a `change/file-count` exception for this PR only. The next run finishes in one PR by putting `BYPASS_CHANGE_FILE_COUNT=<files>:approved by the repo owner` in the commit description. Never apply that bypass without the recorded authorization in the task description. The authorization does not relax any other check.
+- **No** authorizes a `change/file-count` exception for this PR only. The next run finishes in one PR by putting `BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered No by the repo owner on <date>; one-PR exception for this PR only` in the commit description. Never apply that bypass without the recorded authorization in the task description. The authorization does not relax any other check.
 
-The question must state the projected upper-bound file count of the single-PR change, the limit, and the proposed split's PR boundaries. `--file-count` is that projected upper bound, and the bypass binds to it. If the finished change exceeds the approved bound, ask again.
+The question must state the projected upper-bound file count of the single-PR change, the limit, and the proposed split's PR boundaries. `--file-count` records the projected upper bound. Checkleft does not enforce the approved count: before pushing, compare the non-deleted file count from `jj diff --stat` against the PR base with the approved bound, and ask again if it is over. Use a free-form bypass reason without a numeric prefix, citing the recorded answer and date.
 
 Check the footprint early, not after the work is built. Once the shape of the change is clear, and again before final validation, run the file-count check or `jj diff --stat` against the base. If the change is heading past the limit, stop and ask before building the rest:
 

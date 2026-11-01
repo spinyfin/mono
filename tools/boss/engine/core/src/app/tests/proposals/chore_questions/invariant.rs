@@ -328,12 +328,23 @@ async fn file_count_no_after_pr_finished_requires_fresh_approval() {
 }
 
 #[tokio::test]
-async fn file_count_no_before_first_pr_retains_approval() {
-    file_count_successor(crate::work::PrOpenState::Open, false, true).await;
+async fn file_count_no_without_a_pr_requires_fresh_approval() {
+    file_count_successor(crate::work::PrOpenState::Open, false, false).await;
 }
 
 async fn file_count_successor(pr_state: crate::work::PrOpenState, has_pr: bool, authorized: bool) {
-    let (state, _dir, execution, task) = fixture(&TaskKind::ProjectTask, &TaskStatus::InReview, false);
+    for kind in [TaskKind::ProjectTask, TaskKind::Chore] {
+        file_count_successor_for_kind(pr_state.clone(), has_pr, authorized, &kind).await;
+    }
+}
+
+async fn file_count_successor_for_kind(
+    pr_state: crate::work::PrOpenState,
+    has_pr: bool,
+    authorized: bool,
+    kind: &TaskKind,
+) {
+    let (state, _dir, execution, task) = fixture(kind, &TaskStatus::InReview, false);
     if !has_pr {
         state
             .work_db
@@ -388,7 +399,16 @@ async fn file_count_successor(pr_state: crate::work::PrOpenState, has_pr: bool, 
             Ok((row.get(0)?, row.get(1)?))
         })
         .unwrap();
-    assert_eq!(produced_kind, if has_pr && authorized { "revision" } else { "design" });
+    assert_eq!(
+        produced_kind,
+        if has_pr && authorized {
+            "revision"
+        } else if *kind == TaskKind::Chore {
+            "chore"
+        } else {
+            "design"
+        }
+    );
     if !authorized {
         assert!(description.contains("**Answer:** no"));
         assert!(description.contains("grants no authorization for a new PR"));
@@ -401,6 +421,10 @@ async fn file_count_successor(pr_state: crate::work::PrOpenState, has_pr: bool, 
     assert!(description.contains("Repo owner approval"));
     assert!(description.contains("No — keep this change in one PR"));
     assert!(description.contains("change/file-count for this PR only, up to 48 files"));
-    assert!(description.contains("BYPASS_CHANGE_FILE_COUNT=48:approved by the repo owner"));
+    assert!(
+        description.contains("BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered No by the repo owner on ")
+    );
+    assert!(description.contains("one-PR exception for this PR only"));
+    assert!(description.contains("Checkleft does not enforce the approved count"));
     assert!(!description.contains("A No answer does not authorize the proposed action."));
 }

@@ -747,7 +747,7 @@ async fn file_count_split_no_records_scoped_authorization_and_redispatches() {
     );
     assert!(
         task.description
-            .contains("BYPASS_CHANGE_FILE_COUNT=48:approved by the repo owner")
+            .contains("BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered No by the repo owner on ")
     );
     assert!(
         task.description

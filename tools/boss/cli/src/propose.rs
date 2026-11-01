@@ -453,8 +453,9 @@ pub(crate) struct RunDoneArgs {
     /// Projected upper-bound non-deleted file count of the single-PR change.
     /// With `--file-count-limit`, this is a split-vs-bypass question: Yes
     /// creates the prerequisite; No authorizes a `change/file-count` exception
-    /// for this PR only, bound to this number. Ask again if the finished
-    /// change exceeds the approved bound.
+    /// for this PR only. Checkleft does not enforce the approved count: before
+    /// pushing, compare the non-deleted count from `jj diff --stat` against
+    /// the PR base with this bound, and ask again if it is over.
     #[arg(long, requires_all = ["answer_type", "file_count_limit"])]
     file_count: Option<u32>,
 

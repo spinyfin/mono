@@ -733,14 +733,16 @@ pub struct OperatorQuestion {
 /// Counts that turn a `create_prerequisite_task` question into split-vs-bypass.
 ///
 /// Yes still creates `name`. No authorizes a `change/file-count` exception for
-/// this PR only, bound to [`Self::files`], and redispatches so the next worker
+/// this PR only, and redispatches so the next worker
 /// finishes in one PR. Absent on ordinary prerequisite questions, whose No
 /// records the declined path and redispatches with no authorization.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FileCountBypassSpec {
     /// Projected upper-bound non-deleted file count of the single-PR change.
-    /// The bypass binds to this number.
+    /// Recorded approval bound; checkleft does not enforce it. Before pushing,
+    /// the worker must compare the non-deleted count from `jj diff --stat`
+    /// against the PR base with this bound and ask again if it is over.
     pub files: u32,
     /// The repository `change/file-count` `max_files` limit.
     pub limit: u32,
@@ -880,7 +882,7 @@ impl OperatorAnswerType {
         )
     }
 
-    /// The file-count bypass bound on a split-vs-bypass prerequisite question.
+    /// The recorded file-count approval spec on a split-vs-bypass prerequisite question.
     pub fn file_count_bypass(&self) -> Option<FileCountBypassSpec> {
         match self {
             Self::CreatePrerequisiteTask { file_count_bypass, .. } => *file_count_bypass,
