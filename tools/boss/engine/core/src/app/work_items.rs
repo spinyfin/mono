@@ -91,14 +91,16 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
                 let coordinator = &server_state.execution_coordinator;
                 let held_by_operator = work_db.get_execution(&execution_id).ok().is_some_and(|execution| {
                     coordinator
-                        .dispatch_hold_for(&execution, crate::coordinator::DispatchAdmission::Queued)
-                        .is_some_and(|hold| hold.pause.origin == crate::coordinator::DispatchPauseOrigin::Operator)
+                        .dispatch_hold_for(&execution, boss_execution_contracts::DispatchAdmission::Queued)
+                        .is_some_and(|hold| {
+                            hold.pause.origin == boss_execution_contracts::DispatchPauseOrigin::Operator
+                        })
                 });
                 if held_by_operator
                     && let Err(err) = coordinator
                         .force_dispatch(
                             &execution_id,
-                            crate::coordinator::DispatchAdmission::PauseBypassOverride,
+                            boss_execution_contracts::DispatchAdmission::PauseBypassOverride,
                         )
                         .await
                 {

@@ -3,7 +3,7 @@
 use super::*;
 use boss_protocol::{ExecutionStatus, PauseReason};
 
-use crate::coordinator::DispatchPauseOrigin;
+use boss_execution_contracts::DispatchPauseOrigin;
 
 #[path = "question_cube.rs"]
 mod question_cube;
@@ -93,7 +93,7 @@ async fn force_launched_question() -> (Arc<ServerState>, tempfile::TempDir, Stri
         .unwrap();
     state
         .execution_coordinator
-        .force_dispatch(&asking, crate::coordinator::DispatchAdmission::OperatorForced)
+        .force_dispatch(&asking, boss_execution_contracts::DispatchAdmission::OperatorForced)
         .await
         .unwrap();
     wait_for_starts(&state, &runner, 1).await;
