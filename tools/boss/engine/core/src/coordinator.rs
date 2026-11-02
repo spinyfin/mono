@@ -17,12 +17,11 @@ use boss_engine_storage_values::Host;
 use boss_engine_storage_values::attention_kinds::{
     EXECUTION_BOOKMARK_CREATE_FAILED_ATTENTION_KIND as CREATE_FAILED,
     EXECUTION_BOOKMARK_RECOVERY_FAILED_ATTENTION_KIND as RECOVERY_FAILED,
-    EXECUTION_BOOKMARK_RECOVERY_RETIRED_ATTENTION_KIND as RECOVERY_RETIRED,
 };
 use boss_execution_contracts::{
     ChoreRequirements, FailureEffect, HostSlot, IneligibilityReason, LeaseReleaseOutcome, LifecycleServices,
-    LiveWorkerLiveness, NoopLifecycleServices, PidStatus, PreStartStage, PreStartStreakTracker, TeardownReason,
-    TerminalCause, WorkerPaneReleaser, driver_capability, select_host,
+    LiveWorkerLiveness, PidStatus, PreStartStage, PreStartStreakTracker, TeardownReason, TerminalCause,
+    WorkerPaneReleaser, driver_capability, select_host,
 };
 
 use crate::config::RuntimeConfig;
@@ -33,14 +32,16 @@ use crate::dispatch_events::{
 use crate::dispatch_inflight::InflightDispatches;
 #[cfg(test)]
 use crate::effort::PoolModelTier;
-use crate::host_adapter::{LocalHostAdapter, LocalHostAdapterProvider};
+#[cfg(test)]
+use crate::host_adapter::LocalHostAdapter;
+use crate::host_adapter::LocalHostAdapterProvider;
 use crate::metrics::Registry;
 use crate::work::{
     CreateAttentionItemInput, DispatchClaimOutcome, DispatchClass, FinishExecutionRunInput, PreStartFailureOutcome,
     WorkDb, WorkExecution, WorkItem, WorkRun,
 };
-use boss_execution_contracts::{ExecutionRunner, RunOutcome, RunWaitState};
 use boss_execution_contracts::{HostAdapter, HostAdapterProvider};
+use boss_execution_contracts::{RunOutcome, RunWaitState};
 
 // Phase-3 counter handles for the cube workspace lease boundary.
 crate::register_counter!(
@@ -431,9 +432,18 @@ pub use boss_execution_contracts::{CubeClient, RebaseOutcome};
 #[cfg(not(test))]
 use boss_execution_contracts::{CubeClient, RebaseOutcome};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CommandCubeClient {
     cfg: Arc<RuntimeConfig>,
+    lifecycle: Arc<dyn LifecycleServices>,
+}
+
+impl std::fmt::Debug for CommandCubeClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommandCubeClient")
+            .field("cfg", &self.cfg)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Strip the trailing jj conflict-type descriptor (e.g. `"    2-sided
@@ -514,8 +524,9 @@ fn parse_rebase_payload(payload: serde_json::Value) -> Result<RebaseOutcome> {
 }
 
 impl CommandCubeClient {
-    pub fn new(cfg: Arc<RuntimeConfig>) -> Self {
-        Self { cfg }
+    /// `lifecycle` supplies the merge-parent deletion tripwire.
+    pub fn new(cfg: Arc<RuntimeConfig>, lifecycle: Arc<dyn LifecycleServices>) -> Self {
+        Self { cfg, lifecycle }
     }
 
     async fn run_json(&self, args: &[&str]) -> Result<serde_json::Value> {
@@ -684,7 +695,9 @@ impl CubeClient for CommandCubeClient {
         base_sha: &str,
         pr_number: u64,
     ) -> Vec<String> {
-        crate::lifecycle_adapter::verify_deletion_tripwire(repo_slug, head_before, base_sha, pr_number).await
+        self.lifecycle
+            .verify_deletion_tripwire(repo_slug, head_before, base_sha, pr_number)
+            .await
     }
 
     fn command_repr(&self, args: &[&str]) -> Option<(String, String)> {
@@ -768,10 +781,13 @@ pub(crate) fn occupying_live_worker(
         .map(|s| s.run_id.clone())
 }
 
-fn default_coordinator_metrics() -> Arc<Registry> {
+/// Fresh registry with the coordinator's counters pre-registered, including
+/// the answer-agent metrics registered through `lifecycle`.
+pub fn default_coordinator_metrics(lifecycle: &dyn LifecycleServices) -> Arc<Registry> {
     let metrics = Arc::new(Registry::new());
     register_metrics(&metrics);
     crate::dispatch_metrics::register_metrics(&metrics);
+    lifecycle.register_answer_agent_metrics(&metrics);
     metrics
 }
 
@@ -813,10 +829,8 @@ pub struct ExecutionCoordinator {
     host_adapter_provider: Arc<dyn HostAdapterProvider>,
     remote_pane_releaser: Option<Arc<dyn WorkerPaneReleaser>>,
     /// Engine lifecycle operations (lease release, teardown, bookmark
-    /// recovery, remote reattach). Defaults to [`NoopLifecycleServices`] on
-    /// the builder; production constructors install
-    /// [`crate::lifecycle_adapter::CoreLifecycleServices`].
-    #[builder(default = Arc::new(NoopLifecycleServices))]
+    /// recovery, remote reattach). Required: the caller supplies the
+    /// implementation (production composition passes the core adapter).
     lifecycle: Arc<dyn LifecycleServices>,
     #[builder(default = Arc::new(NoopExecutionPublisher))]
     publisher: Arc<dyn ExecutionPublisher>,
@@ -899,11 +913,9 @@ pub struct ExecutionCoordinator {
     /// to [`crate::config::MAX_MERGE_ORDER_STAGGER_SECS`]) at construction.
     #[builder(default)]
     merge_order_stagger_secs: u64,
-    /// Engine-wide counter registry. Defaults to a fresh local registry
-    /// with the lease counters pre-registered so tests that do not call
-    /// `set_metrics` still get valid increments. Production wires in the
-    /// shared engine registry via `set_metrics` after construction.
-    #[builder(default = default_coordinator_metrics())]
+    /// Engine-wide counter registry. Required: build one with
+    /// [`default_coordinator_metrics`] (which registers the lifecycle's
+    /// answer-agent metrics) or pass the shared engine registry.
     metrics: Arc<Registry>,
     /// Hook called when an execution transitions to `running`.
     /// Defaults to [`NoopExecutionStartedHook`]; production installs

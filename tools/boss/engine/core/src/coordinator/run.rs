@@ -382,7 +382,7 @@ impl ExecutionCoordinator {
                     if effect != FailureEffect::BelowThreshold {
                         tracing::error!(
                             driver = %streak_key.driver,
-                            worker_kind = streak_key.worker_kind,
+                            worker_kind = streak_key.worker_kind.label(),
                             newly_raised = effect == FailureEffect::Raised,
                             execution_id = %execution.id,
                             error = %err_detail,

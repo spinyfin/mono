@@ -33,6 +33,7 @@ use crate::external_tracker::auth_forwarder::run_auth_forwarder;
 use crate::external_tracker::github_oauth::{
     DeviceFlow, GitHubAuthController, GitHubAuthState, KeychainTokenStore, probe_and_record_org_state,
 };
+use crate::host_adapter::LocalHostAdapter;
 use crate::ipc_log::IpcLogger;
 use crate::live_status_loop::{
     LiveStatusBroadcaster, LiveStatusManager, LiveStatusRun, TranscriptPathResolver, Trigger,
@@ -57,7 +58,7 @@ use crate::work::{
 use crate::worker_registry::WorkerRegistry;
 use async_trait::async_trait;
 use boss_execution_contracts::ExecutionRunner;
-use boss_execution_contracts::{CubeClient, ExecutionPublisher, WorkerPool};
+use boss_execution_contracts::{CubeClient, ExecutionPublisher, LifecycleServices, WorkerPool};
 use tokio::time::{Duration, timeout};
 
 /// How long the engine waits for the app to acknowledge detaching a viewer.
@@ -1419,8 +1420,10 @@ impl ServerState {
                 .build(),
         );
         let publisher: Arc<dyn ExecutionPublisher> = publisher_impl.clone();
-        let cube_client: Arc<dyn CubeClient> =
-            cube_client_override.unwrap_or_else(|| Arc::new(CommandCubeClient::new(cfg.clone())));
+        let lifecycle: Arc<dyn LifecycleServices> =
+            crate::lifecycle_adapter::CoreLifecycleServices::new(work_db.clone());
+        let cube_client: Arc<dyn CubeClient> = cube_client_override
+            .unwrap_or_else(|| Arc::new(CommandCubeClient::new(cfg.clone(), Arc::clone(&lifecycle))));
         let pr_detector: Arc<dyn PrDetector> =
             pr_detector_override.unwrap_or_else(|| Arc::new(CommandPrDetector::new()));
         // The pane releaser and probe queuer both need a Weak<ServerState>
@@ -1691,12 +1694,12 @@ impl ServerState {
         let provider_control_dir = crate::ssh_transport::default_control_socket_dir();
         let remote_pane_releaser = pane_releaser.clone();
         let server_state = Arc::new_cyclic(move |weak_self: &Weak<ServerState>| {
-            let mut execution_coordinator_inner = ExecutionCoordinator::with_publisher(
+            let mut execution_coordinator_inner = ExecutionCoordinator::with_host_adapter_and_publisher(
                 work_db.clone(),
                 worker_pool,
-                cube_client,
-                runner_for_coordinator,
+                Arc::new(LocalHostAdapter::new(cube_client, runner_for_coordinator)),
                 publisher,
+                lifecycle,
             );
             execution_coordinator_inner.set_dispatch_events(dispatch_events);
             execution_coordinator_inner.set_metrics(metrics_for_coordinator);

@@ -33,33 +33,6 @@ pub const STARTUP_RECOVERY_PENDING_REASON: &str =
 ///
 /// The caller is responsible for releasing the workspace on error.
 impl ExecutionCoordinator {
-    /// Convenience constructor for tests and simple callers. Wraps the
-    /// provided `cube_client` and `execution_runner` in a
-    /// `LocalHostAdapter` and calls [`Self::with_publisher`].
-    pub fn new(
-        work_db: Arc<WorkDb>,
-        worker_pool: WorkerPool,
-        cube_client: Arc<dyn CubeClient>,
-        execution_runner: Arc<dyn ExecutionRunner>,
-    ) -> Self {
-        let host_adapter = Arc::new(LocalHostAdapter::new(cube_client, execution_runner));
-        Self::with_host_adapter_and_publisher(work_db, worker_pool, host_adapter, Arc::new(NoopExecutionPublisher))
-    }
-
-    /// Constructor that accepts a publisher alongside the cube/runner
-    /// primitives. Wraps them in `LocalHostAdapter` and delegates to
-    /// [`Self::with_host_adapter_and_publisher`].
-    pub fn with_publisher(
-        work_db: Arc<WorkDb>,
-        worker_pool: WorkerPool,
-        cube_client: Arc<dyn CubeClient>,
-        execution_runner: Arc<dyn ExecutionRunner>,
-        publisher: Arc<dyn ExecutionPublisher>,
-    ) -> Self {
-        let host_adapter = Arc::new(LocalHostAdapter::new(cube_client, execution_runner));
-        Self::with_host_adapter_and_publisher(work_db, worker_pool, host_adapter, publisher)
-    }
-
     /// Primary constructor for Phase 3+. Callers that need to dispatch
     /// to a non-local host (e.g. `SshHostAdapter`) build the adapter
     /// themselves and pass it here directly.
@@ -68,15 +41,12 @@ impl ExecutionCoordinator {
         worker_pool: WorkerPool,
         host_adapter: Arc<dyn HostAdapter>,
         publisher: Arc<dyn ExecutionPublisher>,
+        lifecycle: Arc<dyn LifecycleServices>,
     ) -> Self {
-        // Build a local registry for tests that never call `set_metrics`.
+        // Build a local registry for callers that never call `set_metrics`.
         // Pre-register the lease counter handles so `.inc()` never panics
         // on "counter not registered" in a test context.
-        let local_metrics = Arc::new(Registry::new());
-        register_metrics(&local_metrics);
-        crate::dispatch_metrics::register_metrics(&local_metrics);
-        let lifecycle = crate::lifecycle_adapter::CoreLifecycleServices::new(Arc::clone(&work_db));
-        lifecycle.register_answer_agent_metrics(&local_metrics);
+        let local_metrics = default_coordinator_metrics(lifecycle.as_ref());
         let host_adapter_provider: Arc<dyn HostAdapterProvider> =
             Arc::new(LocalHostAdapterProvider::new(Arc::clone(&host_adapter)));
         Self {

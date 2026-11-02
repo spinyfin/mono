@@ -9,12 +9,14 @@ use anyhow::Result;
 use async_trait::async_trait;
 use boss_dispatch_events::DispatchEventSink;
 use boss_execution_contracts::{
-    ExecutionPublisher, HostAdapter, HostAdapterProvider, LeaseReleaseOutcome, LifecycleServices, LiveWorkerLiveness,
-    PaneStatus, PidStatus, PreStartStage, ReattachSummary, RemoteLeaseReconcileOutcome, TeardownReason, TerminalCause,
-    WorkerPaneReleaser,
+    CubeClient, ExecutionPublisher, ExecutionRunner, HostAdapter, HostAdapterProvider, LeaseReleaseOutcome,
+    LifecycleServices, LiveWorkerLiveness, NoopExecutionPublisher, PaneStatus, PidStatus, PreStartStage,
+    ReattachSummary, RemoteLeaseReconcileOutcome, TeardownReason, TerminalCause, WorkerPaneReleaser, WorkerPool,
 };
 use boss_protocol::WorkExecution;
 
+use crate::coordinator::ExecutionCoordinator;
+use crate::host_adapter::LocalHostAdapter;
 use crate::metrics::Registry;
 use crate::spawn_flow::StartWorkerError;
 use crate::work::WorkDb;
@@ -41,17 +43,49 @@ fn map_pid_status(status: crate::dead_pid_sweep::PidStatus) -> PidStatus {
     }
 }
 
-/// Merge-parent deletion tripwire used by [`crate::coordinator::CommandCubeClient`].
-pub async fn verify_deletion_tripwire(
-    repo_slug: &str,
-    head_before: &str,
-    base_sha: &str,
-    pr_number: u64,
-) -> Vec<String> {
+/// Merge-parent deletion tripwire, reached through
+/// [`LifecycleServices::verify_deletion_tripwire`].
+async fn verify_deletion_tripwire(repo_slug: &str, head_before: &str, base_sha: &str, pr_number: u64) -> Vec<String> {
     let Some(head_after) = crate::merge_parent_deletion::fetch_pr_head_sha(repo_slug, pr_number).await else {
         return Vec::new();
     };
     crate::merge_parent_deletion::compute_merged_parent_deletions(repo_slug, head_before, base_sha, &head_after).await
+}
+
+/// Convenience coordinator constructors for tests and simple callers. They
+/// live here, with the core adapter they install, so the coordinator's own
+/// modules never name the concrete lifecycle implementation.
+impl ExecutionCoordinator {
+    /// Wraps `cube_client` and `execution_runner` in a `LocalHostAdapter`
+    /// and calls [`Self::with_publisher`] with a no-op publisher.
+    pub fn new(
+        work_db: Arc<WorkDb>,
+        worker_pool: WorkerPool,
+        cube_client: Arc<dyn CubeClient>,
+        execution_runner: Arc<dyn ExecutionRunner>,
+    ) -> Self {
+        Self::with_publisher(
+            work_db,
+            worker_pool,
+            cube_client,
+            execution_runner,
+            Arc::new(NoopExecutionPublisher),
+        )
+    }
+
+    /// Wraps the cube/runner primitives in a `LocalHostAdapter` and installs
+    /// [`CoreLifecycleServices`].
+    pub fn with_publisher(
+        work_db: Arc<WorkDb>,
+        worker_pool: WorkerPool,
+        cube_client: Arc<dyn CubeClient>,
+        execution_runner: Arc<dyn ExecutionRunner>,
+        publisher: Arc<dyn ExecutionPublisher>,
+    ) -> Self {
+        let host_adapter = Arc::new(LocalHostAdapter::new(cube_client, execution_runner));
+        let lifecycle = CoreLifecycleServices::new(Arc::clone(&work_db));
+        Self::with_host_adapter_and_publisher(work_db, worker_pool, host_adapter, publisher, lifecycle)
+    }
 }
 
 #[async_trait]

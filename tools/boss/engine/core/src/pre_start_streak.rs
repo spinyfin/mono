@@ -226,7 +226,7 @@ mod tests {
     fn unresolved_driver_is_still_counted() {
         let key = StreakKey::for_execution(None, &ExecutionKind::PrReview);
         assert_eq!(key.driver, UNRESOLVED_DRIVER_LABEL);
-        assert_eq!(key.worker_kind, "reviewer");
+        assert_eq!(key.worker_kind.label(), "reviewer");
         assert_eq!(StreakKey::for_execution(Some("  "), &ExecutionKind::PrReview), key);
     }
 
