@@ -105,10 +105,9 @@ use boss_protocol::WorkExecution;
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEventSink, Stage};
 use crate::durable_liveness::WorkerProcess;
-use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::work::WorkDb;
 use crate::worker_readoption::LiveWorkerConvergence;
-use boss_execution_contracts::CubeClient;
+use boss_execution_contracts::{CubeClient, LiveWorkerLiveness};
 
 /// Cadence for the periodic pass. Fires immediately on boot, then every
 /// interval — fast enough that a pane killed mid-run is cleared and its work
@@ -305,7 +304,7 @@ pub(crate) async fn shell_pid_death_evidence(
     work_db: &WorkDb,
     execution: &WorkExecution,
     now_epoch_secs: i64,
-    live_states: Option<&LiveWorkerStateRegistry>,
+    live_states: Option<&dyn LiveWorkerLiveness>,
 ) -> Option<i64> {
     // Only reconcile states where the design expects a LIVE pane to still be
     // holding the workspace: `running` (a pr_review reviewer pane) and
@@ -419,7 +418,7 @@ pub async fn reconcile_if_pane_dead(
     dispatch_events: &dyn DispatchEventSink,
     execution: &WorkExecution,
     now_epoch_secs: i64,
-    live_states: Option<&LiveWorkerStateRegistry>,
+    live_states: Option<&dyn LiveWorkerLiveness>,
     cube_client: Option<&dyn CubeClient>,
 ) -> bool {
     let Some(shell_pid) = shell_pid_death_evidence(work_db, execution, now_epoch_secs, live_states).await else {
@@ -524,6 +523,7 @@ pub async fn reconcile_if_pane_dead(
 mod tests {
     use super::*;
     use crate::dispatch_events::NoopDispatchEventSink;
+    use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::test_support::*;
     use crate::work::{AutomationFireRecord, WorkDb};
     use boss_protocol::{

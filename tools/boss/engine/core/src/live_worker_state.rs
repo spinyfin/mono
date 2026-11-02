@@ -2427,6 +2427,32 @@ impl LiveWorkerStateRegistry {
     }
 }
 
+impl boss_execution_contracts::LiveWorkerLiveness for LiveWorkerStateRegistry {
+    fn is_run_live(&self, run_id: &str) -> bool {
+        LiveWorkerStateRegistry::is_run_live(self, run_id)
+    }
+
+    fn snapshot(&self) -> Vec<LiveWorkerState> {
+        LiveWorkerStateRegistry::snapshot(self)
+    }
+
+    fn release_slot_for_run(&self, run_id: &str) -> Option<u8> {
+        LiveWorkerStateRegistry::release_slot_for_run(self, run_id)
+    }
+
+    fn release_persona_for_run(&self, run_id: &str) {
+        LiveWorkerStateRegistry::release_persona_for_run(self, run_id)
+    }
+
+    fn last_event_at_for_run(&self, run_id: &str) -> Option<String> {
+        LiveWorkerStateRegistry::last_event_at_for_run(self, run_id)
+    }
+
+    fn current_tool_for_run(&self, run_id: &str) -> Option<String> {
+        LiveWorkerStateRegistry::current_tool_for_run(self, run_id)
+    }
+}
+
 /// What [`LiveWorkerStateRegistry::apply_sequenced_event`] did with an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyEventOutcome {

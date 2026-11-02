@@ -306,7 +306,7 @@ impl ExecutionCoordinator {
     pub async fn dispatch_with_pause_bypass(
         self: &Arc<Self>,
         input: RequestExecutionInput,
-        live_states: Arc<crate::live_worker_state::LiveWorkerStateRegistry>,
+        live_states: Arc<dyn LiveWorkerLiveness>,
     ) -> Result<PauseBypassOutcome> {
         let entry_point = input
             .entry_point
@@ -451,7 +451,7 @@ impl ExecutionCoordinator {
     async fn request_execution_ordinary(
         self: &Arc<Self>,
         input: RequestExecutionInput,
-        live_states: Arc<crate::live_worker_state::LiveWorkerStateRegistry>,
+        live_states: Arc<dyn LiveWorkerLiveness>,
     ) -> Result<WorkExecution> {
         let execution = self.request_execution_via_db(input, live_states)?;
         self.kick();
@@ -461,7 +461,7 @@ impl ExecutionCoordinator {
     pub(crate) fn request_execution_via_db(
         &self,
         mut input: RequestExecutionInput,
-        live_states: Arc<crate::live_worker_state::LiveWorkerStateRegistry>,
+        live_states: Arc<dyn LiveWorkerLiveness>,
     ) -> Result<WorkExecution> {
         if let Some(host_id) = input.requested_host_id.clone() {
             // `request_execution_with_live_check` (called below) resolves

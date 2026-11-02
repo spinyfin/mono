@@ -381,7 +381,7 @@ impl ExecutionCoordinator {
         self.work_db.create_attention_item(CreateAttentionItemInput {
             execution_id: Some(prior.id.clone()),
             work_item_id: None,
-            kind: crate::execution_bookmark_recovery::RECOVERY_RETIRED.to_owned(),
+            kind: RECOVERY_RETIRED.to_owned(),
             status: None,
             title: "Recovery pointers retired; item restarted fresh".to_owned(),
             body_markdown: format!(

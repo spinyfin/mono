@@ -1,6 +1,9 @@
 //! Shared execution service contracts and worker-pool state.
 //! Concrete host operations remain in the host executor and upper adapters.
 
+mod lifecycle;
+pub use lifecycle::*;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

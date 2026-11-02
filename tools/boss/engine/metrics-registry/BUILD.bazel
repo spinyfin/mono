@@ -10,6 +10,7 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/engine/event-bus:__pkg__",
+        "//tools/boss/engine/execution-contracts:__pkg__",
         "//tools/boss/engine/metrics:__pkg__",
     ],
     deps = [

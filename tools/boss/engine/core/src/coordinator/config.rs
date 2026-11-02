@@ -75,7 +75,8 @@ impl ExecutionCoordinator {
         let local_metrics = Arc::new(Registry::new());
         register_metrics(&local_metrics);
         crate::dispatch_metrics::register_metrics(&local_metrics);
-        crate::answer_agent_observability::register_metrics(&local_metrics);
+        let lifecycle = crate::lifecycle_adapter::CoreLifecycleServices::new(Arc::clone(&work_db));
+        lifecycle.register_answer_agent_metrics(&local_metrics);
         let host_adapter_provider: Arc<dyn HostAdapterProvider> =
             Arc::new(LocalHostAdapterProvider::new(Arc::clone(&host_adapter)));
         Self {
@@ -86,6 +87,7 @@ impl ExecutionCoordinator {
             host_adapter,
             host_adapter_provider,
             remote_pane_releaser: None,
+            lifecycle,
             publisher,
             dispatch_events: Arc::new(NoopDispatchEventSink),
             inflight_dispatches: InflightDispatches::new(),
@@ -145,9 +147,9 @@ impl ExecutionCoordinator {
     /// means the worker may still be writing its leased workspace; retain the
     /// lease in that case rather than handing the checkout to another worker.
     pub(crate) async fn release_lease_after_reconcile(&self, execution: &WorkExecution, reconciled_dead_pane: bool) {
-        let Some(lease_id) = execution.cube_lease_id.as_deref() else {
+        if execution.cube_lease_id.is_none() {
             return;
-        };
+        }
 
         let registry_still_live = reconciled_dead_pane
             && self
@@ -162,13 +164,14 @@ impl ExecutionCoordinator {
         } else {
             "execution-liveness reconcile: worker pane gone"
         };
-        crate::workspace_lease_release::release_lease_after_inferred_death(
-            &self.work_db,
-            execution,
-            crate::workspace_lease_release::PaneStatus::Gone,
-            self.host_adapter().force_release_lease(lease_id, Some(reason)),
-        )
-        .await;
+        self.lifecycle
+            .release_lease_after_inferred_death(
+                execution,
+                boss_execution_contracts::PaneStatus::Gone,
+                self.host_adapter().as_ref(),
+                reason,
+            )
+            .await;
     }
 
     /// Install the host-adapter provider used to build per-host adapters
@@ -225,17 +228,14 @@ impl ExecutionCoordinator {
     /// [`crate::remote_reattach::reattach_remote_runs`]; `app.rs` calls
     /// this once at startup so a remote worker that outlived the previous
     /// engine has its hook stream (and eventual completion) routed back.
-    pub async fn reattach_remote_runs(&self, engine_events_socket: &str) -> crate::remote_reattach::ReattachSummary {
-        crate::remote_reattach::reattach_remote_runs(
-            &self.work_db,
-            self.host_adapter_provider.as_ref(),
-            engine_events_socket,
-        )
-        .await
+    pub async fn reattach_remote_runs(&self, engine_events_socket: &str) -> boss_execution_contracts::ReattachSummary {
+        self.lifecycle
+            .reattach_remote_runs(self.host_adapter_provider.as_ref(), engine_events_socket)
+            .await
     }
 
     /// Share the app's terminal-remote slot and live-state cleanup with the reaper.
-    pub fn set_remote_pane_releaser(&mut self, releaser: Arc<dyn crate::completion::WorkerPaneReleaser>) {
+    pub fn set_remote_pane_releaser(&mut self, releaser: Arc<dyn WorkerPaneReleaser>) {
         self.remote_pane_releaser = Some(releaser);
     }
 
@@ -247,14 +247,15 @@ impl ExecutionCoordinator {
     /// the periodic sweep in `app.rs` drives it.
     pub async fn reconcile_remote_leases_once(
         self: &Arc<Self>,
-    ) -> crate::remote_lease_reconcile::RemoteLeaseReconcileOutcome {
-        let outcome = crate::remote_lease_reconcile::reconcile_remote_leases(
-            &self.work_db,
-            self.host_adapter_provider.as_ref(),
-            self.dispatch_events.as_ref(),
-            self.remote_pane_releaser.as_deref(),
-        )
-        .await;
+    ) -> boss_execution_contracts::RemoteLeaseReconcileOutcome {
+        let outcome = self
+            .lifecycle
+            .reconcile_remote_leases(
+                self.host_adapter_provider.as_ref(),
+                self.dispatch_events.as_ref(),
+                self.remote_pane_releaser.as_deref(),
+            )
+            .await;
         if outcome.reaped > 0 {
             self.kick();
         }
@@ -408,7 +409,7 @@ impl ExecutionCoordinator {
     /// calls this once with the shared registry; tests that want to
     /// exercise the guard install a registry, and those that don't leave
     /// it unset (the guard then fails open, preserving legacy behaviour).
-    pub fn set_live_worker_states(&mut self, live: Arc<crate::live_worker_state::LiveWorkerStateRegistry>) {
+    pub fn set_live_worker_states(&mut self, live: Arc<dyn LiveWorkerLiveness>) {
         self.live_worker_states = Some(live);
     }
 
@@ -418,7 +419,7 @@ impl ExecutionCoordinator {
     /// dead": [`crate::durable_liveness::corroborate_against_live_registry`]
     /// and its callers ([`crate::dead_pane_sweep`], [`crate::orphan_sweep`]'s
     /// redispatch guard) already fail open (trust the raw pid probe) on `None`.
-    pub(crate) fn live_worker_states(&self) -> Option<&crate::live_worker_state::LiveWorkerStateRegistry> {
+    pub(crate) fn live_worker_states(&self) -> Option<&dyn LiveWorkerLiveness> {
         self.live_worker_states.as_deref()
     }
 
@@ -871,7 +872,7 @@ impl ExecutionCoordinator {
     /// engine health report reads its active alerts, and
     /// `ServerState::spawn_spawn_streak_health_broadcaster` subscribes to
     /// its changes. See [`crate::pre_start_streak`].
-    pub fn pre_start_streaks(&self) -> &Arc<crate::pre_start_streak::PreStartStreakTracker> {
+    pub fn pre_start_streaks(&self) -> &Arc<PreStartStreakTracker> {
         &self.pre_start_streaks
     }
 
@@ -891,13 +892,13 @@ impl ExecutionCoordinator {
         &self,
         execution: &WorkExecution,
         worker_id: &str,
-    ) -> crate::pre_start_streak::StreakKey {
+    ) -> boss_execution_contracts::StreakKey {
         let driver = self.resolve_spawn_driver(execution, worker_id).unwrap_or_else(|err| {
             tracing::warn!(execution_id = %execution.id, error = %format!("{err:#}"),
                 "streak tracking: failed to resolve spawn driver; treating as unknown");
             None
         });
-        crate::pre_start_streak::StreakKey::for_execution(driver.as_deref(), &execution.kind)
+        boss_execution_contracts::StreakKey::for_execution(driver.as_deref(), &execution.kind)
     }
 
     /// The epoch-seconds timestamp at which automation was last paused, or

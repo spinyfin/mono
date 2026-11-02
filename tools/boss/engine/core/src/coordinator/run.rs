@@ -147,32 +147,23 @@ impl ExecutionCoordinator {
             // normal completion recording — the row is already
             // `cancelled`, so `finish_execution_run` would reject it.
             Ok(outcome) if outcome.wait_state == RunWaitState::CancelledDuringSpawn => {
-                crate::driver_teardown::teardown_driver_workspace(
-                    &self.work_db,
-                    &execution.id,
-                    execution.workspace_path.as_deref().map(std::path::Path::new),
-                    crate::driver_teardown::TeardownReason::CancelledDuringSpawn,
-                )
-                .await;
-                let released = matches!(
-                    crate::workspace_lease_release::apply_release(
-                        &self.work_db,
-                        &execution,
-                        &lease.lease_id,
-                        crate::workspace_lease_release::ReleaseEvidence {
-                            cause: crate::workspace_lease_release::TerminalCause::ProvenStopped,
-                            pane: crate::workspace_lease_release::PaneStatus::Gone,
-                            occupancy: &crate::workspace_lease_release::EmptyOccupancy,
-                            bookmark: &crate::workspace_lease_release::DbBookmarkGate {
-                                db: &self.work_db,
-                                adapter: Some(adapter.as_ref())
-                            }
-                        },
-                        adapter.release_workspace_with_reset(&lease.lease_id)
+                self.lifecycle
+                    .teardown_driver_workspace(
+                        &execution.id,
+                        execution.workspace_path.as_deref().map(std::path::Path::new),
+                        TeardownReason::CancelledDuringSpawn,
                     )
-                    .await,
-                    crate::workspace_lease_release::LeaseReleaseOutcome::Released
-                        | crate::workspace_lease_release::LeaseReleaseOutcome::NoLease
+                    .await;
+                let released = matches!(
+                    self.lifecycle
+                        .apply_proven_workspace_release(
+                            &execution,
+                            &lease.lease_id,
+                            TerminalCause::ProvenStopped,
+                            adapter.as_ref(),
+                        )
+                        .await,
+                    LeaseReleaseOutcome::Released | LeaseReleaseOutcome::NoLease
                 );
                 tracing::warn!(
                     execution_id = %execution.id,
@@ -388,11 +379,11 @@ impl ExecutionCoordinator {
                         &err_detail,
                         boss_engine_utils::epoch_time::now_epoch_secs(),
                     );
-                    if effect != crate::pre_start_streak::FailureEffect::BelowThreshold {
+                    if effect != FailureEffect::BelowThreshold {
                         tracing::error!(
                             driver = %streak_key.driver,
                             worker_kind = streak_key.worker_kind,
-                            newly_raised = effect == crate::pre_start_streak::FailureEffect::Raised,
+                            newly_raised = effect == FailureEffect::Raised,
                             execution_id = %execution.id,
                             error = %err_detail,
                             "pre-start spawn failure streak: consecutive spawns for this driver and \
@@ -404,12 +395,7 @@ impl ExecutionCoordinator {
                 // A rejected viewer may already have a running tmux process.
                 // If verified teardown failed, preserve its workspace and driver
                 // state for recovery rather than leasing them to another worker.
-                abort_unconfirmed = err.chain().any(|cause| {
-                    matches!(
-                        cause.downcast_ref::<crate::spawn_flow::StartWorkerError>(),
-                        Some(crate::spawn_flow::StartWorkerError::ViewerAbortFailed { .. })
-                    )
-                });
+                abort_unconfirmed = self.lifecycle.is_unconfirmed_spawn_abort(&err);
                 let released = if abort_unconfirmed {
                     false
                 } else {
@@ -422,32 +408,23 @@ impl ExecutionCoordinator {
                     // out-of-workspace state from the workspace path never
                     // races a concurrent re-lease of the same workspace once
                     // cube has it back.
-                    crate::driver_teardown::teardown_driver_workspace(
-                        &self.work_db,
-                        &execution.id,
-                        Some(&lease.workspace_path),
-                        crate::driver_teardown::TeardownReason::SpawnFailed,
-                    )
-                    .await;
-                    matches!(
-                        crate::workspace_lease_release::apply_release(
-                            &self.work_db,
-                            &execution,
-                            &lease.lease_id,
-                            crate::workspace_lease_release::ReleaseEvidence {
-                                cause: crate::workspace_lease_release::TerminalCause::ProvenStopped,
-                                pane: crate::workspace_lease_release::PaneStatus::Gone,
-                                occupancy: &crate::workspace_lease_release::EmptyOccupancy,
-                                bookmark: &crate::workspace_lease_release::DbBookmarkGate {
-                                    db: &self.work_db,
-                                    adapter: Some(adapter.as_ref())
-                                }
-                            },
-                            adapter.release_workspace_with_reset(&lease.lease_id)
+                    self.lifecycle
+                        .teardown_driver_workspace(
+                            &execution.id,
+                            Some(&lease.workspace_path),
+                            TeardownReason::SpawnFailed,
                         )
-                        .await,
-                        crate::workspace_lease_release::LeaseReleaseOutcome::Released
-                            | crate::workspace_lease_release::LeaseReleaseOutcome::NoLease
+                        .await;
+                    matches!(
+                        self.lifecycle
+                            .apply_proven_workspace_release(
+                                &execution,
+                                &lease.lease_id,
+                                TerminalCause::ProvenStopped,
+                                adapter.as_ref(),
+                            )
+                            .await,
+                        LeaseReleaseOutcome::Released | LeaseReleaseOutcome::NoLease
                     )
                 };
                 // Persist the same full cause chain the abort log and
@@ -968,7 +945,8 @@ impl ExecutionCoordinator {
                 );
                 let counted = updated.and_then(|row| row.conflict_class.clone().map(|class| (row.product_id, class)));
                 if let Some((product_id, class)) = counted {
-                    crate::merge_poller::record_conflict_class_counter(&self.metrics, &product_id, &class);
+                    self.lifecycle
+                        .record_conflict_class_counter(&self.metrics, &product_id, &class);
                 }
             }
         }
@@ -1065,35 +1043,22 @@ impl ExecutionCoordinator {
         // out-of-workspace state from the workspace path never races a
         // concurrent re-lease of the same workspace once cube has it back.
         if release_workspace {
-            crate::driver_teardown::teardown_driver_workspace(
-                &self.work_db,
-                &execution.id,
-                Some(&lease.workspace_path),
-                crate::driver_teardown::TeardownReason::RunCompleted,
-            )
-            .await;
+            self.lifecycle
+                .teardown_driver_workspace(&execution.id, Some(&lease.workspace_path), TeardownReason::RunCompleted)
+                .await;
         }
 
         let released = if release_workspace {
             matches!(
-                crate::workspace_lease_release::apply_release(
-                    &self.work_db,
-                    execution,
-                    &lease.lease_id,
-                    crate::workspace_lease_release::ReleaseEvidence {
-                        cause: crate::workspace_lease_release::TerminalCause::ProvenCompleted,
-                        pane: crate::workspace_lease_release::PaneStatus::Gone,
-                        occupancy: &crate::workspace_lease_release::EmptyOccupancy,
-                        bookmark: &crate::workspace_lease_release::DbBookmarkGate {
-                            db: &self.work_db,
-                            adapter: Some(adapter.as_ref())
-                        }
-                    },
-                    adapter.release_workspace_with_reset(&lease.lease_id)
-                )
-                .await,
-                crate::workspace_lease_release::LeaseReleaseOutcome::Released
-                    | crate::workspace_lease_release::LeaseReleaseOutcome::NoLease
+                self.lifecycle
+                    .apply_proven_workspace_release(
+                        execution,
+                        &lease.lease_id,
+                        TerminalCause::ProvenCompleted,
+                        adapter.as_ref(),
+                    )
+                    .await,
+                LeaseReleaseOutcome::Released | LeaseReleaseOutcome::NoLease
             )
         } else {
             false
@@ -1189,13 +1154,11 @@ impl ExecutionCoordinator {
         match inspection {
             Ok(None) => {}
             Ok(Some(_)) => {
-                self.work_db.resolve_attention_kind_for_execution(
-                    &execution.id,
-                    crate::execution_bookmark_recovery::RECOVERY_FAILED,
-                )?;
+                self.work_db
+                    .resolve_attention_kind_for_execution(&execution.id, RECOVERY_FAILED)?;
             }
             Err(err) => {
-                crate::execution_bookmark_recovery::report_failure(&self.work_db, execution, &format!("{err:#}"));
+                self.lifecycle.report_bookmark_failure(execution, &format!("{err:#}"));
                 return Err(err);
             }
         }

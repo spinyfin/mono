@@ -57,207 +57,14 @@
 //! may have changed, and an alert persisted across it would assert a
 //! failure the new build has not yet been observed to have.
 
-use std::collections::BTreeMap;
-use std::sync::Mutex;
+use boss_protocol::{EngineHealthIssue, SpawnFailureStreak};
 
-use boss_protocol::{EngineHealthIssue, ExecutionKind, SpawnFailureStreak};
-
-use crate::worker_setup::{WorkerKind, worker_kind_for_execution};
-
-/// Consecutive pre-start failures, with no success in between, at which a
-/// (driver, worker kind) combination raises its alert. See the module docs
-/// for why this is 2.
-pub const PRE_START_FAILURE_STREAK_THRESHOLD: u32 = 2;
+pub use boss_execution_contracts::{
+    FailureEffect, PRE_START_FAILURE_STREAK_THRESHOLD, PreStartStreakTracker, StreakKey, UNRESOLVED_DRIVER_LABEL,
+};
 
 /// `EngineHealthIssue::kind` of the alert in the engine health report.
 pub const PRE_START_FAILURE_STREAK_ISSUE_KIND: &str = "pre_start_spawn_failure_streak";
-
-/// Driver label used when no driver slug resolves for an execution. A
-/// failure still has to be counted somewhere; dropping it because the
-/// driver lookup also failed would hide exactly the broken-configuration
-/// case this tracker exists for.
-pub const UNRESOLVED_DRIVER_LABEL: &str = "unknown";
-
-/// Display label for a [`WorkerKind`] in alerts and bossctl output. Exhaustive (no `_` arm) so a
-/// new kind must pick its label rather than silently sharing a streak with
-/// another kind.
-pub fn worker_kind_label(kind: WorkerKind) -> &'static str {
-    match kind {
-        WorkerKind::Standard => "standard",
-        WorkerKind::Reviewer => "reviewer",
-        WorkerKind::Triage => "triage",
-        WorkerKind::AnswerAgent => "answer-agent",
-        WorkerKind::ReviewGuide => "review-guide",
-    }
-}
-
-/// The combination a streak is tracked for.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct StreakKey {
-    pub driver: String,
-    pub worker_kind: &'static str,
-}
-
-impl StreakKey {
-    pub fn new(driver: impl Into<String>, worker_kind: WorkerKind) -> Self {
-        Self {
-            driver: driver.into(),
-            worker_kind: worker_kind_label(worker_kind),
-        }
-    }
-
-    /// Key for an execution of `kind` that resolved to `driver`
-    /// ([`UNRESOLVED_DRIVER_LABEL`] when nothing resolved).
-    pub fn for_execution(driver: Option<&str>, kind: &ExecutionKind) -> Self {
-        let driver = driver
-            .map(str::trim)
-            .filter(|slug| !slug.is_empty())
-            .unwrap_or(UNRESOLVED_DRIVER_LABEL);
-        Self::new(driver, worker_kind_for_execution(kind))
-    }
-}
-
-/// What recording one failure did to its combination's alert.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FailureEffect {
-    /// Counted, but the streak is still below the threshold: no alert.
-    BelowThreshold,
-    /// This failure took the streak to the threshold: the alert is new.
-    Raised,
-    /// An alert was already active and now carries this failure.
-    Updated,
-}
-
-#[derive(Debug, Clone)]
-struct Streak {
-    consecutive_failures: u32,
-    first_failure_epoch_s: i64,
-    latest_failure_epoch_s: i64,
-    latest_error: String,
-    latest_execution_id: String,
-}
-
-/// Per-(driver, worker kind) consecutive pre-start failure counter. One per
-/// engine, owned by the coordinator. See the module docs.
-///
-/// A `std::sync::Mutex` guards the small map and is never held across an
-/// `.await`.
-#[derive(Debug)]
-pub struct PreStartStreakTracker {
-    streaks: Mutex<BTreeMap<StreakKey, Streak>>,
-    /// Generation counter bumped whenever the set of *active alerts* or
-    /// their contents change (raise, in-place update, resolve), so the
-    /// health broadcaster can push a fresh report without polling. A
-    /// `watch` for the same reason the pause-state notifier is one:
-    /// latest-state-wins, and subscribers re-read [`Self::active_alerts`]
-    /// rather than trusting the value.
-    alerts_changed: tokio::sync::watch::Sender<u64>,
-}
-
-impl Default for PreStartStreakTracker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PreStartStreakTracker {
-    pub fn new() -> Self {
-        Self {
-            streaks: Mutex::new(BTreeMap::new()),
-            alerts_changed: tokio::sync::watch::channel(0).0,
-        }
-    }
-
-    /// Record one pre-start spawn failure for `key`. Never drops or
-    /// coalesces an occurrence: every call increments the count and
-    /// replaces the latest error, so an active alert always shows the
-    /// current count and the most recent cause.
-    pub fn record_failure(
-        &self,
-        key: StreakKey,
-        execution_id: &str,
-        error: &str,
-        now_epoch_secs: i64,
-    ) -> FailureEffect {
-        let effect = {
-            let mut streaks = self.streaks.lock().expect("pre-start streak lock poisoned");
-            let streak = streaks.entry(key).or_insert_with(|| Streak {
-                consecutive_failures: 0,
-                first_failure_epoch_s: now_epoch_secs,
-                latest_failure_epoch_s: now_epoch_secs,
-                latest_error: String::new(),
-                latest_execution_id: String::new(),
-            });
-            streak.consecutive_failures = streak.consecutive_failures.saturating_add(1);
-            streak.latest_failure_epoch_s = now_epoch_secs;
-            streak.latest_error = error.to_owned();
-            streak.latest_execution_id = execution_id.to_owned();
-            match streak.consecutive_failures {
-                n if n < PRE_START_FAILURE_STREAK_THRESHOLD => FailureEffect::BelowThreshold,
-                PRE_START_FAILURE_STREAK_THRESHOLD => FailureEffect::Raised,
-                _ => FailureEffect::Updated,
-            }
-        };
-        if effect != FailureEffect::BelowThreshold {
-            self.notify_alerts_changed();
-        }
-        effect
-    }
-
-    /// Record one successful spawn for `key`, ending its streak. Returns the
-    /// alert this resolved, if one was active — `None` when the combination
-    /// had no failures or was still below the threshold.
-    pub fn record_success(&self, key: &StreakKey) -> Option<SpawnFailureStreak> {
-        let removed = self
-            .streaks
-            .lock()
-            .expect("pre-start streak lock poisoned")
-            .remove_entry(key);
-        let resolved = removed
-            .filter(|(_, streak)| streak.consecutive_failures >= PRE_START_FAILURE_STREAK_THRESHOLD)
-            .map(|(key, streak)| to_wire(&key, &streak));
-        if resolved.is_some() {
-            self.notify_alerts_changed();
-        }
-        resolved
-    }
-
-    /// Every combination currently at or past the threshold, ordered by
-    /// (driver, worker kind) so the report is stable between reads.
-    pub fn active_alerts(&self) -> Vec<SpawnFailureStreak> {
-        self.streaks
-            .lock()
-            .expect("pre-start streak lock poisoned")
-            .iter()
-            .filter(|(_, streak)| streak.consecutive_failures >= PRE_START_FAILURE_STREAK_THRESHOLD)
-            .map(|(key, streak)| to_wire(key, streak))
-            .collect()
-    }
-
-    /// Subscribe to alert changes. The receiver starts already-seen, so
-    /// `changed()` first resolves on the next raise / update / resolve.
-    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.alerts_changed.subscribe()
-    }
-
-    fn notify_alerts_changed(&self) {
-        self.alerts_changed.send_modify(|generation| {
-            *generation = generation.wrapping_add(1);
-        });
-    }
-}
-
-fn to_wire(key: &StreakKey, streak: &Streak) -> SpawnFailureStreak {
-    SpawnFailureStreak::builder()
-        .driver(key.driver.clone())
-        .worker_kind(key.worker_kind)
-        .consecutive_failures(streak.consecutive_failures)
-        .first_failure_epoch_s(streak.first_failure_epoch_s)
-        .latest_failure_epoch_s(streak.latest_failure_epoch_s)
-        .latest_error(streak.latest_error.clone())
-        .latest_execution_id(streak.latest_execution_id.clone())
-        .build()
-}
 
 /// Render one active alert as the engine-health issue the app banner and
 /// `bossctl` show. The engine owns the wording; the app renders it verbatim.
@@ -305,6 +112,7 @@ pub fn health_issue_for(alert: &SpawnFailureStreak, now_epoch_secs: i64) -> Engi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boss_protocol::ExecutionKind;
 
     fn codex_guide() -> StreakKey {
         StreakKey::for_execution(Some("codex"), &ExecutionKind::PrReviewGuide)

@@ -235,4 +235,5 @@ mod worker_throttle;
 pub mod workspace_lease_release;
 pub mod wrapper_distribution;
 
+mod lifecycle_adapter;
 mod runner_adapter;
