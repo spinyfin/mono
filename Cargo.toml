@@ -39,6 +39,8 @@ members = [
   "tools/boss/engine/spoke",
   "tools/boss/engine/host-execution",
   "tools/boss/engine/core",
+  "tools/boss/engine/execution-runner",
+  "tools/boss/engine/pane-summary",
   "tools/boss/engine/execution-contracts",
   "tools/boss/engine/grok-home-retention",
   "tools/boss/engine/host-enrollment",

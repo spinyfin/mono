@@ -1,0 +1,53 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "pane-summary",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "boss_pane_summary",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    visibility = [
+        "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/execution-runner:__pkg__",
+    ],
+    deps = [
+        "//tools/boss/claude_client",
+        "//tools/boss/engine/utility-model",
+        "//tools/boss/engine/utils",
+        "//tools/boss/engine/work-db",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_library(
+    name = "pane_summary_test_support",
+    testonly = True,
+    srcs = glob(["src/**/*.rs"]),
+    aliases = {"//tools/boss/engine/work-db:work_db_test_support": "boss_work_db"},
+    crate_name = "boss_pane_summary_test_support",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    visibility = [
+        "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/execution-runner:__pkg__",
+    ],
+    deps = [
+        "//tools/boss/claude_client",
+        "//tools/boss/engine/utility-model",
+        "//tools/boss/engine/utils",
+        "//tools/boss/engine/work-db:work_db_test_support",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "pane_summary_test",
+    size = "small",
+    crate = ":pane-summary",
+    edition = "2024",
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

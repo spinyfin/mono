@@ -1,0 +1,1349 @@
+//! Worker-spawn composition: [`compose_worker_spawn`] assembles the worker
+//! prompt + resolved effort/model config ([`ComposedWorkerSpawn`]), fetching
+//! PR review context and diffs for the `pr_review` path.
+
+use std::path::Path;
+
+#[cfg(test)]
+#[path = "worker_spawn/tests.rs"]
+mod tests;
+
+use anyhow::Context as _;
+use boss_engine_gh_invocation::gh_output;
+use boss_gh_telemetry::{callers, scope as gh_scope};
+
+use crate::effort::{SpawnConfig, SpawnResolutionInput, resolve_spawn_config_in};
+use crate::structured_output::StructuredOutputKind;
+use crate::work::{
+    REASON_ALLOCATION, REASON_LEGACY_PERCENTAGE, WorkDb, WorkExecution, WorkItem, driver_clears_dispatch_gate,
+};
+use boss_engine_storage_values::pool_policy::pool_dispatch_policy_for_worker_id;
+use boss_protocol::{
+    EffortLevel, ExecutionKind, ProposalKind, ProposalState, ReviewBatchMember, ReviewBatchMemberRole,
+    ReviewBatchMemberStatus, ReviewBatchPhase, ReviewBatchStatus, ReviewReportProposalPayload, TaskKind,
+};
+
+use super::answer_agent_prompt::compose_answer_agent_prompt;
+use super::prompt::{
+    ExecutionPromptParams, append_bazel_caching_rule, compose_execution_prompt, designated_output_kind,
+    render_merge_order_preservation_lines, with_bazel_caching_rule,
+};
+use super::review_guide_prompt::compose_review_guide_prompt;
+use super::work_item::{
+    followup_pr_backlink_for_work_item, work_item_created_via, work_item_pr_url, work_item_task_kind_enum,
+};
+
+/// Composed worker prompt + resolved effort/model config, the output of
+/// [`compose_worker_spawn`].
+pub struct ComposedWorkerSpawn {
+    pub prompt_text: String,
+    pub spawn_config: SpawnConfig,
+    /// The designated structured-output path actually rendered into
+    /// `prompt_text`, when this execution has one. `None` either because the
+    /// execution kind has no designated payload ([`designated_output_kind`]
+    /// returns `None`), or because a fallback branch degraded to the generic
+    /// prompt without rendering it (e.g. an `automation_triage` execution
+    /// whose automation row failed to resolve, or a `pr_review` execution
+    /// whose producing task has no `pr_url` yet). Callers that need to
+    /// assert the prompt actually carries a structured-output path (the
+    /// remote spawn path swaps it for `$BOSS_STRUCTURED_OUTPUT`) must check
+    /// this field rather than re-deriving the expected path from
+    /// `designated_output_kind` alone — that alone can't tell a rendered
+    /// path from a degraded fallback that never rendered one.
+    pub embedded_output_path: Option<String>,
+}
+
+/// Editorial + worker-proposal-seam knobs [`compose_worker_spawn`] threads
+/// into prompt composition, bundled into one named struct (rather than
+/// positional bools) so call sites state what they are setting. Each
+/// `*_proposals_seam_enabled` field mirrors a feature flag of the same name
+/// gating one seam of the worker-proposal-API migration; see
+/// [`super::prompt::ExecutionPromptParams`]'s matching fields for what each
+/// one does to the rendered prompt. Feature flags default OFF; the merge-review
+/// policy is required so every caller explicitly chooses which checks are human-gated.
+///
+/// `automation_outcome_proposals_seam_enabled` is the odd one out: it does
+/// not feed `ExecutionPromptParams` at all (triage executions render
+/// [`crate::automation_triage::render_triage_preamble`] directly, bypassing
+/// the standard prompt composition), and it ALSO gates the triage worker's
+/// CLAUDE.md (`crate::automation_triage::render_triage_claude_md`, threaded
+/// separately via `crate::worker_setup::WorkerSetupInput` — see
+/// `runner::pane_spawn`'s spawn call site for where both are computed from
+/// the same flag read).
+#[derive(Debug, Clone, Copy, bon::Builder)]
+#[builder(on(String, into))]
+pub struct WorkerSpawnOpts {
+    pub review_signal_checks: fn(&str) -> &'static [&'static str],
+    #[builder(default)]
+    pub editorial_enabled: bool,
+    #[builder(default)]
+    pub max_embed_diff_lines: u64,
+    #[builder(default)]
+    pub worker_signal_proposals_seam_enabled: bool,
+    #[builder(default)]
+    pub deferred_scope_proposals_seam_enabled: bool,
+    #[builder(default)]
+    pub followup_proposals_seam_enabled: bool,
+    #[builder(default)]
+    pub automation_outcome_proposals_seam_enabled: bool,
+    /// Mirrors `pr_transition.rs`'s own `review_batch_fanout` read. When on,
+    /// a `pr_review` execution with no persisted batch-member row must fail
+    /// closed rather than silently falling back to the legacy Claude pool —
+    /// see `docs/designs/multi-agent-code-review.md`, "Dispatch three
+    /// executions, not one execution with subagents".
+    #[builder(default)]
+    pub review_batch_fanout_enabled: bool,
+    #[builder(default)]
+    pub run_done_proposals_seam_enabled: bool,
+    /// Override for whether the execution workspace is a Bazel workspace.
+    /// `None` means the composer probes `workspace_path` locally (and does
+    /// not treat a missing path as non-Bazel). Remote (SSH) spawns set this
+    /// from a marker probe on the execution host before composing.
+    pub bazel_workspace: Option<bool>,
+}
+
+/// Fetch authoritative PR metadata for a reviewer worker's initial prompt.
+///
+/// Calls `gh pr view <pr_url> --json baseRefOid,headRefOid,files` and returns
+/// a [`crate::pr_review::PrReviewContext`] on success. Returns `None` on any
+/// network or parse error — callers fall back to the URL-only prompt
+/// gracefully without blocking the spawn.
+async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrReviewContext> {
+    #[derive(serde::Deserialize)]
+    struct PrViewResponse {
+        #[serde(rename = "baseRefOid")]
+        base_ref_oid: String,
+        #[serde(rename = "headRefOid")]
+        head_ref_oid: String,
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        body: String,
+        #[serde(default)]
+        commits: Vec<PrCommit>,
+        #[serde(default)]
+        comments: Vec<PrComment>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PrCommit {
+        #[serde(rename = "messageHeadline", default)]
+        message_headline: String,
+        #[serde(rename = "messageBody", default)]
+        message_body: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PrComment {
+        #[serde(default)]
+        body: String,
+    }
+
+    let pr_number = boss_github::pr_url::pr_number_from_url(pr_url)?;
+
+    // Shellout + exit-code/parse boilerplate lives once in
+    // `boss_github::pr_files`, shared with `design_detector.rs` and
+    // `stacked_pr_structuring.rs`.
+    let root =
+        boss_github::pr_files::fetch_pr_view_json(pr_url, "baseRefOid,headRefOid,files,title,body,commits,comments")
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    pr_url,
+                    error = %e,
+                    "fetch_pr_review_context: gh pr view failed; reviewer will use URL-only prompt",
+                );
+                e
+            })
+            .ok()?;
+
+    let changed_files = boss_github::pr_files::parse_changed_file_paths(&root);
+
+    let response: PrViewResponse = serde_json::from_value(root)
+        .map_err(|e| {
+            tracing::warn!(
+                pr_url,
+                error = %e,
+                "fetch_pr_review_context: failed to parse gh pr view JSON",
+            );
+            e
+        })
+        .ok()?;
+
+    // incident-002: deterministically scan the worker's *narrative*
+    // surfaces (PR body, commit messages, PR comments) for supersession /
+    // obsolescence language. When present, the reviewer is required to verify
+    // a design-doc citation for each flagged claim. The diff itself is
+    // deliberately excluded ("replace" is ubiquitous in source).
+    let mut narrative = String::new();
+    narrative.push_str(&response.body);
+    narrative.push('\n');
+    for c in &response.commits {
+        narrative.push_str(&c.message_headline);
+        narrative.push('\n');
+        narrative.push_str(&c.message_body);
+        narrative.push('\n');
+    }
+    for c in &response.comments {
+        narrative.push_str(&c.body);
+        narrative.push('\n');
+    }
+    let supersession_flags =
+        crate::supersession_scan::hit_lines(&crate::supersession_scan::scan_supersession_language(&narrative));
+
+    // Mechanical assist for the agent-isms "Boss-construct references"
+    // sub-rule: deterministically sweep the PR's own title and description
+    // (not commits/comments, which are not part of the sub-rule's scope) for
+    // bare T<n>/P<n> tokens. The diff-added-lines half of the sweep is filled
+    // in by the caller once the diff is fetched (see `compose_worker_spawn`).
+    let mut boss_construct_refs = crate::boss_construct_scan::hit_lines(
+        &crate::boss_construct_scan::scan_narrative_text(&response.title, "PR title"),
+    );
+    boss_construct_refs.extend(crate::boss_construct_scan::hit_lines(
+        &crate::boss_construct_scan::scan_narrative_text(&response.body, "PR description"),
+    ));
+
+    Some(crate::pr_review::PrReviewContext {
+        pr_number,
+        base_sha: response.base_ref_oid,
+        head_sha: response.head_ref_oid,
+        changed_files,
+        diff_content: None,
+        // Filled in by the caller, which has the `WorkDb` handle needed to
+        // resolve the review-cycle root for a revision-triggered pass.
+        last_reviewed_sha: None,
+        supersession_flags,
+        // Filled in by the caller (the spawn path computes the merge-parent
+        // deletion tripwire for conflict-resolution reviews — incident-002).
+        merged_parent_deletions: Vec::new(),
+        boss_construct_refs,
+    })
+}
+
+/// Fetch the raw diff for a PR via `gh pr diff <pr_url>`.
+///
+/// Returns the full diff text on success. Returns `None` on any error —
+/// callers fall back gracefully (reviewer fetches the diff itself). The
+/// caller is responsible for deciding whether the diff is small enough to
+/// embed.
+async fn fetch_pr_diff(pr_url: &str) -> Option<String> {
+    let output = gh_scope(callers::WORKER_SPAWN, gh_output(&["pr", "diff", pr_url]))
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        tracing::warn!(
+            pr_url,
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "fetch_pr_diff: gh pr diff failed; reviewer will fetch diff itself",
+        );
+        return None;
+    }
+
+    String::from_utf8(output.stdout)
+        .map_err(|e| {
+            tracing::warn!(
+                pr_url,
+                error = %e,
+                "fetch_pr_diff: diff output is not valid UTF-8",
+            );
+            e
+        })
+        .ok()
+}
+
+/// Drop a live task/product driver pin that cannot clear the capability gate
+/// for `(task_kind, execution_kind)`, returning the next-precedence pin (or
+/// `None`) so spawn falls through to allocation / the engine default.
+///
+/// Same substitution shape the review/automation pool pin already uses:
+/// a source that cannot honour the dispatch is dropped rather than hard-
+/// failing the worker. Without this, a product whose `default_driver` is
+/// codex/grok (or a row with an explicit `--driver` pin) would refuse to
+/// spawn `ConflictResolution` / `CiRemediation` workers at the capability
+/// gate — those kinds require `CommandOutcomeObservation`, which only
+/// claude declares today.
+///
+/// Logs each substitution so an operator can see their pin was not
+/// honoured for that one execution.
+fn yield_pins_that_fail_capability_gate<'a>(
+    execution_id: &str,
+    execution_kind: &ExecutionKind,
+    task_kind: Option<&TaskKind>,
+    task_driver: Option<&'a str>,
+    product_default_driver: Option<&'a str>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    let Some(task_kind) = task_kind else {
+        return (task_driver, product_default_driver);
+    };
+    let task_driver = match task_driver.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(pin) if !driver_clears_dispatch_gate(pin, task_kind, execution_kind) => {
+            tracing::info!(
+                execution_id = %execution_id,
+                execution_kind = %execution_kind,
+                pinned_driver = %pin,
+                pin_source = "tasks.driver",
+                "dropping driver pin that fails the capability gate for this execution kind; \
+                 falling through to product/allocation/engine default",
+            );
+            None
+        }
+        other => other,
+    };
+    // Product pin only matters when the task pin is absent (or just yielded).
+    let product_default_driver = if task_driver.is_some() {
+        product_default_driver
+    } else {
+        match product_default_driver.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(pin) if !driver_clears_dispatch_gate(pin, task_kind, execution_kind) => {
+                tracing::info!(
+                    execution_id = %execution_id,
+                    execution_kind = %execution_kind,
+                    pinned_driver = %pin,
+                    pin_source = "products.default_driver",
+                    "dropping product default driver that fails the capability gate for this \
+                     execution kind; falling through to allocation/engine default",
+                );
+                None
+            }
+            other => other,
+        }
+    };
+    (task_driver, product_default_driver)
+}
+
+/// Model/driver compatibility gate. Returns an error naming both the driver
+/// and the model when `model` is not one `driver_descriptor`'s
+/// [`crate::driver::ModelMenu::model_belongs_to_driver`] recognises as
+/// belonging to that driver.
+///
+/// A separate, standalone function (rather than inlined at the
+/// [`compose_worker_spawn`] call site) so it can be exercised directly by
+/// unit tests without standing up the full async prompt-composition
+/// machinery — see the `model_driver_gate_tests` module below.
+fn check_model_driver_compatibility(
+    driver_descriptor: &crate::driver::DriverDescriptor,
+    model: &str,
+) -> anyhow::Result<()> {
+    if (driver_descriptor.model_menu.model_belongs_to_driver)(model) {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "model/driver gate: resolved model {model:?} is not valid for driver {:?} ({}); \
+             refusing to dispatch a mismatched pair instead of letting the CLI reject it after spawn",
+            driver_descriptor.name,
+            driver_descriptor.label,
+        ))
+    }
+}
+
+/// Load every leaf report the engine has accepted for `batch_id`, paired with
+/// which leaf produced it, for embedding in the supervisor's initial prompt.
+///
+/// Sourced from each leaf member's `report_proposal_id` pointer into its
+/// accepted (`applied`) `review_report` proposal — never re-derived from a
+/// transcript, matching the batch-review contract that transcript recovery is
+/// unavailable for batch members. A member with no `report_proposal_id` (it
+/// exhausted its retry without reporting) is simply omitted; the supervisor
+/// prompt names the gap explicitly instead of silently listing an empty
+/// report for it.
+fn load_batch_leaf_reports(
+    work_db: &WorkDb,
+    cycle_root_id: &str,
+    batch_id: &str,
+) -> anyhow::Result<Vec<crate::pr_review::SupervisorReportInput>> {
+    let members = work_db
+        .review_batch_members(batch_id)
+        .with_context(|| format!("loading members of review batch {batch_id}"))?;
+    let proposals = work_db
+        .list_worker_proposals_for_work_item(
+            cycle_root_id,
+            Some(ProposalKind::ReviewReport),
+            Some(ProposalState::Applied),
+        )
+        .with_context(|| format!("loading accepted review-report proposals for work item {cycle_root_id}"))?;
+
+    let reported_member_count = members
+        .iter()
+        .filter(|member| member.status == ReviewBatchMemberStatus::Reported)
+        .count();
+
+    let mut reports = Vec::new();
+    for member in &members {
+        let role = match member.role {
+            ReviewBatchMemberRole::ClaudeReviewer => crate::pr_review::SupervisorSourceRole::Claude,
+            ReviewBatchMemberRole::CodexReviewer => crate::pr_review::SupervisorSourceRole::Codex,
+            ReviewBatchMemberRole::GrokReviewer => crate::pr_review::SupervisorSourceRole::Grok,
+            ReviewBatchMemberRole::Supervisor | ReviewBatchMemberRole::PostMergeReviewer => continue,
+        };
+        let Some(proposal_id) = member.report_proposal_id.as_deref() else {
+            continue;
+        };
+        let Some(proposal) = proposals.iter().find(|proposal| proposal.id == proposal_id) else {
+            tracing::warn!(
+                member_id = member.id,
+                proposal_id,
+                "review batch member has a report_proposal_id but no matching applied \
+                 review_report proposal was found for its work item; the supervisor prompt \
+                 will not see this leaf's report",
+            );
+            continue;
+        };
+        let payload: ReviewReportProposalPayload = serde_json::from_str(&proposal.payload_json)
+            .with_context(|| format!("parsing accepted review-report proposal {proposal_id} payload"))?;
+        if payload.batch_id != batch_id {
+            tracing::warn!(
+                member_id = member.id,
+                proposal_id,
+                payload_batch_id = payload.batch_id,
+                expected_batch_id = batch_id,
+                "review batch member's report_proposal_id resolved to a proposal for a \
+                 different batch_id; the supervisor prompt will not see this leaf's report",
+            );
+            continue;
+        }
+        let report: crate::pr_review::ReviewerReport = serde_json::from_value(payload.report)
+            .with_context(|| format!("parsing accepted review-report proposal {proposal_id} report body"))?;
+        reports.push(crate::pr_review::SupervisorReportInput { role, report });
+    }
+    if reports.len() < reported_member_count {
+        anyhow::bail!(
+            "review batch {batch_id} has {reported_member_count} member(s) with status `reported`, but only \
+             {} of their accepted review-report proposals could be loaded; refusing to render a supervisor \
+             prompt that would misreport a lookup gap as \"that reviewer did not report\"",
+            reports.len(),
+        );
+    }
+    Ok(reports)
+}
+
+/// Batch members carry the exact policy chosen when the immutable target was
+/// created. This intentionally bypasses review-pool Claude/strong defaults so
+/// a leaf remains on its assigned provider even if task settings change later.
+fn resolve_batch_reviewer_spawn(
+    registry: &crate::driver::DriverRegistry,
+    member: &ReviewBatchMember,
+    work_item_kind: Option<&TaskKind>,
+) -> anyhow::Result<SpawnConfig> {
+    let effort = member.provider_effort.parse::<EffortLevel>().map_err(|error| {
+        anyhow::anyhow!(
+            "invalid persisted review batch effort {:?}: {error}",
+            member.provider_effort
+        )
+    })?;
+    let input = SpawnResolutionInput::builder()
+        .effort_level(effort)
+        .model_override(member.resolved_model.as_str())
+        .task_driver(member.requested_driver.as_str())
+        .maybe_kind(work_item_kind)
+        .build();
+    resolve_spawn_config_in(registry, &input)
+        .map_err(|error| anyhow::anyhow!("review batch effort/model resolution: {error}"))
+}
+
+/// The one driver every `pr_review_guide` execution runs on. Shared with the
+/// coordinator's host selection and pre-start streak keying so all three
+/// name the same driver.
+pub const REVIEW_GUIDE_DRIVER: &str = "codex";
+
+/// The enforced-fixed Astra profile for every `pr_review_guide` execution:
+/// driver `codex`, model `gpt-6-astra`, `EffortLevel::Medium` (which
+/// `codex_effort_value_for_level` maps to provider `"high"`). Bypasses task/
+/// product driver and model defaults entirely — unlike every other kind,
+/// this one's model policy is not configurable per task or product. Verifies
+/// the resolved configuration is EXACTLY what was requested before letting
+/// the worker spawn: a missing driver, an unsupported effort value, an
+/// unavailable model, or any other silent fallback from the requested
+/// configuration must fail the spawn (a retryable pre-start failure through
+/// the normal execution retry path) rather than quietly run at a different
+/// model/effort. See design "Generation and read-only enforcement".
+fn resolve_review_guide_spawn_config(registry: &crate::driver::DriverRegistry) -> anyhow::Result<SpawnConfig> {
+    const REVIEW_GUIDE_MODEL: &str = "gpt-6-astra";
+    const REVIEW_GUIDE_EFFORT: EffortLevel = EffortLevel::Medium;
+    const REVIEW_GUIDE_EFFORT_VALUE: &str = "high";
+
+    let input = SpawnResolutionInput::builder()
+        .effort_level(REVIEW_GUIDE_EFFORT)
+        .model_override(REVIEW_GUIDE_MODEL)
+        .task_driver(REVIEW_GUIDE_DRIVER)
+        .build();
+    let config = resolve_spawn_config_in(registry, &input)
+        .map_err(|error| anyhow::anyhow!("review-guide Astra profile resolution: {error}"))?;
+    anyhow::ensure!(
+        config.driver == REVIEW_GUIDE_DRIVER,
+        "review-guide Astra profile refused: resolved driver `{}`, expected `{REVIEW_GUIDE_DRIVER}` \
+         (no fallback to another driver is permitted for this execution kind)",
+        config.driver,
+    );
+    anyhow::ensure!(
+        config.model == REVIEW_GUIDE_MODEL,
+        "review-guide Astra profile refused: resolved model `{}`, expected `{REVIEW_GUIDE_MODEL}` \
+         (no fallback to another model is permitted for this execution kind)",
+        config.model,
+    );
+    anyhow::ensure!(
+        config.effort_value == Some(REVIEW_GUIDE_EFFORT_VALUE),
+        "review-guide Astra profile refused: resolved effort value {:?}, expected exactly {REVIEW_GUIDE_EFFORT_VALUE:?}",
+        config.effort_value,
+    );
+    Ok(config)
+}
+
+/// Effort-level prompt addenda tell the worker to plan files it will
+/// touch and start editing. That framing is implementation-only.
+///
+/// Restricted worker kinds — [`crate::worker_setup::WorkerKind::Reviewer`],
+/// [`crate::worker_setup::WorkerKind::Triage`],
+/// [`crate::worker_setup::WorkerKind::AnswerAgent`] — are read-only or
+/// decision-only. Prepending the addendum would contradict their mandate
+/// (the observed failure: a reviewer prompt opened with "Begin with a
+/// written plan… Identify the files you expect to touch").
+///
+/// Effort resolution is unchanged: `SpawnConfig.prompt_addendum` still
+/// reflects the level. This is the single prepend gate, keyed off the
+/// same exhaustive [`crate::worker_setup::worker_kind_for_execution`]
+/// mapping that already classifies implementing vs restricted kinds.
+fn prompt_addendum_to_prepend(kind: &ExecutionKind, addendum: Option<&'static str>) -> Option<&'static str> {
+    match crate::worker_setup::worker_kind_for_execution(kind) {
+        crate::worker_setup::WorkerKind::Standard => addendum,
+        crate::worker_setup::WorkerKind::Reviewer
+        | crate::worker_setup::WorkerKind::Triage
+        | crate::worker_setup::WorkerKind::AnswerAgent
+        | crate::worker_setup::WorkerKind::ReviewGuide => None,
+    }
+}
+
+/// Per-execution prompt + spawn-config composition shared by every
+/// worker transport.
+///
+/// [`PaneSpawnRunner`] (local tmux panes) and
+/// `host_adapter::SshHostAdapter` (remote SSH workers) both call
+/// this so the two launch paths hand the worker a byte-identical prompt
+/// and resolve the same effort/model knobs (design §Q3). It gathers the
+/// per-execution collaborator context (parent project, merge-conflict /
+/// CI-remediation attempt, crash-recovery branch, automation-triage
+/// preamble), composes the prompt via [`compose_execution_prompt`], then
+/// prepends the effort addendum and the product dispatch preamble exactly
+/// as the local runner historically did.
+///
+/// Transport-agnostic: it reads only from `work_db` (and, for `pr_review`
+/// executions, calls `gh pr view` to pre-fetch the PR metadata for the
+/// reviewer's initial prompt).
+pub async fn compose_worker_spawn(
+    work_db: &WorkDb,
+    worker_id: &str,
+    execution: &WorkExecution,
+    work_item: &WorkItem,
+    workspace_path: &Path,
+    cube_change_id: Option<&str>,
+    // Bundled (rather than a run of positional bools) to keep the parameter
+    // count under clippy::too_many_arguments AND so call sites name what
+    // they set instead of relying on positional order — a transposed pair
+    // of seam flags here would compile silently and mis-gate a prompt.
+    editorial_opts: WorkerSpawnOpts,
+) -> anyhow::Result<ComposedWorkerSpawn> {
+    // Validate provenance before dispatch and give it directly to the worker.
+    // Both local and remote spawns use this prompt; cube stays a plain launcher.
+    //
+    // The provenance check inside `followup_pr_backlink_for_work_item` must
+    // run unconditionally for every execution kind: it is where the hard-fail
+    // lives for a `TaskKind::Followup` work item with a missing origin PR
+    // number, a non-positive number, or a remote URL that doesn't parse as a
+    // github.com slug (see `work_item.rs`'s doc comment — the contract keys
+    // on durable origin provenance, not on execution kind). Only whether the
+    // resulting backlink text is appended to the prompt is gated on worker
+    // kind: a Standard-kind worker (this includes CiRemediation, which maps
+    // to `WorkerKind::Standard` and can push branches/open PRs like any
+    // other implementing worker) is the one that actually runs `cube pr
+    // create`/`pr update --body-file`, while PrReview, PrReviewGuide, AnswerAgent, and
+    // AutomationTriage executions never write a PR body, so appending the
+    // backlink there would contradict that worker's read-only/decision-only
+    // mandate. This mirrors the `prompt_addendum_to_prepend` kind-gate
+    // above.
+    let origin_pr_backlink = followup_pr_backlink_for_work_item(work_item, &execution.repo_remote_url)?;
+    let origin_pr_backlink = match crate::worker_setup::worker_kind_for_execution(&execution.kind) {
+        crate::worker_setup::WorkerKind::Standard => origin_pr_backlink,
+        crate::worker_setup::WorkerKind::Reviewer
+        | crate::worker_setup::WorkerKind::ReviewGuide
+        | crate::worker_setup::WorkerKind::Triage
+        | crate::worker_setup::WorkerKind::AnswerAgent => None,
+    };
+    let WorkerSpawnOpts {
+        review_signal_checks,
+        editorial_enabled,
+        max_embed_diff_lines,
+        worker_signal_proposals_seam_enabled,
+        deferred_scope_proposals_seam_enabled,
+        followup_proposals_seam_enabled,
+        automation_outcome_proposals_seam_enabled,
+        review_batch_fanout_enabled,
+        run_done_proposals_seam_enabled,
+        bazel_workspace,
+    } = editorial_opts;
+    // For any project-scoped task (the synthetic `kind = 'design'`
+    // task and ordinary `project_task` rows alike), the richer
+    // brief — what the project is for, what its goal is — lives
+    // on the parent project rather than on the task row. Look it
+    // up at spawn time so the worker prompt is always anchored on
+    // the current project state, not whatever was copied at
+    // create time.
+    let parent_project = match work_item {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task
+            .project_id
+            .as_deref()
+            .and_then(|project_id| work_db.get_project(project_id).ok()),
+        _ => None,
+    };
+    // For revision_implementation executions with a merge-conflict
+    // provenance, look up the linked attempt by the id embedded in
+    // created_via (format: "merge-conflict:<crz_id>") so
+    // compose_revision_directive can inject the conflict fragment.
+    let conflict_attempt = if execution.kind == ExecutionKind::RevisionImplementation {
+        work_item_created_via(work_item)
+            .and_then(|cv| cv.strip_prefix("merge-conflict:"))
+            .and_then(|id| work_db.get_conflict_resolution(id).ok().flatten())
+    } else {
+        None
+    };
+    // merge_order forward-port stamping (direction 2): when this is a
+    // conflict-resolution revision whose parent has a `merge_order` sibling
+    // that already merged, name that sibling in the brief so the worker
+    // preserves its surfaces. Keyed on the review-cycle root (the in-review
+    // parent), since the merge_order edge is on the original sibling task, not
+    // this revision row. Fail-open: a lookup error just omits the clause (the
+    // generic preservation rule + the deletion tripwire still apply).
+    let merge_order_preservation: Vec<String> = if conflict_attempt.is_some() {
+        let root = work_db.review_cycle_root_id(&execution.work_item_id);
+        match work_db.merge_order_merged_siblings(&root) {
+            Ok(siblings) => render_merge_order_preservation_lines(&siblings),
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    error = %format!("{err:#}"),
+                    "merge_order: merged-sibling lookup failed for forward-port brief; omitting sibling clause",
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    // For ci_remediation executions (retrigger-kind only after Phase 5),
+    // look up the active attempt so the prompt can show the failing checks.
+    //
+    // For revision_implementation executions with a ci-fix provenance,
+    // look up the linked attempt by the id embedded in created_via
+    // (format: "ci-fix:<crm_id>") so compose_revision_directive can
+    // inject the CI remediation fragment.
+    let ci_attempt = if execution.kind == ExecutionKind::CiRemediation {
+        work_db
+            .active_ci_remediation_for_work_item(&execution.work_item_id)
+            .ok()
+            .flatten()
+    } else if execution.kind == ExecutionKind::RevisionImplementation {
+        work_item_created_via(work_item)
+            .and_then(|cv| cv.strip_prefix("ci-fix:"))
+            .and_then(|id| work_db.get_ci_remediation(id).ok().flatten())
+    } else {
+        None
+    };
+    // Fetch the product before composing the prompt so we can pass
+    // editorial_rules, dispatch_preamble, and design_guidance into
+    // compose_execution_prompt. Derived via `WorkItem::product_id()` — which
+    // covers every variant, not just Task/Chore — so a `ProductDesign`
+    // execution (whose work item IS the product) resolves its own product
+    // row instead of silently losing it to a `_ => None` fallthrough. A DB
+    // error reading the row propagates via `?` rather than being swallowed
+    // into "no product": a genuine read failure must be loud, never
+    // rendered as an empty preamble/guidance block.
+    let product = work_db.get_product(work_item.product_id())?;
+    // `default_model` / `default_driver` / `editorial_rules` apply only to
+    // Task/Chore executions. They determine the model, driver, and
+    // PR-surface rules for ordinary work-item executions; Product-/
+    // Project-scoped runs must not inherit them. Only `dispatch_preamble`
+    // and `design_guidance` reach every execution kind on the product.
+    let is_task_or_chore = matches!(work_item, WorkItem::Task(_) | WorkItem::Chore(_));
+    let product_editorial_rules = if is_task_or_chore {
+        product.as_ref().and_then(|p| p.editorial_rules.clone())
+    } else {
+        None
+    };
+    let product_default_model = if is_task_or_chore {
+        product.as_ref().and_then(|p| p.default_model.clone())
+    } else {
+        None
+    };
+    let product_default_driver = if is_task_or_chore {
+        product.as_ref().and_then(|p| p.default_driver.clone())
+    } else {
+        None
+    };
+    let allocated_driver = if is_task_or_chore {
+        work_db
+            .get_execution_driver_decision(&execution.id)
+            .ok()
+            .flatten()
+            .filter(|decision| matches!(decision.reason, REASON_ALLOCATION | REASON_LEGACY_PERCENTAGE))
+            .and_then(|decision| decision.driver)
+    } else {
+        None
+    };
+    let product_dispatch_preamble = product
+        .as_ref()
+        .and_then(|p| p.dispatch_preamble.clone())
+        .filter(|s| !s.is_empty());
+    let product_design_guidance = product
+        .as_ref()
+        .and_then(|p| p.design_guidance.clone())
+        .filter(|s| !s.is_empty());
+    let (row_effort, row_model_override, row_driver, row_reasoning, row_design_reasoning_effort_xhigh) = match work_item
+    {
+        WorkItem::Task(task) | WorkItem::Chore(task) => (
+            task.effort_level,
+            task.model_override.clone(),
+            task.driver.clone(),
+            task.reasoning,
+            task.design_reasoning_effort_xhigh,
+        ),
+        _ => (None, None, None, None, false),
+    };
+    // Load the PR template for editorial-rules prompt injection. Uses
+    // `WorkItem::product_id()` (total over every variant) rather than a
+    // Task/Chore-only match, so a Product-/Project-scoped execution (e.g.
+    // `ProductDesign`) resolves its product's PR template set instead of
+    // always loading an empty one.
+    let pr_template_product_id = work_item.product_id();
+    let pr_template_lease_id = execution.cube_lease_id.as_deref().unwrap_or("");
+    let pr_template_set = crate::pr_template::load(pr_template_product_id, pr_template_lease_id, workspace_path);
+    // An `automation_triage` execution renders the triage
+    // preamble (decision-marker contract + "do not do the work / do not
+    // open a PR" guardrails) instead of the ordinary implementer prompt.
+    // Its `work_item_id` is the automation id, so we read the automation
+    // directly. If the automation vanished mid-flight, fall back to the
+    // generic prompt so the worker at least has workspace context.
+    //
+    // Likewise, a `pr_review` execution renders the reviewer prompt
+    // instead of the ordinary implementer prompt. Its `work_item_id` is
+    // the producing task id, so we read the task to get the PR context.
+    // If the task or its pr_url cannot be resolved, fall back to the
+    // generic prompt (reviewer still gets workspace context but a weaker
+    // framing — better than no spawn at all).
+    // Baseline: the path `designated_output_kind` says this execution kind
+    // should carry. Overridden to `None` below in the specific fallback
+    // branches that degrade to the generic prompt without rendering it —
+    // `compose_execution_prompt`'s own designated-kind branches (Followups /
+    // PostmortemFollowups) always render unconditionally, so the baseline
+    // holds for those; only the AutomationTriage/PrReview degraded paths
+    // need an override.
+    let mut embedded_output_path = designated_output_kind(execution, work_item)
+        .map(|kind| crate::structured_output::default_path_string(&execution.id, kind));
+    let bookmark_recovery = work_db.bookmark_recovery(&execution.id)?;
+    let restore_report = work_db.execution_restore_report(&execution.id)?;
+    let reconciliation_note = work_db.bookmark_reconciliation_note(&execution.id)?;
+    let prompt_text = if execution.kind == ExecutionKind::AutomationTriage {
+        match work_db.get_automation(&execution.work_item_id) {
+            Ok(Some(automation)) => {
+                let product_name = work_db
+                    .get_product(&automation.product_id)
+                    .ok()
+                    .flatten()
+                    .map(|p| p.name)
+                    .unwrap_or_else(|| automation.product_id.clone());
+                // Best-effort: a failed sibling lookup degrades the
+                // preamble to its pre-dedup form rather than costing the
+                // spawn. The hard gate at create time still holds.
+                let siblings = work_db
+                    .list_automation_sibling_tasks(&automation.id)
+                    .unwrap_or_else(|err| {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            automation_id = %automation.id,
+                            ?err,
+                            "could not load already-tracked tasks for the triage preamble; \
+                             rendering without the dedup section",
+                        );
+                        Vec::new()
+                    });
+                // Layer-0 context injection (automation-duplicate-work
+                // investigation, 2026-07-14, §4): gather in-flight and
+                // recently-merged automation work for the WHOLE product —
+                // across all automations, not just this one — so the agent
+                // can decline a candidate that overlaps a sibling
+                // automation's recent output. Failures here degrade to an
+                // empty context rather than blocking the spawn.
+                let since_epoch = boss_engine_utils::epoch_time::now_epoch_secs()
+                    - crate::automation_triage::RECENTLY_MERGED_WINDOW_SECS;
+                let open_tasks = work_db
+                    .list_open_automation_tasks_for_product(&automation.product_id)
+                    .unwrap_or_default();
+                let merged_tasks = work_db
+                    .list_recently_completed_automation_tasks_for_product(&automation.product_id, since_epoch)
+                    .unwrap_or_default();
+                let triage_context = crate::automation_triage::TriageContext::from_rows(open_tasks, merged_tasks);
+                let prompt = crate::automation_triage::render_triage_preamble(
+                    &automation,
+                    &product_name,
+                    &siblings,
+                    &triage_context,
+                    &crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::TriageDecision),
+                    automation_outcome_proposals_seam_enabled,
+                );
+                with_bazel_caching_rule(prompt)
+            }
+            other => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    automation_id = %execution.work_item_id,
+                    resolved = ?other.as_ref().map(|o| o.is_some()),
+                    "automation_triage execution could not resolve its automation; \
+                     falling back to generic prompt",
+                );
+                embedded_output_path = None;
+                compose_execution_prompt(
+                    ExecutionPromptParams::builder()
+                        .review_signal_checks(review_signal_checks)
+                        .execution(execution)
+                        .work_item(work_item)
+                        .workspace_path(workspace_path)
+                        .maybe_bookmark_recovery(bookmark_recovery.as_ref())
+                        .maybe_restore_report(restore_report.as_ref())
+                        .maybe_reconciliation_note(reconciliation_note.as_deref())
+                        .maybe_parent_project(parent_project.as_ref())
+                        .maybe_cube_change_id(cube_change_id)
+                        .maybe_conflict_attempt(conflict_attempt.as_ref())
+                        .maybe_ci_attempt(ci_attempt.as_ref())
+                        .maybe_editorial_rules(product_editorial_rules.as_ref())
+                        .maybe_design_guidance(product_design_guidance.as_deref())
+                        .pr_template_set(&pr_template_set)
+                        .editorial_enabled(editorial_enabled)
+                        .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
+                        .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
+                        .followup_proposals_seam_enabled(followup_proposals_seam_enabled)
+                        .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
+                        .maybe_bazel_workspace(bazel_workspace)
+                        .build(),
+                )
+            }
+        }
+    } else if execution.kind == ExecutionKind::PrReview {
+        let pr_url = work_item_pr_url(work_item).unwrap_or_default();
+        if pr_url.is_empty() {
+            tracing::warn!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                "pr_review execution: producing task has no pr_url; \
+                 falling back to generic prompt — review will lack PR context",
+            );
+            embedded_output_path = None;
+            compose_execution_prompt(
+                ExecutionPromptParams::builder()
+                    .review_signal_checks(review_signal_checks)
+                    .execution(execution)
+                    .work_item(work_item)
+                    .workspace_path(workspace_path)
+                    .maybe_bookmark_recovery(bookmark_recovery.as_ref())
+                    .maybe_restore_report(restore_report.as_ref())
+                    .maybe_reconciliation_note(reconciliation_note.as_deref())
+                    .maybe_parent_project(parent_project.as_ref())
+                    .maybe_cube_change_id(cube_change_id)
+                    .maybe_conflict_attempt(conflict_attempt.as_ref())
+                    .maybe_ci_attempt(ci_attempt.as_ref())
+                    .maybe_editorial_rules(product_editorial_rules.as_ref())
+                    .maybe_design_guidance(product_design_guidance.as_deref())
+                    .pr_template_set(&pr_template_set)
+                    .editorial_enabled(editorial_enabled)
+                    .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
+                    .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
+                    .followup_proposals_seam_enabled(followup_proposals_seam_enabled)
+                    .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
+                    .build(),
+            )
+        } else {
+            // Pre-fetch PR metadata so the reviewer starts with the full diff
+            // context (base/head SHAs, changed files) rather than discovering
+            // it turn-by-turn. Fail open on error — the URL-only prompt is
+            // still functional.
+            let mut pr_review_context = fetch_pr_review_context(pr_url).await;
+            // 2026-07-01 revision-review experiment: tell the reviewer what
+            // head SHA the PR was already reviewed up to, so a revision-
+            // triggered pass can prioritise the delta. Resolved via the
+            // review-cycle root (chain root for a revision, the task itself
+            // otherwise) so the value reflects the PR's actual review
+            // history rather than resetting for every fresh revision task
+            // row — see `WorkDb::review_cycle_root_id`.
+            if let Some(ref mut ctx) = pr_review_context {
+                let cycle_root_id = work_db.review_cycle_root_id(&execution.work_item_id);
+                ctx.last_reviewed_sha = work_db
+                    .get_task_review_cycle_state(&cycle_root_id)
+                    .ok()
+                    .and_then(|(_, sha)| sha);
+            }
+            if let Some(ref ctx) = pr_review_context {
+                tracing::info!(
+                    execution_id = %execution.id,
+                    pr_url,
+                    pr_number = ctx.pr_number,
+                    head_sha = %ctx.head_sha,
+                    changed_files = ctx.changed_files.len(),
+                    last_reviewed_sha = ?ctx.last_reviewed_sha,
+                    "pr_review execution: pre-fetched PR metadata for reviewer context",
+                );
+            } else {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    pr_url,
+                    "pr_review execution: PR metadata fetch failed; reviewer will use URL-only prompt",
+                );
+            }
+            // Fetch the diff unconditionally (independent of
+            // max_embed_diff_lines) so the mechanical Boss-construct sweep
+            // below always runs, even when diff embedding is disabled via
+            // BOSS_MAX_EMBED_DIFF_LINES=0. Embedding the fetched diff into
+            // the reviewer's initial prompt is still gated on
+            // max_embed_diff_lines so operators can disable that separately.
+            if let Some(ref mut ctx) = pr_review_context
+                && let Some(diff) = fetch_pr_diff(pr_url).await
+            {
+                // Mechanical assist for the agent-isms "Boss-construct
+                // references" sub-rule: sweep the diff's added lines for bare
+                // T<n>/P<n> tokens regardless of whether the diff ends up
+                // embedded, so a large diff the reviewer fetches itself still
+                // gets forced-disposition candidates.
+                let diff_hits = crate::boss_construct_scan::scan_diff_added_lines(&diff);
+                ctx.boss_construct_refs
+                    .extend(crate::boss_construct_scan::hit_lines(&diff_hits));
+
+                let line_count = diff.lines().count() as u64;
+                if max_embed_diff_lines > 0 && line_count <= max_embed_diff_lines {
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        pr_url,
+                        line_count,
+                        max_embed_diff_lines,
+                        "pr_review execution: embedding diff in reviewer prompt",
+                    );
+                    ctx.diff_content = Some(diff);
+                } else {
+                    tracing::debug!(
+                        execution_id = %execution.id,
+                        pr_url,
+                        line_count,
+                        max_embed_diff_lines,
+                        "pr_review execution: diff too large to embed, or \
+                         embedding disabled; reviewer will fetch it",
+                    );
+                }
+            }
+            // Use the changed-file list (when available) to classify the review
+            // scope accurately, instead of always defaulting to Code.
+            let scope = match &pr_review_context {
+                Some(ctx) => {
+                    let files: Vec<&str> = ctx.changed_files.iter().map(String::as_str).collect();
+                    crate::pr_review::classify_changed_files(&files)
+                }
+                None => crate::pr_review::ReviewScope::Code,
+            };
+            let reviewer_repo_slug = git_utils::repo_slug::parse_github_slug(&execution.repo_remote_url)
+                .unwrap_or_else(|| "<owner/repo>".to_owned());
+            // A member row existing is the same signal `finalize_pr_review_pass`
+            // uses to take the batch branch unconditionally (it never falls
+            // back to reading the legacy artifact once a member row exists).
+            // So once we observe a member row here, the batch destination is
+            // the ONLY delivery channel the finalizer will ever read for this
+            // execution: falling back to the legacy prompt in that case would
+            // render a prompt whose artifact/transcript delivery instructions
+            // the finalizer is guaranteed to ignore, silently discarding a
+            // review the worker actually completed. Fail the dispatch instead
+            // so the execution surfaces as a real failure rather than a
+            // reviewer that appears to succeed but whose report vanishes.
+            let member_and_batch = match work_db.review_batch_member_for_execution(&execution.id) {
+                Ok(Some(member)) => match work_db.review_batch(&member.batch_id) {
+                    Ok(Some(batch)) => Some((member, batch)),
+                    Ok(None) => {
+                        anyhow::bail!(
+                            "pr_review execution {} has review-batch member for batch {} but the batch row is \
+                             missing; refusing to dispatch with the legacy prompt, which finalize_pr_review_pass \
+                             would never read",
+                            execution.id,
+                            member.batch_id,
+                        );
+                    }
+                    Err(err) => {
+                        return Err(err).context(format!(
+                            "loading review batch {} for execution {} member row; refusing to dispatch with the \
+                             legacy prompt, which finalize_pr_review_pass would never read",
+                            member.batch_id, execution.id,
+                        ));
+                    }
+                },
+                Ok(None) => None,
+                Err(err) => {
+                    return Err(err).context(format!(
+                        "determining whether reviewer execution {} belongs to a review batch",
+                        execution.id,
+                    ));
+                }
+            };
+            // The batch's cycle root (`execution.work_item_id` in the batch
+            // path) is a revision's producing item collapsed for review-cycle
+            // accounting — see `pr_transition::review_batch_input_from_metadata`.
+            // Resolve the packet from the actual producing item (persisted as
+            // `producing_work_item_id`) so a revision's review still sees the
+            // revision ask and its own deferred-scope declarations, not just
+            // the chain-root brief the root's own work item carries.
+            let brief_work_item_id = member_and_batch
+                .as_ref()
+                .and_then(|(_, batch)| batch.producing_work_item_id.clone());
+            let mut producing_item_load_error: Option<(String, String)> = None;
+            let brief_work_item_owned = match brief_work_item_id {
+                Some(ref id) if id != &execution.work_item_id => match work_db.get_work_item(id) {
+                    Ok(item) => Some(item),
+                    Err(err) => {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            producing_work_item_id = %id,
+                            error = %err,
+                            "pr_review: failed to load producing work item for revision brief; \
+                             falling back to the batch's cycle-root work item and recording an \
+                             unresolved brief input",
+                        );
+                        producing_item_load_error = Some((id.clone(), err.to_string()));
+                        None
+                    }
+                },
+                _ => None,
+            };
+            let brief_work_item = brief_work_item_owned.as_ref().unwrap_or(work_item);
+            let mut review_brief =
+                super::review_brief::assemble_review_brief_packet(work_db, brief_work_item, execution).await;
+            if let Some((id, err)) = producing_item_load_error {
+                review_brief
+                    .unresolved
+                    .push(crate::pr_review::UnresolvedReviewInput::Brief {
+                        reason: format!("revision ask for producing work item {id} could not be loaded: {err}"),
+                    });
+            }
+            let report_destination = match member_and_batch {
+                Some((member, batch)) => Some((
+                    member.role,
+                    crate::pr_review::ReviewerReportDestination::builder()
+                        .batch_id(batch.id)
+                        .pr_url(batch.pr_url)
+                        .target_sha(batch.target_sha)
+                        .phase(batch.phase)
+                        .body_path(crate::structured_output::default_path_string(
+                            &execution.id,
+                            StructuredOutputKind::ReviewResult,
+                        ))
+                        .build(),
+                )),
+                None => None,
+            };
+            let prompt = match report_destination.as_ref() {
+                Some((ReviewBatchMemberRole::Supervisor, destination)) => {
+                    let cycle_root_id = work_db.review_cycle_root_id(&execution.work_item_id);
+                    let reports = load_batch_leaf_reports(work_db, &cycle_root_id, &destination.batch_id)
+                        .context("loading accepted leaf reports for supervisor prompt")?;
+                    let mut configured_roles = work_db
+                        .review_batch_members(&destination.batch_id)?
+                        .iter()
+                        .filter_map(|member| match member.role {
+                            ReviewBatchMemberRole::ClaudeReviewer => {
+                                Some(crate::pr_review::SupervisorSourceRole::Claude)
+                            }
+                            ReviewBatchMemberRole::CodexReviewer => Some(crate::pr_review::SupervisorSourceRole::Codex),
+                            ReviewBatchMemberRole::GrokReviewer => Some(crate::pr_review::SupervisorSourceRole::Grok),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    configured_roles.dedup();
+                    crate::pr_review::render_supervisor_initial_prompt(
+                        &review_brief,
+                        destination,
+                        &reports,
+                        &configured_roles,
+                        &reviewer_repo_slug,
+                    )
+                }
+                Some((ReviewBatchMemberRole::PostMergeReviewer, destination)) => {
+                    crate::pr_review::render_post_merge_reviewer_initial_prompt(
+                        &review_brief,
+                        destination,
+                        scope,
+                        &reviewer_repo_slug,
+                    )
+                }
+                Some((_, destination)) => crate::pr_review::render_batch_reviewer_initial_prompt(
+                    &review_brief,
+                    destination,
+                    scope,
+                    pr_review_context.as_ref(),
+                    &reviewer_repo_slug,
+                ),
+                None => crate::pr_review::render_reviewer_initial_prompt(
+                    &review_brief,
+                    pr_url,
+                    &crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::ReviewResult),
+                    scope,
+                    pr_review_context.as_ref(),
+                    &reviewer_repo_slug,
+                ),
+            };
+            with_bazel_caching_rule(prompt)
+        }
+    } else if execution.kind == ExecutionKind::AnswerAgent {
+        // An `answer_agent` execution renders the answer-agent prompt
+        // (doc content, comment, thread history, reply instructions) instead
+        // of the ordinary implementer prompt. Its `work_item_id` is the
+        // comment id (see `WorkDb::create_answer_agent_execution`).
+        with_bazel_caching_rule(compose_answer_agent_prompt(work_db, execution).await)
+    } else if execution.kind == ExecutionKind::PrReviewGuide {
+        // A `pr_review_guide` execution renders the review-guide prompt
+        // (exact versioned template + embedded source packet) instead of
+        // the ordinary implementer prompt. Its `work_item_id` is the
+        // comparison id (see `WorkDb::create_pr_review_guide_execution`).
+        append_bazel_caching_rule(compose_review_guide_prompt(work_db, execution, workspace_path)?)
+    } else {
+        compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .review_signal_checks(review_signal_checks)
+                .execution(execution)
+                .work_item(work_item)
+                .workspace_path(workspace_path)
+                .maybe_bookmark_recovery(bookmark_recovery.as_ref())
+                .maybe_restore_report(restore_report.as_ref())
+                .maybe_reconciliation_note(reconciliation_note.as_deref())
+                .maybe_parent_project(parent_project.as_ref())
+                .maybe_cube_change_id(cube_change_id)
+                .maybe_conflict_attempt(conflict_attempt.as_ref())
+                .maybe_ci_attempt(ci_attempt.as_ref())
+                .maybe_editorial_rules(product_editorial_rules.as_ref())
+                .maybe_design_guidance(product_design_guidance.as_deref())
+                .pr_template_set(&pr_template_set)
+                .editorial_enabled(editorial_enabled)
+                .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
+                .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
+                .followup_proposals_seam_enabled(followup_proposals_seam_enabled)
+                .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
+                .merge_order_preservation(&merge_order_preservation)
+                .maybe_bazel_workspace(bazel_workspace)
+                .build(),
+        )
+    };
+    let prompt_text = if execution.kind == ExecutionKind::PrReviewGuide {
+        prompt_text
+    } else {
+        let bookmark_instructions = crate::execution_bookmark_recovery::worker_instructions(execution);
+        let (opening, rest) = prompt_text.split_once('\n').unwrap_or((&prompt_text, ""));
+        format!("{opening}\n\n{bookmark_instructions}{rest}")
+    };
+    let prompt_text = if execution.kind == ExecutionKind::RevisionImplementation {
+        format!(
+            "{prompt_text}\n\n{}",
+            super::prompt::revision_conflict_notice(work_db, execution).unwrap_or_else(|error| {
+                tracing::warn!(%error, "Could not load advisory revision conflict notice");
+                String::new()
+            })
+        )
+    } else {
+        prompt_text
+    };
+    let prompt_text = match origin_pr_backlink {
+        Some(backlink) => format!(
+            "{prompt_text}\n\n## Origin PR backlink\n\n\
+             When writing this run's PR body, include the following backlink to the origin PR. \
+             Compose it together with your summary and validation in the body file you pass to cube:\n\n\
+             ```markdown\n{backlink}\n```\n"
+        ),
+        None => prompt_text,
+    };
+    let work_item_kind = work_item_task_kind_enum(work_item);
+    let registry = crate::driver::DriverRegistry::default();
+    let batch_member = if execution.kind == ExecutionKind::PrReview {
+        work_db
+            .review_batch_member_for_execution(&execution.id)
+            .map_err(|error| anyhow::anyhow!("loading review batch member for spawn: {error}"))?
+    } else {
+        None
+    };
+    // Fail closed rather than falling back to the legacy Claude pool, but
+    // ONLY when this execution should have had a member row: a live
+    // (non-terminal) pre_merge batch already exists for the work item, so a
+    // memberless `pr_review` execution here is a genuine race (a leaf whose
+    // member-row write raced this read) rather than one of the other
+    // legacy-dispatch paths. Although automatic starts and `bossctl review
+    // start` honor `review_batch_fanout`, the merge poller's reviewer-fallback re-fire,
+    // pr_review_recovery's legacy loop, and pr_transition's own
+    // batch-metadata-failure fallback all still mint memberless legacy
+    // `pr_review` executions with the flag on, matching
+    // docs/designs/multi-agent-code-review.md's rollout clause that "the old
+    // single-reviewer path remains available behind the batch feature
+    // flag". Keying the gate on "no live batch exists for this work item"
+    // instead of "flag is on" lets those genuine legacy executions keep
+    // resolving `pool_dispatch_policy_for_worker_id` below.
+    if review_batch_fanout_enabled && execution.kind == ExecutionKind::PrReview && batch_member.is_none() {
+        let live_batch_exists = work_db
+            .review_batches_for_cycle_root(&execution.work_item_id)
+            .map_err(|error| anyhow::anyhow!("checking for a live review batch before spawn: {error}"))?
+            .into_iter()
+            .any(|batch| {
+                batch.phase == ReviewBatchPhase::PreMerge
+                    && !matches!(batch.status, ReviewBatchStatus::Completed | ReviewBatchStatus::Failed)
+            });
+        if live_batch_exists {
+            anyhow::bail!(
+                "review_batch_fanout is enabled and a live pre_merge batch already exists for work item {} \
+                 but execution {} (pr_review) has no review batch member row; refusing to spawn rather than \
+                 silently falling back to the legacy Claude pool",
+                execution.work_item_id,
+                execution.id
+            );
+        }
+    }
+    // Single resolution point for review/automation dispatch policy — see
+    // `pool_dispatch_policy_for_worker_id`'s doc comment. `None` for
+    // main-pool workers, which dispatch on the row's own `driver` column.
+    let pool_policy = batch_member
+        .is_none()
+        .then(|| pool_dispatch_policy_for_worker_id(worker_id))
+        .flatten();
+    // Main-pool only: a live pin that the capability gate will refuse for
+    // this execution kind yields to allocation / the engine default rather
+    // than hard-failing `compose_worker_spawn`. Pool workers already ignore
+    // row pins via `pool_policy_driver`, so they skip this yield.
+    let (effective_task_driver, effective_product_default_driver) = if pool_policy.is_some() {
+        (row_driver.as_deref(), product_default_driver.as_deref())
+    } else {
+        yield_pins_that_fail_capability_gate(
+            &execution.id,
+            &execution.kind,
+            work_item_kind,
+            row_driver.as_deref(),
+            product_default_driver.as_deref(),
+        )
+    };
+    let spawn_config = if execution.kind == ExecutionKind::PrReviewGuide {
+        let config = resolve_review_guide_spawn_config(&registry)?;
+        if let Ok(Some(attempt)) = work_db.pr_review_guide_attempt_for_execution(&execution.id)
+            && let Err(error) = work_db.record_pr_review_guide_attempt_spawn_config(
+                &attempt.id,
+                &config.driver,
+                &config.model,
+                config.effort_value.unwrap_or_default(),
+            )
+        {
+            tracing::warn!(
+                execution_id = %execution.id,
+                attempt_id = %attempt.id,
+                ?error,
+                "review_guide execution: could not record the resolved spawn config on its attempt",
+            );
+        }
+        config
+    } else {
+        match batch_member.as_ref() {
+            Some(member) => resolve_batch_reviewer_spawn(&registry, member, work_item_kind)?,
+            None => {
+                let spawn_input = SpawnResolutionInput::builder()
+                    // Effort always comes from the owning row, for pool and main-pool workers alike.
+                    // For review/automation pools this is deliberate: capability comes from the pool's
+                    // strong model tier below, while effort stays proportional to the likely material to
+                    // inspect instead of raising every small review's spend. The automated-reviewer
+                    // design §5 defines that override; §10 keeps production effort/model selection unchanged.
+                    // `resolve_spawn_config` documents their independent precedence, and
+                    // `pool_override_does_not_change_effort_or_addendum` pins the separation.
+                    // For PR reviews this is only a size proxy, not a claim that small
+                    // diffs are low risk: the rubric applies the same correctness bar at
+                    // every level.
+                    .maybe_effort_level(row_effort)
+                    .maybe_model_override(row_model_override.as_deref())
+                    .maybe_pool_model_override(pool_policy.map(|p| p.model_tier))
+                    .maybe_product_default_model(product_default_model.as_deref())
+                    .maybe_task_driver(effective_task_driver)
+                    .maybe_product_default_driver(effective_product_default_driver)
+                    .maybe_pool_policy_driver(pool_policy.map(|policy| policy.driver))
+                    .maybe_allocated_driver(allocated_driver.as_deref())
+                    .maybe_kind(work_item_kind)
+                    .maybe_reasoning(row_reasoning)
+                    .design_reasoning_effort_xhigh(row_design_reasoning_effort_xhigh)
+                    .build();
+                resolve_spawn_config_in(&registry, &spawn_input)
+                    .map_err(|error| anyhow::anyhow!("effort/model resolution: {error}"))?
+            }
+        }
+    };
+
+    tracing::info!(
+        execution_id = %execution.id,
+        driver = %spawn_config.driver,
+        model = %spawn_config.model,
+        driver_source = spawn_config.driver_source.as_str(),
+        model_source = spawn_config.model_source.as_str(),
+        "resolved worker model/driver pair",
+    );
+
+    // Model/driver compatibility gate: fail closed before the pane spawns
+    // when the resolved model does not belong to the resolved driver's
+    // vocabulary. `resolve_spawn_config_in` now guarantees this invariant;
+    // the independent gate deliberately remains as defence in depth so a
+    // future resolver regression or hand-built config still fails closed
+    // before any CLI is launched.
+    //
+    // `spawn_config.driver` was already validated against this same
+    // `registry` by `resolve_spawn_config_in` above (it returns
+    // `UnknownDriverError` and bails before reaching here on an
+    // unregistered slug), so the lookup cannot fail.
+    let resolved_driver = registry
+        .get(&spawn_config.driver)
+        .expect("slug validated by resolve_spawn_config_in");
+    check_model_driver_compatibility(resolved_driver.descriptor(), &spawn_config.model)?;
+
+    // Capability gate: fail closed before the pane spawns when the resolved
+    // driver cannot satisfy the work-item kind's requirements. Products and
+    // projects do not have a TaskKind; only Task/Chore rows are gated.
+    if let Some(kind) = work_item_kind {
+        let resolver = registry
+            .resolver(&spawn_config.driver)
+            .expect("slug validated by resolve_spawn_config_in");
+        resolver
+            .check_dispatch(kind, Some(&execution.kind))
+            .map_err(|e| anyhow::anyhow!("capability gate: {e}"))?;
+    }
+
+    // Per-level prompt addendum lands at the very top of the file
+    // (design §Q2: "concatenated to .claude/initial-prompt.txt
+    // BEFORE the existing prompt body"). The existing task /
+    // design / conflict-resolution framing must stay byte-identical
+    // when the addendum is `None`.
+    //
+    // Implementation-only: the addendum tells the worker to plan files
+    // it will touch and start editing. Restricted kinds (reviewer,
+    // triage, answer-agent) are read-only or decision-only — prepending
+    // that framing contradicts their mandate. Effort resolution is
+    // unchanged (`spawn_config.prompt_addendum` still reflects the
+    // level); this is the single prepend gate.
+    let prompt_text = match prompt_addendum_to_prepend(&execution.kind, spawn_config.prompt_addendum) {
+        Some(addendum) => format!("{}\n\n{}", addendum, prompt_text),
+        None => prompt_text,
+    };
+
+    // Product dispatch preamble is prepended before the effort
+    // addendum, with visible bracket markers so humans reading
+    // transcripts know what was injected by the engine.
+    // Empty / null preamble → today's behaviour, no change.
+    let prompt_text = match product_dispatch_preamble {
+        Some(preamble) => {
+            format!(
+                "[product-preamble]\n{}\n[/product-preamble]\n\n{}",
+                preamble, prompt_text
+            )
+        }
+        None => prompt_text,
+    };
+
+    Ok(ComposedWorkerSpawn {
+        prompt_text,
+        spawn_config,
+        embedded_output_path,
+    })
+}

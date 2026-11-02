@@ -187,3 +187,7 @@ pub struct Host {
     pub consecutive_failures: i64,
     pub created_at: String,
 }
+
+pub mod audit_text;
+pub mod breakdown;
+pub mod supersession_scan;

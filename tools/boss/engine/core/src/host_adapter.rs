@@ -1023,6 +1023,7 @@ impl HostAdapter for SshHostAdapter {
         // Keep prompt and generated-rules feature gates on the same values.
         let bazel_workspace = self.probe_remote_bazel_workspace(&workspace).await;
         let spawn_opts = WorkerSpawnOpts::builder()
+            .review_signal_checks(crate::merge_poller::review_signal_checks_for_owner)
             .max_embed_diff_lines(self.cfg.work.max_review_embed_diff_lines)
             .maybe_bazel_workspace(bazel_workspace)
             .build();

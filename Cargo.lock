@@ -616,6 +616,7 @@ dependencies = [
  "boss-engine-worker-policy",
  "boss-event-bus",
  "boss-execution-contracts",
+ "boss-execution-runner",
  "boss-feature-flags",
  "boss-gh-telemetry",
  "boss-github",
@@ -624,6 +625,7 @@ dependencies = [
  "boss-http-retry",
  "boss-log-files",
  "boss-metrics",
+ "boss-pane-summary",
  "boss-pr-review",
  "boss-pr-template",
  "boss-prose-vocabulary",
@@ -944,10 +946,12 @@ dependencies = [
  "anyhow",
  "bon",
  "boss-engine-effort",
+ "boss-pr-template",
  "boss-protocol",
  "serde",
  "serde_json",
  "sha2",
+ "tracing",
 ]
 
 [[package]]
@@ -1047,6 +1051,55 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "boss-execution-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bon",
+ "boss-ci-log-reader",
+ "boss-conflict-diagnosis",
+ "boss-design-doc-fetcher",
+ "boss-engine-driver",
+ "boss-engine-effort",
+ "boss-engine-gh-invocation",
+ "boss-engine-recovery",
+ "boss-engine-storage-values",
+ "boss-engine-structured-output",
+ "boss-engine-utility-model",
+ "boss-engine-utils",
+ "boss-engine-worker-bin",
+ "boss-execution-contracts",
+ "boss-feature-flags",
+ "boss-gh-telemetry",
+ "boss-github",
+ "boss-host-execution",
+ "boss-log-files",
+ "boss-pane-summary",
+ "boss-pr-review",
+ "boss-pr-review-sources",
+ "boss-pr-template",
+ "boss-prose-vocabulary",
+ "boss-protocol",
+ "boss-review-guide",
+ "boss-ssh-transport",
+ "boss-tmux",
+ "boss-work-db",
+ "chrono",
+ "git-utils",
+ "libc",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -1204,6 +1257,24 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "boss-pane-summary"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boss-claude-client",
+ "boss-engine-utility-model",
+ "boss-engine-utils",
+ "boss-protocol",
+ "boss-work-db",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]

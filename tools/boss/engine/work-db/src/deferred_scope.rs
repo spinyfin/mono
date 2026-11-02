@@ -33,7 +33,7 @@
 use boss_engine_utils::quoted_field::extract_quoted;
 
 /// `[deferred-scope]` marker prefix.
-pub const DEFERRED_SCOPE_MARKER: &str = "[deferred-scope]";
+pub use boss_engine_storage_values::audit_text::DEFERRED_SCOPE_MARKER;
 
 pub use boss_engine_storage_values::attention_kinds::DEFERRED_SCOPE_ATTENTION_KIND;
 

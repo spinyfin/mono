@@ -13,6 +13,7 @@ rust_library(
     visibility = [
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/driver:__pkg__",
+        "//tools/boss/engine/execution-runner:__pkg__",
     ],
     deps = ["//tools/boss/shell-quote"] + all_crate_deps(normal = True),
 )

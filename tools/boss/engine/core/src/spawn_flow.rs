@@ -22,9 +22,12 @@ use std::process::{Command, Stdio};
 use std::time::Duration as StdDuration;
 
 use anyhow::{Context, anyhow};
+#[cfg(test)]
 use boss_protocol::WorkItemBinding;
 use boss_tmux::TMUX_SPAWN_TOKEN_ENV;
-use boss_tmux::{DisplayField, NewSession, Tmux};
+#[cfg(test)]
+use boss_tmux::Tmux;
+use boss_tmux::{DisplayField, NewSession};
 use thiserror::Error;
 use tokio::time::Duration;
 
@@ -33,9 +36,10 @@ use std::sync::Arc;
 use crate::driver::{AgentDriver, Capability, ProgressFidelity, ProgressIngress, ProgressObservationConfig};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::protocol::{AttachWorkerPaneInput, EngineToAppError, EngineToAppRequest, EngineToAppResponse, EnvVar};
-use crate::work::WorkDb;
 use crate::worker_registry::WorkerRegistry;
-use crate::worker_setup::{WorkerKind, WorkerSetupInput, WrittenFiles, write_workspace_files};
+#[cfg(test)]
+use crate::worker_setup::WorkerKind;
+use crate::worker_setup::{WorkerSetupInput, write_workspace_files};
 
 /// Sanitized PATH for worker panes. Excludes `~/bin` (where the
 /// `bossctl` symlink lives in this user's setup) and any other
@@ -289,90 +293,8 @@ const TMUX_SPAWN_TOKEN_OPTION: &str = "@boss_spawn_token";
 
 /// Durable writes surrounding a tmux session creation. Kept as a narrow
 /// seam so the spawn-ordering test can exercise the real tmux command shape
-/// without requiring a SQLite fixture; [`WorkDb`] is the production store.
-pub trait TmuxSpawnStore: Send + Sync {
-    /// Persist the session identity before tmux receives any command.
-    fn record_tmux_spawn_intent(
-        &self,
-        execution_id: &str,
-        server_label: &str,
-        session_name: &str,
-        spawn_token: &str,
-    ) -> anyhow::Result<bool>;
-
-    /// Mark the pre-recorded session as created after its pane pid is known.
-    /// `session_name` / `server_label` are already known to the caller at
-    /// this point (the intent write above recorded them), so this passes
-    /// them straight through to [`WorkDb::persist_tmux_identity_after_observation`]
-    /// rather than going through the test-only None/None wrapper.
-    fn record_tmux_session_created(
-        &self,
-        execution_id: &str,
-        spawn_token: &str,
-        pane_pid: i64,
-        session_name: &str,
-        server_label: &str,
-    ) -> anyhow::Result<bool>;
-}
-
-impl TmuxSpawnStore for WorkDb {
-    fn record_tmux_spawn_intent(
-        &self,
-        execution_id: &str,
-        server_label: &str,
-        session_name: &str,
-        spawn_token: &str,
-    ) -> anyhow::Result<bool> {
-        self.record_tmux_spawn_intent_for_execution(execution_id, server_label, session_name, spawn_token)
-    }
-
-    fn record_tmux_session_created(
-        &self,
-        execution_id: &str,
-        spawn_token: &str,
-        pane_pid: i64,
-        session_name: &str,
-        server_label: &str,
-    ) -> anyhow::Result<bool> {
-        self.persist_tmux_identity_after_observation(
-            execution_id,
-            spawn_token,
-            pane_pid,
-            Some(session_name),
-            Some(server_label),
-        )
-    }
-}
-
-/// Required collaborators for a local worker spawn.
-#[derive(Clone)]
-pub struct TmuxWorkerHost {
-    tmux: Tmux,
-    spawn_store: Arc<dyn TmuxSpawnStore>,
-    session_name: String,
-}
-
-impl TmuxWorkerHost {
-    pub fn new(tmux: Tmux, spawn_store: Arc<dyn TmuxSpawnStore>, session_name: String) -> Self {
-        Self {
-            tmux,
-            spawn_store,
-            session_name,
-        }
-    }
-
-    pub(crate) fn tmux(&self) -> &boss_tmux::Tmux {
-        &self.tmux
-    }
-
-    pub(crate) fn session_name(&self) -> &str {
-        &self.session_name
-    }
-
-    fn socket_path(&self) -> Option<&Path> {
-        self.tmux.socket_path()
-    }
-}
+/// without requiring a SQLite fixture; [`crate::work::WorkDb`] is the production store.
+pub use boss_execution_runner::host::{TmuxSpawnStore, TmuxWorkerHost};
 
 /// Create one detached tmux session using the durable write ordering required
 /// for restart adoption. Once the intent write succeeds, every later failure
@@ -393,8 +315,8 @@ async fn start_tmux_worker(
         .spawn_store
         .record_tmux_spawn_intent(
             execution_id,
-            &host.tmux.server_identity(),
-            &host.session_name,
+            &host.tmux().server_identity(),
+            host.session_name(),
             &spawn_token,
         )
         .context("recording tmux spawn intent")
@@ -417,13 +339,13 @@ async fn start_tmux_worker(
     environment.insert("BOSS_RUN_ID".to_owned(), execution_id.to_owned());
     crate::tmux_session_options::insert_color_environment(&mut environment);
 
-    crate::tmux_session_options::prepare_server(&host.tmux)
+    crate::tmux_session_options::prepare_server(host.tmux())
         .await
         .context("preparing Boss tmux server before creating worker session")
         .map_err(StartWorkerError::Tmux)?;
-    host.tmux
+    host.tmux()
         .new_session(&NewSession {
-            name: host.session_name.clone(),
+            name: host.session_name().to_owned(),
             environment,
             working_directory: workspace_path.to_path_buf(),
             command: pane_launch.tmux_command(command),
@@ -431,7 +353,7 @@ async fn start_tmux_worker(
         .await
         .context("creating detached tmux session")
         .map_err(StartWorkerError::Tmux)?;
-    crate::tmux_session_options::apply(&host.tmux, &host.session_name)
+    crate::tmux_session_options::apply(host.tmux(), host.session_name())
         .await
         .context("applying Boss worker tmux session options")
         .map_err(StartWorkerError::Tmux)?;
@@ -443,10 +365,10 @@ async fn start_tmux_worker(
     // sending it — an older server rejects the flag outright, which would
     // otherwise fail the whole spawn over a cosmetic scrollback fix.
     if let Some(config) = crate::driver::tmux_session_config_for(driver_name) {
-        match host.tmux.version().await {
+        match host.tmux().version().await {
             Ok(version) if version.supports_source_file_target() => {
-                host.tmux
-                    .source_file(&host.session_name, config)
+                host.tmux()
+                    .source_file(host.session_name(), config)
                     .await
                     .with_context(|| format!("sourcing {driver_name} tmux session config"))
                     .map_err(StartWorkerError::Tmux)?;
@@ -470,14 +392,14 @@ async fn start_tmux_worker(
             }
         }
     }
-    host.tmux
-        .set_option(&host.session_name, TMUX_SPAWN_TOKEN_OPTION, &spawn_token)
+    host.tmux()
+        .set_option(host.session_name(), TMUX_SPAWN_TOKEN_OPTION, &spawn_token)
         .await
         .context("mirroring tmux spawn token in session option")
         .map_err(StartWorkerError::Tmux)?;
     let pane_pid = host
-        .tmux
-        .display_message(&host.session_name, DisplayField::PanePid)
+        .tmux()
+        .display_message(host.session_name(), DisplayField::PanePid)
         .await
         .context("reading tmux pane pid")
         .map_err(StartWorkerError::Tmux)?
@@ -491,8 +413,8 @@ async fn start_tmux_worker(
             execution_id,
             &spawn_token,
             i64::from(pane_pid),
-            &host.session_name,
-            &host.tmux.server_identity(),
+            host.session_name(),
+            &host.tmux().server_identity(),
         )
         .context("recording tmux session creation")
         .map_err(StartWorkerError::Tmux)?;
@@ -504,128 +426,7 @@ async fn start_tmux_worker(
     Ok(pane_pid)
 }
 
-// No `Debug` derive: `Arc<dyn AgentDriver>` is not `Debug`, and nothing
-// logs or asserts on a full `StartWorkerInput` dump.
-#[derive(Clone, bon::Builder)]
-#[builder(on(String, into))]
-pub struct StartWorkerInput {
-    pub run_id: String,
-    pub lease_id: String,
-    /// Slot the engine has already claimed for this worker (1-indexed,
-    /// matches the app's WorkersWorkspaceModel slot numbering). The
-    /// engine is the source of truth for slot allocation; an optional app
-    /// viewer attaches to the tmux worker in this slot.
-    pub slot_id: u8,
-    pub workspace_path: PathBuf,
-    pub events_socket_path: PathBuf,
-    /// Frontend (control) socket this engine bound. Exported as
-    /// `BOSS_SOCKET_PATH` so `boss` CLI verbs reach this engine even when a
-    /// driver has scoped `$HOME` (Grok's process-home sandbox). `None` skips
-    /// the export — tests that don't exercise CLI reachability. Must be the
-    /// bound path, never re-derived from `$BOSS_SOCKET_PATH` / `$HOME`.
-    pub frontend_socket_path: Option<PathBuf>,
-    /// Control-token file this engine wrote. Exported as
-    /// `BOSS_ENGINE_CONTROL_TOKEN_PATH` alongside [`Self::frontend_socket_path`]
-    /// so CLI discovery does not derive `<socket-stem>.control-token` (a
-    /// filename the engine never writes). Must be the bound path from
-    /// `resolve_engine_paths`, never re-derived from the socket stem.
-    /// `None` skips the export.
-    pub control_token_path: Option<PathBuf>,
-    pub boss_event_path: PathBuf,
-    pub initial_input: String,
-    /// Extra env vars to thread to the worker on top of the ones the
-    /// worker settings template injects (`BOSS_EVENTS_SOCKET`,
-    /// `BOSS_SOCKET_PATH`, `BOSS_ENGINE_CONTROL_TOKEN_PATH`,
-    /// `BOSS_LEASE_ID`).
-    #[builder(default)]
-    pub extra_env: Vec<(String, String)>,
-    /// Optional 2–4 word gerund summary to display in the pane
-    /// titlebar (e.g. `"fixing the fencer scraper"`). Set only when
-    /// the engine successfully called Claude to generate the phrase.
-    /// When absent, `task_title` is used for the fallback display.
-    pub title_summary: Option<String>,
-    /// Raw work-item title passed alongside `title_summary` so the
-    /// app can render `"<AgentName>: <task_title>"` when no gerund
-    /// summary is available (no API key or generation failed).
-    pub task_title: Option<String>,
-    /// Work-item linkage stamped onto the resulting `LiveWorkerState`
-    /// so `bossctl agents list` / `agents status` can resolve "the
-    /// worker on chore X" without prompting for a slot. `None` from
-    /// callers that don't have a work item (tests).
-    pub work_item_binding: Option<WorkItemBinding>,
-    /// The model that was actually passed to the claude CLI via `--model`.
-    /// Stamped onto `LiveWorkerState` at spawn so `bossctl agents list`
-    /// reports the real dispatched model instead of a hardcoded default.
-    pub model: String,
-    /// When `true`, the engine-injected CLAUDE.md includes a directive
-    /// to pass `--draft` to `gh pr create` by default. Sourced from
-    /// the `default_pr_draft_mode` per-installation setting.
-    #[builder(default)]
-    pub draft_pr_mode: bool,
-    /// Execution kind (e.g. `"chore_implementation"`, `"revision_implementation"`).
-    /// Forwarded to `WorkerSetupInput` so the worker settings file can
-    /// install kind-specific hook guards. Also stamped onto
-    /// `LiveWorkerState.kind` at registration so `bossctl agents list`
-    /// can render it without joining the execution table.
-    pub execution_kind: String,
-    /// Attributed worker pool for this run (`"main"`, `"automation"`, or
-    /// `"review"`). Stamped onto `LiveWorkerState.pool` at registration.
-    /// Production dispatch always sets this; tests may leave it `None`.
-    pub pool: Option<String>,
-    /// Task kind from the underlying work item (e.g. `"revision"`, `"chore"`).
-    /// `None` for non-task work items (products, projects).
-    /// Forwarded to `WorkerSetupInput` for defense-in-depth guard checks.
-    pub task_kind: Option<String>,
-    /// Worker kind — forwarded to `WorkerSetupInput` to select the per-kind
-    /// tool denylist. Defaults to [`WorkerKind::Standard`] for all
-    /// current callers; set to [`WorkerKind::Reviewer`] when spawning a
-    /// reviewer worker.
-    #[builder(default = WorkerKind::Standard)]
-    pub worker_kind: WorkerKind,
-    /// Resolved agent driver for this worker. Production callers look the
-    /// slug up once via [`crate::driver::DriverRegistry::require`] and pass
-    /// the same `Arc` into provision, spawn, and this struct so every trait
-    /// method on the run goes through one object. Tests may pass any
-    /// registered (or stub) driver.
-    pub driver: Arc<dyn AgentDriver>,
-    /// Required tmux owner for this local worker.
-    pub tmux_host: TmuxWorkerHost,
-    /// Forwarded to `WorkerSetupInput` — see that field's doc. Ignored
-    /// unless `worker_kind` is [`WorkerKind::Triage`].
-    #[builder(default)]
-    pub automation_outcome_proposals_seam_enabled: bool,
-    /// Forwarded to worker rules to gate operator question guidance.
-    #[builder(default)]
-    pub run_done_proposals_seam_enabled: bool,
-    /// Forwarded to worker rules so the Revisions `propose blocked` sentence
-    /// matches the revision prompt's seam-gated blocked channel.
-    #[builder(default)]
-    pub worker_signal_proposals_seam_enabled: bool,
-    /// Forwarded to `WorkerSetupInput` — see that field's doc. Ignored
-    /// unless `worker_kind` is [`WorkerKind::Reviewer`].
-    #[builder(default)]
-    pub is_review_supervisor: bool,
-    /// Forwarded to `WorkerSetupInput` — see that field's doc. Ignored
-    /// unless `worker_kind` is [`WorkerKind::Reviewer`].
-    #[builder(default)]
-    pub is_post_merge_reviewer: bool,
-    /// Forwarded to `WorkerSetupInput` — see that field's doc. Ignored
-    /// unless `worker_kind` is [`WorkerKind::AnswerAgent`].
-    #[builder(default)]
-    pub checkout_positioned_on_pr_head: bool,
-    /// Badge type, project, host, and start-time stamps for the resulting
-    /// `LiveWorkerState`. Production dispatch resolves these from the
-    /// execution; tests may leave them empty.
-    #[builder(default)]
-    pub live_metadata: boss_protocol::LiveWorkerMetadata,
-}
-
-#[derive(Debug)]
-pub struct StartedWorker {
-    pub slot_id: u8,
-    pub shell_pid: i32,
-    pub written_files: WrittenFiles,
-}
+pub use boss_execution_runner::host::{StartWorkerInput, StartedWorker};
 
 #[derive(Debug, Error)]
 pub enum StartWorkerError {

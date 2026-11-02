@@ -1,0 +1,109 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+RUNNER_DEPS = [
+    "//tools/boss/engine/ci-log-reader",
+    "//tools/boss/engine/conflict-diagnosis",
+    "//tools/boss/engine/design-doc-fetcher",
+    "//tools/boss/engine/driver",
+    "//tools/boss/engine/effort",
+    "//tools/boss/engine/gh-invocation",
+    "//tools/boss/engine/recovery",
+    "//tools/boss/engine/storage-values",
+    "//tools/boss/engine/structured-output",
+    "//tools/boss/engine/utility-model",
+    "//tools/boss/engine/pane-summary",
+    "//tools/boss/engine/utils",
+    "//tools/boss/engine/worker-bin",
+    "//tools/boss/engine/execution-contracts",
+    "//tools/boss/engine/feature-flags",
+    "//tools/boss/gh_telemetry",
+    "//tools/boss/github",
+    "//tools/boss/engine/host-execution",
+    "//tools/boss/log-files",
+    "//tools/boss/engine/pr-review",
+    "//tools/boss/engine/pr-review-sources",
+    "//tools/boss/engine/pr-template",
+    "//tools/boss/protocol",
+    "//tools/boss/engine/review-guide",
+    "//tools/boss/engine/ssh-transport",
+    "//tools/boss/tmux",
+    "//tools/boss/engine/work-db",
+    "//lib/rust/git_utils",
+]
+
+rust_library(
+    name = "execution-runner",
+    srcs = glob(["src/**/*.rs"]),
+    compile_data = ["//:CHECKS.yaml"],
+    crate_name = "boss_execution_runner",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    rustc_env = {"BOSS_CHECKS_YAML": "$(execpath //:CHECKS.yaml)"},
+    visibility = ["//tools/boss/engine/core:__pkg__"],
+    deps = RUNNER_DEPS + all_crate_deps(normal = True),
+)
+
+rust_library(
+    name = "runner_test_support",
+    testonly = True,
+    srcs = glob(["src/**/*.rs"]),
+    aliases = {
+        "//tools/boss/engine/pane-summary:pane_summary_test_support": "boss_pane_summary",
+        "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
+        "//tools/boss/engine/execution-contracts:execution_contracts_test_support": "boss_execution_contracts",
+    },
+    compile_data = ["//:CHECKS.yaml"],
+    crate_features = ["test-support"],
+    crate_name = "boss_execution_runner_test_support",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    rustc_env = {"BOSS_CHECKS_YAML": "$(execpath //:CHECKS.yaml)"},
+    visibility = ["//tools/boss/engine/core:__pkg__"],
+    deps = [d for d in RUNNER_DEPS if d not in [
+        "//tools/boss/engine/pane-summary",
+        "//tools/boss/engine/work-db",
+        "//tools/boss/engine/execution-contracts",
+    ]] + [
+        "//tools/boss/engine/execution-contracts:execution_contracts_test_support",
+        "//tools/boss/engine/pane-summary:pane_summary_test_support",
+        "//tools/boss/engine/work-db:work_db_test_support",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "runner_test",
+    size = "small",
+    timeout = "moderate",
+    aliases = {
+        "//tools/boss/engine/pane-summary:pane_summary_test_support": "boss_pane_summary",
+        "//tools/boss/engine/work-db": "boss_work_db_production",
+        "//tools/boss/engine/pane-summary": "boss_pane_summary_production",
+        "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
+    },
+    crate = ":execution-runner",
+    edition = "2024",
+    env = {"HOME": "/tmp"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//tools/boss/engine/pane-summary:pane_summary_test_support",
+        "//tools/boss/engine/prose-vocabulary",
+        "//tools/boss/engine/work-db:work_db_test_support",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//tools/boss/engine/core:__pkg__"],
+)

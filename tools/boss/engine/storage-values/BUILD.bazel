@@ -13,10 +13,12 @@ rust_library(
     visibility = [
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/execution-contracts:__pkg__",
+        "//tools/boss/engine/execution-runner:__pkg__",
         "//tools/boss/engine/work-db:__pkg__",
     ],
     deps = [
         "//tools/boss/engine/effort",
+        "//tools/boss/engine/pr-template",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
 )
@@ -32,6 +34,7 @@ rust_test(
     ),
     deps = [
         "//tools/boss/engine/effort",
+        "//tools/boss/engine/pr-template",
         "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,

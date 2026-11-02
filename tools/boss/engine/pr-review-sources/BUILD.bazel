@@ -12,6 +12,7 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/execution-runner:__pkg__",
         "//tools/boss/engine/review-guide:__pkg__",
         "//tools/boss/engine/work-db:__pkg__",
     ],
