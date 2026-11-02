@@ -1374,6 +1374,12 @@ pub enum FrontendEvent {
     DriverQuotaUsageResult {
         snapshot: DriverQuotaSnapshot,
     },
+    /// Response to [`FrontendRequest::GetDispatchFocus`] and
+    /// [`FrontendRequest::UpdateDispatchFocus`]: the focus set as it stands
+    /// after the request, and how many ready executions it is holding.
+    DispatchFocusResult {
+        focus: DispatchFocusState,
+    },
     /// Response to [`FrontendRequest::SetDispatchPaused`] and
     /// [`FrontendRequest::GetDispatchState`]. Carries the current pause state
     /// and, when paused, the epoch-seconds timestamp at which it was set.

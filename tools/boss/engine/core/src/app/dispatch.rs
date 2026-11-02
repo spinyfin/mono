@@ -154,6 +154,7 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
         r @ FrontendRequest::GetCostWindowReport { .. } => Box::pin(cost::handle_get_cost_window_report(ctx, r)),
         r @ FrontendRequest::GetDecision { .. } => Box::pin(decisions::handle_get_decision(ctx, r)),
         r @ FrontendRequest::GetDispatchConcurrency => Box::pin(engine_meta::handle_get_dispatch_concurrency(ctx, r)),
+        r @ FrontendRequest::GetDispatchFocus => Box::pin(dispatch_focus::handle_get_dispatch_focus(ctx, r)),
         r @ FrontendRequest::GetDispatchState => Box::pin(engine_meta::handle_get_dispatch_state(ctx, r)),
         r @ FrontendRequest::GetOffsiteBackup => Box::pin(engine_meta::handle_get_offsite_backup(ctx, r)),
         r @ FrontendRequest::GetEngineHealth => Box::pin(engine_meta::handle_get_engine_health(ctx, r)),
@@ -324,6 +325,9 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
             Box::pin(engine_meta::handle_set_dispatch_concurrency(ctx, r))
         }
         r @ FrontendRequest::SetDispatchPaused { .. } => Box::pin(engine_meta::handle_set_dispatch_paused(ctx, r)),
+        r @ FrontendRequest::UpdateDispatchFocus { .. } => {
+            Box::pin(dispatch_focus::handle_update_dispatch_focus(ctx, r))
+        }
         r @ FrontendRequest::SetFeatureFlag { .. } => Box::pin(engine_meta::handle_set_feature_flag(ctx, r)),
         r @ FrontendRequest::SetHostEnabled { .. } => Box::pin(hosts::handle_set_host_enabled(ctx, r)),
         r @ FrontendRequest::SetLiveStatusEnabled { .. } => {

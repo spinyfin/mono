@@ -162,6 +162,7 @@ pub(super) fn kind(event: &FrontendEvent) -> &'static str {
         FrontendEvent::MetricsResetDone { .. } => "MetricsResetDone",
         FrontendEvent::PrReconcilersKicked { .. } => "PrReconcilersKicked",
         FrontendEvent::DispatchConcurrencyResult { .. } => "DispatchConcurrencyResult",
+        FrontendEvent::DispatchFocusResult { .. } => "DispatchFocusResult",
         FrontendEvent::DriverTrafficSplitResult { .. } => "DriverTrafficSplitResult",
         FrontendEvent::DriverQuotaUsageResult { .. } => "DriverQuotaUsageResult",
         FrontendEvent::DispatchStateResult { .. } => "DispatchStateResult",

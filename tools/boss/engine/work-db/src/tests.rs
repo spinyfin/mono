@@ -570,6 +570,7 @@ mod current_head_review_badge_tests;
 mod dead_chain_tail_tests;
 mod decision_tests;
 mod design_doc_audit_tests;
+mod dispatch_focus_tests;
 mod effort_model_tests;
 mod followup_membership_tests;
 mod human_driven_tests;

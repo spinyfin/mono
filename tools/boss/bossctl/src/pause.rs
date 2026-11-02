@@ -338,11 +338,43 @@ pub(super) async fn dispatch_set_paused(
     Ok(())
 }
 
+/// Focus mode alongside the pause state. A failure to read it (an engine
+/// that predates focus mode) must not hide the pause state, so it is
+/// reported in place instead of failing the command.
+async fn focus_report(socket_path: &Option<String>) -> Result<boss_protocol::DispatchFocusState, String> {
+    super::focus::get_focus(socket_path)
+        .await
+        .map_err(|err| format!("{err:#}"))
+}
+
+fn print_focus_report(focus: &Result<boss_protocol::DispatchFocusState, String>) {
+    match focus {
+        Ok(focus) => {
+            for line in super::focus::focus_lines(focus) {
+                println!("{line}");
+            }
+        }
+        Err(err) => println!("focus: unavailable ({err})"),
+    }
+}
+
+fn focus_report_json(focus: &Result<boss_protocol::DispatchFocusState, String>) -> serde_json::Value {
+    match focus {
+        Ok(focus) => super::focus::focus_json(focus),
+        Err(err) => serde_json::json!({ "error": err }),
+    }
+}
+
 pub(super) async fn dispatch_state(socket_path: &Option<String>, json: bool) -> Result<()> {
     let state = get_dispatch_state_raw(socket_path).await?;
+    let focus = focus_report(socket_path).await;
     if json {
-        println!("{}", state.to_json());
-    } else if state.paused {
+        let mut value = state.to_json();
+        value["focus"] = focus_report_json(&focus);
+        println!("{value}");
+        return Ok(());
+    }
+    if state.paused {
         let since_str = state
             .paused_since_epoch_s
             .map(|s| format!("  paused_since: epoch {s}"))
@@ -366,6 +398,7 @@ pub(super) async fn dispatch_state(socket_path: &Option<String>, json: bool) -> 
     } else {
         println!("state: running");
     }
+    print_focus_report(&focus);
     Ok(())
 }
 
@@ -558,12 +591,14 @@ pub(super) async fn unified_state(socket_path: &Option<String>, json: bool) -> R
     let dispatch = get_dispatch_state_raw(socket_path).await?;
     let automation = get_automation_state_raw(socket_path).await?;
     let spawn_failure_streaks = get_spawn_failure_streaks_raw(socket_path).await?;
+    let focus = focus_report(socket_path).await;
 
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "dispatch": dispatch.to_json(),
+                "focus": focus_report_json(&focus),
                 "automation": {
                     "paused": automation.paused,
                     "paused_since_epoch_s": automation.paused_since_epoch_s,
@@ -594,6 +629,7 @@ pub(super) async fn unified_state(socket_path: &Option<String>, json: bool) -> R
             println!("            scope: {}", scope.as_str());
             println!("            {reviews}");
         }
+        print_focus_report(&focus);
         println!(
             "automation: {}",
             format_state_summary(automation.paused, automation.paused_since_epoch_s)

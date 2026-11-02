@@ -169,7 +169,18 @@ impl ExecutionCoordinator {
                         continue;
                     }
                 };
-                let stranded = coordinator.stranded_ready_executions(&ready, interval_ms);
+                let mut stranded = coordinator.stranded_ready_executions(&ready, interval_ms);
+                // A row the focus set is holding is queued on purpose, not
+                // stranded; reporting it would warn every beat for as long as
+                // focus mode stays on.
+                let focus = coordinator.dispatch_focus();
+                if focus.is_active() && !stranded.is_empty() {
+                    let held = coordinator
+                        .work_db
+                        .executions_outside_dispatch_focus(&ready, &focus)
+                        .unwrap_or_default();
+                    stranded.retain(|(id, _)| !held.contains(id));
+                }
                 if !stranded.is_empty() {
                     tracing::warn!(
                         count = stranded.len(),
@@ -1078,6 +1089,36 @@ impl ExecutionCoordinator {
             }
         }
 
+        // Dispatch focus gate (`bossctl dispatch focus`): while the focus set
+        // is non-empty, only rows whose work is in scope may be admitted;
+        // the rest stay `ready` with the `focus_mode` wait reason, exactly as
+        // they would under the pause or the concurrency cap. Resolved once
+        // per pass so "which rows are held" cannot change mid-pass.
+        //
+        // This runs AFTER the pause gate above and only ever holds more: a
+        // paused engine already returned (all-spawns) or holds non-review
+        // rows below with `dispatch_paused`, which keeps precedence for the
+        // reason a row shows — focus never admits what a pause holds.
+        // `bossctl agents launch` (`force_dispatch`) never passes through
+        // here, so it bypasses focus exactly as it bypasses the pause.
+        // Failing to resolve scope holds everything: admitting a row we could
+        // not prove in scope would break the one promise focus makes.
+        let focus = self.dispatch_focus();
+        let out_of_focus: HashSet<String> = if focus.is_active() {
+            match self.work_db.executions_outside_dispatch_focus(&executions, &focus) {
+                Ok(ids) => ids,
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        "drain_ready_queue: failed to resolve dispatch focus scope — holding every ready row"
+                    );
+                    executions.iter().map(|e| e.id.clone()).collect()
+                }
+            }
+        } else {
+            HashSet::new()
+        };
+
         let mut main_pool_exhausted = false;
         let mut auto_pool_exhausted = false;
         let mut review_pool_exhausted = false;
@@ -1114,7 +1155,7 @@ impl ExecutionCoordinator {
         // winning against every other row counted for its pool here.
         let pool_ready_counts: HashMap<&'static str, usize> = {
             let mut counts: HashMap<&'static str, usize> = HashMap::new();
-            for execution in &executions {
+            for execution in executions.iter().filter(|e| !out_of_focus.contains(&e.id)) {
                 let is_review = self.execution_targets_review_pool(execution);
                 let is_automation = !is_review && self.execution_targets_automation_pool(execution);
                 let label = if is_review {
@@ -1197,6 +1238,18 @@ impl ExecutionCoordinator {
             // claim ANY slot, home or spilled.
             if automation_paused && is_automation {
                 changed_waits.extend(self.record_dispatch_wait_reason(&execution, "automation_paused", None));
+                continue;
+            }
+
+            // Outside the dispatch focus set: hold, never drop. The row keeps
+            // its `ready` execution untouched and dispatches on a later pass
+            // once focus is cleared or its project/product is added.
+            if out_of_focus.contains(&execution.id) {
+                changed_waits.extend(self.record_dispatch_wait_reason(
+                    &execution,
+                    boss_protocol::DISPATCH_WAIT_REASON_FOCUS_MODE,
+                    None,
+                ));
                 continue;
             }
 

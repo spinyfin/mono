@@ -139,6 +139,7 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::GetCostWindowReport { .. }
         | FrontendRequest::GetDecision { .. }
         | FrontendRequest::GetDispatchConcurrency
+        | FrontendRequest::GetDispatchFocus
         | FrontendRequest::GetDispatchState
         | FrontendRequest::GetDriverQuotaUsage { .. }
         | FrontendRequest::GetCodexSolPercentage
@@ -221,6 +222,7 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::SetCoordinatorHandoff { .. }
         | FrontendRequest::SetDispatchConcurrency { .. }
         | FrontendRequest::SetDispatchPaused { .. }
+        | FrontendRequest::UpdateDispatchFocus { .. }
         | FrontendRequest::SetCodexSolPercentage { .. }
         | FrontendRequest::SetDriverTrafficSplit { .. }
         | FrontendRequest::SetFeatureFlag { .. }

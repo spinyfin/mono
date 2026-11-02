@@ -1960,6 +1960,15 @@ pub fn run_diagnose(
         }
     }
 
+    // Focus mode can hold a ready execution without any dispatch event
+    // saying so (the hold is a wait reason, not a stream stage), so diagnose
+    // reads it from state.db and says it outright.
+    let focus_diagnosis = db.and_then(|work_db| {
+        crate::focus::FocusDiagnosis::load(work_db, &scope.execution_ids)
+            .map_err(|err| eprintln!("warning: dispatch focus lookup skipped: {err:#}"))
+            .ok()
+    });
+
     let mut findings = match_dispatch_signatures(&events, now_ms, Some(&fleet), Some(&db_facts), &scope_execs);
 
     match load_scope_trace_records(root, &scope_execs, &scope_items) {
@@ -2042,6 +2051,9 @@ pub fn run_diagnose(
             payload.insert("events".into(), events_value);
         }
         payload.insert("timelines".into(), Value::Object(timelines));
+        if let Some(focus) = &focus_diagnosis {
+            payload.insert("focus".into(), focus.to_json());
+        }
         println!("{}", Value::Object(payload));
         return Ok(());
     }
@@ -2071,6 +2083,12 @@ pub fn run_diagnose(
     // learns it had holes has already formed the conclusion this is meant to
     // prevent.
     integrity.print_banner();
+
+    if let Some(focus) = focus_diagnosis.as_ref().filter(|f| f.focus.is_active()) {
+        for line in focus.lines() {
+            println!("{line}");
+        }
+    }
 
     if events.is_empty() && findings.is_empty() {
         // "Nothing here" is precisely the conclusion damage invalidates, so it

@@ -952,6 +952,15 @@ pub struct ExecutionCoordinator {
     /// sites) to become `async`.
     #[builder(default)]
     dispatch_pause: std::sync::Mutex<Option<DispatchPause>>,
+    /// The dispatch focus set (see `boss_protocol::DispatchFocus`): while it
+    /// is non-empty, `drain_ready_queue` admits only rows whose work is in
+    /// scope and holds the rest with the `focus_mode` wait reason. A pure
+    /// admission gate, independent of [`Self::dispatch_pause`]: it can only
+    /// hold more, never admit what a pause holds. Seeded from the engine
+    /// metadata KV at startup and persisted on every change by
+    /// `handle_update_dispatch_focus`.
+    #[builder(default)]
+    dispatch_focus: std::sync::Mutex<boss_protocol::DispatchFocus>,
     /// Execution ids `drain_ready_queue`'s pause gate must let through this
     /// pass even though [`Self::is_dispatch_paused`] is `true` — the
     /// in-memory, never-persisted mechanism behind the pause-only

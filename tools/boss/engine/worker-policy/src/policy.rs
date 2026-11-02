@@ -470,6 +470,7 @@ fn worker_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::GetCodexSolPercentage
         | FrontendRequest::GetDriverTrafficSplit
         | FrontendRequest::GetDispatchConcurrency
+        | FrontendRequest::GetDispatchFocus
         | FrontendRequest::GetDispatchState
         | FrontendRequest::GetEngineHealth
         | FrontendRequest::GetEnginePoolConfig
@@ -507,6 +508,7 @@ fn worker_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::SetDriverTrafficSplit { .. }
         | FrontendRequest::SetDispatchConcurrency { .. }
         | FrontendRequest::SetDispatchPaused { .. }
+        | FrontendRequest::UpdateDispatchFocus { .. }
         | FrontendRequest::SetFeatureFlag { .. }
         | FrontendRequest::SetLiveStatusEnabled { .. }
         | FrontendRequest::SetSetting { .. }

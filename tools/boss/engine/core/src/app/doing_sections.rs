@@ -140,11 +140,13 @@ impl ServerState {
     pub(super) fn queued_dispatch_snapshot(&self) -> BTreeMap<String, QueuedDispatch> {
         let coordinator = &self.execution_coordinator;
         let pause = coordinator.dispatch_pause();
+        let focus = coordinator.dispatch_focus();
         let pool_of = |execution: &WorkExecution| coordinator.dispatch_pool_for(execution);
         let chain_blocked = |execution: &WorkExecution| coordinator.is_chain_blocked(execution);
         let gate = DispatchGate {
             pause: pause.as_ref(),
             automation_paused: coordinator.is_automation_paused(),
+            focus: &focus,
             pool_of: &pool_of,
             chain_blocked: &chain_blocked,
         };

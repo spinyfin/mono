@@ -309,6 +309,7 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::MetricsResetDone { .. }
         | FrontendEvent::PrReconcilersKicked { .. }
         | FrontendEvent::DispatchConcurrencyResult { .. }
+        | FrontendEvent::DispatchFocusResult { .. }
         | FrontendEvent::DriverQuotaUsageResult { .. }
         | FrontendEvent::DriverTrafficSplitResult { .. }
         | FrontendEvent::CodexSolPercentage { .. }

@@ -84,6 +84,7 @@ mod critical_requests;
 mod decisions;
 mod dependencies;
 mod design_docs;
+mod dispatch_focus;
 mod doing_sections;
 mod effort;
 mod engine_meta;
@@ -1966,6 +1967,9 @@ impl ServerState {
                 ),
             }
         }
+        // Restore the dispatch focus set before the first scheduler kick, so
+        // a restart never lets out-of-scope rows through while focus is on.
+        dispatch_focus::restore_persisted_dispatch_focus(&server_state);
         timeline.mark("coordinator_and_subsystems");
         timeline.finish();
 

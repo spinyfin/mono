@@ -2239,6 +2239,17 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "sol_comparison_report",
         },
         TagCase {
+            label: "DispatchFocusResult",
+            event: FrontendEvent::DispatchFocusResult {
+                focus: crate::DispatchFocusState {
+                    active: false,
+                    targets: vec![],
+                    held_count: 0,
+                },
+            },
+            expected_tag: "dispatch_focus_result",
+        },
+        TagCase {
             label: "DriverQuotaUsageResult",
             event: FrontendEvent::DriverQuotaUsageResult {
                 snapshot: DriverQuotaSnapshot::default(),
@@ -2405,6 +2416,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::MetricsResetDone { .. }
         | FrontendEvent::PrReconcilersKicked { .. }
         | FrontendEvent::DispatchConcurrencyResult { .. }
+        | FrontendEvent::DispatchFocusResult { .. }
         | FrontendEvent::DriverTrafficSplitResult { .. }
         | FrontendEvent::CodexSolPercentage { .. }
         | FrontendEvent::SolComparisonReport { .. }

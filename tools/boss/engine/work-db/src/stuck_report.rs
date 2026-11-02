@@ -118,6 +118,7 @@ fn build(conn: &Connection, minimum_age_secs: i64, now: i64) -> Result<(StuckRep
                     | "interactive_concurrency_cap"
                     | "dispatch_paused"
                     | "automation_paused"
+                    | "focus_mode"
                     | "slot_busy"
             )
         ) || wait
@@ -361,7 +362,7 @@ pub(super) fn classification(conn: &Connection, task: &Task, wait: Option<&str>)
     // A queued execution means a start was already requested, so the item is
     // waiting on dispatch even when autostart is off.
     if let Some(wait) = wait {
-        let kind = if matches!(wait, "dispatch_paused" | "automation_paused") {
+        let kind = if matches!(wait, "dispatch_paused" | "automation_paused" | "focus_mode") {
             "S23_global_hold"
         } else {
             "S20_dispatch_wait"

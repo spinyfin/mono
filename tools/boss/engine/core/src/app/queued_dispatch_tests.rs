@@ -73,6 +73,7 @@ fn classify_with_chain_blocked(
         &DispatchGate {
             pause,
             automation_paused,
+            focus: &boss_protocol::DispatchFocus::default(),
             pool_of: &pool_of,
             chain_blocked: &|execution| chain_blocked_tasks.contains(&execution.work_item_id.as_str()),
         },
@@ -554,4 +555,60 @@ async fn the_order_is_not_replaced_mid_claim_and_recovers_after_release() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     panic!("order never caught up after the claim was released");
+}
+
+/// Rows outside the focus set are held by the drain, so the board must not
+/// rank them (or call one of them "next up").
+#[test]
+fn rows_outside_the_focus_set_have_no_position() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db).id;
+    let focused_project = db
+        .create_project(boss_protocol::CreateProjectInput {
+            product_id: product.clone(),
+            name: "Focused".to_owned(),
+            description: None,
+            goal: None,
+            autostart: false,
+            no_design_task: true,
+            design_reasoning_effort_xhigh: false,
+        })
+        .unwrap()
+        .id;
+    insert_task(&db, &product, "task_in_focus", "chore", "cli", "medium");
+    insert_task(&db, &product, "task_outside", "chore", "cli", "critical");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET project_id = ?1 WHERE id = 'task_in_focus'",
+            [&focused_project],
+        )
+        .unwrap();
+    ready_execution(&db, "task_outside", "1000");
+    ready_execution(&db, "task_in_focus", "1001");
+    let mut focus = boss_protocol::DispatchFocus::default();
+    focus.insert(
+        boss_protocol::DispatchFocusTargetKind::Project,
+        focused_project.to_owned(),
+    );
+
+    let pool_of = |_: &WorkExecution| DispatchPool::Main;
+    let entries = classify_queued_dispatch(
+        &db,
+        &DispatchGate {
+            pause: None,
+            automation_paused: false,
+            focus: &focus,
+            pool_of: &pool_of,
+            chain_blocked: &|_| false,
+        },
+    );
+
+    assert_eq!(ranked(&entries), ["task_in_focus"]);
+    assert_eq!(entries["task_outside"].position, None);
+    assert!(
+        entries["task_in_focus"].next_up,
+        "the critical row outside focus does not take next_up"
+    );
+    assert!(!entries["task_outside"].next_up);
 }

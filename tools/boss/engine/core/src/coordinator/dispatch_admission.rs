@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use anyhow::bail;
 use boss_protocol::{
     ADMISSION_BLOCKER_AUTOSTART_DISABLED, ADMISSION_BLOCKER_CHURN_GUARD_PARKED, ADMISSION_BLOCKER_DELIBERATE_PARKED,
-    ADMISSION_BLOCKER_INELIGIBLE_STATUS, ADMISSION_BLOCKER_INTERACTIVE_CONCURRENCY_CAP,
+    ADMISSION_BLOCKER_FOCUS_MODE, ADMISSION_BLOCKER_INELIGIBLE_STATUS, ADMISSION_BLOCKER_INTERACTIVE_CONCURRENCY_CAP,
     ADMISSION_BLOCKER_UNMET_DEPENDENCY, DispatchAdmission, DispatchAdmissionBlocker, DispatchAdmissionEntryPoint,
     DispatchPauseSnapshot, RequestExecutionInput,
 };
@@ -177,6 +177,27 @@ impl ExecutionCoordinator {
                 message:
                     "deliberately parked after a blocked declaration (an explicit start resumes this, force or not)"
                         .to_string(),
+            });
+        }
+        // Dispatch focus mode holds every row outside the focus set, and a
+        // pause-only force start does not override it (`bossctl agents
+        // launch` is the explicit bypass). Resolution failure reads as out of
+        // scope, matching the drain's fail-closed rule.
+        let focus = self.dispatch_focus();
+        if facts.ineligible_reason.is_none()
+            && focus.is_active()
+            && !self
+                .work_db
+                .work_item_in_dispatch_focus(&facts.resolved_work_item_id, &focus)
+                .unwrap_or(false)
+        {
+            blockers.push(DispatchAdmissionBlocker {
+                code: ADMISSION_BLOCKER_FOCUS_MODE.to_string(),
+                message: format!(
+                    "dispatch focus mode is on and {} is outside the focus set — add its project or product with \
+                     `bossctl dispatch focus add`, clear focus, or use `bossctl agents launch`",
+                    facts.resolved_work_item_id
+                ),
             });
         }
         // The interactive concurrency cap only governs main-pool work, and

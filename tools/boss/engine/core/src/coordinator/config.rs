@@ -73,6 +73,7 @@ impl ExecutionCoordinator {
             execution_started_hook: Arc::new(NoopExecutionStartedHook),
             automation_preemptor: Arc::new(NoopAutomationPreemptor),
             dispatch_pause: std::sync::Mutex::new(None),
+            dispatch_focus: std::sync::Mutex::new(boss_protocol::DispatchFocus::default()),
             dispatch_pause_bypass_execution_ids: std::sync::Mutex::new(HashSet::new()),
             requested_host_ids: std::sync::Mutex::new(HashMap::new()),
             dispatch_preflight_block_reason: std::sync::Mutex::new(None),
@@ -557,6 +558,35 @@ impl ExecutionCoordinator {
     /// way to be sure they describe the same instant.
     pub fn dispatch_pause(&self) -> Option<DispatchPause> {
         self.dispatch_pause.lock().unwrap().clone()
+    }
+
+    /// The current dispatch focus set (empty when focus mode is off).
+    pub fn dispatch_focus(&self) -> boss_protocol::DispatchFocus {
+        self.dispatch_focus.lock().unwrap().clone()
+    }
+
+    /// Replace the dispatch focus set and kick the scheduler so rows that
+    /// just came into scope (or out of a cleared focus) dispatch now rather
+    /// than at the next heartbeat. The caller persists the new set.
+    pub fn set_dispatch_focus(self: &Arc<Self>, focus: boss_protocol::DispatchFocus) {
+        *self.dispatch_focus.lock().unwrap() = focus;
+        self.kick();
+    }
+
+    /// Seed the focus set at startup, before the first drain. Unlike
+    /// [`Self::set_dispatch_focus`] this does not kick the scheduler.
+    pub fn restore_dispatch_focus(&self, focus: boss_protocol::DispatchFocus) {
+        *self.dispatch_focus.lock().unwrap() = focus;
+    }
+
+    /// Ready executions the current focus set holds back right now.
+    pub fn focus_held_count(&self) -> Result<usize> {
+        let focus = self.dispatch_focus();
+        if !focus.is_active() {
+            return Ok(0);
+        }
+        let ready = self.work_db.list_ready_executions()?;
+        Ok(self.work_db.executions_outside_dispatch_focus(&ready, &focus)?.len())
     }
 
     /// `true` when dispatch is globally paused.
