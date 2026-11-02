@@ -20,6 +20,7 @@ rust_library(
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/design-doc-fetcher:__pkg__",
         "//tools/boss/engine/design-docs:__pkg__",
+        "//tools/boss/engine/execution-runner:__pkg__",
         "//tools/boss/engine/host-execution:__pkg__",
         "//tools/boss/engine/recovery:__pkg__",
         "//tools/boss/engine/work-db:__pkg__",

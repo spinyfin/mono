@@ -33,7 +33,7 @@ pub(crate) fn followup_kind_label(created_via: &str, task_kind: &TaskKind) -> St
     }
 }
 
-pub(crate) fn work_item_name(work_item: &WorkItem) -> &str {
+pub fn work_item_name(work_item: &WorkItem) -> &str {
     match work_item {
         WorkItem::Product(product) => &product.name,
         WorkItem::Project(project) => &project.name,
@@ -52,7 +52,7 @@ pub(crate) fn work_item_id(work_item: &WorkItem) -> &str {
 /// Return the task `kind` string (e.g. `"revision"`, `"chore"`) for task
 /// work items. Returns `None` for products and projects, which have no
 /// task-kind concept.
-pub(crate) fn work_item_task_kind(work_item: &WorkItem) -> Option<&str> {
+pub fn work_item_task_kind(work_item: &WorkItem) -> Option<&str> {
     match work_item {
         WorkItem::Task(task) | WorkItem::Chore(task) => Some(task.kind.as_str()),
         WorkItem::Product(_) | WorkItem::Project(_) => None,
@@ -78,7 +78,7 @@ pub(crate) fn work_item_task_kind_enum(work_item: &WorkItem) -> Option<&TaskKind
 /// a reason to publish an unlinked PR. Other kinds that merely record an
 /// origin PR number (plain chores) lose only the provenance header when the
 /// remote is not a github.com URL — they stay dispatchable.
-pub(crate) fn followup_pr_backlink(
+pub fn followup_pr_backlink(
     task_kind: &TaskKind,
     created_via: &str,
     origin_pr_number: Option<i64>,
@@ -93,7 +93,9 @@ pub(crate) fn followup_pr_backlink(
     if pr_number <= 0 {
         bail!("followup task has invalid origin PR number {pr_number}; refusing to open an unlinked derived PR");
     }
-    let slug = match crate::completion::parse_repo_slug(repo_remote_url) {
+    let slug = match git_utils::repo_slug::parse_github_owner_repo(repo_remote_url)
+        .map(|(owner, repo)| format!("{owner}/{repo}"))
+    {
         Ok(slug) => slug,
         Err(err) if *task_kind == TaskKind::Followup => {
             bail!("could not resolve origin PR URL for followup task: {err}");
@@ -156,7 +158,7 @@ pub(crate) fn work_item_pr_url(work_item: &WorkItem) -> Option<&str> {
 /// The reconciler path (`reconciler_attach_pr_url`) is responsible for
 /// populating `task.pr_url` before dispatch; if it has not done so yet
 /// the dispatcher should treat the task as PR-less and start fresh.
-pub(crate) fn task_bound_pr_url(task: &crate::work::Task) -> Option<&str> {
+pub fn task_bound_pr_url(task: &crate::work::Task) -> Option<&str> {
     task.pr_url.as_deref().filter(|u| !u.is_empty())
 }
 

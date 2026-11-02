@@ -1,0 +1,56 @@
+[package]
+name = "boss-execution-runner"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+test-support = []
+
+[dependencies]
+boss-claude-client = { path = "../../claude_client" }
+boss-ci-log-reader = { path = "../ci-log-reader" }
+boss-conflict-diagnosis = { path = "../conflict-diagnosis" }
+boss-design-doc-fetcher = { path = "../design-doc-fetcher" }
+boss-engine-driver = { path = "../driver" }
+boss-engine-effort = { path = "../effort" }
+boss-engine-gh-invocation = { path = "../gh-invocation" }
+boss-engine-recovery = { path = "../recovery" }
+boss-engine-storage-values = { path = "../storage-values" }
+boss-engine-structured-output = { path = "../structured-output" }
+boss-engine-utility-model = { path = "../utility-model" }
+boss-engine-utils = { path = "../utils" }
+boss-engine-worker-bin = { path = "../worker-bin" }
+boss-execution-contracts = { path = "../execution-contracts" }
+boss-feature-flags = { path = "../feature-flags" }
+boss-gh-telemetry = { path = "../../gh_telemetry" }
+boss-github = { path = "../../github" }
+boss-host-execution = { path = "../host-execution" }
+boss-log-files = { path = "../../log-files" }
+boss-pr-review = { path = "../pr-review" }
+boss-pr-review-sources = { path = "../pr-review-sources" }
+boss-pr-template = { path = "../pr-template" }
+boss-protocol = { path = "../../protocol" }
+boss-review-guide = { path = "../review-guide" }
+boss-ssh-transport = { path = "../ssh-transport" }
+boss-tmux = { path = "../../tmux" }
+boss-work-db = { path = "../work-db" }
+git-utils = { path = "../../../../lib/rust/git_utils" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bon = { workspace = true }
+chrono = { workspace = true }
+libc = "0.2"
+regex = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rusqlite = { workspace = true }
+boss-work-db = { path = "../work-db", features = ["test-support"] }
+boss-prose-vocabulary = { path = "../prose-vocabulary" }
+tempfile = { workspace = true }
+wiremock = { workspace = true }

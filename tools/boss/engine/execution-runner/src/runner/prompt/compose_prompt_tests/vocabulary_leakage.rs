@@ -251,34 +251,3 @@ fn worker_prompts_for_every_dispatch_kind_avoid_internal_vocabulary() {
         failures.join("\n"),
     );
 }
-
-#[test]
-fn probe_and_nudge_texts_avoid_internal_vocabulary() {
-    use crate::completion::{
-        NO_OP_DECLARATION_REFUSED_PROBE, PROBE_EMPTY_PR, PROBE_NO_PR, PROBE_STALE_PR, WORKER_WAIT_NUDGE_DIRECTIVE,
-        probe_push_to_existing_pr,
-    };
-    let pr = "https://github.com/org/repo/pull/42";
-    for (label, text) in [
-        ("no PR probe", PROBE_NO_PR.to_owned()),
-        ("existing PR probe", probe_push_to_existing_pr(pr)),
-        ("stale PR probe", PROBE_STALE_PR.to_owned()),
-        ("empty PR probe", PROBE_EMPTY_PR.to_owned()),
-        ("refused no-op probe", NO_OP_DECLARATION_REFUSED_PROBE.to_owned()),
-        ("wait nudge directive", WORKER_WAIT_NUDGE_DIRECTIVE.to_owned()),
-        (
-            "declare-done probe",
-            crate::run_done_backstop::PROBE_DECLARE_DONE.to_owned(),
-        ),
-        (
-            "conflict still present probe",
-            crate::conflict_stop_gate::probe_conflict_still_present(pr, "CONFLICTING", "DIRTY"),
-        ),
-        (
-            "conflict mergeability unknown probe",
-            crate::conflict_stop_gate::probe_conflict_mergeability_unknown(pr),
-        ),
-    ] {
-        assert_no_forbidden_prose(label, &text);
-    }
-}

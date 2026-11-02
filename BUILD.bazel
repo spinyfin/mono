@@ -25,5 +25,8 @@ exports_files(
 # there.
 exports_files(
     ["CHECKS.yaml"],
-    visibility = ["//tools/boss/engine/core:__pkg__"],
+    visibility = [
+        "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/execution-runner:__pkg__",
+    ],
 )

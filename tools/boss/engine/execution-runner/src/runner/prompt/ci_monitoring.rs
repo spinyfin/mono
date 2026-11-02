@@ -3,11 +3,16 @@
 use crate::work::WorkExecution;
 
 /// Adds repository-specific human-gated checks to the shared CI policy in worker rules.
-pub(super) fn ci_monitoring_directive(execution: &WorkExecution) -> String {
+pub(super) fn ci_monitoring_directive(
+    execution: &WorkExecution,
+    review_signal_checks: fn(&str) -> &'static [&'static str],
+) -> String {
     let mut out = String::new();
-    if let Ok(slug) = crate::completion::parse_repo_slug(&execution.repo_remote_url) {
+    if let Ok(slug) = git_utils::repo_slug::parse_github_owner_repo(&execution.repo_remote_url)
+        .map(|(owner, repo)| format!("{owner}/{repo}"))
+    {
         let owner = slug.split('/').next().unwrap_or("");
-        let names = crate::merge_poller::review_signal_checks_for_owner(owner);
+        let names = review_signal_checks(owner);
         if !names.is_empty() {
             let rendered = names
                 .iter()

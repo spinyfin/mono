@@ -82,6 +82,7 @@ rust_library(
         "//tools/boss/client:__pkg__",
     ],
     deps = [
+        "//tools/boss/engine/execution-runner",
         "//tools/boss/engine/host-execution",
         "//tools/boss/engine/execution-contracts",
         "//lib/rust/git_utils",
@@ -257,6 +258,8 @@ rust_test(
     # crate inheritance keeps the production dependency; compile this test
     # against the fixture variant under its usual Rust name instead.
     aliases = {
+        "//tools/boss/engine/execution-runner": "boss_execution_runner_production",
+        "//tools/boss/engine/execution-runner:runner_test_support": "boss_execution_runner",
         "//tools/boss/engine/execution-contracts": "boss_execution_contracts_production",
         "//tools/boss/engine/execution-contracts:execution_contracts_test_support": "boss_execution_contracts",
         "//tools/boss/engine/work-db:work-db": "boss_work_db_production",
@@ -289,6 +292,7 @@ rust_test(
     shard_count = 11,
     deps = [
         "//tools/boss/engine/execution-contracts:execution_contracts_test_support",
+        "//tools/boss/engine/execution-runner:runner_test_support",
         "//tools/boss/engine/prose-vocabulary",
         "//tools/boss/engine/task-scope",
         "//tools/boss/engine/test-git",
@@ -306,6 +310,8 @@ network_enabled_rust_test(
     # crate inheritance keeps the production dependency; compile this test
     # against the fixture variant under its usual Rust name instead.
     aliases = {
+        "//tools/boss/engine/execution-runner": "boss_execution_runner_production",
+        "//tools/boss/engine/execution-runner:runner_test_support": "boss_execution_runner",
         "//tools/boss/engine/execution-contracts": "boss_execution_contracts_production",
         "//tools/boss/engine/execution-contracts:execution_contracts_test_support": "boss_execution_contracts",
         "//tools/boss/engine/work-db:work-db": "boss_work_db_production",
@@ -345,6 +351,7 @@ network_enabled_rust_test(
     tags = ["manual"],
     deps = [
         "//tools/boss/engine/execution-contracts:execution_contracts_test_support",
+        "//tools/boss/engine/execution-runner:runner_test_support",
         "//tools/boss/engine/prose-vocabulary",
         "//tools/boss/engine/task-scope",
         "//tools/boss/engine/test-git",
@@ -871,6 +878,7 @@ sh_test(
         "//tools/boss/app-macos:swift_sources",
         "//tools/boss/bossctl:srcs",
         "//tools/boss/engine/driver:srcs",
+        "//tools/boss/engine/execution-runner:srcs",
         "//tools/boss/protocol:srcs",
     ],
 )

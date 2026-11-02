@@ -42,7 +42,7 @@ pub(crate) const FAIL_CLOSED_REMOTE_MAX_ARG_STRLEN: usize = 128 * 1024;
 
 /// Exec-time limits the preflight budgets against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ExecArgLimits {
+pub struct ExecArgLimits {
     pub arg_max: usize,
     pub environment_bytes: usize,
     /// Per-argument cap. `Some` on Linux (`MAX_ARG_STRLEN`); `None` on
@@ -52,7 +52,7 @@ pub(crate) struct ExecArgLimits {
 
 impl ExecArgLimits {
     /// Limits measured on this engine host.
-    pub(crate) fn local() -> Result<Self> {
+    pub fn local() -> Result<Self> {
         Ok(Self {
             arg_max: local_arg_max()?,
             environment_bytes: environment_bytes(),
@@ -61,7 +61,7 @@ impl ExecArgLimits {
     }
 
     /// Linux-shaped fail-closed limits for a remote host we could not probe.
-    pub(crate) fn fail_closed_remote() -> Self {
+    pub fn fail_closed_remote() -> Self {
         Self {
             arg_max: FAIL_CLOSED_REMOTE_ARG_MAX,
             environment_bytes: REMOTE_ENVIRONMENT_BYTES_FALLBACK,
@@ -89,7 +89,7 @@ pub(crate) fn exec_arg_limits_from_probe(os: &str, arg_max: usize, page_size: us
 /// Parse `uname -s`, `ARG_MAX`, and `PAGE_SIZE` from a single probe line
 /// (`Linux 2097152 4096`). Returns `None` when any field is missing or
 /// unparseable so the caller can fail closed.
-pub(crate) fn parse_remote_exec_arg_limits_line(line: &str) -> Option<ExecArgLimits> {
+pub fn parse_remote_exec_arg_limits_line(line: &str) -> Option<ExecArgLimits> {
     let mut parts = line.split_whitespace();
     let os = parts.next()?;
     let arg_max = parts.next()?.parse::<usize>().ok().filter(|n| *n > 0)?;
@@ -143,11 +143,7 @@ pub(crate) fn check_launch_command_arg_max(command: &str, driver_name: &str) -> 
 
 /// Same preflight as [`check_launch_command_arg_max`], against the **target**
 /// host's exec limits (the remote spawn path).
-pub(crate) fn check_launch_command_arg_max_with_limits(
-    command: &str,
-    driver_name: &str,
-    limits: ExecArgLimits,
-) -> Result<()> {
+pub fn check_launch_command_arg_max_with_limits(command: &str, driver_name: &str, limits: ExecArgLimits) -> Result<()> {
     check_exec_arg_limits(command.len(), command.len(), &limits, driver_name)
 }
 

@@ -14,10 +14,15 @@ use boss_protocol::{EditorialRules, ExecutionKind, TaskKind, TemplatePolicy};
 
 use super::work_item::{project_details, work_item_details, work_item_name, work_item_pr_url};
 
+#[path = "prompt/block_boundary.rs"]
 mod block_boundary;
+#[path = "prompt/ci_monitoring.rs"]
 mod ci_monitoring;
+#[path = "prompt/design.rs"]
 mod design;
+#[path = "prompt/repo_gate.rs"]
 mod repo_gate;
+#[path = "prompt/revision_rebase.rs"]
 mod revision_rebase;
 use block_boundary::block_boundary_fragment;
 use ci_monitoring::ci_monitoring_directive;
@@ -26,6 +31,8 @@ pub(super) use revision_rebase::revision_conflict_notice;
 
 #[derive(bon::Builder)]
 pub(super) struct ExecutionPromptParams<'a> {
+    #[builder(default = |_| &[])]
+    pub review_signal_checks: fn(&str) -> &'static [&'static str],
     execution: &'a WorkExecution,
     work_item: &'a WorkItem,
     workspace_path: &'a Path,
@@ -133,7 +140,7 @@ pub(super) struct ExecutionPromptParams<'a> {
 /// gets its own path and env var (see [`structured_output_env_vars`]).
 /// Returns `None` for kinds with no designated payload (answer agent, CI
 /// remediation, plain design tasks).
-pub(crate) fn designated_output_kind(execution: &WorkExecution, work_item: &WorkItem) -> Option<StructuredOutputKind> {
+pub fn designated_output_kind(execution: &WorkExecution, work_item: &WorkItem) -> Option<StructuredOutputKind> {
     match execution.kind {
         ExecutionKind::PrReview => Some(StructuredOutputKind::ReviewResult),
         ExecutionKind::AutomationTriage => Some(StructuredOutputKind::TriageDecision),
@@ -204,6 +211,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
 
 fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
     let ExecutionPromptParams {
+        review_signal_checks,
         execution,
         work_item,
         parent_project,
@@ -280,7 +288,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         ));
     }
 
-    let expected_branch = crate::completion::expected_branch_name(
+    let expected_branch = boss_engine_storage_values::branch_identity::expected_branch_name(
         &execution.id,
         &execution.branch_naming,
         execution.worker_branch_prefix.as_deref(),
@@ -477,7 +485,8 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
             let pr_number = boss_github::pr_url::pr_number_from_url(pr_url)
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "?".into());
-            let repo_slug = crate::completion::parse_repo_slug(&execution.repo_remote_url)
+            let repo_slug = git_utils::repo_slug::parse_github_owner_repo(&execution.repo_remote_url)
+                .map(|(owner, repo)| format!("{owner}/{repo}"))
                 .unwrap_or_else(|_| "<owner/repo>".into());
             prompt.push_str(&format!(
                 "- Bound PR: {pr_url}; inspection command: `gh pr view {pr_number} -R {repo_slug}`.\n",
@@ -497,7 +506,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         // Issue #899: hand the worker the engine's CI-completion definition
         // so it stops once CI is effectively green rather than polling
         // forever on human-gated checks (e.g. LinkedIn's `Owner Approval`).
-        prompt.push_str(&ci_monitoring_directive(execution));
+        prompt.push_str(&ci_monitoring_directive(execution, review_signal_checks));
         // Incident 2026-07-02 (exec_18b5243e65ff188_2d): teach the
         // full escalation/blocker marker syntax so a well-formed marker is
         // the default, not a lucky accident — see the function doc for why.
@@ -922,7 +931,7 @@ fn pr_terminal_directive(seam_enabled: bool) -> String {
 
 /// Worker Stop-boundary escalation/blocker protocol directive. `seam_enabled`
 /// mirrors the `worker_signal_proposals_seam` feature flag — the same flag
-/// [`crate::completion::WorkerCompletionHandler::detect_and_file_worker_signals`]
+/// `completion::WorkerCompletionHandler::detect_and_file_worker_signals`
 /// reads for the engine's read path, threaded here so the two halves of the
 /// migration move together: a worker must never be taught a verb the engine
 /// won't yet read proposals-first for, and flipping the flag off must
@@ -959,7 +968,7 @@ fn pr_terminal_directive(seam_enabled: bool) -> String {
 /// which the coordinator's documented parser treats as malformed.
 ///
 /// See [`crate::worker_escalation`] for the legacy marker parser and
-/// [`crate::completion::WorkerCompletionHandler::detect_and_file_worker_signals`]
+/// `completion::WorkerCompletionHandler::detect_and_file_worker_signals`
 /// for what the engine does with either channel: files a coordinator-visible
 /// attention item and pauses the "produce a PR" auto-nudge until it is
 /// resolved (a coordinator probe on this run resolves it — see
@@ -1311,13 +1320,13 @@ pub(crate) fn run_done_directive(
 /// later. This directive gives deferred scope a parseable channel mirroring
 /// `[effort-escalation]`'s grammar; see [`crate::deferred_scope`] for the
 /// parser and
-/// [`crate::completion::WorkerCompletionHandler::detect_and_record_deferred_scope`]
+/// `completion::WorkerCompletionHandler::detect_and_record_deferred_scope`
 /// for what the engine does with it: appends a durable audit line to the
 /// work item's description and files a coordinator-visible attention item.
 ///
 /// `seam_enabled` mirrors the `deferred_scope_proposals_seam` feature flag —
 /// the same flag
-/// [`crate::completion::WorkerCompletionHandler::detect_and_record_deferred_scope`]
+/// `completion::WorkerCompletionHandler::detect_and_record_deferred_scope`
 /// reads for the engine's read path, threaded here so the two halves of the
 /// migration move together (design implementation task 9, following the
 /// recipe [`worker_escalation_protocol_directive`] established): a worker
@@ -1702,8 +1711,9 @@ fn compose_revision_directive(
     let pr_number = boss_github::pr_url::pr_number_from_url(parent_pr_url)
         .map(|n| n.to_string())
         .unwrap_or_else(|| "?".into());
-    let repo_slug =
-        crate::completion::parse_repo_slug(&execution.repo_remote_url).unwrap_or_else(|_| "<owner/repo>".to_owned());
+    let repo_slug = git_utils::repo_slug::parse_github_owner_repo(&execution.repo_remote_url)
+        .map(|(owner, repo)| format!("{owner}/{repo}"))
+        .unwrap_or_else(|_| "<owner/repo>".to_owned());
     // Bazel conflict-resolution revisions push as soon as the merged code
     // compiles (tests run in the PR's CI). Non-Bazel conflict revisions
     // must also run the repo's documented test commands. Other revisions
@@ -2896,4 +2906,5 @@ fn render_diagnosis_markdown(diagnosis: &ConflictDiagnosis) -> String {
 }
 
 #[cfg(test)]
+#[path = "prompt/compose_prompt_tests.rs"]
 mod compose_prompt_tests;

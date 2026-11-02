@@ -32,7 +32,7 @@ use boss_protocol::PaneMonitorSpec;
 /// Typed spawn-confirmation failure so the coordinator can classify the
 /// attention body without matching error-message substrings.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum SpawnConfirmationError {
+pub enum SpawnConfirmationError {
     #[error(
         "refusing to complete {driver_name} spawn for {run_id}: driver composer never became ready within {timeout_secs}s \
          (no driver signal or pane marker after prompt delivery); recording a failed spawn"
@@ -54,18 +54,18 @@ pub(crate) enum SpawnConfirmationError {
 }
 
 /// Walk an anyhow chain for a [`SpawnConfirmationError`].
-pub(crate) fn spawn_confirmation_error(err: &anyhow::Error) -> Option<&SpawnConfirmationError> {
+pub fn spawn_confirmation_error(err: &anyhow::Error) -> Option<&SpawnConfirmationError> {
     err.chain()
         .find_map(|cause| cause.downcast_ref::<SpawnConfirmationError>())
 }
 
 use crate::driver::{AgentDriver, ProgressIngress, ProgressObservationConfig};
-use crate::live_worker_state::LiveWorkerStateRegistry;
+use crate::host::DriverSignals;
 use crate::work::WorkDb;
 
 /// How long spawn may wait for driver-specific PTY evidence that the CLI
 /// is up. Sized well above a healthy driver's first paint (seconds) and
-/// well below [`crate::live_worker_state::DRIVER_START_GRACE_SECS`] so a
+/// well below `live_worker_state::DRIVER_START_GRACE_SECS` so a
 /// doomed exec is a spawn failure, not a five-minute `Spawning` hang.
 pub(crate) const COMPOSER_READY_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -77,13 +77,13 @@ pub(crate) const COMPOSER_READY_TIMEOUT: Duration = Duration::from_secs(20);
 /// Codex (and any other [`ProgressIngress::AgentJsonlFile`] driver) does
 /// not emit SessionStart: its first driver signal is rollout discovery,
 /// which the engine already budgets at
-/// [`crate::agent_jsonl_discovery::DISCOVERY_TIMEOUT`]. Use
+/// the injected discovery deadline. Use
 /// [`turn_start_timeout_for_driver`] rather than this constant at the
 /// spawn call site.
 pub(crate) const TURN_START_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Poll period for both waits.
-pub(crate) const SPAWN_CONFIRM_POLL: Duration = Duration::from_millis(100);
+pub const SPAWN_CONFIRM_POLL: Duration = Duration::from_millis(100);
 
 /// True when `pane_text` shows this driver's TUI is up. Only
 /// [`PaneMonitorSpec::agent_markers`] count: a bare composer glyph (Claude's
@@ -98,8 +98,8 @@ pub(crate) fn pane_shows_driver_ready(pane_text: &str, spec: &PaneMonitorSpec) -
 /// Turn-start wait for `driver`, sized from how that driver first proves
 /// it started. Hook-callback drivers use [`TURN_START_TIMEOUT`];
 /// [`ProgressIngress::AgentJsonlFile`] drivers use rollout
-/// [`crate::agent_jsonl_discovery::DISCOVERY_TIMEOUT`].
-pub(crate) fn turn_start_timeout_for_driver(driver: &dyn AgentDriver) -> Duration {
+/// the injected discovery deadline.
+pub fn turn_start_timeout_for_driver(driver: &dyn AgentDriver, discovery_timeout: Duration) -> Duration {
     let dummy = ProgressObservationConfig {
         events_socket_path: PathBuf::from("/dev/null"),
         lease_id: String::new(),
@@ -108,7 +108,7 @@ pub(crate) fn turn_start_timeout_for_driver(driver: &dyn AgentDriver) -> Duratio
         forwarder_binary: PathBuf::from("/dev/null"),
     };
     match driver.progress_observation_wiring(&dummy) {
-        ProgressIngress::AgentJsonlFile(_) => crate::agent_jsonl_discovery::DISCOVERY_TIMEOUT,
+        ProgressIngress::AgentJsonlFile(_) => discovery_timeout,
         ProgressIngress::HookCallback(_) | ProgressIngress::StdoutJsonl => TURN_START_TIMEOUT,
     }
 }
@@ -116,9 +116,9 @@ pub(crate) fn turn_start_timeout_for_driver(driver: &dyn AgentDriver) -> Duratio
 /// Fresh turn-start evidence for the **current** run of `execution_id`.
 /// A historical `work_runs` row with a transcript does not count; a driver
 /// hook that never persisted `transcript_path` does.
-pub(crate) fn current_run_has_turn_start_evidence(
+pub fn current_run_has_turn_start_evidence(
     db: &WorkDb,
-    live_states: Option<&LiveWorkerStateRegistry>,
+    live_states: Option<&dyn DriverSignals>,
     execution_id: &str,
 ) -> bool {
     if live_states.is_some_and(|registry| registry.has_driver_signal_for_run(execution_id)) {
@@ -150,7 +150,7 @@ where
     }
 }
 
-pub(crate) fn composer_not_ready_error(driver_name: &str, run_id: &str, timeout: Duration) -> anyhow::Error {
+pub fn composer_not_ready_error(driver_name: &str, run_id: &str, timeout: Duration) -> anyhow::Error {
     anyhow::Error::from(SpawnConfirmationError::ComposerNotReady {
         driver_name: driver_name.to_owned(),
         run_id: run_id.to_owned(),
@@ -158,7 +158,7 @@ pub(crate) fn composer_not_ready_error(driver_name: &str, run_id: &str, timeout:
     })
 }
 
-pub(crate) fn turn_did_not_start_error(driver_name: &str, run_id: &str, timeout: Duration) -> anyhow::Error {
+pub fn turn_did_not_start_error(driver_name: &str, run_id: &str, timeout: Duration) -> anyhow::Error {
     anyhow::Error::from(SpawnConfirmationError::TurnDidNotStart {
         driver_name: driver_name.to_owned(),
         run_id: run_id.to_owned(),
@@ -172,7 +172,7 @@ pub(crate) fn turn_did_not_start_error(driver_name: &str, run_id: &str, timeout:
 /// Phase 1 treats turn-start evidence as readiness: a driver hook is
 /// stronger proof the CLI exec'd than a scraped pane marker, so a spawn
 /// whose turn has already started is not reaped for missing chrome.
-pub(crate) async fn confirm_spawn_started<Ready, ReadyFut, Started, StartedFut>(
+pub async fn confirm_spawn_started<Ready, ReadyFut, Started, StartedFut>(
     driver_name: &str,
     run_id: &str,
     composer_timeout: Duration,
@@ -211,7 +211,7 @@ where
 
 /// Remote turn-start wait: same [`wait_until`] loop as the local path, then
 /// `reap` (pid kill) when no evidence arrives.
-pub(crate) async fn confirm_turn_start_or_reap<Started, StartedFut, Reap, ReapFut>(
+pub async fn confirm_turn_start_or_reap<Started, StartedFut, Reap, ReapFut>(
     driver_name: &str,
     run_id: &str,
     timeout: Duration,
@@ -236,7 +236,6 @@ where
 mod tests {
     use super::*;
     use crate::driver::{AgentDriver, ClaudeDriver, CodexDriver, GrokDriver};
-    use crate::live_worker_state::{DriverSignalKind, LiveWorkerStateRegistry};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -296,18 +295,19 @@ mod tests {
 
     #[test]
     fn turn_start_timeout_follows_the_driver_ingress() {
+        let discovery_timeout = Duration::from_secs(123);
         assert_eq!(
-            turn_start_timeout_for_driver(&ClaudeDriver),
+            turn_start_timeout_for_driver(&ClaudeDriver, discovery_timeout),
             TURN_START_TIMEOUT,
             "hook-callback drivers wait for SessionStart/UserPromptSubmit"
         );
         assert_eq!(
-            turn_start_timeout_for_driver(&GrokDriver::default()),
+            turn_start_timeout_for_driver(&GrokDriver::default(), discovery_timeout),
             TURN_START_TIMEOUT
         );
         assert_eq!(
-            turn_start_timeout_for_driver(&CodexDriver::default()),
-            crate::agent_jsonl_discovery::DISCOVERY_TIMEOUT,
+            turn_start_timeout_for_driver(&CodexDriver::default(), discovery_timeout),
+            discovery_timeout,
             "AgentJsonlFile drivers inherit rollout discovery's budget"
         );
     }
@@ -475,28 +475,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_start_predicate_can_read_driver_signal_registry() {
-        let registry = Arc::new(LiveWorkerStateRegistry::new());
-        registry.register_spawn(1, "exec-hook", "opus", 42, None);
-        let live = Arc::clone(&registry);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(15)).await;
-            live.record_driver_signal("exec-hook", DriverSignalKind::HookEvent);
-        });
-        confirm_spawn_started(
-            "claude",
-            "exec-hook",
-            Duration::from_millis(100),
-            Duration::from_millis(200),
-            Duration::from_millis(5),
-            std::future::pending::<bool>,
-            || async { registry.has_driver_signal_for_run("exec-hook") },
-        )
-        .await
-        .expect("a recorded hook must count as turn-start evidence");
-    }
-
-    #[tokio::test]
     async fn remote_turn_start_timeout_reaps_then_fails() {
         let reaped = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&reaped);
@@ -587,21 +565,5 @@ mod tests {
             !current_run_has_turn_start_evidence(&db, None, &execution.id),
             "a silent relaunch must not inherit an old run's transcript_path"
         );
-    }
-
-    #[test]
-    fn current_run_turn_start_accepts_a_driver_signal_without_transcript_path() {
-        let (_dir, db) = crate::test_support::open_db();
-        let product = crate::test_support::create_test_product(&db);
-        let chore = crate::test_support::create_test_chore(&db, product.id.clone(), "Hook only");
-        let ready = crate::test_support::create_ready_chore_execution(&db, chore.id.clone());
-        let (execution, _run) = db
-            .start_execution_run(&ready.id, "worker-1", "foo", "lease-1", "ws-1", "/tmp/ws-1")
-            .unwrap();
-        let registry = LiveWorkerStateRegistry::new();
-        registry.register_spawn(1, execution.id.clone(), "opus", 42, None);
-        registry.record_driver_signal(&execution.id, DriverSignalKind::HookEvent);
-        assert!(db.transcript_path_for_execution(&execution.id).unwrap().is_none());
-        assert!(current_run_has_turn_start_evidence(&db, Some(&registry), &execution.id));
     }
 }

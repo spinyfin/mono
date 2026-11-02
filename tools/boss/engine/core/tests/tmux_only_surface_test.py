@@ -41,6 +41,7 @@ def source_files(root):
     sources = {}
     for directory, extension in (
         ("engine/core/src", ".rs"),
+        ("engine/execution-runner/src", ".rs"),
         ("protocol/src", ".rs"),
         ("engine/driver/src", ".rs"),
         ("bossctl/src", ".rs"),
@@ -81,7 +82,7 @@ def violations(sources):
                     continue
             line = content.count("\n", 0, match.start()) + 1
             errors.append(f"{path}:{line}: removed identifier {identifier}")
-        if path.startswith("engine/core/src/") and OPTIONAL_HOST.search(content):
+        if path.startswith(("engine/core/src/", "engine/execution-runner/src/")) and OPTIONAL_HOST.search(content):
             errors.append(f"{path}: an optional TmuxWorkerHost permits a local spawn without identity")
 
     settings = sources["engine/core/src/settings.rs"]
@@ -90,7 +91,8 @@ def violations(sources):
         errors.append("settings REGISTRY must not expose the removed tmux hosting key")
 
     spawn = sources["engine/core/src/spawn_flow.rs"]
-    declaration = re.search(r"pub struct StartWorkerInput\b[^\{]*\{(.*?)^\}", spawn, re.M | re.S)
+    host = sources["engine/execution-runner/src/host.rs"]
+    declaration = re.search(r"pub struct StartWorkerInput\b[^\{]*\{(.*?)^\}", host, re.M | re.S)
     if not declaration or not re.search(r"pub\s+tmux_host\s*:\s*TmuxWorkerHost\s*,", declaration[1]):
         errors.append("StartWorkerInput.tmux_host must be a required TmuxWorkerHost")
     # Match the call, not the earlier trait declaration. Behavioral tests in
@@ -116,10 +118,12 @@ def violations(sources):
 def verify_guard(sources):
     """Negative controls prove the scan rejects regressions, not just today's tree."""
     spawn_path = "engine/core/src/spawn_flow.rs"
+    host_path = "engine/execution-runner/src/host.rs"
     # Structural checks need these real declarations. Restrict the controls to
     # them so every spelling need not rescan the entire production tree.
     sources = {path: sources[path] for path in (
         spawn_path,
+        host_path,
         "engine/core/src/settings.rs",
         "engine/core/src/app/tmux_teardown.rs",
         "engine/core/src/worker_registry.rs",
@@ -127,7 +131,7 @@ def verify_guard(sources):
     )}
     spawn = sources[spawn_path]
     mutations = [
-        (spawn_path, spawn.replace("pub tmux_host: TmuxWorkerHost,", "pub tmux_host: Option<TmuxWorkerHost>,")),
+        (host_path, sources[host_path].replace("pub tmux_host: TmuxWorkerHost,", "pub tmux_host: Option<TmuxWorkerHost>,")),
         (spawn_path, spawn.replace(".record_tmux_spawn_intent(", ".skip_intent(")),
         (spawn_path, spawn.replace(".record_tmux_spawn_intent(", ".new_session(); store.record_tmux_spawn_intent(", 1)),
         ("engine/core/src/app/tmux_teardown.rs", "NotTmuxHosted"),

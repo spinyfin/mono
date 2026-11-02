@@ -3,17 +3,17 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 
-use crate::config::RuntimeConfig;
-use crate::coordinator::slot_id_from_worker_id;
+use crate::host::{RunnerConfig, RunnerHost, RunnerHostFactory};
+use crate::host::{StartWorkerInput, TmuxWorkerHost};
 use crate::pane_summary;
-use crate::spawn_flow::{StartWorkerInput, TmuxWorkerHost, start_worker};
 use crate::work::{WorkDb, WorkExecution, WorkItem};
+use boss_execution_contracts::slot_id_from_worker_id;
 use boss_protocol::{ExecutionKind, ExecutionStatus, ReviewBatchMemberRole, WorkItemBinding};
 
 use super::prompt::structured_output_env_vars;
@@ -179,17 +179,14 @@ mod sol_spawn {
         }
     }
 }
-use super::{
-    ExecutionRunner, RunOutcome, RunWaitState, bound_control_token_path, bound_events_socket_path,
-    bound_frontend_socket_path,
-};
+use super::{ExecutionRunner, RunOutcome, RunWaitState};
 
 /// Render one driver-supplied [`crate::driver::EnvDirective`] as a shell
 /// statement to prepend to the worker pane's spawn command. Generic over
 /// every driver: the engine knows how to turn a `Set`/`Unset` directive into
 /// shell syntax, but never which vars a given driver names (that knowledge
 /// stays in the driver's [`crate::driver::SpawnPlan`]).
-pub(crate) fn render_env_directive(directive: &crate::driver::EnvDirective) -> String {
+pub fn render_env_directive(directive: &crate::driver::EnvDirective) -> String {
     match directive {
         crate::driver::EnvDirective::Set(key, value) => {
             format!("export {key}={}; ", crate::ssh_transport::shell_quote(value))
@@ -198,7 +195,7 @@ pub(crate) fn render_env_directive(directive: &crate::driver::EnvDirective) -> S
     }
 }
 
-fn assemble_worker_command(priority: &str, worker_bin_dir: &Path, plan: &crate::driver::SpawnPlan) -> String {
+pub fn assemble_worker_command(priority: &str, worker_bin_dir: &Path, plan: &crate::driver::SpawnPlan) -> String {
     let env_prefix: String = plan.env.iter().map(render_env_directive).collect();
     let environment = boss_engine_worker_bin::environment::shell_environment_clause(worker_bin_dir);
     format!(
@@ -396,6 +393,7 @@ mod apply_permission_extra_args_tests {
 }
 
 #[cfg(test)]
+#[path = "pane_spawn/pty_initial_input_tests.rs"]
 mod pty_initial_input_tests;
 
 /// `ExecutionRunner` that writes per-lease configuration, starts a detached
@@ -410,7 +408,7 @@ mod pty_initial_input_tests;
 /// "Stop" → run completes) lands once the events-socket consumer drives
 /// state transitions.
 pub struct PaneSpawnRunner {
-    cfg: Arc<RuntimeConfig>,
+    cfg: Arc<RunnerConfig>,
     /// Backing store for the pane-titlebar summary cache. Looked up
     /// in `run_execution` to compute a 2–4 word label for the work
     /// item before asking the app to spawn the pane.
@@ -418,10 +416,9 @@ pub struct PaneSpawnRunner {
     /// Feature flags store — checked at spawn time to decide whether
     /// editorial controls are active for this execution.
     feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>,
-    /// Set after construction via [`PaneSpawnRunner::set_server_state`].
-    /// Stored as `Weak` to avoid the runner ↔ ServerState reference
-    /// cycle. Resolved each call.
-    server_state: std::sync::OnceLock<Weak<dyn crate::spawn_flow::WorkerSpawner>>,
+    /// Bound after construction. The engine adapter retains only a weak
+    /// reference to its server, avoiding a runner/server ownership cycle.
+    server_state: std::sync::OnceLock<Arc<dyn RunnerHostFactory>>,
     /// Test-injection override for the boss-event binary path. When set,
     /// `boss_event_binary()` returns this directly without consulting the
     /// environment — so tests don't depend on host PATH/filesystem layout.
@@ -431,20 +428,25 @@ pub struct PaneSpawnRunner {
 #[derive(Default)]
 struct PaneSpawnOverrides {
     boss_event_path: std::sync::OnceLock<PathBuf>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     tmux_host: std::sync::OnceLock<TmuxWorkerHost>,
     /// When true, `run_execution` skips the composer-ready / turn-start
     /// wait. Existing pane-spawn tests inject a stub tmux that never
     /// paints driver chrome; they opt out via [`PaneSpawnRunner::set_skip_spawn_confirm`].
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     skip_spawn_confirm: std::sync::atomic::AtomicBool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     spawn_confirm_timeout: std::sync::OnceLock<StdDuration>,
 }
 
 impl PaneSpawnRunner {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_tmux_host(&self, host: TmuxWorkerHost) {
+        assert!(self.overrides.tmux_host.set(host).is_ok());
+    }
+
     pub fn new(
-        cfg: Arc<RuntimeConfig>,
+        cfg: Arc<RunnerConfig>,
         work_db: Arc<WorkDb>,
         feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>,
     ) -> Self {
@@ -457,21 +459,21 @@ impl PaneSpawnRunner {
         }
     }
 
-    pub fn set_server_state(&self, server_state: Weak<dyn crate::spawn_flow::WorkerSpawner>) {
+    pub fn set_server_state(&self, server_state: Arc<dyn RunnerHostFactory>) {
         let _ = self.server_state.set(server_state);
     }
 
     /// Inject a known absolute boss-event path for tests so they don't
     /// depend on the host filesystem or `BOSS_EVENT_BIN` env var.
-    #[cfg(test)]
-    pub(crate) fn set_boss_event_path(&self, path: PathBuf) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_boss_event_path(&self, path: PathBuf) {
         let _ = self.overrides.boss_event_path.set(path);
     }
 
     /// Skip the spawn-time composer/turn-start wait. Stub tmux in the
     /// existing pane-spawn tests never paints driver chrome.
-    #[cfg(test)]
-    pub(crate) fn set_skip_spawn_confirm(&self, skip: bool) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_skip_spawn_confirm(&self, skip: bool) {
         self.overrides
             .skip_spawn_confirm
             .store(skip, std::sync::atomic::Ordering::SeqCst);
@@ -480,37 +482,37 @@ impl PaneSpawnRunner {
     /// Override both confirmation waits (composer + turn-start) with a
     /// short timeout so timeout-path tests do not sit on the production
     /// 20s/45s windows.
-    #[cfg(test)]
-    pub(crate) fn set_spawn_confirm_timeout(&self, timeout: StdDuration) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_spawn_confirm_timeout(&self, timeout: StdDuration) {
         let _ = self.overrides.spawn_confirm_timeout.set(timeout);
     }
 
     fn skip_spawn_confirm(&self) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             self.overrides
                 .skip_spawn_confirm
                 .load(std::sync::atomic::Ordering::SeqCst)
         }
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         {
             false
         }
     }
 
     fn spawn_confirm_timeouts(&self, driver: &dyn crate::driver::AgentDriver) -> (StdDuration, StdDuration) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(timeout) = self.overrides.spawn_confirm_timeout.get() {
             return (*timeout, *timeout);
         }
         (
             super::spawn_confirmation::COMPOSER_READY_TIMEOUT,
-            super::spawn_confirmation::turn_start_timeout_for_driver(driver),
+            super::spawn_confirmation::turn_start_timeout_for_driver(driver, self.cfg.rollout_discovery_timeout),
         )
     }
 
     fn events_socket_path(&self) -> PathBuf {
-        bound_events_socket_path(&self.cfg)
+        self.cfg.events_socket_path.clone()
     }
 
     fn boss_event_binary(&self) -> PathBuf {
@@ -541,7 +543,7 @@ impl PaneSpawnRunner {
     }
 
     fn tmux_worker_host(&self, slot_id: u8, execution_id: &str) -> Result<TmuxWorkerHost> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(host) = self.overrides.tmux_host.get() {
             return Ok(host.clone());
         }
@@ -556,20 +558,20 @@ impl PaneSpawnRunner {
             anyhow::bail!("cannot derive tmux session name from empty execution id");
         }
         let session_name = format!("boss-{slot_id}-{short_execution_id}");
-        let tmux = boss_tmux::Tmux::resolve(self.cfg.work.resolved_tmux_socket_path())
+        let tmux = boss_tmux::Tmux::resolve(self.cfg.tmux_socket_path.clone())
             .with_context(|| format!("resolving tmux for execution {execution_id}"))?;
-        let spawn_store: Arc<dyn crate::spawn_flow::TmuxSpawnStore> = self.work_db.clone();
+        let spawn_store: Arc<dyn crate::host::TmuxSpawnStore> = self.work_db.clone();
         Ok(TmuxWorkerHost::new(tmux, spawn_store, session_name))
     }
 }
 
 /// Resolve the absolute path of the `boss-event` shim. Thin re-export of
 /// [`boss_engine_worker_bin::resolve_boss_event_binary`] so existing
-/// `crate::runner::resolve_boss_event_binary` call sites (and the
+/// `crate::resolve_boss_event_binary` call sites (and the
 /// hard-panic contract in [`PaneSpawnRunner::boss_event_binary`]) stay
 /// put. Shared with `resolve_boss_cli` via
 /// [`boss_engine_worker_bin::resolve_engine_binary`].
-pub(crate) fn resolve_boss_event_binary(
+pub fn resolve_boss_event_binary(
     engine_path: &Path,
     workspace_dir: Option<&Path>,
     env_override: Option<&Path>,
@@ -591,7 +593,7 @@ pub(crate) fn resolve_boss_event_binary(
 /// The `[ -n … ]` guard makes an unset var a no-op, so the clause is
 /// safe to emit unconditionally. Clauses compose left to right: the
 /// *last* one emitted ends up first on `PATH`.
-pub(crate) fn path_prepend_clause(var: &str) -> String {
+pub fn path_prepend_clause(var: &str) -> String {
     format!("[ -n \"${var}\" ] && export PATH=\"${var}:$PATH\"; ")
 }
 
@@ -670,7 +672,7 @@ pub(crate) use super::spawn_launch_limits::{check_arg_max_budget, local_arg_max}
 /// Materialize the per-workspace launcher directory and return it, so the
 /// caller can put it on the worker's `PATH`.
 ///
-/// Keyed like [`crate::worker_setup::worker_settings_path`]: under
+/// Keyed like [`crate::host::RunnerHost::worker_settings_path`]: under
 /// `<settings_dir>/bin/<workspace-name>/`, so concurrent spawns for
 /// different workspaces never rewrite each other's `boss` launcher.
 /// The write itself is atomic (temp sibling + rename) via
@@ -700,7 +702,11 @@ fn ensure_worker_bin_dir(settings_dir: &Path, workspace_path: &Path) -> Option<P
     ensure_worker_bin_dir_for_engine(settings_dir, workspace_path, &engine_path)
 }
 
-fn ensure_worker_bin_dir_for_engine(settings_dir: &Path, workspace_path: &Path, engine_path: &Path) -> Option<PathBuf> {
+pub fn ensure_worker_bin_dir_for_engine(
+    settings_dir: &Path,
+    workspace_path: &Path,
+    engine_path: &Path,
+) -> Option<PathBuf> {
     let workspace_dir = std::env::var_os(boss_engine_worker_bin::BUILD_WORKSPACE_DIRECTORY_ENV).map(PathBuf::from);
     let env_override = std::env::var_os(boss_engine_worker_bin::BOSS_CLI_BIN_ENV).map(PathBuf::from);
     let boss_bin_dir = std::env::var_os(boss_engine_worker_bin::BOSS_BIN_DIR_ENV).map(PathBuf::from);
@@ -813,7 +819,7 @@ fn ensure_worker_bin_dir_for_engine(settings_dir: &Path, workspace_path: &Path, 
 /// (`~/Library/Application Support/Boss/bin/`). Returns the stable path
 /// on success. If `source_shim` is already inside `stable_bin_dir`,
 /// returns `Ok(source_shim)` without copying (no-op for installed mode).
-pub(crate) fn install_boss_event_to_stable_bin(source_shim: &Path, stable_bin_dir: &Path) -> io::Result<PathBuf> {
+pub fn install_boss_event_to_stable_bin(source_shim: &Path, stable_bin_dir: &Path) -> io::Result<PathBuf> {
     let stable_path = stable_bin_dir.join("boss-event");
     if stable_path == source_shim {
         return Ok(stable_path);
@@ -840,14 +846,17 @@ impl ExecutionRunner for PaneSpawnRunner {
         workspace_path: &Path,
         cube_change_id: Option<&str>,
     ) -> Result<RunOutcome> {
+        let factory = self
+            .server_state
+            .get()
+            .ok_or_else(|| anyhow!("PaneSpawnRunner not bound to ServerState"))?;
+        let spawner = factory.bind()?;
         let guide_git_dir = if execution.kind == ExecutionKind::PrReviewGuide {
             let capture = self
                 .work_db
                 .get_pr_review_guide_comparison_by_id(&execution.work_item_id)?
                 .context("review-guide comparison missing before spawn")?;
-            match crate::review_guide_workspace::off_runtime_worker(|| {
-                crate::review_guide_workspace::verify(workspace_path, &capture.packet)
-            }) {
+            match spawner.verify_review_guide(workspace_path, &capture.packet) {
                 Ok(git_dir) => Some(git_dir),
                 Err(error) => {
                     self.work_db.finish_pr_review_guide_attempt_for_terminal_execution(
@@ -862,13 +871,6 @@ impl ExecutionRunner for PaneSpawnRunner {
         } else {
             None
         };
-        let weak = self
-            .server_state
-            .get()
-            .ok_or_else(|| anyhow!("PaneSpawnRunner not bound to ServerState"))?;
-        let spawner = weak
-            .upgrade()
-            .ok_or_else(|| anyhow!("ServerState dropped before run_execution"))?;
 
         let lease_id = execution
             .cube_lease_id
@@ -941,8 +943,9 @@ impl ExecutionRunner for PaneSpawnRunner {
             workspace_path,
             cube_change_id,
             WorkerSpawnOpts::builder()
+                .review_signal_checks(self.cfg.review_signal_checks)
                 .editorial_enabled(editorial_enabled)
-                .max_embed_diff_lines(self.cfg.work.max_review_embed_diff_lines)
+                .max_embed_diff_lines(self.cfg.max_review_embed_diff_lines)
                 .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
                 .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
                 .followup_proposals_seam_enabled(followup_proposals_seam_enabled)
@@ -1062,7 +1065,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // live outside the workspace tree; point the agent at them with
         // `--settings` (or the driver-equivalent flag). `write_workspace_files`
         // writes the same path.
-        let worker_settings_path = crate::worker_setup::worker_settings_path(workspace_path);
+        let worker_settings_path = spawner.worker_settings_path(workspace_path);
         // Re-prepend BOSS_BIN_DIR to PATH in the worker's first shell line,
         // mirroring the Boss/coordinator pane (see BossPaneModel.swift and
         // the feba26d2 fix). `spawn_flow` already sets PATH with
@@ -1120,38 +1123,12 @@ impl ExecutionRunner for PaneSpawnRunner {
         // or which vars they name.
         // Materialise local guard scripts before permission config so Codex
         // can wire absolute paths into CODEX_HOME PreToolUse hooks.
-        let settings_dir = crate::worker_setup::worker_settings_dir();
-        let path_guard_script = if matches!(worker_kind, crate::worker_setup::WorkerKind::Standard)
-            || matches!(worker_kind, crate::worker_setup::WorkerKind::Reviewer)
-            || matches!(worker_kind, crate::worker_setup::WorkerKind::Triage)
-            || matches!(worker_kind, crate::worker_setup::WorkerKind::AnswerAgent)
-        {
-            Some(
-                crate::worker_setup::ensure_path_guard_script_in(&settings_dir)
-                    .with_context(|| format!("materialising path guard script for execution {}", execution.id))?,
-            )
-        } else {
-            None
-        };
-        let checkleft_guard_script = Some(
-            crate::worker_setup::ensure_checkleft_push_guard_script_in(&settings_dir).with_context(|| {
-                format!(
-                    "materialising checkleft push-guard script for execution {}",
-                    execution.id
-                )
-            })?,
-        );
-        // Every local worker kind — including review guides, whose pinned
-        // read-only git access is exactly the explicit `--git-dir` form this
-        // gate still permits — gets the shared-source-store write gate.
-        let git_store_guard_script = Some(
-            crate::worker_setup::ensure_git_store_guard_script_in(&settings_dir).with_context(|| {
-                format!(
-                    "materialising shared-source-store guard script for execution {}",
-                    execution.id
-                )
-            })?,
-        );
+        let crate::host::GuardScripts {
+            settings_dir,
+            path: path_guard_script,
+            checkleft: checkleft_guard_script,
+            git_store: git_store_guard_script,
+        } = spawner.install_guard_scripts(&worker_kind, &execution.id)?;
 
         // Permission artifacts (Codex: hooks + trust attest into CODEX_HOME;
         // Claude: empty — settings still come from worker_setup).
@@ -1165,7 +1142,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             },
             workspace_path: workspace_path.to_path_buf(),
             events_socket_path: self.events_socket_path(),
-            frontend_socket_path: bound_frontend_socket_path(&self.cfg),
+            frontend_socket_path: self.cfg.frontend_socket_path.clone(),
             boss_event_path: self.boss_event_binary(),
             run_id: execution.id.clone(),
             lease_id: lease_id.clone(),
@@ -1212,7 +1189,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         if let Some(git_dir) = guide_git_dir {
             use crate::driver::EnvDirective::{Set, Unset};
             if let Some((old_head, _)) = self.work_db.review_guide_update_context(&execution.id)? {
-                crate::review_guide_workspace::verify_previous_head(workspace_path, &old_head)?;
+                spawner.verify_previous_head(workspace_path, &old_head)?;
                 spawn_plan
                     .env
                     .push(Set("BOSS_REVIEW_GUIDE_PREVIOUS_HEAD_SHA".into(), old_head));
@@ -1264,7 +1241,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // repobin shim was winning.
         let worker_bin_dir = ensure_worker_bin_dir(&settings_dir, workspace_path)
             .context("materializing the worker tool environment")?;
-        let priority_clause = worker_background_priority_clause(&self.work_db)?;
+        let priority_clause = spawner.throttle_clause(&self.work_db)?;
         let assembled_command = assemble_worker_command(priority_clause, &worker_bin_dir, &spawn_plan);
         // Write the full assembled command to a workspace-relative script and
         // type only a short, fixed-length line that sources it — never the
@@ -1298,7 +1275,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // resolve the utility-model provider lazily and let the helper handle
         // every failure mode (no credential, API error, cache miss) so a slow
         // or unreachable provider never blocks the spawn.
-        let utility = self.cfg.utility_model();
+        let utility = self.cfg.utility.clone();
         // `derived_title_summary` exhaustively matches `ExecutionKind` (its doc
         // comment demands this — see `execution.rs`) to decide whether this kind
         // needs a pure derived phrase or can use the cached/LLM path; see its
@@ -1336,7 +1313,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             self.work_db.source_automation_id_for_work_item(&execution.work_item_id),
             Ok(Some(_))
         );
-        let pool = crate::live_worker_state::attributed_pool_label(execution.kind.clone(), has_source_automation);
+        let pool = spawner.attributed_pool_label(execution, has_source_automation);
         if let Some(reason) = self.work_db.local_dispatch_quarantine_reason()? {
             return Err(anyhow!(reason));
         }
@@ -1344,65 +1321,60 @@ impl ExecutionRunner for PaneSpawnRunner {
             .tmux_worker_host(slot_id, &execution.id)
             .context("local dispatch requires a tmux worker host")?;
 
-        let started = start_worker(
-            spawner.as_ref(),
-            StartWorkerInput::builder()
-                .run_id(execution.id.clone())
-                .lease_id(lease_id)
-                .slot_id(slot_id)
-                .workspace_path(workspace_path.to_path_buf())
-                .events_socket_path(self.events_socket_path())
-                .maybe_frontend_socket_path(bound_frontend_socket_path(&self.cfg))
-                .maybe_control_token_path(if execution.kind == ExecutionKind::PrReviewGuide {
-                    None
-                } else {
-                    bound_control_token_path(&self.cfg)
-                })
-                .boss_event_path(self.boss_event_binary())
-                .initial_input(initial_input)
-                .extra_env({
-                    let mut env = structured_output_env;
-                    env.push((
-                        boss_engine_worker_bin::WORKER_BIN_DIR_ENV.to_owned(),
-                        worker_bin_dir.display().to_string(),
-                    ));
-                    env
-                })
-                .maybe_title_summary(title_summary)
-                .task_title(work_item_name(work_item).to_owned())
-                .maybe_work_item_binding(work_item_binding)
-                .model(spawn_config.model.clone())
-                .draft_pr_mode(spawner.draft_pr_mode())
-                .execution_kind(execution.kind.as_str().to_owned())
-                .pool(pool.to_owned())
-                .live_metadata(crate::live_worker_metadata::resolve_with_automation(
-                    &self.work_db,
-                    execution,
-                    boss_protocol::LOCAL_HOST_ID,
-                    has_source_automation,
-                ))
-                .maybe_task_kind(work_item_task_kind(work_item).map(str::to_owned))
-                // Per-kind worker posture (reviewer/triage/answer-agent are
-                // restricted; everything else is a Standard implementer),
-                // derived once above via the shared `worker_kind_for_execution`
-                // so the settings posture and the forced CLI permission mode
-                // are driven by one value and cannot diverge.
-                .worker_kind(worker_kind)
-                // Same Arc resolved above for provision/spawn — settings
-                // wiring and live-state capability flags use it too.
-                .driver(driver.clone())
-                .tmux_host(tmux_host.clone())
-                .automation_outcome_proposals_seam_enabled(automation_outcome_proposals_seam_enabled)
-                .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
-                .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
-                .is_review_supervisor(is_review_supervisor)
-                .is_post_merge_reviewer(is_post_merge_reviewer)
-                .checkout_positioned_on_pr_head(checkout_positioned_on_pr_head)
-                .build(),
-            StdDuration::from_secs(30),
-        )
-        .await
-        .with_context(|| format!("spawning worker pane for run {}", execution.id))?;
+        let started = spawner
+            .start_worker(
+                StartWorkerInput::builder()
+                    .run_id(execution.id.clone())
+                    .lease_id(lease_id)
+                    .slot_id(slot_id)
+                    .workspace_path(workspace_path.to_path_buf())
+                    .events_socket_path(self.events_socket_path())
+                    .maybe_frontend_socket_path(self.cfg.frontend_socket_path.clone())
+                    .maybe_control_token_path(if execution.kind == ExecutionKind::PrReviewGuide {
+                        None
+                    } else {
+                        self.cfg.control_token_path.clone()
+                    })
+                    .boss_event_path(self.boss_event_binary())
+                    .initial_input(initial_input)
+                    .extra_env({
+                        let mut env = structured_output_env;
+                        env.push((
+                            boss_engine_worker_bin::WORKER_BIN_DIR_ENV.to_owned(),
+                            worker_bin_dir.display().to_string(),
+                        ));
+                        env
+                    })
+                    .maybe_title_summary(title_summary)
+                    .task_title(work_item_name(work_item).to_owned())
+                    .maybe_work_item_binding(work_item_binding)
+                    .model(spawn_config.model.clone())
+                    .draft_pr_mode(spawner.draft_pr_mode())
+                    .execution_kind(execution.kind.as_str().to_owned())
+                    .pool(pool.to_owned())
+                    .live_metadata(spawner.live_metadata(execution, has_source_automation))
+                    .maybe_task_kind(work_item_task_kind(work_item).map(str::to_owned))
+                    // Per-kind worker posture (reviewer/triage/answer-agent are
+                    // restricted; everything else is a Standard implementer),
+                    // derived once above via the shared `worker_kind_for_execution`
+                    // so the settings posture and the forced CLI permission mode
+                    // are driven by one value and cannot diverge.
+                    .worker_kind(worker_kind)
+                    // Same Arc resolved above for provision/spawn — settings
+                    // wiring and live-state capability flags use it too.
+                    .driver(driver.clone())
+                    .tmux_host(tmux_host.clone())
+                    .automation_outcome_proposals_seam_enabled(automation_outcome_proposals_seam_enabled)
+                    .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
+                    .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
+                    .is_review_supervisor(is_review_supervisor)
+                    .is_post_merge_reviewer(is_post_merge_reviewer)
+                    .checkout_positioned_on_pr_head(checkout_positioned_on_pr_head)
+                    .build(),
+                StdDuration::from_secs(30),
+            )
+            .await
+            .with_context(|| format!("spawning worker pane for run {}", execution.id))?;
 
         let spawned_at = std::time::Instant::now();
         tracing::info!(
@@ -1453,7 +1425,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             let confirm = confirm_local_spawn(
                 &tmux_host,
                 driver.as_ref(),
-                spawner.live_worker_state_registry(),
+                spawner.driver_signals(),
                 &self.work_db,
                 &execution.id,
                 composer_timeout,
@@ -1467,12 +1439,9 @@ impl ExecutionRunner for PaneSpawnRunner {
                 return Ok(cancelled);
             }
             if let Err(err) = confirm
-                && !spawner.live_worker_state_registry().is_some_and(|registry| {
-                    matches!(
-                        registry.confirm_never_started_reap(started.slot_id, &execution.id),
-                        crate::live_worker_state::NeverStartedReapCommit::DriverSignalled
-                    )
-                })
+                && !spawner
+                    .driver_signals()
+                    .is_some_and(|registry| registry.driver_signalled_before_reap(started.slot_id, &execution.id))
             {
                 tracing::warn!(
                     worker_id,
@@ -1516,10 +1485,10 @@ impl PaneSpawnRunner {
     /// flight, reap the pane and return [`RunWaitState::CancelledDuringSpawn`].
     async fn take_cancelled_during_spawn(
         &self,
-        spawner: &dyn crate::spawn_flow::WorkerSpawner,
+        spawner: &dyn RunnerHost,
         execution_id: &str,
         worker_id: &str,
-        started: &crate::spawn_flow::StartedWorker,
+        started: &crate::host::StartedWorker,
         spawn_config: &crate::effort::SpawnConfig,
     ) -> Option<RunOutcome> {
         match self.work_db.get_execution(execution_id) {
@@ -1562,7 +1531,7 @@ impl PaneSpawnRunner {
 async fn confirm_local_spawn(
     tmux_host: &TmuxWorkerHost,
     driver: &dyn crate::driver::AgentDriver,
-    live_states: Option<&crate::live_worker_state::LiveWorkerStateRegistry>,
+    live_states: Option<&dyn crate::host::DriverSignals>,
     work_db: &WorkDb,
     run_id: &str,
     composer_timeout: StdDuration,
@@ -1617,7 +1586,7 @@ fn store_capture_snapshot(snapshot: &std::sync::Mutex<String>, text: &str) {
 /// `snapshot` is updated right after each *successful* capture, before the
 /// next command is awaited, so a stalled history read cannot lose the visible
 /// text, and a failed capture never erases an earlier good snapshot.
-async fn capture_shows_driver_ready(
+pub async fn capture_shows_driver_ready(
     tmux: &boss_tmux::Tmux,
     session: &str,
     spec: Option<&boss_protocol::PaneMonitorSpec>,
@@ -1637,16 +1606,3 @@ async fn capture_shows_driver_ready(
     }
     false
 }
-
-/// The shell's background tier is inherited by drivers and build tools,
-/// including Bazel servers that can outlive the pane. Off emits no command.
-fn worker_background_priority_clause(db: &WorkDb) -> Result<&'static str> {
-    let enabled = crate::worker_throttle::enabled(db)?;
-    Ok(crate::worker_throttle::priority_clause(
-        enabled,
-        cfg!(target_os = "macos"),
-    ))
-}
-
-#[cfg(test)]
-mod pane_spawn_tests;

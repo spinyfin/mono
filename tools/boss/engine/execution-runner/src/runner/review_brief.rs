@@ -50,7 +50,7 @@ where
             "pr_review: work item is not a task/chore; brief cannot be resolved",
         );
         return ReviewBriefPacket {
-            task_name: crate::runner::work_item::work_item_name(work_item).to_owned(),
+            task_name: crate::work_item::work_item_name(work_item).to_owned(),
             work_item_brief: None,
             revision_ask: None,
             design_section: None,
@@ -244,7 +244,7 @@ where
             match outcome {
                 DocFetchOutcome::Content(text) => {
                     clear_design_doc_attention(work_db, work_item_id);
-                    let entries = crate::planner::extract_breakdown_entries(&text);
+                    let entries = crate::breakdown::extract_breakdown_entries(&text);
                     let breakdown: Vec<BreakdownSection<'_>> = entries
                         .iter()
                         .map(|entry| BreakdownSection {
@@ -339,7 +339,7 @@ fn work_item_task(work_item: &WorkItem) -> Option<&crate::work::Task> {
 }
 
 fn nonempty_desc(description: &str) -> Option<String> {
-    let stripped = crate::reconcile_audit::strip_engine_audit_lines(description);
+    let stripped = crate::audit_text::strip_engine_audit_lines(description);
     let trimmed = stripped.trim();
     if trimmed.is_empty() {
         None
@@ -1125,14 +1125,14 @@ mod tests {
         insert_host(&db);
         let product = create_test_product(&db);
         let chore = create_test_chore_manual(&db, product.id.clone(), "Empty brief chore");
-        crate::reconcile_audit::append_description_line(
+        crate::audit_text::append_description_line(
             &db,
             &chore.id,
             "\n[doc-detector] no doc pointer auto-populated for this PR because it did not \
              touch exactly one docs/designs|investigations|postmortems file.",
         )
         .unwrap();
-        crate::reconcile_audit::append_description_line(
+        crate::audit_text::append_description_line(
             &db,
             &chore.id,
             "\n[engine-reconcile] epoch 1700000000: worker pid 123 exited.",
@@ -1166,7 +1166,7 @@ mod tests {
         insert_host(&db);
         let product = create_test_product(&db);
         let chore = create_test_chore_manual(&db, product.id.clone(), "Empty brief chore");
-        crate::reconcile_audit::append_description_line(
+        crate::audit_text::append_description_line(
             &db,
             &chore.id,
             "\n[pr-review-skip] epoch 1700000000: reason=pure_rebase created_via=cli \
@@ -1207,7 +1207,7 @@ mod tests {
                     .build(),
             )
             .unwrap();
-        crate::reconcile_audit::append_description_line(
+        crate::audit_text::append_description_line(
             &db,
             &chore.id,
             "\n[doc-detector] no doc pointer auto-populated for this PR.",

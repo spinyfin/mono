@@ -7,6 +7,7 @@ edition = "2024"
 test-support = ["boss-work-db/test-support"]
 
 [dependencies]
+boss-execution-runner = { path = "../execution-runner" }
 boss-execution-contracts = { path = "../execution-contracts" }
 boss-engine-storage-values = { path = "../storage-values" }
 boss-work-db = { path = "../work-db" }
@@ -95,6 +96,7 @@ toml = { workspace = true }
 unicode-segmentation = { workspace = true }
 
 [dev-dependencies]
+boss-execution-runner = { path = "../execution-runner", features = ["test-support"] }
 boss-execution-contracts = { path = "../execution-contracts", features = ["test-support"] }
 boss-work-db = { path = "../work-db", features = ["test-support"] }
 boss-prose-vocabulary = { path = "../prose-vocabulary" }

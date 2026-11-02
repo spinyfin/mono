@@ -7,11 +7,17 @@ use boss_protocol::{ExecutionStatus, TaskStatus};
 use super::*;
 use crate::work::Task;
 
+#[path = "compose_prompt_tests/blocked_recovery.rs"]
 mod blocked_recovery;
+#[path = "compose_prompt_tests/invocation.rs"]
 mod invocation;
+#[path = "compose_prompt_tests/non_bazel_gate.rs"]
 mod non_bazel_gate;
+#[path = "compose_prompt_tests/prepush_rebase.rs"]
 mod prepush_rebase;
+#[path = "compose_prompt_tests/revision_rebase.rs"]
 mod revision_rebase;
+#[path = "compose_prompt_tests/vocabulary_leakage.rs"]
 mod vocabulary_leakage;
 
 #[test]
@@ -397,17 +403,19 @@ fn execution_for_remote(remote: &str) -> WorkExecution {
 #[test]
 fn ci_monitoring_directive_omits_shared_policy() {
     let execution = base_execution();
-    assert!(ci_monitoring_directive(&execution).is_empty());
+    assert!(ci_monitoring_directive(&execution, |_| &[]).is_empty());
 }
 
 #[test]
-fn ci_monitoring_directive_names_human_gated_checks_for_linkedin_org() {
-    // The human-gated check name must be sourced from the engine's
-    // REVIEW_SIGNAL_RULES table (via review_signal_checks_for_owner),
-    // not re-hardcoded in the prompt — single sourcing is the fix.
+fn ci_monitoring_directive_names_injected_human_gated_checks() {
+    // The runner renders the policy supplied by the merge observer.
     let exec = execution_for_remote("git@github.com:linkedin-multiproduct/some-repo.git");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|owner| {
+                assert_eq!(owner, "linkedin-multiproduct");
+                &["Owner Approval"]
+            })
             .execution(&exec)
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))

@@ -344,100 +344,6 @@ struct DeliveryEnvironment {
     prior: Vec<(&'static str, Option<std::ffi::OsString>)>,
 }
 
-#[test]
-fn actual_driver_spawn_prefix_pins_boss_and_cube_before_path_decoys() {
-    use crate::driver::{DriverRegistry, grok, test_support};
-    use crate::protocol::EnvVar;
-    use std::os::unix::fs::PermissionsExt;
-    let root = TempDir::new().unwrap();
-    let _codex = test_support::codex_auth_source_override(&root.path().join("codex"), &root.path().join("auth.json"));
-    let _grok = test_support::grok_homes_override(&root.path().join("grok"));
-    let bundle = root.path().join("bundle");
-    let decoy = root.path().join("decoy");
-    std::fs::create_dir_all(&bundle).unwrap();
-    std::fs::create_dir_all(&decoy).unwrap();
-    for name in ["boss", "cube"] {
-        for (dir, output) in [(&bundle, "bundled"), (&decoy, "decoy")] {
-            let path = dir.join(name);
-            std::fs::write(&path, format!("#!/bin/sh\necho {output}-{name}\n")).unwrap();
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-    }
-    let mut restore = DeliveryEnvironment { prior: Vec::new() };
-    for key in [
-        "BOSS_BIN_DIR",
-        "BOSS_CLI_BIN",
-        "CUBE_CLI_BIN",
-        "BUILD_WORKSPACE_DIRECTORY",
-    ] {
-        restore.prior.push((key, std::env::var_os(key)));
-        unsafe { std::env::remove_var(key) };
-    }
-    unsafe { std::env::set_var("BOSS_BIN_DIR", &bundle) };
-    let run_id = "run-tool-prefix";
-    let grok_home = grok::grok_home_for_run(run_id).unwrap();
-    std::fs::create_dir_all(&grok_home).unwrap();
-    std::fs::write(
-        grok_home.join("boss-session-id"),
-        "22222222-3333-4444-8555-666666666666\n",
-    )
-    .unwrap();
-    std::fs::write(
-        grok_home.join("boss-workspace-path"),
-        format!("{}\n", root.path().display()),
-    )
-    .unwrap();
-    let worker_bin = super::ensure_worker_bin_dir_for_engine(root.path(), root.path(), &bundle.join("engine")).unwrap();
-    let inherited = format!("{}:/bin:/usr/bin", decoy.display());
-    let mut env = vec![
-        EnvVar {
-            key: "PATH".into(),
-            value: inherited.clone(),
-        },
-        EnvVar {
-            key: boss_engine_worker_bin::WORKER_BIN_DIR_ENV.into(),
-            value: worker_bin.display().to_string(),
-        },
-    ];
-    crate::spawn_flow::apply_worker_tool_env(&mut env, bundle.to_str());
-    let registry = DriverRegistry::default();
-    for slug in registry.slugs() {
-        let driver = registry.require(slug).unwrap();
-        let mut plan = driver.spawn_invocation(SpawnRequest {
-            model: driver.descriptor().model_menu.engine_default,
-            effort: None,
-            settings_path: None,
-            non_opus_auto_mode: false,
-            permission_mode_override: None,
-            run_id: Some(run_id),
-        });
-        // Keep the real driver env directives; substitute only its CLI so the
-        // assembled prefix can be exercised without starting an agent.
-        plan.command = format!(
-            "/bin/bash -c {}",
-            crate::ssh_transport::shell_quote("command -v boss; command -v cube; \"$BOSS_BIN\"; \"$CUBE_BIN\"")
-        );
-        let assembled = super::assemble_worker_command("", &worker_bin, &plan);
-        let output = std::process::Command::new("/bin/sh")
-            .args(["-c", &assembled])
-            .env("PATH", &inherited)
-            .envs(env.iter().map(|entry| (&entry.key, &entry.value)))
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{slug}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let expected = format!(
-            "{}/boss\n{}/cube\nbundled-boss\nbundled-cube\n",
-            worker_bin.display(),
-            worker_bin.display()
-        );
-        assert_eq!(String::from_utf8_lossy(&output.stdout), expected, "{slug}: {assembled}");
-    }
-}
-
 impl Drop for DeliveryEnvironment {
     fn drop(&mut self) {
         for (key, value) in &self.prior {
@@ -483,7 +389,7 @@ fn per_driver_small_and_large_prompts_are_delivered_and_start_the_turn() {
 /// the stub received the prompt intact through terminal stdin and emitted
 /// the turn-start signal confirmation consumes.
 async fn per_driver_delivery_body() {
-    use crate::runner::spawn_confirmation::{confirm_spawn_started, pane_shows_driver_ready};
+    use crate::spawn_confirmation::{confirm_spawn_started, pane_shows_driver_ready};
     use std::time::Duration;
 
     struct Case {
@@ -674,5 +580,325 @@ async fn per_driver_delivery_body() {
                 )
             });
         }
+    }
+}
+
+mod spawn_artifacts {
+    use super::super::*;
+    use tempfile::TempDir;
+    #[test]
+    fn resolve_boss_event_prefers_env_override() {
+        let dir = TempDir::new().unwrap();
+        let engine = dir.path().join("engine");
+        std::fs::write(&engine, b"").unwrap();
+        let override_path = PathBuf::from("/opt/whatever/boss-event");
+        let resolved = resolve_boss_event_binary(&engine, None, Some(&override_path), None, None);
+        assert_eq!(resolved, Some(override_path));
+    }
+
+    /// `BOSS_BIN_DIR` is the installed-mode path; it wins over the
+    /// dev-mode runfiles and workspace-bazel-bin candidates so a
+    /// deployed Boss.app never silently falls through to a workspace clone.
+    #[test]
+    fn resolve_boss_event_prefers_boss_bin_dir_over_runfiles() {
+        let dir = TempDir::new().unwrap();
+        let engine = dir.path().join("engine");
+        std::fs::write(&engine, b"").unwrap();
+
+        // Synthesize the bundle bin/ directory (installed mode).
+        let bundle_bin = dir.path().join("bundle-bin");
+        std::fs::create_dir_all(&bundle_bin).unwrap();
+        let bundle_shim = bundle_bin.join("boss-event");
+        std::fs::write(&bundle_shim, b"").unwrap();
+
+        // Also synthesize runfiles (dev mode) — must NOT be picked.
+        let runfiles = dir.path().join("engine.runfiles/_main/tools/boss/event-shim");
+        std::fs::create_dir_all(&runfiles).unwrap();
+        std::fs::write(runfiles.join("boss-event"), b"").unwrap();
+
+        let resolved = resolve_boss_event_binary(&engine, None, None, Some(&bundle_bin), None);
+        assert_eq!(resolved, Some(bundle_shim));
+    }
+
+    /// When the engine binary has runfiles at the bazel-conventional
+    /// path, the resolver must pick that up — this is the production
+    /// path under `bazel run //tools/boss/engine/core:engine` once the
+    /// engine `rust_binary` has the `data` dep on
+    /// `//tools/boss/event-shim:boss-event`. The original #174 fix
+    /// only covered the BOSS_EVENT_BIN branch; this test covers the
+    /// branch that actually fires in real launches.
+    #[test]
+    fn resolve_boss_event_uses_runfiles_when_present() {
+        let dir = TempDir::new().unwrap();
+        let engine = dir.path().join("engine");
+        std::fs::write(&engine, b"").unwrap();
+
+        // Synthesize the bazel runfiles tree the data dep produces.
+        let runfiles = dir.path().join("engine.runfiles/_main/tools/boss/event-shim");
+        std::fs::create_dir_all(&runfiles).unwrap();
+        let shim = runfiles.join("boss-event");
+        std::fs::write(&shim, b"").unwrap();
+
+        let resolved = resolve_boss_event_binary(&engine, None, None, None, None);
+        assert_eq!(resolved, Some(shim));
+    }
+
+    /// Workspace `bazel-bin` symlink path is the secondary candidate
+    /// — covers `bazel build` + non-`bazel run` scenarios where the
+    /// engine binary is invoked directly but `BUILD_WORKSPACE_DIRECTORY`
+    /// is set.
+    #[test]
+    fn resolve_boss_event_falls_back_to_workspace_bazel_bin() {
+        let dir = TempDir::new().unwrap();
+        let engine = dir.path().join("engine");
+        std::fs::write(&engine, b"").unwrap();
+
+        let workspace = dir.path().join("workspace");
+        let bazel_bin = workspace.join("bazel-bin/tools/boss/event-shim");
+        std::fs::create_dir_all(&bazel_bin).unwrap();
+        let shim = bazel_bin.join("boss-event");
+        std::fs::write(&shim, b"").unwrap();
+
+        let resolved = resolve_boss_event_binary(&engine, Some(&workspace), None, None, None);
+        assert_eq!(resolved, Some(shim));
+    }
+
+    /// The `PATH`-prepend clauses compose so that the clause emitted
+    /// LAST ends up FIRST on `PATH`. The worker launcher dir has to be
+    /// last for that reason, and each clause must no-op on an unset var.
+    #[test]
+    fn path_prepend_clauses_compose_with_the_last_one_winning() {
+        let line = format!(
+            "{}{}",
+            path_prepend_clause("BOSS_BIN_DIR"),
+            path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
+        );
+        assert_eq!(
+            line,
+            "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; \
+             [ -n \"$BOSS_WORKER_BIN_DIR\" ] && export PATH=\"$BOSS_WORKER_BIN_DIR:$PATH\"; "
+        );
+
+        // Both vars set: the launcher dir must be the first PATH entry.
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("{line}printf '%s' \"$PATH\""))
+            .env("PATH", "/usr/bin")
+            .env("BOSS_BIN_DIR", "/bundle/bin")
+            .env("BOSS_WORKER_BIN_DIR", "/worker/bin")
+            .output()
+            .expect("sh must be available");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "/worker/bin:/bundle/bin:/usr/bin");
+
+        // Neither set (dev mode, launcher write failed): PATH unchanged,
+        // and in particular no empty leading entry.
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("{line}printf '%s' \"$PATH\""))
+            .env("PATH", "/usr/bin")
+            .env_remove("BOSS_BIN_DIR")
+            .env_remove("BOSS_WORKER_BIN_DIR")
+            .output()
+            .expect("sh must be available");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "/usr/bin");
+    }
+
+    /// `ensure_worker_bin_dir` always leaves a usable `boss` (and `cube`)
+    /// behind, even when nothing resolves — an unresolved launcher that
+    /// fails loudly beats letting the worker PATH-resolve a build-from-source
+    /// shim. `bossctl` stays Boss-tier. The dir is keyed by workspace name
+    /// so concurrent spawns do not share a path. A workspace with no
+    /// `REPOBIN.toml` must not get a `checkleft` launcher.
+    #[test]
+    fn ensure_worker_bin_dir_writes_boss_and_cube_never_bossctl() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("workspaces/mono-agent-007");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let bin_dir = ensure_worker_bin_dir(dir.path(), &workspace).expect("launcher dir must be written");
+        assert_eq!(bin_dir, dir.path().join("bin").join("mono-agent-007"));
+
+        let mut entries: Vec<String> = std::fs::read_dir(&bin_dir)
+            .expect("readdir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec!["boss".to_owned(), "cube".to_owned()],
+            "workers get `boss` and `cube` launchers; `bossctl` is Boss-tier; checkleft requires REPOBIN.toml",
+        );
+    }
+
+    #[test]
+    fn ensure_worker_bin_dir_omits_checkleft_when_workspace_has_no_repobin_toml() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("workspaces/checkleft-sandbox");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let bin_dir = dir.path().join("bin").join("checkleft-sandbox");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("checkleft"), "#!/bin/sh\nexit 92\n").unwrap();
+
+        let out = ensure_worker_bin_dir(dir.path(), &workspace).expect("launcher dir must be written");
+        assert_eq!(out, bin_dir);
+        assert!(
+            !bin_dir.join("checkleft").exists(),
+            "a leftover checkleft launcher must be removed when the workspace has no REPOBIN.toml"
+        );
+    }
+
+    #[test]
+    fn ensure_worker_bin_dir_writes_checkleft_when_repobin_toml_declares_it() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("workspaces/mono-agent-009");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("REPOBIN.toml"),
+            "version = 1\n[tools.checkleft]\ntarget = \"//tools/checkleft:checkleft\"\n",
+        )
+        .unwrap();
+        let bin_dir = ensure_worker_bin_dir(dir.path(), &workspace).expect("launcher dir must be written");
+        let launcher = std::fs::read_to_string(bin_dir.join("checkleft")).expect("checkleft launcher");
+        assert!(
+            launcher.contains(" exec 'checkleft'") || launcher.contains("refusing a host PATH fallback"),
+            "declared checkleft must write a launcher, got:\n{launcher}"
+        );
+
+        std::fs::write(
+            workspace.join("REPOBIN.toml"),
+            "version = 1\n[pins.checkleft]\nrepo = \"https://example.invalid/mono.git\"\ntag = \"v1\"\n",
+        )
+        .unwrap();
+        let again = ensure_worker_bin_dir(dir.path(), &workspace).expect("pin rewrite");
+        assert!(again.join("checkleft").is_file());
+    }
+
+    /// Export the spawn-path launchers as Bazel artifacts for validation in a
+    /// leased checkout without starting an agent. Repository builds must run
+    /// outside the test sandbox. The dispatcher path comes from
+    /// `BOSS_TEST_REPOBIN` (`$(rootpath //tools/repobin)`), not from the
+    /// rules_rust test-wrapper filename.
+    /// A non-derived spawn must still call `write_cube_launcher` so a stale
+    /// derived-PR compose wrapper left by a PREVIOUS worker in this same
+    /// workspace cannot linger and silently run for the new worker. Simulate
+    /// that stale state directly (bypassing `ensure_worker_bin_dir`, which
+    /// would itself already overwrite it) and assert the overwrite lands.
+    #[test]
+    fn ensure_worker_bin_dir_clears_a_stale_compose_wrapper() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("workspaces/mono-agent-008");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let bin_dir = dir.path().join("bin").join("mono-agent-008");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(
+            bin_dir.join("cube"),
+            "#!/bin/sh\n# Prior worker PR body header\nexec cube \"$@\"\n",
+        )
+        .expect("seed a stale compose wrapper");
+        let stale = std::fs::read_to_string(bin_dir.join("cube")).unwrap();
+        assert!(
+            stale.contains("Prior worker PR body header"),
+            "test setup must actually seed the compose wrapper"
+        );
+
+        let out = ensure_worker_bin_dir(dir.path(), &workspace).expect("launcher dir must be written");
+        assert_eq!(out, bin_dir);
+        let after = std::fs::read_to_string(bin_dir.join("cube")).unwrap();
+        assert!(
+            !after.contains("Prior worker PR body header"),
+            "a non-derived spawn must overwrite a stale compose wrapper from a previous worker, got:\n{after}",
+        );
+    }
+
+    /// Distinct workspaces get distinct launcher dirs under the shared
+    /// settings root — never a single host-wide `bin/boss`.
+    #[test]
+    fn ensure_worker_bin_dir_is_per_workspace() {
+        let dir = TempDir::new().unwrap();
+        let ws_a = dir.path().join("workspaces/mono-agent-a");
+        let ws_b = dir.path().join("workspaces/mono-agent-b");
+        std::fs::create_dir_all(&ws_a).unwrap();
+        std::fs::create_dir_all(&ws_b).unwrap();
+
+        let a = ensure_worker_bin_dir(dir.path(), &ws_a).expect("a");
+        let b = ensure_worker_bin_dir(dir.path(), &ws_b).expect("b");
+        assert_ne!(a, b);
+        assert!(a.ends_with("bin/mono-agent-a"));
+        assert!(b.ends_with("bin/mono-agent-b"));
+        assert!(a.join("boss").exists());
+        assert!(b.join("boss").exists());
+    }
+
+    /// When nothing resolves the function returns `None` — the caller
+    /// (`boss_event_binary`) turns this into a hard panic rather than
+    /// silently baking a bare `boss-event` into hook commands (which
+    /// causes `command not found` in the worker's sanitized PATH).
+    #[test]
+    fn resolve_boss_event_returns_none_when_nothing_resolves() {
+        let dir = TempDir::new().unwrap();
+        let engine = dir.path().join("engine");
+        std::fs::write(&engine, b"").unwrap();
+        let resolved = resolve_boss_event_binary(&engine, None, None, None, None);
+        assert_eq!(resolved, None);
+    }
+
+    /// The stable bin dir (installed by the engine at startup) is
+    /// preferred over bazel runfiles and bazel-bin so a `bazel clean`
+    /// doesn't break hook paths already baked into worker settings.json.
+    #[test]
+    fn resolve_boss_event_prefers_stable_bin_dir_over_runfiles() {
+        let dir = TempDir::new().unwrap();
+        let engine = dir.path().join("engine");
+        std::fs::write(&engine, b"").unwrap();
+
+        // Synthesize the stable bin dir (engine startup installs it here).
+        let stable_bin = dir.path().join("stable-bin");
+        std::fs::create_dir_all(&stable_bin).unwrap();
+        let stable_shim = stable_bin.join("boss-event");
+        std::fs::write(&stable_shim, b"stable").unwrap();
+
+        // Also synthesize runfiles — must NOT be picked when stable exists.
+        let runfiles = dir.path().join("engine.runfiles/_main/tools/boss/event-shim");
+        std::fs::create_dir_all(&runfiles).unwrap();
+        std::fs::write(runfiles.join("boss-event"), b"runfiles").unwrap();
+
+        let resolved = resolve_boss_event_binary(&engine, None, None, None, Some(&stable_bin));
+        assert_eq!(resolved, Some(stable_shim));
+    }
+
+    /// `install_boss_event_to_stable_bin` copies the shim and marks it
+    /// executable so workers can invoke it directly.
+    #[test]
+    fn install_boss_event_to_stable_bin_copies_and_makes_executable() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("boss-event-source");
+        std::fs::write(&source, b"#!/bin/sh\necho ok\n").unwrap();
+
+        let stable_bin = dir.path().join("stable/bin");
+        let result = install_boss_event_to_stable_bin(&source, &stable_bin);
+        assert!(result.is_ok(), "install should succeed: {result:?}");
+        let stable = result.unwrap();
+        assert_eq!(stable, stable_bin.join("boss-event"));
+        assert!(stable.exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&stable).unwrap().permissions().mode();
+            assert!(mode & 0o111 != 0, "boss-event must be executable after install");
+        }
+    }
+
+    /// Installing when src == dst is a no-op (doesn't fail or corrupt the file).
+    #[test]
+    fn install_boss_event_to_stable_bin_no_op_when_already_stable() {
+        let dir = TempDir::new().unwrap();
+        let stable_bin = dir.path().join("bin");
+        std::fs::create_dir_all(&stable_bin).unwrap();
+        let stable = stable_bin.join("boss-event");
+        std::fs::write(&stable, b"#!/bin/sh\n").unwrap();
+
+        let result = install_boss_event_to_stable_bin(&stable, &stable_bin);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), stable);
     }
 }
