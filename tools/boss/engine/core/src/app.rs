@@ -25,7 +25,8 @@ use crate::completion::{
     WorkerPaneReleaser,
 };
 use crate::config::RuntimeConfig;
-use crate::coordinator::{CommandCubeClient, ExecutionCoordinator, pause_bypass_decision};
+use crate::coordinator::{ExecutionCoordinator, pause_bypass_decision};
+use crate::cube_client::CommandCubeClient;
 use crate::driver::AgentDriver;
 use crate::events_socket::{bind_events_socket, handle_connection, peer_pid};
 use crate::external_tracker::WorkDbOrgStateSink;

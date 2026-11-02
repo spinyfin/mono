@@ -1074,7 +1074,7 @@ async fn retire_attempt_at_rung(
 /// Verify a mechanical rung's pushed resolution against the both-parent
 /// deletion tripwire before retiring the attempt. Delegates to
 /// [`CubeClient::verify_deletion_tripwire`] (test doubles fail open with
-/// no network call by default; only [`crate::coordinator::CommandCubeClient`]
+/// no network call by default; only [`crate::cube_client::CommandCubeClient`]
 /// makes the real gh-backed check).
 ///
 /// Re-derives the repo slug from `work_db` rather than adding a parameter
@@ -1089,7 +1089,7 @@ async fn retire_attempt_at_rung(
 /// `compute_merged_parent_deletions` check on the worker's actual PR
 /// output before it can retire. Rungs 0 and 1 retire straight to
 /// `in_review` with **no worker spawned at all**, so a transient
-/// `gh`/network error here (in [`crate::coordinator::CommandCubeClient`]'s
+/// `gh`/network error here (in [`crate::cube_client::CommandCubeClient`]'s
 /// `fetch_pr_head_sha` or the `gh compare` calls inside
 /// `compute_merged_parent_deletions`) — as opposed to a genuinely clean
 /// tripwire result — silently auto-retires a possibly-deletion-bearing

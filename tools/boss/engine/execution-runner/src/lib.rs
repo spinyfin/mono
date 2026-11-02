@@ -8,7 +8,8 @@ pub use runner::{pane_spawn, work_item};
 use runner::{prompt, worker_spawn};
 pub use runner::{spawn_confirmation, spawn_launch_limits};
 pub use work_item::{task_bound_pr_url, work_item_name, work_item_task_kind};
-pub use worker_spawn::{ComposedWorkerSpawn, REVIEW_GUIDE_DRIVER, WorkerSpawnOpts, compose_worker_spawn};
+pub use boss_execution_contracts::REVIEW_GUIDE_DRIVER;
+pub use worker_spawn::{ComposedWorkerSpawn, WorkerSpawnOpts, compose_worker_spawn};
 
 /// Thin wrappers over crate-internal helpers so engine-level tests can drive
 /// them without widening the runner's production API.

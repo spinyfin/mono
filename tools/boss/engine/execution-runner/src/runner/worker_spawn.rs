@@ -17,7 +17,7 @@ use crate::structured_output::StructuredOutputKind;
 use crate::work::{
     REASON_ALLOCATION, REASON_LEGACY_PERCENTAGE, WorkDb, WorkExecution, WorkItem, driver_clears_dispatch_gate,
 };
-use boss_execution_contracts::pool_dispatch_policy_for_worker_id;
+use boss_execution_contracts::{REVIEW_GUIDE_DRIVER, pool_dispatch_policy_for_worker_id};
 use boss_protocol::{
     EffortLevel, ExecutionKind, ProposalKind, ProposalState, ReviewBatchMember, ReviewBatchMemberRole,
     ReviewBatchMemberStatus, ReviewBatchPhase, ReviewBatchStatus, ReviewReportProposalPayload, TaskKind,
@@ -440,11 +440,6 @@ fn resolve_batch_reviewer_spawn(
     resolve_spawn_config_in(registry, &input)
         .map_err(|error| anyhow::anyhow!("review batch effort/model resolution: {error}"))
 }
-
-/// The one driver every `pr_review_guide` execution runs on. Shared with the
-/// coordinator's host selection and pre-start streak keying so all three
-/// name the same driver.
-pub const REVIEW_GUIDE_DRIVER: &str = "codex";
 
 /// The enforced-fixed Astra profile for every `pr_review_guide` execution:
 /// driver `codex`, model `gpt-6-astra`, `EffortLevel::Medium` (which

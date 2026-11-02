@@ -59,6 +59,7 @@ pub(crate) mod coordinator_tmux;
 pub mod cost_pricing;
 pub mod cost_report;
 pub use boss_host_execution::cube as cube_commands;
+pub mod cube_client;
 pub mod cube_lease_heartbeat;
 pub use boss_host_execution::cube_op_budget;
 pub mod database_backup;

@@ -157,6 +157,11 @@ pub fn select_host(requirements: &ChoreRequirements, slots: &[HostSlot]) -> (Opt
     (picked, report)
 }
 
+/// The one driver every `pr_review_guide` execution runs on. Shared by the
+/// worker-spawn profile that enforces it and the coordinator's host selection
+/// and pre-start streak keying, so all three name the same driver.
+pub const REVIEW_GUIDE_DRIVER: &str = "codex";
+
 /// Capability key for an installed agent driver. Spelling is load-bearing:
 /// host selection requires `driver=<slug>` for the execution's resolved
 /// driver and compares by exact string equality.
