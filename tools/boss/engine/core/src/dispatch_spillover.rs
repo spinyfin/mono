@@ -1,8 +1,10 @@
 //! Pure scheduling policy for automation spillover and mainline
-//! preemption. No I/O, no DB, no pool locks — the coordinator maps its
-//! live state into the small view types here, calls a decision function,
-//! and acts on the answer. Keeping the policy separate from
-//! `coordinator.rs`'s dispatch plumbing is what makes it unit-testable
+//! preemption. No I/O, no DB, no pool locks. The slot view type and the
+//! spill-selection function come from `boss_execution_contracts` (where
+//! the worker pool lives); this module holds the preemption policy. The
+//! coordinator maps its live state into the small view types, calls a
+//! decision function, and acts on the answer. Keeping the policy separate
+//! from `coordinator.rs`'s dispatch plumbing is what makes it unit-testable
 //! without standing up a `WorkDb`, a `WorkerPool`, and a runner.
 //!
 //! # The priority order
@@ -56,9 +58,6 @@ pub(crate) struct PreemptionCandidate {
     /// [`select_preemption_victim`]).
     pub started_epoch: Option<i64>,
 }
-
-#[cfg(test)]
-use boss_execution_contracts::select_spill_claim_index;
 
 /// `true` when a mainline item may preempt to obtain an interactive slot:
 /// every interactive slot on both pages is occupied.
@@ -163,61 +162,6 @@ mod tests {
             worker_id: "worker-9".to_owned(),
             started_epoch,
         }
-    }
-
-    #[test]
-    fn spill_never_takes_a_bridge_crew_slot_even_when_bridge_crew_is_idle() {
-        // The whole point of confining spill to page 1: Bridge Crew is
-        // completely free here, and automation still lands on slot 8
-        // (the first Lower Decks slot), leaving all 8 mainline slots.
-        let s = paged(0, 0);
-        assert_eq!(select_spill_claim_index(&s, None, PAGE), Some(8));
-    }
-
-    #[test]
-    fn spill_picks_lowest_free_lower_decks_slot() {
-        let s = paged(8, 3);
-        assert_eq!(select_spill_claim_index(&s, None, PAGE), Some(11));
-    }
-
-    #[test]
-    fn spill_returns_none_when_lower_decks_is_full() {
-        // Bridge Crew idle, Lower Decks full: still no spill. Automation
-        // waits rather than reaching into mainline's page.
-        let s = paged(0, 8);
-        assert_eq!(select_spill_claim_index(&s, None, PAGE), None);
-    }
-
-    #[test]
-    fn spill_returns_none_for_a_pool_with_no_lower_decks_page() {
-        // Test/config pools smaller than one page have no page 1.
-        let s = slots(&[false, false, false]);
-        assert_eq!(select_spill_claim_index(&s, None, PAGE), None);
-    }
-
-    #[test]
-    fn spill_prefers_workspace_affinity_within_lower_decks() {
-        let mut s = paged(8, 0);
-        s[13].last_workspace_id = Some("ws-warm".to_owned());
-        assert_eq!(select_spill_claim_index(&s, Some("ws-warm"), PAGE), Some(13));
-    }
-
-    #[test]
-    fn spill_affinity_never_escapes_lower_decks_into_bridge_crew() {
-        // The warm workspace was last run on a Bridge Crew slot. Affinity
-        // must not drag the spill onto page 0 — correctness (mainline
-        // headroom) outranks warmth.
-        let mut s = paged(0, 0);
-        s[2].last_workspace_id = Some("ws-warm".to_owned());
-        assert_eq!(select_spill_claim_index(&s, Some("ws-warm"), PAGE), Some(8));
-    }
-
-    #[test]
-    fn spill_falls_back_to_lowest_free_when_affinity_slot_is_busy() {
-        let mut s = paged(8, 2);
-        // Slot 9 has the warm workspace but is already occupied.
-        s[9].last_workspace_id = Some("ws-warm".to_owned());
-        assert_eq!(select_spill_claim_index(&s, Some("ws-warm"), PAGE), Some(10));
     }
 
     #[test]

@@ -39,8 +39,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::coordinator::CubeClient;
 use crate::sweep_loop::{SweepOutcome, spawn_sweep_loop};
+use boss_execution_contracts::CubeClient;
 
 /// TTL (seconds) this sweep refreshes every tracked rung-1 lease to.
 /// Deliberately far below cube's 86400 s / 24 h default: observed full
@@ -129,7 +129,7 @@ mod tests {
     use anyhow::Result;
 
     use super::*;
-    use crate::coordinator::CubeWorkspaceLease;
+    use boss_host_execution::types::CubeWorkspaceLease;
 
     #[derive(Default)]
     struct RecordingCube {

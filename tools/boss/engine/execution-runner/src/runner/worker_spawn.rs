@@ -17,7 +17,7 @@ use crate::structured_output::StructuredOutputKind;
 use crate::work::{
     REASON_ALLOCATION, REASON_LEGACY_PERCENTAGE, WorkDb, WorkExecution, WorkItem, driver_clears_dispatch_gate,
 };
-use boss_engine_storage_values::pool_policy::pool_dispatch_policy_for_worker_id;
+use boss_execution_contracts::pool_dispatch_policy_for_worker_id;
 use boss_protocol::{
     EffortLevel, ExecutionKind, ProposalKind, ProposalState, ReviewBatchMember, ReviewBatchMemberRole,
     ReviewBatchMemberStatus, ReviewBatchPhase, ReviewBatchStatus, ReviewReportProposalPayload, TaskKind,

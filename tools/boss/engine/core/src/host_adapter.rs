@@ -30,9 +30,6 @@ use boss_protocol::ExecutionKind;
 use tokio::sync::Mutex;
 
 use crate::config::RuntimeConfig;
-use crate::coordinator::{
-    CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
-};
 use crate::host_registry::Host;
 use crate::remote_wrapper::remote_wrapper_path;
 use crate::runner::{
@@ -47,6 +44,10 @@ use crate::ssh_transport::{SshOutput, SshTransport};
 use crate::work::{WorkDb, WorkExecution, WorkItem};
 use crate::worker_setup::{WorkerSetupInput, render_remote_settings_json};
 use crate::wrapper_distribution::{WrapperPushLocks, WrapperPushOutcome, ensure_wrapper_current};
+use boss_execution_contracts::CubeClient;
+use boss_host_execution::types::{
+    CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
+};
 
 /// Remote dir (under `$HOME`) that holds rendered worker `--settings`
 /// files. Outside any workspace tree so the worker's `jj`/`git` never

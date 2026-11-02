@@ -17,9 +17,9 @@ use std::time::Duration;
 use anyhow::Result;
 use boss_protocol::{CreateAttentionItemInput, WorkExecution};
 
-use crate::coordinator::CubeClient;
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::work::WorkDb;
+use boss_execution_contracts::CubeClient;
 
 /// Cadence for the leftover-lease sweep. Fires on boot so leases left by a
 /// previous engine process return to the pool without waiting a day.
