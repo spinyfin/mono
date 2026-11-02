@@ -1,4 +1,7 @@
 //! Engine bindings for the worker runner.
+//!
+//! Execution contracts are imported directly by production consumers and
+//! re-exported here only for test fixtures.
 pub use super::runner_adapter::PaneSpawnRunner;
 use crate::config::RuntimeConfig;
 pub(crate) use boss_execution_runner::{
