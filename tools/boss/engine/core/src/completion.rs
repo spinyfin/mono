@@ -346,52 +346,7 @@ pub const CI_NO_PUSH_REASON: &str = "no_push_no_classification";
 /// one working tree. The lease must stay held until the occupant is
 /// genuinely gone; the in-flight run reaps + releases once its spawn
 /// settles (see `PaneSpawnRunner::run_execution`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PaneReleaseOutcome {
-    /// A mapped worker slot was found: its pane was torn down and its OS
-    /// process tree signalled (SIGTERM, escalating to SIGKILL). The
-    /// workspace is no longer occupied, so the caller may free the lease.
-    Reaped,
-    /// No slot was mapped for the run. Either the worker already released
-    /// (idempotent second call) or — the case this distinction exists for
-    /// — it is still mid-spawn with no pid yet, so nothing could be
-    /// reaped. The caller MUST NOT free the cube lease on this outcome.
-    NoLiveWorker,
-}
-
-/// Tears down the tmux session hosting `run_id` after verifying its token
-/// and detaches its app viewer. Implementations must be idempotent: a duplicate
-/// call after the slot has been released is a no-op, not an error.
-/// The completion handler calls this after a successful cube lease
-/// release on PR detection so the Workers grid pane disappears.
-///
-/// Returns [`PaneReleaseOutcome`] so the caller can decide whether it is
-/// safe to release the cube lease (only when a live worker was reaped).
-#[async_trait]
-pub trait WorkerPaneReleaser: Send + Sync {
-    async fn release_pane(&self, run_id: &str) -> PaneReleaseOutcome;
-
-    /// Remove a retained live entry's roster name before its persona becomes reusable.
-    async fn forget_persona_name(&self, _run_id: &str) {}
-
-    /// The owning host has positively confirmed this remote worker is gone.
-    async fn release_proven_dead_remote_pane(&self, run_id: &str) -> PaneReleaseOutcome {
-        self.release_pane(run_id).await
-    }
-}
-
-/// `WorkerPaneReleaser` that does nothing — used when no app session
-/// release is wired (tests, headless runs). Reports `Reaped` so the
-/// lease-release path is unchanged for setups without a pane subsystem.
-#[derive(Debug, Default)]
-pub struct NoopWorkerPaneReleaser;
-
-#[async_trait]
-impl WorkerPaneReleaser for NoopWorkerPaneReleaser {
-    async fn release_pane(&self, _run_id: &str) -> PaneReleaseOutcome {
-        PaneReleaseOutcome::Reaped
-    }
-}
+pub use boss_execution_contracts::{NoopWorkerPaneReleaser, PaneReleaseOutcome, WorkerPaneReleaser};
 
 /// What GitHub reports about a PR associated with the worker's
 /// local commits.

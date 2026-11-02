@@ -72,18 +72,7 @@ pub use boss_engine_storage_values::attention_kinds::REMOTE_WORKER_DIED_ATTENTIO
 /// interval.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Counts from one pass; logged at `info` when any reaping occurred.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct RemoteLeaseReconcileOutcome {
-    /// Remote runs whose worker was provably dead → reaped + lease released.
-    pub reaped: usize,
-    /// Remote runs confirmed alive (left running).
-    pub alive: usize,
-    /// Remote runs we could not adjudicate — no recorded `remote_pid`, an
-    /// inconclusive probe (host unreachable), or a host that has since been
-    /// removed / whose adapter could not be built. Left ALONE.
-    pub skipped: usize,
-}
+pub use boss_execution_contracts::RemoteLeaseReconcileOutcome;
 
 impl crate::sweep_loop::SweepOutcome for RemoteLeaseReconcileOutcome {
     fn has_activity(&self) -> bool {

@@ -566,23 +566,20 @@ impl ExecutionCoordinator {
             }
             let mut any_reconciled = false;
             for sibling in &siblings {
-                let reconciled_lost_workspace = crate::lost_workspace_sweep::reconcile_if_execution_dead(
-                    self.work_db.as_ref(),
-                    self.dispatch_events.as_ref(),
-                    sibling,
-                    None, // lease release follows via host_adapter below
-                )
-                .await;
-                let reconciled_dead_pane = !reconciled_lost_workspace
-                    && crate::dead_pane_sweep::reconcile_if_pane_dead(
-                        self.work_db.as_ref(),
-                        self.dispatch_events.as_ref(),
-                        sibling,
-                        boss_engine_utils::epoch_time::now_epoch_secs(),
-                        self.live_worker_states.as_deref(),
-                        None, // lease release follows via host_adapter below
-                    )
+                let reconciled_lost_workspace = self
+                    .lifecycle
+                    .reconcile_if_execution_dead(sibling, self.dispatch_events.as_ref())
                     .await;
+                let reconciled_dead_pane = !reconciled_lost_workspace
+                    && self
+                        .lifecycle
+                        .reconcile_if_pane_dead(
+                            sibling,
+                            self.dispatch_events.as_ref(),
+                            boss_engine_utils::epoch_time::now_epoch_secs(),
+                            self.live_worker_states.as_deref(),
+                        )
+                        .await;
                 if reconciled_lost_workspace || reconciled_dead_pane {
                     any_reconciled = true;
                     tracing::warn!(
@@ -2492,14 +2489,14 @@ impl ExecutionCoordinator {
             }
         };
         if let Some(lease_id) = current.cube_lease_id.clone() {
-            crate::workspace_lease_release::release_lease_after_proven_never_started(
-                &self.work_db,
-                &current,
-                &lease_id,
-                self.host_adapter().as_ref(),
-                crate::workspace_lease_release::PreStartStage::AtOrAfterRecoveryBookmark,
-            )
-            .await;
+            self.lifecycle
+                .release_lease_after_proven_never_started(
+                    &current,
+                    &lease_id,
+                    self.host_adapter().as_ref(),
+                    PreStartStage::AtOrAfterRecoveryBookmark,
+                )
+                .await;
         }
         if current.status != ExecutionStatus::Claimed {
             return;

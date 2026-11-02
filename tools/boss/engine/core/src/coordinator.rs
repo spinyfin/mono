@@ -13,6 +13,18 @@ use boss_protocol::{
 };
 use tokio::sync::{Mutex, Semaphore};
 
+use boss_engine_storage_values::Host;
+use boss_engine_storage_values::attention_kinds::{
+    EXECUTION_BOOKMARK_CREATE_FAILED_ATTENTION_KIND as CREATE_FAILED,
+    EXECUTION_BOOKMARK_RECOVERY_FAILED_ATTENTION_KIND as RECOVERY_FAILED,
+    EXECUTION_BOOKMARK_RECOVERY_RETIRED_ATTENTION_KIND as RECOVERY_RETIRED,
+};
+use boss_execution_contracts::{
+    ChoreRequirements, FailureEffect, HostSlot, IneligibilityReason, LeaseReleaseOutcome, LifecycleServices,
+    LiveWorkerLiveness, PidStatus, PreStartStage, PreStartStreakTracker, TeardownReason, TerminalCause,
+    WorkerPaneReleaser, driver_capability, select_host,
+};
+
 use crate::config::RuntimeConfig;
 use crate::conflict_diagnosis;
 use crate::dispatch_events::{
@@ -21,16 +33,16 @@ use crate::dispatch_events::{
 use crate::dispatch_inflight::InflightDispatches;
 #[cfg(test)]
 use crate::effort::PoolModelTier;
-use crate::host_adapter::{LocalHostAdapter, LocalHostAdapterProvider};
-use crate::host_registry::Host;
-use crate::host_scheduling::{self, ChoreRequirements, HostSlot};
+#[cfg(test)]
+use crate::host_adapter::LocalHostAdapter;
+use crate::host_adapter::LocalHostAdapterProvider;
 use crate::metrics::Registry;
 use crate::work::{
     CreateAttentionItemInput, DispatchClaimOutcome, DispatchClass, FinishExecutionRunInput, PreStartFailureOutcome,
     WorkDb, WorkExecution, WorkItem, WorkRun,
 };
-use boss_execution_contracts::{ExecutionRunner, RunOutcome, RunWaitState};
 use boss_execution_contracts::{HostAdapter, HostAdapterProvider};
+use boss_execution_contracts::{RunOutcome, RunWaitState};
 
 // Phase-3 counter handles for the cube workspace lease boundary.
 crate::register_counter!(
@@ -421,9 +433,18 @@ pub use boss_execution_contracts::{CubeClient, RebaseOutcome};
 #[cfg(not(test))]
 use boss_execution_contracts::{CubeClient, RebaseOutcome};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CommandCubeClient {
     cfg: Arc<RuntimeConfig>,
+    lifecycle: Arc<dyn LifecycleServices>,
+}
+
+impl std::fmt::Debug for CommandCubeClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommandCubeClient")
+            .field("cfg", &self.cfg)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Strip the trailing jj conflict-type descriptor (e.g. `"    2-sided
@@ -504,8 +525,9 @@ fn parse_rebase_payload(payload: serde_json::Value) -> Result<RebaseOutcome> {
 }
 
 impl CommandCubeClient {
-    pub fn new(cfg: Arc<RuntimeConfig>) -> Self {
-        Self { cfg }
+    /// `lifecycle` supplies the merge-parent deletion tripwire.
+    pub fn new(cfg: Arc<RuntimeConfig>, lifecycle: Arc<dyn LifecycleServices>) -> Self {
+        Self { cfg, lifecycle }
     }
 
     async fn run_json(&self, args: &[&str]) -> Result<serde_json::Value> {
@@ -674,10 +696,8 @@ impl CubeClient for CommandCubeClient {
         base_sha: &str,
         pr_number: u64,
     ) -> Vec<String> {
-        let Some(head_after) = crate::merge_parent_deletion::fetch_pr_head_sha(repo_slug, pr_number).await else {
-            return Vec::new();
-        };
-        crate::merge_parent_deletion::compute_merged_parent_deletions(repo_slug, head_before, base_sha, &head_after)
+        self.lifecycle
+            .verify_deletion_tripwire(repo_slug, head_before, base_sha, pr_number)
             .await
     }
 
@@ -762,11 +782,13 @@ pub(crate) fn occupying_live_worker(
         .map(|s| s.run_id.clone())
 }
 
-fn default_coordinator_metrics() -> Arc<Registry> {
+/// Fresh registry with the coordinator's counters pre-registered, including
+/// the answer-agent metrics registered through `lifecycle`.
+pub fn default_coordinator_metrics(lifecycle: &dyn LifecycleServices) -> Arc<Registry> {
     let metrics = Arc::new(Registry::new());
     register_metrics(&metrics);
     crate::dispatch_metrics::register_metrics(&metrics);
-    crate::answer_agent_observability::register_metrics(&metrics);
+    lifecycle.register_answer_agent_metrics(&metrics);
     metrics
 }
 
@@ -780,7 +802,7 @@ use boss_execution_contracts::{
 };
 
 #[derive(bon::Builder)]
-#[builder(on(String, into))]
+#[builder(on(String, into), finish_fn(name = build_inner, vis = ""))]
 pub struct ExecutionCoordinator {
     work_db: Arc<WorkDb>,
     worker_pool: WorkerPool,
@@ -806,7 +828,11 @@ pub struct ExecutionCoordinator {
     /// [`crate::host_adapter::SshHostAdapterProvider`] via
     /// [`Self::set_host_adapter_provider`].
     host_adapter_provider: Arc<dyn HostAdapterProvider>,
-    remote_pane_releaser: Option<Arc<dyn crate::completion::WorkerPaneReleaser>>,
+    remote_pane_releaser: Option<Arc<dyn WorkerPaneReleaser>>,
+    /// Engine lifecycle operations (lease release, teardown, bookmark
+    /// recovery, remote reattach). Required: the caller supplies the
+    /// implementation (production composition passes the core adapter).
+    lifecycle: Arc<dyn LifecycleServices>,
     #[builder(default = Arc::new(NoopExecutionPublisher))]
     publisher: Arc<dyn ExecutionPublisher>,
     /// Structured stream of dispatch-pipeline events. Defaults to a
@@ -888,11 +914,8 @@ pub struct ExecutionCoordinator {
     /// to [`crate::config::MAX_MERGE_ORDER_STAGGER_SECS`]) at construction.
     #[builder(default)]
     merge_order_stagger_secs: u64,
-    /// Engine-wide counter registry. Defaults to a fresh local registry
-    /// with the lease counters pre-registered so tests that do not call
-    /// `set_metrics` still get valid increments. Production wires in the
-    /// shared engine registry via `set_metrics` after construction.
-    #[builder(default = default_coordinator_metrics())]
+    /// Engine-wide counter registry. Builder finalization registers the
+    /// supplied lifecycle's answer-agent metrics, including for a shared registry.
     metrics: Arc<Registry>,
     /// Hook called when an execution transitions to `running`.
     /// Defaults to [`NoopExecutionStartedHook`]; production installs
@@ -1032,7 +1055,7 @@ pub struct ExecutionCoordinator {
     /// in tests that don't wire it; production installs it via
     /// [`Self::set_live_worker_states`]. When absent the guard fails open
     /// (the historical no-check behaviour).
-    live_worker_states: Option<Arc<crate::live_worker_state::LiveWorkerStateRegistry>>,
+    live_worker_states: Option<Arc<dyn LiveWorkerLiveness>>,
     /// Workspace IDs refused by the occupancy guard, keyed by execution id.
     /// When cube hands us a workspace that the engine's live-worker registry
     /// knows is still occupied, we release the lease and record the workspace
@@ -1081,7 +1104,7 @@ pub struct ExecutionCoordinator {
     /// the engine health report. Visibility only — nothing in dispatch
     /// consults it. See [`crate::pre_start_streak`].
     #[builder(default)]
-    pre_start_streaks: Arc<crate::pre_start_streak::PreStartStreakTracker>,
+    pre_start_streaks: Arc<PreStartStreakTracker>,
     /// Per-repo bound on concurrent cube workspace-lease attempts. Drain
     /// takes a permit before claiming a slot so a lease storm cannot fill
     /// the interactive pool. Defaults to
@@ -1160,12 +1183,12 @@ fn work_item_project_id(item: &WorkItem) -> Option<String> {
 /// with an explicit "no enabled host has driver X" so an operator reading
 /// the queue never has to decode per-host capability lists to see the
 /// hold reason.
-fn summarize_ineligibility(report: &[host_scheduling::Eligibility], required_driver: Option<&str>) -> String {
-    use host_scheduling::IneligibilityReason as R;
+fn summarize_ineligibility(report: &[boss_execution_contracts::Eligibility], required_driver: Option<&str>) -> String {
+    use IneligibilityReason as R;
     if report.is_empty() {
         return "no hosts are registered".to_owned();
     }
-    let driver_cap = required_driver.map(crate::host_capability_probe::driver_capability);
+    let driver_cap = required_driver.map(driver_capability);
     let per_host: Vec<String> = report
         .iter()
         .map(|h| {
@@ -1215,9 +1238,7 @@ fn summarize_ineligibility(report: &[host_scheduling::Eligibility], required_dri
             !h.eligible
                 && !h.reasons.iter().any(|r| matches!(r, R::DriverProbeNotRun))
                 && h.reasons.iter().any(|r| match r {
-                    R::MissingCapabilities(missing) => missing
-                        .iter()
-                        .any(|m| m == &crate::host_capability_probe::driver_capability(driver)),
+                    R::MissingCapabilities(missing) => missing.iter().any(|m| m == &driver_capability(driver)),
                     _ => false,
                 })
         });
@@ -1372,3 +1393,14 @@ fn cold_repo_attention_body(repo: &CubeRepoSummary) -> String {
 #[cfg(test)]
 #[path = "coordinator_tests/mod.rs"]
 mod tests;
+
+impl<S: execution_coordinator_builder::IsComplete> ExecutionCoordinatorBuilder<S> {
+    /// Register lifecycle metrics before exposing the completed coordinator.
+    pub fn build(self) -> ExecutionCoordinator {
+        let coordinator = self.build_inner();
+        coordinator
+            .lifecycle
+            .register_answer_agent_metrics(&coordinator.metrics);
+        coordinator
+    }
+}

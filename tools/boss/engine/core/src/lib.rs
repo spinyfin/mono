@@ -235,4 +235,6 @@ mod worker_throttle;
 pub mod workspace_lease_release;
 pub mod wrapper_distribution;
 
+mod lifecycle_adapter;
+pub use lifecycle_adapter::CoreCoordinatorConstructors;
 mod runner_adapter;

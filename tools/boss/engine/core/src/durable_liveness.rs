@@ -59,8 +59,10 @@
 //! working" must corroborate with hook recency on top, the way
 //! `live_process_evidence` does.
 
+use boss_execution_contracts::LiveWorkerLiveness;
+
 use crate::dead_pid_sweep::PidStatus;
-use crate::live_worker_state::{LiveWorkerStateRegistry, iso8601_utc};
+use crate::live_worker_state::iso8601_utc;
 use crate::work::WorkDb;
 
 /// How far back a recorded `work_runs.shell_pid` is trusted by the callers
@@ -127,7 +129,7 @@ pub const CORROBORATION_WINDOW_SECS: i64 = 120;
 /// timestamp is still reaped, while a live worker with flowing events is
 /// spared.
 pub fn corroborating_liveness(
-    live_states: &LiveWorkerStateRegistry,
+    live_states: &dyn LiveWorkerLiveness,
     execution_id: &str,
     started_epoch: i64,
     now_epoch_secs: i64,
@@ -185,7 +187,7 @@ pub fn corroborating_liveness(
 /// not trusted.
 pub fn corroborate_against_live_registry(
     process: WorkerProcess,
-    live_states: &LiveWorkerStateRegistry,
+    live_states: &dyn LiveWorkerLiveness,
     execution_id: &str,
     started_epoch: i64,
     now_epoch_secs: i64,
@@ -399,6 +401,7 @@ pub(crate) fn probe_recorded_pid(shell_pid: Option<i64>) -> WorkerProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::test_support::*;
     use boss_protocol::WorkerEvent;
 

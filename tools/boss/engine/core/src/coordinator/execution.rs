@@ -302,7 +302,7 @@ impl ExecutionCoordinator {
         // enforce — see [`Self::select_host_for_execution`] for how it is
         // resolved.
         if let Some(ref driver) = required_driver {
-            required_capabilities.insert(crate::host_capability_probe::driver_capability(driver));
+            required_capabilities.insert(driver_capability(driver));
         }
 
         self.work_db.ensure_work_item_not_quarantined(work_item.primary_id())?;
@@ -347,7 +347,7 @@ impl ExecutionCoordinator {
             pinned_host_id,
             requested_host_id,
         };
-        let (picked, report) = host_scheduling::select_host(&requirements, &slots);
+        let (picked, report) = select_host(&requirements, &slots);
         match picked {
             Some(host_id) => hosts
                 .into_iter()
@@ -560,23 +560,20 @@ impl ExecutionCoordinator {
                     // blocking. This is the restart-robust check that keeps the guard
                     // from deferring forever to a corpse (the recurring 2026-07-03
                     // redundant_spawn spam).
-                    let reconciled_lost_workspace = crate::lost_workspace_sweep::reconcile_if_execution_dead(
-                        self.work_db.as_ref(),
-                        self.dispatch_events.as_ref(),
-                        &live,
-                        None, // lease release follows via host_adapter below
-                    )
-                    .await;
-                    let reconciled_dead_pane = !reconciled_lost_workspace
-                        && crate::dead_pane_sweep::reconcile_if_pane_dead(
-                            self.work_db.as_ref(),
-                            self.dispatch_events.as_ref(),
-                            &live,
-                            boss_engine_utils::epoch_time::now_epoch_secs(),
-                            self.live_worker_states.as_deref(),
-                            None, // lease release follows via host_adapter below
-                        )
+                    let reconciled_lost_workspace = self
+                        .lifecycle
+                        .reconcile_if_execution_dead(&live, self.dispatch_events.as_ref())
                         .await;
+                    let reconciled_dead_pane = !reconciled_lost_workspace
+                        && self
+                            .lifecycle
+                            .reconcile_if_pane_dead(
+                                &live,
+                                self.dispatch_events.as_ref(),
+                                boss_engine_utils::epoch_time::now_epoch_secs(),
+                                self.live_worker_states.as_deref(),
+                            )
+                            .await;
                     if reconciled_lost_workspace || reconciled_dead_pane {
                         tracing::warn!(
                             execution_id = %execution.id,
@@ -1100,7 +1097,7 @@ impl ExecutionCoordinator {
         // Mirror the argv `ensure_repo` actually drives so the dispatch-event
         // `cube_command` is reproducible from a terminal: a bare resolver
         // slug goes positionally (`repo ensure <name>`), a URL via `--origin`.
-        let ensure_args = crate::repo_slug::repo_ensure_args(&execution.repo_remote_url);
+        let ensure_args = boss_host_execution::cube::repo_ensure_args(&execution.repo_remote_url);
         // Record the attempt *before* the subprocess, mirroring
         // `cube_workspace_lease_attempted`. `cube repo ensure` on a cold
         // repo can outrun the `worker_claimed` stall threshold; with this
@@ -1336,12 +1333,7 @@ impl ExecutionCoordinator {
                 &execution.id,
                 &snapshot,
                 |eid| self.work_db.get_execution(eid).ok().and_then(|e| e.cube_workspace_id),
-                |pid| {
-                    !matches!(
-                        crate::dead_pid_sweep::probe_pid(pid),
-                        crate::dead_pid_sweep::PidStatus::Dead
-                    )
-                },
+                |pid| !matches!(self.lifecycle.probe_pid(pid), PidStatus::Dead),
             );
             if let Some(occupant_run_id) = occupant {
                 tracing::error!(
@@ -1382,13 +1374,9 @@ impl ExecutionCoordinator {
 
                 // Drop only the refused registry lease, never reset the live
                 // occupant's checkout. This execution has not positioned it.
-                crate::workspace_lease_release::release_refused_workspace(
-                    &self.work_db,
-                    execution,
-                    &lease.lease_id,
-                    adapter.as_ref(),
-                )
-                .await;
+                self.lifecycle
+                    .release_refused_workspace(execution, &lease.lease_id, adapter.as_ref())
+                    .await;
                 let err = anyhow!(
                     "leased workspace {} is occupied by live worker {}",
                     lease.workspace_id,
@@ -1466,13 +1454,8 @@ impl ExecutionCoordinator {
                 // so the row returns to `ready` (the deferral path) and
                 // `recover_failed_dispatch` does not count this serialization
                 // as a spawn failure.
-                self.release_pre_start_workspace(
-                    execution,
-                    &lease,
-                    &adapter,
-                    crate::workspace_lease_release::PreStartStage::BeforeRecoveryBookmark,
-                )
-                .await;
+                self.release_pre_start_workspace(execution, &lease, &adapter, PreStartStage::BeforeRecoveryBookmark)
+                    .await;
                 if let Err(err) = self.work_db.release_dispatch_claim(&execution.id) {
                     tracing::error!(
                         execution_id = %execution.id,
@@ -1555,20 +1538,11 @@ impl ExecutionCoordinator {
         {
             Ok(recovered) => recovered,
             Err(err) => {
-                self.release_pre_start_workspace(
-                    execution,
-                    &lease,
-                    &adapter,
-                    crate::workspace_lease_release::PreStartStage::BeforeRecoveryBookmark,
-                )
-                .await;
-                let pointer_damaged =
-                    crate::execution_bookmark_recovery::block_unrecoverable(&self.work_db, execution, &err)?;
+                self.release_pre_start_workspace(execution, &lease, &adapter, PreStartStage::BeforeRecoveryBookmark)
+                    .await;
+                let pointer_damaged = self.lifecycle.block_unrecoverable_bookmark(execution, &err)?;
                 let attention = if pointer_damaged {
-                    (
-                        crate::execution_bookmark_recovery::RECOVERY_FAILED,
-                        "Execution bookmark recovery failed",
-                    )
+                    (RECOVERY_FAILED, "Execution bookmark recovery failed")
                 } else {
                     ("cube_workspace_positioning_failed", "Execution bookmark restore failed")
                 };
@@ -1723,7 +1697,7 @@ impl ExecutionCoordinator {
                             execution,
                             &lease,
                             &adapter,
-                            crate::workspace_lease_release::PreStartStage::BeforeRecoveryBookmark,
+                            PreStartStage::BeforeRecoveryBookmark,
                         )
                         .await;
                         let failure_label = match target {
@@ -1794,7 +1768,7 @@ impl ExecutionCoordinator {
                         execution,
                         &lease,
                         &adapter,
-                        crate::workspace_lease_release::PreStartStage::BeforeRecoveryBookmark,
+                        PreStartStage::BeforeRecoveryBookmark,
                     )
                     .await;
                     self.dispatch_events
@@ -1860,23 +1834,15 @@ impl ExecutionCoordinator {
         }
         .await;
         if let Err(err) = bookmark_result {
-            crate::execution_bookmark_recovery::report_failure(&self.work_db, execution, &format!("{err:#}"));
-            self.release_pre_start_workspace(
-                execution,
-                &lease,
-                &adapter,
-                crate::workspace_lease_release::PreStartStage::AtOrAfterRecoveryBookmark,
-            )
-            .await;
+            self.lifecycle.report_bookmark_failure(execution, &format!("{err:#}"));
+            self.release_pre_start_workspace(execution, &lease, &adapter, PreStartStage::AtOrAfterRecoveryBookmark)
+                .await;
             self.record_start_failure(
                 Arc::clone(self),
                 execution,
                 worker_id,
                 Some(&repo.repo_id),
-                (
-                    crate::execution_bookmark_recovery::CREATE_FAILED,
-                    "Execution bookmark creation failed",
-                ),
+                (CREATE_FAILED, "Execution bookmark creation failed"),
                 &err,
             )
             .await?;
@@ -1888,10 +1854,7 @@ impl ExecutionCoordinator {
         // released or detached before this lease), and would otherwise keep
         // this lease held at completion. Failures raised from here on belong
         // to this lease and stay open for the release gate.
-        for kind in [
-            crate::execution_bookmark_recovery::CREATE_FAILED,
-            crate::execution_bookmark_recovery::RECOVERY_FAILED,
-        ] {
+        for kind in [CREATE_FAILED, RECOVERY_FAILED] {
             if let Err(err) = self.work_db.resolve_attention_kind_for_execution(&execution.id, kind) {
                 tracing::warn!(execution_id = %execution.id, kind, ?err, "could not resolve superseded bookmark failure");
             }
@@ -1921,7 +1884,7 @@ impl ExecutionCoordinator {
                     .map(|(started, created)| (started.saturating_sub(created).max(0) as u64).saturating_mul(1_000))
                     .unwrap_or(0);
                 if execution.kind == ExecutionKind::AnswerAgent {
-                    crate::answer_agent_observability::record_started(&self.metrics, queue_wait_ms);
+                    self.lifecycle.record_answer_agent_started(&self.metrics, queue_wait_ms);
                     tracing::info!(
                         execution_id = %execution.id,
                         comment_id = %execution.work_item_id,
@@ -2011,13 +1974,8 @@ impl ExecutionCoordinator {
                 Ok(())
             }
             Err(err) => {
-                self.release_pre_start_workspace(
-                    execution,
-                    &lease,
-                    &adapter,
-                    crate::workspace_lease_release::PreStartStage::AtOrAfterRecoveryBookmark,
-                )
-                .await;
+                self.release_pre_start_workspace(execution, &lease, &adapter, PreStartStage::AtOrAfterRecoveryBookmark)
+                    .await;
                 self.dispatch_events
                     .emit(
                         DispatchEvent::new(Stage::RunStarted, DispatchOutcome::Error, &execution.id)
@@ -2151,26 +2109,26 @@ impl ExecutionCoordinator {
         // keep trying to return it. A lease retained after a bookmark
         // failure keeps its bookmark gate (see `never_positioned`).
         if let Some(existing_lease) = execution.cube_lease_id.as_deref() {
-            let outcome = crate::workspace_lease_release::release_lease_after_proven_never_started(
-                &self.work_db,
-                execution,
-                existing_lease,
-                adapter.as_ref(),
-                crate::workspace_lease_release::PreStartStage::BeforeRecoveryBookmark,
-            )
-            .await;
+            let outcome = self
+                .lifecycle
+                .release_lease_after_proven_never_started(
+                    execution,
+                    existing_lease,
+                    adapter.as_ref(),
+                    PreStartStage::BeforeRecoveryBookmark,
+                )
+                .await;
             match outcome {
-                crate::workspace_lease_release::LeaseReleaseOutcome::Released
-                | crate::workspace_lease_release::LeaseReleaseOutcome::NoLease => {}
+                LeaseReleaseOutcome::Released | LeaseReleaseOutcome::NoLease => {}
                 // Every gate passed and cube itself failed. The lease stays
                 // recorded on this execution so the leftover-lease sweep keeps
                 // retrying it; leasing a fresh workspace would overwrite it.
-                crate::workspace_lease_release::LeaseReleaseOutcome::CubeFailed { error } => {
+                LeaseReleaseOutcome::CubeFailed { error } => {
                     return Err(anyhow!(
                         "previous cube workspace lease {existing_lease} could not be released yet: {error}"
                     ));
                 }
-                crate::workspace_lease_release::LeaseReleaseOutcome::Kept { .. } => {
+                LeaseReleaseOutcome::Kept { .. } => {
                     tracing::warn!(
                         execution_id = %execution.id,
                         lease_id = existing_lease,
@@ -2481,16 +2439,11 @@ impl ExecutionCoordinator {
         execution: &WorkExecution,
         lease: &CubeWorkspaceLease,
         adapter: &Arc<dyn HostAdapter>,
-        stage: crate::workspace_lease_release::PreStartStage,
+        stage: PreStartStage,
     ) {
-        crate::workspace_lease_release::release_lease_after_proven_never_started(
-            &self.work_db,
-            execution,
-            &lease.lease_id,
-            adapter.as_ref(),
-            stage,
-        )
-        .await;
+        self.lifecycle
+            .release_lease_after_proven_never_started(execution, &lease.lease_id, adapter.as_ref(), stage)
+            .await;
     }
 
     /// Record a pre-start failure and either schedule an automatic retry
@@ -2515,7 +2468,7 @@ impl ExecutionCoordinator {
     ) -> Result<()> {
         let (attention_kind, attention_title) = attention;
         let error_text = format!("{error:#}");
-        let retry_delays: &[Duration] = if attention_kind == crate::execution_bookmark_recovery::RECOVERY_FAILED
+        let retry_delays: &[Duration] = if attention_kind == RECOVERY_FAILED
             && matches!(
                 execution.kind,
                 ExecutionKind::ChoreImplementation
@@ -2762,6 +2715,7 @@ impl ExecutionCoordinator {
         }
         let work_db = self.work_db.clone();
         let publisher = self.publisher.clone();
+        let lifecycle = self.lifecycle.clone();
         let execution_id = execution.id.clone();
         boss_task_scope::spawn(async move {
             let Ok(Some(attempt)) = work_db.pr_review_guide_attempt_for_execution(&execution_id) else {
@@ -2770,13 +2724,9 @@ impl ExecutionCoordinator {
             let Ok(Some(root_task_id)) = work_db.root_task_id_for_review_guide_series(&attempt.series_id) else {
                 return;
             };
-            crate::execution_publisher::notify_review_guide_changed(
-                &work_db,
-                &publisher,
-                &root_task_id,
-                "review_guide_failed",
-            )
-            .await;
+            lifecycle
+                .notify_review_guide_changed(&publisher, &root_task_id, "review_guide_failed")
+                .await;
         });
     }
 

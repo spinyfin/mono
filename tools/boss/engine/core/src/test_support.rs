@@ -6,6 +6,7 @@
 //! here means a new field on [`CreateProductInput`] touches one site
 //! instead of ~250, and keeps the setup readable at each call site.
 
+pub use crate::lifecycle_adapter::CoreCoordinatorConstructors;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

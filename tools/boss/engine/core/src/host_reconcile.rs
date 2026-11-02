@@ -325,6 +325,7 @@ async fn drain_execution(
 
 #[cfg(test)]
 mod tests {
+    use crate::lifecycle_adapter::CoreCoordinatorConstructors;
     use std::collections::BTreeSet;
     use std::path::Path;
     use std::sync::{Arc, Mutex};

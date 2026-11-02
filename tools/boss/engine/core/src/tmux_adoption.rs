@@ -1600,6 +1600,7 @@ async fn refuse_and_reap(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lifecycle_adapter::CoreCoordinatorConstructors;
     use std::collections::HashMap;
     use std::ffi::OsString;
     use std::path::Path;
