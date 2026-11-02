@@ -5,7 +5,7 @@
 //!
 //! Every liveness decision in this crate used to read one of two in-memory
 //! structures: [`crate::live_worker_state::LiveWorkerStateRegistry`] (the
-//! per-slot live state) or the [`crate::coordinator::WorkerPool`]'s claim
+//! per-slot live state) or the [`boss_execution_contracts::WorkerPool`]'s claim
 //! table. Both are *derived* bookkeeping — the engine's belief about what is
 //! running — and both are cleared unconditionally at the end of
 //! [`crate::app::ServerState::release_worker_pane`], which runs on every

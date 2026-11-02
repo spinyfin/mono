@@ -17,9 +17,9 @@ use std::time::Duration;
 use anyhow::Result;
 use boss_protocol::{CreateAttentionItemInput, WorkExecution};
 
-use crate::coordinator::CubeClient;
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::work::WorkDb;
+use boss_execution_contracts::CubeClient;
 
 /// Cadence for the leftover-lease sweep. Fires on boot so leases left by a
 /// previous engine process return to the pool without waiting a day.
@@ -145,7 +145,7 @@ pub fn decide(
 /// is never evidence of an empty workspace.
 pub struct DbBookmarkGate<'a> {
     pub db: &'a WorkDb,
-    pub adapter: Option<&'a dyn crate::host_adapter::HostAdapter>,
+    pub adapter: Option<&'a dyn boss_execution_contracts::HostAdapter>,
 }
 
 #[async_trait::async_trait]
@@ -426,7 +426,7 @@ pub async fn release_refused_workspace(
     db: &WorkDb,
     execution: &WorkExecution,
     lease_id: &str,
-    adapter: &dyn crate::host_adapter::HostAdapter,
+    adapter: &dyn boss_execution_contracts::HostAdapter,
 ) -> LeaseReleaseOutcome {
     apply_release(
         db,
@@ -479,7 +479,7 @@ pub async fn release_lease_after_proven_never_started(
     work_db: &WorkDb,
     execution: &WorkExecution,
     lease_id: &str,
-    adapter: &dyn crate::host_adapter::HostAdapter,
+    adapter: &dyn boss_execution_contracts::HostAdapter,
     stage: PreStartStage,
 ) -> LeaseReleaseOutcome {
     let current = match work_db.get_execution(&execution.id) {

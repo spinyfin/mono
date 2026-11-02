@@ -2351,7 +2351,7 @@ pub(super) async fn noop_skip_reason(
 
 /// Outcome of [`WorkerCompletionHandler::collect_remote_structured_output`],
 /// carrying the host id alongside the adapter's
-/// [`crate::host_adapter::CollectOutcome`] so a terminal failure can name
+/// [`boss_execution_contracts::CollectOutcome`] so a terminal failure can name
 /// which host it came from.
 pub(super) enum RemoteCollectionResult {
     /// Not a remote execution, no host to collect from — the ordinary
@@ -2429,9 +2429,9 @@ impl WorkerCompletionHandler {
             .collect_structured_output(&execution.id, kind, &destination)
             .await
         {
-            Ok(crate::host_adapter::CollectOutcome::Collected) => RemoteCollectionResult::Collected,
-            Ok(crate::host_adapter::CollectOutcome::NotAvailable) => RemoteCollectionResult::NotAvailable,
-            Ok(crate::host_adapter::CollectOutcome::Failed(reason)) => {
+            Ok(boss_execution_contracts::CollectOutcome::Collected) => RemoteCollectionResult::Collected,
+            Ok(boss_execution_contracts::CollectOutcome::NotAvailable) => RemoteCollectionResult::NotAvailable,
+            Ok(boss_execution_contracts::CollectOutcome::Failed(reason)) => {
                 RemoteCollectionResult::Failed { host_id, reason }
             }
             Err(err) => {

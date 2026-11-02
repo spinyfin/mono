@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 
 use boss_engine_utility_model::{self as utility_model, UtilityModel};
 
-use crate::coordinator::{DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE};
+use boss_execution_contracts::{DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE};
 
 /// Environment override for the SQLite state database path.
 pub const DB_PATH_ENV: &str = "BOSS_DB_PATH";

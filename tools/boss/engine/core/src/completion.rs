@@ -61,7 +61,6 @@ use crate::automation_triage::TriageDecision;
 use crate::build_wait::detect_build_wait_signal;
 use crate::build_wait_tracker::{BuildWaitDecision, BuildWaitTracker, DEFAULT_BUILD_WAIT_HORIZON_SECS};
 use crate::conflict_stop_gate::{self, ConflictClearance};
-use crate::coordinator::{CubeClient, ExecutionPublisher, PreemptOutcome};
 use crate::design_detector;
 use crate::dispatch_events::{
     DispatchEvent, DispatchEventSink, NoopDispatchEventSink, Outcome as DispatchOutcome, Stage,
@@ -78,6 +77,7 @@ use crate::work::{
 use crate::work::{FinishExecutionRunInput, TaskStatus};
 use crate::worker_escalation::{self, WorkerSignal, WorkerSignalKind};
 use boss_engine_gh_invocation::{gh_compare_jq, run_gh};
+use boss_execution_contracts::{CubeClient, ExecutionPublisher, PreemptOutcome};
 use boss_gh_telemetry::{callers, scope as gh_scope};
 use boss_github::pr_url::pr_number_from_url;
 
@@ -1618,7 +1618,7 @@ pub struct WorkerCompletionHandler {
     structured_output_dir: std::path::PathBuf,
     /// Resolves remote adapters for structured-output collection at the read
     /// site. Kept optional for local-only tests and installations.
-    host_adapter_provider: Arc<std::sync::RwLock<Option<Arc<dyn crate::host_adapter::HostAdapterProvider>>>>,
+    host_adapter_provider: Arc<std::sync::RwLock<Option<Arc<dyn boss_execution_contracts::HostAdapterProvider>>>>,
     /// Owning-cube resolver shared with the lease heartbeat
     /// ([`crate::cube_lease_heartbeat::HostRoutedCubes`]); installed together
     /// with the adapter provider. Until then a remote run fails to resolve
@@ -1643,7 +1643,7 @@ pub struct WorkerCompletionHandler {
     review_batch_enqueuer: Arc<dyn ReviewBatchEnqueuer>,
     /// Configured review-pool slot count used as weighted-admission
     /// reservation capacity. Defaults to
-    /// [`crate::coordinator::DEFAULT_REVIEW_POOL_SIZE`]; production wires
+    /// [`boss_execution_contracts::DEFAULT_REVIEW_POOL_SIZE`]; production wires
     /// `WorkConfig.review_pool_size` via [`Self::with_review_pool_size`].
     review_pool_size: usize,
     /// GitHub source-packet collector used by review-guide capture seams.
@@ -1730,7 +1730,7 @@ impl ForceReleaseOutcome {
 }
 
 #[async_trait]
-impl crate::coordinator::ExecutionStartedHook for WorkerCompletionHandler {
+impl boss_execution_contracts::ExecutionStartedHook for WorkerCompletionHandler {
     async fn on_execution_started(&self, execution_id: &str) {
         // Inherent method already does the work; this just satisfies
         // the trait the coordinator depends on.
@@ -1739,7 +1739,7 @@ impl crate::coordinator::ExecutionStartedHook for WorkerCompletionHandler {
 }
 
 #[async_trait]
-impl crate::coordinator::AutomationPreemptor for WorkerCompletionHandler {
+impl boss_execution_contracts::AutomationPreemptor for WorkerCompletionHandler {
     /// Route dispatcher-initiated preemption through the exact teardown
     /// `bossctl agents stop` and the stale-worker sweep use: pane
     /// release + `reap_worker_process_tree` SIGTERM/SIGKILL ladder over

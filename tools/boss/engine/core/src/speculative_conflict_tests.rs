@@ -6,10 +6,11 @@ use tempfile::tempdir;
 use tokio::sync::Mutex;
 
 use super::*;
-use crate::coordinator::{CubeRepoHandle, CubeWorkspaceLease, RebaseOutcome};
 use crate::metrics::Registry;
 use crate::test_support::*;
 use crate::work::PendingMergeCheck;
+use boss_execution_contracts::RebaseOutcome;
+use boss_host_execution::types::{CubeRepoHandle, CubeWorkspaceLease};
 
 /// Flip `products.auto_pr_maintenance_enabled` directly on the SQLite file
 /// (mirrors `conflict_watch_tests.rs`'s helper of the same shape — no

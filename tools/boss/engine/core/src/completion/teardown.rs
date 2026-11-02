@@ -87,7 +87,7 @@ impl WorkerCompletionHandler {
     pub(super) async fn recovery_adapter(
         &self,
         execution_id: &str,
-    ) -> Option<Arc<dyn crate::host_adapter::HostAdapter>> {
+    ) -> Option<Arc<dyn boss_execution_contracts::HostAdapter>> {
         let host = self.work_db.execution_host_id(execution_id).ok().flatten()?;
         if host == "local" {
             return None;

@@ -1,7 +1,7 @@
 //! Execution runner.
 //!
-//! The pane-spawn [`ExecutionRunner`] and its supporting machinery, grouped
-//! into sibling modules:
+//! The pane-spawn [`ExecutionRunner`](boss_execution_contracts::ExecutionRunner)
+//! implementation and its supporting machinery, grouped into sibling modules:
 //!
 //! - [`pane_spawn`] — the [`PaneSpawnRunner`] `ExecutionRunner` impl plus the
 //!   boss-event shim install/resolve helpers.
@@ -12,9 +12,10 @@
 //! - [`prompt`] — worker prompt composition (the directive/fragment family).
 //! - [`work_item`] — [`boss_protocol::WorkItem`] accessor helpers and PR-URL extraction.
 //!
-//! This module re-exports the shared run-outcome vocabulary and the
-//! [`ExecutionRunner`] trait from execution contracts, plus the items other engine modules
-//! reach as `crate::runner::*`.
+//! This module re-exports [`PaneSpawnRunner`] and the items other engine
+//! modules reach as `crate::runner::*`. The run-outcome vocabulary and the
+//! `ExecutionRunner` trait live in `boss_execution_contracts`; they are
+//! re-exported here only in test builds.
 
 use std::path::PathBuf;
 
@@ -36,6 +37,7 @@ pub(crate) use prompt::designated_output_kind;
 pub(crate) use work_item::{task_bound_pr_url, work_item_name, work_item_task_kind};
 pub(crate) use worker_spawn::{ComposedWorkerSpawn, REVIEW_GUIDE_DRIVER, WorkerSpawnOpts, compose_worker_spawn};
 
+#[cfg(test)]
 pub use boss_execution_contracts::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
 
 /// Absolute path of the events socket this engine bound — where worker hook

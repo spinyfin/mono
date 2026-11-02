@@ -7,7 +7,7 @@
 
 use super::*;
 
-use crate::coordinator::DispatchAdmission;
+use boss_execution_contracts::DispatchAdmission;
 
 /// Byte cap for an over-SSH remote transcript tail pull. The
 /// `TailRunTranscript` RPC requests a line count, not a byte count, so

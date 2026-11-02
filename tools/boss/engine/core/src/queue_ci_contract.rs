@@ -110,7 +110,7 @@ pub(crate) use boss_engine_storage_values::attention_kinds::QUEUE_CI_CONTRACT_ER
 
 pub(crate) async fn surface_error(
     db: &crate::work::WorkDb,
-    publisher: &dyn crate::coordinator::ExecutionPublisher,
+    publisher: &dyn boss_execution_contracts::ExecutionPublisher,
     candidate: &crate::work::PendingMergeCheck,
     error: &anyhow::Error,
 ) {
@@ -155,12 +155,12 @@ pub(crate) mod tests;
 /// External dependencies for queue failure detection, separate from events.
 #[derive(Clone, Copy)]
 pub struct DetectionContext<'a> {
-    pub publisher: &'a dyn crate::coordinator::ExecutionPublisher,
+    pub publisher: &'a dyn boss_execution_contracts::ExecutionPublisher,
     pub fetcher: &'a dyn ContractFetcher,
 }
 
 #[cfg(test)]
-pub(crate) fn test_context(publisher: &dyn crate::coordinator::ExecutionPublisher) -> DetectionContext<'_> {
+pub(crate) fn test_context(publisher: &dyn boss_execution_contracts::ExecutionPublisher) -> DetectionContext<'_> {
     DetectionContext {
         publisher,
         fetcher: &tests::FakeFetcher(None),

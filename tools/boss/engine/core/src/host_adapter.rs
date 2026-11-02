@@ -30,15 +30,9 @@ use boss_protocol::ExecutionKind;
 use tokio::sync::Mutex;
 
 use crate::config::RuntimeConfig;
-use crate::coordinator::{
-    CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
-};
 use crate::host_registry::Host;
 use crate::remote_wrapper::remote_wrapper_path;
-use crate::runner::{
-    ComposedWorkerSpawn, ExecutionRunner, RunOutcome, RunWaitState, WorkerSpawnOpts, compose_worker_spawn,
-    work_item_name, work_item_task_kind,
-};
+use crate::runner::{ComposedWorkerSpawn, WorkerSpawnOpts, compose_worker_spawn, work_item_name, work_item_task_kind};
 use crate::ssh_spawn::{
     REASON_WORKER_LAUNCH_FAILED, RemoteSpawnPlan, SshExec, perform_remote_launch, reap_failed_remote_turn,
     remote_events_socket_path,
@@ -47,6 +41,11 @@ use crate::ssh_transport::{SshOutput, SshTransport};
 use crate::work::{WorkDb, WorkExecution, WorkItem};
 use crate::worker_setup::{WorkerSetupInput, render_remote_settings_json};
 use crate::wrapper_distribution::{WrapperPushLocks, WrapperPushOutcome, ensure_wrapper_current};
+use boss_execution_contracts::CubeClient;
+use boss_execution_contracts::{ExecutionRunner, RunOutcome, RunWaitState};
+use boss_host_execution::types::{
+    CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
+};
 
 /// Remote dir (under `$HOME`) that holds rendered worker `--settings`
 /// files. Outside any workspace tree so the worker's `jj`/`git` never
@@ -155,7 +154,10 @@ async fn recovery_pr_is_open(adapter: &dyn HostAdapter, repo_id: &str, pr: u64) 
     }
 }
 
+#[cfg(test)]
 pub use boss_execution_contracts::{CollectOutcome, HostAdapter};
+#[cfg(not(test))]
+use boss_execution_contracts::{CollectOutcome, HostAdapter};
 
 /// How much of a dead remote worker's `worker.log` to pull. The interesting
 /// content is a startup failure — an auth error, a missing binary, a config
@@ -1713,7 +1715,10 @@ impl CubeClient for HostAdapterCubeClient {
 
 // ── HostAdapterProvider ─────────────────────────────────────────────────────────
 
+#[cfg(test)]
 pub use boss_execution_contracts::HostAdapterProvider;
+#[cfg(not(test))]
+use boss_execution_contracts::HostAdapterProvider;
 
 /// The default provider: hands back the one local adapter for every host.
 /// Used by tests and local-only deployments — when no remote hosts are

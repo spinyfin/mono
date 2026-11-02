@@ -787,7 +787,7 @@ impl ServerState {
         }
         self.check_retiring_slot_owner(slot_id, retiring_run.as_deref()).await?;
         if let Some(run_id) = retiring_run {
-            let worker_id = crate::coordinator::worker_id_for_slot(slot_id);
+            let worker_id = boss_execution_contracts::worker_id_for_slot(slot_id);
             self.execution_coordinator
                 .release_pool_claim_if_execution(&worker_id, &run_id)
                 .await;
@@ -800,7 +800,7 @@ impl ServerState {
 
     /// Refuse slot-scoped viewer operations if ownership changed during an await.
     async fn check_retiring_slot_owner(&self, slot_id: u8, run_id: Option<&str>) -> Result<(), RetirePaneError> {
-        let worker_id = crate::coordinator::worker_id_for_slot(slot_id);
+        let worker_id = boss_execution_contracts::worker_id_for_slot(slot_id);
         let holder = self.execution_coordinator.claim_holder(&worker_id).await;
         let live = self.live_worker_states.get(slot_id);
         if let Some(owner) = holder.filter(|owner| Some(owner.as_str()) != run_id).or_else(|| {
@@ -987,7 +987,7 @@ impl ServerState {
         if let Some(run_id) = self.worker_registry.run_for_slot(slot_id) {
             return SlotOccupancy::Occupied(run_id);
         }
-        let worker_id = crate::coordinator::worker_id_for_slot(slot_id);
+        let worker_id = boss_execution_contracts::worker_id_for_slot(slot_id);
         let execution_id = match self.work_db.latest_local_execution_id_for_agent_id(&worker_id) {
             Ok(Some(execution_id)) => execution_id,
             Ok(None) => return SlotOccupancy::Absent,

@@ -62,7 +62,7 @@ impl WorkerCompletionHandler {
             execution_cubes: Arc::new(std::sync::RwLock::new(None)),
             now_fn: Arc::new(std::time::Instant::now),
             review_batch_enqueuer: Arc::new(GhReviewBatchEnqueuer),
-            review_pool_size: crate::coordinator::DEFAULT_REVIEW_POOL_SIZE,
+            review_pool_size: boss_execution_contracts::DEFAULT_REVIEW_POOL_SIZE,
             source_packet_collector: crate::review_guide_capture::github_source_packet_collector(),
         }
     }
@@ -107,7 +107,7 @@ impl WorkerCompletionHandler {
 
     /// Install the same provider the coordinator uses so every completion
     /// route can collect remote artifacts immediately before reading them.
-    pub fn set_host_adapter_provider(&self, provider: Arc<dyn crate::host_adapter::HostAdapterProvider>) {
+    pub fn set_host_adapter_provider(&self, provider: Arc<dyn boss_execution_contracts::HostAdapterProvider>) {
         *self
             .host_adapter_provider
             .write()
@@ -460,7 +460,7 @@ impl WorkerCompletionHandler {
     /// Wire the live `BOSS_REVIEW_POOL_SIZE` / `WorkConfig.review_pool_size`
     /// into admission accounting.
     pub fn with_review_pool_size(mut self, size: usize) -> Self {
-        self.review_pool_size = size.min(crate::coordinator::MAX_REVIEW_POOL_SIZE);
+        self.review_pool_size = size.min(boss_execution_contracts::MAX_REVIEW_POOL_SIZE);
         self
     }
 

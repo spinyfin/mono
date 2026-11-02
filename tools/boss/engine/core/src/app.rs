@@ -25,9 +25,7 @@ use crate::completion::{
     WorkerPaneReleaser,
 };
 use crate::config::RuntimeConfig;
-use crate::coordinator::{
-    CommandCubeClient, CubeClient, ExecutionCoordinator, ExecutionPublisher, WorkerPool, pause_bypass_decision,
-};
+use crate::coordinator::{CommandCubeClient, ExecutionCoordinator, pause_bypass_decision};
 use crate::driver::AgentDriver;
 use crate::events_socket::{bind_events_socket, handle_connection, peer_pid};
 use crate::external_tracker::WorkDbOrgStateSink;
@@ -51,7 +49,6 @@ use crate::protocol::{
     work_product_topic,
 };
 use crate::repo_slug;
-use crate::runner::ExecutionRunner;
 use crate::work::{
     ANSWER_AGENT_RUN_STATUS_FAILED, ANSWER_AGENT_RUN_STATUS_REPLIED, ActionedAttentionGroup, DuplicateTaskError,
     ExecutionKind, ExecutionStatus, GhPrStateChecker, INTENT_QUESTION, ProducerConflictInsertInput, ReviseDocOutcome,
@@ -59,6 +56,8 @@ use crate::work::{
 };
 use crate::worker_registry::WorkerRegistry;
 use async_trait::async_trait;
+use boss_execution_contracts::ExecutionRunner;
+use boss_execution_contracts::{CubeClient, ExecutionPublisher, WorkerPool};
 use tokio::time::{Duration, timeout};
 
 /// How long the engine waits for the app to acknowledge detaching a viewer.
@@ -2153,7 +2152,7 @@ impl ServerState {
         // claims with an unconfirmed detach are handed back by pool_claim_sweep.
         // Nonterminal claims must be released here because that sweep only
         // considers terminal rows. The tmux process has already been reaped.
-        let worker_id = crate::coordinator::worker_id_for_slot(slot_id);
+        let worker_id = boss_execution_contracts::worker_id_for_slot(slot_id);
         let sweep_owns_handback = !pane_confirmed_released && self.execution_is_terminal(run_id);
         if sweep_owns_handback {
             tracing::warn!(
@@ -2203,7 +2202,7 @@ impl ServerState {
     async fn detach_untracked_worker_viewer(&self, run_id: &str) -> PaneReleaseOutcome {
         self.live_worker_states.release_persona_for_run(run_id);
         if let Some(slot_id) = self.hosted_pane_slot_for_run(run_id) {
-            let worker_id = crate::coordinator::worker_id_for_slot(slot_id);
+            let worker_id = boss_execution_contracts::worker_id_for_slot(slot_id);
             let pool_holder = self.execution_coordinator.claim_holder(&worker_id).await;
             let pool_held_by_other = pool_holder.as_deref().is_some_and(|holder| holder != run_id);
             let live_held_by_other = self

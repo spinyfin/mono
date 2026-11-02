@@ -381,7 +381,7 @@ impl WorkerCompletionHandler {
     }
 
     /// Finalize a completed remote worker whose structured-output artifact
-    /// the engine could not pull off its host — [`crate::host_adapter::CollectOutcome::Failed`]:
+    /// the engine could not pull off its host — [`boss_execution_contracts::CollectOutcome::Failed`]:
     /// positive proof (an invalid descriptor, or a copy that ran and failed)
     /// that the result sitting on the remote host cannot be trusted here.
     /// The worker itself may have finished cleanly; this is an engine-side

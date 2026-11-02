@@ -16,13 +16,14 @@ use tempfile::TempDir;
 
 use tokio::sync::Mutex;
 
-use crate::coordinator::{
-    CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
-    ExecutionCoordinator, ExecutionPublisher, WorkerPool,
-};
+use crate::coordinator::ExecutionCoordinator;
 use crate::review_guide_capture::SourcePacketCollector;
-use crate::runner::{ExecutionRunner, RunOutcome, RunWaitState};
 use crate::work::WorkDb;
+use boss_execution_contracts::{CubeClient, ExecutionPublisher, WorkerPool};
+use boss_execution_contracts::{ExecutionRunner, RunOutcome, RunWaitState};
+use boss_host_execution::types::{
+    CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
+};
 use boss_pr_review_sources::SourcePacket;
 use boss_protocol::{FrontendEvent, WorkComment, WorkExecution};
 
@@ -365,7 +366,7 @@ impl ExecutionRunner for AlwaysSucceedsRunner {
     }
 }
 
-/// Implement [`CubeClient`](crate::coordinator::CubeClient) for a test
+/// Implement [`CubeClient`](boss_execution_contracts::CubeClient) for a test
 /// double, spelling out only the methods a given test actually drives.
 /// Every trait method left unlisted is filled in with `unimplemented!()`,
 /// which is exactly what a double wants for the paths it never exercises.
@@ -586,7 +587,7 @@ macro_rules! stub_cube_client {
     };
 }
 
-/// Implement [`HostAdapter`](crate::host_adapter::HostAdapter) for a test
+/// Implement [`HostAdapter`](boss_execution_contracts::HostAdapter) for a test
 /// double, spelling out only the methods a given test drives. Every
 /// workspace-lifecycle method and `spawn_worker` left unlisted is filled
 /// in with `unimplemented!()`; `command_repr` defaults to `None`; and the

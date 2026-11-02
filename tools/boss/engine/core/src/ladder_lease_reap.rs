@@ -59,8 +59,8 @@
 
 use std::sync::OnceLock;
 
-use crate::coordinator::CubeClient;
 use crate::dead_pid_sweep::{PidStatus, probe_pid};
+use boss_execution_contracts::CubeClient;
 
 /// Stable identifier for this engine installation (its hostname), embedded
 /// in every rung-1 lease's task label at acquisition
@@ -185,7 +185,7 @@ mod tests {
     use anyhow::Result;
 
     use super::*;
-    use crate::coordinator::{CubeRepoSummary, CubeWorkspaceStatus};
+    use boss_host_execution::types::{CubeRepoSummary, CubeWorkspaceStatus};
 
     #[derive(Default)]
     struct RecordingCube {

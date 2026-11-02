@@ -40,7 +40,7 @@ use crate::work::WorkDb;
 /// The [`AgentDriver`] governing `execution_id`, resolved through the same
 /// precedence used at spawn time: a pool-dispatched run (review/automation
 /// pool worker) always resolves to
-/// [`crate::coordinator::pool_dispatch_policy_for_worker_id`]'s fixed driver,
+/// [`boss_execution_contracts::pool_dispatch_policy_for_worker_id`]'s fixed driver,
 /// ahead of and overriding the reviewed/automated row's own
 /// `tasks.driver` → `products.default_driver` → engine-default chain
 /// ([`WorkDb::get_execution_driver_slug`]) — exactly the precedence
@@ -183,9 +183,8 @@ pub(crate) fn resolve_execution_driver_slug(work_db: &WorkDb, execution_id: &str
 /// through to the row's own driver, unchanged).
 fn pool_override_driver_slug(work_db: &WorkDb, execution_id: &str) -> Option<String> {
     match work_db.latest_run_agent_id_for_execution(execution_id) {
-        Ok(Some(worker_id)) => {
-            crate::coordinator::pool_dispatch_policy_for_worker_id(&worker_id).map(|policy| policy.driver.to_owned())
-        }
+        Ok(Some(worker_id)) => boss_execution_contracts::pool_dispatch_policy_for_worker_id(&worker_id)
+            .map(|policy| policy.driver.to_owned()),
         Ok(None) => None,
         Err(err) => {
             tracing::warn!(
