@@ -111,8 +111,8 @@ pub(crate) fn interactive_pool_is_full(slots: &[SlotView]) -> bool {
 /// Candidates with no parseable `started_epoch` are skipped entirely
 /// rather than treated as newest or oldest: an unset `started_at` means
 /// the run has not recorded a start yet (it is mid-spawn), and tearing
-/// down a mid-spawn worker is exactly the T981 hazard that
-/// `force_release` refuses to do. Ties break on `execution_id` so the
+/// down a mid-spawn worker is the same hazard `force_release`
+/// refuses. Ties break on `execution_id` so the
 /// choice is deterministic under equal-second starts.
 pub(crate) fn select_preemption_victim(candidates: &[PreemptionCandidate]) -> Option<&PreemptionCandidate> {
     candidates.iter().filter(|c| c.started_epoch.is_some()).max_by(|a, b| {
