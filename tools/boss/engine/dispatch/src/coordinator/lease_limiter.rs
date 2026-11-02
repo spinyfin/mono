@@ -143,6 +143,7 @@ impl RepoLeaseLimiter {
     }
 
     /// Attempts currently in flight for `repo`.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn in_flight(&self, repo: &str) -> usize {
         self.inner
             .state
@@ -155,6 +156,7 @@ impl RepoLeaseLimiter {
     }
 
     /// Whether a row was denied a permit for `repo` while the bound was sat.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn denied(&self, repo: &str) -> bool {
         self.inner
             .state

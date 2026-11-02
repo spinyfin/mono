@@ -1554,13 +1554,13 @@ async fn kick_during_active_scheduler_latches_pending_wakeup() {
     ));
 
     // Simulate "another scheduler is already running".
-    coordinator.scheduling_active.store(true, Ordering::Release);
-    coordinator.scheduling_pending.store(false, Ordering::Release);
+    coordinator.scheduling_active().store(true, Ordering::Release);
+    coordinator.scheduling_pending().store(false, Ordering::Release);
 
     coordinator.kick();
 
     assert!(
-        coordinator.scheduling_pending.load(Ordering::Acquire),
+        coordinator.scheduling_pending().load(Ordering::Acquire),
         "kick that lost the active-flag race must still latch pending so the alive \
              scheduler re-enters its drain loop instead of exiting on stale state",
     );
@@ -1598,17 +1598,17 @@ async fn ready_row_added_during_active_window_still_dispatches() {
     //      returns, and the (now-exiting) scheduler drops the
     //      guard without re-checking. New row stranded.
     //   3. With the fix: kick latches pending=true.
-    coordinator.scheduling_active.store(true, Ordering::Release);
-    coordinator.scheduling_pending.store(false, Ordering::Release);
+    coordinator.scheduling_active().store(true, Ordering::Release);
+    coordinator.scheduling_pending().store(false, Ordering::Release);
     coordinator.kick(); // noop on `active`, but latches pending
 
     // Now simulate the previous scheduler exiting: it must
     // honour the pending bit. Drop `active` and re-enter
     // `run_scheduler` exactly as the lossless-wakeup logic
     // would on the post-drain re-check path.
-    coordinator.scheduling_active.store(false, Ordering::Release);
+    coordinator.scheduling_active().store(false, Ordering::Release);
     assert!(
-        coordinator.scheduling_pending.load(Ordering::Acquire),
+        coordinator.scheduling_pending().load(Ordering::Acquire),
         "post-drain re-check must see pending=true so the new row is not lost",
     );
 
@@ -1652,16 +1652,16 @@ async fn dispatch_ready_event_during_active_scheduler_latches_pending_wakeup() {
     // `scheduling_active`/`scheduling_pending` state this test hand-sets
     // below. This is the same filter that method installs.
     let mut subscription = coordinator
-        .event_bus
+        .event_bus()
         .subscribe(TopicFilter::kind(EventKind::DispatchReady));
 
     // Simulate "another scheduler is already running".
-    coordinator.scheduling_active.store(true, Ordering::Release);
-    coordinator.scheduling_pending.store(false, Ordering::Release);
+    coordinator.scheduling_active().store(true, Ordering::Release);
+    coordinator.scheduling_pending().store(false, Ordering::Release);
 
     coordinator.kick();
     assert!(
-        !coordinator.scheduling_pending.load(Ordering::Acquire),
+        !coordinator.scheduling_pending().load(Ordering::Acquire),
         "a bus-routed kick() must not latch scheduling_pending directly — only the \
          subscriber's reaction to the event may, otherwise the flag changes nothing \
          observable and there is nothing to roll back",
@@ -1674,10 +1674,10 @@ async fn dispatch_ready_event_during_active_scheduler_latches_pending_wakeup() {
     assert_eq!(event, Event::DispatchReady);
 
     // The subscriber's reaction to the event it just received.
-    coordinator.note_dispatch_ready();
+    coordinator.note_dispatch_ready_for_test();
 
     assert!(
-        coordinator.scheduling_pending.load(Ordering::Acquire),
+        coordinator.scheduling_pending().load(Ordering::Acquire),
         "a DispatchReady event delivered while scheduling_active is true must still latch \
          scheduling_pending so the alive scheduler re-enters its drain loop instead of \
          exiting on stale state — same TOCTOU contract as \
@@ -1733,8 +1733,8 @@ async fn spawn_dispatch_ready_subscriber_delivers_kick_without_hand_call() {
     // `spawn_dispatch_ready_subscriber`'s doc) finds a scheduler already
     // "active" and only latches `scheduling_pending`, rather than racing
     // a real `run_scheduler` task to completion on an empty queue.
-    coordinator.scheduling_active.store(true, Ordering::Release);
-    coordinator.scheduling_pending.store(false, Ordering::Release);
+    coordinator.scheduling_active().store(true, Ordering::Release);
+    coordinator.scheduling_pending().store(false, Ordering::Release);
 
     let handle = coordinator
         .spawn_dispatch_ready_subscriber()
@@ -1746,7 +1746,7 @@ async fn spawn_dispatch_ready_subscriber_delivers_kick_without_hand_call() {
     // below must re-latch.
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if coordinator.scheduling_pending.load(Ordering::Acquire) {
+            if coordinator.scheduling_pending().load(Ordering::Acquire) {
                 break;
             }
             sleep(Duration::from_millis(2)).await;
@@ -1754,14 +1754,14 @@ async fn spawn_dispatch_ready_subscriber_delivers_kick_without_hand_call() {
     })
     .await
     .expect("subscriber's reconcile-on-start pass must latch scheduling_pending");
-    coordinator.scheduling_pending.store(false, Ordering::Release);
+    coordinator.scheduling_pending().store(false, Ordering::Release);
 
     // The real path under test — no hand-call to note_dispatch_ready.
     coordinator.kick();
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if coordinator.scheduling_pending.load(Ordering::Acquire) {
+            if coordinator.scheduling_pending().load(Ordering::Acquire) {
                 break;
             }
             sleep(Duration::from_millis(2)).await;
@@ -1920,7 +1920,7 @@ async fn stranded_ready_executions_only_returns_rows_past_the_threshold() {
     // Threshold far in the future: the freshly-inserted row is too
     // young to count as stranded.
     let ready = db.list_ready_executions().unwrap();
-    let fresh = coordinator.stranded_ready_executions(&ready, 60_000);
+    let fresh = coordinator.stranded_ready_executions_for_test(&ready, 60_000);
     assert!(
         fresh.is_empty(),
         "row younger than the threshold must not be flagged as stranded: {fresh:?}",
@@ -1928,7 +1928,7 @@ async fn stranded_ready_executions_only_returns_rows_past_the_threshold() {
 
     // Threshold of zero: any ready row should appear. The
     // execution we just inserted is in the queue with age >= 0.
-    let any = coordinator.stranded_ready_executions(&ready, 0);
+    let any = coordinator.stranded_ready_executions_for_test(&ready, 0);
     assert!(
         any.iter().any(|(id, _)| id == &execution_id),
         "with min_age_ms=0 the helper must surface the freshly-inserted ready row; \
@@ -1977,8 +1977,8 @@ fn overdue_ready_answer_agent_files_one_question_specific_attention() {
         Arc::new(FakeExecutionRunner::default()),
     );
     let ready = db.list_ready_executions().unwrap();
-    coordinator.raise_ready_answer_agent_alarms(&ready, Duration::ZERO);
-    coordinator.raise_ready_answer_agent_alarms(&ready, Duration::ZERO);
+    coordinator.raise_ready_answer_agent_alarms_for_test(&ready, Duration::ZERO);
+    coordinator.raise_ready_answer_agent_alarms_for_test(&ready, Duration::ZERO);
 
     // Read the item back through the same public API a real surface
     // (e.g. `handle_list_attention_items_for_work_item`) would use — not a
@@ -2108,7 +2108,7 @@ async fn answer_agent_start_records_queue_wait_metric_and_dispatch_event() {
         .expect("worker should be available");
 
     coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await
         .unwrap();
 

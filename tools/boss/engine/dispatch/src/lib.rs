@@ -12,8 +12,8 @@ pub mod dispatch_inflight;
 pub mod dispatch_metrics;
 mod dispatch_spillover;
 
-// Aliases under the module paths these sources have always used, so the
-// moved coordinator code keeps resolving `crate::work`, `crate::metrics`, ...
+// Short aliases for the storage, metrics and host crates so coordinator
+// sources can refer to them as `crate::work`, `crate::metrics`, ...
 use boss_conflict_diagnosis as conflict_diagnosis;
 use boss_dispatch_events as dispatch_events;
 use boss_host_execution::{cube as cube_commands, cube_op_budget};

@@ -107,6 +107,141 @@ impl ExecutionCoordinator {
         self.automation_pool = pool;
     }
 
+    /// Test-only views of coordinator internals the integration suite drives
+    /// directly. Gated so production code cannot reach the scheduler latches
+    /// or the other state they guard.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn work_db(&self) -> &Arc<WorkDb> {
+        &self.work_db
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inflight_dispatches(&self) -> &InflightDispatches {
+        &self.inflight_dispatches
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn scheduling_active(&self) -> &AtomicBool {
+        &self.scheduling_active
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn scheduling_pending(&self) -> &AtomicBool {
+        &self.scheduling_pending
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn requested_host_ids(&self) -> &std::sync::Mutex<HashMap<String, String>> {
+        &self.requested_host_ids
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn repo_lease_limiter(&self) -> &lease_limiter::RepoLeaseLimiter {
+        &self.repo_lease_limiter
+    }
+
+    // Test-only entry points onto crate-internal coordinator operations.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn drain_ready_queue_for_test(self: &Arc<Self>) -> DrainOutcome {
+        self.drain_ready_queue().await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pool_for_execution_for_test<'a>(&'a self, execution: &WorkExecution) -> &'a WorkerPool {
+        self.pool_for_execution(execution)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn schedule_execution_for_test(
+        self: &Arc<Self>,
+        execution: &WorkExecution,
+        worker_id: &str,
+        admission: DispatchAdmission,
+    ) -> Result<()> {
+        self.schedule_execution(execution, worker_id, admission).await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn recover_failed_dispatch_for_test(
+        self: &Arc<Self>,
+        execution: &WorkExecution,
+        worker_id: &str,
+        err: &anyhow::Error,
+    ) {
+        self.recover_failed_dispatch(execution, worker_id, err).await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn resolve_spawn_driver_for_test(&self, execution: &WorkExecution, worker_id: &str) -> Result<Option<String>> {
+        self.resolve_spawn_driver(execution, worker_id)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn validate_requested_host_for_test(&self, work_item_id: &str, host_id: &str) -> Result<()> {
+        self.validate_requested_host(work_item_id, host_id)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn mark_requested_host_for_test(&self, execution_id: &str, host_id: String) {
+        self.mark_requested_host(execution_id, host_id)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn note_dispatch_ready_for_test(self: &Arc<Self>) {
+        self.note_dispatch_ready()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn stranded_ready_executions_for_test(&self, ready: &[WorkExecution], min_age_ms: u64) -> Vec<(String, u64)> {
+        self.stranded_ready_executions(ready, min_age_ms)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn raise_ready_answer_agent_alarms_for_test(&self, ready: &[WorkExecution], threshold: Duration) {
+        self.raise_ready_answer_agent_alarms(ready, threshold)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn record_start_failure_for_test(
+        &self,
+        coordinator: Arc<ExecutionCoordinator>,
+        execution: &WorkExecution,
+        worker_id: &str,
+        cube_repo_id: Option<&str>,
+        attention: (&str, &str),
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        self.record_start_failure(coordinator, execution, worker_id, cube_repo_id, attention, error)
+            .await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn lease_workspace_with_fallback_for_test(
+        &self,
+        execution: &WorkExecution,
+        worker_id: &str,
+        repo: &CubeRepoHandle,
+        task: &str,
+        adapter: &Arc<dyn HostAdapter>,
+    ) -> Result<CubeWorkspaceLease> {
+        self.lease_workspace_with_fallback(execution, worker_id, repo, task, adapter)
+            .await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn recover_execution_bookmark_for_test(
+        &self,
+        execution: &WorkExecution,
+        lease: &CubeWorkspaceLease,
+        adapter: &Arc<dyn HostAdapter>,
+        repo_id: &str,
+        pr_for_goto: Option<u64>,
+        pr_for_reconcile: Option<u64>,
+    ) -> Result<Option<blocked_workspace::Recovered>> {
+        self.recover_execution_bookmark(execution, lease, adapter, repo_id, pr_for_goto, pr_for_reconcile)
+            .await
+    }
+
     /// The local-host adapter. `app.rs` reads this to seed the production
     /// `boss_engine::host_adapter::SshHostAdapterProvider` (which returns it
     /// verbatim for `host_id = "local"`).
@@ -952,8 +1087,7 @@ impl ExecutionCoordinator {
     /// automation pool. Regular task executions route to the automation pool
     /// when the owning task has `source_automation_id IS NOT NULL` (it was
     /// produced by an automation). All other executions go to the main pool.
-    #[doc(hidden)]
-    pub fn pool_for_execution<'a>(&'a self, execution: &WorkExecution) -> &'a WorkerPool {
+    pub(crate) fn pool_for_execution<'a>(&'a self, execution: &WorkExecution) -> &'a WorkerPool {
         match self.dispatch_pool_for(execution) {
             boss_protocol::DispatchPool::Review => &self.review_pool,
             boss_protocol::DispatchPool::Automation => &self.automation_pool,

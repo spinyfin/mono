@@ -42,8 +42,7 @@ impl ExecutionCoordinator {
     /// (a revision's bound PR, or the task's own open PR), used only to name
     /// the `pr/<n>` bookmark cube writes when damaged pointers must be
     /// re-anchored; a verified PR anchor also controls positioning.
-    #[doc(hidden)]
-    pub async fn recover_execution_bookmark(
+    pub(crate) async fn recover_execution_bookmark(
         &self,
         execution: &WorkExecution,
         lease: &CubeWorkspaceLease,

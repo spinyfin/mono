@@ -75,7 +75,7 @@ async fn critical_admission_respects_operator_all_spawns_scope() {
     assert!(admission.pause.active);
     assert!(!admission.pause.overridable);
     assert_eq!(admission.pause.scope, Some(DispatchPauseScope::AllSpawns));
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     let held = db.get_execution(&execution.id).unwrap();
     assert_eq!(held.status, ExecutionStatus::Ready);
     assert_eq!(held.dispatch_wait_reason.as_deref(), Some("dispatch_paused"));
@@ -101,7 +101,7 @@ async fn all_spawns_operator_pause_holds_ready_review_and_review_guide_execution
         let coordinator = Arc::new(coord);
 
         operator_pause(&coordinator, DispatchPauseScope::AllSpawns);
-        coordinator.drain_ready_queue().await;
+        coordinator.drain_ready_queue_for_test().await;
         assert_eq!(
             runner.calls.lock().await.len(),
             0,

@@ -40,8 +40,7 @@ impl ExecutionCoordinator {
     /// `kick_during_active_scheduler_latches_pending_wakeup` /
     /// `dispatch_ready_event_during_active_scheduler_latches_pending_wakeup`
     /// for the pinning regression tests on each path.
-    #[doc(hidden)]
-    pub fn note_dispatch_ready(self: &Arc<Self>) {
+    pub(crate) fn note_dispatch_ready(self: &Arc<Self>) {
         // Order matters: `scheduling_pending` must be written BEFORE we
         // contend on `scheduling_active`. If we lose the swap race
         // (another scheduler is already running) the alive scheduler
@@ -217,8 +216,7 @@ impl ExecutionCoordinator {
     /// milliseconds. Used by [`spawn_scheduler_heartbeat`] to surface
     /// stranded rows; kept as a separate method so the heartbeat path
     /// is testable without involving any timers.
-    #[doc(hidden)]
-    pub fn stranded_ready_executions(&self, ready: &[WorkExecution], min_age_ms: u64) -> Vec<(String, u64)> {
+    pub(crate) fn stranded_ready_executions(&self, ready: &[WorkExecution], min_age_ms: u64) -> Vec<(String, u64)> {
         let now_secs = boss_engine_utils::epoch_time::now_epoch_secs() as u64;
         let cutoff_ms = min_age_ms;
         ready
@@ -252,8 +250,7 @@ impl ExecutionCoordinator {
     /// attention per overdue answer-agent execution. This deliberately does
     /// not reuse or filter the generic heartbeat warning: generic stuck-row
     /// telemetry has a distinct diagnostic purpose and must remain intact.
-    #[doc(hidden)]
-    pub fn raise_ready_answer_agent_alarms(&self, ready: &[WorkExecution], threshold: Duration) {
+    pub(crate) fn raise_ready_answer_agent_alarms(&self, ready: &[WorkExecution], threshold: Duration) {
         let now_secs = boss_engine_utils::epoch_time::now_epoch_secs() as u64;
         let threshold_ms = threshold.as_millis() as u64;
         for execution in ready
@@ -950,8 +947,7 @@ impl ExecutionCoordinator {
     /// mainline arrivals cannot cascade into wiping out every spilled
     /// automation run at once. See [`crate::dispatch_spillover`] for the
     /// policy and its rationale.
-    #[doc(hidden)]
-    pub async fn drain_ready_queue(self: &Arc<Self>) -> DrainOutcome {
+    pub(crate) async fn drain_ready_queue(self: &Arc<Self>) -> DrainOutcome {
         if let Some(reason) = self.dispatch_preflight_block_reason() {
             // A probe still in flight is the expected first seconds of every
             // boot, not a failure; a failed runtime preflight is.
@@ -2528,8 +2524,7 @@ impl ExecutionCoordinator {
     /// where they could not — historically because the reconciler had
     /// flipped the row to `waiting_dependency` and the Ready guard
     /// rejected the write, leaving the orphan sweeper as the only recovery.
-    #[doc(hidden)]
-    pub async fn recover_failed_dispatch(
+    pub(crate) async fn recover_failed_dispatch(
         self: &Arc<Self>,
         execution: &WorkExecution,
         worker_id: &str,

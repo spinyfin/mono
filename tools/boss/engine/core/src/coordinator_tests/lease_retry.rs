@@ -38,12 +38,12 @@ fn pr_review_execution(db: &WorkDb) -> WorkExecution {
 
 async fn schedule(coordinator: &Arc<ExecutionCoordinator>, execution: &WorkExecution) -> Result<()> {
     let worker_id = coordinator
-        .pool_for_execution(execution)
+        .pool_for_execution_for_test(execution)
         .claim_worker(&execution.id, None)
         .await
         .expect("worker pool slot available");
     coordinator
-        .schedule_execution(execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(execution, &worker_id, DispatchAdmission::Queued)
         .await
         .map(|_| ())
 }
@@ -291,7 +291,7 @@ async fn retry_after_cube_release_failure_keeps_the_lease_tracked() {
     let repo = CubeRepoHandle { repo_id: "mono".into() };
     let held = db.get_execution(&execution.id).unwrap();
     let err = coordinator
-        .lease_workspace_with_fallback(&held, "worker", &repo, "task", &coordinator.host_adapter)
+        .lease_workspace_with_fallback_for_test(&held, "worker", &repo, "task", &coordinator.host_adapter())
         .await
         .expect_err("a lease cube could not release stays tracked");
     assert!(format!("{err:#}").contains("could not be released"), "{err:#}");

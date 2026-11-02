@@ -772,10 +772,10 @@ async fn saturated_repo_lease_bound_defers_preemption_until_a_permit_frees() {
 
     // Saturate the per-repo bound for the late row's origin.
     let holder = coordinator
-        .repo_lease_limiter
+        .repo_lease_limiter()
         .try_begin(&late_execution.repo_remote_url, "lease-holder")
         .expect("the bound is free once the initial leases returned");
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
 
     assert!(
         preemptor.calls().await.is_empty(),
@@ -1157,7 +1157,7 @@ async fn critical_waits_without_preempting_spilled_automation() {
         boss_protocol::LAST_STATUS_ACTOR_HUMAN,
     )
     .unwrap();
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     assert!(preemptor.calls().await.is_empty());
     assert_eq!(
         db.get_execution(&spilled_execution_id).unwrap().status,

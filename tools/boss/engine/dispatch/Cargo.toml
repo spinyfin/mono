@@ -5,8 +5,9 @@ edition.workspace = true
 workspace = "../../../.."
 
 [features]
-# Re-exports the contract and host types the engine's integration suite
-# reaches through this crate. Always on under `cfg(test)`.
+# Exposes the coordinator accessors and probes the engine's integration suite
+# drives (scheduler latches, lease-limiter counters, ...). Always on under
+# `cfg(test)`; never enabled in production builds.
 test-support = []
 
 [dependencies]

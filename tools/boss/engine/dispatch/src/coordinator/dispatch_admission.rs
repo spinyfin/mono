@@ -287,8 +287,7 @@ impl ExecutionCoordinator {
             .remove(execution_id)
     }
 
-    #[doc(hidden)]
-    pub fn mark_requested_host(&self, execution_id: &str, host_id: String) {
+    pub(crate) fn mark_requested_host(&self, execution_id: &str, host_id: String) {
         self.requested_host_ids
             .lock()
             .unwrap()

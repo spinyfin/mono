@@ -61,7 +61,7 @@ async fn interactive_cap_only_holds_new_main_pool_admission() {
             .await
             .unwrap();
     }
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     wait_for_execution_status(&db, &review.id, ExecutionStatus::Running).await;
     assert_eq!(runner.calls.lock().await.len(), 1);
     assert!(db.active_run_ids_for_execution(&main.id).unwrap().is_empty());
@@ -74,7 +74,7 @@ async fn interactive_cap_only_holds_new_main_pool_admission() {
     );
     // Lowering the cap changes admission, never the pool or existing claims.
     coordinator.set_max_concurrent_interactive_workers(4).unwrap();
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     assert!(db.active_run_ids_for_execution(&main.id).unwrap().is_empty());
     assert_eq!(coordinator.worker_pool().capacity().await, 16);
     assert_eq!(coordinator.worker_pool().idle_count().await, 8);

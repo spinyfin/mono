@@ -45,7 +45,7 @@ async fn task_and_chore_recovery_keeps_verified_pr_files_and_persists_baseline()
             workspace_path: repo.replacement.clone(),
         };
         let recovered = coordinator
-            .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", None, Some(99))
+            .recover_execution_bookmark_for_test(&next, &lease, &coordinator.host_adapter(), "mono", None, Some(99))
             .await
             .unwrap()
             .unwrap();
@@ -62,7 +62,7 @@ async fn task_and_chore_recovery_keeps_verified_pr_files_and_persists_baseline()
         // Retry after pointers were reconciled but before the new run starts.
         // No reconciliation is needed now; the recorded PR still owns positioning.
         coordinator
-            .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", None, Some(99))
+            .recover_execution_bookmark_for_test(&next, &lease, &coordinator.host_adapter(), "mono", None, Some(99))
             .await
             .unwrap()
             .unwrap();
@@ -114,7 +114,7 @@ async fn checkout_of_predecessor_publication_cannot_hide_unpublished_work() {
         workspace_path: repo.replacement.clone(),
     };
     let error = coordinator
-        .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", Some(99), Some(99))
+        .recover_execution_bookmark_for_test(&next, &lease, &coordinator.host_adapter(), "mono", Some(99), Some(99))
         .await
         .unwrap_err();
     assert_eq!(
@@ -179,7 +179,7 @@ async fn read_only_review_ignores_a_damaged_predecessor_record() {
     };
     assert!(db.recovery_predecessor(&next).unwrap().is_none());
     let recovered = coordinator
-        .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", Some(99), Some(99))
+        .recover_execution_bookmark_for_test(&next, &lease, &coordinator.host_adapter(), "mono", Some(99), Some(99))
         .await
         .unwrap();
     assert!(recovered.is_none(), "{recovered:?}");
@@ -212,7 +212,14 @@ async fn read_only_review_ignores_a_damaged_predecessor_record() {
         next.kind = kind;
         assert!(
             coordinator
-                .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", Some(99), Some(99))
+                .recover_execution_bookmark_for_test(
+                    &next,
+                    &lease,
+                    &coordinator.host_adapter(),
+                    "mono",
+                    Some(99),
+                    Some(99)
+                )
                 .await
                 .unwrap()
                 .is_none()
@@ -228,7 +235,14 @@ async fn read_only_review_ignores_a_damaged_predecessor_record() {
         db.record_execution_bookmark(&unreadable).unwrap();
         assert!(
             coordinator
-                .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", Some(99), Some(99))
+                .recover_execution_bookmark_for_test(
+                    &next,
+                    &lease,
+                    &coordinator.host_adapter(),
+                    "mono",
+                    Some(99),
+                    Some(99)
+                )
                 .await
                 .unwrap()
                 .is_none()
@@ -273,7 +287,7 @@ async fn closed_pr_does_not_prevent_retiring_a_missing_baseline() {
     };
     assert!(
         coordinator
-            .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", None, Some(99))
+            .recover_execution_bookmark_for_test(&next, &lease, &coordinator.host_adapter(), "mono", None, Some(99))
             .await
             .unwrap()
             .is_none()
@@ -316,7 +330,7 @@ async fn abandoned_recorded_baseline_is_retired_and_a_fresh_dispatch_proceeds() 
     };
     assert!(
         coordinator
-            .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", None, None)
+            .recover_execution_bookmark_for_test(&next, &lease, &coordinator.host_adapter(), "mono", None, None)
             .await
             .unwrap()
             .is_none()
@@ -325,7 +339,7 @@ async fn abandoned_recorded_baseline_is_retired_and_a_fresh_dispatch_proceeds() 
     // The retired record no longer blocks: a later dispatch starts fresh.
     assert!(
         coordinator
-            .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", None, None)
+            .recover_execution_bookmark_for_test(&next, &lease, &coordinator.host_adapter(), "mono", None, None)
             .await
             .unwrap()
             .is_none()

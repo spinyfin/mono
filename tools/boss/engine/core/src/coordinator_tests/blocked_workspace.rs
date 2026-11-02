@@ -91,7 +91,7 @@ async fn blocked_revision_leases_clean_scratch_regardless_of_prior_lease_identit
         ));
         let repo = CubeRepoHandle { repo_id: "mono".into() };
         let lease = coordinator
-            .lease_workspace_with_fallback(&next, "worker", &repo, "task", &coordinator.host_adapter)
+            .lease_workspace_with_fallback_for_test(&next, "worker", &repo, "task", &coordinator.host_adapter())
             .await
             .unwrap();
         let calls = cube.lease_calls.lock().await;
@@ -153,7 +153,7 @@ async fn blocked_revision_retry_ignores_old_workspace_markers() {
     .unwrap();
     let repo = CubeRepoHandle { repo_id: "mono".into() };
     let lease = coordinator
-        .lease_workspace_with_fallback(&next, "worker", &repo, "task", &coordinator.host_adapter)
+        .lease_workspace_with_fallback_for_test(&next, "worker", &repo, "task", &coordinator.host_adapter())
         .await
         .unwrap();
     assert_ne!(lease.workspace_id, "workspace-old");
@@ -184,7 +184,7 @@ async fn blocked_recovery_missing_bookmark_yields_none_and_dispatch_proceeds() {
             dirty_verified,
         };
         let recovered = coordinator
-            .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", None, None)
+            .recover_execution_bookmark_for_test(&next, &lease, &coordinator.host_adapter(), "mono", None, None)
             .await
             .unwrap();
         assert!(recovered.is_none());
@@ -240,7 +240,7 @@ async fn self_retry_with_deleted_own_heads_drops_the_stale_row_and_continues() {
         dirty_verified: None,
     };
     let recovered = coordinator
-        .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", None, None)
+        .recover_execution_bookmark_for_test(&next, &lease, &coordinator.host_adapter(), "mono", None, None)
         .await
         .unwrap();
     assert!(recovered.is_none());
@@ -251,7 +251,7 @@ async fn self_retry_with_deleted_own_heads_drops_the_stale_row_and_continues() {
     // Dispatch now creates fresh pointers for the same execution id; the
     // surviving baseline must not make that fail.
     let fresh = coordinator
-        .host_adapter
+        .host_adapter()
         .create_execution_bookmark(&repo.worker, &next.id, None, None)
         .await
         .expect("fresh creation must succeed after the orphaned baseline is discarded");
@@ -307,12 +307,12 @@ async fn self_retry_with_deleted_own_heads_and_stale_report_still_positions_on_t
         runner,
     ));
     let worker = coordinator
-        .pool_for_execution(&next)
+        .pool_for_execution_for_test(&next)
         .claim_worker(&next.id, None)
         .await
         .unwrap();
     coordinator
-        .schedule_execution(&next, &worker, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&next, &worker, DispatchAdmission::Queued)
         .await
         .unwrap();
     assert_eq!(
@@ -350,7 +350,7 @@ async fn non_implementation_with_deleted_predecessor_heads_continues_without_rec
         dirty_verified: None,
     };
     let recovered = coordinator
-        .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", None, None)
+        .recover_execution_bookmark_for_test(&next, &lease, &coordinator.host_adapter(), "mono", None, None)
         .await
         .unwrap();
     assert!(recovered.is_none());
@@ -383,12 +383,12 @@ async fn missing_predecessor_bookmark_dispatches_into_a_clean_workspace() {
             .with_dispatch_events(recording.clone()),
     );
     let worker = coordinator
-        .pool_for_execution(&next)
+        .pool_for_execution_for_test(&next)
         .claim_worker(&next.id, None)
         .await
         .unwrap();
     coordinator
-        .schedule_execution(&next, &worker, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&next, &worker, DispatchAdmission::Queued)
         .await
         .unwrap();
     assert_eq!(db.get_execution(&next.id).unwrap().status, ExecutionStatus::Running);
@@ -441,12 +441,12 @@ async fn blocked_revision_dispatch_restores_bookmark_with_or_without_original_wo
             runner,
         ));
         let worker = coordinator
-            .pool_for_execution(&next)
+            .pool_for_execution_for_test(&next)
             .claim_worker(&next.id, None)
             .await
             .unwrap();
         coordinator
-            .schedule_execution(&next, &worker, DispatchAdmission::Queued)
+            .schedule_execution_for_test(&next, &worker, DispatchAdmission::Queued)
             .await
             .unwrap();
         assert!(
@@ -552,12 +552,12 @@ async fn blocked_revision_dispatch_resumes_from_pr_head_or_retires_an_unvouched_
             runner,
         ));
         let worker = coordinator
-            .pool_for_execution(&next)
+            .pool_for_execution_for_test(&next)
             .claim_worker(&next.id, None)
             .await
             .unwrap();
         coordinator
-            .schedule_execution(&next, &worker, DispatchAdmission::Queued)
+            .schedule_execution_for_test(&next, &worker, DispatchAdmission::Queued)
             .await
             .unwrap();
         assert!(
@@ -756,12 +756,12 @@ impl ChainHarness {
     async fn dispatch(&self) -> Result<()> {
         let worker = self
             .coordinator
-            .pool_for_execution(&self.next)
+            .pool_for_execution_for_test(&self.next)
             .claim_worker(&self.next.id, None)
             .await
             .unwrap();
         self.coordinator
-            .schedule_execution(&self.next, &worker, DispatchAdmission::Queued)
+            .schedule_execution_for_test(&self.next, &worker, DispatchAdmission::Queued)
             .await
             .map(|_| ())
     }
@@ -778,7 +778,7 @@ async fn resumed_revision_without_pr_url_recovers_using_the_chain_root_pr() {
     );
     let report = h
         .coordinator
-        .work_db
+        .work_db()
         .execution_restore_report(&h.next.id)
         .unwrap()
         .expect("report");
@@ -792,7 +792,7 @@ async fn conflicting_revision_restore_reaches_the_database() {
     h.dispatch().await.unwrap();
     let report = h
         .coordinator
-        .work_db
+        .work_db()
         .execution_restore_report(&h.next.id)
         .unwrap()
         .expect("report");
@@ -826,7 +826,7 @@ async fn rewritten_pr_dispatch_preserves_successor_work_through_second_recovery(
     use boss_engine_recovery::execution_bookmark::{LocalJj, diff};
     use boss_engine_test_git::jj::JjRepo;
     let mut h = chain_harness(true, true, false).await;
-    let db = h.coordinator.work_db.clone();
+    let db = h.coordinator.work_db().clone();
     let prior = db.recovery_predecessor(&h.next).unwrap().unwrap();
     let record = db.execution_bookmark(&prior.id).unwrap();
     JjRepo::run(&h.repo.repo, &["new", "main", "-m", "Old published PR"]);
@@ -900,7 +900,7 @@ async fn revision_without_any_bound_pr_blocks_the_work_item() {
     assert!(error.to_string().contains("bound PR"), "{error:#}");
     assert!(h.cube.goto_calls.lock().await.is_empty());
     let (WorkItem::Chore(item) | WorkItem::Task(item)) =
-        h.coordinator.work_db.get_work_item(&h.next.work_item_id).unwrap()
+        h.coordinator.work_db().get_work_item(&h.next.work_item_id).unwrap()
     else {
         panic!("expected chore")
     };
@@ -912,20 +912,20 @@ async fn revision_without_any_bound_pr_blocks_the_work_item() {
 async fn transient_fetch_failure_keeps_the_item_retryable() {
     // No origin remote: `jj git fetch` fails while the pointer is intact.
     let h = chain_harness(true, false, false).await;
-    let autostart_before = match h.coordinator.work_db.get_work_item(&h.next.work_item_id).unwrap() {
+    let autostart_before = match h.coordinator.work_db().get_work_item(&h.next.work_item_id).unwrap() {
         WorkItem::Chore(item) | WorkItem::Task(item) => item.autostart,
         _ => panic!("expected task"),
     };
     h.dispatch().await.unwrap_err();
     let (WorkItem::Chore(item) | WorkItem::Task(item)) =
-        h.coordinator.work_db.get_work_item(&h.next.work_item_id).unwrap()
+        h.coordinator.work_db().get_work_item(&h.next.work_item_id).unwrap()
     else {
         panic!("expected chore")
     };
     assert_ne!(item.status, TaskStatus::Blocked, "transient failure must not block");
     assert_eq!(item.autostart, autostart_before, "autostart must not be cleared");
     assert_ne!(
-        h.coordinator.work_db.get_execution(&h.next.id).unwrap().status,
+        h.coordinator.work_db().get_execution(&h.next.id).unwrap().status,
         ExecutionStatus::Failed
     );
 }
@@ -934,7 +934,7 @@ async fn transient_fetch_failure_keeps_the_item_retryable() {
 async fn orphaned_predecessor_with_no_head_bookmarks_dispatches_cleanly() {
     use boss_engine_test_git::jj::JjRepo;
     let h = chain_harness(true, true, false).await;
-    let db = &h.coordinator.work_db;
+    let db = &h.coordinator.work_db();
     let prior = db.recovery_predecessor(&h.next).unwrap().unwrap();
     let record = db.execution_bookmark(&prior.id).unwrap();
     JjRepo::run(
@@ -966,7 +966,7 @@ async fn revision_start_retry_keeps_its_own_pointers_on_the_staged_history() {
     use boss_engine_test_git::jj::JjRepo;
     for fresh in [false, true] {
         let mut h = chain_harness(true, true, false).await;
-        let db = h.coordinator.work_db.clone();
+        let db = h.coordinator.work_db().clone();
         let conn = rusqlite::Connection::open(h._dir.path().join("boss.db")).unwrap();
         if fresh {
             conn.execute("DELETE FROM execution_bookmarks WHERE execution_id != ?1", [&h.next.id])
@@ -1044,7 +1044,7 @@ async fn non_implementation_pointer_failure_keeps_pre_start_retries() {
         .with_pre_start_retry_delays(vec![Duration::from_secs(60)]),
     );
     coordinator
-        .record_start_failure(
+        .record_start_failure_for_test(
             coordinator.clone(),
             &next,
             "worker",
@@ -1066,7 +1066,7 @@ async fn revision_recovery_falls_back_to_main_when_the_pr_base_is_unavailable() 
     h.dispatch().await.unwrap();
     let report = h
         .coordinator
-        .work_db
+        .work_db()
         .execution_restore_report(&h.next.id)
         .unwrap()
         .expect("report");
@@ -1095,7 +1095,7 @@ async fn revision_recovery_discloses_a_missing_pr_base_branch() {
     h.dispatch().await.unwrap();
     let report = h
         .coordinator
-        .work_db
+        .work_db()
         .execution_restore_report(&h.next.id)
         .unwrap()
         .expect("report");
@@ -1126,7 +1126,14 @@ async fn revision_recovery_selects_the_repo_by_id_not_by_stored_url() {
         };
         let recovered = h
             .coordinator
-            .recover_execution_bookmark(&h.next, &lease, &h.coordinator.host_adapter, "mono", Some(99), Some(99))
+            .recover_execution_bookmark_for_test(
+                &h.next,
+                &lease,
+                &h.coordinator.host_adapter(),
+                "mono",
+                Some(99),
+                Some(99),
+            )
             .await
             .unwrap();
         assert!(recovered.is_some(), "{spelling}");
@@ -1137,7 +1144,7 @@ async fn revision_recovery_selects_the_repo_by_id_not_by_stored_url() {
 async fn pr_review_self_retry_with_a_record_still_positions_via_goto() {
     use boss_engine_recovery::execution_bookmark::{LocalJj, create};
     let mut h = chain_harness(true, true, false).await;
-    let db = h.coordinator.work_db.clone();
+    let db = h.coordinator.work_db().clone();
     rusqlite::Connection::open(h._dir.path().join("boss.db"))
         .unwrap()
         .execute(
@@ -1201,7 +1208,7 @@ async fn kept_pre_start_lease_does_not_block_redispatch() {
     let repo = CubeRepoHandle { repo_id: "mono".into() };
     let next = db.get_execution(&next.id).unwrap();
     let lease = coordinator
-        .lease_workspace_with_fallback(&next, "worker", &repo, "task", &coordinator.host_adapter)
+        .lease_workspace_with_fallback_for_test(&next, "worker", &repo, "task", &coordinator.host_adapter())
         .await
         .expect("a kept lease must not block leasing a fresh workspace");
     assert_ne!(lease.lease_id, "kept-lease");

@@ -6,8 +6,8 @@
 
 pub(super) use crate::coordinator::*;
 
-// Names the coordinator module imported for its own use, which these tests
-// inherited through a glob of that module before it moved crates.
+// Items the coordinator module uses internally but does not re-export; the
+// integration tests name them directly.
 pub(super) use boss_engine_storage_values::Host;
 pub(super) use boss_engine_storage_values::pool_policy::{AUTOMATION_WORKER_ID_PREFIX, REVIEW_WORKER_ID_PREFIX};
 pub(super) use boss_event_bus::{Event, EventKind, TopicFilter};

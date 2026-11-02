@@ -195,7 +195,7 @@ async fn bookkeeping_failure_is_terminal_and_recovery_does_not_record_it_twice()
     );
     let original = anyhow!("underlying bookmark error").context("bookmark creation failed");
     let error = coordinator
-        .record_start_failure(
+        .record_start_failure_for_test(
             coordinator.clone(),
             &execution,
             "worker-1",
@@ -208,7 +208,7 @@ async fn bookkeeping_failure_is_terminal_and_recovery_does_not_record_it_twice()
     // Even if the database recovers, fallback must not count this attempt again.
     connection.execute_batch("DROP TRIGGER reject_failure").unwrap();
     coordinator
-        .recover_failed_dispatch(&execution, "worker-1", &error)
+        .recover_failed_dispatch_for_test(&execution, "worker-1", &error)
         .await;
     let events = sink.events_for(&execution.id).await;
     assert_eq!(events.len(), 1, "{events:?}");

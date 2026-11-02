@@ -84,8 +84,7 @@ impl ExecutionCoordinator {
     /// refresh an execution. This makes `bossctl ... --host` failures
     /// transactional from the operator's point of view: an unknown,
     /// disabled, or saturated host leaves no queued execution behind.
-    #[doc(hidden)]
-    pub fn validate_requested_host(&self, work_item_id: &str, host_id: &str) -> Result<()> {
+    pub(crate) fn validate_requested_host(&self, work_item_id: &str, host_id: &str) -> Result<()> {
         let hosts = self.work_db.list_hosts().context("host validation: list hosts")?;
         let known_hosts = hosts.iter().map(|host| host.id.as_str()).collect::<Vec<_>>().join(", ");
         let host = hosts
@@ -419,8 +418,7 @@ impl ExecutionCoordinator {
     }
 
     /// Resolve the driver used by both host placement and spawn-failure alerts.
-    #[doc(hidden)]
-    pub fn resolve_spawn_driver(&self, execution: &WorkExecution, worker_id: &str) -> Result<Option<String>> {
+    pub(crate) fn resolve_spawn_driver(&self, execution: &WorkExecution, worker_id: &str) -> Result<Option<String>> {
         if execution.kind == ExecutionKind::PrReviewGuide {
             return Ok(Some(boss_execution_contracts::REVIEW_GUIDE_DRIVER.to_owned()));
         }
@@ -447,8 +445,7 @@ impl ExecutionCoordinator {
     /// forgot to check one, which is precisely how the 2026-08-10 incident
     /// happened. Any future caller must name a [`DispatchAdmission`], and
     /// the compiler will not let it avoid the question.
-    #[doc(hidden)]
-    pub async fn schedule_execution(
+    pub(crate) async fn schedule_execution(
         self: &Arc<Self>,
         execution: &WorkExecution,
         worker_id: &str,
@@ -2093,8 +2090,7 @@ impl ExecutionCoordinator {
         }
     }
 
-    #[doc(hidden)]
-    pub async fn lease_workspace_with_fallback(
+    pub(crate) async fn lease_workspace_with_fallback(
         &self,
         execution: &WorkExecution,
         worker_id: &str,
@@ -2459,8 +2455,7 @@ impl ExecutionCoordinator {
     ///
     /// Do NOT call this for post-`run_started` failures — those require
     /// `finish_execution_run`.
-    #[doc(hidden)]
-    pub async fn record_start_failure(
+    pub(crate) async fn record_start_failure(
         &self,
         coordinator: Arc<ExecutionCoordinator>,
         execution: &WorkExecution,

@@ -487,8 +487,7 @@ pub use boss_execution_contracts::{
 #[derive(bon::Builder)]
 #[builder(on(String, into), finish_fn(name = build_inner, vis = ""))]
 pub struct ExecutionCoordinator {
-    #[doc(hidden)]
-    pub work_db: Arc<WorkDb>,
+    pub(crate) work_db: Arc<WorkDb>,
     worker_pool: WorkerPool,
     /// Dedicated pool for automation triage and automation-produced task
     /// executions. Sized independently from the main pool (default 3) so
@@ -504,8 +503,7 @@ pub struct ExecutionCoordinator {
     /// The local-host adapter. Retained as the `local` special case and
     /// the backing adapter for the default provider; the dispatch loop
     /// resolves the per-execution adapter through `host_adapter_provider`.
-    #[doc(hidden)]
-    pub host_adapter: Arc<dyn HostAdapter>,
+    pub(crate) host_adapter: Arc<dyn HostAdapter>,
     /// Builds the right [`HostAdapter`] for the host the scheduler selects
     /// (local vs SSH-remote). Defaults to [`LocalHostAdapterProvider`]
     /// (every host → the local adapter), which preserves the historical
@@ -539,8 +537,7 @@ pub struct ExecutionCoordinator {
     /// concurrent hand-off it no longer is, and the guards union it with this
     /// registry to stay correct. See [`crate::dispatch_inflight`].
     #[builder(default)]
-    #[doc(hidden)]
-    pub inflight_dispatches: InflightDispatches,
+    pub(crate) inflight_dispatches: InflightDispatches,
     /// Permits bounding concurrent handed-off dispatch tails to
     /// [`MAX_INFLIGHT_DISPATCHES`].
     #[builder(default = Arc::new(Semaphore::new(MAX_INFLIGHT_DISPATCHES)))]
@@ -549,8 +546,7 @@ pub struct ExecutionCoordinator {
     /// without spawning when this is already set; the alive scheduler
     /// is responsible for noticing the wakeup via `scheduling_pending`.
     #[builder(default)]
-    #[doc(hidden)]
-    pub scheduling_active: AtomicBool,
+    pub(crate) scheduling_active: AtomicBool,
     /// Wakeup flag set by every `kick()` (whether or not it spawned a
     /// fresh scheduler). The running scheduler reads + resets this on
     /// each outer iteration so that a kick which arrived during the
@@ -560,16 +556,14 @@ pub struct ExecutionCoordinator {
     /// TOCTOU between "queue saw empty" and "active=false" that left
     /// fresh `ready` executions stranded with no scheduler running.
     #[builder(default)]
-    #[doc(hidden)]
-    pub scheduling_pending: AtomicBool,
+    pub(crate) scheduling_pending: AtomicBool,
     /// Engine event bus. `kick()` publishes `Event::DispatchReady` onto it
     /// when [`Self::enable_dispatch_ready_bus`] is on; otherwise it goes
     /// unused. Defaults to a fresh, subscriber-less bus so every existing
     /// constructor and test needs no changes — publishing to a bus with no
     /// subscribers is simply a no-op fan-out.
     #[builder(default = Arc::new(EventBus::new()))]
-    #[doc(hidden)]
-    pub event_bus: Arc<EventBus>,
+    pub(crate) event_bus: Arc<EventBus>,
     /// Kill-switch for routing `kick()` through [`Self::event_bus`] instead
     /// of latching `scheduling_pending`/`scheduling_active` directly. OFF by
     /// default — see `boss_engine::config::DEFAULT_ENABLE_DISPATCH_READY_BUS`.
@@ -701,8 +695,7 @@ pub struct ExecutionCoordinator {
     /// bind to another execution — but it does mean this map is not
     /// guaranteed empty for every terminal execution.
     #[builder(default)]
-    #[doc(hidden)]
-    pub requested_host_ids: std::sync::Mutex<HashMap<String, String>>,
+    pub(crate) requested_host_ids: std::sync::Mutex<HashMap<String, String>>,
     /// Startup capability gate for the local tmux runtime. Unlike the
     /// operator/breaker pause state this is not user-resumable: a worker
     /// cannot be dispatched until the engine has recorded a passing probe.
@@ -815,8 +808,7 @@ pub struct ExecutionCoordinator {
     /// because [`lease_limiter::RepoLeaseLimiter`] is crate-private; tests
     /// override via [`Self::with_max_concurrent_leases_per_repo`].
     #[builder(skip = lease_limiter::RepoLeaseLimiter::new(MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO))]
-    #[doc(hidden)]
-    pub repo_lease_limiter: lease_limiter::RepoLeaseLimiter,
+    pub(crate) repo_lease_limiter: lease_limiter::RepoLeaseLimiter,
     /// Outer bound on a single `cube workspace lease` invocation. Defaults
     /// to [`CUBE_LEASE_TIMEOUT`]. Tests override via
     /// [`Self::with_cube_lease_timeout`] so a hang can fire without waiting
