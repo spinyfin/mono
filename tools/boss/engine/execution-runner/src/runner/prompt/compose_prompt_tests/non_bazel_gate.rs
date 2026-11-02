@@ -18,6 +18,7 @@ fn conflict_prompt(ws: &std::path::Path) -> String {
     let attempt = sample_conflict_attempt();
     compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(ws)
@@ -31,6 +32,7 @@ fn conflict_prompt(ws: &std::path::Path) -> String {
 fn chore_prompt(ws: &std::path::Path) -> String {
     compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(ws)
@@ -43,6 +45,7 @@ fn chore_prompt(ws: &std::path::Path) -> String {
 fn revision_prompt(ws: &std::path::Path) -> String {
     compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&revision_task_with_created_via(None, "operator"))
             .workspace_path(ws)
@@ -59,6 +62,7 @@ fn ci_fix_prompt(ws: &std::path::Path, failure_kind: &str, failed_checks: &str) 
     attempt.failed_checks = failed_checks.into();
     compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(ws)
@@ -172,6 +176,7 @@ fn worker_signal_seam_off_uses_blocked_marker_wording() {
     let ws = tempfile::TempDir::new().unwrap();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&revision_task_with_created_via(None, "operator"))
             .workspace_path(ws.path())
@@ -215,6 +220,7 @@ fn bazel_override_on_missing_local_path_gets_bazel_gate_not_non_bazel() {
     assert!(!missing.exists());
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(missing)
@@ -233,6 +239,7 @@ fn bazel_override_on_missing_local_path_gets_bazel_gate_not_non_bazel() {
 
     let revision = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&revision_task_with_created_via(None, "operator"))
             .workspace_path(missing)
@@ -296,6 +303,7 @@ fn queue_ci_section(prompt: &str) -> String {
 fn missing_local_path_without_override_is_not_treated_as_non_bazel() {
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(missing_path())
@@ -385,6 +393,7 @@ fn bazel_override_ci_fix_keeps_bazel_test_step3() {
             .into();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(missing_path())

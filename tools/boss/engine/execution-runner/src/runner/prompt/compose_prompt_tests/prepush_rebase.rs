@@ -42,6 +42,7 @@ fn every_pr_producing_brief_and_driver_rules_require_fresh_base_before_each_push
             execution.kind = kind.clone();
             let prompt = compose_execution_prompt(
                 ExecutionPromptParams::builder()
+                    .review_signal_checks(|_| &[])
                     .execution(&execution)
                     .work_item(&item)
                     .workspace_path(Path::new("/tmp/workspace"))
@@ -79,6 +80,7 @@ fn read_only_briefs_do_not_receive_pr_push_instructions() {
         execution.kind = kind.clone();
         let prompt = compose_execution_prompt(
             ExecutionPromptParams::builder()
+                .review_signal_checks(|_| &[])
                 .execution(&execution)
                 .work_item(&chore_without_pr())
                 .workspace_path(Path::new("/tmp/workspace"))
@@ -105,6 +107,7 @@ fn revision_ci_and_conflict_workers_keep_the_existing_rebase_flow_only() {
         execution.kind = kind.clone();
         let prompt = compose_execution_prompt(
             ExecutionPromptParams::builder()
+                .review_signal_checks(|_| &[])
                 .execution(&execution)
                 .work_item(&chore_with_pr(pr))
                 .workspace_path(Path::new("/tmp/workspace"))

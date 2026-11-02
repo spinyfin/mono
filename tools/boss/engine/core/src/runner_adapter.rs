@@ -172,11 +172,15 @@ impl DriverSignals for crate::live_worker_state::LiveWorkerStateRegistry {
     fn first_hook_event_for_run(&self, run_id: &str) -> Option<String> {
         self.first_hook_event_for_run(run_id)
     }
-    fn driver_signalled_before_reap(&self, slot_id: u8, run_id: &str) -> bool {
-        matches!(
-            self.confirm_never_started_reap(slot_id, run_id),
-            crate::live_worker_state::NeverStartedReapCommit::DriverSignalled
-        )
+    fn commit_never_started_reap(&self, slot_id: u8, run_id: &str) -> boss_execution_runner::host::NeverStartedReap {
+        use crate::live_worker_state::NeverStartedReapCommit as RegistryOutcome;
+        use boss_execution_runner::host::NeverStartedReap;
+        match self.confirm_never_started_reap(slot_id, run_id) {
+            RegistryOutcome::Committed { .. } => NeverStartedReap::Committed,
+            RegistryOutcome::DriverSignalled => NeverStartedReap::DriverSignalled,
+            RegistryOutcome::SlotGone => NeverStartedReap::SlotGone,
+            RegistryOutcome::AlreadyCommitted => NeverStartedReap::AlreadyCommitted,
+        }
     }
 }
 
@@ -187,8 +191,49 @@ pub(crate) async fn compose_worker_spawn(
     item: &WorkItem,
     workspace: &Path,
     change: Option<&str>,
-    mut opts: boss_execution_runner::WorkerSpawnOpts,
+    opts: boss_execution_runner::WorkerSpawnOpts,
 ) -> Result<boss_execution_runner::ComposedWorkerSpawn> {
-    opts.review_signal_checks = crate::merge_poller::review_signal_checks_for_owner;
     boss_execution_runner::compose_worker_spawn(db, worker_id, execution, item, workspace, change, opts).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DriverSignals;
+    use crate::live_worker_state::{DriverSignalKind, LiveWorkerStateRegistry};
+    use boss_execution_runner::host::NeverStartedReap;
+
+    #[test]
+    fn runner_reap_operation_fences_later_signals_and_preserves_earlier_signals() {
+        let registry = LiveWorkerStateRegistry::new();
+        let signals: &dyn DriverSignals = &registry;
+        assert_eq!(
+            signals.commit_never_started_reap(1, "missing"),
+            NeverStartedReap::SlotGone
+        );
+
+        registry.register_spawn(1, "fenced-run", "test", 123, None);
+        assert_eq!(
+            signals.commit_never_started_reap(1, "fenced-run"),
+            NeverStartedReap::Committed
+        );
+        assert_eq!(
+            registry.record_driver_signal("fenced-run", DriverSignalKind::HookEvent),
+            None
+        );
+        assert_eq!(
+            signals.commit_never_started_reap(1, "fenced-run"),
+            NeverStartedReap::AlreadyCommitted
+        );
+
+        registry.register_spawn(2, "signalled-run", "test", 124, None);
+        assert_eq!(
+            registry.record_driver_signal("signalled-run", DriverSignalKind::HookEvent),
+            Some(2)
+        );
+        assert_eq!(
+            signals.commit_never_started_reap(2, "signalled-run"),
+            NeverStartedReap::DriverSignalled
+        );
+        assert!(signals.has_driver_signal_for_run("signalled-run"));
+    }
 }

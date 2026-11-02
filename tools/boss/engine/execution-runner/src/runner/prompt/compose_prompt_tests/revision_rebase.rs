@@ -6,6 +6,7 @@ fn every_revision_rebases_before_edits_and_preserves_the_existing_gate() {
         for recovered in [true, false] {
             let prompt = compose_execution_prompt(
                 ExecutionPromptParams::builder()
+                    .review_signal_checks(|_| &[])
                     .execution(&revision_execution("https://github.com/org/repo/pull/77"))
                     .work_item(&revision_task_with_created_via(None, "operator"))
                     .workspace_path(Path::new("/tmp/workspace"))

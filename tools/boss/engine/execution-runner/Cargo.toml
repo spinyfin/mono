@@ -7,7 +7,7 @@ edition = "2024"
 test-support = []
 
 [dependencies]
-boss-claude-client = { path = "../../claude_client" }
+boss-pane-summary = { path = "../pane-summary" }
 boss-ci-log-reader = { path = "../ci-log-reader" }
 boss-conflict-diagnosis = { path = "../conflict-diagnosis" }
 boss-design-doc-fetcher = { path = "../design-doc-fetcher" }
@@ -43,7 +43,6 @@ libc = "0.2"
 regex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }

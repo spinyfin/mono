@@ -40,7 +40,7 @@ use crate::work::{CREATED_VIA_ENGINE_AUTO, CreateTaskInput, WorkDb, WorkItem};
 /// Prefix marker appended to a postmortem task's `description` once this
 /// reconcile has run for it (successfully or with an error) — the
 /// idempotency guard against re-processing the same postmortem twice.
-pub use boss_execution_runner::audit_text::PROCESSED_MARKER;
+pub use boss_engine_storage_values::audit_text::PROCESSED_MARKER;
 
 /// One entry of the postmortem-followups JSON array. All three fields are
 /// required (no `#[serde(default)]`): a genuinely strict schema is the

@@ -144,7 +144,7 @@ pub use boss_metrics::{register_counter, register_gauge};
 pub mod metrics_init;
 pub mod nudge_breaker;
 pub mod orphan_sweep;
-pub use boss_execution_runner::pane_summary;
+pub use boss_pane_summary;
 pub mod planner;
 pub mod pool_claim_sweep;
 pub use boss_metrics::population_progress;
@@ -202,7 +202,7 @@ pub mod stranded_answering_sweep;
 pub use boss_engine_structured_output as structured_output;
 #[cfg(test)]
 mod storage_orchestration_tests;
-pub use boss_execution_runner::supersession_scan;
+pub use boss_engine_storage_values::supersession_scan;
 pub(crate) mod sweep_loop;
 pub mod sweep_metrics;
 pub mod syspolicyd_monitor;

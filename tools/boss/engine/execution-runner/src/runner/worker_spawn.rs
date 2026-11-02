@@ -59,8 +59,8 @@ pub struct ComposedWorkerSpawn {
 /// `*_proposals_seam_enabled` field mirrors a feature flag of the same name
 /// gating one seam of the worker-proposal-API migration; see
 /// [`super::prompt::ExecutionPromptParams`]'s matching fields for what each
-/// one does to the rendered prompt. All fields default OFF, matching every
-/// flag's registry default.
+/// one does to the rendered prompt. Feature flags default OFF; the merge-review
+/// policy is required so every caller explicitly chooses which checks are human-gated.
 ///
 /// `automation_outcome_proposals_seam_enabled` is the odd one out: it does
 /// not feed `ExecutionPromptParams` at all (triage executions render
@@ -73,7 +73,6 @@ pub struct ComposedWorkerSpawn {
 #[derive(Debug, Clone, Copy, bon::Builder)]
 #[builder(on(String, into))]
 pub struct WorkerSpawnOpts {
-    #[builder(default = empty_review_signals)]
     pub review_signal_checks: fn(&str) -> &'static [&'static str],
     #[builder(default)]
     pub editorial_enabled: bool,
@@ -716,7 +715,7 @@ pub async fn compose_worker_spawn(
     let pr_template_product_id = work_item.product_id();
     let pr_template_lease_id = execution.cube_lease_id.as_deref().unwrap_or("");
     let pr_template_set = crate::pr_template::load(pr_template_product_id, pr_template_lease_id, workspace_path);
-    // Maint task 6: an `automation_triage` execution renders the triage
+    // An `automation_triage` execution renders the triage
     // preamble (decision-marker contract + "do not do the work / do not
     // open a PR" guardrails) instead of the ordinary implementer prompt.
     // Its `work_item_id` is the automation id, so we read the automation
@@ -944,9 +943,8 @@ pub async fn compose_worker_spawn(
                 }
                 None => crate::pr_review::ReviewScope::Code,
             };
-            let reviewer_repo_slug = git_utils::repo_slug::parse_github_owner_repo(&execution.repo_remote_url)
-                .map(|(owner, repo)| format!("{owner}/{repo}"))
-                .unwrap_or_else(|_| "<owner/repo>".to_owned());
+            let reviewer_repo_slug = git_utils::repo_slug::parse_github_slug(&execution.repo_remote_url)
+                .unwrap_or_else(|| "<owner/repo>".to_owned());
             // A member row existing is the same signal `finalize_pr_review_pass`
             // uses to take the batch branch unconditionally (it never falls
             // back to reading the legacy artifact once a member row exists).
@@ -1348,13 +1346,4 @@ pub async fn compose_worker_spawn(
         spawn_config,
         embedded_output_path,
     })
-}
-
-fn empty_review_signals(_: &str) -> &'static [&'static str] {
-    &[]
-}
-impl Default for WorkerSpawnOpts {
-    fn default() -> Self {
-        Self::builder().build()
-    }
 }

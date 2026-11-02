@@ -93,9 +93,7 @@ pub fn followup_pr_backlink(
     if pr_number <= 0 {
         bail!("followup task has invalid origin PR number {pr_number}; refusing to open an unlinked derived PR");
     }
-    let slug = match git_utils::repo_slug::parse_github_owner_repo(repo_remote_url)
-        .map(|(owner, repo)| format!("{owner}/{repo}"))
-    {
+    let slug = match git_utils::repo_slug::parse_github_slug_result(repo_remote_url) {
         Ok(slug) => slug,
         Err(err) if *task_kind == TaskKind::Followup => {
             bail!("could not resolve origin PR URL for followup task: {err}");

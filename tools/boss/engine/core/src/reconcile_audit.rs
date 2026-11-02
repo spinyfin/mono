@@ -36,7 +36,7 @@ pub(crate) fn append_reconcile_audit(
     append_description_line(work_db, work_item_id, &audit_line)
 }
 
-pub use boss_execution_runner::audit_text::*;
+pub use boss_engine_storage_values::audit_text::*;
 
 /// Append `line` verbatim to `work_item_id`'s description. Shared by
 /// [`append_reconcile_audit`] and [`crate::completion::WorkerCompletionHandler::record_deferred_scope_item`]

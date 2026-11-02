@@ -389,6 +389,22 @@ fn deferred_declarations_for(work_db: &WorkDb, work_item_id: &str) -> Vec<String
 
 #[cfg(test)]
 mod tests {
+    use boss_engine_storage_values::supersession_scan::{hit_lines, scan_supersession_language};
+    use boss_pr_review::render_supersession_flag_block;
+    #[test]
+    fn render_block_empty_when_no_hits() {
+        assert_eq!(render_supersession_flag_block(&[]), "");
+    }
+    #[test]
+    fn render_block_lists_flags_and_demands_citation() {
+        let hits = scan_supersession_language("supersedes the badge");
+        let block = render_supersession_flag_block(&hit_lines(&hits));
+        assert!(block.contains("Supersession-claim citation check"));
+        assert!(block.contains("design doc"));
+        assert!(block.contains("regression"));
+        assert!(block.contains("supersedes"));
+    }
+
     use super::*;
     use crate::pr_review::render_brief_packet_block;
     use crate::test_support::{
@@ -1125,15 +1141,13 @@ mod tests {
         insert_host(&db);
         let product = create_test_product(&db);
         let chore = create_test_chore_manual(&db, product.id.clone(), "Empty brief chore");
-        crate::audit_text::append_description_line(
-            &db,
+        db.append_work_item_description_line(
             &chore.id,
             "\n[doc-detector] no doc pointer auto-populated for this PR because it did not \
              touch exactly one docs/designs|investigations|postmortems file.",
         )
         .unwrap();
-        crate::audit_text::append_description_line(
-            &db,
+        db.append_work_item_description_line(
             &chore.id,
             "\n[engine-reconcile] epoch 1700000000: worker pid 123 exited.",
         )
@@ -1166,8 +1180,7 @@ mod tests {
         insert_host(&db);
         let product = create_test_product(&db);
         let chore = create_test_chore_manual(&db, product.id.clone(), "Empty brief chore");
-        crate::audit_text::append_description_line(
-            &db,
+        db.append_work_item_description_line(
             &chore.id,
             "\n[pr-review-skip] epoch 1700000000: reason=pure_rebase created_via=cli \
              pre_head=abc123 post_head=def456 — automated review skipped: the resolution's diff \
@@ -1207,12 +1220,8 @@ mod tests {
                     .build(),
             )
             .unwrap();
-        crate::audit_text::append_description_line(
-            &db,
-            &chore.id,
-            "\n[doc-detector] no doc pointer auto-populated for this PR.",
-        )
-        .unwrap();
+        db.append_work_item_description_line(&chore.id, "\n[doc-detector] no doc pointer auto-populated for this PR.")
+            .unwrap();
         let item = db.get_work_item(&chore.id).unwrap();
         let packet = assemble_with_doc_fetch(&db, &item, &execution_for(&chore.id), canned_missing).await;
         assert_eq!(

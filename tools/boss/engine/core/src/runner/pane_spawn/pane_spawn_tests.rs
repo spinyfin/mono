@@ -2457,7 +2457,9 @@ async fn merge_review_policy_reaches_worker_prompt_through_adapter() {
         &WorkItem::Chore(task),
         workspace.path(),
         None,
-        crate::runner::WorkerSpawnOpts::default(),
+        crate::runner::WorkerSpawnOpts::builder()
+            .review_signal_checks(crate::merge_poller::review_signal_checks_for_owner)
+            .build(),
     )
     .await
     .unwrap();

@@ -625,6 +625,7 @@ dependencies = [
  "boss-http-retry",
  "boss-log-files",
  "boss-metrics",
+ "boss-pane-summary",
  "boss-pr-review",
  "boss-pr-template",
  "boss-prose-vocabulary",
@@ -945,10 +946,12 @@ dependencies = [
  "anyhow",
  "bon",
  "boss-engine-effort",
+ "boss-pr-template",
  "boss-protocol",
  "serde",
  "serde_json",
  "sha2",
+ "tracing",
 ]
 
 [[package]]
@@ -1058,7 +1061,6 @@ dependencies = [
  "async-trait",
  "bon",
  "boss-ci-log-reader",
- "boss-claude-client",
  "boss-conflict-diagnosis",
  "boss-design-doc-fetcher",
  "boss-engine-driver",
@@ -1076,6 +1078,7 @@ dependencies = [
  "boss-github",
  "boss-host-execution",
  "boss-log-files",
+ "boss-pane-summary",
  "boss-pr-review",
  "boss-pr-review-sources",
  "boss-pr-template",
@@ -1092,7 +1095,6 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -1255,6 +1257,24 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "boss-pane-summary"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boss-claude-client",
+ "boss-engine-utility-model",
+ "boss-engine-utils",
+ "boss-protocol",
+ "boss-work-db",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]

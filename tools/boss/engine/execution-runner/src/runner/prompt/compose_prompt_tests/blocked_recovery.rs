@@ -12,6 +12,7 @@ fn render(
 ) -> String {
     compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(execution)
             .work_item(item)
             .workspace_path(path)

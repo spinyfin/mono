@@ -36,6 +36,7 @@ fn design_workers_receive_ci_classification_once_with_either_completion_channel(
             let rules = render_claude_md(&input, ClaudeDriver.agent_rules_preamble(), ".claude");
             let prompt = compose_execution_prompt(
                 ExecutionPromptParams::builder()
+                    .review_signal_checks(|_| &[])
                     .execution(&execution)
                     .work_item(&item)
                     .workspace_path(&input.workspace_path)
@@ -105,6 +106,7 @@ fn rendered_prompt_uses_engine_owned_binary_invocations() {
 
     let chore_prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -115,6 +117,7 @@ fn rendered_prompt_uses_engine_owned_binary_invocations() {
     );
     let design_prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&design_exec)
             .work_item(&design_item)
             .parent_project(&parent_project)
@@ -125,6 +128,7 @@ fn rendered_prompt_uses_engine_owned_binary_invocations() {
     );
     let existing_pr_prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&existing_pr)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -134,6 +138,7 @@ fn rendered_prompt_uses_engine_owned_binary_invocations() {
     );
     let conflict_prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&conflict_item)
             .conflict_attempt(&conflict_attempt)
@@ -191,6 +196,7 @@ fn run_done_seam_on_worker_signal_seam_off_teaches_summary_not_blocked_verb() {
     let ws = bazel_workspace();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(ws.path())
@@ -293,6 +299,7 @@ fn run_done_directive_omits_question_contract_for_non_standard_kinds() {
         execution.kind = kind.clone();
         let prompt = compose_execution_prompt(
             ExecutionPromptParams::builder()
+                .review_signal_checks(|_| &[])
                 .execution(&execution)
                 .work_item(&chore_without_pr())
                 .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -319,6 +326,7 @@ fn run_done_directive_omits_question_contract_for_non_standard_kinds() {
 fn run_done_seam_on_worker_signal_seam_on_teaches_propose_blocked() {
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -341,6 +349,7 @@ fn run_done_seam_on_worker_signal_seam_on_teaches_propose_blocked() {
 fn both_seams_on_forbid_companion_propose_blocked_for_typed_questions() {
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -371,6 +380,7 @@ fn bazel_prepush_gate_allows_evidenced_unattributable_push_when_run_done_seam_on
     let ws = bazel_workspace();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(ws.path())
@@ -421,6 +431,7 @@ fn bazel_prepush_gate_keeps_absolute_stop_when_run_done_seam_off() {
     let ws = bazel_workspace();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(ws.path())
@@ -452,6 +463,7 @@ fn revision_prepush_gate_allows_evidenced_unattributable_push_when_run_done_seam
     let work_item = revision_task_with_created_via(None, "operator");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(ws.path())
@@ -485,6 +497,7 @@ fn conflict_revision_keeps_absolute_compile_stop_when_run_done_seam_on() {
     let attempt = sample_conflict_attempt();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(ws.path())
@@ -566,6 +579,7 @@ fn implementation_brief_and_validation_exception_are_rendered_once() {
         execution.pr_url = Some("https://github.com/org/repo/pull/42".into());
         let prompt = compose_execution_prompt(
             ExecutionPromptParams::builder()
+                .review_signal_checks(|_| &[])
                 .execution(&execution)
                 .work_item(&chore_without_pr())
                 .workspace_path(ws.path())
@@ -607,6 +621,7 @@ fn every_block_boundary_kind_emits_check_prohibition_once() {
             execution.pr_url = Some("https://github.com/org/repo/pull/42".into());
             let prompt = compose_execution_prompt(
                 ExecutionPromptParams::builder()
+                    .review_signal_checks(|_| &[])
                     .execution(&execution)
                     .work_item(&chore_without_pr())
                     .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -631,6 +646,7 @@ fn revision_attempts_emit_check_prohibition_once() {
             let execution = revision_execution("https://github.com/org/repo/pull/77");
             let prompt = compose_execution_prompt(
                 ExecutionPromptParams::builder()
+                    .review_signal_checks(|_| &[])
                     .execution(&execution)
                     .work_item(&chore_without_pr())
                     .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -645,6 +661,7 @@ fn revision_attempts_emit_check_prohibition_once() {
         let execution = super::ci_remediation_execution("https://github.com/org/repo/pull/77");
         let prompt = compose_execution_prompt(
             ExecutionPromptParams::builder()
+                .review_signal_checks(|_| &[])
                 .execution(&execution)
                 .work_item(&chore_without_pr())
                 .workspace_path(std::path::Path::new("/tmp/workspace"))

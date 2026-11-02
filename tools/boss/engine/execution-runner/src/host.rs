@@ -20,11 +20,26 @@ pub struct RunnerConfig {
     pub review_signal_checks: fn(&str) -> &'static [&'static str],
 }
 
-/// Observations of the current run, supplied by the engine's live-state owner.
+/// Result of atomically checking and fencing a never-started run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeverStartedReap {
+    /// The run is now fenced against later driver signals.
+    Committed,
+    /// A driver signal won the race; the run must not be reaped.
+    DriverSignalled,
+    /// The slot no longer belongs to this run.
+    SlotGone,
+    /// The run was already fenced against later driver signals.
+    AlreadyCommitted,
+}
+
+/// Driver observations and atomic reap fencing, supplied by the engine's live-state owner.
 pub trait DriverSignals: Send + Sync {
     fn has_driver_signal_for_run(&self, run_id: &str) -> bool;
     fn first_hook_event_for_run(&self, run_id: &str) -> Option<String>;
-    fn driver_signalled_before_reap(&self, slot_id: u8, run_id: &str) -> bool;
+    /// Atomically commit the reap fence unless a driver signal already won.
+    /// A successful commit prevents later driver signals from reviving the run.
+    fn commit_never_started_reap(&self, slot_id: u8, run_id: &str) -> NeverStartedReap;
 }
 
 pub struct GuardScripts {

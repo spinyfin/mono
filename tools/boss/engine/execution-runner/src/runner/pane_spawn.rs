@@ -179,7 +179,7 @@ mod sol_spawn {
         }
     }
 }
-use super::{ExecutionRunner, RunOutcome, RunWaitState};
+use crate::{ExecutionRunner, RunOutcome, RunWaitState};
 
 /// Render one driver-supplied [`crate::driver::EnvDirective`] as a shell
 /// statement to prepend to the worker pane's spawn command. Generic over
@@ -1439,9 +1439,10 @@ impl ExecutionRunner for PaneSpawnRunner {
                 return Ok(cancelled);
             }
             if let Err(err) = confirm
-                && !spawner
-                    .driver_signals()
-                    .is_some_and(|registry| registry.driver_signalled_before_reap(started.slot_id, &execution.id))
+                && !spawner.driver_signals().is_some_and(|registry| {
+                    registry.commit_never_started_reap(started.slot_id, &execution.id)
+                        == crate::host::NeverStartedReap::DriverSignalled
+                })
             {
                 tracing::warn!(
                     worker_id,

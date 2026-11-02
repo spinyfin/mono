@@ -215,6 +215,7 @@ fn worker_prompts_for_every_dispatch_kind_avoid_internal_vocabulary() {
             for editorial in [false, true] {
                 let prompt = compose_execution_prompt(
                     ExecutionPromptParams::builder()
+                        .review_signal_checks(|_| &[])
                         .execution(&case.execution)
                         .work_item(&case.work_item)
                         .workspace_path(workspace.path())

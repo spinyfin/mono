@@ -50,6 +50,7 @@ fn execution_prompts_include_bazel_caching_rule_once() {
         let attempt = sample_ci_attempt();
         let prompt = compose_execution_prompt(
             ExecutionPromptParams::builder()
+                .review_signal_checks(|_| &[])
                 .execution(&execution)
                 .work_item(&work_item)
                 .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -138,6 +139,7 @@ fn acceptance_criterion_names_the_pr_url_artifact_and_keeps_the_final_line() {
         let execution = base_execution();
         let prompt = compose_execution_prompt(
             ExecutionPromptParams::builder()
+                .review_signal_checks(|_| &[])
                 .execution(&execution)
                 .work_item(&work_item)
                 .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -239,6 +241,7 @@ fn structured_output_env_always_carries_the_pr_url_path() {
 fn no_resume_directive_when_pr_url_is_absent() {
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -256,6 +259,7 @@ fn no_resume_directive_when_pr_url_is_empty() {
     let chore = chore_with_pr("");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -273,6 +277,7 @@ fn resume_directive_present_when_pr_url_is_set() {
     let chore = chore_with_pr("https://github.com/org/repo/pull/42");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -298,6 +303,7 @@ fn resume_directive_appears_before_execution_context() {
     let chore = chore_with_pr("https://github.com/org/repo/pull/99");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -317,6 +323,7 @@ fn expected_branch_name_suppressed_when_pr_url_set() {
     let chore = chore_with_pr("https://github.com/org/repo/pull/42");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -333,6 +340,7 @@ fn expected_branch_name_suppressed_when_pr_url_set() {
 fn expected_branch_name_present_when_no_pr_url() {
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -350,6 +358,7 @@ fn acceptance_criterion_references_existing_pr_when_pr_url_set() {
     let chore = chore_with_pr("https://github.com/org/repo/pull/42");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -370,6 +379,7 @@ fn acceptance_criterion_references_existing_pr_when_pr_url_set() {
 fn acceptance_criterion_uses_fresh_branch_when_no_pr_url() {
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -438,6 +448,7 @@ fn ci_monitoring_directive_omits_human_gated_names_for_plain_org() {
     // in generated worker rules, so no CI directive is needed here.
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&execution_for_remote("git@github.com:org/repo.git"))
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -461,6 +472,7 @@ fn no_op_directive_present_for_fresh_chore_without_pr() {
     // done — `propose done --outcome no-changes-needed` — instead of only "stop and explain".
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -488,6 +500,7 @@ fn no_op_directive_absent_when_pr_already_exists() {
     // — NOT by closing the task as a no-op. The directive must not appear.
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_with_pr("https://github.com/org/repo/pull/7"))
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -645,6 +658,7 @@ fn resume_directive_absent_when_pr_url_is_null() {
     };
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -663,6 +677,7 @@ fn resume_directive_present_when_structured_pr_url_is_set() {
     let chore = chore_with_pr("https://github.com/org/repo/pull/235");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -709,6 +724,7 @@ fn bazel_gate_present_for_chore_on_bazel_workspace_seam_on() {
     let ws = bazel_workspace();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(ws.path())
@@ -749,6 +765,7 @@ fn bazel_gate_present_for_chore_on_bazel_workspace_seam_on() {
 fn chore_prompt_teaches_propose_wait() {
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -770,6 +787,7 @@ fn chore_prompt_teaches_propose_wait() {
 fn terminal_directive_gates_the_pr_on_real_results_without_reading_as_a_background_ban() {
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -797,6 +815,7 @@ fn bazel_gate_present_for_chore_on_bazel_workspace_seam_off() {
     let ws = bazel_workspace();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(ws.path())
@@ -824,6 +843,7 @@ fn worker_escalation_directive_teaches_boss_propose_verbs_when_seam_is_on() {
     let ws = tempfile::TempDir::new().unwrap();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(ws.path())
@@ -860,6 +880,7 @@ fn worker_escalation_directive_teaches_legacy_markers_when_seam_is_off() {
     let ws = tempfile::TempDir::new().unwrap();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(ws.path())
@@ -887,6 +908,7 @@ fn bazel_gate_absent_on_non_bazel_workspace() {
     let ws = tempfile::TempDir::new().unwrap();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(ws.path())
@@ -904,6 +926,7 @@ fn bazel_gate_present_for_revision_on_bazel_workspace() {
     let ws = bazel_workspace();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/250"))
             .work_item(&chore_without_pr())
             .workspace_path(ws.path())
@@ -926,6 +949,7 @@ fn revision_prompt_omits_expected_branch_line() {
     let ws = tempfile::TempDir::new().unwrap();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/250"))
             .work_item(&chore_without_pr())
             .workspace_path(ws.path())
@@ -952,6 +976,7 @@ fn chore_prompt_keeps_expected_branch_line() {
     let ws = tempfile::TempDir::new().unwrap();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(ws.path())
@@ -1072,6 +1097,7 @@ fn revision_directive_with_conflict_provenance_injects_conflict_fragment() {
     let attempt = sample_conflict_attempt();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -1165,6 +1191,7 @@ fn conflict_fragment_hard_gates_the_ground_truth_commands_before_local_jj_reason
     let attempt = sample_conflict_attempt();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -1228,6 +1255,7 @@ fn conflict_revision_uses_merge_correctness_gate_not_full_test_gate() {
     let attempt = sample_conflict_attempt();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(ws.path())
@@ -1277,6 +1305,7 @@ fn conflict_revision_gate_points_at_boss_propose_blocked_when_seam_is_on() {
     let attempt = sample_conflict_attempt();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(ws.path())
@@ -1315,6 +1344,7 @@ fn conflict_revision_gate_points_at_legacy_marker_when_seam_is_off() {
     let attempt = sample_conflict_attempt();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(ws.path())
@@ -1343,6 +1373,7 @@ fn no_op_directive_points_at_boss_propose_blocked_when_seam_is_on() {
     // pointer must land on whichever channel this run actually honors.
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -1364,6 +1395,7 @@ fn no_op_directive_points_at_boss_propose_blocked_when_seam_is_on() {
 fn no_op_directive_points_at_legacy_marker_when_seam_is_off() {
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -1432,6 +1464,7 @@ fn revision_directive_injects_merge_order_preservation_when_sibling_merged() {
     let lines = vec!["`task_sibling` (merged: https://github.com/org/repo/pull/50)".to_owned()];
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -1458,6 +1491,7 @@ fn revision_directive_omits_merge_order_clause_without_merged_sibling() {
     let attempt = sample_conflict_attempt();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -1482,6 +1516,7 @@ fn non_conflict_revision_keeps_full_build_and_test_gate() {
     let work_item = revision_task_with_created_via(None, "operator");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(ws.path())
@@ -1508,6 +1543,7 @@ fn revision_directive_with_ci_fix_provenance_injects_ci_fragment() {
     let attempt = sample_ci_attempt();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -1576,6 +1612,7 @@ fn ci_remediation_prompt_offers_mark_noop_for_non_rebounce() {
     let attempt = sample_ci_attempt();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&ci_remediation_execution(&attempt.pr_url))
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -1602,6 +1639,7 @@ fn trunk_eviction_revision_prompt(failed_checks_json: &str) -> String {
     attempt.failed_checks = failed_checks_json.into();
     compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -1611,7 +1649,7 @@ fn trunk_eviction_revision_prompt(failed_checks_json: &str) -> String {
     )
 }
 
-/// T792/T793: a Trunk eviction with no failing build attached is the shape
+/// Regression: a Trunk eviction with no failing build attached is the shape
 /// that destroyed flunge#1137. The worker was told to find a build that did
 /// not exist, given no way out, and assured that "something landed on the
 /// target branch" — so it rebased and force-pushed an empty commit over the
@@ -1698,6 +1736,7 @@ fn ci_remediation_prompt_omits_mark_noop_for_rebounce() {
     attempt.before_commit_sha = Some("mergesha999".into());
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&ci_remediation_execution(&attempt.pr_url))
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -1764,6 +1803,7 @@ fn revision_directive_without_provenance_has_no_fragment() {
     let work_item = revision_task_with_created_via(None, "operator");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -1794,6 +1834,7 @@ fn revision_directive_requires_pr_title_update() {
     let work_item = revision_task_with_created_via(None, "operator");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -1832,6 +1873,7 @@ fn revision_directive_permits_leaving_accurate_description_untouched() {
     let work_item = revision_task_with_created_via(None, "operator");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -1860,6 +1902,7 @@ fn revision_directive_requires_findings_status_comment() {
     let work_item = revision_task_with_created_via(None, "operator");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -1912,6 +1955,7 @@ fn revision_directive_requires_findings_status_comment() {
 fn deferred_scope_directive_present_for_chore_implementation() {
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -1943,6 +1987,7 @@ fn deferred_scope_directive_present_for_chore_implementation() {
 fn deferred_scope_directive_teaches_boss_propose_verb_when_seam_is_on() {
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -1965,6 +2010,7 @@ fn deferred_scope_directive_present_for_revision_implementation() {
     let work_item = revision_task_with_created_via(None, "operator");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -1988,6 +2034,7 @@ fn deferred_scope_directive_teaches_boss_propose_verb_when_seam_is_on_for_revisi
     let work_item = revision_task_with_created_via(None, "operator");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2017,6 +2064,7 @@ fn revision_no_op_directive_teaches_no_changes_needed_declaration() {
     let work_item = revision_task_with_created_via(None, "operator");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2054,6 +2102,7 @@ fn escalation_protocol_directive_present_for_revision_implementation_seam_off() 
     let work_item = revision_task_with_created_via(None, "operator");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2081,6 +2130,7 @@ fn guide_comment_revision_directive_injects_guide_instructions() {
     let work_item = revision_task_with_created_via(None, "guide-comment:rgs_1");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2102,6 +2152,7 @@ fn revision_prerequisite_route_requires_run_done_seam() {
     let work_item = revision_task_with_created_via(None, "operator");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2117,6 +2168,7 @@ fn revision_directive_routes_blocking_pr_work_to_prerequisite_and_later_work_to_
     let work_item = revision_task_with_created_via(None, "operator");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2151,6 +2203,7 @@ fn revision_directive_steers_blocked_progress_to_propose_blocked_when_seam_is_on
     let work_item = revision_task_with_created_via(None, "operator");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2174,6 +2227,7 @@ fn ordinary_revision_directive_omits_guide_instructions() {
     let work_item = revision_task_with_created_via(None, "operator");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2191,6 +2245,7 @@ fn escalation_protocol_directive_teaches_boss_propose_verb_when_seam_is_on_for_r
     let work_item = revision_task_with_created_via(None, "operator");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2230,6 +2285,7 @@ fn deferred_scope_directive_absent_for_answer_agent() {
         .build();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&execution)
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2243,8 +2299,7 @@ fn deferred_scope_directive_absent_for_answer_agent() {
 }
 
 // -----------------------------------------------------------
-// Worker-proposal seam (worker-proposal-api-replace-fragile-worker-to-engine-seams.md,
-// implementation task 10): `followup_proposals_seam` teaches
+// Worker-proposal seam (worker-proposal-api-replace-fragile-worker-to-engine-seams.md): `followup_proposals_seam` teaches
 // `"$BOSS_BIN" propose followup-task` instead of the legacy structured-output
 // artifact / `FOLLOWUPS:` sentinel. Mirrors the `deferred_scope_proposals_seam`
 // tests above.
@@ -2254,6 +2309,7 @@ fn deferred_scope_directive_absent_for_answer_agent() {
 fn followups_block_teaches_legacy_artifact_and_sentinel_when_seam_is_off() {
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2278,6 +2334,7 @@ fn followups_block_teaches_legacy_artifact_and_sentinel_when_seam_is_off() {
 fn followups_block_teaches_boss_propose_verb_when_seam_is_on() {
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2309,6 +2366,7 @@ fn editorial_rules_block_always_rendered_with_baked_in_rules() {
     // Default config: block always appears with baked-in rules.
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2339,6 +2397,7 @@ fn editorial_rules_block_default_config_has_no_instructions_section() {
     // Default config: no instructions, no template, no enforcement banner.
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2368,6 +2427,7 @@ fn editorial_rules_block_with_instructions_renders_full_configured_sections() {
     };
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2407,6 +2467,7 @@ fn editorial_rules_block_with_enforce_template_includes_template_text() {
     };
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2438,6 +2499,7 @@ fn editorial_rules_block_appears_before_per_kind_directive() {
     // [editorial-rules] must appear before "Expected outcome for this run:"
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2463,6 +2525,7 @@ fn editorial_rules_block_advise_template_policy_rendered() {
     };
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2490,6 +2553,7 @@ fn editorial_controls_flag_off_omits_block() {
     // With editorial_enabled = false, no [editorial-rules] block in the prompt.
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2521,6 +2585,7 @@ fn editorial_controls_flag_off_omits_block_even_with_configured_rules() {
     };
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2541,6 +2606,7 @@ fn editorial_controls_flag_on_preserves_existing_behavior() {
     // and contain the baked-in rules — identical to the original behavior.
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&base_execution())
             .work_item(&chore_without_pr())
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2739,6 +2805,7 @@ fn design_guidance_block_wraps_configured_text_in_design_directive() {
     let work_item = design_task();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&execution)
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2761,6 +2828,7 @@ fn design_guidance_block_absent_when_not_configured() {
     let work_item = design_task();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&execution)
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2789,6 +2857,7 @@ fn design_guidance_block_present_in_postmortem_directive_too() {
     };
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&execution)
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2811,6 +2880,7 @@ fn design_guidance_absent_from_non_design_execution_kind() {
     let work_item = chore_without_pr();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&execution)
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2832,6 +2902,7 @@ fn revision_directive_injects_guide_fragment_for_guide_created_revision() {
     );
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -2854,6 +2925,7 @@ fn revision_directive_omits_guide_fragment_for_non_guide_revision() {
         let work_item = revision_task_with_created_via(None, created_via);
         let prompt = compose_execution_prompt(
             ExecutionPromptParams::builder()
+                .review_signal_checks(|_| &[])
                 .execution(&revision_execution("https://github.com/org/repo/pull/77"))
                 .work_item(&work_item)
                 .workspace_path(std::path::Path::new("/tmp/workspace"))

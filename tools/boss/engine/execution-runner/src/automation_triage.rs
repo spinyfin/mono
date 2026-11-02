@@ -402,7 +402,7 @@ run.\n\n",
 /// emits a marker, so the run is finalised `failed_will_retry` /
 /// "triage ended without a decision marker". This CLAUDE.md restates the
 /// marker contract and the no-work / no-PR posture, and omits the PR-delivery
-/// mandate entirely (the engine worker-setup triage denylist denylist is
+/// mandate entirely (the engine worker-setup triage denylist is
 /// the suspenders to this belt).
 ///
 /// `automation_outcome_proposals_seam_enabled` mirrors the
@@ -649,7 +649,7 @@ fn claude_md_decision_contract(seam_enabled: bool) -> String {
 /// `automation_outcome_proposals_seam` feature flag (composed with the
 /// `worker_proposals` master flag) — the same flag
 /// `completion::WorkerCompletionHandler::finalize_automation_triage`
-/// reads for the engine's read path (design implementation task 11),
+/// reads for the engine's read path ,
 /// threaded here so the two halves of the migration move together: a
 /// triage worker must never be taught a verb the engine won't yet read
 /// proposals-first for, and flipping the flag off must restore today's

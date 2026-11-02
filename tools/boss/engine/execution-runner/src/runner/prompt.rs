@@ -31,7 +31,6 @@ pub(super) use revision_rebase::revision_conflict_notice;
 
 #[derive(bon::Builder)]
 pub(super) struct ExecutionPromptParams<'a> {
-    #[builder(default = |_| &[])]
     pub review_signal_checks: fn(&str) -> &'static [&'static str],
     execution: &'a WorkExecution,
     work_item: &'a WorkItem,
@@ -73,8 +72,7 @@ pub(super) struct ExecutionPromptParams<'a> {
     #[builder(default)]
     worker_signal_proposals_seam_enabled: bool,
     /// Whether `deferred_scope_proposals_seam` is on — gates the worker-facing
-    /// prompt half of the deferred-scope seam migration (design
-    /// implementation task 9): [`deferred_scope_directive`]. `false` (the
+    /// prompt half of the deferred-scope seam migration: [`deferred_scope_directive`]. `false` (the
     /// flag's registry default) reproduces the exact marker-only text;
     /// `true` teaches `"$BOSS_BIN" propose deferred-scope` instead. This is the
     /// OTHER half of the flag: the engine's read path
@@ -387,7 +385,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         ExecutionKind::AnswerAgent => {
             // Read-only answer agent: it never touches the workspace or opens a
             // PR — its whole mandate is to answer the question and post one
-            // thread reply. (The full answer-agent prompt is composed by P3b;
+            // thread reply. (The full answer-agent prompt is composed by the answer-agent composer;
             // this arm keeps the generic composer sane and PR-free if reached.)
             prompt.push_str(
                 "Expected outcome for this run:\n- read what you need to answer the question accurately,\n- post exactly one comprehensive reply to the comment thread,\n- take no other action — you are read-only.\n",
@@ -485,9 +483,8 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
             let pr_number = boss_github::pr_url::pr_number_from_url(pr_url)
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "?".into());
-            let repo_slug = git_utils::repo_slug::parse_github_owner_repo(&execution.repo_remote_url)
-                .map(|(owner, repo)| format!("{owner}/{repo}"))
-                .unwrap_or_else(|_| "<owner/repo>".into());
+            let repo_slug = git_utils::repo_slug::parse_github_slug(&execution.repo_remote_url)
+                .unwrap_or_else(|| "<owner/repo>".into());
             prompt.push_str(&format!(
                 "- Bound PR: {pr_url}; inspection command: `gh pr view {pr_number} -R {repo_slug}`.\n",
             ));
@@ -1328,7 +1325,7 @@ pub(crate) fn run_done_directive(
 /// the same flag
 /// `completion::WorkerCompletionHandler::detect_and_record_deferred_scope`
 /// reads for the engine's read path, threaded here so the two halves of the
-/// migration move together (design implementation task 9, following the
+/// migration move together (following the
 /// recipe [`worker_escalation_protocol_directive`] established): a worker
 /// must never be taught the `"$BOSS_BIN" propose deferred-scope` verb when the
 /// engine won't yet read proposals-first for it, and flipping the flag off
@@ -1562,8 +1559,7 @@ fn postmortem_followups_emission_block(output_path: &str) -> String {
 
 /// Followups emission instruction (design:
 /// `tools/boss/docs/designs/attentions.md`, "Creation pipeline";
-/// `worker-proposal-api-replace-fragile-worker-to-engine-seams.md`,
-/// implementation task 10). Appended to the implementation-worker directive:
+/// `worker-proposal-api-replace-fragile-worker-to-engine-seams.md`). Appended to the implementation-worker directive:
 /// a worker that notices concrete, out-of-scope follow-on work near task
 /// completion surfaces it for the human.
 ///
@@ -1711,9 +1707,8 @@ fn compose_revision_directive(
     let pr_number = boss_github::pr_url::pr_number_from_url(parent_pr_url)
         .map(|n| n.to_string())
         .unwrap_or_else(|| "?".into());
-    let repo_slug = git_utils::repo_slug::parse_github_owner_repo(&execution.repo_remote_url)
-        .map(|(owner, repo)| format!("{owner}/{repo}"))
-        .unwrap_or_else(|_| "<owner/repo>".to_owned());
+    let repo_slug = git_utils::repo_slug::parse_github_slug(&execution.repo_remote_url)
+        .unwrap_or_else(|| "<owner/repo>".to_owned());
     // Bazel conflict-resolution revisions push as soon as the merged code
     // compiles (tests run in the PR's CI). Non-Bazel conflict revisions
     // must also run the repo's documented test commands. Other revisions

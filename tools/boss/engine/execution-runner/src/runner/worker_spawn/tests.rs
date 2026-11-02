@@ -48,7 +48,10 @@ async fn first_prompt_sizes_by_driver_and_kind() {
                 &WorkItem::Chore(task),
                 workspace.path(),
                 None,
-                WorkerSpawnOpts::builder().run_done_proposals_seam_enabled(true).build(),
+                WorkerSpawnOpts::builder()
+                    .review_signal_checks(|_| &[])
+                    .run_done_proposals_seam_enabled(true)
+                    .build(),
             )
             .await
             .unwrap();
@@ -325,7 +328,7 @@ mod compose_worker_spawn_tests {
             &db.get_work_item(&task.id).unwrap(),
             workspace.path(),
             None,
-            WorkerSpawnOpts::default(),
+            WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
         )
         .await
         .unwrap();
@@ -436,7 +439,7 @@ mod compose_worker_spawn_tests {
                 &WorkItem::Chore(task),
                 workspace.path(),
                 None,
-                WorkerSpawnOpts::default(),
+                WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
             )
             .await
             .unwrap();
@@ -479,7 +482,7 @@ mod compose_worker_spawn_tests {
             &WorkItem::Chore(task),
             workspace.path(),
             None,
-            WorkerSpawnOpts::default(),
+            WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
         )
         .await
         .unwrap();
@@ -517,7 +520,7 @@ mod compose_worker_spawn_tests {
             &WorkItem::Chore(task),
             workspace.path(),
             None,
-            WorkerSpawnOpts::default(),
+            WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
         )
         .await
         .unwrap();
@@ -557,7 +560,7 @@ mod compose_worker_spawn_tests {
                 &WorkItem::Chore(task),
                 workspace.path(),
                 None,
-                WorkerSpawnOpts::default(),
+                WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
             )
             .await
             .err()
@@ -602,7 +605,7 @@ mod compose_worker_spawn_tests {
                 &WorkItem::Chore(task),
                 workspace.path(),
                 None,
-                WorkerSpawnOpts::default(),
+                WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
             )
             .await
             .err()
@@ -630,7 +633,7 @@ mod compose_worker_spawn_tests {
             None,
             WorkerSpawnOpts {
                 run_done_proposals_seam_enabled: true,
-                ..WorkerSpawnOpts::default()
+                ..WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build()
             },
         )
         .await
@@ -699,7 +702,7 @@ mod compose_worker_spawn_tests {
             None,
             WorkerSpawnOpts {
                 run_done_proposals_seam_enabled: true,
-                ..WorkerSpawnOpts::default()
+                ..WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build()
             },
         )
         .await
@@ -750,7 +753,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            WorkerSpawnOpts::default(),
+            WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
         )
         .await
         .unwrap();
@@ -879,7 +882,7 @@ mod compose_worker_spawn_tests {
             &root_work_item,
             workspace.path(),
             None,
-            WorkerSpawnOpts::default(),
+            WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
         )
         .await
         .unwrap();
@@ -913,7 +916,7 @@ mod compose_worker_spawn_tests {
                 &root_work_item,
                 workspace.path(),
                 None,
-                WorkerSpawnOpts::default(),
+                WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
             )
             .await
             .unwrap();
@@ -1009,7 +1012,7 @@ mod compose_worker_spawn_tests {
             &root_work_item,
             workspace.path(),
             None,
-            WorkerSpawnOpts::default(),
+            WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
         )
         .await
         .unwrap();
@@ -1059,7 +1062,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            WorkerSpawnOpts::default(),
+            WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
         )
         .await
         .unwrap();
@@ -1099,7 +1102,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            WorkerSpawnOpts::default(),
+            WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
         )
         .await
         .unwrap();
@@ -1174,7 +1177,7 @@ mod compose_worker_spawn_tests {
                 &work_item,
                 workspace.path(),
                 None,
-                WorkerSpawnOpts::default(),
+                WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
             )
             .await
             .unwrap();
@@ -1237,7 +1240,7 @@ mod compose_worker_spawn_tests {
                 &work_item,
                 workspace.path(),
                 None,
-                WorkerSpawnOpts::default(),
+                WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
             )
             .await
             .unwrap();
@@ -1295,7 +1298,7 @@ mod compose_worker_spawn_tests {
                 &work_item,
                 workspace.path(),
                 None,
-                WorkerSpawnOpts::default(),
+                WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
             )
             .await
             .unwrap();
@@ -1355,7 +1358,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            WorkerSpawnOpts::default(),
+            WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
         )
         .await
         .unwrap();
@@ -1455,7 +1458,7 @@ mod compose_worker_spawn_tests {
             &design_with_product("task-design-grok", &product.id),
             workspace.path(),
             None,
-            WorkerSpawnOpts::default(),
+            WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
         )
         .await
         .expect("grok product default must yield rather than wedge a design spawn");
@@ -1479,7 +1482,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            WorkerSpawnOpts::default(),
+            WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
         )
         .await
         .expect("codex pin must yield, not fail the capability gate");
@@ -1521,7 +1524,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            WorkerSpawnOpts::default(),
+            WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
         )
         .await
         .expect("product codex pin must yield, not fail the capability gate");
@@ -1556,7 +1559,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            WorkerSpawnOpts::default(),
+            WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
         )
         .await
         .expect("codex pin must yield for CiRemediation");
@@ -1618,7 +1621,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            WorkerSpawnOpts::default(),
+            WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
         )
         .await
         .expect("review-guide spawn must compose");
@@ -1689,7 +1692,7 @@ mod compose_worker_spawn_tests {
                 &item,
                 workspace.path(),
                 None,
-                WorkerSpawnOpts::default(),
+                WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
             )
             .await
             .unwrap()

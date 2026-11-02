@@ -99,6 +99,7 @@ mod tests {
     fn compose(work_item: &WorkItem) -> String {
         compose_execution_prompt(
             ExecutionPromptParams::builder()
+                .review_signal_checks(|_| &[])
                 .execution(&base_execution())
                 .work_item(work_item)
                 .workspace_path(std::path::Path::new("/tmp/workspace"))
@@ -142,11 +143,7 @@ mod tests {
 
     #[test]
     fn fragment_classifies_ci_failures_instead_of_treating_them_as_blockers() {
-        let frag = format!(
-            "{}{}",
-            block_boundary_fragment(),
-            crate::worker_setup::ci_failure::GUIDANCE
-        );
+        let frag = format!("{}{}", block_boundary_fragment(), crate::ci_failure::GUIDANCE);
         assert!(
             frag.contains("A CI failure caused by your change"),
             "a CI failure caused by the worker's change must not be a blocker; got: {frag}",
@@ -290,6 +287,7 @@ mod tests {
             let work_item = chore_without_pr();
             let prompt = compose_execution_prompt(
                 ExecutionPromptParams::builder()
+                    .review_signal_checks(|_| &[])
                     .execution(&execution)
                     .work_item(&work_item)
                     .workspace_path(std::path::Path::new("/tmp/workspace"))

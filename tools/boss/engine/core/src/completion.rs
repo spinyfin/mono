@@ -1156,8 +1156,7 @@ async fn verify_pr_diff_nonempty(repo_slug: &str, pr_url: &str) -> Result<bool> 
 /// (`git@github.com:owner/repo.git`) and HTTPS
 /// (`https://github.com/owner/repo[.git]`) shapes.
 pub(crate) fn parse_repo_slug(remote_url: &str) -> Result<String> {
-    let (owner, repo) = git_utils::repo_slug::parse_github_owner_repo(remote_url)?;
-    Ok(format!("{owner}/{repo}"))
+    git_utils::repo_slug::parse_github_slug_result(remote_url)
 }
 
 /// Queues an automatic probe for `run_id`. The shape mirrors

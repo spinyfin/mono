@@ -8,9 +8,7 @@ pub(super) fn ci_monitoring_directive(
     review_signal_checks: fn(&str) -> &'static [&'static str],
 ) -> String {
     let mut out = String::new();
-    if let Ok(slug) = git_utils::repo_slug::parse_github_owner_repo(&execution.repo_remote_url)
-        .map(|(owner, repo)| format!("{owner}/{repo}"))
-    {
+    if let Some(slug) = git_utils::repo_slug::parse_github_slug(&execution.repo_remote_url) {
         let owner = slug.split('/').next().unwrap_or("");
         let names = review_signal_checks(owner);
         if !names.is_empty() {

@@ -40,10 +40,10 @@ use std::time::Duration;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 
-use crate::claude_client::{self, CallConfig, Message, MessagesRequest, RetryPolicy};
-use crate::utility_model::{UtilityCall, UtilityModel, UtilityTask};
-use crate::work::{WorkDb, WorkItem};
+use boss_claude_client::{self as claude_client, CallConfig, Message, MessagesRequest, RetryPolicy};
+use boss_engine_utility_model::{UtilityCall, UtilityModel, UtilityTask};
 use boss_protocol::{ExecutionKind, ReviewStage};
+use boss_work_db::{WorkDb, WorkItem};
 
 // The model is no longer pinned here: it comes from the `UtilityModel`
 // provider via `UtilityTask::PaneSummary`, whose default is Sonnet 4.6 —
@@ -455,7 +455,7 @@ fn build_prompt(name: &str, description: &str) -> String {
     prompt
 }
 
-/// Ask for a short gerund summary via the shared [`crate::claude_client`]
+/// Ask for a short gerund summary via the shared [`boss_claude_client`]
 /// pipeline, addressed at whatever the [`UtilityModel`] provider resolved, and
 /// pull the first text block out of the response. Transient failures
 /// (transport, timeout, 429, 5xx) are retried once under a tight spawn-path
@@ -529,8 +529,8 @@ fn clean_summary(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::work::WorkDb;
     use boss_protocol::{Task, TaskKind, TaskStatus};
+    use boss_work_db::WorkDb;
     use tempfile::TempDir;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -538,8 +538,8 @@ mod tests {
     /// A provider that resolves no credential for any task, so
     /// `get_or_generate` takes the no-credential branch without a network
     /// call — the analogue of the `None` API key these tests used to pass.
-    fn keyless_utility() -> crate::utility_model::AnthropicUtilityModel {
-        crate::utility_model::AnthropicUtilityModel::from_lookup(None, |_| None)
+    fn keyless_utility() -> boss_engine_utility_model::AnthropicUtilityModel {
+        boss_engine_utility_model::AnthropicUtilityModel::from_lookup(None, |_| None)
     }
 
     fn sample_task(id: &str, name: &str, description: &str) -> WorkItem {
@@ -902,8 +902,9 @@ mod tests {
         // Drive the real entry point through a provider pointed at the mock,
         // so the endpoint/model/credential all come from the seam rather than
         // from constants this test re-declares.
-        let provider = crate::utility_model::AnthropicUtilityModel::from_lookup(Some("test-key".to_owned()), |_| None)
-            .with_endpoint(format!("{}/v1/messages", server.uri()));
+        let provider =
+            boss_engine_utility_model::AnthropicUtilityModel::from_lookup(Some("test-key".to_owned()), |_| None)
+                .with_endpoint(format!("{}/v1/messages", server.uri()));
         let call = provider.resolve(UtilityTask::PaneSummary).expect("key was supplied");
         assert_eq!(call.model, UtilityTask::PaneSummary.default_model());
 
@@ -932,8 +933,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = crate::utility_model::AnthropicUtilityModel::from_lookup(Some("test-key".to_owned()), |_| None)
-            .with_endpoint(format!("{}/v1/messages", server.uri()));
+        let provider =
+            boss_engine_utility_model::AnthropicUtilityModel::from_lookup(Some("test-key".to_owned()), |_| None)
+                .with_endpoint(format!("{}/v1/messages", server.uri()));
         let call = provider.resolve(UtilityTask::PaneSummary).expect("key was supplied");
 
         let summary = claude_short_summary(&call, "Fix fencer scraper", "desc")
@@ -962,8 +964,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = crate::utility_model::AnthropicUtilityModel::from_lookup(Some("bad-key".to_owned()), |_| None)
-            .with_endpoint(format!("{}/v1/messages", server.uri()));
+        let provider =
+            boss_engine_utility_model::AnthropicUtilityModel::from_lookup(Some("bad-key".to_owned()), |_| None)
+                .with_endpoint(format!("{}/v1/messages", server.uri()));
         let call = provider.resolve(UtilityTask::PaneSummary).expect("key was supplied");
 
         let err = claude_short_summary(&call, "name", "desc")
@@ -983,8 +986,9 @@ mod tests {
     /// success, and never more than the pinned attempt count.
     #[tokio::test]
     async fn transport_error_exhausts_budget_then_surfaces() {
-        let provider = crate::utility_model::AnthropicUtilityModel::from_lookup(Some("test-key".to_owned()), |_| None)
-            .with_endpoint("http://127.0.0.1:1/v1/messages");
+        let provider =
+            boss_engine_utility_model::AnthropicUtilityModel::from_lookup(Some("test-key".to_owned()), |_| None)
+                .with_endpoint("http://127.0.0.1:1/v1/messages");
         let call = provider.resolve(UtilityTask::PaneSummary).expect("key was supplied");
 
         let started = std::time::Instant::now();

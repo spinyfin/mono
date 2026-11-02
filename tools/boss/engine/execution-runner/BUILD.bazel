@@ -4,7 +4,6 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 exports_files(["Cargo.toml"])
 
 RUNNER_DEPS = [
-    "//tools/boss/claude_client",
     "//tools/boss/engine/ci-log-reader",
     "//tools/boss/engine/conflict-diagnosis",
     "//tools/boss/engine/design-doc-fetcher",
@@ -15,6 +14,7 @@ RUNNER_DEPS = [
     "//tools/boss/engine/storage-values",
     "//tools/boss/engine/structured-output",
     "//tools/boss/engine/utility-model",
+    "//tools/boss/engine/pane-summary",
     "//tools/boss/engine/utils",
     "//tools/boss/engine/worker-bin",
     "//tools/boss/engine/execution-contracts",
@@ -52,6 +52,7 @@ rust_library(
     testonly = True,
     srcs = glob(["src/**/*.rs"]),
     aliases = {
+        "//tools/boss/engine/pane-summary:pane_summary_test_support": "boss_pane_summary",
         "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
         "//tools/boss/engine/execution-contracts:execution_contracts_test_support": "boss_execution_contracts",
     },
@@ -64,10 +65,12 @@ rust_library(
     rustc_env = {"BOSS_CHECKS_YAML": "$(execpath //:CHECKS.yaml)"},
     visibility = ["//tools/boss/engine/core:__pkg__"],
     deps = [d for d in RUNNER_DEPS if d not in [
+        "//tools/boss/engine/pane-summary",
         "//tools/boss/engine/work-db",
         "//tools/boss/engine/execution-contracts",
     ]] + [
         "//tools/boss/engine/execution-contracts:execution_contracts_test_support",
+        "//tools/boss/engine/pane-summary:pane_summary_test_support",
         "//tools/boss/engine/work-db:work_db_test_support",
     ] + all_crate_deps(normal = True),
 )
@@ -77,7 +80,9 @@ rust_test(
     size = "small",
     timeout = "moderate",
     aliases = {
+        "//tools/boss/engine/pane-summary:pane_summary_test_support": "boss_pane_summary",
         "//tools/boss/engine/work-db": "boss_work_db_production",
+        "//tools/boss/engine/pane-summary": "boss_pane_summary_production",
         "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
     },
     crate = ":execution-runner",
@@ -88,6 +93,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//tools/boss/engine/pane-summary:pane_summary_test_support",
         "//tools/boss/engine/prose-vocabulary",
         "//tools/boss/engine/work-db:work_db_test_support",
     ] + all_crate_deps(

@@ -1,5 +1,6 @@
 //! Worker posture and prompt setup shared by local and remote execution.
 
+use crate::{ci_failure, operator_question};
 use boss_protocol::ExecutionKind;
 use std::path::PathBuf;
 
@@ -16,10 +17,10 @@ pub enum WorkerKind {
     Standard,
     /// Read-only reviewer worker (design §9). Reads the PR diff and workspace
     /// files; MUST NOT mutate files, push commits, or interact with GitHub
-    /// write endpoints. The deny rules in the engine reviewer deny rules are the
+    /// write endpoints. The engine reviewer deny rules are the
     /// primary enforcement layer for this mandate.
     Reviewer,
-    /// Automation triage worker (Maint task 6). Investigates the repo and
+    /// Automation triage worker. Investigates the repo and
     /// emits a single decision marker (`automation: task <id>` /
     /// `automation: skip — …`), optionally running one
     /// `boss task create --automation`. It MUST NOT do the work itself: no
@@ -27,18 +28,18 @@ pub enum WorkerKind {
     /// deliverable**, so it must not receive the [`WorkerKind::Standard`]
     /// "a PR is the deliverable / print the PR URL as your last line"
     /// CLAUDE.md, which otherwise overrides the marker contract and leaves
-    /// the run ending without a decision marker. The deny rules in
-    /// the engine triage deny rules enforce the no-work posture; `boss task create`
+    /// the run ending without a decision marker. The engine triage deny rules
+    /// enforce the no-work posture; `boss task create`
     /// is intentionally left allowed.
     Triage,
-    /// Read-only "mini-coordinator" answer agent (P3a of
+    /// Read-only "mini-coordinator" answer agent (see
     /// `comment-triggered-document-revisions.md`). Answers one reviewer
     /// question in a doc-comment thread. Unlike every other kind it is
     /// enforced with an **allowlist, not a blocklist**: it is spawned in
     /// deny-by-default `dontAsk` permission mode with an explicit
-    /// the engine answer-agent allow rules allowlist (read-only tools + the single
-    /// thread-reply command), plus a comprehensive the engine answer-agent deny rules
-    /// belt. It reads anything the coordinator can see and reads code in a
+    /// allowlist (read-only tools and the single thread-reply command), plus
+    /// comprehensive engine answer-agent deny rules. It reads anything the
+    /// coordinator can see and reads code in a
     /// read-only checkout, but MUST NOT edit, push, open/modify a PR, mutate
     /// task/comment/cube state, or take any action other than posting its one
     /// reply. See [`crate::answer_agent`] for the worker-facing surface.
@@ -156,7 +157,7 @@ pub struct WorkerSetupInput {
     /// (composed with the `worker_proposals` master flag) — gates the
     /// `boss propose automation-outcome` teaching in
     /// [`crate::automation_triage::render_triage_claude_md`] for
-    /// [`WorkerKind::Triage`] workers (design implementation task 11).
+    /// [`WorkerKind::Triage`] workers.
     /// Ignored for every other worker kind. The caller must pass the same
     /// value used to render this triage execution's preamble
     /// (`runner::worker_spawn::WorkerSpawnOpts::automation_outcome_proposals_seam_enabled`)
@@ -608,70 +609,4 @@ fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir
         boss = boss,
         cube = cube,
     )
-}
-
-mod operator_question {
-    //! Worker-facing writing contract for the existing question/explanation fields.
-
-    pub(crate) const GUIDANCE: &str = r#"
-## Write questions for someone arriving cold
-
-Assume the repo owner has not seen the PR, review, code, or your run. Use everyday words: no internal symbols, types, file names, API names, review jargon, or links in the question or Yes/No meanings. Keep technical evidence reachable in a separate Details section, not mixed into the decision.
-
-Use `--question` for one specific Yes/No decision in plain language. In `--explanation`, require these labels on their own lines, in this order (actual newlines, no Markdown heading decoration):
-
-Context:
-One or two plain-language sentences: what work you are doing and what problem forces this decision.
-Yes:
-What Yes does: the path the engine or the next worker will take, the user-visible result, and the rough size of the work.
-No:
-What No does: a different path the engine or the next worker will take, the user-visible result, and the rough size of that work. "No = remain blocked" is not a real choice. If you cannot name a second path, do not ask; proceed, or report the blocker without a question.
-Recommendation:
-I recommend Yes (or No) because <one-line reason>.
-Details:
-Optional technical evidence, symbols, file names, links, and review references. Omit this label if no detail is needed. Never truncate evidence just to make the question shorter.
-
-The card presents Context, Question, Yes, No, Recommendation, then expandable Details. The same format applies to prerequisite questions: use a plain-language prerequisite name, explain the work and the dependency in Context, and explain that Yes creates/links the prerequisite and waits, while No records the declined path and redispatches. For a change that would exceed the file-count limit, No authorizes a file-count exception for this PR only and the next worker finishes in one PR. `--file-count` records the projected upper bound. Checkleft does not enforce the approved count: before pushing, compare the non-deleted file count from `jj diff --stat` against the PR base with the approved bound, and ask again if it is over. Use a free-form bypass reason without a numeric prefix, citing the recorded answer and date. The question must state that projected count, the limit, and the proposed split's PR boundaries. Never apply that exception without the recorded authorization. The prerequisite description can retain the technical instructions for the next worker.
-
-Before submitting, read only Context, Question, Yes, No, and Recommendation. Can someone who has never seen the work decide what each button will do? If not, rewrite those parts yourself. This writing contract does not change when a question is warranted or grant permission to bypass checks.
-"#;
-}
-
-pub mod ci_failure {
-    //! CI failure classification shared by all standard workers.
-
-    pub(crate) const GUIDANCE: &str = "\n## CI failure classification\n\n\
-     Classify a CI failure by cause, then act — do not park, and do not \
-     leave \"someone else will handle it\" as an available excuse:\n\
-     - Caused by your change: fix it. No judgement call, not grounds to \
-     block, no handoff.\n\
-     - Unrelated to your change AND trivial: fix it inline — that is what \
-     a human would do.\n\
-     - Unrelated AND not trivial: do not absorb it into this PR. Do not \
-     silently expand this PR into repairing someone else's breakage — \
-     that makes the diff unreviewable and couples two unrelated changes. \
-     This is the case where stopping to escalate can be legitimate. Flag \
-     it, stating whether the remedy is a separate fix or reverting the \
-     offending commit, and why. \"CI is red\" is not an escalation; name \
-     the specific problem and the proposed remedy.\n\
-     \n\
-     Whichever branch you take, the PR description must say which \
-     category you judged the failure into and on what basis. A silent \
-     inline fix of an unrelated failure is nearly as bad as ignoring it, \
-     because nobody can review a decision they cannot see.\n\
-     \n\
-     Trivial means the correct fix is mechanical and obviously correct — \
-     the canonical case is `main` adding a required `is_review_supervisor` \
-     field to `StartWorkerInput` after a test was written, breaking clippy \
-     on an unrelated PR's merge-queue synthetic commit. One line, \
-     mechanical. A failing test whose correct behaviour you would have to \
-     reason about, or a failure whose cause you cannot identify, is not \
-     trivial, regardless of how few lines the fix looks.\n\
-     \n\
-     The engine already mints CI-fix revisions. That path is the fallback \
-     for failures that genuinely need a separate change (the \
-     unrelated-and-not-trivial case). It is not a reason to punt a \
-     failure you could fix in this run.\n\
-     \n\
-";
 }
