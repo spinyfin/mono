@@ -53,6 +53,22 @@ A re-adopted slot seeded from the tool condition alone reads `Idle` over a worke
 
 A pane going `Terminated`/`Errored` is deliberately NOT mirrored. That is a death signal, and death detection has its own owners with their own corroboration rules — see Convergence below.
 
+### A worker parked on its own work is not "needs input"
+
+`WaitingForInput` / the app's "Needs input" count mean exactly one thing: a person must answer. A worker that ended its turn while a build or command it started is still running (and said so with `boss propose wait`) is not that — the driver still emits an idle-prompt `Notification` after the `Stop`, which by itself does not distinguish autonomous waiting from a human prompt. The engine folds the worker's declared wait into the parked activity, in one place (`apply_hook_event` in `engine/core/src/live_worker_state.rs`, classification in `live_worker_state/declared_wait.rs`), so the pill, the header subtitle, the top-bar count, the durable `waiting_human` mirror and `bossctl` all read one value:
+
+| Parked worker                                                        | `activity`          | Counts as "Needs input"      |
+| -------------------------------------------------------------------- | ------------------- | ---------------------------- |
+| Blocking prompt (permission, elicitation, …), with or without a wait | `waiting_for_input` | yes                          |
+| `Stop` or idle prompt, declared wait still live                      | `waiting_on_work`   | no                           |
+| Declared wait expired while parked, no re-wake                       | `wait_overdue`      | no (but surfaced as stalled) |
+| Idle prompt, no wait                                                 | `waiting_for_input` | yes                          |
+| `Stop`, no wait                                                      | `idle`              | no                           |
+
+The wait is read from `WaitRegistry` (the `boss propose wait` declaration) — never from pane or footer text. A periodic pass on the 10s honesty tick (`reconcile_declared_waits`) covers what hooks cannot: a wait declared after the worker parked, and a deadline passing on a silent worker. Expiry is a one-way move to `wait_overdue` (never back to `waiting_for_input`); main-session activity after a Stop consumes the declaration without refunding its charged duration. This uses emission-order turn boundaries, including a Stop overtaken by a resumed tool hook; subagent activity and a newer declaration do not consume the wait. A later human prompt therefore requires input unless a new wait is declared. An unconsumed wait that expires before Stop or before the first reconcile tick also gives `wait_overdue`. Renewing a wait returns the worker to `waiting_on_work`. Only `WorkerActivity::needs_human()` (Rust) / `WorkerActivity.needsHuman` (Swift) feed the count, so the app has no second definition to drift.
+
+Undeclared background shells and monitors are not covered: Claude's hooks carry no completion signal for them, so the engine cannot tell "still running" from "forgotten", and inferring it from the footer is forbidden.
+
 ### `live_status` is not the indicator's input
 
 Two unrelated fields are named `live_status`, and neither drives the dot:

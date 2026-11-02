@@ -212,6 +212,86 @@ final class AwaitingInputKanbanTests: XCTestCase {
         XCTAssertTrue(AgentsBadge.labels(waitingOnJob: 0, needsInput: 0).isEmpty)
     }
 
+    // MARK: - Waiting on the worker's own declared work
+
+    func testWaitingOnWorkReadsAsWaitingWithTheDeclaredReasonNotInput() {
+        let live = makeLiveState(
+            activity: .waitingOnWork,
+            waitReason: "bazel build of merge resolution",
+            waitExpiresAt: "2026-10-21T02:26:57Z"
+        )
+        for state in [
+            AgentActivityState.forDoingCard(
+                runtime: makeRuntime(),
+                liveState: live,
+                isDispatchPending: false,
+                isResolvingConflicts: false,
+                isRemediatingCI: false
+            ),
+            AgentActivityState(runtime: makeRuntime(), liveState: live),
+        ] {
+            guard case let .waiting(reason) = state else {
+                return XCTFail("expected .waiting; got \(state)")
+            }
+            XCTAssertTrue(reason.contains("bazel build of merge resolution"), reason)
+            XCTAssertFalse(reason.lowercased().contains("input"), reason)
+        }
+        XCTAssertTrue(live.isWaitingOnJob)
+        XCTAssertTrue(WorkerSlotLiveSlice(live).isWaitingOnJob)
+        XCTAssertFalse(WorkerActivity.waitingOnWork.needsHuman)
+    }
+
+    func testWaitOverdueReadsAsWaitingAndIsNotNeedsInput() {
+        let live = makeLiveState(activity: .waitOverdue, waitReason: "bazel build")
+        let state = AgentActivityState.forDoingCard(
+            runtime: makeRuntime(),
+            liveState: live,
+            isDispatchPending: false,
+            isResolvingConflicts: false,
+            isRemediatingCI: false
+        )
+        guard case let .waiting(reason) = state else {
+            return XCTFail("expected .waiting; got \(state)")
+        }
+        XCTAssertTrue(reason.lowercased().contains("expired"), reason)
+        XCTAssertTrue(live.isWaitingOnJob)
+        XCTAssertTrue(WorkerSlotLiveSlice(live).isWaitingOnJob)
+        XCTAssertEqual(WorkerSlotLiveSlice(live).waitCaption, reason)
+        XCTAssertFalse(WorkerActivity.waitOverdue.needsHuman)
+    }
+
+    func testOnlyWaitingForInputNeedsAHuman() {
+        for activity in [
+            WorkerActivity.spawning, .working, .waitingOnWork, .waitOverdue, .idle, .errored, .terminated,
+        ] {
+            XCTAssertFalse(activity.needsHuman, "\(activity)")
+        }
+        XCTAssertTrue(WorkerActivity.waitingForInput.needsHuman)
+    }
+
+    func testPillLabelsNeverSayWaitingForTheNewStates() {
+        XCTAssertEqual(WorkerActivity.waitingOnWork.agentsPaneLabel, "Waiting on work")
+        XCTAssertEqual(WorkerActivity.waitOverdue.agentsPaneLabel, "Wait overdue")
+    }
+
+    func testSubtitleAndNeedsInputAgreeAcrossTransitions() {
+        let cases: [(WorkerActivity, String?, Bool)] = [
+            (.waitingOnWork, "waiting on its own work", false),
+            (.waitOverdue, "wait expired — check on it", false),
+            (.waitingForInput, "awaiting input", true),
+            (.working, nil, false),
+            (.idle, nil, false),
+        ]
+        for (activity, expected, needsHuman) in cases {
+            for prior in ["awaiting input", "waiting on its own work", "wait expired — check on it"] {
+                XCTAssertEqual(activity.slotSubtitle(prior: prior), expected)
+                XCTAssertEqual(activity.needsHuman, needsHuman)
+            }
+            XCTAssertEqual(activity.slotSubtitle(prior: "investigating the bug"), "investigating the bug")
+            XCTAssertEqual(activity.slotSubtitle(prior: nil), expected)
+        }
+    }
+
     // MARK: - Helpers
 
     private func makeLiveState(

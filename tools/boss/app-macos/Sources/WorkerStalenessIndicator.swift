@@ -73,7 +73,13 @@ struct WorkerWaitingIndicator: View {
     let lastEventAt: String?
 
     var body: some View {
-        if activity == .waitingForInput {
+        if activity == .waitOverdue {
+            Image(systemName: "clock.badge.exclamationmark")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.yellow)
+                .help(Self.overdueMeaning)
+                .accessibilityLabel(Self.overdueMeaning)
+        } else if activity == .waitingForInput {
             // Re-evaluate on a slow cadence so the elapsed time in the
             // tooltip stays roughly current even while the worker is
             // silent and the engine pushes no fresh state.
@@ -86,6 +92,9 @@ struct WorkerWaitingIndicator: View {
             }
         }
     }
+
+    static let overdueMeaning =
+        "The wait this worker declared has expired and it has not woken up. It is not asking for input, but it may be stuck. Open its pane to check on it."
 
     private func tooltip(now: Date) -> String {
         let meaning = "Worker paused — it has stopped and is waiting for input, so it isn't making progress. Open its pane to check on it."

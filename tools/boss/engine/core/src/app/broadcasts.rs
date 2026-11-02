@@ -117,7 +117,10 @@ impl ServerState {
                     .live_worker_states
                     .last_stop_ingress_seq(state.slot_id)
                     .is_some_and(|stop| wait.declared_after_seq.is_none_or(|declared| stop > declared));
-                if turn_ended && state.activity == boss_protocol::WorkerActivity::WaitingForInput {
+                if turn_ended
+                    && state.activity == boss_protocol::WorkerActivity::WaitingForInput
+                    && !self.live_worker_states.has_blocking_prompt(state.slot_id)
+                {
                     state.activity = boss_protocol::WorkerActivity::Idle;
                     if state.live_status.as_deref() == Some(crate::live_status::AWAITING_INPUT_LITERAL) {
                         state.live_status = None;

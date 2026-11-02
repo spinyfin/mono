@@ -360,7 +360,7 @@ extension ChatViewModel {
         switch live.activity {
         case .terminated, .errored:
             return false
-        case .spawning, .working, .waitingForInput, .idle:
+        case .spawning, .working, .waitingForInput, .waitingOnWork, .waitOverdue, .idle:
             return true
         }
     }

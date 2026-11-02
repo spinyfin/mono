@@ -2609,7 +2609,15 @@ async fn serve_scoped(
                     );
                 }
                 let hung_changed = server_clone.refresh_hung_workers(&mut hung_workers);
-                if !stalled.is_empty() || !downgraded.is_empty() || hung_changed {
+                let wait_changed = crate::awaiting_input_status::sweep_declared_waits(
+                    &live_worker_states,
+                    &server_clone.work_db,
+                    &server_clone.publisher,
+                    &server_clone.live_status_manager,
+                    now,
+                )
+                .await;
+                if !stalled.is_empty() || !downgraded.is_empty() || hung_changed || !wait_changed.is_empty() {
                     server_clone.broadcast_live_worker_states().await;
                 }
             }
