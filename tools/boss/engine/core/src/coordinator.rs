@@ -1,3 +1,4 @@
+pub use crate::lifecycle_adapter::CoreCoordinatorConstructors;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use boss_engine_storage_values::Host;
 use boss_engine_storage_values::attention_kinds::{
     EXECUTION_BOOKMARK_CREATE_FAILED_ATTENTION_KIND as CREATE_FAILED,
     EXECUTION_BOOKMARK_RECOVERY_FAILED_ATTENTION_KIND as RECOVERY_FAILED,
+    EXECUTION_BOOKMARK_RECOVERY_RETIRED_ATTENTION_KIND as RECOVERY_RETIRED,
 };
 use boss_execution_contracts::{
     ChoreRequirements, FailureEffect, HostSlot, IneligibilityReason, LeaseReleaseOutcome, LifecycleServices,
@@ -801,7 +803,7 @@ use boss_execution_contracts::{
 };
 
 #[derive(bon::Builder)]
-#[builder(on(String, into))]
+#[builder(on(String, into), finish_fn(name = build_inner, vis = ""))]
 pub struct ExecutionCoordinator {
     work_db: Arc<WorkDb>,
     worker_pool: WorkerPool,
@@ -1393,3 +1395,12 @@ fn cold_repo_attention_body(repo: &CubeRepoSummary) -> String {
 #[cfg(test)]
 #[path = "coordinator_tests/mod.rs"]
 mod tests;
+
+impl<S: execution_coordinator_builder::IsComplete> ExecutionCoordinatorBuilder<S> {
+    /// Register lifecycle metrics before exposing the completed coordinator.
+    pub fn build(self) -> ExecutionCoordinator {
+        let coordinator = self.build_inner();
+        coordinator.lifecycle.register_answer_agent_metrics(&coordinator.metrics);
+        coordinator
+    }
+}

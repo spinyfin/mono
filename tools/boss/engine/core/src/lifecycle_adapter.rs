@@ -52,13 +52,20 @@ async fn verify_deletion_tripwire(repo_slug: &str, head_before: &str, base_sha: 
     crate::merge_parent_deletion::compute_merged_parent_deletions(repo_slug, head_before, base_sha, &head_after).await
 }
 
+/// Test-support factories that install the core lifecycle implementation.
+/// A local trait remains implementable when the coordinator moves crates.
+pub trait CoreCoordinatorConstructors: Sized {
+    fn new(work_db: Arc<WorkDb>, worker_pool: WorkerPool, cube_client: Arc<dyn CubeClient>, execution_runner: Arc<dyn ExecutionRunner>) -> Self;
+    fn with_publisher(work_db: Arc<WorkDb>, worker_pool: WorkerPool, cube_client: Arc<dyn CubeClient>, execution_runner: Arc<dyn ExecutionRunner>, publisher: Arc<dyn ExecutionPublisher>) -> Self;
+}
+
 /// Convenience coordinator constructors for tests and simple callers. They
 /// live here, with the core adapter they install, so the coordinator's own
 /// modules never name the concrete lifecycle implementation.
-impl ExecutionCoordinator {
+impl CoreCoordinatorConstructors for ExecutionCoordinator {
     /// Wraps `cube_client` and `execution_runner` in a `LocalHostAdapter`
     /// and calls [`Self::with_publisher`] with a no-op publisher.
-    pub fn new(
+    fn new(
         work_db: Arc<WorkDb>,
         worker_pool: WorkerPool,
         cube_client: Arc<dyn CubeClient>,
@@ -75,7 +82,7 @@ impl ExecutionCoordinator {
 
     /// Wraps the cube/runner primitives in a `LocalHostAdapter` and installs
     /// [`CoreLifecycleServices`].
-    pub fn with_publisher(
+    fn with_publisher(
         work_db: Arc<WorkDb>,
         worker_pool: WorkerPool,
         cube_client: Arc<dyn CubeClient>,

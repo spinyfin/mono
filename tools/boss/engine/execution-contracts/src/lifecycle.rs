@@ -448,7 +448,7 @@ pub struct RemoteLeaseReconcileOutcome {
 ///
 /// New kinds should document their read/write access contract in a comment
 /// so reviewers can verify the deny rules match the stated posture.
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum WorkerKind {
     /// Normal implementation worker (task, chore, revision, etc.). Has
     /// write access to its leased workspace; can push branches and open
@@ -563,10 +563,21 @@ pub const PRE_START_FAILURE_STREAK_THRESHOLD: u32 = 2;
 pub const UNRESOLVED_DRIVER_LABEL: &str = "unknown";
 
 /// The combination a streak is tracked for.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreakKey {
     pub driver: String,
     pub worker_kind: WorkerKind,
+}
+
+impl Ord for StreakKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.driver.as_str(), self.worker_kind.label()).cmp(&(other.driver.as_str(), other.worker_kind.label()))
+    }
+}
+impl PartialOrd for StreakKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl StreakKey {
@@ -843,110 +854,22 @@ pub trait LifecycleServices: Send + Sync {
     ) -> Vec<String>;
 }
 
-/// Inert implementation for tests that never exercise lifecycle side effects.
-/// Lease release reports `NoLease` and teardown does nothing, so it must not
-/// be used in production composition.
-#[cfg(any(test, feature = "test-support"))]
-#[derive(Debug, Default)]
-pub struct NoopLifecycleServices;
-
-#[cfg(any(test, feature = "test-support"))]
-#[async_trait]
-impl LifecycleServices for NoopLifecycleServices {
-    async fn apply_proven_workspace_release(
-        &self,
-        _: &WorkExecution,
-        _: &str,
-        _: TerminalCause,
-        _: &dyn HostAdapter,
-    ) -> LeaseReleaseOutcome {
-        LeaseReleaseOutcome::NoLease
-    }
-
-    async fn release_lease_after_proven_never_started(
-        &self,
-        _: &WorkExecution,
-        _: &str,
-        _: &dyn HostAdapter,
-        _: PreStartStage,
-    ) -> LeaseReleaseOutcome {
-        LeaseReleaseOutcome::NoLease
-    }
-
-    async fn release_refused_workspace(&self, _: &WorkExecution, _: &str, _: &dyn HostAdapter) -> LeaseReleaseOutcome {
-        LeaseReleaseOutcome::NoLease
-    }
-
-    async fn release_lease_after_inferred_death(
-        &self,
-        _: &WorkExecution,
-        _: PaneStatus,
-        _: &dyn HostAdapter,
-        _: &str,
-    ) -> LeaseReleaseOutcome {
-        LeaseReleaseOutcome::NoLease
-    }
-
-    async fn teardown_driver_workspace(&self, _: &str, _: Option<&Path>, _: TeardownReason) {}
-
-    fn report_bookmark_failure(&self, _: &WorkExecution, _: &str) {}
-
-    fn block_unrecoverable_bookmark(&self, _: &WorkExecution, _: &anyhow::Error) -> anyhow::Result<bool> {
-        Ok(false)
-    }
-
-    async fn reconcile_if_execution_dead(&self, _: &WorkExecution, _: &dyn DispatchEventSink) -> bool {
-        false
-    }
-
-    async fn reconcile_if_pane_dead(
-        &self,
-        _: &WorkExecution,
-        _: &dyn DispatchEventSink,
-        _: i64,
-        _: Option<&dyn LiveWorkerLiveness>,
-    ) -> bool {
-        false
-    }
-
-    fn probe_pid(&self, _: i32) -> PidStatus {
-        PidStatus::Unknown
-    }
-
-    async fn reattach_remote_runs(&self, _: &dyn HostAdapterProvider, _: &str) -> ReattachSummary {
-        ReattachSummary::default()
-    }
-
-    async fn reconcile_remote_leases(
-        &self,
-        _: &dyn HostAdapterProvider,
-        _: &dyn DispatchEventSink,
-        _: Option<&dyn WorkerPaneReleaser>,
-    ) -> RemoteLeaseReconcileOutcome {
-        RemoteLeaseReconcileOutcome::default()
-    }
-
-    fn register_answer_agent_metrics(&self, _: &Registry) {}
-
-    fn record_answer_agent_started(&self, _: &Registry, _: u64) {}
-
-    fn record_conflict_class_counter(&self, _: &Registry, _: &str, _: &str) {}
-
-    async fn notify_review_guide_changed(&self, _: &Arc<dyn ExecutionPublisher>, _: &str, _: &str) {}
-
-    fn is_unconfirmed_spawn_abort(&self, _: &anyhow::Error) -> bool {
-        false
-    }
-
-    async fn verify_deletion_tripwire(&self, _: &str, _: &str, _: &str, _: u64) -> Vec<String> {
-        Vec::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use boss_protocol::ExecutionKind;
+
+    #[test]
+    fn active_alerts_order_worker_kinds_by_label() {
+        let tracker = PreStartStreakTracker::default();
+        for kind in [WorkerKind::Standard, WorkerKind::ReviewGuide] {
+            for _ in 0..PRE_START_FAILURE_STREAK_THRESHOLD {
+                tracker.record_failure(StreakKey::new("codex", kind.clone()), "execution", "error", 1);
+            }
+        }
+        let alerts = tracker.active_alerts();
+        assert_eq!(alerts.iter().map(|alert| alert.worker_kind.as_str()).collect::<Vec<_>>(), vec!["review-guide", "standard"]);
+    }
 
     #[test]
     fn driver_capability_uses_slug_tag() {

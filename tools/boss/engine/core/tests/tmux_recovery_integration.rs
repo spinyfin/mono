@@ -7,6 +7,7 @@
 //! restart through tmux adoption and drives the production stale-reap and
 //! orphan-redispatch passes with short, injected time windows.
 
+use boss_engine::coordinator::CoreCoordinatorConstructors;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
