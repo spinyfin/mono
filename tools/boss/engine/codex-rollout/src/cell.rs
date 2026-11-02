@@ -44,6 +44,9 @@ use serde_json::Value;
 
 use crate::coerce_command_to_string;
 
+#[path = "cell_object.rs"]
+mod cell_object;
+
 /// The tool Codex calls to poll a cell that yielded while still running.
 pub const CELL_WAIT_TOOL: &str = "wait";
 
@@ -231,10 +234,9 @@ pub fn payload_session_id(payload: &str) -> Option<String> {
 ///
 /// The cell's tool input is JavaScript source, so it never parses as JSON
 /// and the command lives inside a `tools.exec_command({…})` argument. That
-/// argument object is itself emitted as JSON in every captured transcript,
-/// so it is extracted by brace balancing and parsed as JSON — a script that
-/// uses JavaScript object shorthand instead yields nothing here rather than
-/// a guess.
+/// argument object is extracted by brace balancing and decoded as static
+/// literals, including bare JavaScript property names and single-quoted
+/// strings. Dynamic expressions yield nothing rather than a guessed command.
 ///
 /// Empty means "no command-bearing call in this script": a pure
 /// continuation cell (`tools.write_stdin`), a `store`/`load` cell, or a
@@ -246,7 +248,7 @@ pub fn commands_from_cell_script(source: &str) -> Vec<String> {
     while let Some((at, needle_len)) = next_command_bearing_call(rest) {
         let after = &rest[at + needle_len..];
         if let Some(object) = balanced_object_literal(after)
-            && let Ok(parsed) = serde_json::from_str::<Value>(object)
+            && let Some(parsed) = cell_object::parse_literal_object(object)
             && let Some(command) = parsed.get("cmd").or_else(|| parsed.get("command"))
         {
             commands.push(coerce_command_to_string(command));
@@ -282,7 +284,7 @@ fn next_command_bearing_call(source: &str) -> Option<(usize, usize)> {
 }
 
 /// Take the balanced `{…}` object literal at the start of `source` (after
-/// any leading whitespace), respecting JSON string literals and escapes.
+/// any leading whitespace), respecting quoted string literals and escapes.
 fn balanced_object_literal(source: &str) -> Option<&str> {
     let trimmed = source.trim_start();
     let offset = source.len() - trimmed.len();
@@ -290,20 +292,20 @@ fn balanced_object_literal(source: &str) -> Option<&str> {
         return None;
     }
     let mut depth = 0usize;
-    let mut in_string = false;
+    let mut quote = None;
     let mut escaped = false;
     for (index, ch) in trimmed.char_indices() {
-        if in_string {
+        if let Some(delimiter) = quote {
             match ch {
                 _ if escaped => escaped = false,
                 '\\' => escaped = true,
-                '"' => in_string = false,
+                ch if ch == delimiter => quote = None,
                 _ => {}
             }
             continue;
         }
         match ch {
-            '"' => in_string = true,
+            '"' | '\'' => quote = Some(ch),
             '{' => depth += 1,
             '}' => {
                 depth -= 1;
@@ -379,9 +381,22 @@ mod tests {
     }
 
     #[test]
-    fn javascript_object_shorthand_is_not_guessed_at() {
+    fn javascript_bare_property_name_preserves_the_literal_command() {
         let source = r#"await tools.exec_command({cmd: "echo hi"});"#;
-        assert_eq!(cell_script_command(source), None);
+        assert_eq!(cell_script_command(source).as_deref(), Some("echo hi"));
+        let source = r#"await tools.exec_command({cmd: 'echo }', yield_time_ms: 1000});"#;
+        assert_eq!(cell_script_command(source).as_deref(), Some("echo }"));
+    }
+
+    #[test]
+    fn javascript_dynamic_command_is_not_guessed_at() {
+        for source in [
+            "await tools.exec_command({cmd});",
+            "await tools.exec_command({cmd: command});",
+            "await tools.exec_command({cmd: 'boss ' + verb});",
+        ] {
+            assert_eq!(cell_script_command(source), None);
+        }
     }
 
     #[test]

@@ -130,6 +130,10 @@ fn agent_rules_require_session_polling_until_a_real_exit_status() {
         "yield_time_ms: 300000",
         "Do not wrap `bazel build`",
         "at least two hours",
+        "Every `boss propose ...` command, including `boss propose pr-created ...`",
+        "`propose wait`, and terminal `propose done`, MUST run to completion.",
+        "Inspect the exit code AND printed result.",
+        "failure, fix the reported cause and retry",
     ] {
         assert!(
             preamble.contains(required),
