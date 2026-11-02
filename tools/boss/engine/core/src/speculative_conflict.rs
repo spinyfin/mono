@@ -34,10 +34,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::coordinator::CubeClient;
 use crate::merge_poller::{sanitize_metric_name_component, stored_pr_number};
 use crate::metrics::Registry;
 use crate::work::{PendingMergeCheck, SpeculativeConflictInsertInput, WorkDb};
+use boss_execution_contracts::CubeClient;
 
 /// Minimum time between speculative rebase attempts for the same work
 /// item — the design's "must be rate-limited to avoid churn".

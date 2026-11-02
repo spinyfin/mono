@@ -10,10 +10,10 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 
 use crate::config::RuntimeConfig;
-use crate::coordinator::slot_id_from_worker_id;
 use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, TmuxWorkerHost, start_worker};
 use crate::work::{WorkDb, WorkExecution, WorkItem};
+use boss_execution_contracts::slot_id_from_worker_id;
 use boss_protocol::{ExecutionKind, ExecutionStatus, ReviewBatchMemberRole, WorkItemBinding};
 
 use super::prompt::structured_output_env_vars;

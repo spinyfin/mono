@@ -12,8 +12,8 @@
 //! section_order}`) stay distinct without duplicating the load-sort-diff-
 //! write loop around them.
 
-use crate::coordinator::ExecutionPublisher;
 use crate::work::{QueuedMergeQueueMember, WorkDb};
+use boss_execution_contracts::ExecutionPublisher;
 
 /// The invariant, non-closure part of a [`renumber_section_order`] call —
 /// split out purely to keep the function's argument count under the

@@ -11,12 +11,12 @@ use anyhow::Context as _;
 use boss_engine_gh_invocation::gh_output;
 use boss_gh_telemetry::{callers, scope as gh_scope};
 
-use crate::coordinator::pool_dispatch_policy_for_worker_id;
 use crate::effort::{SpawnConfig, SpawnResolutionInput, resolve_spawn_config_in};
 use crate::structured_output::StructuredOutputKind;
 use crate::work::{
     REASON_ALLOCATION, REASON_LEGACY_PERCENTAGE, WorkDb, WorkExecution, WorkItem, driver_clears_dispatch_gate,
 };
+use boss_execution_contracts::pool_dispatch_policy_for_worker_id;
 use boss_protocol::{
     EffortLevel, ExecutionKind, ProposalKind, ProposalState, ReviewBatchMember, ReviewBatchMemberRole,
     ReviewBatchMemberStatus, ReviewBatchPhase, ReviewBatchStatus, ReviewReportProposalPayload, TaskKind,
@@ -1351,8 +1351,8 @@ mod reviewer_pool_policy_tests {
     //! row and product driver sources.
     #[test]
     fn reviewer_policy_is_a_distinct_driver_source() {
-        let policy =
-            crate::coordinator::pool_dispatch_policy_for_worker_id("review-1").expect("review worker has a policy");
+        let policy = boss_execution_contracts::pool_dispatch_policy_for_worker_id("review-1")
+            .expect("review worker has a policy");
         for row_driver in [Some("codex"), Some("grok"), Some("claude"), None] {
             let input = crate::effort::SpawnResolutionInput::builder()
                 .maybe_task_driver(row_driver)
@@ -1374,7 +1374,7 @@ mod reviewer_pool_policy_tests {
         effort: Option<boss_protocol::EffortLevel>,
         design_reasoning_effort_xhigh: bool,
     ) -> crate::effort::SpawnConfig {
-        let pool_policy = crate::coordinator::pool_dispatch_policy_for_worker_id("review-1").unwrap();
+        let pool_policy = boss_execution_contracts::pool_dispatch_policy_for_worker_id("review-1").unwrap();
         let registry = crate::driver::DriverRegistry::default();
         let input = crate::effort::SpawnResolutionInput::builder()
             .maybe_task_driver(row_driver)

@@ -61,7 +61,6 @@ use crate::automation_triage::TriageDecision;
 use crate::build_wait::detect_build_wait_signal;
 use crate::build_wait_tracker::{BuildWaitDecision, BuildWaitTracker, DEFAULT_BUILD_WAIT_HORIZON_SECS};
 use crate::conflict_stop_gate::{self, ConflictClearance};
-use crate::coordinator::{CubeClient, ExecutionPublisher, PreemptOutcome};
 use crate::design_detector;
 use crate::dispatch_events::{
     DispatchEvent, DispatchEventSink, NoopDispatchEventSink, Outcome as DispatchOutcome, Stage,
@@ -78,6 +77,7 @@ use crate::work::{
 use crate::work::{FinishExecutionRunInput, TaskStatus};
 use crate::worker_escalation::{self, WorkerSignal, WorkerSignalKind};
 use boss_engine_gh_invocation::{gh_compare_jq, run_gh};
+use boss_execution_contracts::{CubeClient, ExecutionPublisher, PreemptOutcome};
 use boss_gh_telemetry::{callers, scope as gh_scope};
 use boss_github::pr_url::pr_number_from_url;
 
@@ -1730,7 +1730,7 @@ impl ForceReleaseOutcome {
 }
 
 #[async_trait]
-impl crate::coordinator::ExecutionStartedHook for WorkerCompletionHandler {
+impl boss_execution_contracts::ExecutionStartedHook for WorkerCompletionHandler {
     async fn on_execution_started(&self, execution_id: &str) {
         // Inherent method already does the work; this just satisfies
         // the trait the coordinator depends on.
@@ -1739,7 +1739,7 @@ impl crate::coordinator::ExecutionStartedHook for WorkerCompletionHandler {
 }
 
 #[async_trait]
-impl crate::coordinator::AutomationPreemptor for WorkerCompletionHandler {
+impl boss_execution_contracts::AutomationPreemptor for WorkerCompletionHandler {
     /// Route dispatcher-initiated preemption through the exact teardown
     /// `bossctl agents stop` and the stale-worker sweep use: pane
     /// release + `reap_worker_process_tree` SIGTERM/SIGKILL ladder over
