@@ -6,3 +6,5 @@ workspace = "../../../.."
 
 [dependencies]
 boss-protocol = { path = "../../protocol" }
+boss-pr-template = { path = "../pr-template" }
+tracing = { workspace = true }

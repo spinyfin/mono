@@ -5,8 +5,6 @@ edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
-tracing = { workspace = true }
-boss-pr-template = { path = "../pr-template" }
 anyhow = { workspace = true }
 boss-engine-effort = { path = "../effort" }
 boss-protocol = { path = "../../protocol" }

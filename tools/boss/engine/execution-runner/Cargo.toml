@@ -28,6 +28,7 @@ boss-host-execution = { path = "../host-execution" }
 boss-log-files = { path = "../../log-files" }
 boss-pr-review = { path = "../pr-review" }
 boss-pr-review-sources = { path = "../pr-review-sources" }
+boss-engine-planner-validation = { path = "../planner-validation" }
 boss-pr-template = { path = "../pr-template" }
 boss-protocol = { path = "../../protocol" }
 boss-review-guide = { path = "../review-guide" }

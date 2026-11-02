@@ -626,7 +626,6 @@ dependencies = [
  "boss-http-retry",
  "boss-log-files",
  "boss-metrics",
- "boss-pane-summary",
  "boss-pr-review",
  "boss-pr-template",
  "boss-prose-vocabulary",
@@ -893,7 +892,9 @@ dependencies = [
 name = "boss-engine-planner-validation"
 version = "0.1.0"
 dependencies = [
+ "boss-pr-template",
  "boss-protocol",
+ "tracing",
 ]
 
 [[package]]
@@ -947,12 +948,10 @@ dependencies = [
  "anyhow",
  "bon",
  "boss-engine-effort",
- "boss-pr-template",
  "boss-protocol",
  "serde",
  "serde_json",
  "sha2",
- "tracing",
 ]
 
 [[package]]
@@ -1067,6 +1066,7 @@ dependencies = [
  "boss-engine-driver",
  "boss-engine-effort",
  "boss-engine-gh-invocation",
+ "boss-engine-planner-validation",
  "boss-engine-recovery",
  "boss-engine-storage-values",
  "boss-engine-structured-output",

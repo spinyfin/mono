@@ -586,6 +586,7 @@ async fn per_driver_delivery_body() {
 mod spawn_artifacts {
     use super::super::*;
     use tempfile::TempDir;
+    /// `BOSS_EVENT_BIN` short-circuits everything else.
     #[test]
     fn resolve_boss_event_prefers_env_override() {
         let dir = TempDir::new().unwrap();
@@ -772,11 +773,6 @@ mod spawn_artifacts {
         assert!(again.join("checkleft").is_file());
     }
 
-    /// Export the spawn-path launchers as Bazel artifacts for validation in a
-    /// leased checkout without starting an agent. Repository builds must run
-    /// outside the test sandbox. The dispatcher path comes from
-    /// `BOSS_TEST_REPOBIN` (`$(rootpath //tools/repobin)`), not from the
-    /// rules_rust test-wrapper filename.
     /// A non-derived spawn must still call `write_cube_launcher` so a stale
     /// derived-PR compose wrapper left by a PREVIOUS worker in this same
     /// workspace cannot linger and silently run for the new worker. Simulate

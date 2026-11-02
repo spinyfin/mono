@@ -9,6 +9,7 @@
 //! See design §"Validation of the structured proposal":
 //! `tools/boss/docs/designs/auto-populate-project-tasks-on-design-pr-merge.md`
 
+pub mod breakdown;
 pub mod footprint;
 
 use std::collections::{HashMap, HashSet};

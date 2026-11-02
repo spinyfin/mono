@@ -16,10 +16,11 @@ use crate::spawn_flow::TmuxWorkerHost;
 use crate::work::WorkDb;
 use anyhow::Result;
 use async_trait::async_trait;
-use boss_execution_runner::pane_spawn::{
-    capture_shows_driver_ready, ensure_worker_bin_dir_for_engine, path_prepend_clause,
+use boss_execution_runner::pane_spawn::path_prepend_clause;
+use boss_execution_runner::spawn_confirmation::current_run_has_turn_start_evidence;
+use boss_execution_runner::test_exports::{
+    capture_shows_driver_ready, confirm_spawn_started, ensure_worker_bin_dir_for_engine,
 };
-use boss_execution_runner::spawn_confirmation::{confirm_spawn_started, current_run_has_turn_start_evidence};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -1951,7 +1952,6 @@ async fn settings_json_uses_absolute_boss_event_path() {
     );
 }
 
-/// `BOSS_EVENT_BIN` short-circuits everything else.
 #[tokio::test]
 async fn mismatched_guide_head_fails_attempt_without_spawning() {
     use crate::work::{PrSourceCapturePersistOutcome, PrSourceCaptureTrigger};
@@ -2401,6 +2401,11 @@ async fn turn_start_predicate_can_read_driver_signal_registry() {
     .expect("a recorded hook must count as turn-start evidence");
 }
 
+/// Export the spawn-path launchers as Bazel artifacts for validation in a
+/// leased checkout without starting an agent. Repository builds must run
+/// outside the test sandbox. The dispatcher path comes from
+/// `BOSS_TEST_REPOBIN` (`$(rootpath //tools/repobin)`), not from the rules_rust
+/// test-wrapper filename.
 #[test]
 fn worker_environment_probe_artifacts_use_the_bundled_dispatcher() {
     let output = PathBuf::from(std::env::var_os("TEST_UNDECLARED_OUTPUTS_DIR").unwrap());
@@ -2442,34 +2447,37 @@ fn worker_environment_probe_artifacts_use_the_bundled_dispatcher() {
     std::fs::write(output.join("activate-worker-environment.sh"), activate).unwrap();
 }
 
+/// The local adapter must hand the merge-review policy to the runner: a
+/// remote owned by `linkedin-multiproduct` gets every human-gated check in the
+/// worker prompt.
 #[tokio::test]
 async fn merge_review_policy_reaches_worker_prompt_through_adapter() {
     let workspace = TempDir::new().unwrap();
-    let (_dir, db) = crate::test_support::open_db();
-    let product = create_product(&db);
-    let task = create_test_chore(&db, product, "Observe required checks");
-    let mut execution = create_ready_chore_execution(&db, task.id.clone());
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db, flags);
+    bind_runner(&runner, weak, &spawner);
+    let mut execution = sample_execution(workspace.path());
     execution.repo_remote_url = "git@github.com:linkedin-multiproduct/some-repo.git".into();
-    let composed = crate::runner::compose_worker_spawn(
-        &db,
-        "worker-1",
-        &execution,
-        &WorkItem::Chore(task),
-        workspace.path(),
-        None,
-        crate::runner::WorkerSpawnOpts::builder()
-            .review_signal_checks(crate::merge_poller::review_signal_checks_for_owner)
-            .build(),
-    )
-    .await
-    .unwrap();
-    for check in crate::merge_poller::review_signal_checks_for_owner("linkedin-multiproduct") {
-        assert!(
-            composed.prompt_text.contains(check),
-            "missing merge observer check {check}"
-        );
+    runner
+        .run_execution(
+            "worker-1",
+            &execution,
+            &sample_chore(),
+            workspace.path(),
+            Some("change-1"),
+        )
+        .await
+        .unwrap();
+    let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
+    let checks = crate::merge_poller::review_signal_checks_for_owner("linkedin-multiproduct");
+    assert!(!checks.is_empty());
+    for check in checks {
+        assert!(prompt.contains(check), "missing merge observer check {check}");
     }
-    assert!(composed.prompt_text.contains("Owner Approval"));
+    assert!(prompt.contains("Owner Approval"));
 }
 
 #[test]
@@ -2530,7 +2538,7 @@ fn actual_driver_spawn_prefix_pins_boss_and_cube_before_path_decoys() {
         format!("{}\n", root.path().display()),
     )
     .unwrap();
-    let worker_bin = boss_execution_runner::pane_spawn::ensure_worker_bin_dir_for_engine(
+    let worker_bin = boss_execution_runner::test_exports::ensure_worker_bin_dir_for_engine(
         root.path(),
         root.path(),
         &bundle.join("engine"),
@@ -2565,7 +2573,7 @@ fn actual_driver_spawn_prefix_pins_boss_and_cube_before_path_decoys() {
             "/bin/bash -c {}",
             crate::ssh_transport::shell_quote("command -v boss; command -v cube; \"$BOSS_BIN\"; \"$CUBE_BIN\"")
         );
-        let assembled = boss_execution_runner::pane_spawn::assemble_worker_command("", &worker_bin, &plan);
+        let assembled = boss_execution_runner::test_exports::assemble_worker_command("", &worker_bin, &plan);
         let output = std::process::Command::new("/bin/sh")
             .args(["-c", &assembled])
             .env("PATH", &inherited)

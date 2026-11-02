@@ -623,6 +623,16 @@ pub(crate) fn map_remote_bazel_probe_output(result: Result<SshOutput>, host_id: 
     }
 }
 
+/// Options for composing a worker prompt on the remote spawn path. Kept as one
+/// function so the merge-review policy wiring is covered by a test.
+fn remote_spawn_opts(max_embed_diff_lines: u64, bazel_workspace: Option<bool>) -> WorkerSpawnOpts {
+    WorkerSpawnOpts::builder()
+        .review_signal_checks(crate::merge_poller::review_signal_checks_for_owner)
+        .max_embed_diff_lines(max_embed_diff_lines)
+        .maybe_bazel_workspace(bazel_workspace)
+        .build()
+}
+
 /// A single-string command so the remote shell evaluates the whole
 /// `test … -o …` expression (a multi-token argv would be space-joined
 /// by ssh and mis-parsed). Workspace paths come from cube and contain
@@ -1024,11 +1034,7 @@ impl HostAdapter for SshHostAdapter {
         //    criterion, effort addendum, product preamble).
         // Keep prompt and generated-rules feature gates on the same values.
         let bazel_workspace = self.probe_remote_bazel_workspace(&workspace).await;
-        let spawn_opts = WorkerSpawnOpts::builder()
-            .review_signal_checks(crate::merge_poller::review_signal_checks_for_owner)
-            .max_embed_diff_lines(self.cfg.work.max_review_embed_diff_lines)
-            .maybe_bazel_workspace(bazel_workspace)
-            .build();
+        let spawn_opts = remote_spawn_opts(self.cfg.work.max_review_embed_diff_lines, bazel_workspace);
         let ComposedWorkerSpawn {
             mut prompt_text,
             spawn_config,
@@ -1986,6 +1992,15 @@ mod tests {
     use crate::ssh_spawn::SshExec;
     use crate::ssh_transport::SshOutput;
     use async_trait::async_trait;
+
+    #[test]
+    fn remote_spawn_opts_carry_the_merge_review_policy() {
+        let opts = remote_spawn_opts(0, None);
+        let owner = "linkedin-multiproduct";
+        let expected = crate::merge_poller::review_signal_checks_for_owner(owner);
+        assert!(!expected.is_empty(), "fixture owner must have human-gated checks");
+        assert_eq!((opts.review_signal_checks)(owner), expected);
+    }
 
     fn run_occupancy_script(workspace: &Path) -> String {
         let output = std::process::Command::new("sh")

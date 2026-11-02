@@ -78,7 +78,7 @@ pub(crate) fn work_item_task_kind_enum(work_item: &WorkItem) -> Option<&TaskKind
 /// a reason to publish an unlinked PR. Other kinds that merely record an
 /// origin PR number (plain chores) lose only the provenance header when the
 /// remote is not a github.com URL — they stay dispatchable.
-pub fn followup_pr_backlink(
+pub(crate) fn followup_pr_backlink(
     task_kind: &TaskKind,
     created_via: &str,
     origin_pr_number: Option<i64>,

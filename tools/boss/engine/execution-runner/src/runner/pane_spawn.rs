@@ -195,7 +195,11 @@ pub fn render_env_directive(directive: &crate::driver::EnvDirective) -> String {
     }
 }
 
-pub fn assemble_worker_command(priority: &str, worker_bin_dir: &Path, plan: &crate::driver::SpawnPlan) -> String {
+pub(crate) fn assemble_worker_command(
+    priority: &str,
+    worker_bin_dir: &Path,
+    plan: &crate::driver::SpawnPlan,
+) -> String {
     let env_prefix: String = plan.env.iter().map(render_env_directive).collect();
     let environment = boss_engine_worker_bin::environment::shell_environment_clause(worker_bin_dir);
     format!(
@@ -702,7 +706,7 @@ fn ensure_worker_bin_dir(settings_dir: &Path, workspace_path: &Path) -> Option<P
     ensure_worker_bin_dir_for_engine(settings_dir, workspace_path, &engine_path)
 }
 
-pub fn ensure_worker_bin_dir_for_engine(
+pub(crate) fn ensure_worker_bin_dir_for_engine(
     settings_dir: &Path,
     workspace_path: &Path,
     engine_path: &Path,
@@ -1271,10 +1275,11 @@ impl ExecutionRunner for PaneSpawnRunner {
 
         // Look up (or generate) a 2–4 word pane-titlebar summary for
         // this work item. The full run id is still used for logs and
-        // every other identifier — this label is purely visual. We
-        // resolve the utility-model provider lazily and let the helper handle
-        // every failure mode (no credential, API error, cache miss) so a slow
-        // or unreachable provider never blocks the spawn.
+        // every other identifier — this label is purely visual. The
+        // engine supplies the utility-model provider at construction
+        // (`RunnerConfig.utility`), and the helper handles every failure mode
+        // (no credential, API error, cache miss) so a slow or unreachable
+        // provider never blocks the spawn.
         let utility = self.cfg.utility.clone();
         // `derived_title_summary` exhaustively matches `ExecutionKind` (its doc
         // comment demands this — see `execution.rs`) to decide whether this kind
@@ -1587,7 +1592,7 @@ fn store_capture_snapshot(snapshot: &std::sync::Mutex<String>, text: &str) {
 /// `snapshot` is updated right after each *successful* capture, before the
 /// next command is awaited, so a stalled history read cannot lose the visible
 /// text, and a failed capture never erases an earlier good snapshot.
-pub async fn capture_shows_driver_ready(
+pub(crate) async fn capture_shows_driver_ready(
     tmux: &boss_tmux::Tmux,
     session: &str,
     spec: Option<&boss_protocol::PaneMonitorSpec>,

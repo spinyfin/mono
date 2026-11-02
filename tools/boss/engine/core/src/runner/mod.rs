@@ -116,6 +116,3 @@ pub(crate) mod spawn_confirmation {
         )
     }
 }
-
-#[cfg(test)]
-pub(crate) use boss_execution_runner::work_item;
