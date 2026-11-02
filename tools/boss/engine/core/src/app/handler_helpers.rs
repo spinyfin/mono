@@ -8,7 +8,7 @@ use super::*;
 use boss_engine_utils::iso8601::{format_epoch_iso8601, format_paused_since_phrase};
 use boss_protocol::DispatchPauseScope;
 
-use crate::coordinator::DispatchPauseOrigin;
+use boss_execution_contracts::DispatchPauseOrigin;
 use sha2::{Digest, Sha256};
 
 /// Build the per-product effort-audit report. Handles the product
@@ -487,7 +487,7 @@ pub(super) fn load_live_status_disabled_slots(work_db: &WorkDb) -> Vec<u8> {
 /// [`LEGACY_PAUSE_REASON_FALLBACK`]).
 pub(super) fn load_dispatch_paused_state(
     work_db: &WorkDb,
-) -> (bool, u64, crate::coordinator::DispatchPauseOrigin, Option<String>) {
+) -> (bool, u64, boss_execution_contracts::DispatchPauseOrigin, Option<String>) {
     let paused = work_db
         .get_metadata(METADATA_KEY_DISPATCH_PAUSED)
         .ok()
@@ -501,7 +501,7 @@ pub(super) fn load_dispatch_paused_state(
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
     let origin_raw = work_db.get_metadata(METADATA_KEY_DISPATCH_PAUSE_ORIGIN).ok().flatten();
-    let origin = crate::coordinator::DispatchPauseOrigin::from_metadata_str(origin_raw.as_deref());
+    let origin = boss_execution_contracts::DispatchPauseOrigin::from_metadata_str(origin_raw.as_deref());
     let reason = load_persisted_pause_reason(work_db, METADATA_KEY_DISPATCH_PAUSE_REASON, paused);
     (paused, since_epoch_s, origin, reason)
 }
@@ -515,7 +515,7 @@ pub(super) fn load_dispatch_paused_state(
 /// operator had held.
 pub(super) fn load_dispatch_pause_scope(
     work_db: &WorkDb,
-    origin: crate::coordinator::DispatchPauseOrigin,
+    origin: boss_execution_contracts::DispatchPauseOrigin,
 ) -> boss_protocol::DispatchPauseScope {
     match work_db.get_metadata(METADATA_KEY_DISPATCH_PAUSE_SCOPE).ok().flatten() {
         Some(raw) => boss_protocol::DispatchPauseScope::from_persisted(&raw),

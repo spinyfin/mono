@@ -1,7 +1,9 @@
 //! The `executions.<id>` / product-topic publication contract and the post-commit
 //! review-guide notification built on it.
 
-pub use boss_execution_contracts::{ExecutionPublisher, NoopExecutionPublisher};
+use boss_execution_contracts::ExecutionPublisher;
+#[cfg(test)]
+pub use boss_execution_contracts::NoopExecutionPublisher;
 
 use crate::work::WorkDb;
 use std::sync::Arc;

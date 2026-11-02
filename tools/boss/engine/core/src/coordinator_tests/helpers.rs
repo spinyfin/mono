@@ -21,12 +21,12 @@ pub(super) use tokio::time::sleep;
 
 pub(super) use boss_protocol::{CreateRunInput, EngineToAppError, ExecutionStatus};
 
-pub(super) use crate::runner::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
 pub(super) use crate::work::{
     AddDependencyInput, CreateChoreInput, CreateExecutionInput, CreateProductInput, CreateProjectInput,
     CreateTaskInput, DispatchClaimOutcome, FinishExecutionRunInput, RequestExecutionInput, TaskStatus, WorkDb,
     WorkExecution, WorkItem, WorkItemPatch,
 };
+pub(super) use boss_execution_contracts::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
 
 /// Coordinator fixtures that exercise a launch seed the local driver's
 /// discovered capability explicitly. The production probe never fabricates

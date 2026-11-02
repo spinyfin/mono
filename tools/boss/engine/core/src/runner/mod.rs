@@ -1,12 +1,16 @@
 //! Engine bindings for the worker runner.
+//!
+//! Execution contracts are imported directly by production consumers and
+//! re-exported here only for test fixtures.
 pub use super::runner_adapter::PaneSpawnRunner;
 use crate::config::RuntimeConfig;
+#[cfg(test)]
+pub use boss_execution_contracts::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
 pub(crate) use boss_execution_runner::{
     ComposedWorkerSpawn, REVIEW_GUIDE_DRIVER, WorkerSpawnOpts, designated_output_kind,
     install_boss_event_to_stable_bin, pane_spawn, resolve_boss_event_binary, spawn_launch_limits, task_bound_pr_url,
     work_item_name, work_item_task_kind,
 };
-pub use boss_execution_runner::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
 use std::path::PathBuf;
 
 /// Absolute path of the events socket this engine bound — where worker hook

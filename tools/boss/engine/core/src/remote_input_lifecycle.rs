@@ -11,9 +11,10 @@ use std::future::Future;
 
 use anyhow::Result;
 
-use crate::host_adapter::{HostAdapterProvider, resolve_host_adapter};
+use crate::host_adapter::resolve_host_adapter;
 use crate::ssh_spawn::{RemoteLaunchOutcome, SshExec};
 use crate::work::WorkDb;
+use boss_execution_contracts::HostAdapterProvider;
 
 pub(crate) fn validate_run_id(run_id: &str) -> Result<()> {
     anyhow::ensure!(
@@ -45,7 +46,7 @@ fn driver_config_dirs() -> Vec<&'static str> {
 /// the attempt id in the marker, not by the execution id.
 pub(crate) async fn cleanup_execution_inputs(
     work_db: &WorkDb,
-    adapter: &dyn crate::host_adapter::HostAdapter,
+    adapter: &dyn boss_execution_contracts::HostAdapter,
     execution_id: &str,
 ) -> Result<()> {
     for item in work_db.pending_remote_input_cleanups_for_execution(execution_id)? {

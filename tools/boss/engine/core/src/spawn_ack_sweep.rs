@@ -161,7 +161,7 @@ use std::time::Duration;
 use boss_protocol::{CreateAttentionItemInput, WorkExecution, WorkerActivity};
 
 use crate::agent_jsonl_progress::{DiscoveryVerdict, IngressCheckpoint, IngressCheckpointStore};
-use crate::coordinator::{CubeClient, ExecutionCoordinator, worker_id_for_slot};
+use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::{
     DriverSignalKind, DriverStartExpectation, LiveWorkerStateRegistry, NeverStartedReapCommit,
@@ -171,6 +171,7 @@ use crate::spawn_health::{
 };
 use crate::transcript_liveness::{TranscriptLiveness, probe_transcript_liveness};
 use crate::work::WorkDb;
+use boss_execution_contracts::{CubeClient, worker_id_for_slot};
 
 pub use boss_engine_storage_values::attention_kinds::DRIVER_START_ATTENTION_KIND;
 
@@ -1834,7 +1835,7 @@ mod tests {
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
         coordinator.pause_dispatch(
             now.max(0) as u64,
-            crate::coordinator::DispatchPauseOrigin::Operator,
+            boss_execution_contracts::DispatchPauseOrigin::Operator,
             boss_protocol::PauseReason::new("test: operator pause").unwrap(),
         );
         assert!(

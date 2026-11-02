@@ -369,7 +369,7 @@ impl ServerState {
                     );
                     None
                 } else {
-                    let worker_id = crate::coordinator::worker_id_for_slot(candidate_slot_id);
+                    let worker_id = boss_execution_contracts::worker_id_for_slot(candidate_slot_id);
                     let reclaimed = self.execution_coordinator.reclaim_slot(&worker_id, run_id).await;
                     if reclaimed {
                         Some(candidate_slot_id)
@@ -775,7 +775,7 @@ impl ServerState {
     ///
     /// Tmux is the sole *local* pane host, so a local worker id a spawn
     /// recorded durably decides the slot the run was given
-    /// ([`crate::coordinator::slot_id_from_worker_id`]) — the same derivation
+    /// ([`boss_execution_contracts::slot_id_from_worker_id`]) — the same derivation
     /// [`crate::tmux_adoption`]'s boot-time adoption uses to rebuild a slot
     /// claim. Every caller here is resolving a case where in-memory
     /// bookkeeping (the worker registry, the live-state registry) is known to
@@ -801,7 +801,7 @@ impl ServerState {
     /// as a pool slot".
     pub(super) fn hosted_pane_slot_for_run(&self, run_id: &str) -> Option<u8> {
         match self.work_db.latest_local_agent_id_for_execution(run_id) {
-            Ok(Some(agent_id)) => crate::coordinator::slot_id_from_worker_id(&agent_id),
+            Ok(Some(agent_id)) => boss_execution_contracts::slot_id_from_worker_id(&agent_id),
             Ok(None) => None,
             Err(err) => {
                 tracing::debug!(run_id, %err, "readopt: could not read the durable worker id for this run");

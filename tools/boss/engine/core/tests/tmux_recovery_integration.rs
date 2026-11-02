@@ -14,16 +14,12 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use boss_engine::app::SendToAppError;
-use boss_engine::coordinator::{
-    CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
-    ExecutionCoordinator, WorkerPool,
-};
+use boss_engine::coordinator::ExecutionCoordinator;
 use boss_engine::dispatch_events::RecordingDispatchEventSink;
 use boss_engine::driver::ClaudeDriver;
 use boss_engine::hold_registry::HoldRegistry;
 use boss_engine::live_worker_state::LiveWorkerStateRegistry;
 use boss_engine::orphan_sweep::run_one_pass_for_item_with_min_age;
-use boss_engine::runner::{ExecutionRunner, RunOutcome};
 use boss_engine::spawn_flow::{StartWorkerInput, TmuxWorkerHost, WorkerSpawner, start_worker};
 use boss_engine::stale_worker_sweep::{
     StaleWorkerReaper, StaleWorkerSweepControls, StaleWorkerSweepTiming, StaleWorkerThresholds,
@@ -33,6 +29,11 @@ use boss_engine::tmux_adoption::run_adoption_pass;
 use boss_engine::work::WorkDb;
 use boss_engine::worker_readoption::NoopLiveWorkerConvergence;
 use boss_engine::worker_registry::WorkerRegistry;
+use boss_execution_contracts::{CubeClient, WorkerPool};
+use boss_execution_contracts::{ExecutionRunner, RunOutcome};
+use boss_host_execution::types::{
+    CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
+};
 use boss_protocol::{
     AttachWorkerPaneResult, CreateChoreInput, CreateProductInput, EngineToAppRequest, EngineToAppResponse,
     RequestExecutionInput, WorkerEvent,

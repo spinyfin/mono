@@ -25,9 +25,11 @@
 use boss_deterministic_resolvers::{ConflictedFile, RegistryResolution, ResolvedFile, ResolverRegistry};
 use boss_protocol::{CreateAttentionItemInput, FrontendEvent};
 
-use crate::coordinator::{CubeClient, CubeWorkspaceLease, ExecutionPublisher};
+use boss_execution_contracts::{CubeClient, ExecutionPublisher};
+
 use crate::merge_poller::stored_pr_number;
 use crate::work::{ConflictResolution, PendingMergeCheck, WorkDb};
+use boss_host_execution::types::CubeWorkspaceLease;
 
 /// Builds the rung-0 resolver registry for a base revision (e.g.
 /// `main@origin`). Production uses [`builtin_resolvers`]; tests inject a
@@ -442,7 +444,7 @@ pub(crate) async fn run_rung1_in_lease(
     candidate: &PendingMergeCheck,
     attempt: &ConflictResolution,
     pr_number: u64,
-    lease: &crate::coordinator::CubeWorkspaceLease,
+    lease: &boss_host_execution::types::CubeWorkspaceLease,
 ) -> LadderOutcome {
     let workspace = RungWorkspace {
         lease,

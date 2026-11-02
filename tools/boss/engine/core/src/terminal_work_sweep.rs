@@ -134,11 +134,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::coordinator::CubeClient;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::teardown_registry::{TeardownRegistry, TeardownState};
 use crate::work::WorkDb;
+use boss_execution_contracts::CubeClient;
 
 /// How often the terminal-work reconciler runs. 60s mirrors the dead-pid,
 /// stale-worker, and pool-claim sweeps. Because reaping requires a
@@ -679,7 +679,7 @@ async fn reap_confirmed_candidates(
             .emit(
                 DispatchEvent::new(Stage::TerminalWorkReconcile, Outcome::Ok, &candidate.run_id)
                     .with_work_item(&candidate.work_item_id)
-                    .with_worker(crate::coordinator::worker_id_for_slot(candidate.slot_id))
+                    .with_worker(boss_execution_contracts::worker_id_for_slot(candidate.slot_id))
                     .with_details(serde_json::json!({
                         "reason": candidate.reason,
                         "slot_id": candidate.slot_id,

@@ -6,7 +6,7 @@
 //! whose recheck interval has elapsed, lease a scratch workspace and run a
 //! throwaway, no-push engine-direct rebase (`cube workspace rebase --pr <n>
 //! --no-push`) against current `main`. No worker is spawned and the real PR
-//! branch is never mutated — [`crate::coordinator::CubeClient::rebase_workspace_no_push`]
+//! branch is never mutated — [`boss_execution_contracts::CubeClient::rebase_workspace_no_push`]
 //! is the same engine-direct mechanical rebase rung 1 uses, minus the push.
 //! Outcomes:
 //!
@@ -34,10 +34,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::coordinator::CubeClient;
 use crate::merge_poller::{sanitize_metric_name_component, stored_pr_number};
 use crate::metrics::Registry;
 use crate::work::{PendingMergeCheck, SpeculativeConflictInsertInput, WorkDb};
+use boss_execution_contracts::CubeClient;
 
 /// Minimum time between speculative rebase attempts for the same work
 /// item — the design's "must be rate-limited to avoid churn".

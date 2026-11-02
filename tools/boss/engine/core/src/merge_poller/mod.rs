@@ -55,7 +55,6 @@ use crate::ci_watch;
 use crate::completion::{StopOutcome, WorkerCompletionHandler};
 use crate::conflict_remediation::{ConflictRemediationQueue, LadderRemediationJob};
 use crate::conflict_watch;
-use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
 use crate::metrics::Registry;
 #[cfg(test)]
@@ -66,6 +65,7 @@ use crate::work::{
 };
 use boss_engine_gh_invocation::gh_output;
 use boss_engine_utils::iso8601::parse_iso8601_lenient;
+use boss_execution_contracts::{CubeClient, ExecutionPublisher};
 // GitHub-call attribution. Every path in this module that reaches GitHub
 // runs inside a `gh_scope`, because "the merge poller" is not a fine
 // enough answer: the batched full sweep and the un-batched per-PR

@@ -613,7 +613,7 @@ pub async fn run_one_pass_observed(
     if skip_unbatched_review_holds {
         let pool_size = completion_handler
             .map(|handler| handler.review_pool_size())
-            .unwrap_or(crate::coordinator::DEFAULT_REVIEW_POOL_SIZE);
+            .unwrap_or(boss_execution_contracts::DEFAULT_REVIEW_POOL_SIZE);
         sweep_deferred_review_admission(work_db, publisher, None, pool_size, &mut outcome).await;
     }
     if let Err(err) = work_db.sweep_reported_live_review_batch_members() {
@@ -839,7 +839,7 @@ pub async fn reconcile_batch(
     if skip_unbatched_review_holds {
         let pool_size = completion_handler
             .map(|handler| handler.review_pool_size())
-            .unwrap_or(crate::coordinator::DEFAULT_REVIEW_POOL_SIZE);
+            .unwrap_or(boss_execution_contracts::DEFAULT_REVIEW_POOL_SIZE);
         sweep_deferred_review_admission(work_db, publisher, Some(&wanted), pool_size, &mut outcome).await;
     }
 

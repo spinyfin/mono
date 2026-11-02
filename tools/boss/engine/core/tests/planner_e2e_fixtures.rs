@@ -47,12 +47,12 @@ use boss_protocol::{
 };
 
 use boss_design_doc_fetcher::DocFetchOutcome;
-use boss_engine::coordinator::NoopExecutionPublisher;
 use boss_engine::materializer::Materializer;
 use boss_engine::planner::{PLANNER_MODEL, PlannerOutcome, build_request_body, build_user_prompt};
 use boss_engine::populator::{DEFAULT_MAX_TASKS, PopulateContext, PopulateOutcome, Populator, PopulatorSteps};
 use boss_engine::work::WorkDb;
 use boss_engine_planner_validation::{ValidationResult, validate};
+use boss_execution_contracts::NoopExecutionPublisher;
 
 // ---------------------------------------------------------------------------
 // Ground-truth fixture docs (verbatim breakdown excerpts, see tests/fixtures)

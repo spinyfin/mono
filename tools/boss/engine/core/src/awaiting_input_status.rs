@@ -61,9 +61,9 @@ use std::sync::Arc;
 
 use boss_protocol::{ExecutionKind, WorkExecution, WorkerActivity};
 
-use crate::coordinator::ExecutionPublisher;
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::work::WorkDb;
+use boss_execution_contracts::ExecutionPublisher;
 
 /// Reason string stamped on the `executions.<id>` topic invalidation when
 /// a worker parks on a human.

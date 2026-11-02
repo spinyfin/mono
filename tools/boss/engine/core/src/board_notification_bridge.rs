@@ -13,7 +13,7 @@ use std::sync::Arc;
 /// to the board as a work-item invalidation.
 pub fn spawn_notifications(
     event_bus: Arc<boss_event_bus::EventBus>,
-    publisher: Arc<dyn crate::coordinator::ExecutionPublisher>,
+    publisher: Arc<dyn boss_execution_contracts::ExecutionPublisher>,
 ) -> tokio::task::JoinHandle<()> {
     // Subscribe before returning so an immediately applied verdict is not lost.
     let subscription = event_bus.subscribe(boss_event_bus::TopicFilter::kinds([
@@ -27,7 +27,7 @@ pub fn spawn_notifications(
 
 async fn forward_notifications(
     mut subscription: boss_event_bus::Subscription,
-    publisher: &dyn crate::coordinator::ExecutionPublisher,
+    publisher: &dyn boss_execution_contracts::ExecutionPublisher,
 ) {
     while let Some(event) = subscription.recv().await {
         let (product_id, task_id, reason) = match event {
