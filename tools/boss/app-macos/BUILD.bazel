@@ -430,9 +430,13 @@ macos_application(
     # a single `bazel build //tools/boss/app-macos:Boss` produces a fully
     # self-contained .app (design doc Q3 on-disk layout, Q4 Phase 1).
     # cube is bundled so the engine can find it even when the macOS GUI launchd
-    # PATH excludes the user's shell PATH (see config.rs resolve_cube_command).
-    # Workers run inside Ghostty terminal panes and inherit the user's shell PATH,
-    # so they continue to resolve cube (and jj, gh, claude, etc.) from PATH.
+    # PATH excludes the user's shell PATH (see AgentConfig::load_for_engine in config.rs and
+    # boss_engine_worker_bin::resolve_cube_cli_for_engine).
+    # Boss-owned tools (boss, cube, bossctl, boss-event, repobin) are always run
+    # from this bundle by absolute path: the engine resolves them through
+    # //tools/boss/engine/worker-bin and workers get them via per-workspace
+    # launchers, never via a PATH search that a ~/bin repobin shim can win.
+    # Third-party tools (jj, gh, claude, etc.) still resolve from PATH.
     additional_contents = {
         ENGINE_BINARY_TARGET: "Resources/bin",
         "//tools/boss/cli:boss": "Resources/bin",

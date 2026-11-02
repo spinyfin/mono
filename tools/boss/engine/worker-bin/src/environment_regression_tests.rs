@@ -1,4 +1,5 @@
 use super::*;
+use crate::{boss_bin_in, cube_bin_in, write_boss_launcher, write_cube_launcher};
 use std::process::Command;
 
 #[test]
@@ -86,4 +87,106 @@ fn declarations_use_toml_syntax_and_ignore_string_contents() {
     std::fs::write(root.path().join(REPOBIN_CONFIG_NAME), "[tools.checkleft]").unwrap();
     std::fs::create_dir_all(&bin).unwrap();
     assert!(!workspace_declares_repo_tool(&bin, "checkleft"));
+}
+
+/// A decoy `cube` and `boss` earlier on the inherited `PATH` — the shape of the
+/// user's `~/bin` repobin shims — must lose to the Boss-bundled binaries in the
+/// worker's tool shells, however a driver reaches its shell:
+///
+/// * `claude`: a shell snapshot re-exports `PATH` after startup files ran;
+/// * `codex`: the driver demotes the launcher directory behind the decoys;
+/// * `grok`: a login shell under a scoped `HOME` whose profile prepends them.
+///
+/// The launchers are the real ones the engine writes (`write_boss_launcher` /
+/// `write_cube_launcher`), pinned to bundled stand-ins by absolute path. The
+/// decoy fails loudly if it ever runs, as the shim's Xcode-pin build did.
+#[test]
+fn bundled_cube_and_boss_beat_decoys_on_the_inherited_path_for_every_driver_shell() {
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("worker bin's");
+    let bundle = root.path().join("Boss.app/Contents/Resources/bin");
+    let decoys = root.path().join("home bin");
+    for name in ["boss", "cube"] {
+        write_launcher(&bundle, name, &format!("#!/bin/sh\necho bundled-{name}\n")).unwrap();
+        write_launcher(
+            &decoys,
+            name,
+            &format!("#!/bin/sh\necho 'repobin: building //tools/{name}:{name}' >&2\nexit 36\n"),
+        )
+        .unwrap();
+    }
+    write_boss_launcher(&bin, Some(&bundle.join("boss"))).unwrap();
+    write_cube_launcher(&bin, Some(&bundle.join("cube"))).unwrap();
+    write_shell_environment(&bin).unwrap();
+
+    let home = root.path().join("scoped home");
+    std::fs::create_dir_all(&home).unwrap();
+    let profile = format!("export PATH={}:\"$PATH\"\n", sh_quote(&decoys.to_string_lossy()));
+    std::fs::write(home.join(".bash_profile"), &profile).unwrap();
+    std::fs::write(home.join(".zprofile"), &profile).unwrap();
+    let snapshot = root.path().join("snapshot.sh");
+    std::fs::write(
+        &snapshot,
+        format!("export PATH={}:/usr/bin:/bin\n", sh_quote(&decoys.to_string_lossy())),
+    )
+    .unwrap();
+
+    let probe = "command -v boss; boss; command -v cube; cube; \"$BOSS_BIN\"; \"$CUBE_BIN\"";
+    #[cfg(target_os = "macos")]
+    let shells = ["/bin/bash", "/bin/zsh"];
+    #[cfg(not(target_os = "macos"))]
+    let shells = ["/bin/bash"];
+    for shell in shells {
+        for (driver, tool_shell) in [
+            (
+                "claude",
+                format!(
+                    "{shell} -c {}",
+                    sh_quote(&format!(
+                        "source {} && eval {}",
+                        sh_quote(&snapshot.to_string_lossy()),
+                        sh_quote(probe)
+                    ))
+                ),
+            ),
+            (
+                "codex",
+                format!(
+                    "export PATH={}:{}:\"$PATH\"; {shell} -c {}",
+                    sh_quote(&decoys.to_string_lossy()),
+                    sh_quote(&bin.to_string_lossy()),
+                    sh_quote(probe)
+                ),
+            ),
+            ("grok", format!("{shell} -lc {}", sh_quote(probe))),
+        ] {
+            let script = format!(
+                "export PATH={}:/usr/bin:/bin; export BOSS_BIN={} CUBE_BIN={}; {} {tool_shell}",
+                sh_quote(&decoys.to_string_lossy()),
+                sh_quote(&boss_bin_in(&bin).to_string_lossy()),
+                sh_quote(&cube_bin_in(&bin).to_string_lossy()),
+                shell_environment_clause(&bin),
+            );
+            let output = Command::new("/bin/sh")
+                .env("HOME", &home)
+                .env("BOSS_BIN_DIR", &bundle)
+                .args(["-c", &script])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{driver}/{shell}: {output:?}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(
+                stdout.lines().collect::<Vec<_>>(),
+                [
+                    bin.join("boss").to_str().unwrap(),
+                    "bundled-boss",
+                    bin.join("cube").to_str().unwrap(),
+                    "bundled-cube",
+                    "bundled-boss",
+                    "bundled-cube",
+                ],
+                "{driver}/{shell}: bare names must resolve to the worker launchers, never a decoy",
+            );
+        }
+    }
 }

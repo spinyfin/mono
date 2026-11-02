@@ -198,6 +198,17 @@ pub(crate) fn render_env_directive(directive: &crate::driver::EnvDirective) -> S
     }
 }
 
+fn assemble_worker_command(priority: &str, worker_bin_dir: &Path, plan: &crate::driver::SpawnPlan) -> String {
+    let env_prefix: String = plan.env.iter().map(render_env_directive).collect();
+    let environment = boss_engine_worker_bin::environment::shell_environment_clause(worker_bin_dir);
+    format!(
+        "{priority}{}{}{env_prefix}{environment}{}",
+        path_prepend_clause("BOSS_BIN_DIR"),
+        path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
+        plan.command,
+    )
+}
+
 #[cfg(test)]
 mod render_env_directive_tests {
     use super::render_env_directive;
@@ -507,9 +518,9 @@ impl PaneSpawnRunner {
             return injected.clone();
         }
         let engine_path = std::env::current_exe().unwrap_or_default();
-        let workspace = std::env::var_os("BUILD_WORKSPACE_DIRECTORY").map(PathBuf::from);
+        let workspace = std::env::var_os(boss_engine_worker_bin::BUILD_WORKSPACE_DIRECTORY_ENV).map(PathBuf::from);
         let env_override = std::env::var_os("BOSS_EVENT_BIN").map(PathBuf::from);
-        let boss_bin_dir = std::env::var_os("BOSS_BIN_DIR").map(PathBuf::from);
+        let boss_bin_dir = std::env::var_os(boss_engine_worker_bin::BOSS_BIN_DIR_ENV).map(PathBuf::from);
         let stable_bin_dir = boss_log_files::default_state_root().map(|root| root.join("bin"));
         resolve_boss_event_binary(
             &engine_path,
@@ -690,9 +701,9 @@ fn ensure_worker_bin_dir(settings_dir: &Path, workspace_path: &Path) -> Option<P
 }
 
 fn ensure_worker_bin_dir_for_engine(settings_dir: &Path, workspace_path: &Path, engine_path: &Path) -> Option<PathBuf> {
-    let workspace_dir = std::env::var_os("BUILD_WORKSPACE_DIRECTORY").map(PathBuf::from);
+    let workspace_dir = std::env::var_os(boss_engine_worker_bin::BUILD_WORKSPACE_DIRECTORY_ENV).map(PathBuf::from);
     let env_override = std::env::var_os(boss_engine_worker_bin::BOSS_CLI_BIN_ENV).map(PathBuf::from);
-    let boss_bin_dir = std::env::var_os("BOSS_BIN_DIR").map(PathBuf::from);
+    let boss_bin_dir = std::env::var_os(boss_engine_worker_bin::BOSS_BIN_DIR_ENV).map(PathBuf::from);
 
     let resolved = boss_engine_worker_bin::resolve_boss_cli(
         engine_path,
@@ -734,13 +745,7 @@ fn ensure_worker_bin_dir_for_engine(settings_dir: &Path, workspace_path: &Path, 
         }
     }
 
-    let cube_override = std::env::var_os(boss_engine_worker_bin::CUBE_CLI_BIN_ENV).map(PathBuf::from);
-    let cube_resolved = boss_engine_worker_bin::resolve_cube_cli(
-        engine_path,
-        workspace_dir.as_deref(),
-        cube_override.as_deref(),
-        boss_bin_dir.as_deref(),
-    );
+    let cube_resolved = boss_engine_worker_bin::resolve_cube_cli_for_engine(engine_path);
     match boss_engine_worker_bin::write_cube_launcher(&dir, cube_resolved.as_deref()) {
         Ok(launcher) => {
             tracing::debug!(
@@ -1259,18 +1264,8 @@ impl ExecutionRunner for PaneSpawnRunner {
         // repobin shim was winning.
         let worker_bin_dir = ensure_worker_bin_dir(&settings_dir, workspace_path)
             .context("materializing the worker tool environment")?;
-        let environment_clause = boss_engine_worker_bin::environment::shell_environment_clause(&worker_bin_dir);
-        let env_prefix: String = spawn_plan.env.iter().map(render_env_directive).collect();
-        // All local pools, including review and automation, share this
-        // tmux worker assembly. Read state.db at each
-        // spawn so changes take effect without restarting the engine.
         let priority_clause = worker_background_priority_clause(&self.work_db)?;
-        let assembled_command = format!(
-            "{priority_clause}{}{}{env_prefix}{environment_clause}{}",
-            path_prepend_clause("BOSS_BIN_DIR"),
-            path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
-            spawn_plan.command,
-        );
+        let assembled_command = assemble_worker_command(priority_clause, &worker_bin_dir, &spawn_plan);
         // Write the full assembled command to a workspace-relative script and
         // type only a short, fixed-length line that sources it — never the
         // command itself. See `MAX_CANON_LINE_BYTES` for why: the pty's tty

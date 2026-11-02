@@ -184,9 +184,50 @@ fn set_env_var(env: &mut Vec<EnvVar>, key: &str, value: String) {
 ///   exported as its own env var, and `BOSS_LAUNCH_GUARD_COMMAND` blocks it
 ///   by basename regardless of where PATH resolution finds it.
 ///
-/// Empty / missing is a no-op: dev / `bazel run` mode relies on the
-/// per-workspace `boss` launcher instead, and never falls back to a
-/// user `PATH` copy for `boss`.
+/// The per-workspace launchers take priority in both installed and dev mode;
+/// their absolute paths are exported for driver tool shells as well.
+pub(crate) fn apply_worker_tool_env(env: &mut Vec<EnvVar>, boss_bin_dir: Option<&str>) {
+    apply_boss_bin_dir_to_worker_env(env, boss_bin_dir);
+
+    // The per-workspace launcher dir goes ahead of everything, including
+    // BOSS_BIN_DIR: it holds a `boss` pinned to an absolute path, so it
+    // is the one entry that stays correct in dev mode (no bundle) as
+    // well as installed mode. Applied after the BOSS_BIN_DIR prepend
+    // above so it lands in front of it, mirroring the ordering of the
+    // pane's first shell line in `pane_spawn`.
+    let worker_bin_dir = env
+        .iter()
+        .find(|e| e.key == boss_engine_worker_bin::WORKER_BIN_DIR_ENV)
+        .map(|e| e.value.clone());
+    if let Some(worker_bin_dir) = worker_bin_dir.filter(|dir| !dir.is_empty()) {
+        if let Some(path_entry) = env.iter_mut().find(|e| e.key == "PATH") {
+            path_entry.value = format!("{worker_bin_dir}:{}", path_entry.value);
+        }
+        // Name the binaries, not a PATH entry. A driver shell snapshot can
+        // demote the launcher dir (Codex does this today); `"$BOSS_BIN"` /
+        // `"$CUBE_BIN"` still exec the launchers. Overwrites the bundle
+        // `BOSS_BIN`/`CUBE_BIN` set above (if any) rather than pushing a
+        // duplicate key: a duplicate is last-wins for the shell env prefix a
+        // worker pane runs under, but any `.find(|e| e.key == ..)` consumer
+        // — including this crate's own tests — sees the FIRST match, which
+        // would silently be the bundle path instead of the launcher.
+        set_env_var(
+            env,
+            boss_engine_worker_bin::BOSS_BIN_ENV,
+            boss_engine_worker_bin::boss_bin_in(Path::new(&worker_bin_dir))
+                .display()
+                .to_string(),
+        );
+        set_env_var(
+            env,
+            boss_engine_worker_bin::CUBE_BIN_ENV,
+            boss_engine_worker_bin::cube_bin_in(Path::new(&worker_bin_dir))
+                .display()
+                .to_string(),
+        );
+    }
+}
+
 fn apply_boss_bin_dir_to_worker_env(env: &mut Vec<EnvVar>, boss_bin_dir: Option<&str>) {
     let Some(boss_bin_dir) = boss_bin_dir.filter(|d| !d.is_empty()) else {
         return;
@@ -951,45 +992,7 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
     // Unset in dev mode (no bundle bin/ directory); the per-workspace
     // `boss` launcher (BOSS_WORKER_BIN_DIR) still pins bare `boss` to the
     // engine's own CLI without searching PATH.
-    apply_boss_bin_dir_to_worker_env(&mut env, std::env::var("BOSS_BIN_DIR").ok().as_deref());
-
-    // The per-workspace launcher dir goes ahead of everything, including
-    // BOSS_BIN_DIR: it holds a `boss` pinned to an absolute path, so it
-    // is the one entry that stays correct in dev mode (no bundle) as
-    // well as installed mode. Applied after the BOSS_BIN_DIR prepend
-    // above so it lands in front of it, mirroring the ordering of the
-    // pane's first shell line in `pane_spawn`.
-    let worker_bin_dir = env
-        .iter()
-        .find(|e| e.key == boss_engine_worker_bin::WORKER_BIN_DIR_ENV)
-        .map(|e| e.value.clone());
-    if let Some(worker_bin_dir) = worker_bin_dir.filter(|dir| !dir.is_empty()) {
-        if let Some(path_entry) = env.iter_mut().find(|e| e.key == "PATH") {
-            path_entry.value = format!("{worker_bin_dir}:{}", path_entry.value);
-        }
-        // Name the binaries, not a PATH entry. A driver shell snapshot can
-        // demote the launcher dir (Codex does this today); `"$BOSS_BIN"` /
-        // `"$CUBE_BIN"` still exec the launchers. Overwrites the bundle
-        // `BOSS_BIN`/`CUBE_BIN` set above (if any) rather than pushing a
-        // duplicate key: a duplicate is last-wins for the shell env prefix a
-        // worker pane runs under, but any `.find(|e| e.key == ..)` consumer
-        // — including this crate's own tests — sees the FIRST match, which
-        // would silently be the bundle path instead of the launcher.
-        set_env_var(
-            &mut env,
-            boss_engine_worker_bin::BOSS_BIN_ENV,
-            boss_engine_worker_bin::boss_bin_in(Path::new(&worker_bin_dir))
-                .display()
-                .to_string(),
-        );
-        set_env_var(
-            &mut env,
-            boss_engine_worker_bin::CUBE_BIN_ENV,
-            boss_engine_worker_bin::cube_bin_in(Path::new(&worker_bin_dir))
-                .display()
-                .to_string(),
-        );
-    }
+    apply_worker_tool_env(&mut env, std::env::var("BOSS_BIN_DIR").ok().as_deref());
 
     let slot_id = input.slot_id;
     let tmux_host = &input.tmux_host;

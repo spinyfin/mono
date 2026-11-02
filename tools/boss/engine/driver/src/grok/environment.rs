@@ -67,6 +67,12 @@ pub struct GrokProcessEnvironment {
     process_home: PathBuf,
     auth_path: PathBuf,
     host_tools: HostToolPaths,
+    /// Absolute path of the `cube` that ships with this engine, resolved once
+    /// by [`boss_engine_worker_bin::resolve_cube_cli_from_process`]. `None`
+    /// means no bundled `cube` exists; the preflight then fails loudly rather
+    /// than hand a bare `cube` to a `PATH` search that finds the user's
+    /// repobin shim and builds the CLI from source.
+    bundled_cube: Option<PathBuf>,
 }
 
 impl GrokProcessEnvironment {
@@ -97,7 +103,22 @@ impl GrokProcessEnvironment {
             process_home: process_home.to_path_buf(),
             auth_path: auth_path.to_path_buf(),
             host_tools,
+            bundled_cube: boss_engine_worker_bin::resolve_cube_cli_from_process(),
         })
+    }
+
+    /// The Boss-bundled `cube` to run by absolute path, or an error naming
+    /// what was searched. Never falls back to a `PATH` lookup: on a developer
+    /// machine that finds a repobin shim, which builds `//tools/cube:cube`
+    /// from source and dies on any toolchain mismatch before the worker pane
+    /// ever starts.
+    pub fn bundled_cube(&self) -> anyhow::Result<&Path> {
+        self.bundled_cube.as_deref().context(
+            "Grok worker preflight failed: the Boss-bundled `cube` could not be located \
+             (checked CUBE_CLI_BIN, BOSS_BIN_DIR, the engine's runfiles, bazel-bin and the engine's \
+             sibling directory); refusing a PATH lookup of `cube`, which would run a \
+             build-from-source shim. Install the Boss app bundle or set CUBE_CLI_BIN.",
+        )
     }
 
     /// The per-run `GROK_HOME` this environment points Grok at. Preflight
@@ -298,8 +319,14 @@ impl GrokProcessEnvironment {
     }
 
     #[cfg(test)]
+    pub(super) fn with_bundled_cube(self, bundled_cube: Option<PathBuf>) -> Self {
+        Self { bundled_cube, ..self }
+    }
+
+    #[cfg(test)]
     pub(super) fn for_test() -> Self {
         Self {
+            bundled_cube: Some(PathBuf::from("/bundle/bin/cube")),
             grok_home: PathBuf::from("/tmp/grok-home"),
             process_home: PathBuf::from("/tmp/process-home"),
             auth_path: PathBuf::from("/host/auth.json"),

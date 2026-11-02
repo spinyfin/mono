@@ -258,6 +258,17 @@ fn python3_dir() -> PathBuf {
 /// callers can plant fake `repobin`/`checkleft` binaries to observe which
 /// one the guard picks.
 fn run_push_guard_resolving(command: &str, cwd: &Path, path_dirs: &[&Path]) -> serde_json::Value {
+    run_push_guard_resolving_with_env(command, cwd, path_dirs, &[])
+}
+
+/// [`run_push_guard_resolving`] with extra environment variables (for example
+/// `BOSS_BIN_DIR`) set on the guard subprocess.
+fn run_push_guard_resolving_with_env(
+    command: &str,
+    cwd: &Path,
+    path_dirs: &[&Path],
+    extra_env: &[(&str, &Path)],
+) -> serde_json::Value {
     use std::io::Write as _;
     let script_dir = TempDir::new().unwrap();
     let script_path = script_dir.path().join(CHECKLEFT_PUSH_GUARD_SCRIPT_NAME);
@@ -281,10 +292,17 @@ fn run_push_guard_resolving(command: &str, cwd: &Path, path_dirs: &[&Path]) -> s
     dirs.push(PathBuf::from("/usr/bin"));
     let path_var = std::env::join_paths(&dirs).unwrap();
 
-    let mut child = std::process::Command::new("python3")
+    let mut guard = std::process::Command::new("python3");
+    guard
         .arg(&script_path)
         .env_remove("BOSS_CHECKLEFT_BIN")
-        .env("PATH", &path_var)
+        .env_remove("BOSS_BIN_DIR")
+        .env_remove("BOSS_WORKER_BIN_DIR")
+        .env("PATH", &path_var);
+    for (key, value) in extra_env {
+        guard.env(key, value);
+    }
+    let mut child = guard
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -349,6 +367,31 @@ fn push_guard_dispatches_through_repobin_exec_when_repobin_is_installed() {
     );
 }
 
+#[test]
+fn push_guard_prefers_the_bundled_repobin_over_a_decoy_earlier_on_path() {
+    // A user-shell `repobin` ahead of the bundle on PATH (the shape of
+    // `~/bin/repobin`) must not win: the guard dispatches through
+    // `$BOSS_BIN_DIR/repobin` by absolute path.
+    let dir = TempDir::new().unwrap();
+    let bundle = TempDir::new().unwrap();
+    let decoy = TempDir::new().unwrap();
+    let bundled_argv = dir.path().join("bundled-argv.txt");
+    let decoy_argv = dir.path().join("decoy-argv.txt");
+    write_fake_repobin_recording_argv(bundle.path(), &bundled_argv);
+    write_fake_repobin_recording_argv(decoy.path(), &decoy_argv);
+
+    let decision = run_push_guard_resolving_with_env(
+        "jj git push -b boss/foo --allow-new",
+        dir.path(),
+        &[decoy.path(), bundle.path()],
+        &[("BOSS_BIN_DIR", bundle.path())],
+    );
+    assert_eq!(decision["decision"], "approve", "{decision}");
+    let argv = std::fs::read_to_string(&bundled_argv).expect("the bundled repobin must have run");
+    assert_eq!(argv.lines().collect::<Vec<_>>(), vec!["exec", "checkleft", "run"]);
+    assert!(!decoy_argv.exists(), "the decoy repobin on PATH must never be executed");
+}
+
 /// Write an executable fake `repobin` that always exits non-zero and
 /// records its argv (one arg per line) into `argv_out`, modelling a
 /// dispatch/build failure (e.g. a broken bazel target) for every
@@ -397,27 +440,32 @@ fn push_guard_env_override_wins_over_a_present_repobin() {
 }
 
 #[test]
-fn push_guard_dispatches_through_repobin_found_only_on_path() {
-    // The realistic cube-workspace case: no <repo-root>/bin directory at
-    // all (nothing installs one), so repobin must still be found via a
-    // plain PATH search rather than only the <repo-root>/bin/repobin path.
+fn push_guard_uses_pinned_launcher_without_bundle_env() {
     let dir = TempDir::new().unwrap();
-    let path_dir = TempDir::new().unwrap();
-    let argv_out = dir.path().join("argv.txt");
-    write_fake_repobin_recording_argv(path_dir.path(), &argv_out);
-
-    let decision = run_push_guard_resolving("jj git push -b boss/foo --allow-new", dir.path(), &[path_dir.path()]);
-    assert_eq!(
-        decision["decision"], "approve",
-        "a clean PATH-resolved repobin-dispatched checkleft must allow the push: {decision}"
+    let engine_bin = TempDir::new().unwrap();
+    let worker_bin = TempDir::new().unwrap();
+    let decoy = TempDir::new().unwrap();
+    let engine_argv = dir.path().join("engine-argv.txt");
+    let decoy_argv = dir.path().join("decoy-argv.txt");
+    let repobin = write_fake_repobin_recording_argv(engine_bin.path(), &engine_argv);
+    write_fake_repobin_recording_argv(decoy.path(), &decoy_argv);
+    boss_engine_worker_bin::environment::write_repo_tool_launcher(worker_bin.path(), "checkleft", Some(&repobin))
+        .unwrap();
+    let decision = run_push_guard_resolving_with_env(
+        "jj git push -b boss/foo",
+        dir.path(),
+        &[decoy.path()],
+        &[("BOSS_WORKER_BIN_DIR", worker_bin.path())],
     );
-    let argv = std::fs::read_to_string(&argv_out).expect("fake repobin must have recorded its argv");
-    let args: Vec<&str> = argv.lines().collect();
+    assert_eq!(decision["decision"], "approve", "{decision}");
     assert_eq!(
-        args,
-        vec!["exec", "checkleft", "run"],
-        "guard must dispatch via `repobin exec checkleft run` found on PATH: {argv:?}"
+        std::fs::read_to_string(engine_argv)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["exec", "checkleft", "run"]
     );
+    assert!(!decoy_argv.exists(), "host repobin must never run");
 }
 
 #[test]

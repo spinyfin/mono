@@ -112,6 +112,13 @@ pub const BOSS_CLI_BIN_ENV: &str = "BOSS_CLI_BIN";
 /// as [`BOSS_CLI_BIN_ENV`].
 pub const CUBE_CLI_BIN_ENV: &str = "CUBE_CLI_BIN";
 
+/// Env var naming the installed bundle's bin directory
+/// (`Boss.app/Contents/Resources/bin`). Set by the macOS app.
+pub const BOSS_BIN_DIR_ENV: &str = "BOSS_BIN_DIR";
+
+/// Env var set by `bazel run` to the checkout it was launched from.
+pub const BUILD_WORKSPACE_DIRECTORY_ENV: &str = "BUILD_WORKSPACE_DIRECTORY";
+
 /// Workspace-relative path of the `cube` CLI under runfiles / bazel-bin.
 const CUBE_CLI_RUNFILES_REL: &str = "tools/cube/cube";
 
@@ -281,6 +288,29 @@ pub fn resolve_cube_cli(
             stable_bin_dir: None,
         },
         true,
+    )
+}
+
+/// [`resolve_cube_cli`] fed from the running engine's own process: its
+/// executable path, `BUILD_WORKSPACE_DIRECTORY`, `CUBE_CLI_BIN` and
+/// `BOSS_BIN_DIR`.
+///
+/// Returns `None` when no bundled cube exists; callers must fail rather
+/// than substitute a PATH lookup.
+pub fn resolve_cube_cli_from_process() -> Option<PathBuf> {
+    resolve_cube_cli_for_engine(&std::env::current_exe().unwrap_or_default())
+}
+
+/// Resolve cube using the engine path and the shared process environment.
+pub fn resolve_cube_cli_for_engine(engine_path: &Path) -> Option<PathBuf> {
+    let workspace_dir = std::env::var_os(BUILD_WORKSPACE_DIRECTORY_ENV).map(PathBuf::from);
+    let env_override = std::env::var_os(CUBE_CLI_BIN_ENV).map(PathBuf::from);
+    let boss_bin_dir = std::env::var_os(BOSS_BIN_DIR_ENV).map(PathBuf::from);
+    resolve_cube_cli(
+        engine_path,
+        workspace_dir.as_deref(),
+        env_override.as_deref(),
+        boss_bin_dir.as_deref(),
     )
 }
 
@@ -739,6 +769,56 @@ mod tests {
             resolve_boss_cli(&tmp.path().join("engine"), None, None, Some(shimmed.as_path())),
             None,
             "resolution must fail rather than return a build-from-source shim"
+        );
+    }
+
+    // ── resolve_cube_cli ────────────────────────────────────────────────────
+
+    /// A decoy `cube` (a repobin symlink, exactly what `~/bin/cube` is) sitting
+    /// on the inherited `PATH` must never be what resolution returns. The
+    /// resolver takes no `PATH`, so the bundle copy is the only candidate it can
+    /// reach — and a bundle dir that *itself* holds a shim is skipped.
+    #[cfg(unix)]
+    #[test]
+    fn cube_resolves_to_the_bundle_copy_and_never_a_path_decoy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let decoy_dir = tmp.path().join("home-bin");
+        touch_exe(&decoy_dir.join("repobin"));
+        std::os::unix::fs::symlink(decoy_dir.join("repobin"), decoy_dir.join("cube")).expect("symlink");
+        let bundle = tmp.path().join("bundle");
+        touch_exe(&bundle.join("cube"));
+
+        // Even with the decoy dir first on a PATH-shaped string, resolution
+        // is by absolute bundle path.
+        let path = format!("{}:{}", decoy_dir.display(), bundle.display());
+        assert_eq!(
+            resolve_on_path("cube", &path).as_deref(),
+            Some(decoy_dir.join("cube").as_path()),
+            "precondition: a PATH search WOULD find the decoy first"
+        );
+        assert_eq!(
+            resolve_cube_cli(&tmp.path().join("engine"), None, None, Some(bundle.as_path())),
+            Some(bundle.join("cube")),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cube_in_a_shimmed_bundle_falls_back_to_runfiles_then_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shimmed = tmp.path().join("home-bin");
+        touch_exe(&shimmed.join("repobin"));
+        std::os::unix::fs::symlink(shimmed.join("repobin"), shimmed.join("cube")).expect("symlink");
+        let engine = tmp.path().join("engine");
+        touch_exe(&engine);
+
+        assert_eq!(resolve_cube_cli(&engine, None, None, Some(shimmed.as_path())), None);
+
+        let runfiles = tmp.path().join("engine.runfiles/_main/tools/cube/cube");
+        touch_exe(&runfiles);
+        assert_eq!(
+            resolve_cube_cli(&engine, None, None, Some(shimmed.as_path())),
+            Some(runfiles)
         );
     }
 

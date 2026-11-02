@@ -123,11 +123,6 @@ pub const DEFAULT_ENABLE_DISPATCH_READY_BUS: bool = false;
 /// higher tier — no code change required.
 pub const DEFAULT_COORDINATOR_MODEL: &str = "opus";
 
-// Bare name used as the PATH fallback. In installed Boss.app the engine
-// resolves cube from the bundle first (see resolve_cube_command); this
-// constant is only reached in dev mode or when the bundle copy is absent.
-const DEFAULT_CUBE_COMMAND: &str = "cube";
-
 #[derive(Debug, Clone)]
 pub struct CubeConfig {
     pub command: String,
@@ -425,6 +420,12 @@ fn lookup_bool(lookup: impl Fn(&str) -> Option<OsString>, name: &str) -> Result<
     }
 }
 
+/// The `ANTHROPIC_API_KEY` the engine was launched with. Read independently of
+/// [`AgentConfig`] so a cube-resolution failure cannot hide an exported key.
+fn anthropic_api_key_from_env() -> Option<String> {
+    std::env::var("ANTHROPIC_API_KEY").ok()
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub anthropic_api_key: Option<String>,
@@ -434,14 +435,23 @@ pub struct AgentConfig {
 
 impl AgentConfig {
     pub fn load_from_env(work: &WorkConfig) -> Result<Self> {
-        let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
+        Self::load_for_engine(work, &std::env::current_exe()?)
+    }
 
-        let (cube_command, cube_args) = parse_command_line(
-            "BOSS_CUBE_CMD",
-            std::env::var("BOSS_CUBE_CMD").unwrap_or_else(|_| resolve_cube_command()),
-        )?;
+    fn load_for_engine(work: &WorkConfig, engine_path: &Path) -> Result<Self> {
+        let anthropic_api_key = anthropic_api_key_from_env();
 
-        log_cube_resolution(&cube_command);
+        let (cube_command, cube_args) = match std::env::var("BOSS_CUBE_CMD") {
+            Ok(command) => parse_command_line("BOSS_CUBE_CMD", command)?,
+            Err(_) => (
+                boss_engine_worker_bin::resolve_cube_cli_for_engine(engine_path)
+                    .context("no bundled cube found; set BOSS_CUBE_CMD or CUBE_CLI_BIN to an executable path")?
+                    .to_string_lossy()
+                    .into_owned(),
+                Vec::new(),
+            ),
+        };
+        tracing::info!(command = cube_command, "cube command configured");
 
         Ok(Self {
             anthropic_api_key,
@@ -525,6 +535,16 @@ impl RuntimeConfig {
         }
     }
 
+    /// The Anthropic API key, independent of cube resolution: a missing
+    /// bundled cube makes [`Self::agent`] fail but must not make an exported
+    /// key look unset.
+    pub fn anthropic_api_key(&self) -> Option<String> {
+        match self.agent_cell.get() {
+            Some(agent) => agent.anthropic_api_key.clone(),
+            None => anthropic_api_key_from_env(),
+        }
+    }
+
     /// The [`UtilityModel`] provider for the engine's own inference calls.
     ///
     /// Infallible on purpose — provider selection never fails, it falls back
@@ -546,7 +566,7 @@ impl RuntimeConfig {
         if let Some(provider) = self.utility_cell.get() {
             return provider.clone();
         }
-        let base_api_key = self.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
+        let base_api_key = self.anthropic_api_key();
         let selection = utility_model::select(base_api_key);
         selection.log();
         let provider = selection.provider;
@@ -567,49 +587,6 @@ impl RuntimeConfig {
     /// process environment. No-op if a provider is already installed.
     pub fn set_utility_model(&self, provider: Arc<dyn UtilityModel>) {
         let _ = self.utility_cell.set(provider);
-    }
-}
-
-/// Returns the cube command to use, preferring a bundle-relative binary when
-/// the engine itself was launched from a bundle (installed Boss.app).
-///
-/// Resolution order:
-///   1. `<engine_exe_dir>/cube` — present in the bundle; used by installed
-///      Boss.app so the engine never depends on the GUI launchd PATH.
-///   2. `"cube"` — bare name resolved from PATH at exec time; used in dev
-///      mode where the engine runs via `bazel run` outside a bundle.
-///
-/// Workers run inside Ghostty terminal panes which inherit the user's shell
-/// PATH, so they continue to resolve cube (and jj, gh, claude, etc.) from
-/// PATH naturally. This bundle-relative lookup is engine-only.
-fn resolve_cube_command() -> String {
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let candidate = dir.join(DEFAULT_CUBE_COMMAND);
-        if candidate.is_file() {
-            return candidate.to_string_lossy().into_owned();
-        }
-    }
-    DEFAULT_CUBE_COMMAND.to_owned()
-}
-
-/// Logs how cube was resolved and warns if the bare name cannot be found on PATH.
-fn log_cube_resolution(command: &str) {
-    if command.contains('/') {
-        tracing::info!(command, "cube resolved from bundle");
-        return;
-    }
-    let path_env = std::env::var("PATH").unwrap_or_default();
-    let found = std::env::split_paths(&path_env).any(|dir| dir.join(command).is_file());
-    if found {
-        tracing::info!(command, "cube resolved from PATH");
-    } else {
-        tracing::warn!(
-            command,
-            "cube executable not found on PATH; worker dispatch will fail — \
-             install cube or set BOSS_CUBE_CMD to its full path"
-        );
     }
 }
 
@@ -653,6 +630,66 @@ mod tests {
     };
     use std::ffi::OsString;
     use std::path::Path;
+
+    #[test]
+    fn missing_bundled_cube_rejects_config_without_running_path_decoy() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::driver::grok::GROK_HOMES_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        struct Restore(Vec<(&'static str, Option<OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(key, value),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("decoy-ran");
+        let decoy = dir.path().join("cube");
+        std::fs::write(&decoy, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let keys = [
+            "PATH",
+            "BOSS_CUBE_CMD",
+            "CUBE_CLI_BIN",
+            "BOSS_BIN_DIR",
+            "BUILD_WORKSPACE_DIRECTORY",
+            "ANTHROPIC_API_KEY",
+        ];
+        let _restore = Restore(keys.iter().map(|&key| (key, std::env::var_os(key))).collect());
+        for key in keys {
+            unsafe { std::env::remove_var(key) };
+        }
+        let inherited_path = std::env::join_paths(
+            std::iter::once(dir.path().to_path_buf())
+                .chain(_restore.0[0].1.as_ref().into_iter().flat_map(std::env::split_paths)),
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("PATH", inherited_path);
+            std::env::set_var("ANTHROPIC_API_KEY", "sk-test-independent");
+        };
+        let work = WorkConfig::load_from(|key| match key {
+            "BOSS_DB_PATH" => Some(dir.path().join("state.db").into_os_string()),
+            _ => None,
+        })
+        .unwrap();
+        // A synthetic engine path has neither runfiles nor sibling binaries.
+        let engine = dir.path().join("missing/engine");
+        let error = super::AgentConfig::load_for_engine(&work, &engine).unwrap_err();
+        assert!(error.to_string().contains("no bundled cube found"), "{error:#}");
+        assert!(!marker.exists(), "PATH cube must never be invoked");
+        // The cube failure must not null out the unrelated API key.
+        let runtime = super::RuntimeConfig::from_parts(work, None);
+        assert_eq!(runtime.anthropic_api_key().as_deref(), Some("sk-test-independent"));
+    }
 
     #[test]
     fn prefers_bazel_workspace_directory_when_present() {

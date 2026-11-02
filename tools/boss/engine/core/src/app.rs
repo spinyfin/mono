@@ -902,6 +902,10 @@ struct ServerState {
     /// read it directly — they go through [`Self::utility_model`], which is
     /// seeded from this same snapshot.
     anthropic_api_key: Option<String>,
+    /// Why the cube command could not be resolved at startup, if it could not.
+    /// Reported by the health verb as `cube_unresolved`.
+    #[builder(default)]
+    cube_resolution_error: std::sync::RwLock<Option<String>>,
     /// Where the engine's *own* short inference calls — live status, pane
     /// title, attentions backstop, comment intent, Planner — get their
     /// endpoint, model and credential.
@@ -1308,7 +1312,14 @@ impl ServerState {
                 .with_engine_build_identity(crate::build_info::build_identity()),
         );
         timeline.mark("work_db_open");
-        let anthropic_api_key = cfg.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
+        let anthropic_api_key = cfg.anthropic_api_key();
+        // A cube that cannot resolve is a distinct, loud failure: log it and
+        // surface it in the health report rather than letting it masquerade
+        // as an unrelated missing setting.
+        let cube_resolution_error = cfg.agent().err().map(|error| format!("{error:#}"));
+        if let Some(error) = &cube_resolution_error {
+            tracing::error!(%error, "cube command could not be resolved; worker dispatch will fail");
+        }
         timeline.mark("agent_config");
         // Resolve the engine's own inference provider once, here, and install
         // it process-wide so paths too deep to thread a handle through (the
@@ -1804,6 +1815,7 @@ impl ServerState {
                 .staged_unobserved_commands(staged_unobserved_commands)
                 .editorial_deny_tracker(Arc::new(crate::editorial_hook::DenyTracker::new()))
                 .maybe_anthropic_api_key(anthropic_api_key)
+                .cube_resolution_error(std::sync::RwLock::new(cube_resolution_error))
                 .utility_model(utility_model)
                 .worker_pool_size(worker_pool_size)
                 .automation_pool_size(automation_pool_size)
