@@ -109,6 +109,7 @@ rust_library(
         "//tools/boss/engine/design-doc-fetcher",
         "//tools/boss/engine/design-docs",
         "//tools/boss/engine/deterministic-resolvers",
+        "//tools/boss/engine/dispatch",
         "//tools/boss/engine/dispatch-events",
         "//tools/boss/engine/dispatch-reader",
         "//tools/boss/engine/driver",
@@ -258,6 +259,8 @@ rust_test(
     # crate inheritance keeps the production dependency; compile this test
     # against the fixture variant under its usual Rust name instead.
     aliases = {
+        "//tools/boss/engine/dispatch": "boss_engine_dispatch_production",
+        "//tools/boss/engine/dispatch:dispatch_test_support": "boss_engine_dispatch",
         "//tools/boss/engine/execution-runner": "boss_execution_runner_production",
         "//tools/boss/engine/execution-runner:runner_test_support": "boss_execution_runner",
         "//tools/boss/engine/execution-contracts": "boss_execution_contracts_production",
@@ -291,6 +294,7 @@ rust_test(
     ),
     shard_count = 11,
     deps = [
+        "//tools/boss/engine/dispatch:dispatch_test_support",
         "//tools/boss/engine/execution-contracts:execution_contracts_test_support",
         "//tools/boss/engine/execution-runner:runner_test_support",
         "//tools/boss/engine/prose-vocabulary",
@@ -310,6 +314,8 @@ network_enabled_rust_test(
     # crate inheritance keeps the production dependency; compile this test
     # against the fixture variant under its usual Rust name instead.
     aliases = {
+        "//tools/boss/engine/dispatch": "boss_engine_dispatch_production",
+        "//tools/boss/engine/dispatch:dispatch_test_support": "boss_engine_dispatch",
         "//tools/boss/engine/execution-runner": "boss_execution_runner_production",
         "//tools/boss/engine/execution-runner:runner_test_support": "boss_execution_runner",
         "//tools/boss/engine/execution-contracts": "boss_execution_contracts_production",
@@ -350,6 +356,7 @@ network_enabled_rust_test(
     ),
     tags = ["manual"],
     deps = [
+        "//tools/boss/engine/dispatch:dispatch_test_support",
         "//tools/boss/engine/execution-contracts:execution_contracts_test_support",
         "//tools/boss/engine/execution-runner:runner_test_support",
         "//tools/boss/engine/prose-vocabulary",

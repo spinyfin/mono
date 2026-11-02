@@ -29,50 +29,42 @@ use crate::dispatch_events::{
     DispatchEvent, DispatchEventSink, NoopDispatchEventSink, Outcome as DispatchOutcome, Stage,
 };
 use crate::dispatch_inflight::InflightDispatches;
-#[cfg(test)]
-use crate::effort::PoolModelTier;
-#[cfg(test)]
-use crate::host_adapter::LocalHostAdapter;
-use crate::host_adapter::LocalHostAdapterProvider;
 use crate::metrics::Registry;
 use crate::work::{
     CreateAttentionItemInput, DispatchClaimOutcome, DispatchClass, FinishExecutionRunInput, PreStartFailureOutcome,
     WorkDb, WorkExecution, WorkItem, WorkRun,
 };
-use boss_execution_contracts::{HostAdapter, HostAdapterProvider};
+use boss_execution_contracts::{HostAdapter, HostAdapterProvider, LocalHostAdapterProvider};
 use boss_execution_contracts::{RunOutcome, RunWaitState};
 
 // Phase-3 counter handles for the cube workspace lease boundary.
-crate::register_counter!(
+boss_metrics::register_counter!(
     CUBE_WORKSPACE_LEASE_ATTEMPTS,
     "cube_workspace_lease.attempts",
     "Number of cube workspace lease invocations attempted (each fallback counts separately).",
 );
-crate::register_counter!(
+boss_metrics::register_counter!(
     CUBE_WORKSPACE_LEASE_SUCCESS,
     "cube_workspace_lease.success",
     "Number of cube workspace lease invocations that succeeded.",
 );
-crate::register_counter!(
+boss_metrics::register_counter!(
     CUBE_WORKSPACE_LEASE_FAILURE,
     "cube_workspace_lease.failure",
     "Number of cube workspace lease sequences that exhausted all attempts and failed.",
 );
 
 /// Register all cube-workspace-lease counter handles with `registry`. Called
-/// from [`crate::metrics_init::init_all`] at engine startup.
+/// from `boss_engine::metrics_init::init_all` at engine startup.
 pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&CUBE_WORKSPACE_LEASE_ATTEMPTS);
     registry.register_counter(&CUBE_WORKSPACE_LEASE_SUCCESS);
     registry.register_counter(&CUBE_WORKSPACE_LEASE_FAILURE);
 }
 
-#[cfg(test)]
+// The contract and host types below are re-exported so the composition root
+// and the engine's integration suite can reach them through the coordinator.
 pub use boss_execution_contracts::{
-    AutomationPreemptor, ExecutionStartedHook, NoopAutomationPreemptor, NoopExecutionStartedHook, PreemptOutcome,
-};
-#[cfg(not(test))]
-use boss_execution_contracts::{
     AutomationPreemptor, ExecutionStartedHook, NoopAutomationPreemptor, NoopExecutionStartedHook, PreemptOutcome,
 };
 
@@ -97,11 +89,6 @@ enum PreemptionAttempt {
     Preempted { claimed: Option<String> },
 }
 
-#[cfg(not(test))]
-use boss_execution_contracts::{
-    DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_REVIEW_POOL_SIZE, MAX_WORKER_POOL_SIZE,
-};
-#[cfg(test)]
 pub use boss_execution_contracts::{
     DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_REVIEW_POOL_SIZE, MAX_WORKER_POOL_SIZE, WORKER_PAGE_COUNT,
     WORKER_PAGE_SIZE,
@@ -173,7 +160,7 @@ pub const MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO: usize = 2;
 /// already has [`MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO`] lease calls
 /// in flight. Distinct from the interactive-cap wording: these rows are
 /// not waiting for a worker slot.
-pub(crate) const WAITING_FOR_WORKSPACE_REASON: &str = "Waiting for a workspace";
+pub const WAITING_FOR_WORKSPACE_REASON: &str = "Waiting for a workspace";
 
 use boss_engine_storage_values::pool_policy::{AUTOMATION_WORKER_ID_PREFIX, REVIEW_WORKER_ID_PREFIX};
 
@@ -181,8 +168,7 @@ use boss_engine_storage_values::pool_policy::{AUTOMATION_WORKER_ID_PREFIX, REVIE
 /// reviews a worker's PR read-only and always routes to the dedicated review
 /// pool. Re-exported from `boss_protocol` so routing and the (future)
 /// completion handler share one source of truth.
-#[cfg(test)]
-pub(crate) use boss_protocol::EXECUTION_KIND_PR_REVIEW;
+pub use boss_protocol::EXECUTION_KIND_PR_REVIEW;
 
 /// Outer bound on how long the engine waits for a single
 /// `cube workspace lease` invocation before declaring the attempt a
@@ -227,7 +213,7 @@ const MAX_INFLIGHT_DISPATCHES: usize = MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POO
 /// before a pre-start failure surfaces to the operator.
 ///
 /// This is a genuinely different seam from
-/// [`crate::automation_scheduler::AUTOMATION_RETRY_HOLD_MAX_SECS`] (~3600s
+/// `boss_engine::automation_scheduler::AUTOMATION_RETRY_HOLD_MAX_SECS` (~3600s
 /// budget), not a duplicate: this one is keyed on
 /// `work_executions.pre_start_failure_count` / `dispatch_not_before` and
 /// requires an execution row to already exist, whereas the scheduler's
@@ -243,7 +229,7 @@ const PRE_START_RETRY_DELAYS: [Duration; 3] =
 
 /// User-visible interactive-cap hold text. Lease-pending slots are
 /// never called "working".
-pub(crate) fn interactive_cap_wait_reason(working: usize, lease_pending: usize) -> String {
+pub fn interactive_cap_wait_reason(working: usize, lease_pending: usize) -> String {
     if lease_pending == 0 {
         format!("Waiting for an available worker ({working} working)")
     } else {
@@ -253,7 +239,7 @@ pub(crate) fn interactive_cap_wait_reason(working: usize, lease_pending: usize) 
 
 /// How often `run_execution`'s [`HeartbeatGuard`] re-stamps the cube
 /// lease expiry. Cube's `DEFAULT_LEASE_TTL_SECS` (and the engine's
-/// matching [`crate::cube_lease_heartbeat::LEASE_TTL_SECS`]) is 24 hours,
+/// matching `boss_engine::cube_lease_heartbeat::LEASE_TTL_SECS`) is 24 hours,
 /// so a 5-minute cadence renews far more often than needed within one
 /// TTL window — generous enough that many consecutive failed beats
 /// (e.g., a transient cube subprocess failure) don't put the lease at
@@ -331,15 +317,15 @@ enum ChainHold {
 /// single beat for a pane worker. That was the accurate root cause of
 /// the recurrence: the guard existed but was dropped before it could
 /// cover the pane worker's lifetime. The complementary fix is the
-/// engine-wide periodic sweep in `crate::cube_lease_heartbeat`, which
+/// engine-wide periodic sweep in `boss_engine::cube_lease_heartbeat`, which
 /// covers pane workers via the live-worker registry and a DB-fallback
 /// path for the post-restart gap.
-struct HeartbeatGuard {
+pub struct HeartbeatGuard {
     handle: tokio::task::JoinHandle<()>,
 }
 
 impl HeartbeatGuard {
-    fn spawn(
+    pub fn spawn(
         host_adapter: Arc<dyn HostAdapter>,
         lease_id: String,
         execution_id: String,
@@ -360,7 +346,7 @@ impl HeartbeatGuard {
     /// interval (e.g., 50 ms) so they can exercise multiple beats
     /// without depending on tokio's paused-time API. Production
     /// callers go through [`Self::spawn`].
-    fn spawn_with_interval(
+    pub fn spawn_with_interval(
         host_adapter: Arc<dyn HostAdapter>,
         lease_id: String,
         execution_id: String,
@@ -417,24 +403,17 @@ impl Drop for HeartbeatGuard {
     }
 }
 
-#[cfg(test)]
 pub use boss_host_execution::types::{
     CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
 };
-#[cfg(not(test))]
-use boss_host_execution::types::{CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease};
 
-#[cfg(test)]
 pub use boss_execution_contracts::{CubeClient, RebaseOutcome};
 
-#[cfg(test)]
 pub use boss_execution_contracts::{
     PoolDispatchPolicy, WorkerClaim, WorkerPool, WorkerPoolOccupancy, kind_always_dispatches_on_pool_driver,
     pool_dispatch_policy_for_worker_id, pool_driver_slug_for_execution_kind, slot_id_from_worker_id,
     worker_id_for_slot, worker_page_label,
 };
-#[cfg(not(test))]
-use boss_execution_contracts::{WorkerPool, slot_id_from_worker_id, worker_id_for_slot, worker_page_label};
 
 /// If `err` is (transitively) a `SlotBusy` app-error from the spawn
 /// flow, return the run id the app reported as occupying the slot
@@ -447,19 +426,15 @@ use boss_execution_contracts::{WorkerPool, slot_id_from_worker_id, worker_id_for
 /// the concrete `EngineToAppError` is not the outermost type — this
 /// walks the anyhow source chain rather than downcasting `err`
 /// directly, which would only ever match the context wrapper.
-fn slot_busy_occupant(err: &anyhow::Error) -> Option<Option<String>> {
+pub fn slot_busy_occupant(err: &anyhow::Error) -> Option<Option<String>> {
     match err.chain().find_map(|cause| cause.downcast_ref::<EngineToAppError>()) {
         Some(EngineToAppError::SlotBusy { occupying_run_id }) => Some(occupying_run_id.clone()),
         _ => None,
     }
 }
 
-#[cfg(test)]
 pub use boss_execution_contracts::{ExecutionPublisher, NoopExecutionPublisher};
-#[cfg(not(test))]
-use boss_execution_contracts::{ExecutionPublisher, NoopExecutionPublisher};
 
-#[cfg(test)]
 pub use boss_execution_contracts::RevisionSource;
 
 /// Lease-time occupancy guard (defect 3). Given the workspace cube just
@@ -505,19 +480,15 @@ fn default_coordinator_metrics(lifecycle: &dyn LifecycleServices) -> Arc<Registr
     metrics
 }
 
-#[cfg(test)]
 pub use boss_execution_contracts::{
-    DispatchAdmission, DispatchHold, DispatchPause, DispatchPauseOrigin, SetConcurrencyCapOutcome,
-};
-#[cfg(not(test))]
-use boss_execution_contracts::{
     DispatchAdmission, DispatchHold, DispatchPause, DispatchPauseOrigin, SetConcurrencyCapOutcome,
 };
 
 #[derive(bon::Builder)]
 #[builder(on(String, into), finish_fn(name = build_inner, vis = ""))]
 pub struct ExecutionCoordinator {
-    work_db: Arc<WorkDb>,
+    #[doc(hidden)]
+    pub work_db: Arc<WorkDb>,
     worker_pool: WorkerPool,
     /// Dedicated pool for automation triage and automation-produced task
     /// executions. Sized independently from the main pool (default 3) so
@@ -533,12 +504,13 @@ pub struct ExecutionCoordinator {
     /// The local-host adapter. Retained as the `local` special case and
     /// the backing adapter for the default provider; the dispatch loop
     /// resolves the per-execution adapter through `host_adapter_provider`.
-    host_adapter: Arc<dyn HostAdapter>,
+    #[doc(hidden)]
+    pub host_adapter: Arc<dyn HostAdapter>,
     /// Builds the right [`HostAdapter`] for the host the scheduler selects
     /// (local vs SSH-remote). Defaults to [`LocalHostAdapterProvider`]
     /// (every host → the local adapter), which preserves the historical
     /// local-only behaviour; production installs an
-    /// [`crate::host_adapter::SshHostAdapterProvider`] via
+    /// `boss_engine::host_adapter::SshHostAdapterProvider` via
     /// [`Self::set_host_adapter_provider`].
     host_adapter_provider: Arc<dyn HostAdapterProvider>,
     remote_pane_releaser: Option<Arc<dyn WorkerPaneReleaser>>,
@@ -567,7 +539,8 @@ pub struct ExecutionCoordinator {
     /// concurrent hand-off it no longer is, and the guards union it with this
     /// registry to stay correct. See [`crate::dispatch_inflight`].
     #[builder(default)]
-    inflight_dispatches: InflightDispatches,
+    #[doc(hidden)]
+    pub inflight_dispatches: InflightDispatches,
     /// Permits bounding concurrent handed-off dispatch tails to
     /// [`MAX_INFLIGHT_DISPATCHES`].
     #[builder(default = Arc::new(Semaphore::new(MAX_INFLIGHT_DISPATCHES)))]
@@ -576,7 +549,8 @@ pub struct ExecutionCoordinator {
     /// without spawning when this is already set; the alive scheduler
     /// is responsible for noticing the wakeup via `scheduling_pending`.
     #[builder(default)]
-    scheduling_active: AtomicBool,
+    #[doc(hidden)]
+    pub scheduling_active: AtomicBool,
     /// Wakeup flag set by every `kick()` (whether or not it spawned a
     /// fresh scheduler). The running scheduler reads + resets this on
     /// each outer iteration so that a kick which arrived during the
@@ -586,17 +560,19 @@ pub struct ExecutionCoordinator {
     /// TOCTOU between "queue saw empty" and "active=false" that left
     /// fresh `ready` executions stranded with no scheduler running.
     #[builder(default)]
-    scheduling_pending: AtomicBool,
+    #[doc(hidden)]
+    pub scheduling_pending: AtomicBool,
     /// Engine event bus. `kick()` publishes `Event::DispatchReady` onto it
     /// when [`Self::enable_dispatch_ready_bus`] is on; otherwise it goes
     /// unused. Defaults to a fresh, subscriber-less bus so every existing
     /// constructor and test needs no changes — publishing to a bus with no
     /// subscribers is simply a no-op fan-out.
     #[builder(default = Arc::new(EventBus::new()))]
-    event_bus: Arc<EventBus>,
+    #[doc(hidden)]
+    pub event_bus: Arc<EventBus>,
     /// Kill-switch for routing `kick()` through [`Self::event_bus`] instead
     /// of latching `scheduling_pending`/`scheduling_active` directly. OFF by
-    /// default — see [`crate::config::DEFAULT_ENABLE_DISPATCH_READY_BUS`].
+    /// default — see `boss_engine::config::DEFAULT_ENABLE_DISPATCH_READY_BUS`.
     /// Seeded once at construction from `WorkConfig::enable_dispatch_ready_bus`
     /// via [`Self::set_enable_dispatch_ready_bus`] (a boot-time setting, not a
     /// live-toggle — unlike `dispatch_paused`, nothing flips this after
@@ -623,8 +599,8 @@ pub struct ExecutionCoordinator {
     /// high-overlap `merge_order` sibling pair. `0` (the default) disables the
     /// stagger — the non-blocking `merge_order` relation still sequences merges,
     /// but no dispatch offset is applied. Seeded from
-    /// [`crate::config::WorkConfig::merge_order_stagger_secs`] (already clamped
-    /// to [`crate::config::MAX_MERGE_ORDER_STAGGER_SECS`]) at construction.
+    /// `boss_engine::config::WorkConfig::merge_order_stagger_secs` (already clamped
+    /// to `boss_engine::config::MAX_MERGE_ORDER_STAGGER_SECS`) at construction.
     #[builder(default)]
     merge_order_stagger_secs: u64,
     /// Engine-wide counter registry. Builder finalization registers the
@@ -725,7 +701,8 @@ pub struct ExecutionCoordinator {
     /// bind to another execution — but it does mean this map is not
     /// guaranteed empty for every terminal execution.
     #[builder(default)]
-    requested_host_ids: std::sync::Mutex<HashMap<String, String>>,
+    #[doc(hidden)]
+    pub requested_host_ids: std::sync::Mutex<HashMap<String, String>>,
     /// Startup capability gate for the local tmux runtime. Unlike the
     /// operator/breaker pause state this is not user-resumable: a worker
     /// cannot be dispatched until the engine has recorded a passing probe.
@@ -738,7 +715,7 @@ pub struct ExecutionCoordinator {
     /// every execution instead of failing it with "driver discovery has
     /// not run". Distinct from `dispatch_preflight_block_reason` so lifting
     /// this hold can never lift a failed tmux preflight. See
-    /// [`crate::host_registry::refresh_local_host_auto_capabilities`].
+    /// `boss_engine::host_registry::refresh_local_host_auto_capabilities`.
     #[builder(default)]
     local_capability_discovery_pending: AtomicBool,
     /// `true` from engine startup until tmux adoption and the boot-only
@@ -752,7 +729,7 @@ pub struct ExecutionCoordinator {
     /// Global automation-pause flag — independent of `dispatch_paused`. When
     /// `true`: `drain_ready_queue` holds every execution bound for the
     /// automation pool (see [`Self::execution_targets_automation_pool`]),
-    /// and [`crate::automation_triage::EngineTriageDispatcher::fire`] refuses
+    /// and `boss_engine::automation_triage::EngineTriageDispatcher::fire` refuses
     /// to start a new triage pass (both the scheduler's and `boss automation
     /// run`'s fire path go through that one seam). Already-claimed automation
     /// workers are unaffected. Seeded from the `automation_paused` metadata
@@ -813,7 +790,7 @@ pub struct ExecutionCoordinator {
     /// This is keyed to the **state transition**, deliberately not to any
     /// caller: every pauser — the `Set*Paused` RPC handlers, the
     /// spawn-capability circuit breaker
-    /// ([`crate::spawn_health::trip_spawn_capability_circuit`]), or any
+    /// (`boss_engine::spawn_health::trip_spawn_capability_circuit`), or any
     /// future programmatic one — is observed by construction and none of
     /// them needs to fire a notification itself. See
     /// `ServerState::spawn_pause_state_health_broadcaster`.
@@ -828,7 +805,7 @@ pub struct ExecutionCoordinator {
     /// Consecutive pre-start spawn failures per (driver, worker kind), fed
     /// by both arms of [`Self::run_execution`]'s spawn outcome and read by
     /// the engine health report. Visibility only — nothing in dispatch
-    /// consults it. See [`crate::pre_start_streak`].
+    /// consults it. See `boss_engine::pre_start_streak`.
     #[builder(default)]
     pre_start_streaks: Arc<PreStartStreakTracker>,
     /// Per-repo bound on concurrent cube workspace-lease attempts. Drain
@@ -838,7 +815,8 @@ pub struct ExecutionCoordinator {
     /// because [`lease_limiter::RepoLeaseLimiter`] is crate-private; tests
     /// override via [`Self::with_max_concurrent_leases_per_repo`].
     #[builder(skip = lease_limiter::RepoLeaseLimiter::new(MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO))]
-    repo_lease_limiter: lease_limiter::RepoLeaseLimiter,
+    #[doc(hidden)]
+    pub repo_lease_limiter: lease_limiter::RepoLeaseLimiter,
     /// Outer bound on a single `cube workspace lease` invocation. Defaults
     /// to [`CUBE_LEASE_TIMEOUT`]. Tests override via
     /// [`Self::with_cube_lease_timeout`] so a hang can fire without waiting
@@ -1020,7 +998,7 @@ fn pick_worst_failing_check(failed_checks_json: &str) -> Option<FailedCheckJson>
 /// fresh scheduler anyway, and we only re-loop here when
 /// `scheduling_pending` was raised after we started this drain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DrainOutcome {
+pub enum DrainOutcome {
     /// No more `ready` rows in the database.
     QueueEmpty,
     /// Found a `ready` row but the worker pool had no idle slot;
@@ -1060,7 +1038,7 @@ fn execution_change_title(execution: &WorkExecution, work_item: &WorkItem) -> St
 /// into `~/.local/share/cube/workspaces`; once they run
 /// `cube repo add` the next probe sees customised fields and the item
 /// no longer surfaces.
-fn repo_has_default_pool_config(repo: &CubeRepoSummary) -> bool {
+pub fn repo_has_default_pool_config(repo: &CubeRepoSummary) -> bool {
     if repo.main_branch != "main" {
         return false;
     }
@@ -1117,8 +1095,7 @@ fn cold_repo_attention_body(repo: &CubeRepoSummary) -> String {
 }
 
 #[cfg(test)]
-#[path = "coordinator_tests/mod.rs"]
-mod tests;
+mod unit_tests;
 
 impl<S: execution_coordinator_builder::IsComplete> ExecutionCoordinatorBuilder<S> {
     /// Register lifecycle metrics before exposing the completed coordinator.

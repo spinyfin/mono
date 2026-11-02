@@ -95,7 +95,7 @@ impl ExecutionCoordinator {
 
     /// Seed the bounded `merge_order` dispatch-stagger window (seconds).
     /// `app.rs` calls this with the (already-clamped)
-    /// [`crate::config::WorkConfig::merge_order_stagger_secs`]; `0` disables
+    /// `boss_engine::config::WorkConfig::merge_order_stagger_secs`; `0` disables
     /// the stagger. Tests set it directly to exercise the deferral.
     pub fn set_merge_order_stagger_secs(&mut self, secs: u64) {
         self.merge_order_stagger_secs = secs;
@@ -108,7 +108,7 @@ impl ExecutionCoordinator {
     }
 
     /// The local-host adapter. `app.rs` reads this to seed the production
-    /// [`crate::host_adapter::SshHostAdapterProvider`] (which returns it
+    /// `boss_engine::host_adapter::SshHostAdapterProvider` (which returns it
     /// verbatim for `host_id = "local"`).
     pub fn host_adapter(&self) -> Arc<dyn HostAdapter> {
         Arc::clone(&self.host_adapter)
@@ -158,7 +158,7 @@ impl ExecutionCoordinator {
     ///
     /// Exposed so lease bookkeeping that runs OUTSIDE the dispatch loop can
     /// reach the same per-host cube the dispatch loop leased with — notably
-    /// [`crate::cube_lease_heartbeat::HostRoutedCubes`], which must beat a
+    /// `boss_engine::cube_lease_heartbeat::HostRoutedCubes`, which must beat a
     /// remote lease against the remote cube that issued it rather than the
     /// engine's own. Read only after `app.rs` has installed the SSH-capable
     /// provider; a caller that reads it earlier gets the local-only default,
@@ -197,7 +197,7 @@ impl ExecutionCoordinator {
     /// Re-establish reverse events forwards for every detached remote run
     /// after an engine restart. Thin binding of the coordinator's
     /// `work_db` + host-adapter provider to
-    /// [`crate::remote_reattach::reattach_remote_runs`]; `app.rs` calls
+    /// `boss_engine::remote_reattach::reattach_remote_runs`; `app.rs` calls
     /// this once at startup so a remote worker that outlived the previous
     /// engine has its hook stream (and eventual completion) routed back.
     pub async fn reattach_remote_runs(&self, engine_events_socket: &str) -> boss_execution_contracts::ReattachSummary {
@@ -215,7 +215,7 @@ impl ExecutionCoordinator {
     /// scheduler if anything was reaped (a cleared remote zombie unblocks
     /// the redundant-spawn guard for its work item). Thin binding of the
     /// coordinator's `work_db` + host-adapter provider + dispatch-event
-    /// sink to [`crate::remote_lease_reconcile::reconcile_remote_leases`];
+    /// sink to `boss_engine::remote_lease_reconcile::reconcile_remote_leases`;
     /// the periodic sweep in `app.rs` drives it.
     pub async fn reconcile_remote_leases_once(
         self: &Arc<Self>,
@@ -352,7 +352,7 @@ impl ExecutionCoordinator {
     /// there must be exactly one `EventBus` per engine process so every
     /// producer and subscriber — this coordinator's `kick()`/
     /// `spawn_dispatch_ready_subscriber`, and any future producer wired
-    /// through `crate::event_publish::commit_and_publish` — reaches the same
+    /// through `boss_engine::event_publish::commit_and_publish` — reaches the same
     /// fan-out. `app.rs` calls this once at construction with the single
     /// `Arc<EventBus>` it also hands to `ServerState`. Left unset, the
     /// coordinator keeps its private `EventBus::new()` default, which is
@@ -364,7 +364,7 @@ impl ExecutionCoordinator {
 
     /// The coordinator's `EventBus`, per the design doc's "one engine
     /// process, one bus" invariant. A future producer living outside the
-    /// coordinator (e.g. a `crate::event_publish::commit_and_publish` call
+    /// coordinator (e.g. a `boss_engine::event_publish::commit_and_publish` call
     /// site in another module) reaches the same bus `kick()` and
     /// `spawn_dispatch_ready_subscriber` use through
     /// `server_state.execution_coordinator.event_bus()`, rather than
@@ -372,7 +372,7 @@ impl ExecutionCoordinator {
     /// also uses this to log the subscriber count once the dispatch-ready
     /// subscriber has attached, as a boot-time sanity check that the
     /// injected bus in [`Self::set_event_bus`] is actually the one wired up.
-    pub(crate) fn event_bus(&self) -> &Arc<EventBus> {
+    pub fn event_bus(&self) -> &Arc<EventBus> {
         &self.event_bus
     }
 
@@ -388,10 +388,10 @@ impl ExecutionCoordinator {
     /// The live per-slot worker registry, when [`Self::set_live_worker_states`]
     /// has wired one up. `None` in tests that don't install it — callers must
     /// treat that as "no corroborating signal available", never as "worker is
-    /// dead": [`crate::durable_liveness::corroborate_against_live_registry`]
-    /// and its callers ([`crate::dead_pane_sweep`], [`crate::orphan_sweep`]'s
+    /// dead": `boss_engine::durable_liveness::corroborate_against_live_registry`
+    /// and its callers (`boss_engine::dead_pane_sweep`, `boss_engine::orphan_sweep`'s
     /// redispatch guard) already fail open (trust the raw pid probe) on `None`.
-    pub(crate) fn live_worker_states(&self) -> Option<&dyn LiveWorkerLiveness> {
+    pub fn live_worker_states(&self) -> Option<&dyn LiveWorkerLiveness> {
         self.live_worker_states.as_deref()
     }
 
@@ -654,7 +654,7 @@ impl ExecutionCoordinator {
     ///   The review exclusion is the fix for the incident's actual damage:
     ///   the canary's death records another terminal execution against its
     ///   work item, and for a `pr_review` that feeds
-    ///   [`crate::pr_review_recovery`]'s churn guard, which parks the item
+    ///   `boss_engine::pr_review_recovery`'s churn guard, which parks the item
     ///   and leaves an open PR permanently unreviewed. It is also what makes
     ///   `reviews: held` true — a breaker pause that spent reviews as
     ///   canaries was not holding them.
@@ -883,7 +883,7 @@ impl ExecutionCoordinator {
     /// The per-(driver, worker kind) pre-start failure streak tracker. The
     /// engine health report reads its active alerts, and
     /// `ServerState::spawn_spawn_streak_health_broadcaster` subscribes to
-    /// its changes. See [`crate::pre_start_streak`].
+    /// its changes. See `boss_engine::pre_start_streak`.
     pub fn pre_start_streaks(&self) -> &Arc<PreStartStreakTracker> {
         &self.pre_start_streaks
     }
@@ -952,7 +952,8 @@ impl ExecutionCoordinator {
     /// automation pool. Regular task executions route to the automation pool
     /// when the owning task has `source_automation_id IS NOT NULL` (it was
     /// produced by an automation). All other executions go to the main pool.
-    pub(super) fn pool_for_execution<'a>(&'a self, execution: &WorkExecution) -> &'a WorkerPool {
+    #[doc(hidden)]
+    pub fn pool_for_execution<'a>(&'a self, execution: &WorkExecution) -> &'a WorkerPool {
         match self.dispatch_pool_for(execution) {
             boss_protocol::DispatchPool::Review => &self.review_pool,
             boss_protocol::DispatchPool::Automation => &self.automation_pool,
@@ -967,7 +968,7 @@ impl ExecutionCoordinator {
     /// pool and pause rules as reviews rather than the automation pool.
     ///
     /// `pub` rather than `pub(super)` because [`Self::dispatch_hold_for`] and
-    /// [`crate::spawn_health::maybe_admit_recovery_probe`] must agree exactly
+    /// `boss_engine::spawn_health::maybe_admit_recovery_probe` must agree exactly
     /// on what counts as a review: the gate refuses a review canary, and the
     /// probe skips review rows so it never wastes its turn being refused.
     /// Two independent notions of "is this a review" is precisely the drift

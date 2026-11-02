@@ -16,49 +16,49 @@
 
 use crate::metrics::Registry;
 
-crate::register_gauge!(
+boss_metrics::register_gauge!(
     DISPATCH_QUEUE_DEPTH_MAIN,
     "dispatch.queue_depth.main",
     "Number of `ready` executions targeting the main pool, sampled at the start of the most recent drain pass.",
 );
-crate::register_gauge!(
+boss_metrics::register_gauge!(
     DISPATCH_QUEUE_DEPTH_AUTOMATION,
     "dispatch.queue_depth.automation",
     "Number of `ready` executions targeting the automation pool, sampled at the start of the most recent drain pass.",
 );
-crate::register_gauge!(
+boss_metrics::register_gauge!(
     DISPATCH_QUEUE_DEPTH_REVIEW,
     "dispatch.queue_depth.review",
     "Number of `ready` executions targeting the review pool, sampled at the start of the most recent drain pass.",
 );
-crate::register_gauge!(
+boss_metrics::register_gauge!(
     DISPATCH_QUEUE_OLDEST_WAIT_SECONDS_MAIN,
     "dispatch.queue_oldest_wait_seconds.main",
     "Age in seconds (by created_at) of the oldest ready main-pool execution, sampled at the start of the most recent drain pass.",
 );
-crate::register_gauge!(
+boss_metrics::register_gauge!(
     DISPATCH_QUEUE_OLDEST_WAIT_SECONDS_AUTOMATION,
     "dispatch.queue_oldest_wait_seconds.automation",
     "Age in seconds (by created_at) of the oldest ready automation-pool execution, sampled at the start of the most recent drain pass.",
 );
-crate::register_gauge!(
+boss_metrics::register_gauge!(
     DISPATCH_QUEUE_OLDEST_WAIT_SECONDS_REVIEW,
     "dispatch.queue_oldest_wait_seconds.review",
     "Age in seconds (by created_at) of the oldest ready review-pool execution, sampled at the start of the most recent drain pass.",
 );
-crate::register_counter!(
+boss_metrics::register_counter!(
     DISPATCH_COMPLETED,
     "dispatch.completed",
     "Total executions that claimed a worker slot (WorkerClaimed ok) since engine start; rate over a window gives the dispatch rate.",
 );
-crate::register_gauge!(
+boss_metrics::register_gauge!(
     DISPATCH_DRAIN_PASS_DURATION_MS,
     "dispatch.drain_pass_duration_ms",
     "Wall-clock duration in milliseconds of the most recently completed drain_ready_queue pass.",
 );
 
 /// Register every handle this module declares. Called from
-/// [`crate::metrics_init::init_all`] at engine startup.
+/// `boss_engine::metrics_init::init_all` at engine startup.
 pub fn register_metrics(registry: &Registry) {
     registry.register_gauge(&DISPATCH_QUEUE_DEPTH_MAIN);
     registry.register_gauge(&DISPATCH_QUEUE_DEPTH_AUTOMATION);

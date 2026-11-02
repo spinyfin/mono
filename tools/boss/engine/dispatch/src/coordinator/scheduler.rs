@@ -40,7 +40,8 @@ impl ExecutionCoordinator {
     /// `kick_during_active_scheduler_latches_pending_wakeup` /
     /// `dispatch_ready_event_during_active_scheduler_latches_pending_wakeup`
     /// for the pinning regression tests on each path.
-    pub(super) fn note_dispatch_ready(self: &Arc<Self>) {
+    #[doc(hidden)]
+    pub fn note_dispatch_ready(self: &Arc<Self>) {
         // Order matters: `scheduling_pending` must be written BEFORE we
         // contend on `scheduling_active`. If we lose the swap race
         // (another scheduler is already running) the alive scheduler
@@ -216,7 +217,8 @@ impl ExecutionCoordinator {
     /// milliseconds. Used by [`spawn_scheduler_heartbeat`] to surface
     /// stranded rows; kept as a separate method so the heartbeat path
     /// is testable without involving any timers.
-    pub(super) fn stranded_ready_executions(&self, ready: &[WorkExecution], min_age_ms: u64) -> Vec<(String, u64)> {
+    #[doc(hidden)]
+    pub fn stranded_ready_executions(&self, ready: &[WorkExecution], min_age_ms: u64) -> Vec<(String, u64)> {
         let now_secs = boss_engine_utils::epoch_time::now_epoch_secs() as u64;
         let cutoff_ms = min_age_ms;
         ready
@@ -250,7 +252,8 @@ impl ExecutionCoordinator {
     /// attention per overdue answer-agent execution. This deliberately does
     /// not reuse or filter the generic heartbeat warning: generic stuck-row
     /// telemetry has a distinct diagnostic purpose and must remain intact.
-    pub(super) fn raise_ready_answer_agent_alarms(&self, ready: &[WorkExecution], threshold: Duration) {
+    #[doc(hidden)]
+    pub fn raise_ready_answer_agent_alarms(&self, ready: &[WorkExecution], threshold: Duration) {
         let now_secs = boss_engine_utils::epoch_time::now_epoch_secs() as u64;
         let threshold_ms = threshold.as_millis() as u64;
         for execution in ready
@@ -531,9 +534,9 @@ impl ExecutionCoordinator {
     /// treating it as blocking (see the "Liveness gate" comment there); this
     /// applies the identical reconciliation to the *cross-work-item* chain
     /// sibling this guard inspects, using the same two positive-evidence
-    /// checks: [`crate::lost_workspace_sweep::reconcile_if_execution_dead`]
+    /// checks: `boss_engine::lost_workspace_sweep::reconcile_if_execution_dead`
     /// (cube workspace directory gone, pane pid dead, or pane never attached) and
-    /// [`crate::dead_pane_sweep::reconcile_if_pane_dead`] (durable shell pid
+    /// `boss_engine::dead_pane_sweep::reconcile_if_pane_dead` (durable shell pid
     /// is `ESRCH`). Both only ever act on positive evidence of death, so
     /// this can only ever *unblock* a wrongly-serialized dispatch — it can
     /// never falsely treat a genuinely live sibling as dead.
@@ -645,7 +648,7 @@ impl ExecutionCoordinator {
     ///
     /// Rationale: a review execution is strictly read-only — never writes,
     /// commits, or pushes (enforced by the reviewer CLAUDE.md, its tool
-    /// denylist, and its prompt mandate; see `crate::pr_review` module
+    /// denylist, and its prompt mandate; see `boss_engine::pr_review` module
     /// docs) — so it cannot participate in the writer-vs-writer
     /// two-concurrent-writers-to-one-PR hazard this guard exists to prevent
     /// (two *writers* rebasing/rewriting each other's commits on the shared
@@ -947,7 +950,8 @@ impl ExecutionCoordinator {
     /// mainline arrivals cannot cascade into wiping out every spilled
     /// automation run at once. See [`crate::dispatch_spillover`] for the
     /// policy and its rationale.
-    pub(super) async fn drain_ready_queue(self: &Arc<Self>) -> DrainOutcome {
+    #[doc(hidden)]
+    pub async fn drain_ready_queue(self: &Arc<Self>) -> DrainOutcome {
         if let Some(reason) = self.dispatch_preflight_block_reason() {
             // A probe still in flight is the expected first seconds of every
             // boot, not a failure; a failed runtime preflight is.
@@ -1967,7 +1971,7 @@ impl ExecutionCoordinator {
     /// [`PreemptOutcome::MidSpawn`] or [`PreemptOutcome::Failed`] we
     /// abandon the whole preemption having changed nothing, leaving the
     /// victim to run to completion normally. Cancelling first and
-    /// releasing second (the shape [`crate::completion::WorkerCompletionHandler::cancel_and_release`]
+    /// releasing second (the shape `boss_engine::completion::WorkerCompletionHandler::cancel_and_release`
     /// uses, where teardown failure is recoverable) would instead strand
     /// a cancelled-but-still-alive worker here.
     async fn try_preempt_automation_for(self: &Arc<Self>, execution: &WorkExecution) -> PreemptionAttempt {
@@ -2524,7 +2528,8 @@ impl ExecutionCoordinator {
     /// where they could not — historically because the reconciler had
     /// flipped the row to `waiting_dependency` and the Ready guard
     /// rejected the write, leaving the orphan sweeper as the only recovery.
-    pub(super) async fn recover_failed_dispatch(
+    #[doc(hidden)]
+    pub async fn recover_failed_dispatch(
         self: &Arc<Self>,
         execution: &WorkExecution,
         worker_id: &str,

@@ -6,11 +6,11 @@ use boss_engine_recovery::execution_bookmark::{
 
 /// What dispatch recovered into the new lease.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Recovered {
-    pub(crate) predecessor: String,
-    pub(crate) has_work: bool,
+pub struct Recovered {
+    pub predecessor: String,
+    pub has_work: bool,
     /// Set when the predecessor's pointers had to be re-anchored first.
-    pub(crate) reconciliation: Option<Reconciliation>,
+    pub reconciliation: Option<Reconciliation>,
 }
 
 /// Outcome of inspecting a recovery source's pointers.
@@ -42,7 +42,8 @@ impl ExecutionCoordinator {
     /// (a revision's bound PR, or the task's own open PR), used only to name
     /// the `pr/<n>` bookmark cube writes when damaged pointers must be
     /// re-anchored; a verified PR anchor also controls positioning.
-    pub(super) async fn recover_execution_bookmark(
+    #[doc(hidden)]
+    pub async fn recover_execution_bookmark(
         &self,
         execution: &WorkExecution,
         lease: &CubeWorkspaceLease,
@@ -447,7 +448,7 @@ impl ExecutionCoordinator {
             .await;
     }
 
-    pub(crate) async fn inspect_execution_bookmark(
+    pub async fn inspect_execution_bookmark(
         &self,
         record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark,
     ) -> Result<String> {
@@ -464,7 +465,7 @@ impl ExecutionCoordinator {
 
     /// Forget a finished execution's pointers once `vouchers` prove its
     /// work published, on whichever host holds the record.
-    pub(crate) async fn prune_execution_bookmark(
+    pub async fn prune_execution_bookmark(
         &self,
         record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark,
         vouchers: &[boss_engine_recovery::execution_bookmark::Voucher],
@@ -483,7 +484,7 @@ impl ExecutionCoordinator {
 
     /// The main branch cube records for `repo_id` on `host_id`, when the
     /// repo is registered there.
-    pub(crate) async fn recovery_trunk(&self, host_id: &str, repo_id: &str) -> Result<Option<String>> {
+    pub async fn recovery_trunk(&self, host_id: &str, repo_id: &str) -> Result<Option<String>> {
         let host = self
             .work_db
             .get_host(host_id)?

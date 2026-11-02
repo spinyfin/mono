@@ -52,7 +52,6 @@ pub mod conflict_ladder;
 pub mod conflict_remediation;
 pub mod conflict_stop_gate;
 pub mod conflict_watch;
-pub mod coordinator;
 pub(crate) mod coordinator_guidance;
 pub(crate) mod coordinator_handoff;
 pub(crate) mod coordinator_tmux;
@@ -71,14 +70,17 @@ pub mod design_detector;
 mod offsite_runtime;
 pub use boss_deterministic_resolvers as deterministic_resolvers;
 pub use boss_dispatch_events as dispatch_events;
+// The dispatch coordinator lives in its own crate; alias it under the module
+// paths the engine has always used it by.
+pub use boss_engine_dispatch::{coordinator, dispatch_inflight, dispatch_metrics};
 pub mod attachment_retention_sweep;
 pub mod attachment_server;
 pub mod codex_guard_trace;
 pub mod codex_home_retention_sweep;
 pub mod codex_unobserved_command;
+#[cfg(test)]
+mod coordinator_tests;
 pub mod dispatch_failure_recovery_sweep;
-pub mod dispatch_inflight;
-pub mod dispatch_metrics;
 pub mod driver_teardown;
 pub mod driver_transcript;
 pub mod durable_liveness;
@@ -88,7 +90,6 @@ pub use boss_dispatch_reader as dispatch_reader;
 pub use boss_engine_attachments as attachments;
 pub use boss_engine_codex_rollout_retention as codex_rollout_retention;
 pub use boss_engine_grok_home_retention as grok_home_retention;
-pub(crate) mod dispatch_spillover;
 pub mod dispatch_stall_escalation;
 pub use boss_editorial as editorial;
 pub use boss_engine_driver as driver;

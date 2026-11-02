@@ -13,6 +13,7 @@ rust_library(
         "//tools/boss/engine/attachments:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/day-rotated-log:__pkg__",
+        "//tools/boss/engine/dispatch:__pkg__",
         "//tools/boss/engine/dispatch-reader:__pkg__",
         "//tools/boss/engine/driver-quota:__pkg__",
         "//tools/boss/engine/event-bus:__pkg__",

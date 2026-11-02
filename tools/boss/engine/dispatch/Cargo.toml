@@ -1,0 +1,38 @@
+[package]
+name = "boss-engine-dispatch"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[features]
+# Re-exports the contract and host types the engine's integration suite
+# reaches through this crate. Always on under `cfg(test)`.
+test-support = []
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bon = { workspace = true }
+boss-conflict-diagnosis = { path = "../conflict-diagnosis" }
+boss-dispatch-events = { path = "../dispatch-events" }
+boss-engine-effort = { path = "../effort" }
+boss-engine-recovery = { path = "../recovery" }
+boss-engine-storage-values = { path = "../storage-values" }
+boss-engine-utils = { path = "../utils" }
+boss-event-bus = { path = "../event-bus" }
+boss-execution-contracts = { path = "../execution-contracts" }
+boss-github = { path = "../../github" }
+boss-host-execution = { path = "../host-execution" }
+boss-metrics = { path = "../metrics" }
+boss-protocol = { path = "../../protocol" }
+boss-task-scope = { path = "../task-scope" }
+boss-work-db = { path = "../work-db" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+boss-work-db = { path = "../work-db", features = ["test-support"] }
+tempfile = { workspace = true }

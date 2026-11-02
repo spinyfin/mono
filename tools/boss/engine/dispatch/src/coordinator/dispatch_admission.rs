@@ -287,7 +287,8 @@ impl ExecutionCoordinator {
             .remove(execution_id)
     }
 
-    pub(super) fn mark_requested_host(&self, execution_id: &str, host_id: String) {
+    #[doc(hidden)]
+    pub fn mark_requested_host(&self, execution_id: &str, host_id: String) {
         self.requested_host_ids
             .lock()
             .unwrap()
@@ -479,7 +480,7 @@ impl ExecutionCoordinator {
         Ok(execution)
     }
 
-    pub(crate) fn request_execution_via_db(
+    pub fn request_execution_via_db(
         &self,
         mut input: RequestExecutionInput,
         live_states: Arc<dyn LiveWorkerLiveness>,

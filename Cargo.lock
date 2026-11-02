@@ -596,6 +596,7 @@ dependencies = [
  "boss-engine-comment-classifier",
  "boss-engine-day-rotated-log",
  "boss-engine-design-docs",
+ "boss-engine-dispatch",
  "boss-engine-driver",
  "boss-engine-driver-quota",
  "boss-engine-effort",
@@ -772,6 +773,35 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "boss-engine-dispatch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bon",
+ "boss-conflict-diagnosis",
+ "boss-dispatch-events",
+ "boss-engine-effort",
+ "boss-engine-recovery",
+ "boss-engine-storage-values",
+ "boss-engine-utils",
+ "boss-event-bus",
+ "boss-execution-contracts",
+ "boss-github",
+ "boss-host-execution",
+ "boss-metrics",
+ "boss-protocol",
+ "boss-task-scope",
+ "boss-work-db",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
 ]

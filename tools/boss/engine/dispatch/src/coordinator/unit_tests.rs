@@ -1,12 +1,9 @@
-//! Unit tests for the module's free helper functions (conflict-descriptor
-//! stripping, rebase-payload parsing, live-worker occupancy, failing-check
-//! ranking).
-//!
-//! Shared fixtures live in [`super::helpers`].
+//! Unit tests for the coordinator's free helper functions (ineligibility
+//! summary, live-worker occupancy, failing-check ranking). The cube payload
+//! parsing helpers are tested beside `CommandCubeClient` in the engine.
 
-use super::super::summarize_ineligibility;
-use super::helpers::*;
-use crate::host_scheduling::{Eligibility, IneligibilityReason};
+use super::{occupying_live_worker, pick_worst_failing_check, summarize_ineligibility};
+use boss_execution_contracts::{Eligibility, IneligibilityReason};
 
 fn ineligible_host(id: &str, reasons: Vec<IneligibilityReason>) -> Eligibility {
     Eligibility {

@@ -23,14 +23,14 @@ fn pane_spawn_failed_attention_body(
         "still held by the engine (release failed — see the engine log)"
     };
     let err_detail = format!("{err:#}");
-    let lead = match crate::runner::spawn_confirmation::spawn_confirmation_error(err) {
-        Some(crate::runner::spawn_confirmation::SpawnConfirmationError::TurnDidNotStart { .. }) => {
+    let lead = match boss_execution_contracts::spawn_confirmation_error(err) {
+        Some(boss_execution_contracts::SpawnConfirmationError::TurnDidNotStart { .. }) => {
             format!(
                 "Execution `{exec_id}` leased workspace `{workspace_id}` and the driver started, \
                  but spawn confirmation failed and the pane was reaped."
             )
         }
-        Some(crate::runner::spawn_confirmation::SpawnConfirmationError::ComposerNotReady { .. }) => {
+        Some(boss_execution_contracts::SpawnConfirmationError::ComposerNotReady { .. }) => {
             format!(
                 "Execution `{exec_id}` leased workspace `{workspace_id}`: spawn confirmation failed \
                  and the pane was reaped."
@@ -64,7 +64,7 @@ impl ExecutionCoordinator {
         // fakes, ACP-style runners). For pane-spawn (the production path),
         // spawn_worker returns immediately and this guard is dropped below
         // without ever firing — pane workers are covered instead by the
-        // engine-wide periodic sweep in `crate::cube_lease_heartbeat`.
+        // engine-wide periodic sweep in `boss_engine::cube_lease_heartbeat`.
         // See the HeartbeatGuard doc comment for the full coverage split.
         let heartbeat = HeartbeatGuard::spawn(
             Arc::clone(&adapter),
@@ -1129,10 +1129,7 @@ impl ExecutionCoordinator {
     /// committed). Claims a pool slot, reconstructs the lease from the
     /// execution row, and hands off to [`Self::run_execution`] the same way
     /// a successful `schedule_execution` does after `run_started`.
-    pub(crate) async fn resume_pane_spawn_for_running_execution(
-        self: &Arc<Self>,
-        execution: &WorkExecution,
-    ) -> Result<()> {
+    pub async fn resume_pane_spawn_for_running_execution(self: &Arc<Self>, execution: &WorkExecution) -> Result<()> {
         // This path resumes an already-held live lease after an engine restart.
         // A recorded bookmark is still inspected; a missing pointer must not
         // wedge a live worker.
@@ -1243,7 +1240,7 @@ impl ExecutionCoordinator {
 #[cfg(test)]
 mod pane_spawn_failed_attention_body_tests {
     use super::pane_spawn_failed_attention_body;
-    use crate::runner::spawn_confirmation::{composer_not_ready_error, turn_did_not_start_error};
+    use boss_execution_contracts::{composer_not_ready_error, turn_did_not_start_error};
     use std::time::Duration;
 
     #[test]

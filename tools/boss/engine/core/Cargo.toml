@@ -45,6 +45,7 @@ boss-editorial = { path = "../editorial" }
 boss-engine-board-gesture = { path = "../board-gesture" }
 boss-engine-design-docs = { path = "../design-docs" }
 boss-engine-codex-rollout-retention = { path = "../codex-rollout-retention" }
+boss-engine-dispatch = { path = "../dispatch" }
 boss-engine-driver = { path = "../driver" }
 boss-engine-driver-quota = { path = "../driver-quota" }
 boss-engine-attachments = { path = "../attachments" }

@@ -1,6 +1,7 @@
 //! Worker execution implementation, isolated from engine orchestration.
 
 mod runner;
+pub use boss_execution_contracts::REVIEW_GUIDE_DRIVER;
 pub use pane_spawn::PaneSpawnRunner;
 pub use pane_spawn::{install_boss_event_to_stable_bin, resolve_boss_event_binary};
 pub use prompt::designated_output_kind;
@@ -8,7 +9,6 @@ pub use runner::{pane_spawn, work_item};
 use runner::{prompt, worker_spawn};
 pub use runner::{spawn_confirmation, spawn_launch_limits};
 pub use work_item::{task_bound_pr_url, work_item_name, work_item_task_kind};
-pub use boss_execution_contracts::REVIEW_GUIDE_DRIVER;
 pub use worker_spawn::{ComposedWorkerSpawn, WorkerSpawnOpts, compose_worker_spawn};
 
 /// Thin wrappers over crate-internal helpers so engine-level tests can drive

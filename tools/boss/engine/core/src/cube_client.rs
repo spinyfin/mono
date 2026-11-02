@@ -11,7 +11,9 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use boss_execution_contracts::{CubeClient, LifecycleServices, RebaseOutcome};
-use boss_host_execution::types::{CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus};
+use boss_host_execution::types::{
+    CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
+};
 
 use crate::config::RuntimeConfig;
 
