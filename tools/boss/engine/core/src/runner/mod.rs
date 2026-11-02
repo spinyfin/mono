@@ -1,42 +1,13 @@
-//! Execution runner.
-//!
-//! The pane-spawn [`ExecutionRunner`] and its supporting machinery, grouped
-//! into sibling modules:
-//!
-//! - [`pane_spawn`] — the [`PaneSpawnRunner`] `ExecutionRunner` impl plus the
-//!   boss-event shim install/resolve helpers.
-//! - [`spawn_launch_limits`] — ARG_MAX / MAX_ARG_STRLEN preflight.
-//! - [`spawn_confirmation`] — bounded composer-readiness and turn-start wait.
-//! - [`worker_spawn`] — worker-spawn composition ([`ComposedWorkerSpawn`],
-//!   [`compose_worker_spawn`], PR review/diff fetch).
-//! - [`prompt`] — worker prompt composition (the directive/fragment family).
-//! - [`work_item`] — [`boss_protocol::WorkItem`] accessor helpers and PR-URL extraction.
-//!
-//! This module re-exports the shared run-outcome vocabulary and the
-//! [`ExecutionRunner`] trait from execution contracts, plus the items other engine modules
-//! reach as `crate::runner::*`.
-
-use std::path::PathBuf;
-
+//! Engine bindings for the worker runner.
+pub use super::runner_adapter::PaneSpawnRunner;
 use crate::config::RuntimeConfig;
-
-mod answer_agent_prompt;
-pub(crate) mod pane_spawn;
-mod prompt;
-mod review_brief;
-mod review_guide_prompt;
-pub(crate) mod spawn_confirmation;
-pub(crate) mod spawn_launch_limits;
-pub(crate) mod work_item;
-mod worker_spawn;
-
-pub use pane_spawn::PaneSpawnRunner;
-pub(crate) use pane_spawn::{install_boss_event_to_stable_bin, resolve_boss_event_binary};
-pub(crate) use prompt::designated_output_kind;
-pub(crate) use work_item::{task_bound_pr_url, work_item_name, work_item_task_kind};
-pub(crate) use worker_spawn::{ComposedWorkerSpawn, REVIEW_GUIDE_DRIVER, WorkerSpawnOpts, compose_worker_spawn};
-
-pub use boss_execution_contracts::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
+pub(crate) use boss_execution_runner::{
+    ComposedWorkerSpawn, REVIEW_GUIDE_DRIVER, WorkerSpawnOpts, designated_output_kind,
+    install_boss_event_to_stable_bin, pane_spawn, resolve_boss_event_binary, spawn_launch_limits, task_bound_pr_url,
+    work_item_name, work_item_task_kind,
+};
+pub use boss_execution_runner::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
+use std::path::PathBuf;
 
 /// Absolute path of the events socket this engine bound — where worker hook
 /// shims connect, and the target of each remote run's reverse `ssh -R`
@@ -115,3 +86,32 @@ pub fn engine_events_socket_path() -> PathBuf {
     }
     boss_log_files::default_events_socket_path().unwrap_or_default()
 }
+
+pub(crate) use super::runner_adapter::compose_worker_spawn;
+#[cfg(test)]
+#[path = "pane_spawn/pane_spawn_tests.rs"]
+mod pane_spawn_tests;
+
+pub(crate) mod spawn_confirmation {
+    pub use boss_execution_runner::spawn_confirmation::*;
+    pub fn turn_start_timeout_for_driver(driver: &dyn crate::driver::AgentDriver) -> std::time::Duration {
+        boss_execution_runner::spawn_confirmation::turn_start_timeout_for_driver(
+            driver,
+            crate::agent_jsonl_discovery::DISCOVERY_TIMEOUT,
+        )
+    }
+    pub fn current_run_has_turn_start_evidence(
+        db: &crate::work::WorkDb,
+        states: Option<&crate::live_worker_state::LiveWorkerStateRegistry>,
+        id: &str,
+    ) -> bool {
+        boss_execution_runner::spawn_confirmation::current_run_has_turn_start_evidence(
+            db,
+            states.map(|s| s as &dyn boss_execution_runner::host::DriverSignals),
+            id,
+        )
+    }
+}
+
+#[cfg(test)]
+pub(crate) use boss_execution_runner::work_item;

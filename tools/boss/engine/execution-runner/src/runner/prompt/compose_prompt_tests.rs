@@ -1,0 +1,2940 @@
+#![cfg(test)]
+//! Tests for the worker prompt composition family.
+
+use super::super::work_item::{extract_pr_url_from_text, task_bound_pr_url};
+use boss_protocol::{ExecutionStatus, TaskStatus};
+
+use super::*;
+use crate::work::Task;
+
+#[path = "compose_prompt_tests/blocked_recovery.rs"]
+mod blocked_recovery;
+#[path = "compose_prompt_tests/invocation.rs"]
+mod invocation;
+#[path = "compose_prompt_tests/non_bazel_gate.rs"]
+mod non_bazel_gate;
+#[path = "compose_prompt_tests/prepush_rebase.rs"]
+mod prepush_rebase;
+#[path = "compose_prompt_tests/revision_rebase.rs"]
+mod revision_rebase;
+#[path = "compose_prompt_tests/vocabulary_leakage.rs"]
+mod vocabulary_leakage;
+
+#[test]
+fn execution_prompts_include_bazel_caching_rule_once() {
+    let mut postmortem = design_task();
+    if let WorkItem::Task(task) = &mut postmortem {
+        task.kind = TaskKind::DesignPostmortem;
+    }
+    for (kind, work_item) in [
+        (ExecutionKind::TaskImplementation, chore_without_pr()),
+        (ExecutionKind::ChoreImplementation, chore_without_pr()),
+        (
+            ExecutionKind::RevisionImplementation,
+            chore_with_pr("https://github.com/org/repo/pull/42"),
+        ),
+        (ExecutionKind::ProjectDesign, design_task()),
+        (ExecutionKind::ProjectDesign, postmortem),
+        (ExecutionKind::InvestigationImplementation, chore_without_pr()),
+        (
+            ExecutionKind::ConflictResolution,
+            chore_with_pr("https://github.com/org/repo/pull/42"),
+        ),
+        (
+            ExecutionKind::CiRemediation,
+            chore_with_pr("https://github.com/org/repo/pull/42"),
+        ),
+    ] {
+        let mut execution = base_execution();
+        execution.kind = kind;
+        let attempt = sample_ci_attempt();
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .review_signal_checks(|_| &[])
+                .execution(&execution)
+                .work_item(&work_item)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .ci_attempt(&attempt)
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
+        );
+        assert_eq!(
+            prompt.matches("Trust Bazel's caching").count(),
+            1,
+            "{:?}",
+            execution.kind
+        );
+        assert!(prompt.contains("--remote_accept_cached=false"), "{:?}", execution.kind);
+    }
+}
+
+fn base_execution() -> WorkExecution {
+    WorkExecution::builder()
+        .id("exec_abc123_01")
+        .work_item_id("task-1")
+        .kind(ExecutionKind::ChoreImplementation)
+        .status(ExecutionStatus::Running)
+        .repo_remote_url("git@github.com:org/repo.git")
+        .workspace_path("/tmp/workspace")
+        .created_at("2026-05-15T00:00:00Z")
+        .build()
+}
+
+fn chore_without_pr() -> WorkItem {
+    WorkItem::Chore(
+        Task::builder()
+            .id("task-1")
+            .product_id("prod-1")
+            .kind(TaskKind::Chore)
+            .name("Fix the thing")
+            .description("Description here.")
+            .status(TaskStatus::Todo)
+            .created_at("2026-05-15T00:00:00Z")
+            .updated_at("2026-05-15T00:00:00Z")
+            .autostart(false)
+            .build(),
+    )
+}
+
+fn chore_with_pr(pr_url: &str) -> WorkItem {
+    match chore_without_pr() {
+        WorkItem::Chore(mut task) => {
+            task.pr_url = Some(pr_url.into());
+            WorkItem::Chore(task)
+        }
+        other => other,
+    }
+}
+
+fn review_followup() -> WorkItem {
+    match chore_without_pr() {
+        WorkItem::Chore(mut task) => {
+            task.kind = TaskKind::Followup;
+            task.origin_pr_number = Some(1501);
+            WorkItem::Chore(task)
+        }
+        other => other,
+    }
+}
+
+/// A `kind = 'design'` task, wrapped as `WorkItem::Task` (design tasks are
+/// never `Chore`s — see `task_to_item`), for tests that need
+/// `ExecutionKind::ProjectDesign` to reach `compose_design_directive`.
+fn design_task() -> WorkItem {
+    match chore_without_pr() {
+        WorkItem::Chore(mut task) => {
+            task.kind = TaskKind::Design;
+            WorkItem::Task(task)
+        }
+        other => other,
+    }
+}
+
+#[test]
+fn acceptance_criterion_names_the_pr_url_artifact_and_keeps_the_final_line() {
+    // Both acceptance-criterion variants (fresh PR, resumed PR) must carry
+    // the file contract *and* the final-message convention: the file is the
+    // primary channel, the printed line is the driver's fallback.
+    for work_item in [chore_without_pr(), chore_with_pr("https://github.com/org/repo/pull/42")] {
+        let execution = base_execution();
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .review_signal_checks(|_| &[])
+                .execution(&execution)
+                .work_item(&work_item)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
+        );
+        let expected_path = crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::PrUrl);
+        assert!(
+            prompt.contains(&expected_path),
+            "prompt must name the PR-URL artifact path ({expected_path}):\n{prompt}",
+        );
+        assert!(
+            prompt.contains("$BOSS_PR_URL_OUTPUT"),
+            "prompt must name the env var carrying that path:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("the final-response URL in the generated rules is its fallback"),
+            "the prompt must refer to the canonical fallback convention:\n{prompt}",
+        );
+        for banned in ["`Write` tool", "run_in_background", "subagent"] {
+            assert!(
+                !prompt.contains(banned),
+                "prompt must stay driver-agnostic: {banned} is Claude Code-specific:\n{prompt}",
+            );
+        }
+    }
+}
+
+#[test]
+fn designated_output_kind_matches_the_prompt_each_execution_kind_renders() {
+    // The env var must name the payload the prompt actually asks for.
+    assert_eq!(
+        designated_output_kind(&base_execution(), &chore_without_pr()),
+        Some(StructuredOutputKind::Followups),
+    );
+
+    let mut reviewer = base_execution();
+    reviewer.kind = ExecutionKind::PrReview;
+    assert_eq!(
+        designated_output_kind(&reviewer, &chore_without_pr()),
+        Some(StructuredOutputKind::ReviewResult),
+    );
+
+    let mut triage = base_execution();
+    triage.kind = ExecutionKind::AutomationTriage;
+    assert_eq!(
+        designated_output_kind(&triage, &chore_without_pr()),
+        Some(StructuredOutputKind::TriageDecision),
+    );
+
+    // ProjectDesign splits on the *task's* kind, mirroring the directive branch.
+    let mut design = base_execution();
+    design.kind = ExecutionKind::ProjectDesign;
+    assert_eq!(designated_output_kind(&design, &chore_without_pr()), None);
+    let postmortem = match chore_without_pr() {
+        WorkItem::Chore(mut t) => {
+            t.kind = TaskKind::DesignPostmortem;
+            WorkItem::Task(t)
+        }
+        other => other,
+    };
+    assert_eq!(
+        designated_output_kind(&design, &postmortem),
+        Some(StructuredOutputKind::PostmortemFollowups),
+    );
+}
+
+#[test]
+fn structured_output_env_always_carries_the_pr_url_path() {
+    let execution = base_execution();
+    let dir = std::path::Path::new("/tmp/boss-worker-output");
+    let env = structured_output_env_vars(dir, &execution, &chore_without_pr());
+    let lookup = |key: &str| {
+        env.iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        lookup("BOSS_PR_URL_OUTPUT"),
+        "/tmp/boss-worker-output/exec_abc123_01.pr-url.json",
+    );
+    assert_eq!(
+        lookup("BOSS_STRUCTURED_OUTPUT"),
+        "/tmp/boss-worker-output/exec_abc123_01.followups.json",
+        "the designated payload for an implementer is its followups manifest",
+    );
+
+    // A kind with no designated payload still gets the PR-URL path, and
+    // must not export a stale/ambiguous BOSS_STRUCTURED_OUTPUT.
+    let mut answer_agent = base_execution();
+    answer_agent.kind = ExecutionKind::AnswerAgent;
+    let env = structured_output_env_vars(dir, &answer_agent, &chore_without_pr());
+    assert_eq!(env.len(), 1, "only the PR-URL path is exported: {env:?}");
+    assert_eq!(env[0].0, "BOSS_PR_URL_OUTPUT");
+}
+
+#[test]
+fn no_resume_directive_when_pr_url_is_absent() {
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        !prompt.contains("RESUME EXISTING PR"),
+        "should have no resume block when pr_url is None:\n{prompt}",
+    );
+}
+
+#[test]
+fn no_resume_directive_when_pr_url_is_empty() {
+    let chore = chore_with_pr("");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        !prompt.contains("RESUME EXISTING PR"),
+        "should have no resume block when pr_url is empty:\n{prompt}",
+    );
+}
+
+#[test]
+fn resume_directive_present_when_pr_url_is_set() {
+    let chore = chore_with_pr("https://github.com/org/repo/pull/42");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("## RESUME EXISTING PR"),
+        "missing resume block when pr_url is set:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("https://github.com/org/repo/pull/42"),
+        "resume block should include the PR URL:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("#42"),
+        "resume block should include the PR number:\n{prompt}",
+    );
+}
+
+#[test]
+fn resume_directive_appears_before_execution_context() {
+    let chore = chore_with_pr("https://github.com/org/repo/pull/99");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    let resume_pos = prompt.find("## RESUME EXISTING PR").expect("missing resume block");
+    let exec_pos = prompt.find("Execution context:").expect("missing execution context");
+    assert!(
+        resume_pos < exec_pos,
+        "resume block must appear before execution context:\n{prompt}",
+    );
+}
+
+#[test]
+fn expected_branch_name_suppressed_when_pr_url_set() {
+    let chore = chore_with_pr("https://github.com/org/repo/pull/42");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        !prompt.contains("expected branch name"),
+        "expected-branch-name line should be suppressed when resuming a PR:\n{prompt}",
+    );
+}
+
+#[test]
+fn expected_branch_name_present_when_no_pr_url() {
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("expected branch name"),
+        "expected-branch-name line must be present for fresh dispatches:\n{prompt}",
+    );
+}
+
+#[test]
+fn acceptance_criterion_references_existing_pr_when_pr_url_set() {
+    let chore = chore_with_pr("https://github.com/org/repo/pull/42");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("Do not open a parallel PR"),
+        "acceptance criterion should prohibit opening a new PR:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("gh pr view 42"),
+        "acceptance criterion should reference gh pr view for the existing PR:\n{prompt}",
+    );
+}
+
+#[test]
+fn acceptance_criterion_uses_fresh_branch_when_no_pr_url() {
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("jj bookmark set"),
+        "acceptance criterion should guide fresh branch creation:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("gh pr create") || prompt.contains("cube pr create") || prompt.contains("$CUBE_BIN"),
+        "acceptance criterion should guide opening a new PR:\n{prompt}",
+    );
+}
+
+/// Like `base_execution` but pointed at a given repo remote, so the
+/// CI-monitoring directive's org-specific branch can be exercised.
+fn execution_for_remote(remote: &str) -> WorkExecution {
+    WorkExecution::builder()
+        .id("exec_abc123_01")
+        .work_item_id("task-1")
+        .kind(ExecutionKind::ChoreImplementation)
+        .status(ExecutionStatus::Running)
+        .repo_remote_url(remote.to_string())
+        .workspace_path("/tmp/workspace")
+        .created_at("2026-05-15T00:00:00Z")
+        .build()
+}
+
+#[test]
+fn ci_monitoring_directive_omits_shared_policy() {
+    let execution = base_execution();
+    assert!(ci_monitoring_directive(&execution, |_| &[]).is_empty());
+}
+
+#[test]
+fn ci_monitoring_directive_names_injected_human_gated_checks() {
+    // The runner renders the policy supplied by the merge observer.
+    let exec = execution_for_remote("git@github.com:linkedin-multiproduct/some-repo.git");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|owner| {
+                assert_eq!(owner, "linkedin-multiproduct");
+                &["Owner Approval"]
+            })
+            .execution(&exec)
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("Owner Approval"),
+        "directive should name the org's human-gated check:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("linkedin-multiproduct"),
+        "directive should name the org:\n{prompt}",
+    );
+}
+
+#[test]
+fn ci_monitoring_directive_omits_human_gated_names_for_plain_org() {
+    // A non-LinkedIn org has no review-signal rules; shared guidance lives
+    // in generated worker rules, so no CI directive is needed here.
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&execution_for_remote("git@github.com:org/repo.git"))
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        !prompt.contains("do not babysit CI"),
+        "shared policy belongs in generated rules:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("Owner Approval"),
+        "no human-gated check should be named for a plain org:\n{prompt}",
+    );
+}
+
+#[test]
+fn no_op_directive_present_for_fresh_chore_without_pr() {
+    // A fresh chore_implementation worker (no existing PR) must
+    // be told the sanctioned way to terminate when the work is already
+    // done — `propose done --outcome no-changes-needed` — instead of only "stop and explain".
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("propose done --outcome no-changes-needed --summary"),
+        "fresh-chore prompt must teach the typed no-op declaration:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("NO_CHANGES_NEEDED"),
+        "fresh-chore prompt must not teach the retired text marker:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("signal a sanctioned no-op"),
+        "fresh-chore prompt must carry the no-op completion directive:\n{prompt}",
+    );
+}
+
+#[test]
+fn no_op_directive_absent_when_pr_already_exists() {
+    // When a PR already exists (resume / existing-PR flow), an empty diff
+    // means "already pushed" and is handled by the push-to-existing path
+    // — NOT by closing the task as a no-op. The directive must not appear.
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_with_pr("https://github.com/org/repo/pull/7"))
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        !prompt.contains("signal a sanctioned no-op"),
+        "existing-PR prompt must NOT carry the no-op directive:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("NO_CHANGES_NEEDED"),
+        "existing-PR prompt must not teach the retired text marker:\n{prompt}",
+    );
+}
+
+#[test]
+fn work_item_pr_url_returns_none_for_project() {
+    let project = WorkItem::Project(
+        crate::work::Project::builder()
+            .id("proj-1")
+            .product_id("prod-1")
+            .name("My Project")
+            .description("")
+            .goal("")
+            .status(crate::work::ProjectStatus::Active)
+            .slug("my-project")
+            .created_at("2026-05-15T00:00:00Z")
+            .updated_at("2026-05-15T00:00:00Z")
+            .build(),
+    );
+    assert!(work_item_pr_url(&project).is_none());
+}
+
+// `extract_pr_number` was removed in favour of the shared
+// `boss_github::pr_url::pr_number_from_url`; its canonical-parse and
+// malformed-rejection cases are covered by that helper's own unit tests
+// in `tools/boss/github/src/pr_url.rs`.
+
+#[test]
+fn extract_pr_url_from_text_finds_bare_url() {
+    let s = "see https://github.com/org/repo/pull/42 for context";
+    assert_eq!(extract_pr_url_from_text(s), Some("https://github.com/org/repo/pull/42"),);
+}
+
+#[test]
+fn extract_pr_url_from_text_strips_trailing_punctuation() {
+    let s = "follow-up on https://github.com/org/repo/pull/42.";
+    assert_eq!(extract_pr_url_from_text(s), Some("https://github.com/org/repo/pull/42"),);
+}
+
+#[test]
+fn extract_pr_url_from_text_strips_subpath() {
+    let s = "see https://github.com/org/repo/pull/42/files";
+    assert_eq!(extract_pr_url_from_text(s), Some("https://github.com/org/repo/pull/42"),);
+}
+
+#[test]
+fn extract_pr_url_from_text_handles_markdown_link() {
+    let s = "[PR](https://github.com/org/repo/pull/7) is in review";
+    assert_eq!(extract_pr_url_from_text(s), Some("https://github.com/org/repo/pull/7"),);
+}
+
+#[test]
+fn extract_pr_url_from_text_returns_none_for_issue_url() {
+    let s = "> Imported from https://github.com/org/repo/issues/742";
+    assert_eq!(extract_pr_url_from_text(s), None);
+}
+
+#[test]
+fn extract_pr_url_from_text_returns_none_for_no_url() {
+    assert_eq!(extract_pr_url_from_text("just a #235 reference"), None);
+    assert_eq!(extract_pr_url_from_text(""), None);
+}
+
+#[test]
+fn extract_pr_url_from_text_returns_none_when_two_distinct_prs() {
+    // Two distinct PR URLs in the same text — abort rather than
+    // guess; the worker is safer in the new-PR flow than bound to
+    // the wrong existing PR.
+    let s = "rebase https://github.com/org/repo/pull/10 onto https://github.com/org/repo/pull/20";
+    assert_eq!(extract_pr_url_from_text(s), None);
+}
+
+#[test]
+fn extract_pr_url_from_text_dedupes_same_url() {
+    // The same PR mentioned twice (once bare, once with /files) is
+    // still one match.
+    let s = "PR https://github.com/org/repo/pull/42 also at https://github.com/org/repo/pull/42/files";
+    assert_eq!(extract_pr_url_from_text(s), Some("https://github.com/org/repo/pull/42"),);
+}
+
+#[test]
+fn task_bound_pr_url_prefers_explicit_column() {
+    let chore = chore_with_pr("https://github.com/org/repo/pull/99");
+    let task = match &chore {
+        WorkItem::Chore(t) => t,
+        _ => unreachable!(),
+    };
+    assert_eq!(task_bound_pr_url(task), Some("https://github.com/org/repo/pull/99"),);
+}
+
+#[test]
+fn task_bound_pr_url_returns_none_when_description_has_only_issue_url() {
+    let chore = match chore_without_pr() {
+        WorkItem::Chore(mut task) => {
+            task.description = "> Imported from https://github.com/org/repo/issues/742".into();
+            WorkItem::Chore(task)
+        }
+        other => other,
+    };
+    let task = match &chore {
+        WorkItem::Chore(t) => t,
+        _ => unreachable!(),
+    };
+    assert!(task_bound_pr_url(task).is_none());
+}
+
+#[test]
+fn task_bound_pr_url_ignores_pr_url_in_description() {
+    // Regression for exec_18b341df81251750_4: a chore imported
+    // from an issue whose body *mentions* a PR URL (e.g. as a repro
+    // example) must NOT cause a RESUME EXISTING PR block. The structured
+    // `pr_url` field is the only authoritative source.
+    let chore = match chore_without_pr() {
+        WorkItem::Chore(mut task) => {
+            task.description =
+                "Parent chore C19 landed at https://github.com/linkedin-multiproduct/dev-infra/pull/250 \
+                     as a repro example — this chore has no PR yet."
+                    .into();
+            WorkItem::Chore(task)
+        }
+        other => other,
+    };
+    let task = match &chore {
+        WorkItem::Chore(t) => t,
+        _ => unreachable!(),
+    };
+    assert!(
+        task_bound_pr_url(task).is_none(),
+        "description-embedded PR URL must not be treated as the task's PR",
+    );
+}
+
+#[test]
+fn resume_directive_absent_when_pr_url_is_null() {
+    // Regression: a chore with pr_url=null and a description
+    // mentioning a PR must not generate a RESUME EXISTING PR block.
+    let chore = match chore_without_pr() {
+        WorkItem::Chore(mut task) => {
+            task.description = "Ref: https://github.com/linkedin-multiproduct/dev-infra/pull/250".into();
+            WorkItem::Chore(task)
+        }
+        other => other,
+    };
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        !prompt.contains("## RESUME EXISTING PR"),
+        "RESUME block must NOT fire when task.pr_url is null, even if description mentions a PR:\n{prompt}",
+    );
+}
+
+#[test]
+fn resume_directive_present_when_structured_pr_url_is_set() {
+    // Positive case: task with an explicit pr_url gets the RESUME block.
+    let chore = chore_with_pr("https://github.com/org/repo/pull/235");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("## RESUME EXISTING PR"),
+        "resume block must fire when task.pr_url is set:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("https://github.com/org/repo/pull/235"),
+        "resume block must quote the structured PR URL:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("#235"),
+        "resume block must surface the PR number:\n{prompt}",
+    );
+}
+
+fn revision_execution(pr_url: &str) -> WorkExecution {
+    WorkExecution::builder()
+        .id("exec_rev_01")
+        .work_item_id("task-1")
+        .kind(ExecutionKind::RevisionImplementation)
+        .status(ExecutionStatus::Running)
+        .repo_remote_url("git@github.com:org/repo.git")
+        .workspace_path("/tmp/workspace")
+        .pr_url(pr_url)
+        .created_at("2026-05-15T00:00:00Z")
+        .build()
+}
+
+/// Lay down a `MODULE.bazel` marker so `is_bazel_workspace` treats
+/// the tempdir as a Bazel workspace (issue #804).
+fn bazel_workspace() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("MODULE.bazel"), "module(name = \"x\")\n").unwrap();
+    dir
+}
+
+#[test]
+fn bazel_gate_present_for_chore_on_bazel_workspace_seam_on() {
+    let ws = bazel_workspace();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(ws.path())
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .worker_signal_proposals_seam_enabled(true)
+            .build(),
+    );
+    assert!(
+        prompt.contains("## Pre-push build gate (Bazel workspace)"),
+        "bazel pre-push gate must fire for code chores on a Bazel workspace:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("bazel build") && prompt.contains("bazel test"),
+        "gate must require both bazel build and bazel test:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("\"$BOSS_BIN\" propose blocked"),
+        "with the seam flag on, the gate must direct failures to the $BOSS_BIN propose blocked \
+             verb:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("build-class command")
+            && prompt.contains("checkleft")
+            && prompt.contains("FOREGROUND")
+            && prompt.contains("keep polling that session until it returns `exit_code`")
+            && prompt.contains("backgrounded/asynchronous invocation")
+            && prompt.contains(&crate::prompt_fragments::background_wait_declaration("\"$BOSS_BIN\""))
+            && prompt.contains("global process-name matches"),
+        "gate must define foreground session polling, require a declared wait when backgrounding, and prohibit ambiguous global-process attribution:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("Do NOT background one") && !prompt.contains("Do NOT background it and idle in a wait-loop"),
+        "the blanket background prohibition must be gone:\n{prompt}",
+    );
+}
+
+#[test]
+fn chore_prompt_teaches_propose_wait() {
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("\"$BOSS_BIN\" propose wait --reason"),
+        "chore prompt must teach `boss propose wait` so a worker waiting on a long-running job \
+         can declare it instead of answering in prose:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("## If you are waiting on a long-running job"),
+        "chore prompt must include the wait section:\n{prompt}",
+    );
+}
+
+#[test]
+fn terminal_directive_gates_the_pr_on_real_results_without_reading_as_a_background_ban() {
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains(
+            "do not open the PR until every gate, build, test run, review and sub-agent run you started has returned its real result"
+        ),
+        "the PR must still not be opened before a gate has a real result:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("backgrounded builds"),
+        "the PR-timing rule must not read as a ban on backgrounding:\n{prompt}",
+    );
+}
+
+#[test]
+fn bazel_gate_present_for_chore_on_bazel_workspace_seam_off() {
+    // Flag off (the builder default, matching the registry default):
+    // the gate must point failures at the legacy `[blocked]` marker, not
+    // `"$BOSS_BIN" propose` — a worker on the flag-off path must never be
+    // taught a verb the engine's read path won't yet honor.
+    let ws = bazel_workspace();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(ws.path())
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("## Pre-push build gate (Bazel workspace)"),
+        "bazel pre-push gate must fire for code chores on a Bazel workspace:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("\"$BOSS_BIN\" propose blocked")
+            && !prompt.contains("\"$BOSS_BIN\" propose effort-escalation"),
+        "with the seam flag off, the gate must not teach the seam-gated propose verbs:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("[blocked] reason=\"...\""),
+        "with the seam flag off, the gate must direct failures to the legacy [blocked] \
+             marker:\n{prompt}",
+    );
+}
+
+#[test]
+fn worker_escalation_directive_teaches_boss_propose_verbs_when_seam_is_on() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(ws.path())
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .worker_signal_proposals_seam_enabled(true)
+            .build(),
+    );
+    assert!(
+        prompt.contains("\"$BOSS_BIN\" propose effort-escalation --level"),
+        "seam on: the prompt must teach the effort-escalation verb with a worked example:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("\"$BOSS_BIN\" propose blocked --reason"),
+        "seam on: the prompt must teach the blocked verb with a worked example:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("Bootstrap fallback only:") && prompt.contains("[blocked] reason="),
+        "seam on: [blocked] must be documented as the bootstrap-only fallback, not a \
+             normal-path channel:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("[effort-escalation] requested_level="),
+        "seam on: new workers must no longer be taught the [effort-escalation] marker \
+             grammar at all:\n{prompt}",
+    );
+}
+
+#[test]
+fn worker_escalation_directive_teaches_legacy_markers_when_seam_is_off() {
+    // Flag off (builder default = registry default): the directive must
+    // reproduce the pre-migration marker-only text byte-for-byte in
+    // spirit — no seam-gated `"$BOSS_BIN" propose blocked` / `effort-escalation`
+    // verbs, both markers taught. `propose wait` is always available.
+    let ws = tempfile::TempDir::new().unwrap();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(ws.path())
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        !prompt.contains("\"$BOSS_BIN\" propose blocked")
+            && !prompt.contains("\"$BOSS_BIN\" propose effort-escalation"),
+        "seam off: the escalation directive must not teach the seam-gated propose verbs:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("[effort-escalation] requested_level=<level> reason=\"<why>\""),
+        "seam off: the directive must teach the full [effort-escalation] marker grammar:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("[blocked] reason=\"<why>\""),
+        "seam off: the directive must teach the [blocked] marker grammar:\n{prompt}",
+    );
+}
+
+#[test]
+fn bazel_gate_absent_on_non_bazel_workspace() {
+    // Empty tempdir — no MODULE.bazel / WORKSPACE marker.
+    let ws = tempfile::TempDir::new().unwrap();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(ws.path())
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        !prompt.contains("Pre-push build gate (Bazel workspace)"),
+        "bazel gate must NOT fire on a non-Bazel repo:\n{prompt}",
+    );
+}
+
+#[test]
+fn bazel_gate_present_for_revision_on_bazel_workspace() {
+    let ws = bazel_workspace();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/250"))
+            .work_item(&chore_without_pr())
+            .workspace_path(ws.path())
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("## Pre-push build gate (Bazel workspace)"),
+        "revision chores (the #804 offenders) must get the bazel gate:\n{prompt}",
+    );
+}
+
+#[test]
+fn revision_prompt_omits_expected_branch_line() {
+    // Issue #842: the preamble "expected branch name" line directs the
+    // worker to push a fresh `boss/exec_*` bookmark, which directly
+    // contradicts the revision directive's "Do NOT create a
+    // `boss/exec_*` bookmark". A revision lands its commit on the
+    // parent PR's existing branch, so the line must be omitted.
+    let ws = tempfile::TempDir::new().unwrap();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/250"))
+            .work_item(&chore_without_pr())
+            .workspace_path(ws.path())
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        !prompt.contains("expected branch name"),
+        "revision prompt must NOT template the expected-branch line (issue #842):\n{prompt}",
+    );
+    // The revision directive remains the only — and now uncontradicted —
+    // word on branching.
+    assert!(
+        prompt.contains("The engine owns your `boss-recovery/exec_*` recovery bookmark; keep it advanced locally"),
+        "revision directive must still forbid creating a boss/exec_* bookmark:\n{prompt}",
+    );
+}
+
+#[test]
+fn chore_prompt_keeps_expected_branch_line() {
+    // Guard the inverse: a fresh chore opens its own PR off a
+    // `boss/exec_<id>` branch, so it must still be told the
+    // engine-supplied branch name to push to.
+    let ws = tempfile::TempDir::new().unwrap();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(ws.path())
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("expected branch name"),
+        "a fresh chore must still receive the expected-branch line:\n{prompt}",
+    );
+}
+
+#[test]
+fn bazel_gate_recognizes_workspace_marker_files() {
+    for marker in ["WORKSPACE", "WORKSPACE.bazel"] {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(marker), "").unwrap();
+        assert!(
+            is_bazel_workspace(dir.path()),
+            "`{marker}` at the root must be recognized as a Bazel workspace",
+        );
+    }
+}
+
+// Helpers shared by revision fragment tests.
+
+fn revision_task_with_created_via(pr_url: Option<&str>, created_via: &str) -> WorkItem {
+    let mut task = crate::work::Task::builder()
+        .id("task-rev-1")
+        .product_id("prod-1")
+        .kind(TaskKind::Revision)
+        .name("Revision task")
+        .description("Fix the merge conflict.")
+        .status(TaskStatus::Active)
+        .created_at("2026-05-15T00:00:00Z")
+        .updated_at("2026-05-15T00:00:00Z")
+        .autostart(false)
+        .created_via(created_via)
+        .build();
+    task.pr_url = pr_url.map(|s| s.to_owned());
+    WorkItem::Task(task)
+}
+
+fn sample_conflict_attempt() -> crate::work::ConflictResolution {
+    use crate::conflict_diagnosis::{ConflictDiagnosis, ConflictedFile};
+    let diag = ConflictDiagnosis {
+        schema_version: 1,
+        base_sha: "aaa111".into(),
+        head_sha: "bbb222".into(),
+        files: vec![ConflictedFile {
+            path: "src/lib.rs".into(),
+            marker_count: Some(1),
+            shape: "content".into(),
+        }],
+        error: None,
+    };
+    crate::work::ConflictResolution {
+        id: "crz_frag_01".into(),
+        product_id: "prod-1".into(),
+        work_item_id: "task-rev-1".into(),
+        pr_url: "https://github.com/org/repo/pull/77".into(),
+        pr_number: 77,
+        head_branch: "feature/frag".into(),
+        base_branch: "main".into(),
+        base_sha_at_trigger: Some("aaa111".into()),
+        head_sha_before: None,
+        head_sha_after: None,
+        status: "running".into(),
+        failure_reason: None,
+        cube_lease_id: None,
+        cube_workspace_id: None,
+        worker_id: None,
+        conflict_diagnosis: Some(serde_json::to_string(&diag).unwrap()),
+        created_at: "2026-05-15T00:00:00Z".into(),
+        started_at: None,
+        finished_at: None,
+        revision_task_id: Some("task-rev-1".into()),
+        event_source: "review_watch".into(),
+        conflict_class: None,
+        resolved_by_rung: None,
+        mechanical_rung_in_flight: None,
+    }
+}
+
+fn sample_ci_attempt() -> crate::work::CiRemediation {
+    crate::work::CiRemediation {
+            id: "crm_frag_01".into(),
+            product_id: "prod-1".into(),
+            work_item_id: "task-rev-1".into(),
+            pr_url: "https://github.com/org/repo/pull/77".into(),
+            pr_number: 77,
+            head_branch: "feature/frag".into(),
+            head_sha_at_trigger: "ccc333".into(),
+            head_sha_after: None,
+            attempt_kind: "fix".into(),
+            consumes_budget: 1,
+            failed_checks: r#"[{"name":"ci/test","conclusion":"FAILURE","target_url":"https://buildkite.com/myorg/mypipeline/builds/1329","provider":"buildkite","provider_job_id":"job-uuid-456"}]"#.into(),
+            triage_class: None,
+            log_excerpt: Some("ERROR: test failed at line 42".into()),
+            status: "running".into(),
+            failure_reason: None,
+            cube_lease_id: None,
+            cube_workspace_id: None,
+            worker_id: None,
+            created_at: "2026-05-15T00:00:00Z".into(),
+            started_at: None,
+            finished_at: None,
+            failure_kind: None,
+            before_commit_sha: None,
+            queue_base_sha: None,
+            revision_task_id: Some("task-rev-1".into()),
+        }
+}
+
+#[test]
+fn revision_directive_with_conflict_provenance_injects_conflict_fragment() {
+    let work_item = revision_task_with_created_via(None, "merge-conflict:crz_frag_01");
+    let attempt = sample_conflict_attempt();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .conflict_attempt(&attempt)
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    // Must contain the conflict-resolution section header.
+    assert!(
+        prompt.contains("## Conflict resolution context"),
+        "conflict fragment must be injected into revision directive:\n{prompt}",
+    );
+    // Must embed the attempt id.
+    assert!(
+        prompt.contains("`crz_frag_01`"),
+        "conflict fragment must include the attempt id:\n{prompt}",
+    );
+    // Must embed the diagnosis file.
+    assert!(
+        prompt.contains("`src/lib.rs`"),
+        "conflict fragment must render the conflict diagnosis:\n{prompt}",
+    );
+    // Must include the stop conditions.
+    assert!(
+        prompt.contains("\"$BOSS_BIN\" engine conflicts mark-failed"),
+        "conflict fragment must include the mark-failed stop condition:\n{prompt}",
+    );
+    // Must contain the jj first-class conflict / stacked-branch recipe.
+    assert!(
+        prompt.contains("jj records conflicts IN each commit independently"),
+        "conflict fragment must explain jj first-class conflict model:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("Resolve from the BASE upward"),
+        "conflict fragment must instruct base-up resolution for stacked branches:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("conflicts=true"),
+        "conflict fragment must reference the conflicts=true log template:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("EDITOR=false"),
+        "conflict fragment must warn about non-interactive editor env:\n{prompt}",
+    );
+    // Must still contain the base revision directive spine.
+    assert!(
+        prompt.contains("The engine owns your `boss-recovery/exec_*` recovery bookmark; keep it advanced locally"),
+        "base revision directive must still be present:\n{prompt}",
+    );
+    // incident-002: the preservation rule must be present so a
+    // resolution never silently deletes functionality a merged parent
+    // added.
+    assert!(
+        prompt.contains("Preservation rule (HARD CONSTRAINT"),
+        "conflict fragment must include the preservation rule:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("must NOT remove functionality introduced by either parent"),
+        "preservation rule must forbid dropping either parent's functionality:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("design-doc citation"),
+        "preservation rule must require a design-doc citation for any removal:\n{prompt}",
+    );
+    // incident-002: the post-resolution comment must be
+    // removal-forward and must not fabricate a review history.
+    assert!(
+        prompt.contains("⚠️ Removed"),
+        "comment template must carry a prominent Removed section:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("pulls/<n>/reviews"),
+        "comment guidance must condition the approvals line on the reviews API:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("OMIT that line"),
+        "comment guidance must tell the worker to omit the approvals line when no review existed:\n{prompt}",
+    );
+}
+
+#[test]
+fn conflict_fragment_hard_gates_the_ground_truth_commands_before_local_jj_reasoning() {
+    // 2026-07-23 incident (spinyfin/mono#2070): the worker went straight
+    // to `jj log`, never queried `mergeable`, never ran `cube workspace
+    // rebase`, and concluded "already resolved" from two
+    // divergent-change-id revsets that answered about two different
+    // commits. This fragment must order the two authoritative commands
+    // first, forbid the local-state-only conclusion, and name the `??`
+    // divergence hazard.
+    let work_item = revision_task_with_created_via(None, "merge-conflict:crz_frag_01");
+    let attempt = sample_conflict_attempt();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .conflict_attempt(&attempt)
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+
+    let ground_truth = prompt.split("### Ground truth:").nth(1).unwrap();
+    let gh_query = ground_truth
+        .find("--json mergeable,mergeStateStatus")
+        .unwrap_or_else(|| panic!("brief must mandate the mergeable query:\n{prompt}"));
+    let rebase = ground_truth
+        .find("workspace local-rebase --pr")
+        .unwrap_or_else(|| panic!("brief must mandate the rebase:\n{prompt}"));
+    assert!(
+        gh_query < rebase,
+        "the mergeable query must be ordered before the rebase:\n{prompt}",
+    );
+    // Both must precede the local-inspection recipe the worker jumped to.
+    let jj_recipe = ground_truth
+        .find("List every conflicted commit on the branch")
+        .unwrap_or_else(|| panic!("brief must still carry the jj recipe:\n{prompt}"));
+    assert!(
+        rebase < jj_recipe,
+        "the two ground-truth commands must be ordered before local jj inspection:\n{prompt}",
+    );
+
+    assert!(
+        prompt.contains("You may NOT conclude \"already resolved\" from local `jj` state alone"),
+        "brief must forbid concluding 'already resolved' from local jj state:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("Only `mergeable: MERGEABLE` supports a claim"),
+        "brief must name MERGEABLE as the only validating value:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("`mergeable: UNKNOWN` means GitHub is still")
+            && prompt.contains("not** a clean bill of health"),
+        "brief must deny that UNKNOWN clears the conflict:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("`qtltpmoy??`") && prompt.contains("DIVERGENT"),
+        "brief must teach the `??` divergent-change-id hazard:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("full commit ids"),
+        "divergence guidance must direct the worker to full commit ids:\n{prompt}",
+    );
+}
+
+#[test]
+fn conflict_revision_uses_merge_correctness_gate_not_full_test_gate() {
+    // A conflict-resolution revision must push the merge-corrected
+    // branch as soon as it COMPILES (the merge-correctness gate); the
+    // full `bazel test` suite is the PR's own CI's job, run after the
+    // push. Blocking the push behind the full suite is what stranded
+    // correct resolutions unpushed (the loop this fix addresses).
+    let ws = bazel_workspace();
+    let work_item = revision_task_with_created_via(None, "merge-conflict:crz_frag_01");
+    let attempt = sample_conflict_attempt();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(ws.path())
+            .conflict_attempt(&attempt)
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("## Pre-push gate for conflict resolution (Bazel workspace)"),
+        "conflict revision must get the merge-correctness gate:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("Do NOT block the push on a full `bazel test //...`"),
+        "conflict gate must defer the full test suite to CI:\n{prompt}",
+    );
+    // The generic build-AND-test-before-push gate must NOT be present
+    // for conflict revisions — it is what caused the pre-push stall.
+    assert!(
+        !prompt.contains("## Pre-push build gate (Bazel workspace)"),
+        "conflict revision must NOT carry the generic build+test gate:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("Both `bazel build` and `bazel test` must finish clean"),
+        "conflict revision must not require a full test pass before push:\n{prompt}",
+    );
+    // The rebase clause must reference the merge-correctness gate, not
+    // the full build+test gate.
+    assert!(
+        prompt.contains("The full `bazel test` suite is NOT a precondition for this push"),
+        "conflict rebase clause must defer tests to CI:\n{prompt}",
+    );
+    // Verification is NOT skipped — the merged code must still build.
+    assert!(
+        prompt.contains("The merged code MUST COMPILE"),
+        "conflict gate must still require a clean build:\n{prompt}",
+    );
+}
+
+#[test]
+fn conflict_revision_gate_points_at_boss_propose_blocked_when_seam_is_on() {
+    // Mirrors `bazel_gate_present_for_chore_on_bazel_workspace_seam_on`,
+    // but for the conflict-resolution revision's own gate text
+    // (`bazel_conflict_resolution_gate_text`) — a separate call site
+    // threading the same `worker_signal_proposals_seam_enabled` flag.
+    let ws = bazel_workspace();
+    let work_item = revision_task_with_created_via(None, "merge-conflict:crz_frag_01");
+    let attempt = sample_conflict_attempt();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(ws.path())
+            .conflict_attempt(&attempt)
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .worker_signal_proposals_seam_enabled(true)
+            .build(),
+    );
+    assert!(
+        prompt.contains(
+            "Do NOT idle waiting on a wedged build; call `\"$BOSS_BIN\" propose blocked --reason \"...\"` naming the failure and stop."
+        ),
+        "seam on: conflict-resolution gate's own sentence must direct a wedged build to boss \
+             propose blocked (not merely any occurrence of that phrase elsewhere in the prompt):\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("[blocked] reason=\"...\""),
+        "seam on: conflict-resolution gate must not also teach the legacy marker:\n{prompt}",
+    );
+    assert!(
+        prompt.contains(
+            "If you do background a long-running command, declare it with `\"$BOSS_BIN\" propose wait --reason \"<what you are waiting on>\" --duration <bound>` before ending your turn, and never idle in a wait-loop without that declaration."
+        ),
+        "conflict-resolution gate must require a declared wait when the build is backgrounded:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("Do NOT background it and idle in a wait-loop"),
+        "conflict-resolution gate must not carry the old blanket background ban:\n{prompt}",
+    );
+}
+
+#[test]
+fn conflict_revision_gate_points_at_legacy_marker_when_seam_is_off() {
+    let ws = bazel_workspace();
+    let work_item = revision_task_with_created_via(None, "merge-conflict:crz_frag_01");
+    let attempt = sample_conflict_attempt();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(ws.path())
+            .conflict_attempt(&attempt)
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains(
+            "Do NOT idle waiting on a wedged build; emit a `[blocked] reason=\"...\"` marker naming the failure and stop."
+        ),
+        "seam off (builder default = registry default): conflict-resolution gate's own \
+             sentence must direct a wedged build to the legacy [blocked] marker:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("\"$BOSS_BIN\" propose blocked")
+            && !prompt.contains("\"$BOSS_BIN\" propose effort-escalation"),
+        "seam off: conflict-resolution gate must not teach the seam-gated propose verbs:\n{prompt}",
+    );
+}
+
+#[test]
+fn no_op_directive_points_at_boss_propose_blocked_when_seam_is_on() {
+    // `no_op_completion_directive`'s "if you are blocked" pointer mirrors
+    // `worker_signal_proposals_seam_enabled` — a worker reading that
+    // pointer must land on whichever channel this run actually honors.
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .worker_signal_proposals_seam_enabled(true)
+            .build(),
+    );
+    assert!(
+        prompt.contains("call `\"$BOSS_BIN\" propose blocked --reason \"...\"` instead"),
+        "seam on: no-op directive's blocked-pointer must name $BOSS_BIN propose blocked:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("emit a `[blocked] reason=\"...\"` marker instead"),
+        "seam on: no-op directive must not also point at the legacy marker:\n{prompt}",
+    );
+}
+
+#[test]
+fn no_op_directive_points_at_legacy_marker_when_seam_is_off() {
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("emit a `[blocked] reason=\"...\"` marker instead"),
+        "seam off (builder default = registry default): no-op directive's blocked-pointer \
+             must name the legacy [blocked] marker:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("call `\"$BOSS_BIN\" propose blocked --reason \"...\"` instead"),
+        "seam off: no-op directive must not point at $BOSS_BIN propose:\n{prompt}",
+    );
+}
+
+#[test]
+fn merge_order_preservation_fragment_names_merged_siblings() {
+    let lines = vec!["`task_abc` (merged: https://github.com/org/repo/pull/12)".to_owned()];
+    let frag = compose_merge_order_preservation_fragment(&lines);
+    assert!(
+        frag.contains("Merge-order preservation contract"),
+        "fragment must carry the section header:\n{frag}",
+    );
+    assert!(
+        frag.contains("task_abc"),
+        "fragment must name the merged sibling:\n{frag}"
+    );
+    assert!(
+        frag.contains("both-parents deletion tripwire"),
+        "fragment must point at the tripwire as verifier:\n{frag}",
+    );
+}
+
+#[test]
+fn merge_order_preservation_fragment_is_empty_without_merged_siblings() {
+    assert!(
+        compose_merge_order_preservation_fragment(&[]).is_empty(),
+        "no merged overlap partner ⇒ no sibling-specific clause",
+    );
+}
+
+#[test]
+fn render_merge_order_lines_include_pr_url_when_present() {
+    let siblings = vec![
+        crate::work_dependencies::MergeOrderMergedSibling {
+            task_id: "task_with_pr".into(),
+            pr_url: Some("https://github.com/org/repo/pull/9".into()),
+        },
+        crate::work_dependencies::MergeOrderMergedSibling {
+            task_id: "task_no_pr".into(),
+            pr_url: None,
+        },
+    ];
+    let lines = render_merge_order_preservation_lines(&siblings);
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].contains("task_with_pr") && lines[0].contains("pull/9"));
+    assert!(lines[1].contains("task_no_pr") && !lines[1].contains("merged:"));
+}
+
+#[test]
+fn revision_directive_injects_merge_order_preservation_when_sibling_merged() {
+    let work_item = revision_task_with_created_via(None, "merge-conflict:crz_frag_01");
+    let attempt = sample_conflict_attempt();
+    let lines = vec!["`task_sibling` (merged: https://github.com/org/repo/pull/50)".to_owned()];
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .conflict_attempt(&attempt)
+            .merge_order_preservation(&lines)
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("Merge-order preservation contract"),
+        "conflict brief must carry the sibling-specific preservation clause:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("task_sibling"),
+        "clause must name the merged sibling:\n{prompt}",
+    );
+}
+
+#[test]
+fn revision_directive_omits_merge_order_clause_without_merged_sibling() {
+    // A conflict revision with no merged overlap partner keeps only the
+    // generic preservation rule — no sibling-specific block.
+    let work_item = revision_task_with_created_via(None, "merge-conflict:crz_frag_01");
+    let attempt = sample_conflict_attempt();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .conflict_attempt(&attempt)
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        !prompt.contains("Merge-order preservation contract"),
+        "no merged sibling ⇒ no sibling-specific block:\n{prompt}",
+    );
+    // The generic preservation rule is still present.
+    assert!(prompt.contains("Preservation rule (HARD CONSTRAINT"));
+}
+
+#[test]
+fn non_conflict_revision_keeps_full_build_and_test_gate() {
+    // A plain operator revision (no conflict attempt) keeps the
+    // build-AND-test-before-push gate — the merge-correctness rescope
+    // is conflict-resolution-specific.
+    let ws = bazel_workspace();
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(ws.path())
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("## Pre-push build gate (Bazel workspace)"),
+        "non-conflict revision must keep the generic build+test gate:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("Both `bazel build` and `bazel test` must finish clean"),
+        "non-conflict revision must still require a full test pass before push:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("## Pre-push gate for conflict resolution"),
+        "non-conflict revision must NOT get the conflict merge-correctness gate:\n{prompt}",
+    );
+}
+
+#[test]
+fn revision_directive_with_ci_fix_provenance_injects_ci_fragment() {
+    let work_item = revision_task_with_created_via(None, "ci-fix:crm_frag_01");
+    let attempt = sample_ci_attempt();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .ci_attempt(&attempt)
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    // Must contain the CI remediation section header.
+    assert!(
+        prompt.contains("## CI remediation context"),
+        "CI fragment must be injected into revision directive:\n{prompt}",
+    );
+    // Must embed the attempt id.
+    assert!(
+        prompt.contains("`crm_frag_01`"),
+        "CI fragment must include the attempt id:\n{prompt}",
+    );
+    // Must embed the failing check name.
+    assert!(
+        prompt.contains("`ci/test`"),
+        "CI fragment must render the failing check list:\n{prompt}",
+    );
+    // Must embed the log excerpt.
+    assert!(
+        prompt.contains("ERROR: test failed at line 42"),
+        "CI fragment must include the log excerpt:\n{prompt}",
+    );
+    // Must contain the pre-filled bk commands block.
+    assert!(
+        prompt.contains("bk build view 1329 --pipeline mypipeline"),
+        "CI fragment must include pre-filled bk build view command:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("bk job log --pipeline mypipeline --build-number 1329 job-uuid-456"),
+        "CI fragment must include pre-filled bk job log command:\n{prompt}",
+    );
+    // Must still contain the base revision directive spine.
+    assert!(
+        prompt.contains("The engine owns your `boss-recovery/exec_*` recovery bookmark; keep it advanced locally"),
+        "base revision directive must still be present:\n{prompt}",
+    );
+}
+
+/// A bespoke `ci_remediation`-kind execution routes to
+/// `compose_ci_remediation_prompt` (the retrigger playbook) instead
+/// of the revision directive.
+fn ci_remediation_execution(pr_url: &str) -> WorkExecution {
+    WorkExecution::builder()
+        .id("exec_cir_01")
+        .work_item_id("task-cir-1")
+        .kind(ExecutionKind::CiRemediation)
+        .status(ExecutionStatus::Running)
+        .repo_remote_url("git@github.com:org/repo.git")
+        .workspace_path("/tmp/workspace")
+        .pr_url(pr_url)
+        .created_at("2026-05-15T00:00:00Z")
+        .build()
+}
+
+#[test]
+fn ci_remediation_prompt_offers_mark_noop_for_non_rebounce() {
+    // A bespoke (retrigger / stranded-rescue) ci_remediation worker
+    // should be told it can declare a validated noop if the failure
+    // already cleared — the engine re-probes live CI before honoring
+    // it. `sample_ci_attempt` has `failure_kind: None`.
+    let attempt = sample_ci_attempt();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&ci_remediation_execution(&attempt.pr_url))
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .ci_attempt(&attempt)
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("### If CI is already green (nothing to fix)"),
+        "non-rebounce ci_remediation prompt must offer the validated mark-noop escape:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("\"$BOSS_BIN\" engine ci mark-noop --attempt-id"),
+        "non-rebounce ci_remediation prompt must include the mark-noop verb:\n{prompt}",
+    );
+}
+
+/// Compose the CI-fix revision fragment for a `trunk_queue_eviction`
+/// attempt whose `failed_checks` blob is `failed_checks_json`.
+fn trunk_eviction_revision_prompt(failed_checks_json: &str) -> String {
+    let work_item = revision_task_with_created_via(None, "ci-fix:crm_frag_01");
+    let mut attempt = sample_ci_attempt();
+    attempt.failure_kind = Some("trunk_queue_eviction".into());
+    attempt.failed_checks = failed_checks_json.into();
+    compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .ci_attempt(&attempt)
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    )
+}
+
+/// Regression: a Trunk eviction with no failing build attached is the shape
+/// that destroyed flunge#1137. The worker was told to find a build that did
+/// not exist, given no way out, and assured that "something landed on the
+/// target branch" — so it rebased and force-pushed an empty commit over the
+/// PR. The brief must instead offer a terminal and forbid the destructive
+/// move.
+#[test]
+fn trunk_eviction_prompt_offers_a_terminal_when_no_failing_build_was_captured() {
+    let prompt = trunk_eviction_revision_prompt("[]");
+
+    assert!(
+        prompt.contains("### If there is no failing build to find (STOP — do not invent one)"),
+        "an eviction with no evidence must offer a bail-out:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("\"$BOSS_BIN\" engine ci mark-failed --attempt-id"),
+        "the bail-out must name the terminal the engine actually accepts:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("mark-noop"),
+        "mark-noop is rejected outright for queue-side attempts; offering it would be a dead end:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("zero-diff commit"),
+        "the brief must forbid pushing an empty commit to look productive:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("A Trunk queue eviction almost always means"),
+        "the unconditional 'something landed on the target branch' claim must be gone:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("There is no conflict on the head branch to resolve"),
+        "the engine cannot know there is no conflict from an empty failed_checks blob alone; \
+         asserting it as fact is what let a real conflict be dispatched as an unfixable CI failure:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("gh api repos/<owner>/<repo>/issues/77/comments"),
+        "the brief must point the worker at the Trunk bot's own comment to determine the cause:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("gh pr view 77 --json mergeable,mergeStateStatus"),
+        "the brief must point the worker at live GitHub mergeability, read fresh:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("jj workspace update-stale"),
+        "the brief must offer the offline jj conflict check:\n{prompt}",
+    );
+}
+
+/// The other arm: when the engine DID identify the failing construction
+/// build, the rebase-and-fix playbook is correct and must survive — the
+/// bail-out is only for the evidence-free case.
+#[test]
+fn trunk_eviction_prompt_keeps_the_rebase_playbook_when_a_build_was_captured() {
+    let prompt = trunk_eviction_revision_prompt(
+        r#"[{"name":"Trunk merge queue: ci","conclusion":"FAILURE","target_url":"https://buildkite.com/o/p/builds/9","provider":"buildkite","provider_job_id":"job-9"}]"#,
+    );
+
+    assert!(
+        !prompt.contains("### If there is no failing build to find"),
+        "no bail-out when there is a real failing build to fix:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("rebase onto the PR's actual base branch"),
+        "the rebase-and-fix playbook must survive for a genuine test failure:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("Trunk merge queue: ci"),
+        "the captured failing check must still be rendered:\n{prompt}",
+    );
+}
+
+#[test]
+fn ci_remediation_prompt_omits_mark_noop_for_rebounce() {
+    // A merge_queue_rebounce failure lives on the synthetic merge
+    // commit, so the PR's head-branch checks always read green. The
+    // engine REJECTS a rebounce noop outright
+    // (`handle_mark_ci_remediation_noop`), so the brief must NOT
+    // surface it — as `compose_ci_remediation_fragment` also omits it by
+    // routing every rebounce into the queue CI fragment. (A rebounce normally
+    // delivers via a revision; the stranded-rescue path can still
+    // re-dispatch one through this bespoke prompt.)
+    let mut attempt = sample_ci_attempt();
+    attempt.failure_kind = Some("merge_queue_rebounce".into());
+    attempt.before_commit_sha = Some("mergesha999".into());
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&ci_remediation_execution(&attempt.pr_url))
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .ci_attempt(&attempt)
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        !prompt.contains("mark-noop"),
+        "rebounce ci_remediation prompt must NOT surface mark-noop (engine rejects it):\n{prompt}",
+    );
+    // Sanity: we still produced the bespoke ci_remediation prompt.
+    assert!(
+        prompt.contains("CI remediation: PR #"),
+        "expected the bespoke ci_remediation prompt to be generated:\n{prompt}",
+    );
+}
+
+#[test]
+fn merge_queue_brief_names_failure_source_and_requires_rebased_bazel_evidence() {
+    let mut attempt = sample_ci_attempt();
+    attempt.failure_kind = Some("merge_queue_rebounce".into());
+    attempt.before_commit_sha = Some("queue-commit".into());
+    attempt.failed_checks = r#"[{"name":"bazel-build-test","conclusion":"FAILURE","target_url":"https://buildkite.com/flunge/mono/builds/20619","provider":"buildkite"}]"#.into();
+    attempt.queue_base_sha = Some("historical-base".into());
+    let prompt = compose_ci_remediation_fragment(&attempt, Some(true));
+    for required in [
+        "Failure source: the failing merge-queue build",
+        "builds/20619",
+        "queue-commit",
+        "historical-base",
+        "workspace local-rebase --pr",
+        "EVERY failed test target",
+        "FULL build/test invocation",
+        "--queue-ci-evidence-file",
+        "enqueuePullRequest",
+        "expectedHeadOid",
+        "no code changed",
+    ] {
+        assert!(prompt.contains(required), "missing {required}: {prompt}");
+    }
+    attempt.failed_checks = "[]".into();
+    attempt.queue_base_sha = Some("empty-capture-base".into());
+    assert!(compose_ci_remediation_fragment(&attempt, Some(true)).contains("empty-capture-base"));
+    attempt.failure_kind = Some("trunk_queue_eviction".into());
+    attempt.failed_checks = "{malformed".into();
+    assert!(compose_ci_remediation_fragment(&attempt, Some(true)).contains("Merge-queue CI verification"));
+    let legacy = compose_ci_remediation_prompt(
+        &ci_remediation_execution(&attempt.pr_url),
+        &chore_without_pr(),
+        std::path::Path::new("/tmp/workspace"),
+        None,
+        &attempt,
+        None,
+        Some(true),
+    );
+    assert!(legacy.contains("Merge-queue CI verification"));
+    assert!(!prompt.contains("rely on CI to verify the push"));
+}
+
+#[test]
+fn revision_directive_without_provenance_has_no_fragment() {
+    // Operator-triggered revision: no conflict or CI attempt → no fragment.
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        !prompt.contains("## Conflict resolution context"),
+        "no conflict fragment for operator revision:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("## CI remediation context"),
+        "no CI fragment for operator revision:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("The engine owns your `boss-recovery/exec_*` recovery bookmark; keep it advanced locally"),
+        "base revision directive must still be present:\n{prompt}",
+    );
+}
+
+#[test]
+fn revision_directive_requires_pr_title_update() {
+    // Issue #843 (motivating incident PR #713): the revision worker
+    // correctly fixed the code but left the original PR title and body
+    // arguing the now-overturned conclusion. The directive must instruct
+    // the worker to update BOTH the title and the description to match the
+    // final state — not just the description.
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("Update the PR title AND description"),
+        "revision directive must instruct updating BOTH title and description:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("title MUST be updated") || prompt.contains("title MUST reflect"),
+        "revision directive must have a hard instruction to update the title when scope/conclusion changes:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("--title"),
+        "revision directive must show the gh pr edit --title command:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("gh pr edit 77 --title"),
+        "revision directive must interpolate the actual PR number into the title command, not emit literal {{pr_number}}:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("{pr_number}"),
+        "revision directive must not emit the literal placeholder {{pr_number}} — it must be interpolated:\n{prompt}",
+    );
+}
+
+#[test]
+fn revision_directive_permits_leaving_accurate_description_untouched() {
+    // Motivating incidents: flunge PR #1306 and #1301, where a revision's PR
+    // description drifted to assert the opposite of the diff it described.
+    // The fix is "verify against the current diff", not "always rewrite" —
+    // a worker that finds the description already accurate must leave it
+    // alone and say so, not edit it just to show it did something.
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("do NOT edit it just to have touched it"),
+        "revision directive must instruct the worker to leave an already-accurate \
+             description untouched rather than rewrite it for its own sake:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("say so explicitly in your final response"),
+        "revision directive must require the worker to state affirmatively when the \
+             description was already accurate, not just silently skip the edit:\n{prompt}",
+    );
+}
+
+#[test]
+fn revision_directive_requires_findings_status_comment() {
+    // Operator instruction: revisions that address automated review
+    // findings must post a compact GitHub comment summarising the status of
+    // every finding, alongside (not instead of) the PR-description
+    // reconciliation above. It must be skipped entirely — no empty table —
+    // when the revision has no review findings to report.
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("findings-status summary comment"),
+        "revision directive must require a findings-status summary comment:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("Every finding from that review pass must appear as a row"),
+        "revision directive must require every finding to appear, including unaddressed ones:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("SKIP the comment entirely"),
+        "revision directive must instruct skipping the comment (not posting an empty table) when there are no review findings:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("findings-status comment was not applicable"),
+        "a legitimate no-op must be explicit in the worker's recorded final response:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("gh pr comment 77 -R org/repo --body-file"),
+        "revision directive must interpolate the real PR number and repo slug into the gh pr comment command:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("\"not addressed\" alone is not acceptable"),
+        "a red-cross row must require a reason, not just \"not addressed\":\n{prompt}",
+    );
+    assert!(
+        prompt.contains("does not substitute for the PR description update"),
+        "the findings comment must be required in addition to, not instead of, the PR description reconciliation:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("finish them before your final response"),
+        "prompt-owned post-push steps must precede the worker's completion boundary:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("a push or staged PR URL alone does not mean the revision is done"),
+        "the revision directive must state the completion contract explicitly:\n{prompt}",
+    );
+}
+
+// -----------------------------------------------------------------------
+// `[deferred-scope]` marker directive (root-caused to PR #765)
+// -----------------------------------------------------------------------
+
+#[test]
+fn deferred_scope_directive_present_for_chore_implementation() {
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("[deferred-scope] summary=\"<what you did not deliver>\""),
+        "chore_implementation prompt must teach the [deferred-scope] marker grammar:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("filed as a followup"),
+        "directive must forbid the false \"filed as a followup\" claim:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("only sanctioned channel for declaring deferred scope"),
+        "directive must state the marker is the only sanctioned channel — prose-only \
+             deferral declarations (e.g. a \"## Deferred\" section with no markers) must be \
+             called out as insufficient:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("protocol violation"),
+        "directive must state that a prose deferral section with no matching markers is a \
+             protocol violation reviewers are instructed to flag:\n{prompt}",
+    );
+}
+
+#[test]
+fn deferred_scope_directive_teaches_boss_propose_verb_when_seam_is_on() {
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .deferred_scope_proposals_seam_enabled(true)
+            .build(),
+    );
+    assert!(
+        prompt.contains("\"$BOSS_BIN\" propose deferred-scope --summary"),
+        "seam on: the prompt must teach the deferred-scope verb with a worked example:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("[deferred-scope] summary="),
+        "seam on: the prompt must not also teach the legacy marker grammar:\n{prompt}",
+    );
+}
+
+#[test]
+fn deferred_scope_directive_present_for_revision_implementation() {
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("[deferred-scope] summary=\"<what you did not deliver>\""),
+        "revision_implementation prompt must teach the [deferred-scope] marker grammar:\n{prompt}",
+    );
+}
+
+#[test]
+fn deferred_scope_directive_teaches_boss_propose_verb_when_seam_is_on_for_revision_implementation() {
+    // Mirrors `deferred_scope_directive_teaches_boss_propose_verb_when_seam_is_on`
+    // above, but through `compose_revision_directive`'s call site
+    // (runner.rs's `proposals_seam_flags` tuple) rather than the
+    // chore/task-implementation one — the two flags in that tuple are
+    // same-typed bools a future edit could transpose silently, so both
+    // call sites need their own coverage.
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .deferred_scope_proposals_seam_enabled(true)
+            .build(),
+    );
+    assert!(
+        prompt.contains("\"$BOSS_BIN\" propose deferred-scope --summary"),
+        "revision prompt, seam on: must teach the deferred-scope verb with a worked example:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("[deferred-scope] summary="),
+        "revision prompt, seam on: must not also teach the legacy marker grammar:\n{prompt}",
+    );
+}
+
+#[test]
+fn revision_no_op_directive_teaches_no_changes_needed_declaration() {
+    // `no_op_completion_directive` is gated to `TaskImplementation |
+    // ChoreImplementation` with no existing PR, and a revision always has a
+    // bound parent PR — so a revision needs its own directive teaching the
+    // declaration, or `on_stop_inner`'s revision no-op terminal
+    // (`worker_signalled_no_op`, which reads only the typed declaration) is
+    // unreachable. Assert the declaration and its revision-specific framing
+    // (keyed on the dispatched finding, not on an empty `jj diff`) are present.
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("propose done --outcome no-changes-needed --summary"),
+        "revision prompt must teach the typed no-op declaration:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("NO_CHANGES_NEEDED"),
+        "revision prompt must not teach the retired text marker:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("If the finding needs no code change"),
+        "revision prompt must carry the revision-flavoured no-op directive, keyed on the \
+         dispatched finding rather than an empty diff:\n{prompt}",
+    );
+}
+
+#[test]
+fn escalation_protocol_directive_present_for_revision_implementation_seam_off() {
+    // A RevisionImplementation prompt never received
+    // `worker_escalation_protocol_directive` — only TaskImplementation /
+    // ChoreImplementation / ProjectDesign / InvestigationImplementation did
+    // (see the `matches!` guard above `deferred_scope_directive`'s call
+    // site). But `compose_revision_directive` injects a Bazel pre-push gate
+    // whose flag-on failure sentence points at `"$BOSS_BIN" propose blocked` and,
+    // for the non-conflict-resolution variant, at "see \"If you are blocked
+    // or the work is bigger than estimated\" below for the exact syntax" —
+    // a section that was never rendered for revisions, leaving the
+    // cross-reference dangling. Assert the section is now present on both
+    // the seam-off (this test) and seam-on (below) revision paths.
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("## If you are blocked or the work is bigger than estimated"),
+        "revision_implementation prompt must render the escalation-protocol section so the \
+             Bazel gate's cross-reference to it is not dangling:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("[blocked] reason=\"<why>\""),
+        "revision prompt, seam off: escalation section must teach the legacy [blocked] marker:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("\"$BOSS_BIN\" propose blocked")
+            && !prompt.contains("\"$BOSS_BIN\" propose effort-escalation"),
+        "revision prompt, seam off: escalation section must not teach the seam-gated propose verbs:\n{prompt}",
+    );
+}
+
+#[test]
+fn guide_comment_revision_directive_injects_guide_instructions() {
+    let work_item = revision_task_with_created_via(None, "guide-comment:rgs_1");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("Editing generated Markdown cannot satisfy an implementation request"),
+        "guide-comment revision must inject guide instructions:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("boss comment guide-outcome"),
+        "guide-comment revision must teach the outcome command:\n{prompt}",
+    );
+}
+
+#[test]
+fn revision_prerequisite_route_requires_run_done_seam() {
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(!prompt.contains("--answer-type create-prerequisite-task"));
+    assert!(prompt.contains("report the dependency using the blocker channel"));
+}
+
+#[test]
+fn revision_directive_routes_blocking_pr_work_to_prerequisite_and_later_work_to_followup() {
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .run_done_proposals_seam_enabled(true)
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("A revision never opens a new PR"),
+        "revision prompt must state a revision never opens a new PR:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("\"$BOSS_BIN\" propose done --outcome blocked --summary \"<blocker>\" --answer-type create-prerequisite-task")
+            && prompt.contains("--prerequisite-name")
+            && prompt.contains("--prerequisite-brief"),
+        "revision prompt must route a PR that must land first to create-prerequisite-task:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("\"$BOSS_BIN\" propose followup-task --name \"<short title>\"")
+            && prompt.contains("only for non-blocking work that can happen later"),
+        "revision prompt must keep followup-task as the non-blocking path:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("[blocked] reason=\"<specific question>\""),
+        "revision prompt, seam off: must steer a blocked guard/policy/decision to a specific \
+             question marker rather than a could-not-complete exit:\n{prompt}",
+    );
+}
+
+#[test]
+fn revision_directive_steers_blocked_progress_to_propose_blocked_when_seam_is_on() {
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .worker_signal_proposals_seam_enabled(true)
+            .build(),
+    );
+    assert!(
+        prompt.contains("\"$BOSS_BIN\" propose blocked --reason \"<specific question>\""),
+        "revision prompt, seam on: must steer a blocked guard/policy/decision to propose \
+             blocked with a specific question:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("instead of declaring you could not complete"),
+        "revision prompt must name the could-not-complete exit it is replacing:\n{prompt}",
+    );
+}
+
+#[test]
+fn ordinary_revision_directive_omits_guide_instructions() {
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        !prompt.contains("boss comment guide-outcome"),
+        "non-guide revision must not inject guide outcome instructions:\n{prompt}",
+    );
+}
+
+#[test]
+fn escalation_protocol_directive_teaches_boss_propose_verb_when_seam_is_on_for_revision_implementation() {
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .worker_signal_proposals_seam_enabled(true)
+            .build(),
+    );
+    assert!(
+        prompt.contains("## If you are blocked or the work is bigger than estimated"),
+        "revision_implementation prompt, seam on: must still render the escalation-protocol \
+             section:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("\"$BOSS_BIN\" propose blocked --reason \"<why>\""),
+        "revision prompt, seam on: escalation section must teach the $BOSS_BIN propose blocked verb:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("Two sanctioned markers, each on its own line in your final response"),
+        "revision prompt, seam on: must not also teach the legacy marker-only intro (the bare \
+             `[blocked] reason=\"<why>\"` bootstrap fallback IS still taught deliberately, so this \
+             checks the off-branch's distinguishing intro text instead):\n{prompt}",
+    );
+}
+
+#[test]
+fn deferred_scope_directive_absent_for_answer_agent() {
+    // The answer agent is read-only and never delivers scope against a
+    // brief — it must not be taught a marker it has no reason to emit.
+    let execution = WorkExecution::builder()
+        .id("exec_answer_01")
+        .work_item_id("task-1")
+        .kind(ExecutionKind::AnswerAgent)
+        .status(ExecutionStatus::Running)
+        .repo_remote_url("git@github.com:org/repo.git")
+        .workspace_path("/tmp/workspace")
+        .created_at("2026-05-15T00:00:00Z")
+        .build();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&execution)
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        !prompt.contains("[deferred-scope]"),
+        "read-only answer-agent prompt must not carry the [deferred-scope] directive:\n{prompt}",
+    );
+}
+
+// -----------------------------------------------------------
+// Worker-proposal seam (worker-proposal-api-replace-fragile-worker-to-engine-seams.md): `followup_proposals_seam` teaches
+// `"$BOSS_BIN" propose followup-task` instead of the legacy structured-output
+// artifact / `FOLLOWUPS:` sentinel. Mirrors the `deferred_scope_proposals_seam`
+// tests above.
+// -----------------------------------------------------------
+
+#[test]
+fn followups_block_teaches_legacy_artifact_and_sentinel_when_seam_is_off() {
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("\"proposed_name\""),
+        "seam off: the prompt must teach the legacy structured-output artifact shape:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("FOLLOWUPS:"),
+        "seam off: the prompt must keep the FOLLOWUPS: sentinel fallback:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("\"$BOSS_BIN\" propose followup-task"),
+        "seam off: the prompt must not teach a verb the engine won't yet read proposals-first for:\n{prompt}",
+    );
+}
+
+#[test]
+fn followups_block_teaches_boss_propose_verb_when_seam_is_on() {
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .followup_proposals_seam_enabled(true)
+            .build(),
+    );
+    assert!(
+        prompt.contains("\"$BOSS_BIN\" propose followup-task --name"),
+        "seam on: the prompt must teach the followup-task verb with a worked example:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("proposed follow-up `prp_"),
+        "seam on: the prompt must teach the \"proposed follow-up prp_…\" phrasing, never \
+         \"filed\":\n{prompt}",
+    );
+    assert!(
+        prompt.contains("never \"filed as a followup\""),
+        "seam on: the prompt must still forbid the false \"filed as a followup\" claim:\n{prompt}",
+    );
+}
+
+// -----------------------------------------------------------------------
+// editorial-rules block rendering (chore #5)
+// -----------------------------------------------------------------------
+
+#[test]
+fn editorial_rules_block_always_rendered_with_baked_in_rules() {
+    // Default config: block always appears with baked-in rules.
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .editorial_enabled(true)
+            .build(),
+    );
+    assert!(
+        prompt.contains("[editorial-rules]"),
+        "editorial-rules block must always be present:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("[/editorial-rules]"),
+        "editorial-rules closing tag must be present:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("exec_\u{2026}"),
+        "baked-in identifier rule must be present:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("Do not describe the tooling or process that produced the work"),
+        "baked-in phrase rule must be present:\n{prompt}",
+    );
+}
+
+#[test]
+fn editorial_rules_block_default_config_has_no_instructions_section() {
+    // Default config: no instructions, no template, no enforcement banner.
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .editorial_enabled(true)
+            .build(),
+    );
+    assert!(
+        !prompt.contains("Product-specific rules"),
+        "default config must not render instructions section:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("Template policy"),
+        "default config must not render template section:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("Enforcement:"),
+        "default config must not render enforcement banner:\n{prompt}",
+    );
+}
+
+#[test]
+fn editorial_rules_block_with_instructions_renders_full_configured_sections() {
+    let rules = boss_protocol::EditorialRules {
+        instructions: Some("No emoji in PR titles.".to_owned()),
+        ..Default::default()
+    };
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .editorial_rules(&rules)
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .editorial_enabled(true)
+            .build(),
+    );
+    assert!(
+        prompt.contains("Product-specific rules"),
+        "configured product must render instructions section:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("No emoji in PR titles."),
+        "configured product must include verbatim instructions:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("Enforcement:"),
+        "configured product must render enforcement banner:\n{prompt}",
+    );
+}
+
+#[test]
+fn editorial_rules_block_with_enforce_template_includes_template_text() {
+    let tmpl = crate::pr_template::PrTemplate {
+        text: "## Summary\n\n## Test plan\n".to_owned(),
+        required_headings: vec!["Summary".to_owned(), "Test plan".to_owned()],
+        source_path: std::path::PathBuf::from(".github/PULL_REQUEST_TEMPLATE.md"),
+    };
+    let pr_template_set = crate::pr_template::PrTemplateSet {
+        default_template: Some(tmpl),
+        named_templates: std::collections::HashMap::new(),
+    };
+    let rules = boss_protocol::EditorialRules {
+        template_policy: boss_protocol::TemplatePolicy::Enforce,
+        ..Default::default()
+    };
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .editorial_rules(&rules)
+            .pr_template_set(&pr_template_set)
+            .editorial_enabled(true)
+            .build(),
+    );
+    assert!(
+        prompt.contains("Template policy: Enforce"),
+        "enforce policy must appear in prompt:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("## Summary"),
+        "template content must be rendered verbatim:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("## Test plan"),
+        "template content must be rendered verbatim:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("Enforcement:"),
+        "enforcement banner must be present for configured product:\n{prompt}",
+    );
+}
+
+#[test]
+fn editorial_rules_block_appears_before_per_kind_directive() {
+    // [editorial-rules] must appear before "Expected outcome for this run:"
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .editorial_enabled(true)
+            .build(),
+    );
+    let editorial_pos = prompt.find("[editorial-rules]").expect("editorial-rules block missing");
+    let directive_pos = prompt
+        .find("Expected outcome for this run:")
+        .expect("per-kind directive missing");
+    assert!(
+        editorial_pos < directive_pos,
+        "editorial-rules block must appear before the per-kind directive:\n{prompt}",
+    );
+}
+
+#[test]
+fn editorial_rules_block_advise_template_policy_rendered() {
+    let rules = boss_protocol::EditorialRules {
+        template_policy: boss_protocol::TemplatePolicy::Advise,
+        ..Default::default()
+    };
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .editorial_rules(&rules)
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .editorial_enabled(true)
+            .build(),
+    );
+    assert!(
+        prompt.contains("Template policy: Advise"),
+        "advise policy must appear in prompt:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("Enforcement:"),
+        "enforcement banner must be present when template policy is set:\n{prompt}",
+    );
+}
+
+// -----------------------------------------------------------------------
+// editorial_controls feature flag (kill switch, default off)
+// -----------------------------------------------------------------------
+
+#[test]
+fn editorial_controls_flag_off_omits_block() {
+    // With editorial_enabled = false, no [editorial-rules] block in the prompt.
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .editorial_enabled(false)
+            .build(),
+    );
+    assert!(
+        !prompt.contains("[editorial-rules]"),
+        "editorial-rules block must be absent when flag is off:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("[/editorial-rules]"),
+        "editorial-rules closing tag must be absent when flag is off:\n{prompt}",
+    );
+    // Prompt must still be a valid worker prompt (has execution context).
+    assert!(
+        prompt.contains("execution id"),
+        "prompt must still contain execution context when editorial is off:\n{prompt}",
+    );
+}
+
+#[test]
+fn editorial_controls_flag_off_omits_block_even_with_configured_rules() {
+    // Rules configured on the product are also suppressed when the flag is off.
+    let rules = boss_protocol::EditorialRules {
+        instructions: Some("No emoji in titles.".to_owned()),
+        ..Default::default()
+    };
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .editorial_rules(&rules)
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .editorial_enabled(false)
+            .build(),
+    );
+    assert!(
+        !prompt.contains("[editorial-rules]"),
+        "editorial-rules block must be absent when flag is off (even with rules configured):\n{prompt}",
+    );
+}
+
+#[test]
+fn editorial_controls_flag_on_preserves_existing_behavior() {
+    // With editorial_enabled = true, the [editorial-rules] block must be present
+    // and contain the baked-in rules — identical to the original behavior.
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .editorial_enabled(true)
+            .build(),
+    );
+    assert!(
+        prompt.contains("[editorial-rules]"),
+        "editorial-rules block must be present when flag is on:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("[/editorial-rules]"),
+        "editorial-rules closing tag must be present when flag is on:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("exec_\u{2026}"),
+        "baked-in identifier rule must be present when flag is on:\n{prompt}",
+    );
+}
+
+/// The design directive must require the `Scope:` tag on every breakdown
+/// entry — this is the structured marker the Planner's system prompt
+/// (`tools/boss/engine/core/src/planner.rs`) keys off to park deferred
+/// items instead of proposing them as ordinary startable work.
+#[test]
+fn design_directive_requires_the_scope_tag() {
+    let directive = compose_design_directive(None, None);
+    assert!(directive.contains("Scope: in-scope"), "{directive}");
+    assert!(
+        directive.contains("Scope: deferred (future / not a v1 blocker)"),
+        "{directive}"
+    );
+    assert!(
+        directive.contains("downstream scheduling keys off it verbatim"),
+        "{directive}"
+    );
+    assert!(
+        directive.contains("rather than silently omitting a decision the design already made"),
+        "{directive}"
+    );
+    // Deferred rows are only for genuine analysis outcomes, not padding.
+    assert!(
+        directive.contains("Do not invent deferred rows for topics the change never needed"),
+        "{directive}"
+    );
+}
+/// The breakdown block must carry proportionality calibration, not just
+/// split rules: a named cost for over-splitting, honesty that the planner
+/// materialises entries one-for-one (it will not re-split an oversize entry),
+/// a ban on fabricating entries to pad a band, anchor bands that include a
+/// one-entry outcome, and a `Breakdown size:` self-check line the author
+/// must defend N from the change (not from a band). Without these the
+/// guidance is one-directional and designs over-produce or invent entries —
+/// see `compose_design_directive`'s docs for the measured distribution that
+/// motivated the calibration, and the one-entry / no-fabricate rules that
+/// close the remaining floor-and-symmetry gaps.
+#[test]
+fn design_directive_calibrates_breakdown_size_to_problem_size() {
+    let directive = compose_design_directive(None, None);
+    assert!(directive.contains("Major deliverables:"));
+    assert!(directive.contains("Likely changed files:"));
+    assert!(directive.contains("Estimated size: ~N files / ~M changed lines"));
+    assert!(directive.contains("materialization rejects these entries and never auto-splits them"));
+    // The split rules this calibration must not displace — tempered so a
+    // thin multi-layer change may stay one entry, and so the planner is not
+    // claimed to re-expand oversize entries.
+    assert!(directive.contains("keep each entry single-subsystem"), "{directive}");
+    assert!(
+        directive.contains("the planner trusts this breakdown and does not re-expand entries"),
+        "{directive}"
+    );
+    // Each entry must carry the `###` heading the parser keys off of —
+    // without this mandate, a doc that uses bullets or bold-numbered items
+    // instead parses to zero entries and silently loses the hard entry
+    // boundary this whole calibration exists to enforce.
+    assert!(
+        directive.contains("each entry must open with `### <task name>`"),
+        "{directive}"
+    );
+    assert!(
+        directive.contains("the planner will not re-split it for you"),
+        "{directive}"
+    );
+    // The symmetric cost for over-splitting.
+    assert!(directive.contains("**too many entries**"), "{directive}");
+    assert!(directive.contains("neither side is automatically safe"), "{directive}");
+    // Fabricating entries is a named failure mode (symmetric with under-splitting).
+    assert!(directive.contains("**fabricated entries**"), "{directive}");
+    assert!(
+        directive.contains("never invent tasks the requested change does not need"),
+        "{directive}"
+    );
+    assert!(
+        directive.contains("neither as `Scope: in-scope` entries nor as `Scope: deferred` ones"),
+        "{directive}"
+    );
+    // One-entry breakdown is explicitly sanctioned — not under-analysis.
+    assert!(
+        directive.contains("**one entry is a valid and expected outcome.**"),
+        "{directive}"
+    );
+    assert!(
+        directive.contains("a single-entry breakdown is the correct answer"),
+        "{directive}"
+    );
+    assert!(directive.contains("**1 entry**"), "{directive}");
+    // Do not manufacture unreviewable intermediate contracts.
+    assert!(
+        directive.contains("**do not manufacture unreviewable intermediates.**"),
+        "{directive}"
+    );
+    assert!(
+        directive.contains("the seam's own PR would ship with no exercised caller"),
+        "{directive}"
+    );
+    // Non-compounding instruction and the anchor bands (smallest band includes one).
+    assert!(
+        directive.contains("split rules add, they do not multiply."),
+        "{directive}"
+    );
+    assert!(directive.contains("**1-4 entries**"), "{directive}");
+    assert!(directive.contains("**4-8 entries**"), "{directive}");
+    assert!(directive.contains("**8-14 entries**"), "{directive}");
+    assert!(directive.contains("**15+ entries**"), "{directive}");
+    // No cap: a genuinely large design may still propose more.
+    assert!(directive.contains("not a cap"), "{directive}");
+    // The count must be stated and justified from the change, not from a band.
+    assert!(
+        directive.contains("Breakdown size: N entries (M in-scope, K deferred)"),
+        "{directive}"
+    );
+    assert!(
+        directive.contains("what the change actually touches and why that yields N"),
+        "{directive}"
+    );
+    assert!(
+        directive.contains("must not by itself constitute the defence"),
+        "{directive}"
+    );
+}
+/// The portable design-discipline block must appear in both design-family
+/// directives, not be duplicated as separate text in each.
+#[test]
+fn design_discipline_block_present_in_both_design_directives() {
+    let design = compose_design_directive(None, None);
+    assert!(design.contains("Name the contested property up front"), "{design}");
+    assert!(design.contains("Every rejection must be checkable"), "{design}");
+
+    let postmortem = compose_design_postmortem_directive(None, "/tmp/followups.json", None);
+    assert!(postmortem.contains("`- details:` task description at the end of this prompt"));
+    assert!(!postmortem.contains("details above"));
+    assert!(
+        postmortem.contains("Name the contested property up front"),
+        "{postmortem}"
+    );
+    assert!(postmortem.contains("Every rejection must be checkable"), "{postmortem}");
+}
+
+#[test]
+fn design_directive_for_another_product_has_no_boss_repo_assumptions() {
+    let project = crate::work::Project::builder()
+        .id("proj-other-product")
+        .product_id("product-other")
+        .name("External project")
+        .description("")
+        .goal("")
+        .status(crate::work::ProjectStatus::Active)
+        .slug("external-project")
+        .created_at("2026-05-15T00:00:00Z")
+        .updated_at("2026-05-15T00:00:00Z")
+        .build();
+
+    let directive = compose_design_directive(Some(&project), None);
+    assert!(directive.contains("**Design discipline:**"), "{directive}");
+    assert!(directive.contains("client, service, shared data model"), "{directive}");
+    for repo_specific_text in [
+        "tools/boss/",
+        "codex-driver-execution-shape-postmortem",
+        "engine + cli + protocol + app",
+    ] {
+        assert!(
+            !directive.contains(repo_specific_text),
+            "non-Boss design directive must not mention {repo_specific_text}:\n{directive}",
+        );
+    }
+}
+
+/// `products.design_guidance` renders inside the design directive, wrapped
+/// in visible `[product-design-guidance]…[/product-design-guidance]`
+/// markers — mirrors `[product-preamble]`'s transcript-visibility contract.
+#[test]
+fn design_guidance_block_wraps_configured_text_in_design_directive() {
+    let mut execution = base_execution();
+    execution.kind = ExecutionKind::ProjectDesign;
+    let work_item = design_task();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&execution)
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .design_guidance("Prefer terse prose; cite prior art.")
+            .build(),
+    );
+    assert!(
+        prompt.contains("[product-design-guidance]\nPrefer terse prose; cite prior art.\n[/product-design-guidance]"),
+        "design guidance must render wrapped in visible markers:\n{prompt}",
+    );
+}
+
+/// `None` / unset `design_guidance` renders no block at all — today's
+/// behaviour, unchanged.
+#[test]
+fn design_guidance_block_absent_when_not_configured() {
+    let mut execution = base_execution();
+    execution.kind = ExecutionKind::ProjectDesign;
+    let work_item = design_task();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&execution)
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        !prompt.contains("[product-design-guidance]"),
+        "no design guidance configured; block must not render:\n{prompt}",
+    );
+}
+
+/// The `design_postmortem` directive renders the same shared block —
+/// `compose_design_directive` and `compose_design_postmortem_directive`
+/// must not maintain two copies of this render logic.
+#[test]
+fn design_guidance_block_present_in_postmortem_directive_too() {
+    let mut execution = base_execution();
+    execution.kind = ExecutionKind::ProjectDesign;
+    let work_item = match design_task() {
+        WorkItem::Task(mut t) => {
+            t.kind = TaskKind::DesignPostmortem;
+            WorkItem::Task(t)
+        }
+        other => other,
+    };
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&execution)
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .design_guidance("Match house style.")
+            .build(),
+    );
+    assert!(
+        prompt.contains("[product-design-guidance]\nMatch house style.\n[/product-design-guidance]"),
+        "postmortem directive must render the shared guidance block too:\n{prompt}",
+    );
+}
+
+/// `design_guidance` must not leak into an unrelated execution kind — it is
+/// injected only into the design-family directive, unlike `dispatch_preamble`
+/// which every kind receives (rendered separately in `worker_spawn.rs`).
+#[test]
+fn design_guidance_absent_from_non_design_execution_kind() {
+    let execution = base_execution();
+    let work_item = chore_without_pr();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&execution)
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .design_guidance("Should never appear here.")
+            .build(),
+    );
+    assert!(
+        !prompt.contains("[product-design-guidance]"),
+        "a chore_implementation execution must not render the design guidance block:\n{prompt}",
+    );
+}
+
+#[test]
+fn revision_directive_injects_guide_fragment_for_guide_created_revision() {
+    let work_item = revision_task_with_created_via(
+        None,
+        &format!("{}series-1", boss_protocol::CREATED_VIA_GUIDE_COMMENT_PREFIX),
+    );
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .review_signal_checks(|_| &[])
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("This revision was dispatched from review-guide feedback."),
+        "guide-created revision must get the guide fragment:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("boss comment guide-outcome"),
+        "guide fragment must teach the guide-outcome command:\n{prompt}",
+    );
+}
+
+#[test]
+fn revision_directive_omits_guide_fragment_for_non_guide_revision() {
+    for created_via in ["operator", "merge-conflict:crz_frag_01", "ci-fix:crm_frag_01"] {
+        let work_item = revision_task_with_created_via(None, created_via);
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .review_signal_checks(|_| &[])
+                .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+                .work_item(&work_item)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
+        );
+        assert!(
+            !prompt.contains("This revision was dispatched from review-guide feedback."),
+            "non-guide revision ({created_via}) must not get the guide fragment:\n{prompt}",
+        );
+    }
+}

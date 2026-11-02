@@ -1,0 +1,18 @@
+[package]
+name = "boss-pane-summary"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+boss-engine-utils = { path = "../utils" }
+boss-claude-client = { path = "../../claude_client" }
+boss-engine-utility-model = { path = "../utility-model" }
+boss-work-db = { path = "../work-db" }
+boss-protocol = { path = "../../protocol" }
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+wiremock = { workspace = true }
