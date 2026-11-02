@@ -49,10 +49,6 @@ use boss_protocol::{CoordinatorGuidanceView, CoordinatorHandoffView, Coordinator
 
 use crate::work::CoordinatorTmuxRecord;
 
-/// Metadata key holding the JSON-encoded [`CoordinatorHandoff`].
-#[cfg(test)]
-pub(crate) use crate::work::HANDOFF_METADATA_KEY;
-
 /// Upper bound on a handoff body. A handoff is a brief — operator-stated
 /// facts, decisions, open threads, prohibitions — not a transcript
 /// replay; the cap is what keeps it that way when a session is tempted to
@@ -380,7 +376,6 @@ pub(crate) fn write_start_brief(working_directory: &Path, brief: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::work::WorkDb;
 
     const NOW: i64 = 1_756_800_000;
 
@@ -442,21 +437,6 @@ mod tests {
         let err = validate_handoff_body(&big).unwrap_err();
         assert!(err.contains(&MAX_HANDOFF_BYTES.to_string()), "got: {err}");
         assert!(validate_handoff_body(&"x".repeat(MAX_HANDOFF_BYTES)).is_ok());
-    }
-
-    #[test]
-    fn state_distinguishes_missing_present_and_unreadable() {
-        let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
-        assert_eq!(db.coordinator_handoff_state(), HandoffState::Missing);
-
-        let written = db.set_coordinator_handoff("- fact", "token-a", NOW).unwrap();
-        assert_eq!(db.coordinator_handoff_state(), HandoffState::Present(written));
-
-        db.set_metadata(HANDOFF_METADATA_KEY, "{not json").unwrap();
-        match db.coordinator_handoff_state() {
-            HandoffState::Unreadable(reason) => assert!(reason.contains("not valid JSON"), "got: {reason}"),
-            other => panic!("corrupt value must read as Unreadable, got {other:?}"),
-        }
     }
 
     #[test]

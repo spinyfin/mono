@@ -6,16 +6,10 @@ exports_files(["Cargo.toml"])
 rust_library(
     name = "work-db",
     srcs = glob(["src/**/*.rs"]),
-    compile_data = [
-        "//tools/boss/app-macos:work_board_banners_swift",
-    ],
     crate_name = "boss_work_db",
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = ["//tools/boss/engine/work-db-boundary:work_db_boundary"] + all_crate_deps(proc_macro = True),
-    rustc_env = {
-        "BOSS_WORK_BOARD_BANNERS_SWIFT": "$(execpath //tools/boss/app-macos:work_board_banners_swift)",
-    },
     visibility = [
         "//tools/boss/engine/core:__pkg__",
     ],
@@ -50,17 +44,11 @@ rust_library(
     name = "work_db_test_support",
     testonly = True,
     srcs = glob(["src/**/*.rs"]),
-    compile_data = [
-        "//tools/boss/app-macos:work_board_banners_swift",
-    ],
     crate_features = ["test-support"],
     crate_name = "boss_work_db_test_support",
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = ["//tools/boss/engine/work-db-boundary:work_db_boundary"] + all_crate_deps(proc_macro = True),
-    rustc_env = {
-        "BOSS_WORK_BOARD_BANNERS_SWIFT": "$(execpath //tools/boss/app-macos:work_board_banners_swift)",
-    },
     visibility = [
         "//tools/boss/engine/core:__pkg__",
     ],
@@ -88,7 +76,10 @@ rust_library(
         "//tools/boss/gh_telemetry",
         "//tools/boss/github",
         "//tools/boss/protocol",
-    ] + all_crate_deps(normal = True),
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
 )
 
 rust_test(

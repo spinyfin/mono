@@ -2876,8 +2876,7 @@ mod tests {
         let created = ensure_for_attach(&spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe))
             .await
             .unwrap();
-        db.set_metadata(coordinator_handoff::HANDOFF_METADATA_KEY, "{corrupt")
-            .unwrap();
+        db.set_metadata(crate::work::HANDOFF_METADATA_KEY, "{corrupt").unwrap();
 
         let (tmux, _server) = tmux_for(FakeTmux::new(
             vec![COORDINATOR_SESSION_NAME],

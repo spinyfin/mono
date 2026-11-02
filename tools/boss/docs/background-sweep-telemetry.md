@@ -63,7 +63,7 @@ wait-reason text) — but the single-item read builds the full kanban card:
 revision-chain slices plus the AI-review badge, whose query is a recursive
 revision-family CTE with a `ROW_NUMBER` window over `pr_review_verdicts`.
 That is SQLite page I/O (`pread` was 48 % of leaf samples), repeated N+1
-per pass. Fix: narrow reads in `engine/core/src/work/sweep_reads.rs`
+per pass. Fix: narrow reads in `tools/boss/engine/work-db/src/sweep_reads.rs`
 (`task_effort_levels`, `task_closed_states`, `task_pr_url`,
 `task_wait_label`), batched per pass with one `IN (...)` query where the
 pass has the id set up front. `is_bound_work_item_closed` itself now reads

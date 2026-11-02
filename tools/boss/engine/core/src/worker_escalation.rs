@@ -31,6 +31,8 @@
 //! included), not a substring scan — prose that merely *mentions* the
 //! protocol must not trip it.
 
+use boss_engine_utils::quoted_field::extract_quoted;
+
 /// `[effort-escalation]` marker prefix (design `effort-and-model-estimation.md`).
 pub const EFFORT_ESCALATION_MARKER: &str = "[effort-escalation]";
 
@@ -175,20 +177,6 @@ fn extract_bareword<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
     let value = &rest[..end];
     (!value.is_empty()).then_some(value)
-}
-
-/// Extract `key="quoted value"` from `text`. Requires a matching closing
-/// quote on the same line; an unterminated quote yields `None` (malformed).
-///
-/// `pub(crate)` so [`crate::deferred_scope`] can reuse it for its own
-/// `summary=`/`reason=` field extraction rather than reimplementing the
-/// same quoted-value scan.
-pub(crate) fn extract_quoted<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    let needle = format!("{key}=\"");
-    let idx = text.find(&needle)?;
-    let rest = &text[idx + needle.len()..];
-    let end = rest.find('"')?;
-    Some(&rest[..end])
 }
 
 #[cfg(test)]

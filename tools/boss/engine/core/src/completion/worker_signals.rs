@@ -125,7 +125,8 @@ impl WorkerCompletionHandler {
             WorkerSignalKind::EffortEscalation => ProposalKind::EffortEscalation,
             WorkerSignalKind::Blocked => ProposalKind::Blocked,
         };
-        let marker_reason = worker_escalation::extract_quoted(&signal.marker_line, "reason").map(str::trim);
+        let marker_reason =
+            boss_engine_utils::quoted_field::extract_quoted(&signal.marker_line, "reason").map(str::trim);
         self.execution_has_matching_proposal(execution, proposal_kind, "worker_signal_proposals_seam", |payload| {
             let proposal_reason = payload.get("reason").and_then(|r| r.as_str()).map(str::trim);
             match (marker_reason, proposal_reason) {

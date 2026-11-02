@@ -83,10 +83,13 @@ pub fn tombstone_orphaned_remediation(db: &WorkDb, task: &str) {
     db.test_tombstone_orphaned_remediation(task).unwrap();
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub use db_helpers::*;
 
-#[cfg(test)]
+/// Storage fixtures shared by this crate's tests and by downstream crates
+/// that compile against the `test-support` variant, so a new field on a
+/// create-input type is absorbed in one place.
+#[cfg(any(test, feature = "test-support"))]
 mod db_helpers {
     use tempfile::TempDir;
 
@@ -371,6 +374,9 @@ mod db_helpers {
         .unwrap()
     }
 
+    /// Process-wide captured-log buffer. Exactly one module per test binary may
+    /// own the global tracing subscriber (`set_global_default` is once-only), so
+    /// every test that reads captured logs goes through this one.
     pub mod log_capture {
         use std::io;
         use std::sync::{Arc, Mutex, OnceLock};

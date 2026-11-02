@@ -1,10 +1,10 @@
 # Engine database migrations
 
-Engine startup owns migration execution in `core/src/work/schema_init.rs`. It takes one `BEGIN IMMEDIATE` transaction covering baseline creation, legacy bootstrap, every pending migration, and required local-host data. An error rolls the whole transaction back. CLI inspection and direct attachment do not run migrations.
+Engine startup owns migration execution in `tools/boss/engine/work-db/src/schema_init.rs`. It takes one `BEGIN IMMEDIATE` transaction covering baseline creation, legacy bootstrap, every pending migration, and required local-host data. An error rolls the whole transaction back. CLI inspection and direct attachment do not run migrations.
 
 ## Adding a migration
 
-Add a separate `Migration` entry in `core/src/work/schema_migration_registry.rs`, with a unique `YYYYMMDD_HHMM_short_snake_name` id using UTC and `legacy_version: None`. The descriptive suffix distinguishes migrations authored in the same minute. Put substantial SQL or Rust transformation logic in its own file or the existing owning module, then call it from the entry. Do not edit a shared version counter, renumber existing entries, or modify a shipped migration's id or behavior.
+Add a separate `Migration` entry in `tools/boss/engine/work-db/src/schema_migration_registry.rs`, with a unique `YYYYMMDD_HHMM_short_snake_name` id using UTC and `legacy_version: None`. The descriptive suffix distinguishes migrations authored in the same minute. Put substantial SQL or Rust transformation logic in its own file or the existing owning module, then call it from the entry. Do not edit a shared version counter, renumber existing entries, or modify a shipped migration's id or behavior.
 
 The runner sorts entries by id, independently of their source order, and applies every known id absent from `schema_migrations`. An earlier timestamp that merges later is still applied; this is set membership, not a high-water mark. Duplicate registry ids fail startup before any migration runs.
 
