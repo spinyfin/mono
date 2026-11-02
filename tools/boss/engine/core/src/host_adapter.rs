@@ -623,10 +623,6 @@ pub(crate) fn map_remote_bazel_probe_output(result: Result<SshOutput>, host_id: 
     }
 }
 
-/// A single-string command so the remote shell evaluates the whole
-/// `test … -o …` expression (a multi-token argv would be space-joined
-/// by ssh and mis-parsed). Workspace paths come from cube and contain
-/// no shell metacharacters.
 /// Options for composing a worker prompt on the remote spawn path. Kept as one
 /// function so the merge-review policy wiring is covered by a test.
 fn remote_spawn_opts(max_embed_diff_lines: u64, bazel_workspace: Option<bool>) -> WorkerSpawnOpts {
@@ -637,6 +633,10 @@ fn remote_spawn_opts(max_embed_diff_lines: u64, bazel_workspace: Option<bool>) -
         .build()
 }
 
+/// A single-string command so the remote shell evaluates the whole
+/// `test … -o …` expression (a multi-token argv would be space-joined
+/// by ssh and mis-parsed). Workspace paths come from cube and contain
+/// no shell metacharacters.
 pub(crate) async fn probe_remote_bazel_workspace_on(exec: &dyn SshExec, workspace: &str) -> Option<bool> {
     let probe = format!(
         "test -f '{ws}/MODULE.bazel' -o -f '{ws}/WORKSPACE' -o -f '{ws}/WORKSPACE.bazel'",
@@ -1987,20 +1987,20 @@ pub(crate) async fn stage_remote_initial_input(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn remote_spawn_opts_carry_the_merge_review_policy() {
-        let opts = super::remote_spawn_opts(0, None);
-        let owner = "linkedin-multiproduct";
-        let expected = crate::merge_poller::review_signal_checks_for_owner(owner);
-        assert!(!expected.is_empty(), "fixture owner must have human-gated checks");
-        assert_eq!((opts.review_signal_checks)(owner), expected);
-    }
-
     use super::*;
     use crate::driver::AgentDriver;
     use crate::ssh_spawn::SshExec;
     use crate::ssh_transport::SshOutput;
     use async_trait::async_trait;
+
+    #[test]
+    fn remote_spawn_opts_carry_the_merge_review_policy() {
+        let opts = remote_spawn_opts(0, None);
+        let owner = "linkedin-multiproduct";
+        let expected = crate::merge_poller::review_signal_checks_for_owner(owner);
+        assert!(!expected.is_empty(), "fixture owner must have human-gated checks");
+        assert_eq!((opts.review_signal_checks)(owner), expected);
+    }
 
     fn run_occupancy_script(workspace: &Path) -> String {
         let output = std::process::Command::new("sh")
