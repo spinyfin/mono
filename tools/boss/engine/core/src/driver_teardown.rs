@@ -23,11 +23,7 @@ use std::time::Instant;
 use crate::driver::DriverRegistry;
 use crate::work::WorkDb;
 
-/// Which termination path invoked [`teardown_driver_workspace`], and why.
-///
-/// Both the entry and completion traces carry this, so "who tore this
-/// execution down?" is answerable from the teardown line itself rather than
-/// inferred from whichever sweep happened to log next to it.
+/// Re-exported from `boss_execution_contracts`.
 pub use boss_execution_contracts::TeardownReason;
 
 /// How a teardown pass ended, for the completion trace's `outcome` field.

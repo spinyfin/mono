@@ -334,18 +334,7 @@ pub const CONFLICT_NO_PUSH_REASON: &str = "no_push_no_stop_condition";
 /// catch-all fired in.
 pub const CI_NO_PUSH_REASON: &str = "no_push_no_classification";
 
-/// Result of a [`WorkerPaneReleaser::release_pane`] call. Tells the
-/// caller whether a live worker slot was actually found and reaped — the
-/// signal that gates the cube-lease release in [`WorkerCompletionHandler::force_release`].
-///
-/// The distinction exists to close a mid-spawn-cancel collision:
-/// a worker whose pid has not yet materialized has no mapped slot, so the
-/// pane release is a no-op (`NoLiveWorker`). Freeing its cube lease at
-/// that point would hand a still-to-be-occupied workspace back to cube,
-/// which then re-leases it to another execution — two live processes,
-/// one working tree. The lease must stay held until the occupant is
-/// genuinely gone; the in-flight run reaps + releases once its spawn
-/// settles (see `PaneSpawnRunner::run_execution`).
+/// Re-exported from `boss_execution_contracts`.
 pub use boss_execution_contracts::{NoopWorkerPaneReleaser, PaneReleaseOutcome, WorkerPaneReleaser};
 
 /// What GitHub reports about a PR associated with the worker's

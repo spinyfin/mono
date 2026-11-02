@@ -1,8 +1,26 @@
 //! Shared execution service contracts and worker-pool state.
 //! Concrete host operations remain in the host executor and upper adapters.
 
+mod lease_release;
+pub use lease_release::{
+    BookmarkStatus, KeepReason, LeaseReleaseDecision, LeaseReleaseOutcome, PaneStatus, PreStartStage, TerminalCause,
+};
+mod host_selection;
+pub use host_selection::{
+    ChoreRequirements, DRIVERS_PROBED_CAPABILITY, Eligibility, HostSlot, IneligibilityReason, driver_capability,
+    select_host,
+};
+mod worker_kind;
+pub use worker_kind::{WorkerKind, worker_kind_for_execution};
+mod pre_start_streak;
+pub use pre_start_streak::{
+    FailureEffect, PRE_START_FAILURE_STREAK_THRESHOLD, PreStartStreakTracker, StreakKey, UNRESOLVED_DRIVER_LABEL,
+};
 mod lifecycle;
-pub use lifecycle::*;
+pub use lifecycle::{
+    LifecycleServices, LiveWorkerLiveness, NoopWorkerPaneReleaser, PaneReleaseOutcome, PidStatus, ReattachSummary,
+    RemoteLeaseReconcileOutcome, TeardownReason, WorkerPaneReleaser,
+};
 
 use std::path::Path;
 use std::sync::Arc;

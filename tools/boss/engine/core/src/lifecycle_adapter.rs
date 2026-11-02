@@ -252,15 +252,7 @@ impl LifecycleServices for CoreLifecycleServices {
     }
 
     fn register_answer_agent_metrics(&self, registry: &Registry) {
-        use crate::answer_agent_observability::{ENQUEUED, FAILED, QUEUE_WAIT_MS, REPLIED, STARTED, SUPERSEDED};
-        for handle in [&ENQUEUED, &STARTED, &REPLIED, &FAILED, &SUPERSEDED, &QUEUE_WAIT_MS] {
-            if registry
-                .counter_snapshot_one(handle.name())
-                .is_none_or(|counter| counter.stale)
-            {
-                registry.register_counter(handle);
-            }
-        }
+        crate::answer_agent_observability::ensure_registered(registry);
     }
 
     fn record_answer_agent_started(&self, registry: &Registry, queue_wait_ms: u64) {
