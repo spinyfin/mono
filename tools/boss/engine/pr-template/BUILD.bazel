@@ -11,9 +11,9 @@ rust_library(
     visibility = [
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/execution-runner:__pkg__",
+        "//tools/boss/engine/planner-validation:__pkg__",
         "//tools/boss/engine/pr-review:__pkg__",
         "//tools/boss/engine/review-guide:__pkg__",
-        "//tools/boss/engine/storage-values:__pkg__",
     ],
     deps = all_crate_deps(normal = True),
 )

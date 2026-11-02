@@ -649,7 +649,7 @@ fn claude_md_decision_contract(seam_enabled: bool) -> String {
 /// `automation_outcome_proposals_seam` feature flag (composed with the
 /// `worker_proposals` master flag) — the same flag
 /// `completion::WorkerCompletionHandler::finalize_automation_triage`
-/// reads for the engine's read path ,
+/// reads for the engine's read path,
 /// threaded here so the two halves of the migration move together: a
 /// triage worker must never be taught a verb the engine won't yet read
 /// proposals-first for, and flipping the flag off must restore today's

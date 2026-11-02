@@ -83,8 +83,8 @@ pub(super) struct ExecutionPromptParams<'a> {
     #[builder(default)]
     deferred_scope_proposals_seam_enabled: bool,
     /// Whether `followup_proposals_seam` is on — gates the worker-facing
-    /// prompt half of the follow-ups seam migration (design implementation
-    /// task 10): [`followups_emission_block`]. `false` (the flag's registry
+    /// prompt half of the follow-ups seam migration
+    /// (`worker-proposal-api-replace-fragile-worker-to-engine-seams.md`): [`followups_emission_block`]. `false` (the flag's registry
     /// default) reproduces the exact structured-output-artifact-primary /
     /// `FOLLOWUPS:`-sentinel-fallback text; `true` teaches `"$BOSS_BIN" propose
     /// followup-task` instead. This is the OTHER half of the flag:

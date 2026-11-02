@@ -389,7 +389,7 @@ fn deferred_declarations_for(work_db: &WorkDb, work_item_id: &str) -> Vec<String
 
 #[cfg(test)]
 mod tests {
-    use boss_engine_storage_values::supersession_scan::{hit_lines, scan_supersession_language};
+    use crate::supersession_scan::{hit_lines, scan_supersession_language};
     use boss_pr_review::render_supersession_flag_block;
     #[test]
     fn render_block_empty_when_no_hits() {

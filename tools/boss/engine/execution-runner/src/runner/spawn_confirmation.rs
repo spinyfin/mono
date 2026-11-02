@@ -172,7 +172,7 @@ pub fn turn_did_not_start_error(driver_name: &str, run_id: &str, timeout: Durati
 /// Phase 1 treats turn-start evidence as readiness: a driver hook is
 /// stronger proof the CLI exec'd than a scraped pane marker, so a spawn
 /// whose turn has already started is not reaped for missing chrome.
-pub async fn confirm_spawn_started<Ready, ReadyFut, Started, StartedFut>(
+pub(crate) async fn confirm_spawn_started<Ready, ReadyFut, Started, StartedFut>(
     driver_name: &str,
     run_id: &str,
     composer_timeout: Duration,

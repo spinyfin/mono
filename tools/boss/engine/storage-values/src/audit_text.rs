@@ -24,7 +24,8 @@ pub const PR_REVIEW_SKIP_MARKER: &str = "[pr-review-skip]";
 /// Every `append_description_line` writer's marker must appear here — this
 /// list is the single source of truth for what counts as an engine audit
 /// line rather than human-authored brief text. See
-/// `engine_audit_line_prefixes_cover_every_known_writer` below, which pins
+/// `engine_audit_line_prefixes_cover_every_known_writer` (in
+/// `core/src/reconcile_audit.rs`), which pins
 /// each writer's marker constant against this list so a new writer that
 /// forgets to register here fails a test instead of silently poisoning
 /// empty-brief detection.
