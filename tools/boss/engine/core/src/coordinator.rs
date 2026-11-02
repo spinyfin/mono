@@ -1,4 +1,3 @@
-pub use crate::lifecycle_adapter::CoreCoordinatorConstructors;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -915,9 +914,8 @@ pub struct ExecutionCoordinator {
     /// to [`crate::config::MAX_MERGE_ORDER_STAGGER_SECS`]) at construction.
     #[builder(default)]
     merge_order_stagger_secs: u64,
-    /// Engine-wide counter registry. Required: build one with
-    /// [`default_coordinator_metrics`] (which registers the lifecycle's
-    /// answer-agent metrics) or pass the shared engine registry.
+    /// Engine-wide counter registry. Builder finalization registers the
+    /// supplied lifecycle's answer-agent metrics, including for a shared registry.
     metrics: Arc<Registry>,
     /// Hook called when an execution transitions to `running`.
     /// Defaults to [`NoopExecutionStartedHook`]; production installs
@@ -1400,7 +1398,9 @@ impl<S: execution_coordinator_builder::IsComplete> ExecutionCoordinatorBuilder<S
     /// Register lifecycle metrics before exposing the completed coordinator.
     pub fn build(self) -> ExecutionCoordinator {
         let coordinator = self.build_inner();
-        coordinator.lifecycle.register_answer_agent_metrics(&coordinator.metrics);
+        coordinator
+            .lifecycle
+            .register_answer_agent_metrics(&coordinator.metrics);
         coordinator
     }
 }

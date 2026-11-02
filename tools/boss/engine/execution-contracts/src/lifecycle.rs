@@ -830,6 +830,7 @@ pub trait LifecycleServices: Send + Sync {
         pane_releaser: Option<&dyn WorkerPaneReleaser>,
     ) -> RemoteLeaseReconcileOutcome;
 
+    /// Ensure answer-agent counters exist; preserve counters already in a shared registry.
     fn register_answer_agent_metrics(&self, registry: &Registry);
 
     fn record_answer_agent_started(&self, registry: &Registry, queue_wait_ms: u64);
@@ -868,7 +869,13 @@ mod tests {
             }
         }
         let alerts = tracker.active_alerts();
-        assert_eq!(alerts.iter().map(|alert| alert.worker_kind.as_str()).collect::<Vec<_>>(), vec!["review-guide", "standard"]);
+        assert_eq!(
+            alerts
+                .iter()
+                .map(|alert| alert.worker_kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["review-guide", "standard"]
+        );
     }
 
     #[test]

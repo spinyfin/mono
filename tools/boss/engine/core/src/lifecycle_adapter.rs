@@ -54,12 +54,25 @@ async fn verify_deletion_tripwire(repo_slug: &str, head_before: &str, base_sha: 
 
 /// Test-support factories that install the core lifecycle implementation.
 /// A local trait remains implementable when the coordinator moves crates.
+/// Exposed for integration fixtures; production composition injects services explicitly.
+#[doc(hidden)]
 pub trait CoreCoordinatorConstructors: Sized {
-    fn new(work_db: Arc<WorkDb>, worker_pool: WorkerPool, cube_client: Arc<dyn CubeClient>, execution_runner: Arc<dyn ExecutionRunner>) -> Self;
-    fn with_publisher(work_db: Arc<WorkDb>, worker_pool: WorkerPool, cube_client: Arc<dyn CubeClient>, execution_runner: Arc<dyn ExecutionRunner>, publisher: Arc<dyn ExecutionPublisher>) -> Self;
+    fn new(
+        work_db: Arc<WorkDb>,
+        worker_pool: WorkerPool,
+        cube_client: Arc<dyn CubeClient>,
+        execution_runner: Arc<dyn ExecutionRunner>,
+    ) -> Self;
+    fn with_publisher(
+        work_db: Arc<WorkDb>,
+        worker_pool: WorkerPool,
+        cube_client: Arc<dyn CubeClient>,
+        execution_runner: Arc<dyn ExecutionRunner>,
+        publisher: Arc<dyn ExecutionPublisher>,
+    ) -> Self;
 }
 
-/// Convenience coordinator constructors for tests and simple callers. They
+/// Convenience coordinator constructors for test fixtures. They
 /// live here, with the core adapter they install, so the coordinator's own
 /// modules never name the concrete lifecycle implementation.
 impl CoreCoordinatorConstructors for ExecutionCoordinator {
@@ -239,7 +252,15 @@ impl LifecycleServices for CoreLifecycleServices {
     }
 
     fn register_answer_agent_metrics(&self, registry: &Registry) {
-        crate::answer_agent_observability::register_metrics(registry);
+        use crate::answer_agent_observability::{ENQUEUED, FAILED, QUEUE_WAIT_MS, REPLIED, STARTED, SUPERSEDED};
+        for handle in [&ENQUEUED, &STARTED, &REPLIED, &FAILED, &SUPERSEDED, &QUEUE_WAIT_MS] {
+            if registry
+                .counter_snapshot_one(handle.name())
+                .is_none_or(|counter| counter.stale)
+            {
+                registry.register_counter(handle);
+            }
+        }
     }
 
     fn record_answer_agent_started(&self, registry: &Registry, queue_wait_ms: u64) {
@@ -276,5 +297,39 @@ impl LifecycleServices for CoreLifecycleServices {
         pr_number: u64,
     ) -> Vec<String> {
         verify_deletion_tripwire(repo_slug, head_before, base_sha, pr_number).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host_adapter::LocalHostAdapterProvider;
+    use crate::test_support::{NoopCube, NoopRunner, open_db_arc};
+
+    #[test]
+    fn builder_registers_injected_lifecycle_metrics_in_shared_registry() {
+        let (_dir, db) = open_db_arc();
+        let lifecycle = CoreLifecycleServices::new(Arc::clone(&db));
+        let metrics = Arc::new(Registry::new());
+        crate::coordinator::register_metrics(&metrics);
+        crate::dispatch_metrics::register_metrics(&metrics);
+        assert_eq!(metrics.counter_value("answer_agent.started"), None);
+        metrics.insert_stale_counter("answer_agent.started", "persisted counter", 4, 1);
+        for expected in 5..=6 {
+            let adapter: Arc<dyn HostAdapter> =
+                Arc::new(LocalHostAdapter::new(Arc::new(NoopCube), Arc::new(NoopRunner)));
+            let _coordinator = ExecutionCoordinator::builder()
+                .work_db(Arc::clone(&db))
+                .worker_pool(WorkerPool::new(1))
+                .host_adapter(Arc::clone(&adapter))
+                .host_adapter_provider(Arc::new(LocalHostAdapterProvider::new(adapter)))
+                .lifecycle(lifecycle.clone())
+                .metrics(Arc::clone(&metrics))
+                .build();
+            lifecycle.record_answer_agent_started(&metrics, 100);
+            assert_eq!(metrics.counter_value("answer_agent.started"), Some(expected));
+            assert_eq!(metrics.counter_value("answer_agent.queue_wait_ms"), Some(expected - 4));
+            assert!(!metrics.counter_snapshot_one("answer_agent.started").unwrap().stale);
+        }
     }
 }
