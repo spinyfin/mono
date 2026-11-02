@@ -43,7 +43,8 @@ use boss_protocol::WorkExecution;
 #[cfg(test)]
 use boss_protocol::{ExecutionKind, ExecutionStatus};
 
-use crate::coordinator::{CubeClient, CubeWorkspaceStatus};
+use boss_execution_contracts::CubeClient;
+use boss_host_execution::types::CubeWorkspaceStatus;
 
 pub use boss_engine_storage_values::RunReconcileVerdict;
 
@@ -248,7 +249,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
 
-    use crate::coordinator::CubeWorkspaceStatus;
+    use boss_host_execution::types::CubeWorkspaceStatus;
 
     struct StubCube {
         list_response: Mutex<Result<Vec<CubeWorkspaceStatus>>>,

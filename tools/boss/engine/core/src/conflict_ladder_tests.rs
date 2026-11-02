@@ -7,11 +7,12 @@ use tempfile::tempdir;
 use tokio::sync::Mutex;
 
 use super::*;
-use crate::coordinator::{CubeRepoHandle, CubeWorkspaceLease, RebaseOutcome};
 use crate::test_support::*;
 use crate::work::{
     ConflictResolution, ConflictResolutionInsertInput, PendingMergeCheck, WorkDb, WorkItem, WorkItemPatch,
 };
+use boss_execution_contracts::RebaseOutcome;
+use boss_host_execution::types::{CubeRepoHandle, CubeWorkspaceLease};
 
 /// What the scripted cube double's `rebase_workspace` returns.
 #[derive(Clone)]

@@ -107,7 +107,7 @@ impl WorkerCompletionHandler {
 
     /// Install the same provider the coordinator uses so every completion
     /// route can collect remote artifacts immediately before reading them.
-    pub fn set_host_adapter_provider(&self, provider: Arc<dyn crate::host_adapter::HostAdapterProvider>) {
+    pub fn set_host_adapter_provider(&self, provider: Arc<dyn boss_execution_contracts::HostAdapterProvider>) {
         *self
             .host_adapter_provider
             .write()

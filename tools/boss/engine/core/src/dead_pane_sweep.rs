@@ -102,12 +102,13 @@ use std::time::Duration;
 
 use boss_protocol::WorkExecution;
 
-use crate::coordinator::{CubeClient, ExecutionCoordinator};
+use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEventSink, Stage};
 use crate::durable_liveness::WorkerProcess;
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::work::WorkDb;
 use crate::worker_readoption::LiveWorkerConvergence;
+use boss_execution_contracts::CubeClient;
 
 /// Cadence for the periodic pass. Fires immediately on boot, then every
 /// interval — fast enough that a pane killed mid-run is cleared and its work

@@ -13,7 +13,7 @@ use crate::config::RuntimeConfig;
 use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, TmuxWorkerHost, start_worker};
 use crate::work::{WorkDb, WorkExecution, WorkItem};
-use boss_execution_contracts::slot_id_from_worker_id;
+use boss_execution_contracts::{ExecutionRunner, RunOutcome, RunWaitState, slot_id_from_worker_id};
 use boss_protocol::{ExecutionKind, ExecutionStatus, ReviewBatchMemberRole, WorkItemBinding};
 
 use super::prompt::structured_output_env_vars;
@@ -179,10 +179,7 @@ mod sol_spawn {
         }
     }
 }
-use super::{
-    ExecutionRunner, RunOutcome, RunWaitState, bound_control_token_path, bound_events_socket_path,
-    bound_frontend_socket_path,
-};
+use super::{bound_control_token_path, bound_events_socket_path, bound_frontend_socket_path};
 
 /// Render one driver-supplied [`crate::driver::EnvDirective`] as a shell
 /// statement to prepend to the worker pane's spawn command. Generic over

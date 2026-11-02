@@ -1618,7 +1618,7 @@ pub struct WorkerCompletionHandler {
     structured_output_dir: std::path::PathBuf,
     /// Resolves remote adapters for structured-output collection at the read
     /// site. Kept optional for local-only tests and installations.
-    host_adapter_provider: Arc<std::sync::RwLock<Option<Arc<dyn crate::host_adapter::HostAdapterProvider>>>>,
+    host_adapter_provider: Arc<std::sync::RwLock<Option<Arc<dyn boss_execution_contracts::HostAdapterProvider>>>>,
     /// Owning-cube resolver shared with the lease heartbeat
     /// ([`crate::cube_lease_heartbeat::HostRoutedCubes`]); installed together
     /// with the adapter provider. Until then a remote run fails to resolve
@@ -1643,7 +1643,7 @@ pub struct WorkerCompletionHandler {
     review_batch_enqueuer: Arc<dyn ReviewBatchEnqueuer>,
     /// Configured review-pool slot count used as weighted-admission
     /// reservation capacity. Defaults to
-    /// [`crate::coordinator::DEFAULT_REVIEW_POOL_SIZE`]; production wires
+    /// [`boss_execution_contracts::DEFAULT_REVIEW_POOL_SIZE`]; production wires
     /// `WorkConfig.review_pool_size` via [`Self::with_review_pool_size`].
     review_pool_size: usize,
     /// GitHub source-packet collector used by review-guide capture seams.

@@ -137,13 +137,14 @@ use anyhow::Result;
 use boss_protocol::WorkerActivity;
 use boss_tmux::Tmux;
 
-use crate::coordinator::{CubeClient, ExecutionCoordinator, worker_id_for_slot};
+use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::driver::ProgressFidelity;
 use crate::hold_registry::HoldRegistry;
 use crate::live_worker_state::{LiveWorkerStateRegistry, iso8601_utc};
 use crate::semantic_progress::SemanticToolCondition;
 use crate::work::WorkDb;
+use boss_execution_contracts::{CubeClient, worker_id_for_slot};
 
 pub use boss_engine_storage_values::attention_kinds::STALE_WORKER_ATTENTION_KIND;
 

@@ -36,6 +36,7 @@ pub(crate) use prompt::designated_output_kind;
 pub(crate) use work_item::{task_bound_pr_url, work_item_name, work_item_task_kind};
 pub(crate) use worker_spawn::{ComposedWorkerSpawn, REVIEW_GUIDE_DRIVER, WorkerSpawnOpts, compose_worker_spawn};
 
+#[cfg(test)]
 pub use boss_execution_contracts::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
 
 /// Absolute path of the events socket this engine bound — where worker hook

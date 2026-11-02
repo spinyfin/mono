@@ -28,7 +28,8 @@ use std::sync::Arc;
 
 use git_utils::repo_slug::is_bare_repo_slug;
 
-use crate::coordinator::{CubeClient, CubeRepoSummary};
+use boss_execution_contracts::CubeClient;
+use boss_host_execution::types::CubeRepoSummary;
 
 /// Build the argv tail for `cube repo ensure` from a repo reference that
 /// may be either a canonical origin URL or a bare cube slug.

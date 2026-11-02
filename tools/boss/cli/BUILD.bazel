@@ -594,6 +594,7 @@ rust_test(
         ":harness",
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/engine/host-execution",
         "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,

@@ -50,10 +50,11 @@ use std::time::Duration;
 use boss_event_bus::{Event, Subscription};
 use boss_protocol::ExecutionKind;
 
-use crate::coordinator::{CubeClient, ExecutionCoordinator};
+use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::sweep_loop::SweepOutcome;
 use crate::work::{HostBoundExecution, WorkDb};
+use boss_execution_contracts::CubeClient;
 
 /// How often the host-reconcile sweep runs. Matches the other steady-state
 /// reconcilers (orphan / pool-claim / lost-workspace, all 60s) so a host
@@ -333,12 +334,14 @@ mod tests {
     use boss_protocol::{CreateExecutionInput, ExecutionStatus, RequestExecutionInput, WorkExecution};
 
     use super::*;
-    use crate::coordinator::{CubeRepoSummary, ExecutionCoordinator, WorkerPool};
+    use crate::coordinator::ExecutionCoordinator;
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::host_scheduling::{self, ChoreRequirements, HostSlot};
-    use crate::runner::{ExecutionRunner, RunOutcome};
     use crate::test_support::{create_test_chore, create_test_product_with_repo, open_db};
     use crate::work::WorkDb;
+    use boss_execution_contracts::WorkerPool;
+    use boss_execution_contracts::{ExecutionRunner, RunOutcome};
+    use boss_host_execution::types::CubeRepoSummary;
 
     /// No-op execution runner: the real re-route tests only need
     /// `orphan_sweep::run_one_pass` to produce a fresh `ready` execution;

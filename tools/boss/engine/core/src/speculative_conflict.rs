@@ -6,7 +6,7 @@
 //! whose recheck interval has elapsed, lease a scratch workspace and run a
 //! throwaway, no-push engine-direct rebase (`cube workspace rebase --pr <n>
 //! --no-push`) against current `main`. No worker is spawned and the real PR
-//! branch is never mutated — [`crate::coordinator::CubeClient::rebase_workspace_no_push`]
+//! branch is never mutated — [`boss_execution_contracts::CubeClient::rebase_workspace_no_push`]
 //! is the same engine-direct mechanical rebase rung 1 uses, minus the push.
 //! Outcomes:
 //!

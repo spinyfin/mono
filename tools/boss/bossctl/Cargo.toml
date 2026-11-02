@@ -13,6 +13,7 @@ async-trait = { workspace = true }
 bon = { workspace = true }
 boss-build-info = { path = "../build-info" }
 boss-client = { path = "../client" }
+boss-execution-contracts = { path = "../engine/execution-contracts" }
 boss-engine = { path = "../engine/core" }
 boss-log-files = { path = "../log-files" }
 boss-protocol = { path = "../protocol" }

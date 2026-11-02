@@ -1059,7 +1059,7 @@ mod tests {
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
         let worker_id = coordinator.worker_pool().claim_worker(&exec_id, None).await.unwrap();
-        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        let slot_id = boss_execution_contracts::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
 
         let nudger = RecordingNudger::new();
@@ -1104,7 +1104,7 @@ mod tests {
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
         let worker_id = coordinator.worker_pool().claim_worker(&exec_id, None).await.unwrap();
-        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        let slot_id = boss_execution_contracts::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
 
         // Pre-populate nudged set to simulate a prior-pass nudge.
@@ -1160,7 +1160,7 @@ mod tests {
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
         let worker_id = coordinator.worker_pool().claim_worker(&dead_id, None).await.unwrap();
-        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        let slot_id = boss_execution_contracts::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
 
         let (outcome, sink, reaped) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
@@ -1202,7 +1202,7 @@ mod tests {
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
         let worker_id = coordinator.worker_pool().claim_worker(&dead_id, None).await.unwrap();
-        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        let slot_id = boss_execution_contracts::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
 
         let (outcome, sink, reaped) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
@@ -1252,7 +1252,7 @@ mod tests {
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
         let worker_id = coordinator.worker_pool().claim_worker(&dead_id, None).await.unwrap();
-        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        let slot_id = boss_execution_contracts::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
 
         let (outcome, _sink, reaped) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
@@ -1281,7 +1281,7 @@ mod tests {
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
         let worker_id = coordinator.worker_pool().claim_worker(&exec_id, None).await.unwrap();
-        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        let slot_id = boss_execution_contracts::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
 
         let nudger = RecordingNudger::new();
@@ -1316,7 +1316,7 @@ mod tests {
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
         let worker_id = coordinator.worker_pool().claim_worker(&exec_id, None).await.unwrap();
-        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        let slot_id = boss_execution_contracts::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
 
         let (outcome, _sink, reaped) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
@@ -1348,7 +1348,7 @@ mod tests {
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
         let worker_id = coordinator.worker_pool().claim_worker(&dead_id, None).await.unwrap();
-        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        let slot_id = boss_execution_contracts::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
 
         let (outcome, sink, reaped) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
@@ -1386,7 +1386,7 @@ mod tests {
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
         let worker_id = coordinator.worker_pool().claim_worker(&dead_id, None).await.unwrap();
-        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        let slot_id = boss_execution_contracts::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
 
         let (outcome, sink, reaped) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
@@ -1422,7 +1422,7 @@ mod tests {
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
         let worker_id = coordinator.worker_pool().claim_worker(&exec_id, None).await.unwrap();
-        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        let slot_id = boss_execution_contracts::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
 
         let (outcome, sink, reaped) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
@@ -1473,7 +1473,7 @@ mod tests {
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
         let worker_id = coordinator.worker_pool().claim_worker(&exec_id, None).await.unwrap();
-        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        let slot_id = boss_execution_contracts::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
 
         let (outcome, sink, reaped) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
@@ -1503,7 +1503,7 @@ mod tests {
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
         let worker_id = coordinator.worker_pool().claim_worker(&exec_id, None).await.unwrap();
-        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        let slot_id = boss_execution_contracts::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
 
         let (outcome, _sink, reaped) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
@@ -1763,7 +1763,7 @@ mod tests {
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
         let worker_id = coordinator.worker_pool().claim_worker(&exec_id, None).await.unwrap();
-        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        let slot_id = boss_execution_contracts::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
@@ -1839,7 +1839,7 @@ mod tests {
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
         let worker_id = coordinator.worker_pool().claim_worker(&exec_id, None).await.unwrap();
-        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        let slot_id = boss_execution_contracts::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
 
         let sink = Arc::new(RecordingDispatchEventSink::new());

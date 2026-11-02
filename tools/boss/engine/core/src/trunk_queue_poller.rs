@@ -63,7 +63,6 @@ use boss_trunk_client::{
 };
 
 use crate::conflict_stop_gate::{self, ConflictClearance};
-use crate::coordinator::ExecutionPublisher;
 use crate::merge_poller::{CommandMergeProbe, RequiredCheckFailure};
 use crate::metrics::Registry;
 use crate::trunk_merge::{
@@ -71,6 +70,7 @@ use crate::trunk_merge::{
     is_terminal_trunk_state, trunk_repo_ref,
 };
 use crate::work::{ActiveTrunkMergeIntent, PendingMergeCheck, WorkDb};
+use boss_execution_contracts::ExecutionPublisher;
 
 // ── Metrics ───────────────────────────────────────────────────────────────
 

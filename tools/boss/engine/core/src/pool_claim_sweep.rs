@@ -3,7 +3,7 @@
 //!
 //! ## The leak this closes
 //!
-//! A [`crate::coordinator::WorkerPool`] slot is claimed at dispatch
+//! A [`boss_execution_contracts::WorkerPool`] slot is claimed at dispatch
 //! (`drain_ready_queue` / `force_dispatch` → `claim_worker`) and, for a
 //! pane-spawned run, its release is DEFERRED to
 //! [`crate::app::ServerState::release_worker_pane`], which frees the

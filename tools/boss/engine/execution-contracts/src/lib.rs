@@ -2100,8 +2100,7 @@ mod tests {
 
     #[tokio::test]
     async fn worker_pool_claims_lowest_free_slot_deterministically() {
-        // Claim-release-claim must always return to the lowest free slot —
-        // the deterministic replacement for the old random spread. Every
+        // Claim-release-claim must always return to the lowest free slot. Every
         // claim after a release lands back on worker-1, never a higher slot.
         let pool = WorkerPool::new(4);
         for i in 0..50 {

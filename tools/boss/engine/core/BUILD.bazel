@@ -438,6 +438,7 @@ rust_test(
     deps = [
         ":engine_lib",
         "//tools/boss/engine/design-doc-fetcher",
+        "//tools/boss/engine/execution-contracts",
         "//tools/boss/engine/planner-validation",
         "//tools/boss/protocol",
     ] + all_crate_deps(
@@ -772,6 +773,8 @@ rust_test(
     deps = [
         ":engine_lib",
         ":tmux_fixture",
+        "//tools/boss/engine/execution-contracts",
+        "//tools/boss/engine/host-execution",
         "//tools/boss/protocol",
         "//tools/boss/tmux",
     ] + all_crate_deps(
@@ -837,6 +840,7 @@ rust_test(
     deps = [
         ":engine_lib",
         "//tools/boss/client",
+        "//tools/boss/engine/host-execution",
         "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,

@@ -99,12 +99,13 @@ use std::path::Path;
 
 use boss_tmux::{DisplayField, TMUX_SPAWN_TOKEN_ENV, Tmux};
 
-use crate::coordinator::{ExecutionCoordinator, slot_id_from_worker_id};
+use crate::coordinator::ExecutionCoordinator;
 use crate::dead_pid_sweep::{PidStatus, probe_pid};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, ENGINE_BOOT_EXECUTION_ID, Outcome, Stage};
 use crate::spawn_flow::{TMUX_SESSION_SCHEMA, WorkerSpawner};
 use crate::work::{TmuxRunHandle, WorkDb};
 use crate::worker_readoption::LiveWorkerConvergence;
+use boss_execution_contracts::slot_id_from_worker_id;
 
 mod dead_pane;
 mod persist;
@@ -1609,7 +1610,7 @@ mod tests {
     use tokio::time::Duration;
 
     use crate::app::SendToAppError;
-    use crate::coordinator::{ExecutionCoordinator, WorkerPool};
+    use crate::coordinator::ExecutionCoordinator;
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::driver::AgentDriver;
     use crate::live_worker_state::LiveWorkerStateRegistry;
@@ -1617,6 +1618,7 @@ mod tests {
     use crate::test_support::{NoopCube, NoopRunner, create_test_chore_manual, create_test_product_named, open_db_arc};
     use crate::worker_readoption::{LiveWorkerConvergence, NoopLiveWorkerConvergence};
     use crate::worker_registry::WorkerRegistry;
+    use boss_execution_contracts::WorkerPool;
 
     /// A fake `boss` tmux server: scripted answers for `list-sessions`,
     /// `show-environment`, and `display-message #{pane_pid}`, keyed by

@@ -67,7 +67,7 @@
 //! ONE ready **non-review** execution as a canary while the breaker is
 //! tripped. This is the pause's one automatic exception, and it is declared:
 //! it goes through the coordinator's admission gate as
-//! [`crate::coordinator::DispatchAdmission::BreakerRecoveryProbe`] and emits
+//! [`boss_execution_contracts::DispatchAdmission::BreakerRecoveryProbe`] and emits
 //! a [`Stage::BreakerRecoveryProbeAdmitted`] event, so it is distinguishable
 //! in `bossctl dispatch tail` from a pause that is not being honoured.
 //! `pr_review` rows are never eligible — see
@@ -94,9 +94,10 @@ use boss_protocol::{CreateAttentionItemInput, WorkExecution};
 use serde::Serialize;
 
 use crate::config::DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER;
-use crate::coordinator::{DispatchAdmission, DispatchPauseOrigin, ExecutionCoordinator};
+use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::work::WorkDb;
+use boss_execution_contracts::{DispatchAdmission, DispatchPauseOrigin};
 use boss_execution_contracts::{
     METADATA_KEY_DISPATCH_PAUSE_ORIGIN, METADATA_KEY_DISPATCH_PAUSE_REASON, METADATA_KEY_DISPATCH_PAUSE_SCOPE,
     METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE,

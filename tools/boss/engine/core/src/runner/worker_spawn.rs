@@ -1346,7 +1346,7 @@ pub(crate) async fn compose_worker_spawn(
 mod reviewer_pool_policy_tests {
     //! Verifies review/automation dispatch policy is decoupled from the
     //! reviewed/automated row's own `driver` column — the single resolution
-    //! point is `crate::coordinator::pool_dispatch_policy_for_worker_id`,
+    //! point is `boss_execution_contracts::pool_dispatch_policy_for_worker_id`,
     //! and `SpawnResolutionInput::pool_policy_driver` applies it ahead of
     //! row and product driver sources.
     #[test]
