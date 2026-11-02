@@ -41,7 +41,6 @@ use boss_protocol::{
 use serde::Serialize;
 
 use crate::blocking_signal::{self, SignalKind};
-use crate::coordinator::ExecutionPublisher;
 use crate::merge_poller::{
     OpenPrCiStatus, OpenPrMergeability, PrLifecycleProbe, PrLifecycleState, RequiredCheckFailure, pr_labels_opt_out,
     stored_pr_number,
@@ -51,6 +50,7 @@ use crate::work::{
     CreateExecutionInput, PendingMergeCheck, PrStateChecker, StrandedCiRemediationAttempt, TaskStatus, WorkDb,
     WorkItem,
 };
+use boss_execution_contracts::ExecutionPublisher;
 
 /// Pre-spawn classification (design §Q4 "pre-triage"): if every failure
 /// has `conclusion ∈ {STARTUP_FAILURE, CANCELLED}` (engine-discernible

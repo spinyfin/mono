@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 
 use boss_protocol::{DispatchPool, QueuedDispatch, WorkExecution};
 
-use crate::coordinator::DispatchPause;
 use crate::work::WorkDb;
+use boss_execution_contracts::DispatchPause;
 
 /// What the scheduler consults before it walks the ready queue: the pause
 /// state, and the per-row chain-serialization hold.

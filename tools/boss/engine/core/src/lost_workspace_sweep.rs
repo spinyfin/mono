@@ -94,10 +94,11 @@ use std::time::Duration;
 
 use boss_protocol::WorkExecution;
 
-use crate::coordinator::{CubeClient, ExecutionCoordinator};
+use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEventSink, Stage};
 use crate::execution_liveness::{classify_pane_liveness, execution_workspace_dir_missing};
 use crate::work::WorkDb;
+use boss_execution_contracts::CubeClient;
 
 /// Cadence for the periodic pass. Fires immediately on boot, then every
 /// interval — fast enough that a zombie formed mid-run is cleared long

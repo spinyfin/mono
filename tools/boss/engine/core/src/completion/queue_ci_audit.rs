@@ -583,7 +583,7 @@ mod tests {
         let mut outcome = crate::merge_poller::SweepOutcome::default();
         crate::merge_poller::maybe_clear_blocked(
             &db,
-            &crate::coordinator::NoopExecutionPublisher,
+            &boss_execution_contracts::NoopExecutionPublisher,
             (None, None),
             &candidate,
             &probe,

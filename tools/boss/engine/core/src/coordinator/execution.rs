@@ -427,7 +427,7 @@ impl ExecutionCoordinator {
         {
             return Ok(Some(member.requested_driver));
         }
-        if let Some(policy) = crate::coordinator::pool_dispatch_policy_for_worker_id(worker_id) {
+        if let Some(policy) = boss_execution_contracts::pool_dispatch_policy_for_worker_id(worker_id) {
             return Ok(Some(policy.driver.to_owned()));
         }
         self.work_db.get_execution_driver_slug(&execution.id)

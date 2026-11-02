@@ -78,9 +78,9 @@ use tokio::sync::Semaphore;
 
 use crate::conflict_ladder::{self, LadderOutcome};
 use crate::conflict_watch;
-use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::merge_poller::PrLifecycleProbe;
 use crate::work::{ConflictResolution, GhPrStateChecker, PendingMergeCheck, PrOpenState, PrStateChecker, WorkDb};
+use boss_execution_contracts::{CubeClient, ExecutionPublisher};
 
 /// How many conflict remediations may run at once.
 ///
@@ -985,9 +985,9 @@ mod tests {
         use std::sync::atomic::AtomicUsize;
 
         use super::*;
-        use crate::coordinator::CubeRepoHandle;
         use crate::test_support::{RecordingPublisher, create_test_chore_manual, create_test_product_with_repo};
         use crate::work::{ConflictResolutionInsertInput, StaticPrStateChecker, WorkItemPatch};
+        use boss_host_execution::types::CubeRepoHandle;
 
         /// Cube double that records every `ensure_repo` origin the ladder
         /// asks for. `ensure_repo` is the ladder's **first** cube call, so

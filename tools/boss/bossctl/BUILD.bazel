@@ -41,6 +41,7 @@ rust_binary(
         "//tools/boss/client",
         "//tools/boss/command-runner",
         "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/engine/execution-contracts",
         "//tools/boss/log-files",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
@@ -60,6 +61,7 @@ rust_test(
         "//tools/boss/client",
         "//tools/boss/command-runner",
         "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/engine/execution-contracts",
         "//tools/boss/log-files",
         "//tools/boss/protocol",
     ] + all_crate_deps(

@@ -48,7 +48,7 @@
 //!       (this is what makes "kill the worker → lease frees within
 //!       ~TTL" hold). The dead-PID sweep reaps the slot in parallel.
 //!    2. Otherwise call
-//!       [`CubeClient::heartbeat_lease`](crate::coordinator::CubeClient::heartbeat_lease)
+//!       [`CubeClient::heartbeat_lease`](boss_execution_contracts::CubeClient::heartbeat_lease)
 //!       with an explicit TTL, refreshing the expiry to now + TTL.
 //!
 //! ## TTL ownership (engine-owned, not implicit)
@@ -198,13 +198,15 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use boss_protocol::{ExecutionKind, WorkExecution};
 
-use crate::coordinator::{CubeClient, ExecutionCoordinator};
+use crate::coordinator::ExecutionCoordinator;
 use crate::dead_pid_sweep::{PidStatus, probe_pid};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
-use crate::host_adapter::{HostAdapterCubeClient, HostAdapterProvider};
+use crate::host_adapter::HostAdapterCubeClient;
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::run_reconcile::{self, RunReconcileReport, RunReconcileVerdict};
 use crate::work::WorkDb;
+use boss_execution_contracts::CubeClient;
+use boss_execution_contracts::HostAdapterProvider;
 
 /// Cube that owns an execution's lease, plus the host that cube lives on.
 ///
@@ -1515,13 +1517,13 @@ mod tests {
     };
 
     use super::*;
-    use crate::coordinator::{CubeRepoSummary, CubeWorkspaceStatus};
     use crate::dead_pane_sweep::PANE_DEATH_GRACE_SECS;
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::run_reconcile::{RunReconcileReport, RunReconcileVerdict};
     use crate::test_support::*;
     use crate::work::WorkDb;
+    use boss_host_execution::types::{CubeRepoSummary, CubeWorkspaceStatus};
 
     // ─── cube stub ────────────────────────────────────────────────────────────
 
@@ -1748,15 +1750,15 @@ mod tests {
     }
 
     #[async_trait]
-    impl crate::host_adapter::HostAdapterProvider for HostRoutedStubProvider {
+    impl boss_execution_contracts::HostAdapterProvider for HostRoutedStubProvider {
         async fn adapter_for(
             &self,
             host: &crate::host_registry::Host,
-        ) -> Result<Arc<dyn crate::host_adapter::HostAdapter>> {
+        ) -> Result<Arc<dyn boss_execution_contracts::HostAdapter>> {
             if host.id != self.adapter.host_id {
                 return Err(anyhow!("stub provider has no adapter for host '{}'", host.id));
             }
-            Ok(self.adapter.clone() as Arc<dyn crate::host_adapter::HostAdapter>)
+            Ok(self.adapter.clone() as Arc<dyn boss_execution_contracts::HostAdapter>)
         }
     }
 
@@ -1790,7 +1792,7 @@ mod tests {
         let local_cube = Arc::new(RecordingCube::default());
         let cubes = HostRoutedCubes::new(
             Arc::clone(&db),
-            provider as Arc<dyn crate::host_adapter::HostAdapterProvider>,
+            provider as Arc<dyn boss_execution_contracts::HostAdapterProvider>,
             Arc::clone(&local_cube) as Arc<dyn CubeClient>,
         );
 

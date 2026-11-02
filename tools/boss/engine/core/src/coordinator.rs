@@ -21,15 +21,16 @@ use crate::dispatch_events::{
 use crate::dispatch_inflight::InflightDispatches;
 #[cfg(test)]
 use crate::effort::PoolModelTier;
-use crate::host_adapter::{HostAdapter, HostAdapterProvider, LocalHostAdapter, LocalHostAdapterProvider};
+use crate::host_adapter::{LocalHostAdapter, LocalHostAdapterProvider};
 use crate::host_registry::Host;
 use crate::host_scheduling::{self, ChoreRequirements, HostSlot};
 use crate::metrics::Registry;
-use crate::runner::{ExecutionRunner, RunOutcome, RunWaitState};
 use crate::work::{
     CreateAttentionItemInput, DispatchClaimOutcome, DispatchClass, FinishExecutionRunInput, PreStartFailureOutcome,
     WorkDb, WorkExecution, WorkItem, WorkRun,
 };
+use boss_execution_contracts::{ExecutionRunner, RunOutcome, RunWaitState};
+use boss_execution_contracts::{HostAdapter, HostAdapterProvider};
 
 // Phase-3 counter handles for the cube workspace lease boundary.
 crate::register_counter!(
@@ -56,7 +57,12 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&CUBE_WORKSPACE_LEASE_FAILURE);
 }
 
+#[cfg(test)]
 pub use boss_execution_contracts::{
+    AutomationPreemptor, ExecutionStartedHook, NoopAutomationPreemptor, NoopExecutionStartedHook, PreemptOutcome,
+};
+#[cfg(not(test))]
+use boss_execution_contracts::{
     AutomationPreemptor, ExecutionStartedHook, NoopAutomationPreemptor, NoopExecutionStartedHook, PreemptOutcome,
 };
 
@@ -81,6 +87,11 @@ enum PreemptionAttempt {
     Preempted { claimed: Option<String> },
 }
 
+#[cfg(not(test))]
+use boss_execution_contracts::{
+    DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_REVIEW_POOL_SIZE, MAX_WORKER_POOL_SIZE,
+};
+#[cfg(test)]
 pub use boss_execution_contracts::{
     DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_REVIEW_POOL_SIZE, MAX_WORKER_POOL_SIZE, WORKER_PAGE_COUNT,
     WORKER_PAGE_SIZE,
@@ -396,11 +407,19 @@ impl Drop for HeartbeatGuard {
     }
 }
 
+#[cfg(test)]
 pub use boss_host_execution::types::{
     CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
 };
+#[cfg(not(test))]
+use boss_host_execution::types::{
+    CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
+};
 
+#[cfg(test)]
 pub use boss_execution_contracts::{CubeClient, RebaseOutcome};
+#[cfg(not(test))]
+use boss_execution_contracts::{CubeClient, RebaseOutcome};
 
 #[derive(Debug, Clone)]
 pub struct CommandCubeClient {
@@ -675,11 +694,14 @@ impl CubeClient for CommandCubeClient {
     }
 }
 
+#[cfg(test)]
 pub use boss_execution_contracts::{
     PoolDispatchPolicy, WorkerClaim, WorkerPool, WorkerPoolOccupancy, kind_always_dispatches_on_pool_driver,
     pool_dispatch_policy_for_worker_id, pool_driver_slug_for_execution_kind, slot_id_from_worker_id,
     worker_id_for_slot, worker_page_label,
 };
+#[cfg(not(test))]
+use boss_execution_contracts::{WorkerPool, slot_id_from_worker_id, worker_id_for_slot, worker_page_label};
 
 /// If `err` is (transitively) a `SlotBusy` app-error from the spawn
 /// flow, return the run id the app reported as occupying the slot
@@ -699,11 +721,12 @@ fn slot_busy_occupant(err: &anyhow::Error) -> Option<Option<String>> {
     }
 }
 
-// The publication contract lives below the coordinator so storage-adjacent code
-// (review-guide notifications) can depend on it without importing the
-// coordinator; re-exported so existing callers keep their paths.
-pub use crate::execution_publisher::{ExecutionPublisher, NoopExecutionPublisher};
+#[cfg(test)]
+pub use boss_execution_contracts::{ExecutionPublisher, NoopExecutionPublisher};
+#[cfg(not(test))]
+use boss_execution_contracts::{ExecutionPublisher, NoopExecutionPublisher};
 
+#[cfg(test)]
 pub use boss_execution_contracts::RevisionSource;
 
 /// Lease-time occupancy guard (defect 3). Given the workspace cube just
@@ -747,7 +770,12 @@ fn default_coordinator_metrics() -> Arc<Registry> {
     metrics
 }
 
+#[cfg(test)]
 pub use boss_execution_contracts::{
+    DispatchAdmission, DispatchHold, DispatchPause, DispatchPauseOrigin, SetConcurrencyCapOutcome,
+};
+#[cfg(not(test))]
+use boss_execution_contracts::{
     DispatchAdmission, DispatchHold, DispatchPause, DispatchPauseOrigin, SetConcurrencyCapOutcome,
 };
 

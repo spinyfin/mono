@@ -1,6 +1,6 @@
-//! Worker-pool mechanics and scheduler basics: slot claiming/affinity,
-//! worker-id round-trips, priority ordering, capacity, pool exhaustion and
-//! recovery, force-dispatch, and heartbeat/kick behavior.
+//! Scheduler priority ordering, capacity, pool exhaustion and recovery,
+//! force-dispatch, heartbeat/kick behavior, and slot-busy handling.
+//! Pure pool and worker-id tests live in the execution-contracts crate.
 //!
 //! Shared fixtures live in [`super::helpers`].
 
@@ -1795,7 +1795,7 @@ async fn spawn_dispatch_ready_subscriber_delivers_kick_without_hand_call() {
 #[tokio::test]
 async fn heartbeat_guard_renews_lease_until_dropped() {
     use super::helpers::{HeartbeatGuard, LocalHostAdapter};
-    use crate::host_adapter::HostAdapter;
+    use boss_execution_contracts::HostAdapter;
 
     let cube = Arc::new(FakeCubeClient::default());
     // Thin shim: wrap the FakeCubeClient in a LocalHostAdapter so the

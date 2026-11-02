@@ -13,8 +13,8 @@ use tempfile::{TempDir, tempdir};
 use tokio::sync::Mutex;
 
 use super::*;
-use crate::coordinator::{CubeRepoSummary, CubeWorkspaceStatus};
 use crate::test_support::*;
+use boss_host_execution::types::{CubeRepoSummary, CubeWorkspaceStatus};
 
 use crate::merge_poller::{MergeProbe, PrLifecycleProbe, PrLifecycleState};
 use crate::work::{

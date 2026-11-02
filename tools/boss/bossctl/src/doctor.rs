@@ -2185,9 +2185,9 @@ fn write_timeline_event(out: &mut String, event: &DispatchEvent, stage_duration_
     // Lower Decks spawn/claim failure is distinguishable from a Bridge Crew
     // one at a glance. Automation/review workers resolve a slot but no page.
     if let Some(worker_id) = &event.worker_id
-        && let Some(slot) = boss_engine::coordinator::slot_id_from_worker_id(worker_id)
+        && let Some(slot) = boss_execution_contracts::slot_id_from_worker_id(worker_id)
     {
-        let _ = match boss_engine::coordinator::worker_page_label(slot) {
+        let _ = match boss_execution_contracts::worker_page_label(slot) {
             Some(page) => writeln!(out, "    page:      {page} (slot {slot})"),
             None => writeln!(out, "    slot:      {slot}"),
         };

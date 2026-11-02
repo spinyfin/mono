@@ -24,8 +24,8 @@
 //! [`crate::ssh_spawn::reestablish_events_forward`], unit-tested against a
 //! stubbed transport.
 
-use crate::host_adapter::HostAdapterProvider;
 use crate::work::WorkDb;
+use boss_execution_contracts::HostAdapterProvider;
 
 /// Tally from one [`reattach_remote_runs`] pass.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -168,12 +168,12 @@ pub async fn reattach_remote_runs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host_adapter::HostAdapter;
     use crate::host_registry::Host;
     use crate::test_support::*;
     use crate::work::{CreateChoreInput, WorkDb};
     use anyhow::{Result, anyhow, bail};
     use async_trait::async_trait;
+    use boss_execution_contracts::HostAdapter;
     use boss_protocol::RequestExecutionInput;
     use std::sync::Arc;
     use std::sync::Mutex;

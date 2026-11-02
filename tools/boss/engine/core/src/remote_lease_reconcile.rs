@@ -62,9 +62,9 @@ use boss_protocol::{CreateAttentionItemInput, ExecutionKind};
 
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
-use crate::host_adapter::HostAdapter;
-use crate::host_adapter::HostAdapterProvider;
 use crate::work::{RemoteRunHandle, WorkDb};
+use boss_execution_contracts::HostAdapter;
+use boss_execution_contracts::HostAdapterProvider;
 
 pub use boss_engine_storage_values::attention_kinds::REMOTE_WORKER_DIED_ATTENTION_KIND;
 

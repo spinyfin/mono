@@ -522,7 +522,7 @@ pub(super) async fn handle_get_dispatch_concurrency(ctx: Dispatch, req: Frontend
         .execution_coordinator
         .worker_pool()
         .capacity_sync()
-        .min(crate::coordinator::MAX_WORKER_POOL_SIZE);
+        .min(boss_execution_contracts::MAX_WORKER_POOL_SIZE);
     send_response(
         &sink,
         &request_id,
@@ -557,7 +557,7 @@ pub(super) async fn handle_set_dispatch_concurrency(ctx: Dispatch, req: Frontend
     let max = coordinator
         .worker_pool()
         .capacity_sync()
-        .min(crate::coordinator::MAX_WORKER_POOL_SIZE);
+        .min(boss_execution_contracts::MAX_WORKER_POOL_SIZE);
     // Persist so the cap survives an engine restart — same pattern as
     // `handle_set_dispatch_paused`.
     if let Err(err) = work_db.set_metadata(METADATA_KEY_DISPATCH_CONCURRENCY_LIMIT, &outcome.applied.to_string()) {
@@ -763,7 +763,8 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
                 .filter(|s| *s == boss_protocol::DispatchPauseScope::AllSpawns)
                 .is_some_and(|requested| {
                     current.as_ref().is_some_and(|pause| {
-                        pause.scope != requested || pause.origin != crate::coordinator::DispatchPauseOrigin::Operator
+                        pause.scope != requested
+                            || pause.origin != boss_execution_contracts::DispatchPauseOrigin::Operator
                     })
                 });
         if current.is_some() == paused && !scope_changed {
@@ -803,7 +804,7 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
         // work — stay exempt; `all_spawns` holds them too. Origin and scope
         // are recorded separately so who paused and what is held stay
         // independently visible. See `DispatchPauseOrigin`.
-        let origin = crate::coordinator::DispatchPauseOrigin::Operator;
+        let origin = boss_execution_contracts::DispatchPauseOrigin::Operator;
         let scope = scope.unwrap_or_default();
         let reason_str = if paused {
             let pause_reason = pause_reason.expect("validated above");
@@ -922,7 +923,7 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
 /// no state the engine was ever actually in — e.g. `paused: false` carrying
 /// the previous episode's `reviews_exempt`, which is exactly the stale-scope
 /// report this refactor exists to make impossible.
-fn dispatch_state_result(pause: Option<crate::coordinator::DispatchPause>) -> FrontendEvent {
+fn dispatch_state_result(pause: Option<boss_execution_contracts::DispatchPause>) -> FrontendEvent {
     FrontendEvent::DispatchStateResult {
         paused: pause.is_some(),
         paused_since_epoch_s: pause.as_ref().map(|p| p.since_epoch_s),

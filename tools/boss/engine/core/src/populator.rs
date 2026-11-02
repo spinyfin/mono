@@ -57,13 +57,13 @@ use boss_protocol::{
     PlannerOutput, ProductContext, ProjectContext, TaskBrief, TaskKind, WorkItem,
 };
 
-use crate::coordinator::ExecutionPublisher;
 use crate::materializer::Materializer;
 use crate::planner::{PLANNER_MODEL, Planner, PlannerOutcome};
 use crate::utility_model::{UtilityModel, UtilityTask};
 use crate::work::{ClaimPlannerRunInput, PlannerRunPatch, WorkDb};
 use boss_design_doc_fetcher::{DocFetchOutcome, fetch_design_doc};
 use boss_engine_planner_validation::{ValidationResult, validate};
+use boss_execution_contracts::ExecutionPublisher;
 
 /// Default hard cap on how many tasks one populate may create (design
 /// §"Bounding & guardrails"). A proposal exceeding it is rejected whole —
