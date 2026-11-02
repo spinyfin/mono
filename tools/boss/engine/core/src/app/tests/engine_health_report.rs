@@ -54,6 +54,9 @@ async fn engine_health_report_flags_missing_anthropic_api_key() {
         program: std::path::PathBuf::from("/usr/local/bin/tmux"),
         version: boss_tmux::MINIMUM_VERSION,
     };
+    // The fixture resolves its cube from the real environment; this test is
+    // about the key alone, so pin the cube state out of the picture.
+    *state.cube_resolution_error.write().unwrap() = None;
     // Pin: the test fixture intentionally builds without an
     // ANTHROPIC_API_KEY so the missing-key arm is exercised.
     assert!(
@@ -420,4 +423,43 @@ async fn get_engine_version_response_matches_swift_app_parser() {
     // task exits without us having to call any shutdown verb.
     drop(write_half);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), conn).await;
+}
+
+/// A cube that failed to resolve must be reported as its own issue, and must
+/// not be conflated with (or hide) the API key state.
+#[tokio::test]
+async fn engine_health_report_flags_unresolved_cube_without_blaming_api_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let work = crate::config::WorkConfig::builder()
+        .cwd(temp.path().to_path_buf())
+        .db_path(temp.path().join("state.db"))
+        .build();
+    let agent = crate::config::AgentConfig {
+        anthropic_api_key: Some("sk-test".to_owned()),
+        cube: crate::config::CubeConfig {
+            command: "cube".to_owned(),
+            args: vec![],
+        },
+        cwd: work.cwd.clone(),
+    };
+    let cfg = Arc::new(RuntimeConfig::from_parts(work, Some(agent)));
+    let state =
+        ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, ServerStateOverrides::default()).unwrap();
+    *state.tmux_preflight.write().unwrap() = crate::tmux_preflight::TmuxPreflight::Ready {
+        program: std::path::PathBuf::from("/usr/local/bin/tmux"),
+        version: boss_tmux::MINIMUM_VERSION,
+    };
+    *state.cube_resolution_error.write().unwrap() = Some("no bundled cube found".to_owned());
+    let report = build_engine_health_report(&state);
+    assert!(report.anthropic_api_key_present);
+    assert!(
+        report.issues.iter().all(|i| i.kind != "missing_anthropic_api_key"),
+        "{:?}",
+        report.issues
+    );
+    assert!(
+        report.issues.iter().any(|i| i.kind == "cube_unresolved"),
+        "{:?}",
+        report.issues
+    );
 }

@@ -2015,19 +2015,21 @@ def probe_repobin_checkleft(repobin):
 def resolve_checkleft_command(root):
     """Return the argv prefix that runs checkleft's `run` subcommand.
 
-    Preferred over a bare `checkleft` lookup: `repobin exec checkleft`
-    dispatches through repobin's normal build-from-source path (per
-    REPOBIN.toml), so it can never run a binary older than the current
-    source tree. A plain PATH search for `checkleft` has no such
-    guarantee -- it can resolve an unrelated, stale build (e.g. an old
-    `cargo install checkleft`) that still runs and still exits non-zero,
-    which fails the gate *closed* with "unknown implementation" errors
-    for every check added since that build, rather than failing open.
+    Resolution order, first match wins:
 
-    The repobin path is only used once `probe_repobin_checkleft` confirms
-    it actually works -- a repobin whose underlying bazel dispatch is
-    broken falls through to the legacy resolution below instead of taking
-    the whole push gate down with it.
+    1. `BOSS_CHECKLEFT_BIN`, an explicit override.
+    2. `$BOSS_WORKER_BIN_DIR/checkleft`, the launcher the engine pinned for
+       this worker. It is NOT probed: when the engine resolved no repobin the
+       launcher is an exit-127 stub, so the gate fails closed (the push is
+       blocked as a checkleft internal error) rather than silently running
+       some other checkleft.
+    3. The workspace repobin (`repobin exec checkleft`), used only after
+       `probe_repobin_checkleft` confirms it can dispatch; a repobin whose
+       bazel dispatch is broken falls through instead of taking the whole
+       push gate down with it.
+    4. `<root>/bin/checkleft`, then a `checkleft` on PATH. The PATH lookup is
+       last because it can resolve an unrelated, stale build that fails the
+       gate closed with "unknown implementation" errors.
     """
     override = os.environ.get("BOSS_CHECKLEFT_BIN", "").strip()
     if override:

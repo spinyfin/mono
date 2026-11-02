@@ -159,6 +159,23 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
             .clone(),
     );
 
+    if let Some(error) = server_state
+        .cube_resolution_error
+        .read()
+        .expect("cube error lock poisoned")
+        .as_ref()
+    {
+        issues.push(EngineHealthIssue {
+            kind: "cube_unresolved".to_owned(),
+            severity: "error".to_owned(),
+            title: "Bundled cube could not be found".to_owned(),
+            body: format!(
+                "Boss could not locate its cube binary, so workers cannot be started. \
+                 Reinstall Boss, or set BOSS_CUBE_CMD or CUBE_CLI_BIN to an executable cube path. Details: {error}"
+            ),
+        });
+    }
+
     if !anthropic_api_key_present {
         issues.push(EngineHealthIssue {
             kind: "missing_anthropic_api_key".to_owned(),

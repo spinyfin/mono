@@ -420,6 +420,12 @@ fn lookup_bool(lookup: impl Fn(&str) -> Option<OsString>, name: &str) -> Result<
     }
 }
 
+/// The `ANTHROPIC_API_KEY` the engine was launched with. Read independently of
+/// [`AgentConfig`] so a cube-resolution failure cannot hide an exported key.
+fn anthropic_api_key_from_env() -> Option<String> {
+    std::env::var("ANTHROPIC_API_KEY").ok()
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub anthropic_api_key: Option<String>,
@@ -433,7 +439,7 @@ impl AgentConfig {
     }
 
     fn load_for_engine(work: &WorkConfig, engine_path: &Path) -> Result<Self> {
-        let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
+        let anthropic_api_key = anthropic_api_key_from_env();
 
         let (cube_command, cube_args) = match std::env::var("BOSS_CUBE_CMD") {
             Ok(command) => parse_command_line("BOSS_CUBE_CMD", command)?,
@@ -529,6 +535,16 @@ impl RuntimeConfig {
         }
     }
 
+    /// The Anthropic API key, independent of cube resolution: a missing
+    /// bundled cube makes [`Self::agent`] fail but must not make an exported
+    /// key look unset.
+    pub fn anthropic_api_key(&self) -> Option<String> {
+        match self.agent_cell.get() {
+            Some(agent) => agent.anthropic_api_key.clone(),
+            None => anthropic_api_key_from_env(),
+        }
+    }
+
     /// The [`UtilityModel`] provider for the engine's own inference calls.
     ///
     /// Infallible on purpose — provider selection never fails, it falls back
@@ -550,7 +566,7 @@ impl RuntimeConfig {
         if let Some(provider) = self.utility_cell.get() {
             return provider.clone();
         }
-        let base_api_key = self.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
+        let base_api_key = self.anthropic_api_key();
         let selection = utility_model::select(base_api_key);
         selection.log();
         let provider = selection.provider;
@@ -645,6 +661,7 @@ mod tests {
             "CUBE_CLI_BIN",
             "BOSS_BIN_DIR",
             "BUILD_WORKSPACE_DIRECTORY",
+            "ANTHROPIC_API_KEY",
         ];
         let _restore = Restore(keys.iter().map(|&key| (key, std::env::var_os(key))).collect());
         for key in keys {
@@ -655,7 +672,10 @@ mod tests {
                 .chain(_restore.0[0].1.as_ref().into_iter().flat_map(std::env::split_paths)),
         )
         .unwrap();
-        unsafe { std::env::set_var("PATH", inherited_path) };
+        unsafe {
+            std::env::set_var("PATH", inherited_path);
+            std::env::set_var("ANTHROPIC_API_KEY", "sk-test-independent");
+        };
         let work = WorkConfig::load_from(|key| match key {
             "BOSS_DB_PATH" => Some(dir.path().join("state.db").into_os_string()),
             _ => None,
@@ -666,6 +686,9 @@ mod tests {
         let error = super::AgentConfig::load_for_engine(&work, &engine).unwrap_err();
         assert!(error.to_string().contains("no bundled cube found"), "{error:#}");
         assert!(!marker.exists(), "PATH cube must never be invoked");
+        // The cube failure must not null out the unrelated API key.
+        let runtime = super::RuntimeConfig::from_parts(work, None);
+        assert_eq!(runtime.anthropic_api_key().as_deref(), Some("sk-test-independent"));
     }
 
     #[test]
