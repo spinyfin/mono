@@ -695,26 +695,8 @@ impl WorkDb {
         if artifact_kind != "pr_doc" {
             return Ok(None);
         }
-        let Some((repo, branch, path)) = parse_pr_doc_artifact_id(artifact_id) else {
-            return Ok(None);
-        };
         let conn = self.connect()?;
-
-        let branch_suffix = branch.rsplit('/').next().unwrap_or(branch.as_str());
-        if branch_suffix.starts_with("exec_") {
-            return match query_execution(&conn, branch_suffix)? {
-                Some(execution) => build_doc_owner(&conn, &execution.work_item_id),
-                None => Ok(None),
-            };
-        }
-
-        if let Some(task_id) = find_design_task_by_project_doc_pointer(&conn, &repo, &branch, &path)? {
-            return build_doc_owner(&conn, &task_id);
-        }
-        if let Some(task_id) = find_task_by_doc_pointer(&conn, &repo, &branch, &path)? {
-            return build_doc_owner(&conn, &task_id);
-        }
-        Ok(None)
+        resolve_doc_owner_on(&conn, artifact_kind, artifact_id)
     }
 
     /// Resolve a user-supplied `pr_doc:<repo>:<branch>:<path>` artifact id
@@ -1178,6 +1160,36 @@ fn find_task_by_doc_pointer(conn: &Connection, repo: &str, branch: &str, path: &
     } else {
         Ok(None)
     }
+}
+
+/// [`WorkDb::resolve_doc_owner`] on an already-open connection.
+pub(crate) fn resolve_doc_owner_on(
+    conn: &Connection,
+    artifact_kind: &str,
+    artifact_id: &str,
+) -> Result<Option<DocOwner>> {
+    if artifact_kind != "pr_doc" {
+        return Ok(None);
+    }
+    let Some((repo, branch, path)) = parse_pr_doc_artifact_id(artifact_id) else {
+        return Ok(None);
+    };
+
+    let branch_suffix = branch.rsplit('/').next().unwrap_or(branch.as_str());
+    if branch_suffix.starts_with("exec_") {
+        return match query_execution(conn, branch_suffix)? {
+            Some(execution) => build_doc_owner(conn, &execution.work_item_id),
+            None => Ok(None),
+        };
+    }
+
+    if let Some(task_id) = find_design_task_by_project_doc_pointer(conn, &repo, &branch, &path)? {
+        return build_doc_owner(conn, &task_id);
+    }
+    if let Some(task_id) = find_task_by_doc_pointer(conn, &repo, &branch, &path)? {
+        return build_doc_owner(conn, &task_id);
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

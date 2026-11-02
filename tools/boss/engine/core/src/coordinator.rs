@@ -961,6 +961,10 @@ pub struct ExecutionCoordinator {
     /// `handle_update_dispatch_focus`.
     #[builder(default)]
     dispatch_focus: std::sync::Mutex<boss_protocol::DispatchFocus>,
+    /// Why the persisted focus set could not be restored at startup, if it
+    /// could not. Surfaced in the focus state until the next focus update.
+    #[builder(default)]
+    dispatch_focus_restore_error: std::sync::Mutex<Option<String>>,
     /// Execution ids `drain_ready_queue`'s pause gate must let through this
     /// pass even though [`Self::is_dispatch_paused`] is `true` — the
     /// in-memory, never-persisted mechanism behind the pause-only

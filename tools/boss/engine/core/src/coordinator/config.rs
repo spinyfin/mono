@@ -74,6 +74,7 @@ impl ExecutionCoordinator {
             automation_preemptor: Arc::new(NoopAutomationPreemptor),
             dispatch_pause: std::sync::Mutex::new(None),
             dispatch_focus: std::sync::Mutex::new(boss_protocol::DispatchFocus::default()),
+            dispatch_focus_restore_error: std::sync::Mutex::new(None),
             dispatch_pause_bypass_execution_ids: std::sync::Mutex::new(HashSet::new()),
             requested_host_ids: std::sync::Mutex::new(HashMap::new()),
             dispatch_preflight_block_reason: std::sync::Mutex::new(None),
@@ -570,7 +571,18 @@ impl ExecutionCoordinator {
     /// than at the next heartbeat. The caller persists the new set.
     pub fn set_dispatch_focus(self: &Arc<Self>, focus: boss_protocol::DispatchFocus) {
         *self.dispatch_focus.lock().unwrap() = focus;
+        *self.dispatch_focus_restore_error.lock().unwrap() = None;
         self.kick();
+    }
+
+    /// Why the persisted focus set failed to restore at startup, if it did.
+    pub fn dispatch_focus_restore_error(&self) -> Option<String> {
+        self.dispatch_focus_restore_error.lock().unwrap().clone()
+    }
+
+    /// Record that the persisted focus set could not be restored.
+    pub fn record_dispatch_focus_restore_error(&self, error: String) {
+        *self.dispatch_focus_restore_error.lock().unwrap() = Some(error);
     }
 
     /// Seed the focus set at startup, before the first drain. Unlike

@@ -110,6 +110,11 @@ pub struct DispatchFocusState {
     /// Ready executions that focus mode would hold right now (their work is
     /// outside the set). Always zero while inactive.
     pub held_count: usize,
+    /// Set when the persisted focus set could not be loaded at engine start,
+    /// so dispatch started unrestricted. Cleared by the next successful focus
+    /// update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_error: Option<String>,
 }
 
 #[cfg(test)]
@@ -175,6 +180,7 @@ mod tests {
                     name: "Focus".into(),
                 }],
                 held_count: 2,
+                restore_error: None,
             },
         };
         let json = serde_json::to_value(&reply).unwrap();

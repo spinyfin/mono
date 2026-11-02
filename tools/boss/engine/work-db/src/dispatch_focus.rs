@@ -23,12 +23,13 @@
 //!
 //! Executions whose `work_item_id` is not a task are attributed to the task
 //! that owns them: a review-guide run to its series' root task, an
-//! answer-agent run to the item its comment is on, an automation triage run
+//! answer-agent run to the task owning the commented document or review guide, an automation triage run
 //! to its product. A row that cannot be attributed to anything is out of
 //! scope: focus mode admits only what it can prove is in scope.
 
 use boss_protocol::{DispatchFocus, DispatchFocusTarget, DispatchFocusTargetKind, TaskKind};
 
+use super::products_design::resolve_doc_owner_on;
 use super::*;
 
 /// Metadata KV key holding the JSON-encoded [`DispatchFocus`].
@@ -76,15 +77,37 @@ impl<'a> ScopeResolver<'a> {
             return self.project_in_scope(id);
         }
         if id.starts_with("cmt_") {
-            let artifact: Option<String> = self
+            // An answer agent runs on a comment; attribute it to the task
+            // that owns the commented artifact. Answer agents only spawn for
+            // design/investigation-owned `pr_doc` comments and
+            // `pr_review_guide` comments.
+            let comment: Option<(String, String)> = self
                 .conn
-                .query_row("SELECT artifact_id FROM work_comments WHERE id = ?1", [id], |row| {
-                    row.get(0)
-                })
+                .query_row(
+                    "SELECT artifact_kind, artifact_id FROM work_comments WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
                 .optional()?;
-            return match artifact {
-                Some(artifact_id) if artifact_id != id => self.resolve(&artifact_id, depth + 1),
-                _ => Ok(false),
+            let Some((kind, artifact_id)) = comment else {
+                return Ok(false);
+            };
+            let owner: Option<String> = match kind.as_str() {
+                "work_item" if artifact_id != id => Some(artifact_id),
+                "pr_doc" => resolve_doc_owner_on(self.conn, &kind, &artifact_id)?.map(|owner| owner.task_id),
+                "pr_review_guide" => self
+                    .conn
+                    .query_row(
+                        "SELECT root_task_id FROM pr_review_guide_source_series WHERE id = ?1",
+                        [&artifact_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?,
+                _ => None,
+            };
+            return match owner {
+                Some(owner_id) => self.resolve(&owner_id, depth + 1),
+                None => Ok(false),
             };
         }
         if id.starts_with("prgc_") {
@@ -184,7 +207,7 @@ impl WorkDb {
     }
 
     /// Resolve one `bossctl dispatch focus` target: a project or product id,
-    /// a project short id (`P3`, `#3`, `3`, `slug/3`), or a product slug.
+    /// a project short id (`P<n>`, `#<n>`, `<n>`, `<slug>/<n>`), or a product slug.
     /// Tasks and everything else are refused: focus scopes whole projects
     /// and products, and quietly accepting a task would scope nothing.
     pub fn resolve_dispatch_focus_target(&self, raw: &str) -> Result<(DispatchFocusTargetKind, String)> {

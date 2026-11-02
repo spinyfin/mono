@@ -2245,6 +2245,7 @@ fn tag_cases() -> Vec<TagCase> {
                     active: false,
                     targets: vec![],
                     held_count: 0,
+                    restore_error: None,
                 },
             },
             expected_tag: "dispatch_focus_result",

@@ -1,6 +1,5 @@
 //! `bossctl dispatch concurrency`: read or set the interactive-pool
-//! concurrency cap. Split out of `main.rs` to keep it under the repo's
-//! file-size limit; no behavioural change.
+//! concurrency cap.
 
 use anyhow::{Context, Result, bail};
 use boss_protocol::{FrontendEvent, FrontendRequest};

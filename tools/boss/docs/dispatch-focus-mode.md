@@ -10,9 +10,9 @@ bossctl dispatch focus clear                          # focus mode off
 bossctl dispatch focus show                           # the set + how many rows it holds
 ```
 
-Targets are project or product ids, project short ids (`P12`), or product slugs. Tasks are refused: focus scopes whole projects and products. `bossctl dispatch state` and `bossctl state` print the focus set; `bossctl dispatch diagnose <id>` says whether focus is holding that execution.
+Targets are project or product ids, project short ids (`P<n>`), or product slugs. Tasks are refused: focus scopes whole projects and products. `bossctl dispatch state` and `bossctl state` print the focus set; `bossctl dispatch diagnose <id>` says whether focus is holding that execution.
 
-Focus mode is on while the set is non-empty. The set is persisted in the engine metadata KV (`dispatch_focus`) and restored before the first scheduler drain, so a restart does not release held rows.
+Focus mode is on while the set is non-empty. The set is persisted in the engine metadata KV (`dispatch_focus`) and restored before the first scheduler drain, so a restart does not release held rows. If the persisted value cannot be read after a few attempts, the engine starts with focus off and `bossctl dispatch focus show` / `bossctl dispatch state` print a warning with the error until the next focus update; re-apply the set with `bossctl dispatch focus set`.
 
 ## It is an admission gate and nothing else
 
@@ -32,7 +32,7 @@ Executions keyed by something other than a task are attributed to the task that 
 | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | `pr_review`         | the task whose PR is reviewed (`work_item_id`), then rules 1-3. A review of an out-of-scope PR is held with `focus_mode`, not skipped |
 | `pr_review_guide`   | the root task of the comparison's series                                                                                              |
-| `answer_agent`      | the item the comment is on                                                                                                            |
+| `answer_agent`      | the task owning the commented design/investigation doc, or the root task of the commented review guide's series                       |
 | `automation_triage` | the automation's product                                                                                                              |
 
 A row that cannot be attributed to anything is out of scope: focus admits only what it can prove is in scope. If scope cannot be resolved at all (a database error), the pass holds every ready row.
@@ -40,6 +40,7 @@ A row that cannot be attributed to anything is out of scope: focus admits only w
 ## Precedence
 
 - The **global dispatch pause** overrides focus. The focus gate runs after the pause gate and only ever holds more, so focus never resumes anything while paused, and a paused row shows `dispatch_paused` rather than `focus_mode`. Under the default `new_work` pause, PR reviews stay exempt from the pause, so they follow focus instead.
+- The spawn-breaker's half-open recovery probe is an automatic path, so it respects focus: under a breaker pause it picks its canary only from ready rows inside the focus set, and admits nothing when every ready row is out of scope or scope cannot be resolved. Only an explicit `bossctl agents launch` bypasses focus.
 - `bossctl agents launch` (`force_dispatch`) bypasses focus, as it bypasses the pause. `bossctl work start --force` (the pause-only override) does **not**: the admission preview reports a `focus_mode` blocker and the request is refused with the same guidance.
 - The interactive concurrency cap applies as usual to in-scope rows.
 - Priority `critical` bypasses the pause and the cap but not focus.

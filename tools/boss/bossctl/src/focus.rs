@@ -15,7 +15,7 @@ use super::connect;
 pub(crate) enum FocusAction {
     /// Restrict automatic dispatch to exactly these projects and products,
     /// replacing any current focus set. Targets are project or product ids,
-    /// project short ids (`P12`), or product slugs.
+    /// project short ids (`P<n>`), or product slugs.
     Set {
         #[arg(required = true, value_name = "PROJECT_OR_PRODUCT")]
         targets: Vec<String>,
@@ -75,14 +75,22 @@ pub(crate) async fn get_focus(socket_path: &Option<String>) -> Result<DispatchFo
 /// Human-readable lines for a focus state, shared by every surface that
 /// prints it (`focus show`, `dispatch state`, `state`).
 pub(crate) fn focus_lines(focus: &DispatchFocusState) -> Vec<String> {
-    if !focus.active {
-        return vec!["focus: off — every project and product is in scope".to_owned()];
+    let mut lines = Vec::new();
+    if let Some(err) = &focus.restore_error {
+        lines.push(format!(
+            "WARNING: the persisted focus set could not be loaded at engine start, so dispatch started \
+             unrestricted ({err}). Re-apply it with `bossctl dispatch focus set`."
+        ));
     }
-    let mut lines = vec![format!(
+    if !focus.active {
+        lines.push("focus: off — every project and product is in scope".to_owned());
+        return lines;
+    }
+    lines.push(format!(
         "focus: on — automatic dispatch is restricted to {} target(s); rows outside it are held with reason `{}`",
         focus.targets.len(),
         boss_protocol::DISPATCH_WAIT_REASON_FOCUS_MODE,
-    )];
+    ));
     for target in &focus.targets {
         let short = target.short_id.map(|n| format!("P{n} ")).unwrap_or_default();
         let name = if target.name.is_empty() {
@@ -150,6 +158,7 @@ impl FocusDiagnosis {
             active: self.focus.is_active(),
             targets: self.targets.clone(),
             held_count: self.ready.iter().filter(|(_, _, held)| *held).count(),
+            restore_error: None,
         };
         let mut lines = focus_lines(&state);
         // The held count above is scoped to the executions diagnosed, not
@@ -267,7 +276,16 @@ mod tests {
             active: false,
             targets: Vec::new(),
             held_count: 0,
+            restore_error: None,
         };
+        let mut failed = off.clone();
+        failed.restore_error = Some("db locked".to_owned());
+        assert!(
+            focus_lines(&failed)[0].starts_with("WARNING:"),
+            "{:?}",
+            focus_lines(&failed)
+        );
+        assert!(focus_lines(&failed)[0].contains("db locked"));
         assert_eq!(focus_lines(&off).len(), 1);
         assert!(focus_lines(&off)[0].starts_with("focus: off"));
 
@@ -288,6 +306,7 @@ mod tests {
                 },
             ],
             held_count: 7,
+            restore_error: None,
         };
         let text = focus_lines(&on).join("\n");
         assert!(text.contains("focus: on"), "{text}");

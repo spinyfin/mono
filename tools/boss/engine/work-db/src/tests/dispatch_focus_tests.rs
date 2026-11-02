@@ -252,6 +252,8 @@ fn an_unattributable_execution_is_out_of_scope() {
     let focus = focus_on_product(&product.id);
     assert!(!in_focus(&db, "task_does_not_exist", &focus));
     assert!(!in_focus(&db, "cmt_does_not_exist", &focus));
+    let comment = comment_on(&db, "work_item", "cmt_self");
+    assert!(!in_focus(&db, &comment.id, &focus));
     assert!(!in_focus(&db, "prgc_does_not_exist", &focus));
     assert!(!in_focus(&db, "not-an-id", &focus));
 }
@@ -323,4 +325,103 @@ fn describe_resolves_names_and_survives_missing_rows() {
     assert_eq!(named.short_id, focused.short_id);
     assert_eq!(targets.iter().find(|t| t.id == product.id).unwrap().name, product.slug);
     assert_eq!(targets.iter().find(|t| t.id == "proj_gone").unwrap().name, "");
+}
+
+fn comment_on(db: &WorkDb, artifact_kind: &str, artifact_id: &str) -> WorkComment {
+    db.create_comment(CreateCommentInput {
+        artifact_kind: artifact_kind.to_owned(),
+        artifact_id: artifact_id.to_owned(),
+        doc_version: "v0".to_owned(),
+        anchor: CommentAnchor {
+            exact: "text".to_owned(),
+            prefix: String::new(),
+            suffix: String::new(),
+        },
+        body: "why?".to_owned(),
+        author: "user:test@example.com".to_owned(),
+        plain_text_projection_version: 1,
+    })
+    .unwrap()
+}
+
+#[test]
+fn answer_agent_on_a_pr_doc_comment_follows_the_design_task_that_owns_the_doc() {
+    const REPO: &str = "https://github.com/acme/widget.git";
+    const DOC_PATH: &str = "docs/design.md";
+    let db = WorkDb::open(temp_db_path("focus-answer-pr-doc")).unwrap();
+    let product = create_test_product(&db);
+    let focused = project(&db, &product.id, "Focused", true);
+    let other = project(&db, &product.id, "Other", true);
+    for (project, path) in [(&focused, DOC_PATH), (&other, "docs/other.md")] {
+        db.set_project_design_doc(SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            design_doc_repo_remote_url: Some(REPO.to_owned()),
+            design_doc_branch: Some("main".to_owned()),
+            design_doc_path: Some(path.to_owned()),
+            unset: false,
+        })
+        .unwrap();
+    }
+    let focus = focus_on_project(&focused.id);
+
+    let on_focused = comment_on(&db, "pr_doc", &format!("pr_doc:{REPO}:main:{DOC_PATH}"));
+    let on_other = comment_on(&db, "pr_doc", &format!("pr_doc:{REPO}:main:docs/other.md"));
+    let on_unowned = comment_on(&db, "pr_doc", &format!("pr_doc:{REPO}:main:docs/nobody.md"));
+    assert!(in_focus(&db, &on_focused.id, &focus));
+    assert!(!in_focus(&db, &on_other.id, &focus));
+    assert!(!in_focus(&db, &on_unowned.id, &focus));
+}
+
+/// A project task with an open PR and a published review guide; returns the
+/// guide series id.
+fn published_guide_on(db: &WorkDb, product_id: &str, project_id: &str, pr_number: u32) -> String {
+    use crate::test_support::seed_review_guide_series_for_pr;
+    let root = project_task(db, product_id, project_id, &format!("PR {pr_number}"));
+    let pr_url = format!("https://github.com/acme/widget/pull/{pr_number}");
+    db.update_work_item(
+        &root.id,
+        WorkItemPatch {
+            status: Some("in_review".to_owned()),
+            pr_url: Some(pr_url.clone()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    let (series, comparison) = seed_review_guide_series_for_pr(db, &root.id, &pr_url, "base", "head");
+    let attempt = db
+        .create_pr_review_guide_attempt(&series, &comparison, "review-guide-v1")
+        .unwrap();
+    db.publish_pr_review_guide_version(&attempt.id, "# Guide\n\nOriginal quote", "raw")
+        .unwrap();
+    series
+}
+
+#[test]
+fn answer_agent_on_a_review_guide_comment_follows_the_series_root_task() {
+    use crate::test_support::{add_guide_comment, open_db};
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let focused = project(&db, &product.id, "Focused", false);
+    let other = project(&db, &product.id, "Other", false);
+    let in_series = published_guide_on(&db, &product.id, &focused.id, 9);
+    let out_series = published_guide_on(&db, &product.id, &other.id, 10);
+    let focus = focus_on_project(&focused.id);
+
+    let in_comment = add_guide_comment(&db, &in_series, "why?");
+    let out_comment = add_guide_comment(&db, &out_series, "why?");
+    assert!(in_focus(&db, &in_comment.id, &focus));
+    assert!(!in_focus(&db, &out_comment.id, &focus));
+}
+
+#[test]
+fn answer_agent_on_a_work_item_comment_follows_the_work_item() {
+    let db = WorkDb::open(temp_db_path("focus-answer-work-item")).unwrap();
+    let product = create_test_product(&db);
+    let focused = project(&db, &product.id, "Focused", false);
+    let other = project(&db, &product.id, "Other", false);
+    let inside = project_task(&db, &product.id, &focused.id, "Inside");
+    let outside = project_task(&db, &product.id, &other.id, "Outside");
+    let focus = focus_on_project(&focused.id);
+    assert!(in_focus(&db, &comment_on(&db, "work_item", &inside.id).id, &focus));
+    assert!(!in_focus(&db, &comment_on(&db, "work_item", &outside.id).id, &focus));
 }

@@ -20,6 +20,8 @@ use std::collections::HashSet;
 
 use super::helpers::*;
 
+use crate::dispatch_events::RecordingDispatchEventSink;
+use crate::spawn_health::{SpawnHealthTracker, maybe_admit_recovery_probe};
 use boss_protocol::{
     DISPATCH_WAIT_REASON_FOCUS_MODE, DispatchFocus, DispatchFocusTargetKind, DispatchPauseScope, ExecutionKind,
     OperatorAnswer, PauseReason, Project,
@@ -467,7 +469,7 @@ async fn clearing_focus_releases_held_rows_exactly_as_they_were() {
     );
 }
 
-/// A worker blocks on a question for an in-scope row; the operator answers;
+/// A worker blocks on a question for an in-scope row; the question is answered;
 /// the minted execution must dispatch under focus without any force-launch.
 #[tokio::test]
 async fn answering_a_question_on_an_in_scope_row_redispatches_it_automatically() {
@@ -574,4 +576,62 @@ async fn held_count_reports_only_rows_focus_is_holding() {
     assert_eq!(h.coordinator.focus_held_count().unwrap(), 2);
     h.clear_focus();
     assert_eq!(h.coordinator.focus_held_count().unwrap(), 0);
+}
+
+/// The breaker's half-open recovery probe is an automatic `force_dispatch`
+/// path, so it must respect focus: it picks its canary only from rows inside
+/// the focus set. The out-of-scope row is queued last, which is the row the
+/// probe prefers when focus is off.
+#[tokio::test]
+async fn the_breaker_recovery_probe_only_picks_an_in_scope_canary() {
+    let h = harness();
+    seed_local_claude_driver(&h.db);
+    let focused = h.project("Focused");
+    let other = h.project("Other");
+    let (_, in_scope_exec) = h.ready_project_task(&focused, "In scope");
+    let (_, other_exec) = h.ready_project_task(&other, "Other project");
+    h.focus_on(&[&focused]);
+    h.coordinator.pause_dispatch(
+        1_786_385_816,
+        DispatchPauseOrigin::Breaker,
+        PauseReason::new("test: spawn-capability breaker tripped").unwrap(),
+    );
+
+    let spawn_health = SpawnHealthTracker::new();
+    let events = Arc::new(RecordingDispatchEventSink::default());
+    maybe_admit_recovery_probe(&h.db, &h.coordinator, &spawn_health, events.as_ref(), 1000).await;
+
+    assert!(
+        spawn_health.is_probe_execution(&in_scope_exec),
+        "the canary must be the in-scope row"
+    );
+    assert!(!spawn_health.is_probe_execution(&other_exec));
+    assert_eq!(h.execution(&other_exec).status, ExecutionStatus::Ready);
+}
+
+#[tokio::test]
+async fn the_breaker_recovery_probe_admits_nothing_when_every_ready_row_is_out_of_scope() {
+    let h = harness();
+    seed_local_claude_driver(&h.db);
+    let focused = h.project("Focused");
+    let other = h.project("Other");
+    let (_, other_exec) = h.ready_project_task(&other, "Other project");
+    let (_, loose_exec) = h.ready_loose_chore("Loose chore");
+    h.focus_on(&[&focused]);
+    h.coordinator.pause_dispatch(
+        1_786_385_816,
+        DispatchPauseOrigin::Breaker,
+        PauseReason::new("test: spawn-capability breaker tripped").unwrap(),
+    );
+
+    let spawn_health = SpawnHealthTracker::new();
+    let events = Arc::new(RecordingDispatchEventSink::default());
+    maybe_admit_recovery_probe(&h.db, &h.coordinator, &spawn_health, events.as_ref(), 1000).await;
+
+    for id in [&other_exec, &loose_exec] {
+        assert!(!spawn_health.is_probe_execution(id), "{id} is outside focus");
+        assert_eq!(h.execution(id).status, ExecutionStatus::Ready);
+    }
+    assert!(h.dispatched().await.is_empty());
+    assert!(events.events().await.is_empty());
 }

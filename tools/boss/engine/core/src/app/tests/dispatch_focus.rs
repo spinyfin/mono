@@ -1,5 +1,5 @@
 // Behaviour tests for `GetDispatchFocus` / `UpdateDispatchFocus`: the focus
-// set the operator edits with `bossctl dispatch focus`, its persistence
+// set edited with `bossctl dispatch focus`, its persistence
 // across an engine restart, and the all-or-nothing handling of bad targets.
 
 use super::*;
@@ -241,4 +241,29 @@ async fn focus_survives_an_engine_restart() {
     // And clearing persists too: the next restart comes up unfocused.
     update(&restarted, DispatchFocusAction::Clear, &[]).await;
     assert!(!state.work_db.load_dispatch_focus().unwrap().is_active());
+}
+
+/// An unreadable persisted value starts dispatch unrestricted, but the focus
+/// state reports the failure until the next successful update.
+#[tokio::test]
+async fn an_unreadable_persisted_focus_is_reported_in_the_focus_state() {
+    let (state, dir) = test_server_state();
+    state.work_db.set_metadata("dispatch_focus", "{not json").unwrap();
+
+    let cfg = Arc::new(RuntimeConfig::from_parts(
+        crate::config::WorkConfig::builder()
+            .cwd(dir.path().to_path_buf())
+            .db_path(dir.path().join("state.db"))
+            .build(),
+        None,
+    ));
+    let restarted =
+        ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, ServerStateOverrides::default()).unwrap();
+
+    let shown = show(&restarted).await;
+    assert!(!shown.active, "an unreadable set starts with focus off");
+    assert!(shown.restore_error.is_some(), "the failure must be visible: {shown:?}");
+
+    let cleared = focus_of(update(&restarted, DispatchFocusAction::Clear, &[]).await);
+    assert_eq!(cleared.restore_error, None, "a successful update clears the report");
 }

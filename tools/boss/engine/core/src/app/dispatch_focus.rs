@@ -17,15 +17,30 @@ fn focus_state(server_state: &ServerState, work_db: &WorkDb) -> Result<DispatchF
         active: focus.is_active(),
         targets: work_db.describe_dispatch_focus(&focus)?,
         held_count: coordinator.focus_held_count()?,
+        restore_error: coordinator.dispatch_focus_restore_error(),
     })
 }
 
-/// Seed the coordinator from the persisted set at startup. An unreadable
-/// value is logged loudly and treated as no focus: the set cannot be
-/// recovered from it, and holding every row until someone notices would be
-/// the worse failure.
+/// How many times startup reads the persisted focus set before giving up, so
+/// a transient database error does not silently release held work.
+const FOCUS_RESTORE_ATTEMPTS: u32 = 3;
+const FOCUS_RESTORE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Seed the coordinator from the persisted set at startup. A read that keeps
+/// failing is logged loudly and recorded on the coordinator so the focus
+/// state reports it, then treated as no focus: the set cannot be recovered
+/// from an unreadable value, and holding every row until someone notices
+/// would be the worse failure.
 pub(super) fn restore_persisted_dispatch_focus(server_state: &ServerState) {
-    match server_state.work_db.load_dispatch_focus() {
+    let mut loaded = server_state.work_db.load_dispatch_focus();
+    for _ in 1..FOCUS_RESTORE_ATTEMPTS {
+        if loaded.is_ok() {
+            break;
+        }
+        std::thread::sleep(FOCUS_RESTORE_RETRY_DELAY);
+        loaded = server_state.work_db.load_dispatch_focus();
+    }
+    match loaded {
         Ok(focus) if focus.is_active() => {
             tracing::info!(
                 projects = focus.project_ids.len(),
@@ -36,10 +51,15 @@ pub(super) fn restore_persisted_dispatch_focus(server_state: &ServerState) {
             server_state.execution_coordinator.restore_dispatch_focus(focus);
         }
         Ok(_) => {}
-        Err(err) => tracing::error!(
-            ?err,
-            "dispatch: persisted dispatch focus is unreadable — starting with focus mode off",
-        ),
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                "dispatch: persisted dispatch focus is unreadable — starting with focus mode off",
+            );
+            server_state
+                .execution_coordinator
+                .record_dispatch_focus_restore_error(format!("{err:#}"));
+        }
     }
 }
 
@@ -123,7 +143,7 @@ pub(super) async fn handle_update_dispatch_focus(ctx: Dispatch, req: FrontendReq
         }
     };
     // Persist before applying: a focus that silently reverts on restart would
-    // dispatch everything the operator meant to hold back, so a failed write
+    // dispatch every row the focus set holds back, so a failed write
     // fails the request instead of leaving memory and disk disagreeing.
     if let Err(err) = work_db.save_dispatch_focus(&next) {
         send_work_error(

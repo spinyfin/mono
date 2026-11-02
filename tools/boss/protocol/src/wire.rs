@@ -2963,9 +2963,8 @@ pub use snapshot_wire::{
     WorkerPoolEntry, WorkspacePoolEntry,
 };
 
-// The topic-push payload enum lives in `topic_event_payload` (extracted to keep
-// this file under the size limit); re-exported so `boss_protocol::TopicEventPayload`
-// is unchanged.
+// The topic-push payload enum lives in `topic_event_payload`; re-exported as
+// `boss_protocol::TopicEventPayload`.
 mod topic_event_payload;
 pub use topic_event_payload::TopicEventPayload;
 
