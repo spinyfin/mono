@@ -6,6 +6,7 @@
 
 mod board_population;
 mod boothby;
+mod dispatch_focus;
 mod doing_section;
 mod engine_app;
 mod health_wire;
@@ -26,6 +27,7 @@ mod worker_names;
 
 pub use board_population::*;
 pub use boothby::*;
+pub use dispatch_focus::*;
 pub use doing_section::*;
 pub use engine_app::*;
 pub use health_wire::*;

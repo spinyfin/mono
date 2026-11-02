@@ -68,6 +68,7 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::GetCostWindowReport { .. }
         | R::GetDecision { .. }
         | R::GetDispatchConcurrency
+        | R::GetDispatchFocus
         | R::GetDispatchState
         | R::GetDriverQuotaUsage { .. }
         | R::GetCodexSolPercentage
@@ -230,6 +231,7 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::SetCoordinatorHandoff { .. }
         | R::SetDispatchConcurrency { .. }
         | R::SetDispatchPaused { .. }
+        | R::UpdateDispatchFocus { .. }
         | R::SetCodexSolPercentage { .. }
         | R::SetDriverTrafficSplit { .. }
         | R::SetFeatureFlag { .. }

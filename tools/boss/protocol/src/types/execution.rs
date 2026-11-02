@@ -539,8 +539,9 @@ pub enum DispatchAdmissionEntryPoint {
 /// dispatch. This list mixes two different kinds of constraint — see the
 /// design doc's "Exactly what force overrides" section:
 ///
-/// - `INTERACTIVE_CONCURRENCY_CAP`, `UNMET_DEPENDENCY`, and
-///   `INELIGIBLE_STATUS` are genuinely enforced: force never bypasses them.
+/// - `INTERACTIVE_CONCURRENCY_CAP`, `UNMET_DEPENDENCY`,
+///   `INELIGIBLE_STATUS`, and `FOCUS_MODE` are genuinely enforced: force never
+///   bypasses them.
 /// - `CHURN_GUARD_PARKED`, `AUTOSTART_DISABLED`, and `DELIBERATE_PARKED`
 ///   are informational only (see `INFORMATIONAL_ONLY_BLOCKER_CODES` in
 ///   `coordinator/dispatch_admission.rs`) — an explicit dispatch request
@@ -558,6 +559,10 @@ pub const ADMISSION_BLOCKER_CHURN_GUARD_PARKED: &str = "churn_guard_parked";
 pub const ADMISSION_BLOCKER_AUTOSTART_DISABLED: &str = "autostart_disabled";
 pub const ADMISSION_BLOCKER_DELIBERATE_PARKED: &str = "deliberate_parked";
 pub const ADMISSION_BLOCKER_INELIGIBLE_STATUS: &str = "ineligible_status";
+/// The work item is outside the dispatch focus set (`bossctl dispatch
+/// focus`). Genuinely enforced, like the concurrency cap: a pause-only force
+/// start never bypasses it. `bossctl agents launch` is the explicit override.
+pub const ADMISSION_BLOCKER_FOCUS_MODE: &str = "focus_mode";
 
 /// One non-overridable reason [`DispatchAdmission`] found dispatch would
 /// currently refuse for, independent of the dispatch pause.

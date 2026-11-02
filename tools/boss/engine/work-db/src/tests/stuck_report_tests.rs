@@ -637,6 +637,16 @@ fn classification_table_covers_failure_attention_and_global_hold_precedence() {
             Some("automation_paused"),
             "S23_global_hold:automation_paused",
         ),
+        (
+            None,
+            None,
+            "todo",
+            None,
+            None,
+            false,
+            Some("focus_mode"),
+            "S23_global_hold:focus_mode",
+        ),
     ] {
         let task = create_test_chore_manual(&db, &product.id, expected);
         db.connect().unwrap().execute("UPDATE tasks SET dispatch_failed_reason = ?1, blocked_reason = ?2, status = ?3, ci_required_state = ?4, kind = ?5, parent_task_id = ?6 WHERE id = ?7", params![dispatch, blocked, status, ci, if revision { "revision" } else { "chore" }, if revision { Some(&root.id) } else { None }, task.id]).unwrap();

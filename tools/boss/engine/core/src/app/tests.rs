@@ -503,6 +503,7 @@ mod coordinator_guidance;
 mod coordinator_handoff;
 mod coordinator_reset;
 mod create_revision_actor;
+mod dispatch_focus;
 mod dispatch_pause;
 mod driver_start_signal;
 mod engine_health_report;

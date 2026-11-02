@@ -735,6 +735,26 @@ pub async fn maybe_admit_recovery_probe(
         .filter(|e| !coordinator.execution_targets_review_pool(e))
         .collect();
     let skipped_reviews = total_ready - eligible.len();
+    // Dispatch focus mode holds out-of-scope rows from every automatic path,
+    // and this probe is one: only an explicit `bossctl agents launch` may
+    // bypass focus. Drop held rows before choosing a canary, and admit nothing
+    // when scope cannot be resolved (fail closed, like the queue drain).
+    let focus = coordinator.dispatch_focus();
+    let eligible: Vec<&WorkExecution> = if focus.is_active() {
+        match work_db.executions_outside_dispatch_focus(&ready, &focus) {
+            Ok(held) => eligible.into_iter().filter(|e| !held.contains(&e.id)).collect(),
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "spawn-capability breaker: failed to resolve dispatch focus scope; \
+                     admitting no recovery probe this tick",
+                );
+                return;
+            }
+        }
+    } else {
+        eligible
+    };
     // `list_ready_executions` orders by dispatch class then FIFO, so
     // `.first()` would be the fleet's single most urgent row (typically a
     // merge-conflict revision) — sacrificing it repeatedly to a sustained

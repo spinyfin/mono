@@ -716,6 +716,7 @@ mod design_postmortem;
 mod dispatch;
 mod dispatch_admission;
 mod dispatch_class;
+mod dispatch_focus;
 mod dispatch_helpers;
 mod driver_allocation;
 mod driver_lookup;

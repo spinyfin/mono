@@ -25,8 +25,10 @@ use boss_client::{BossClient, Discovery};
 mod agents;
 mod command_types;
 mod comments;
+mod dispatch_concurrency;
 mod dispatch_stats;
 mod doctor;
+mod focus;
 mod hosts;
 mod logs;
 mod pause;
@@ -591,6 +593,20 @@ enum DispatchAction {
         /// Maximum number of currently-blocked items to print.
         #[arg(long, default_value_t = 10)]
         top: usize,
+    },
+    /// Restrict automatic dispatch to chosen projects and products ("focus
+    /// mode"). While the focus set is non-empty, only rows in a focused
+    /// project or product — plus the revisions and followups the engine
+    /// mints for them (review, CI-fix, merge-conflict, post-merge review) —
+    /// dispatch automatically; everything else stays queued with the
+    /// `focus_mode` hold reason and dispatches normally once focus is cleared
+    /// or its project/product is added. Nothing is rewritten: it is only an
+    /// admission gate. The global pause still overrides it, `bossctl agents
+    /// launch` still bypasses it, and the concurrency cap still applies.
+    /// Persisted across engine restarts.
+    Focus {
+        #[command(subcommand)]
+        action: focus::FocusAction,
     },
     /// Get or set the interactive-pool ("Bridge Crew" + "Lower Decks")
     /// concurrency cap — the ceiling `drain_ready_queue` enforces on live
@@ -1458,8 +1474,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
             action: DispatchAction::Stats { state_root, since, top },
         } => dispatch_stats::dispatch_stats(cli.json, state_root, since.as_deref(), top),
         Command::Dispatch {
+            action: DispatchAction::Focus { action },
+        } => focus::run(&cli.socket_path, cli.json, action).await,
+        Command::Dispatch {
             action: DispatchAction::Concurrency { set },
-        } => dispatch_concurrency(&cli.socket_path, cli.json, set).await,
+        } => dispatch_concurrency::dispatch_concurrency(&cli.socket_path, cli.json, set).await,
         Command::Automation {
             action: AutomationAction::Pause { reason },
         } => pause::automation_set_paused(&cli.socket_path, cli.json, Some(reason)).await,
@@ -1841,93 +1860,6 @@ fn drop_closed_work_items(
             }
         })
         .collect()
-}
-
-/// Current interactive-pool concurrency cap as returned by
-/// [`FrontendRequest::SetDispatchConcurrency`] / [`FrontendRequest::GetDispatchConcurrency`].
-struct DispatchConcurrencyState {
-    limit: usize,
-    max: usize,
-    clamped_from: Option<usize>,
-}
-
-async fn get_dispatch_concurrency_raw(socket_path: &Option<String>) -> Result<DispatchConcurrencyState> {
-    let mut client = connect(socket_path).await?;
-    let response = client
-        .send_request(&FrontendRequest::GetDispatchConcurrency)
-        .await
-        .context("sending GetDispatchConcurrency")?;
-    match response {
-        FrontendEvent::DispatchConcurrencyResult {
-            limit,
-            max,
-            clamped_from,
-        } => Ok(DispatchConcurrencyState {
-            limit,
-            max,
-            clamped_from,
-        }),
-        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
-            bail!("engine rejected GetDispatchConcurrency: {message}")
-        }
-        other => bail!("engine returned unexpected response: {other:?}"),
-    }
-}
-
-async fn set_dispatch_concurrency_raw(socket_path: &Option<String>, limit: usize) -> Result<DispatchConcurrencyState> {
-    let mut client = connect(socket_path).await?;
-    let response = client
-        .send_request(&FrontendRequest::SetDispatchConcurrency { limit })
-        .await
-        .context("sending SetDispatchConcurrency")?;
-    match response {
-        FrontendEvent::DispatchConcurrencyResult {
-            limit,
-            max,
-            clamped_from,
-        } => Ok(DispatchConcurrencyState {
-            limit,
-            max,
-            clamped_from,
-        }),
-        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
-            bail!("engine rejected SetDispatchConcurrency: {message}")
-        }
-        other => bail!("engine returned unexpected response: {other:?}"),
-    }
-}
-
-fn print_dispatch_concurrency(json: bool, state: &DispatchConcurrencyState) {
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "limit": state.limit,
-                "max": state.max,
-                "clamped_from": state.clamped_from,
-            })
-        );
-    } else {
-        println!(
-            "interactive concurrency cap: {} (worker-pool ceiling: {})",
-            state.limit, state.max
-        );
-        if let Some(requested) = state.clamped_from {
-            println!(
-                "  requested {requested} exceeded the ceiling — clamped to {}",
-                state.limit
-            );
-        }
-    }
-}
-
-async fn dispatch_concurrency(socket_path: &Option<String>, json: bool, set: Option<usize>) -> Result<()> {
-    let state = match set {
-        Some(limit) => set_dispatch_concurrency_raw(socket_path, limit).await?,
-        None => get_dispatch_concurrency_raw(socket_path).await?,
-    };
-    print_dispatch_concurrency(json, &state);
-    Ok(())
 }
 
 fn filter_and_tail<'a>(

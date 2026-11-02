@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::dispatch_focus::{DispatchFocusAction, DispatchFocusState};
 use crate::engine_app::{EngineToAppRequest, EngineToAppResponse};
 use crate::health_wire::EngineHealthReport;
 use crate::host_registry_wire::HostSnapshot;
@@ -879,6 +880,11 @@ pub enum FrontendRequest {
     /// Query the current interactive-pool concurrency cap without changing
     /// it. Replies with [`FrontendEvent::DispatchConcurrencyResult`].
     GetDispatchConcurrency,
+
+    /// Query the dispatch focus set and how many ready executions it is
+    /// holding, without changing anything. Replies with
+    /// [`FrontendEvent::DispatchFocusResult`].
+    GetDispatchFocus,
 
     /// Query the current dispatch-pause state without changing it.
     /// Replies with [`FrontendEvent::DispatchStateResult`].
@@ -2898,6 +2904,19 @@ pub enum FrontendRequest {
         patch: AutomationPatch,
     },
 
+    /// Change the dispatch focus set (focus mode is on while it is non-empty).
+    /// Targets are project or product ids, short ids, or product slugs; an
+    /// unresolvable target rejects the whole request and changes nothing.
+    /// `Clear` takes no targets. Persisted so it survives an engine restart,
+    /// and kicks the scheduler so rows that just came into scope (or out of
+    /// a cleared focus) dispatch immediately. Replies with
+    /// [`FrontendEvent::DispatchFocusResult`] or [`FrontendEvent::WorkError`].
+    UpdateDispatchFocus {
+        action: DispatchFocusAction,
+        #[serde(default)]
+        targets: Vec<String>,
+    },
+
     /// Apply an `IdeaPatch` to an idea. `None` fields are left unchanged.
     /// Replies with [`FrontendEvent::IdeaUpdated`].
     UpdateIdea {
@@ -2944,38 +2963,10 @@ pub use snapshot_wire::{
     WorkerPoolEntry, WorkspacePoolEntry,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum TopicEventPayload {
-    WorkInvalidated {
-        reason: String,
-        product_id: Option<String>,
-        item_ids: Vec<String>,
-        /// How much of the board the change can have touched. Absent on the
-        /// wire means [`InvalidationClass::Structural`].
-        #[serde(default)]
-        class: InvalidationClass,
-    },
-    ExecutionInvalidated {
-        reason: String,
-        execution_id: String,
-        work_item_id: String,
-        status: String,
-    },
-    /// An editorial hook decision was recorded for a product's execution.
-    /// Emitted to the `"editorial_actions.<product_id>"` topic so the UI
-    /// can badge product cards when actions accumulate.
-    WorkEditorialAction { action: EditorialAction },
-    /// The engine dropped one or more pending invalidations for this
-    /// session's outbound queue while riding out a publish burst (a
-    /// merge-poller sweep across many products/executions, for example)
-    /// rather than disconnecting a client that was draining fine, just not
-    /// fast enough for an instant. The app should treat this the same way
-    /// it treats reconnecting — refetch its subscribed topics — without
-    /// tearing down or reporting the connection as lost, since it never
-    /// was.
-    ResyncRequired,
-}
+// The topic-push payload enum lives in `topic_event_payload`; re-exported as
+// `boss_protocol::TopicEventPayload`.
+mod topic_event_payload;
+pub use topic_event_payload::TopicEventPayload;
 
 #[cfg(test)]
 mod editorial_controls_tests;

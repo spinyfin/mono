@@ -4,16 +4,19 @@
 
 use std::collections::BTreeMap;
 
-use boss_protocol::{DispatchPool, QueuedDispatch, WorkExecution};
+use boss_protocol::{DispatchFocus, DispatchPool, QueuedDispatch, WorkExecution};
 
 use crate::work::WorkDb;
 use boss_execution_contracts::DispatchPause;
 
 /// What the scheduler consults before it walks the ready queue: the pause
-/// state, and the per-row chain-serialization hold.
+/// state, the dispatch focus set, and the per-row chain-serialization hold.
 pub(super) struct DispatchGate<'a> {
     pub pause: Option<&'a DispatchPause>,
     pub automation_paused: bool,
+    /// Rows outside a non-empty focus set are held by `drain_ready_queue`, so
+    /// they carry no queue position either.
+    pub focus: &'a DispatchFocus,
     pub pool_of: &'a dyn Fn(&WorkExecution) -> DispatchPool,
     /// `true` when the scheduler would defer the row behind a live writer on
     /// its PR chain (the row stays `ready` with a wait reason).
@@ -41,11 +44,17 @@ pub(super) fn classify_queued_dispatch(db: &WorkDb, gate: &DispatchGate<'_>) -> 
     // Same exemption set the drain reads: critical main-pool rows dispatch
     // through an operator pause.
     let critical = db.list_critical_ready_execution_ids().unwrap_or_default();
+    // Fail closed like the drain: if scope cannot be resolved, no row is ranked.
+    let out_of_focus = db
+        .executions_outside_dispatch_focus(&ready, gate.focus)
+        .unwrap_or_else(|_| ready.iter().map(|execution| execution.id.clone()).collect());
     let mut entries: BTreeMap<String, QueuedDispatch> = BTreeMap::new();
     let mut next_position = 0u32;
     for execution in &ready {
         let pool = (gate.pool_of)(execution);
-        let held = is_held(gate, pool, critical.contains(&execution.id)) || (gate.chain_blocked)(execution);
+        let held = is_held(gate, pool, critical.contains(&execution.id))
+            || out_of_focus.contains(&execution.id)
+            || (gate.chain_blocked)(execution);
         let position = (!held).then(|| {
             let position = next_position;
             next_position += 1;

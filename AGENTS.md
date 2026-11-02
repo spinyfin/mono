@@ -78,6 +78,10 @@ root-cause rule as the section below.
   intervals for the two singleton sweeps, and what each one's cost scales
   with):
   [`tools/boss/docs/background-sweep-telemetry.md`](tools/boss/docs/background-sweep-telemetry.md)
+- Dispatch focus mode (`bossctl dispatch focus`: restrict automatic
+  dispatch to chosen projects/products; scope rules, precedence against the
+  pause and force-launch, the `focus_mode` hold reason):
+  [`tools/boss/docs/dispatch-focus-mode.md`](tools/boss/docs/dispatch-focus-mode.md)
 - Operator runbooks:
   [`tools/boss/docs/runbooks/`](tools/boss/docs/runbooks/)
 
