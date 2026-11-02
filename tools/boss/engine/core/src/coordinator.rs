@@ -784,7 +784,7 @@ pub(crate) fn occupying_live_worker(
 
 /// Fresh registry with the coordinator's counters pre-registered, including
 /// the answer-agent metrics registered through `lifecycle`.
-pub fn default_coordinator_metrics(lifecycle: &dyn LifecycleServices) -> Arc<Registry> {
+fn default_coordinator_metrics(lifecycle: &dyn LifecycleServices) -> Arc<Registry> {
     let metrics = Arc::new(Registry::new());
     register_metrics(&metrics);
     crate::dispatch_metrics::register_metrics(&metrics);

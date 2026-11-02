@@ -6,7 +6,7 @@
 //! totals visible in every metrics listing.
 
 use crate::merge_poller::sanitize_metric_name_component;
-use crate::metrics::Registry;
+use crate::metrics::{CounterHandle, Registry};
 
 crate::register_counter!(
     ENQUEUED,
@@ -39,14 +39,20 @@ crate::register_counter!(
     "Answer-agent queue-wait histogram sample count; answer_agent.queue_wait_ms.<bucket> holds bounded millisecond buckets."
 );
 
+const HANDLES: [&CounterHandle; 6] = [&ENQUEUED, &STARTED, &REPLIED, &FAILED, &SUPERSEDED, &QUEUE_WAIT_MS];
+
 /// Register the answer-agent lifecycle metric family during engine boot.
 pub fn register_metrics(registry: &Registry) {
-    registry.register_counter(&ENQUEUED);
-    registry.register_counter(&STARTED);
-    registry.register_counter(&REPLIED);
-    registry.register_counter(&FAILED);
-    registry.register_counter(&SUPERSEDED);
-    registry.register_counter(&QUEUE_WAIT_MS);
+    for handle in HANDLES {
+        registry.register_counter(handle);
+    }
+}
+
+/// Ensure the family exists when coordinators share or restore a registry.
+pub fn ensure_registered(registry: &Registry) {
+    for handle in HANDLES {
+        registry.ensure_counter(handle);
+    }
 }
 
 pub fn record_enqueued(registry: &Registry) {
