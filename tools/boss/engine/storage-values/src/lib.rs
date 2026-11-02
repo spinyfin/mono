@@ -167,3 +167,23 @@ pub struct SolPrRecord {
     pub runs: Vec<CostRunRecord>,
     pub first_ci: Option<bool>,
 }
+
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
+pub struct Host {
+    pub id: String,
+    pub ssh_target: Option<String>,
+    pub pool_size: i64,
+    pub enabled: bool,
+    /// Epoch-seconds string of the most recent contact *attempt* with
+    /// this host (success or failure) — either a dispatch-time cube
+    /// invocation or the registration-time wrapper push. `None` when
+    /// the host has never been contacted.
+    pub last_seen_at: Option<String>,
+    pub last_error_text: Option<String>,
+    /// Consecutive dispatch-time cube invocations that have failed on
+    /// this host, reset to 0 on any success. See
+    /// `HOST_HEALTH_FAILURE_THRESHOLD` / `WorkDb::record_host_dispatch_failure`.
+    pub consecutive_failures: i64,
+    pub created_at: String,
+}

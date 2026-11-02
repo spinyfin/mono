@@ -615,6 +615,7 @@ dependencies = [
  "boss-engine-worker-bin",
  "boss-engine-worker-policy",
  "boss-event-bus",
+ "boss-execution-contracts",
  "boss-feature-flags",
  "boss-gh-telemetry",
  "boss-github",
@@ -1026,6 +1027,23 @@ version = "0.1.0"
 dependencies = [
  "boss-engine-metrics-registry",
  "boss-task-scope",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "boss-execution-contracts"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "boss-engine-effort",
+ "boss-engine-recovery",
+ "boss-engine-storage-values",
+ "boss-engine-structured-output",
+ "boss-host-execution",
+ "boss-protocol",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
 ]

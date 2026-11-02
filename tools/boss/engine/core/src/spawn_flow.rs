@@ -646,7 +646,7 @@ pub trait WorkerSpawner: Send + Sync {
         &self,
         request: EngineToAppRequest,
         timeout: Duration,
-    ) -> Result<EngineToAppResponse, crate::app::SendToAppError>;
+    ) -> Result<EngineToAppResponse, boss_execution_contracts::SendToAppError>;
 
     /// Abort our newly started process without detaching another run's viewer.
     async fn abort_worker_spawn(&self, _run_id: &str) -> Result<(), String> {
@@ -1081,7 +1081,7 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
             // running, so there is nobody to show a card. Registration
             // re-attaches every live worker and no failure is recorded.
             match err {
-                crate::app::SendToAppError::NotRegistered => None,
+                boss_execution_contracts::SendToAppError::NotRegistered => None,
                 other => Some(format!("request to the app failed: {other}")),
             }
         }
@@ -1158,9 +1158,9 @@ pub(crate) fn viewer_attach_failure_reason(response: &EngineToAppResponse) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::SendToAppError;
     use crate::driver::test_support::{codex_homes_override, transcript_store_override};
     use crate::protocol::{AttachWorkerPaneResult, EngineToAppError};
+    use boss_execution_contracts::SendToAppError;
     use boss_tmux::{CommandOutput, CommandRunner};
     use std::ffi::OsString;
     use std::path::Path;

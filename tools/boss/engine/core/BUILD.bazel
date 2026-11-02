@@ -83,6 +83,7 @@ rust_library(
     ],
     deps = [
         "//tools/boss/engine/host-execution",
+        "//tools/boss/engine/execution-contracts",
         "//lib/rust/git_utils",
         "//tools/boss/backoff",
         # NOT "//tools/boss/build-provenance": that crate's source embeds
@@ -250,6 +251,8 @@ rust_test(
     # crate inheritance keeps the production dependency; compile this test
     # against the fixture variant under its usual Rust name instead.
     aliases = {
+        "//tools/boss/engine/execution-contracts": "boss_execution_contracts_production",
+        "//tools/boss/engine/execution-contracts:execution_contracts_test_support": "boss_execution_contracts",
         "//tools/boss/engine/work-db:work-db": "boss_work_db_production",
         "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
     },
@@ -277,6 +280,7 @@ rust_test(
     ),
     shard_count = 11,
     deps = [
+        "//tools/boss/engine/execution-contracts:execution_contracts_test_support",
         "//tools/boss/engine/prose-vocabulary",
         "//tools/boss/engine/task-scope",
         "//tools/boss/engine/test-git",
@@ -294,6 +298,8 @@ network_enabled_rust_test(
     # crate inheritance keeps the production dependency; compile this test
     # against the fixture variant under its usual Rust name instead.
     aliases = {
+        "//tools/boss/engine/execution-contracts": "boss_execution_contracts_production",
+        "//tools/boss/engine/execution-contracts:execution_contracts_test_support": "boss_execution_contracts",
         "//tools/boss/engine/work-db:work-db": "boss_work_db_production",
         "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
     },
@@ -330,6 +336,7 @@ network_enabled_rust_test(
     ),
     tags = ["manual"],
     deps = [
+        "//tools/boss/engine/execution-contracts:execution_contracts_test_support",
         "//tools/boss/engine/prose-vocabulary",
         "//tools/boss/engine/task-scope",
         "//tools/boss/engine/test-git",

@@ -45,38 +45,10 @@ pub(super) fn build_effort_audit_report(
 /// most 8 entries, so we don't bother with JSON.
 const META_LIVE_STATUS_DISABLED_SLOTS: &str = "live_status_disabled_slots";
 
-/// Metadata key for the global dispatch-pause flag. `"1"` = paused, `"0"` or
-/// absent = running. Persisted at every toggle so the pause survives an engine
-/// restart. `pub(crate)` so the spawn-capability circuit breaker
-/// ([`crate::spawn_health`]) can persist the auto-pause it applies through the
-/// same key the human toggle (`handle_set_dispatch_paused`) uses.
-pub(crate) const METADATA_KEY_DISPATCH_PAUSED: &str = "dispatch_paused";
-/// Metadata key storing the epoch-seconds timestamp at which dispatch was last
-/// paused. Zero (or absent) means not paused.
-pub(crate) const METADATA_KEY_DISPATCH_PAUSED_SINCE: &str = "dispatch_paused_since_epoch_s";
-/// Metadata key storing the origin of the current pause — one of
-/// [`crate::coordinator::DispatchPauseOrigin::as_metadata_str`]'s values.
-/// Determines whether the pause exempts `pr_review` executions on restore;
-/// absent (a pause persisted before this key existed) defaults to the
-/// non-exempt `breaker` origin — see
-/// [`crate::coordinator::DispatchPauseOrigin::from_metadata_str`].
-pub(crate) const METADATA_KEY_DISPATCH_PAUSE_ORIGIN: &str = "dispatch_paused_origin";
-/// Metadata key storing the scope of the current pause — one of
-/// [`boss_protocol::DispatchPauseScope::as_str`]'s values — so a restart
-/// restores what the pause *held*, not just who paused. Absent (a
-/// pause persisted before this key existed) restores as the origin's default
-/// scope; an unrecognised value restores as the stricter `all_spawns` — see
-/// [`load_dispatch_pause_scope`]. `pub(crate)` for the same reason as the
-/// origin key: the spawn-capability breaker persists its pause through it.
-pub(crate) const METADATA_KEY_DISPATCH_PAUSE_SCOPE: &str = "dispatch_paused_scope";
-/// Metadata key storing why dispatch is currently paused. Absent (or
-/// empty) while running; always set alongside [`METADATA_KEY_DISPATCH_PAUSED`]
-/// `"1"` and cleared alongside it going back to `"0"` — see
-/// [`crate::coordinator::ExecutionCoordinator::pause_dispatch`] /
-/// `resume_dispatch`. `pub(crate)` for the same reason as
-/// `METADATA_KEY_DISPATCH_PAUSED`: the spawn-capability breaker persists
-/// its own reason through this key.
-pub(crate) const METADATA_KEY_DISPATCH_PAUSE_REASON: &str = "dispatch_paused_reason";
+pub(crate) use boss_execution_contracts::{
+    METADATA_KEY_DISPATCH_PAUSE_ORIGIN, METADATA_KEY_DISPATCH_PAUSE_REASON, METADATA_KEY_DISPATCH_PAUSE_SCOPE,
+    METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE,
+};
 
 /// Fallback reason used only when restoring a persisted pause at boot whose
 /// `METADATA_KEY_DISPATCH_PAUSE_REASON` (or the automation equivalent) is

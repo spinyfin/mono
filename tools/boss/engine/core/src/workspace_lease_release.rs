@@ -50,14 +50,7 @@ pub enum PaneStatus {
     Present,
 }
 
-/// Whether any process has its cwd inside the workspace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Occupancy {
-    Empty,
-    Occupied,
-    /// Probe failed; inferred death must not release.
-    Unknown,
-}
+pub use boss_execution_contracts::Occupancy;
 
 /// Whether the recovery bookmark is confirmed written, when the run had work.
 #[derive(Debug, Clone, PartialEq, Eq)]

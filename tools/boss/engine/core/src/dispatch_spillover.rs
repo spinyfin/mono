@@ -41,18 +41,7 @@
 //! once mainline itself has filled all of Bridge Crew *and* whatever part
 //! of Lower Decks automation left alone.
 
-/// One interactive-pool slot, as the policy sees it. Mapped from the
-/// coordinator's private `WorkerSlot` at the call site.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SlotView {
-    /// Zero-based index into the pool's slot vector. `index / page_size`
-    /// is the page: 0 = Bridge Crew, 1 = Lower Decks.
-    pub index: usize,
-    /// `true` when some execution currently holds this slot.
-    pub occupied: bool,
-    /// The workspace this slot last ran, for claim-time affinity.
-    pub last_workspace_id: Option<String>,
-}
+pub(crate) use boss_execution_contracts::SlotView;
 
 /// An in-progress automation run occupying an interactive slot — i.e. a
 /// spilled automation run, the only kind eligible for preemption.
@@ -68,43 +57,8 @@ pub(crate) struct PreemptionCandidate {
     pub started_epoch: Option<i64>,
 }
 
-/// Choose the Lower Decks slot an automation execution should spill into,
-/// or `None` when page 1 is full (or does not exist, e.g. a test pool
-/// smaller than one page).
-///
-/// Deliberately *not* the same function as the coordinator's
-/// `select_claim_index`: that one implements strict spillover for
-/// mainline (lowest free slot in the lowest non-full page, so Bridge Crew
-/// fills first). This one is the mirror image — it considers page 1 and
-/// nothing else, so a spilling automation can never take a Bridge Crew
-/// slot even when Bridge Crew is completely idle.
-///
-/// Within Lower Decks, workspace affinity wins if an idle slot last ran
-/// the preferred workspace; otherwise the lowest free Lower Decks index
-/// is chosen. Fully deterministic — no RNG — matching `select_claim_index`
-/// so engine and app never disagree about which slot a dispatch lands on.
-pub(crate) fn select_spill_claim_index(
-    slots: &[SlotView],
-    preferred_workspace_id: Option<&str>,
-    page_size: usize,
-) -> Option<usize> {
-    // Page 1 == Lower Decks. A pool with fewer than `page_size` slots has
-    // no page 1 at all, so `free` comes back empty and we return `None`.
-    let free: Vec<usize> = slots
-        .iter()
-        .filter(|s| !s.occupied && s.index / page_size == 1)
-        .map(|s| s.index)
-        .collect();
-    let lowest_free = *free.first()?;
-
-    let affinity_idx = preferred_workspace_id.and_then(|target| {
-        free.iter()
-            .copied()
-            .find(|&idx| slots[idx].last_workspace_id.as_deref() == Some(target))
-    });
-
-    Some(affinity_idx.unwrap_or(lowest_free))
-}
+#[cfg(test)]
+use boss_execution_contracts::select_spill_claim_index;
 
 /// `true` when a mainline item may preempt to obtain an interactive slot:
 /// every interactive slot on both pages is occupied.

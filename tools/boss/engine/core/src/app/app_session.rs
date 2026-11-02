@@ -100,19 +100,7 @@ impl AppChannelHealth {
     }
 }
 
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum SendToAppError {
-    #[error("no app session is registered")]
-    NotRegistered,
-    #[error("app session outbound queue is saturated; request could not be delivered")]
-    SessionWedged,
-    #[error("app disconnected before responding")]
-    AppDisconnected,
-    #[error("timed out waiting for app response")]
-    Timeout,
-    #[error("app responded with unexpected response kind for request kind {0}")]
-    ResponseKindMismatch(&'static str),
-}
+pub use boss_execution_contracts::SendToAppError;
 
 impl ServerState {
     /// Send a request to the registered app session and await the

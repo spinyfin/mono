@@ -14,6 +14,7 @@ rust_library(
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/driver:__pkg__",
         "//tools/boss/engine/effort:__pkg__",
+        "//tools/boss/engine/execution-contracts:__pkg__",
         "//tools/boss/engine/pr-review:__pkg__",
         "//tools/boss/engine/stdout-progress:__pkg__",
     ],

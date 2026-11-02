@@ -7,6 +7,7 @@ mod blocked_workspace;
 mod claimed_dispatch;
 mod dispatch;
 mod execution_bookmarks;
+mod execution_contracts;
 mod helpers;
 mod lease_pending;
 mod lease_retry;
