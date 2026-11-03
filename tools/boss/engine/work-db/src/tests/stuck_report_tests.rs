@@ -169,7 +169,7 @@ fn report_fixtures_cover_human_capacity_dependency_and_engine_stuck() {
             [&review.id],
         )
         .unwrap();
-    assert_eq!(row(&db, &review.id).bucket, StuckBucket::EngineStuck);
+    assert_eq!(row(&db, &review.id).bucket, StuckBucket::WaitingOnHuman);
     assert_eq!(row(&db, &review.id).classification, "S18_pr_behind");
     assert_eq!(
         db.stuck_report(0, now(), &observed_live_pid)
@@ -225,10 +225,7 @@ fn waiting_human_age_tracks_execution_transition_and_live_work_is_excluded() {
     let timestamp = now();
     db.connect()
         .unwrap()
-        .execute(
-            "UPDATE task_status_audit SET changed_at = ?1 WHERE property = 'execution_waiting_human'",
-            [timestamp - 100],
-        )
+        .execute("UPDATE execution_wait_history SET changed_at = ?1", [timestamp - 100])
         .unwrap();
     db.connect()
         .unwrap()
@@ -279,11 +276,8 @@ fn waiting_human_age_tracks_execution_transition_and_live_work_is_excluded() {
     assert_eq!(
         db.connect()
             .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM task_status_audit WHERE property = 'execution_waiting_human'",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
+            .query_row("SELECT COUNT(*) FROM execution_wait_history", [], |r| r
+                .get::<_, i64>(0))
             .unwrap(),
         2
     );
@@ -296,10 +290,10 @@ fn waiting_human_migration_backfills_lower_bound_and_survives_reopen() {
     let (_, id, _) = make_waiting_human_chore(&db, "Historical wait");
     let conn = db.connect().unwrap();
     conn.execute_batch(
-        "DROP TRIGGER execution_waiting_human_insert;
-        DROP TRIGGER execution_waiting_human_update;
-        DELETE FROM task_status_audit WHERE property = 'execution_waiting_human';
-        DELETE FROM schema_migrations WHERE id = '20261029_1900_execution_waiting_human_history';",
+        "DROP TRIGGER execution_wait_history_insert;
+        DROP TRIGGER execution_wait_history_update;
+        DROP TABLE execution_wait_history;
+        DELETE FROM schema_migrations WHERE id IN ('20261029_1900_execution_waiting_human_history', '20261103_1800_execution_wait_history');",
     )
     .unwrap();
     drop(conn);
@@ -312,11 +306,8 @@ fn waiting_human_migration_backfills_lower_bound_and_survives_reopen() {
         assert_eq!(
             db.connect()
                 .unwrap()
-                .query_row(
-                    "SELECT COUNT(*) FROM task_status_audit WHERE property = 'execution_waiting_human'",
-                    [],
-                    |r| r.get::<_, i64>(0)
-                )
+                .query_row("SELECT COUNT(*) FROM execution_wait_history", [], |r| r
+                    .get::<_, i64>(0))
                 .unwrap(),
             1
         );
@@ -673,7 +664,7 @@ fn ended_human_wait_does_not_replace_task_age_or_basis() {
         let conn = db.connect().unwrap();
         conn.execute("UPDATE tasks SET status = ?1 WHERE id = ?2", params![status, id])
             .unwrap();
-        conn.execute("UPDATE task_status_audit SET changed_at = ?1, basis = 'status_change', age_is_lower_bound = 0 WHERE work_item_id = ?2 AND property != 'execution_waiting_human'", params![timestamp - 500, id]).unwrap();
+        conn.execute("UPDATE task_status_audit SET changed_at = ?1, basis = 'status_change', age_is_lower_bound = 0 WHERE work_item_id = ?2", params![timestamp - 500, id]).unwrap();
         // Resuming and waiting again places the wait after the last task transition.
         conn.execute(
             "UPDATE work_executions SET status = 'running' WHERE id = ?1",
@@ -685,7 +676,11 @@ fn ended_human_wait_does_not_replace_task_age_or_basis() {
             [&execution],
         )
         .unwrap();
-        conn.execute("UPDATE task_status_audit SET changed_at = ?1, basis = ?2, age_is_lower_bound = ?3 WHERE work_item_id = ?4 AND property = 'execution_waiting_human'", params![timestamp - 100, if legacy { "unknown_legacy" } else { "execution_waiting_human" }, legacy, id]).unwrap();
+        conn.execute(
+            "UPDATE execution_wait_history SET changed_at = ?1, age_is_lower_bound = ?2 WHERE execution_id = ?3",
+            params![timestamp - 100, legacy, execution],
+        )
+        .unwrap();
         conn.execute(
             "UPDATE work_executions SET status = 'running' WHERE id = ?1",
             [&execution],
@@ -748,7 +743,7 @@ fn non_task_waits_never_enter_task_history() {
         .unwrap();
     }
     let conn = db.connect().unwrap();
-    crate::stuck_report::migrate_wait_history(&conn).unwrap();
+    crate::execution_wait_history::migrate(&conn).unwrap();
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM task_status_audit WHERE property = 'execution_waiting_human'",

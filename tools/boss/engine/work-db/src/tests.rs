@@ -634,6 +634,7 @@ mod board_projection_tests;
 
 mod task_status_audit_tests;
 
+mod stuck_report_progress_tests;
 mod stuck_report_tests;
 
 mod conflict_mismatch_tests;
