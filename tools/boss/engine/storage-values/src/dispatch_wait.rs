@@ -3,6 +3,18 @@
 /// The per-repository workspace lease limiter is at capacity.
 pub const WAITING_FOR_WORKSPACE_REASON: &str = "Waiting for a workspace";
 
+/// Worker pool has no free slot this drain pass.
+pub const DISPATCH_WAIT_REASON_POOL_EXHAUSTED: &str = "pool_exhausted";
+
+/// Global dispatch pause is holding this ready row.
+pub const DISPATCH_WAIT_REASON_DISPATCH_PAUSED: &str = "dispatch_paused";
+
+/// Automation pause is holding this automation-pool row.
+pub const DISPATCH_WAIT_REASON_AUTOMATION_PAUSED: &str = "automation_paused";
+
+/// Dispatch focus is holding an out-of-scope ready row.
+pub use boss_protocol::DISPATCH_WAIT_REASON_FOCUS_MODE;
+
 /// User-visible interactive-cap hold text. Lease-pending slots are
 /// never called "working".
 pub fn interactive_cap_wait_reason(working: usize, lease_pending: usize) -> String {
@@ -17,7 +29,11 @@ pub fn interactive_cap_wait_reason(working: usize, lease_pending: usize) -> Stri
 pub fn is_capacity_wait_reason(reason: &str) -> bool {
     matches!(
         reason,
-        WAITING_FOR_WORKSPACE_REASON | "pool_exhausted" | "dispatch_paused" | "automation_paused" | "focus_mode"
+        WAITING_FOR_WORKSPACE_REASON
+            | DISPATCH_WAIT_REASON_POOL_EXHAUSTED
+            | DISPATCH_WAIT_REASON_DISPATCH_PAUSED
+            | DISPATCH_WAIT_REASON_AUTOMATION_PAUSED
+            | DISPATCH_WAIT_REASON_FOCUS_MODE
     ) || reason.starts_with("Waiting for an available worker (")
 }
 
@@ -31,10 +47,10 @@ mod tests {
             WAITING_FOR_WORKSPACE_REASON.to_owned(),
             interactive_cap_wait_reason(8, 0),
             interactive_cap_wait_reason(6, 2),
-            "pool_exhausted".into(),
-            "dispatch_paused".into(),
-            "automation_paused".into(),
-            "focus_mode".into(),
+            DISPATCH_WAIT_REASON_POOL_EXHAUSTED.to_owned(),
+            DISPATCH_WAIT_REASON_DISPATCH_PAUSED.to_owned(),
+            DISPATCH_WAIT_REASON_AUTOMATION_PAUSED.to_owned(),
+            DISPATCH_WAIT_REASON_FOCUS_MODE.to_owned(),
         ] {
             assert!(is_capacity_wait_reason(&reason), "{reason}");
         }

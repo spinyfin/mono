@@ -155,7 +155,11 @@ pub const MAX_CONCURRENT_INTERACTIVE_WORKERS: usize = 8;
 /// claimed and released as soon as the lease returns, success or failure.
 pub const MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO: usize = 2;
 
-pub use boss_engine_storage_values::dispatch_wait::{WAITING_FOR_WORKSPACE_REASON, interactive_cap_wait_reason};
+pub use boss_engine_storage_values::dispatch_wait::{
+    DISPATCH_WAIT_REASON_AUTOMATION_PAUSED, DISPATCH_WAIT_REASON_DISPATCH_PAUSED, DISPATCH_WAIT_REASON_FOCUS_MODE,
+    DISPATCH_WAIT_REASON_POOL_EXHAUSTED, WAITING_FOR_WORKSPACE_REASON, interactive_cap_wait_reason,
+    is_capacity_wait_reason,
+};
 
 use boss_engine_storage_values::pool_policy::{AUTOMATION_WORKER_ID_PREFIX, REVIEW_WORKER_ID_PREFIX};
 

@@ -1179,7 +1179,11 @@ impl ExecutionCoordinator {
                     .any(|e| Self::forced_admissible(operator_forced_ids.contains(&e.id), pause.as_ref()));
                 if !any_forced_admissible {
                     for execution in &executions {
-                        changed_waits.extend(self.record_dispatch_wait_reason(execution, "dispatch_paused", None));
+                        changed_waits.extend(self.record_dispatch_wait_reason(
+                            execution,
+                            DISPATCH_WAIT_REASON_DISPATCH_PAUSED,
+                            None,
+                        ));
                     }
                     tracing::debug!(
                         held_count,
@@ -1346,14 +1350,22 @@ impl ExecutionCoordinator {
             // rows unless a pause-bypass marker is consumed.
             if paused && !forced_admissible {
                 if !reviews_exempt_from_pause {
-                    changed_waits.extend(self.record_dispatch_wait_reason(&execution, "dispatch_paused", None));
+                    changed_waits.extend(self.record_dispatch_wait_reason(
+                        &execution,
+                        DISPATCH_WAIT_REASON_DISPATCH_PAUSED,
+                        None,
+                    ));
                     continue;
                 }
                 if !is_review && !is_critical {
                     if self.take_dispatch_pause_bypass(&execution.id) {
                         pause_bypass_admitted.insert(execution.id.clone());
                     } else {
-                        changed_waits.extend(self.record_dispatch_wait_reason(&execution, "dispatch_paused", None));
+                        changed_waits.extend(self.record_dispatch_wait_reason(
+                            &execution,
+                            DISPATCH_WAIT_REASON_DISPATCH_PAUSED,
+                            None,
+                        ));
                         continue;
                     }
                 }
@@ -1365,7 +1377,11 @@ impl ExecutionCoordinator {
             // candidate queue below — an automation-paused row must not
             // claim ANY slot, home or spilled.
             if automation_paused && is_automation {
-                changed_waits.extend(self.record_dispatch_wait_reason(&execution, "automation_paused", None));
+                changed_waits.extend(self.record_dispatch_wait_reason(
+                    &execution,
+                    DISPATCH_WAIT_REASON_AUTOMATION_PAUSED,
+                    None,
+                ));
                 continue;
             }
 
@@ -1375,7 +1391,7 @@ impl ExecutionCoordinator {
             if out_of_focus.contains(&execution.id) && !forced_admissible {
                 changed_waits.extend(self.record_dispatch_wait_reason(
                     &execution,
-                    boss_protocol::DISPATCH_WAIT_REASON_FOCUS_MODE,
+                    DISPATCH_WAIT_REASON_FOCUS_MODE,
                     None,
                 ));
                 continue;
@@ -1394,11 +1410,19 @@ impl ExecutionCoordinator {
             // leave the rest of Lower Decks idle. The redundant home claim
             // this costs is one in-memory mutex acquisition per row.
             if is_review && review_pool_exhausted {
-                changed_waits.extend(self.record_dispatch_wait_reason(&execution, "pool_exhausted", None));
+                changed_waits.extend(self.record_dispatch_wait_reason(
+                    &execution,
+                    DISPATCH_WAIT_REASON_POOL_EXHAUSTED,
+                    None,
+                ));
                 continue;
             }
             if is_main && main_pool_exhausted {
-                changed_waits.extend(self.record_dispatch_wait_reason(&execution, "pool_exhausted", None));
+                changed_waits.extend(self.record_dispatch_wait_reason(
+                    &execution,
+                    DISPATCH_WAIT_REASON_POOL_EXHAUSTED,
+                    None,
+                ));
                 continue;
             }
 
@@ -1925,7 +1949,11 @@ impl ExecutionCoordinator {
                             })),
                     )
                     .await;
-                changed_waits.extend(self.record_dispatch_wait_reason(&execution, "pool_exhausted", None));
+                changed_waits.extend(self.record_dispatch_wait_reason(
+                    &execution,
+                    DISPATCH_WAIT_REASON_POOL_EXHAUSTED,
+                    None,
+                ));
 
                 if is_review {
                     review_pool_exhausted = true;
@@ -2011,7 +2039,11 @@ impl ExecutionCoordinator {
                             })),
                     )
                     .await;
-                changed_waits.extend(self.record_dispatch_wait_reason(&execution, "pool_exhausted", None));
+                changed_waits.extend(self.record_dispatch_wait_reason(
+                    &execution,
+                    DISPATCH_WAIT_REASON_POOL_EXHAUSTED,
+                    None,
+                ));
 
                 // Keep the Automations tab honest: "Queued", not a failure
                 // badge. Same treatment the pre-spillover exhaustion path

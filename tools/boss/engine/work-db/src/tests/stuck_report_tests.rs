@@ -75,6 +75,14 @@ fn project_prerequisite_is_progressing_until_terminal_or_missing() {
         relation: None,
     })
     .unwrap();
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(&task.id)
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::WaitingDependency)
+            .build(),
+    )
+    .unwrap();
     assert_eq!(row(&db, &task.id).bucket, StuckBucket::WaitingOnDependency);
     db.connect()
         .unwrap()
@@ -165,7 +173,8 @@ fn report_fixtures_cover_human_capacity_dependency_and_engine_stuck() {
     db.connect()
         .unwrap()
         .execute(
-            "UPDATE tasks SET pr_merge_state_status = 'BEHIND' WHERE id = ?1",
+            "UPDATE tasks SET pr_merge_state_status = 'BEHIND', review_required_state = 'approved',
+             ci_required_state = 'success' WHERE id = ?1",
             [&review.id],
         )
         .unwrap();
@@ -462,6 +471,14 @@ fn human_only_gates_do_not_count_as_progressing_prerequisites() {
             relation: None,
         })
         .unwrap();
+        db.create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&dependent.id)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::WaitingDependency)
+                .build(),
+        )
+        .unwrap();
         assert_eq!(
             row(&db, &dependent.id).bucket,
             if expected == StuckBucket::WaitingOnHuman {
@@ -515,7 +532,10 @@ fn classification_table_covers_failure_attention_and_global_hold_precedence() {
     let root = create_test_chore_manual(&db, &product.id, "Green parent");
     db.connect()
         .unwrap()
-        .execute("UPDATE tasks SET ci_required_state = 'pass' WHERE id = ?1", [&root.id])
+        .execute(
+            "UPDATE tasks SET ci_required_state = 'success' WHERE id = ?1",
+            [&root.id],
+        )
         .unwrap();
     for (dispatch, blocked, status, attention, ci, revision, wait, expected) in [
         (
@@ -716,6 +736,7 @@ fn non_task_waits_never_enter_task_history() {
             design_reasoning_effort_xhigh: false,
         })
         .unwrap();
+    let mut execution_ids = Vec::new();
     for (id, kind) in [
         (&product.id, ExecutionKind::ProductDesign),
         (&project.id, ExecutionKind::ProjectDesign),
@@ -730,28 +751,35 @@ fn non_task_waits_never_enter_task_history() {
                     .build(),
             )
             .unwrap();
-        let conn = db.connect().unwrap();
-        conn.execute(
-            "UPDATE work_executions SET status = 'running' WHERE id = ?1",
-            [&execution.id],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE work_executions SET status = 'waiting_human' WHERE id = ?1",
-            [&execution.id],
-        )
-        .unwrap();
+        execution_ids.push(execution.id);
     }
     let conn = db.connect().unwrap();
-    crate::execution_wait_history::migrate(&conn).unwrap();
-    let count: i64 = conn
+    for execution_id in &execution_ids {
+        let history: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM execution_wait_history WHERE execution_id = ?1",
+                [execution_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(history, 1, "{execution_id}");
+    }
+    let audit: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM task_status_audit WHERE property = 'execution_waiting_human'",
             [],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(count, 0);
+    assert_eq!(audit, 0);
+    drop(conn);
+    let report = db.stuck_report(0, now(), &observed_live_pid).unwrap();
+    for id in [&product.id, &project.id] {
+        assert!(
+            report.rows.iter().all(|row| row.work_item_id != *id),
+            "non-task {id} must not appear in the stuck report"
+        );
+    }
 }
 
 #[test]

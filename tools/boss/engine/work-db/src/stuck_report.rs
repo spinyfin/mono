@@ -5,6 +5,9 @@
 //! given an `S<n>` code from the stuck-state enumeration in the task
 //! persistence design.
 use super::*;
+use boss_engine_storage_values::dispatch_wait::{
+    DISPATCH_WAIT_REASON_AUTOMATION_PAUSED, DISPATCH_WAIT_REASON_DISPATCH_PAUSED, DISPATCH_WAIT_REASON_FOCUS_MODE,
+};
 use boss_protocol::{StuckBucket, StuckReport, StuckRow};
 use std::collections::BTreeMap;
 
@@ -55,7 +58,11 @@ fn build(conn: &Connection, minimum_age_secs: i64, now: i64) -> Result<(StuckRep
     let mut unconverted = 0;
     for id in ids {
         let task = query_task(conn, &id)?.context("stuck item disappeared inside read transaction")?;
-        if super::stuck_activity::related_work_is_live(conn, &task)? {
+        let waiting_human = query_live_execution_for_work_item(conn, &id)?
+            .filter(|execution| execution.status == ExecutionStatus::WaitingHuman);
+        // A live human wait on this item is itself the reportable state.
+        // Related queued work must not hide it.
+        if waiting_human.is_none() && super::stuck_activity::related_work_is_live(conn, &task)? {
             continue;
         }
         let failure_basis = latest_basis(conn, &id, "blocked_reason")?;
@@ -89,9 +96,7 @@ fn build(conn: &Connection, minimum_age_secs: i64, now: i64) -> Result<(StuckRep
             .unwrap_or((task.updated_at.parse().unwrap_or(now), true));
         let execution = query_latest_execution_for_work_item(conn, &id)?;
         let wait = super::queued_wait::for_execution(conn, execution.as_ref(), now)?.reason;
-        if let Some(execution) =
-            query_live_execution_for_work_item(conn, &id)?.filter(|e| e.status == ExecutionStatus::WaitingHuman)
-        {
+        if let Some(execution) = &waiting_human {
             (changed_at, legacy) = conn
                 .query_row(
                     "SELECT changed_at, age_is_lower_bound FROM execution_wait_history
@@ -125,8 +130,13 @@ fn build(conn: &Connection, minimum_age_secs: i64, now: i64) -> Result<(StuckRep
             StuckBucket::WaitingOnCapacity
         } else if dependency {
             StuckBucket::WaitingOnDependency
-        } else if super::stuck_activity::has_pending_execution(conn, &id)? {
-            // Pending dispatch is active work, including chain-serialization holds.
+        } else if super::stuck_activity::has_pending_execution(conn, &id)?
+            || (super::stuck_activity::has_waiting_dependency_execution(conn, &id)?
+                && progressing_prerequisite(conn, &id, now)?)
+        {
+            // Queued/ready dispatch is active work, including chain-serialization
+            // holds. A waiting_dependency row is active only while its gate is
+            // actually progressing; otherwise it is the stuck state.
             continue;
         } else {
             StuckBucket::EngineStuck
@@ -339,7 +349,7 @@ pub(super) fn classification(conn: &Connection, task: &Task, wait: Option<&str>)
             "worker_failed" | "spawning_attempt_retired_unsuccessfully"
                 if task.kind == TaskKind::Revision
                     && get_chain_root_task(conn, &task.id)?
-                        .is_some_and(|root| root.ci_required_state.as_deref() == Some("pass")) =>
+                        .is_some_and(|root| root.ci_required_state.as_deref() == Some("success")) =>
             {
                 "S13_revision_chain"
             }
@@ -359,7 +369,12 @@ pub(super) fn classification(conn: &Connection, task: &Task, wait: Option<&str>)
     // A queued execution means a start was already requested, so the item is
     // waiting on dispatch even when autostart is off.
     if let Some(wait) = wait {
-        let kind = if matches!(wait, "dispatch_paused" | "automation_paused" | "focus_mode") {
+        let kind = if matches!(
+            wait,
+            DISPATCH_WAIT_REASON_DISPATCH_PAUSED
+                | DISPATCH_WAIT_REASON_AUTOMATION_PAUSED
+                | DISPATCH_WAIT_REASON_FOCUS_MODE
+        ) {
             "S23_global_hold"
         } else {
             "S20_dispatch_wait"
@@ -397,19 +412,20 @@ pub(super) fn classification(conn: &Connection, task: &Task, wait: Option<&str>)
         if kinds.iter().any(|k| k == "churn_guard_parked") {
             return Ok("S16_review_churn".into());
         }
-        let behind: bool = conn.query_row(
-            "SELECT COALESCE(pr_merge_state_status = 'BEHIND', 0) FROM tasks WHERE id = ?1",
-            [&task.id],
-            |r| r.get(0),
-        )?;
-        if behind {
-            return Ok("S18_pr_behind".into());
-        }
-        if !super::stuck_activity::review_is_stalled(conn, task)?
-            && task.review_required_state.as_deref() != Some("changes_requested")
-            && task.ci_required_state.as_deref() != Some("fail")
-        {
-            return Ok("awaiting_merge".into());
+        let stalled = super::stuck_activity::review_is_stalled(conn, task)?;
+        let changes_requested = task.review_required_state.as_deref() == Some("changes_requested");
+        if !stalled && !changes_requested {
+            let behind: bool = conn.query_row(
+                "SELECT COALESCE(pr_merge_state_status = 'BEHIND', 0) FROM tasks WHERE id = ?1",
+                [&task.id],
+                |r| r.get(0),
+            )?;
+            if behind {
+                return Ok("S18_pr_behind".into());
+            }
+            if task.ci_required_state.as_deref() == Some("success") {
+                return Ok("awaiting_merge".into());
+            }
         }
     }
     Ok(match task.status {
