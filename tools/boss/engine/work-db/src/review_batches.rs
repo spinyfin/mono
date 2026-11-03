@@ -851,6 +851,10 @@ fn admission_deferred_attention_text(pr_url: &str) -> (&'static str, String) {
 }
 
 fn file_admission_deferred_attention_in_tx(tx: &Transaction<'_>, work_item_id: &str, pr_url: &str) -> Result<()> {
+    // Deleted roots and producing tasks no longer need an admission marker.
+    if super::query_task(tx, work_item_id)?.is_none_or(|task| task.deleted_at.is_some()) {
+        return Ok(());
+    }
     let (title, body) = admission_deferred_attention_text(pr_url);
     super::workitems::upsert_refreshing_work_item_attention_in_tx(
         tx,
@@ -1452,6 +1456,31 @@ impl WorkDb {
         pre_merge_dispatch_hold_on(&conn, cycle_root_id)
     }
 
+    /// Skip remote metadata only when a held root has no review history that
+    /// could settle it. Any batch, verdict or legacy reviewer requires the
+    /// normal immutable-head checks, even while spawning is held.
+    pub fn pre_merge_review_hold_without_history(
+        &self,
+        cycle_root_id: &str,
+        work_item_id: &str,
+    ) -> Result<Option<&'static str>> {
+        let conn = self.connect()?;
+        let hold = pre_merge_dispatch_hold_on(&conn, cycle_root_id)?;
+        if hold.is_none() {
+            return Ok(None);
+        }
+        let has_history: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pr_review_batches WHERE cycle_root_id = ?1)
+                 OR EXISTS(SELECT 1 FROM pr_review_verdicts WHERE work_item_id IN (?1, ?2))
+                 OR EXISTS(SELECT 1 FROM work_executions
+                           WHERE work_item_id IN (?1, ?2) AND kind = 'pr_review'
+                             AND status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned'))",
+            params![cycle_root_id, work_item_id],
+            |row| row.get(0),
+        )?;
+        Ok(if has_history { None } else { hold })
+    }
+
     /// File (or re-raise and refresh) the review-admission-deferred attention
     /// item for `work_item_id`. The single filer behind the pool-full,
     /// focus-hold and all-spawns-hold paths.
@@ -1528,7 +1557,12 @@ impl WorkDb {
         // unpaused) candidate is not starved by never-started out-of-scope
         // batches. Own transaction so abandoned member executions publish
         // terminal events even when this call later defers.
-        self.release_unstartable_pre_merge_review_reservations()?;
+        if let Err(err) = self.release_unstartable_pre_merge_review_reservations() {
+            tracing::warn!(
+                ?err,
+                "review admission: reservation cleanup failed; checking capacity anyway"
+            );
+        }
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if explicit {

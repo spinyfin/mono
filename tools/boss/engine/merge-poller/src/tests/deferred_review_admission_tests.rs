@@ -218,20 +218,7 @@ async fn sweep_skips_enqueue_for_roots_held_by_focus() {
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
     let root_id = in_review_root(&db);
-    let (batch, _) = settled_batch(&db, &root_id, "head-a");
-    {
-        let conn = db.connect().unwrap();
-        conn.execute(
-            "UPDATE pr_review_batch_members SET status = 'failed' WHERE batch_id = ?1",
-            rusqlite::params![batch.id],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE pr_review_batches SET status = 'failed' WHERE id = ?1",
-            rusqlite::params![batch.id],
-        )
-        .unwrap();
-    }
+    db.file_admission_deferred_attention(&root_id, PR_URL).unwrap();
     let mut focus = boss_protocol::DispatchFocus::default();
     focus.insert(
         boss_protocol::DispatchFocusTargetKind::Project,
@@ -253,4 +240,77 @@ async fn sweep_skips_enqueue_for_roots_held_by_focus() {
 
     assert_eq!(outcome.review_admission_recovered, 0);
     assert_eq!(outcome.review_admission_still_deferred, 1);
+}
+
+/// Focus restricts new spawns, not the transition for a settled head.
+#[tokio::test]
+async fn focus_held_settled_review_advances_and_resolves_deferred_attention() {
+    for keep_batch in [true, false] {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let root_id = in_review_root(&db);
+        let (batch, executions) = settled_batch(&db, &root_id, "head-a");
+        // A completed batch owns one aggregate verdict, attached to its
+        // latest reviewer execution for the pending-review advance query.
+        let execution = executions.iter().max_by_key(|e| (&e.created_at, &e.id)).unwrap();
+        {
+            db.connect()
+                .unwrap()
+                .execute(
+                    "INSERT INTO pr_review_verdicts
+                (id, execution_id, work_item_id, head_sha, findings_count,
+                 revision_warranted, gate_outcome, created_at, batch_id)
+             VALUES (?1, ?1, ?2, 'head-a', 0, 0, ?3, '1', ?4)",
+                    rusqlite::params![
+                        execution.id,
+                        root_id,
+                        crate::work::REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+                        batch.id
+                    ],
+                )
+                .unwrap();
+        }
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE pr_review_batches SET status = 'completed' WHERE id = ?1",
+                [&batch.id],
+            )
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET status = 'active' WHERE id = ?1", [&root_id])
+            .unwrap();
+        db.file_admission_deferred_attention(&root_id, PR_URL).unwrap();
+        let mut focus = boss_protocol::DispatchFocus::default();
+        focus.insert(
+            boss_protocol::DispatchFocusTargetKind::Project,
+            "proj_elsewhere".to_owned(),
+        );
+        db.save_dispatch_focus(&focus).unwrap();
+
+        if !keep_batch {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE pr_review_verdicts SET batch_id = NULL WHERE batch_id = ?1",
+                [&batch.id],
+            )
+            .unwrap();
+            conn.execute("DELETE FROM pr_review_batches WHERE id = ?1", [&batch.id])
+                .unwrap();
+        }
+
+        let outcome = sweep(&db, &RecordingPublisher::default(), "head-a").await;
+
+        assert_eq!(outcome.reviewer_fallback_advanced, 1);
+        assert_eq!(outcome.review_admission_still_deferred, 0);
+        assert!(
+            matches!(db.get_work_item(&root_id).unwrap(), boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) if t.status == boss_protocol::TaskStatus::InReview)
+        );
+        assert!(
+            db.list_open_attention_items_of_kind(crate::work::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND)
+                .unwrap()
+                .is_empty()
+        );
+    }
 }

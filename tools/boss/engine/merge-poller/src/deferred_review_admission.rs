@@ -36,6 +36,9 @@ pub(crate) async fn sweep_deferred_review_admission_with(
             return;
         }
     };
+    let mut enqueued = 0;
+    let deferred_before = outcome.review_admission_still_deferred;
+    let recovered_before = outcome.review_admission_recovered;
     for candidate in candidates {
         if wanted_pr_urls.is_some_and(|wanted| !wanted.contains(candidate.pr_url.as_str())) {
             continue;
@@ -50,10 +53,9 @@ pub(crate) async fn sweep_deferred_review_admission_with(
             outcome.review_admission_still_deferred += 1;
             continue;
         }
-        // A root that focus mode or an all-spawns pause holds can only
-        // defer again, so skip the PR-metadata fetch the enqueuer performs
-        // and keep the marker visible. The hold is a local DB read.
-        match work_db.pre_merge_review_hold_reason(&candidate.cycle_root_id) {
+        // A spawn hold must not suppress settlement of an existing review.
+        // Roots with any review history still need the immutable-head checks.
+        match work_db.pre_merge_review_hold_without_history(&candidate.cycle_root_id, &candidate.task_id) {
             Ok(Some(reason)) => {
                 tracing::debug!(
                     task_id = %candidate.task_id,
@@ -72,6 +74,7 @@ pub(crate) async fn sweep_deferred_review_admission_with(
                 "merge poller: failed to evaluate review-admission hold; attempting admission"
             ),
         }
+        enqueued += 1;
         match enqueuer
             .enqueue(
                 work_db,
@@ -216,4 +219,10 @@ pub(crate) async fn sweep_deferred_review_admission_with(
             }
         }
     }
+    tracing::debug!(
+        enqueued,
+        deferred = outcome.review_admission_still_deferred - deferred_before,
+        recovered = outcome.review_admission_recovered - recovered_before,
+        "merge poller: deferred review admission sweep"
+    );
 }

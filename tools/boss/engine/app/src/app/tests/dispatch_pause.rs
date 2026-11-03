@@ -423,6 +423,16 @@ fn test_project(state: &ServerState, product_id: &str, name: &str) -> boss_proto
         .unwrap()
 }
 
+fn started_pre_merge_batch(state: &ServerState, project_id: &str, product_id: &str) -> String {
+    let id = never_started_pre_merge_batch(state, project_id, product_id, "Started review");
+    let members = state.work_db.review_batch_members(&id).unwrap();
+    state
+        .work_db
+        .force_started_at_for_test(members[0].execution_id.as_deref().unwrap(), 1_700_000_000)
+        .unwrap();
+    id
+}
+
 /// Narrowing focus through `UpdateDispatchFocus` releases the never-started
 /// out-of-scope reservation and keeps the in-scope one.
 #[tokio::test]
@@ -433,6 +443,7 @@ async fn update_dispatch_focus_releases_never_started_out_of_scope_reservations(
     let drop = test_project(&state, &product.id, "Drop");
     let kept_batch = never_started_pre_merge_batch(&state, &keep.id, &product.id, "In scope");
     let dropped_batch = never_started_pre_merge_batch(&state, &drop.id, &product.id, "Out of scope");
+    let started_batch = started_pre_merge_batch(&state, &drop.id, &product.id);
 
     let sink = make_session_sink();
     crate::app::dispatch_focus::handle_update_dispatch_focus(
@@ -447,6 +458,8 @@ async fn update_dispatch_focus_releases_never_started_out_of_scope_reservations(
 
     assert!(state.work_db.review_batch(&dropped_batch).unwrap().is_none());
     assert!(state.work_db.review_batch(&kept_batch).unwrap().is_some());
+    assert!(state.work_db.review_batch(&started_batch).unwrap().is_some());
+    assert_eq!(state.work_db.review_pool_reserved_units().unwrap().0, 8);
 }
 
 /// An all-spawns `SetDispatchPaused` releases never-started reservations, but
@@ -457,12 +470,15 @@ async fn all_spawns_set_dispatch_paused_releases_never_started_reservations() {
     let product = boss_engine_runtime::test_support::create_test_product(&state.work_db);
     let project = test_project(&state, &product.id, "Reviewed");
     let batch = never_started_pre_merge_batch(&state, &project.id, &product.id, "Pending review");
+    let started_batch = started_pre_merge_batch(&state, &project.id, &product.id);
 
     pause_with_scope(&state, Some(DispatchPauseScope::NewWork)).await;
     assert!(state.work_db.review_batch(&batch).unwrap().is_some());
 
     pause_with_scope(&state, Some(DispatchPauseScope::AllSpawns)).await;
     assert!(state.work_db.review_batch(&batch).unwrap().is_none());
+    assert!(state.work_db.review_batch(&started_batch).unwrap().is_some());
+    assert_eq!(state.work_db.review_pool_reserved_units().unwrap().0, 4);
 }
 
 /// Cold start with a persisted pause: an operator all-spawns pause releases
@@ -493,6 +509,149 @@ async fn restoring_a_persisted_pause_releases_reservations_only_for_operator_all
             db.review_batch(&batch).unwrap().is_none(),
             released,
             "origin={origin} scope={scope:?}"
+        );
+    }
+}
+
+struct AdmissionEnqueuer;
+
+#[async_trait::async_trait]
+impl boss_observation_contracts::ReviewBatchEnqueuer for AdmissionEnqueuer {
+    async fn enqueue(
+        &self,
+        db: &boss_work_db::WorkDb,
+        task: &str,
+        repo: &str,
+        pr: &str,
+        pool: usize,
+    ) -> anyhow::Result<boss_work_db::ReviewBatchDispatch> {
+        let input = boss_engine_completion::review_batch_input_from_metadata(
+            db,
+            task,
+            pr,
+            serde_json::json!({"baseRefOid": "base-sha", "headRefOid": "head-sha",
+                "files": [{"path": "src/lib.rs"}], "additions": 1, "deletions": 0}),
+        )?;
+        db.create_pre_merge_review_batch_for_pool(input, repo, pool)
+    }
+}
+
+/// Persisted gates are restored before admission; a fresh frontend session
+/// observes the same gate and can clear or widen it to recover the released PR.
+#[tokio::test]
+async fn restored_focus_and_pause_readmit_after_reconnect_and_gate_change() {
+    for pause in [false, true] {
+        let (state, dir) = test_server_state();
+        let product = boss_engine_runtime::test_support::create_test_product_with_repo(
+            &state.work_db,
+            "example/repo",
+            Some("https://github.com/example/repo"),
+        );
+        let keep = test_project(&state, &product.id, "Keep");
+        let other = test_project(&state, &product.id, "Other");
+        let batch_id = never_started_pre_merge_batch(&state, &other.id, &product.id, "Held PR");
+        let batch = state.work_db.review_batch(&batch_id).unwrap().unwrap();
+        state
+            .work_db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'active', pr_url = 'https://github.com/example/repo/pull/42' WHERE id = ?1",
+                [&batch.cycle_root_id],
+            )
+            .unwrap();
+        if pause {
+            state.work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSED, "1").unwrap();
+            state
+                .work_db
+                .set_metadata(METADATA_KEY_DISPATCH_PAUSE_ORIGIN, "operator")
+                .unwrap();
+            state
+                .work_db
+                .set_metadata(METADATA_KEY_DISPATCH_PAUSE_SCOPE, "all_spawns")
+                .unwrap();
+        } else {
+            let mut focus = boss_protocol::DispatchFocus::default();
+            focus.insert(boss_protocol::DispatchFocusTargetKind::Project, keep.id);
+            state.work_db.save_dispatch_focus(&focus).unwrap();
+        }
+        drop(state);
+        let cfg = Arc::new(RuntimeConfig::from_parts(
+            boss_engine_runtime::config::WorkConfig::builder()
+                .cwd(dir.path().to_path_buf())
+                .db_path(dir.path().join("state.db"))
+                .build(),
+            None,
+        ));
+        let restarted =
+            ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, ServerStateOverrides::default())
+                .unwrap();
+        // Startup restores focus; repeating restore must remain idempotent.
+        crate::app::dispatch_focus::restore_persisted_dispatch_focus(&restarted);
+        assert!(restarted.work_db.review_batch(&batch_id).unwrap().is_none());
+        assert!(restarted.work_db.list_dead_pr_review_candidates().unwrap().is_empty());
+        let held = boss_engine_merge_poller::test_support::sweep_deferred_review_admission(
+            &restarted.work_db,
+            &AdmissionEnqueuer,
+        )
+        .await;
+        assert_eq!(held.review_admission_still_deferred, 1);
+        assert_eq!(held.review_admission_recovered, 0);
+
+        // Disconnect the first frontend, then read through a new session.
+        let first = make_session_sink();
+        crate::app::dispatch_focus::handle_get_dispatch_focus(
+            dispatch(&restarted, &first),
+            FrontendRequest::GetDispatchFocus,
+        )
+        .await;
+        let before_reconnect = sole_response(&first).await;
+        assert!(matches!(before_reconnect, FrontendEvent::DispatchFocusResult { focus } if focus.active == !pause));
+        let reconnected = make_session_sink();
+        crate::app::dispatch_focus::handle_get_dispatch_focus(
+            dispatch(&restarted, &reconnected),
+            FrontendRequest::GetDispatchFocus,
+        )
+        .await;
+        let response = sole_response(&reconnected).await;
+        assert!(matches!(response, FrontendEvent::DispatchFocusResult { focus } if focus.active == !pause));
+        if pause {
+            set_dispatch_paused(&restarted, false, None).await;
+        } else {
+            let sink = make_session_sink();
+            crate::app::dispatch_focus::handle_update_dispatch_focus(
+                dispatch(&restarted, &sink),
+                FrontendRequest::UpdateDispatchFocus {
+                    action: boss_protocol::DispatchFocusAction::Add,
+                    targets: vec![other.id],
+                },
+            )
+            .await;
+            sole_response(&sink).await;
+        }
+        let recovered = boss_engine_merge_poller::test_support::sweep_deferred_review_admission(
+            &restarted.work_db,
+            &AdmissionEnqueuer,
+        )
+        .await;
+        assert_eq!(recovered.review_admission_recovered, 1);
+        assert_eq!(recovered.review_admission_still_deferred, 0);
+        let again = restarted
+            .work_db
+            .review_batch_for_target(
+                &batch.cycle_root_id,
+                boss_protocol::ReviewBatchPhase::PreMerge,
+                "head-sha",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.generation, 1);
+        assert!(
+            restarted
+                .work_db
+                .list_open_attention_items_of_kind(boss_work_db::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND)
+                .unwrap()
+                .is_empty()
         );
     }
 }

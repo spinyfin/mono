@@ -121,6 +121,13 @@ fn in_focus_admission_releases_four_never_started_out_of_focus_reservations() {
     }
     for (task, batch, members) in &out_of_focus {
         assert!(
+            !db.list_dead_pr_review_candidates()
+                .unwrap()
+                .iter()
+                .any(|c| c.work_item_id == task.id),
+            "released batch leaves must return through batch admission, not legacy reviewer recovery"
+        );
+        assert!(
             db.review_batch(&batch.id).unwrap().is_none(),
             "never-started out-of-focus batch {} must be released",
             batch.id
@@ -307,7 +314,7 @@ fn breaker_pause_does_not_hold_or_release_reviews() {
     }
 }
 
-/// An operator-requested (explicit) batch is not released by an all-spawns
+/// An explicitly started batch is not released by an all-spawns
 /// pause: deleting it would re-admit it later as a non-explicit batch.
 #[test]
 fn all_spawns_pause_keeps_explicit_never_started_batches() {
@@ -363,4 +370,73 @@ fn release_refreshes_an_existing_admission_deferred_item() {
     assert_eq!(items.len(), 1);
     assert_ne!(items[0].title, "stale");
     assert!(items[0].body_markdown.contains("focus"));
+}
+
+/// A deleted root or producing revision must not poison the release pass
+/// and prevent an unrelated in-focus PR from taking a free reservation.
+#[test]
+fn focus_admission_survives_deleted_reservation_owners() {
+    for deleted_root in [true, false] {
+        let db = WorkDb::open(temp_db_path("focus-deleted-reservation-owner")).unwrap();
+        let product = create_test_product(&db);
+        let keep = project(&db, &product.id, "Keep");
+        let other = project(&db, &product.id, "Other");
+        let root = project_task(&db, &product.id, &other.id, "Old root");
+        let producer = project_task(&db, &product.id, &other.id, "Old revision");
+        let (batch, _) = created_batch(create_batch(&db, &root.id, "old-head"));
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE pr_review_batches SET producing_work_item_id = ?2 WHERE id = ?1",
+            rusqlite::params![batch.id, producer.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET deleted_at = '1' WHERE id = ?1",
+            [if deleted_root { &root.id } else { &producer.id }],
+        )
+        .unwrap();
+        drop(conn);
+        focus_on_project(&db, &keep.id);
+        let target = project_task(&db, &product.id, &keep.id, "In focus");
+
+        created_batch(create_batch(&db, &target.id, "new-head"));
+
+        assert!(db.review_batch(&batch.id).unwrap().is_none());
+        let attention = db
+            .list_open_attention_items_of_kind(PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND)
+            .unwrap();
+        assert_eq!(attention.len(), 1);
+        assert_eq!(
+            attention[0].work_item_id.as_deref(),
+            Some(if deleted_root {
+                producer.id.as_str()
+            } else {
+                root.id.as_str()
+            })
+        );
+    }
+}
+
+#[test]
+fn focus_admission_checks_capacity_even_when_release_fails() {
+    let db = WorkDb::open(temp_db_path("focus-release-error")).unwrap();
+    let product = create_test_product(&db);
+    let keep = project(&db, &product.id, "Keep");
+    let other = project(&db, &product.id, "Other");
+    let root = project_task(&db, &product.id, &other.id, "Old root");
+    let (old, _) = created_batch(create_batch(&db, &root.id, "old-head"));
+    db.connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_reservation_release BEFORE DELETE ON pr_review_batches
+         BEGIN SELECT RAISE(ABORT, 'injected release failure'); END;",
+        )
+        .unwrap();
+    focus_on_project(&db, &keep.id);
+    let target = project_task(&db, &product.id, &keep.id, "In focus");
+
+    created_batch(create_batch(&db, &target.id, "new-head"));
+
+    assert!(db.review_batch(&old.id).unwrap().is_some());
+    assert_eq!(db.review_pool_reserved_units().unwrap().0, 8);
 }

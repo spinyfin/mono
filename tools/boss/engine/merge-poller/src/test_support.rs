@@ -21,6 +21,24 @@ pub use boss_work_db::test_support::{
 /// with a running binary's, only with what the same database recorded.
 const FIXTURE_BUILD_IDENTITY: &str = "merge-poller-test-build";
 
+/// Drive the production deferred-admission pass with deterministic PR metadata.
+pub async fn sweep_deferred_review_admission(
+    db: &WorkDb,
+    enqueuer: &dyn boss_observation_contracts::ReviewBatchEnqueuer,
+) -> crate::SweepOutcome {
+    let mut outcome = crate::SweepOutcome::default();
+    crate::deferred_review_admission::sweep_deferred_review_admission_with(
+        db,
+        &RecordingPublisher::default(),
+        enqueuer,
+        None,
+        16,
+        &mut outcome,
+    )
+    .await;
+    outcome
+}
+
 /// Open a fresh file-backed [`WorkDb`] under a throwaway [`TempDir`], stamped
 /// with [`FIXTURE_BUILD_IDENTITY`]. The returned `TempDir` must outlive the
 /// `WorkDb`: dropping it deletes the backing `state.db`.
