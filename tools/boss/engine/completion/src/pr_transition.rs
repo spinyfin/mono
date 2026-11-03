@@ -417,9 +417,10 @@ impl WorkerCompletionHandler {
                                         tracing::info!(
                                             execution_id,
                                             pr_url = %pr_url,
-                                            "review pool's weighted reservation accounting has no room for a new \
-                                             pre-merge batch; holding the task pending review — the deferred-\
-                                             admission sweep retries once an existing batch completes",
+                                            "pre-merge review admission deferred (pool full, or held by focus / \
+                                             all-spawns pause); holding the task pending review — the deferred-\
+                                             admission sweep retries once a reservation is free and the PR may \
+                                             dispatch",
                                         );
                                         file_admission_deferred_attention(
                                             &self.work_db,

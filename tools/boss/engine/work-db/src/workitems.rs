@@ -143,8 +143,8 @@ pub(crate) fn upsert_refreshing_work_item_attention_in_tx(
         // leaving it frozen at whatever it said the first time it
         // tripped — a caller like the churn guard re-files on every
         // sweep pass with an updated failure count / execution list,
-        // and a stale snapshot misleads the operator into thinking
-        // nothing has changed since the first trip.
+        // and a frozen snapshot would wrongly suggest nothing has
+        // changed since the first trip.
         tx.execute(
             "UPDATE work_attention_items
                 SET title = ?3, body_markdown = ?4
