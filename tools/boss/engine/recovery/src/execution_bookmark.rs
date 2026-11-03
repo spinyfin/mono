@@ -12,6 +12,9 @@ use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// Editable setup state, without authored content, a message, or merge topology.
+const EMPTY_SETUP_CHANGES: &str = r#"(empty() & description(exact:"")) ~ (merges() | root())"#;
+
 mod baseline;
 pub use baseline::checkpoint_baseline;
 
@@ -815,16 +818,31 @@ pub async fn restore_for_retry(
     if !has_work && !self_retry {
         return Ok(false);
     }
-    jj.run(
-        workspace,
-        &[
-            "new",
-            &revision(&head_bookmark(jj, record).await?),
-            "-m",
-            "Resume recovered execution work",
-        ],
-    )
-    .await?;
+    let head = revision(&head_bookmark(jj, record).await?);
+    if self_retry {
+        let empty_setup = jj
+            .run(
+                workspace,
+                &[
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    &format!("{head} & ({EMPTY_SETUP_CHANGES})"),
+                    "-T",
+                    "commit_id",
+                ],
+            )
+            .await?;
+        if !empty_setup.trim().is_empty() {
+            // This execution still owns its untouched editable change. Resume
+            // it, so a retry cannot strand it below a newly authored child.
+            // Its existing baseline and head pointers continue to follow edits.
+            jj.run(workspace, &["edit", &head]).await?;
+            return Ok(has_work);
+        }
+    }
+    jj.run(workspace, &["new", &head, "-m", "Resume recovered execution work"])
+        .await?;
     Ok(has_work)
 }
 
