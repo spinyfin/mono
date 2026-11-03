@@ -93,6 +93,50 @@ fn report_build_does_not_take_the_shared_writer_connection() {
 }
 
 #[test]
+fn snapshot_read_transaction_does_not_block_a_writer() {
+    let (_dir, path) = disk_db_path("stuck-snapshot-read-tx-overlap");
+    let db = std::sync::Arc::new(WorkDb::open(path).unwrap());
+    let product = create_test_product_named(&db, "Overlap");
+    create_test_chore_manual(&db, &product.id, "Item");
+    let now = 20_000 * DAY + 5;
+    let (tx_started_tx, tx_started_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+    let (write_done_tx, write_done_rx) = std::sync::mpsc::sync_channel(1);
+    struct Release(std::sync::mpsc::SyncSender<()>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    let release = Release(release_tx);
+
+    let reader_db = std::sync::Arc::clone(&db);
+    let reader = std::thread::spawn(move || {
+        reader_db.stuck_snapshot_read_phase_after_tx_read(now.div_euclid(DAY), now, &|| {
+            tx_started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        })
+    });
+    tx_started_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("read phase should open its deferred transaction");
+
+    let writer_db = std::sync::Arc::clone(&db);
+    let product_id = product.id.clone();
+    let writer = std::thread::spawn(move || {
+        create_test_chore_manual(&writer_db, &product_id, "Written during read");
+        write_done_tx.send(()).unwrap();
+    });
+    let write_result = write_done_rx.recv_timeout(std::time::Duration::from_secs(2));
+    drop(release);
+    write_result.expect("writer should commit while the snapshot read transaction is open");
+
+    let read = reader.join().unwrap().unwrap();
+    writer.join().unwrap();
+    assert!(matches!(read, crate::stuck_snapshot::SnapshotRead::Built(..)));
+}
+
+#[test]
 fn undecodable_stored_row_is_replaced() {
     let db = WorkDb::open(temp_db_path("stuck-snapshot-corrupt")).unwrap();
     let now = 20_000 * DAY + 5;

@@ -20,10 +20,10 @@ impl WorkDb {
     /// Return the stored report for `now`'s UTC day, sampling and storing one
     /// if the day has none. A zero age threshold measures the whole backlog.
     ///
-    /// The report is built inside a deferred read transaction, so no engine
-    /// writer is blocked while it is assembled. The row is then inserted with
-    /// `INSERT OR IGNORE`; when a concurrent sampler won the race, every
-    /// caller returns the row that was stored first.
+    /// The report is built on a reader connection. The shared connection is
+    /// then used for a short Immediate transaction that returns the first
+    /// decodable stored row for the day, otherwise stores this report and
+    /// replaces an undecodable row.
     pub fn stuck_daily_snapshot(&self, now: i64, pid_is_alive: &dyn Fn(Option<i64>) -> bool) -> Result<StuckReport> {
         let day = now.div_euclid(86400);
         // The read phase runs on an independent connection, so the shared
@@ -52,11 +52,39 @@ impl WorkDb {
     /// the shared connection mutex (in-memory test databases excepted, where
     /// `reader()` is a clone).
     pub(super) fn stuck_snapshot_read_phase(&self, day: i64, now: i64) -> Result<SnapshotRead> {
+        self.stuck_snapshot_read_phase_inner(day, now, None)
+    }
+
+    /// Test seam: `after_tx_read` runs after the deferred transaction has
+    /// begun and issued a read, while the transaction is still open.
+    #[cfg(test)]
+    pub(super) fn stuck_snapshot_read_phase_after_tx_read(
+        &self,
+        day: i64,
+        now: i64,
+        after_tx_read: &dyn Fn(),
+    ) -> Result<SnapshotRead> {
+        self.stuck_snapshot_read_phase_inner(day, now, Some(after_tx_read))
+    }
+
+    fn stuck_snapshot_read_phase_inner(
+        &self,
+        day: i64,
+        now: i64,
+        after_tx_read: Option<&dyn Fn()>,
+    ) -> Result<SnapshotRead> {
         let reader = self.reader()?;
         let mut conn = reader.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
         // An undecodable stored row counts as a miss; the store step replaces it.
-        if let Ok(Some(report)) = stored(&tx, day) {
+        let stored_report = match stored(&tx, day) {
+            Ok(Some(report)) => Some(report),
+            _ => None,
+        };
+        if let Some(hold) = after_tx_read {
+            hold();
+        }
+        if let Some(report) = stored_report {
             return Ok(SnapshotRead::Stored(report));
         }
         let (report, probes) = build(&tx, 0, now - 86400, now)?;
