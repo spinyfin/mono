@@ -14,6 +14,7 @@ rust_library(
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/dispatch:__pkg__",
         "//tools/boss/engine/execution-runner:__pkg__",
+        "//tools/boss/engine/observation-contracts:__pkg__",
         "//tools/boss/engine/pane-summary:__pkg__",
     ],
     deps = [
@@ -56,6 +57,7 @@ rust_library(
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/dispatch:__pkg__",
         "//tools/boss/engine/execution-runner:__pkg__",
+        "//tools/boss/engine/observation-contracts:__pkg__",
         "//tools/boss/engine/pane-summary:__pkg__",
     ],
     deps = [

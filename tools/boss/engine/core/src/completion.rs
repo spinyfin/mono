@@ -65,9 +65,6 @@ use crate::design_detector;
 use crate::dispatch_events::{
     DispatchEvent, DispatchEventSink, NoopDispatchEventSink, Outcome as DispatchOutcome, Stage,
 };
-use crate::merge_poller::{
-    MergeProbe, NoopMergeProbe, OpenPrCiStatus, OpenPrMergeability, PrLifecycleState, update_pr_poll_state,
-};
 use crate::metrics::Registry;
 use crate::nudge_breaker::{DEFAULT_MAX_UNPRODUCTIVE_NUDGES, NudgeBreaker, NudgeDecision};
 use crate::work::{
@@ -80,6 +77,10 @@ use boss_engine_gh_invocation::{gh_compare_jq, run_gh};
 use boss_execution_contracts::{CubeClient, ExecutionPublisher, PreemptOutcome};
 use boss_gh_telemetry::{callers, scope as gh_scope};
 use boss_github::pr_url::pr_number_from_url;
+use boss_observation_contracts::{
+    MergeProbe, MergeQueueDequeueEvent, MergeQueueTimeline, NoopMergeProbe, NoopPrPollStateWriter, OpenPrCiStatus,
+    OpenPrMergeability, PrLifecycleProbe, PrLifecycleState, PrPollStateWriter, UnsupportedMergeQueueTimeline,
+};
 
 // The inherent `impl WorkerCompletionHandler` is split across the submodules
 // below to keep each file under the 3000-line size limit. Each contributes
@@ -110,12 +111,12 @@ mod worker_signals;
 // Re-export contribution-gate types into this parent so sibling completion
 // submodules (which `use super::*`) can name them — same pattern as the
 // free helpers defined directly in this file.
+pub use boss_observation_contracts::{
+    CompletionRequests, ReviewBatchEnqueuer, StopOutcome, file_admission_deferred_attention,
+};
 use conflict_delivery_gate::ConflictDeliveryDecision;
 use contribution_gate::{RevisionContributionReason, RevisionReviewGate};
-pub use pr_transition::ReviewBatchEnqueuer;
-pub(crate) use pr_transition::{
-    GhReviewBatchEnqueuer, file_admission_deferred_attention, review_batch_input_from_metadata,
-};
+pub(crate) use pr_transition::{GhReviewBatchEnqueuer, review_batch_input_from_metadata};
 
 // Counter handles for the PR URL capture channels, in the order they are
 // consulted: the worker's structured-output artifact (the driver-agnostic file
@@ -627,11 +628,7 @@ pub trait BranchVerifier: Send + Sync {
         Err(anyhow!("ancestry lookup unsupported by this verifier"))
     }
 
-    async fn fetch_queue_dequeues(
-        &self,
-        _repo_slug: &str,
-        _pr_number: u64,
-    ) -> Result<Vec<crate::merge_poller::MergeQueueDequeueEvent>> {
+    async fn fetch_queue_dequeues(&self, _repo_slug: &str, _pr_number: u64) -> Result<Vec<MergeQueueDequeueEvent>> {
         Err(anyhow!("queue timeline lookup unsupported by this verifier"))
     }
 
@@ -648,12 +645,33 @@ pub trait BranchVerifier: Send + Sync {
 }
 
 /// `BranchVerifier` that shells out to `gh pr view`.
-#[derive(Debug, Default)]
-pub struct CommandBranchVerifier;
+pub struct CommandBranchVerifier {
+    queue_timeline: Arc<dyn MergeQueueTimeline>,
+}
+
+impl Default for CommandBranchVerifier {
+    fn default() -> Self {
+        Self {
+            queue_timeline: Arc::new(UnsupportedMergeQueueTimeline),
+        }
+    }
+}
 
 impl CommandBranchVerifier {
+    /// Command verifier with no merge-queue timeline transport.
+    /// [`BranchVerifier::fetch_queue_dequeues`] returns the unsupported
+    /// error until [`Self::with_queue_timeline`] installs one. Callers that
+    /// only read PR head refs (the PR-binding repair sweep) can keep this
+    /// default.
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Install the merge-queue timeline used by
+    /// [`BranchVerifier::fetch_queue_dequeues`].
+    pub fn with_queue_timeline(mut self, timeline: Arc<dyn MergeQueueTimeline>) -> Self {
+        self.queue_timeline = timeline;
+        self
     }
 }
 
@@ -699,14 +717,9 @@ impl BranchVerifier for CommandBranchVerifier {
         Ok(matches!(status.as_str(), "ahead" | "identical"))
     }
 
-    async fn fetch_queue_dequeues(
-        &self,
-        repo_slug: &str,
-        pr_number: u64,
-    ) -> Result<Vec<crate::merge_poller::MergeQueueDequeueEvent>> {
+    async fn fetch_queue_dequeues(&self, repo_slug: &str, pr_number: u64) -> Result<Vec<MergeQueueDequeueEvent>> {
         let url = format!("https://github.com/{repo_slug}/pull/{pr_number}");
-        let mut events = crate::merge_poller::fetch_merge_queue_dequeue_events_batch(std::slice::from_ref(&url)).await;
-        events.remove(&url).context("queue timeline unavailable")
+        self.queue_timeline.fetch_dequeues(&url).await
     }
 
     async fn fetch_pr_merge_queue_snapshot(
@@ -1417,6 +1430,15 @@ pub struct WorkerCompletionHandler {
     /// Tests that exercise the staged-URL path must wire in a stub via
     /// [`Self::with_branch_verifier`] to avoid live network calls.
     branch_verifier: Arc<dyn BranchVerifier>,
+    /// Merge-queue timeline applied to the default [`CommandBranchVerifier`].
+    /// Stored independently so [`Self::with_merge_queue_timeline`] cannot
+    /// replace a verifier installed via [`Self::with_branch_verifier`].
+    merge_queue_timeline: Option<Arc<dyn MergeQueueTimeline>>,
+    /// True after [`Self::with_branch_verifier`] replaces the default
+    /// command verifier. Timeline application then leaves the injected
+    /// verifier in place.
+    #[builder(default)]
+    branch_verifier_overridden: bool,
     /// Engine-wide counter registry. Defaults to a fresh local registry
     /// with the PR-capture counters pre-registered so tests that do not
     /// call `with_metrics` still get valid increments. Production wires
@@ -1429,6 +1451,10 @@ pub struct WorkerCompletionHandler {
     /// Defaults to [`NoopMergeProbe`]; production wires in the shared
     /// [`CommandMergeProbe`] via [`Self::with_merge_probe`].
     merge_probe: Arc<dyn MergeProbe>,
+    /// Writes PR poll state after the on-transition CI pre-fetch.
+    /// Defaults to [`NoopPrPollStateWriter`]; production wires
+    /// `MergePollerPrPollStateWriter` via [`Self::with_pr_poll_state_writer`].
+    pr_poll_state_writer: Arc<dyn PrPollStateWriter>,
     /// Base backoff between the conflict stop gate's `mergeable=UNKNOWN`
     /// re-probes (see [`crate::conflict_stop_gate`]). Defaults to
     /// [`conflict_stop_gate::DEFAULT_UNKNOWN_RETRY_BACKOFF`]; tests set it
@@ -1624,7 +1650,7 @@ struct ConflictSignalPrefetch {
     /// recomputes ownership itself via `has_active_conflict_attempt`, since
     /// this call site's parent-attempt lookup has no crz_id to match
     /// against and would silently bypass the ownership check if reused.
-    probe: crate::merge_poller::PrLifecycleProbe,
+    probe: PrLifecycleProbe,
 }
 
 /// What [`WorkerCompletionHandler::force_release`] actually did. Surfaced
@@ -2042,307 +2068,6 @@ Run `jj diff -r @` to verify your working-copy changes. If the diff is empty, \
 you have not made any changes — do not keep this PR open. Either make the required \
 edits and push them, or close the PR and explain what went wrong.";
 
-/// What happened during a stop event handler invocation. The runtime
-/// only logs this; tests assert on it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StopOutcome {
-    /// The engine could not retrieve a required structured-output artifact
-    /// from the remote host after the worker reached its terminal boundary.
-    RemoteCollectionFailed { detail: String },
-    /// Stop arrived for a run id that doesn't map to a known execution
-    /// (e.g., test infra, agent runs).
-    UnknownExecution,
-    /// Execution was already in a terminal status — no transition.
-    AlreadyTerminal,
-    /// The Stop arrived for an execution that is a stale prior occupant
-    /// of a reused (warm-cached) cube workspace — a newer live execution
-    /// now claims the same workspace. The event leaked from a stale
-    /// `boss-event` hook registration left in the re-leased workspace;
-    /// processing it would mis-attribute completion or release the live
-    /// run's workspace. Quiet outcome — no transition, no reap. The
-    /// newest execution's own Stop drives its completion.
-    SupersededInWorkspace,
-    /// Execution had no workspace_path recorded.
-    NoWorkspace,
-    /// `gh` failed with a non-"no-PR" error; surfaced as awaiting input.
-    DetectorFailed,
-    /// No PR yet — worker is idle awaiting input.
-    AwaitingInput,
-    /// AI #6 / incident 001: the Stop hook fired for an execution in
-    /// `running` status with an empty staged-URL cache. The fallback
-    /// is reserved for `waiting_human`; the worker is still alive and
-    /// any positive result would race against its own in-flight push.
-    /// Quiet outcome — no probe, no publish, no transition.
-    RunningNoStagedPr,
-    /// AI #5 / incident 001: the human has flipped the
-    /// `detect_pr_cold_fallback` feature flag OFF via the debug pane,
-    /// so the cold-path fallback is suppressed. With no staged URL
-    /// the engine treats the empty staging as "no PR pushed" — the
-    /// chore stays in `waiting_human` for the human to resolve by
-    /// hand. Quiet outcome — no probe, no publish, no transition.
-    FallbackDisabledByFlag,
-    /// PR detected; work item moved to `in_review` and execution finalised.
-    PrDetected { pr_url: String },
-    /// PR detected and already merged at Stop time; work item moved
-    /// straight to `done` and execution finalised.
-    PrMerged { pr_url: String },
-    /// PR exists but local commits are ahead of its head sha. The
-    /// worker is probed to push the missing commits; the work item
-    /// stays in its current state until the next Stop reports a fresh PR.
-    ///
-    /// Post-incident-001 the branch-keyed detector cannot produce this
-    /// classification (there is no SHA matching to fail). The variant
-    /// is kept for callers that already pattern-match on it.
-    StalePr { pr_url: String, reason: String },
-    /// PR exists and head_match, but has zero file changes. The worker
-    /// is probed to make real edits or close the PR; the work item
-    /// stays in its current state.
-    EmptyDiffPr { pr_url: String },
-    /// The auto-nudge circuit breaker tripped: the worker was nudged
-    /// `max_unproductive_nudges` consecutive times with no new commit,
-    /// PR, or state transition. The execution fails and releases its resources;
-    /// the task records the failure reason and is excluded from automatic retry.
-    /// The variant name is retained for existing consumers; no park is created.
-    NudgeBreakerParked { reason: String },
-    /// The nudge breaker rejected an otherwise valid probe because the same
-    /// fingerprint was queued too recently. No probe was delivered; a
-    /// recurring background-child recheck retains its intent and retries.
-    NudgeDebounced,
-    /// The worker emitted an `[effort-escalation]` or `[blocked]` marker on
-    /// a prior Stop and the filed attention item is still unresolved: the
-    /// "produce a PR" auto-nudge is suppressed for this execution (never
-    /// queued via `nudge_or_park`) instead of dogging a worker that already
-    /// declared itself stuck awaiting coordinator direction (incident
-    /// 2026-07-02, exec_18b5243e65ff188_2d). `reason` names the
-    /// pending signal kind(s). The execution stays `waiting_human` with its
-    /// lease and pane attached; no probe is sent. There is no time bound —
-    /// this is the AGENTS.md mandated-stop channel (`boss propose blocked`
-    /// without a terminal `done`). The coordinator-visible attention item
-    /// is the release valve (`bossctl probe`), not the nudge breaker.
-    /// Resolving the attention item (coordinator ack) resumes normal
-    /// nudging on the next Stop.
-    EscalationPending { reason: String },
-    /// The worker's Stop-boundary text matched the [`crate::build_wait`]
-    /// heuristic — it is narrating that it is legitimately waiting on a
-    /// backgrounded build/test gate (2026-07-14 log-volume incident:
-    /// `exec_18c21add1416b5e8_3b`, `exec_18c21ba9b3fd2ef8_9e`). The
-    /// "produce a PR" auto-nudge is suppressed — and, critically, the
-    /// circuit breaker in [`crate::nudge_breaker`] is never even consulted,
-    /// so this Stop does not burn any of its cap — for as long as
-    /// [`crate::build_wait_tracker::BuildWaitTracker`] considers the wait
-    /// still within its horizon. `waited_secs` is how long this execution
-    /// has been continuously reporting the wait. The execution stays
-    /// `waiting_human`; no probe is sent, nothing is parked. Once the
-    /// horizon elapses, the normal nudge/park flow resumes automatically
-    /// (no coordinator action required — unlike [`StopOutcome::EscalationPending`]).
-    BuildWaitPending { waited_secs: i64 },
-    /// The worker's Stop-boundary process tree still has live delegated
-    /// descendants — e.g. a backgrounded subagent spawned via the harness
-    /// Agent tool that has not yet reported back (observed live
-    /// 2026-07-17). Same suppression shape as [`Self::BuildWaitPending`]
-    /// (checked before [`crate::nudge_breaker`] is even consulted, so this
-    /// Stop does not burn any of its cap) but a distinct signal:
-    /// process-tree-based rather than text-narration-based.
-    /// `descendant_count` is how many delegated descendants
-    /// [`crate::background_children`] found; `waited_secs` is how long this
-    /// execution has been continuously reporting delegated descendants. The
-    /// execution stays `waiting_human`; no probe is sent, nothing is parked. Once
-    /// [`Self::background_children_horizon_secs`] elapses, the normal
-    /// nudge/park flow resumes automatically.
-    ///
-    /// **Currently unreachable in production.** The process-group
-    /// discriminator this variant's `descendant_count` used to come from
-    /// was disproved (driver helpers and ordinary tool subprocesses may
-    /// legitimately run in their own process group, indistinguishable from
-    /// a delegated child) and removed — see
-    /// [`crate::background_children`]'s module doc. The production probe
-    /// now reports indeterminate on every Stop, so this variant only fires
-    /// today from a test-supplied probe, pending a driver/harness-owned
-    /// delegated-work signal to replace the process-group walk.
-    BackgroundChildrenPending { descendant_count: usize, waited_secs: i64 },
-    /// An operator placed an explicit hold on this execution via
-    /// `bossctl agents hold` (see [`crate::hold_registry`]). The
-    /// idle-park flow is skipped entirely — no nudge, no breaker
-    /// consultation, no park — until the operator releases the hold or
-    /// the run ends. `reason` is the operator-supplied explanation, if
-    /// any.
-    Held { reason: Option<String> },
-    /// The worker declared a time-bounded wait via `boss propose wait`
-    /// that has not yet expired. The produce-a-PR auto-nudge is suppressed
-    /// and the circuit breaker is not consulted. `reason` is the worker's
-    /// free-text explanation; `expires_at_epoch` is when nudging resumes.
-    /// The 2-hour stale-worker reap and other safety checks keep firing.
-    WorkerWaitPending { reason: String, expires_at_epoch: i64 },
-    /// The worker is a conflict-resolution or CI-failure revision that
-    /// stopped without pushing, but the blocking signal was already
-    /// cleared (conflict: PR `mergeable`; CI: required checks green)
-    /// before this run started. The active `conflict_resolutions` or
-    /// `ci_remediations` attempt is retired as `succeeded`, the parent
-    /// task is snapped back to `in_review`, and the execution is
-    /// finalised. No nudge is sent.
-    SignalAlreadyCleared { pr_url: String },
-    /// The bound PR was in a deliverable-satisfied state at Stop time
-    /// — open with CI clean and no merge conflict, or already merged —
-    /// even though the worker did not push new commits this run.
-    /// Detected by `try_finalize_satisfied_deliverable_on_stop` in
-    /// the `NoContribution` branch of `on_stop_inner`. The execution
-    /// is finalised and the worker reaped without nudging, preventing
-    /// the "nothing left to do" zombie loop.
-    ///
-    /// For a `revision_implementation` the health-alone arm of that gate
-    /// additionally requires that the SHA-delta gate has NOT proven the
-    /// run contributed nothing — see [`health_alone_satisfies_deliverable`].
-    /// A revision is dispatched into an already-healthy PR, so without
-    /// that requirement this outcome fires on the first Stop of every
-    /// revision whose parent PR happens to be open and CI-clean, which is
-    /// the normal case.
-    DeliverableSatisfied { pr_url: String },
-    /// The bound PR looks satisfied, but this run has not declared itself
-    /// finished (`boss propose done`) and the run-done backstop is holding
-    /// it rather than terminalizing on the PR's health — see
-    /// [`crate::run_done_backstop`]. Quiet outcome: no probe, no breaker
-    /// consumption, no transition, no reap. The execution stays live.
-    ///
-    /// `reason` names *which* hold applied — the worker has live background
-    /// children, or the silence horizon has not yet elapsed — because those
-    /// are different findings to an operator reading back why a run is
-    /// still open: the first says the worker is demonstrably working, the
-    /// second says nothing is known either way yet.
-    ///
-    /// This is the outcome that replaces
-    /// [`Self::DeliverableSatisfied`] for an undeclared run. It is
-    /// deliberately not a terminal state: a run that never declares reaches
-    /// [`Self::RunUndeclaredParked`] via the ask, or is reclaimed by
-    /// [`crate::stale_worker_sweep`], but is never quietly recorded as a
-    /// success.
-    AwaitingRunDoneDeclaration { reason: String },
-    /// The run-done backstop asked an undeclared run whether it was
-    /// finished, the ask went unanswered until the auto-nudge breaker
-    /// tripped, and the run was parked for a human. `run_undeclared_at` is
-    /// stamped on the execution row and a
-    /// [`RUN_UNDECLARED_ATTENTION_KIND`] attention filed, so the ending is
-    /// distinguishable — in stored state and on the row — from a run that
-    /// declared itself done. `waited_secs` is how long the run was silent
-    /// before the backstop first asked.
-    ///
-    /// The execution stays `waiting_human`; it is NOT `completed`. An
-    /// undeclared run that produced nothing must never be recorded as a
-    /// successful completion, which is the failure this whole path exists
-    /// to end.
-    RunUndeclaredParked { reason: String, waited_secs: i64 },
-    /// A CI-remediation worker classified the failure as flaky/infra and
-    /// re-triggered the failing job (`boss engine ci mark-retriggered`),
-    /// which stamped the `ci_flaky_retriggered` signal on the parent.
-    /// There is genuinely nothing to push, so the completion path parks
-    /// the worker — awaiting the CI retry or a human decision — instead of
-    /// probing it for a diff. No nudge is sent; the execution is left
-    /// `waiting_human`. This is the fix for the stuck-loop bug where the
-    /// engine re-derived the same flaky verdict on every probe.
-    FlakyRetriggered { pr_url: String },
-    /// Maint task 6: an `automation_triage` execution finished and its
-    /// final message was run through the marker-protocol outcome detector.
-    /// `outcome` is the `automation_runs.outcome` discriminator recorded
-    /// (`produced_task` / `skipped` / `failed_will_retry`). The execution is
-    /// finalised (`completed`) and its pane/workspace released regardless of
-    /// which marker (if any) the agent emitted.
-    AutomationTriage { outcome: String },
-    /// P3b: an `answer_agent` execution finished. `replied` is `true` when
-    /// the agent posted its reply mid-session via `CommentsPostAnswer`
-    /// before Stop fired, `false` when the session ended without one (the
-    /// finalizer marks the run `failed` and posts an apology thread entry so
-    /// the comment doesn't sit in `answering` forever). The execution is
-    /// finalised (`completed`) and its pane/workspace released either way.
-    AnswerAgent { replied: bool },
-    /// A `pr_review_guide` execution finished. `published` is `true` when its
-    /// raw output passed validation and was durably published as the
-    /// series' new readable version (subject to the publication fence — a
-    /// stale comparison still finalizes the execution but does not advance
-    /// the pointer), `false` when validation failed or the driver produced
-    /// no usable text (the attempt is recorded `failed`/`superseded` either
-    /// way). The execution is finalised (`completed`) and its pane/
-    /// workspace released regardless.
-    ReviewGuide { published: bool },
-    /// A primary-implementation worker's PR was detected and
-    /// an independent reviewer pass has been enqueued. The producing task
-    /// remains in `active` (Doing column) until the reviewer resolves.
-    ReviewerEnqueued { pr_url: String },
-    /// A `pr_review` reviewer execution finished and the
-    /// producing task has been advanced to `in_review`.
-    ReviewPassCompleted { pr_url: String },
-    /// A `pr_review` reviewer execution stopped without a readable
-    /// `ReviewResult` — neither the structured-output artifact nor the
-    /// transcript fallback yielded a valid object. The engine queued a probe
-    /// asking the reviewer to (re-)write the artifact and left the execution
-    /// live (non-terminal); the next Stop re-runs the finalizer. This replaces
-    /// the old silent "advance to in_review with no revision" drop. Bounded by
-    /// the auto-nudge breaker — once it trips, the finalizer advances to
-    /// `in_review` without a revision and files an attention.
-    ReviewPassAwaitingResult,
-    /// A `pr_review` reviewer execution found qualifying findings
-    /// (at least one `critical`/`high` severity or `regression` category) and
-    /// created a revision task on the producing task. The producing task is
-    /// advanced to `in_review`; the revision is dispatched on the general
-    /// worker pool to apply the feedback. Nothing is posted to GitHub.
-    ReviewPassRevisionCreated { pr_url: String, revision_task_id: String },
-    /// A primary-implementation worker (`chore_implementation` /
-    /// `task_implementation`) verified its assigned work was already done —
-    /// the change is already on `main`, the diff is empty, and there is
-    /// genuinely nothing to commit/push/open a PR for — and emitted the
-    /// `boss propose done --outcome no-changes-needed` declaration. The task is closed as `done` WITHOUT a PR and the execution is
-    /// finalised. No nudge is sent. This is the fix for the produce-a-PR nudge
-    /// loop on a worker that correctly found nothing to do. `work_item_id` is
-    /// the closed task/chore.
-    NoChangesNeeded { work_item_id: String },
-    /// The run's driver reported its own terminal turn boundary as an
-    /// unrecoverable error — Codex's rollout `task_complete.error`, or a
-    /// stdout `turn.failed` / fatal top-level `error` envelope
-    /// ([`crate::driver::TurnEnd::reason`] = [`boss_protocol::StopReason::Other`]).
-    /// The process that produced this Stop has already exited on its own;
-    /// there is nothing left to nudge or wait on. The execution is marked
-    /// `failed` (not left `running`/`waiting_human`), its cube lease and
-    /// pane are released, and an attention item naming the provider's error
-    /// text is filed. No nudge probe is queued — this bypasses every
-    /// kind-specific finalizer (including the `pr_review` ReviewResult
-    /// nudge loop) so a driver-reported fatal error can never wedge an
-    /// execution on a dead process the way an unparsed provider error used
-    /// to.
-    DriverTerminalError { detail: String },
-    /// Unexpected DB failure while recording completion.
-    DbError,
-    /// The pre-completion probe pass in
-    /// [`crate::app::worker_events::dispatch_worker_event_fanout`] delivered
-    /// a probe into the pane for this boundary, so the worker is entitled to
-    /// a turn to act on it before the generic PR-detection/nudge/park
-    /// decision runs — that decision is deferred to the `Stop` the granted
-    /// turn produces. Everything upstream of that decision inside
-    /// `on_stop_inner` — the stale-Stop supersession guard, the `stop_seen`
-    /// stamp, `StopReason::Other` driver-fatal-error handling, and every
-    /// kind-specific finalizer (`automation_triage`, `answer_agent`,
-    /// `pr_review`, the CI-remediation flaky-retrigger park) — still ran
-    /// normally for this boundary; only the terminal decision was withheld.
-    DeferredForProbeTurn,
-    /// A `run_done` declaration's acceptance IS the completion signal — see
-    /// `completion::run_done_declaration` and `app::proposals::handle_submit_proposal`.
-    /// The execution is finalised synchronously at submit time, not at a
-    /// later Stop boundary that may never arrive. Fired for `blocked` (the
-    /// run is over without delivering) or `delivered` with no PR the engine
-    /// could resolve. Both fail the execution and, for a task still in
-    /// `active`/`todo`, record `blocked:worker_failed` before releasing the
-    /// lease and pane; neither creates a deliberate park. A parent already
-    /// in `in_review` or a domain-owned blocked reason is left in that
-    /// recovery state — see [`crate::work::WorkDb::record_worker_failure`].
-    /// `delivered` with a resolvable PR instead reaches [`Self::PrDetected`],
-    /// and `no_changes_needed` reaches [`Self::NoChangesNeeded`] — both
-    /// existing variants, reused because their semantics already fit.
-    RunDoneDeclaredWithoutDelivery { detail: String },
-    /// A primary execution's completion resolved to a PR that is already
-    /// bound to a different work item (`pr_binding_guard`). Nothing was
-    /// bound: the execution failed visibly, the task row records `detail`
-    /// as its blocked reason, and an attention item was filed. A PR that
-    /// belongs to another row is never this execution's deliverable.
-    ForeignPrRefused { pr_url: String, detail: String },
-}
-
 /// Number of transcript-read attempts [`WorkerCompletionHandler::read_final_triage_message`]
 /// makes before concluding a triage transcript genuinely has no assistant
 /// text. Mirrors the linear-backoff shape of `ci_log_reader::run_capture`'s
@@ -2611,4 +2336,158 @@ mod tests;
 #[cfg(test)]
 pub(crate) fn integration_handler(db: Arc<crate::work::WorkDb>, pr_url: &str) -> WorkerCompletionHandler {
     tests::integration_handler(db, pr_url)
+}
+
+#[cfg(test)]
+mod queue_timeline_contract_tests {
+    use super::*;
+
+    struct RecordingTimeline {
+        urls: std::sync::Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl MergeQueueTimeline for RecordingTimeline {
+        async fn fetch_dequeues(&self, url: &str) -> Result<Vec<MergeQueueDequeueEvent>> {
+            self.urls.lock().unwrap().push(url.into());
+            if self.fail {
+                anyhow::bail!("queue timeline unavailable");
+            }
+            Ok(vec![MergeQueueDequeueEvent {
+                reason: "FAILED_CHECKS".into(),
+                created_at: Some("2026-10-01T00:00:00Z".into()),
+                pr_head_oid: Some("head".into()),
+                before_commit_oid: Some("queue".into()),
+                queue_base_oid: Some("base".into()),
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn command_verifier_delegates_queue_timeline_and_propagates_errors() {
+        for fail in [false, true] {
+            let timeline = Arc::new(RecordingTimeline {
+                urls: Default::default(),
+                fail,
+            });
+            let verifier = CommandBranchVerifier::new().with_queue_timeline(timeline.clone());
+            let result = verifier.fetch_queue_dequeues("example/repo", 42).await;
+            assert_eq!(
+                timeline.urls.lock().unwrap().as_slice(),
+                &["https://github.com/example/repo/pull/42"]
+            );
+            if fail {
+                assert_eq!(result.unwrap_err().to_string(), "queue timeline unavailable");
+            } else {
+                let events = result.unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].reason, "FAILED_CHECKS");
+                assert_eq!(events[0].pr_head_oid.as_deref(), Some("head"));
+                assert_eq!(events[0].before_commit_oid.as_deref(), Some("queue"));
+                assert_eq!(events[0].queue_base_oid.as_deref(), Some("base"));
+                assert_eq!(events[0].created_at.as_deref(), Some("2026-10-01T00:00:00Z"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn command_verifier_without_timeline_preserves_unsupported_error() {
+        let err = CommandBranchVerifier::new()
+            .fetch_queue_dequeues("example/repo", 42)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "queue timeline lookup unsupported by this verifier");
+    }
+
+    struct InjectedVerifier;
+
+    #[async_trait]
+    impl BranchVerifier for InjectedVerifier {
+        async fn fetch_pr_head_ref(&self, _: &str, _: u64) -> Result<String> {
+            Ok("injected".into())
+        }
+        async fn fetch_pr_head_oid(&self, _: &str, _: u64) -> Result<String> {
+            Ok("oid".into())
+        }
+        async fn fetch_pr_head_oid_fresh(&self, _: &str, _: u64) -> Result<String> {
+            Ok("oid".into())
+        }
+        async fn fetch_diff_line_count(&self, _: &str, _: &str, _: &str) -> Result<u64> {
+            Ok(0)
+        }
+        async fn fetch_pr_base_ref(&self, _: &str, _: u64) -> Result<String> {
+            Ok("main".into())
+        }
+        async fn fetch_diff_signature(&self, _: &str, _: &str, _: &str) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn fetch_pr_title_and_body(&self, _: &str, _: u64) -> Result<(String, String)> {
+            Ok((String::new(), String::new()))
+        }
+        async fn fetch_queue_dequeues(&self, _: &str, _: u64) -> Result<Vec<MergeQueueDequeueEvent>> {
+            anyhow::bail!("injected verifier has no timeline");
+        }
+    }
+
+    fn handler_for_timeline_tests() -> (tempfile::TempDir, WorkerCompletionHandler) {
+        let (dir, db) = crate::test_support::open_db_arc();
+        let handler = WorkerCompletionHandler::new(
+            db,
+            Arc::new(CommandPrDetector::new()),
+            Arc::new(crate::test_support::NoopCube),
+            Arc::new(crate::test_support::RecordingPublisher::default()),
+            Arc::new(NoopWorkerPaneReleaser),
+            Arc::new(NoopProbeQueuer),
+        );
+        (dir, handler)
+    }
+
+    #[tokio::test]
+    async fn merge_queue_timeline_applies_to_default_command_verifier() {
+        let timeline = Arc::new(RecordingTimeline {
+            urls: Default::default(),
+            fail: false,
+        });
+        let (_dir, handler) = handler_for_timeline_tests();
+        let handler = handler.with_merge_queue_timeline(timeline.clone());
+        let events = handler
+            .branch_verifier
+            .fetch_queue_dequeues("example/repo", 7)
+            .await
+            .unwrap();
+        assert_eq!(events[0].reason, "FAILED_CHECKS");
+        assert_eq!(
+            timeline.urls.lock().unwrap().as_slice(),
+            &["https://github.com/example/repo/pull/7"]
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_queue_timeline_does_not_replace_injected_verifier() {
+        let timeline = Arc::new(RecordingTimeline {
+            urls: Default::default(),
+            fail: false,
+        });
+        let injected: Arc<dyn BranchVerifier> = Arc::new(InjectedVerifier);
+        for after_timeline in [false, true] {
+            let (_dir, handler) = handler_for_timeline_tests();
+            let handler = if after_timeline {
+                handler
+                    .with_merge_queue_timeline(timeline.clone())
+                    .with_branch_verifier(injected.clone())
+            } else {
+                handler
+                    .with_branch_verifier(injected.clone())
+                    .with_merge_queue_timeline(timeline.clone())
+            };
+            let err = handler
+                .branch_verifier
+                .fetch_queue_dequeues("example/repo", 7)
+                .await
+                .unwrap_err();
+            assert_eq!(err.to_string(), "injected verifier has no timeline");
+        }
+        assert!(timeline.urls.lock().unwrap().is_empty());
+    }
 }

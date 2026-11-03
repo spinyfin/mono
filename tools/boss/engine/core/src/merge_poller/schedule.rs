@@ -572,7 +572,7 @@ pub(crate) fn kick_clears_quiesce(last_run_at: Instant, now: Instant, window: Du
 /// driven by its own cadence tiers, so it inherits this task's lifetime
 /// and publisher plumbing while keeping its 15 s/30 s cadence independent
 /// of the 60 s full-sweep tick.
-pub fn spawn_loop(
+pub fn spawn_loop<C: CompletionRequests + 'static>(
     work_db: Arc<WorkDb>,
     probe: Arc<dyn MergeProbe>,
     publisher: Arc<dyn ExecutionPublisher>,
@@ -580,7 +580,7 @@ pub fn spawn_loop(
     // the parameter count under clippy::too_many_arguments.
     handlers: (
         Arc<dyn CubeClient>,
-        Arc<WorkerCompletionHandler>,
+        Arc<C>,
         Arc<dyn crate::trunk_queue_poller::TrunkQueueApi>,
     ),
     interval: Duration,

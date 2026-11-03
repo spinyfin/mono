@@ -1,43 +1,5 @@
 use super::*;
 
-/// Review-gating state of a PR at probe time. Derived from
-/// GitHub's `reviewDecision` field and the `reviews` array.
-///
-/// `Required` maps to `REVIEW_REQUIRED` — at least one approving
-/// review is still needed. `Approved` means all required reviewers
-/// have approved; the `reviewers` list carries their login names
-/// for the tooltip. `ChangesRequested` means at least one reviewer
-/// blocked the PR; `reviewers` lists who. `Unknown` is the
-/// fallback when GitHub omitted the field or returned an
-/// unrecognised value (e.g., no branch protection configured).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PrReviewState {
-    Required,
-    Approved { reviewers: Vec<String> },
-    ChangesRequested { reviewers: Vec<String> },
-    Unknown,
-}
-
-impl PrReviewState {
-    /// Stable DB string for the `review_required_state` column.
-    pub fn as_db_str(&self) -> &'static str {
-        match self {
-            PrReviewState::Required => "required",
-            PrReviewState::Approved { .. } => "approved",
-            PrReviewState::ChangesRequested { .. } => "changes_requested",
-            PrReviewState::Unknown => "unknown",
-        }
-    }
-
-    /// Reviewer login names for the tooltip, if available.
-    pub fn reviewers(&self) -> &[String] {
-        match self {
-            PrReviewState::Approved { reviewers } | PrReviewState::ChangesRequested { reviewers } => reviewers,
-            _ => &[],
-        }
-    }
-}
-
 /// Derive the [`PrReviewState`] from GitHub's `reviewDecision` string,
 /// the `reviews` array, and an optional per-org review-signal verdict
 /// produced from reclassified status checks (e.g. LinkedIn's
@@ -499,44 +461,6 @@ pub(crate) fn leaf_check_name(leaf: &serde_json::Value) -> Option<&str> {
         .and_then(|v| v.as_str())
         .or_else(|| leaf.get("context").and_then(|v| v.as_str()))
         .filter(|name| !name.is_empty())
-}
-
-/// A terminally-failed `"Trunk Merge Queue (<branch>)"` leaf observed on a
-/// PR's head — i.e. GitHub's own record that a Trunk merge-queue episode
-/// for this PR ended in an eviction.
-///
-/// Deliberately *not* a [`RequiredCheckFailure`]: this must never be mixed
-/// into the `pr_branch_ci` failure set (see [`classify_ci`]'s exclusion),
-/// and the distinct type is what makes that impossible by construction
-/// rather than by convention.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TrunkQueueCheckFailure {
-    /// Verbatim leaf name, e.g. `"Trunk Merge Queue (main)"`.
-    pub name: String,
-    /// Uppercased terminal conclusion, e.g. `"FAILURE"`.
-    pub conclusion: String,
-    /// Trunk's own episode page, e.g.
-    /// `https://app.trunk.io/<org>/merge-queue/<queue-uuid>/<pr-number>`.
-    /// Empty when GitHub omitted it. Diagnostic only — the queue uuid in
-    /// that path is per-queue, not per-episode, so it is not usable as an
-    /// idempotency key.
-    pub details_url: String,
-    /// The check run's `completedAt`, verbatim RFC 3339 (e.g.
-    /// `"2026-07-28T09:14:02Z"`). `None` for a `StatusContext` leaf, which
-    /// has no such field, and on any provider that omits it.
-    ///
-    /// This is the *episode* discriminator. A PR head sha is not one: a PR
-    /// can enter the queue more than once on an unchanged head (a human
-    /// cancels and re-checks the box; or Trunk retires the entry for a base
-    /// mismatch and Boss's own attention item tells them to requeue), and
-    /// Trunk concludes a fresh check run for each attempt. Pairing this with
-    /// the head sha is what lets a genuinely new episode be adopted while a
-    /// re-observation of the same one is not — see
-    /// [`crate::work::WorkDb::trunk_merge_intent_adopted_at_episode`]. It is
-    /// also the only datum that bounds how *old* an eviction is, which
-    /// [`crate::trunk_queue_adopt`] uses to refuse to resurrect an episode a
-    /// human walked away from days ago.
-    pub completed_at: Option<String>,
 }
 
 /// Closed set of conclusions on Trunk's own check that mean "this queue

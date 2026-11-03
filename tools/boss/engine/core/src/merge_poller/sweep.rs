@@ -1,4 +1,4 @@
-use super::deferred_review_admission::sweep_deferred_review_admission;
+use super::deferred_review_admission::sweep_deferred_review_admission_with;
 use super::post_merge_review::maybe_trigger_post_merge_review;
 use super::*;
 
@@ -239,7 +239,7 @@ fn remaining_probe_urls<'a>(remaining: impl IntoIterator<Item = &'a PendingMerge
 /// determine which comparison becomes the desired one.
 fn allocate_source_observation_sequences(
     work_db: &WorkDb,
-    completion_handler: Option<&WorkerCompletionHandler>,
+    completion_handler: Option<&dyn CompletionRequests>,
     probe_urls: &[String],
 ) -> HashMap<String, i64> {
     completion_handler
@@ -294,7 +294,7 @@ pub async fn run_one_pass(
     probe: &dyn MergeProbe,
     publisher: &dyn ExecutionPublisher,
     cube_client: Option<&dyn CubeClient>,
-    completion_handler: Option<&WorkerCompletionHandler>,
+    completion_handler: Option<&dyn CompletionRequests>,
     remediation: Option<&ConflictRemediationQueue>,
 ) -> SweepOutcome {
     run_one_pass_observed(work_db, probe, publisher, cube_client, completion_handler, remediation)
@@ -322,7 +322,7 @@ pub async fn run_one_pass_observed(
     probe: &dyn MergeProbe,
     publisher: &dyn ExecutionPublisher,
     cube_client: Option<&dyn CubeClient>,
-    completion_handler: Option<&WorkerCompletionHandler>,
+    completion_handler: Option<&dyn CompletionRequests>,
     remediation: Option<&ConflictRemediationQueue>,
 ) -> (SweepOutcome, Vec<PollObservation>) {
     let in_review = match work_db.list_chores_pending_merge_check() {
@@ -369,7 +369,7 @@ pub async fn run_one_pass_observed(
     // revision executions with an already-bound PR, not just the no-PR query
     // above.
     let pending_background_nudges = completion_handler
-        .map(WorkerCompletionHandler::pending_background_nudge_execution_ids)
+        .map(|handler| handler.pending_background_nudge_execution_ids())
         .unwrap_or_default();
     let stranded_ci_attempts = match work_db.list_stranded_ci_remediation_attempts() {
         Ok(items) => items,
@@ -414,7 +414,7 @@ pub async fn run_one_pass_observed(
         + stranded_ci_attempts.len()
         + stranded_blocked.len()
         + late_pr_candidates.len();
-    if total == 0 {
+    if total == 0 && !super::deferred_review_admission::has_pending_review_admission(work_db, completion_handler) {
         // No candidates at all: an empty observation set, which retires every
         // remaining adaptive slot rather than leaving orphans behind.
         return (SweepOutcome::default(), Vec::new());
@@ -610,11 +610,17 @@ pub async fn run_one_pass_observed(
         .await;
     }
 
-    if skip_unbatched_review_holds {
-        let pool_size = completion_handler
-            .map(|handler| handler.review_pool_size())
-            .unwrap_or(boss_execution_contracts::DEFAULT_REVIEW_POOL_SIZE);
-        sweep_deferred_review_admission(work_db, publisher, None, pool_size, &mut outcome).await;
+    if skip_unbatched_review_holds && let Some(handler) = completion_handler {
+        let pool_size = handler.review_pool_size();
+        sweep_deferred_review_admission_with(
+            work_db,
+            publisher,
+            handler.review_batch_enqueuer(),
+            None,
+            pool_size,
+            &mut outcome,
+        )
+        .await;
     }
     if let Err(err) = work_db.sweep_reported_live_review_batch_members() {
         tracing::warn!(?err, "merge poller: failed to sweep reported live batch members");
@@ -694,7 +700,7 @@ pub async fn reconcile_one(
     probe: &dyn MergeProbe,
     publisher: &dyn ExecutionPublisher,
     cube_client: Option<&dyn CubeClient>,
-    completion_handler: Option<&WorkerCompletionHandler>,
+    completion_handler: Option<&dyn CompletionRequests>,
     remediation: Option<&ConflictRemediationQueue>,
     pr_url: &str,
 ) -> (SweepOutcome, Option<PollTier>) {
@@ -739,7 +745,7 @@ pub async fn reconcile_batch(
     probe: &dyn MergeProbe,
     publisher: &dyn ExecutionPublisher,
     cube_client: Option<&dyn CubeClient>,
-    completion_handler: Option<&WorkerCompletionHandler>,
+    completion_handler: Option<&dyn CompletionRequests>,
     remediation: Option<&ConflictRemediationQueue>,
     pr_urls: &[String],
 ) -> (SweepOutcome, Vec<PollObservation>) {
@@ -836,11 +842,17 @@ pub async fn reconcile_batch(
         }
         Err(err) => tracing::warn!(?err, "merge poller: failed to list stalled reviewer tasks"),
     }
-    if skip_unbatched_review_holds {
-        let pool_size = completion_handler
-            .map(|handler| handler.review_pool_size())
-            .unwrap_or(boss_execution_contracts::DEFAULT_REVIEW_POOL_SIZE);
-        sweep_deferred_review_admission(work_db, publisher, Some(&wanted), pool_size, &mut outcome).await;
+    if skip_unbatched_review_holds && let Some(handler) = completion_handler {
+        let pool_size = handler.review_pool_size();
+        sweep_deferred_review_admission_with(
+            work_db,
+            publisher,
+            handler.review_batch_enqueuer(),
+            Some(&wanted),
+            pool_size,
+            &mut outcome,
+        )
+        .await;
     }
 
     // Observe every *requested* URL, not just the probed ones, so a URL that
@@ -883,7 +895,7 @@ pub(crate) fn candidates_for_pr_urls(
 pub(crate) async fn stop_active_revision_executions(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
-    completion_handler: Option<&WorkerCompletionHandler>,
+    completion_handler: Option<&dyn CompletionRequests>,
     chain_root_id: &str,
     outcome: &mut SweepOutcome,
 ) {
@@ -1003,14 +1015,14 @@ pub(crate) async fn stop_active_revision_executions(
 /// worker slot indefinitely. We force-stop it regardless of what it is
 /// doing — cancel the execution row and release its cube lease + pane.
 ///
-/// [`WorkerCompletionHandler::force_stop_execution`] only demotes a task
+/// `CompletionRequests::force_stop_execution` only demotes a task
 /// that is still `active`; since the task is now `in_review`, that guard
 /// does not fire and the task stays in Review. Idempotent: a no-op when
 /// no live execution exists or `completion_handler` is `None` (tests /
 /// cold-path wiring).
 pub(crate) async fn stop_worker_on_review_transition(
     work_db: &WorkDb,
-    completion_handler: Option<&WorkerCompletionHandler>,
+    completion_handler: Option<&dyn CompletionRequests>,
     work_item_id: &str,
     outcome: &mut SweepOutcome,
 ) {
@@ -1046,14 +1058,10 @@ pub(crate) async fn stop_worker_on_review_transition(
 /// classified as having no PR but whose chore is still `active` (i.e.,
 /// the worker stopped, the engine missed the PR-open transition, and
 /// the chore is stuck in `active`). Delegates to
-/// [`WorkerCompletionHandler::recheck_for_pr`], which transitions the
+/// `CompletionRequests::recheck_for_pr`, which transitions the
 /// chore on `Fresh`/`Merged` and stays quiet on the no-PR / stale-PR
 /// branches so the poller doesn't spam probes or awaiting-input events.
-pub(crate) async fn sweep_pending_pr(
-    handler: &WorkerCompletionHandler,
-    execution_id: &str,
-    outcome: &mut SweepOutcome,
-) {
+pub(crate) async fn sweep_pending_pr(handler: &dyn CompletionRequests, execution_id: &str, outcome: &mut SweepOutcome) {
     match handler.recheck_for_pr(execution_id).await {
         StopOutcome::PrDetected { pr_url } => {
             outcome.pr_recheck_recovered += 1;
@@ -1202,12 +1210,12 @@ pub(crate) async fn sweep_pending_pr(
 /// Run late-PR detection against a terminal execution (abandoned /
 /// completed / failed within the recent lookback window) whose task is
 /// still `active` with no `pr_url`. Delegates to
-/// [`WorkerCompletionHandler::recheck_for_pr_late`], which bypasses the
+/// `CompletionRequests::recheck_for_pr_late`, which bypasses the
 /// `AlreadyTerminal` gate and calls
 /// [`WorkDb::bind_pr_to_active_task_from_terminal_execution`] directly
 /// on a positive detection result.
 pub(crate) async fn sweep_late_pr(
-    handler: &WorkerCompletionHandler,
+    handler: &dyn CompletionRequests,
     candidate: &LatePrCandidate,
     outcome: &mut SweepOutcome,
 ) {
@@ -1319,7 +1327,7 @@ pub(crate) async fn sweep_one(
     // parameter count under clippy::too_many_arguments.
     handlers: (
         Option<&dyn CubeClient>,
-        Option<&WorkerCompletionHandler>,
+        Option<&dyn CompletionRequests>,
         Option<&ConflictRemediationQueue>,
     ),
     candidate: &PendingMergeCheck,
@@ -1405,7 +1413,8 @@ pub(crate) async fn sweep_one(
                 handler.reconcile_review_guide_source_from_probe(
                     &candidate.work_item_id,
                     &candidate.pr_url,
-                    boss_pr_review_sources::PinnedComparison { base_sha, head_sha },
+                    &base_sha,
+                    &head_sha,
                     observation_sequence,
                 );
             }
@@ -2038,7 +2047,7 @@ pub(crate) async fn maybe_clear_blocked(
     publisher: &dyn ExecutionPublisher,
     // (cube_client, completion_handler) — bundled to keep the parameter
     // count under clippy::too_many_arguments.
-    handlers: (Option<&dyn CubeClient>, Option<&WorkerCompletionHandler>),
+    handlers: (Option<&dyn CubeClient>, Option<&dyn CompletionRequests>),
     candidate: &PendingMergeCheck,
     // Supplies `labels`, `raw_mergeable`, `raw_merge_state_status`.
     probe_result: &PrLifecycleProbe,
@@ -2236,15 +2245,41 @@ pub(crate) fn review_detail_json(reviewers: &[String]) -> Option<String> {
     serde_json::to_string(reviewers).ok()
 }
 
+/// Adapter that routes completion's on-transition CI pre-fetch into
+/// [`update_pr_poll_state`]. Holds the publisher so observation contracts
+/// do not depend on execution-contracts.
+pub struct MergePollerPrPollStateWriter {
+    publisher: Arc<dyn ExecutionPublisher>,
+}
+
+impl MergePollerPrPollStateWriter {
+    pub fn new(publisher: Arc<dyn ExecutionPublisher>) -> Self {
+        Self { publisher }
+    }
+}
+
+#[async_trait]
+impl PrPollStateWriter for MergePollerPrPollStateWriter {
+    async fn update_pr_poll_state(
+        &self,
+        work_db: &WorkDb,
+        candidate: &PendingMergeCheck,
+        probe: &PrLifecycleProbe,
+        caller: &str,
+    ) {
+        update_pr_poll_state(work_db, self.publisher.as_ref(), candidate, probe, None, caller).await;
+    }
+}
+
 /// Persist CI + review + merge-queue poll state and emit a change event
 /// when any field flips value. Called from `sweep_one` for every open PR and
-/// from `completion.rs` after the on-transition initial CI fetch.
+/// through [`MergePollerPrPollStateWriter`] after completion's initial CI fetch.
 ///
 /// `known_active_queue_failure` lets the sweep reaper hand off its already-
 /// loaded merge-queue remediation (or `Some(None)` when it just retired one)
 /// so this function does not open a second sqlite connection for the same
 /// work item on the same pass. Pass `None` when the caller did not run the
-/// reaper — this function self-fetches in that case (e.g. `completion.rs`).
+/// reaper — this function self-fetches in that case (e.g. the completion adapter).
 pub(crate) async fn update_pr_poll_state(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -2558,7 +2593,7 @@ fn queue_failure_detail_json(failed_checks: &str) -> Option<String> {
 pub(crate) async fn mark_merged(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
-    _completion_handler: Option<&WorkerCompletionHandler>,
+    _completion_handler: Option<&dyn CompletionRequests>,
     candidate: &PendingMergeCheck,
     probe: &PrLifecycleProbe,
 ) -> bool {

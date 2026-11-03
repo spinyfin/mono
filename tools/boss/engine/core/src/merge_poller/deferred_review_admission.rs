@@ -2,33 +2,29 @@
 
 use super::*;
 
+/// Deferred admission can be the only work in an otherwise empty sweep.
+pub(super) fn has_pending_review_admission(work_db: &WorkDb, handler: Option<&dyn CompletionRequests>) -> bool {
+    if !handler.is_some_and(|handler| handler.review_batch_fanout_enabled()) {
+        return false;
+    }
+    match work_db.list_tasks_awaiting_pre_merge_review_admission() {
+        Ok(candidates) => !candidates.is_empty(),
+        Err(err) => {
+            tracing::warn!(?err, "merge poller: failed to list deferred review-admission tasks");
+            false
+        }
+    }
+}
+
 /// Retry pre-merge review admission for tasks held in PendingReview with no
 /// live batch. Distinguishes a new head (create a batch or stay deferred)
 /// from a completed batch on the current SHA (advance to human Review).
-pub(crate) async fn sweep_deferred_review_admission(
-    work_db: &WorkDb,
-    publisher: &dyn ExecutionPublisher,
-    wanted_pr_urls: Option<&std::collections::HashSet<&str>>,
-    review_pool_size: usize,
-    outcome: &mut SweepOutcome,
-) {
-    sweep_deferred_review_admission_with(
-        work_db,
-        publisher,
-        &crate::completion::GhReviewBatchEnqueuer,
-        wanted_pr_urls,
-        review_pool_size,
-        outcome,
-    )
-    .await;
-}
-
-/// [`sweep_deferred_review_admission`] with the batch-creation strategy
-/// injected, so tests can supply PR metadata without `gh`.
+/// The batch-creation strategy is injected so tests can supply PR metadata
+/// without `gh`.
 pub(crate) async fn sweep_deferred_review_admission_with(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
-    enqueuer: &dyn crate::completion::ReviewBatchEnqueuer,
+    enqueuer: &dyn ReviewBatchEnqueuer,
     wanted_pr_urls: Option<&std::collections::HashSet<&str>>,
     review_pool_size: usize,
     outcome: &mut SweepOutcome,
@@ -50,7 +46,7 @@ pub(crate) async fn sweep_deferred_review_admission_with(
                 pr_url = %candidate.pr_url,
                 "merge poller: deferred review admission has no repo URL; leaving the hold"
             );
-            crate::completion::file_admission_deferred_attention(work_db, &candidate.task_id, &candidate.pr_url);
+            file_admission_deferred_attention(work_db, &candidate.task_id, &candidate.pr_url);
             outcome.review_admission_still_deferred += 1;
             continue;
         }
@@ -169,11 +165,7 @@ pub(crate) async fn sweep_deferred_review_admission_with(
                              (no matching verdict, or a live non-review execution is blocking); \
                              filing an attention marker so the hold stays visible"
                         );
-                        crate::completion::file_admission_deferred_attention(
-                            work_db,
-                            &candidate.task_id,
-                            &candidate.pr_url,
-                        );
+                        file_admission_deferred_attention(work_db, &candidate.task_id, &candidate.pr_url);
                         outcome.review_admission_still_deferred += 1;
                         continue;
                     }
@@ -189,7 +181,7 @@ pub(crate) async fn sweep_deferred_review_admission_with(
                 );
             }
             Ok(crate::work::ReviewBatchDispatch::AdmissionDeferred) => {
-                crate::completion::file_admission_deferred_attention(work_db, &candidate.task_id, &candidate.pr_url);
+                file_admission_deferred_attention(work_db, &candidate.task_id, &candidate.pr_url);
                 outcome.review_admission_still_deferred += 1;
             }
             Err(err) => {

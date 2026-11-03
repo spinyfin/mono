@@ -9,6 +9,7 @@ test-support = ["boss-work-db/test-support"]
 [dependencies]
 boss-execution-runner = { path = "../execution-runner" }
 boss-execution-contracts = { path = "../execution-contracts" }
+boss-observation-contracts = { path = "../observation-contracts" }
 boss-engine-storage-values = { path = "../storage-values" }
 boss-work-db = { path = "../work-db" }
 boss-board-projection = { path = "../board-projection" }

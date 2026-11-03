@@ -75,20 +75,6 @@ pub(crate) fn review_batch_input_from_metadata(
     Ok(input)
 }
 
-/// Production or test strategy for creating a pre-merge review batch from
-/// a producing execution's PR. Tests inject a stub that skips `gh`.
-#[async_trait]
-pub trait ReviewBatchEnqueuer: Send + Sync {
-    async fn enqueue(
-        &self,
-        work_db: &crate::work::WorkDb,
-        work_item_id: &str,
-        repo_remote_url: &str,
-        pr_url: &str,
-        review_pool_size: usize,
-    ) -> anyhow::Result<crate::work::ReviewBatchDispatch>;
-}
-
 /// Default enqueuer: fetch immutable SHAs from GitHub, then admit a batch.
 pub(crate) struct GhReviewBatchEnqueuer;
 
@@ -103,28 +89,6 @@ impl ReviewBatchEnqueuer for GhReviewBatchEnqueuer {
         review_pool_size: usize,
     ) -> anyhow::Result<crate::work::ReviewBatchDispatch> {
         enqueue_review_batch(work_db, work_item_id, repo_remote_url, pr_url, review_pool_size).await
-    }
-}
-
-pub(crate) fn file_admission_deferred_attention(work_db: &crate::work::WorkDb, work_item_id: &str, pr_url: &str) {
-    let title = "Automated reviewer: waiting for a review-pool slot";
-    let body = format!(
-        "Pre-merge review for {pr_url} was deferred because the review pool has no free \
-         reservation for another pre-merge batch. The review starts once a batch completes \
-         and the deferred-admission sweep retries. Dismiss this item once that \
-         pass starts."
-    );
-    if let Err(err) = work_db.upsert_external_tracker_attention(
-        work_item_id,
-        crate::work::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
-        title,
-        &body,
-    ) {
-        tracing::warn!(
-            work_item_id,
-            ?err,
-            "failed to file review-admission-deferred attention item"
-        );
     }
 }
 
@@ -1021,7 +985,7 @@ impl WorkerCompletionHandler {
             // and the merge-poller sweep picks it up on its next pass.
             let probe = self.merge_probe.clone();
             let work_db = self.work_db.clone();
-            let publisher = self.publisher.clone();
+            let writer = self.pr_poll_state_writer.clone();
             let candidate = PendingMergeCheck {
                 work_item_id: work_item_id.clone(),
                 product_id: product_id.clone(),
@@ -1030,15 +994,9 @@ impl WorkerCompletionHandler {
             boss_task_scope::spawn(async move {
                 match probe.probe(&candidate.pr_url).await {
                     Ok(lifecycle_probe) => {
-                        update_pr_poll_state(
-                            &work_db,
-                            publisher.as_ref(),
-                            &candidate,
-                            &lifecycle_probe,
-                            None,
-                            "completion",
-                        )
-                        .await;
+                        writer
+                            .update_pr_poll_state(&work_db, &candidate, &lifecycle_probe, "completion")
+                            .await;
                     }
                     Err(err) => {
                         tracing::debug!(
@@ -1311,5 +1269,242 @@ mod already_reviewed_at_head_tests {
         insert_verdict(&db, &task.id, "head-sha", REVIEW_GATE_OUTCOME_GAVE_UP);
 
         assert!(!already_reviewed_at_head(&db, &task.id, "head-sha"));
+    }
+}
+
+#[cfg(test)]
+mod observation_seam_tests {
+    use super::*;
+    use crate::test_support::*;
+    use boss_observation_contracts::PrReviewState;
+    use tokio::sync::{Mutex, Notify};
+
+    const PR: &str = "https://github.com/spinyfin/mono/pull/42";
+
+    fn lifecycle_probe() -> PrLifecycleProbe {
+        PrLifecycleProbe::builder()
+            .url(PR)
+            .state(PrLifecycleState::Open(boss_observation_contracts::OpenPrStatus::clean()))
+            .labels(Vec::new())
+            .review(PrReviewState::Required)
+            .build()
+    }
+
+    struct PrefetchProbe {
+        fail: bool,
+        called: Notify,
+    }
+
+    #[async_trait]
+    impl MergeProbe for PrefetchProbe {
+        async fn probe(&self, pr_url: &str) -> Result<PrLifecycleProbe> {
+            assert_eq!(pr_url, PR);
+            self.called.notify_one();
+            if self.fail {
+                anyhow::bail!("probe unavailable");
+            }
+            Ok(lifecycle_probe())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingWriter {
+        calls: Mutex<Vec<(PendingMergeCheck, String, String)>>,
+        called: Notify,
+    }
+
+    #[async_trait]
+    impl PrPollStateWriter for RecordingWriter {
+        async fn update_pr_poll_state(
+            &self,
+            db: &WorkDb,
+            candidate: &PendingMergeCheck,
+            probe: &PrLifecycleProbe,
+            caller: &str,
+        ) {
+            // The asynchronous pre-fetch must run after the transition commits.
+            let item = serde_json::to_value(db.get_work_item(&candidate.work_item_id).unwrap()).unwrap();
+            assert_eq!(item["status"], "in_review");
+            self.calls
+                .lock()
+                .await
+                .push((candidate.clone(), caller.into(), probe.url.clone()));
+            self.called.notify_one();
+        }
+    }
+
+    async fn check_completion_prefetch(fail: bool) {
+        let (dir, db) = open_db_arc();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, product.id.clone(), "PR pre-fetch");
+        let execution = create_ready_chore_execution(&db, chore.id.clone());
+        let (execution, run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker",
+                "mono",
+                "lease",
+                "workspace",
+                dir.path().to_str().unwrap(),
+            )
+            .unwrap();
+        finish_run_worker_pane_alive(&db, &execution.id, &run.id, None);
+        let writer = Arc::new(RecordingWriter::default());
+        let probe = Arc::new(PrefetchProbe {
+            fail,
+            called: Notify::new(),
+        });
+        let handler = super::super::tests::integration_handler(db.clone(), PR)
+            .with_max_review_cycles(0)
+            .with_merge_probe(probe.clone())
+            .with_pr_poll_state_writer(writer.clone());
+        let outcome = handler
+            .finalize_pr_transition(&execution.id, PR.into(), WorkerPrCompletionTarget::InReview, "stop")
+            .await;
+        assert_eq!(outcome, StopOutcome::PrDetected { pr_url: PR.into() });
+        tokio::time::timeout(Duration::from_secs(5), probe.called.notified())
+            .await
+            .unwrap();
+        if fail {
+            // This current-thread test resumes after the probe's immediate error
+            // return and its caller's error arm have completed in the same poll.
+            assert!(writer.calls.lock().await.is_empty());
+        } else {
+            tokio::time::timeout(Duration::from_secs(5), writer.called.notified())
+                .await
+                .unwrap();
+            let calls = writer.calls.lock().await;
+            assert_eq!(calls.len(), 1);
+            let (candidate, caller, url) = &calls[0];
+            assert_eq!(candidate.work_item_id, chore.id);
+            assert_eq!(candidate.product_id, product.id);
+            assert_eq!(candidate.pr_url, PR);
+            assert_eq!(caller, "completion");
+            assert_eq!(url, PR);
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_prefetch_calls_writer_after_in_review_transition() {
+        check_completion_prefetch(false).await;
+    }
+
+    #[tokio::test]
+    async fn completion_prefetch_does_not_write_after_probe_failure() {
+        check_completion_prefetch(true).await;
+    }
+
+    #[tokio::test]
+    async fn poll_state_adapter_persists_and_publishes_like_direct_update() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Poll-state adapter");
+        let candidate = PendingMergeCheck {
+            work_item_id: chore.id.clone(),
+            product_id: product.id.clone(),
+            pr_url: PR.into(),
+        };
+        let publisher = Arc::new(RecordingPublisher::default());
+        let adapter = crate::merge_poller::MergePollerPrPollStateWriter::new(publisher.clone());
+        let probe = lifecycle_probe();
+        adapter
+            .update_pr_poll_state(&db, &candidate, &probe, "completion")
+            .await;
+        let adapted = db.get_work_item(&chore.id).unwrap();
+        assert_eq!(publisher.runtime_reasons().await, ["pr_poll_state_updated"]);
+        assert_eq!(
+            publisher.events.lock().await.as_slice(),
+            &[(product.id.clone(), chore.id.clone(), "pr_poll_state_updated".into())]
+        );
+        let state = serde_json::to_value(&adapted).unwrap();
+        assert_eq!(state["ci_required_state"], "success");
+        assert_eq!(state["review_required_state"], "required");
+        // Replaying the same observation must not emit another invalidation.
+        adapter
+            .update_pr_poll_state(&db, &candidate, &probe, "completion")
+            .await;
+        assert_eq!(publisher.events.lock().await.len(), 1);
+        db.connect().unwrap().execute(
+            "UPDATE tasks SET ci_required_state = NULL, review_required_state = NULL, pr_mergeable_state = NULL, ci_required_detail = NULL, review_required_detail = NULL WHERE id = ?1", [&chore.id],
+        ).unwrap();
+        publisher.events.lock().await.clear();
+        crate::merge_poller::update_pr_poll_state(&db, publisher.as_ref(), &candidate, &probe, None, "completion")
+            .await;
+        let direct = serde_json::to_value(db.get_work_item(&chore.id).unwrap()).unwrap();
+        for field in [
+            "ci_required_state",
+            "review_required_state",
+            "pr_mergeable_state",
+            "ci_required_detail",
+            "review_required_detail",
+            "merge_queue_state",
+            "merge_queue_detail",
+        ] {
+            assert_eq!(state[field], direct[field], "{field}");
+        }
+        assert_eq!(
+            publisher.events.lock().await.as_slice(),
+            &[(product.id, chore.id, "pr_poll_state_updated".into())]
+        );
+    }
+
+    #[derive(Default)]
+    struct DeferredEnqueuer {
+        calls: Mutex<Vec<(String, String, String, usize)>>,
+    }
+
+    #[async_trait]
+    impl ReviewBatchEnqueuer for DeferredEnqueuer {
+        async fn enqueue(
+            &self,
+            _: &WorkDb,
+            work_item_id: &str,
+            repo: &str,
+            pr: &str,
+            pool: usize,
+        ) -> Result<crate::work::ReviewBatchDispatch> {
+            self.calls
+                .lock()
+                .await
+                .push((work_item_id.into(), repo.into(), pr.into(), pool));
+            Ok(crate::work::ReviewBatchDispatch::AdmissionDeferred)
+        }
+    }
+
+    #[tokio::test]
+    async fn run_one_pass_uses_injected_enqueuer_for_pending_review() {
+        let (dir, db) = open_db_arc();
+        let product = create_test_product(&db);
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Deferred review");
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'active', pr_url = ?2 WHERE id = ?1",
+                rusqlite::params![chore.id, PR],
+            )
+            .unwrap();
+        file_admission_deferred_attention(&db, &chore.id, PR);
+        assert_eq!(db.list_tasks_awaiting_pre_merge_review_admission().unwrap().len(), 1);
+        let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            dir.path().join("flags.toml"),
+        ));
+        flags.load().unwrap();
+        flags.set("review_batch_fanout", true).unwrap();
+        let enqueuer = Arc::new(DeferredEnqueuer::default());
+        // Arc forwarding is the same path used by the production scheduling loop.
+        let handler = Arc::new(
+            super::super::tests::integration_handler(db.clone(), PR)
+                .with_feature_flags(flags)
+                .with_review_pool_size(3)
+                .with_review_batch_enqueuer(enqueuer.clone()),
+        );
+        let publisher = RecordingPublisher::default();
+        let outcome =
+            crate::merge_poller::run_one_pass(&db, &NoopMergeProbe, &publisher, None, Some(&handler), None).await;
+        assert_eq!(
+            enqueuer.calls.lock().await.as_slice(),
+            &[(chore.id, product.repo_remote_url.unwrap(), PR.into(), 3)]
+        );
+        assert_eq!(outcome.review_admission_still_deferred, 1);
     }
 }

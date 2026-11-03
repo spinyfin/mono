@@ -1,0 +1,17 @@
+[package]
+name = "boss-observation-contracts"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bon = { workspace = true }
+boss-github = { path = "../../github" }
+boss-protocol = { path = "../../protocol" }
+boss-work-db = { path = "../work-db" }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
