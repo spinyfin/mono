@@ -488,6 +488,43 @@ fn rewrite_replaces_the_fix_with_a_port_sized_revision_ahead_of_review_revisions
 }
 
 #[test]
+fn admission_copy_probes_only_forced_executions() {
+    let f = fixture();
+    let conn = f.db.connect().unwrap();
+    let trigger: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'work_executions_copy_operator_forced_admission'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    // Explain the actual trigger probe so an unindexed scan of all earlier
+    // executions cannot silently make bulk history inserts quadratic.
+    let probe = trigger
+        .split_once("AND EXISTS (")
+        .unwrap()
+        .1
+        .split_once(");")
+        .unwrap()
+        .0;
+    let probe = probe
+        .replace("NEW.work_item_id", "'fixture'")
+        .replace("NEW.id", "'new'");
+    let plan: Vec<String> = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {probe}"))
+        .unwrap()
+        .query_map([], |row| row.get(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("work_executions_operator_forced_idx")),
+        "{plan:?}"
+    );
+}
+
+#[test]
 fn an_answer_that_does_not_belong_to_the_question_is_refused() {
     let f = fixture();
     raise_question(&f);

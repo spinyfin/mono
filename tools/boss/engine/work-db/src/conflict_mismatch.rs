@@ -74,7 +74,9 @@ pub(super) fn migrate_operator_forced_admission(conn: &Connection) -> Result<()>
         )?;
     }
     conn.execute_batch(
-        "CREATE TRIGGER IF NOT EXISTS work_executions_copy_operator_forced_admission
+        "CREATE INDEX IF NOT EXISTS work_executions_operator_forced_idx
+           ON work_executions(work_item_id) WHERE operator_forced_admission = 1;
+         CREATE TRIGGER IF NOT EXISTS work_executions_copy_operator_forced_admission
          AFTER INSERT ON work_executions
          BEGIN
            UPDATE work_executions SET operator_forced_admission = 1 WHERE id = NEW.id
