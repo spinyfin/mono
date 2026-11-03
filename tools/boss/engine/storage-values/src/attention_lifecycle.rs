@@ -186,7 +186,12 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
         PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
-        "Dispatch files this when a recorded preserved tip cannot be restaged. A later successful restage of that execution's preserved work resolves it; starting fresh is not evidence the work was recovered.",
+        "Dispatch files this when a recorded preserved tip cannot be restaged, and when restore archives unpublished unselected variants. A later successful restage of that execution's preserved work that leaves no unpublished unselected variants resolves it; starting fresh is not evidence the work was recovered. Teardown inspect verdicts use preserved_work_needs_inspection.",
+    ),
+    entry(
+        PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND,
+        ClearedBy::HumanDecision,
+        "Teardown kept the existing preserved bookmark and released the lease because the workspace tip and the existing work could not be combined. A later restage of the old tip does not recover the new workspace tip named in the item.",
     ),
     entry(
         LEASE_UNRELEASED_ATTENTION_KIND,

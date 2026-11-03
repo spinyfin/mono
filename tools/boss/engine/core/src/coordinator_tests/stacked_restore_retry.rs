@@ -253,7 +253,7 @@ async fn restore_transport_failure_retries_on_the_same_stacked_base() {
     assert!(
         JjRepo::run(
             &h.repo.repo,
-            &["bookmark", "list", &format!("glob:preserved/{}/*", source.id)]
+            &["bookmark", "list", &format!("glob:preserved-archive/{}/*", source.id)]
         )
         .is_empty()
     );
@@ -321,7 +321,7 @@ async fn every_integrity_verdict_archives_and_allows_fresh_dispatch() {
         assert!(
             !JjRepo::run(
                 &h.repo.repo,
-                &["bookmark", "list", &format!("glob:preserved/{}/*", prior.id)]
+                &["bookmark", "list", &format!("glob:preserved-archive/{}/*", prior.id)]
             )
             .is_empty(),
             "{kind:?}"
@@ -439,7 +439,7 @@ async fn conflicted_recovery_bookmark_archives_both_heads_and_starts_worker() {
         let notes = db.list_attention_items_for_work_item(&prior.work_item_id).unwrap();
         assert!(notes.iter().any(|note| note.body_markdown.contains("exactly one")));
         for twin in twins.lines() {
-            let archive = format!("preserved/{}/{twin}", prior.id);
+            let archive = format!("preserved-archive/{}/{twin}", prior.id);
             assert_eq!(
                 JjRepo::run(&h.repo.repo, &["log", "-r", &archive, "--no-graph", "-T", "commit_id"]),
                 twin

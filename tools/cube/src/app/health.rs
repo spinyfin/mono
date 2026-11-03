@@ -203,12 +203,20 @@ const PR_REPAIR_LOCK_BUDGET: std::time::Duration = std::time::Duration::from_sec
 
 /// Bookmark namespaces that are shared, repo-global pointers owned by the PR
 /// flow or the Boss engine rather than by the workspace being repaired:
-/// `pr/<n>` aliases and the per-execution publication, recovery and base
-/// bookmarks. Bookmarks live in the shared jj store, so forgetting one here
+/// `pr/<n>` aliases, the per-execution publication, recovery and base
+/// bookmarks, teardown-preserved tips, and archived unpublished heads.
+/// Bookmarks live in the shared jj store, so forgetting one here
 /// would also drop it for every other lease that depends on it. (`pr/<n>`
 /// aliases never reach the forget path: [`repair_conflicted_bookmarks`]
 /// repairs them in place instead.)
-const SHARED_POINTER_BOOKMARK_PREFIXES: [&str; 4] = ["pr/", "boss/", "boss-recovery/", "boss-base/"];
+const SHARED_POINTER_BOOKMARK_PREFIXES: [&str; 6] = [
+    "pr/",
+    "boss/",
+    "boss-recovery/",
+    "boss-base/",
+    "preserved/",
+    "preserved-archive/",
+];
 
 fn is_shared_pointer_bookmark(bookmark: &str) -> bool {
     SHARED_POINTER_BOOKMARK_PREFIXES
@@ -595,7 +603,14 @@ mod shared_pointer_tests {
 
     #[test]
     fn only_shared_pointer_namespaces_are_protected() {
-        for shared in ["pr/42", "boss/exec_1", "boss-recovery/exec_1", "boss-base/exec_1"] {
+        for shared in [
+            "pr/42",
+            "boss/exec_1",
+            "boss-recovery/exec_1",
+            "boss-base/exec_1",
+            "preserved/exec_1",
+            "preserved-archive/exec_1/abc",
+        ] {
             assert!(is_shared_pointer_bookmark(shared), "{shared}");
         }
         for owned in ["fix-burst", "feature/pr/42", "boss-ish"] {

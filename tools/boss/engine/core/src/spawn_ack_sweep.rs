@@ -968,22 +968,23 @@ pub(crate) async fn reap_never_started_spawn(
     // An overdue or failed ingress does not prove the workspace was
     // unoccupied: a driver may have run unobserved. Release relies on the
     // pane teardown above preventing further pane-hosted worker progress,
-    // not on missing signals. Keeping the lease after teardown would leave
-    // it warmed by DB heartbeats until TTL, as in the 2026-07-30 incident. Mirrors
+    // not on missing signals. The inferred-death helper still runs the
+    // preservation gate before cube release, so unpushed work is bookmarked.
+    // Keeping the lease after teardown would leave it warmed by DB
+    // heartbeats until TTL, as in the 2026-07-30 incident. Mirrors
     // `lost_workspace_sweep::run_one_pass`. Best-effort: a lease already
     // gone is the common benign case, so failure is `debug`, not `warn`.
-    if let Some(lease_id) = execution.cube_lease_id.as_deref()
-        && let Err(err) = ctx
-            .cube_client
-            .force_release_lease(lease_id, Some(orphan_reason.as_str()))
-            .await
-    {
-        tracing::debug!(
-            execution_id,
-            lease_id,
-            error = %format!("{err:#}"),
-            "reap-never-started-spawn: best-effort cube lease force-release failed (likely already released)",
-        );
+    if execution.cube_lease_id.is_some() {
+        crate::workspace_lease_release::release_lease_after_inferred_death(
+            ctx.work_db,
+            execution,
+            crate::workspace_lease_release::PaneStatus::Gone,
+            ctx.cube_client.force_release_lease(
+                execution.cube_lease_id.as_deref().expect("lease checked"),
+                Some(orphan_reason.as_str()),
+            ),
+        )
+        .await;
     }
 
     // Structured event for bossctl dispatch tail.

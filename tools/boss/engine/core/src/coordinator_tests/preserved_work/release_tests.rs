@@ -1,6 +1,7 @@
 use super::*;
 use crate::workspace_lease_release::{
-    DbBookmarkGate, EmptyOccupancy, LeaseReleaseOutcome, PaneStatus, ReleaseEvidence, TerminalCause, apply_release,
+    BookmarkGate, BookmarkStatus, DbBookmarkGate, EmptyOccupancy, LeaseReleaseOutcome, PaneStatus, ReleaseEvidence,
+    TerminalCause, apply_release,
 };
 use recovery::{ExecutionBookmark, PreservedTip, RestoreReport};
 
@@ -55,6 +56,7 @@ async fn failed_self_retry_then_pre_start_release_retains_recorded_work() {
         let tip = recovery::preserve(&LocalJj, &record, &repo.worker, None, None)
             .await
             .unwrap()
+            .tip
             .unwrap();
         db.record_preserved_tip(&execution.id, &tip).unwrap();
         rusqlite::Connection::open(&db_path).unwrap().execute(
@@ -153,6 +155,7 @@ async fn conflicted_preserved_bookmark_releases_clean_workspace_without_moving_v
     let tip = recovery::preserve(&LocalJj, &record, &repo.worker, None, None)
         .await
         .unwrap()
+        .tip
         .unwrap();
     db.record_preserved_tip(&execution.id, &tip).unwrap();
     let op = JjRepo::run(&repo.repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
@@ -213,6 +216,7 @@ async fn missing_bookmark_failed_restore_then_release_keeps_recorded_tip() {
     let tip = recovery::preserve(&LocalJj, &record, &repo.worker, None, None)
         .await
         .unwrap()
+        .tip
         .unwrap();
     db.record_preserved_tip(&execution.id, &tip).unwrap();
     JjRepo::run(
@@ -290,6 +294,7 @@ async fn conflicted_preserved_bookmark_is_resolved_so_later_work_can_be_preserve
     let tip = recovery::preserve(&LocalJj, &record, &repo.worker, None, None)
         .await
         .unwrap()
+        .tip
         .unwrap();
     db.record_preserved_tip(&execution.id, &tip).unwrap();
     let op = JjRepo::run(&repo.repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
@@ -370,4 +375,93 @@ async fn conflicted_preserved_bookmark_is_resolved_so_later_work_can_be_preserve
         std::fs::read_to_string(repo.replacement.join("extra")).unwrap(),
         "later unpublished"
     );
+    assert!(
+        db.list_attention_items(&execution.id).unwrap().iter().any(|item| {
+            item.kind == boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND
+                && item.body_markdown.contains("preserved-archive/")
+        }),
+        "unselected unpublished variants must raise restage attention"
+    );
+}
+
+#[tokio::test]
+async fn inspect_verdict_releases_the_lease_and_raises_inspection_attention() {
+    let dir = tempdir().unwrap();
+    let repo = JjRepo::new(dir.path());
+    let db_path = dir.path().join("boss.db");
+    let (db, execution, _) = super::super::blocked_workspace::blocked_pair(&db_path);
+    export_origin(&repo);
+    let record = recovery::create(&LocalJj, &repo.worker, &execution.id, "local")
+        .await
+        .unwrap();
+    db.record_execution_bookmark(&record).unwrap();
+    std::fs::write(repo.worker.join("fix"), "unpublished fix").unwrap();
+    let tip = recovery::preserve(&LocalJj, &record, &repo.worker, None, None)
+        .await
+        .unwrap()
+        .tip
+        .unwrap();
+    db.record_preserved_tip(&execution.id, &tip).unwrap();
+    JjRepo::run(&repo.replacement, &["new", "main"]);
+    std::fs::write(repo.replacement.join("other"), "another occupant").unwrap();
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET cube_lease_id = 'retry', workspace_path = ?2 WHERE id = ?1",
+            rusqlite::params![execution.id, repo.replacement.to_str().unwrap()],
+        )
+        .unwrap();
+    let execution = db.get_execution(&execution.id).unwrap();
+    let outcome = apply_release(
+        &db,
+        &execution,
+        "retry",
+        ReleaseEvidence {
+            cause: TerminalCause::ProvenCompleted,
+            pane: PaneStatus::Gone,
+            occupancy: &EmptyOccupancy,
+            bookmark: &DbBookmarkGate { db: &db, adapter: None },
+        },
+        async { Ok(()) },
+    )
+    .await;
+    assert_eq!(outcome, LeaseReleaseOutcome::Released);
+    assert_eq!(db.preserved_tip(&execution.id).unwrap(), Some(tip.clone()));
+    let items = db.list_attention_items(&execution.id).unwrap();
+    let inspect = items
+        .iter()
+        .find(|item| {
+            item.kind == boss_engine_storage_values::attention_kinds::PRESERVED_WORK_NEEDS_INSPECTION_ATTENTION_KIND
+        })
+        .expect("teardown inspect verdict must raise inspection attention");
+    assert!(
+        inspect.body_markdown.contains(&tip.commit_id),
+        "{}",
+        inspect.body_markdown
+    );
+    assert!(
+        inspect.body_markdown.contains("unpublished"),
+        "{}",
+        inspect.body_markdown
+    );
+}
+
+#[tokio::test]
+async fn db_bookmark_gate_rejects_an_open_bookmark_create_failure() {
+    let dir = tempdir().unwrap();
+    let (db, execution, _) = super::super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
+    db.create_attention_item(boss_protocol::CreateAttentionItemInput {
+        execution_id: Some(execution.id.clone()),
+        work_item_id: None,
+        kind: boss_engine_storage_values::attention_kinds::EXECUTION_BOOKMARK_CREATE_FAILED_ATTENTION_KIND.to_owned(),
+        status: None,
+        title: "bookmark create failed".into(),
+        body_markdown: "store unavailable".into(),
+        resolved_at: None,
+    })
+    .unwrap();
+    assert!(matches!(
+        DbBookmarkGate { db: &db, adapter: None }.status(&execution).await,
+        BookmarkStatus::Unconfirmed(_)
+    ));
 }

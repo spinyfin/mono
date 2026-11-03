@@ -113,8 +113,8 @@ crate::stub_host_adapter! { FixedCollectAdapter {
     async fn probe_workspace_occupancy(&self, _: &std::path::Path) -> anyhow::Result<crate::workspace_lease_release::Occupancy> {
         Ok(crate::workspace_lease_release::Occupancy::Empty)
     }
-    async fn confirm_workspace_recovery(&self, record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark, workspace: &std::path::Path, _recorded: Option<&boss_engine_recovery::execution_bookmark::PreservedTip>, _since_unix: Option<i64>) -> anyhow::Result<Option<boss_engine_recovery::execution_bookmark::PreservedTip>> {
-        crate::test_support::confirm_remote_test_recovery(record, workspace, self.host_id).map(|()| None)
+    async fn confirm_workspace_recovery(&self, record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark, workspace: &std::path::Path, _recorded: Option<&boss_engine_recovery::execution_bookmark::PreservedTip>, _since_unix: Option<i64>) -> anyhow::Result<boss_engine_recovery::execution_bookmark::PreserveOutcome> {
+        crate::test_support::confirm_remote_test_recovery(record, workspace, self.host_id).map(|()| Default::default())
     }
 } }
 

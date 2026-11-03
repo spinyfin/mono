@@ -63,6 +63,12 @@ State is in memory and starts empty on engine restart; a combination that is sti
 
 `workspace_lease_unreleased` (a release gate kept the lease: unconfirmed recovery bookmark) and `workspace_lease_release_failed` (every gate passed but cube's release call failed) are both `ProducerReconciles`. `apply_release` (`engine/core/src/workspace_lease_release.rs`) resolves them for the execution as soon as the lease is released or found already gone, so a later sweep or gate pass that returns the workspace lowers them. `workspace_lease_release_failed` is also the durable proof the leftover-lease sweep uses to retry a row that never recorded a worker pid.
 
+## Preserved-work attention
+
+`preserved_work_not_restaged` is `ProducerReconciles`. Dispatch files it when a recorded preserved tip cannot be restaged into a new lease, including when restore selects one conflicted variant and archives the unpublished others under `preserved-archive/<execution>/<commit>`. A later successful restage of that execution's preserved work that leaves no unpublished unselected variants resolves it; starting fresh is not evidence the work was recovered.
+
+`preserved_work_needs_inspection` is `HumanDecision`. Teardown files it when the workspace tip and the existing preserved bookmark cannot be combined. The lease is still released and nothing is deleted; the item names both tips. A later restage of the old tip does not recover the new workspace tip named in the item.
+
 ## Adding a new attention kind
 
 Add an entry to `ATTENTION_LIFECYCLES` at the same time you add the kind. `ClearedBy::HumanDecision` is a perfectly good answer — an _undeclared_ kind is not. Filing an unregistered kind emits a `tracing::warn!` from `warn_if_lifecycle_undeclared`, and `every_attention_kind_constant_in_the_crate_is_registered` fails if a constant exists with no entry.

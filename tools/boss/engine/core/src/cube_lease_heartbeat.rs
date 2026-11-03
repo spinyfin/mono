@@ -109,7 +109,7 @@
 //! its job, opened its PR, and exited by design, and must never be reaped
 //! just because its pane is (correctly) gone. On positive evidence of death
 //! from a *live* row the row is reaped and its lease is **actively
-//! force-released** via [`reap_and_release_lease`] — unlike the dead-PID
+//! released through the preservation gate** via [`reap_and_release_lease`] — unlike the dead-PID
 //! skip above, which deliberately leaves the lease to expire on its own TTL,
 //! a DB-fallback row has no other mechanism watching it, so waiting out the
 //! (24 h) TTL is not an option. Everything short of positive evidence from a
@@ -1206,7 +1206,9 @@ async fn auto_reap_dead_lease(
 /// kind-specific bookkeeping, and — unlike the other DB-driven local
 /// reapers ([`crate::dead_pane_sweep`], [`crate::lost_workspace_sweep`]),
 /// which deliberately preserve the lease so a same-workspace resume can
-/// reclaim it — best-effort force-release the cube lease. Used by both
+/// reclaim it — release the cube lease through
+/// [`crate::workspace_lease_release::release_lease_after_inferred_death`]
+/// so unpublished work is preserved first. Used by both
 /// [`auto_reap_dead_lease`] (consecutive-heartbeat-failure path, confirmed
 /// via `cube workspace list`) and the DB-fallback sweep's own durable
 /// liveness gate (confirmed via a dead or never-reported worker pid) in
@@ -1307,14 +1309,13 @@ async fn reap_and_release_lease(
     // logged rather than propagated.
     match ctx.cubes.cube_for_execution(&execution.id).await {
         Ok(resolved) => {
-            if let Err(err) = resolved.cube.force_release_lease(lease_id, Some(reason)).await {
-                tracing::debug!(
-                    execution_id = %execution.id,
-                    lease_id,
-                    error = %format!("{err:#}"),
-                    "cube-lease heartbeat: best-effort force-release after reap failed (likely already released)",
-                );
-            }
+            crate::workspace_lease_release::release_lease_after_inferred_death(
+                ctx.work_db,
+                execution,
+                crate::workspace_lease_release::PaneStatus::Gone,
+                resolved.cube.force_release_lease(lease_id, Some(reason)),
+            )
+            .await;
         }
         Err(err) => tracing::warn!(
             execution_id = %execution.id,
@@ -2096,6 +2097,7 @@ mod tests {
         let product_id = create_product(&db);
         let work_item_id = create_chore(&db, &product_id);
         let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-dead-forever");
+        record_preservation_off_host(&db, &execution_id, "off-host");
 
         let live_states = LiveWorkerStateRegistry::new();
         register_slot(&live_states, 1, &execution_id, std::process::id() as i32);
@@ -2273,6 +2275,7 @@ mod tests {
         let work_item_id = create_chore(&db, &product_id);
         db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
         let execution_id = running_execution_on_host_with_lease(&db, &work_item_id, "lease-anaplian", "anaplian");
+        record_preservation_off_host(&db, &execution_id, "anaplian");
         db.set_host_enabled("anaplian", false).unwrap();
 
         let live_states = LiveWorkerStateRegistry::new();
@@ -2519,6 +2522,7 @@ mod tests {
         let product_id = create_product(&db);
         let work_item_id = create_chore(&db, &product_id);
         let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-durably-dead");
+        record_preservation_off_host(&db, &execution_id, "off-host");
         db.set_run_shell_pid_for_execution(&execution_id, dead_pid() as i64)
             .unwrap();
         // Past the shared pid-death grace window, so the durable signal
@@ -2580,6 +2584,7 @@ mod tests {
         let product_id = create_product(&db);
         let work_item_id = create_chore(&db, &product_id);
         let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-never-attached");
+        record_preservation_off_host(&db, &execution_id, "off-host");
         // No shell pid ever recorded. Push the *current run's* start well past
         // the pane-attach deadline so the age-based classifier fires without a
         // real sleep — ages off `work_runs.created_at`, not
@@ -2854,5 +2859,113 @@ mod tests {
             1,
             "a no-longer-seen execution's streak must have been dropped, so this is a fresh count"
         );
+    }
+
+    use boss_engine_recovery::execution_bookmark::{self as recovery, LocalJj};
+    use boss_engine_test_git::jj::JjRepo;
+
+    fn record_preservation_off_host(db: &WorkDb, execution_id: &str, host_id: &str) {
+        db.record_execution_bookmark(&recovery::ExecutionBookmark {
+            execution_id: execution_id.to_owned(),
+            repo_path: std::path::PathBuf::from("/tmp/off-host-repo"),
+            host_id: host_id.to_owned(),
+            base_commit: None,
+        })
+        .unwrap();
+    }
+
+    fn export_origin(repo: &JjRepo) {
+        JjRepo::run(&repo.repo, &["bookmark", "set", "main", "-r", "@"]);
+        JjRepo::run(&repo.repo, &["git", "export"]);
+        JjRepo::run(
+            &repo.repo,
+            &[
+                "git",
+                "remote",
+                "add",
+                "origin",
+                repo.repo.join(".jj/repo/store/git").to_str().unwrap(),
+            ],
+        );
+        JjRepo::run(&repo.repo, &["git", "fetch"]);
+    }
+
+    fn preserved_names(repo: &JjRepo, execution_id: &str) -> Vec<String> {
+        let name = recovery::preserved_name(execution_id);
+        JjRepo::run(&repo.repo, &["bookmark", "list", "-T", "name ++ \"\\n\""])
+            .lines()
+            .filter(|line| *line == name)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    async fn reap_dead_lease_with_workspace(pushed: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = JjRepo::new(dir.path());
+        export_origin(&repo);
+        let (_db_dir, db) = open_db_arc();
+        let product_id = create_product(&db);
+        let work_item_id = create_chore(&db, &product_id);
+        let lease_id = if pushed { "lease-pushed" } else { "lease-unpushed" };
+        let execution_id = running_execution_with_lease(&db, &work_item_id, lease_id);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET workspace_path = ?2 WHERE id = ?1",
+                rusqlite::params![execution_id, repo.worker.to_str().unwrap()],
+            )
+            .unwrap();
+        let record = recovery::create(&LocalJj, &repo.worker, &execution_id, "local")
+            .await
+            .unwrap();
+        db.record_execution_bookmark(&record).unwrap();
+        std::fs::write(repo.worker.join("work.txt"), "worker edits").unwrap();
+        if pushed {
+            JjRepo::run(&repo.worker, &["bookmark", "set", "published", "-r", "@"]);
+            JjRepo::run(&repo.worker, &["git", "export"]);
+            JjRepo::run(&repo.repo, &["git", "fetch"]);
+            JjRepo::run(&repo.worker, &["new", "-m", "Empty trailing commit"]);
+        }
+        db.set_run_shell_pid_for_execution(&execution_id, dead_pid() as i64)
+            .unwrap();
+        db.force_started_at_for_test(
+            &execution_id,
+            boss_engine_utils::epoch_time::now_epoch_secs() - PANE_DEATH_GRACE_SECS - 300,
+        )
+        .unwrap();
+
+        let live_states = LiveWorkerStateRegistry::new();
+        let cube = Arc::new(RecordingCube::default());
+        let sink = RecordingDispatchEventSink::new();
+        let breaker = HeartbeatFailureBreaker::default();
+        let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+
+        assert_eq!(outcome.auto_reaped, 1, "dead worker pid must be reaped");
+        assert_eq!(cube.force_release_calls(), vec![lease_id.to_owned()]);
+        let names = preserved_names(&repo, &execution_id);
+        if pushed {
+            assert!(
+                names.is_empty(),
+                "pushed work must not leave a preserved bookmark: {names:?}"
+            );
+            assert!(db.preserved_tip(&execution_id).unwrap().is_none());
+        } else {
+            assert_eq!(
+                names.len(),
+                1,
+                "unpushed work must yield exactly one preserved bookmark: {names:?}"
+            );
+            assert!(db.preserved_tip(&execution_id).unwrap().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn db_fallback_reap_preserves_exactly_one_bookmark_for_unpushed_work() {
+        reap_dead_lease_with_workspace(false).await;
+    }
+
+    #[tokio::test]
+    async fn db_fallback_reap_creates_no_bookmark_for_pushed_work() {
+        reap_dead_lease_with_workspace(true).await;
     }
 }

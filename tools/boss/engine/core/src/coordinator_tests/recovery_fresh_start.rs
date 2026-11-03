@@ -169,7 +169,7 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
     assert_eq!(db.get_execution(&next.id).unwrap().status, ExecutionStatus::Running);
     assert_eq!(db.get_execution(&next.id).unwrap().pre_start_failure_count, 0);
     assert_eq!(cube.lease_calls.lock().await.len(), 1);
-    let archive = format!("preserved/{source}/{preserved}");
+    let archive = format!("preserved-archive/{source}/{preserved}");
     if kind.is_read_only_review() {
         assert_eq!(
             recovery::snapshot_pointers(&LocalJj, &record).await.unwrap(),
@@ -182,7 +182,13 @@ async fn fresh_start_on_host(kind: ExecutionKind, resume: bool, pr: bool, disabl
                 .unwrap()
                 .is_empty()
         );
-        assert!(JjRepo::run(&repo.repo, &["bookmark", "list", &format!("glob:preserved/{source}/*")]).is_empty());
+        assert!(
+            JjRepo::run(
+                &repo.repo,
+                &["bookmark", "list", &format!("glob:preserved-archive/{source}/*")]
+            )
+            .is_empty()
+        );
         assert!(
             db.list_open_attention_items_of_kind(crate::execution_bookmark_recovery::CHAIN_BLOCKED)
                 .unwrap()
@@ -395,7 +401,7 @@ async fn source_host_dispatch(full: bool) {
     assert!(
         JjRepo::run(
             &repo.repo,
-            &["bookmark", "list", &format!("glob:preserved/{}/*", prior.id)]
+            &["bookmark", "list", &format!("glob:preserved-archive/{}/*", prior.id)]
         )
         .is_empty()
     );
@@ -479,7 +485,7 @@ async fn stale_current_names_retry_adoption_without_retiring_valid_predecessor()
         .await
         .unwrap();
     assert!(retained);
-    let archive = format!("preserved/{}/{stale_head}", next.id);
+    let archive = format!("preserved-archive/{}/{stale_head}", next.id);
     assert_eq!(commit(&repo.repo, &archive), stale_head);
     let notes = db.list_attention_items_for_work_item(&next.work_item_id).unwrap();
     assert!(notes.iter().any(|note| note.body_markdown.contains(&archive)
@@ -637,7 +643,7 @@ async fn startup_pane_resume_archives_damaged_pointers_and_spawns() {
         .resume_pane_spawn_for_running_execution(&next)
         .await
         .unwrap();
-    assert_eq!(commit(&repo.repo, &format!("preserved/{}/{old}", next.id)), old);
+    assert_eq!(commit(&repo.repo, &format!("preserved-archive/{}/{old}", next.id)), old);
     let fresh = db.execution_bookmark(&next.id).unwrap();
     assert_eq!(fresh.base_commit, Some(commit(&repo.repo, "main")));
     assert!(recovery::diff(&LocalJj, &fresh).await.unwrap().is_empty());
@@ -754,7 +760,7 @@ async fn initialization_fallback(inherited: bool) {
     };
     assert_eq!(fresh.base_commit.unwrap(), commit(&repo.repo, "main"));
     assert!(!repo.replacement.join("lost.txt").exists());
-    assert_eq!(commit(&repo.repo, &format!("preserved/{source_id}/{old}")), old);
+    assert_eq!(commit(&repo.repo, &format!("preserved-archive/{source_id}/{old}")), old);
     assert_eq!(
         db.list_attention_items_for_work_item(&next.work_item_id).unwrap()[0].status,
         "resolved"

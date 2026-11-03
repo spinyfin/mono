@@ -239,7 +239,7 @@ impl HostAdapter for LocalHostAdapter {
         workspace: &Path,
         recorded: Option<&execution_bookmark::PreservedTip>,
         since_unix: Option<i64>,
-    ) -> anyhow::Result<Option<boss_engine_recovery::execution_bookmark::PreservedTip>> {
+    ) -> anyhow::Result<execution_bookmark::PreserveOutcome> {
         anyhow::ensure!(record.host_id == self.host_id(), "recovery host mismatch");
         execution_bookmark::preserve(&LocalJj, record, workspace, recorded, since_unix).await
     }
@@ -861,7 +861,7 @@ impl HostAdapter for SshHostAdapter {
         workspace: &Path,
         recorded: Option<&execution_bookmark::PreservedTip>,
         since_unix: Option<i64>,
-    ) -> anyhow::Result<Option<boss_engine_recovery::execution_bookmark::PreservedTip>> {
+    ) -> anyhow::Result<execution_bookmark::PreserveOutcome> {
         anyhow::ensure!(record.host_id == self.host_id(), "recovery host mismatch");
         execution_bookmark::preserve(self, record, workspace, recorded, since_unix).await
     }

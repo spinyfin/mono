@@ -86,7 +86,7 @@ async fn conflicted_and_diverged_targets_are_all_archived_before_release() {
     .unwrap();
     assert!(matches!(outcome, PruneOutcome::Published { .. }));
     for (name, commit) in archived {
-        assert!(name.starts_with("preserved/exec_archive_conflict/"));
+        assert!(name.starts_with("preserved-archive/exec_archive_conflict/"));
         assert_eq!(one(repo, &revision(&name)), commit);
     }
 }
@@ -209,7 +209,7 @@ async fn empty_run_needs_no_permanent_archive() {
 #[async_trait]
 impl Jj for ArchiveWriteFailure {
     async fn run(&self, repo: &Path, args: &[&str]) -> Result<String> {
-        if args.iter().any(|arg| arg.starts_with("preserved/")) {
+        if args.iter().any(|arg| arg.starts_with("preserved-archive/")) {
             anyhow::bail!("archive storage unavailable");
         }
         LocalJj.run(repo, args).await

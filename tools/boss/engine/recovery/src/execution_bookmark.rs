@@ -18,7 +18,7 @@ const EMPTY_SETUP_CHANGES: &str = r#"(empty() & description(exact:"")) ~ (merges
 mod preserved;
 #[cfg(test)]
 mod preserved_tests;
-pub use preserved::{PreservedTip, preserve, preserved_name};
+pub use preserved::{PreserveInspect, PreserveOutcome, PreservedTip, preserve, preserved_archive_name, preserved_name};
 mod preserved_restore;
 pub use preserved_restore::restore_preserved;
 
@@ -747,7 +747,7 @@ pub async fn release_heads(
         if unpublished.trim().is_empty() {
             continue;
         }
-        let archive = format!("preserved/{}/{}", record.execution_id, commit);
+        let archive = preserved_archive_name(&record.execution_id, &commit);
         jj.run(&record.repo_path, &["bookmark", "set", &archive, "-r", &commit])
             .await?;
         archived.push((archive, commit));

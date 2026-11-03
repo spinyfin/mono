@@ -4,7 +4,7 @@
 //! `apply_release` and the bookmark/occupancy gates) lives in
 //! `boss_engine_completion::workspace_lease_release` and is re-exported here.
 //!
-//! Resume reads preserved work from `boss-recovery/<execution>` bookmarks
+//! Resume reads preserved work from `preserved/<execution>` bookmarks
 //! in the shared jj store, never from the originating working copy.
 
 use std::future::Future;
@@ -36,7 +36,10 @@ impl WorkspaceOccupancy for HostOccupancy {
 
 /// Inferred-death helper used by pane/pid/lost-workspace reconcilers.
 /// Occupancy is scanned on the host; a live pane still mapped in
-/// `live_states` is treated as present.
+/// `live_states` is treated as present. Remote rows use
+/// [`OwningHostOccupancy`] with [`Occupancy::Empty`]: the caller has already
+/// proven the worker is gone, and an engine-host process scan cannot observe
+/// that workspace.
 pub async fn release_lease_after_inferred_death(
     work_db: &WorkDb,
     execution: &WorkExecution,
@@ -46,7 +49,11 @@ pub async fn release_lease_after_inferred_death(
     let Some(lease_id) = execution.cube_lease_id.as_deref() else {
         return LeaseReleaseOutcome::NoLease;
     };
+    let local = matches!(work_db.execution_host_id(&execution.id), Ok(None))
+        || matches!(work_db.execution_host_id(&execution.id), Ok(Some(host)) if host == "local");
     let snapshot = ProcessSnapshot::capture_async().await;
+    let owning = OwningHostOccupancy(Occupancy::Empty);
+    let occupancy: &dyn WorkspaceOccupancy = if local { &snapshot } else { &owning };
     apply_release(
         work_db,
         execution,
@@ -54,7 +61,7 @@ pub async fn release_lease_after_inferred_death(
         ReleaseEvidence {
             cause: TerminalCause::Inferred,
             pane,
-            occupancy: &snapshot,
+            occupancy,
             bookmark: &DbBookmarkGate {
                 db: work_db,
                 adapter: None,

@@ -30,6 +30,7 @@ async fn dispatch_prefers_preserved_work_over_retired_legacy_pointers() {
     let tip = recovery::preserve(&LocalJj, &record, &repo.worker, None, None)
         .await
         .unwrap()
+        .tip
         .unwrap();
     db.record_preserved_tip(&prior.id, &tip).unwrap();
     db.retire_execution_bookmark(&prior.id, "legacy pointers retired")
@@ -92,6 +93,7 @@ async fn undecidable_preserved_bookmark_starts_fresh_and_raises_one_attention() 
     let tip = recovery::preserve(&LocalJj, &record, &repo.worker, None, None)
         .await
         .unwrap()
+        .tip
         .unwrap();
     db.record_preserved_tip(&prior.id, &tip).unwrap();
     let name = recovery::preserved_name(&prior.id);
@@ -226,6 +228,7 @@ async fn self_retry_restages_preserved_work_when_legacy_pointers_are_retired() {
     let tip = recovery::preserve(&LocalJj, &record, &repo.worker, None, None)
         .await
         .unwrap()
+        .tip
         .unwrap();
     db.record_preserved_tip(&execution.id, &tip).unwrap();
     db.retire_execution_bookmark(&execution.id, "legacy pointers retired")
@@ -289,6 +292,7 @@ async fn pre_start_teardown_then_retry_preserves_later_unpublished_edits() {
     let inherited = recovery::preserve(&LocalJj, &prior_record, &repo.worker, None, None)
         .await
         .unwrap()
+        .tip
         .unwrap();
     db.record_preserved_tip(&prior.id, &inherited).unwrap();
     let (coordinator, _) = coordinator_for(db.clone());
@@ -489,11 +493,15 @@ async fn missing_preserved_bookmark_with_unresolvable_commit_raises_attention() 
     let mut tip = recovery::preserve(&LocalJj, &record, &repo.worker, None, None)
         .await
         .unwrap()
+        .tip
         .unwrap();
     JjRepo::run(
         &repo.repo,
         &["bookmark", "delete", &recovery::preserved_name(&prior.id)],
     );
+    // Both identities must be unresolvable: restore prefers the change id
+    // when the bookmark is missing, and a still-visible change would restage.
+    tip.change_id = "kqkqkqkqkqkqkqkqkqkqkqkqkqkqkqkq".into();
     tip.commit_id = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into();
     db.record_preserved_tip(&prior.id, &tip).unwrap();
     let (coordinator, _) = coordinator_for(db.clone());

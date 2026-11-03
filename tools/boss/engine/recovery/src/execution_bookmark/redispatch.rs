@@ -25,6 +25,11 @@ pub struct RestoreReport {
     #[serde(default)]
     #[builder(default)]
     pub discarded_tips: String,
+    /// Unpublished unselected variants that still have a named archive
+    /// reference. Dispatch raises attention when this is non-empty.
+    #[serde(default)]
+    #[builder(default)]
+    pub unrestaged_unpublished: String,
 }
 
 impl RestoreReport {

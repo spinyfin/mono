@@ -42,7 +42,16 @@ impl ExecutionCoordinator {
             Ok(Some(report)) => {
                 let has_work = !report.commits.trim().is_empty();
                 self.work_db.record_execution_restore_report(&execution.id, &report)?;
-                if let Err(err) = self
+                if !report.unrestaged_unpublished.trim().is_empty() {
+                    let name = preserved_name(&prior.id);
+                    let err = pointer_integrity_error(format!(
+                        "unselected preserved variants still have unpublished work: {}",
+                        report.unrestaged_unpublished
+                    ));
+                    if let Err(note_error) = self.preserved_work_attention(prior, &name, &err) {
+                        tracing::error!(?note_error, "could not raise preserved-work attention");
+                    }
+                } else if let Err(err) = self
                     .work_db
                     .resolve_attention_kind_for_execution(&prior.id, PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND)
                 {
