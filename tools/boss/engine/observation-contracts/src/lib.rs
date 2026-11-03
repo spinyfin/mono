@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use anyhow::Result;
 use async_trait::async_trait;
 use boss_github::RequiredCheckFailure;
+use boss_protocol::{ExecutionStatus, WorkExecution};
+use boss_work_db::{LatePrCandidate, PendingMergeCheck, ReviewBatchDispatch, WorkDb};
 
 /// One slice of GitHub-reported PR lifecycle state, captured by a
 /// single `gh pr view` round-trip. Carries everything the poller's
@@ -391,9 +393,6 @@ impl MergeQueueTimeline for UnsupportedMergeQueueTimeline {
         anyhow::bail!("queue timeline lookup unsupported by this verifier")
     }
 }
-
-use boss_protocol::{ExecutionStatus, WorkExecution};
-use boss_work_db::{LatePrCandidate, PendingMergeCheck, ReviewBatchDispatch, WorkDb};
 
 /// What happened during a stop event handler invocation. The runtime
 /// only logs this; tests assert on it.

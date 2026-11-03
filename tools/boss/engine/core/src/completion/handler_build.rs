@@ -39,6 +39,8 @@ impl WorkerCompletionHandler {
             staged_unobserved_commands: Arc::new(crate::codex_unobserved_command::UnobservedCommandTracker::new()),
             feature_flags: Arc::new(crate::feature_flags::FeatureFlagsStore::new(std::path::PathBuf::new())),
             branch_verifier: Arc::new(CommandBranchVerifier::new()),
+            merge_queue_timeline: None,
+            branch_verifier_overridden: false,
             metrics: local_metrics,
             merge_probe: Arc::new(NoopMergeProbe),
             pr_poll_state_writer: Arc::new(NoopPrPollStateWriter),
@@ -323,12 +325,18 @@ impl WorkerCompletionHandler {
     }
 
     /// Wire an externally-owned [`BranchVerifier`] into this handler
-    /// for Layer-2 staged-URL branch validation. `app.rs` does not need
-    /// to call this — the default `CommandBranchVerifier` is correct for
-    /// production. Tests that exercise the staged-URL path must call
-    /// this with a stub to avoid live `gh pr view` calls.
+    /// for Layer-2 staged-URL branch validation. Replaces the default
+    /// [`CommandBranchVerifier`], including any merge-queue timeline
+    /// already applied to it. `app.rs` does not need to call this — the
+    /// default `CommandBranchVerifier` is correct for production. Tests
+    /// that exercise the staged-URL path must call this with a stub to
+    /// avoid live `gh pr view` calls. A custom verifier that still needs
+    /// queue-dequeue evidence must attach the timeline itself;
+    /// [`Self::with_merge_queue_timeline`] will not overwrite this
+    /// injection.
     pub fn with_branch_verifier(mut self, verifier: Arc<dyn BranchVerifier>) -> Self {
         self.branch_verifier = verifier;
+        self.branch_verifier_overridden = true;
         self
     }
 
@@ -491,10 +499,25 @@ impl WorkerCompletionHandler {
         self
     }
 
-    /// Configure the command verifier's merge-queue timeline transport.
+    /// Store the merge-queue timeline used by the default
+    /// [`CommandBranchVerifier`]. Applied whenever that default is in
+    /// use; does not replace a verifier installed via
+    /// [`Self::with_branch_verifier`].
     pub fn with_merge_queue_timeline(mut self, timeline: Arc<dyn MergeQueueTimeline>) -> Self {
-        self.branch_verifier = Arc::new(CommandBranchVerifier::new().with_queue_timeline(timeline));
+        self.merge_queue_timeline = Some(timeline);
+        self.apply_merge_queue_timeline_to_default_verifier();
         self
+    }
+
+    fn apply_merge_queue_timeline_to_default_verifier(&mut self) {
+        if self.branch_verifier_overridden {
+            return;
+        }
+        let mut verifier = CommandBranchVerifier::new();
+        if let Some(timeline) = self.merge_queue_timeline.clone() {
+            verifier = verifier.with_queue_timeline(timeline);
+        }
+        self.branch_verifier = Arc::new(verifier);
     }
 
     /// Configure the writer for completion's on-transition CI pre-fetch.

@@ -1328,7 +1328,7 @@
           "FILE:@@//tools/boss/tmux/Cargo.toml fc69fee5b4fcb1e050bf283b5b3c2eafe15a4f378cc89af6d213309435c0864b",
           "FILE:@@//tools/boss/github_tracker/Cargo.toml f182ad9a1a8beb6272d248fbf18e79e5523a1ca97d6fcd88d1dfe3d509c82482",
           "FILE:@@//tools/boss/keychain/Cargo.toml 9f498e48da24a35153491adc0dbd771967359e6ede5b58ad3f4f09176978f9ea",
-          "FILE:@@//tools/boss/engine/observation-contracts/Cargo.toml 1873e9da3b32924107001fd9565516ca6d7e830c51026fdf4e9c214cfe558b9d",
+          "FILE:@@//tools/boss/engine/observation-contracts/Cargo.toml 897a9a58ada6714cfa7004156ac005e596a4171e6614a0557c52ec8e65eb7e75",
           "FILE:@@//tools/boss/engine/single-flight/Cargo.toml e4304ba813bf545bd1c50f35fc0a900b62ac99a5dcaaffa8bedd7f20fa660fdd",
           "FILE:@@//tools/boss/engine/timer-wheel/Cargo.toml 6f1e9fa4c08674baa9b45a9a97f93a5a1fc4a836984e1321d8c91802bc9013b1",
           "FILE:@@//tools/boss/engine/transcript-markdown/Cargo.toml 9770eb9c70a273392800affb7854fa03fe3076e65afb0169368afdf6dda47119",

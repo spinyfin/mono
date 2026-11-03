@@ -658,10 +658,17 @@ impl Default for CommandBranchVerifier {
 }
 
 impl CommandBranchVerifier {
+    /// Command verifier with no merge-queue timeline transport.
+    /// [`BranchVerifier::fetch_queue_dequeues`] returns the unsupported
+    /// error until [`Self::with_queue_timeline`] installs one. Callers that
+    /// only read PR head refs (the PR-binding repair sweep) can keep this
+    /// default.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Install the merge-queue timeline used by
+    /// [`BranchVerifier::fetch_queue_dequeues`].
     pub fn with_queue_timeline(mut self, timeline: Arc<dyn MergeQueueTimeline>) -> Self {
         self.queue_timeline = timeline;
         self
@@ -1423,6 +1430,15 @@ pub struct WorkerCompletionHandler {
     /// Tests that exercise the staged-URL path must wire in a stub via
     /// [`Self::with_branch_verifier`] to avoid live network calls.
     branch_verifier: Arc<dyn BranchVerifier>,
+    /// Merge-queue timeline applied to the default [`CommandBranchVerifier`].
+    /// Stored independently so [`Self::with_merge_queue_timeline`] cannot
+    /// replace a verifier installed via [`Self::with_branch_verifier`].
+    merge_queue_timeline: Option<Arc<dyn MergeQueueTimeline>>,
+    /// True after [`Self::with_branch_verifier`] replaces the default
+    /// command verifier. Timeline application then leaves the injected
+    /// verifier in place.
+    #[builder(default)]
+    branch_verifier_overridden: bool,
     /// Engine-wide counter registry. Defaults to a fresh local registry
     /// with the PR-capture counters pre-registered so tests that do not
     /// call `with_metrics` still get valid increments. Production wires
@@ -2382,5 +2398,96 @@ mod queue_timeline_contract_tests {
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "queue timeline lookup unsupported by this verifier");
+    }
+
+    struct InjectedVerifier;
+
+    #[async_trait]
+    impl BranchVerifier for InjectedVerifier {
+        async fn fetch_pr_head_ref(&self, _: &str, _: u64) -> Result<String> {
+            Ok("injected".into())
+        }
+        async fn fetch_pr_head_oid(&self, _: &str, _: u64) -> Result<String> {
+            Ok("oid".into())
+        }
+        async fn fetch_pr_head_oid_fresh(&self, _: &str, _: u64) -> Result<String> {
+            Ok("oid".into())
+        }
+        async fn fetch_diff_line_count(&self, _: &str, _: &str, _: &str) -> Result<u64> {
+            Ok(0)
+        }
+        async fn fetch_pr_base_ref(&self, _: &str, _: u64) -> Result<String> {
+            Ok("main".into())
+        }
+        async fn fetch_diff_signature(&self, _: &str, _: &str, _: &str) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn fetch_pr_title_and_body(&self, _: &str, _: u64) -> Result<(String, String)> {
+            Ok((String::new(), String::new()))
+        }
+        async fn fetch_queue_dequeues(&self, _: &str, _: u64) -> Result<Vec<MergeQueueDequeueEvent>> {
+            anyhow::bail!("injected verifier has no timeline");
+        }
+    }
+
+    fn handler_for_timeline_tests() -> (tempfile::TempDir, WorkerCompletionHandler) {
+        let (dir, db) = crate::test_support::open_db_arc();
+        let handler = WorkerCompletionHandler::new(
+            db,
+            Arc::new(CommandPrDetector::new()),
+            Arc::new(crate::test_support::NoopCube),
+            Arc::new(crate::test_support::RecordingPublisher::default()),
+            Arc::new(NoopWorkerPaneReleaser),
+            Arc::new(NoopProbeQueuer),
+        );
+        (dir, handler)
+    }
+
+    #[tokio::test]
+    async fn merge_queue_timeline_applies_to_default_command_verifier() {
+        let timeline = Arc::new(RecordingTimeline {
+            urls: Default::default(),
+            fail: false,
+        });
+        let (_dir, handler) = handler_for_timeline_tests();
+        let handler = handler.with_merge_queue_timeline(timeline.clone());
+        let events = handler
+            .branch_verifier
+            .fetch_queue_dequeues("example/repo", 7)
+            .await
+            .unwrap();
+        assert_eq!(events[0].reason, "FAILED_CHECKS");
+        assert_eq!(
+            timeline.urls.lock().unwrap().as_slice(),
+            &["https://github.com/example/repo/pull/7"]
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_queue_timeline_does_not_replace_injected_verifier() {
+        let timeline = Arc::new(RecordingTimeline {
+            urls: Default::default(),
+            fail: false,
+        });
+        let injected: Arc<dyn BranchVerifier> = Arc::new(InjectedVerifier);
+        for after_timeline in [false, true] {
+            let (_dir, handler) = handler_for_timeline_tests();
+            let handler = if after_timeline {
+                handler
+                    .with_merge_queue_timeline(timeline.clone())
+                    .with_branch_verifier(injected.clone())
+            } else {
+                handler
+                    .with_branch_verifier(injected.clone())
+                    .with_merge_queue_timeline(timeline.clone())
+            };
+            let err = handler
+                .branch_verifier
+                .fetch_queue_dequeues("example/repo", 7)
+                .await
+                .unwrap_err();
+            assert_eq!(err.to_string(), "injected verifier has no timeline");
+        }
+        assert!(timeline.urls.lock().unwrap().is_empty());
     }
 }

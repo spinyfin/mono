@@ -4,9 +4,6 @@ version.workspace = true
 edition.workspace = true
 workspace = "../../../.."
 
-[features]
-test-support = []
-
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }

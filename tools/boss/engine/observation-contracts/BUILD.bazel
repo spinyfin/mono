@@ -27,7 +27,6 @@ rust_library(
     aliases = {
         "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
     },
-    crate_features = ["test-support"],
     crate_name = "boss_observation_contracts",
     crate_root = "src/lib.rs",
     edition = "2024",
