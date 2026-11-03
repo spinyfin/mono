@@ -2,8 +2,10 @@
 //!
 //! The worker advances the execution bookmark before editing a new change;
 //! jj itself follows rewrites of the bookmarked change. Recovery never reads
-//! the originating working copy. A separate baseline preserves the initial
-//! state; published upstream history is excluded when checking for abandoned work.
+//! the originating working copy. The baseline is the commit id recorded on the
+//! execution row at dispatch (the PR head for a bound PR, the trunk commit for a
+//! fresh item), so rewriting or abandoning any bookmark never invalidates it;
+//! published upstream history is excluded when checking for abandoned work.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -24,9 +26,6 @@ pub use preserved::{
 };
 mod preserved_restore;
 pub use preserved_restore::restore_preserved;
-
-mod baseline;
-pub use baseline::checkpoint_baseline;
 
 mod pr_anchor;
 pub use pr_anchor::is_legacy_pr_anchor_blocker;
@@ -60,23 +59,12 @@ pub use reconcile::{
 #[cfg(test)]
 mod reconcile_tests;
 
-/// Which invariant a damaged pointer broke. The engine repairs the first
-/// three only against pointers it recorded itself (the PR head cube wrote,
-/// the baseline commit in the record, or the other head of the same
-/// execution). A missing or conflicted PR alias requires a fresh GitHub head
-/// lookup; other pointer failures cannot be repaired by merely re-running.
+/// Which invariant a damaged pointer broke. Lineage between the pointers and
+/// the baseline is deliberately not an invariant: jj rewrites commits and
+/// merges concurrent operations as a matter of course, so the recorded
+/// baseline commit id is a floor, never something the heads must descend from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PointerIntegrityKind {
-    /// A head no longer descends from `boss-base/<execution id>`: the
-    /// baseline sits on a variant of its change that the head's lineage
-    /// does not include (the change was rewritten under it).
-    NotDescended,
-    /// `boss-recovery/…` and `boss/…` are on different lines of history:
-    /// one followed the published PR lineage, the other a local rewrite.
-    Diverged,
-    /// `boss-base/<execution id>` no longer exists and the record carries
-    /// no baseline commit (or that commit is gone) while a head still does.
-    MissingBaseline,
     /// Reconciliation was attempted and the preserved work is not carried by
     /// anything the engine can vouch for. Nothing was moved.
     NotContained,
@@ -103,13 +91,13 @@ impl std::fmt::Display for PointerIntegrityError {
 
 impl std::error::Error for PointerIntegrityError {}
 
-/// The message a pointer that is not descended from its baseline reports,
-/// followed by ` boss-base/<execution id>` and the commits involved. Shared so a stored work-item blocker can
-/// be recognised exactly, rather than by a copied string.
+/// The message the retired lineage check reported, followed by
+/// ` boss-base/<execution id>`. Kept only so a stored work-item blocker written
+/// by an earlier engine can still be recognised exactly.
 pub const NOT_DESCENDED_MESSAGE: &str = "preserved execution pointer is not descended from its engine-created baseline";
 
-/// The sentence two preserved pointers on different lines report, preceded
-/// by `preserved pointers <recovery> and <publication> `.
+/// The sentence the retired divergence check reported, preceded by
+/// `preserved pointers <recovery> and <publication> `. Legacy blocker recognition only.
 pub const DIVERGED_MESSAGE: &str = "diverged; refusing to drop either history";
 
 /// The sentence a bookmark that does not resolve reports, preceded by
@@ -138,17 +126,6 @@ pub fn pointer_integrity_kind(error: &anyhow::Error) -> Option<PointerIntegrityK
         .chain()
         .find_map(|cause| cause.downcast_ref::<PointerIntegrityError>())
         .map(|cause| cause.kind)
-}
-
-/// True when `error` is one of the failures [`reconcile`] can repair from an
-/// engine-recorded pointer: a stranded or missing baseline, or diverged heads.
-pub fn is_reconcilable_pointer_error(error: &anyhow::Error) -> bool {
-    matches!(
-        pointer_integrity_kind(error),
-        Some(
-            PointerIntegrityKind::NotDescended | PointerIntegrityKind::Diverged | PointerIntegrityKind::MissingBaseline
-        )
-    )
 }
 
 fn is_execution_id(text: &str) -> bool {
@@ -234,9 +211,9 @@ pub struct ExecutionBookmark {
     pub execution_id: String,
     pub repo_path: PathBuf,
     pub host_id: String,
-    /// The last checkpointed baseline commit. This identity, or a verified
-    /// evolution successor, can rebuild a missing baseline bookmark.
-    /// Legacy records may lack this provenance.
+    /// The baseline commit id recorded at dispatch: the floor of this
+    /// execution's work. Recovery reads this, never the `boss-base/…` bookmark.
+    /// Legacy records may lack it, in which case trunk is the floor.
     #[serde(default)]
     pub base_commit: Option<String>,
 }
@@ -368,31 +345,6 @@ async fn resolve_optional(jj: &dyn Jj, repo: &Path, bookmark: &str) -> Result<Op
     Ok(ids.first().map(|id| (*id).to_owned()))
 }
 
-/// True when `commit` is an ancestor of (or is) every head of the record.
-async fn commit_in_ancestry(jj: &dyn Jj, record: &ExecutionBookmark, commit: &str, heads: &Heads) -> Result<bool> {
-    let ancestry = heads
-        .named(record)
-        .iter()
-        .map(|(_, head)| format!("::{head}"))
-        .collect::<Vec<_>>()
-        .join(" & ");
-    let out = jj
-        .run(
-            &record.repo_path,
-            &[
-                "--ignore-working-copy",
-                "log",
-                "--no-graph",
-                "-r",
-                &format!("{commit} & ({ancestry})"),
-                "-T",
-                "commit_id",
-            ],
-        )
-        .await?;
-    Ok(out.trim() == commit)
-}
-
 /// True when `commit` (a full commit id) exists in the store, visible or not.
 async fn commit_exists(jj: &dyn Jj, repo: &Path, commit: &str) -> Result<bool> {
     if commit.is_empty() || !commit.bytes().all(|c| c.is_ascii_hexdigit()) {
@@ -449,86 +401,49 @@ impl Heads {
     }
 }
 
-/// The commits the engine's three references for one execution resolve to.
-/// Produced by [`resolve_pointers`], consumed by the lineage check and by
-/// reconciliation.
+/// The recovery head and the floor of the execution's work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Pointers {
+    /// A revset naming the floor: the recorded baseline commit id, or `trunk()`.
     pub(crate) base: String,
-    /// False when `boss-base/…` is gone and `base` came from the record's
-    /// `base_commit` instead; the bookmark can be recreated from it.
-    pub(crate) base_bookmarked: bool,
     pub(crate) heads: Heads,
-}
-
-impl Pointers {
-    /// `(bookmark name, commit)` for each head that exists.
-    pub(crate) fn heads(&self, record: &ExecutionBookmark) -> Vec<(String, String)> {
-        self.heads.named(record)
-    }
 }
 
 pub(crate) async fn resolve_heads(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<Heads> {
     let recovery = resolve_optional(jj, &record.repo_path, &record.head()).await?;
     let publication = resolve_optional(jj, &record.repo_path, &record.publication()).await?;
     if recovery.is_none() && publication.is_none() {
-        // Checked before the baseline so a fully deleted record reports as
-        // missing rather than as a baseline integrity failure.
         return Err(missing_heads_error(record));
     }
     Ok(Heads { recovery, publication })
 }
 
-fn missing_baseline_error(record: &ExecutionBookmark, heads: &Heads) -> anyhow::Error {
-    let at = heads
-        .named(record)
-        .into_iter()
-        .map(|(bookmark, commit)| format!("{bookmark} is at {commit}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let recorded = match &record.base_commit {
-        Some(commit) => format!("; the recorded baseline commit {commit} is not in the store"),
-        None => "; the record carries no baseline commit".to_owned(),
-    };
-    pointer_integrity_error_of(
-        PointerIntegrityKind::MissingBaseline,
-        format!(
-            "recovery bookmark {} {UNRESOLVED_MESSAGE}; found 0 ({at}{recorded})",
-            record.base()
-        ),
-    )
-}
-
-/// The baseline commit: the `boss-base/…` bookmark when it exists, else the
-/// recorded commit, following verified evolution to a common ancestor of
-/// the heads when necessary. `Err(MissingBaseline)` when neither can be found.
-pub(crate) async fn resolve_base(jj: &dyn Jj, record: &ExecutionBookmark, heads: &Heads) -> Result<(String, bool)> {
-    if let Some(base) = resolve_optional(jj, &record.repo_path, &record.base()).await? {
-        let evolved = baseline::evolved_baseline(jj, record, &base, heads).await?;
-        let unchanged = evolved == base;
-        return Ok((evolved, unchanged));
-    }
+/// The floor of the execution's work: the commit id recorded on its row. A
+/// rewritten or abandoned baseline commit still exists in the store, so it
+/// keeps working as a floor; a record with no usable commit (legacy, or
+/// collected from the store) falls back to trunk. Neither is an error.
+pub(crate) async fn resolve_base(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
     if let Some(commit) = &record.base_commit
         && commit_exists(jj, &record.repo_path, commit).await?
     {
-        let evolved = baseline::evolved_baseline(jj, record, commit, heads).await?;
-        // An abandoned commit that was not rewritten and that the heads no
-        // longer descend from cannot serve as a baseline.
-        if evolved != *commit || commit_in_ancestry(jj, record, commit, heads).await? {
-            return Ok((evolved, false));
-        }
+        return Ok(commit.clone());
     }
-    Err(missing_baseline_error(record, heads))
+    Ok("trunk()".to_owned())
 }
 
 pub(crate) async fn resolve_pointers(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<Pointers> {
     let heads = resolve_heads(jj, record).await?;
-    let (base, base_bookmarked) = resolve_base(jj, record, &heads).await?;
-    Ok(Pointers {
-        base,
-        base_bookmarked,
-        heads,
-    })
+    let base = resolve_base(jj, record).await?;
+    Ok(Pointers { base, heads })
+}
+
+/// Work above the floor: everything the head reaches that the floor's own
+/// ancestry does not. Ancestry is subtracted by commit id, so the floor needs
+/// no bookmark and no descent relationship with the head: a head that was
+/// rebased away from it (or a floor that was abandoned) still has a
+/// well-defined range.
+pub(crate) fn above_floor(base: &str, head: &str) -> String {
+    format!("(::({head}) ~ ::({base}))")
 }
 
 /// True when `descendant` is reachable from `ancestor` (or is it).
@@ -550,53 +465,40 @@ pub(crate) async fn descends(jj: &dyn Jj, repo: &Path, ancestor: &str, descendan
     Ok(connected.trim() == descendant)
 }
 
-/// Pick the head to resume from: the one that descends from the other, both
-/// descended from the baseline. The two repairable failures name every
-/// commit involved so a blocked item can be understood without a jj session.
-pub(crate) async fn head_bookmark_of(jj: &dyn Jj, record: &ExecutionBookmark, pointers: &Pointers) -> Result<String> {
-    let base = &pointers.base;
-    for (bookmark, head) in pointers.heads(record) {
-        if !descends(jj, &record.repo_path, base, &head).await? {
-            return Err(pointer_integrity_error_of(
-                PointerIntegrityKind::NotDescended,
-                format!(
-                    "{NOT_DESCENDED_MESSAGE} {} ({base}); {bookmark} is at {head}",
-                    record.base()
-                ),
-            ));
-        }
-    }
+/// The head bookmarks to resume from. One head normally; the one that
+/// descends from the other when they sit on the same line. Two heads on
+/// different lines are not an integrity failure and neither is dropped: both
+/// are resumed, so work that only one of them carries is still recovered.
+pub(crate) async fn resume_heads(jj: &dyn Jj, record: &ExecutionBookmark, pointers: &Pointers) -> Result<Vec<String>> {
     match (&pointers.heads.recovery, &pointers.heads.publication) {
         // Unreachable while `resolve_heads` rejects two missing heads;
         // typed so an edit that moves it degrades instead of panicking.
         (None, None) => Err(missing_heads_error(record)),
         (Some(recovery), Some(publication)) if recovery != publication => {
-            if descends(jj, &record.repo_path, publication, recovery).await? {
-                return Ok(record.head());
-            }
             if descends(jj, &record.repo_path, recovery, publication).await? {
-                return Ok(record.publication());
+                return Ok(vec![record.publication()]);
             }
-            Err(pointer_integrity_error_of(
-                PointerIntegrityKind::Diverged,
-                format!(
-                    "preserved pointers {} and {} {DIVERGED_MESSAGE} ({} is at {recovery}, {} is at {publication}; baseline {} is at {base})",
-                    record.head(),
-                    record.publication(),
-                    record.head(),
-                    record.publication(),
-                    record.base()
-                ),
-            ))
+            if descends(jj, &record.repo_path, publication, recovery).await? {
+                return Ok(vec![record.head()]);
+            }
+            Ok(vec![record.head(), record.publication()])
         }
-        (Some(_), _) => Ok(record.head()),
-        (None, Some(_)) => Ok(record.publication()),
+        (Some(_), _) => Ok(vec![record.head()]),
+        (None, Some(_)) => Ok(vec![record.publication()]),
     }
 }
 
-async fn head_bookmark(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
+/// A revset naming every resumed head.
+pub(crate) fn heads_revset(heads: &[String]) -> String {
+    format!(
+        "({})",
+        heads.iter().map(|head| revision(head)).collect::<Vec<_>>().join(" | ")
+    )
+}
+
+pub(crate) async fn resume_heads_of(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<Vec<String>> {
     let pointers = resolve_pointers(jj, record).await?;
-    head_bookmark_of(jj, record, &pointers).await
+    resume_heads(jj, record, &pointers).await
 }
 
 /// Called after positioning, before a worker can run. Existing refs are errors:
@@ -658,13 +560,15 @@ pub async fn create_from(
                 ));
             }
             diff(jj, prior).await?;
-            inherited_base
-                .map(str::to_owned)
-                .unwrap_or_else(|| revision(&prior.base()))
+            match (inherited_base, &prior.base_commit) {
+                (Some(base), _) => base.to_owned(),
+                (None, Some(commit)) => commit.clone(),
+                (None, None) => positioned_base(jj, workspace).await?,
+            }
         } else if let Some(base) = inherited_base {
             base.to_owned()
         } else {
-            baseline::durable_baseline(jj, workspace).await?
+            positioned_base(jj, workspace).await?
         };
         jj.run(workspace, &["bookmark", "create", &record.base(), "-r", &baseline])
             .await?;
@@ -674,7 +578,7 @@ pub async fn create_from(
         )
         .await?;
         // The bookmark is the convenience; the commit is the baseline's identity.
-        record.base_commit = Some(resolve_created_base(jj, &record).await?);
+        record.base_commit = Some(resolve_commit(jj, workspace, &baseline).await?);
         // Validate through the shared store, not the workspace we just positioned.
         diff(jj, &record).await?;
         Ok(record.clone())
@@ -683,10 +587,27 @@ pub async fn create_from(
     result.map_err(|error: anyhow::Error| error.context(CreationFailure { record }))
 }
 
-async fn resolve_created_base(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
-    resolve_optional(jj, &record.repo_path, &record.base())
-        .await?
-        .ok_or_else(|| pointer_integrity_error(format!("recovery bookmark {} was not created", record.base())))
+/// The commit a freshly positioned workspace sits on: the PR head for a bound
+/// PR, the trunk commit for a fresh item. Cube leaves `@` as an empty,
+/// undescribed child of that commit (and `change create` adds the titled change
+/// above it), so the baseline is the nearest ancestor of `@-` that is not such
+/// setup state. The result is recorded as a commit id on the execution row.
+async fn positioned_base(jj: &dyn Jj, workspace: &Path) -> Result<String> {
+    resolve_commit(jj, workspace, &format!("heads(::@- ~ ({EMPTY_SETUP_CHANGES}))")).await
+}
+
+/// Resolve a revset to exactly one commit id.
+async fn resolve_commit(jj: &dyn Jj, repo: &Path, revset: &str) -> Result<String> {
+    let output = jj
+        .run(repo, &["log", "--no-graph", "-r", revset, "-T", "commit_id ++ \"\\n\""])
+        .await?;
+    let ids: Vec<_> = output.lines().filter(|s| !s.is_empty()).collect();
+    ensure!(
+        ids.len() == 1,
+        "expected exactly one baseline commit for {revset}; found {}",
+        ids.len()
+    );
+    Ok(ids[0].to_owned())
 }
 
 /// Clean reinitialisation for a self-retry whose own heads are both gone: drop
@@ -727,11 +648,7 @@ pub async fn release_heads(
         commits.insert(base.clone());
     }
     let mut archived = Vec::new();
-    let baseline = record.base_commit.as_deref().or_else(|| {
-        targets
-            .get(&record.base())
-            .and_then(|commits| (commits.len() == 1).then(|| commits[0].as_str()))
-    });
+    let baseline = record.base_commit.as_deref();
     for commit in commits {
         let base = format!("present({})", baseline.unwrap_or("root()"));
         let unpublished = jj
@@ -774,46 +691,28 @@ pub async fn release_heads(
 /// unavailable jj, and unrelated targets are errors, never empty results.
 pub async fn diff(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
     let pointers = resolve_pointers(jj, record).await?;
-    let head_bookmark = head_bookmark_of(jj, record, &pointers).await?;
-    let patch = jj
-        .run(
-            &record.repo_path,
-            &[
-                "--ignore-working-copy",
-                "diff",
-                "--git",
-                "--from",
-                &pointers.base,
-                "--to",
-                &revision(&head_bookmark),
-            ],
-        )
-        .await?;
-    Ok(crate::recovery_apply::filter_bookkeeping(&patch).text)
-}
-
-/// Validate the pointers and, when `boss-base/…` is gone but the record's
-/// own commit vouched for the heads, recreate the bookmark there. Called on
-/// the paths that are about to hand the history to a worker, so everything
-/// downstream (and the worker) sees the bookmark the record describes.
-pub(crate) async fn heal_baseline(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<Pointers> {
-    let pointers = resolve_pointers(jj, record).await?;
-    head_bookmark_of(jj, record, &pointers).await?;
-    if !pointers.base_bookmarked {
-        jj.run(
-            &record.repo_path,
-            &[
-                "bookmark",
-                "set",
-                &record.base(),
-                "-r",
-                &pointers.base,
-                "--allow-backwards",
-            ],
-        )
-        .await?;
+    let mut patches = String::new();
+    for head in resume_heads(jj, record, &pointers).await? {
+        let head = revision(&head);
+        let patch = jj
+            .run(
+                &record.repo_path,
+                &[
+                    "--ignore-working-copy",
+                    "diff",
+                    "--git",
+                    "--from",
+                    // The common ancestor tolerates a floor that the head no
+                    // longer descends from, after a rewrite or an abandon.
+                    &format!("fork_point(({}) | ({head}))", pointers.base),
+                    "--to",
+                    &head,
+                ],
+            )
+            .await?;
+        patches.push_str(&crate::recovery_apply::filter_bookkeeping(&patch).text);
     }
-    Ok(pointers)
+    Ok(patches)
 }
 
 /// Fork from the reference so later edits cannot rewrite the predecessor's work.
@@ -833,13 +732,13 @@ pub async fn restore_for_retry(
         jj.shared_repo(workspace).await? == record.repo_path,
         "recovery destination belongs to a different shared repository"
     );
-    heal_baseline(jj, record).await?;
     let has_work = !unpublished_diff(jj, record).await?.trim().is_empty();
     if !has_work && !self_retry {
         return Ok(false);
     }
-    let head = revision(&head_bookmark(jj, record).await?);
-    if self_retry {
+    let heads = resume_heads_of(jj, record).await?;
+    let head = heads_revset(&heads);
+    if self_retry && heads.len() == 1 {
         let empty_setup = jj
             .run(
                 workspace,
@@ -861,8 +760,12 @@ pub async fn restore_for_retry(
             return Ok(has_work);
         }
     }
-    jj.run(workspace, &["new", &head, "-m", "Resume recovered execution work"])
-        .await?;
+    // Several heads (different lines) become the parents of one resumed change.
+    let mut args = vec!["new".to_owned()];
+    args.extend(heads.iter().map(|head| revision(head)));
+    args.extend(["-m".to_owned(), "Resume recovered execution work".to_owned()]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    jj.run(workspace, &args).await?;
     Ok(has_work)
 }
 
@@ -875,9 +778,11 @@ pub async fn unpublished_diff(jj: &dyn Jj, record: &ExecutionBookmark) -> Result
     }
     let pointers = resolve_pointers(jj, record).await?;
     let range = format!(
-        "(({})::{} ~ ::remote_bookmarks()) & ~empty()",
-        pointers.base,
-        revision(&head_bookmark_of(jj, record, &pointers).await?)
+        "({} ~ ::remote_bookmarks()) & ~empty()",
+        above_floor(
+            &pointers.base,
+            &heads_revset(&resume_heads(jj, record, &pointers).await?)
+        )
     );
     let unpublished = jj
         .run(

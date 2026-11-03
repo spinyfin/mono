@@ -7,7 +7,6 @@ struct Store {
     damage_on_fetch: AtomicBool,
     conflicted: bool,
     fail_fetch: AtomicBool,
-    damage_after_repair: AtomicBool,
 }
 
 fn one(repo: &Path, rev: &str) -> String {
@@ -66,9 +65,6 @@ impl Jj for Store {
             anyhow::bail!("SSH connection reset");
         }
         let result = LocalJj.run(workspace, args).await?;
-        if self.damage_after_repair.load(Ordering::SeqCst) && args.starts_with(&["bookmark", "set", "pr/7"]) {
-            damage(&self.repo.repo, self.conflicted);
-        }
         if args.starts_with(&["git", "fetch"]) && self.damage_on_fetch.swap(false, Ordering::SeqCst) {
             damage(&self.repo.repo, self.conflicted);
         }
@@ -117,7 +113,6 @@ async fn scene(dir: &Path, conflicted: bool, restore: bool) -> (Store, Execution
             damage_on_fetch: AtomicBool::new(restore),
             conflicted,
             fail_fetch: false.into(),
-            damage_after_repair: false.into(),
         },
         record,
         head,
@@ -145,25 +140,9 @@ async fn repaired(conflicted: bool, restore: bool) {
         assert!(JjRepo::run(&store.repo.replacement, &["file", "show", "root:work.txt"]).contains("preserved work"));
         assert_eq!(one(&store.repo.repo, &record.head()), preserved);
         assert_eq!(one(&store.repo.repo, &record.publication()), preserved);
-    } else {
-        let result = reconcile(&store, &cube, &record, Some("pr/7"), "main")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(result.anchor.commit(), head);
     }
     assert_eq!(one(&store.repo.repo, "pr/7"), head);
     assert!(execution_bookmark::diff(&store, &record).await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn reconcile_repairs_missing_alias_through_fake_gh() {
-    repaired(false, false).await;
-}
-
-#[tokio::test]
-async fn reconcile_repairs_conflicted_alias_through_fake_gh() {
-    repaired(true, false).await;
 }
 
 #[tokio::test]
@@ -214,48 +193,6 @@ impl PrAliasRepair for FakeCube<'_> {
     }
 }
 
-/// Fails the way the production wrappers do: Cube's stderr, classified.
-struct FailingCube(&'static str);
-
-#[async_trait]
-impl PrAliasRepair for FailingCube {
-    async fn repair(&self, _: &Path, _: u64) -> Result<()> {
-        Err(classify_repair_error(anyhow::anyhow!(self.0)))
-    }
-}
-
-#[tokio::test]
-async fn lookup_failures_remain_retryable_but_cube_refusals_block() {
-    let dir = tempfile::tempdir().unwrap();
-    let (store, record, _) = scene(dir.path(), false, false).await;
-    let transient = reconcile(
-        &store,
-        &FailingCube("Cube command failed: HTTP 503 network unavailable"),
-        &record,
-        Some("pr/7"),
-        "main",
-    )
-    .await
-    .unwrap_err();
-    assert!(
-        !execution_bookmark::is_pointer_integrity_error(&transient),
-        "{transient:#}"
-    );
-    for refusal in [
-        "Cube command failed: cannot repair `pr/7`: cube cannot move `pr/7`: cube will not pick a side with unique content",
-        "Cube command failed: cannot repair `pr/7`: PR 7 returned no head.sha",
-        "Cube command failed: cannot repair `pr/7`: PR 7 returned no head.sha: \"\" is not a full 40-character commit id",
-        // The shape `cube --json` writes to stderr, as the local and SSH
-        // transports surface it.
-        r#"Cube command failed: {"error":"cannot repair `pr/7`: PR 7 returned no head.sha: \"abc123\" is not a full 40-character commit id"}"#,
-    ] {
-        let blocked = reconcile(&store, &FailingCube(refusal), &record, Some("pr/7"), "main")
-            .await
-            .unwrap_err();
-        assert!(execution_bookmark::is_pointer_integrity_error(&blocked), "{blocked:#}");
-    }
-}
-
 /// Moves the execution's publication pointer (as Cube's fetch can) and then
 /// hangs, so the timeout path has something real to restore.
 struct MovesPointerThenHangs<'a>(&'a Store, String);
@@ -300,23 +237,6 @@ async fn ensure_repairs_missing_and_conflicted_alias_once() {
         ensure(&store, &lookup, &record, 7).await.unwrap();
         assert_eq!(one(&store.repo.repo, "pr/7"), lookup.sha);
         ensure(&store, &lookup, &record, 7).await.unwrap();
-        assert_eq!(lookup.calls.load(Ordering::SeqCst), 1);
-    }
-}
-
-#[tokio::test]
-async fn lost_again_after_repair_is_loud_and_not_a_legacy_blocker() {
-    for conflicted in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
-        let (store, record, sha) = scene(dir.path(), conflicted, false).await;
-        store.damage_after_repair.store(true, Ordering::SeqCst);
-        let lookup = FakeCube::new(&store, &sha);
-        let err = reconcile(&store, &lookup, &record, Some("pr/7"), "main")
-            .await
-            .unwrap_err();
-        assert!(execution_bookmark::is_pointer_integrity_error(&err));
-        assert!(err.to_string().contains("removed or conflicted again"));
-        assert!(!execution_bookmark::is_legacy_pr_anchor_blocker(&err.to_string()));
         assert_eq!(lookup.calls.load(Ordering::SeqCst), 1);
     }
 }

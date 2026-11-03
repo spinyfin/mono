@@ -301,13 +301,6 @@ impl HostAdapter for LocalHostAdapter {
         let remote = boss_host_execution::workspace::recovery_remote(&LocalJj, workspace).await?;
         pr_anchor::restore_rebased(&LocalJj, self, record, workspace, pr_bookmark, base_branch, &remote).await
     }
-    async fn checkpoint_execution_baseline(&self, record: &ExecutionBookmark) -> Result<String> {
-        anyhow::ensure!(
-            record.host_id == self.host_id(),
-            "recovery store belongs to another host"
-        );
-        execution_bookmark::checkpoint_baseline(&LocalJj, record).await
-    }
     async fn prepare_recovery_pr(
         &self,
         record: &ExecutionBookmark,
@@ -337,7 +330,7 @@ impl HostAdapter for LocalHostAdapter {
             "recovery bookmark belongs to host {}",
             record.host_id
         );
-        pr_anchor::reconcile(&LocalJj, self, record, pr_bookmark, trunk).await
+        execution_bookmark::reconcile(&LocalJj, record, pr_bookmark, trunk).await
     }
     async fn start_fresh_workspace(&self, workspace: &Path) -> Result<()> {
         execution_bookmark::Jj::run(&LocalJj, workspace, &["new", "trunk()", "-m", "Fresh execution"]).await?;
@@ -923,13 +916,6 @@ impl HostAdapter for SshHostAdapter {
         let remote = boss_host_execution::workspace::recovery_remote(self, workspace).await?;
         pr_anchor::restore_rebased(self, self, record, workspace, pr_bookmark, base_branch, &remote).await
     }
-    async fn checkpoint_execution_baseline(&self, record: &ExecutionBookmark) -> Result<String> {
-        anyhow::ensure!(
-            record.host_id == self.host_id(),
-            "recovery store belongs to another host"
-        );
-        execution_bookmark::checkpoint_baseline(self, record).await
-    }
     async fn prepare_recovery_pr(
         &self,
         record: &ExecutionBookmark,
@@ -961,7 +947,7 @@ impl HostAdapter for SshHostAdapter {
             record.host_id == self.host_id(),
             "recovery store belongs to another host"
         );
-        pr_anchor::reconcile(self, self, record, pr_bookmark, trunk).await
+        execution_bookmark::reconcile(self, record, pr_bookmark, trunk).await
     }
     async fn start_fresh_workspace(&self, workspace: &Path) -> Result<()> {
         execution_bookmark::Jj::run(self, workspace, &["new", "trunk()", "-m", "Fresh execution"]).await?;

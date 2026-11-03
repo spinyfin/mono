@@ -85,7 +85,6 @@ pub async fn restore_rebased(
             "recovery destination belongs to a different shared repository",
         ));
     }
-    checkpoint_baseline(jj, record).await?;
     let saved = snapshot_pointers(jj, record).await?;
     let fetched = jj.run(workspace, &["git", "fetch", "--remote", upstream]).await;
     restore_pointers(jj, record, &saved).await?;
@@ -96,8 +95,10 @@ pub async fn restore_rebased(
         serde_json::to_string(upstream)?
     );
     let base_sha = base_commit(jj, workspace, &base_ref, base_branch, upstream).await?;
-    let pointer = head_bookmark(jj, record).await?;
-    let head = revision(&pointer);
+    let heads = resume_heads_of(jj, record).await?;
+    let pointer = heads.join(" + ");
+    let head = heads_revset(&heads);
+    let floor = resolve_base(jj, record).await?;
     let pr_head = match pr_bookmark {
         Some(bookmark) => Some(super::reconcile::resolve_pr_head(jj, record, bookmark).await?),
         None => None,
@@ -130,18 +131,13 @@ pub async fn restore_rebased(
         )
         .await?;
         let baseline = one_commit(jj, workspace, "@-").await?;
-        let unpublished = format!("({}..{head}) ~ (::{pr} | ::{base_sha})", revision(&record.base()));
+        let unpublished = format!("{} ~ (::{pr} | ::{base_sha})", above_floor(&floor, &head));
         stage_unpublished(jj, workspace, &unpublished).await?;
         Some(baseline)
     } else {
         jj.run(workspace, &["new", &base_sha, "-m", "Resume recovered execution work"])
             .await?;
-        stage_unpublished(
-            jj,
-            workspace,
-            &format!("{}..{head} ~ ::{base_sha}", revision(&record.base())),
-        )
-        .await?;
+        stage_unpublished(jj, workspace, &format!("{} ~ ::{base_sha}", above_floor(&floor, &head))).await?;
         Some(base_sha.clone())
     };
     let conflicted = jj

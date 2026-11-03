@@ -160,7 +160,7 @@ async fn published_work_with_an_empty_working_child_is_not_reported_as_abandoned
 }
 
 #[tokio::test]
-async fn empty_run_is_distinct_from_a_missing_or_unrelated_pointer() {
+async fn empty_run_is_distinct_from_a_missing_pointer() {
     let f = Fixture::new().await;
     let record = f.record("exec_empty").await;
     assert!(diff(&LocalJj, &record).await.unwrap().is_empty());
@@ -171,10 +171,9 @@ async fn empty_run_is_distinct_from_a_missing_or_unrelated_pointer() {
         )
         .await
         .unwrap();
-    let error = diff(&LocalJj, &record).await.unwrap_err();
-    assert!(error.to_string().contains("baseline"));
-    assert!(is_pointer_integrity_error(&error));
-    assert!(!is_missing_pointer_error(&error));
+    // A head that no longer descends from the baseline is not an integrity
+    // failure: lineage is not an invariant.
+    assert!(diff(&LocalJj, &record).await.unwrap().is_empty());
     LocalJj
         .run(&f.repo, &["bookmark", "delete", &record.head(), &record.publication()])
         .await
@@ -190,7 +189,7 @@ async fn empty_run_is_distinct_from_a_missing_or_unrelated_pointer() {
 }
 
 #[tokio::test]
-async fn missing_heads_are_distinct_from_baseline_and_divergence_failures() {
+async fn only_missing_heads_fail_without_lineage_or_baseline_bookmark_checks() {
     let f = Fixture::new().await;
     let record = f.record("exec_integrity").await;
     LocalJj
@@ -204,18 +203,15 @@ async fn missing_heads_are_distinct_from_baseline_and_divergence_failures() {
         )
         .await
         .unwrap();
-    let error = diff(&LocalJj, &record).await.unwrap_err();
-    assert!(is_pointer_integrity_error(&error));
-    assert!(!is_missing_pointer_error(&error));
-    assert!(error.to_string().contains("diverged"));
+    // Heads on different lines resume from the recovery head; no verdict.
+    diff(&LocalJj, &record).await.unwrap();
 
+    // The baseline bookmark is never read.
     LocalJj
         .run(&f.repo, &["bookmark", "delete", &record.base()])
         .await
         .unwrap();
-    let error = diff(&LocalJj, &record).await.unwrap_err();
-    assert!(is_pointer_integrity_error(&error));
-    assert!(!is_missing_pointer_error(&error));
+    diff(&LocalJj, &record).await.unwrap();
     LocalJj
         .run(&f.repo, &["bookmark", "delete", &record.head(), &record.publication()])
         .await
@@ -299,7 +295,7 @@ async fn divergent_change_id_does_not_fail_the_ancestry_check() {
 }
 
 #[tokio::test]
-async fn divergent_change_id_still_fails_when_the_pointer_does_not_descend_from_baseline() {
+async fn a_baseline_bookmark_on_a_divergent_twin_is_ignored() {
     let f = Fixture::new().await;
     let record = f.record("exec_divergent_unrelated").await;
     let twins = rewrite_head_concurrently(&f, &record).await;
@@ -309,15 +305,13 @@ async fn divergent_change_id_still_fails_when_the_pointer_does_not_descend_from_
             .await
             .unwrap();
     }
-    // The other twin is a sibling, not an ancestor; the checked pointer
-    // still has a divergent change id.
+    // The other twin is a sibling, not an ancestor. The recorded baseline
+    // commit is the floor, so the bookmark's position is irrelevant.
     LocalJj
         .run(&f.repo, &["bookmark", "set", &record.base(), "-r", &twins[1]])
         .await
         .unwrap();
-    let error = diff(&LocalJj, &record).await.unwrap_err();
-    assert!(is_pointer_integrity_error(&error), "{error:#}");
-    assert!(error.to_string().contains("not descended"), "{error:#}");
+    diff(&LocalJj, &record).await.unwrap();
 }
 
 #[tokio::test]

@@ -1889,7 +1889,7 @@ pub mod workspace {
                                 }
                                 Kind::CheckpointBaseline => {
                                     *phase = Phase::Effect;
-                                    json!(recovery::checkpoint_baseline(&LocalJj, &record).await?)
+                                    json!(record.base_commit.clone().unwrap_or_default())
                                 }
                                 Kind::RestoreRebased => {
                                     *phase = Phase::Effect;

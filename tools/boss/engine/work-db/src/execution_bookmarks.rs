@@ -157,22 +157,6 @@ impl WorkDb {
         true
     }
 
-    /// Checkpoint intact records independently without changing ladder outcomes.
-    pub async fn checkpoint_rewritten_baselines(&self, chain_root_id: &str) -> Result<()> {
-        use boss_engine_recovery::execution_bookmark::checkpoint_baseline;
-        for record in self.chain_bookmark_records(chain_root_id) {
-            let result: Result<()> = async {
-                let base = checkpoint_baseline(&LocalJj, &record).await?;
-                self.update_execution_bookmark_base(&record.execution_id, &base)
-            }
-            .await;
-            if let Err(err) = result {
-                tracing::warn!(execution_id = %record.execution_id, ?err, "rebase baseline checkpoint failed; keeping recorded baseline");
-            }
-        }
-        Ok(())
-    }
-
     pub fn record_execution_restore_report(
         &self,
         execution_id: &str,

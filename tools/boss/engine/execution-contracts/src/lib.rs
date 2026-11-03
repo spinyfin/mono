@@ -1516,11 +1516,6 @@ pub trait HostAdapter: Send + Sync {
         let _ = (record, workspace, pr_bookmark, base_branch);
         bail!("rebased execution recovery is not supported by this host adapter")
     }
-    /// Validate and heal the baseline, returning its current durable identity.
-    async fn checkpoint_execution_baseline(&self, record: &ExecutionBookmark) -> Result<String> {
-        let _ = record;
-        bail!("baseline checkpoint is not supported by this host adapter")
-    }
     /// Resolve an open PR while preserving the pre-checkout recovery pointers.
     /// Returns false for a closed or merged PR, which cannot anchor recovery.
     async fn prepare_recovery_pr(
