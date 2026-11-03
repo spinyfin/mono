@@ -442,7 +442,89 @@ impl ExecutionCoordinator {
             return Err(err);
         }
         spawn_claim.disarm();
+        self.consume_operator_forced_if_admitted(execution_id, admission);
         Ok(worker_id)
+    }
+
+    /// Launch the ready execution an operator's answer just created for
+    /// `work_item_id`, the way `bossctl agents launch` would.
+    ///
+    /// Answering is an explicit human decision, so the work it creates must not
+    /// be re-queued behind the global dispatch pause or the focus set. The
+    /// latest non-terminal execution is marked operator-forced first, so a
+    /// writer wait, pool cap, preflight, or drain race keeps the admission
+    /// until the work is admitted or cancelled. A `ready` execution is handed
+    /// to [`Self::force_dispatch`] as [`DispatchAdmission::OperatorForced`].
+    /// An execution gated behind another writer stays `waiting_dependency` for
+    /// the dependency cascade, which then drains it as operator-forced. The
+    /// dispatch claim and per-repo lease bound are respected. Returns the
+    /// worker id, or `None` when there is no ready execution to launch.
+    pub async fn launch_answered_work(self: &Arc<Self>, work_item_id: &str) -> Result<Option<String>> {
+        if let Err(err) = self.work_db.mark_operator_forced_admission(work_item_id) {
+            tracing::warn!(
+                work_item_id,
+                error = %format!("{err:#}"),
+                "failed to persist operator-forced admission for answered work",
+            );
+        }
+        let ready = self
+            .work_db
+            .list_executions(Some(work_item_id))?
+            .into_iter()
+            .filter(|execution| execution.work_item_id == work_item_id && execution.status == ExecutionStatus::Ready)
+            .max_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+        match ready {
+            Some(execution) => {
+                // A breaker pause is never overridable for this path. Keep
+                // the flag so the drain can admit the row after resume
+                // instead of spending the human's answer against a broken
+                // spawn path. Explicit `bossctl agents launch` still uses
+                // `force_dispatch` directly and can probe the breaker.
+                if self
+                    .dispatch_pause()
+                    .is_some_and(|pause| pause.origin == DispatchPauseOrigin::Breaker)
+                {
+                    return Ok(None);
+                }
+                self.force_dispatch(&execution.id, DispatchAdmission::OperatorForced)
+                    .await
+                    .map(Some)
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn consume_operator_forced_if_admitted(&self, execution_id: &str, admission: DispatchAdmission) {
+        if admission != DispatchAdmission::OperatorForced {
+            return;
+        }
+        if let Err(err) = self.work_db.clear_operator_forced_admission(execution_id) {
+            tracing::warn!(
+                execution_id,
+                error = %format!("{err:#}"),
+                "failed to clear operator-forced admission after dispatch",
+            );
+        }
+    }
+
+    /// Persisted operator-forced admission bypasses an operator-origin pause
+    /// (including all-spawns). A breaker-origin pause is never overridable:
+    /// the spawn path is broken, so a deferred answer must not spend itself
+    /// against it.
+    fn forced_admissible(is_operator_forced: bool, pause: Option<&DispatchPause>) -> bool {
+        is_operator_forced && pause.is_none_or(|p| p.origin == DispatchPauseOrigin::Operator)
+    }
+
+    fn drain_row_admission(forced_admissible: bool, is_critical: bool, pause_bypass: bool) -> DispatchAdmission {
+        if forced_admissible {
+            DispatchAdmission::OperatorForced
+        } else if is_critical {
+            DispatchAdmission::Critical
+        } else if pause_bypass {
+            DispatchAdmission::PauseBypassOverride
+        } else {
+            DispatchAdmission::Queued
+        }
     }
 
     async fn run_scheduler(self: Arc<Self>) {
@@ -1007,6 +1089,23 @@ impl ExecutionCoordinator {
                 HashSet::new()
             }
         };
+        // Answer-created work keeps operator-forced admission until it is
+        // admitted or cancelled. Under an operator-origin pause the drain
+        // honours that the way `bossctl agents launch` would: through that
+        // pause and outside the focus set, still subject to writer exclusion,
+        // the claim, and the lease bound. A breaker-origin pause is never
+        // overridable: flagged rows stay `ready` with `dispatch_paused` and
+        // keep the flag until resume.
+        let operator_forced_ids: HashSet<String> = match self.work_db.operator_forced_ready_execution_ids() {
+            Ok(ids) => ids,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "failed to list operator-forced ready executions — treating none as forced"
+                );
+                HashSet::new()
+            }
+        };
 
         // Queue-level depth/oldest-wait gauges, sampled here (before the
         // pause gate and any filtering below) so they reflect the true
@@ -1075,17 +1174,31 @@ impl ExecutionCoordinator {
                      draining review-pool exemptions",
                 );
             } else {
-                for execution in &executions {
-                    changed_waits.extend(self.record_dispatch_wait_reason(execution, "dispatch_paused", None));
+                let any_forced_admissible = executions
+                    .iter()
+                    .any(|e| Self::forced_admissible(operator_forced_ids.contains(&e.id), pause.as_ref()));
+                if !any_forced_admissible {
+                    for execution in &executions {
+                        changed_waits.extend(self.record_dispatch_wait_reason(execution, "dispatch_paused", None));
+                    }
+                    tracing::debug!(
+                        held_count,
+                        review_exempt_count = 0,
+                        "drain_ready_queue: dispatch is globally paused — skipping (all-spawns scope, no exemptions)",
+                    );
+                    self.publish_dispatch_runtime_changed(&changed_waits, "dispatch_wait_changed")
+                        .await;
+                    return DrainOutcome::QueueEmpty;
                 }
                 tracing::debug!(
                     held_count,
                     review_exempt_count = 0,
-                    "drain_ready_queue: dispatch is globally paused — skipping (all-spawns scope, no exemptions)",
+                    forced_count = executions
+                        .iter()
+                        .filter(|e| Self::forced_admissible(operator_forced_ids.contains(&e.id), pause.as_ref()))
+                        .count(),
+                    "drain_ready_queue: dispatch is globally paused (operator all-spawns) — draining operator-forced rows",
                 );
-                self.publish_dispatch_runtime_changed(&changed_waits, "dispatch_wait_changed")
-                    .await;
-                return DrainOutcome::QueueEmpty;
             }
         }
 
@@ -1095,12 +1208,13 @@ impl ExecutionCoordinator {
         // they would under the pause or the concurrency cap. Resolved once
         // per pass so "which rows are held" cannot change mid-pass.
         //
-        // This runs AFTER the pause gate above and only ever holds more: a
-        // paused engine already returned (all-spawns) or holds non-review
-        // rows below with `dispatch_paused`, which keeps precedence for the
-        // reason a row shows — focus never admits what a pause holds.
-        // `bossctl agents launch` (`force_dispatch`) never passes through
-        // here, so it bypasses focus exactly as it bypasses the pause.
+        // This runs AFTER the pause gate above and only ever holds more. An
+        // all-spawns pause with no operator-forced-admissible rows already
+        // returned (a breaker pause always does). Operator-forced rows that
+        // remain skip the focus hold the way `bossctl agents launch` bypasses
+        // focus. `bossctl agents launch` (`force_dispatch`) never passes
+        // through here, so it bypasses focus exactly as it bypasses an
+        // operator pause.
         // Failing to resolve scope holds everything: admitting a row we could
         // not prove in scope would break the one promise focus makes.
         let focus = self.dispatch_focus();
@@ -1135,8 +1249,9 @@ impl ExecutionCoordinator {
         // `schedule_execution`, in both Pass 1 and Pass 2, or the chokepoint
         // would refuse the very row the bypass just admitted.
         // `PauseBypassOverride` is admitted only under an operator-origin
-        // pause; a breaker pause still refuses it at the chokepoint (unlike
-        // `OperatorForced`, which is never held).
+        // pause; a breaker pause still refuses it at the chokepoint. The
+        // same is true of persisted `OperatorForced`: it bypasses an
+        // operator pause and is held under a breaker pause.
         let mut pause_bypass_admitted: HashSet<String> = HashSet::new();
         // At most one automation run may be preempted per drain pass, so a
         // burst of mainline arrivals never cascades into tearing down every
@@ -1191,13 +1306,12 @@ impl ExecutionCoordinator {
             };
 
             // Dispatch is paused and this row isn't exempt: leave it `ready`
-            // for the next drain after resume. Reached only when
-            // `reviews_exempt_from_pause` is true (an all-spawns pause —
-            // breaker or operator — already returned above, before this
-            // loop, so it can never reach the bypass check below —
-            // consistent with such a pause never being overridable),
-            // so this holds every non-review row while review rows fall
-            // through to normal dispatch below.
+            // for the next drain after resume. An all-spawns pause with no
+            // operator-forced-admissible rows already returned above (a
+            // breaker pause always does). An operator all-spawns pause with
+            // forced rows reaches this loop so those rows can drain; a
+            // new-work pause holds every non-review non-critical row while
+            // review rows fall through.
             //
             // The ONE exception is a row `ExecutionCoordinator::
             // dispatch_with_pause_bypass` marked via
@@ -1220,14 +1334,28 @@ impl ExecutionCoordinator {
             // escape hatch dispatches through an operator pause by
             // design, every pass, with no marker to consume — it carries
             // `DispatchAdmission::Critical` to the chokepoint instead.
-            // (A breaker pause never reaches this loop, so a critical row
-            // is still held by one — see `dispatch_hold_for`.)
-            if paused && !is_review && !is_critical {
-                if self.take_dispatch_pause_bypass(&execution.id) {
-                    pause_bypass_admitted.insert(execution.id.clone());
-                } else {
+            // A breaker pause still holds critical rows at `dispatch_hold_for`.
+            // Operator-forced rows skip an *operator-origin* pause, including
+            // all-spawns. A breaker-origin pause holds them as
+            // `dispatch_paused` and keeps the flag — that pause is never
+            // overridable.
+            let is_operator_forced = operator_forced_ids.contains(&execution.id);
+            let forced_admissible = Self::forced_admissible(is_operator_forced, pause.as_ref());
+            // Everyone else keeps the previous rules: all-spawns holds the
+            // whole queue; a new-work pause holds non-review non-critical
+            // rows unless a pause-bypass marker is consumed.
+            if paused && !forced_admissible {
+                if !reviews_exempt_from_pause {
                     changed_waits.extend(self.record_dispatch_wait_reason(&execution, "dispatch_paused", None));
                     continue;
+                }
+                if !is_review && !is_critical {
+                    if self.take_dispatch_pause_bypass(&execution.id) {
+                        pause_bypass_admitted.insert(execution.id.clone());
+                    } else {
+                        changed_waits.extend(self.record_dispatch_wait_reason(&execution, "dispatch_paused", None));
+                        continue;
+                    }
                 }
             }
 
@@ -1244,7 +1372,7 @@ impl ExecutionCoordinator {
             // Outside the dispatch focus set: hold, never drop. The row keeps
             // its `ready` execution untouched and dispatches on a later pass
             // once focus is cleared or its project/product is added.
-            if out_of_focus.contains(&execution.id) {
+            if out_of_focus.contains(&execution.id) && !forced_admissible {
                 changed_waits.extend(self.record_dispatch_wait_reason(
                     &execution,
                     boss_protocol::DISPATCH_WAIT_REASON_FOCUS_MODE,
@@ -1316,6 +1444,7 @@ impl ExecutionCoordinator {
                 None
             };
             let capped = !is_critical
+                && !is_operator_forced
                 && occupancy_at_cap_check.is_some_and(|occ| occ.working >= self.max_concurrent_interactive_workers());
 
             if capped {
@@ -1382,11 +1511,11 @@ impl ExecutionCoordinator {
                     ));
                     continue;
                 };
-                let admission = if pause_bypass_admitted.contains(&execution.id) {
-                    DispatchAdmission::PauseBypassOverride
-                } else {
-                    DispatchAdmission::Queued
-                };
+                let admission = Self::drain_row_admission(
+                    forced_admissible,
+                    is_critical,
+                    pause_bypass_admitted.contains(&execution.id),
+                );
                 self.dispatch_claimed_execution(
                     &execution,
                     &worker_id,
@@ -1806,13 +1935,11 @@ impl ExecutionCoordinator {
                 continue;
             };
 
-            let admission = if is_critical {
-                DispatchAdmission::Critical
-            } else if pause_bypass_admitted.contains(&execution.id) {
-                DispatchAdmission::PauseBypassOverride
-            } else {
-                DispatchAdmission::Queued
-            };
+            let admission = Self::drain_row_admission(
+                forced_admissible,
+                is_critical,
+                pause_bypass_admitted.contains(&execution.id),
+            );
             dispatch_claim.disarm();
             self.dispatch_claimed_execution(
                 &execution,
@@ -1914,11 +2041,11 @@ impl ExecutionCoordinator {
                 worker_id = %worker_id,
                 "automation spilled into Lower Decks — automation pool full, no mainline work wanted this slot"
             );
-            let admission = if pause_bypass_admitted.contains(&execution.id) {
-                DispatchAdmission::PauseBypassOverride
-            } else {
-                DispatchAdmission::Queued
-            };
+            let admission = Self::drain_row_admission(
+                Self::forced_admissible(operator_forced_ids.contains(&execution.id), pause.as_ref()),
+                false,
+                pause_bypass_admitted.contains(&execution.id),
+            );
             self.dispatch_claimed_execution(
                 &execution,
                 &worker_id,
@@ -2492,6 +2619,7 @@ impl ExecutionCoordinator {
             match coordinator.schedule_execution(&execution, &worker_id, admission).await {
                 Ok(()) => {
                     spawn_claim.disarm();
+                    coordinator.consume_operator_forced_if_admitted(&execution.id, admission);
                     tracing::info!(
                         execution_id = %execution.id,
                         work_item_id = %execution.work_item_id,

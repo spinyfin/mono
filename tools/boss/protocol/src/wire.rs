@@ -1788,6 +1788,10 @@ pub enum FrontendRequest {
     MarkConflictResolutionFailed {
         attempt_id: String,
         reason: String,
+        /// Required (and validated) when `reason` is
+        /// `architectural_mismatch`; ignored for every other reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<crate::ArchitecturalMismatchEvidence>,
     },
 
     /// User-initiated "Merge When Ready" for a Review-lane task's PR.

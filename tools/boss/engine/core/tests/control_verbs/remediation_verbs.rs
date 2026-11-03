@@ -72,6 +72,7 @@ async fn mark_conflict_resolution_failed_flips_attempt_status() -> Result<()> {
         .send_request(&FrontendRequest::MarkConflictResolutionFailed {
             attempt_id: attempt.id.clone(),
             reason: "product_decision_required".to_owned(),
+            evidence: None,
         })
         .await?;
     let flipped = match response {
@@ -89,6 +90,7 @@ async fn mark_conflict_resolution_failed_flips_attempt_status() -> Result<()> {
         .send_request(&FrontendRequest::MarkConflictResolutionFailed {
             attempt_id: attempt.id.clone(),
             reason: "ignored".to_owned(),
+            evidence: None,
         })
         .await?;
     match response {
@@ -107,6 +109,7 @@ async fn mark_conflict_resolution_failed_flips_attempt_status() -> Result<()> {
         .send_request(&FrontendRequest::MarkConflictResolutionFailed {
             attempt_id: "crz_does_not_exist".to_owned(),
             reason: "nope".to_owned(),
+            evidence: None,
         })
         .await?;
     match response {
@@ -1148,7 +1151,8 @@ async fn engine_conflicts_retry_resets_terminal_rows() -> Result<()> {
     client
         .send_request(&FrontendRequest::MarkConflictResolutionFailed {
             attempt_id: b.id.clone(),
-            reason: "architectural_mismatch".to_owned(),
+            reason: "gave_up".to_owned(),
+            evidence: None,
         })
         .await?;
 
@@ -1302,4 +1306,111 @@ async fn seed_two_conflict_resolutions(
         .expect("second insert seeds the row (different base_sha)");
     drop(work_db);
     Ok((product, chore, a, b))
+}
+
+/// `mark-failed --reason architectural_mismatch` over the socket: refactor-only
+/// or missing evidence is rejected with guidance and leaves the attempt live;
+/// valid evidence is recorded without failing the attempt, so the PR is never
+/// left in a dead-end failed state.
+#[tokio::test]
+async fn architectural_mismatch_requires_evidence_and_never_fails_the_attempt() -> Result<()> {
+    use boss_protocol::{ArchitecturalMismatchEvidence, MismatchBasis};
+
+    let engine = spawn_engine().await?;
+    let work_db = WorkDb::open(engine.db_path.clone())?;
+    let product = work_db.create_product(
+        CreateProductInput::builder()
+            .name("P")
+            .repo_remote_url("git@example.invalid:foo/bar.git")
+            .build(),
+    )?;
+    let chore = work_db.create_chore(
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("C")
+            .autostart(false)
+            .build(),
+    )?;
+    let pr_url = "https://github.com/foo/bar/pull/43";
+    work_db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("in_review".to_owned()),
+            pr_url: Some(pr_url.to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )?;
+    let attempt = work_db
+        .insert_conflict_resolution(boss_engine::work::ConflictResolutionInsertInput {
+            product_id: product.id.clone(),
+            work_item_id: chore.id.clone(),
+            pr_url: pr_url.to_owned(),
+            pr_number: 43,
+            head_branch: "feature".to_owned(),
+            base_branch: "main".to_owned(),
+            base_sha_at_trigger: Some("abc123".to_owned()),
+            head_sha_before: Some("def456".to_owned()),
+        })?
+        .expect("insert should succeed on a fresh row");
+    let revision = work_db.create_revision(
+        boss_protocol::CreateRevisionInput::builder()
+            .parent_task_id(chore.id.clone())
+            .description("Resolve merge conflict against main")
+            .created_via(format!(
+                "{}{}",
+                boss_protocol::CREATED_VIA_MERGE_CONFLICT_PREFIX,
+                attempt.id
+            ))
+            .build(),
+        &boss_engine::work::StaticPrStateChecker(boss_engine::work::PrOpenState::Open),
+    )?;
+    work_db.set_conflict_resolution_revision_task_id(&attempt.id, &revision.id)?;
+    drop(work_db);
+
+    let evidence = ArchitecturalMismatchEvidence {
+        basis: MismatchBasis::SubsystemDeleted,
+        conflicting_commits: "abc123".into(),
+        main_changes: "the legacy queue was deleted".into(),
+        attempted_port: "searched main for a replacement and found none".into(),
+        contradiction: "Main deleted the legacy queue entirely, so the new queue priority has nowhere to live.".into(),
+        recommendation: "Rewrite around the dispatcher.".into(),
+    };
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let mark = |evidence| FrontendRequest::MarkConflictResolutionFailed {
+        attempt_id: attempt.id.clone(),
+        reason: "architectural_mismatch".to_owned(),
+        evidence,
+    };
+
+    for rejected in [
+        None,
+        Some(ArchitecturalMismatchEvidence {
+            contradiction: "The files moved into the dispatch crate and the helpers became private.".into(),
+            ..evidence.clone()
+        }),
+    ] {
+        match client.send_request(&mark(rejected)).await? {
+            FrontendEvent::WorkError { message } => {
+                assert!(
+                    message.contains("normal conflict work"),
+                    "unhelpful rejection: {message}"
+                );
+            }
+            other => return Err(anyhow!("expected WorkError, got: {other:?}")),
+        }
+    }
+
+    match client.send_request(&mark(Some(evidence))).await? {
+        FrontendEvent::ConflictResolution { attempt: recorded } => {
+            assert_eq!(recorded.id, attempt.id);
+            assert_eq!(
+                recorded.status, "pending",
+                "recording the mismatch must not fail the attempt"
+            );
+            assert_eq!(recorded.failure_reason, None);
+            assert!(!recorded.mismatch_exit_barred);
+        }
+        other => return Err(anyhow!("expected the live attempt, got: {other:?}")),
+    }
+    Ok(())
 }

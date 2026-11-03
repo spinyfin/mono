@@ -701,6 +701,7 @@ mod chain_helpers;
 mod ci_failure_identity;
 mod comment_thread_entries;
 mod comments;
+mod conflict_mismatch;
 mod conflict_res;
 mod coordinator_guidance_cache;
 mod coordinator_handoff_store;

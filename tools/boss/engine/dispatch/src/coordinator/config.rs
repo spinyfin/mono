@@ -797,8 +797,12 @@ impl ExecutionCoordinator {
     ///   operator pause exempts review-pool rows
     ///   ([`DispatchPause::reviews_held`]).
     /// - [`DispatchAdmission::OperatorForced`] — never held. A human naming
-    ///   one execution by hand is overriding their own pause deliberately;
-    ///   `bossctl dispatch state` declares this bypass.
+    ///   one execution by hand (`bossctl agents launch`) is overriding the
+    ///   pause deliberately, including a breaker pause they may be probing.
+    ///   Persisted operator-forced rows in the ready-queue drain are a
+    ///   different path: they are only admitted as this variant under an
+    ///   operator-origin pause. Under a breaker pause the drain holds them
+    ///   as `dispatch_paused` and keeps the flag.
     /// - [`DispatchAdmission::BreakerRecoveryProbe`] — allowed **only** under
     ///   a Breaker-origin pause (an operator pause is manual-resume-only and
     ///   must never be auto-probed), and **never** for a review-pool row.

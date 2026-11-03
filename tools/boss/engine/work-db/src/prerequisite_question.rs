@@ -258,7 +258,7 @@ fn order_project_prerequisites(conn: &Connection, task: &Task, prerequisite: &Ta
 /// The row carries the asking run's workspace preference, as a plain Yes does,
 /// so the resumed run lands where the branch state is. Revisions are left
 /// alone: their own reconciler mints the replacement when the gate clears.
-fn queue_gated_execution(conn: &Connection, task: &Task, question: &OperatorQuestionView) -> Result<()> {
+pub(super) fn queue_gated_execution(conn: &Connection, task: &Task, question: &OperatorQuestionView) -> Result<()> {
     let kind = execution_kind_for_work_item(conn, &task.id)?;
     if kind == ExecutionKind::RevisionImplementation
         || deps::gating_prereqs_for(conn, &task.id)?.is_empty()

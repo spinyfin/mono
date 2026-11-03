@@ -2256,7 +2256,16 @@ pub(super) fn insert_question_with_liveness(
     let Some(task) = query_task(conn, &execution.work_item_id)? else {
         return Ok(());
     };
-    let parkable = task.deleted_at.is_none() && matches!(task.status, TaskStatus::Active | TaskStatus::Todo);
+    // Open only when the item can actually park on the question. Active and
+    // Todo can. A task already blocked awaiting this same operator answer
+    // can too: the engine may re-raise after a withdrawal while the task is
+    // still waiting on the human. Any other blocked reason, an archived or
+    // deleted item, or a work item that is not a task, is withdrawn as
+    // `task_not_parkable`.
+    let parkable = task.deleted_at.is_none()
+        && (matches!(task.status, TaskStatus::Active | TaskStatus::Todo)
+            || (task.status == TaskStatus::Blocked
+                && task.blocked_reason.as_deref() == Some("awaiting_operator_answer")));
     let stuck_classification = if task.blocked_reason.is_some() || task.dispatch_failed_reason.is_some() {
         let durable = super::stuck_report::classification(conn, &task, None)?;
         if let Some(worker) = worker
@@ -2350,12 +2359,30 @@ impl WorkDb {
                 |row| row.get(0),
             )
             .optional()?;
-        payload
+        let declared = payload
             .map(|json| {
                 serde_json::from_str::<boss_protocol::RunDoneProposalPayload>(&json).map(|payload| payload.question)
             })
             .transpose()
-            .map(Option::flatten)
+            .map(Option::flatten)?;
+        if declared.is_some() {
+            return Ok(declared);
+        }
+        // A question the engine raised on the run's behalf (an
+        // architectural-mismatch stop) is stored with the run, not in what the
+        // worker declared.
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT question_json FROM operator_questions
+                 WHERE execution_id = ?1 AND status = 'open' AND conflict_resolution_id IS NOT NULL
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+                [execution_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        stored
+            .map(|json| serde_json::from_str(&json))
+            .transpose()
             .map_err(Into::into)
     }
 
@@ -2373,6 +2400,18 @@ impl WorkDb {
     /// failing at the read-to-write upgrade: the loser then reads the winner's
     /// `answered` row and is an idempotent repeat (or a `Conflict`).
     pub fn answer_operator_question(&self, id: &str, answer: OperatorAnswer) -> Result<OperatorAnswerOutcome> {
+        self.answer_operator_question_with(id, answer, &GhPrStateChecker)
+    }
+
+    /// [`Self::answer_operator_question`] with the PR-state probe an answer may
+    /// need: a *Rewrite* answer to an architectural-mismatch question creates a
+    /// revision on the PR, and revision creation checks the PR is still open.
+    pub fn answer_operator_question_with(
+        &self,
+        id: &str,
+        answer: OperatorAnswer,
+        pr_checker: &dyn PrStateChecker,
+    ) -> Result<OperatorAnswerOutcome> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let question = tx
@@ -2429,7 +2468,30 @@ impl WorkDb {
         let mut pending = PendingEvents::new();
         let mut minted_execution = false;
         let mut prerequisite_work_item_id = None;
+        let mut touched_work_item_ids = Vec::new();
+        let mut dispatch_work_item_id = None;
+        let mismatch_attempt = super::conflict_mismatch::attempt_for_question(&tx, &question.question.id)?;
         match (answer, &question.question.answer_type) {
+            (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. })
+                if mismatch_attempt.is_some() =>
+            {
+                let effect = super::conflict_mismatch::answer_in_tx(
+                    &mut pending,
+                    &tx,
+                    &task,
+                    &question.question,
+                    &super::conflict_mismatch::Answer {
+                        attempt_id: mismatch_attempt.as_deref().unwrap_or_default(),
+                        choice: &value,
+                        pr_checker,
+                        answered_at,
+                        now: &now,
+                    },
+                )?;
+                minted_execution = effect.minted_execution;
+                touched_work_item_ids = effect.touched;
+                dispatch_work_item_id = effect.dispatch;
+            }
             (OperatorAnswer::YesNo { value: true }, OperatorAnswerType::CreatePrerequisiteTask { name, brief, .. }) => {
                 let linked = super::prerequisite_question::approve_in_tx(
                     &mut pending,
@@ -2445,14 +2507,12 @@ impl WorkDb {
             (OperatorAnswer::YesNo { value: true }, OperatorAnswerType::YesNo) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
                 let block = authorization_block(&question.question, &timestamp);
-                restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
-                minted_execution = true;
+                minted_execution = restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
             }
             (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. }) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
                 let block = choice_block(&question.question, &value, &timestamp);
-                restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
-                minted_execution = true;
+                minted_execution = restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
             }
             (
                 OperatorAnswer::YesNo { value: false },
@@ -2463,14 +2523,12 @@ impl WorkDb {
             ) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
                 let block = file_count_bypass_authorization_block(&question.question, *spec, &timestamp);
-                restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
-                minted_execution = true;
+                minted_execution = restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
             }
             (OperatorAnswer::YesNo { value: false }, _) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
                 let block = declined_block(&question.question, &timestamp);
-                restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
-                minted_execution = true;
+                minted_execution = restart_after_answer(&mut pending, &tx, &task, &question.question, &block, &now)?;
             }
             // `check_answer` above refuses every other pairing.
             (answer, answer_type) => anyhow::bail!("unhandled operator answer {answer:?} for {answer_type:?}"),
@@ -2483,6 +2541,8 @@ impl WorkDb {
             item: task_to_item(updated),
             minted_execution,
             prerequisite_work_item_id,
+            touched_work_item_ids,
+            dispatch_work_item_id,
         })
     }
 }
@@ -2497,6 +2557,14 @@ pub struct OperatorAnswerOutcome {
     /// The prerequisite task a Yes created or linked, so the RPC layer can
     /// invalidate it alongside the answered task.
     pub prerequisite_work_item_id: Option<String>,
+    /// Other tasks the answer created, changed or retired (a port revision and
+    /// the conflict revision it replaced), so the RPC layer can invalidate them.
+    pub touched_work_item_ids: Vec<String>,
+    /// The task whose ready execution the answer wants dispatched immediately,
+    /// like `bossctl agents launch`: through the global dispatch pause and
+    /// focus mode. Set only where the answer *creates* the work (an
+    /// architectural-mismatch answer), never for an ordinary resume.
+    pub dispatch_work_item_id: Option<String>,
 }
 
 impl OperatorAnswerOutcome {
@@ -2505,20 +2573,30 @@ impl OperatorAnswerOutcome {
             item,
             minted_execution: false,
             prerequisite_work_item_id: None,
+            touched_work_item_ids: Vec::new(),
+            dispatch_work_item_id: None,
         }
     }
 }
 
 /// Move the answered task back to Todo with `block` appended to its brief and
-/// mint the ready execution that carries the answer to the next worker.
-fn restart_after_answer(
+/// carry the answer to the next worker. Returns `true` when a ready execution
+/// was minted for it to start now.
+///
+/// A task still gated by prerequisites (a conflict revision queued behind
+/// another writer on the same PR is the common case) cannot be started
+/// explicitly: that request is refused, which would roll the whole answer back
+/// and leave the question open. Such a task is returned to Todo with a
+/// waiting execution instead, and the dependency cascade promotes it when the
+/// gate clears.
+pub(super) fn restart_after_answer(
     pending: &mut PendingEvents,
     tx: &rusqlite::Transaction<'_>,
     task: &Task,
     question: &OperatorQuestionView,
     block: &str,
     now: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let description = format!("{}{block}", task.description);
     super::description_guard::validate_description_update(&task.description, &description, false)?;
     crate::task_status_audit::execute(
@@ -2529,6 +2607,15 @@ fn restart_after_answer(
          blocked_detail = NULL, autostart = 1, last_status_actor = 'human', updated_at = ?3 WHERE id = ?1",
         params![task.id, description, now],
     )?;
+    if !deps::gating_prereqs_for(tx, &task.id)?.is_empty() {
+        let task = query_task(tx, &task.id).require("task", &task.id)?;
+        if task.kind == TaskKind::Revision {
+            reconcile_revision_execution(pending, tx, &mut ExecutionReconcileResult::default(), &task)?;
+        } else {
+            super::prerequisite_question::queue_gated_execution(tx, &task, question)?;
+        }
+        return Ok(false);
+    }
     let asking = query_execution(tx, &question.execution_id).require("execution", &question.execution_id)?;
     request_execution_in_tx_with_live_check(
         pending,
@@ -2543,7 +2630,7 @@ fn restart_after_answer(
         // no live-worker oracle is supplied.
         |_| true,
     )?;
-    Ok(())
+    Ok(true)
 }
 
 /// No on a plain yes-no or ordinary prerequisite question: record the

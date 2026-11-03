@@ -762,9 +762,14 @@ Same three patterns as auto-rebase escalation (see `auto-rebase-stacked-prs.md` 
 2. **Product decision required** — the conflict needs a human choice between
    two valid resolutions. Comment, ask, do not push. Engine flips attempt to
    `failed` with `failure_reason = 'product_decision_required'`.
-3. **Architectural mismatch** — the upstream removed an abstraction this PR
-   was extending. Comment, ask, do not push. Engine flips attempt to `failed`
-   with `failure_reason = 'architectural_mismatch'`.
+3. **Architectural mismatch** — a *behavioural* conflict that remains after a
+   genuine attempt to port the change onto the new layout (the reference case:
+   the PR adds a feature to a subsystem `main` deleted completely). Moved or
+   deleted files, split or renamed modules, newly private helpers and every
+   commit conflicting are ordinary porting work and never qualify. The engine
+   does not flip the attempt to `failed`: it asks the repo owner to choose
+   between rewriting onto the new base and forcing a merge (see
+   "Architectural mismatch handling" below).
 
 Do NOT close the PR yourself. Closing is the human's call.
 
@@ -2338,3 +2343,55 @@ The `ci_failure` remediation follows the same state machine. Now that the `fix`-
 - [`chore-lifecycle-pr-closed-unmerged`](chore-lifecycle-pr-closed-unmerged.md) — adjacent merge-poller extension; the probe enum evolution composes with that work.
 - [`work-dependencies`](work-dependencies.md) — owns `blocked: dependency`; this design adds the `blocked_reason` column it implicitly assumed.
 - review-feedback workflow (`proj_18ad7d43affb0370_2a`) — sibling design that should share the `blocked_reason`, `blocked_attempt_id`, and engine-activity surfaces.
+
+### Architectural mismatch handling
+
+A merge-conflict revision that cannot merge a PR textually used to stop with `boss engine conflicts mark-failed <attempt> --reason architectural_mismatch` and leave the PR blocked with nothing following. The engine now turns that stop into a question for the repo owner. This page covers the bar for asking, what the question carries, the two answers, and how they dispatch.
+
+#### The bar is very high
+
+Porting is part of conflict resolution. These are normal conflict work and never grounds to stop:
+
+- files moved or deleted on main;
+- modules or crates split or renamed;
+- helpers that became private or moved behind a new crate boundary;
+- migrations that must move to another crate's sequence;
+- every commit of the PR conflicting.
+
+The worker is expected to study main's new layout and port the change's intent onto it. Effort is not a reason either: if the port is bigger than the attempt's sizing, the worker continues and emits the effort-escalation marker.
+
+`architectural_mismatch` is allowed only after a genuine attempt to port, and only for a real behavioural conflict. The reference case is a PR that adds a feature to a subsystem main deleted completely. Comparable cases: main redesigned the concept the PR changes so there is no faithful place for its behaviour, or main's new behaviour contradicts the PR's intent. A subsystem that was moved, split or renamed never qualifies.
+
+`mark-failed --reason architectural_mismatch` therefore requires evidence, in both the CLI (required flags) and the engine (`ArchitecturalMismatchEvidence::validate` in `tools/boss/protocol/src/types/conflict_mismatch.rs`):
+
+| Flag                    | Content                                                                      |
+| ----------------------- | ---------------------------------------------------------------------------- |
+| `--basis`               | `subsystem_deleted`, `concept_redesigned` or `behaviour_contradiction`       |
+| `--conflicting-commits` | the commits of the PR that conflict                                          |
+| `--main-changes`        | files or symbols that moved or were deleted on main, and the PRs that did it |
+| `--attempted-port`      | what was tried when porting                                                  |
+| `--contradiction`       | the specific behavioural contradiction, in one sentence                      |
+| `--recommendation`      | one line: rewrite or force a merge                                           |
+
+A contradiction or recommendation that leans on refactor-only wording ("too many conflicts", "files moved", "large rewrite", "became private", ...) is rejected, and so is missing evidence. A rejected call raises no question and leaves the attempt live.
+
+#### Lifecycle
+
+1. A valid call records the evidence on the **live** attempt. The attempt is not marked `failed`.
+2. The worker declares `propose done --outcome blocked`. Applying that declaration raises an ordinary multiple-choice operator question on the conflict revision, carrying the evidence, and the revision parks as `blocked` / `awaiting_operator_answer`. This is the same surface as any worker question: the kanban card and `boss task answer`.
+3. While the question is open the parked revision still counts as the attempt's fix vehicle, so the merge poller neither supersedes the attempt nor mints a competing revision.
+
+#### The two answers
+
+- **Rewrite onto the new base.** The parked conflict revision is archived and a new revision is created on the same PR. It carries the conflict provenance (so it queues ahead of the PR's other revisions the same way), a port brief, and `large` effort. The brief preserves the PR's behaviour and every earlier review fix, puts code where it now lives, and forbids stopping on architectural mismatch. Review-finding revisions queued on the PR are sequenced after it. The attempt follows the new revision.
+- **Force a merge.** The same conflict revision is re-dispatched with an instruction to resolve the conflicts in place against the refactored code.
+
+Both answers close the `architectural_mismatch` exit for the attempt (`conflict_resolutions.mismatch_exit_barred`): the engine refuses `mark-failed --reason architectural_mismatch` and the prompt does not offer it. There is deliberately no abandon or skip answer; closing the PR remains a manual human action.
+
+#### Dispatch
+
+Answering is an explicit human decision, so the work an answer creates is launched like `bossctl agents launch` (`ExecutionCoordinator::launch_answered_work`): through the global dispatch pause and focus mode. PR-writer sequencing still applies. An execution gated behind another writer on the PR waits as `waiting_dependency` and is promoted when the gate clears, and the launch respects the dispatch claim and per-repo lease bound. If a launch is refused, the ready execution stays queued for the ordinary scheduler.
+
+#### Shared question mechanism
+
+Answering a task that is still gated by prerequisites used to be refused by the explicit-start check, rolling the whole answer back and leaving the question open. `restart_after_answer` now returns a gated task to `todo` with a waiting execution instead, for every question type.

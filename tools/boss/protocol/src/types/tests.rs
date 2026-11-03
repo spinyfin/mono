@@ -455,6 +455,7 @@ fn conflict_resolution_roundtrips_with_all_fields() {
         conflict_class: Some("semantic".into()),
         resolved_by_rung: Some(3),
         mechanical_rung_in_flight: None,
+        mismatch_exit_barred: false,
     };
     let raw = serde_json::to_value(&attempt).unwrap();
     let back: ConflictResolution = serde_json::from_value(raw).unwrap();
@@ -488,6 +489,7 @@ fn conflict_resolution_pending_skips_optional_fields_on_encode() {
         conflict_class: None,
         resolved_by_rung: None,
         mechanical_rung_in_flight: None,
+        mismatch_exit_barred: false,
     };
     let encoded = serde_json::to_value(&attempt).unwrap();
     let obj = encoded.as_object().unwrap();

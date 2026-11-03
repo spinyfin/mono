@@ -270,6 +270,15 @@ pub struct ConflictResolution {
     /// halt, or fall-through). `None` for every non-mechanical row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mechanical_rung_in_flight: Option<i64>,
+
+    /// `true` once the repo owner has answered the architectural-mismatch
+    /// question for this attempt (rewrite or force a merge). From then on
+    /// `architectural_mismatch` is no longer an allowed exit: the engine
+    /// refuses `mark-failed` with that reason and the worker prompt does not
+    /// offer it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[builder(default)]
+    pub mismatch_exit_barred: bool,
 }
 
 fn default_review_watch_event_source() -> String {

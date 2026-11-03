@@ -219,9 +219,39 @@ pub(super) async fn handle_mark_conflict_resolution_failed(ctx: Dispatch, req: F
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::MarkConflictResolutionFailed { attempt_id, reason } = req else {
+    let FrontendRequest::MarkConflictResolutionFailed {
+        attempt_id,
+        reason,
+        evidence,
+    } = req
+    else {
         unreachable!()
     };
+    if reason == boss_protocol::CONFLICT_ARCHITECTURAL_MISMATCH_REASON {
+        // Not a dead end: the evidence is validated and recorded on the live
+        // attempt, and the worker's blocked declaration then raises the
+        // rewrite-or-force-a-merge question. The attempt is not marked failed.
+        match work_db.record_conflict_architectural_mismatch(&attempt_id, evidence.as_ref()) {
+            Ok(Some(attempt)) => {
+                tracing::warn!(
+                    attempt_id = %attempt.id,
+                    work_item_id = %attempt.work_item_id,
+                    pr_url = %attempt.pr_url,
+                    "architectural_mismatch recorded; the repo owner will be asked",
+                );
+                send_response(&sink, &request_id, FrontendEvent::ConflictResolution { attempt });
+            }
+            Ok(None) => send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: format!("conflict resolution attempt {attempt_id:?} is unknown or already terminal",),
+                },
+            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
+        }
+        return;
+    }
     {
         // Worker-facing stop-condition surface. `User` tier:
         // the worker pane invokes `boss engine conflicts

@@ -722,10 +722,25 @@ pub(crate) async fn run_engine_conflicts_command(
                 .send_request(&FrontendRequest::MarkConflictResolutionFailed {
                     attempt_id: args.attempt_id.clone(),
                     reason: args.reason.clone(),
+                    evidence: args.evidence(),
                 })
                 .await
                 .map_err(CliError::internal)?;
             match response {
+                FrontendEvent::ConflictResolution { attempt } => print_entity(
+                    ctx,
+                    &serde_json::to_value(&attempt).unwrap_or(serde_json::Value::Null),
+                    || {
+                        if !ctx.quiet {
+                            println!(
+                                "Architectural mismatch recorded for conflict resolution {}. The attempt stays open. \
+                                 Do not push. Declare `propose done --outcome blocked`: the engine will then ask the \
+                                 repo owner whether to rewrite onto the new base or force a merge.",
+                                attempt.id,
+                            );
+                        }
+                    },
+                ),
                 FrontendEvent::ConflictResolutionMarkedFailed { attempt } => print_entity(
                     ctx,
                     &serde_json::to_value(&attempt).unwrap_or(serde_json::Value::Null),
@@ -1102,4 +1117,75 @@ pub(crate) fn print_effort_audit_report(report: &EffortAuditReport) {
          heuristic code-defined.",
         report.under_class_threshold * 100.0,
     );
+}
+
+// ── `engine conflicts mark-failed` arguments ───────────────────────────────
+// Kept here, rather than in `commands.rs`, to hold that file under the
+// repo's file-size limit.
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct EngineConflictsMarkFailedArgs {
+    /// Attempt id from the `conflict_resolutions` table (e.g.
+    /// `crz_…`). The current attempt id is part of the worker's
+    /// spawn prompt.
+    pub(crate) attempt_id: String,
+
+    /// Failure reason. The design canonicalises three:
+    /// `obsolescence_suspected`, `product_decision_required`,
+    /// `architectural_mismatch`. Any string is accepted; the engine
+    /// stores it verbatim on the attempt row. `architectural_mismatch`
+    /// is only for a real behavioural conflict after a genuine attempt
+    /// to port the change onto main's new layout, and requires the
+    /// evidence flags below; it asks the repo owner instead of failing
+    /// the attempt.
+    #[arg(long)]
+    pub(crate) reason: String,
+
+    /// Why main has no faithful place for the PR's behaviour:
+    /// `subsystem_deleted`, `concept_redesigned` or
+    /// `behaviour_contradiction`. A subsystem that was moved, split or
+    /// renamed is not a basis. Required for `architectural_mismatch`.
+    #[arg(long, value_parser = ["subsystem_deleted", "concept_redesigned", "behaviour_contradiction"], required_if_eq("reason", "architectural_mismatch"))]
+    pub(crate) basis: Option<String>,
+
+    /// The commits of the PR that conflict. Required for
+    /// `architectural_mismatch`.
+    #[arg(long, required_if_eq("reason", "architectural_mismatch"))]
+    pub(crate) conflicting_commits: Option<String>,
+
+    /// The files or symbols that moved or were deleted on main, and the
+    /// PRs that changed them. Required for `architectural_mismatch`.
+    #[arg(long, required_if_eq("reason", "architectural_mismatch"))]
+    pub(crate) main_changes: Option<String>,
+
+    /// What you did to port the change onto main's new layout before
+    /// concluding it cannot be done faithfully. Required for
+    /// `architectural_mismatch`.
+    #[arg(long, required_if_eq("reason", "architectural_mismatch"))]
+    pub(crate) attempted_port: Option<String>,
+
+    /// The specific behavioural contradiction, in one sentence. "Too many
+    /// conflicts", "files moved" or "large rewrite" are rejected. Required
+    /// for `architectural_mismatch`.
+    #[arg(long, required_if_eq("reason", "architectural_mismatch"))]
+    pub(crate) contradiction: Option<String>,
+
+    /// One-line recommendation between rewriting onto the new base and
+    /// forcing a merge. Required for `architectural_mismatch`.
+    #[arg(long, required_if_eq("reason", "architectural_mismatch"))]
+    pub(crate) recommendation: Option<String>,
+}
+
+impl EngineConflictsMarkFailedArgs {
+    /// The evidence flags as the wire type, when all are present.
+    pub(crate) fn evidence(&self) -> Option<boss_protocol::ArchitecturalMismatchEvidence> {
+        Some(boss_protocol::ArchitecturalMismatchEvidence {
+            basis: boss_protocol::MismatchBasis::parse(self.basis.as_deref()?)?,
+            conflicting_commits: self.conflicting_commits.clone()?,
+            main_changes: self.main_changes.clone()?,
+            attempted_port: self.attempted_port.clone()?,
+            contradiction: self.contradiction.clone()?,
+            recommendation: self.recommendation.clone()?,
+        })
+    }
 }
