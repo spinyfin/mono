@@ -6,7 +6,7 @@ The engine keeps three bookmarks per execution in the shared jj store of the rep
 - `boss-recovery/<execution id>`: the recovery head the worker advances as it works.
 - `boss/<execution id>`: the publication head, the branch a worker pushes.
 
-The `execution_bookmarks` row for the execution records the shared store path, the host, and the baseline commit id (`base_commit`) recorded at dispatch. Recovery reads that commit id as the floor of the execution's work; it never reads the `boss-base/` bookmark. A baseline commit that was rewritten or abandoned still exists in the store and still works as a floor; a row with no usable commit falls back to trunk.
+The `execution_bookmarks` row for the execution records the shared store path, the host, and the baseline commit id (`base_commit`) recorded at dispatch from `work_executions.pr_head_before` (bound PR) or the trunk commit resolved at positioning (fresh item). Recovery reads that commit id as the floor of the execution's work; it never reads the `boss-base/` bookmark. A baseline commit that was rewritten or abandoned still exists in the store and still works as a floor; a row with no usable `base_commit` uses the bound PR's `pr_head_before`, then trunk.
 
 Recovery is an optimisation. If pointer integrity checks cannot establish safe recovery, the engine archives the preserved commits and starts fresh. Transport failures retry through the ordinary positioning-failure path without retiring the recovery source. Redoing work is preferable to leaving an item unable to progress.
 

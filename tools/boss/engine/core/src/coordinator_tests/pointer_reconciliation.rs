@@ -893,6 +893,7 @@ mod rebase_adoption {
                 repo_path: fx.dir.path().join("missing-store"),
                 host_id: "local".into(),
                 base_commit: None,
+                pr_head_before: None,
             })
             .unwrap();
     }

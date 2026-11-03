@@ -3,9 +3,9 @@
 //! The worker advances the execution bookmark before editing a new change;
 //! jj itself follows rewrites of the bookmarked change. Recovery never reads
 //! the originating working copy. The baseline is the commit id recorded on the
-//! execution row at dispatch (the PR head for a bound PR, the trunk commit for a
-//! fresh item), so rewriting or abandoning any bookmark never invalidates it;
-//! published upstream history is excluded when checking for abandoned work.
+//! execution row at dispatch (`pr_head_before` for a bound PR, the trunk commit
+//! for a fresh item), so rewriting or abandoning any bookmark never invalidates
+//! it; published upstream history is excluded when checking for abandoned work.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -213,9 +213,14 @@ pub struct ExecutionBookmark {
     pub host_id: String,
     /// The baseline commit id recorded at dispatch: the floor of this
     /// execution's work. Recovery reads this, never the `boss-base/…` bookmark.
-    /// Legacy records may lack it, in which case trunk is the floor.
+    /// Legacy records may lack it, in which case `pr_head_before` is the floor
+    /// for a bound PR, then trunk.
     #[serde(default)]
     pub base_commit: Option<String>,
+    /// Bound-PR head snapshotted on the execution row. Used when `base_commit`
+    /// is missing or no longer in the store, before falling back to trunk.
+    #[serde(default)]
+    pub pr_head_before: Option<String>,
 }
 
 impl ExecutionBookmark {
@@ -420,15 +425,24 @@ pub(crate) async fn resolve_heads(jj: &dyn Jj, record: &ExecutionBookmark) -> Re
 
 /// The floor of the execution's work: the commit id recorded on its row. A
 /// rewritten or abandoned baseline commit still exists in the store, so it
-/// keeps working as a floor; a record with no usable commit (legacy, or
-/// collected from the store) falls back to trunk. Neither is an error.
+/// keeps working as a floor. A record with no usable `base_commit` (legacy, or
+/// collected from the store) uses the bound PR's `pr_head_before`, then trunk.
+/// Neither is an error.
 pub(crate) async fn resolve_base(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
-    if let Some(commit) = &record.base_commit
-        && commit_exists(jj, &record.repo_path, commit).await?
-    {
-        return Ok(commit.clone());
+    if let Some(commit) = usable_commit(jj, &record.repo_path, record.base_commit.as_deref()).await? {
+        return Ok(commit);
+    }
+    if let Some(commit) = usable_commit(jj, &record.repo_path, record.pr_head_before.as_deref()).await? {
+        return Ok(commit);
     }
     Ok("trunk()".to_owned())
+}
+
+async fn usable_commit(jj: &dyn Jj, repo: &Path, commit: Option<&str>) -> Result<Option<String>> {
+    match commit {
+        Some(commit) if commit_exists(jj, repo, commit).await? => Ok(Some(commit.to_owned())),
+        _ => Ok(None),
+    }
 }
 
 pub(crate) async fn resolve_pointers(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<Pointers> {
@@ -542,6 +556,7 @@ pub async fn create_from(
         repo_path: jj.shared_repo(workspace).await?,
         host_id: host_id.to_owned(),
         base_commit: None,
+        pr_head_before: None,
     };
     let result = async {
         // Existing names are an integrity verdict. Command failures (including
@@ -560,10 +575,9 @@ pub async fn create_from(
                 ));
             }
             diff(jj, prior).await?;
-            match (inherited_base, &prior.base_commit) {
-                (Some(base), _) => base.to_owned(),
-                (None, Some(commit)) => commit.clone(),
-                (None, None) => positioned_base(jj, workspace).await?,
+            match inherited_base {
+                Some(base) => base.to_owned(),
+                None => predecessor_floor(jj, prior).await?,
             }
         } else if let Some(base) = inherited_base {
             base.to_owned()
@@ -587,13 +601,77 @@ pub async fn create_from(
     result.map_err(|error: anyhow::Error| error.context(CreationFailure { record }))
 }
 
-/// The commit a freshly positioned workspace sits on: the PR head for a bound
-/// PR, the trunk commit for a fresh item. Cube leaves `@` as an empty,
-/// undescribed child of that commit (and `change create` adds the titled change
-/// above it), so the baseline is the nearest ancestor of `@-` that is not such
-/// setup state. The result is recorded as a commit id on the execution row.
-async fn positioned_base(jj: &dyn Jj, workspace: &Path) -> Result<String> {
-    resolve_commit(jj, workspace, &format!("heads(::@- ~ ({EMPTY_SETUP_CHANGES}))")).await
+/// Effective floor of a predecessor whose restore report did not supply one:
+/// its recorded `base_commit` when that hash is still in the store, else its
+/// `boss-base/` bookmark if that still exists, else `pr_head_before`, else
+/// trunk. Never inferred from the successor workspace (which has already been
+/// restored onto the predecessor heads) and never an unchecked raw hash.
+async fn predecessor_floor(jj: &dyn Jj, prior: &ExecutionBookmark) -> Result<String> {
+    if let Some(commit) = usable_commit(jj, &prior.repo_path, prior.base_commit.as_deref()).await? {
+        return Ok(commit);
+    }
+    if let Some(commit) = resolve_optional(jj, &prior.repo_path, &prior.base()).await? {
+        return Ok(commit);
+    }
+    if let Some(commit) = usable_commit(jj, &prior.repo_path, prior.pr_head_before.as_deref()).await? {
+        return Ok(commit);
+    }
+    resolve_commit(jj, &prior.repo_path, "trunk()").await
+}
+
+/// The commit a freshly positioned workspace sits on when the execution row
+/// has not yet recorded one: the PR head for a bound PR, the trunk commit for
+/// a fresh item. Cube leaves `@` as an empty, undescribed child of that commit
+/// (and `change create` adds the titled change above it). Only inspect
+/// emptiness above trunk; the parent of that floor may be outside a shallow
+/// clone. Callers that already have `pr_head_before` or a restore-report
+/// baseline pass it as `inherited_base` and never reach this path.
+pub(crate) async fn positioned_base(jj: &dyn Jj, workspace: &Path) -> Result<String> {
+    let output = jj
+        .run(
+            workspace,
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"heads(heads(::trunk() & ::@-) | ((trunk()..@-) ~ (empty() & description(exact:""))))"#,
+                "-T",
+                "commit_id ++ \"\\n\"",
+            ],
+        )
+        .await;
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => return Err(positioned_base_error(jj, workspace, error).await),
+    };
+    let ids: Vec<_> = output.lines().filter(|s| !s.is_empty()).collect();
+    ensure!(
+        ids.len() == 1,
+        "expected exactly one positioned baseline commit below @; found {}",
+        ids.len()
+    );
+    Ok(ids[0].to_owned())
+}
+
+/// Read jj's Git-store location rather than assuming a colocated checkout.
+async fn positioned_base_error(jj: &dyn Jj, workspace: &Path, error: anyhow::Error) -> anyhow::Error {
+    let boundaries = async {
+        let repo = jj.shared_repo(workspace).await?;
+        let store = repo.join(".jj/repo/store");
+        let target = std::fs::read_to_string(store.join("git_target"))?;
+        let shallow = store.join(target.trim()).join("shallow");
+        let boundaries = std::fs::read_to_string(&shallow)?;
+        Ok::<_, anyhow::Error>((shallow, boundaries))
+    }
+    .await;
+    match boundaries {
+        Ok((path, ids)) if !ids.trim().is_empty() => error.context(format!(
+            "cannot compute execution baseline in shallow repository; shallow boundaries in {}: {}",
+            path.display(),
+            ids.split_whitespace().collect::<Vec<_>>().join(", ")
+        )),
+        _ => error.context("cannot compute execution baseline above trunk"),
+    }
 }
 
 /// Resolve a revset to exactly one commit id.
@@ -687,8 +765,10 @@ pub async fn release_heads(
     Ok(archived)
 }
 
-/// A successful empty diff proves an empty run. Missing/conflicted references,
-/// unavailable jj, and unrelated targets are errors, never empty results.
+/// Diff from `fork_point(base | head)` for each resumed head, concatenated.
+/// A successful empty patch proves an empty run (including a head that shares
+/// no history with the floor beyond the fork, such as `root()`). Missing or
+/// conflicted references and unavailable jj are errors, never empty results.
 pub async fn diff(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
     let pointers = resolve_pointers(jj, record).await?;
     let mut patches = String::new();

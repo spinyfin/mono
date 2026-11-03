@@ -113,6 +113,93 @@ async fn consecutive_recoveries_keep_inherited_work_when_the_next_run_makes_no_e
 }
 
 #[tokio::test]
+async fn consecutive_recoveries_keep_work_when_the_predecessor_has_no_recorded_baseline() {
+    let f = Fixture::new().await;
+    let prior = f.record("exec_legacy_null_base").await;
+    let floor = prior.base_commit.clone().unwrap();
+    f.edit(&prior).await;
+    let mut legacy = prior.clone();
+    legacy.base_commit = None;
+    assert!(restore(&LocalJj, &legacy, &f.replacement).await.unwrap());
+    let next = create_from(
+        &LocalJj,
+        &f.replacement,
+        "exec_legacy_null_next",
+        "local",
+        Some(&legacy),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(next.base_commit.as_deref(), Some(floor.as_str()));
+    let patch = unpublished_diff(&LocalJj, &next).await.unwrap();
+    assert!(patch.contains("work.txt") && patch.contains("second.txt"), "{patch}");
+}
+
+#[tokio::test]
+async fn consecutive_recoveries_keep_work_when_the_predecessors_baseline_hash_is_gone() {
+    let f = Fixture::new().await;
+    let prior = f.record("exec_missing_hash").await;
+    let floor = prior.base_commit.clone().unwrap();
+    f.edit(&prior).await;
+    let mut gone = prior.clone();
+    gone.base_commit = Some("0123456789abcdef0123456789abcdef01234567".to_owned());
+    LocalJj
+        .run(&f.repo, &["bookmark", "delete", &prior.base()])
+        .await
+        .unwrap();
+    gone.pr_head_before = Some(floor.clone());
+    assert!(restore(&LocalJj, &gone, &f.replacement).await.unwrap());
+    let next = create_from(
+        &LocalJj,
+        &f.replacement,
+        "exec_missing_hash_next",
+        "local",
+        Some(&gone),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(next.base_commit.as_deref(), Some(floor.as_str()));
+    let patch = unpublished_diff(&LocalJj, &next).await.unwrap();
+    assert!(patch.contains("work.txt") && patch.contains("second.txt"), "{patch}");
+}
+
+#[tokio::test]
+async fn restoration_uses_pr_head_before_when_base_commit_is_absent_or_unusable() {
+    let f = Fixture::new().await;
+    let prior = f.record("exec_pr_head_floor").await;
+    let floor = prior.base_commit.clone().unwrap();
+    f.edit(&prior).await;
+    LocalJj
+        .run(&f.repo, &["bookmark", "delete", &prior.base()])
+        .await
+        .unwrap();
+    for base_commit in [
+        None,
+        Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+    ] {
+        let record = ExecutionBookmark {
+            base_commit,
+            pr_head_before: Some(floor.clone()),
+            ..prior.clone()
+        };
+        let patch = unpublished_diff(&LocalJj, &record).await.unwrap();
+        assert!(patch.contains("work.txt") && patch.contains("second.txt"), "{patch}");
+    }
+    let record = ExecutionBookmark {
+        base_commit: None,
+        pr_head_before: Some(floor),
+        ..prior
+    };
+    assert!(restore(&LocalJj, &record, &f.replacement).await.unwrap());
+    assert_eq!(
+        std::fs::read_to_string(f.replacement.join("second.txt")).unwrap(),
+        "second change\n"
+    );
+}
+
+#[tokio::test]
 async fn publication_cleanup_cannot_remove_the_engine_owned_recovery_pointer() {
     let f = Fixture::new().await;
     let record = f.record("exec_retained").await;
@@ -359,4 +446,61 @@ async fn initialization_transport_error_remains_retryable() {
     assert!(error.downcast_ref::<CreationFailure>().is_some());
     assert!(!is_pointer_integrity_error(&error));
     assert!(format!("{error:#}").contains("SSH unavailable"));
+}
+
+#[tokio::test]
+async fn shallow_history_below_trunk_does_not_affect_baseline_creation() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = boss_engine_test_git::jj::JjRepo::new(root.path());
+    let missing = boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+    boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["new", "-m", "Shallow boundary"]);
+    let boundary = boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+    boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["new", "-m", "Trunk base"]);
+    boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["bookmark", "create", "main", "-r", "@"]);
+    boss_engine_test_git::jj::JjRepo::run(
+        &repo.repo,
+        &["config", "set", "--repo", "revset-aliases.\"trunk()\"", "main"],
+    );
+    let base = boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+    boss_engine_test_git::jj::JjRepo::run(&repo.worker, &["new", "main"]);
+    boss_engine_test_git::jj::JjRepo::run(&repo.worker, &["new", "-m", "Execution"]);
+    let git = repo.repo.join(".jj/repo/store/git");
+    std::fs::write(git.join("shallow"), format!("{boundary}\n")).unwrap();
+    std::fs::remove_file(git.join("objects").join(&missing[..2]).join(&missing[2..])).unwrap();
+
+    // The unbounded empty() walk needs the missing parent to test whether the
+    // boundary is empty.
+    let old = LocalJj
+        .run(
+            &repo.worker,
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "heads((::@-) ~ (empty() & description(exact:\"\")))",
+                "-T",
+                "commit_id",
+            ],
+        )
+        .await;
+    let old_error = format!("{:#}", old.unwrap_err());
+    assert!(old_error.contains(&missing), "{old_error}");
+    let record = create(&LocalJj, &repo.worker, "exec_shallow", "local").await.unwrap();
+    assert_eq!(record.base_commit.as_deref(), Some(base.as_str()));
+
+    // A concurrently advancing trunk must not remove the positioned base
+    // from the candidate set, even when that base is an empty commit.
+    boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["new", "-m", "Advanced trunk"]);
+    boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["bookmark", "set", "main", "-r", "@"]);
+    assert_eq!(positioned_base(&LocalJj, &repo.worker).await.unwrap(), base);
+
+    // If trunk itself cannot bound the missing history, preserve the failure
+    // and identify the shallow boundary instead of silently losing provenance.
+    boss_engine_test_git::jj::JjRepo::run(
+        &repo.repo,
+        &["config", "set", "--repo", "revset-aliases.\"trunk()\"", "root()"],
+    );
+    let error = positioned_base(&LocalJj, &repo.worker).await.unwrap_err();
+    assert!(error.to_string().contains("shallow boundaries"), "{error:#}");
+    assert!(error.to_string().contains(&boundary), "{error:#}");
 }

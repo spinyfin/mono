@@ -163,11 +163,26 @@ async fn abandoned_baseline_commit_is_still_the_floor() {
 }
 
 #[tokio::test]
-async fn unusable_recorded_baseline_falls_back_to_trunk() {
+async fn unusable_recorded_baseline_falls_back_to_pr_head_before_then_trunk() {
     let s = revision_on_pr_head("exec_no_base").await;
+    let pr_head = one(&s.repo.repo, "pr/7");
     for base_commit in [None, Some("0123456789abcdef0123456789abcdef01234567".to_owned())] {
         let record = ExecutionBookmark {
             base_commit,
+            pr_head_before: Some(pr_head.clone()),
+            ..s.record.clone()
+        };
+        let patch = diff(&LocalJj, &record).await.unwrap();
+        assert!(
+            patch.contains("revision.txt") && !patch.contains("pr.txt"),
+            "{patch}"
+        );
+        assert!(!unpublished_diff(&LocalJj, &record).await.unwrap().is_empty());
+    }
+    for base_commit in [None, Some("0123456789abcdef0123456789abcdef01234567".to_owned())] {
+        let record = ExecutionBookmark {
+            base_commit,
+            pr_head_before: None,
             ..s.record.clone()
         };
         let patch = diff(&LocalJj, &record).await.unwrap();

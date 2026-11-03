@@ -41,7 +41,10 @@ impl WorkDb {
         Ok(self
             .connect()?
             .query_row(
-                "SELECT repo_path, host_id, base_commit FROM execution_bookmarks WHERE execution_id = ?1",
+                "SELECT eb.repo_path, eb.host_id, eb.base_commit, we.pr_head_before
+                 FROM execution_bookmarks eb
+                 LEFT JOIN work_executions we ON we.id = eb.execution_id
+                 WHERE eb.execution_id = ?1",
                 [execution_id],
                 |row| {
                     Ok(boss_engine_recovery::execution_bookmark::ExecutionBookmark {
@@ -49,6 +52,7 @@ impl WorkDb {
                         repo_path: PathBuf::from(row.get::<_, String>(0)?),
                         host_id: row.get(1)?,
                         base_commit: row.get(2)?,
+                        pr_head_before: row.get(3)?,
                     })
                 },
             )

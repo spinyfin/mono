@@ -1188,7 +1188,12 @@ impl ExecutionCoordinator {
                 )
                 .await?;
                 let fresh = adapter
-                    .create_execution_bookmark(Path::new(workspace), &execution.id, None, None)
+                    .create_execution_bookmark(
+                        Path::new(workspace),
+                        &execution.id,
+                        None,
+                        execution.pr_head_before.as_deref(),
+                    )
                     .await?;
                 self.work_db.record_execution_bookmark(&fresh)?;
                 self.work_db.delete_execution_restore_report(&execution.id)?;

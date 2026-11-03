@@ -1946,6 +1946,7 @@ pub mod workspace {
                 repo_path: LocalJj.shared_repo(path).await?,
                 host_id: self.host_id.clone(),
                 base_commit: bookmark.and_then(|b| optional(&b.anchor_commit)).map(str::to_owned),
+                pr_head_before: None,
             })
         }
     }

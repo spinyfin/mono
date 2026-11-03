@@ -184,6 +184,7 @@ mod tests {
             repo_path: dir.path().join("missing"),
             host_id: "local".into(),
             base_commit: None,
+            pr_head_before: None,
         };
         assert!(
             backup_execution_patch(dir.path(), &crate::execution_bookmark::LocalJj, &record)
@@ -201,6 +202,7 @@ mod tests {
             repo_path: repo.repo,
             host_id: "local".into(),
             base_commit: None,
+            pr_head_before: None,
         };
         assert!(
             backup_execution_patch(dir.path(), &crate::execution_bookmark::LocalJj, &record)

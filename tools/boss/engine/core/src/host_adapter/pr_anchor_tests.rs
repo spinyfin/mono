@@ -7,6 +7,7 @@ struct Store {
     damage_on_fetch: AtomicBool,
     conflicted: bool,
     fail_fetch: AtomicBool,
+    damage_after_repair: AtomicBool,
 }
 
 fn one(repo: &Path, rev: &str) -> String {
@@ -65,6 +66,9 @@ impl Jj for Store {
             anyhow::bail!("SSH connection reset");
         }
         let result = LocalJj.run(workspace, args).await?;
+        if self.damage_after_repair.load(Ordering::SeqCst) && args.starts_with(&["bookmark", "set", "pr/7"]) {
+            damage(&self.repo.repo, self.conflicted);
+        }
         if args.starts_with(&["git", "fetch"]) && self.damage_on_fetch.swap(false, Ordering::SeqCst) {
             damage(&self.repo.repo, self.conflicted);
         }
@@ -113,46 +117,45 @@ async fn scene(dir: &Path, conflicted: bool, restore: bool) -> (Store, Execution
             damage_on_fetch: AtomicBool::new(restore),
             conflicted,
             fail_fetch: false.into(),
+            damage_after_repair: false.into(),
         },
         record,
         head,
     )
 }
 
-async fn repaired(conflicted: bool, restore: bool) {
+async fn repaired(conflicted: bool) {
     let dir = tempfile::tempdir().unwrap();
-    let (store, record, head) = scene(dir.path(), conflicted, restore).await;
+    let (store, record, head) = scene(dir.path(), conflicted, true).await;
     let cube = FakeCube::new(&store, &head);
-    if restore {
-        let preserved = one(&store.repo.repo, &record.head());
-        let report = restore_rebased(
-            &store,
-            &cube,
-            &record,
-            &store.repo.replacement,
-            Some("pr/7"),
-            "main",
-            "origin",
-        )
-        .await
-        .unwrap();
-        assert!(report.pr_bound);
-        assert!(JjRepo::run(&store.repo.replacement, &["file", "show", "root:work.txt"]).contains("preserved work"));
-        assert_eq!(one(&store.repo.repo, &record.head()), preserved);
-        assert_eq!(one(&store.repo.repo, &record.publication()), preserved);
-    }
+    let preserved = one(&store.repo.repo, &record.head());
+    let report = restore_rebased(
+        &store,
+        &cube,
+        &record,
+        &store.repo.replacement,
+        Some("pr/7"),
+        "main",
+        "origin",
+    )
+    .await
+    .unwrap();
+    assert!(report.pr_bound);
+    assert!(JjRepo::run(&store.repo.replacement, &["file", "show", "root:work.txt"]).contains("preserved work"));
+    assert_eq!(one(&store.repo.repo, &record.head()), preserved);
+    assert_eq!(one(&store.repo.repo, &record.publication()), preserved);
     assert_eq!(one(&store.repo.repo, "pr/7"), head);
     assert!(execution_bookmark::diff(&store, &record).await.unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn restore_repairs_alias_deleted_by_fetch() {
-    repaired(false, true).await;
+    repaired(false).await;
 }
 
 #[tokio::test]
 async fn restore_repairs_alias_conflicted_by_fetch() {
-    repaired(true, true).await;
+    repaired(true).await;
 }
 
 /// Stands in for `cube workspace repair-pr-bookmark`: fetches the head branch
@@ -190,6 +193,48 @@ impl PrAliasRepair for FakeCube<'_> {
         )
         .await?;
         Ok(())
+    }
+}
+
+/// Fails the way the production wrappers do: Cube's stderr, classified.
+struct FailingCube(&'static str);
+
+#[async_trait]
+impl PrAliasRepair for FailingCube {
+    async fn repair(&self, _: &Path, _: u64) -> Result<()> {
+        Err(classify_repair_error(anyhow::anyhow!(self.0)))
+    }
+}
+
+#[tokio::test]
+async fn lookup_failures_remain_retryable_but_cube_refusals_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, record, _) = scene(dir.path(), false, false).await;
+    let transient = ensure(
+        &store,
+        &FailingCube("Cube command failed: HTTP 503 network unavailable"),
+        &record,
+        7,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        !execution_bookmark::is_pointer_integrity_error(&transient),
+        "{transient:#}"
+    );
+    for refusal in [
+        "Cube command failed: cannot repair `pr/7`: cube cannot move `pr/7`: cube will not pick a side with unique content",
+        "Cube command failed: cannot repair `pr/7`: PR 7 returned no head.sha",
+        "Cube command failed: cannot repair `pr/7`: PR 7 returned no head.sha: \"\" is not a full 40-character commit id",
+        // The shape `cube --json` writes to stderr, as the local and SSH
+        // transports surface it.
+        r#"Cube command failed: {"error":"cannot repair `pr/7`: PR 7 returned no head.sha: \"abc123\" is not a full 40-character commit id"}"#,
+    ] {
+        let blocked = ensure(&store, &FailingCube(refusal), &record, 7).await.unwrap_err();
+        assert!(
+            execution_bookmark::is_pointer_integrity_error(&blocked),
+            "{blocked:#}"
+        );
     }
 }
 
@@ -237,6 +282,31 @@ async fn ensure_repairs_missing_and_conflicted_alias_once() {
         ensure(&store, &lookup, &record, 7).await.unwrap();
         assert_eq!(one(&store.repo.repo, "pr/7"), lookup.sha);
         ensure(&store, &lookup, &record, 7).await.unwrap();
+        assert_eq!(lookup.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn lost_again_after_repair_is_loud_and_not_a_legacy_blocker() {
+    for conflicted in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, record, sha) = scene(dir.path(), conflicted, false).await;
+        store.damage_after_repair.store(true, Ordering::SeqCst);
+        let lookup = FakeCube::new(&store, &sha);
+        let err = restore_rebased(
+            &store,
+            &lookup,
+            &record,
+            &store.repo.replacement,
+            Some("pr/7"),
+            "main",
+            "origin",
+        )
+        .await
+        .unwrap_err();
+        assert!(execution_bookmark::is_pointer_integrity_error(&err));
+        assert!(err.to_string().contains("removed or conflicted again"));
+        assert!(!execution_bookmark::is_legacy_pr_anchor_blocker(&err.to_string()));
         assert_eq!(lookup.calls.load(Ordering::SeqCst), 1);
     }
 }

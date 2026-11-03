@@ -1215,6 +1215,7 @@ async fn kept_pre_start_lease_does_not_block_redispatch() {
         repo_path: PathBuf::from("/tmp/boss-no-such-repo"),
         host_id: "local".to_owned(),
         base_commit: None,
+        pr_head_before: None,
     })
     .unwrap();
     let cube = Arc::new(FakeCubeClient::default());

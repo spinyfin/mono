@@ -26,6 +26,15 @@ impl ExecutionCoordinator {
         positioning: FreshStart<'_>,
     ) -> Result<(ExecutionBookmark, bool)> {
         let (predecessor, inherited_base) = inheritance;
+        // A restore report's copied PR baseline wins. On a fresh start, the
+        // bound-PR snapshot on the execution row is the floor; never walk the
+        // positioned workspace. A predecessor without a report inherits its
+        // own resolved floor inside pointer creation.
+        let inherited_base = if predecessor.is_some() {
+            inherited_base
+        } else {
+            inherited_base.or(execution.pr_head_before.as_deref())
+        };
         let result = adapter
             .create_execution_bookmark(&lease.workspace_path, &execution.id, predecessor, inherited_base)
             .await;
@@ -85,7 +94,12 @@ impl ExecutionCoordinator {
         position_fresh_workspace(adapter.as_ref(), &lease.workspace_path, &positioning).await?;
         adapter.create_change(&lease.workspace_path, positioning.title).await?;
         let record = adapter
-            .create_execution_bookmark(&lease.workspace_path, &execution.id, None, None)
+            .create_execution_bookmark(
+                &lease.workspace_path,
+                &execution.id,
+                None,
+                execution.pr_head_before.as_deref(),
+            )
             .await?;
         Ok((record, false))
     }

@@ -278,6 +278,7 @@ macro_rules! stub_cube_client {
                     repo_path: workspace.to_path_buf(),
                     host_id: "local".to_owned(),
                     base_commit: None,
+                    pr_head_before: None,
                 })
             }
         }
