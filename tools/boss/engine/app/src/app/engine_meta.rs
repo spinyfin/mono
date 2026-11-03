@@ -843,6 +843,19 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
                  applied in-memory but will revert on engine restart",
             );
         }
+        if paused && scope.holds_reviews() {
+            match work_db.release_unstartable_pre_merge_review_reservations() {
+                Ok(released) if !released.is_empty() => tracing::info!(
+                    released = released.len(),
+                    "dispatch: released never-started pre-merge review reservations held by all-spawns pause"
+                ),
+                Ok(_) => {}
+                Err(err) => tracing::warn!(
+                    ?err,
+                    "dispatch: failed to release never-started pre-merge review reservations on all-spawns pause"
+                ),
+            }
+        }
         if paused {
             // The line states the scope from the same pause value the
             // admission gate reads (`scope_description`), so the words cannot

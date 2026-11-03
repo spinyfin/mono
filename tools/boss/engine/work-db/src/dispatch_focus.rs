@@ -27,6 +27,7 @@
 //! to its product. A row that cannot be attributed to anything is out of
 //! scope: focus mode admits only what it can prove is in scope.
 
+use anyhow::Context;
 use boss_protocol::{DispatchFocus, DispatchFocusTarget, DispatchFocusTargetKind, TaskKind};
 
 use super::products_design::resolve_doc_owner_on;
@@ -188,16 +189,42 @@ impl<'a> ScopeResolver<'a> {
     }
 }
 
+/// The persisted focus set against an open connection or transaction.
+pub(crate) fn load_dispatch_focus_on(conn: &Connection) -> Result<DispatchFocus> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = ?1",
+            [METADATA_KEY_DISPATCH_FOCUS],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match raw {
+        Some(raw) if !raw.trim().is_empty() => {
+            serde_json::from_str(&raw).with_context(|| format!("unreadable persisted dispatch focus: {raw}"))
+        }
+        _ => Ok(DispatchFocus::default()),
+    }
+}
+
+/// Whether `work_item_id` is inside `focus` against an open connection.
+/// An inactive focus contains everything.
+pub(crate) fn work_item_in_dispatch_focus_on(
+    conn: &Connection,
+    work_item_id: &str,
+    focus: &DispatchFocus,
+) -> Result<bool> {
+    if !focus.is_active() {
+        return Ok(true);
+    }
+    ScopeResolver::new(conn, focus).in_scope(work_item_id)
+}
+
 #[work_db_boundary::instrument]
 impl WorkDb {
     /// The persisted focus set. Absent means no focus mode.
     pub fn load_dispatch_focus(&self) -> Result<DispatchFocus> {
-        match self.get_metadata(METADATA_KEY_DISPATCH_FOCUS)? {
-            Some(raw) if !raw.trim().is_empty() => {
-                serde_json::from_str(&raw).with_context(|| format!("unreadable persisted dispatch focus: {raw}"))
-            }
-            _ => Ok(DispatchFocus::default()),
-        }
+        let conn = self.connect()?;
+        load_dispatch_focus_on(&conn)
     }
 
     /// Persist the focus set. An inactive (empty) set is stored as such
@@ -283,11 +310,8 @@ impl WorkDb {
     /// Whether `work_item_id` is inside `focus`. An inactive focus contains
     /// everything.
     pub fn work_item_in_dispatch_focus(&self, work_item_id: &str, focus: &DispatchFocus) -> Result<bool> {
-        if !focus.is_active() {
-            return Ok(true);
-        }
         let conn = self.connect()?;
-        ScopeResolver::new(&conn, focus).in_scope(work_item_id)
+        work_item_in_dispatch_focus_on(&conn, work_item_id, focus)
     }
 
     /// The ids of the executions in `executions` that lie outside `focus` —

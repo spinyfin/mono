@@ -992,6 +992,9 @@ impl WorkDb {
     pub fn list_dead_pr_review_candidates(&self) -> Result<Vec<DeadPrReviewCandidate>> {
         let conn = self.connect()?;
         let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
+        // Releasing a never-started batch abandons its leaves and removes
+        // their membership rows. The deferred marker routes those roots back
+        // through batch admission rather than minting a legacy reviewer.
         let sql = format!(
             "SELECT t.id, we.id, we.status
              FROM tasks t
@@ -1000,6 +1003,12 @@ impl WorkDb {
                AND t.status NOT IN ('done', 'archived')
                AND t.pr_url IS NOT NULL AND t.pr_url != ''
                AND we.kind = 'pr_review'
+               AND NOT EXISTS (
+                   SELECT 1 FROM work_attention_items ai
+                   WHERE ai.work_item_id = t.id
+                     AND ai.kind = 'pr_review_admission_deferred'
+                     AND ai.status = 'open'
+               )
                AND (
                    we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
                    OR {unproductive_completed}
