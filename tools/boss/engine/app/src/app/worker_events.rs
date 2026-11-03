@@ -67,8 +67,12 @@ fn worker_event_kind(event: &boss_protocol::WorkerEvent) -> &'static str {
 /// `ProgressIngress::HookCallback` driver. This impl is the whole of the
 /// byte-stream arm's engine-side behaviour — everything downstream is shared
 /// with the hook path, by construction.
-/// The wrapper keeps the sink app-owned while handlers retain their shared
-/// server reference across spawned work.
+///
+/// Newtype around `Arc<ServerState>` because the orphan rule forbids
+/// implementing `WorkerEventSink` (defined in `boss_engine_runtime`) on
+/// `Arc<ServerState>` from this crate: `Arc` is foreign and `ServerState` is
+/// local, but the combination is not a local type. Keep the wrapper so nobody
+/// later tries to impl the trait on `Arc<ServerState>` directly.
 pub(super) struct ServerEventSink(pub(super) Arc<ServerState>);
 
 #[async_trait::async_trait]

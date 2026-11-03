@@ -240,10 +240,9 @@ fn deferred_scope_item_product_id(work_db: &WorkDb, item: &WorkAttentionItem) ->
     Some(work_item.product_id().to_owned())
 }
 
-/// The Notifications UI's merge-provenance affordance reads
-/// the `attention_merges` ledger (already built in task 1) for one canonical
-/// `Attention` id, on demand. Empty until the dedup creation/sweep paths
-/// (tasks 5/7) exist to write rows.
+/// The Notifications UI's merge-provenance affordance reads the
+/// `attention_merges` ledger for one canonical `Attention` id, on demand.
+/// Returns an empty list when no merges were recorded for that id.
 pub(super) async fn handle_list_attention_merges(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         work_db,
