@@ -16,12 +16,11 @@ use boss_engine_storage_values::Host;
 use boss_engine_storage_values::attention_kinds::{
     EXECUTION_BOOKMARK_CREATE_FAILED_ATTENTION_KIND as CREATE_FAILED,
     EXECUTION_BOOKMARK_RECOVERY_FAILED_ATTENTION_KIND as RECOVERY_FAILED,
-    EXECUTION_BOOKMARK_RECOVERY_RETIRED_ATTENTION_KIND as RECOVERY_RETIRED,
 };
 use boss_execution_contracts::{
-    ChoreRequirements, FailureEffect, HostSlot, IneligibilityReason, LeaseReleaseOutcome, LifecycleServices,
-    LiveWorkerLiveness, PidStatus, PreStartStage, PreStartStreakTracker, TeardownReason, TerminalCause,
-    WorkerPaneReleaser, driver_capability, select_host,
+    ChoreRequirements, Eligibility, FailureEffect, HostSlot, IneligibilityReason, LeaseReleaseOutcome,
+    LifecycleServices, LiveWorkerLiveness, PidStatus, PreStartStage, PreStartStreakTracker, TeardownReason,
+    TerminalCause, WorkerPaneReleaser, driver_capability, select_host,
 };
 
 use crate::conflict_diagnosis;
@@ -821,9 +820,12 @@ mod blocked_workspace;
 mod config;
 mod dispatch_admission;
 mod execution;
+mod fresh_start;
 mod lease_limiter;
 mod run;
 mod scheduler;
+
+pub use fresh_start::FreshStart;
 
 pub use config::{LOCAL_CAPABILITY_DISCOVERY_PENDING_REASON, STARTUP_RECOVERY_PENDING_REASON};
 pub use dispatch_admission::{PauseBypassOutcome, pause_bypass_decision};

@@ -534,4 +534,75 @@ impl WorkDb {
             .optional()?
             .flatten())
     }
+
+    /// A resolved informational note: archiving is successful recovery handling,
+    /// never a request for intervention or a reason to disable autostart.
+    pub fn record_recovery_fresh_start(
+        &self,
+        prior: &WorkExecution,
+        next_id: &str,
+        reason: &str,
+        archives: &[(String, String)],
+    ) -> Result<()> {
+        self.record_recovery_archive_note(
+            prior,
+            reason,
+            archives,
+            (
+                "Recovery source retired; starting fresh",
+                &format!(
+                    "Execution `{next_id}` starts fresh from an open PR, trunk, or the captured immutable review target. No action is required."
+                ),
+            ),
+        )
+    }
+
+    /// Stale current-attempt names were archived while predecessor adoption continues.
+    pub fn record_recovery_adoption_archive(
+        &self,
+        execution: &WorkExecution,
+        reason: &str,
+        archives: &[(String, String)],
+    ) -> Result<()> {
+        self.record_recovery_archive_note(
+            execution,
+            reason,
+            archives,
+            (
+                "Stale recovery names archived; continuing predecessor adoption",
+                "Stale current-attempt names were archived. Predecessor adoption continues; no action is required.",
+            ),
+        )
+    }
+
+    fn record_recovery_archive_note(
+        &self,
+        prior: &WorkExecution,
+        reason: &str,
+        archives: &[(String, String)],
+        wording: (&str, &str),
+    ) -> Result<()> {
+        use boss_engine_storage_values::attention_kinds::EXECUTION_BOOKMARK_RECOVERY_RETIRED_ATTENTION_KIND;
+        let mut retained = archives
+            .iter()
+            .map(|(name, commit)| format!("`{name}` retains `{commit}`"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if retained.is_empty() {
+            retained = "No archive bookmarks were created.".to_owned();
+        }
+        self.create_attention_item(CreateAttentionItemInput {
+            execution_id: None,
+            work_item_id: Some(self.owning_work_item_id(&prior.work_item_id)),
+            kind: EXECUTION_BOOKMARK_RECOVERY_RETIRED_ATTENTION_KIND.to_owned(),
+            status: Some("resolved".to_owned()),
+            title: wording.0.to_owned(),
+            body_markdown: format!(
+                "Execution `{}` encountered a recovery problem: {reason}\n\nRecovery archive:\n{retained}\n\n{}",
+                prior.id, wording.1
+            ),
+            resolved_at: Some(now_string()),
+        })?;
+        Ok(())
+    }
 }

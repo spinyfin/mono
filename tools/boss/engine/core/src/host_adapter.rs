@@ -303,13 +303,21 @@ impl HostAdapter for LocalHostAdapter {
         );
         pr_anchor::reconcile(&LocalJj, self, record, pr_bookmark, trunk).await
     }
-    async fn release_execution_bookmark_heads(&self, record: &ExecutionBookmark) -> Result<Vec<(String, String)>> {
+    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<()> {
+        execution_bookmark::Jj::run(&LocalJj, workspace, &["new", "trunk()", "-m", "Fresh execution"]).await?;
+        Ok(())
+    }
+    async fn release_execution_bookmark_heads(
+        &self,
+        record: &ExecutionBookmark,
+        release_names: bool,
+    ) -> Result<Vec<(String, String)>> {
         anyhow::ensure!(
             record.host_id == "local",
             "recovery bookmark belongs to host {}",
             record.host_id
         );
-        execution_bookmark::release_heads(&LocalJj, record).await
+        execution_bookmark::release_heads(&LocalJj, record, release_names).await
     }
     async fn prune_execution_bookmark(
         &self,
@@ -900,12 +908,20 @@ impl HostAdapter for SshHostAdapter {
         );
         pr_anchor::reconcile(self, self, record, pr_bookmark, trunk).await
     }
-    async fn release_execution_bookmark_heads(&self, record: &ExecutionBookmark) -> Result<Vec<(String, String)>> {
+    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<()> {
+        execution_bookmark::Jj::run(self, workspace, &["new", "trunk()", "-m", "Fresh execution"]).await?;
+        Ok(())
+    }
+    async fn release_execution_bookmark_heads(
+        &self,
+        record: &ExecutionBookmark,
+        release_names: bool,
+    ) -> Result<Vec<(String, String)>> {
         anyhow::ensure!(
             record.host_id == self.host_id(),
             "recovery store belongs to another host"
         );
-        execution_bookmark::release_heads(self, record).await
+        execution_bookmark::release_heads(self, record, release_names).await
     }
 
     fn host_id(&self) -> &str {

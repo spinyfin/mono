@@ -150,8 +150,8 @@ const fn entry(kind: &'static str, cleared_by: ClearedBy, rationale: &'static st
 pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
         REVISION_CHAIN_RECOVERY_BLOCKED_ATTENTION_KIND,
-        ClearedBy::HumanDecision,
-        "The PR owner must acknowledge an unrecoverable revision blocking the chain; unrelated root PR review activity does not prove the blocked revision recovered.",
+        ClearedBy::WorkResumed,
+        "Legacy recovery blockers are rearmed by the fresh-start migration; a successful start clears the obsolete failure.",
     ),
     entry(
         HUNG_WORKER_ATTENTION_KIND,
@@ -180,8 +180,8 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     ),
     entry(
         EXECUTION_BOOKMARK_RECOVERY_RETIRED_ATTENTION_KIND,
-        ClearedBy::HumanDecision,
-        "The engine already started the item fresh; the superseded commits it names stay in the shared store until a human inspects or discards them, which no later run can prove happened.",
+        ClearedBy::ProducerReconciles,
+        "Archiving writes this informational note already resolved. Durable archive references retain the preserved commits independently of later pruning.",
     ),
     entry(
         LEASE_UNRELEASED_ATTENTION_KIND,

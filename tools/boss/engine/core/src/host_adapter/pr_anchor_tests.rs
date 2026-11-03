@@ -331,61 +331,9 @@ async fn transient_fetch_failure_retries_repair_and_preserves_pointers() {
     let err = ensure(&store, &lookup, &record, 7).await.unwrap_err();
     assert!(!execution_bookmark::is_pointer_integrity_error(&err));
     assert!(format!("{err:#}").contains("SSH connection reset"));
-    use crate::work::{CreateExecutionInput, ExecutionKind, WorkDb};
-    let alerts = |db: &WorkDb| {
-        db.list_open_attention_items_of_kind(crate::execution_bookmark_recovery::CHAIN_BLOCKED)
-            .unwrap()
-            .len()
-    };
-    let db = WorkDb::open_in_memory().unwrap();
-    let product = crate::test_support::create_test_product(&db);
-    let root = crate::test_support::create_test_chore(&db, &product.id, "retry recovery");
-    let task_id = insert_revision(&db, &product.id, &root.id);
-    let (crate::work::WorkItem::Task(before) | crate::work::WorkItem::Chore(before)) =
-        db.get_work_item(&task_id).unwrap()
-    else {
-        panic!("expected a task row")
-    };
-    let execution = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(task_id.clone())
-                .kind(ExecutionKind::RevisionImplementation)
-                .build(),
-        )
-        .unwrap();
-    assert!(!crate::execution_bookmark_recovery::block_unrecoverable(&db, &execution, &err).unwrap());
-    let (crate::work::WorkItem::Task(current) | crate::work::WorkItem::Chore(current)) =
-        db.get_work_item(&task_id).unwrap()
-    else {
-        panic!("expected a task row")
-    };
-    assert_eq!(current.status, before.status);
-    assert_eq!(current.autostart, before.autostart);
-    assert!(current.blocked_reason.is_none());
-    assert_eq!(alerts(&db), 0);
-    // Positive control: the same revision fixture does raise the root-card
-    // alert for an authoritative failure, so the zero above is meaningful.
-    let integrity = execution_bookmark::pointer_integrity_error("GitHub head is gone");
-    assert!(crate::execution_bookmark_recovery::block_unrecoverable(&db, &execution, &integrity).unwrap());
-    assert_eq!(alerts(&db), 1);
     assert_eq!(one(&store.repo.repo, &record.head()), saved);
     store.fail_fetch.store(false, Ordering::SeqCst);
     ensure(&store, &lookup, &record, 7).await.unwrap();
     assert_eq!(lookup.calls.load(Ordering::SeqCst), 2);
     assert_eq!(one(&store.repo.repo, "pr/7"), lookup.sha);
-}
-
-/// A real revision row under `root_id`, so chain-root lookups resolve.
-fn insert_revision(db: &crate::work::WorkDb, product_id: &str, root_id: &str) -> String {
-    let conn = db.connect().unwrap();
-    let id = crate::work::next_id("task");
-    let now = crate::work::now_string();
-    conn.execute(
-        "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id)
-             VALUES (?1, ?2, 'revision', 'Test revision', '', 'todo', ?3, ?3, ?4)",
-        rusqlite::params![id, product_id, now, root_id],
-    )
-    .unwrap();
-    id
 }
