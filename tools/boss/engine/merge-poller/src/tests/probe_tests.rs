@@ -395,7 +395,7 @@ fn walk_batch_response_finds_nodes_by_alias_and_flags_null_nodes() {
 /// `(state × mergeability × ci-leaf-set × combined-state)` matrix for
 /// the CI predicate. Exercises the latest-leaf-per-name collapse, the
 /// required/not-required filter, the closed conclusion set from design
-/// §Q1 / Phase 8 #21, and the combined-commit-status fallback used to
+/// §Q1, and the combined-commit-status fallback used to
 /// surface EXPECTED (not-yet-submitted) required checks.
 #[test]
 fn parse_probe_covers_ci_leaf_set_matrix() {

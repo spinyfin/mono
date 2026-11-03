@@ -927,40 +927,50 @@ async fn renumber_merge_queue_excludes_orphaned_terminal_rows() {
 async fn mid_queue_member_leaving_renumbers_remaining_siblings_via_update_pr_poll_state() {
     let (_dir, db) = open_db();
     let product = create_test_product_with_repo(&db, "RenumberWiring", Some("git@github.com:foo/bar.git"));
-    let t1 = chore_in_review_for_product(&db, &product.id, "T1", "https://github.com/foo/bar/pull/1");
-    let t2 = chore_in_review_for_product(&db, &product.id, "T2", "https://github.com/foo/bar/pull/2");
-    let t3 = chore_in_review_for_product(&db, &product.id, "T3", "https://github.com/foo/bar/pull/3");
+    let first_member =
+        chore_in_review_for_product(&db, &product.id, "first-member", "https://github.com/foo/bar/pull/1");
+    let departing_member = chore_in_review_for_product(
+        &db,
+        &product.id,
+        "departing-member",
+        "https://github.com/foo/bar/pull/2",
+    );
+    let trailing_member =
+        chore_in_review_for_product(&db, &product.id, "trailing-member", "https://github.com/foo/bar/pull/3");
 
-    seed_queued(&db, &t1, Some(1), "2026-07-15T10:00:00Z", "MERGEABLE");
-    seed_queued(&db, &t2, Some(2), "2026-07-15T10:01:00Z", "MERGEABLE");
-    seed_queued(&db, &t3, Some(3), "2026-07-15T10:02:00Z", "MERGEABLE");
+    seed_queued(&db, &first_member, Some(1), "2026-07-15T10:00:00Z", "MERGEABLE");
+    seed_queued(&db, &departing_member, Some(2), "2026-07-15T10:01:00Z", "MERGEABLE");
+    seed_queued(&db, &trailing_member, Some(3), "2026-07-15T10:02:00Z", "MERGEABLE");
 
     let publisher = RecordingPublisher::default();
-    // T2 fails and GitHub dequeues it: still an open, clean-enough PR,
+    // departing member fails and GitHub dequeues it: still an open, clean-enough PR,
     // but `in_merge_queue` flips false.
     let left_queue_probe = probe_with_queue_fields(false, None, None, None, false, None);
     let candidate = PendingMergeCheck {
-        work_item_id: t2.clone(),
+        work_item_id: departing_member.clone(),
         product_id: product.id.clone(),
         pr_url: "https://github.com/foo/bar/pull/2".to_owned(),
     };
     update_pr_poll_state(&db, &publisher, &candidate, &left_queue_probe, None, "test").await;
 
-    let (t2_state, t2_detail) = merge_queue_columns(&db, &t2);
-    assert!(t2_state.is_none(), "T2 must leave the queued set once it's dequeued");
-    assert_eq!(t2_detail, serde_json::Value::Null);
+    let (departing_state, departing_detail) = merge_queue_columns(&db, &departing_member);
+    assert!(
+        departing_state.is_none(),
+        "departing member must leave the queued set once it's dequeued"
+    );
+    assert_eq!(departing_detail, serde_json::Value::Null);
 
-    let (_, t1_detail) = merge_queue_columns(&db, &t1);
-    let (_, t3_detail) = merge_queue_columns(&db, &t3);
+    let (_, first_detail) = merge_queue_columns(&db, &first_member);
+    let (_, trailing_detail) = merge_queue_columns(&db, &trailing_member);
     assert_eq!(
-        t1_detail["position"],
+        first_detail["position"],
         serde_json::json!(1),
-        "T1 was already correct and stays #1"
+        "first member was already correct and stays #1"
     );
     assert_eq!(
-        t3_detail["position"],
+        trailing_detail["position"],
         serde_json::json!(2),
-        "T3 must shift down to #2 once T2 leaves — no gap, no stale #3"
+        "trailing member must shift down to #2 once departing member leaves — no gap, no stale #3"
     );
 
     let renumbered: std::collections::HashSet<String> = publisher
@@ -972,12 +982,12 @@ async fn mid_queue_member_leaving_renumbers_remaining_siblings_via_update_pr_pol
         .map(|(_, task_id, _)| task_id.clone())
         .collect();
     assert!(
-        renumbered.contains(&t3),
-        "T3's position change must be broadcast so its card refreshes; events={renumbered:?}"
+        renumbered.contains(&trailing_member),
+        "trailing member's position change must be broadcast so its card refreshes; events={renumbered:?}"
     );
     assert!(
-        !renumbered.contains(&t1),
-        "T1's position didn't change and must not generate a redundant event"
+        !renumbered.contains(&first_member),
+        "first member's position didn't change and must not generate a redundant event"
     );
 }
 

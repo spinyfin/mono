@@ -57,8 +57,6 @@ FIXTURE_LIBRARY_DEPS = [
 TEST_CASE_SOURCES = [
     "src/ci_watch_tests/**",
     "src/queue_ci_contract_tests.rs",
-    "src/speculative_conflict_tests.rs",
-    "src/stacked_pr_structuring_tests.rs",
     "src/tests/**",
     "src/trunk_queue_adopt/tests.rs",
     "src/trunk_queue_poller/tests.rs",

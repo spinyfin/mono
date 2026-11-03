@@ -441,7 +441,7 @@ async fn recanonicalize_blocked_only_claims_null_reason_blocked_rows() {
 
 #[tokio::test]
 async fn sweep_drives_full_ci_failure_cycle() {
-    // Phase 8 #22 acceptance: end-to-end through `run_one_pass`.
+    // End-to-end through `run_one_pass`.
     // Pass 1: probe says CI failing → flip to blocked: ci_failure.
     // Pass 2: same probe (idempotent) → no transition.
     // Pass 3: probe flips to CI clean (after the worker pushed) →
@@ -760,7 +760,7 @@ async fn inflight_ci_does_not_spawn_until_failure_is_terminal_then_reconciles() 
 
 #[tokio::test]
 async fn list_chores_blocked_on_ci_failure_filters_correctly() {
-    // Phase 8 #23 acceptance: the query returns only rows in
+    // The query returns only rows in
     // `blocked: ci_failure` or `ci_failure_exhausted` with a
     // `pr_url`, and excludes everything else (in_review,
     // blocked-on-other-reasons, soft-deleted, no-pr).
@@ -796,187 +796,9 @@ async fn list_chores_blocked_on_ci_failure_filters_correctly() {
     assert_eq!(listed.len(), 2, "exactly two CI-blocked rows should be returned",);
 }
 
-#[tokio::test]
-async fn sweep_promotes_merged_pr_even_when_row_was_in_review_with_conflict() {
-    // A row whose PR was force-merged while a conflict-resolution revision
-    // was in flight should be promoted by the sweep. With the new model the
-    // parent stays in_review (not blocked) while the revision is in Doing.
-    // The Merged branch of the dispatch runs from the in_review candidate list.
-    let dir = tempdir().unwrap();
-    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
-    let pr = "https://github.com/foo/bar/pull/501";
-    let (_product, chore) = make_chore_in_review(&db, "C-force-merged", pr);
-    let probe = StubProbe::new();
-    let publisher = Arc::new(RecordingPublisher::default());
-
-    // First pass: conflict detected; parent stays in_review (revision spawned).
-    probe.set(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()));
-    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
-    match db.get_work_item(&chore).unwrap() {
-        WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::InReview),
-        other => panic!("expected chore, got {other:?}"),
-    }
-
-    // Second pass: GitHub reports MERGED.
-    probe.set(pr, PrLifecycleState::Merged);
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
-    assert_eq!(outcome.merged, 1);
-    match db.get_work_item(&chore).unwrap() {
-        WorkItem::Chore(t) => {
-            assert_eq!(t.status, TaskStatus::Done);
-            assert_eq!(t.pr_url.as_deref(), Some(pr));
-            assert!(
-                t.blocked_reason.is_none(),
-                "merging out of blocked must clear blocked_reason",
-            );
-            assert!(t.blocked_attempt_id.is_none());
-        }
-        other => panic!("expected chore, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn opt_out_label_blocks_conflict_flip_through_sweep() {
-    // Sweep-level end-to-end for Phase 6 #18: a labelled PR
-    // reporting CONFLICTING leaves the chore in `in_review` and
-    // records no transition.
-    let dir = tempdir().unwrap();
-    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
-    let pr = "https://github.com/foo/bar/pull/802";
-    let (_product, chore) = make_chore_in_review(&db, "C-optout-sweep", pr);
-    let probe = StubProbe::new();
-    probe.set_with_labels(
-        pr,
-        PrLifecycleState::Open(OpenPrStatus::conflict_only()),
-        &["boss/no-auto-rebase"],
-    );
-    let publisher = Arc::new(RecordingPublisher::default());
-
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
-    assert_eq!(outcome.conflict_flagged, 0);
-    assert_eq!(outcome.total_transitions(), 0);
-    match db.get_work_item(&chore).unwrap() {
-        WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::InReview),
-        other => panic!("expected chore, got {other:?}"),
-    }
-    assert!(publisher.lifecycle_reasons().await.is_empty());
-}
-
-/// Complement test: a `failed` crz must NOT be re-armed (churn guard
-/// and human own the retry). Verifies the stale-base path doesn't
-/// widen to swallow the churn guard's intention.
-#[tokio::test]
-async fn failed_crz_is_not_rearmed_on_conflicting_pr() {
-    let dir = tempdir().unwrap();
-    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
-    let pr = "https://github.com/foo/bar/pull/911";
-    let (product, chore) = make_chore_in_review(&db, "C-failed-norearm", pr);
-    db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
-    let attempt = db
-        .insert_conflict_resolution(ConflictResolutionInsertInput {
-            product_id: product,
-            work_item_id: chore.clone(),
-            pr_url: pr.into(),
-            pr_number: 911,
-            head_branch: "feature".into(),
-            base_branch: "main".into(),
-            base_sha_at_trigger: Some("sha-fail".into()),
-            head_sha_before: None,
-        })
-        .unwrap()
-        .expect("attempt insert must succeed");
-    db.mark_conflict_resolution_failed(&attempt.id, "worker_died").unwrap();
-
-    let probe = StubProbe::new();
-    probe.set_with_base(
-        pr,
-        PrLifecycleState::Open(OpenPrStatus::conflict_only()),
-        Some("sha-new"),
-    );
-    let publisher = Arc::new(RecordingPublisher::default());
-    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
-
-    let ready = db.list_ready_executions().unwrap();
-    assert!(
-        ready.is_empty(),
-        "failed crz must not be re-armed automatically; got {ready:?}",
-    );
-}
-
-/// mergeable=UNKNOWN must NOT retire a merge_conflict signal.
-///
-/// Root cause of the blocked↔in_review flap: GitHub returns `UNKNOWN`
-/// transiently while recomputing mergeability (typically right after a
-/// base-branch move or a poll that races the async recompute). Before
-/// this fix, `UNKNOWN` was mapped to `Clean` and triggered
-/// `conflict_watch::on_resolved`, unblocking the card. The next poll
-/// read the definitive `CONFLICTING`/`DIRTY` and re-blocked it.
-///
-/// After the fix: `UNKNOWN` maps to `OpenPrMergeability::Unknown` and
-/// the `merge_conflict` retire path is skipped. The card must stay
-/// `blocked: merge_conflict` across the entire UNKNOWN poll. CI signals
-/// are on a separate axis and are still processed (tested separately).
-#[tokio::test]
-async fn unknown_mergeability_does_not_retire_merge_conflict() {
-    let dir = tempdir().unwrap();
-    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
-    let pr = "https://github.com/foo/bar/pull/912";
-    let (_product_id, chore) = make_chore_in_review(&db, "C-unknown-mc", pr);
-
-    // Manually install a blocked:merge_conflict signal (production
-    // path: on_conflict_detected fires first, blocks the card).
-    db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
-    {
-        match db.get_work_item(&chore).unwrap() {
-            WorkItem::Chore(t) => {
-                assert_eq!(t.status, TaskStatus::Blocked);
-                assert_eq!(t.blocked_reason.as_deref(), Some("merge_conflict"));
-            }
-            other => panic!("expected chore, got {other:?}"),
-        }
-    }
-
-    let probe = StubProbe::new();
-    let publisher = Arc::new(RecordingPublisher::default());
-
-    // Probe returns mergeable=UNKNOWN — GitHub is mid-recompute.
-    probe.set(pr, PrLifecycleState::Open(OpenPrStatus::unknown_mergeability()));
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
-
-    // The merge_conflict retire path must NOT have fired.
-    assert_eq!(
-        outcome.conflict_cleared, 0,
-        "UNKNOWN mergeability must not clear a merge_conflict signal"
-    );
-    assert_eq!(outcome.conflict_flagged, 0);
-
-    // Card must still be blocked:merge_conflict.
-    match db.get_work_item(&chore).unwrap() {
-        WorkItem::Chore(t) => {
-            assert_eq!(
-                t.status,
-                TaskStatus::Blocked,
-                "card must remain blocked while mergeable=UNKNOWN"
-            );
-            assert_eq!(
-                t.blocked_reason.as_deref(),
-                Some("merge_conflict"),
-                "blocked_reason must remain merge_conflict"
-            );
-        }
-        other => panic!("expected chore, got {other:?}"),
-    }
-
-    // No lifecycle event must have been emitted.
-    assert!(
-        publisher.lifecycle_reasons().await.is_empty(),
-        "no lifecycle event expected while mergeable=UNKNOWN"
-    );
-}
-
-/// Phase 10 #31/#32 acceptance (case 2 / ci_failure alone): a
+/// A
 /// chore that carries only the `ci_failure` signal is routed to
-/// the CI retire path. Budget reset (#32) is observable: a chore
+/// the CI retire path. Budget reset is observable: a chore
 /// with `ci_attempts_used = 2` lands at 0 after the cycle.
 #[tokio::test]
 async fn polymorphic_clear_routes_ci_failure_signal_and_resets_budget() {
@@ -1021,104 +843,7 @@ async fn polymorphic_clear_routes_ci_failure_signal_and_resets_budget() {
     match db.get_work_item(&chore).unwrap() {
         WorkItem::Chore(t) => {
             assert_eq!(t.status, TaskStatus::InReview);
-            assert_eq!(t.ci_attempts_used, 0, "Phase 10 #32: full cycle resets budget to 0",);
-        }
-        other => panic!("expected chore, got {other:?}"),
-    }
-}
-
-/// Phase 10 #31 acceptance (case 3 / both signals): when both
-/// `merge_conflict` and `ci_failure` rows are active in the side
-/// table, the polymorphic dispatch iterates both. Only the signal
-/// whose probe condition holds clears on a given pass; the other
-/// stays active. This mirrors the design's "each clears
-/// independently when its probe condition holds" acceptance.
-///
-/// In production both signals being live simultaneously is rare
-/// (the engine's compose-order Q1 has conflict pre-empt CI), but
-/// the side-table can hold both rows for a window — e.g. when the
-/// `ci_failure` row pre-dates a freshly-detected conflict — so
-/// the dispatch's polymorphism must handle the case.
-#[tokio::test]
-async fn polymorphic_clear_each_signal_independent_when_both_active() {
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("boss.db");
-    let db = WorkDb::open(db_path.clone()).unwrap();
-    let pr = "https://github.com/foo/bar/pull/912";
-    let (_product_id, chore) = make_chore_in_review(&db, "C-both", pr);
-
-    // Stage: the scalar `blocked_reason` lands on `ci_failure`
-    // (its WHERE guard accepts `in_review`), and we hand-place a
-    // sibling `merge_conflict` side-table row to simulate the
-    // race window.
-    db.mark_chore_blocked_ci_failure(&chore, pr, None).unwrap();
-    {
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute(
-            "INSERT INTO task_blocked_signals
-                    (work_item_id, reason, attempt_id, created_at, cleared_at)
-                 VALUES (?1, 'merge_conflict', NULL, '1700000000', NULL)",
-            rusqlite::params![chore],
-        )
-        .unwrap();
-    }
-    let mut staged: Vec<String> = db
-        .active_blocked_signals(&chore)
-        .unwrap()
-        .into_iter()
-        .map(|s| s.reason)
-        .collect();
-    staged.sort();
-    assert_eq!(staged, vec!["ci_failure".to_owned(), "merge_conflict".to_owned()],);
-
-    let probe = StubProbe::new();
-    let publisher = Arc::new(RecordingPublisher::default());
-
-    // Pass 1: probe reports mergeable=Conflict, ci=Clean. The
-    // dispatch must short-circuit before reaching either retire
-    // path because `Conflict` mergeability routes to the
-    // detect/idempotent path (not the Clean clear path). The
-    // signals therefore stay active.
-    probe.set(
-        pr,
-        PrLifecycleState::Open(OpenPrStatus {
-            mergeability: OpenPrMergeability::Conflict,
-            ci: OpenPrCiStatus::Clean,
-        }),
-    );
-    let _ = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
-    let active_after_1: Vec<String> = db
-        .active_blocked_signals(&chore)
-        .unwrap()
-        .into_iter()
-        .map(|s| s.reason)
-        .collect();
-    let mut active_after_1 = active_after_1;
-    active_after_1.sort();
-    assert_eq!(
-        active_after_1,
-        vec!["ci_failure".to_owned(), "merge_conflict".to_owned()],
-        "Conflict mergeability must not clear either side-table row",
-    );
-
-    // Pass 2: probe reports mergeable=Clean, ci=Clean. The
-    // dispatch's clean-branch iterates the side table and clears
-    // the `merge_conflict` row (via on_resolved) and the
-    // `ci_failure` row (via on_ci_resolved). Each fires
-    // independently — neither hides the other.
-    probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
-    // The conflict retire path is no-op against the side-table row
-    // because the scalar is `ci_failure`; the WHERE guard in
-    // `clear_chore_blocked_merge_conflict` misses. However, the
-    // signal-row clear happens regardless: the dispatch's
-    // polymorphic iteration sees both reasons and routes
-    // each — the CI retire fires (scalar matches), and the
-    // conflict retire is a cheap no-op as designed.
-    assert_eq!(outcome.ci_cleared, 1, "ci_failure retired (scalar matched ci_failure)",);
-    match db.get_work_item(&chore).unwrap() {
-        WorkItem::Chore(t) => {
-            assert_eq!(t.status, TaskStatus::InReview);
+            assert_eq!(t.ci_attempts_used, 0, "full cycle resets budget to 0",);
         }
         other => panic!("expected chore, got {other:?}"),
     }

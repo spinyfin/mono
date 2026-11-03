@@ -768,18 +768,12 @@ fn rewind_inflight_observation(db_path: &std::path::Path, work_item_id: &str, he
     .unwrap();
 }
 
-/// Regression for the operator-reported "stale badge from prior run" scenario:
-/// a push to the PR changes the head SHA while the prior run's `ci_remediations`
+/// Stale-badge scenario: a push to the PR changes the head SHA while the prior run's `ci_remediations`
 /// row is still `pending`. The new CI run is all-in-flight (no failing leaf).
 ///
-/// Before the fix, `on_ci_in_flight_supersedes_failure` bailed when it found the
-/// pending row (even though it was for the old head SHA), leaving the macOS badge
-/// stuck at "ci failing". After the fix the stale row is abandoned and
+/// `on_ci_in_flight_supersedes_failure` must not bail on that pending row (it is
+/// for the old head SHA): the stale row is abandoned and
 /// `CiFailureCleared` is emitted so the badge correctly reflects the new run.
-///
-/// This is the scenario the operator described: "they were all in progress, but it
-/// was showing a stale badge. I don't think the original shake was actually based
-/// on things that had one test failing."
 #[tokio::test]
 async fn new_commit_all_inflight_abandons_stale_remediation_and_clears_badge() {
     let dir = tempdir().unwrap();

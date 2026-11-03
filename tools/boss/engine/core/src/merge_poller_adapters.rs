@@ -31,10 +31,10 @@ use crate::work::{PendingMergeCheck, PrStateChecker, WorkDb};
 /// The sweep host a production merge-poller loop runs against.
 pub struct CoreSweepHost {
     /// Conflict remediation runs HERE — on its own bounded tasks — not on the
-    /// detection path. See [`crate::conflict_remediation`] for why (short
-    /// version: the escalation ladder leases a cube workspace and rebases,
-    /// which awaited inline turned a 60-second sweep into a 32-minute
-    /// detection blackout). `None` keeps the pre-existing inline behaviour.
+    /// detection path. See [`crate::conflict_remediation`] for why: the escalation
+    /// ladder leases a cube workspace and rebases, which awaited inline turned a
+    /// 60-second sweep into a 32-minute detection blackout. `None` runs the
+    /// ladder inline on the sweep's task when the sweep has a cube client.
     remediation: Option<ConflictRemediationQueue>,
     design: CoreDocDetection,
 }
@@ -73,9 +73,9 @@ impl ConflictHandling for CoreSweepHost {
         let mode = match (response.ladder_enabled, self.remediation.as_ref(), response.cube_client) {
             (false, _, _) => ConflictRemediationMode::Disabled,
             (true, Some(queue), _) => ConflictRemediationMode::Deferred(queue),
-            // No remediator wired (tests, pre-Phase wiring): fall back to the
-            // pre-existing inline behaviour rather than silently dropping the
-            // ladder.
+            // No background remediator (tests, or a host built with
+            // `with_remediation(None)`): run the ladder inline on the sweep task
+            // when a cube client is supplied, rather than drop it.
             (true, None, Some(cube)) => ConflictRemediationMode::Inline(cube),
             (true, None, None) => ConflictRemediationMode::Disabled,
         };

@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 use super::*;
 use crate::test_support::*;
 #[cfg(test)]
-use crate::work::{CommentAnchor, ConflictResolutionInsertInput, CreateCommentInput, WorkItem};
+use crate::work::{CommentAnchor, CreateCommentInput, WorkItem};
 use crate::work::{
     CreateExecutionInput, CreateProjectInput, CreateTaskInput, ExecutionStatus, FinishExecutionRunInput, WorkDb,
     WorkItemPatch,

@@ -606,11 +606,8 @@ pub fn spawn_loop<C: CompletionRequests + 'static>(
         let mut pr_requests_closed = false;
         let mut trunk_probe = crate::trunk_queue_poller::TrunkQueueProbe::new();
         let mut passes = host.start_passes();
-        // Conflict remediation runs on the host's own bounded tasks, not on the
-        // detection path below (short version: the escalation ladder leases a
-        // cube workspace and rebases, which awaited inline turned a 60-second
-        // sweep into a 32-minute detection blackout). The host owns that
-        // remediator; the loop only hands it each observation.
+        // Conflict remediation runs on the host's bounded background tasks, never
+        // on this detection path; see `SweepHost::on_conflict_detected`.
         let budget = pass_budget(interval);
         loop {
             // Refresh the shared-token budget from GitHub before probing so
