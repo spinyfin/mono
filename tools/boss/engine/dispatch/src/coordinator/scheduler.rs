@@ -442,6 +442,7 @@ impl ExecutionCoordinator {
             return Err(err);
         }
         spawn_claim.disarm();
+        self.consume_operator_forced_if_admitted(execution_id, admission);
         Ok(worker_id)
     }
 
@@ -449,15 +450,23 @@ impl ExecutionCoordinator {
     /// `work_item_id`, the way `bossctl agents launch` would.
     ///
     /// Answering is an explicit human decision, so the work it creates must not
-    /// be re-queued behind the global dispatch pause or the focus set. This
-    /// hands the execution to [`Self::force_dispatch`] as
-    /// [`DispatchAdmission::OperatorForced`], which bypasses both. Everything
-    /// else still applies: an execution gated behind another writer on the same
-    /// PR is not `ready` (it waits as `waiting_dependency`) and is left for the
-    /// dependency cascade, and the dispatch claim and per-repo lease bound are
-    /// respected. Returns the worker id, or `None` when there is no ready
-    /// execution to launch.
+    /// be re-queued behind the global dispatch pause or the focus set. The
+    /// latest non-terminal execution is marked operator-forced first, so a
+    /// writer wait, pool cap, preflight, or drain race keeps the admission
+    /// until the work is admitted or cancelled. A `ready` execution is handed
+    /// to [`Self::force_dispatch`] as [`DispatchAdmission::OperatorForced`].
+    /// An execution gated behind another writer stays `waiting_dependency` for
+    /// the dependency cascade, which then drains it as operator-forced. The
+    /// dispatch claim and per-repo lease bound are respected. Returns the
+    /// worker id, or `None` when there is no ready execution to launch.
     pub async fn launch_answered_work(self: &Arc<Self>, work_item_id: &str) -> Result<Option<String>> {
+        if let Err(err) = self.work_db.mark_operator_forced_admission(work_item_id) {
+            tracing::warn!(
+                work_item_id,
+                error = %format!("{err:#}"),
+                "failed to persist operator-forced admission for answered work",
+            );
+        }
         let ready = self
             .work_db
             .list_executions(Some(work_item_id))?
@@ -470,6 +479,31 @@ impl ExecutionCoordinator {
                 .await
                 .map(Some),
             None => Ok(None),
+        }
+    }
+
+    fn consume_operator_forced_if_admitted(&self, execution_id: &str, admission: DispatchAdmission) {
+        if admission != DispatchAdmission::OperatorForced {
+            return;
+        }
+        if let Err(err) = self.work_db.clear_operator_forced_admission(execution_id) {
+            tracing::warn!(
+                execution_id,
+                error = %format!("{err:#}"),
+                "failed to clear operator-forced admission after dispatch",
+            );
+        }
+    }
+
+    fn drain_row_admission(operator_forced: bool, is_critical: bool, pause_bypass: bool) -> DispatchAdmission {
+        if operator_forced {
+            DispatchAdmission::OperatorForced
+        } else if is_critical {
+            DispatchAdmission::Critical
+        } else if pause_bypass {
+            DispatchAdmission::PauseBypassOverride
+        } else {
+            DispatchAdmission::Queued
         }
     }
 
@@ -1035,6 +1069,20 @@ impl ExecutionCoordinator {
                 HashSet::new()
             }
         };
+        // Answer-created work keeps operator-forced admission until it is
+        // admitted or cancelled. The drain honours that the way
+        // `bossctl agents launch` would: through the pause and the focus set,
+        // still subject to writer exclusion, the claim, and the lease bound.
+        let operator_forced_ids: HashSet<String> = match self.work_db.operator_forced_ready_execution_ids() {
+            Ok(ids) => ids,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "failed to list operator-forced ready executions — treating none as forced"
+                );
+                HashSet::new()
+            }
+        };
 
         // Queue-level depth/oldest-wait gauges, sampled here (before the
         // pause gate and any filtering below) so they reflect the true
@@ -1103,17 +1151,29 @@ impl ExecutionCoordinator {
                      draining review-pool exemptions",
                 );
             } else {
-                for execution in &executions {
-                    changed_waits.extend(self.record_dispatch_wait_reason(execution, "dispatch_paused", None));
+                let any_forced = executions.iter().any(|e| operator_forced_ids.contains(&e.id));
+                if !any_forced {
+                    for execution in &executions {
+                        changed_waits.extend(self.record_dispatch_wait_reason(execution, "dispatch_paused", None));
+                    }
+                    tracing::debug!(
+                        held_count,
+                        review_exempt_count = 0,
+                        "drain_ready_queue: dispatch is globally paused — skipping (all-spawns scope, no exemptions)",
+                    );
+                    self.publish_dispatch_runtime_changed(&changed_waits, "dispatch_wait_changed")
+                        .await;
+                    return DrainOutcome::QueueEmpty;
                 }
                 tracing::debug!(
                     held_count,
                     review_exempt_count = 0,
-                    "drain_ready_queue: dispatch is globally paused — skipping (all-spawns scope, no exemptions)",
+                    forced_count = executions
+                        .iter()
+                        .filter(|e| operator_forced_ids.contains(&e.id))
+                        .count(),
+                    "drain_ready_queue: dispatch is globally paused (all-spawns) — draining operator-forced rows",
                 );
-                self.publish_dispatch_runtime_changed(&changed_waits, "dispatch_wait_changed")
-                    .await;
-                return DrainOutcome::QueueEmpty;
             }
         }
 
@@ -1250,12 +1310,23 @@ impl ExecutionCoordinator {
             // `DispatchAdmission::Critical` to the chokepoint instead.
             // (A breaker pause never reaches this loop, so a critical row
             // is still held by one — see `dispatch_hold_for`.)
-            if paused && !is_review && !is_critical {
-                if self.take_dispatch_pause_bypass(&execution.id) {
-                    pause_bypass_admitted.insert(execution.id.clone());
-                } else {
+            let is_operator_forced = operator_forced_ids.contains(&execution.id);
+            // Operator-forced rows skip the pause, including all-spawns.
+            // Everyone else keeps the previous rules: all-spawns holds the
+            // whole queue; a new-work pause holds non-review non-critical
+            // rows unless a pause-bypass marker is consumed.
+            if paused && !is_operator_forced {
+                if !reviews_exempt_from_pause {
                     changed_waits.extend(self.record_dispatch_wait_reason(&execution, "dispatch_paused", None));
                     continue;
+                }
+                if !is_review && !is_critical {
+                    if self.take_dispatch_pause_bypass(&execution.id) {
+                        pause_bypass_admitted.insert(execution.id.clone());
+                    } else {
+                        changed_waits.extend(self.record_dispatch_wait_reason(&execution, "dispatch_paused", None));
+                        continue;
+                    }
                 }
             }
 
@@ -1272,7 +1343,7 @@ impl ExecutionCoordinator {
             // Outside the dispatch focus set: hold, never drop. The row keeps
             // its `ready` execution untouched and dispatches on a later pass
             // once focus is cleared or its project/product is added.
-            if out_of_focus.contains(&execution.id) {
+            if out_of_focus.contains(&execution.id) && !is_operator_forced {
                 changed_waits.extend(self.record_dispatch_wait_reason(
                     &execution,
                     boss_protocol::DISPATCH_WAIT_REASON_FOCUS_MODE,
@@ -1344,6 +1415,7 @@ impl ExecutionCoordinator {
                 None
             };
             let capped = !is_critical
+                && !is_operator_forced
                 && occupancy_at_cap_check.is_some_and(|occ| occ.working >= self.max_concurrent_interactive_workers());
 
             if capped {
@@ -1410,11 +1482,11 @@ impl ExecutionCoordinator {
                     ));
                     continue;
                 };
-                let admission = if pause_bypass_admitted.contains(&execution.id) {
-                    DispatchAdmission::PauseBypassOverride
-                } else {
-                    DispatchAdmission::Queued
-                };
+                let admission = Self::drain_row_admission(
+                    is_operator_forced,
+                    is_critical,
+                    pause_bypass_admitted.contains(&execution.id),
+                );
                 self.dispatch_claimed_execution(
                     &execution,
                     &worker_id,
@@ -1834,13 +1906,11 @@ impl ExecutionCoordinator {
                 continue;
             };
 
-            let admission = if is_critical {
-                DispatchAdmission::Critical
-            } else if pause_bypass_admitted.contains(&execution.id) {
-                DispatchAdmission::PauseBypassOverride
-            } else {
-                DispatchAdmission::Queued
-            };
+            let admission = Self::drain_row_admission(
+                is_operator_forced,
+                is_critical,
+                pause_bypass_admitted.contains(&execution.id),
+            );
             dispatch_claim.disarm();
             self.dispatch_claimed_execution(
                 &execution,
@@ -1942,11 +2012,11 @@ impl ExecutionCoordinator {
                 worker_id = %worker_id,
                 "automation spilled into Lower Decks — automation pool full, no mainline work wanted this slot"
             );
-            let admission = if pause_bypass_admitted.contains(&execution.id) {
-                DispatchAdmission::PauseBypassOverride
-            } else {
-                DispatchAdmission::Queued
-            };
+            let admission = Self::drain_row_admission(
+                operator_forced_ids.contains(&execution.id),
+                false,
+                pause_bypass_admitted.contains(&execution.id),
+            );
             self.dispatch_claimed_execution(
                 &execution,
                 &worker_id,
@@ -2520,6 +2590,7 @@ impl ExecutionCoordinator {
             match coordinator.schedule_execution(&execution, &worker_id, admission).await {
                 Ok(()) => {
                     spawn_claim.disarm();
+                    coordinator.consume_operator_forced_if_admitted(&execution.id, admission);
                     tracing::info!(
                         execution_id = %execution.id,
                         work_item_id = %execution.work_item_id,

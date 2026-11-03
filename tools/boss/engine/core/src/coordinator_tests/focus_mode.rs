@@ -758,12 +758,16 @@ async fn work_created_by_an_answer_launches_through_the_pause_and_outside_the_fo
 
 /// Writer sequencing still applies: an execution gated behind another writer
 /// on the PR is not `ready`, so there is nothing to launch until the gate
-/// clears.
+/// clears. The human's operator-forced admission is kept, and once the row is
+/// ready again the drain dispatches it through the pause and outside the
+/// focus set.
 #[tokio::test]
 async fn work_created_by_an_answer_still_waits_behind_a_live_writer() {
     let h = harness();
-    let project = h.project("Gated");
-    let (task, _) = h.ready_project_task(&project, "Gated answer");
+    let focused = h.project("Focused");
+    let other = h.project("Other");
+    let _ = h.ready_project_task(&focused, "In scope");
+    let (task, exec) = h.ready_project_task(&other, "Gated answer");
     h.db.connect()
         .unwrap()
         .execute(
@@ -774,4 +778,83 @@ async fn work_created_by_an_answer_still_waits_behind_a_live_writer() {
 
     assert_eq!(h.coordinator.launch_answered_work(&task).await.unwrap(), None);
     assert!(h.dispatched().await.is_empty());
+    assert!(
+        h.db.execution_has_operator_forced_admission(&exec).unwrap(),
+        "the waiting execution keeps operator-forced admission"
+    );
+
+    h.db.connect()
+        .unwrap()
+        .execute("UPDATE work_executions SET status = 'ready' WHERE id = ?1", [&exec])
+        .unwrap();
+    h.focus_on(&[&focused]);
+    h.coordinator.pause_dispatch_scoped(
+        1_786_385_816,
+        DispatchPauseOrigin::Operator,
+        DispatchPauseScope::NewWork,
+        PauseReason::new("test: operator pause after the writer left").unwrap(),
+    );
+    h.drain_and_wait_for(&[&exec]).await;
+    assert_eq!(h.dispatched().await, HashSet::from([exec]));
+}
+
+/// A capacity refusal (startup preflight) at answer time keeps operator-forced
+/// admission. Clearing the block lets the drain dispatch through the pause
+/// and outside the focus set.
+#[tokio::test]
+async fn answered_work_dispatches_through_pause_and_focus_after_a_preflight_refusal() {
+    let h = harness();
+    let focused = h.project("Focused");
+    let other = h.project("Other");
+    let _ = h.ready_project_task(&focused, "In scope");
+    let (answered_task, answered_exec) = h.ready_project_task(&other, "Answered, outside focus");
+    h.focus_on(&[&focused]);
+    h.coordinator.pause_dispatch_scoped(
+        1_786_385_816,
+        DispatchPauseOrigin::Operator,
+        DispatchPauseScope::NewWork,
+        PauseReason::new("test: operator pause").unwrap(),
+    );
+    h.coordinator
+        .set_dispatch_preflight_block(Some("test: local dispatch unavailable".into()));
+
+    let err = h
+        .coordinator
+        .launch_answered_work(&answered_task)
+        .await
+        .expect_err("preflight refuses the immediate launch");
+    assert!(format!("{err:#}").contains("unavailable"), "{err:#}");
+    assert_eq!(h.execution(&answered_exec).status, ExecutionStatus::Ready);
+    assert!(h.db.execution_has_operator_forced_admission(&answered_exec).unwrap());
+    assert!(h.dispatched().await.is_empty());
+
+    h.coordinator.set_dispatch_preflight_block(None);
+    h.drain_and_wait_for(&[&answered_exec]).await;
+    assert_eq!(h.dispatched().await, HashSet::from([answered_exec]));
+}
+
+/// Operator-forced admission is the exemption that lets answered work drain
+/// under an all-spawns pause; an ordinary ready row stays held.
+#[tokio::test]
+async fn operator_forced_work_drains_through_an_all_spawns_pause() {
+    let h = harness();
+    let project = h.project("Any");
+    let (ordinary_task, ordinary_exec) = h.ready_project_task(&project, "Ordinary");
+    let (answered_task, answered_exec) = h.ready_project_task(&project, "Answered");
+    let _ = ordinary_task;
+    h.db.mark_operator_forced_admission(&answered_task).unwrap();
+    h.coordinator.pause_dispatch_scoped(
+        1_786_385_816,
+        DispatchPauseOrigin::Operator,
+        DispatchPauseScope::AllSpawns,
+        PauseReason::new("test: spawn path suspect").unwrap(),
+    );
+
+    h.drain_and_wait_for(&[&answered_exec]).await;
+    assert_eq!(h.dispatched().await, HashSet::from([answered_exec.clone()]));
+    assert_eq!(h.execution(&ordinary_exec).status, ExecutionStatus::Ready);
+    assert_eq!(
+        h.execution(&ordinary_exec).dispatch_wait_reason.as_deref(),
+        Some("dispatch_paused")
+    );
 }

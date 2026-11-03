@@ -2096,13 +2096,12 @@ If already queued, read its existing entry ID with `gh api graphql -f query='que
 /// The "porting is normal conflict work" guidance and the stop conditions for a
 /// conflict-resolution revision.
 ///
-/// The bar for stopping on `architectural_mismatch` is very high, so the
-/// refactor cases that used to look like grounds to stop (files moved or
-/// deleted, modules or crates split or renamed, helpers behind a new crate
-/// boundary, migrations that must move, every commit conflicting) are named
-/// here as ordinary work. Once the repo owner has answered the
-/// architectural-mismatch question for this attempt, that exit is not offered
-/// at all and the engine refuses it.
+/// The bar for stopping on `architectural_mismatch` is very high: refactor
+/// cases (files moved or deleted, modules or crates split or renamed, helpers
+/// behind a new crate boundary, migrations that must move, every commit
+/// conflicting) are named here as ordinary conflict work. Once the repo owner
+/// has answered the architectural-mismatch question for this attempt, that
+/// exit is not offered at all and the engine refuses it.
 fn conflict_porting_and_stop_conditions(attempt: &ConflictResolution) -> String {
     let mut out = String::new();
     out.push_str("\n### Porting is part of conflict resolution\n\n");
@@ -2125,7 +2124,7 @@ fn conflict_porting_and_stop_conditions(attempt: &ConflictResolution) -> String 
     );
     out.push_str("### Stop conditions\n\n");
     out.push_str(
-        "If either of the following applies, comment on the PR explaining the situation,\n\
+        "If one of the following applies, comment on the PR explaining the situation,\n\
          do NOT push, and run `\"$BOSS_BIN\" engine conflicts mark-failed <attempt-id> --reason <r>`\n\
          with the appropriate reason — the engine will mark the attempt `failed`:\n\n\
             1. **Semantic obsolescence** — the upstream change accomplished what this PR\n   \
@@ -2141,7 +2140,8 @@ fn conflict_porting_and_stop_conditions(attempt: &ConflictResolution) -> String 
         );
     } else {
         out.push_str(
-            "3. **Architectural mismatch** — a *behavioural* conflict that remains after a genuine \
+            "### Architectural mismatch\n\n\
+             A *behavioural* conflict that remains after a genuine \
              attempt to port the change onto `main`'s new layout. The reference case: this PR adds a \
              feature to a subsystem that `main` deleted completely, so the feature has nowhere to \
              live. Comparable: `main` redesigned the concept the PR changes so there is no faithful \

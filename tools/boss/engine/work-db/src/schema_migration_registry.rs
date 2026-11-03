@@ -308,6 +308,11 @@ pub(super) fn all() -> Vec<Migration> {
             legacy_version: None,
             apply: preserved_work::migrate,
         },
+        Migration {
+            id: conflict_mismatch::OPERATOR_FORCED_ADMISSION_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: conflict_mismatch::migrate_operator_forced_admission,
+        },
     ]);
     migrations
 }

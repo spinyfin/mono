@@ -27,6 +27,14 @@ use boss_protocol::{
 
 pub(super) const MIGRATION_ID: &str = "20261102_1500_conflict_architectural_mismatch";
 
+/// Persist the human's operator-forced admission on an execution an answer
+/// created, so a writer wait, pool cap, preflight, or drain race cannot drop
+/// it. Independent of [`MIGRATION_ID`]: that migration may already have
+/// applied on databases this binary upgrades.
+pub(super) const OPERATOR_FORCED_ADMISSION_MIGRATION_ID: &str = "20261103_1800_operator_forced_admission";
+
+const TERMINAL_EXECUTION_STATUSES: &str = "'completed', 'failed', 'cancelled', 'orphaned', 'abandoned'";
+
 /// Archive mechanism recorded on the conflict revision a *Rewrite* answer
 /// replaces with a port revision.
 pub const ARCHIVE_MECHANISM_CONFLICT_REWRITE_ANSWER: &str = "conflict_rewrite_answer";
@@ -53,6 +61,39 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
             conn.execute_batch(ddl)?;
         }
     }
+    Ok(())
+}
+
+/// Persist operator-forced admission on `work_executions` and copy it onto a
+/// later non-terminal execution of the same work item (a restart). Consume it
+/// when the row becomes terminal so a cancelled wait does not keep forcing.
+pub(super) fn migrate_operator_forced_admission(conn: &Connection) -> Result<()> {
+    if !super::schema_init::table_has_column(conn, "work_executions", "operator_forced_admission")? {
+        conn.execute_batch(
+            "ALTER TABLE work_executions ADD COLUMN operator_forced_admission INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS work_executions_copy_operator_forced_admission
+         AFTER INSERT ON work_executions
+         BEGIN
+           UPDATE work_executions SET operator_forced_admission = 1 WHERE id = NEW.id
+             AND EXISTS (
+               SELECT 1 FROM work_executions AS prev
+               WHERE prev.work_item_id = NEW.work_item_id
+                 AND prev.id != NEW.id
+                 AND prev.operator_forced_admission = 1
+                 AND prev.status NOT IN ('completed', 'failed', 'cancelled', 'orphaned', 'abandoned')
+             );
+         END;
+         CREATE TRIGGER IF NOT EXISTS work_executions_clear_operator_forced_on_terminal
+         AFTER UPDATE OF status ON work_executions
+         WHEN NEW.operator_forced_admission = 1
+          AND NEW.status IN ('completed', 'failed', 'cancelled', 'orphaned', 'abandoned')
+         BEGIN
+           UPDATE work_executions SET operator_forced_admission = 0 WHERE id = NEW.id;
+         END;",
+    )?;
     Ok(())
 }
 
@@ -109,23 +150,96 @@ impl WorkDb {
         Ok(updated)
     }
 
-    /// Whether a conflict revision is parked on an open architectural-mismatch
-    /// question. Such a revision is still the live fix vehicle for its attempt.
-    pub fn conflict_revision_awaits_mismatch_answer(&self, revision_task_id: &str) -> Result<bool> {
-        let conn = self.connect()?;
-        Ok(conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM operator_questions
-             WHERE work_item_id = ?1 AND status = 'open' AND conflict_resolution_id IS NOT NULL)",
-            [revision_task_id],
-            |row| row.get(0),
-        )?)
+    /// Record that the human's answer created this work and it must dispatch
+    /// like `bossctl agents launch`: through the pause and the focus set.
+    /// Applied to the latest non-terminal execution of `work_item_id`.
+    pub fn mark_operator_forced_admission(&self, work_item_id: &str) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        mark_operator_forced_admission_in_tx(&tx, work_item_id)?;
+        tx.commit()?;
+        Ok(())
     }
+
+    /// Consume operator-forced admission after the execution is admitted.
+    /// Terminal rows are cleared by the schema trigger as well.
+    pub fn clear_operator_forced_admission(&self, execution_id: &str) -> Result<()> {
+        self.connect()?.execute(
+            "UPDATE work_executions SET operator_forced_admission = 0 WHERE id = ?1",
+            [execution_id],
+        )?;
+        Ok(())
+    }
+
+    /// Ready executions that still carry operator-forced admission, so the
+    /// drain can admit them through the pause and the focus set.
+    pub fn operator_forced_ready_execution_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM work_executions
+             WHERE operator_forced_admission = 1 AND status = 'ready'",
+        )?;
+        let ids = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+        Ok(ids)
+    }
+
+    /// Whether `execution_id` currently carries operator-forced admission.
+    pub fn execution_has_operator_forced_admission(&self, execution_id: &str) -> Result<bool> {
+        Ok(self
+            .connect()?
+            .query_row(
+                "SELECT operator_forced_admission FROM work_executions WHERE id = ?1",
+                [execution_id],
+                |row| {
+                    let flag: i64 = row.get(0)?;
+                    Ok(flag != 0)
+                },
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+}
+
+/// Whether a conflict revision is parked on an open architectural-mismatch
+/// question. Such a revision is still the live fix vehicle for its attempt.
+pub(super) fn conflict_revision_awaits_mismatch_answer(conn: &Connection, revision_task_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM operator_questions
+         WHERE work_item_id = ?1 AND status = 'open' AND conflict_resolution_id IS NOT NULL)",
+        [revision_task_id],
+        |row| row.get(0),
+    )?)
+}
+
+fn mark_operator_forced_admission_in_tx(tx: &Transaction<'_>, work_item_id: &str) -> Result<()> {
+    let id: Option<String> = tx
+        .query_row(
+            &format!(
+                "SELECT id FROM work_executions
+                 WHERE work_item_id = ?1
+                   AND status NOT IN ({TERMINAL_EXECUTION_STATUSES})
+                 ORDER BY created_at DESC, id DESC LIMIT 1"
+            ),
+            [work_item_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(id) = id {
+        tx.execute(
+            "UPDATE work_executions SET operator_forced_admission = 1 WHERE id = ?1",
+            [&id],
+        )?;
+    }
+    Ok(())
 }
 
 /// The question to ask for the attempt this execution's conflict revision
 /// belongs to, when the worker has recorded a mismatch and not yet been
-/// asked about it. Consumes the stored evidence: from here on the question row
-/// carries it.
+/// asked about it. The stored evidence stays until the question is answered,
+/// so a later blocked declaration can re-raise it if the first question was
+/// withdrawn.
 pub(super) fn take_pending_question(
     tx: &Transaction<'_>,
     execution_id: &str,
@@ -145,11 +259,44 @@ pub(super) fn take_pending_question(
         return Ok(None);
     };
     let evidence: ArchitecturalMismatchEvidence = serde_json::from_str(&evidence_json)?;
-    tx.execute(
-        "UPDATE conflict_resolutions SET mismatch_evidence_json = NULL WHERE id = ?1",
-        [&attempt_id],
-    )?;
     Ok(Some((attempt_id, question_for(pr_number, &evidence))))
+}
+
+/// Whether this execution already has an open architectural-mismatch question.
+/// A later blocked declaration without a question of its own keeps that
+/// question instead of withdrawing it.
+pub(super) fn execution_has_open_mismatch_question(conn: &Connection, execution_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM operator_questions
+         WHERE execution_id = ?1 AND status = 'open' AND conflict_resolution_id IS NOT NULL)",
+        [execution_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// Insert the engine-generated mismatch question as `open`. The revision may
+/// already be blocked awaiting this decision; that is still a parkable ask.
+pub(super) fn insert_open_question(
+    tx: &Transaction<'_>,
+    execution_id: &str,
+    proposal_id: &str,
+    question: &OperatorQuestion,
+) -> Result<()> {
+    let execution = query_execution(tx, execution_id).require("execution", execution_id)?;
+    tx.execute(
+        "INSERT INTO operator_questions
+         (id, work_item_id, execution_id, proposal_id, question_json, status, created_at, stuck_classification)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, 'S8_operator_question')",
+        params![
+            next_id("oq"),
+            execution.work_item_id,
+            execution_id,
+            proposal_id,
+            serde_json::to_string(question)?,
+            now_string(),
+        ],
+    )?;
+    Ok(())
 }
 
 /// Tie the question inserted for `proposal_id` to its attempt.
@@ -254,6 +401,7 @@ pub(super) fn answer_in_tx(
         CONFLICT_MISMATCH_CHOICE_FORCE_MERGE => {
             let block = force_merge_block(question, &timestamp);
             let minted_execution = super::pr_flow::restart_after_answer(pending, tx, asker, question, &block, now)?;
+            mark_operator_forced_admission_in_tx(tx, &asker.id)?;
             Ok(AnswerEffect {
                 touched: vec![asker.id.clone()],
                 dispatch: Some(asker.id.clone()),
@@ -266,7 +414,7 @@ pub(super) fn answer_in_tx(
             };
             // Retire the parked fix first so the port revision is sequenced
             // against the rest of the chain, not against a revision about to
-            // disappear. Review-finding revisions queued on the PR end up
+            // disappear. Review-finding revisions queued on the PR wait
             // behind the port.
             archive_revision_task(
                 tx,
@@ -288,7 +436,7 @@ pub(super) fn answer_in_tx(
                     // conflicting, this revision is what resolves it, and it
                     // queues ahead of the PR's other revisions the same way.
                     .created_via(format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}{attempt_id}"))
-                    // Sized for a port, not for the conflict worker's trivial level.
+                    // Allocate enough capacity to port the change onto the new base.
                     .effort_level(EffortLevel::Large)
                     .reasoning(ReasoningMode::Standard)
                     .build(),
@@ -299,6 +447,7 @@ pub(super) fn answer_in_tx(
                 "UPDATE conflict_resolutions SET revision_task_id = ?2 WHERE id = ?1",
                 params![attempt_id, port.id],
             )?;
+            mark_operator_forced_admission_in_tx(tx, &port.id)?;
             Ok(AnswerEffect {
                 touched: vec![asker.id.clone(), port.id.clone()],
                 dispatch: Some(port.id),

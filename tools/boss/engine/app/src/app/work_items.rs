@@ -81,7 +81,7 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
         }
         return;
     };
-    match work_db.answer_operator_question(&id, answer) {
+    match work_db.answer_operator_question_with(&id, answer, server_state.pr_state_checker.as_ref()) {
         Ok(outcome) => {
             let item = outcome.item;
             let product_id = item.product_id().to_string();
@@ -101,10 +101,12 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
             )
             .await;
             if let Some(dispatch_id) = outcome.dispatch_work_item_id {
-                // The answer is committed. Launching is best-effort: when it
+                // The answer is committed and the execution it created is
+                // marked operator-forced. Launching is best-effort: when it
                 // cannot launch now (a writer is live on the PR, the pool is
-                // at its hard cap) the ready execution stays queued and the
-                // ordinary scheduler picks it up.
+                // at its hard cap, preflight) the flag stays until the work
+                // is admitted or cancelled, and the drain dispatches it as
+                // operator-forced once it is ready.
                 match server_state
                     .execution_coordinator
                     .launch_answered_work(&dispatch_id)
@@ -118,7 +120,7 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
                     Err(err) => tracing::warn!(
                         work_item_id = %dispatch_id,
                         error = %format!("{err:#}"),
-                        "operator answer: could not launch the work it created; it stays queued",
+                        "operator answer: could not launch the work it created; operator-forced admission is kept",
                     ),
                 }
             }

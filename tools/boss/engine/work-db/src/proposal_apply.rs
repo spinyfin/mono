@@ -1005,22 +1005,29 @@ fn apply_run_done(
         )));
     }
 
-    tx.execute(
-        "UPDATE operator_questions SET status = 'withdrawn', withdrawn_reason = 'declaration_superseded'
-         WHERE execution_id = ?1 AND status = 'open'",
-        [execution_id],
-    )?;
+    let preserve_mismatch_question = payload.outcome == boss_protocol::RunDoneOutcome::Blocked
+        && payload.question.is_none()
+        && super::conflict_mismatch::execution_has_open_mismatch_question(tx, execution_id)?;
+    if !preserve_mismatch_question {
+        tx.execute(
+            "UPDATE operator_questions SET status = 'withdrawn', withdrawn_reason = 'declaration_superseded'
+             WHERE execution_id = ?1 AND status = 'open'",
+            [execution_id],
+        )?;
+    }
     supersede_prior_run_done_declarations(tx, execution_id, proposal_id)?;
     super::queue_ci_evidence::record_delivery(tx, execution_id, &payload)?;
     if let Some(question) = &payload.question {
         super::pr_flow::insert_question_with_liveness(tx, execution_id, proposal_id, question, question_worker)?;
     } else if payload.outcome == boss_protocol::RunDoneOutcome::Blocked
+        && !preserve_mismatch_question
         && let Some((attempt_id, question)) = super::conflict_mismatch::take_pending_question(tx, execution_id)?
     {
         // A conflict worker that stopped on `architectural_mismatch` declares
         // itself blocked without a question of its own: the engine asks the
         // repo owner on its behalf, with the evidence the worker recorded.
-        super::pr_flow::insert_question_with_liveness(tx, execution_id, proposal_id, &question, question_worker)?;
+        // Always open: the revision may already be blocked on this decision.
+        super::conflict_mismatch::insert_open_question(tx, execution_id, proposal_id, &question)?;
         super::conflict_mismatch::link_question(tx, execution_id, proposal_id, &attempt_id)?;
     }
 

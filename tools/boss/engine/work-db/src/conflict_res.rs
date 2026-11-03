@@ -139,12 +139,7 @@ impl WorkDb {
         // for the repo owner, not dead: it stays the attempt's fix vehicle so
         // the poller neither supersedes it nor mints a competitor.
         if status == "blocked"
-            && conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM operator_questions
-                 WHERE work_item_id = ?1 AND status = 'open' AND conflict_resolution_id IS NOT NULL)",
-                params![revision_task_id],
-                |row| row.get::<_, bool>(0),
-            )?
+            && super::conflict_mismatch::conflict_revision_awaits_mismatch_answer(&conn, revision_task_id)?
         {
             return Ok(true);
         }

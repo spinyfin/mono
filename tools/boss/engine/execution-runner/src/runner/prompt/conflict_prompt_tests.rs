@@ -49,7 +49,7 @@ fn conflict_prompt_names_refactors_as_normal_work_and_sets_a_high_bar_for_a_mism
     ] {
         assert!(prompt.contains(bar), "missing `{bar}`:\n{prompt}");
     }
-    // The old, much lower bar is gone.
+    // A removed abstraction alone is not offered as grounds to stop.
     assert!(
         !prompt.contains("the upstream removed an abstraction this PR"),
         "{prompt}"

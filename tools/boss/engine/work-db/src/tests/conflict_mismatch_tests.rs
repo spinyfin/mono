@@ -101,6 +101,10 @@ fn evidence() -> ArchitecturalMismatchEvidence {
 }
 
 fn declare_blocked(f: &Fixture) {
+    declare_blocked_keyed(f, "declare-blocked");
+}
+
+fn declare_blocked_keyed(f: &Fixture, idempotency_key: &str) {
     let payload = serde_json::to_string(&RunDoneProposalPayload {
         outcome: RunDoneOutcome::Blocked,
         summary: "Architectural mismatch".into(),
@@ -113,10 +117,40 @@ fn declare_blocked(f: &Fixture) {
         work_item_id: &f.revision_id,
         kind: ProposalKind::RunDone,
         payload_json: &payload,
-        idempotency_key: "declare-blocked",
+        idempotency_key,
     })
     .unwrap()
     .unwrap();
+}
+
+fn latest_execution(f: &Fixture, work_item_id: &str) -> (String, String) {
+    executions_for(&f.db, work_item_id)
+        .into_iter()
+        .next_back()
+        .expect("execution")
+}
+
+fn open_linked_question_count(f: &Fixture) -> i64 {
+    f.db.connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM operator_questions
+             WHERE work_item_id = ?1 AND status = 'open' AND conflict_resolution_id IS NOT NULL",
+            [&f.revision_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn mismatch_evidence_present(f: &Fixture) -> bool {
+    f.db.connect()
+        .unwrap()
+        .query_row(
+            "SELECT mismatch_evidence_json IS NOT NULL FROM conflict_resolutions WHERE id = ?1",
+            [&f.crz_id],
+            |row| row.get(0),
+        )
+        .unwrap()
 }
 
 /// Run the whole worker side: record, declare blocked, park on the question.
@@ -233,9 +267,61 @@ fn a_mismatch_raises_a_question_and_leaves_no_dead_end() {
     assert!(f.db.is_conflict_revision_running_or_queued(&f.revision_id).unwrap());
     assert!(f.db.has_live_conflict_revision_for_pr(PR_URL).unwrap());
 
-    // A second declaration does not ask again.
+    // A second declaration with the same idempotency key is a replay and
+    // does not ask again.
     declare_blocked(&f);
     assert!(f.db.execution_operator_question(&f.execution_id).unwrap().is_some());
+    assert!(
+        mismatch_evidence_present(&f),
+        "evidence stays until the question is answered"
+    );
+}
+
+#[test]
+fn a_second_distinct_blocked_declaration_re_raises_the_withdrawn_question() {
+    let f = fixture();
+    raise_question(&f);
+    assert_eq!(open_linked_question_count(&f), 1);
+    assert!(mismatch_evidence_present(&f));
+
+    declare_blocked_keyed(&f, "declare-blocked-again");
+    assert_eq!(open_questions(&f).len(), 1, "{:?}", open_questions(&f));
+    assert_eq!(open_linked_question_count(&f), 1);
+    assert!(f.db.is_conflict_revision_running_or_queued(&f.revision_id).unwrap());
+    assert!(mismatch_evidence_present(&f));
+
+    let outcome =
+        f.db.answer_operator_question_with(
+            &f.revision_id,
+            OperatorAnswer::MultipleChoice {
+                value: CONFLICT_MISMATCH_CHOICE_FORCE_MERGE.into(),
+            },
+            &open_pr(),
+        )
+        .unwrap();
+    assert_eq!(outcome.dispatch_work_item_id.as_deref(), Some(f.revision_id.as_str()));
+    assert_eq!(open_questions(&f).len(), 0);
+    assert!(!mismatch_evidence_present(&f));
+}
+
+#[test]
+fn a_second_distinct_blocked_declaration_still_allows_rewrite() {
+    let f = fixture();
+    raise_question(&f);
+    declare_blocked_keyed(&f, "declare-blocked-again");
+    let outcome =
+        f.db.answer_operator_question_with(
+            &f.revision_id,
+            OperatorAnswer::MultipleChoice {
+                value: CONFLICT_MISMATCH_CHOICE_REWRITE.into(),
+            },
+            &open_pr(),
+        )
+        .unwrap();
+    let port_id = outcome.dispatch_work_item_id.expect("the port revision is launched");
+    assert_ne!(port_id, f.revision_id);
+    assert_eq!(task_status(&f.db, &f.revision_id), "archived");
+    assert_eq!(executions_for(&f.db, &port_id).last().unwrap().1, "ready");
 }
 
 #[test]
@@ -257,6 +343,10 @@ fn force_a_merge_redispatches_the_conflict_revision_and_closes_the_exit() {
     let executions = executions_for(&f.db, &f.revision_id);
     assert_eq!(executions.len(), 2, "{executions:?}");
     assert_eq!(executions[1].1, "ready");
+    assert!(
+        f.db.execution_has_operator_forced_admission(&executions[1].0).unwrap(),
+        "Force keeps operator-forced admission until the work is admitted"
+    );
 
     let WorkItem::Task(task) = f.db.get_work_item(&f.revision_id).unwrap() else {
         panic!("expected a task");
@@ -278,9 +368,8 @@ fn force_a_merge_redispatches_the_conflict_revision_and_closes_the_exit() {
     assert!(format!("{err:#}").contains("no longer an allowed exit"), "{err:#}");
 }
 
-/// The shared answer path used to refuse a gated item, rolling the whole
-/// answer back and leaving the question open. A conflict revision queued
-/// behind another writer on the PR is exactly that shape.
+/// Answering a conflict revision gated behind another writer succeeds and
+/// leaves a waiting execution for the dependency cascade to promote.
 #[test]
 fn answering_a_gated_conflict_revision_parks_it_behind_its_gate_instead_of_failing() {
     let f = fixture();
@@ -305,6 +394,11 @@ fn answering_a_gated_conflict_revision_parks_it_behind_its_gate_instead_of_faili
     assert!(!outcome.minted_execution, "the gate decides when it starts");
     let executions = executions_for(&f.db, &f.revision_id);
     assert_eq!(executions.last().unwrap().1, "waiting_dependency", "{executions:?}");
+    assert!(
+        f.db.execution_has_operator_forced_admission(&executions.last().unwrap().0)
+            .unwrap(),
+        "a gated Force still records operator-forced admission for the cascade"
+    );
     assert!(open_questions(&f).is_empty());
     assert!(
         f.db.get_conflict_resolution(&f.crz_id)
@@ -374,7 +468,12 @@ fn rewrite_replaces_the_fix_with_a_port_sized_revision_ahead_of_review_revisions
     assert_eq!(attempt.revision_task_id.as_deref(), Some(port_id.as_str()));
     assert!(attempt.mismatch_exit_barred);
     assert_eq!(attempt.status, "pending");
-    assert_eq!(executions_for(&f.db, &port_id).last().unwrap().1, "ready");
+    let port_exec = latest_execution(&f, &port_id);
+    assert_eq!(port_exec.1, "ready");
+    assert!(
+        f.db.execution_has_operator_forced_admission(&port_exec.0).unwrap(),
+        "Rewrite keeps operator-forced admission on the port execution"
+    );
 
     // Review revisions queued on the PR run after the port.
     let gates = deps::gating_prereqs_for(&f.db.connect().unwrap(), &review.id).unwrap();
