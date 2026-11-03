@@ -53,8 +53,16 @@ die() {
   exit 1
 }
 
-# Temp files to remove if we exit early. A half-written remux must never be
-# left behind looking like a finished video, and must never replace an original.
+# Everything transient lives in one staging directory under TMPDIR, removed on
+# exit however we leave. Two reasons it is not beside the source file:
+#
+#  - A failed or interrupted run must not strand a half-written multi-gigabyte
+#    file in the user's folder.
+#  - Finder grants a Quick Action access to the *selected* files only (it marks
+#    them with a com.apple.macl xattr). A file we create next to them has no
+#    such grant, so chmod() and unlink() on it fail with EPERM. TMPDIR is not
+#    TCC-protected, and is on the same filesystem, so the final move into place
+#    is still an atomic rename.
 cleanup_paths=()
 cleanup() {
   local status=$?
@@ -213,6 +221,9 @@ packet_count() {
   "$FFPROBE" -v error -select_streams "$2" -show_entries packet=size -of csv=p=0 "$1" | grep -c . || true
 }
 
+stage="$(mktemp -d -t strip-video-metadata)" || die "could not create a staging directory"
+cleanup_paths+=("$stage")
+
 stripped=0
 skipped=0
 failed=0
@@ -283,10 +294,10 @@ for src in "${inputs[@]}"; do
     fi
     tmp="$dst"
   else
-    tmp="$(dirname -- "$src")/.${base}.stripping.${ext}"
+    tmp="${stage}/${base}"
     dst="$src"
   fi
-  cleanup_paths+=("$tmp")
+  rm -f -- "$tmp"
 
   log "strip $base — $tags ($(human "$before"))"
 
@@ -332,17 +343,23 @@ for src in "${inputs[@]}"; do
 
   after="$(/usr/bin/stat -f %z -- "$tmp" 2>/dev/null || echo 0)"
 
-  if [[ -z "$out_dir" ]]; then
-    # Carry the original's permissions and timestamp across, then swap it in
-    # with a rename so there is never a window where the path holds a partial
-    # file. mv within a directory is atomic.
-    chmod "$(/usr/bin/stat -f %Lp -- "$src")" "$tmp" || die "could not set mode on $tmp"
-    touch -r "$src" "$tmp" || die "could not set mtime on $tmp"
-    mv -f -- "$tmp" "$dst" || die "could not replace $dst"
-  fi
+  # Carry the original's permissions and timestamp across. Losing either is a
+  # cosmetic loss, never a reason to abandon a verified-good strip, so these
+  # are best-effort and only warn.
+  chmod "$(/usr/bin/stat -f %Lp -- "$src")" "$tmp" 2>/dev/null \
+    || log "      note: could not preserve file mode on $base"
+  touch -r "$src" "$tmp" 2>/dev/null \
+    || log "      note: could not preserve modification time on $base"
 
-  # Output kept: drop it from the cleanup list.
-  cleanup_paths=("${cleanup_paths[@]/$tmp}")
+  if [[ -z "$out_dir" ]]; then
+    # Swap it in with a rename, so the path never holds a partial file.
+    if ! mv -f -- "$tmp" "$dst"; then
+      log "FAIL  $base — could not replace the original; it is untouched"
+      rm -f -- "$tmp"
+      failed=$((failed + 1))
+      continue
+    fi
+  fi
 
   saved=$((before - after))
   reclaimed=$((reclaimed + saved))
