@@ -105,7 +105,7 @@ pub mod build_wait;
 pub mod build_wait_tracker;
 pub mod codex_unobserved_command;
 pub mod collaborators;
-pub mod conflict_stop_gate;
+pub use boss_observation_contracts::conflict_stop_gate;
 pub mod driver_teardown;
 pub mod driver_transcript;
 pub mod execution_publisher;

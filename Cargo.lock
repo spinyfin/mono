@@ -605,6 +605,7 @@ dependencies = [
  "boss-engine-grok-home-retention",
  "boss-engine-live-status-redact",
  "boss-engine-live-worker-state",
+ "boss-engine-merge-poller",
  "boss-engine-offsite-backup",
  "boss-engine-planner-validation",
  "boss-engine-proposal-validation",
@@ -963,6 +964,38 @@ dependencies = [
  "boss-protocol",
  "boss-work-db",
  "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "boss-engine-merge-poller"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bon",
+ "boss-ci-log-reader",
+ "boss-engine-gh-invocation",
+ "boss-engine-recovery",
+ "boss-engine-storage-values",
+ "boss-engine-utils",
+ "boss-event-bus",
+ "boss-execution-contracts",
+ "boss-gh-telemetry",
+ "boss-github",
+ "boss-metrics",
+ "boss-observation-contracts",
+ "boss-protocol",
+ "boss-task-scope",
+ "boss-trunk-client",
+ "boss-work-db",
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
  "tracing",
 ]
 
@@ -1365,6 +1398,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bon",
+ "boss-engine-worker-bin",
  "boss-github",
  "boss-protocol",
  "boss-work-db",

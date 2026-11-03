@@ -1,5 +1,7 @@
 //! Shared observation contracts for completion and merge polling.
 
+pub mod conflict_stop_gate;
+
 use std::collections::HashMap;
 use std::path::Path;
 

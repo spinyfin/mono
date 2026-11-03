@@ -1,0 +1,673 @@
+use super::*;
+
+/// Timeline-events selection set for [`build_batch_query`]'s `fields`
+/// parameter, used by [`fetch_merge_queue_dequeue_events_batch`]. Requests
+/// the last 20 PR-head / dequeue timeline entries. Including PR commits and
+/// force-pushes is what ties a failed queue run to the exact PR head it
+/// tested; the synthetic squash-mode queue commit is not a descendant of
+/// the PR head and therefore cannot establish that relationship through
+/// Git ancestry.
+pub(crate) const DEQUEUE_EVENTS_FIELDS: &str = concat!(
+    "timelineItems(itemTypes: [PULL_REQUEST_COMMIT, HEAD_REF_FORCE_PUSHED_EVENT, ",
+    "REMOVED_FROM_MERGE_QUEUE_EVENT], last: 20) { nodes { __typename ",
+    "... on PullRequestCommit { commit { oid } } ",
+    "... on HeadRefForcePushedEvent { afterCommit { oid } } ",
+    "... on RemovedFromMergeQueueEvent { reason createdAt beforeCommit { oid parents(first: 1) { nodes { oid } } } } } }",
+);
+
+/// Batch-fetch merge-queue dequeue events for every PR in `pr_urls` with
+/// one GraphQL round trip per pass — one `repository(...)` alias per
+/// distinct repo, one `pullRequest(...)` alias per PR inside it, the same
+/// grouping [`build_batch_query`] uses for the lifecycle probe — instead of
+/// one `gh api graphql` call per PR. This is what collapses
+/// [`check_merge_queue_rebounce`]'s per-candidate polling from O(open rows)
+/// requests per pass down to O(1): previously every `in_review` /
+/// `blocked_ci` candidate got its own unbatched timeline query on every
+/// full sweep, which was the dominant per-pass request volume behind the
+/// hourly quota exhaustion this batching fixes.
+///
+/// Best-effort like the lifecycle probe's degradation path, but stricter:
+/// on ANY failure (spawn error, non-zero exit, unparseable body, top-level
+/// GraphQL `errors`) this returns an empty map for the whole batch rather
+/// than falling back to per-PR fetches. Unlike PR-lifecycle probing, a
+/// missed pass of dequeue detection is harmless — the next pass re-queries
+/// the same 20-item timeline window — so spending N extra requests on a
+/// per-PR fallback is never worth it, and would specifically defeat the
+/// point when the failure IS the rate limit (a fallback would turn one
+/// rejected batch into N more rejected requests).
+pub(crate) async fn fetch_merge_queue_dequeue_events_batch(
+    pr_urls: &[String],
+) -> HashMap<String, Vec<MergeQueueDequeueEvent>> {
+    let mut out = HashMap::new();
+    let mut parsed: HashMap<String, (String, String, u64)> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for url in pr_urls {
+        if parsed.contains_key(url) {
+            continue;
+        }
+        if let Some((owner, repo, number)) = parse_pr_url_parts(url) {
+            parsed.insert(url.clone(), (owner.to_owned(), repo.to_owned(), number));
+            order.push(url.clone());
+        }
+    }
+    if order.is_empty() {
+        return out;
+    }
+
+    let (query, alias_map) = build_batch_query(&order, &parsed, DEQUEUE_EVENTS_FIELDS);
+    // Its own bucket rather than the enclosing sweep's: this is a
+    // second, separately-shaped GraphQL query issued per pass, and
+    // folding it into the sweep's total would hide a distinct cost
+    // behind an aggregate.
+    let output = gh_scope(
+        callers::MERGE_POLLER_MERGE_QUEUE,
+        gh_output(&["api", "graphql", "-f", &format!("query={query}")]),
+    )
+    .await;
+    let body: serde_json::Value = match output {
+        Ok(o) if o.status.success() => match serde_json::from_slice(&o.stdout) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::debug!(
+                    ?err,
+                    "merge poller: failed to parse batched dequeue-events graphql response"
+                );
+                return out;
+            }
+        },
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            if is_rate_limit_error(&stderr) {
+                tracing::warn!(
+                    stderr = %stderr.trim(),
+                    pr_count = order.len(),
+                    "merge poller: batched dequeue-events graphql call rejected — GitHub API rate limit exceeded; skipping this pass",
+                );
+                RATE_LIMIT_REMAINING.store(0, Ordering::Relaxed);
+            } else {
+                tracing::debug!(
+                    stderr = %stderr.trim(),
+                    "merge poller: batched dequeue-events graphql call failed",
+                );
+            }
+            return out;
+        }
+        Err(err) => {
+            tracing::debug!(
+                ?err,
+                "merge poller: failed to spawn batched dequeue-events `gh api graphql`"
+            );
+            return out;
+        }
+    };
+
+    record_rate_limit(&body);
+
+    if body
+        .get("errors")
+        .and_then(|e| e.as_array())
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        tracing::debug!(
+            errors = %body["errors"],
+            "merge poller: batched dequeue-events graphql response carried errors",
+        );
+        return out;
+    }
+
+    for (url, pr_node) in walk_batch_response(&body, &alias_map) {
+        let nodes = pr_node.and_then(|node| node["timelineItems"]["nodes"].as_array());
+        out.insert(url, nodes.map(|n| parse_dequeue_event_nodes(n)).unwrap_or_default());
+    }
+    out
+}
+
+/// Shared node-level parser for an ordered `timelineItems.nodes` array.
+/// Tracks PR-commit / force-push nodes as the head provenance for every
+/// subsequent dequeue node. CI remediation filters to `FAILED_CHECKS`, while
+/// a GitHub-native merge intent must see every reason because a manual or
+/// conflict dequeue is still authoritative evidence that its card left
+/// Merging.
+pub(crate) fn parse_dequeue_event_nodes(nodes: &[serde_json::Value]) -> Vec<MergeQueueDequeueEvent> {
+    let mut events = Vec::new();
+    let mut pr_head_oid: Option<String> = None;
+    for node in nodes {
+        match node["__typename"].as_str() {
+            Some("PullRequestCommit") => {
+                if let Some(oid) = node["commit"]["oid"].as_str() {
+                    pr_head_oid = Some(oid.to_owned());
+                }
+                continue;
+            }
+            Some("HeadRefForcePushedEvent") => {
+                if let Some(oid) = node["afterCommit"]["oid"].as_str() {
+                    pr_head_oid = Some(oid.to_owned());
+                }
+                continue;
+            }
+            _ => {}
+        }
+        let reason = match node["reason"].as_str() {
+            Some(r) => r.to_owned(),
+            None => continue,
+        };
+        let before_commit_oid = node["beforeCommit"]["oid"].as_str().map(|s| s.to_owned());
+        events.push(MergeQueueDequeueEvent {
+            reason,
+            created_at: node["createdAt"].as_str().map(str::to_owned),
+            pr_head_oid: pr_head_oid.clone(),
+            before_commit_oid,
+            queue_base_oid: node["beforeCommit"]["parents"]["nodes"][0]["oid"]
+                .as_str()
+                .map(str::to_owned),
+        });
+    }
+    events
+}
+
+/// Shared by [`run_one_pass`] and [`reconcile_one`]: dedup `in_review` and
+/// `blocked_ci` by `work_item_id`, drop `trunk_queue` products (see
+/// [`is_trunk_queue_product`]), batch-fetch merge-queue dequeue events for
+/// the remaining candidates, and run [`check_merge_queue_rebounce`] on each.
+pub(crate) async fn run_merge_queue_rebounce_pass(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    in_review: &[PendingMergeCheck],
+    blocked_ci: &[PendingMergeCheck],
+    outcome: &mut SweepOutcome,
+) {
+    let mut rebounce_seen = std::collections::HashSet::new();
+    let rebounce_candidates: Vec<&PendingMergeCheck> = in_review
+        .iter()
+        .chain(blocked_ci.iter())
+        .filter(|candidate| rebounce_seen.insert(candidate.work_item_id.clone()))
+        .filter(|candidate| !is_trunk_queue_product(work_db, &candidate.product_id))
+        .collect();
+    let rebounce_urls: Vec<String> = rebounce_candidates.iter().map(|c| c.pr_url.clone()).collect();
+    let dequeue_events = fetch_merge_queue_dequeue_events_batch(&rebounce_urls).await;
+    for candidate in &rebounce_candidates {
+        clear_github_merge_intent_on_observed_dequeue(work_db, publisher, candidate, &dequeue_events).await;
+        check_merge_queue_rebounce(
+            work_db,
+            crate::queue_ci_contract::DetectionContext {
+                publisher,
+                fetcher: &crate::queue_ci_contract::ProviderFetcher,
+            },
+            candidate,
+            &dequeue_events,
+            outcome,
+        )
+        .await;
+    }
+}
+
+/// Clear a GitHub-native merge intent only on timeline evidence that its
+/// exact submitted head left the merge queue. An empty lifecycle probe is not
+/// evidence: it is the expected transient immediately after `gh pr merge`.
+pub(crate) async fn clear_github_merge_intent_on_observed_dequeue(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    dequeue_events: &HashMap<String, Vec<MergeQueueDequeueEvent>>,
+) {
+    let Some(events) = dequeue_events.get(&candidate.pr_url) else {
+        return;
+    };
+    for event in events {
+        let Some(head_sha) = event.pr_head_oid.as_deref() else {
+            continue;
+        };
+        let Some(event_created_at) = event
+            .created_at
+            .as_deref()
+            .and_then(|created_at| chrono::DateTime::parse_from_rfc3339(created_at).ok())
+            .map(|created_at| created_at.timestamp())
+        else {
+            tracing::debug!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                head_sha,
+                "merge poller: dequeue event has no creation time; skipping intent retirement",
+            );
+            continue;
+        };
+        let prior = match work_db.retire_github_merge_intent_on_dequeue(
+            &candidate.work_item_id,
+            &candidate.pr_url,
+            head_sha,
+            event_created_at,
+        ) {
+            Ok(Some(prior)) => prior,
+            Ok(None) => continue,
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    head_sha,
+                    ?err,
+                    "merge poller: failed to retire GitHub merge intent after observed dequeue",
+                );
+                return;
+            }
+        };
+        if prior.is_none() {
+            return;
+        }
+        tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            prior_merge_queue_state = prior.as_deref(),
+            new_merge_queue_state = Option::<&str>::None,
+            in_merge_queue = false,
+            auto_merge_enabled = false,
+            dequeue_reason = %event.reason,
+            "merge poller: card Merging lane state changed",
+        );
+        publisher
+            .publish_work_item_changed(
+                &candidate.product_id,
+                &candidate.work_item_id,
+                "github_merge_intent_dequeued",
+            )
+            .await;
+        if prior.as_deref() == Some("queued") {
+            renumber_merge_queue(work_db, publisher, &candidate.product_id).await;
+        }
+        return;
+    }
+}
+
+/// Poll the PR's merge-queue timeline for `FAILED_CHECKS` dequeue
+/// events and fire [`ci_watch::on_merge_queue_rebounce_detected`] for
+/// any event whose attributed PR head is not yet recorded in
+/// `ci_remediations` (with a transition-safe match against the synthetic
+/// `beforeCommit` for pre-head-key rows). Best-effort: a failed GraphQL
+/// call is logged at debug and skipped; the next sweep will retry.
+pub(crate) async fn check_merge_queue_rebounce(
+    work_db: &WorkDb,
+    context: crate::queue_ci_contract::DetectionContext<'_>,
+    candidate: &PendingMergeCheck,
+    dequeue_events: &HashMap<String, Vec<MergeQueueDequeueEvent>>,
+    outcome: &mut SweepOutcome,
+) {
+    let Some(events) = dequeue_events.get(&candidate.pr_url) else {
+        return;
+    };
+    if events.is_empty() {
+        return;
+    }
+    // Current PR head from the last poll-state write (updated earlier in
+    // this sweep's `sweep_one` → `update_pr_poll_state`). A historical
+    // dequeue attributed to a superseded head must not mint a fresh
+    // remediation after the key migration — only the live head is actionable.
+    let current_pr_head = work_db
+        .get_pr_status_snapshot(&candidate.work_item_id)
+        .ok()
+        .flatten()
+        .and_then(|snap| snap.head_sha);
+    // Newest first: repeated enqueue attempts of the same unchanged PR head
+    // share one remediation budget, and the freshest synthetic run is the
+    // most useful CI evidence to retain on that row.
+    for event in events.iter().rev() {
+        // Other dequeue reasons are still consumed above as evidence to
+        // retire a GitHub merge intent, but only failed checks mint a CI
+        // remediation attempt. GitHub returns the lowercase form
+        // `failed_checks` even though the schema declares `FAILED_CHECKS`,
+        // so compare case-insensitively to accept both.
+        if !event.reason.eq_ignore_ascii_case("failed_checks") {
+            continue;
+        }
+        let Some(pr_head_sha) = event.pr_head_oid.as_deref() else {
+            // Unattributable forever when the bounded timeline window is
+            // crowded out by dequeue events (no PR-head provenance left).
+            // Debug only — a warn per event per candidate per sweep is
+            // operator-visible noise that can never clear.
+            tracing::debug!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                "merge poller: FAILED_CHECKS dequeue event has no attributable PR head; skipping",
+            );
+            continue;
+        };
+        let Some(before_commit_sha) = event.before_commit_oid.as_deref() else {
+            tracing::debug!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                "merge poller: FAILED_CHECKS dequeue event has no beforeCommit.oid; skipping",
+            );
+            continue;
+        };
+        if !dequeue_event_is_for_current_pr_head(event, current_pr_head.as_deref()) {
+            tracing::debug!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                pr_head_sha,
+                current_pr_head = current_pr_head.as_deref(),
+                before_commit_sha,
+                "merge poller: rebounce event attributed to superseded PR head; skipping",
+            );
+            continue;
+        }
+        // A verified requeue archives only the newest queue construction's
+        // dedup key, so older coalesced failures at this head no longer match
+        // any row. Ignore every dequeue at or before the requeue itself: the
+        // receipt's `enqueuedAt`, falling back to the retired attempt's
+        // creation when none was recorded. A failure of the requeued
+        // construction follows `enqueuedAt`, so it still mints even if it
+        // lands before the proposal is applied.
+        match work_db.verified_requeue_boundary(&candidate.work_item_id, pr_head_sha) {
+            Ok(Some(boundary)) => {
+                let created = event
+                    .created_at
+                    .as_deref()
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                    .map(|t| t.timestamp());
+                if created.is_some_and(|created| created <= boundary) {
+                    tracing::debug!(
+                        work_item_id = %candidate.work_item_id,
+                        pr_head_sha,
+                        before_commit_sha,
+                        "merge poller: rebounce event predates verified requeue; skipping",
+                    );
+                    continue;
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::debug!(work_item_id = %candidate.work_item_id, ?err, "merge poller: failed to read requeue boundary; continuing");
+            }
+        }
+        // Per-episode dedup *before* the check-runs/status round trip.
+        // The timeline keeps historical `RemovedFromMergeQueueEvent`s
+        // forever (including on PRs that have since re-queued and
+        // merged), so without this short-circuit every full sweep would
+        // re-fetch CI evidence for already-handled discriminators —
+        // log noise and wasted GitHub quota on rows that are no longer
+        // live (historically 1000+ re-fetches for a single PR episode).
+        // Match PR head *or* synthetic before_commit so pre-transition
+        // rows (synthetic stored in `head_sha_at_trigger`) still hit.
+        // `on_merge_queue_rebounce_detected` repeats this same episode
+        // check as its own guard (the insert alone cannot dedup archived
+        // `mq:<head>@<queue>` rows), so this just avoids the surrounding work.
+        match work_db.ci_remediation_exists_for_merge_queue_episode(
+            &candidate.work_item_id,
+            pr_head_sha,
+            before_commit_sha,
+        ) {
+            Ok(true) => {
+                tracing::debug!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    pr_head_sha,
+                    before_commit_sha,
+                    "merge poller: rebounce episode already recorded; skipping re-fetch",
+                );
+                continue;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                tracing::debug!(
+                    work_item_id = %candidate.work_item_id,
+                    ?err,
+                    "merge poller: failed to check rebounce dedup; continuing",
+                );
+            }
+        }
+        // Fetch the failing CI checks for the synthetic merge commit so the
+        // worker revision directive can show the exact build URL, job id,
+        // and a log excerpt — without the worker having to rediscover them.
+        // Best-effort: an empty result falls back to generic instructions.
+        // Reads both check-runs and legacy commit statuses (Buildkite on
+        // mono posts only the latter — see `fetch_failing_checks_for_commit`).
+        let failures = match repo_from_pr_url(&candidate.pr_url) {
+            Some(owner_repo) => fetch_failing_checks_for_commit(owner_repo, before_commit_sha).await,
+            None => Vec::new(),
+        };
+        tracing::debug!(
+            work_item_id = %candidate.work_item_id,
+            before_commit_sha,
+            failing_checks = failures.len(),
+            "merge poller: fetched failing checks for merge-queue commit",
+        );
+        if ci_watch::on_merge_queue_rebounce_detected(
+            work_db,
+            context,
+            candidate,
+            pr_head_sha,
+            before_commit_sha,
+            event.queue_base_oid.as_deref(),
+            &failures,
+        )
+        .await
+        {
+            // `ci_watch::on_merge_queue_rebounce_detected` is the single
+            // authority for the merge-queue-failure -> blocked transition and
+            // already logs it (at most once per before_commit_sha). Don't
+            // re-log the same flip here — two log lines for one transition,
+            // firing at the same instant, read like two redundant watchers.
+            // Just aggregate the sweep metric.
+            outcome.merge_queue_rebounced += 1;
+        }
+    }
+}
+
+/// A historical dequeue is actionable only while it is attributed to the
+/// freshly-polled PR head. Missing current-head state is tolerated for the
+/// first pass after an older database row; an explicit mismatch is stale.
+pub(crate) fn dequeue_event_is_for_current_pr_head(
+    event: &MergeQueueDequeueEvent,
+    current_pr_head: Option<&str>,
+) -> bool {
+    match (event.pr_head_oid.as_deref(), current_pr_head) {
+        (Some(event_head), Some(current_head)) => event_head == current_head,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+/// Derive the `merge_queue_state` DB string from a probe's merge-queue and
+/// auto-merge flags. `Some("queued")` when the PR is in GitHub's merge
+/// queue; `Some("auto_merge_enabled")` when auto-merge is armed but the PR
+/// hasn't reached a queue (either the "Merge When Ready" request is still
+/// pending required checks, or the repo has no merge queue at all); `None`
+/// (NULL in DB) when neither. A queue entry always implies auto-merge is
+/// also armed on GitHub's side, so `in_merge_queue` takes precedence.
+///
+/// Both values place the task in the macOS kanban's "Merging" section
+/// (above "Today" in Done) — see [`merge_queue_detail_json`] for the
+/// section's ordering key.
+pub(crate) fn merge_queue_state_str(in_merge_queue: bool, auto_merge_enabled: bool) -> Option<&'static str> {
+    if in_merge_queue {
+        Some("queued")
+    } else if auto_merge_enabled {
+        Some("auto_merge_enabled")
+    } else {
+        None
+    }
+}
+
+/// `section_order` sentinel for a queued PR whose GitHub queue position
+/// wasn't reported (rare — schema allows it). Sorts below every PR with a
+/// real numbered position but above the merge-when-ready bucket.
+pub const QUEUED_NO_POSITION_SECTION_ORDER: i64 = 500_000;
+
+/// `section_order` fallback for a merge-when-ready PR whose
+/// `autoMergeRequest.enabledAt` GitHub didn't report. Sorts after every
+/// merge-when-ready PR with a known enable time, at the very bottom of the
+/// Merging section.
+pub(crate) const MERGE_WHEN_READY_UNKNOWN_ENABLED_AT_SECTION_ORDER: i64 = i64::MAX;
+
+/// Build the `merge_queue_detail` JSON blob (`{"position", "state",
+/// "enqueued_at", "section_order"}`) from a probe's merge-queue and
+/// auto-merge sub-state. Returns `None` when the probe is in neither state
+/// (nothing to show). Otherwise always includes `section_order` — the
+/// engine-computed sort key the macOS kanban's Merging section renders in,
+/// so the client never has to reconstruct "queue position first, then
+/// merge-when-ready" ordering itself:
+///   - queued: the GitHub queue position (falls back to
+///     [`QUEUED_NO_POSITION_SECTION_ORDER`] if GitHub omitted it).
+///   - auto-merge armed but not queued: the `enabledAt` epoch (falls back
+///     to [`MERGE_WHEN_READY_UNKNOWN_ENABLED_AT_SECTION_ORDER`]) — always
+///     larger than any realistic queue position/sentinel, so this bucket
+///     sorts below every queued PR, and multiple armed PRs order by which
+///     requested Merge When Ready first.
+pub(crate) fn merge_queue_detail_json(probe: &PrLifecycleProbe) -> Option<String> {
+    let section_order = if probe.in_merge_queue {
+        probe.merge_queue_position.unwrap_or(QUEUED_NO_POSITION_SECTION_ORDER)
+    } else if probe.auto_merge_enabled {
+        probe
+            .auto_merge_enabled_at
+            .as_deref()
+            .and_then(parse_iso8601_lenient)
+            .unwrap_or(MERGE_WHEN_READY_UNKNOWN_ENABLED_AT_SECTION_ORDER)
+    } else {
+        return None;
+    };
+    serde_json::to_string(&serde_json::json!({
+        "position": probe.merge_queue_position,
+        "state": probe.merge_queue_entry_state,
+        "enqueued_at": probe.merge_queue_enqueued_at,
+        "section_order": section_order,
+    }))
+    .ok()
+}
+
+/// Whether `product_id` is on the `trunk_queue` merge mechanism — the Trunk
+/// probe owns `merge_queue_state`/`merge_queue_detail` and the eviction
+/// signal for these products, so the GitHub-side probe must not write those
+/// columns or run GitHub-queue-specific coordination (see
+/// `preserve_merge_queue_state` in [`update_pr_poll_state`] and the
+/// `check_merge_queue_rebounce` gate in [`run_one_pass`]/[`reconcile_one`]).
+/// Defaults to `false` (treat as `direct`) on a missing product or a DB
+/// error, logging the latter — a transient DB failure must not silently
+/// disable GitHub-side merge handling for a `direct` product.
+pub(crate) fn is_trunk_queue_product(work_db: &WorkDb, product_id: &str) -> bool {
+    match work_db.get_product(product_id) {
+        Ok(Some(product)) => matches!(
+            crate::merge_mechanism::MergeMechanism::parse(product.merge_mechanism.as_deref()),
+            Ok(crate::merge_mechanism::MergeMechanism::TrunkQueue { .. })
+        ),
+        Ok(None) => false,
+        Err(err) => {
+            tracing::warn!(
+                product_id,
+                ?err,
+                "merge poller: failed to load product to check merge mechanism; treating as direct",
+            );
+            false
+        }
+    }
+}
+
+/// Fields pulled back out of a stored `merge_queue_detail` JSON blob — the
+/// read-side counterpart to [`merge_queue_detail_json`]'s write. Used only
+/// by [`renumber_merge_queue`] to re-sort and rebuild the blob for every
+/// currently queued member of a product.
+pub(crate) struct StoredMergeQueueDetail {
+    state: Option<String>,
+    enqueued_at: Option<String>,
+    position: Option<i64>,
+}
+
+pub(crate) fn parse_stored_merge_queue_detail(json: Option<&str>) -> StoredMergeQueueDetail {
+    let parsed: Option<serde_json::Value> = json.and_then(|s| serde_json::from_str(s).ok());
+    StoredMergeQueueDetail {
+        state: parsed
+            .as_ref()
+            .and_then(|v| v.get("state"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        enqueued_at: parsed
+            .as_ref()
+            .and_then(|v| v.get("enqueued_at"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        position: parsed.as_ref().and_then(|v| v.get("position")).and_then(|v| v.as_i64()),
+    }
+}
+
+/// Sort key for [`renumber_merge_queue`]: ascending `enqueued_at` (GitHub's
+/// immutable FIFO join time for a queue entry) first since it can't be
+/// clobbered by our own renumbering the way a raw `position` value can;
+/// falls back to the last-known raw `position`, then `task_id`, for members
+/// missing an `enqueued_at` so the ranking stays fully deterministic. A
+/// missing value on either axis always sorts after every present value on
+/// that axis, rather than comparing as smaller/earlier.
+pub(crate) fn merge_queue_sort_key(detail: &StoredMergeQueueDetail, task_id: &str) -> (u8, String, u8, i64, String) {
+    let (enqueued_rank, enqueued_val) = match &detail.enqueued_at {
+        Some(ts) => (0u8, ts.clone()),
+        None => (1u8, String::new()),
+    };
+    let (position_rank, position_val) = match detail.position {
+        Some(p) => (0u8, p),
+        None => (1u8, i64::MAX),
+    };
+    (
+        enqueued_rank,
+        enqueued_val,
+        position_rank,
+        position_val,
+        task_id.to_owned(),
+    )
+}
+
+/// Recompute a canonical, contiguous, duplicate-free position for every
+/// task in `product_id` currently in GitHub's merge queue
+/// (`merge_queue_state = 'queued'`), and re-broadcast for every member
+/// whose displayed position actually changed (mono#1997).
+///
+/// [`update_pr_poll_state`] only ever learns and writes a probed PR's OWN
+/// raw `mergeQueueEntry.position` — siblings aren't touched by that write.
+/// So when one member enters, exits, fails, or reorders, every other
+/// member can keep showing a stale number, including one that now
+/// collides with a sibling's (two cards both showing `#2`) or a missing
+/// number for a member GitHub hadn't yet reported a position for. This
+/// pass is the fix: called after every merge-queue-relevant probe write —
+/// not just for the row that changed — it re-derives a fresh `1..N`
+/// ranking from every currently-tracked queued member and rewrites +
+/// re-broadcasts every row whose rank changed, so the WHOLE queue stays
+/// self-consistent rather than only the mutated item.
+///
+/// Membership in the renumbered set is governed *only* by
+/// `merge_queue_state == "queued"` — a queued-but-failing member (e.g. one
+/// GitHub reports as `UNMERGEABLE` while it's being dequeued) keeps a
+/// position like any other member for as long as that column still reads
+/// `"queued"`, and is excluded the moment it flips away. That is the one
+/// rule callers need: a failed member's number never races between
+/// "kept" and "excluded" mid-transition.
+pub(crate) async fn renumber_merge_queue(work_db: &WorkDb, publisher: &dyn ExecutionPublisher, product_id: &str) {
+    let ctx = crate::merge_queue_renumber::RenumberContext {
+        work_db,
+        publisher,
+        product_id,
+        log_context: "merge poller",
+        event: "merge_queue_renumbered",
+    };
+    crate::merge_queue_renumber::renumber_section_order(
+        &ctx,
+        |member| {
+            Some((
+                member.task_id,
+                parse_stored_merge_queue_detail(member.merge_queue_detail.as_deref()),
+            ))
+        },
+        merge_queue_sort_key,
+        // Diff on the parsed position, not the raw JSON string: a member
+        // already at its canonical rank must be skipped even though the
+        // rewritten blob's key order/section_order differs byte-for-byte
+        // from whatever an earlier write (or a legacy/pre-migration row)
+        // left behind — this is the "only touch what changed" guarantee,
+        // not merely a micro-optimisation.
+        |detail, position| detail.position == Some(position),
+        |detail, position| {
+            serde_json::to_string(&serde_json::json!({
+                "position": position,
+                "state": detail.state,
+                "enqueued_at": detail.enqueued_at,
+                "section_order": position,
+            }))
+            .ok()
+        },
+    )
+    .await;
+}

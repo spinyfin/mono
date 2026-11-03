@@ -1,0 +1,125 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+# Deliberately no core, dispatch or completion dependency: the conflict handling,
+# design-doc maintenance and project population the sweep requests from the
+# engine host reach it through the `SweepHost` traits its caller injects, and the
+# completion service's requests through the observation-contract traits.
+POLLER_DEPS = [
+    "//tools/boss/engine/ci-log-reader",
+    "//tools/boss/engine/event-bus",
+    "//tools/boss/engine/execution-contracts",
+    "//tools/boss/engine/gh-invocation",
+    "//tools/boss/engine/metrics",
+    "//tools/boss/engine/observation-contracts",
+    "//tools/boss/engine/storage-values",
+    "//tools/boss/engine/task-scope",
+    "//tools/boss/engine/utils",
+    "//tools/boss/engine/work-db",
+    "//tools/boss/gh_telemetry",
+    "//tools/boss/github",
+    "//tools/boss/protocol",
+    "//tools/boss/trunk_client",
+]
+
+# Variants of the crates below that carry fixtures; the engine's test build and
+# this crate's own tests compile against them so their types unify.
+TEST_SUPPORT_ALIASES = {
+    "//tools/boss/engine/execution-contracts:execution_contracts_test_support": "boss_execution_contracts",
+    "//tools/boss/engine/observation-contracts:observation_contracts_test_support": "boss_observation_contracts",
+    "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
+}
+
+TEST_SUPPORT_SWAPS = [
+    "//tools/boss/engine/execution-contracts",
+    "//tools/boss/engine/observation-contracts",
+    "//tools/boss/engine/work-db",
+]
+
+TEST_SUPPORT_DEPS = [
+    "//tools/boss/engine/execution-contracts:execution_contracts_test_support",
+    "//tools/boss/engine/observation-contracts:observation_contracts_test_support",
+    "//tools/boss/engine/recovery",
+    "//tools/boss/engine/work-db:work_db_test_support",
+]
+
+# Fixture-only crates the test-support library links as normal dependencies;
+# the crate's own test target already receives them as dev-dependencies.
+FIXTURE_LIBRARY_DEPS = [
+    "@mono_crates//:rusqlite",
+    "@mono_crates//:tempfile",
+]
+
+# Test cases live beside the code they exercise but must not invalidate the
+# service library: editing one recompiles only the crate's own test target.
+TEST_CASE_SOURCES = [
+    "src/ci_watch_tests/**",
+    "src/queue_ci_contract_tests.rs",
+    "src/tests/**",
+    "src/trunk_queue_adopt/tests.rs",
+    "src/trunk_queue_poller/tests.rs",
+]
+
+# The fixture harness is compiled into the test-support library only.
+FIXTURE_SOURCES = [
+    "src/test_support.rs",
+    "src/tests.rs",
+]
+
+rust_library(
+    name = "merge-poller",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = TEST_CASE_SOURCES + FIXTURE_SOURCES,
+    ),
+    crate_name = "boss_engine_merge_poller",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//tools/boss/engine/core:__pkg__"],
+    deps = POLLER_DEPS + all_crate_deps(normal = True),
+)
+
+rust_library(
+    name = "merge_poller_test_support",
+    testonly = True,
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = TEST_CASE_SOURCES,
+    ),
+    aliases = TEST_SUPPORT_ALIASES,
+    crate_features = ["test-support"],
+    crate_name = "boss_engine_merge_poller_test_support",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//tools/boss/engine/core:__pkg__"],
+    deps = [d for d in POLLER_DEPS if d not in TEST_SUPPORT_SWAPS] + TEST_SUPPORT_DEPS + FIXTURE_LIBRARY_DEPS + all_crate_deps(normal = True),
+)
+
+# The crate's own tests compile every source, test cases included, as a unit of
+# their own rather than through `crate = ":merge-poller"`, so that the library
+# targets above can leave the test cases out.
+rust_test(
+    name = "merge_poller_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = TEST_SUPPORT_ALIASES,
+    crate_name = "boss_engine_merge_poller",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    env = {"HOME": "/tmp"},
+    experimental_enable_sharding = True,
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    shard_count = 4,
+    deps = [d for d in POLLER_DEPS if d not in TEST_SUPPORT_SWAPS] + TEST_SUPPORT_DEPS + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

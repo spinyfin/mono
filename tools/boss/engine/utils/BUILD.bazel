@@ -29,6 +29,7 @@ rust_library(
         "//tools/boss/engine/host-execution:__pkg__",
         "//tools/boss/engine/live-status-redact:__pkg__",
         "//tools/boss/engine/live-worker-state:__pkg__",
+        "//tools/boss/engine/merge-poller:__pkg__",
         "//tools/boss/engine/metrics:__pkg__",
         "//tools/boss/engine/metrics-registry:__pkg__",
         "//tools/boss/engine/offsite-backup:__pkg__",
