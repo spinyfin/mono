@@ -568,19 +568,22 @@ pub async fn create_from(
                 "execution recovery pointer names already exist",
             ));
         }
-        let baseline = if let Some(prior) = predecessor {
+        if let Some(prior) = predecessor {
             if prior.repo_path != record.repo_path || prior.host_id != record.host_id {
                 return Err(pointer_integrity_error(
                     "inherited baseline belongs to another recovery store",
                 ));
             }
             diff(jj, prior).await?;
-            match inherited_base {
-                Some(base) => base.to_owned(),
-                None => predecessor_floor(jj, prior).await?,
-            }
-        } else if let Some(base) = inherited_base {
-            base.to_owned()
+        }
+        // A restore-report or `pr_head_before` hash is the floor only when it
+        // still exists. A missing hash is not copied: `jj bookmark create`
+        // would fail on every retry. Fall back to the predecessor's resolved
+        // floor, then the trunk-bounded walk of the positioned workspace.
+        let baseline = if let Some(commit) = usable_commit(jj, &record.repo_path, inherited_base).await? {
+            commit
+        } else if let Some(prior) = predecessor {
+            predecessor_floor(jj, prior).await?
         } else {
             positioned_base(jj, workspace).await?
         };

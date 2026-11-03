@@ -231,10 +231,7 @@ async fn lookup_failures_remain_retryable_but_cube_refusals_block() {
         r#"Cube command failed: {"error":"cannot repair `pr/7`: PR 7 returned no head.sha: \"abc123\" is not a full 40-character commit id"}"#,
     ] {
         let blocked = ensure(&store, &FailingCube(refusal), &record, 7).await.unwrap_err();
-        assert!(
-            execution_bookmark::is_pointer_integrity_error(&blocked),
-            "{blocked:#}"
-        );
+        assert!(execution_bookmark::is_pointer_integrity_error(&blocked), "{blocked:#}");
     }
 }
 

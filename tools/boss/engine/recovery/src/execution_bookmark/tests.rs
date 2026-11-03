@@ -166,6 +166,43 @@ async fn consecutive_recoveries_keep_work_when_the_predecessors_baseline_hash_is
 }
 
 #[tokio::test]
+async fn create_from_ignores_an_unusable_inherited_base() {
+    let f = Fixture::new().await;
+    let prior = f.record("exec_unusable_inherited").await;
+    let floor = prior.base_commit.clone().unwrap();
+    f.edit(&prior).await;
+    assert!(restore(&LocalJj, &prior, &f.replacement).await.unwrap());
+    let missing = "0123456789abcdef0123456789abcdef01234567";
+    let next = create_from(
+        &LocalJj,
+        &f.replacement,
+        "exec_unusable_inherited_next",
+        "local",
+        Some(&prior),
+        Some(missing),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next.base_commit.as_deref(), Some(floor.as_str()));
+    let patch = unpublished_diff(&LocalJj, &next).await.unwrap();
+    assert!(patch.contains("work.txt") && patch.contains("second.txt"), "{patch}");
+
+    let fresh_fixture = Fixture::new().await;
+    let expected = positioned_base(&LocalJj, &fresh_fixture.worker).await.unwrap();
+    let fresh = create_from(
+        &LocalJj,
+        &fresh_fixture.worker,
+        "exec_unusable_inherited_fresh",
+        "local",
+        None,
+        Some(missing),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fresh.base_commit.as_deref(), Some(expected.as_str()));
+}
+
+#[tokio::test]
 async fn restoration_uses_pr_head_before_when_base_commit_is_absent_or_unusable() {
     let f = Fixture::new().await;
     let prior = f.record("exec_pr_head_floor").await;
@@ -175,10 +212,7 @@ async fn restoration_uses_pr_head_before_when_base_commit_is_absent_or_unusable(
         .run(&f.repo, &["bookmark", "delete", &prior.base()])
         .await
         .unwrap();
-    for base_commit in [
-        None,
-        Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
-    ] {
+    for base_commit in [None, Some("0123456789abcdef0123456789abcdef01234567".to_owned())] {
         let record = ExecutionBookmark {
             base_commit,
             pr_head_before: Some(floor.clone()),
@@ -452,9 +486,11 @@ async fn initialization_transport_error_remains_retryable() {
 async fn shallow_history_below_trunk_does_not_affect_baseline_creation() {
     let root = tempfile::tempdir().unwrap();
     let repo = boss_engine_test_git::jj::JjRepo::new(root.path());
-    let missing = boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+    let missing =
+        boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
     boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["new", "-m", "Shallow boundary"]);
-    let boundary = boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+    let boundary =
+        boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
     boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["new", "-m", "Trunk base"]);
     boss_engine_test_git::jj::JjRepo::run(&repo.repo, &["bookmark", "create", "main", "-r", "@"]);
     boss_engine_test_git::jj::JjRepo::run(

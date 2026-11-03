@@ -173,10 +173,7 @@ async fn unusable_recorded_baseline_falls_back_to_pr_head_before_then_trunk() {
             ..s.record.clone()
         };
         let patch = diff(&LocalJj, &record).await.unwrap();
-        assert!(
-            patch.contains("revision.txt") && !patch.contains("pr.txt"),
-            "{patch}"
-        );
+        assert!(patch.contains("revision.txt") && !patch.contains("pr.txt"), "{patch}");
         assert!(!unpublished_diff(&LocalJj, &record).await.unwrap().is_empty());
     }
     for base_commit in [None, Some("0123456789abcdef0123456789abcdef01234567".to_owned())] {

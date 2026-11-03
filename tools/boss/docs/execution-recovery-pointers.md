@@ -10,7 +10,7 @@ The `execution_bookmarks` row for the execution records the shared store path, t
 
 Recovery is an optimisation. If pointer integrity checks cannot establish safe recovery, the engine archives the preserved commits and starts fresh. Transport failures retry through the ordinary positioning-failure path without retiring the recovery source. Redoing work is preferable to leaving an item unable to progress.
 
-Recovery resumes a later execution from `boss-base..<head>` of its predecessor. The integrity check requires a single line of history: every head must descend from the baseline, and when both heads exist one must descend from the other. A pointer that fails the check is never resumed from as-is.
+Recovery resumes a later execution from the unpublished range above the recorded floor (`::head ~ ::floor`). Lineage between the pointers and the floor is not an integrity invariant: two heads on different lines are both resumed. Genuine integrity failures (conflicted or missing heads, a foreign store) archive and start fresh.
 
 ## What each pointer is for, and how long it is needed
 
