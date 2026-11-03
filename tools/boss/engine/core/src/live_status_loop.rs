@@ -146,7 +146,7 @@ fn epoch_now() -> i64 {
     boss_engine_utils::epoch_time::now_epoch_secs()
 }
 
-// Phase-4 counter handles for DispatcherStats. Registered via
+// Counter handles for DispatcherStats. Registered via
 // `register_metrics` which is called from `boss_engine_app::metrics_init::init_all` at
 // engine startup.
 crate::register_counter!(
@@ -2090,7 +2090,7 @@ mod tests {
         mgr.stop_slot(5);
     }
 
-    /// Phase-4 acceptance test: an increment via the legacy `inc_*`
+    /// Acceptance test: an increment via the legacy `inc_*`
     /// wrapper and a direct increment via the framework handle both
     /// show up in `snapshot()` and in `registry.counter_value()`.
     #[test]

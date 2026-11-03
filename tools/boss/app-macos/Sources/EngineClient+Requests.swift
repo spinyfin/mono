@@ -957,7 +957,7 @@ extension EngineClient {
 
     // MARK: - Comments in the markdown viewer
     //
-    // Adapts the engine comment RPCs (`engine/core/src/app/comments.rs`).
+    // Adapts the engine comment RPCs (`engine/app/src/app/comments.rs`).
     // Requests are `FrontendRequest` variants
     // tagged by a snake_case `type`; `comments_create` / `comments_revise_doc`
     // flatten their input struct, so those fields sit at the top level. The

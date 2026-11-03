@@ -7,7 +7,7 @@ import SwiftUI
 /// (`tools/boss/docs/designs/trunk-merge-queue-integration-queue-backed-merges-merging-ui.md`).
 ///
 /// Thin RPC client over the engine's existing `TrunkSetToken`/`TrunkStatus`
-/// handlers (`tools/boss/engine/core/src/app/trunk_auth.rs`) — the token is
+/// handlers (`tools/boss/engine/app/src/app/trunk_auth.rs`) — the token is
 /// persisted to the OS Keychain engine-side; this pane never stores or logs
 /// it itself. Mirrors `EngineConfigPane`'s ANTHROPIC_API_KEY control.
 struct TrunkSettingsPane: View {
